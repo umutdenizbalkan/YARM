@@ -1049,6 +1049,13 @@ pub(crate) fn try_recv_core_user_plain_v2(
 /// For plain messages: `recv_meta_flags = 0`, `recv_local_transfer = None`,
 /// no cap rollback on any failure.  `app_payload = msg.as_slice()` (no prefix
 /// stripping).  Transfer-cap field in meta = `Message::NO_TRANSFER_CAP`.
+///
+/// **Stage 187A:** the live queued-split caller moved to the boundary sibling
+/// [`execute_user_asid_plain_v2_writeback_boundary`] (186E seam copy after the
+/// global-lock borrow drops). This `&mut KernelState` version is retained
+/// unchanged for the §55 semantics-equivalence regression tests, mirroring the
+/// retained Stage 31 `try_split_recv_queued_plain_into_frame_locked` pattern.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn execute_user_asid_plain_v2_writeback(
     kernel: &mut KernelState,
     delivery: &RecvDelivery,
@@ -1103,6 +1110,185 @@ pub(crate) fn execute_user_asid_plain_v2_writeback(
         Err(KernelError::UserMemoryFault) => {
             RecvV2WritebackOutcome::PayloadCopyFault { user_ptr: ptr }
         }
+        Err(_) => RecvV2WritebackOutcome::PayloadCopyFault { user_ptr: ptr },
+    }
+}
+
+// ─── Stage 187A: recv delivery boundary split (Phase B user-copy seam) ────────
+
+/// Stage 187A — by-value snapshot of a queued-split recv delivery whose
+/// user-space writeback is deferred past the global-lock boundary.
+///
+/// Produced by `try_split_recv_queued_plain_with_snapshot_locked` (Phase A,
+/// inside `with_cpu`) AFTER the dequeue, cap materialization, and sender wake
+/// have completed under the global lock — i.e. everything except the user copy.
+/// Consumed by `SharedKernel` (Phase B/C, runtime.rs) AFTER the `with_cpu`
+/// closure returns and the broad `&mut KernelState` borrow is dead.
+///
+/// Contains ONLY owned values — no `&mut KernelState`, no borrowed subsystem
+/// references — so the 186E user-copy seam can run against it without aliasing
+/// the (already released) global-lock borrow. It carries NO sender-local CapId:
+/// `materialized_cap` is the RECEIVER-local cap already minted in Phase A,
+/// carried solely so a writeback failure can roll it back (legacy §58
+/// semantics), never as transferable authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecvBoundaryUserCopySnapshot {
+    /// Receiver's ASID captured in Phase A (same resolution
+    /// `copy_to_current_user` performs: `current_tid → task_asid`). `None`
+    /// maps to the same fault outcome the legacy copy would produce.
+    pub(crate) asid: Option<crate::kernel::vm::Asid>,
+    /// Receiver TID (the current task in Phase A; needed for cap rollback).
+    pub(crate) receiver_tid: u64,
+    /// The dequeued message, by value (one-shot: consumed in Phase A, never
+    /// re-dequeued; a Phase B failure consumes it exactly like legacy).
+    pub(crate) msg: Message,
+    /// The writeback plan (`UserMemory` or `UserMemoryV2` only).
+    pub(crate) writeback: RecvWritebackPlan,
+    /// Receiver-local cap minted in Phase A (for rollback on writeback
+    /// failure), plus whether it is a reply cap (selects the rollback flavor).
+    pub(crate) materialized_cap: Option<u64>,
+    /// Reply-cap flag for the rollback flavor (legacy §58).
+    pub(crate) is_reply_cap: bool,
+}
+
+/// Stage 187B — by-value snapshot of an **ordinary** cap-transfer queued-split
+/// recv delivery whose cap materialization AND user writeback are BOTH deferred
+/// past the global-lock boundary, so the cap is minted through the Stage
+/// 186D2/186D3 cap-transfer seam (not the legacy in-lock router).
+///
+/// Produced by `try_split_recv_queued_plain_with_snapshot_locked` (Phase A,
+/// inside `with_cpu`) for a NON-shared-region ordinary transfer
+/// (`FLAG_CAP_TRANSFER`/`FLAG_CAP_TRANSFER_PLAIN`, non-reply) to a user-ASID
+/// receiver, AFTER the transfer envelope has been consumed once under
+/// `ipc_state_lock` (rank 3) and the source object/rights + receiver cnode
+/// resolved. It carries ONLY owned identity — no `&mut KernelState`, no borrows,
+/// and **no sender-local CapId as receiver authority**: `source_cap` is carried
+/// solely as the delegation-link parent edge (bookkeeping), never resolved-to-
+/// mint; the receiver-local CapId is freshly minted by the seam in Phase B.
+///
+/// The deferred sender wake (`wake_tid`) is applied in Phase B AFTER the seam
+/// mint and BEFORE the user writeback — preserving the §56/§58 order
+/// `materialize → wake → writeback` (the reason materialization is not done
+/// before the wake decision, per the Stage 187B contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecvBoundaryOrdinaryCapSnapshot {
+    /// Receiver's destination cnode (resolved in Phase A under the lock).
+    pub(crate) receiver_cnode: super::capabilities::CNodeId,
+    /// The transferred object identity (resolved from the consumed envelope's
+    /// source capability). Never a Reply object on this path.
+    pub(crate) object: CapObject,
+    /// Attenuated rights (the source capability's rights; the legacy grant's
+    /// `derive(source_rights)` is a no-op — byte-identical minted rights).
+    pub(crate) rights: super::capabilities::CapRights,
+    /// Source task TID — delegation-link parent owner (bookkeeping only).
+    pub(crate) source_tid: u64,
+    /// Source CapId — delegation-link parent edge (bookkeeping only; NEVER
+    /// receiver authority).
+    pub(crate) source_cap: CapId,
+    /// Deferred sender-waiter wake, applied in Phase B after the seam mint and
+    /// before the user writeback.
+    pub(crate) wake_tid: Option<ThreadId>,
+    /// Receiver ASID (Phase A resolution); `None` faults identically to legacy.
+    pub(crate) asid: Option<crate::kernel::vm::Asid>,
+    /// Receiver TID (delegation dest + rollback target).
+    pub(crate) receiver_tid: u64,
+    /// The dequeued message, by value (one-shot: envelope already consumed).
+    pub(crate) msg: Message,
+    /// The user writeback plan (`UserMemory` or `UserMemoryV2` only).
+    pub(crate) writeback: RecvWritebackPlan,
+}
+
+/// Stage 187A — Phase B sibling of [`execute_user_asid_plain_writeback`]
+/// running on the 186E user-copy seam AFTER the global-lock borrow is dead.
+///
+/// Byte-identical outcome mapping to the `&mut KernelState` sibling:
+/// undersized → `UndersizedBuffer`; copy fault (including a missing ASID,
+/// which `copy_to_current_user` maps to `UserMemoryFault`/`TaskMissing`) →
+/// `CopyFault`. Takes ONLY `&SharedKernel`; the copy goes through
+/// `copy_to_user_split` (VM rank 5 + memory rank 6 seams) — no
+/// `ipc_state_lock`, no capability lock, no broad `&mut KernelState`.
+pub(crate) fn execute_user_asid_plain_writeback_boundary(
+    shared: &crate::runtime::SharedKernel,
+    snapshot: &RecvBoundaryUserCopySnapshot,
+) -> RecvUserWritebackOutcome {
+    let (ptr, user_buf_len) = match snapshot.writeback {
+        RecvWritebackPlan::UserMemory {
+            ptr, user_buf_len, ..
+        } => (ptr, user_buf_len),
+        _ => unreachable!("execute_user_asid_plain_writeback_boundary: non-UserMemory plan"),
+    };
+    let payload = snapshot.msg.as_slice();
+    if user_buf_len < payload.len() {
+        return RecvUserWritebackOutcome::UndersizedBuffer;
+    }
+    let Some(asid) = snapshot.asid else {
+        // Legacy copy_to_current_user maps a missing ASID to UserMemoryFault →
+        // the caller's CopyFault arm. Same outcome here.
+        return RecvUserWritebackOutcome::CopyFault { user_ptr: ptr };
+    };
+    match shared.copy_to_user_split(asid, crate::kernel::vm::VirtAddr(ptr as u64), payload) {
+        Ok(()) => RecvUserWritebackOutcome::Ok,
+        Err(_) => RecvUserWritebackOutcome::CopyFault { user_ptr: ptr },
+    }
+}
+
+/// Stage 187A — Phase B sibling of [`execute_user_asid_plain_v2_writeback`]
+/// running on the 186E user-copy seam AFTER the global-lock borrow is dead.
+///
+/// Reproduces the §55 meta-first ordering and all three failure modes
+/// byte-identically: meta fault → `MetaCopyFault`; payload undersized (after
+/// meta succeeds) → `PayloadUndersized`; payload fault → `PayloadCopyFault`.
+/// The 40-byte meta encoding is the same single pure `encode_recv_v2_meta`
+/// codec with the same plain-path constants (`NO_TRANSFER_CAP`,
+/// `recv_meta_flags = 0`).
+pub(crate) fn execute_user_asid_plain_v2_writeback_boundary(
+    shared: &crate::runtime::SharedKernel,
+    snapshot: &RecvBoundaryUserCopySnapshot,
+) -> RecvV2WritebackOutcome {
+    let (ptr, user_buf_len, meta_ptr) = match snapshot.writeback {
+        RecvWritebackPlan::UserMemoryV2 {
+            ptr,
+            user_buf_len,
+            meta_ptr,
+            ..
+        } => (ptr, user_buf_len, meta_ptr),
+        _ => unreachable!("execute_user_asid_plain_v2_writeback_boundary: non-UserMemoryV2 plan"),
+    };
+    let msg = &snapshot.msg;
+    let app_payload = msg.as_slice();
+
+    // Same single pure recv-v2 codec, same plain-path constants as the
+    // `&mut KernelState` sibling (§55 / Stage 155 convergence).
+    let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
+        msg.sender_tid.0,
+        msg.opcode,
+        msg.flags,
+        app_payload.len() as u32,
+        Message::NO_TRANSFER_CAP,
+        0,
+        msg.sender_tid.0,
+    );
+
+    let Some(asid) = snapshot.asid else {
+        // Missing ASID surfaces at the FIRST copy (meta) exactly as the legacy
+        // copy_to_current_user would fault there.
+        return RecvV2WritebackOutcome::MetaCopyFault { meta_ptr };
+    };
+
+    // Copy meta FIRST — §55 ordering.
+    match shared.copy_to_user_split(asid, crate::kernel::vm::VirtAddr(meta_ptr as u64), &meta) {
+        Ok(()) => {}
+        Err(_) => return RecvV2WritebackOutcome::MetaCopyFault { meta_ptr },
+    }
+
+    // Undersized check — after meta copy succeeds (message consumed on failure).
+    if user_buf_len < app_payload.len() {
+        return RecvV2WritebackOutcome::PayloadUndersized;
+    }
+
+    // Copy payload SECOND — §55 ordering.
+    match shared.copy_to_user_split(asid, crate::kernel::vm::VirtAddr(ptr as u64), app_payload) {
+        Ok(()) => RecvV2WritebackOutcome::Ok,
         Err(_) => RecvV2WritebackOutcome::PayloadCopyFault { user_ptr: ptr },
     }
 }

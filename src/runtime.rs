@@ -1042,12 +1042,19 @@ impl SharedKernel {
         // the recv fell through to the global `legacy_full_path`, never emitting
         // the queued-split markers. Binding the CPU here makes the user-ASID
         // receiver class resolve identically to the global path.
-        let result = match self.with_cpu(cpu, |state| {
+        // Stage 187A — recv delivery boundary split. Phase A (inside with_cpu,
+        // broad &mut KernelState live): plan + rank-3 dequeue + legacy cap
+        // materialization + deferred sender wake (§56 order) + kernel-register
+        // writeback. NO seam helper is called inside this closure. For a
+        // user-ASID receiver the closure returns a by-value PendingUserCopy
+        // snapshot instead of copying; the copy runs AFTER this closure
+        // returns, i.e. after the broad borrow is dead (Phase B, 186E seam).
+        let phase_a = match self.with_cpu(cpu, |state| {
             crate::kernel::syscall::try_split_recv_queued_plain_with_snapshot_locked(
                 state, frame, &snapshot,
             )
         }) {
-            Ok(result) => result,
+            Ok(phase_a) => phase_a,
             Err(_) => {
                 // current_cpu bind failed (e.g. CPU offline) — fall back to the
                 // unchanged global-lock path for the canonical handling.
@@ -1056,6 +1063,31 @@ impl SharedKernel {
                     cpu.0
                 );
                 return None;
+            }
+        };
+        let result = match phase_a {
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback => None,
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::Completed(r) => Some(r),
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingUserCopy(pending) => {
+                // The with_cpu closure has returned: the global SpinLock is
+                // released and no &mut KernelState is live. Phase B/C below may
+                // now safely use the data_ptr()-derived seams (Stage 186D4's
+                // aliasing blocker does not apply past this point).
+                crate::yarm_log!(
+                    "IPC_RECV_BOUNDARY_SNAPSHOT_OK receiver_tid={} cap={} reply={}",
+                    pending.receiver_tid,
+                    pending.materialized_cap.map(|c| c as i64).unwrap_or(-1),
+                    pending.is_reply_cap
+                );
+                crate::yarm_log!("IPC_RECV_BOUNDARY_GLOBAL_DROPPED_OK");
+                Some(self.complete_recv_boundary_user_copy(cpu, frame, &pending))
+            }
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingOrdinaryCapUserCopy(pending) => {
+                // Stage 187B — the global lock is released; materialize the
+                // ordinary transferred cap through the 186D2/186D3 seam, wake the
+                // sender, then run the 186E user copy.
+                crate::yarm_log!("IPC_RECV_BOUNDARY_GLOBAL_DROPPED_OK");
+                Some(self.complete_recv_boundary_ordinary_cap(cpu, frame, pending))
             }
         };
         match result {
@@ -1073,6 +1105,695 @@ impl SharedKernel {
             }
         }
         result
+    }
+
+    /// Stage 187A — Phase B (186E user-copy seam) + Phase C (frame/rollback/
+    /// fault completion) for a queued-split recv whose user writeback was
+    /// deferred past the global-lock boundary by
+    /// [`crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingUserCopy`].
+    ///
+    /// # Validation status
+    /// - M2_SEAM_LIVE_187A_RECV_BOUNDARY — first live seam call on the recv
+    ///   delivery path. The copies run through `copy_to_user_split` (VM rank 5
+    ///   + memory rank 6 seams) via the recv_core boundary executors; NO
+    ///   `ipc_state_lock`, NO capability lock, NO broad `&mut KernelState` is
+    ///   held during the copy.
+    ///
+    /// Ordering proof (§56/§58 preserved): Phase A already committed — in
+    /// order — the cap materialization, the sender wake
+    /// (`IPC_RECV_V2_SENDER_WAKE_ORDER_OK … phase=before_writeback`), and the
+    /// ret2 transfer-cap register. This function performs only the writeback
+    /// (meta-first for v2) and the §58 failure handling (cap rollback / user
+    /// fault record) via brief `with_cpu` re-entries — the same operations the
+    /// legacy in-lock path performed at the same point in the sequence.
+    ///
+    /// Failure semantics are byte-identical to the legacy in-lock arms:
+    /// undersized → cap rollback + `InvalidArgs`; v2 meta fault → cap rollback
+    /// + `PageFault`; payload fault → fault record + `Ok(())` (no rollback);
+    /// the message is consumed in every case (one-shot preserved).
+    fn complete_recv_boundary_user_copy(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        pending: &crate::kernel::recv_core::RecvBoundaryUserCopySnapshot,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::recv_core::{
+            RecvUserWritebackOutcome, RecvV2WritebackOutcome, RecvWritebackPlan,
+            execute_user_asid_plain_v2_writeback_boundary,
+            execute_user_asid_plain_writeback_boundary,
+        };
+        use crate::kernel::syscall::SyscallError;
+
+        // Phase C helper: §58 cap rollback under a brief global re-entry. The
+        // seam copy has already completed (or failed) — no seam call happens
+        // inside this closure.
+        let rollback_cap = |shared: &Self, frame: &mut TrapFrame| {
+            if let Some(cap_id) = pending.materialized_cap {
+                let _ = shared.with_cpu(cpu, |kernel| {
+                    kernel.rollback_materialized_recv_cap(
+                        pending.receiver_tid,
+                        crate::kernel::capabilities::CapId(cap_id),
+                        pending.is_reply_cap,
+                    );
+                });
+                crate::kernel::syscall::recv_boundary_clear_transfer_cap_ret(frame);
+                true
+            } else {
+                false
+            }
+        };
+
+        match pending.writeback {
+            RecvWritebackPlan::UserMemory { sender_tid, .. } => {
+                match execute_user_asid_plain_writeback_boundary(self, pending) {
+                    RecvUserWritebackOutcome::Ok => {
+                        let payload_len = pending.msg.as_slice().len();
+                        frame.set_ok(sender_tid, payload_len, frame.ret2());
+                        crate::yarm_log!("IPC_RECV_BOUNDARY_USER_COPY_SEAM_OK kind=user_plain");
+                        crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain");
+                        crate::yarm_log!("IPC_RECV_BOUNDARY_SPLIT_DONE result=ok");
+                        Ok(())
+                    }
+                    RecvUserWritebackOutcome::UndersizedBuffer => {
+                        // §58: rollback materialized cap (matches legacy in-lock arm).
+                        let _ = rollback_cap(self, frame);
+                        Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))
+                    }
+                    RecvUserWritebackOutcome::CopyFault { user_ptr } => {
+                        // No rollback on payload copy fault (§54/§58) — fault
+                        // record + frame error under a brief re-entry, identical
+                        // to the legacy record_user_fault call.
+                        let _ = self.with_cpu(cpu, |kernel| {
+                            crate::kernel::syscall::recv_boundary_record_user_fault(
+                                kernel, frame, user_ptr,
+                            );
+                        });
+                        Ok(())
+                    }
+                }
+            }
+            RecvWritebackPlan::UserMemoryV2 { .. } => {
+                match execute_user_asid_plain_v2_writeback_boundary(self, pending) {
+                    RecvV2WritebackOutcome::Ok => {
+                        let payload_len = pending.msg.as_slice().len();
+                        frame.set_ok(0, payload_len, frame.ret2());
+                        crate::yarm_log!("IPC_RECV_BOUNDARY_USER_COPY_SEAM_OK kind=user_plain_v2");
+                        crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain_v2");
+                        crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=ok");
+                        // Stage 156 IPC oracle: queued-split recv-v2 meta delivered
+                        // (marker relocated with the writeback in Stage 187A —
+                        // same live path, same meaning).
+                        crate::yarm_log!("IPC_RECV_V2_META_QUEUED_SPLIT_OK len=40");
+                        crate::yarm_log!("IPC_RECV_BOUNDARY_SPLIT_DONE result=ok");
+                        Ok(())
+                    }
+                    RecvV2WritebackOutcome::PayloadUndersized => {
+                        crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_undersized");
+                        if rollback_cap(self, frame) {
+                            // Stage 156 IPC oracle: rollback on queued-split undersize.
+                            crate::yarm_log!(
+                                "IPC_RECV_V2_ROLLBACK_OK site=queued_split_undersize reply={}",
+                                pending.is_reply_cap
+                            );
+                        }
+                        Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))
+                    }
+                    RecvV2WritebackOutcome::MetaCopyFault { .. } => {
+                        crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=meta_fault");
+                        if rollback_cap(self, frame) {
+                            // Stage 156 IPC oracle: rollback on queued-split meta fault.
+                            crate::yarm_log!(
+                                "IPC_RECV_V2_ROLLBACK_OK site=queued_split_meta reply={}",
+                                pending.is_reply_cap
+                            );
+                        }
+                        Err(TrapHandleError::Syscall(SyscallError::PageFault))
+                    }
+                    RecvV2WritebackOutcome::PayloadCopyFault { user_ptr } => {
+                        // No rollback on payload copy fault (§55/§58).
+                        crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_fault");
+                        let _ = self.with_cpu(cpu, |kernel| {
+                            crate::kernel::syscall::recv_boundary_record_user_fault(
+                                kernel, frame, user_ptr,
+                            );
+                        });
+                        Ok(())
+                    }
+                }
+            }
+            RecvWritebackPlan::KernelRegister { .. } => {
+                unreachable!("KernelRegister writeback completes in Phase A, never deferred")
+            }
+        }
+    }
+
+    /// Stage 187B — Phase B/C for an ordinary (non-reply, non-shared-region)
+    /// cap transfer to a user receiver on the queued-split recv boundary.
+    ///
+    /// # Validation status
+    /// - M2_SEAM_LIVE_187B_CAP_TRANSFER — the FIRST live use of the Stage
+    ///   186D2/186D3 cap-transfer materialization + delegation seam on a real
+    ///   runtime path. The mint runs through the Stage 186D-proper atomic
+    ///   cap↔memory mint and records the delegation link; NO `ipc_state_lock`,
+    ///   NO broad `&mut KernelState`, NO seam call while the Phase A borrow was
+    ///   live (this runs entirely AFTER the `with_cpu` closure returned).
+    ///
+    /// Order (materialize → wake → writeback, §56/§58 preserved):
+    ///   1. materialize the ordinary cap via
+    ///      `materialize_received_message_cap_routed_with_delegation_split`
+    ///      (atomic mint + delegation link + rollback-on-delegation-failure),
+    ///   2. commit the receiver-local CapId to the transfer-cap return register,
+    ///   3. apply the deferred sender wake (brief `with_cpu` re-entry — no seam),
+    ///   4. run the 186E user copy and §58 writeback/rollback completion (shared
+    ///      with the plain boundary path).
+    ///
+    /// The receiver-local CapId is freshly minted by the seam; the source CapId
+    /// is used ONLY as the delegation-link parent edge, never as authority. On a
+    /// writeback failure the cap is rolled back via `rollback_materialized_recv_cap`
+    /// (revoke + delegation-link removal + refcount drop), exactly as the legacy
+    /// §58 path. The transfer envelope was consumed once in Phase A (one-shot).
+    fn complete_recv_boundary_ordinary_cap(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        pending: crate::kernel::recv_core::RecvBoundaryOrdinaryCapSnapshot,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::boot::{
+            CapTransferMaterializeOutcome, TransferCapDelegation, TransferCapSnapshot,
+        };
+        use crate::kernel::syscall::SyscallError;
+
+        crate::yarm_log!(
+            "CAP_TRANSFER_BOUNDARY_SEAM_BEGIN kind=ordinary receiver_tid={}",
+            pending.receiver_tid
+        );
+
+        let snap = TransferCapSnapshot {
+            receiver_cnode: pending.receiver_cnode,
+            object: pending.object,
+            rights: pending.rights,
+        };
+        let delegation = TransferCapDelegation {
+            source_tid: pending.source_tid,
+            source_cap: pending.source_cap,
+            dest_tid: pending.receiver_tid,
+        };
+        crate::yarm_log!("CAP_TRANSFER_BOUNDARY_SEAM_SNAPSHOT_OK kind=ordinary");
+
+        // Step 1 — seam mint (atomic cap↔memory mint) + delegation link. This is
+        // the first live seam materialization; the broad borrow is dead.
+        let local_cap = match self
+            .materialize_received_message_cap_routed_with_delegation_split(snap, Some(delegation))
+        {
+            Ok(CapTransferMaterializeOutcome::Materialized(cap)) => {
+                crate::yarm_log!(
+                    "CAP_TRANSFER_BOUNDARY_SEAM_ATOMIC_MINT_OK kind=ordinary local_cap={}",
+                    cap.0
+                );
+                crate::yarm_log!("CAP_TRANSFER_BOUNDARY_SEAM_DELEGATION_OK kind=ordinary");
+                cap.0
+            }
+            Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => {
+                // Cannot occur: ordinary (non-reply) objects only reach here. If
+                // it somehow did, surface a real error rather than silently drop.
+                crate::yarm_log!(
+                    "CAP_TRANSFER_BOUNDARY_SEAM_DEFERRED reason=unexpected_reply_object"
+                );
+                return Err(TrapHandleError::Syscall(SyscallError::WrongObject));
+            }
+            Err(e) => {
+                // Same real error the legacy router would raise (CapabilityFull,
+                // WrongObject, StaleCapability, MissingRight, …). The envelope was
+                // already consumed in Phase A — identical to the legacy arm, whose
+                // materialize failure also leaves the envelope consumed.
+                return Err(TrapHandleError::Syscall(SyscallError::from(e)));
+            }
+        };
+
+        // Step 2 — commit the receiver-local CapId to the return register.
+        if crate::kernel::syscall::recv_boundary_encode_transfer_cap_ret(frame, Some(local_cap))
+            .is_err()
+        {
+            // Roll the just-minted cap back so nothing leaks, then fail.
+            let _ = self.with_cpu(cpu, |kernel| {
+                kernel.rollback_materialized_recv_cap(
+                    pending.receiver_tid,
+                    crate::kernel::capabilities::CapId(local_cap),
+                    false,
+                );
+            });
+            return Err(TrapHandleError::Syscall(SyscallError::Internal));
+        }
+
+        // Step 3 — deferred sender wake (AFTER materialize, BEFORE writeback:
+        // §56/§58 order). Brief global re-entry; no seam inside.
+        if let Some(wake_tid) = pending.wake_tid {
+            let _ = self.with_cpu(cpu, |kernel| kernel.apply_split_sender_wake_plan(wake_tid));
+            crate::yarm_log!(
+                "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+                wake_tid.0
+            );
+        }
+
+        // Step 4 — 186E user copy + §58 completion, shared with the plain path.
+        let user_copy = crate::kernel::recv_core::RecvBoundaryUserCopySnapshot {
+            asid: pending.asid,
+            receiver_tid: pending.receiver_tid,
+            msg: pending.msg,
+            writeback: pending.writeback,
+            materialized_cap: Some(local_cap),
+            is_reply_cap: false,
+        };
+        let result = self.complete_recv_boundary_user_copy(cpu, frame, &user_copy);
+        if result.is_ok() {
+            crate::yarm_log!(
+                "CAP_TRANSFER_BOUNDARY_SEAM_DONE result=ok kind=ordinary local_cap={}",
+                local_cap
+            );
+        }
+        result
+    }
+
+    /// Stage 188A — dispatch-return delivery channel drain.
+    ///
+    /// Called by the trap entry (`handle_trap_entry_shared`) **after** the broad
+    /// `with_cpu` / `SpinLock<KernelState>` guard is dropped, alongside the
+    /// existing D2/D6 post-`with_cpu` drains. Takes the per-CPU
+    /// [`crate::kernel::boot::DISPATCH_POST_WORK_STASH`] item a handler produced
+    /// under the broad borrow and executes it through `&SharedKernel` seams.
+    ///
+    /// # Validation status
+    /// - DISPATCH_RETURN_CHANNEL (Stage 188A) — **infrastructure only**. No live
+    ///   handler stashes work in Stage 188A, so on every production trap the stash
+    ///   is empty and this is a no-op (a one-shot `DISPATCH_RETURN_CHANNEL_READY
+    ///   mode=helper_only` marker is emitted as honest evidence the channel is
+    ///   present and inert). The `BlockedWaiterPlainDelivery` executor arm is
+    ///   complete and unit-tested (186E copy seam) but produced by nothing live.
+    ///
+    /// Aliasing: this runs only AFTER `with_cpu` returned, so no broad
+    /// `&mut KernelState` is live when the 186E `copy_to_user_split` seam derives
+    /// its `&mut Subsystem` from `data_ptr()` (Stage 186D4's blocker does not
+    /// apply here). It touches no `ipc_state_lock`.
+    pub(crate) fn drain_dispatch_post_work(&self, cpu: CpuId) -> Result<(), TrapHandleError> {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+            return Ok(());
+        }
+        // One-shot readiness marker (honest boot-log evidence; additive). Stage
+        // 188B wires a live producer (plain blocked-waiter reply delivery), so the
+        // channel is now `mode=live`.
+        if !crate::kernel::boot::DISPATCH_RETURN_CHANNEL_READY_LOGGED
+            .swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            crate::yarm_log!("DISPATCH_RETURN_CHANNEL_READY mode=live");
+        }
+        // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+        // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` drain.
+        let work = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].take() };
+        let Some(work) = work else {
+            return Ok(()); // inert in Stage 188A: no live producer.
+        };
+        self.execute_dispatch_post_work(cpu, work)
+    }
+
+    /// Stage 188A — execute one drained [`DispatchPostWork`] item through
+    /// `&SharedKernel` seams (Phase B) and a brief `with_cpu` completion re-entry
+    /// (Phase C). Runs only outside `with_cpu` (see `drain_dispatch_post_work`).
+    fn execute_dispatch_post_work(
+        &self,
+        cpu: CpuId,
+        work: crate::kernel::dispatch_post_work::DispatchPostWork,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::dispatch_post_work::DispatchPostWork;
+        match work {
+            DispatchPostWork::None => Ok(()),
+            DispatchPostWork::BlockedWaiterPlainDelivery(snap) => {
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_plain waiter_tid={}",
+                    snap.waiter_tid
+                );
+                crate::yarm_log!("DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocked_waiter_plain");
+                // Phase B — user copy through the 186E seam (payload then meta),
+                // to the WAITER's ASID. No ipc_state_lock, no broad borrow.
+                if self
+                    .copy_to_user_split(
+                        snap.waiter_asid,
+                        crate::kernel::vm::VirtAddr(snap.payload_user_ptr as u64),
+                        &snap.payload[..snap.payload_len],
+                    )
+                    .is_err()
+                {
+                    return Err(TrapHandleError::Syscall(
+                        crate::kernel::syscall::SyscallError::InvalidArgs,
+                    ));
+                }
+                if self
+                    .copy_to_user_split(
+                        snap.waiter_asid,
+                        crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
+                        &snap.meta,
+                    )
+                    .is_err()
+                {
+                    return Err(TrapHandleError::Syscall(
+                        crate::kernel::syscall::SyscallError::InvalidArgs,
+                    ));
+                }
+                crate::yarm_log!("DISPATCH_POST_WORK_USER_COPY_OK kind=blocked_waiter_plain");
+                crate::yarm_log!("DISPATCH_POST_WORK_EXECUTE_OK kind=blocked_waiter_plain");
+                // Phase C — completion, via a brief global re-entry (no seam
+                // inside the closure), preserving the legacy order copy → clear
+                // GPRs → clear endpoint waiter slot → wake exactly once:
+                //   1. clear the waiter's return regs (legacy
+                //      complete_blocked_recv_for_waiter completion),
+                //   2. clear the endpoint receiver-waiter slot (legacy Phase 4
+                //      ipc_clear_plain_receiver_waiter_only),
+                //   3. wake the waiter exactly once (legacy Phase 5).
+                let _ = self.with_cpu(cpu, |kernel| {
+                    kernel.clear_blocked_recv_return_regs(snap.waiter_tid);
+                    if let Some(wake_tid) = snap.wake_tid {
+                        kernel.ipc_clear_plain_receiver_waiter_only(snap.endpoint_idx, wake_tid);
+                        let _ = kernel.apply_scheduler_wake_plan(
+                            crate::kernel::boot::SchedulerWakePlan::Wake(wake_tid),
+                        );
+                    }
+                });
+                crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_plain");
+                // Stage 156 IPC oracle: blocked-waiter recv-v2 meta (40 bytes)
+                // delivered (relocated here with the writeback in Stage 188B —
+                // same live path, same meaning as the legacy helper's marker).
+                crate::yarm_log!(
+                    "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
+                    snap.waiter_tid
+                );
+                crate::yarm_log!("DISPATCH_POST_WORK_DONE kind=blocked_waiter_plain result=ok");
+                Ok(())
+            }
+            DispatchPostWork::BlockedWaiterOrdinaryCapDelivery(snap) => {
+                self.execute_blocked_waiter_ordinary_cap_delivery(cpu, snap)
+            }
+            DispatchPostWork::BlockedWaiterReplyCapDelivery(snap) => {
+                self.execute_blocked_waiter_reply_cap_delivery(cpu, snap)
+            }
+        }
+    }
+
+    /// Stage 188D — executor for a reply-cap blocked-waiter delivery. Runs AFTER
+    /// the broad borrow dropped, and **solves `reply_cap_ipc_rank_inversion` by
+    /// phase separation** (disjoint critical sections, no nested acquisition):
+    ///
+    /// - Phase B (rank 4, + rank 6 no-op for `Reply`): mint the receiver-local
+    ///   reply cap via `mint_capability_with_memory_ref_split`. NO IPC lock held.
+    /// - Phase C.1 (rank 3): record the receiver-local CapId into the reply-cap
+    ///   registry via `try_record_reply_waiter_cap_split` (IPC seam only). A stale
+    ///   record rolls the rank-4 mint back (`rollback_minted_cap_split`) so nothing
+    ///   is orphaned — the reply object stays live and re-deliverable.
+    /// - 186E user copy; a copy fault rolls back BOTH the mint and the recorded
+    ///   waiter-cap (`clear_reply_waiter_cap_split`), matching the legacy
+    ///   `rollback_materialized_recv_cap(is_reply=true)` teardown.
+    /// - Phase C.2 (brief `with_cpu`, no seam): clear return regs + waiter slot,
+    ///   wake once.
+    ///
+    /// The receiver-local CapId is minted fresh; the reply object is identified by
+    /// `(reply_index, reply_generation)` — never a sender-local CapId as authority.
+    /// One-shot: the transfer envelope was consumed once in Phase A.
+    fn execute_blocked_waiter_reply_cap_delivery(
+        &self,
+        cpu: CpuId,
+        snap: crate::kernel::dispatch_post_work::BlockedWaiterReplyCapDeliverySnapshot,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::boot::ReplyRecordSetOutcome;
+        use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
+        use crate::kernel::syscall::SyscallError;
+
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_reply_cap waiter_tid={}",
+            snap.waiter_tid
+        );
+        crate::yarm_log!("DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocked_waiter_reply_cap");
+        crate::yarm_log!(
+            "REPLY_CAP_RANK_SEAM_BEGIN waiter_tid={} reply_index={} reply_gen={}",
+            snap.waiter_tid,
+            snap.reply_index,
+            snap.reply_generation
+        );
+
+        let reply_object = CapObject::Reply {
+            index: snap.reply_index,
+            generation: snap.reply_generation,
+        };
+
+        // Phase B (rank 4, no IPC lock): mint the receiver-local reply cap.
+        let local_cap = match self.mint_capability_with_memory_ref_split(
+            snap.receiver_cnode,
+            Capability::new(reply_object, CapRights::SEND),
+        ) {
+            Ok(cap) => {
+                crate::yarm_log!(
+                    "REPLY_CAP_RANK_SEAM_MINT_OK waiter_tid={} local_cap={}",
+                    snap.waiter_tid,
+                    cap.0
+                );
+                cap.0
+            }
+            Err(e) => {
+                crate::yarm_log!("REPLY_CAP_RANK_SEAM_FAIL reason=mint");
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_reply_cap reason=mint"
+                );
+                return Err(TrapHandleError::Syscall(SyscallError::from(e)));
+            }
+        };
+
+        // Phase C.1 (rank 3, IPC seam only — disjoint from the rank-4 mint):
+        // record the receiver-local CapId. A stale record rolls the mint back.
+        match self.try_record_reply_waiter_cap_split(
+            snap.reply_index,
+            snap.reply_generation,
+            CapId(local_cap),
+        ) {
+            ReplyRecordSetOutcome::Set => {
+                crate::yarm_log!(
+                    "REPLY_CAP_RANK_SEAM_IPC_RECORD_OK waiter_tid={} local_cap={}",
+                    snap.waiter_tid,
+                    local_cap
+                );
+            }
+            stale => {
+                self.rollback_minted_cap_split(snap.receiver_cnode, CapId(local_cap), reply_object);
+                crate::yarm_log!(
+                    "REPLY_CAP_RANK_SEAM_ROLLBACK_OK waiter_tid={} reason={}",
+                    snap.waiter_tid,
+                    stale.stale_reason().unwrap_or("unknown")
+                );
+                crate::yarm_log!("REPLY_CAP_RANK_SEAM_FAIL reason=stale_record");
+                // Same error mapping the D5 split uses for a stale record.
+                return Err(TrapHandleError::Syscall(SyscallError::WrongObject));
+            }
+        }
+
+        // Phase B.2 — encode the recv-v2 meta with the fresh receiver-local CapId
+        // and the reply-cap recv-meta flag (byte-identical to the legacy reply arm).
+        let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
+            0,
+            snap.app_opcode,
+            0,
+            snap.payload_len as u32,
+            local_cap,
+            crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64,
+            snap.sender_tid,
+        );
+
+        // Phase B.3 — 186E user copy (payload then meta). On a fault, roll BOTH
+        // the recorded waiter-cap (rank 3) and the minted cap (rank 4) back so
+        // nothing is orphaned, matching the legacy is_reply rollback.
+        let copy_ok = self
+            .copy_to_user_split(
+                snap.waiter_asid,
+                crate::kernel::vm::VirtAddr(snap.payload_user_ptr as u64),
+                &snap.payload[..snap.payload_len],
+            )
+            .is_ok()
+            && self
+                .copy_to_user_split(
+                    snap.waiter_asid,
+                    crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
+                    &meta,
+                )
+                .is_ok();
+        if !copy_ok {
+            self.clear_reply_waiter_cap_split(snap.reply_index, snap.reply_generation);
+            self.rollback_minted_cap_split(snap.receiver_cnode, CapId(local_cap), reply_object);
+            crate::yarm_log!(
+                "REPLY_CAP_RANK_SEAM_ROLLBACK_OK waiter_tid={} reason=user_copy",
+                snap.waiter_tid
+            );
+            crate::yarm_log!("REPLY_CAP_RANK_SEAM_FAIL reason=user_copy");
+            crate::yarm_log!(
+                "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_reply_cap reason=user_copy"
+            );
+            return Err(TrapHandleError::Syscall(SyscallError::InvalidArgs));
+        }
+        crate::yarm_log!("DISPATCH_POST_WORK_USER_COPY_OK kind=blocked_waiter_reply_cap");
+
+        // Phase C.2 — completion (brief `with_cpu`, no seam): clear return regs +
+        // waiter slot, wake once.
+        let _ = self.with_cpu(cpu, |kernel| {
+            kernel.clear_blocked_recv_return_regs(snap.waiter_tid);
+            if let Some(wake_tid) = snap.wake_tid {
+                kernel.ipc_clear_plain_receiver_waiter_only(snap.endpoint_idx, wake_tid);
+                let _ = kernel.apply_scheduler_wake_plan(
+                    crate::kernel::boot::SchedulerWakePlan::Wake(wake_tid),
+                );
+            }
+        });
+        crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_reply_cap");
+        crate::yarm_log!(
+            "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
+            snap.waiter_tid
+        );
+        crate::yarm_log!("REPLY_CAP_RANK_SEAM_DONE result=ok");
+        crate::yarm_log!("DISPATCH_POST_WORK_DONE kind=blocked_waiter_reply_cap result=ok");
+        Ok(())
+    }
+
+    /// Stage 188C — executor for an ordinary (non-reply, non-shared-region)
+    /// single cap-transfer blocked-waiter delivery. Runs AFTER the broad borrow
+    /// dropped (see `drain_dispatch_post_work`), so no `&mut KernelState` is live
+    /// when the 186D2/186D3 cap-transfer seam and the 186E copy seam derive their
+    /// `&mut Subsystem` from `data_ptr()`.
+    ///
+    /// Order (materialize → encode meta → copy → clear/wake), preserving the
+    /// legacy `complete_blocked_recv_for_waiter` semantics: on a user-copy fault
+    /// the freshly-minted cap is rolled back (revoke + delegation-link removal +
+    /// refcount drop) exactly as the legacy §58 meta-fault path, so nothing leaks.
+    /// The receiver-local CapId is minted fresh by the seam; the source CapId is
+    /// used ONLY as the delegation-link parent edge, never as authority.
+    fn execute_blocked_waiter_ordinary_cap_delivery(
+        &self,
+        cpu: CpuId,
+        snap: crate::kernel::dispatch_post_work::BlockedWaiterOrdinaryCapDeliverySnapshot,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::boot::{
+            CapTransferMaterializeOutcome, TransferCapDelegation, TransferCapSnapshot,
+        };
+        use crate::kernel::capabilities::CapId;
+        use crate::kernel::syscall::SyscallError;
+
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid={}",
+            snap.waiter_tid
+        );
+        crate::yarm_log!("DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocked_waiter_ordinary_cap");
+
+        // Phase B.1 — materialize the receiver-local cap through the 186D2/186D3
+        // seam (atomic mint + delegation link + rollback-on-delegation-failure).
+        // The broad borrow is dead; this touches no ipc_state_lock.
+        let seam_snapshot = TransferCapSnapshot {
+            receiver_cnode: snap.receiver_cnode,
+            object: snap.object,
+            rights: snap.rights,
+        };
+        let delegation = TransferCapDelegation {
+            source_tid: snap.source_tid,
+            source_cap: snap.source_cap,
+            dest_tid: snap.waiter_tid,
+        };
+        let local_cap = match self.materialize_received_message_cap_routed_with_delegation_split(
+            seam_snapshot,
+            Some(delegation),
+        ) {
+            Ok(CapTransferMaterializeOutcome::Materialized(cap)) => {
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_CAP_TRANSFER_SEAM_OK kind=blocked_waiter_ordinary_cap local_cap={}",
+                    cap.0
+                );
+                cap.0
+            }
+            Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => {
+                // Cannot occur: the producer excludes reply caps AND non-Reply
+                // objects only reach here. Surface a real error rather than drop.
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap reason=unexpected_reply_object"
+                );
+                return Err(TrapHandleError::Syscall(SyscallError::WrongObject));
+            }
+            Err(e) => {
+                // Same real error the legacy router would raise (CapabilityFull,
+                // WrongObject, StaleCapability, MissingRight, …). The envelope was
+                // already consumed in Phase A — identical to the legacy arm.
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap reason=materialize"
+                );
+                return Err(TrapHandleError::Syscall(SyscallError::from(e)));
+            }
+        };
+
+        // Phase B.2 — encode the recv-v2 meta with the FRESH receiver-local CapId
+        // (byte-identical to the legacy transfer-cap branch: cap_id = local_cap,
+        // recv_meta_flags = SYSCALL_RECV_META_TRANSFERRED_CAP, status/msg-flags 0).
+        let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
+            0,
+            snap.app_opcode,
+            0,
+            snap.payload_len as u32,
+            local_cap,
+            crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
+            snap.sender_tid,
+        );
+
+        // Phase B.3 — user copy through the 186E seam (payload then meta) to the
+        // WAITER's ASID. On a fault, roll the freshly-minted cap all the way back
+        // (revoke + delegation-link removal + refcount drop) so nothing leaks,
+        // then fail — exactly the legacy §58 meta-fault rollback.
+        let copy_ok = self
+            .copy_to_user_split(
+                snap.waiter_asid,
+                crate::kernel::vm::VirtAddr(snap.payload_user_ptr as u64),
+                &snap.payload[..snap.payload_len],
+            )
+            .is_ok()
+            && self
+                .copy_to_user_split(
+                    snap.waiter_asid,
+                    crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
+                    &meta,
+                )
+                .is_ok();
+        if !copy_ok {
+            let _ = self.with_cpu(cpu, |kernel| {
+                kernel.rollback_materialized_recv_cap(snap.waiter_tid, CapId(local_cap), false);
+            });
+            crate::yarm_log!(
+                "IPC_RECV_V2_ROLLBACK_OK site=blocked_ordinary_cap tid={} reply=false",
+                snap.waiter_tid
+            );
+            crate::yarm_log!(
+                "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap reason=user_copy"
+            );
+            return Err(TrapHandleError::Syscall(SyscallError::InvalidArgs));
+        }
+        crate::yarm_log!("DISPATCH_POST_WORK_USER_COPY_OK kind=blocked_waiter_ordinary_cap");
+
+        // Phase C — completion via a brief global re-entry (no seam inside),
+        // preserving the legacy order copy → clear GPRs → clear waiter slot →
+        // wake exactly once.
+        let _ = self.with_cpu(cpu, |kernel| {
+            kernel.clear_blocked_recv_return_regs(snap.waiter_tid);
+            if let Some(wake_tid) = snap.wake_tid {
+                kernel.ipc_clear_plain_receiver_waiter_only(snap.endpoint_idx, wake_tid);
+                let _ = kernel.apply_scheduler_wake_plan(
+                    crate::kernel::boot::SchedulerWakePlan::Wake(wake_tid),
+                );
+            }
+        });
+        crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_ordinary_cap");
+        crate::yarm_log!(
+            "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
+            snap.waiter_tid
+        );
+        crate::yarm_log!("DISPATCH_POST_WORK_DONE kind=blocked_waiter_ordinary_cap result=ok");
+        Ok(())
     }
 
     /// # Validation status

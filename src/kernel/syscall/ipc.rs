@@ -927,7 +927,51 @@ pub(super) fn handle_ipc_call(
         IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
             let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
             if is_recv_v2 {
-                // Phase 3: complete delivery outside ipc_state_lock.
+                // Stage 188E: wire the reply-cap producer (188D rank-inversion
+                // seam) LIVE for the ipc_call blocked recv-v2 path — the real
+                // reply-cap→blocked-waiter path 188D built the seam for. Phase A
+                // (here, under the broad borrow) takes the reply-cap envelope once
+                // and stashes a by-value BlockedWaiterReplyCapDelivery; the
+                // dispatch-return executor mints the receiver-local reply cap
+                // (rank 4), records the waiter-cap (rank 3), copies payload+meta
+                // (186E), and clears + wakes the receiver — all AFTER the broad
+                // borrow drops. Here we only account the split and set the CALLER's
+                // return frame. Non-reply-cap / no-drainer → Ok(false) (legacy).
+                match crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+                    kernel,
+                    receiver_tid.0,
+                    endpoint_idx,
+                    &msg,
+                ) {
+                    Ok(true) => {
+                        kernel.note_ipc_call_split_delivery();
+                        crate::yarm_log!(
+                            "IPC_CALL_SPLIT_DELIVERY tid={} receiver={} endpoint={}",
+                            sender_tid,
+                            receiver_tid.0,
+                            endpoint_idx
+                        );
+                        // Caller (sender) returns Ok now; the receiver slot-clear +
+                        // wake are done by the dispatch-return executor (Phase C).
+                        frame.set_ok(0, 0, 0);
+                        encode_transfer_cap_ret(frame, None)?;
+                        return Ok(());
+                    }
+                    Ok(false) => { /* not reply cap / no drainer — legacy path below */ }
+                    Err(e) => {
+                        // Same envelope disposition as the legacy Err arm: the
+                        // envelope was bound to receiver_tid at stash time (a
+                        // producer Phase-A fault before the take leaves it, so this
+                        // cleanup consumes it; after the take it is already gone and
+                        // this is a no-op).
+                        if let Some(handle) = msg.transferred_cap().map(|c| c.0) {
+                            let _ = kernel.take_transfer_envelope(handle, endpoint, receiver_tid);
+                        }
+                        return Err(e);
+                    }
+                }
+                // Phase 3: complete delivery outside ipc_state_lock (legacy path
+                // when no trap-entry drainer is active).
                 match complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg) {
                     Ok(()) => {
                         // Phase 4: clear waiter slot under ipc_state_lock.

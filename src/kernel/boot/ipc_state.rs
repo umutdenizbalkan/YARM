@@ -1623,6 +1623,88 @@ impl KernelState {
         })
     }
 
+    /// Stage 188F — dispatch an `ipc_reply` delivery to a blocked recv-v2 caller
+    /// through the existing 188B/188C/188D dispatch-return producers, in
+    /// preference order plain → ordinary-cap → reply-cap. Runs entirely in Phase A
+    /// (under the broad borrow): each producer consumes the blocked state + any
+    /// transfer/reply envelope ONCE and stashes a by-value `DispatchPostWork`; the
+    /// trap-entry drain then runs the seam mint + 186E copy + slot-clear + wake
+    /// after the borrow drops. No seam / user-copy / cap-materialization happens
+    /// here. Reuses the 188B/188C/188D producers — no duplicated delivery logic.
+    ///
+    /// Returns `Ok(true)` when a producer stashed post-work (caller returns Ok;
+    /// Phase C does the slot-clear + wake), `Ok(false)` when no producer applied
+    /// (shared-region reply, or no trap-entry drainer — caller uses the legacy
+    /// path), or `Err` on a real producer error (mapped to `UserMemoryFault`,
+    /// exactly as the legacy delivery failure).
+    ///
+    /// The replier's reply-cap record was already consumed once above (the
+    /// `reply_caps[slot] = None` take), so the boundary is one-shot before any
+    /// producer runs.
+    fn try_ipc_reply_boundary_split(
+        &mut self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &Message,
+    ) -> Result<bool, KernelError> {
+        use crate::kernel::syscall::{
+            produce_blocked_waiter_ordinary_cap_delivery, produce_blocked_waiter_plain_delivery,
+            produce_blocked_waiter_reply_cap_delivery,
+        };
+        crate::yarm_log!(
+            "IPC_REPLY_BOUNDARY_SPLIT_BEGIN waiter_tid={} endpoint={}",
+            waiter_tid,
+            endpoint_idx
+        );
+        // The replier's reply-cap record was consumed once in Phase A above.
+        crate::yarm_log!(
+            "IPC_REPLY_BOUNDARY_REPLY_CAP_CONSUME_OK waiter_tid={}",
+            waiter_tid
+        );
+
+        type Producer = fn(
+            &mut KernelState,
+            u64,
+            usize,
+            &Message,
+        ) -> Result<bool, crate::kernel::syscall::SyscallError>;
+        let producers: [(&str, Producer); 3] = [
+            ("plain", produce_blocked_waiter_plain_delivery),
+            ("ordinary_cap", produce_blocked_waiter_ordinary_cap_delivery),
+            ("reply_cap", produce_blocked_waiter_reply_cap_delivery),
+        ];
+        for (kind, producer) in producers {
+            match producer(self, waiter_tid, endpoint_idx, msg) {
+                Ok(true) => {
+                    crate::yarm_log!("IPC_REPLY_BOUNDARY_POST_WORK_STASH_OK kind={}", kind);
+                    self.note_ipc_reply_split_delivery();
+                    crate::yarm_log!(
+                        "IPC_REPLY_DELIVER_TO_WAITER_CONSUMED tid={} endpoint={}",
+                        waiter_tid,
+                        endpoint_idx
+                    );
+                    crate::yarm_log!("IPC_REPLY_BOUNDARY_SPLIT_DONE result=ok kind={}", kind);
+                    return Ok(true);
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    crate::yarm_log!(
+                        "IPC_REPLY_BOUNDARY_SPLIT_FAIL reason=producer_error kind={} err={:?}",
+                        kind,
+                        e
+                    );
+                    return Err(KernelError::UserMemoryFault);
+                }
+            }
+        }
+        // No producer applied: shared-region reply, or no trap-entry drainer.
+        crate::yarm_log!(
+            "IPC_REPLY_BOUNDARY_SPLIT_DEFERRED reason=unsupported_or_no_drainer waiter_tid={}",
+            waiter_tid
+        );
+        Ok(false)
+    }
+
     pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message) -> Result<(), KernelError> {
         let current_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         crate::yarm_log!("IPC_REPLY_ENTER tid={}", current_tid);
@@ -1783,7 +1865,24 @@ impl KernelState {
                     .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
             });
             if waiter_recv_v2_blocked {
-                // Phase 3: complete delivery outside all locks.
+                // Stage 188F: dispatch the reply delivery to the blocked recv-v2
+                // caller through the 188B/188C/188D dispatch-return producers
+                // (plain → ordinary-cap → reply-cap). On a stash, the seam mint +
+                // 186E user copy + slot-clear + wake all run in the trap-entry drain
+                // AFTER the broad borrow drops — no seam/copy/materialization here.
+                // Shared-region replies and the no-drainer case return Ok(false) and
+                // fall through to the unchanged legacy path below.
+                match self.try_ipc_reply_boundary_split(waiter_tid.0, endpoint_idx, &msg) {
+                    Ok(true) => {
+                        // Slot-clear + wake happen in Phase C (the executor),
+                        // preserving the legacy order copy → clear → wake.
+                        return Ok(());
+                    }
+                    Ok(false) => { /* unsupported / no drainer — use the legacy path */ }
+                    Err(e) => return Err(e),
+                }
+                // Phase 3: complete delivery outside all locks (legacy path for
+                // shared-region replies, or when no trap-entry drainer is active).
                 match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
                     Ok(()) => {
                         crate::yarm_log!(

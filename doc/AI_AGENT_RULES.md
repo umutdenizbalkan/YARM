@@ -356,6 +356,185 @@ Reply-cap materialization, `ipc_reply` conversion, and full global-lock retireme
 deferred. Pinned by `stage186d4_ordinary_cap_transfer_live_wiring_hard_stop`. See
 `doc/KERNEL_UNLOCKING.md` (Stage 186D4) and `doc/KERNEL_LOCKING.md §0.7`.
 
+**Stage 187A (IPC-RECV-DELIVERY-BOUNDARY-SPLIT) status — LIVE boundary split, DO NOT
+OVERCLAIM.** The queued-split recv delivery path now performs its user-space writeback
+AFTER the `with_cpu` broad `&mut KernelState` is dropped, through the Stage 186E
+`copy_to_user_split` seam (`M2_SEAM_LIVE_187A_RECV_BOUNDARY`). Phase A (under the lock,
+byte-identical): dequeue + legacy cap materialization + sender wake (§56 order preserved —
+wake still before writeback) + by-value `RecvBoundaryUserCopySnapshot`; Phase B: seam copy;
+Phase C: frame commit + §58 rollback/fault via brief re-entries. Scope honesty: this stage
+does not enable multi-dispatcher/AP user scheduling, does not fully retire the global lock,
+does not solve reply-cap materialization (legacy router in Phase A, never seam-routed), does
+not convert `ipc_send`/`ipc_call`/`ipc_reply` or blocked-waiter delivery
+(`complete_blocked_recv_for_waiter` — still `defer_needs_broad_ipc_decomposition`), and does
+not wire the 186D2/186D3 cap-transfer seam (that follow-on now depends only on this
+boundary). Do not call any `data_ptr()`-derived seam inside the Phase A closure or the Phase
+C re-entry closures — pinned by `stage187a_ipc_recv_delivery_boundary_split`. Relocated
+markers: `YARM_RECV_CORE_LIVE kind=user_plain{,_v2}`, `IPC_RECV_V2_META_QUEUED_SPLIT_OK`,
+and the queued-split `IPC_RECV_V2_ROLLBACK_OK` sites moved WITH the writeback to runtime.rs
+Phase C (same live path; `stage159bcd_target_markers_are_kernel_emitted` re-homed to require
+a literal kernel emission in either file). See `doc/KERNEL_UNLOCKING.md` (Stage 187A) and
+`doc/KERNEL_LOCKING.md §0.8`.
+
+**Stage 187B (ORDINARY-CAP-TRANSFER-SEAM-LIVE-ON-RECV-BOUNDARY) status — LIVE, DO NOT
+OVERCLAIM.** Ordinary (non-reply, non-shared-region) transferred caps received by a user task
+on the 187A queued-split boundary are now materialized through the 186D2/186D3 cap-transfer
+seam — the first live use of that seam (`M2_SEAM_LIVE_187B_CAP_TRANSFER`). Phase A
+(`phase_a_snapshot_ordinary_transfer`, under `with_cpu`) consumes the transfer envelope once
+and snapshots object/rights/cnode + delegation identity by value (no mint, no seam;
+`source_cap` is the delegation edge only, never receiver authority). Phase B/C
+(`SharedKernel::complete_recv_boundary_ordinary_cap`, after the borrow drops): seam mint
+(atomic cap↔memory mint + delegation link) → commit receiver-local CapId → deferred sender
+wake → 186E user copy → §58 rollback via `rollback_materialized_recv_cap`. Order preserved:
+materialize → wake → writeback. Scope honesty: does **not** enable multi-dispatcher/AP user
+scheduling, does **not** fully retire the global lock, **reply-cap materialization remains
+deferred** (rank inversion — reply caps stay on the legacy in-lock router), and it does not
+convert `ipc_reply`/`ipc_send`/`ipc_call`/blocked-waiter delivery (shared-region and
+kernel-register cap transfers also stay legacy). The seam must be called ONLY in `runtime.rs`
+post-boundary, never in `syscall.rs` Phase A (186D4 aliasing). Markers
+`CAP_TRANSFER_BOUNDARY_SEAM_*` fire only on the converted ordinary path. Pinned by
+`stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary`. See `doc/KERNEL_UNLOCKING.md`
+(Stage 187B) and `doc/KERNEL_LOCKING.md §0.9`.
+
+**Stage 187C (IPC-REPLY-RETRY-AFTER-BOUNDARY-SEAMS) status — HARD-STOPPED, DO NOT OVERCLAIM.**
+Retrying the `ipc_reply` conversion was audited and stopped: no runtime path was converted.
+`ipc_reply`'s only seam-eligible work (reply payload copy + any cap materialization to the
+caller) lives inside `complete_blocked_recv_for_waiter` — the shared blocked-waiter delivery
+path (6 production call sites: reply/send/fault) that runs the copy + materialize under the
+broad `&mut KernelState`. 187A/187B split the **queued** recv path, not this blocked-waiter
+path. Converting `ipc_reply` needs (a) boundary-splitting the shared blocked-waiter delivery
+(broad decomposition — out of scope) and (b) for reply-with-cap, the unsolved
+`reply_cap_ipc_rank_inversion`. Do **not** describe `ipc_reply` as boundary-split or emit any
+`IPC_REPLY_BOUNDARY_*` marker; do not fork `complete_blocked_recv_for_waiter` for reply only
+(half-converted path). The reply-cap consume/revoke/enqueue/wake call no seam and need no
+boundary. Recommended next step: Stage 187D (split the shared blocked-waiter delivery) then a
+focused reply-cap rank-inversion stage. Broader IPC conversion, multi-dispatcher, and full
+global-lock retirement remain deferred. Pinned by `stage187c_ipc_reply_retry_hard_stop`. See
+`doc/KERNEL_UNLOCKING.md` (Stage 187C) and `doc/KERNEL_LOCKING.md §0.10`.
+
+**Stage 187D (BLOCKED-WAITER-DELIVERY-BOUNDARY-SPLIT) status — HARD-STOPPED, DO NOT OVERCLAIM.**
+Splitting `complete_blocked_recv_for_waiter` was audited and stopped: no runtime path was
+converted. The helper's seam-eligible shape matches the 187A queued path, but all 6 production
+call sites are `&mut KernelState` syscall handlers (`handle_ipc_send`, `handle_ipc_call`,
+`ipc_reply`, `ipc_send_with_optional_deadline`, `emit_fault_report_for_fault`) buried inside the
+single main-dispatch `with_cpu` closure — none has `&SharedKernel`, and the broad borrow only
+drops when the whole `dispatch()` closure returns. Unlike 187A's dedicated pre-dispatch recv
+fast path, blocked-waiter delivery has **no SharedKernel-level owner** (`try_split_dispatch_into_frame`
+routes only `IpcRecv`/`VmBrk`). Running Phase B/C on the seams needs a dispatch-return
+"pending post-boundary work" channel through every handler, or per-caller pre-dispatch forks
+(wholesale send/reply/call/fault duplication) — broad IPC/dispatch decomposition, out of scope;
+plus the reply-with-cap `reply_cap_ipc_rank_inversion`. Do **not** split the helper into inert
+Phase-A-only infra (no live Phase B/C caller — dead infra that masquerades as progress); do
+**not** emit any `BLOCKED_WAITER_BOUNDARY_*` marker. Recommended next step: the Stage 188+
+multi-dispatcher / dispatch-boundary restructuring (a typed dispatch-return delivery channel).
+Reply-cap materialization, broader IPC conversion, multi-dispatcher, and full global-lock
+retirement remain deferred. Pinned by `stage187d_blocked_waiter_delivery_hard_stop`. See
+`doc/KERNEL_UNLOCKING.md` (Stage 187D) and `doc/KERNEL_LOCKING.md §0.11`.
+
+**Stage 188A (DISPATCH-RETURN-DELIVERY-CHANNEL) status — infrastructure only, DO NOT
+OVERCLAIM.** A typed by-value dispatch-return channel (`crate::kernel::dispatch_post_work::DispatchPostWork`:
+`None` + `BlockedWaiterPlainDelivery`) lets a handler under the broad `with_cpu` /
+`&mut KernelState` borrow stash post-boundary work into a per-CPU `DISPATCH_POST_WORK_STASH`
+(mirroring the Stage 117 `PerCpuSwitchPlanStash`); `SharedKernel::drain_dispatch_post_work(cpu)`
+executes it in `handle_trap_entry_shared` **after** the broad borrow drops, through the 186E
+copy seam. The enum is by-value (no `&mut KernelState`, no borrows, no `CapId`). **No live
+handler stashes work** — the channel is inert (one-shot `DISPATCH_RETURN_CHANNEL_READY
+mode=helper_only`; zero behavior change); the `BlockedWaiterPlainDelivery` executor is
+unit-tested but produced by nothing live. Do **not** describe 188A as converting any IPC path,
+enabling AP user-task scheduling, retiring the global lock, or solving the reply-cap rank
+inversion (`reply_cap_ipc_rank_inversion` still blocks reply-cap materialization). Do **not**
+stash work from a production handler until a focused follow-on wires + proves a specific
+blocked-waiter slice. `KernelState::clear_blocked_recv_return_regs` was extracted
+byte-identically from `complete_blocked_recv_for_waiter` (shared by the legacy path and the
+executor). Pinned by `stage188a_dispatch_return_delivery_channel`. See `doc/KERNEL_UNLOCKING.md`
+(Stage 188A) and `doc/KERNEL_LOCKING.md §0.12`.
+
+**Stage 188B (BLOCKED-WAITER-PLAIN-DELIVERY-LIVE) status — first live producer, PLAIN PATH
+ONLY, DO NOT OVERCLAIM.** The 188A channel now has one live producer: `ipc_reply`'s
+recv-v2-blocked branch, **plain messages only** (no transferred cap, no reply cap). It calls
+`crate::kernel::syscall::produce_blocked_waiter_plain_delivery`, which (Phase A, under the broad
+borrow) consumes the waiter's `blocked_recv_state`, encodes the recv-v2 meta with
+`cap_id = NO_TRANSFER_CAP`, **pre-validates** both user buffers writable with no copy, and stashes
+a by-value `BlockedWaiterPlainDelivery`; the executor does the 186E-seam copy + endpoint
+slot-clear + single wake after the borrow drops (`DISPATCH_RETURN_CHANNEL_READY mode=live`,
+`DISPATCH_POST_WORK_DONE kind=blocked_waiter_plain result=ok`). The producer only stashes with a
+trap-entry drainer active (`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]`), so no orphaned stash; any
+non-plain message or drainerless caller returns `Ok(false)` → unchanged legacy path; a
+non-writable buffer faults **synchronously** (`UserMemoryFault`, no stash), matching legacy.
+**cap-transfer blocked-waiter delivery remains deferred** — do **not** extend this producer to
+cap-transfer / reply-cap / fault delivery, and do **not** describe 188B as converting broader IPC,
+enabling AP user-task scheduling, retiring the global lock, or solving
+`reply_cap_ipc_rank_inversion` (reply-cap materialization still blocked). It converts **only** the
+plain, no-cap reply. Pinned by `stage188b_blocked_waiter_plain_delivery_live`. See
+`doc/KERNEL_UNLOCKING.md` (Stage 188B) and `doc/KERNEL_LOCKING.md §0.13`.
+
+**Stage 188C (BLOCKED-WAITER-ORDINARY-CAP-DELIVERY-LIVE) status — second live producer, ORDINARY
+CAP ONLY, DO NOT OVERCLAIM.** The `ipc_reply` recv-v2-blocked branch now has a second producer,
+`produce_blocked_waiter_ordinary_cap_delivery`, for a single ORDINARY (non-reply,
+non-shared-region) transferred cap. Phase A (under the broad borrow) consumes the transfer
+envelope **once** and snapshots object + rights + receiver cnode + delegation parent edge by
+value (no mint, no seam, no copy); the executor materializes the receiver-local cap through the
+186D2/186D3 seam (`materialize_received_message_cap_routed_with_delegation_split`), encodes the
+recv-v2 meta with that FRESH CapId, copies via the 186E seam, and rolls the mint back on a
+user-copy fault (`DISPATCH_POST_WORK_DONE kind=blocked_waiter_ordinary_cap result=ok`;
+`DISPATCH_POST_WORK_FAIL …` is an HONEST error marker, absent from a healthy boot log). The
+receiver-local CapId is minted fresh — the source CapId is a delegation-link parent edge only,
+**never receiver authority**. Do **not** extend this producer to reply caps (they route to
+`DeferredReplyCap`; `reply_cap_ipc_rank_inversion` still blocks reply-cap materialization),
+shared-region transfers, fault delivery, or broader `ipc_send`/`ipc_call` conversion; do **not**
+describe 188C as enabling AP user-task scheduling, retiring the global lock, or solving the
+reply-cap rank inversion. It converts **only** the ordinary single cap transfer on the
+`ipc_reply` blocked-waiter path. Pinned by
+`stage188c_blocked_waiter_ordinary_cap_delivery_live`. See `doc/KERNEL_UNLOCKING.md` (Stage 188C)
+and `doc/KERNEL_LOCKING.md §0.14`.
+
+**Stage 188D (REPLY-CAP-RANK-INVERSION-SEAM) status — rank inversion SOLVED at the seam;
+ipc_reply slice DORMANT, DO NOT OVERCLAIM.** The `reply_cap_ipc_rank_inversion` blocker is retired
+for the dispatch-return channel by **phase separation** (three disjoint critical sections, no
+nested acquisition): Phase A (broad borrow) takes the reply-cap transfer envelope once and
+snapshots the reply object's `(reply_index, reply_generation)` + receiver cnode by value (no
+sender-local CapId as authority); Phase B mints the receiver-local reply cap via the rank-4
+`mint_capability_with_memory_ref_split` seam (no IPC lock); Phase C records the CapId via the
+rank-3 `SharedKernel::try_record_reply_waiter_cap_split` (`with_ipc_split_mut`), rolling the mint
+back on a stale record (`rollback_minted_cap_split`) and additionally clearing the record on a
+post-record copy fault (`clear_reply_waiter_cap_split`). The rank-4 mint releases its lock before
+the rank-3 record acquires `ipc_state_lock` — **never hold the capability lock while taking the IPC
+lock; never mint under `ipc_state_lock`; never record IPC metadata under a broad
+`&mut KernelState`.** Do **not** claim a live boot conversion: the only reply-cap→blocked-waiter
+path in a real boot is `ipc_call` (out of scope — the broader `ipc_send`/`ipc_call` conversion is
+untouched), so the producer is wired into `ipc_reply` and the seam is proven end-to-end by unit
+tests; `REPLY_CAP_RANK_SEAM_DONE` does not appear in a standard smoke, and that is correct. Do
+**not** describe 188D as enabling AP user-task scheduling or retiring the global lock. Live wiring
+into `ipc_call` is the explicit deferred next step. Pinned by
+`stage188d_reply_cap_rank_inversion_seam`. See `doc/KERNEL_UNLOCKING.md` (Stage 188D) and
+`doc/KERNEL_LOCKING.md §0.15`.
+
+**Stage 188E (IPC-CALL-REPLY-CAP-BLOCKED-WAITER-LIVE) status — 188D seam LIVE on ipc_call.** The
+188D reply-cap seam is now wired live: `handle_ipc_call`, on delivery to a blocked recv-v2 receiver,
+calls `produce_blocked_waiter_reply_cap_delivery` before the legacy `complete_blocked_recv_for_waiter`
+(recv-v2 blocked branch only, drainer-gated). The caller's frame is set to Ok inline; the receiver
+mint (rank 4) + record (rank 3, disjoint) + 186E copy + wake run in the dispatch-return executor
+after the broad borrow drops, so `REPLY_CAP_RANK_SEAM_DONE result=ok` and
+`DISPATCH_POST_WORK_DONE kind=blocked_waiter_reply_cap result=ok` are now live in a real boot. The
+envelope is consumed once and the mint is rolled back on stale record / copy fault. Do **not**
+extend this to shared-region / fault / unrelated `ipc_send`/`ipc_reply`, and do **not** claim it
+enables AP user-task scheduling or retires the global lock. Pinned by
+`stage188e_ipc_call_reply_cap_blocked_waiter_live`. See `doc/KERNEL_UNLOCKING.md` (Stage 188E) and
+`doc/KERNEL_LOCKING.md §0.16`.
+
+**Stage 188F (IPC-REPLY-BOUNDARY-LIVE-RETRY) status — ipc_reply boundary split, supersedes 187C.**
+The 187C hard stop is retired: `ipc_reply`'s blocked recv-v2 delivery is dispatched through a single
+boundary helper `try_ipc_reply_boundary_split` that tries the 188B/188C/188D producers (plain →
+ordinary-cap → reply-cap) and emits the `IPC_REPLY_BOUNDARY_*` markers
+(`IPC_REPLY_BOUNDARY_SPLIT_DONE result=ok` on a stash; `_SPLIT_DEFERRED` for shared-region /
+no-drainer; `_SPLIT_FAIL` only on error). Do **not** reintroduce the retired
+`stage187c_no_reply_boundary_marker_in_src` guard — the IPC_REPLY_BOUNDARY_* markers are now
+legitimate and live in `ipc_state.rs` only. The helper **does not duplicate** any producer, calls no
+seam in Phase A, and the seam mint + 186E copy + wake still run only in the trap-entry drain. Do
+**not** extend this to shared-region / fault / `ipc_send`/`ipc_call`, and do **not** claim it enables
+AP user-task scheduling or retires the global lock. Pinned by `stage188f_ipc_reply_boundary_live`.
+See `doc/KERNEL_UNLOCKING.md` (Stage 188F) and `doc/KERNEL_LOCKING.md §0.17`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

@@ -360,6 +360,29 @@ impl KernelState {
         })
     }
 
+    /// Stage 188A: zero a blocked recv-v2 waiter's saved return registers so the
+    /// resumed task sees a success result (ret0=0, error=0, ret1=0, ret2=0).
+    ///
+    /// Byte-identical to the inline block that `complete_blocked_recv_for_waiter`
+    /// has always performed after a successful blocked-waiter delivery; extracted
+    /// so the same completion can be applied by the Stage 188A dispatch-return
+    /// executor (which runs the delivery's user copy through the 186E seam after
+    /// the broad borrow drops). See that call site for the x86_64 register-slot
+    /// rationale (RCX/RDX/R8 must be zeroed because the resumption path restores
+    /// `user_gprs` verbatim).
+    pub(crate) fn clear_blocked_recv_return_regs(&mut self, waiter_tid: u64) {
+        self.with_tcb_mut(waiter_tid, |tcb| {
+            tcb.user_context.arg0 = 0;
+            tcb.user_context.user_gprs[0] = 0; // RAX / x0  = ret0  = 0 (success)
+            #[cfg(target_arch = "x86_64")]
+            {
+                tcb.user_context.user_gprs[2] = 0; // RCX = error = 0 (success)
+                tcb.user_context.user_gprs[3] = 0; // RDX = ret2  = 0
+                tcb.user_context.user_gprs[7] = 0; // R8  = ret1  = 0
+            }
+        });
+    }
+
     pub fn thread_kernel_context(&self, tid: u64) -> Option<KernelExecutionContext> {
         self.with_tcbs(|tcbs| {
             tcbs.iter()
