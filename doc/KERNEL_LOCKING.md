@@ -28,6 +28,29 @@ remove implicit global-lock coupling from syscall/trap paths.
   no-allocation and does not call the broad `mark_task_dead` helper. Per-stage
   history entries below that record `SYSCALL_COUNT == 30/31` describe the state at
   those earlier stages and are left as historical record.
+- **Stage 188H (PRE-189-MULTI-DISPATCHER-READINESS-AUDIT) — audit-only, GO for
+  189A prep.** No global-lock retirement and no AP user-task scheduling are
+  enabled here. The single-**dispatcher** gates that Stage 189 must lift are all
+  in place and forward-correct, so the AP dispatcher can be wired incrementally:
+  * `dispatching_cpu_count() = popcount(online & !wake_only)`; the out-of-lock
+    seam predicate is `dispatching <= 1` (not `online <= 1`). When `dispatching`
+    rises it re-gates the x86_64 out-of-lock dispatch relocation back to the
+    in-lock path automatically (`ipc_state.rs`, `exec_state.rs`), and the
+    `CROSS_ARCH_TOPOLOGY_*` audit blocks with `reason=multi_dispatcher_unproven`.
+  * APs are admitted **wake-only first** (`mark_cpu_wake_only(cpu, true)` before
+    online — "no placement window"); both placement paths
+    (`enqueue_on_with_priority`, `least_loaded_online_cpu`) skip/deny wake-only
+    CPUs (`SCHED_ENQUEUE_DENIED_WAKE_ONLY reason=no_ap_dispatcher_yet`), so no
+    user task can land on an AP. x86_64 APs park at `no_ap_scheduler_yet`.
+  * TLB-shootdown target computation (`live_cpu_bitmap_for_asid`) excludes
+    wake-only APs (they never load a user CR3), so today's shootdown set is
+    BSP-local — no remote/faked ACK. 189 must supply a real cross-CPU ACK when
+    APs begin dispatching.
+  * The 188A–188F dispatch-return channel is a by-value, **per-CPU-stash**
+    mechanism (`dispatch_post_work.rs`) drained after the broad borrow drops; it
+    carries no `&mut KernelState` and no single-dispatcher assumption, so it is
+    already per-CPU-safe. Pinned by
+    `stage188h_reap_faulted_task_excluded_from_split_dispatch`.
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 

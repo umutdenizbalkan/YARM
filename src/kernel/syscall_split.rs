@@ -952,6 +952,39 @@ mod tests {
         }
     }
 
+    // ---- Stage 188H: pre-189 readiness guard ----
+
+    #[test]
+    fn stage188h_reap_faulted_task_excluded_from_split_dispatch() {
+        // SUP-L7K-A ReapFaultedTask (NR 31) is a PM-only, global-lock-only
+        // terminal-task reap. It must NEVER enter the split (no-global-lock)
+        // dispatch path: both the arg-aware and NR-only classifiers default-deny
+        // it, and `try_split_dispatch` must return `None` (defer to global lock).
+        // This pins the invariant explicitly so a future stage cannot silently
+        // whitelist it while wiring the AP/multi-dispatcher path in Stage 189.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let syscall = decode(crate::kernel::syscall::SYSCALL_REAP_FAULTED_TASK_NR);
+        assert!(
+            matches!(syscall, Syscall::ReapFaultedTask),
+            "NR 31 must decode to ReapFaultedTask"
+        );
+        let args = [3u64, 0, 0, 0, 0, 0];
+        assert_eq!(
+            classify_split_eligible(syscall, 3, args),
+            None,
+            "ReapFaultedTask must NOT be arg-aware split-eligible"
+        );
+        assert!(
+            classify_split_eligible_nr_only(syscall).is_none(),
+            "ReapFaultedTask must NOT be NR-only split-eligible"
+        );
+        assert_eq!(
+            try_split_dispatch(&kernel, syscall, 3, args),
+            None,
+            "ReapFaultedTask must fall back to the global-lock dispatch path"
+        );
+    }
+
     // ---- Part 6: result-writeback equivalence ----
 
     #[test]
