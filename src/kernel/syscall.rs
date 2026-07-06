@@ -698,6 +698,174 @@ pub(crate) fn produce_blocked_waiter_plain_delivery(
     Ok(true)
 }
 
+/// Stage 188C — Phase A producer for an ORDINARY (non-reply, non-shared-region)
+/// single cap-transfer blocked recv-v2 waiter delivery, wired into the Stage
+/// 188A dispatch-return channel.
+///
+/// This is the cap-carrying sibling of [`produce_blocked_waiter_plain_delivery`].
+/// Instead of materializing the transferred cap and copying under the broad
+/// borrow (as `complete_blocked_recv_for_waiter` →
+/// `materialize_received_message_cap_routed` does), it:
+///   1. consumes the waiter's blocked state,
+///   2. pre-validates the PAYLOAD buffer writable (no copy) — a fault here leaves
+///      the transfer envelope UNconsumed, exactly like the legacy payload-copy
+///      fault (which precedes materialization),
+///   3. consumes the transfer envelope ONCE and resolves the source object +
+///      rights + receiver cnode (`phase_a_snapshot_ordinary_transfer`) — NO mint,
+///      NO seam call under the broad borrow,
+///   4. pre-validates the META buffer writable (no copy),
+///   5. stashes a by-value `DispatchPostWork::BlockedWaiterOrdinaryCapDelivery`.
+///
+/// The trap-entry drain then materializes the receiver-local cap through the
+/// Stage 186D2/186D3 seam (atomic mint + delegation link + rollback), encodes the
+/// recv-v2 meta with that fresh CapId, copies payload+meta through the 186E seam,
+/// and clears the waiter slot + wakes it — all AFTER the broad borrow is dropped.
+///
+/// Returns:
+/// - `Ok(true)`  — produced post-work; caller must NOT clear the waiter slot or
+///   wake inline (the executor does both in Phase C).
+/// - `Ok(false)` — NOT eligible (not an ordinary cap transfer: reply cap /
+///   shared-region / no transferred cap; or no trap-entry drainer active). Caller
+///   MUST use the legacy path. The blocked state and envelope are untouched.
+/// - `Err(e)`    — a real Phase-A error (undersized buffer, unmapped/non-writable
+///   waiter buffer, missing/dead envelope, source-cap resolution failure) the
+///   legacy path would also raise, with the SAME envelope disposition.
+///
+/// The source `(source_tid, source_cap)` is carried ONLY as the delegation-link
+/// parent edge; it is never resolved-to-mint and never becomes receiver
+/// authority (the receiver-local CapId is minted fresh by the seam). Reply
+/// objects stay deferred (`reply_cap_ipc_rank_inversion`).
+pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
+    kernel: &mut KernelState,
+    waiter_tid: u64,
+    endpoint_idx: usize,
+    msg: &Message,
+) -> Result<bool, SyscallError> {
+    use crate::kernel::dispatch_post_work::{
+        BlockedWaiterOrdinaryCapDeliverySnapshot, DISPATCH_POST_WORK_META_LEN, DispatchPostWork,
+    };
+    // Ordinary cap transfer only: exactly one transferred cap, the transfer flag
+    // set, NOT a reply cap, and NOT a shared-region transfer. Everything else
+    // (plain, reply cap, shared region, no cap) stays on the legacy path.
+    let is_reply = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
+    let is_transfer =
+        (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0;
+    let ordinary_cap = is_transfer
+        && !is_reply
+        && msg.transferred_cap().is_some()
+        && msg.opcode != OPCODE_SHARED_MEM;
+    if !ordinary_cap {
+        return Ok(false);
+    }
+    // Only produce when a trap-entry drainer will run (mirrors the Stage 117 /
+    // 188B stash discipline). Direct/kernel-internal callers (no drainer) fall
+    // back to the legacy path.
+    let cpu_idx = kernel.current_cpu().0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return Ok(false);
+    }
+
+    // Phase A.1 — consume blocked state (byte-identical to the legacy
+    // top-of-helper) and resolve the waiter ASID + the endpoint the envelope is
+    // bound to (from the waiter's recv_cap, exactly as the legacy router does).
+    let blocked_state = kernel
+        .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
+        .flatten()
+        .ok_or(SyscallError::InvalidArgs)?;
+    let waiter_asid = kernel
+        .task_asid(waiter_tid)
+        .ok_or(SyscallError::InvalidArgs)?;
+    let recv_endpoint = kernel
+        .resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
+        .map_err(SyscallError::from)?
+        .object;
+
+    let payload = msg.as_slice();
+    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2
+    {
+        (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
+    } else {
+        (msg.opcode, payload)
+    };
+    if blocked_state.payload_user_len < app_payload.len() {
+        return Err(SyscallError::InvalidArgs);
+    }
+    // Phase A.2 — pre-validate the PAYLOAD buffer writable (no copy) BEFORE
+    // consuming the envelope, so a payload fault leaves the envelope UNconsumed —
+    // byte-identical to the legacy path, whose payload copy precedes the
+    // materialize (envelope consume).
+    kernel
+        .validate_user_range_writable_for_asid(
+            waiter_asid,
+            blocked_state.payload_user_ptr,
+            app_payload.len(),
+        )
+        .map_err(SyscallError::from)?;
+    if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    // Phase A.3 — consume the transfer envelope ONCE and resolve the ordinary
+    // object + rights + receiver cnode (NO mint, NO seam). This is the exact
+    // envelope-consume + source-resolve the legacy D1 arm does before its mint;
+    // the mint itself is deferred to the executor's seam. Same real errors
+    // (missing/dead envelope, source-cap resolution) as the legacy arm.
+    let (object, rights, source_tid, source_cap, receiver_cnode) =
+        phase_a_snapshot_ordinary_transfer(
+            kernel,
+            msg.transferred_cap().unwrap().0,
+            recv_endpoint,
+            waiter_tid,
+        )?;
+
+    // Phase A.4 — pre-validate the META buffer writable (no copy). On fault the
+    // envelope is already consumed (matching the legacy meta-copy fault, which
+    // materializes then rolls back the mint — net-identical: envelope gone, no
+    // receiver cap); here nothing was minted, so there is nothing to roll back.
+    kernel
+        .validate_user_range_writable_for_asid(
+            waiter_asid,
+            blocked_state.meta_user_ptr,
+            DISPATCH_POST_WORK_META_LEN,
+        )
+        .map_err(SyscallError::from)?;
+
+    let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
+    payload_buf[..app_payload.len()].copy_from_slice(app_payload);
+
+    let snapshot = BlockedWaiterOrdinaryCapDeliverySnapshot {
+        waiter_tid,
+        waiter_asid,
+        payload_user_ptr: blocked_state.payload_user_ptr,
+        payload_len: app_payload.len(),
+        payload: payload_buf,
+        meta_user_ptr: blocked_state.meta_user_ptr,
+        app_opcode,
+        sender_tid: msg.sender_tid.0,
+        receiver_cnode,
+        object,
+        rights,
+        source_tid,
+        source_cap,
+        endpoint_idx,
+        wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
+    };
+    // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+    // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` store.
+    unsafe {
+        crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx]
+            .store(DispatchPostWork::BlockedWaiterOrdinaryCapDelivery(snapshot));
+    }
+    crate::yarm_log!(
+        "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_ordinary_cap waiter_tid={}",
+        waiter_tid
+    );
+    Ok(true)
+}
+
 // Stage 158: the cap-materialization cluster (router + two canonical helpers)
 // re-homed into `ipc_recv_core.rs`. Re-export the two entry points so every
 // existing call site here and every sibling `super::` import keeps resolving.

@@ -8066,6 +8066,70 @@ delivers via the seam and wakes once; cap/reply message → `Ok(false)`; no drai
 unmapped buffer → synchronous `Err`, no stash; producer calls no seam under the broad borrow;
 snapshot by-value; executor Phase C slot-clear + wake + meta marker; docs honest).
 
+**Stage 188C (BLOCKED-WAITER-ORDINARY-CAP-DELIVERY-LIVE) — DONE (second live producer,
+ordinary cap-transfer path only).**
+Stage 188C wires ordinary cap-transfer blocked-waiter delivery through dispatch-return.
+The `ipc_reply` recv-v2-blocked branch now defers a
+single ORDINARY (non-reply, non-shared-region) transferred cap — an endpoint / notification /
+memory-object / DMA-region object cap — instead of materializing + copying it under the broad
+borrow. It is the cap-carrying sibling of the 188B plain producer and the first live wiring of
+the Stage 186D2/186D3 cap-transfer seam onto the **blocked-waiter** path (187B wired it onto the
+queued-recv path).
+
+*Exact live path converted.* `ipc_reply` (`boot/ipc_state.rs`), recv-v2-blocked branch, ordinary
+single cap transfers only. After the 188B plain producer returns `Ok(false)`, the branch calls
+`produce_blocked_waiter_ordinary_cap_delivery(self, waiter_tid, endpoint_idx, &msg)`:
+
+- **`Ok(true)`** — an ordinary cap transfer with a drainer active: Phase A (under the broad
+  borrow) consumes `blocked_recv_state`, **pre-validates the payload buffer** writable (no copy —
+  a fault here leaves the transfer envelope UNconsumed, matching the legacy payload-copy-before-
+  materialize order), consumes the transfer envelope **once** and resolves the source object +
+  rights + receiver cnode (`phase_a_snapshot_ordinary_transfer` — no mint, no seam),
+  **pre-validates the meta buffer**, and stashes a by-value `BlockedWaiterOrdinaryCapDelivery`.
+  Slot-clear + wake are deferred to the executor.
+- **`Ok(false)`** — not an ordinary cap transfer (plain, reply cap, shared region, or no
+  transferred cap), or no trap-entry drainer: falls through to the unchanged legacy
+  `complete_blocked_recv_for_waiter` path.
+- **`Err(..)`** — a real Phase-A error (undersized/unmapped buffer, missing/dead envelope,
+  source-cap resolution) returned synchronously as `KernelError::UserMemoryFault`, with the SAME
+  envelope disposition the legacy path produces on each fault.
+
+The executor (`runtime.rs`, `execute_blocked_waiter_ordinary_cap_delivery`) runs after the broad
+borrow drops: materializes the receiver-local cap through
+`materialize_received_message_cap_routed_with_delegation_split` (Stage 186D2 atomic mint + 186D3
+delegation link + rollback-on-delegation-failure), encodes the recv-v2 meta with that **fresh
+receiver-local CapId** (`cap_id = local_cap`, `recv_meta_flags = TRANSFERRED_CAP`), copies
+payload+meta through the **186E seam**, and — on a user-copy fault — rolls the freshly-minted cap
+all the way back (`rollback_materialized_recv_cap`) so nothing leaks. Phase C clears the return
+regs + receiver-waiter slot and wakes the waiter once. Markers:
+`DISPATCH_POST_WORK_CAP_TRANSFER_SEAM_OK`, `DISPATCH_POST_WORK_USER_COPY_OK`,
+`IPC_RECV_V2_META_BLOCKED_WAITER_OK`, `DISPATCH_POST_WORK_DONE kind=blocked_waiter_ordinary_cap
+result=ok`; on a real failure, the honest `DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap
+reason=<materialize|user_copy|unexpected_reply_object>` (absent from a healthy boot log).
+
+*Authority / envelope / wake proofs.* The transfer envelope is consumed exactly once in Phase A
+(one-shot). The receiver-local CapId is minted **fresh** by the seam; the source `(source_tid,
+source_cap)` is carried ONLY as the delegation-link parent edge (bookkeeping) and is **never
+resolved-to-mint, never receiver authority** — a revoke of the source removes the delegated
+receiver cap through that link. Phase-A pre-validation keeps the deferred copy infallible on the
+supported single-CPU config, preserving failure semantics and wake-once ordering; the
+`IPC_RECV_V2_META_BLOCKED_WAITER_OK` marker is preserved. `WrongObject` / `StaleCapability` /
+`MissingRight` / `CapabilityFull` / `UserMemoryFault` remain real errors.
+
+*Scope honesty.* reply-cap materialization remains deferred (`reply_cap_ipc_rank_inversion`):
+any reply-cap message returns `Ok(false)` and stays legacy — reply objects route to the seam's
+`DeferredReplyCap` and are never materialized here. Shared-region transfers (mapping obligation),
+fault delivery, and the broader `ipc_send`/`ipc_call`/`ipc_reply` conversion remain deferred
+unless explicitly converted. This stage converts only the ordinary single cap transfer on the
+`ipc_reply` blocked-waiter path; it does not enable AP user-task scheduling and does not fully
+retire the global lock. Guarded by `stage188c_blocked_waiter_ordinary_cap_delivery_live`
+(ordinary producer stashes + executor materializes via the seam, delivers, and wakes once;
+receiver gets a fresh receiver-local CapId, not the sender's; delegation link recorded; source
+revoke removes the delegated cap; link-table-full → materialize rollback, no refcount leak;
+reply/plain/shared/no-drainer → `Ok(false)`; missing envelope → synchronous `Err`, no stash;
+producer calls no seam/copy under the broad borrow; snapshot by-value; executor uses the
+cap-transfer + 186E seams + rollback; FAIL only on error paths; docs honest).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

@@ -48916,7 +48916,13 @@ mod stage188a_dispatch_return_delivery_channel {
         );
     }
 
-    // No fallback knobs / emergency opt-out / FAIL markers in the new code.
+    // No fallback knobs / emergency opt-out / channel-fail markers in the new
+    // code. NOTE: `DISPATCH_POST_WORK_FAIL` is deliberately NOT source-forbidden
+    // — Stage 188C emits it as an HONEST failure marker on real error-return
+    // paths (materialize / user-copy rollback). Its absence in a *healthy boot
+    // log* is the acceptance invariant (enforced by the QEMU smokes), not its
+    // absence from source. `stage188c_fail_marker_only_on_error` pins that every
+    // emission sits on an error-return path (never a success path).
     #[test]
     fn stage188a_no_forbidden_markers() {
         for (name, src) in [
@@ -48925,7 +48931,6 @@ mod stage188a_dispatch_return_delivery_channel {
         ] {
             for forbidden in [
                 "DISPATCH_RETURN_CHANNEL_FAIL",
-                "DISPATCH_POST_WORK_FAIL",
                 "UNLOCK_GRADUATED_FALLBACK",
                 "emergency_optout",
             ] {
@@ -49275,7 +49280,7 @@ mod stage188b_blocked_waiter_plain_delivery_live {
         let body = SYSCALL_SRC
             .split("fn produce_blocked_waiter_plain_delivery(")
             .nth(1)
-            .and_then(|r| r.split("\n// Stage 158").next())
+            .and_then(|r| r.split("\n/// Stage 188C").next())
             .expect("producer body");
         for forbidden in [
             "copy_to_user_split",
@@ -49335,6 +49340,575 @@ mod stage188b_blocked_waiter_plain_delivery_live {
             assert!(
                 UNLOCK_DOC.contains(required),
                 "docs must state 188B `{required}`"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Stage 188C — BLOCKED-WAITER-ORDINARY-CAP-DELIVERY-LIVE
+//
+// The second live producer on the Stage 188A dispatch-return channel: the
+// ipc_reply recv-v2-blocked branch now defers an ORDINARY (non-reply,
+// non-shared-region) single cap transfer. Phase A (under the broad borrow)
+// consumes the blocked state, pre-validates the payload buffer, consumes the
+// transfer envelope ONCE, resolves object/rights/cnode + delegation identity,
+// pre-validates the meta buffer, and stashes a by-value
+// BlockedWaiterOrdinaryCapDelivery. The executor (after the borrow drops)
+// materializes the receiver-local cap through the 186D2/186D3 seam (atomic mint
+// + delegation link + rollback), encodes the recv-v2 meta with that FRESH CapId,
+// copies payload+meta via the 186E seam, then clears + wakes the waiter once.
+//
+// Functional tests drive the producer directly (trap-drainer flag set) then the
+// executor: ordinary cap -> stashed + materialized-via-seam + delivered + woken,
+// receiver gets a fresh receiver-local CapId (not the sender's), delegation link
+// recorded, source revoke removes the delegated cap; link-table-full ->
+// materialize fails, cap rolled back (no leak); reply/plain/shared/no-drainer ->
+// Ok(false) (legacy); missing envelope -> synchronous Err (no stash). Source
+// guards pin: producer calls no seam/copy under the broad borrow; snapshot by
+// value; executor uses the cap-transfer + 186E seams + rollback; FAIL only on
+// error paths.
+// ===========================================================================
+#[cfg(test)]
+mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const POST_WORK_SRC: &str = include_str!("../dispatch_post_work.rs");
+    const CPU0: CpuId = CpuId(0);
+
+    fn set_trap_drainer(active: bool) {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+            .store(active, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Ordinary cap-transfer reply message: opcode=0 (OPCODE_INLINE) + FLAG_CAP_TRANSFER,
+    // so the 2-byte inline opcode prefix is stripped (app_opcode=7, body="ord-cap").
+    fn ordinary_cap_msg(handle: u64) -> Message {
+        Message::with_header(
+            0,
+            0,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"\x07\x00ord-cap",
+        )
+        .expect("ordinary cap msg")
+    }
+
+    // Build: task 1 blocked recv-v2 (payload@0x4000, meta@0x4400 — same page), a
+    // memory-object transfer cap owned by task 0, and a transfer envelope bound to
+    // (recv_endpoint, task 1). Returns (state, endpoint_idx, handle, transfer_cap, asid).
+    fn blocked_waiter_with_ordinary_envelope() -> (KernelState, usize, u64, CapId, Asid, u64) {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+
+        // Endpoint (task 0), recv cap granted into task 1.
+        let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap_task1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("grant recv cap to task1");
+
+        // Ordinary object cap to transfer (owned by task 0).
+        let (mem_id, transfer_cap) = state
+            .create_memory_object(PhysAddr(0xCA000))
+            .expect("memory object");
+
+        // Task 1 user memory: one page covers payload (0x4000) + meta (0x4400).
+        let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind task1 asid");
+        state
+            .map_user_page(
+                aspace1,
+                VirtAddr(0x4000),
+                Mapping {
+                    phys: PhysAddr(0x9000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map buffer page");
+
+        // Switch to task 1 and mark it blocked on recv-v2.
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        state.with_tcb_mut(1, |tcb| {
+            tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                recv_cap: recv_cap_task1,
+                payload_user_ptr: 0x4000,
+                payload_user_len: crate::kernel::ipc::Message::MAX_PAYLOAD,
+                meta_user_ptr: 0x4400,
+                meta_user_len: 40,
+                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            });
+        });
+        // Register task 1 as the endpoint waiter (Phase C clears this slot).
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+        });
+
+        // Stash the transfer envelope bound to (recv_endpoint, task 1).
+        let recv_endpoint = state
+            .resolve_capability_for_task(1, recv_cap_task1)
+            .expect("resolve recv cap")
+            .object;
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                transfer_cap,
+                recv_endpoint,
+                Some(ThreadId(1)),
+                None,
+            )
+            .expect("stash envelope");
+        (state, endpoint_idx, handle, transfer_cap, asid1, mem_id)
+    }
+
+    // The ordinary-cap producer stashes work; the executor materializes the cap
+    // through the seam, delivers payload+meta, and wakes the waiter once. The
+    // receiver gets a FRESH receiver-local CapId (not the sender's handle), a
+    // delegation link is recorded, and revoking the source removes it.
+    #[test]
+    fn stage188c_ordinary_cap_producer_stashes_and_executor_delivers() {
+        let (mut state, endpoint_idx, handle, transfer_cap, asid1, _mem_id) =
+            blocked_waiter_with_ordinary_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let msg = ordinary_cap_msg(handle);
+        let produced = crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        assert!(
+            produced,
+            "an ordinary cap reply to a blocked recv-v2 waiter must be produced"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_none(),
+            "producer must consume the waiter's blocked_recv_state"
+        );
+
+        let shared = SharedKernel::new(state);
+        assert!(
+            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            "the drain must deliver the stashed ordinary-cap blocked-waiter work"
+        );
+
+        // Payload body delivered (opcode prefix stripped).
+        let body = shared
+            .with(|k| k.copy_from_user(k.task_asid(1).expect("asid"), VirtAddr(0x4000), 7))
+            .expect("read payload");
+        assert_eq!(&body[..7], b"ord-cap");
+
+        // Meta: TRANSFERRED_CAP flag set + a fresh receiver-local CapId present.
+        let meta = shared
+            .with(|k| k.copy_from_user(asid1, VirtAddr(0x4400), 40))
+            .expect("read meta");
+        let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().unwrap());
+        assert_ne!(
+            recv_meta_flags & crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
+            0,
+            "meta must set SYSCALL_RECV_META_TRANSFERRED_CAP"
+        );
+        let local_cap = u64::from_le_bytes(meta[16..24].try_into().unwrap());
+        assert_ne!(
+            local_cap,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+            "a receiver-local cap must be materialized"
+        );
+        // The receiver-local CapId is FRESH — not the sender's envelope handle nor
+        // the sender's source cap (never sender-local authority).
+        assert_ne!(
+            local_cap, handle,
+            "receiver cap must not be the sender's envelope handle"
+        );
+        assert_ne!(
+            local_cap, transfer_cap.0,
+            "receiver cap must not be the sender's source cap"
+        );
+        // It resolves in task 1's cspace.
+        assert!(
+            shared.with(|k| k.resolve_capability_for_task(1, CapId(local_cap)).is_ok()),
+            "the materialized receiver-local cap must resolve in the waiter's cspace"
+        );
+
+        // Delegation link recorded (source_tid=0 → dest_tid=1, dest_cap=local_cap).
+        let link_ok = shared.with(|k| {
+            k.with_capability_state(|cap| {
+                cap.delegated_capability_links
+                    .iter()
+                    .flatten()
+                    .any(|l| l.source_tid == 0 && l.dest_tid == 1 && l.dest_cap == CapId(local_cap))
+            })
+        });
+        assert!(
+            link_ok,
+            "a sender→receiver delegation link must be recorded"
+        );
+
+        // Waiter woken exactly once.
+        assert!(
+            matches!(
+                shared.with(|k| k.task_status(1)),
+                Some(TaskStatus::Runnable | TaskStatus::Running)
+            ),
+            "the waiter must be woken exactly once"
+        );
+        // Stash consumed (no double delivery).
+        set_trap_drainer(false);
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "the drain must consume the stashed work"
+        );
+
+        // Revoking the source cap in task 0 removes the delegated receiver cap.
+        let task0_cnode = shared.with(|k| k.task_cnode(0)).expect("task0 cnode");
+        shared
+            .with(|k| k.revoke_capability_in_cnode(task0_cnode, transfer_cap))
+            .expect("revoke source cap");
+        assert!(
+            shared.with(|k| k.resolve_capability_for_task(1, CapId(local_cap)).is_err()),
+            "revoking the source must remove the delegated receiver cap"
+        );
+    }
+
+    // A materialize failure (delegation-link table full) rolls the mint back:
+    // no cap in the receiver, memory-object refcount restored, executor returns Err.
+    #[test]
+    fn stage188c_materialize_failure_rolls_back_no_leak() {
+        let (mut state, endpoint_idx, handle, transfer_cap, _asid1, mem_id) =
+            blocked_waiter_with_ordinary_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // Record the source object's cap_refcount before delivery.
+        let mo_slot = state
+            .memory_object_slot_by_id(mem_id)
+            .expect("live object slot");
+        let refcount_before = state.memory.memory_objects[mo_slot]
+            .expect("obj")
+            .cap_refcount;
+
+        // Fill the delegation-link table so the seam's link record fails
+        // (CapabilityFull) and rolls the atomic mint back.
+        let cap_base = 0x8000_0000u64;
+        let mut filled = 0usize;
+        loop {
+            let src = CapId(cap_base + filled as u64);
+            let dst = CapId(cap_base + 0x1_0000_0000 + filled as u64);
+            match state.record_delegated_capability_link(0, src, 1, dst) {
+                Ok(()) => filled += 1,
+                Err(KernelError::CapabilityFull) => break,
+                Err(e) => panic!("unexpected error filling link table: {e:?}"),
+            }
+        }
+        assert!(filled > 0);
+
+        let msg = ordinary_cap_msg(handle);
+        let produced = crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        assert!(
+            produced,
+            "producer stashes regardless of the later seam outcome"
+        );
+
+        let shared = SharedKernel::new(state);
+        let drain = shared.drain_dispatch_post_work(CPU0);
+        assert!(
+            drain.is_err(),
+            "a materialize failure must surface as a real Err"
+        );
+        set_trap_drainer(false);
+
+        // No delegated link for the real (0→1) transfer was left behind, and the
+        // memory-object refcount is restored (the seam rolled the mint back).
+        let _ = transfer_cap;
+        let refcount_after = shared.with(|k| {
+            let slot = k.memory_object_slot_by_id(mem_id).unwrap();
+            k.memory.memory_objects[slot].unwrap().cap_refcount
+        });
+        assert_eq!(
+            refcount_after, refcount_before,
+            "materialize rollback must restore the source object cap_refcount (no leak)"
+        );
+    }
+
+    // A reply-cap reply is NOT produced by the ordinary-cap producer (deferred).
+    #[test]
+    fn stage188c_reply_cap_not_produced() {
+        let (mut state, endpoint_idx, handle, _tc, _asid, _mem_id) =
+            blocked_waiter_with_ordinary_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let msg = Message::with_header(0, 0, Message::FLAG_REPLY_CAP, Some(handle), b"\x00\x00r")
+            .expect("reply cap msg");
+        let produced = crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        set_trap_drainer(false);
+        assert!(
+            !produced,
+            "a reply-cap reply must NOT be produced (reply_cap_ipc_rank_inversion)"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_some(),
+            "a non-ordinary message must not consume the waiter state"
+        );
+    }
+
+    // A plain (no-cap) reply is NOT produced by the ordinary-cap producer.
+    #[test]
+    fn stage188c_plain_not_produced() {
+        let (mut state, endpoint_idx, _handle, _tc, _asid, _mem_id) =
+            blocked_waiter_with_ordinary_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let msg = Message::new(0x42, b"plain").expect("plain");
+        let produced = crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        set_trap_drainer(false);
+        assert!(
+            !produced,
+            "a plain reply must NOT be produced by the ordinary-cap producer"
+        );
+    }
+
+    // A shared-region (OPCODE_SHARED_MEM) transfer is NOT produced (deferred).
+    #[test]
+    fn stage188c_shared_region_not_produced() {
+        let (mut state, endpoint_idx, handle, _tc, _asid, _mem_id) =
+            blocked_waiter_with_ordinary_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let msg = Message::with_header(
+            0,
+            crate::kernel::syscall::OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"shared",
+        )
+        .expect("shared msg");
+        let produced = crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        set_trap_drainer(false);
+        assert!(
+            !produced,
+            "a shared-region transfer must NOT be produced (deferred)"
+        );
+    }
+
+    // With no trap-entry drainer, the ordinary-cap producer does NOT stash.
+    #[test]
+    fn stage188c_no_drainer_no_produce() {
+        let (mut state, endpoint_idx, handle, _tc, _asid, _mem_id) =
+            blocked_waiter_with_ordinary_envelope();
+        set_trap_drainer(false);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let msg = ordinary_cap_msg(handle);
+        let produced = crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        assert!(
+            !produced,
+            "without a drainer the producer must fall back (no orphaned stash)"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no work may be stashed without a drainer"
+        );
+    }
+
+    // A missing/dead transfer envelope is a synchronous Phase-A Err (no stash).
+    #[test]
+    fn stage188c_missing_envelope_synchronous_error_no_stash() {
+        let (mut state, endpoint_idx, handle, _tc, _asid, _mem_id) =
+            blocked_waiter_with_ordinary_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        // Consume the envelope out from under the producer so its take fails.
+        let recv_cap = state
+            .with_tcb_mut(1, |t| t.blocked_recv_state.map(|s| s.recv_cap))
+            .flatten()
+            .unwrap();
+        let recv_endpoint = state
+            .resolve_capability_for_task(1, recv_cap)
+            .unwrap()
+            .object;
+        let _ = state.take_transfer_envelope(handle, recv_endpoint, ThreadId(1));
+        let msg = ordinary_cap_msg(handle);
+        let r = crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "a missing envelope must be a synchronous Phase-A error"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no work may be stashed on a Phase-A error"
+        );
+    }
+
+    // Guard: the producer performs NO seam/cap-materialize and NO user copy under
+    // the broad borrow — only consume/validate/snapshot/stash.
+    #[test]
+    fn stage188c_producer_no_seam_no_copy_under_borrow() {
+        let body = SYSCALL_SRC
+            .split("fn produce_blocked_waiter_ordinary_cap_delivery(")
+            .nth(1)
+            .and_then(|r| r.split("\n// Stage 158").next())
+            .expect("producer body");
+        for forbidden in [
+            "copy_to_user_split",
+            "copy_to_user(",
+            "copy_to_current_user",
+            "materialize_received_message_cap_routed_with_delegation_split",
+            "materialize_received_cap_snapshot_split",
+            "grant_task_to_task_with_rights",
+            "_split_mut",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the ordinary-cap producer must NOT copy or materialize under the broad borrow (`{forbidden}`)"
+            );
+        }
+        assert!(
+            body.contains("phase_a_snapshot_ordinary_transfer")
+                && body.contains("validate_user_range_writable_for_asid")
+                && body.contains("DISPATCH_POST_WORK_STASH"),
+            "the producer must consume the envelope, pre-validate (no copy), and stash"
+        );
+    }
+
+    // Guard: the by-value snapshot carries no &mut KernelState, no borrows, and no
+    // sender-local CapId as authority (source_cap is delegation-parent bookkeeping).
+    #[test]
+    fn stage188c_snapshot_is_by_value() {
+        let body = POST_WORK_SRC
+            .split("pub(crate) struct BlockedWaiterOrdinaryCapDeliverySnapshot {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .expect("snapshot struct");
+        assert!(
+            !body.contains("&mut"),
+            "snapshot must not carry &mut references"
+        );
+        assert!(
+            !body.contains("&'"),
+            "snapshot must not carry borrowed references"
+        );
+        assert!(
+            !body.contains("KernelState"),
+            "snapshot must not carry a KernelState borrow"
+        );
+        // source_cap present but documented as delegation-parent-only (bookkeeping).
+        assert!(
+            body.contains("source_cap: CapId")
+                && body.contains("NEVER")
+                && body.contains("receiver authority"),
+            "source_cap must be documented as delegation-parent-only, never receiver authority"
+        );
+    }
+
+    // Guard: the executor materializes via the 186D2/186D3 seam, copies via the
+    // 186E seam, rolls back on user-copy fault, and emits FAIL only on error.
+    #[test]
+    fn stage188c_executor_uses_seams_and_rollback() {
+        let body = RUNTIME_SRC
+            .split("fn execute_blocked_waiter_ordinary_cap_delivery(")
+            .nth(1)
+            .and_then(|r| r.split("\n    /// Stage").next().or(Some(r)))
+            .expect("executor body");
+        assert!(
+            body.contains("materialize_received_message_cap_routed_with_delegation_split"),
+            "executor must materialize through the 186D2/186D3 seam"
+        );
+        assert!(
+            body.contains("copy_to_user_split"),
+            "executor must copy through the 186E seam"
+        );
+        assert!(
+            body.contains("rollback_materialized_recv_cap"),
+            "executor must roll back the mint on a user-copy fault"
+        );
+        assert!(
+            body.contains("ipc_clear_plain_receiver_waiter_only")
+                && body.contains("apply_scheduler_wake_plan"),
+            "executor Phase C must clear the waiter slot and wake"
+        );
+        assert!(
+            body.contains("DISPATCH_POST_WORK_DONE kind=blocked_waiter_ordinary_cap result=ok"),
+            "executor must emit the DONE marker"
+        );
+        // FAIL only on error-return paths: every FAIL emission is immediately
+        // followed (within the arm) by a `return Err(`.
+        for (idx, _) in body.match_indices("DISPATCH_POST_WORK_FAIL") {
+            let after = &body[idx..];
+            let next_return = after.find("return Err(").unwrap_or(usize::MAX);
+            let next_ok = after.find("result=ok").unwrap_or(usize::MAX);
+            assert!(
+                next_return < next_ok,
+                "every DISPATCH_POST_WORK_FAIL must be on an error-return path"
+            );
+        }
+    }
+
+    // Docs record 188C honestly.
+    #[test]
+    fn stage188c_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 188C"),
+            "docs must document Stage 188C"
+        );
+        for required in [
+            "ordinary cap-transfer blocked-waiter delivery",
+            "reply-cap materialization remains deferred",
+            "reply_cap_ipc_rank_inversion",
+            "does not enable AP user-task scheduling",
+            "does not fully retire the global lock",
+        ] {
+            assert!(
+                UNLOCK_DOC.contains(required),
+                "docs must state 188C `{required}`"
             );
         }
     }

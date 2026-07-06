@@ -37,6 +37,7 @@
 //! only wired variant is a *plain, no-cap* delivery, so it carries no cap at
 //! all).
 
+use super::capabilities::{CNodeId, CapId, CapObject, CapRights};
 use super::ipc::{Message, ThreadId};
 use super::vm::Asid;
 
@@ -64,6 +65,16 @@ pub(crate) enum DispatchPostWork {
     /// produce this instead of copying under the broad borrow.
     #[cfg_attr(not(test), allow(dead_code))]
     BlockedWaiterPlainDelivery(BlockedWaiterPlainDeliverySnapshot),
+    /// An ordinary (non-reply, non-shared-region) single-cap-transfer
+    /// blocked-waiter delivery deferred past the broad borrow (Stage 188C). The
+    /// executor materializes the receiver-local cap through the 186D2/186D3 seam
+    /// (atomic mint + delegation link + rollback), encodes the recv-v2 meta with
+    /// that fresh receiver-local CapId, copies payload+meta through the 186E seam,
+    /// then clears the waiter and wakes it once. **Reply caps are excluded** — the
+    /// snapshot's `object` is never a `Reply` (`reply_cap_ipc_rank_inversion`
+    /// keeps reply-cap materialization deferred).
+    #[cfg_attr(not(test), allow(dead_code))]
+    BlockedWaiterOrdinaryCapDelivery(BlockedWaiterOrdinaryCapDeliverySnapshot),
 }
 
 impl DispatchPostWork {
@@ -79,6 +90,7 @@ impl DispatchPostWork {
         match self {
             Self::None => "none",
             Self::BlockedWaiterPlainDelivery(_) => "blocked_waiter_plain",
+            Self::BlockedWaiterOrdinaryCapDelivery(_) => "blocked_waiter_ordinary_cap",
         }
     }
 }
@@ -109,6 +121,59 @@ pub(crate) struct BlockedWaiterPlainDeliverySnapshot {
     pub(crate) meta: [u8; DISPATCH_POST_WORK_META_LEN],
     /// Endpoint index whose receiver-waiter slot the executor clears in Phase C
     /// (the legacy `ipc_clear_plain_receiver_waiter_only` step).
+    pub(crate) endpoint_idx: usize,
+    /// Optional task to wake exactly once after delivery completes.
+    pub(crate) wake_tid: Option<ThreadId>,
+}
+
+/// By-value snapshot of an ordinary (non-reply, non-shared-region) single
+/// cap-transfer blocked-waiter delivery (Stage 188C).
+///
+/// Contains ONLY owned values — no `&mut KernelState`, no borrowed subsystem
+/// references. It carries the transferred **object identity + rights** (the
+/// authority the receiver actually gets, freshly minted by the seam) plus the
+/// source `(source_tid, source_cap)` **as a delegation-link parent edge only**
+/// (bookkeeping): `source_cap` is NEVER resolved-to-mint and NEVER handed to the
+/// receiver as authority — the receiver-local CapId is minted fresh by the
+/// executor's 186D2/186D3 seam. The `object` is guaranteed non-`Reply` by the
+/// producer (reply caps stay deferred by `reply_cap_ipc_rank_inversion`).
+///
+/// Unlike the plain snapshot, the recv-v2 meta is NOT pre-encoded: the
+/// receiver-local CapId is only known after the seam mint, so the executor
+/// encodes the meta in Phase B (after materialization) from `app_opcode`,
+/// `payload_len`, and `sender_tid`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedWaiterOrdinaryCapDeliverySnapshot {
+    /// The blocked waiter (delivery target + delegation child owner).
+    pub(crate) waiter_tid: u64,
+    /// The waiter's ASID (resolved in Phase A; the copy target address space).
+    pub(crate) waiter_asid: Asid,
+    /// User pointer for the payload buffer.
+    pub(crate) payload_user_ptr: usize,
+    /// Number of valid payload bytes in `payload`.
+    pub(crate) payload_len: usize,
+    /// Payload bytes, by value.
+    pub(crate) payload: [u8; Message::MAX_PAYLOAD],
+    /// User pointer for the recv-v2 meta buffer.
+    pub(crate) meta_user_ptr: usize,
+    /// Application opcode for the recv-v2 meta (encoded in Phase B).
+    pub(crate) app_opcode: u16,
+    /// Sender TID for the recv-v2 meta (encoded in Phase B).
+    pub(crate) sender_tid: u64,
+    /// Receiver's destination cnode (resolved in Phase A). Seam mint target.
+    pub(crate) receiver_cnode: CNodeId,
+    /// The transferred object identity (resolved from the consumed envelope's
+    /// source capability). Never a `Reply` object on this path.
+    pub(crate) object: CapObject,
+    /// Attenuated rights the receiver-local cap is minted with (byte-identical
+    /// to the legacy grant's `derive(source_rights)`).
+    pub(crate) rights: CapRights,
+    /// Source task TID — delegation-link parent owner (bookkeeping only).
+    pub(crate) source_tid: u64,
+    /// Source CapId — delegation-link parent edge (bookkeeping only; NEVER
+    /// receiver authority, NEVER resolved-to-mint by the executor).
+    pub(crate) source_cap: CapId,
+    /// Endpoint index whose receiver-waiter slot the executor clears in Phase C.
     pub(crate) endpoint_idx: usize,
     /// Optional task to wake exactly once after delivery completes.
     pub(crate) wake_tid: Option<ThreadId>,

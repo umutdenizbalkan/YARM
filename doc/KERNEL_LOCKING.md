@@ -307,6 +307,28 @@ delivery remains deferred** (`reply_cap_ipc_rank_inversion` still blocks reply-c
 materialization); does not enable AP user-task scheduling, does not fully retire the global lock.
 Guarded by `stage188b_blocked_waiter_plain_delivery_live`.
 
+### 0.14) Stage 188C (BLOCKED-WAITER-ORDINARY-CAP-DELIVERY-LIVE) — second live producer, ordinary cap only
+
+Extends the dispatch-return mechanism to **ordinary cap-transfer blocked-waiter delivery**. The
+`ipc_reply` recv-v2-blocked branch now defers a single ORDINARY (non-reply, non-shared-region)
+transferred cap: `produce_blocked_waiter_ordinary_cap_delivery` runs Phase A under the broad
+borrow — consume `blocked_recv_state`, pre-validate the payload buffer (no copy), consume the
+transfer envelope **once** and resolve source object + rights + receiver cnode
+(`phase_a_snapshot_ordinary_transfer` — no mint, no seam), pre-validate the meta buffer — then
+stashes a by-value `BlockedWaiterOrdinaryCapDelivery`. The executor (after the borrow drops)
+materializes the receiver-local cap through the 186D2/186D3 seam
+(`materialize_received_message_cap_routed_with_delegation_split`: atomic mint + delegation link +
+rollback), encodes the recv-v2 meta with that **fresh** CapId, copies payload+meta via the 186E
+seam (rolling the mint back on a copy fault so nothing leaks), then clears + wakes the waiter once
+(`DISPATCH_POST_WORK_DONE kind=blocked_waiter_ordinary_cap result=ok`, preserving
+`IPC_RECV_V2_META_BLOCKED_WAITER_OK`). The receiver-local CapId is minted fresh; the source
+`(source_tid, source_cap)` is a delegation-link parent edge only (bookkeeping) — never
+resolved-to-mint, never receiver authority. NO cap materialization under `ipc_state_lock`, NO
+user-copy under `ipc_state_lock`, NO seam call while the broad borrow is live. **Reply-cap
+materialization remains deferred** (`reply_cap_ipc_rank_inversion`); shared-region / fault /
+broader IPC conversion remain deferred; does not enable AP user-task scheduling, does not fully
+retire the global lock. Guarded by `stage188c_blocked_waiter_ordinary_cap_delivery_live`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

@@ -468,6 +468,26 @@ enabling AP user-task scheduling, retiring the global lock, or solving
 plain, no-cap reply. Pinned by `stage188b_blocked_waiter_plain_delivery_live`. See
 `doc/KERNEL_UNLOCKING.md` (Stage 188B) and `doc/KERNEL_LOCKING.md §0.13`.
 
+**Stage 188C (BLOCKED-WAITER-ORDINARY-CAP-DELIVERY-LIVE) status — second live producer, ORDINARY
+CAP ONLY, DO NOT OVERCLAIM.** The `ipc_reply` recv-v2-blocked branch now has a second producer,
+`produce_blocked_waiter_ordinary_cap_delivery`, for a single ORDINARY (non-reply,
+non-shared-region) transferred cap. Phase A (under the broad borrow) consumes the transfer
+envelope **once** and snapshots object + rights + receiver cnode + delegation parent edge by
+value (no mint, no seam, no copy); the executor materializes the receiver-local cap through the
+186D2/186D3 seam (`materialize_received_message_cap_routed_with_delegation_split`), encodes the
+recv-v2 meta with that FRESH CapId, copies via the 186E seam, and rolls the mint back on a
+user-copy fault (`DISPATCH_POST_WORK_DONE kind=blocked_waiter_ordinary_cap result=ok`;
+`DISPATCH_POST_WORK_FAIL …` is an HONEST error marker, absent from a healthy boot log). The
+receiver-local CapId is minted fresh — the source CapId is a delegation-link parent edge only,
+**never receiver authority**. Do **not** extend this producer to reply caps (they route to
+`DeferredReplyCap`; `reply_cap_ipc_rank_inversion` still blocks reply-cap materialization),
+shared-region transfers, fault delivery, or broader `ipc_send`/`ipc_call` conversion; do **not**
+describe 188C as enabling AP user-task scheduling, retiring the global lock, or solving the
+reply-cap rank inversion. It converts **only** the ordinary single cap transfer on the
+`ipc_reply` blocked-waiter path. Pinned by
+`stage188c_blocked_waiter_ordinary_cap_delivery_live`. See `doc/KERNEL_UNLOCKING.md` (Stage 188C)
+and `doc/KERNEL_LOCKING.md §0.14`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

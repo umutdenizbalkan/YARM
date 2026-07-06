@@ -286,6 +286,22 @@ stays on the legacy path, because reply-cap materialization is still blocked by
 `ipc_state_lock`; a non-writable buffer faults synchronously (`UserMemoryFault`) with no stash.
 Guarded by `stage188b_blocked_waiter_plain_delivery_live`.
 
+**Ordinary cap-transfer blocked-waiter delivery goes live (Stage 188C).** The second live
+producer — `ipc_reply`'s recv-v2-blocked branch — now defers a single ORDINARY (non-reply,
+non-shared-region) transferred cap (endpoint / notification / memory-object / DMA-region object)
+through the dispatch-return channel instead of materializing it under the broad borrow. The
+producer consumes the transfer envelope **once** in Phase A and snapshots the object identity +
+rights + receiver cnode + the delegation `(source_tid, source_cap)` parent edge **by value**; the
+executor materializes the receiver-local cap through the 186D2/186D3 seam (atomic mint +
+delegation link + rollback), so the **receiver-local CapId is minted fresh** and the source
+CapId is used ONLY as the delegation-link parent — never resolved-to-mint, never receiver
+authority. A user-copy fault rolls the mint back (`rollback_materialized_recv_cap`), so no cap /
+refcount / delegation edge leaks; a revoke of the source removes the delegated receiver cap
+through the recorded link. **Reply caps stay deferred** — reply objects route to the seam's
+`DeferredReplyCap` (`reply_cap_ipc_rank_inversion`), never materialized on this path — and
+shared-region transfers stay on the legacy path. Guarded by
+`stage188c_blocked_waiter_ordinary_cap_delivery_live`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)
