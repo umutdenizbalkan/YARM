@@ -8130,6 +8130,62 @@ reply/plain/shared/no-drainer → `Ok(false)`; missing envelope → synchronous 
 producer calls no seam/copy under the broad borrow; snapshot by-value; executor uses the
 cap-transfer + 186E seams + rollback; FAIL only on error paths; docs honest).
 
+**Stage 188D (REPLY-CAP-RANK-INVERSION-SEAM) — DONE (rank-inversion solved at the seam;
+infrastructure + dormant ipc_reply slice).**
+Stage 188D builds the reply-cap rank-inversion seam — the smallest safe mechanism that finally
+retires the long-standing `reply_cap_ipc_rank_inversion` blocker for the dispatch-return channel.
+
+*The blocker.* Reply-cap materialization records the receiver-local reply CapId into the
+reply-cap registry, which lives under `ipc_state_lock` (rank 3) — *below* the capability rank
+(rank 4) where the cap is minted. Under the global lock the mint→record sequence is one critical
+section; a seam split makes the window real, and doing it naively would hold the rank-4 lock while
+taking the rank-3 lock (the inversion).
+
+*The solution — phase separation, not nested acquisition.* The seam runs three **disjoint**
+critical sections, each acquiring and fully releasing one subsystem lock before the next:
+- **Phase A (broad borrow, producer):** `produce_blocked_waiter_reply_cap_delivery` takes the
+  reply-cap transfer envelope ONCE (`phase_a_take_reply_envelope` — validates a live `Reply`
+  object, resolves the receiver cnode), pre-validates the user buffers (no copy), ensures the
+  receiver cnode space, and stashes a by-value `BlockedWaiterReplyCapDelivery` snapshot carrying
+  only the reply object's registry coordinates `(reply_index, reply_generation)` — **no
+  sender-local CapId as authority**. No mint, no IPC record, no seam.
+- **Phase B (rank 4, executor):** mint the receiver-local reply cap via the Stage 186D-proper
+  `mint_capability_with_memory_ref_split` (rank-4-only for a `Reply` object — no memory refcount).
+  **No IPC lock held.**
+- **Phase C (rank 3, executor):** record the receiver-local CapId into the reply-cap registry via
+  the new `SharedKernel::try_record_reply_waiter_cap_split` (`with_ipc_split_mut` — IPC lock only,
+  the exact rank-3 half of the D5 split). A stale record (generation mismatch / slot reused in the
+  mint→record window) rolls the rank-4 mint back (`rollback_minted_cap_split`); a post-record
+  user-copy fault additionally clears the recorded waiter-cap (`clear_reply_waiter_cap_split`).
+
+The rank-4 mint fully releases its lock before the rank-3 record acquires `ipc_state_lock`, so the
+seam **never holds the capability lock while taking the IPC lock**, never mints a cap under
+`ipc_state_lock`, and never records IPC metadata under a broad `&mut KernelState` borrow. Markers:
+`REPLY_CAP_RANK_SEAM_BEGIN` / `REPLY_CAP_RANK_SEAM_MINT_OK` / `REPLY_CAP_RANK_SEAM_IPC_RECORD_OK` /
+`REPLY_CAP_RANK_SEAM_ROLLBACK_OK` / `REPLY_CAP_RANK_SEAM_DONE result=ok`, and the honest
+`REPLY_CAP_RANK_SEAM_FAIL reason=<mint|stale_record|user_copy>` on real failures (absent from a
+healthy boot log).
+
+*Live-slice honesty.* The one reply-cap→blocked-waiter delivery path in a real boot is `ipc_call`
+to a blocked server (all 53 boot reply-cap deliveries originate from `IPC_CALL_REPLY_CAP_CREATE`),
+and wiring a live producer into `ipc_call` is out of Stage 188D scope (the broader
+`ipc_send`/`ipc_call` conversion is deliberately untouched). The producer is therefore wired into
+the sanctioned dispatch-return site (`ipc_reply`); a reply carrying a reply cap does not occur in
+the current boot, so the seam is **exercised end-to-end by unit tests**, not by boot traffic —
+`REPLY_CAP_RANK_SEAM_DONE` does not appear in a standard smoke, and that is correct. The rank
+inversion is now **solved at the seam level** with no broad IPC decomposition; live wiring into
+`ipc_call` is the explicit deferred next step.
+
+*Scope honesty.* This stage converts reply-cap materialization only; it does **not** touch
+shared-region transfer, fault delivery, or the broader `ipc_send`/`ipc_call` delivery paths, and
+it **does not enable AP user-task scheduling** and **does not fully retire the global lock**. No
+ABI/count change (`SYSCALL_COUNT=31`, `Syscall::VARIANT_COUNT=23`, x86_64 `MAX_ADDRESS_SPACES=32`).
+Guarded by `stage188d_reply_cap_rank_inversion_seam` (producer takes envelope + validates + stashes
+with no mint/record/seam under the broad borrow; executor mints BEFORE recording with rollback on
+stale record / copy fault; rank-3 record seam holds only the IPC lock; snapshot by-value with no
+CapId authority; reply cap consumed once; stale/wrong-object/missing-buffer stay real errors; exit
+cleanup still revokes reply caps; docs honest).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

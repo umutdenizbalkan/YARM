@@ -49915,6 +49915,517 @@ mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
 }
 
 // ===========================================================================
+// Stage 188D — REPLY-CAP-RANK-INVERSION-SEAM
+//
+// Solves the persistent `reply_cap_ipc_rank_inversion` blocker by phase
+// separation on the dispatch-return channel: Phase A (broad borrow) takes the
+// reply-cap transfer envelope once and snapshots the reply object's registry
+// coordinates by value; the executor mints the receiver-local reply cap through
+// the rank-4 mint seam (no IPC lock), records the waiter-cap through the rank-3
+// IPC seam (disjoint critical section), and rolls the mint back on a stale
+// record or user-copy fault. Reply-cap→blocked-waiter delivery in a real boot
+// flows through ipc_call (out of scope here), so the seam is proven end-to-end
+// by these unit tests; the producer is wired into ipc_reply.
+//
+// Tests drive producer + executor: reply cap -> mint + record + deliver + wake,
+// receiver gets a fresh receiver-local CapId recorded in the registry; stale
+// record -> mint rollback, real Err, no wake; plain/ordinary/no-drainer ->
+// Ok(false); non-Reply object -> WrongObject. Source guards pin: no seam/IPC
+// record under broad borrow; mint before record (no nested rank inversion);
+// snapshot by-value with no sender-local CapId authority.
+// ===========================================================================
+#[cfg(test)]
+mod stage188d_reply_cap_rank_inversion_seam {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const POST_WORK_SRC: &str = include_str!("../dispatch_post_work.rs");
+    const SEAM_SRC: &str = include_str!("reply_cap_rank_split.rs");
+    const CPU0: CpuId = CpuId(0);
+
+    fn set_trap_drainer(active: bool) {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+            .store(active, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Reply-cap reply message: opcode=0 (OPCODE_INLINE) + FLAG_REPLY_CAP, so the
+    // 2-byte inline opcode prefix is stripped (app_opcode=5, body="rep").
+    fn reply_cap_msg(handle: u64) -> Message {
+        Message::with_header(0, 0, Message::FLAG_REPLY_CAP, Some(handle), b"\x05\x00rep")
+            .expect("reply cap msg")
+    }
+
+    // Build: task 1 blocked recv-v2 (payload@0x4000, meta@0x4400), a live reply
+    // record + a Reply cap owned by task 0, and a reply-cap transfer envelope
+    // bound to (recv_endpoint, task 1). Returns
+    // (state, endpoint_idx, handle, reply_index, reply_generation, asid).
+    fn blocked_waiter_with_reply_envelope() -> (KernelState, usize, u64, usize, u64, Asid) {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+
+        // Delivery endpoint (task 0), recv cap granted into task 1.
+        let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap_task1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("grant recv cap to task1");
+
+        // Reply channel endpoint (task 0 holds the RECEIVE cap), then create a
+        // live reply-cap record + a Reply cap in task 0's cnode.
+        let (_reply_eidx, _reply_send, reply_recv_cap) =
+            state.create_endpoint(2).expect("reply endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), reply_recv_cap, Some(ThreadId(1)))
+            .expect("create reply cap");
+        let (reply_index, reply_generation) = match state
+            .resolve_capability_for_task(0, reply_cap)
+            .expect("resolve reply")
+            .object
+        {
+            CapObject::Reply { index, generation } => (index, generation),
+            other => panic!("expected Reply object, got {other:?}"),
+        };
+
+        // Task 1 user memory: one page covers payload (0x4000) + meta (0x4400).
+        let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind task1 asid");
+        state
+            .map_user_page(
+                aspace1,
+                VirtAddr(0x4000),
+                Mapping {
+                    phys: PhysAddr(0x9000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map buffer page");
+
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        state.with_tcb_mut(1, |tcb| {
+            tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                recv_cap: recv_cap_task1,
+                payload_user_ptr: 0x4000,
+                payload_user_len: crate::kernel::ipc::Message::MAX_PAYLOAD,
+                meta_user_ptr: 0x4400,
+                meta_user_len: 40,
+                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            });
+        });
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+        });
+
+        let recv_endpoint = state
+            .resolve_capability_for_task(1, recv_cap_task1)
+            .expect("resolve recv cap")
+            .object;
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                reply_cap,
+                recv_endpoint,
+                Some(ThreadId(1)),
+                None,
+            )
+            .expect("stash reply envelope");
+        (
+            state,
+            endpoint_idx,
+            handle,
+            reply_index,
+            reply_generation,
+            asid1,
+        )
+    }
+
+    // The reply-cap producer stashes work; the executor mints the receiver-local
+    // reply cap (rank 4), records the waiter-cap (rank 3), delivers, and wakes.
+    #[test]
+    fn stage188d_reply_cap_producer_mints_records_and_delivers() {
+        let (mut state, endpoint_idx, handle, reply_index, reply_generation, asid1) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let msg = reply_cap_msg(handle);
+        let produced = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        assert!(
+            produced,
+            "a reply-cap reply to a blocked recv-v2 waiter must be produced"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_none(),
+            "producer must consume the waiter's blocked_recv_state"
+        );
+        let shared = SharedKernel::new(state);
+        assert!(
+            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            "the drain must deliver the stashed reply-cap blocked-waiter work"
+        );
+
+        // Payload body delivered (opcode prefix stripped).
+        let body = shared
+            .with(|k| k.copy_from_user(k.task_asid(1).expect("asid"), VirtAddr(0x4000), 3))
+            .expect("read payload");
+        assert_eq!(&body[..3], b"rep");
+
+        // Meta: REPLY_CAP flag set + a fresh receiver-local CapId present.
+        let meta = shared
+            .with(|k| k.copy_from_user(asid1, VirtAddr(0x4400), 40))
+            .expect("read meta");
+        let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().unwrap());
+        assert_ne!(
+            recv_meta_flags & crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64,
+            0,
+            "meta must set SYSCALL_RECV_META_REPLY_CAP"
+        );
+        let local_cap = u64::from_le_bytes(meta[16..24].try_into().unwrap());
+        assert_ne!(
+            local_cap,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+            "a receiver-local reply cap must be materialized"
+        );
+        assert_ne!(
+            local_cap, handle,
+            "receiver cap must not be the sender's envelope handle"
+        );
+        // The receiver-local reply cap resolves in task 1's cspace.
+        assert!(
+            shared.with(|k| k.resolve_capability_for_task(1, CapId(local_cap)).is_ok()),
+            "the materialized receiver-local reply cap must resolve in the waiter's cspace"
+        );
+        // The rank-3 record now references exactly that receiver-local CapId.
+        let recorded = shared.with(|k| {
+            k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id))
+        });
+        assert_eq!(
+            recorded,
+            Some(CapId(local_cap)),
+            "the reply registry must record the receiver-local CapId (rank-3 record after rank-4 mint)"
+        );
+        let _ = reply_generation;
+
+        // Waiter woken exactly once.
+        assert!(
+            matches!(
+                shared.with(|k| k.task_status(1)),
+                Some(TaskStatus::Runnable | TaskStatus::Running)
+            ),
+            "the waiter must be woken exactly once"
+        );
+        set_trap_drainer(false);
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "the drain must consume the stashed work"
+        );
+    }
+
+    // A stale reply record (generation bumped between mint and record) rolls the
+    // mint back: real Err, waiter NOT woken, no waiter-cap recorded.
+    #[test]
+    fn stage188d_stale_record_rolls_back_no_wake() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let msg = reply_cap_msg(handle);
+        let produced = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        assert!(produced);
+
+        // Simulate a concurrent revoke/reuse: bump the reply-slot generation so
+        // the executor's rank-3 record sees a generation mismatch (stale).
+        state.with_ipc_state_mut(|ipc| {
+            ipc.reply_cap_generations[reply_index] =
+                ipc.reply_cap_generations[reply_index].wrapping_add(1);
+        });
+
+        let shared = SharedKernel::new(state);
+        let drain = shared.drain_dispatch_post_work(CPU0);
+        set_trap_drainer(false);
+        assert!(
+            drain.is_err(),
+            "a stale reply record must surface as a real Err"
+        );
+        // No waiter-cap recorded (the record was rejected; mint rolled back).
+        let recorded = shared.with(|k| {
+            k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id))
+        });
+        assert_eq!(
+            recorded, None,
+            "no receiver-local cap may be recorded after rollback"
+        );
+    }
+
+    // A plain reply is NOT produced by the reply-cap producer.
+    #[test]
+    fn stage188d_plain_not_produced() {
+        let (mut state, endpoint_idx, _handle, _ri, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let msg = Message::new(0x42, b"plain").expect("plain");
+        let produced = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        set_trap_drainer(false);
+        assert!(
+            !produced,
+            "a plain reply must NOT be produced by the reply-cap producer"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_some(),
+            "a non-reply-cap message must not consume the waiter state"
+        );
+    }
+
+    // An ordinary cap-transfer (non-reply) is NOT produced by the reply-cap producer.
+    #[test]
+    fn stage188d_ordinary_cap_not_produced() {
+        let (mut state, endpoint_idx, handle, _ri, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let msg =
+            Message::with_header(0, 0, Message::FLAG_CAP_TRANSFER, Some(handle), b"\x00\x00o")
+                .expect("ordinary msg");
+        let produced = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        set_trap_drainer(false);
+        assert!(
+            !produced,
+            "an ordinary cap transfer must NOT be produced by the reply-cap producer"
+        );
+    }
+
+    // With no trap-entry drainer, the reply-cap producer does NOT stash.
+    #[test]
+    fn stage188d_no_drainer_no_produce() {
+        let (mut state, endpoint_idx, handle, _ri, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(false);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let msg = reply_cap_msg(handle);
+        let produced = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        )
+        .expect("producer");
+        assert!(
+            !produced,
+            "without a drainer the producer must fall back (no orphaned stash)"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no work may be stashed without a drainer"
+        );
+    }
+
+    // Exit cleanup still revokes reply-cap records (unchanged by the seam).
+    #[test]
+    fn stage188d_exit_cleanup_still_revokes_reply_caps() {
+        let (mut state, _eidx, _handle, reply_index, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        // The reply record for caller task 0 is live.
+        assert!(
+            state.with_ipc_state(|ipc| ipc.reply_caps[reply_index].is_some()),
+            "reply record must be live before caller exit cleanup"
+        );
+        let revoked = state.revoke_reply_caps_for_caller(0);
+        assert!(
+            revoked >= 1,
+            "caller exit cleanup must revoke the reply record"
+        );
+        assert!(
+            state.with_ipc_state(|ipc| ipc.reply_caps[reply_index].is_none()),
+            "reply record must be gone after caller exit cleanup"
+        );
+    }
+
+    // Guard: the producer performs NO mint / IPC record / seam / user copy under
+    // the broad borrow — only take-envelope / validate / snapshot / stash.
+    #[test]
+    fn stage188d_producer_no_seam_no_record_under_borrow() {
+        let body = SYSCALL_SRC
+            .split("fn produce_blocked_waiter_reply_cap_delivery(")
+            .nth(1)
+            .and_then(|r| r.split("\n// Stage 158").next())
+            .expect("producer body");
+        for forbidden in [
+            "copy_to_user_split",
+            "copy_to_user(",
+            "mint_capability_with_memory_ref_split",
+            "try_record_reply_waiter_cap_split",
+            "with_ipc_split_mut",
+            "with_capability_state_split_mut",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the reply-cap producer must NOT mint/record/copy under the broad borrow (`{forbidden}`)"
+            );
+        }
+        assert!(
+            body.contains("phase_a_take_reply_envelope")
+                && body.contains("validate_user_range_writable_for_asid")
+                && body.contains("DISPATCH_POST_WORK_STASH"),
+            "the producer must take the reply envelope, pre-validate (no copy), and stash"
+        );
+    }
+
+    // Guard: the executor mints BEFORE it records (no nested rank inversion) and
+    // rolls the mint back on a stale record / user-copy fault.
+    #[test]
+    fn stage188d_executor_mint_before_record_with_rollback() {
+        let body = RUNTIME_SRC
+            .split("fn execute_blocked_waiter_reply_cap_delivery(")
+            .nth(1)
+            .and_then(|r| r.split("\n    fn ").next().or(Some(r)))
+            .expect("executor body");
+        let mint_at = body
+            .find("mint_capability_with_memory_ref_split")
+            .expect("executor must mint via the rank-4 seam");
+        let record_at = body
+            .find("try_record_reply_waiter_cap_split")
+            .expect("executor must record via the rank-3 IPC seam");
+        assert!(
+            mint_at < record_at,
+            "the rank-4 mint must run BEFORE the rank-3 record (no nested rank inversion)"
+        );
+        assert!(
+            body.contains("rollback_minted_cap_split"),
+            "executor must roll the mint back on stale record / user-copy fault"
+        );
+        assert!(
+            body.contains("clear_reply_waiter_cap_split"),
+            "executor must clear the recorded waiter-cap on a post-record user-copy fault"
+        );
+        assert!(
+            body.contains("REPLY_CAP_RANK_SEAM_DONE result=ok"),
+            "executor must emit the seam DONE marker"
+        );
+        // FAIL only on error-return paths.
+        for (idx, _) in body.match_indices("REPLY_CAP_RANK_SEAM_FAIL") {
+            let after = &body[idx..];
+            let next_return = after.find("return Err(").unwrap_or(usize::MAX);
+            let next_ok = after.find("result=ok").unwrap_or(usize::MAX);
+            assert!(
+                next_return < next_ok,
+                "every REPLY_CAP_RANK_SEAM_FAIL must be on an error-return path"
+            );
+        }
+    }
+
+    // Guard: the rank-3 IPC record seam holds ONLY the IPC lock (no cap mint, no
+    // broad borrow) — the disjoint-critical-section discipline.
+    #[test]
+    fn stage188d_ipc_record_seam_ipc_lock_only() {
+        assert!(
+            SEAM_SRC.contains("with_ipc_split_mut"),
+            "the record seam must use the rank-3 IPC split seam"
+        );
+        // The seam body must acquire ONLY the IPC lock — never the capability,
+        // memory, or a broad `with_cpu` borrow. (`mint` appears only in the module
+        // doc comment as a cross-reference, so it is not a body-lock signal.)
+        for forbidden in [
+            "with_capability_state_split_mut",
+            "with_memory_split_mut",
+            "with_cpu(",
+        ] {
+            assert!(
+                !SEAM_SRC.contains(forbidden),
+                "the rank-3 record seam must not take another subsystem lock (`{forbidden}`)"
+            );
+        }
+    }
+
+    // Guard: the by-value snapshot carries no &mut / borrows / KernelState and no
+    // sender-local CapId (the reply object is registry coordinates only).
+    #[test]
+    fn stage188d_snapshot_is_by_value() {
+        let body = POST_WORK_SRC
+            .split("pub(crate) struct BlockedWaiterReplyCapDeliverySnapshot {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .expect("snapshot struct");
+        assert!(
+            !body.contains("&mut"),
+            "snapshot must not carry &mut references"
+        );
+        assert!(
+            !body.contains("&'"),
+            "snapshot must not carry borrowed references"
+        );
+        assert!(
+            !body.contains("KernelState"),
+            "snapshot must not carry a KernelState borrow"
+        );
+        assert!(
+            !body.contains("CapId"),
+            "snapshot must carry no CapId — the reply object is (reply_index, reply_generation), \
+             and the receiver-local CapId is minted fresh"
+        );
+        assert!(
+            body.contains("reply_index") && body.contains("reply_generation"),
+            "snapshot must identify the reply object by registry coordinates"
+        );
+    }
+
+    // Docs record 188D honestly.
+    #[test]
+    fn stage188d_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 188D"),
+            "docs must document Stage 188D"
+        );
+        for required in [
+            "reply-cap rank-inversion seam",
+            "phase separation",
+            "ipc_call",
+            "does not enable AP user-task scheduling",
+            "does not fully retire the global lock",
+        ] {
+            assert!(
+                UNLOCK_DOC.contains(required),
+                "docs must state 188D `{required}`"
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

@@ -20,6 +20,7 @@ mod ipc_state;
 mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;
+mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
 mod task_core_state;

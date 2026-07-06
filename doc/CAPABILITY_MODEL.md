@@ -302,6 +302,23 @@ through the recorded link. **Reply caps stay deferred** — reply objects route 
 shared-region transfers stay on the legacy path. Guarded by
 `stage188c_blocked_waiter_ordinary_cap_delivery_live`.
 
+**Reply-cap rank inversion solved at the seam (Stage 188D).** Reply-cap materialization on the
+dispatch-return channel no longer needs the global lock to span the mint→record window. The seam
+runs three disjoint critical sections: Phase A (broad borrow) takes the reply-cap transfer envelope
+once and snapshots the reply object's `(reply_index, reply_generation)` + receiver cnode **by
+value** (no sender-local CapId as authority); Phase B mints the receiver-local reply cap via the
+rank-4 `mint_capability_with_memory_ref_split` seam (a `Reply` object carries no memory refcount —
+rank-4-only, no IPC lock); Phase C records the receiver-local CapId into the reply-cap registry via
+the rank-3 `SharedKernel::try_record_reply_waiter_cap_split` (`with_ipc_split_mut` — IPC lock only).
+A stale record (generation mismatch / slot reuse in the mint→record window) rolls the rank-4 mint
+back, and a post-record user-copy fault also clears the recorded waiter-cap, so a reply cap is
+**never** left orphaned and the reply object stays one-shot and re-deliverable. The rank-4 mint
+releases its lock before the rank-3 record acquires `ipc_state_lock`, so the seam never holds the
+capability lock while taking the IPC lock and never mints under `ipc_state_lock`. The one live
+reply-cap→blocked-waiter path in a real boot is `ipc_call` (out of scope); the producer is wired
+into `ipc_reply` and the seam is proven end-to-end by unit tests. Guarded by
+`stage188d_reply_cap_rank_inversion_seam`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

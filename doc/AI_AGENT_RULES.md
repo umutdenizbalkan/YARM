@@ -488,6 +488,27 @@ reply-cap rank inversion. It converts **only** the ordinary single cap transfer 
 `stage188c_blocked_waiter_ordinary_cap_delivery_live`. See `doc/KERNEL_UNLOCKING.md` (Stage 188C)
 and `doc/KERNEL_LOCKING.md §0.14`.
 
+**Stage 188D (REPLY-CAP-RANK-INVERSION-SEAM) status — rank inversion SOLVED at the seam;
+ipc_reply slice DORMANT, DO NOT OVERCLAIM.** The `reply_cap_ipc_rank_inversion` blocker is retired
+for the dispatch-return channel by **phase separation** (three disjoint critical sections, no
+nested acquisition): Phase A (broad borrow) takes the reply-cap transfer envelope once and
+snapshots the reply object's `(reply_index, reply_generation)` + receiver cnode by value (no
+sender-local CapId as authority); Phase B mints the receiver-local reply cap via the rank-4
+`mint_capability_with_memory_ref_split` seam (no IPC lock); Phase C records the CapId via the
+rank-3 `SharedKernel::try_record_reply_waiter_cap_split` (`with_ipc_split_mut`), rolling the mint
+back on a stale record (`rollback_minted_cap_split`) and additionally clearing the record on a
+post-record copy fault (`clear_reply_waiter_cap_split`). The rank-4 mint releases its lock before
+the rank-3 record acquires `ipc_state_lock` — **never hold the capability lock while taking the IPC
+lock; never mint under `ipc_state_lock`; never record IPC metadata under a broad
+`&mut KernelState`.** Do **not** claim a live boot conversion: the only reply-cap→blocked-waiter
+path in a real boot is `ipc_call` (out of scope — the broader `ipc_send`/`ipc_call` conversion is
+untouched), so the producer is wired into `ipc_reply` and the seam is proven end-to-end by unit
+tests; `REPLY_CAP_RANK_SEAM_DONE` does not appear in a standard smoke, and that is correct. Do
+**not** describe 188D as enabling AP user-task scheduling or retiring the global lock. Live wiring
+into `ipc_call` is the explicit deferred next step. Pinned by
+`stage188d_reply_cap_rank_inversion_seam`. See `doc/KERNEL_UNLOCKING.md` (Stage 188D) and
+`doc/KERNEL_LOCKING.md §0.15`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

@@ -866,6 +866,151 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
     Ok(true)
 }
 
+/// Stage 188D — Phase A producer for a REPLY-CAP blocked recv-v2 waiter
+/// delivery, wired into the Stage 188A dispatch-return channel.
+///
+/// The reply-cap sibling of [`produce_blocked_waiter_ordinary_cap_delivery`].
+/// The rank inversion (`reply_cap_ipc_rank_inversion`) is solved by phase
+/// separation: Phase A takes the reply-cap transfer envelope ONCE and snapshots
+/// the reply object's registry coordinates `(reply_index, reply_generation)` +
+/// receiver cnode by value — NO mint, NO IPC record, NO seam. The executor then
+/// mints the receiver-local reply cap through the rank-4 seam (no IPC lock) and
+/// records the waiter-cap through the rank-3 IPC seam (disjoint critical
+/// section), rolling the mint back on a stale record or user-copy fault.
+///
+/// Returns `Ok(true)` (produced; executor completes slot-clear + wake), `Ok(false)`
+/// (not a reply-cap message, or no trap-entry drainer — caller uses the legacy
+/// path), or `Err(e)` (real Phase-A error: undersized/unmapped buffer, missing
+/// envelope, non-`Reply` object → `WrongObject`, dead reply object, missing
+/// receiver cnode) with the SAME envelope disposition the legacy path produces.
+///
+/// # Scope note
+///
+/// Reply-cap→blocked-waiter delivery in a real boot flows through `ipc_call` to a
+/// blocked server, NOT `ipc_reply`; wiring a live producer into `ipc_call` is out
+/// of Stage 188D scope. This producer is wired into `ipc_reply` (the sanctioned
+/// dispatch-return site); a reply carrying a reply cap does not occur in the
+/// current boot, so this path is exercised end-to-end by unit tests, and the
+/// rank-inversion seam is proven safe for the future `ipc_call` wiring.
+pub(crate) fn produce_blocked_waiter_reply_cap_delivery(
+    kernel: &mut KernelState,
+    waiter_tid: u64,
+    endpoint_idx: usize,
+    msg: &Message,
+) -> Result<bool, SyscallError> {
+    use crate::kernel::dispatch_post_work::{
+        BlockedWaiterReplyCapDeliverySnapshot, DISPATCH_POST_WORK_META_LEN, DispatchPostWork,
+    };
+    // Reply-cap only: FLAG_REPLY_CAP set with a transferred cap handle. Anything
+    // else (plain, ordinary transfer, no cap) stays on the legacy path.
+    let reply_cap = (msg.flags & Message::FLAG_REPLY_CAP) != 0 && msg.transferred_cap().is_some();
+    if !reply_cap {
+        return Ok(false);
+    }
+    // Only produce when a trap-entry drainer will run (mirrors 188B/188C).
+    let cpu_idx = kernel.current_cpu().0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return Ok(false);
+    }
+
+    // Phase A.1 — consume blocked state, resolve waiter ASID + binding endpoint.
+    let blocked_state = kernel
+        .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
+        .flatten()
+        .ok_or(SyscallError::InvalidArgs)?;
+    let waiter_asid = kernel
+        .task_asid(waiter_tid)
+        .ok_or(SyscallError::InvalidArgs)?;
+    let recv_endpoint = kernel
+        .resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
+        .map_err(SyscallError::from)?
+        .object;
+
+    let payload = msg.as_slice();
+    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2
+    {
+        (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
+    } else {
+        (msg.opcode, payload)
+    };
+    if blocked_state.payload_user_len < app_payload.len() {
+        return Err(SyscallError::InvalidArgs);
+    }
+    // Phase A.2 — pre-validate the PAYLOAD buffer (no copy) BEFORE consuming the
+    // envelope, so a payload fault leaves the envelope UNconsumed (legacy order).
+    kernel
+        .validate_user_range_writable_for_asid(
+            waiter_asid,
+            blocked_state.payload_user_ptr,
+            app_payload.len(),
+        )
+        .map_err(SyscallError::from)?;
+    if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    // Phase A.3 — take the reply-cap transfer envelope ONCE and resolve the reply
+    // object registry coordinates + receiver cnode (NO mint, NO IPC record, NO
+    // seam). Same real errors the legacy D5 reply arm raises: missing/dead
+    // envelope → InvalidCapability; non-`Reply` object → WrongObject.
+    let reply_snap = crate::kernel::cap_transfer_split::phase_a_take_reply_envelope(
+        kernel,
+        msg.transferred_cap().unwrap().0,
+        recv_endpoint,
+        waiter_tid,
+    )?;
+    // Ensure the receiver cnode space is provisioned so the executor's rank-4
+    // mint (which does not itself provision) cannot fail on a growable cspace —
+    // byte-equivalent to the legacy `mint_capability_in_cnode` precondition.
+    kernel
+        .ensure_cnode_space(reply_snap.receiver_cnode)
+        .map_err(SyscallError::from)?;
+
+    // Phase A.4 — pre-validate the META buffer (no copy). On fault the envelope
+    // is already consumed (matching the legacy meta-fault, which mints then rolls
+    // back — net-identical: envelope gone, no receiver cap; here nothing minted).
+    kernel
+        .validate_user_range_writable_for_asid(
+            waiter_asid,
+            blocked_state.meta_user_ptr,
+            DISPATCH_POST_WORK_META_LEN,
+        )
+        .map_err(SyscallError::from)?;
+
+    let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
+    payload_buf[..app_payload.len()].copy_from_slice(app_payload);
+
+    let snapshot = BlockedWaiterReplyCapDeliverySnapshot {
+        waiter_tid,
+        waiter_asid,
+        payload_user_ptr: blocked_state.payload_user_ptr,
+        payload_len: app_payload.len(),
+        payload: payload_buf,
+        meta_user_ptr: blocked_state.meta_user_ptr,
+        app_opcode,
+        sender_tid: msg.sender_tid.0,
+        receiver_cnode: reply_snap.receiver_cnode,
+        reply_index: reply_snap.reply_index,
+        reply_generation: reply_snap.reply_generation,
+        endpoint_idx,
+        wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
+    };
+    // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+    // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` store.
+    unsafe {
+        crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx]
+            .store(DispatchPostWork::BlockedWaiterReplyCapDelivery(snapshot));
+    }
+    crate::yarm_log!(
+        "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_reply_cap waiter_tid={}",
+        waiter_tid
+    );
+    Ok(true)
+}
+
 // Stage 158: the cap-materialization cluster (router + two canonical helpers)
 // re-homed into `ipc_recv_core.rs`. Re-export the two entry points so every
 // existing call site here and every sibling `super::` import keeps resolving.

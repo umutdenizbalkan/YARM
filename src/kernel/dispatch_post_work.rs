@@ -75,6 +75,16 @@ pub(crate) enum DispatchPostWork {
     /// keeps reply-cap materialization deferred).
     #[cfg_attr(not(test), allow(dead_code))]
     BlockedWaiterOrdinaryCapDelivery(BlockedWaiterOrdinaryCapDeliverySnapshot),
+    /// A reply-cap blocked-waiter delivery deferred past the broad borrow (Stage
+    /// 188D). The executor mints the receiver-local reply cap through the rank-4
+    /// mint seam (Phase B, no IPC lock), records the waiter-cap metadata through
+    /// the rank-3 IPC seam (Phase C), rolling the mint back on a stale record or
+    /// user-copy fault. The reply object is identified by `(reply_index,
+    /// reply_generation)` — **no sender-local CapId is carried as authority**; the
+    /// receiver-local CapId is minted fresh. Solves `reply_cap_ipc_rank_inversion`
+    /// by phase separation (disjoint rank-4 then rank-3 critical sections).
+    #[cfg_attr(not(test), allow(dead_code))]
+    BlockedWaiterReplyCapDelivery(BlockedWaiterReplyCapDeliverySnapshot),
 }
 
 impl DispatchPostWork {
@@ -91,6 +101,7 @@ impl DispatchPostWork {
             Self::None => "none",
             Self::BlockedWaiterPlainDelivery(_) => "blocked_waiter_plain",
             Self::BlockedWaiterOrdinaryCapDelivery(_) => "blocked_waiter_ordinary_cap",
+            Self::BlockedWaiterReplyCapDelivery(_) => "blocked_waiter_reply_cap",
         }
     }
 }
@@ -173,6 +184,48 @@ pub(crate) struct BlockedWaiterOrdinaryCapDeliverySnapshot {
     /// Source CapId — delegation-link parent edge (bookkeeping only; NEVER
     /// receiver authority, NEVER resolved-to-mint by the executor).
     pub(crate) source_cap: CapId,
+    /// Endpoint index whose receiver-waiter slot the executor clears in Phase C.
+    pub(crate) endpoint_idx: usize,
+    /// Optional task to wake exactly once after delivery completes.
+    pub(crate) wake_tid: Option<ThreadId>,
+}
+
+/// By-value snapshot of a reply-cap blocked-waiter delivery (Stage 188D).
+///
+/// Contains ONLY owned values — no `&mut KernelState`, no borrows, and **no
+/// sender-local CapId as authority**. The reply object is identified solely by
+/// `(reply_index, reply_generation)` (its registry coordinates, captured from
+/// the consumed one-shot transfer envelope); the receiver-local reply CapId is
+/// minted fresh by the executor's rank-4 seam and recorded into the reply-cap
+/// registry through the rank-3 IPC seam. Like the ordinary-cap snapshot, the
+/// recv-v2 meta is encoded in the executor after the mint (the receiver-local
+/// CapId is only known then).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedWaiterReplyCapDeliverySnapshot {
+    /// The blocked waiter (delivery target + reply-cap owner).
+    pub(crate) waiter_tid: u64,
+    /// The waiter's ASID (resolved in Phase A; the copy target address space).
+    pub(crate) waiter_asid: Asid,
+    /// User pointer for the payload buffer.
+    pub(crate) payload_user_ptr: usize,
+    /// Number of valid payload bytes in `payload`.
+    pub(crate) payload_len: usize,
+    /// Payload bytes, by value.
+    pub(crate) payload: [u8; Message::MAX_PAYLOAD],
+    /// User pointer for the recv-v2 meta buffer.
+    pub(crate) meta_user_ptr: usize,
+    /// Application opcode for the recv-v2 meta (encoded in Phase B).
+    pub(crate) app_opcode: u16,
+    /// Sender TID for the recv-v2 meta (encoded in Phase B).
+    pub(crate) sender_tid: u64,
+    /// Receiver's destination cnode (resolved in Phase A). Rank-4 mint target.
+    pub(crate) receiver_cnode: CNodeId,
+    /// Reply object registry index (from the consumed one-shot envelope). Used
+    /// to mint the `Reply` object cap and to record the waiter-cap under rank 3.
+    pub(crate) reply_index: usize,
+    /// Reply object generation captured in Phase A (stale-detection guard for
+    /// the rank-3 record; a mismatch rolls the rank-4 mint back).
+    pub(crate) reply_generation: u64,
     /// Endpoint index whose receiver-waiter slot the executor clears in Phase C.
     pub(crate) endpoint_idx: usize,
     /// Optional task to wake exactly once after delivery completes.

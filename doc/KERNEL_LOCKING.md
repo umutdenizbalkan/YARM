@@ -329,6 +329,29 @@ materialization remains deferred** (`reply_cap_ipc_rank_inversion`); shared-regi
 broader IPC conversion remain deferred; does not enable AP user-task scheduling, does not fully
 retire the global lock. Guarded by `stage188c_blocked_waiter_ordinary_cap_delivery_live`.
 
+### 0.15) Stage 188D (REPLY-CAP-RANK-INVERSION-SEAM) — rank inversion solved by phase separation
+
+Retires the `reply_cap_ipc_rank_inversion` blocker for the dispatch-return channel. Reply-cap
+materialization records the receiver-local reply CapId into the reply-cap registry under
+`ipc_state_lock` (rank 3) — *below* the rank-4 mint. Stage 188D runs the sequence as three
+**disjoint** critical sections (each acquires and fully releases one lock before the next), so no
+lock is ever held across the acquisition of a lower rank:
+- **Phase A (broad borrow):** `produce_blocked_waiter_reply_cap_delivery` takes the reply-cap
+  transfer envelope once, snapshots the reply object's `(reply_index, reply_generation)` + receiver
+  cnode by value (no sender-local CapId as authority), pre-validates the user buffers, and stashes.
+- **Phase B (rank 4 only):** mint the receiver-local reply cap via
+  `mint_capability_with_memory_ref_split` (rank-4-only for a `Reply` object). NO IPC lock.
+- **Phase C (rank 3 only):** record the CapId via `SharedKernel::try_record_reply_waiter_cap_split`
+  (`with_ipc_split_mut`). A stale record rolls the mint back (`rollback_minted_cap_split`); a
+  post-record copy fault also clears the record (`clear_reply_waiter_cap_split`).
+
+The rank-4 mint releases its lock before the rank-3 record acquires `ipc_state_lock`: **never hold
+the capability lock while taking the IPC lock, never mint under `ipc_state_lock`, never record IPC
+metadata under a broad `&mut KernelState`.** The one live reply-cap→blocked-waiter path in a real
+boot is `ipc_call` (out of scope); the producer is wired into `ipc_reply` and the seam is proven
+end-to-end by unit tests. Does not enable AP user-task scheduling, does not fully retire the global
+lock. Guarded by `stage188d_reply_cap_rank_inversion_seam`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:
