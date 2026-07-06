@@ -2210,8 +2210,11 @@ Changing any image ID requires updating `spawn_image_path_for_image_id`,
 - **`STARTUP_SLOT_COUNT = 18`** — do not increase or decrease. Slots 0–17 are
   documented in `doc/PROCESS_AND_SPAWN.md`. Slot 12 is PM-private for
   PM↔VFS subcalls.
-- **`SYSCALL_COUNT = 31`** — do not add or remove syscalls without a new ABI
-  stage.
+- **`SYSCALL_COUNT = 32`** — do not add or remove syscalls without a new ABI
+  stage. NR 31 is `ReapFaultedTask` (PM-only terminal-task reap), added by the
+  SUP/PM crash-restart merge; existing NRs 0–30 are unchanged. Per-stage history
+  entries below that record `SYSCALL_COUNT == 31` describe the pre-merge baseline
+  at those stages and are left as historical record.
 - **`RecvSharedV3Delivery`** field offsets are frozen.
 
 ### Optional-FS smoke markers (do not rename or remove)
