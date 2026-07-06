@@ -8186,6 +8186,43 @@ stale record / copy fault; rank-3 record seam holds only the IPC lock; snapshot 
 CapId authority; reply cap consumed once; stale/wrong-object/missing-buffer stay real errors; exit
 cleanup still revokes reply caps; docs honest).
 
+**Stage 188E (IPC-CALL-REPLY-CAP-BLOCKED-WAITER-LIVE) — DONE (188D seam goes live on its real
+path).** Stage 188D built the reply-cap rank-inversion seam and proved it by unit tests, but left
+it dormant because the real reply-cap→blocked-waiter path flows through `ipc_call`, not
+`ipc_reply`. Stage 188E wires that live: `handle_ipc_call`, on delivery to a blocked recv-v2
+receiver, now calls `produce_blocked_waiter_reply_cap_delivery` **before** the legacy
+`complete_blocked_recv_for_waiter`. On `Ok(true)` the caller's (sender's) frame is set to Ok and
+the split is accounted; the receiver's mint + record + payload/meta copy + slot-clear + wake all
+run in the dispatch-return executor after the broad borrow drops. `Ok(false)` (no trap-entry
+drainer) and any non-reply-cap message keep the unchanged legacy path.
+
+*Exact live path converted.* `handle_ipc_call` (`syscall/ipc.rs`), the recv-v2 blocked-receiver
+branch, reply-cap messages only. Phase A (broad borrow) takes the reply-cap transfer envelope once
+and stashes a by-value `BlockedWaiterReplyCapDelivery`; the 188D executor runs Phase B (rank-4
+mint via `mint_capability_with_memory_ref_split`, no IPC lock) → Phase C (rank-3 record via
+`try_record_reply_waiter_cap_split`, disjoint) → 186E copy → clear + wake. This makes
+`REPLY_CAP_RANK_SEAM_DONE result=ok` and `DISPATCH_POST_WORK_DONE kind=blocked_waiter_reply_cap
+result=ok` **live in a real boot**, alongside the 188B/188C plain and ordinary-cap DONE markers,
+with the sender-wake ordering (`IPC_RECV_V2_SENDER_WAKE_ORDER_OK` /
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`) preserved.
+
+*Envelope / one-shot / rollback.* The transfer envelope is consumed once in Phase A; on a producer
+Phase-A fault before the take the legacy `take_transfer_envelope` cleanup consumes it, and after the
+take that cleanup is a harmless no-op — the same envelope disposition the legacy arm produces. The
+executor rolls the mint back on a stale record or user-copy fault (and clears the recorded
+waiter-cap on a post-record fault), so no reply cap, refcount, or waiter-cap record is orphaned. On
+the supported single-CPU config the Phase-A pre-validation keeps the deferred copy infallible, so
+the deferred delivery cannot leave the caller with an accepted send but a lost wake.
+
+*Scope honesty.* This stage converts **only** the `ipc_call` reply-cap blocked-waiter delivery; it
+does not touch shared-region transfer, fault delivery, or unrelated `ipc_send`/`ipc_reply` paths,
+does not enable AP user-task scheduling, and does not fully retire the global lock. No ABI/count
+change (`SYSCALL_COUNT=31`, `Syscall::VARIANT_COUNT=23`, x86_64 `MAX_ADDRESS_SPACES=32`). Guarded by
+`stage188e_ipc_call_reply_cap_blocked_waiter_live` (full IpcCall syscall to a blocked receiver
+stashes reply-cap work and the drain mints + records + delivers a fresh receiver-local reply cap
+and wakes the receiver; handle_ipc_call tries the producer before the legacy path, on the recv-v2
+blocked branch only).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

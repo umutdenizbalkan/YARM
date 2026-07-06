@@ -319,6 +319,16 @@ reply-cap→blocked-waiter path in a real boot is `ipc_call` (out of scope); the
 into `ipc_reply` and the seam is proven end-to-end by unit tests. Guarded by
 `stage188d_reply_cap_rank_inversion_seam`.
 
+**Reply-cap seam goes live on ipc_call (Stage 188E).** The 188D reply-cap rank-inversion seam is
+now wired live onto its real path: an `ipc_call` to a blocked recv-v2 receiver defers the reply-cap
+materialization through the dispatch-return channel. The receiver-local reply cap is minted fresh
+by the rank-4 seam and recorded into the reply-cap registry by the rank-3 IPC seam (disjoint
+critical sections — no capability lock held while taking the IPC lock, no mint under
+`ipc_state_lock`); the source reply object is identified by registry coordinates, never a
+sender-local CapId as authority. The reply cap stays one-shot (envelope consumed once, waiter-cap
+recorded once), with mint + record rollback on any failure. Only the `ipc_call` reply-cap path is
+converted. Guarded by `stage188e_ipc_call_reply_cap_blocked_waiter_live`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

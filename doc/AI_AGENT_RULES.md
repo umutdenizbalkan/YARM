@@ -509,6 +509,19 @@ into `ipc_call` is the explicit deferred next step. Pinned by
 `stage188d_reply_cap_rank_inversion_seam`. See `doc/KERNEL_UNLOCKING.md` (Stage 188D) and
 `doc/KERNEL_LOCKING.md §0.15`.
 
+**Stage 188E (IPC-CALL-REPLY-CAP-BLOCKED-WAITER-LIVE) status — 188D seam LIVE on ipc_call.** The
+188D reply-cap seam is now wired live: `handle_ipc_call`, on delivery to a blocked recv-v2 receiver,
+calls `produce_blocked_waiter_reply_cap_delivery` before the legacy `complete_blocked_recv_for_waiter`
+(recv-v2 blocked branch only, drainer-gated). The caller's frame is set to Ok inline; the receiver
+mint (rank 4) + record (rank 3, disjoint) + 186E copy + wake run in the dispatch-return executor
+after the broad borrow drops, so `REPLY_CAP_RANK_SEAM_DONE result=ok` and
+`DISPATCH_POST_WORK_DONE kind=blocked_waiter_reply_cap result=ok` are now live in a real boot. The
+envelope is consumed once and the mint is rolled back on stale record / copy fault. Do **not**
+extend this to shared-region / fault / unrelated `ipc_send`/`ipc_reply`, and do **not** claim it
+enables AP user-task scheduling or retires the global lock. Pinned by
+`stage188e_ipc_call_reply_cap_blocked_waiter_live`. See `doc/KERNEL_UNLOCKING.md` (Stage 188E) and
+`doc/KERNEL_LOCKING.md §0.16`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

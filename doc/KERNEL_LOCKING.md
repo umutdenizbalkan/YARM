@@ -352,6 +352,21 @@ boot is `ipc_call` (out of scope); the producer is wired into `ipc_reply` and th
 end-to-end by unit tests. Does not enable AP user-task scheduling, does not fully retire the global
 lock. Guarded by `stage188d_reply_cap_rank_inversion_seam`.
 
+### 0.16) Stage 188E (IPC-CALL-REPLY-CAP-BLOCKED-WAITER-LIVE) — the 188D seam goes live
+
+Wires the 188D reply-cap seam onto its real path. `handle_ipc_call`, on delivery to a blocked
+recv-v2 receiver, now calls `produce_blocked_waiter_reply_cap_delivery` before the legacy
+`complete_blocked_recv_for_waiter`: Phase A (broad borrow) takes the reply-cap transfer envelope
+once and stashes a by-value `BlockedWaiterReplyCapDelivery`; the dispatch-return executor mints the
+receiver-local reply cap (rank 4, no IPC lock), records the waiter-cap (rank 3, disjoint), copies
+payload+meta (186E), and clears + wakes the receiver — all after the broad borrow drops. The
+caller's frame is set to Ok inline; the receiver delivery/wake is deferred. This makes
+`REPLY_CAP_RANK_SEAM_DONE result=ok` and `DISPATCH_POST_WORK_DONE kind=blocked_waiter_reply_cap
+result=ok` live in a real boot. Envelope consumed once; mint rolled back on stale record / copy
+fault; sender-wake ordering preserved. Only the `ipc_call` reply-cap path is converted; shared-region
+/ fault / unrelated `ipc_send`/`ipc_reply` remain deferred; does not enable AP user-task scheduling,
+does not fully retire the global lock. Guarded by `stage188e_ipc_call_reply_cap_blocked_waiter_live`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

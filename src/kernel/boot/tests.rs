@@ -50426,6 +50426,229 @@ mod stage188d_reply_cap_rank_inversion_seam {
 }
 
 // ===========================================================================
+// Stage 188E — IPC-CALL-REPLY-CAP-BLOCKED-WAITER-LIVE
+//
+// Wires the 188D reply-cap seam LIVE onto its real path: an ipc_call to a
+// blocked recv-v2 receiver now produces a BlockedWaiterReplyCapDelivery through
+// the 188A dispatch-return channel instead of materializing + recording the
+// reply cap under the broad borrow. The executor mints the receiver-local reply
+// cap (rank 4), records the waiter-cap (rank 3, disjoint), copies payload+meta
+// (186E), and wakes the receiver — all after the broad borrow drops.
+//
+// Functional test drives the full IpcCall syscall to a blocked receiver with the
+// trap-drainer active, then drains: the reply cap is delivered via the seam
+// (meta REPLY_CAP flag + a fresh receiver-local CapId that resolves in the
+// receiver cspace) and the receiver is woken. A source guard pins that the
+// ipc_call handler tries the reply-cap producer BEFORE the legacy path.
+// ===========================================================================
+#[cfg(test)]
+mod stage188e_ipc_call_reply_cap_blocked_waiter_live {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const CPU0: CpuId = CpuId(0);
+
+    fn set_trap_drainer(active: bool) {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+            .store(active, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Driving a full IpcCall syscall is stack-heavy — run on a dedicated thread.
+    #[test]
+    fn stage188e_ipc_call_delivers_reply_cap_via_dispatch_return() {
+        std::thread::Builder::new()
+            .name("stage188e_ipc_call_reply_cap".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_stage188e_ipc_call_reply_cap)
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    fn run_stage188e_ipc_call_reply_cap() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        state.register_task(1).expect("register receiver");
+        state.enqueue_current_cpu(1).expect("enqueue receiver");
+
+        // Delivery endpoint (task 0), recv cap granted into task 1.
+        let (endpoint_idx, send_cap_a, recv_cap_a) = state.create_endpoint(2).expect("endpoint A");
+        let recv_cap_a_task1 = state
+            .grant_capability_task_to_task(0, recv_cap_a, 1)
+            .expect("grant recv cap to task1");
+        // Reply channel — task 0 holds the RECEIVE cap.
+        let (_reply_eidx, _reply_send_b, reply_recv_cap_b) =
+            state.create_endpoint(2).expect("reply endpoint B");
+
+        // Task 1 user memory: payload + meta pages.
+        let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind task1 asid");
+        state
+            .map_user_page(
+                aspace1,
+                VirtAddr(0x3000),
+                Mapping {
+                    phys: PhysAddr(0x9000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map payload page");
+        state
+            .map_user_page(
+                aspace1,
+                VirtAddr(0x4000),
+                Mapping {
+                    phys: PhysAddr(0xA000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map meta page");
+
+        // Switch to task 1 and block it in recv-v2 (empty endpoint).
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        let mut recv_frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [
+                recv_cap_a_task1.0 as usize,
+                0x3000,
+                Message::MAX_PAYLOAD,
+                0x4000,
+                40,
+                0,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+            .expect("recv blocks");
+        assert_eq!(
+            state.current_tid(),
+            Some(0),
+            "task 0 current after task1 blocks"
+        );
+
+        // Trap-drainer active (as it is under the real SharedKernel trap entry).
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // Task 0 issues IpcCall — Stage 188E: the reply-cap producer fires.
+        let mut call_frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcCall as usize,
+            [
+                send_cap_a.0 as usize,
+                0,
+                0,
+                0,
+                0,
+                reply_recv_cap_b.0 as usize,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut call_frame))
+            .expect("ipc call");
+        assert_eq!(call_frame.error_code(), None, "caller must return Ok");
+        // Producer consumed the receiver's blocked state (deferred delivery).
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_none(),
+            "the ipc_call reply-cap producer must consume the receiver's blocked_recv_state"
+        );
+
+        // Drain the dispatch-return channel: mint + record + deliver + wake.
+        let shared = SharedKernel::new(*state);
+        assert!(
+            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            "the drain must deliver the stashed ipc_call reply-cap work"
+        );
+        set_trap_drainer(false);
+
+        // Meta carries the REPLY_CAP flag and a fresh receiver-local reply cap.
+        let meta = shared
+            .with(|k| k.copy_from_user(asid1, VirtAddr(0x4000), 40))
+            .expect("read meta");
+        let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().unwrap());
+        assert_ne!(
+            recv_meta_flags & crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64,
+            0,
+            "meta must set SYSCALL_RECV_META_REPLY_CAP"
+        );
+        let local_cap = u64::from_le_bytes(meta[16..24].try_into().unwrap());
+        assert_ne!(
+            local_cap,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+            "a receiver-local reply cap must be materialized into the receiver cspace"
+        );
+        assert!(
+            shared.with(|k| k.resolve_capability_for_task(1, CapId(local_cap)).is_ok()),
+            "the materialized receiver-local reply cap must resolve in the receiver cspace"
+        );
+        // Receiver woken.
+        assert!(
+            matches!(
+                shared.with(|k| k.task_status(1)),
+                Some(TaskStatus::Runnable | TaskStatus::Running)
+            ),
+            "the receiver must be woken after reply-cap delivery"
+        );
+        // Stash consumed (no double delivery).
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "the drain must consume the stashed work"
+        );
+    }
+
+    // Guard: handle_ipc_call tries the reply-cap producer BEFORE the legacy
+    // blocked-waiter delivery, and only on the recv-v2 blocked path.
+    #[test]
+    fn stage188e_ipc_call_wires_reply_cap_producer_before_legacy() {
+        let body = IPC_SRC
+            .split("fn handle_ipc_call(")
+            .nth(1)
+            .and_then(|r| r.split("\npub(super) fn handle_ipc_reply").next())
+            .expect("handle_ipc_call body");
+        let producer_at = body
+            .find("produce_blocked_waiter_reply_cap_delivery")
+            .expect("handle_ipc_call must call the reply-cap producer");
+        let legacy_at = body
+            .find("complete_blocked_recv_for_waiter(")
+            .expect("legacy fallback must remain");
+        assert!(
+            producer_at < legacy_at,
+            "the reply-cap producer must be tried BEFORE the legacy path in handle_ipc_call"
+        );
+        // The producer is gated the same as 188B/188C/188D (drainer-active) and
+        // only runs on the recv-v2 blocked branch.
+        assert!(
+            body.contains("is_task_recv_v2_blocked"),
+            "the reply-cap producer must be confined to the recv-v2 blocked path"
+        );
+    }
+
+    // Docs record 188E honestly.
+    #[test]
+    fn stage188e_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 188E"),
+            "docs must document Stage 188E"
+        );
+        for required in [
+            "IPC-CALL-REPLY-CAP-BLOCKED-WAITER-LIVE",
+            "reply-cap messages only",
+            "does not enable AP user-task scheduling",
+            "does not fully retire the global lock",
+        ] {
+            assert!(
+                UNLOCK_DOC.contains(required),
+                "docs must state 188E `{required}`"
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and
