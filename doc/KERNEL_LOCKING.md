@@ -194,6 +194,27 @@ no `CAP_TRANSFER_LIVE_SEAM_*` marker is emitted (that would dishonestly mark the
 global-lock path). The 186D2/186D3 seam stays `M2_SEAM_HELPER_ONLY`. Pinned by
 `stage186d4_ordinary_cap_transfer_live_wiring_hard_stop`. Recommended next step: Stage 187.
 
+### 0.8) Stage 187A (IPC-RECV-DELIVERY-BOUNDARY-SPLIT) — LIVE queued-recv boundary split
+
+First live resolution of the §0.7 aliasing blocker, on the one recv path with a
+`SharedKernel`-level frame (`try_split_ipc_recv_queued_plain_into_frame`). **Phase A** (inside
+`with_cpu`, byte-identical): plan → rank-3 dequeue → legacy cap materialization (reply-cap arm
+unchanged/deferred) → deferred sender wake (§56, `phase=before_writeback`) → ret2 commit →
+kernel-register writeback. For a user-ASID receiver Phase A returns a by-value
+`RecvBoundaryUserCopySnapshot` (owned fields only; no borrows; no sender-local CapId as
+authority) instead of copying. **The `with_cpu` closure calls no seam.** After the closure
+returns (broad `&mut KernelState` dead), **Phase B** copies payload/meta through the Stage 186E
+`copy_to_user_split` seam (rank 5 + 6 marker locks only; no `ipc_state_lock`; §55 meta-first
+order and failure modes byte-identical) — the first live seam call on the recv path
+(`M2_SEAM_LIVE_187A_RECV_BOUNDARY`). **Phase C** commits the frame and performs §58 failure
+handling (cap rollback / user-fault record) via brief `with_cpu` re-entries that call no seam.
+Externally observable order unchanged: materialize → wake → writeback → return; message
+consumption is one-shot in every outcome. Blocked-waiter delivery
+(`complete_blocked_recv_for_waiter`), reply-cap materialization, `ipc_send`/`call`/`reply`, and
+every other IPC path remain on the unchanged legacy global boundary. This stage does not
+enable multi-dispatcher/AP user scheduling and does not fully retire the global lock. Guarded
+by `stage187a_ipc_recv_delivery_boundary_split`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

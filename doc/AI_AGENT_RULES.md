@@ -356,6 +356,26 @@ Reply-cap materialization, `ipc_reply` conversion, and full global-lock retireme
 deferred. Pinned by `stage186d4_ordinary_cap_transfer_live_wiring_hard_stop`. See
 `doc/KERNEL_UNLOCKING.md` (Stage 186D4) and `doc/KERNEL_LOCKING.md §0.7`.
 
+**Stage 187A (IPC-RECV-DELIVERY-BOUNDARY-SPLIT) status — LIVE boundary split, DO NOT
+OVERCLAIM.** The queued-split recv delivery path now performs its user-space writeback
+AFTER the `with_cpu` broad `&mut KernelState` is dropped, through the Stage 186E
+`copy_to_user_split` seam (`M2_SEAM_LIVE_187A_RECV_BOUNDARY`). Phase A (under the lock,
+byte-identical): dequeue + legacy cap materialization + sender wake (§56 order preserved —
+wake still before writeback) + by-value `RecvBoundaryUserCopySnapshot`; Phase B: seam copy;
+Phase C: frame commit + §58 rollback/fault via brief re-entries. Scope honesty: this stage
+does not enable multi-dispatcher/AP user scheduling, does not fully retire the global lock,
+does not solve reply-cap materialization (legacy router in Phase A, never seam-routed), does
+not convert `ipc_send`/`ipc_call`/`ipc_reply` or blocked-waiter delivery
+(`complete_blocked_recv_for_waiter` — still `defer_needs_broad_ipc_decomposition`), and does
+not wire the 186D2/186D3 cap-transfer seam (that follow-on now depends only on this
+boundary). Do not call any `data_ptr()`-derived seam inside the Phase A closure or the Phase
+C re-entry closures — pinned by `stage187a_ipc_recv_delivery_boundary_split`. Relocated
+markers: `YARM_RECV_CORE_LIVE kind=user_plain{,_v2}`, `IPC_RECV_V2_META_QUEUED_SPLIT_OK`,
+and the queued-split `IPC_RECV_V2_ROLLBACK_OK` sites moved WITH the writeback to runtime.rs
+Phase C (same live path; `stage159bcd_target_markers_are_kernel_emitted` re-homed to require
+a literal kernel emission in either file). See `doc/KERNEL_UNLOCKING.md` (Stage 187A) and
+`doc/KERNEL_LOCKING.md §0.8`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

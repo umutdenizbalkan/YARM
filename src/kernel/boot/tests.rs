@@ -42511,16 +42511,25 @@ mod stage159bcd_ipc_recv_proof_workload {
 
     // 5. The kernel delivery markers each subtest targets are emitted in the
     //    real IPC paths (not by the workload itself).
+    //    Stage 187A re-home: the queued-split user-writeback markers
+    //    (IPC_RECV_V2_META_QUEUED_SPLIT_OK and the queued-split
+    //    IPC_RECV_V2_ROLLBACK_OK sites) moved WITH the writeback to the recv
+    //    boundary Phase C in runtime.rs — same live path, same meaning. The
+    //    guard now checks for a real `yarm_log!("<marker>` emission in either
+    //    kernel file, so a comment mention can never satisfy it.
     #[test]
     fn stage159bcd_target_markers_are_kernel_emitted() {
-        for m in &[
-            "IPC_RECV_V2_META_QUEUED_SPLIT_OK",
-            "IPC_RECV_V2_ROLLBACK_OK",
-            "IPC_RECV_V2_SENDER_WAKE_ORDER_OK",
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        for emit in &[
+            "\"IPC_RECV_V2_META_QUEUED_SPLIT_OK",
+            "\"IPC_RECV_V2_ROLLBACK_OK",
+            "\"IPC_RECV_V2_SENDER_WAKE_ORDER_OK",
         ] {
             assert!(
-                SYSCALL_SRC.contains(m),
-                "kernel delivery marker `{m}` must be emitted by the kernel IPC path"
+                SYSCALL_SRC.contains(emit) || RUNTIME_SRC.contains(emit),
+                "kernel delivery marker `{emit}` must be EMITTED (string literal, not a \
+                 comment) by the kernel IPC path (syscall.rs Phase A or runtime.rs \
+                 recv-boundary Phase C)"
             );
         }
         // The workload may DESCRIBE the kernel markers in doc comments, but must
@@ -46261,9 +46270,19 @@ mod stage186e_vm_user_copy_seam {
 
     // The seam uses ONLY the VM (rank 5) and memory (rank 6) seams — never the
     // IPC / capability / task / scheduler locks, and never a broad &mut KernelState.
+    // Stage 187A: comment lines are stripped so the guard tests the CODE — the
+    // validation-status comments legitimately mention `&mut KernelState` when
+    // documenting that the live boundary caller never holds one.
     #[test]
     fn stage186e_seam_uses_only_vm_and_memory_seams() {
-        let seam = seam_impl_block();
+        let seam = seam_impl_block()
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
         assert!(
             seam.contains("with_vm_user_spaces_split_mut"),
             "seam must validate via the rank-5 VM seam"
@@ -46309,7 +46328,12 @@ mod stage186e_vm_user_copy_seam {
         );
     }
 
-    // Not wired into any live IPC/syscall path in this stage.
+    // Stage 187A update: `copy_to_user_split` is now LIVE — but only via the
+    // recv boundary Phase B (runtime.rs `complete_recv_boundary_user_copy` →
+    // recv_core.rs boundary executors), which runs AFTER the `with_cpu` broad
+    // borrow is dropped. The under-global-lock syscall/IPC files below must
+    // STILL never call the copy seam: inside them a broad `&mut KernelState`
+    // is live and the data_ptr()-derived seam would alias it (Stage 186D4).
     #[test]
     fn stage186e_seam_not_wired_live() {
         for (name, src) in [
@@ -46329,8 +46353,10 @@ mod stage186e_vm_user_copy_seam {
             ] {
                 assert!(
                     !src.contains(helper),
-                    "Stage 186E is helper-only: `{name}` must NOT call `{helper}` (no live \
-                     ipc_reply/IPC conversion in this stage)"
+                    "`{name}` must NOT call `{helper}`: these files run under the broad \
+                     global-lock `&mut KernelState`, where the data_ptr()-derived copy seam \
+                     would alias it (UB). The ONLY sanctioned live caller is the Stage 187A \
+                     recv boundary Phase B (runtime.rs / recv_core.rs), after the borrow drops"
                 );
             }
         }
@@ -47682,6 +47708,378 @@ mod stage186d4_ordinary_cap_transfer_live_wiring_hard_stop {
             UNLOCK_DOC.contains("data_ptr()") && UNLOCK_DOC.contains("aliasing"),
             "docs must name the exact blocker (data_ptr aliasing the global-lock &mut)"
         );
+    }
+}
+
+// ===========================================================================
+// Stage 187A (IPC-RECV-DELIVERY-BOUNDARY-SPLIT) — LIVE boundary split of the
+// queued-split recv delivery path.
+//
+// Phase A (inside with_cpu, broad &mut KernelState live): plan + rank-3
+// dequeue + LEGACY cap materialization (reply-cap arm unchanged/deferred) +
+// deferred sender wake (§56: wake BEFORE writeback) + kernel-register
+// writeback. NO seam call happens inside the closure.
+// Phase B (after with_cpu returns — broad borrow dead): user copy through the
+// Stage 186E copy_to_user_split seam (first live seam call on the recv path).
+// Phase C: frame commit; §58 failure handling (cap rollback / fault record)
+// via brief with_cpu re-entries.
+//
+// These guards pin: the snapshot is by-value (no borrows, no sender-local
+// CapId authority); the with_cpu Phase A closure contains no seam call; the
+// boundary executors take &SharedKernel and use the copy seam without IPC
+// locks; the sender-wake marker still fires in Phase A (before writeback);
+// the reply-cap arm still routes through the legacy materializer; no
+// forbidden fallback/FAIL markers exist; docs don't overclaim.
+// Functional tests drive the REAL runtime entry end-to-end (user receiver:
+// delivered payload, undersized error, one-shot consumption).
+// ===========================================================================
+#[cfg(test)]
+mod stage187a_ipc_recv_delivery_boundary_split {
+    use super::*;
+    use crate::kernel::syscall::RecvQueuedSplitPhaseA;
+    use crate::runtime::SharedKernel;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const RECV_CORE_SRC: &str = include_str!("../recv_core.rs");
+    const CPU0: CpuId = CpuId(0);
+
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // The by-value snapshot: owned fields only — no references, no broad
+    // borrows — and NO sender-local CapId as receiver authority (the only cap
+    // field is the already-minted RECEIVER-local cap, kept for rollback).
+    #[test]
+    fn stage187a_snapshot_is_by_value_no_sender_authority() {
+        let s = RECV_CORE_SRC
+            .split("pub(crate) struct RecvBoundaryUserCopySnapshot {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("RecvBoundaryUserCopySnapshot must exist");
+        let code = code_only(s);
+        assert!(
+            !code.contains('&'),
+            "snapshot must contain no borrowed fields (by-value only)"
+        );
+        for forbidden in ["KernelState", "source_cap", "sender_cap"] {
+            assert!(
+                !code.contains(forbidden),
+                "snapshot must not carry `{forbidden}` (no broad borrow, no sender-local \
+                 CapId as receiver authority)"
+            );
+        }
+        assert!(
+            code.contains("materialized_cap") && code.contains("is_reply_cap"),
+            "snapshot must carry the receiver-local rollback info"
+        );
+    }
+
+    // The with_cpu Phase A closure in the runtime entry contains ONLY the
+    // Phase A call — no seam helper runs while the broad borrow is live.
+    #[test]
+    fn stage187a_no_seam_call_inside_with_cpu_closure() {
+        let body = RUNTIME_SRC
+            .split("fn try_split_ipc_recv_queued_plain_into_frame(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("runtime recv entry must exist");
+        let closure = body
+            .split("self.with_cpu(cpu, |state| {")
+            .nth(1)
+            .and_then(|rest| rest.split("})").next())
+            .expect("Phase A with_cpu closure must exist");
+        for seam in [
+            "copy_to_user_split",
+            "copy_from_user_split",
+            "validate_user_access_for_asid_split",
+            "mint_capability_with_memory_ref_split",
+            "materialize_received_cap_snapshot",
+            "with_vm_user_spaces_split_mut",
+            "with_memory_split_mut",
+            "with_capability_state_split_mut",
+        ] {
+            assert!(
+                !closure.contains(seam),
+                "the Phase A with_cpu closure must NOT call `{seam}` — a data_ptr()-derived \
+                 seam inside the closure would alias the live broad &mut KernelState (186D4)"
+            );
+        }
+        assert!(
+            closure.contains("try_split_recv_queued_plain_with_snapshot_locked"),
+            "the Phase A closure must call the locked Phase A function"
+        );
+    }
+
+    // Phase B executors: take &SharedKernel (never &mut KernelState), copy via
+    // the 186E seam, and never touch the IPC lock.
+    #[test]
+    fn stage187a_boundary_executors_use_copy_seam_without_ipc() {
+        for exec in [
+            "fn execute_user_asid_plain_writeback_boundary(",
+            "fn execute_user_asid_plain_v2_writeback_boundary(",
+        ] {
+            let body = RECV_CORE_SRC
+                .split(exec)
+                .nth(1)
+                .and_then(|rest| rest.split("\npub").next())
+                .unwrap_or_else(|| panic!("{exec} must exist in recv_core.rs"));
+            let code = code_only(body);
+            assert!(
+                code.contains("shared: &crate::runtime::SharedKernel")
+                    || code.contains("&crate::runtime::SharedKernel"),
+                "{exec} must take &SharedKernel"
+            );
+            assert!(
+                code.contains("copy_to_user_split"),
+                "{exec} must copy through the Stage 186E seam"
+            );
+            for forbidden in [
+                "&mut KernelState",
+                "with_ipc_split_mut",
+                "with_ipc_state",
+                "ipc_state_lock",
+                ".with(",
+                ".with_cpu(",
+            ] {
+                assert!(
+                    !code.contains(forbidden),
+                    "{exec} must NOT use `{forbidden}` (no broad borrow, no IPC lock during \
+                     the boundary user copy)"
+                );
+            }
+        }
+    }
+
+    // §56 order pinned: in Phase A the sender-wake marker fires BEFORE the
+    // PendingUserCopy snapshot is constructed (wake before writeback), and the
+    // reply-cap arm still routes through the LEGACY materializer in Phase A.
+    #[test]
+    fn stage187a_wake_before_writeback_and_reply_arm_legacy() {
+        let body = SYSCALL_SRC
+            .split("pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub(crate) fn ").next())
+            .expect("Phase A fn must exist");
+        let wake = body
+            .find("IPC_RECV_V2_SENDER_WAKE_ORDER_OK")
+            .expect("Phase A must emit the sender-wake order marker");
+        let pending = body
+            .find("RecvQueuedSplitPhaseA::PendingUserCopy(")
+            .expect("Phase A must return PendingUserCopy for user arms");
+        assert!(
+            wake < pending,
+            "§56 order: the sender wake must be applied (and its marker emitted) BEFORE \
+             the user writeback is deferred to Phase B"
+        );
+        let materialize = body
+            .find("materialize_received_message_cap_routed(")
+            .expect("Phase A must still materialize via the LEGACY routed engine");
+        assert!(
+            materialize < wake,
+            "§58 order: cap materialization (legacy engine, reply-cap arm included/deferred \
+             there) must happen BEFORE the sender wake"
+        );
+    }
+
+    // No forbidden markers/knobs anywhere in the touched sources.
+    #[test]
+    fn stage187a_no_forbidden_markers() {
+        for (name, src) in [
+            ("syscall.rs", SYSCALL_SRC),
+            ("runtime.rs", RUNTIME_SRC),
+            ("recv_core.rs", RECV_CORE_SRC),
+        ] {
+            for forbidden in [
+                "IPC_RECV_BOUNDARY_SPLIT_FAIL",
+                "UNLOCK_GRADUATED_FALLBACK",
+                "emergency_optout",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "`{name}` must not contain forbidden marker/knob `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    // Functional: end-to-end through the REAL runtime entry — a queued plain
+    // message to a USER-ASID receiver is delivered via the boundary split
+    // (Phase A dequeue under the lock, Phase B seam copy after the drop), and
+    // the message is consumed exactly once (one-shot preserved).
+    #[test]
+    fn stage187a_user_recv_delivers_via_boundary_and_is_one_shot() {
+        let mut state = Bootstrap::init().expect("init");
+        // Receiver task with a user address space and a mapped, writable page.
+        state.register_task(1).expect("task1");
+        let (asid, _map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(1, asid).expect("bind");
+        let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let _ = mem_id;
+        let mem_cap_t1 = state
+            .grant_capability_task_to_task(0, mem_cap, 1)
+            .expect("grant mem");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap_t1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("grant recv");
+        // Queue the message BEFORE the receiver runs (queued-split shape).
+        state
+            .ipc_send(send_cap, Message::new(7, b"boundary").expect("m"))
+            .expect("send");
+        // Switch to the user task and map its buffer page.
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch");
+        assert_eq!(state.current_tid(), Some(1));
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                mem_cap_t1,
+                VirtAddr(0x4000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+                },
+            )
+            .expect("map buffer");
+
+        let shared = SharedKernel::new(state);
+        // Legacy plain ipc_recv frame: cap + user buffer ptr/len (no v2 meta).
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [
+                recv_cap_t1.0 as usize,
+                0x4000,
+                crate::kernel::ipc::Message::MAX_PAYLOAD,
+                0,
+                0,
+                0,
+            ],
+        );
+        let result = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "user-ASID queued plain recv must be serviced via the boundary split"
+        );
+        assert_eq!(frame.ret1(), b"boundary".len(), "payload length delivered");
+        // Payload actually landed in user memory (copied via the 186E seam).
+        let copied = shared
+            .with(|k| k.copy_from_user(asid, VirtAddr(0x4000), b"boundary".len()))
+            .expect("read back");
+        assert_eq!(&copied[..b"boundary".len()], b"boundary");
+        // One-shot: the message is consumed — a second recv finds nothing.
+        let second = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        assert_eq!(
+            second, None,
+            "the queue must be empty after delivery (no envelope/message reuse)"
+        );
+    }
+
+    // Functional: undersized user buffer surfaces the REAL InvalidArgs error
+    // through the boundary (message still consumed — legacy §54 semantics).
+    #[test]
+    fn stage187a_user_recv_undersized_buffer_real_error() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (asid, _map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(1, asid).expect("bind");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap_t1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("grant recv");
+        state
+            .ipc_send(
+                send_cap,
+                Message::new(7, b"too-long-for-buffer").expect("m"),
+            )
+            .expect("send");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch");
+
+        let shared = SharedKernel::new(state);
+        // user_buf_len = 4 < payload len → UndersizedBuffer → InvalidArgs.
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [recv_cap_t1.0 as usize, 0x4000, 4, 0, 0, 0],
+        );
+        let result = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::InvalidArgs
+            ))),
+            "undersized buffer must surface the real InvalidArgs error, never success"
+        );
+        // Message consumed (§54: consumed on undersize) — queue now empty.
+        let second = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        assert_eq!(
+            second, None,
+            "message must be consumed by the failed delivery"
+        );
+    }
+
+    // Phase A unit: for a KERNEL-task receiver the delivery completes entirely
+    // in Phase A (no boundary crossing, no seam involved).
+    #[test]
+    fn stage187a_kernel_receiver_completes_in_phase_a() {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = shared.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(9, b"king").expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let snapshot = shared
+            .resolve_endpoint_recv_cap_split_read(0, recv_cap)
+            .expect("cap snapshot");
+        let phase_a = shared
+            .with_cpu(CPU0, |state| {
+                crate::kernel::syscall::try_split_recv_queued_plain_with_snapshot_locked(
+                    state, &mut frame, &snapshot,
+                )
+            })
+            .expect("bind cpu");
+        assert!(
+            matches!(phase_a, RecvQueuedSplitPhaseA::Completed(Ok(()))),
+            "kernel-task delivery must complete in Phase A (never PendingUserCopy)"
+        );
+        assert_eq!(frame.ret0(), 9);
+    }
+
+    // Docs record 187A honestly.
+    #[test]
+    fn stage187a_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 187A"),
+            "KERNEL_UNLOCKING.md must document Stage 187A"
+        );
+        for required in [
+            "does not enable multi-dispatcher",
+            "does not fully retire the global lock",
+            "does not solve reply-cap",
+        ] {
+            assert!(
+                UNLOCK_DOC.contains(required),
+                "docs must state 187A `{required}`"
+            );
+        }
     }
 }
 

@@ -7677,6 +7677,79 @@ Pinned by `stage186d4_ordinary_cap_transfer_live_wiring_hard_stop` (the two live
 file; no `CAP_TRANSFER_LIVE_SEAM_*` marker exists in `src/`). Reply-cap materialization,
 `ipc_reply` conversion, and full global-lock retirement all remain deferred.
 
+**Stage 187A (IPC-RECV-DELIVERY-BOUNDARY-SPLIT) — DONE (LIVE boundary split, queued-split
+recv path).** Targets the recv/delivery boundary aliasing problem found by 186D4: the seams
+derive `&mut Subsystem` from `data_ptr()` and therefore cannot run while the `with`/`with_cpu`
+broad `&mut KernelState` is live. This stage splits the **queued-split recv delivery** (the
+`SharedKernel::try_split_ipc_recv_queued_plain_into_frame` path — the one live site with a
+`SharedKernel`-level frame) into:
+
+- **Phase A** (`try_split_recv_queued_plain_with_snapshot_locked`, inside `with_cpu`, broad
+  borrow live, byte-identical to pre-187A): plan → rank-3 dequeue → **legacy** cap
+  materialization (`materialize_received_message_cap_routed`, reply-cap arm unchanged /
+  deferred there) → deferred sender wake (§56 order:
+  `IPC_RECV_V2_SENDER_WAKE_ORDER_OK … phase=before_writeback`) → ret2 commit → kernel-register
+  writeback completes here. For a user-ASID receiver Phase A returns a **by-value**
+  `RecvBoundaryUserCopySnapshot` (`RecvQueuedSplitPhaseA::PendingUserCopy`) instead of
+  copying: owned fields only (asid, receiver tid, message, writeback plan, receiver-local
+  rollback cap) — no borrows, no sender-local CapId as authority. **No seam call happens
+  inside the closure** (pinned by guard).
+- **Broad borrow dropped** (`with_cpu` returns; markers `IPC_RECV_BOUNDARY_SNAPSHOT_OK`,
+  `IPC_RECV_BOUNDARY_GLOBAL_DROPPED_OK`).
+- **Phase B** (`recv_core::execute_user_asid_plain{,_v2}_writeback_boundary`, taking
+  `&SharedKernel`): the user copy runs through the **Stage 186E `copy_to_user_split` seam**
+  (rank-5 VM + rank-6 memory marker locks only) — the **first live seam call on the recv
+  path**. No `ipc_state_lock`, no capability lock, no broad borrow. §55 meta-first ordering
+  and all failure modes byte-identical (`IPC_RECV_BOUNDARY_USER_COPY_SEAM_OK`).
+- **Phase C** (`SharedKernel::complete_recv_boundary_user_copy`): frame commit
+  (`IPC_RECV_BOUNDARY_SPLIT_DONE result=ok`) and §58 failure handling — cap rollback
+  (`rollback_materialized_recv_cap`) and user-fault recording via brief `with_cpu`
+  re-entries (no seam inside those closures). Undersized → rollback + `InvalidArgs`; v2 meta
+  fault → rollback + `PageFault`; payload fault → fault record + `Ok` (no rollback) — exactly
+  the legacy in-lock semantics; the message is consumed in every case (one-shot preserved,
+  no envelope/message reuse).
+
+*Ordering proof.* The externally observable §56/§58 sequence is unchanged: materialize →
+sender wake → user writeback → user-visible return. The wake still fires in Phase A **before**
+the writeback (which moved later, out of the lock) — `phase=before_writeback` remains
+literally true; the queued-split markers that belong to the writeback
+(`YARM_RECV_CORE_LIVE kind=user_plain{,_v2}`, `IPC_RECV_V2_META_QUEUED_SPLIT_OK`,
+`IPC_RECV_V2_ROLLBACK_OK site=queued_split_*`) moved WITH the writeback to runtime.rs Phase C
+— same live path, same meaning (guard `stage159bcd_target_markers_are_kernel_emitted`
+re-homed to accept either kernel emission site and now requires a literal emission, not a
+comment).
+
+*Aliasing proof.* Phase B/C run only after the `with_cpu` closure returns, so no broad
+`&mut KernelState` exists when `copy_to_user_split` derives its `&mut Subsystem` from
+`data_ptr()`. The Phase C rollback/fault re-entries take the global lock fresh and call no
+seam inside. Pinned by `stage187a_no_seam_call_inside_with_cpu_closure` and
+`stage187a_boundary_executors_use_copy_seam_without_ipc`.
+
+*Recv/delivery boundary inventory* (Stage 187A):
+
+| Path | Class |
+|---|---|
+| queued-split user-ASID writeback (plain + v2) | `recv_boundary_split_candidate` → **LIVE split (this stage)** |
+| queued-split kernel-register arm | completes in Phase A (no user copy — nothing to split) |
+| queued-split cap materialization | stays legacy in Phase A (`defer_needs_broad_ipc_decomposition` for the seam form; the boundary now exists for a follow-on to move it to Phase B before a wake re-entry) |
+| reply-cap arm (D5 inside the router) | `defer_reply_cap_ipc_rank_inversion` (unchanged) |
+| `complete_blocked_recv_for_waiter` (blocked-waiter delivery, 7 call sites inside `with`-closures in ipc_state.rs/ipc.rs/fault_state.rs) | `defer_needs_broad_ipc_decomposition` (requires waiter-state rewrite; untouched) |
+| timeout cleanup / fault delivery / call-reply path | `legacy_authoritative_runtime` (untouched) |
+
+*What this stage does NOT do.* It **does not enable multi-dispatcher**/AP user scheduling
+(APs remain wake-only); it **does not fully retire the global lock** (Phase A still runs
+under it, and every other IPC path is unchanged); it **does not solve reply-cap**
+materialization (the rank-inversion blocker stands; reply caps still materialize via the
+legacy router in Phase A and are never routed through any seam); ordinary cap-transfer
+**seam** wiring is still deferred — but it depends on exactly this boundary split and can now
+be built as a follow-on (Phase B materialize via 186D2/186D3 before a Phase C wake re-entry).
+
+Guarded by `stage187a_ipc_recv_delivery_boundary_split` (snapshot by-value / no sender-local
+authority; no seam in the Phase A closure; boundary executors on `&SharedKernel` + copy seam
++ no IPC lock; §56 wake-before-writeback and §58 materialize-before-wake order pinned in
+source; no forbidden markers; end-to-end functional: user recv delivered via the boundary,
+one-shot consumption, undersized → real `InvalidArgs`; kernel receiver completes in Phase A).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

@@ -210,6 +210,19 @@ helper-only; no live seam marker is emitted. Reply-cap materialization, `ipc_rep
 conversion, and full global-lock retirement remain deferred. Pinned by
 `stage186d4_ordinary_cap_transfer_live_wiring_hard_stop`.
 
+**Recv delivery boundary split (Stage 187A, LIVE).** The queued-split recv path
+now drops the broad `&mut KernelState` **before** the user-space writeback:
+Phase A (under the lock) dequeues, materializes the cap via the **legacy** routed
+engine (reply-cap arm unchanged — still never seam-materialized), applies the
+sender wake, and snapshots the delivery by value; Phase B copies through the
+Stage 186E `copy_to_user_split` seam after the borrow is dead; Phase C rolls back
+the receiver-local cap (§58) on writeback failure via a brief global re-entry.
+Cap materialization itself still runs under the global lock — the 186D2/186D3
+cap-transfer seam is **not** wired yet; this boundary is what makes wiring it a
+mechanical follow-on. No cap is ever materialized under `ipc_state_lock`; no
+sender-local CapId crosses the boundary as authority. Guarded by
+`stage187a_ipc_recv_delivery_boundary_split`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

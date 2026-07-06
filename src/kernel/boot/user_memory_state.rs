@@ -488,10 +488,20 @@ impl KernelState {
 // target returns `UserMemoryFault` (byte-identical error semantics — the legacy
 // `validate_user_access_for_asid` also only validates flags and never faults in).
 //
-// M2_SEAM_HELPER_ONLY: infrastructure only — NOT wired into any live IPC/syscall
-// path in Stage 186E-prereq. Cap-transfer materialization
-// (`materialize_received_message_cap_routed`) remains a SEPARATE blocker for the
-// `ipc_reply` conversion (see doc/KERNEL_UNLOCKING.md).
+// Validation status:
+// - `copy_to_user_split`: M2_SEAM_LIVE_187A_RECV_BOUNDARY — live since Stage
+//   187A via the queued-split recv delivery boundary (`SharedKernel::
+//   complete_recv_boundary_user_copy` → recv_core boundary executors), which
+//   copies payload/meta AFTER the `with_cpu` broad borrow is dropped. It is
+//   never called while a broad `&mut KernelState` is live and never under
+//   `ipc_state_lock`.
+// - `copy_from_user_split` / `validate_user_access_for_asid_split`:
+//   M2_SEAM_HELPER_ONLY — no live caller yet (future recv/send conversions).
+//
+// Cap-transfer materialization (`materialize_received_message_cap_routed`)
+// remains a SEPARATE blocker for the `ipc_reply` conversion — the Stage 187A
+// boundary makes its seam form wireable next, but it is NOT wired yet (see
+// doc/KERNEL_UNLOCKING.md, Stage 187A).
 impl crate::runtime::SharedKernel {
     /// Rank-5 VM-seam mirror of `KernelState::validate_user_access_for_asid`.
     /// Read-only over `user_spaces`; returns the resolved physical address or a
@@ -640,7 +650,11 @@ impl crate::runtime::SharedKernel {
     /// Rank-5/6-seam mirror of `KernelState::copy_to_user`. No IPC/cap/scheduler
     /// lock is taken; performs NO COW fault-in (non-writable target ⇒
     /// `UserMemoryFault`, identical to the legacy path).
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// M2_SEAM_LIVE_187A_RECV_BOUNDARY — live since Stage 187A: the queued-split
+    /// recv delivery boundary copies payload/meta through this seam AFTER the
+    /// `with_cpu` broad borrow is dropped (never under `ipc_state_lock`, never
+    /// while a broad `&mut KernelState` is live).
     pub(crate) fn copy_to_user_split(
         &self,
         asid: Asid,

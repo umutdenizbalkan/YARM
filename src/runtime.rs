@@ -1042,12 +1042,19 @@ impl SharedKernel {
         // the recv fell through to the global `legacy_full_path`, never emitting
         // the queued-split markers. Binding the CPU here makes the user-ASID
         // receiver class resolve identically to the global path.
-        let result = match self.with_cpu(cpu, |state| {
+        // Stage 187A — recv delivery boundary split. Phase A (inside with_cpu,
+        // broad &mut KernelState live): plan + rank-3 dequeue + legacy cap
+        // materialization + deferred sender wake (§56 order) + kernel-register
+        // writeback. NO seam helper is called inside this closure. For a
+        // user-ASID receiver the closure returns a by-value PendingUserCopy
+        // snapshot instead of copying; the copy runs AFTER this closure
+        // returns, i.e. after the broad borrow is dead (Phase B, 186E seam).
+        let phase_a = match self.with_cpu(cpu, |state| {
             crate::kernel::syscall::try_split_recv_queued_plain_with_snapshot_locked(
                 state, frame, &snapshot,
             )
         }) {
-            Ok(result) => result,
+            Ok(phase_a) => phase_a,
             Err(_) => {
                 // current_cpu bind failed (e.g. CPU offline) — fall back to the
                 // unchanged global-lock path for the canonical handling.
@@ -1056,6 +1063,24 @@ impl SharedKernel {
                     cpu.0
                 );
                 return None;
+            }
+        };
+        let result = match phase_a {
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::Fallback => None,
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::Completed(r) => Some(r),
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingUserCopy(pending) => {
+                // The with_cpu closure has returned: the global SpinLock is
+                // released and no &mut KernelState is live. Phase B/C below may
+                // now safely use the data_ptr()-derived seams (Stage 186D4's
+                // aliasing blocker does not apply past this point).
+                crate::yarm_log!(
+                    "IPC_RECV_BOUNDARY_SNAPSHOT_OK receiver_tid={} cap={} reply={}",
+                    pending.receiver_tid,
+                    pending.materialized_cap.map(|c| c as i64).unwrap_or(-1),
+                    pending.is_reply_cap
+                );
+                crate::yarm_log!("IPC_RECV_BOUNDARY_GLOBAL_DROPPED_OK");
+                Some(self.complete_recv_boundary_user_copy(cpu, frame, &pending))
             }
         };
         match result {
@@ -1073,6 +1098,146 @@ impl SharedKernel {
             }
         }
         result
+    }
+
+    /// Stage 187A — Phase B (186E user-copy seam) + Phase C (frame/rollback/
+    /// fault completion) for a queued-split recv whose user writeback was
+    /// deferred past the global-lock boundary by
+    /// [`crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingUserCopy`].
+    ///
+    /// # Validation status
+    /// - M2_SEAM_LIVE_187A_RECV_BOUNDARY — first live seam call on the recv
+    ///   delivery path. The copies run through `copy_to_user_split` (VM rank 5
+    ///   + memory rank 6 seams) via the recv_core boundary executors; NO
+    ///   `ipc_state_lock`, NO capability lock, NO broad `&mut KernelState` is
+    ///   held during the copy.
+    ///
+    /// Ordering proof (§56/§58 preserved): Phase A already committed — in
+    /// order — the cap materialization, the sender wake
+    /// (`IPC_RECV_V2_SENDER_WAKE_ORDER_OK … phase=before_writeback`), and the
+    /// ret2 transfer-cap register. This function performs only the writeback
+    /// (meta-first for v2) and the §58 failure handling (cap rollback / user
+    /// fault record) via brief `with_cpu` re-entries — the same operations the
+    /// legacy in-lock path performed at the same point in the sequence.
+    ///
+    /// Failure semantics are byte-identical to the legacy in-lock arms:
+    /// undersized → cap rollback + `InvalidArgs`; v2 meta fault → cap rollback
+    /// + `PageFault`; payload fault → fault record + `Ok(())` (no rollback);
+    /// the message is consumed in every case (one-shot preserved).
+    fn complete_recv_boundary_user_copy(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        pending: &crate::kernel::recv_core::RecvBoundaryUserCopySnapshot,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::recv_core::{
+            RecvUserWritebackOutcome, RecvV2WritebackOutcome, RecvWritebackPlan,
+            execute_user_asid_plain_v2_writeback_boundary,
+            execute_user_asid_plain_writeback_boundary,
+        };
+        use crate::kernel::syscall::SyscallError;
+
+        // Phase C helper: §58 cap rollback under a brief global re-entry. The
+        // seam copy has already completed (or failed) — no seam call happens
+        // inside this closure.
+        let rollback_cap = |shared: &Self, frame: &mut TrapFrame| {
+            if let Some(cap_id) = pending.materialized_cap {
+                let _ = shared.with_cpu(cpu, |kernel| {
+                    kernel.rollback_materialized_recv_cap(
+                        pending.receiver_tid,
+                        crate::kernel::capabilities::CapId(cap_id),
+                        pending.is_reply_cap,
+                    );
+                });
+                crate::kernel::syscall::recv_boundary_clear_transfer_cap_ret(frame);
+                true
+            } else {
+                false
+            }
+        };
+
+        match pending.writeback {
+            RecvWritebackPlan::UserMemory { sender_tid, .. } => {
+                match execute_user_asid_plain_writeback_boundary(self, pending) {
+                    RecvUserWritebackOutcome::Ok => {
+                        let payload_len = pending.msg.as_slice().len();
+                        frame.set_ok(sender_tid, payload_len, frame.ret2());
+                        crate::yarm_log!("IPC_RECV_BOUNDARY_USER_COPY_SEAM_OK kind=user_plain");
+                        crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain");
+                        crate::yarm_log!("IPC_RECV_BOUNDARY_SPLIT_DONE result=ok");
+                        Ok(())
+                    }
+                    RecvUserWritebackOutcome::UndersizedBuffer => {
+                        // §58: rollback materialized cap (matches legacy in-lock arm).
+                        let _ = rollback_cap(self, frame);
+                        Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))
+                    }
+                    RecvUserWritebackOutcome::CopyFault { user_ptr } => {
+                        // No rollback on payload copy fault (§54/§58) — fault
+                        // record + frame error under a brief re-entry, identical
+                        // to the legacy record_user_fault call.
+                        let _ = self.with_cpu(cpu, |kernel| {
+                            crate::kernel::syscall::recv_boundary_record_user_fault(
+                                kernel, frame, user_ptr,
+                            );
+                        });
+                        Ok(())
+                    }
+                }
+            }
+            RecvWritebackPlan::UserMemoryV2 { .. } => {
+                match execute_user_asid_plain_v2_writeback_boundary(self, pending) {
+                    RecvV2WritebackOutcome::Ok => {
+                        let payload_len = pending.msg.as_slice().len();
+                        frame.set_ok(0, payload_len, frame.ret2());
+                        crate::yarm_log!("IPC_RECV_BOUNDARY_USER_COPY_SEAM_OK kind=user_plain_v2");
+                        crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain_v2");
+                        crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=ok");
+                        // Stage 156 IPC oracle: queued-split recv-v2 meta delivered
+                        // (marker relocated with the writeback in Stage 187A —
+                        // same live path, same meaning).
+                        crate::yarm_log!("IPC_RECV_V2_META_QUEUED_SPLIT_OK len=40");
+                        crate::yarm_log!("IPC_RECV_BOUNDARY_SPLIT_DONE result=ok");
+                        Ok(())
+                    }
+                    RecvV2WritebackOutcome::PayloadUndersized => {
+                        crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_undersized");
+                        if rollback_cap(self, frame) {
+                            // Stage 156 IPC oracle: rollback on queued-split undersize.
+                            crate::yarm_log!(
+                                "IPC_RECV_V2_ROLLBACK_OK site=queued_split_undersize reply={}",
+                                pending.is_reply_cap
+                            );
+                        }
+                        Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))
+                    }
+                    RecvV2WritebackOutcome::MetaCopyFault { .. } => {
+                        crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=meta_fault");
+                        if rollback_cap(self, frame) {
+                            // Stage 156 IPC oracle: rollback on queued-split meta fault.
+                            crate::yarm_log!(
+                                "IPC_RECV_V2_ROLLBACK_OK site=queued_split_meta reply={}",
+                                pending.is_reply_cap
+                            );
+                        }
+                        Err(TrapHandleError::Syscall(SyscallError::PageFault))
+                    }
+                    RecvV2WritebackOutcome::PayloadCopyFault { user_ptr } => {
+                        // No rollback on payload copy fault (§55/§58).
+                        crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_fault");
+                        let _ = self.with_cpu(cpu, |kernel| {
+                            crate::kernel::syscall::recv_boundary_record_user_fault(
+                                kernel, frame, user_ptr,
+                            );
+                        });
+                        Ok(())
+                    }
+                }
+            }
+            RecvWritebackPlan::KernelRegister { .. } => {
+                unreachable!("KernelRegister writeback completes in Phase A, never deferred")
+            }
+        }
     }
 
     /// # Validation status
