@@ -215,6 +215,24 @@ every other IPC path remain on the unchanged legacy global boundary. This stage 
 enable multi-dispatcher/AP user scheduling and does not fully retire the global lock. Guarded
 by `stage187a_ipc_recv_delivery_boundary_split`.
 
+### 0.9) Stage 187B (ORDINARY-CAP-TRANSFER-SEAM-LIVE-ON-RECV-BOUNDARY)
+
+First live use of the 186D2/186D3 cap-transfer seam. On the 187A queued-split recv boundary,
+ordinary (non-reply, non-shared-region) transferred caps to a **user** receiver are now
+materialized by the seam AFTER the broad borrow drops, not by the legacy in-lock router.
+Phase A (`phase_a_snapshot_ordinary_transfer`, under `with_cpu`) consumes the transfer envelope
+once (rank 3) and snapshots object/rights/cnode + delegation identity by value — no mint, no
+seam. Phase B/C (`SharedKernel::complete_recv_boundary_ordinary_cap`) mints via
+`materialize_received_message_cap_routed_with_delegation_split` (atomic cap↔memory mint +
+delegation link), commits the receiver-local CapId to `ret2`, applies the deferred sender wake
+(brief `with_cpu` re-entry), then runs the 186E user copy; a writeback failure rolls the cap
+back via `rollback_materialized_recv_cap`. No `ipc_state_lock`, no broad `&mut KernelState`,
+no seam call while the Phase A borrow is live (the seam symbol appears only in `runtime.rs`).
+Order preserved: materialize → wake → writeback. Reply caps, shared-region transfers, and
+kernel-register receivers stay on the unchanged legacy Phase-A path; blocked-waiter delivery
+is untouched. Does not enable multi-dispatcher and does not fully retire the global lock.
+Guarded by `stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

@@ -1151,6 +1151,53 @@ pub(crate) struct RecvBoundaryUserCopySnapshot {
     pub(crate) is_reply_cap: bool,
 }
 
+/// Stage 187B — by-value snapshot of an **ordinary** cap-transfer queued-split
+/// recv delivery whose cap materialization AND user writeback are BOTH deferred
+/// past the global-lock boundary, so the cap is minted through the Stage
+/// 186D2/186D3 cap-transfer seam (not the legacy in-lock router).
+///
+/// Produced by `try_split_recv_queued_plain_with_snapshot_locked` (Phase A,
+/// inside `with_cpu`) for a NON-shared-region ordinary transfer
+/// (`FLAG_CAP_TRANSFER`/`FLAG_CAP_TRANSFER_PLAIN`, non-reply) to a user-ASID
+/// receiver, AFTER the transfer envelope has been consumed once under
+/// `ipc_state_lock` (rank 3) and the source object/rights + receiver cnode
+/// resolved. It carries ONLY owned identity — no `&mut KernelState`, no borrows,
+/// and **no sender-local CapId as receiver authority**: `source_cap` is carried
+/// solely as the delegation-link parent edge (bookkeeping), never resolved-to-
+/// mint; the receiver-local CapId is freshly minted by the seam in Phase B.
+///
+/// The deferred sender wake (`wake_tid`) is applied in Phase B AFTER the seam
+/// mint and BEFORE the user writeback — preserving the §56/§58 order
+/// `materialize → wake → writeback` (the reason materialization is not done
+/// before the wake decision, per the Stage 187B contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecvBoundaryOrdinaryCapSnapshot {
+    /// Receiver's destination cnode (resolved in Phase A under the lock).
+    pub(crate) receiver_cnode: super::capabilities::CNodeId,
+    /// The transferred object identity (resolved from the consumed envelope's
+    /// source capability). Never a Reply object on this path.
+    pub(crate) object: CapObject,
+    /// Attenuated rights (the source capability's rights; the legacy grant's
+    /// `derive(source_rights)` is a no-op — byte-identical minted rights).
+    pub(crate) rights: super::capabilities::CapRights,
+    /// Source task TID — delegation-link parent owner (bookkeeping only).
+    pub(crate) source_tid: u64,
+    /// Source CapId — delegation-link parent edge (bookkeeping only; NEVER
+    /// receiver authority).
+    pub(crate) source_cap: CapId,
+    /// Deferred sender-waiter wake, applied in Phase B after the seam mint and
+    /// before the user writeback.
+    pub(crate) wake_tid: Option<ThreadId>,
+    /// Receiver ASID (Phase A resolution); `None` faults identically to legacy.
+    pub(crate) asid: Option<crate::kernel::vm::Asid>,
+    /// Receiver TID (delegation dest + rollback target).
+    pub(crate) receiver_tid: u64,
+    /// The dequeued message, by value (one-shot: envelope already consumed).
+    pub(crate) msg: Message,
+    /// The user writeback plan (`UserMemory` or `UserMemoryV2` only).
+    pub(crate) writeback: RecvWritebackPlan,
+}
+
 /// Stage 187A — Phase B sibling of [`execute_user_asid_plain_writeback`]
 /// running on the 186E user-copy seam AFTER the global-lock borrow is dead.
 ///

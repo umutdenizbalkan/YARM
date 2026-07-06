@@ -1634,6 +1634,15 @@ const STATIC_TID_UPPER_BOUND: u64 = INITIAL_DYNAMIC_TID - 1;
 pub(crate) use defs::*;
 pub use types::*;
 
+// Stage 187B: re-export the cap-transfer seam value types so the recv delivery
+// boundary (runtime.rs, post-`with_cpu`) can build a snapshot and call the
+// 186D2/186D3 seam. The seam *methods* on `SharedKernel` are already
+// `pub(crate)`; these re-exports only surface the by-value input/output types.
+pub(crate) use cap_transfer_delegation_split::TransferCapDelegation;
+pub(crate) use cap_transfer_materialize_split::{
+    CapTransferMaterializeOutcome, TransferCapSnapshot,
+};
+
 #[derive(Debug)]
 pub struct KernelState {
     // Lock ordering is documented in doc/KERNEL_LOCKING.md.

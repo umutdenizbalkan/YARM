@@ -376,6 +376,26 @@ Phase C (same live path; `stage159bcd_target_markers_are_kernel_emitted` re-home
 a literal kernel emission in either file). See `doc/KERNEL_UNLOCKING.md` (Stage 187A) and
 `doc/KERNEL_LOCKING.md §0.8`.
 
+**Stage 187B (ORDINARY-CAP-TRANSFER-SEAM-LIVE-ON-RECV-BOUNDARY) status — LIVE, DO NOT
+OVERCLAIM.** Ordinary (non-reply, non-shared-region) transferred caps received by a user task
+on the 187A queued-split boundary are now materialized through the 186D2/186D3 cap-transfer
+seam — the first live use of that seam (`M2_SEAM_LIVE_187B_CAP_TRANSFER`). Phase A
+(`phase_a_snapshot_ordinary_transfer`, under `with_cpu`) consumes the transfer envelope once
+and snapshots object/rights/cnode + delegation identity by value (no mint, no seam;
+`source_cap` is the delegation edge only, never receiver authority). Phase B/C
+(`SharedKernel::complete_recv_boundary_ordinary_cap`, after the borrow drops): seam mint
+(atomic cap↔memory mint + delegation link) → commit receiver-local CapId → deferred sender
+wake → 186E user copy → §58 rollback via `rollback_materialized_recv_cap`. Order preserved:
+materialize → wake → writeback. Scope honesty: does **not** enable multi-dispatcher/AP user
+scheduling, does **not** fully retire the global lock, **reply-cap materialization remains
+deferred** (rank inversion — reply caps stay on the legacy in-lock router), and it does not
+convert `ipc_reply`/`ipc_send`/`ipc_call`/blocked-waiter delivery (shared-region and
+kernel-register cap transfers also stay legacy). The seam must be called ONLY in `runtime.rs`
+post-boundary, never in `syscall.rs` Phase A (186D4 aliasing). Markers
+`CAP_TRANSFER_BOUNDARY_SEAM_*` fire only on the converted ordinary path. Pinned by
+`stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary`. See `doc/KERNEL_UNLOCKING.md`
+(Stage 187B) and `doc/KERNEL_LOCKING.md §0.9`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

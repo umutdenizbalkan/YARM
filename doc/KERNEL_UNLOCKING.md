@@ -7750,6 +7750,88 @@ authority; no seam in the Phase A closure; boundary executors on `&SharedKernel`
 source; no forbidden markers; end-to-end functional: user recv delivered via the boundary,
 one-shot consumption, undersized → real `InvalidArgs`; kernel receiver completes in Phase A).
 
+**Stage 187B (ORDINARY-CAP-TRANSFER-SEAM-LIVE-ON-RECV-BOUNDARY) — DONE (LIVE, ordinary
+cap-transfer materialization moved onto the 186D2/186D3 seam for the 187A queued-split
+boundary).** This is the **first live use of the cap-transfer materialization + delegation
+seam** (`M2_SEAM_LIVE_187B_CAP_TRANSFER`). It converts ordinary (non-reply, non-shared-region)
+transferred caps delivered to a **user** receiver on the queued-split recv boundary from the
+legacy in-lock router to the post-boundary seam.
+
+*Reachability.* A userspace `ipc_send` of a `FLAG_CAP_TRANSFER` message to a buffered endpoint
+with no blocked waiter **enqueues** it (Stage 4E: `ipc_try_send_queued_plain_endpoint_only` →
+`Enqueued`, envelope stashed unbound), so a later `ipc_recv` receives it through the
+queued-split path — this is the live path 187B converts. (Reply caps and cap transfers to a
+*blocked* receiver go through `complete_blocked_recv_for_waiter`, which is out of scope.)
+
+*Queued-recv cap-transfer inventory:*
+
+| Step | Where | Class |
+|---|---|---|
+| envelope consume (`take_transfer_envelope`, rank 3) | Phase A, `phase_a_snapshot_ordinary_transfer` | `ordinary_cap_transfer_live_on_boundary` |
+| ordinary object materialize | Phase B seam (`materialize_received_message_cap_routed_with_delegation_split`) | `ordinary_cap_transfer_live_on_boundary` |
+| delegation-link record | inside the seam (186D3) | `ordinary_cap_transfer_live_on_boundary` |
+| sender wake | Phase B, after mint, before writeback | `ordinary_cap_transfer_live_on_boundary` |
+| return metadata (`encode_transfer_cap_ret`) | Phase B, after mint | `ordinary_cap_transfer_live_on_boundary` |
+| user writeback | Phase B/C, 186E seam (from 187A) | `ordinary_cap_transfer_live_on_boundary` |
+| reply-cap materialization | legacy Phase-A router (unchanged) | `defer_reply_cap_ipc_rank_inversion` |
+| shared-region (`OPCODE_SHARED_MEM`) transfer | legacy Phase-A router (mapping obligation) | `legacy_authoritative_runtime` |
+| kernel-register receiver cap transfer | legacy Phase-A router (no boundary to cross) | `legacy_authoritative_runtime` |
+| blocked-waiter cap delivery | `complete_blocked_recv_for_waiter` | `defer_blocked_waiter_delivery` |
+
+*Implemented.* `RecvQueuedSplitPhaseA::PendingOrdinaryCapUserCopy` +
+`RecvBoundaryOrdinaryCapSnapshot` (by-value: `receiver_cnode`, `object`, `rights`,
+`source_tid`, `source_cap`, `wake_tid`, `asid`, `receiver_tid`, `msg`, `writeback` — **no
+`&mut KernelState`, no borrows, no sender-local CapId as authority**; `source_cap` is the
+delegation parent edge only). Phase A helper `phase_a_snapshot_ordinary_transfer` consumes the
+envelope once + resolves object/rights/cnode (no mint). Phase B/C
+`SharedKernel::complete_recv_boundary_ordinary_cap`: seam mint → `encode_transfer_cap_ret` →
+deferred wake → 186E copy → §58 rollback via `rollback_materialized_recv_cap`.
+
+*Exact ordinary live path converted.* Non-shared-region `FLAG_CAP_TRANSFER`/`_PLAIN` (non-reply)
+to a `UserMemory`/`UserMemoryV2` receiver on `try_split_ipc_recv_queued_plain_into_frame`.
+
+*Deferred reply-cap path + blocker.* Reply caps (`FLAG_REPLY_CAP`) stay on the legacy Phase-A
+router — the `reply_cap_ipc_rank_inversion` blocker (post-mint IPC rank-3 waiter record) is
+unchanged; **reply-cap materialization remains deferred**.
+
+*Snapshot / envelope one-shot proof.* The envelope is taken exactly once in Phase A
+(`take_transfer_envelope`, rank 3) to build the by-value snapshot; the seam materializes from
+the snapshot with no envelope access; a second recv finds nothing (functional test). A mint or
+copy failure leaves the envelope consumed — identical to the legacy arm.
+
+*Atomic-mint / delegation / rollback proof.* The seam routes through the Stage 186D-proper
+atomic mint (functional test: object `cap_refcount` +1) and records the delegation link
+(functional test: revoking the source cap removes the delegated receiver cap). A writeback
+failure rolls the cap back via `rollback_materialized_recv_cap` (revoke + delegation removal +
+refcount drop) — the same §58 rollback the legacy path used.
+
+*Aliasing proof.* The seam mint runs only in `complete_recv_boundary_ordinary_cap`, i.e. AFTER
+the `with_cpu` closure returned; Phase A (`syscall.rs`, under the borrow) calls no seam
+(guard-pinned: the seam symbol appears only in `runtime.rs`, never in `syscall.rs`). The wake
+and rollback use brief `with_cpu` re-entries that call no seam.
+
+*Sender-wake ordering proof.* Order is materialize → wake → writeback: the boundary method
+emits `CAP_TRANSFER_BOUNDARY_SEAM_ATOMIC_MINT_OK` before
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK … phase=before_writeback` before the
+`complete_recv_boundary_user_copy` writeback (guard-pinned by source position). Plain and
+reply/kernel paths are byte-unchanged from 187A, so `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`,
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`, and `IPC_RECV_V2_META_QUEUED_SPLIT_OK` are
+untouched.
+
+*Markers.* `CAP_TRANSFER_BOUNDARY_SEAM_BEGIN/SNAPSHOT_OK/ATOMIC_MINT_OK/DELEGATION_OK/DONE
+result=ok` on the converted ordinary path only — never for reply caps or legacy paths.
+
+`M2_SEAM_LIVE_187B_CAP_TRANSFER`. Scope honesty: this stage **does not enable multi-dispatcher**
+/AP user scheduling; **does not fully retire the global lock** (Phase A still runs under it,
+and reply/shared/kernel/blocked-waiter cap paths are unchanged); **reply-cap materialization
+remains deferred** (rank inversion); and it does not convert `ipc_reply`, `ipc_send`,
+`ipc_call`, or blocked-waiter delivery. Guarded by
+`stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary` (functional: queued mem-object +
+endpoint cap transfers delivered via the boundary seam, atomic refcount, delegation/revoke
+propagation, one-shot; source: Phase-A-consumes-only-no-mint, seam-only-post-boundary,
+boundary-method-no-IPC-lock, materialize→wake→writeback order, reply/shared excluded, docs
+honest).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

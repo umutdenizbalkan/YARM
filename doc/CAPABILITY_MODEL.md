@@ -223,6 +223,22 @@ mechanical follow-on. No cap is ever materialized under `ipc_state_lock`; no
 sender-local CapId crosses the boundary as authority. Guarded by
 `stage187a_ipc_recv_delivery_boundary_split`.
 
+**Cap-transfer seam LIVE on the recv boundary (Stage 187B).** Ordinary
+(non-reply, non-shared-region) transferred caps received on the 187A queued-split
+boundary by a user task are now materialized through the 186D2/186D3 seam — the
+first live use of the cap-transfer materialization + delegation seam. Phase A
+(under the lock) consumes the transfer envelope once and snapshots
+object+rights+cnode + the delegation identity by value (`source_cap` is the
+delegation parent edge only, never receiver authority); Phase B (after the borrow
+drops) runs `materialize_received_message_cap_routed_with_delegation_split`
+(atomic cap↔memory mint + delegation link), commits the fresh receiver-local
+CapId, wakes the sender, then copies via the 186E seam. A writeback failure rolls
+the cap back (revoke + delegation removal + refcount drop). Reply caps stay on the
+legacy in-lock router (`reply_cap_ipc_rank_inversion` — reply-cap materialization
+remains deferred); shared-region and kernel-register receivers also stay legacy.
+No cap is materialized under `ipc_state_lock`. Guarded by
+`stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

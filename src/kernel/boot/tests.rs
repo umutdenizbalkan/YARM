@@ -48084,6 +48084,384 @@ mod stage187a_ipc_recv_delivery_boundary_split {
 }
 
 // ===========================================================================
+// Stage 187B (ORDINARY-CAP-TRANSFER-SEAM-LIVE-ON-RECV-BOUNDARY) — LIVE wiring
+// of the 186D2/186D3 cap-transfer seam on the Stage 187A queued-split recv
+// boundary, for ordinary (non-reply, non-shared-region) transferred caps to a
+// user receiver.
+//
+// Phase A (under with_cpu): consume the transfer envelope ONCE, snapshot
+// object/rights/cnode + delegation identity by value; NO materialize, NO wake,
+// NO seam call. Phase B/C (after borrow drops, &SharedKernel): seam materialize
+// (atomic mint + delegation link) -> encode ret2 -> deferred wake -> 186E user
+// copy -> §58 rollback on failure. Reply caps, shared-region transfers, and
+// kernel-register receivers stay on the unchanged legacy Phase-A path.
+//
+// Functional tests drive the REAL SharedKernel entry with a queued cap-transfer
+// message. Source guards pin: Phase A helper only consumes/resolves (no mint);
+// the seam materialize lives only in runtime.rs (never in the with_cpu closure
+// / under-lock files); the boundary method uses no IPC lock; delegation +
+// rollback present; reply arm not routed through the ordinary seam.
+// ===========================================================================
+#[cfg(test)]
+mod stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const CPU0: CpuId = CpuId(0);
+
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // Build a booted kernel where a user task 1 has: a bound ASID with a mapped
+    // writable recv buffer at 0x4000, a granted recv cap, and a QUEUED ordinary
+    // cap-transfer message (memory-object cap) waiting on a buffered endpoint.
+    // Returns (SharedKernel, recv_cap_task1, mem_id, mem_cap_task0, cnode0, cnode1).
+    fn queued_mem_cap_transfer_state() -> (SharedKernel, CapId, u64, CapId, CNodeId, CNodeId) {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (asid, _map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(1, asid).expect("bind");
+        let (mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        // A second mem object gives task 1 a mappable buffer page.
+        let (_bid, buf_cap) = state.alloc_anonymous_memory_object().expect("buf");
+        let buf_cap_t1 = state
+            .grant_capability_task_to_task(0, buf_cap, 1)
+            .expect("grant buf");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint_obj = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+        let recv_cap_t1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("grant recv");
+        let cnode0 = state.current_task_cnode().expect("cnode0");
+        let cnode1 = state.task_cnode(1).expect("cnode1");
+        // Reproduce exactly what the userspace `handle_ipc_send` does for a queued
+        // cap transfer (no blocked waiter): stash an UNBOUND transfer envelope,
+        // then plain `ipc_send` the FLAG_CAP_TRANSFER message -> it lands on the
+        // buffered endpoint queue (Stage 4E enqueued cap transfer).
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint_obj, None, None)
+            .expect("stash unbound envelope");
+        let msg = Message::with_header(0, 0x55, Message::FLAG_CAP_TRANSFER, Some(handle), b"xfer")
+            .expect("cap-transfer msg");
+        state.ipc_send(send_cap, msg).expect("enqueue cap transfer");
+        // Switch to task 1 and map its recv buffer page.
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch");
+        assert_eq!(state.current_tid(), Some(1));
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                buf_cap_t1,
+                VirtAddr(0x4000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+                },
+            )
+            .expect("map buffer");
+        let shared = SharedKernel::new(state);
+        (shared, recv_cap_t1, mem_id, mem_cap, cnode0, cnode1)
+    }
+
+    fn recv_frame(recv_cap: CapId) -> TrapFrame {
+        TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [
+                recv_cap.0 as usize,
+                0x4000,
+                crate::kernel::ipc::Message::MAX_PAYLOAD,
+                0,
+                0,
+                0,
+            ],
+        )
+    }
+
+    fn cap_refcount(shared: &SharedKernel, id: u64) -> u32 {
+        shared.with(|k| {
+            let slot = k.memory_object_slot_by_id(id).expect("slot");
+            k.memory.memory_objects[slot].expect("obj").cap_refcount
+        })
+    }
+
+    // Queued ordinary memory-object cap transfer is delivered through the
+    // boundary seam: the receiver-local cap is minted (atomic refcount bumped),
+    // the delegation link is recorded (revoke propagation), the payload lands in
+    // user memory, and the transfer envelope is consumed exactly once.
+    #[test]
+    fn stage187b_queued_mem_cap_transfer_uses_boundary_seam() {
+        let (shared, recv_cap_t1, mem_id, mem_cap0, cnode0, cnode1) =
+            queued_mem_cap_transfer_state();
+        let base_refcount = cap_refcount(&shared, mem_id);
+
+        let mut frame = recv_frame(recv_cap_t1);
+        let result = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "queued ordinary cap transfer must be serviced via the boundary seam"
+        );
+        assert_eq!(frame.ret1(), b"xfer".len(), "payload delivered");
+
+        // Payload copied into user memory (via the 186E seam).
+        let copied = shared
+            .with(|k| k.copy_from_user(k.task_asid(1).expect("asid"), VirtAddr(0x4000), 4))
+            .expect("read back");
+        assert_eq!(&copied[..4], b"xfer");
+
+        // A fresh receiver-local cap was minted into task 1's cnode (ret2 carries it).
+        let local_cap = crate::kernel::capabilities::CapId(frame.ret2() as u64);
+        let resolved = shared
+            .with(|k| k.capability_for_cnode(cnode1, local_cap))
+            .expect("minted receiver cap resolvable");
+        assert!(
+            matches!(resolved.object, CapObject::MemoryObject { id } if id == mem_id),
+            "receiver cap must reference the transferred memory object"
+        );
+        // Atomic mint bumped cap_refcount for the object (+1 vs pre-delivery).
+        assert_eq!(
+            cap_refcount(&shared, mem_id),
+            base_refcount + 1,
+            "boundary seam must use the atomic mint (refcount +1)"
+        );
+
+        // Delegation link recorded: revoking the SOURCE cap (task 0) propagates
+        // to the delegated receiver cap (task 1).
+        shared
+            .with(|k| k.revoke_capability_in_cnode(cnode0, mem_cap0))
+            .expect("revoke source");
+        assert!(
+            shared.with(|k| k.capability_for_cnode(cnode1, local_cap).is_none()),
+            "revoking the source cap must remove the delegated receiver cap (delegation recorded)"
+        );
+
+        // One-shot: the envelope/message is consumed — a second recv finds nothing.
+        let mut frame2 = recv_frame(recv_cap_t1);
+        let second = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame2);
+        assert_eq!(second, None, "envelope/message must not be reusable");
+    }
+
+    // Queued ordinary ENDPOINT cap transfer (non-memory object) is delivered
+    // through the boundary seam and resolves in the receiver cnode.
+    #[test]
+    fn stage187b_queued_endpoint_cap_transfer_uses_boundary_seam() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (asid, _m) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(1, asid).expect("bind");
+        let (_bid, buf_cap) = state.alloc_anonymous_memory_object().expect("buf");
+        let buf_cap_t1 = state
+            .grant_capability_task_to_task(0, buf_cap, 1)
+            .expect("grant buf");
+        // The endpoint cap to be transferred (a second endpoint's send cap).
+        let (_e2, xfer_send_cap, _r2) = state.create_endpoint(2).expect("endpoint2");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint_obj = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+        let recv_cap_t1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("grant recv");
+        let cnode1 = state.task_cnode(1).expect("cnode1");
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), xfer_send_cap, endpoint_obj, None, None)
+            .expect("stash unbound envelope");
+        let msg = Message::with_header(0, 0x56, Message::FLAG_CAP_TRANSFER, Some(handle), b"ep")
+            .expect("cap-transfer msg");
+        state
+            .ipc_send(send_cap, msg)
+            .expect("enqueue ep cap transfer");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                buf_cap_t1,
+                VirtAddr(0x4000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+                },
+            )
+            .expect("map buffer");
+        let shared = SharedKernel::new(state);
+
+        let mut frame = recv_frame(recv_cap_t1);
+        let result = shared.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "queued endpoint cap transfer must be serviced"
+        );
+        let local_cap = crate::kernel::capabilities::CapId(frame.ret2() as u64);
+        let resolved = shared
+            .with(|k| k.capability_for_cnode(cnode1, local_cap))
+            .expect("minted endpoint cap resolvable");
+        assert!(
+            matches!(resolved.object, CapObject::Endpoint { .. }),
+            "receiver cap must reference the transferred endpoint object"
+        );
+    }
+
+    // Guard: the Phase A snapshot helper only CONSUMES the envelope and RESOLVES
+    // identity — it never mints (no seam, no grant) while the broad borrow is live.
+    #[test]
+    fn stage187b_phase_a_helper_consumes_only_no_mint() {
+        let body = SYSCALL_SRC
+            .split("fn phase_a_snapshot_ordinary_transfer(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("phase_a_snapshot_ordinary_transfer must exist");
+        assert!(
+            body.contains("take_transfer_envelope") && body.contains("resolve_capability_for_task"),
+            "Phase A helper must consume the envelope and resolve the source identity"
+        );
+        for forbidden in [
+            "materialize_received_cap_snapshot",
+            "materialize_received_message_cap_routed_with_delegation_split",
+            "mint_capability",
+            "grant_task_to_task",
+            "grant_capability_task_to_task",
+            "record_cap_delegation_link_split",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "Phase A helper must NOT materialize/mint (`{forbidden}`) — that is deferred to \
+                 the post-boundary seam"
+            );
+        }
+    }
+
+    // Guard: the seam materialization for the ordinary path lives ONLY in
+    // runtime.rs (post-boundary) and uses the delegation seam + atomic mint;
+    // syscall.rs (Phase A, under lock) never calls it.
+    #[test]
+    fn stage187b_seam_materialize_only_post_boundary() {
+        assert!(
+            RUNTIME_SRC.contains("materialize_received_message_cap_routed_with_delegation_split"),
+            "runtime.rs (post-boundary) must materialize the ordinary cap via the 186D2/186D3 seam"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("materialize_received_message_cap_routed_with_delegation_split"),
+            "syscall.rs Phase A (under the broad borrow) must NOT call the seam (186D4 aliasing)"
+        );
+    }
+
+    // Guard: the runtime boundary method takes no IPC lock and forms no broad
+    // &mut KernelState directly; the only KernelState access is via with_cpu
+    // re-entries (wake / rollback) that call no seam.
+    #[test]
+    fn stage187b_boundary_method_no_ipc_lock() {
+        let body = RUNTIME_SRC
+            .split("fn complete_recv_boundary_ordinary_cap(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    /// # Validation status").next())
+            .or_else(|| {
+                RUNTIME_SRC
+                    .split("fn complete_recv_boundary_ordinary_cap(")
+                    .nth(1)
+                    .and_then(|rest| rest.split("\n    fn ").next())
+            })
+            .expect("complete_recv_boundary_ordinary_cap body");
+        let code = code_only(body);
+        for forbidden in ["with_ipc_split_mut", "with_ipc_state", "ipc_state_lock"] {
+            assert!(
+                !code.contains(forbidden),
+                "boundary ordinary-cap method must not touch IPC (`{forbidden}`)"
+            );
+        }
+        // The order marker fires before the writeback, after the seam mint.
+        assert!(
+            code.contains("CAP_TRANSFER_BOUNDARY_SEAM_ATOMIC_MINT_OK")
+                && code.contains("CAP_TRANSFER_BOUNDARY_SEAM_DELEGATION_OK")
+                && code.contains("CAP_TRANSFER_BOUNDARY_SEAM_DONE result=ok"),
+            "boundary method must emit the ordinary seam mint/delegation/done markers"
+        );
+    }
+
+    // Guard: §56/§58 order — in the boundary method the atomic-mint marker
+    // precedes the sender-wake marker, which precedes the writeback completion.
+    #[test]
+    fn stage187b_materialize_before_wake_before_writeback() {
+        let body = RUNTIME_SRC
+            .split("fn complete_recv_boundary_ordinary_cap(")
+            .nth(1)
+            .expect("method body");
+        let mint = body
+            .find("CAP_TRANSFER_BOUNDARY_SEAM_ATOMIC_MINT_OK")
+            .expect("mint marker");
+        let wake = body
+            .find("IPC_RECV_V2_SENDER_WAKE_ORDER_OK")
+            .expect("wake marker");
+        let copy = body
+            .find("complete_recv_boundary_user_copy")
+            .expect("writeback call");
+        assert!(
+            mint < wake && wake < copy,
+            "order must be materialize -> wake -> writeback (§56/§58)"
+        );
+    }
+
+    // Guard: reply caps are NOT routed through the ordinary boundary seam — the
+    // Phase A gate excludes reply-cap and shared-region messages.
+    #[test]
+    fn stage187b_reply_and_shared_excluded_from_ordinary_path() {
+        let gate = SYSCALL_SRC
+            .split("Stage 187B — ordinary (non-reply, non-shared-region) cap transfer")
+            .nth(1)
+            .and_then(|rest| rest.split("phase_a_snapshot_ordinary_transfer(").next())
+            .expect("187B gate");
+        assert!(
+            gate.contains("!is_reply_cap") && gate.contains("!= OPCODE_SHARED_MEM"),
+            "the ordinary-seam gate must exclude reply-cap and shared-region transfers"
+        );
+        assert!(
+            gate.contains("is_user_writeback"),
+            "the ordinary-seam gate must apply only to user-receiver writebacks"
+        );
+    }
+
+    // Docs record 187B honestly.
+    #[test]
+    fn stage187b_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 187B"),
+            "docs must document Stage 187B"
+        );
+        for required in [
+            "does not enable multi-dispatcher",
+            "does not fully retire the global lock",
+            "reply-cap materialization remains deferred",
+        ] {
+            assert!(
+                UNLOCK_DOC.contains(required),
+                "docs must state 187B `{required}`"
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

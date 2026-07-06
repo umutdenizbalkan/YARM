@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::boot::{IpcEndpointRecvResult, IpcSchedulerPlan, KernelError, KernelState};
-use super::capabilities::{CapId, CapObject, CapRights};
+use super::capabilities::{CNodeId, CapId, CapObject, CapRights};
 use super::ipc::{Message, pack_register_payload};
 use super::trap::FaultAccess;
 use super::trapframe::TrapFrame;
@@ -825,6 +825,52 @@ pub(crate) enum RecvQueuedSplitPhaseA {
     /// (186E seam copy) and Phase C (frame/rollback/fault completion) after
     /// the global-lock borrow is dropped.
     PendingUserCopy(crate::kernel::recv_core::RecvBoundaryUserCopySnapshot),
+    /// Stage 187B — an ordinary (non-reply, non-shared-region) cap-transfer to a
+    /// user receiver: the envelope has been consumed once under the lock and the
+    /// object/rights/cnode + delegation identity snapshotted by value, but the
+    /// cap is NOT yet materialized and the sender is NOT yet woken. The caller
+    /// must, after dropping the borrow: materialize the cap via the 186D2/186D3
+    /// seam, wake the sender, then run the 186E user copy — in that order.
+    PendingOrdinaryCapUserCopy(crate::kernel::recv_core::RecvBoundaryOrdinaryCapSnapshot),
+}
+
+/// Stage 187B — Phase A helper: for a NON-shared-region ordinary transfer,
+/// consume the transfer envelope ONCE under `ipc_state_lock` (rank 3) and
+/// resolve the source object + rights and the receiver cnode, returning the
+/// by-value identity the post-boundary seam needs. This performs the exact
+/// envelope-consume + source-resolve the legacy D1 arm
+/// (`materialize_split_transfer_cap_equivalent`) does in its Phase A, but stops
+/// BEFORE the mint so the mint can run on the seam after the borrow drops.
+///
+/// Returns the same real errors the legacy arm would (`InvalidCapability` for a
+/// missing/dead envelope or missing receiver cnode; the source-cap resolution
+/// error otherwise). Never a seam call — pure `&mut KernelState` reads/consume.
+fn phase_a_snapshot_ordinary_transfer(
+    kernel: &mut KernelState,
+    raw_handle: u64,
+    endpoint: CapObject,
+    receiver_tid: u64,
+) -> Result<(CapObject, CapRights, u64, CapId, CNodeId), SyscallError> {
+    let envelope = kernel
+        .take_transfer_envelope(
+            raw_handle,
+            endpoint,
+            crate::kernel::ipc::ThreadId(receiver_tid),
+        )
+        .ok_or(SyscallError::InvalidCapability)?;
+    let source_capability = kernel
+        .resolve_capability_for_task(envelope.source_tid.0, envelope.source_cap)
+        .map_err(SyscallError::from)?;
+    let receiver_cnode = kernel
+        .task_cnode(receiver_tid)
+        .ok_or(SyscallError::InvalidCapability)?;
+    Ok((
+        source_capability.object,
+        source_capability.rights(),
+        envelope.source_tid.0,
+        envelope.source_cap,
+        receiver_cnode,
+    ))
 }
 
 pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
@@ -893,6 +939,61 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
             // ipc_state_lock already released; capability lock (rank 4) is safe.
             let receiver_tid = snapshot.requester_tid;
             let is_reply_cap = (delivery.msg.flags & Message::FLAG_REPLY_CAP) != 0;
+
+            // Stage 187B — ordinary (non-reply, non-shared-region) cap transfer
+            // to a USER receiver: defer the cap materialization to the
+            // post-boundary 186D2/186D3 seam instead of the legacy in-lock
+            // router. Consume the envelope ONCE here under the lock and snapshot
+            // the object/rights/cnode + delegation identity by value; the seam
+            // mint, the sender wake, and the user copy all run after the broad
+            // borrow drops, in the order materialize → wake → writeback.
+            //
+            // Reply caps (IPC rank inversion), shared-region transfers (mapping
+            // obligation), and kernel-register receivers (no boundary crossing —
+            // nothing to defer) stay on the unchanged legacy Phase-A path below.
+            let is_user_writeback = matches!(
+                delivery.writeback,
+                RecvWritebackPlan::UserMemory { .. } | RecvWritebackPlan::UserMemoryV2 { .. }
+            );
+            if is_user_writeback
+                && !is_reply_cap
+                && delivery.msg.opcode != OPCODE_SHARED_MEM
+                && let Some(plan) = delivery.cap_transfer
+                && !plan.is_reply_cap
+            {
+                match phase_a_snapshot_ordinary_transfer(
+                    kernel,
+                    plan.raw_handle,
+                    snapshot.endpoint,
+                    receiver_tid,
+                ) {
+                    Ok((object, rights, source_tid, source_cap, receiver_cnode)) => {
+                        let asid = kernel.task_asid(receiver_tid);
+                        let wake_tid = match delivery.scheduler {
+                            RecvSchedulerWakePlan::WakeSender(t) => Some(t),
+                            RecvSchedulerWakePlan::None => None,
+                        };
+                        return RecvQueuedSplitPhaseA::PendingOrdinaryCapUserCopy(
+                            crate::kernel::recv_core::RecvBoundaryOrdinaryCapSnapshot {
+                                receiver_cnode,
+                                object,
+                                rights,
+                                source_tid,
+                                source_cap,
+                                wake_tid,
+                                asid,
+                                receiver_tid,
+                                msg: delivery.msg,
+                                writeback: delivery.writeback,
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        return RecvQueuedSplitPhaseA::Completed(Err(TrapHandleError::Syscall(e)));
+                    }
+                }
+            }
+
             let materialized_cap: Option<u64> = if let Some(_plan) = delivery.cap_transfer {
                 let endpoint = snapshot.endpoint;
                 // Stage 104 / D1: routed — supported transfer-cap messages go
@@ -1024,6 +1125,17 @@ pub(crate) fn recv_boundary_record_user_fault(
 /// (frame, None)` the in-lock rollback arms performed. Pure frame operation.
 pub(crate) fn recv_boundary_clear_transfer_cap_ret(frame: &mut TrapFrame) {
     let _ = encode_transfer_cap_ret(frame, None);
+}
+
+/// Stage 187B — Phase B bridge: commit the receiver-local transfer-cap CapId to
+/// the return register, identical to the legacy `encode_transfer_cap_ret(frame,
+/// local_cap)` the in-lock cap arm performed. Pure frame operation (no seam, no
+/// lock); returns the same `Err` the legacy encode would on an encoding failure.
+pub(crate) fn recv_boundary_encode_transfer_cap_ret(
+    frame: &mut TrapFrame,
+    local_cap: Option<u64>,
+) -> Result<(), SyscallError> {
+    encode_transfer_cap_ret(frame, local_cap)
 }
 
 fn handle_vm_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {

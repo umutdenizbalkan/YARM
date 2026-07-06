@@ -1082,6 +1082,13 @@ impl SharedKernel {
                 crate::yarm_log!("IPC_RECV_BOUNDARY_GLOBAL_DROPPED_OK");
                 Some(self.complete_recv_boundary_user_copy(cpu, frame, &pending))
             }
+            crate::kernel::syscall::RecvQueuedSplitPhaseA::PendingOrdinaryCapUserCopy(pending) => {
+                // Stage 187B — the global lock is released; materialize the
+                // ordinary transferred cap through the 186D2/186D3 seam, wake the
+                // sender, then run the 186E user copy.
+                crate::yarm_log!("IPC_RECV_BOUNDARY_GLOBAL_DROPPED_OK");
+                Some(self.complete_recv_boundary_ordinary_cap(cpu, frame, pending))
+            }
         };
         match result {
             Some(Ok(())) => {
@@ -1238,6 +1245,133 @@ impl SharedKernel {
                 unreachable!("KernelRegister writeback completes in Phase A, never deferred")
             }
         }
+    }
+
+    /// Stage 187B — Phase B/C for an ordinary (non-reply, non-shared-region)
+    /// cap transfer to a user receiver on the queued-split recv boundary.
+    ///
+    /// # Validation status
+    /// - M2_SEAM_LIVE_187B_CAP_TRANSFER — the FIRST live use of the Stage
+    ///   186D2/186D3 cap-transfer materialization + delegation seam on a real
+    ///   runtime path. The mint runs through the Stage 186D-proper atomic
+    ///   cap↔memory mint and records the delegation link; NO `ipc_state_lock`,
+    ///   NO broad `&mut KernelState`, NO seam call while the Phase A borrow was
+    ///   live (this runs entirely AFTER the `with_cpu` closure returned).
+    ///
+    /// Order (materialize → wake → writeback, §56/§58 preserved):
+    ///   1. materialize the ordinary cap via
+    ///      `materialize_received_message_cap_routed_with_delegation_split`
+    ///      (atomic mint + delegation link + rollback-on-delegation-failure),
+    ///   2. commit the receiver-local CapId to the transfer-cap return register,
+    ///   3. apply the deferred sender wake (brief `with_cpu` re-entry — no seam),
+    ///   4. run the 186E user copy and §58 writeback/rollback completion (shared
+    ///      with the plain boundary path).
+    ///
+    /// The receiver-local CapId is freshly minted by the seam; the source CapId
+    /// is used ONLY as the delegation-link parent edge, never as authority. On a
+    /// writeback failure the cap is rolled back via `rollback_materialized_recv_cap`
+    /// (revoke + delegation-link removal + refcount drop), exactly as the legacy
+    /// §58 path. The transfer envelope was consumed once in Phase A (one-shot).
+    fn complete_recv_boundary_ordinary_cap(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+        pending: crate::kernel::recv_core::RecvBoundaryOrdinaryCapSnapshot,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::boot::{
+            CapTransferMaterializeOutcome, TransferCapDelegation, TransferCapSnapshot,
+        };
+        use crate::kernel::syscall::SyscallError;
+
+        crate::yarm_log!(
+            "CAP_TRANSFER_BOUNDARY_SEAM_BEGIN kind=ordinary receiver_tid={}",
+            pending.receiver_tid
+        );
+
+        let snap = TransferCapSnapshot {
+            receiver_cnode: pending.receiver_cnode,
+            object: pending.object,
+            rights: pending.rights,
+        };
+        let delegation = TransferCapDelegation {
+            source_tid: pending.source_tid,
+            source_cap: pending.source_cap,
+            dest_tid: pending.receiver_tid,
+        };
+        crate::yarm_log!("CAP_TRANSFER_BOUNDARY_SEAM_SNAPSHOT_OK kind=ordinary");
+
+        // Step 1 — seam mint (atomic cap↔memory mint) + delegation link. This is
+        // the first live seam materialization; the broad borrow is dead.
+        let local_cap = match self
+            .materialize_received_message_cap_routed_with_delegation_split(snap, Some(delegation))
+        {
+            Ok(CapTransferMaterializeOutcome::Materialized(cap)) => {
+                crate::yarm_log!(
+                    "CAP_TRANSFER_BOUNDARY_SEAM_ATOMIC_MINT_OK kind=ordinary local_cap={}",
+                    cap.0
+                );
+                crate::yarm_log!("CAP_TRANSFER_BOUNDARY_SEAM_DELEGATION_OK kind=ordinary");
+                cap.0
+            }
+            Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => {
+                // Cannot occur: ordinary (non-reply) objects only reach here. If
+                // it somehow did, surface a real error rather than silently drop.
+                crate::yarm_log!(
+                    "CAP_TRANSFER_BOUNDARY_SEAM_DEFERRED reason=unexpected_reply_object"
+                );
+                return Err(TrapHandleError::Syscall(SyscallError::WrongObject));
+            }
+            Err(e) => {
+                // Same real error the legacy router would raise (CapabilityFull,
+                // WrongObject, StaleCapability, MissingRight, …). The envelope was
+                // already consumed in Phase A — identical to the legacy arm, whose
+                // materialize failure also leaves the envelope consumed.
+                return Err(TrapHandleError::Syscall(SyscallError::from(e)));
+            }
+        };
+
+        // Step 2 — commit the receiver-local CapId to the return register.
+        if crate::kernel::syscall::recv_boundary_encode_transfer_cap_ret(frame, Some(local_cap))
+            .is_err()
+        {
+            // Roll the just-minted cap back so nothing leaks, then fail.
+            let _ = self.with_cpu(cpu, |kernel| {
+                kernel.rollback_materialized_recv_cap(
+                    pending.receiver_tid,
+                    crate::kernel::capabilities::CapId(local_cap),
+                    false,
+                );
+            });
+            return Err(TrapHandleError::Syscall(SyscallError::Internal));
+        }
+
+        // Step 3 — deferred sender wake (AFTER materialize, BEFORE writeback:
+        // §56/§58 order). Brief global re-entry; no seam inside.
+        if let Some(wake_tid) = pending.wake_tid {
+            let _ = self.with_cpu(cpu, |kernel| kernel.apply_split_sender_wake_plan(wake_tid));
+            crate::yarm_log!(
+                "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+                wake_tid.0
+            );
+        }
+
+        // Step 4 — 186E user copy + §58 completion, shared with the plain path.
+        let user_copy = crate::kernel::recv_core::RecvBoundaryUserCopySnapshot {
+            asid: pending.asid,
+            receiver_tid: pending.receiver_tid,
+            msg: pending.msg,
+            writeback: pending.writeback,
+            materialized_cap: Some(local_cap),
+            is_reply_cap: false,
+        };
+        let result = self.complete_recv_boundary_user_copy(cpu, frame, &user_copy);
+        if result.is_ok() {
+            crate::yarm_log!(
+                "CAP_TRANSFER_BOUNDARY_SEAM_DONE result=ok kind=ordinary local_cap={}",
+                local_cap
+            );
+        }
+        result
     }
 
     /// # Validation status
