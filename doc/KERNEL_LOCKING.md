@@ -233,6 +233,22 @@ kernel-register receivers stay on the unchanged legacy Phase-A path; blocked-wai
 is untouched. Does not enable multi-dispatcher and does not fully retire the global lock.
 Guarded by `stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary`.
 
+### 0.10) Stage 187C (IPC-REPLY-RETRY-AFTER-BOUNDARY-SEAMS) — HARD-STOPPED
+
+Retried `ipc_reply` with the 187A/187B boundary infrastructure; it **cannot** be boundary-split
+in scope. Every seam-eligible step in `ipc_reply` (the reply payload copy + any cap
+materialization to the caller) lives inside `complete_blocked_recv_for_waiter` — the **shared**
+blocked-waiter delivery path (6 production call sites: reply/send/fault) that runs the copy +
+materialize under the broad `&mut KernelState`. 187A/187B split the **queued** recv path, not
+this blocked-waiter path. Converting `ipc_reply` requires boundary-splitting that shared path
+(broad blocked-waiter decomposition — out of scope) and, for reply-with-cap messages, the
+unsolved `reply_cap_ipc_rank_inversion` (mint at rank 4 then `set_reply_cap_waiter_cap` at rank
+3). The non-delivery parts of `ipc_reply` (reply-cap consume, revoke, enqueue, wake) call no
+seam and gain nothing from a split; the enqueue path's payload/cap is delivered by the caller's
+later (already-split) recv. No runtime code changed; no `IPC_REPLY_BOUNDARY_*` marker emitted.
+Recommended next step: Stage 187D (split the shared blocked-waiter delivery) then a focused
+reply-cap rank-inversion stage. Pinned by `stage187c_ipc_reply_retry_hard_stop`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

@@ -396,6 +396,22 @@ post-boundary, never in `syscall.rs` Phase A (186D4 aliasing). Markers
 `stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary`. See `doc/KERNEL_UNLOCKING.md`
 (Stage 187B) and `doc/KERNEL_LOCKING.md §0.9`.
 
+**Stage 187C (IPC-REPLY-RETRY-AFTER-BOUNDARY-SEAMS) status — HARD-STOPPED, DO NOT OVERCLAIM.**
+Retrying the `ipc_reply` conversion was audited and stopped: no runtime path was converted.
+`ipc_reply`'s only seam-eligible work (reply payload copy + any cap materialization to the
+caller) lives inside `complete_blocked_recv_for_waiter` — the shared blocked-waiter delivery
+path (6 production call sites: reply/send/fault) that runs the copy + materialize under the
+broad `&mut KernelState`. 187A/187B split the **queued** recv path, not this blocked-waiter
+path. Converting `ipc_reply` needs (a) boundary-splitting the shared blocked-waiter delivery
+(broad decomposition — out of scope) and (b) for reply-with-cap, the unsolved
+`reply_cap_ipc_rank_inversion`. Do **not** describe `ipc_reply` as boundary-split or emit any
+`IPC_REPLY_BOUNDARY_*` marker; do not fork `complete_blocked_recv_for_waiter` for reply only
+(half-converted path). The reply-cap consume/revoke/enqueue/wake call no seam and need no
+boundary. Recommended next step: Stage 187D (split the shared blocked-waiter delivery) then a
+focused reply-cap rank-inversion stage. Broader IPC conversion, multi-dispatcher, and full
+global-lock retirement remain deferred. Pinned by `stage187c_ipc_reply_retry_hard_stop`. See
+`doc/KERNEL_UNLOCKING.md` (Stage 187C) and `doc/KERNEL_LOCKING.md §0.10`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

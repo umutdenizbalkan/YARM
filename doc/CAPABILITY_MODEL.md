@@ -239,6 +239,18 @@ remains deferred); shared-region and kernel-register receivers also stay legacy.
 No cap is materialized under `ipc_state_lock`. Guarded by
 `stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary`.
 
+**`ipc_reply` retry hard stop (Stage 187C).** Retrying the `ipc_reply` conversion
+with the 187A/187B boundary was audited and **stopped**: `ipc_reply`'s reply
+payload copy and any cap materialization to the caller happen inside
+`complete_blocked_recv_for_waiter` — the shared blocked-waiter delivery path
+(reply/send/fault) that runs under the broad `&mut KernelState` and was not
+boundary-split. Splitting it is out-of-scope blocked-waiter decomposition; a
+reply-with-cap additionally hits the unsolved `reply_cap_ipc_rank_inversion`
+(mint at capability rank 4 then `set_reply_cap_waiter_cap` at IPC rank 3). The
+reply-cap consume/revoke/enqueue/wake call no seam and need no boundary.
+Reply-cap materialization remains deferred. Pinned by
+`stage187c_ipc_reply_retry_hard_stop`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

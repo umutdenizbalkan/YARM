@@ -48462,6 +48462,151 @@ mod stage187b_ordinary_cap_transfer_seam_live_on_recv_boundary {
 }
 
 // ===========================================================================
+// Stage 187C (IPC-REPLY-RETRY-AFTER-BOUNDARY-SEAMS) — audited, HARD-STOPPED.
+//
+// ipc_reply's only seam-eligible work (the reply payload copy + any cap
+// materialization to the caller) happens inside complete_blocked_recv_for_waiter
+// — the SHARED blocked-waiter delivery path (6 production call sites across
+// reply/send/fault) that runs the copy + materialize under the broad
+// &mut KernelState. Stage 187A/187B split the QUEUED recv path, NOT this
+// blocked-waiter path. Converting ipc_reply requires boundary-splitting that
+// shared path (broad blocked-waiter decomposition — out of scope) and, for
+// reply-with-cap messages, the unsolved reply_cap_ipc_rank_inversion. The
+// non-delivery parts of ipc_reply call no seam and gain nothing from a split.
+// These guards PIN the finding so no future edit silently half-converts
+// ipc_reply or emits a boundary marker on the legacy path. See
+// doc/KERNEL_UNLOCKING.md (Stage 187C).
+// ===========================================================================
+#[cfg(test)]
+mod stage187c_ipc_reply_retry_hard_stop {
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const CAP_TRANSFER_SPLIT_SRC: &str = include_str!("../cap_transfer_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    // ipc_reply still delivers to a blocked caller through the shared
+    // blocked-waiter path complete_blocked_recv_for_waiter — the path 187A did
+    // NOT split.
+    #[test]
+    fn stage187c_reply_delivers_via_shared_blocked_waiter_path() {
+        let body = IPC_STATE_SRC
+            .split("pub fn ipc_reply(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    pub fn ").next())
+            .expect("ipc_reply must exist");
+        assert!(
+            body.contains("complete_blocked_recv_for_waiter("),
+            "ipc_reply must still deliver a blocked-caller reply via the shared \
+             complete_blocked_recv_for_waiter path (the out-of-scope blocked-waiter path)"
+        );
+    }
+
+    // That shared delivery path is still a broad &mut KernelState function used by
+    // reply, send, and fault — it was NOT boundary-split (blocked-waiter
+    // decomposition is out of scope for 187C).
+    #[test]
+    fn stage187c_blocked_waiter_delivery_still_broad_and_shared() {
+        let sig = SYSCALL_SRC
+            .split("fn complete_blocked_recv_for_waiter(")
+            .nth(1)
+            .and_then(|rest| rest.split(" -> ").next())
+            .expect("complete_blocked_recv_for_waiter must exist in syscall.rs");
+        assert!(
+            sig.contains("kernel: &mut KernelState"),
+            "complete_blocked_recv_for_waiter must still take the broad &mut KernelState \
+             (not boundary-split); splitting it is out-of-scope blocked-waiter decomposition"
+        );
+        // Shared across reply (ipc_state.rs), send (ipc.rs), fault (fault_state.rs).
+        assert!(
+            IPC_STATE_SRC.contains("complete_blocked_recv_for_waiter(")
+                && IPC_SRC.contains("complete_blocked_recv_for_waiter(")
+                && FAULT_SRC.contains("complete_blocked_recv_for_waiter("),
+            "the blocked-waiter delivery path is shared by reply/send/fault — forking it for \
+             reply only would duplicate accepted helpers and diverge semantics"
+        );
+    }
+
+    // ipc_reply itself calls NO post-boundary split seam (it is a &mut KernelState
+    // method — calling a data_ptr()-derived seam would alias the broad borrow,
+    // Stage 186D4). No IPC_REPLY_BOUNDARY_* boundary was built.
+    #[test]
+    fn stage187c_ipc_reply_calls_no_split_seam() {
+        let body = IPC_STATE_SRC
+            .split("pub fn ipc_reply(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    pub fn ").next())
+            .expect("ipc_reply body");
+        for seam in [
+            "copy_to_user_split",
+            "materialize_received_cap_snapshot_split",
+            "materialize_received_message_cap_routed_with_delegation_split",
+            "mint_capability_with_memory_ref_split",
+            "complete_recv_boundary_ordinary_cap",
+            "complete_recv_boundary_user_copy",
+        ] {
+            assert!(
+                !body.contains(seam),
+                "ipc_reply must NOT call the post-boundary seam `{seam}` — it holds the broad \
+                 &mut KernelState (186D4 aliasing); no ipc_reply boundary split exists yet"
+            );
+        }
+    }
+
+    // No IPC_REPLY_BOUNDARY_* success/fail marker exists anywhere — no dishonest
+    // marker on the legacy ipc_reply path, and no half-converted boundary.
+    #[test]
+    fn stage187c_no_reply_boundary_marker_in_src() {
+        for (name, src) in [
+            ("ipc_state.rs", IPC_STATE_SRC),
+            ("syscall.rs", SYSCALL_SRC),
+            ("syscall/ipc.rs", IPC_SRC),
+            ("runtime.rs", RUNTIME_SRC),
+        ] {
+            assert!(
+                !src.contains("IPC_REPLY_BOUNDARY_SPLIT")
+                    && !src.contains("IPC_REPLY_BOUNDARY_REPLY_CAP_CONSUME_OK"),
+                "`{name}` must not emit any IPC_REPLY_BOUNDARY_* marker — no live ipc_reply \
+                 boundary split was implemented (Stage 187C hard stop)"
+            );
+        }
+    }
+
+    // The reply-cap materialization arm (D5) still carries the documented rank
+    // inversion (mint at rank 4, then set_reply_cap_waiter_cap at rank 3): the
+    // unsolved reply_cap_ipc_rank_inversion blocker remains real.
+    #[test]
+    fn stage187c_reply_cap_rank_inversion_still_present() {
+        assert!(
+            CAP_TRANSFER_SPLIT_SRC.contains("try_set_reply_cap_waiter_cap")
+                && CAP_TRANSFER_SPLIT_SRC.contains("rank inversion"),
+            "the reply-cap D5 arm must still document the rank inversion \
+             (reply_cap_ipc_rank_inversion) — it is not solved in 187C"
+        );
+    }
+
+    // The hard stop is documented honestly with the exact blockers.
+    #[test]
+    fn stage187c_hard_stop_documented() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 187C"),
+            "KERNEL_UNLOCKING.md must document the Stage 187C hard stop"
+        );
+        assert!(
+            UNLOCK_DOC.contains("HARD-STOP") || UNLOCK_DOC.contains("HARD STOP"),
+            "docs must record Stage 187C as a hard stop"
+        );
+        assert!(
+            UNLOCK_DOC.contains("complete_blocked_recv_for_waiter")
+                && UNLOCK_DOC.contains("reply_cap_ipc_rank_inversion"),
+            "docs must name the exact blockers (blocked-waiter delivery + reply-cap rank inversion)"
+        );
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

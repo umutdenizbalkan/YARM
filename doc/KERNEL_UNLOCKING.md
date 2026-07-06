@@ -7832,6 +7832,62 @@ propagation, one-shot; source: Phase-A-consumes-only-no-mint, seam-only-post-bou
 boundary-method-no-IPC-lock, materialize→wake→writeback order, reply/shared excluded, docs
 honest).
 
+**Stage 187C (IPC-REPLY-RETRY-AFTER-BOUNDARY-SEAMS) — audited, HARD-STOPPED, no runtime
+conversion.** Retried the `ipc_reply` conversion with the 187A/187B boundary infrastructure now
+available. On audit `ipc_reply` **cannot** be boundary-split within this stage's scope. No
+runtime code changed.
+
+*`ipc_reply` phase inventory* (`boot/ipc_state.rs::ipc_reply`):
+
+| Phase | Work | Class |
+|---|---|---|
+| reply-cap resolve + right check | `resolve_send_cap_task_local` (rank 4) + SEND right | `legacy_authoritative_runtime` (no seam) |
+| reply-cap consume (one-shot) | `with_ipc_state_mut { reply_caps[slot] = None }` (rank 3) | `reply_cap_consume_candidate` — but calls no seam |
+| replier/caller cnode revoke | `fast_revoke_reply_cap_in_cnode` (rank 4) | `legacy_authoritative_runtime` (no seam) |
+| reply delivery to a blocked caller | `complete_blocked_recv_for_waiter` (copy_to_user + `materialize_received_message_cap_routed`, all under the broad `&mut KernelState`) | `defer_blocked_waiter_delivery` |
+| reply enqueue to a non-blocked caller | `endpoint.send(msg)` + waiter snapshot (rank 3) | `legacy_authoritative_runtime` — no copy/materialize here; the caller's later recv is already 187A/187B-split |
+| reply-with-reply-cap materialization | D5 arm inside the router (`materialize_split_reply_cap_equivalent`) | `defer_reply_cap_ipc_rank_inversion` |
+| caller wake | `apply_scheduler_wake_plan` (rank 1) | `legacy_authoritative_runtime` (no seam) |
+
+*Exact blocker.* Every **seam-eligible** step in `ipc_reply` (the reply payload copy to the
+caller, and any cap materialization the reply carries) lives inside
+`complete_blocked_recv_for_waiter` — the **shared** blocked-waiter delivery path with **6
+production call sites** (reply: `ipc_state.rs:1787/2258/2333`; send: `ipc.rs:445/931`; fault:
+`fault_state.rs:456`) that runs the copy + materialize under the broad `&mut KernelState`.
+Stage 187A/187B split the **queued** recv path (`try_split_recv_queued_plain_with_snapshot_locked`),
+**not** this blocked-waiter path. Converting `ipc_reply` to post-boundary seams therefore
+requires boundary-splitting `complete_blocked_recv_for_waiter` — **broad blocked-waiter
+delivery decomposition**, explicitly out of scope here — and forking it for the reply case
+only would duplicate the accepted helper and risk diverging its copy-failure / rollback /
+sender-wake semantics (a "half-converted path"). Additionally, a reply that carries a reply
+cap hits the D5 arm's unsolved **`reply_cap_ipc_rank_inversion`** (mint at capability rank 4,
+then `set_reply_cap_waiter_cap` at IPC rank 3).
+
+*Safe subset.* None that constitutes a real conversion. The reply-cap **consume** and the
+cnode revokes are rank-3 IPC + rank-4 capability operations that are already correct under the
+broad borrow; they call **no** seam and gain nothing from a boundary. The **enqueue** path
+performs no user copy or cap materialization inside `ipc_reply` at all — the caller's
+subsequent `ipc_recv` is where a queued reply's payload/cap is delivered, and that recv is
+already boundary-split by 187A/187B. So there is nothing in `ipc_reply` to move onto a seam
+without splitting the shared blocked-waiter delivery.
+
+*Unsafe subset.* (1) reply delivery to a blocked caller via `complete_blocked_recv_for_waiter`
+(blocked-waiter decomposition, forbidden); (2) reply-with-cap materialization
+(`reply_cap_ipc_rank_inversion`, unsolved).
+
+*Recommended next step.* **Stage 187D** — boundary-split the shared blocked-waiter delivery
+`complete_blocked_recv_for_waiter` the way 187A split the queued path (Phase A: snapshot the
+waiter ASID / payload / cap-transfer input under the lock; drop the borrow; Phase B: 186E copy
++ 187B cap seam; Phase C: wake), carefully preserving the semantics shared across its
+reply/send/fault call sites and the sender-wake oracle. Then a **focused reply-cap
+rank-inversion stage** for the D5 arm. Only after both can `ipc_reply`'s cap-carrying replies
+be fully seam-converted. No runtime code changed; no `IPC_REPLY_BOUNDARY_*` marker is emitted
+(that would dishonestly mark the legacy path). Pinned by `stage187c_ipc_reply_retry_hard_stop`
+(ipc_reply still delivers via the shared broad-`&mut KernelState` blocked-waiter path; ipc_reply
+calls no post-boundary seam; the D5 rank inversion is still present; no boundary marker in
+`src/`). Broader IPC conversion, multi-dispatcher, and full global-lock retirement remain
+deferred.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
