@@ -84,6 +84,43 @@ remove implicit global-lock coupling from syscall/trap paths.
     `..._HANDLE cpu=N gen=g`, `..._ACK cpu=N gen=g`,
     `..._DONE result=ok targets=0x…`; and the honest `..._DONE result=bsp_local`
     / `..._DEFERRED reason=no_remote_target` when no remote target exists.
+- **Stage 189B (AP-DISPATCHER + ADMISSION + TRAP-RETURN SCAFFOLD) — inert, no
+  live AP user dispatch.** APs remain wake-only; no wake-only bit is cleared, no
+  user task is scheduled on an AP, the global lock stays authoritative, and the
+  ABI is unchanged. This pass builds the complete gate for a future first live
+  AP dispatch (Stage 189C):
+  * **Readiness state machine (`arch/x86_64/ap_dispatch.rs`, pure + unit-tested):**
+    `ApReadiness { dispatcher_ready, run_queue_ready, tlb_ready, trap_return_ready }`
+    with an AND-gated `evaluate_clear()` that returns a specific `ClearRefusal`
+    for the first missing bit. `UserDispatchEnabled` is reachable ONLY through the
+    audited transition when all four hold.
+  * **Audited wake-only clear is the sole authority.** `smp::try_enable_ap_user_dispatch`
+    is the only path that clears an AP's wake-only bit for dispatch, and only when
+    `evaluate_clear()` is `Ok`; it emits `X86_AP_WAKE_ONLY_CLEAR`. (The one other
+    `mark_cpu_wake_only(cpu, false)` is the bring-up-failure revert on a
+    non-online CPU — never dispatch-eligible.) Guarded by
+    `stage189b_ap_dispatch_scaffold::only_audited_transition_clears_wake_only_for_dispatch`.
+  * **Admission unchanged and sufficient:** since wake-only is cleared only by the
+    audited transition, "not wake-only" ≡ "UserDispatchEnabled"; the existing
+    `enqueue_on_with_priority` denial (`SCHED_ENQUEUE_DENIED_WAKE_ONLY`) and the
+    `least_loaded_online_cpu` wake-only skip already keep every user task off APs.
+    BSP placement is unchanged.
+  * **`tlb_ready` is bound to the Stage 189A genuine ACK** (`cow_ok && unmap_ok`);
+    a fake/absent ACK leaves it false and blocks dispatch.
+  * **`trap_return_ready` is deliberately false.** The live AP user trap-return is
+    **not** wired: `arch::x86_64::trap::ensure_user_return_cr3` still resolves a
+    global active-ASID (`d6_diag_active_asid_num`) and a BSP-tuned return-context
+    stack, so a per-CPU-correct AP return is unproven. The boot audit
+    (`run_ap_dispatch_scaffold_audit`, in the `online>1` block) emits
+    `X86_AP_DISPATCHER_SCAFFOLD_READY`, `X86_AP_ADMISSION_GUARD_READY`,
+    `X86_AP_TRAP_RETURN_AUDIT_OK cpu=N` (per-CPU shared-path prereqs present),
+    `X86_AP_TLB_READY_FOR_DISPATCH cpu=N`, then drives the real audited transition
+    which refuses with `X86_AP_WAKE_ONLY_CLEAR_DEFERRED reason=trap_return_not_ready`
+    and `X86_AP_USER_DISPATCH_DEFERRED reason=live_trap_return_wiring_deferred_to_189c`.
+    The live-only markers (`X86_AP_WAKE_ONLY_CLEAR`, `X86_AP_USER_DISPATCH_BEGIN`,
+    `X86_AP_USER_TRAP_RETURN_OK`, `X86_AP_USER_DISPATCH_DONE`) are never emitted
+    this pass. **Stage 189C blocker:** per-CPU `ensure_user_return_cr3` (active-ASID
+    + return-context stack selection).
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 

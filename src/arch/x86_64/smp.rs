@@ -1773,3 +1773,99 @@ pub fn ap_tlb_shootdown_proof(kernel: &KernelState) -> (bool, bool) {
 pub fn ap_tlb_shootdown_proof(_kernel: &KernelState) -> (bool, bool) {
     (false, false)
 }
+
+/// Hosted-dev stub: the AP dispatch scaffold audit is a bare-metal-only path (it
+/// reads per-CPU records and drives the audited transition). The decision logic it
+/// applies lives in `ap_dispatch` and is unit-tested directly.
+#[cfg(any(test, feature = "hosted-dev"))]
+pub fn run_ap_dispatch_scaffold_audit(_kernel: &mut KernelState, _tlb_ready: bool) {}
+
+/// Stage 189B: structural audit of the per-CPU prerequisites an AP needs to enter
+/// user mode through the shared BSP return path. Verifies the AP has its own TSS,
+/// a recorded kernel idle CR3, and valid idle metadata. This proves the *shared*
+/// return-path prerequisites are present; it does NOT prove a live AP user
+/// trap-return (that is Stage 189C — `ensure_user_return_cr3` still resolves a
+/// global active-ASID and a BSP-tuned return-context stack).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_trap_return_prereqs_present(cpu: CpuId) -> bool {
+    let record = super::percpu::read_record(cpu);
+    record.tss_ptr != 0
+        && record.idle_cr3 != 0
+        && (record.idle_flags & super::percpu::idle_flag::IDLE_TASK_META_SET) != 0
+}
+
+/// Stage 189B: the AUDITED, sole authority for clearing an AP's wake-only bit for
+/// dispatch. Refuses unless every readiness condition holds; on success it clears
+/// wake-only and emits `X86_AP_WAKE_ONLY_CLEAR`. No other code path may clear an
+/// AP's wake-only bit for dispatch. In Stage 189B `readiness.trap_return_ready`
+/// is always false, so this function always refuses and never clears wake-only.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn try_enable_ap_user_dispatch(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    readiness: super::ap_dispatch::ApReadiness,
+) -> Result<(), super::ap_dispatch::ClearRefusal> {
+    use super::ap_dispatch;
+    if let Err(refusal) = readiness.evaluate_clear() {
+        crate::yarm_log!(
+            "{} cpu={} reason={}",
+            ap_dispatch::MARK_WAKE_ONLY_CLEAR_DEFERRED,
+            cpu.0,
+            refusal.reason()
+        );
+        return Err(refusal);
+    }
+    // All readiness bits hold: this is the ONLY site that clears wake-only for
+    // dispatch. (Unreachable in Stage 189B — trap_return_ready is never set.)
+    kernel
+        .mark_cpu_wake_only(cpu, false)
+        .map_err(|_| ap_dispatch::ClearRefusal::RunQueueNotReady)?;
+    crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_WAKE_ONLY_CLEAR, cpu.0);
+    Ok(())
+}
+
+/// Stage 189B: one-shot AP user-dispatch scaffold audit. Runs after the Stage
+/// 189A TLB-shootdown proof. For each online wake-only AP it reports the readiness
+/// state and drives the AUDITED transition, which — because the live trap-return
+/// path is deferred to Stage 189C — refuses and emits the honest deferral markers.
+/// It NEVER clears a wake-only bit and NEVER schedules a user task.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool) {
+    use super::ap_dispatch::{self, ApReadiness};
+    // Scaffold-level facts (topology-independent): the dispatcher state machine and
+    // the run-queue admission guards exist and are validated by hosted-dev tests.
+    crate::yarm_log!("{}", ap_dispatch::MARK_DISPATCHER_SCAFFOLD_READY);
+    crate::yarm_log!("{}", ap_dispatch::MARK_ADMISSION_GUARD_READY);
+
+    let targets = online_wake_only_ap_bitmap(kernel);
+    for raw in 0..crate::arch::platform_constants::MAX_CPUS {
+        if targets & (1u64 << raw) == 0 {
+            continue;
+        }
+        let cpu = CpuId(raw as u8);
+        // Structural trap-return audit: shared-path per-CPU prerequisites present.
+        if ap_trap_return_prereqs_present(cpu) {
+            crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TRAP_RETURN_AUDIT_OK, cpu.0);
+        }
+        if tlb_ready {
+            crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TLB_READY, cpu.0);
+        }
+        // Stage 189B readiness: dispatcher + run-queue + TLB ready; the LIVE
+        // trap-return path is proven in Stage 189C, so trap_return_ready is false.
+        let readiness = ApReadiness {
+            dispatcher_ready: true,
+            run_queue_ready: true,
+            tlb_ready,
+            trap_return_ready: false,
+        };
+        // Drive the REAL audited transition. It refuses (trap_return_ready=false),
+        // logs `X86_AP_WAKE_ONLY_CLEAR_DEFERRED reason=trap_return_not_ready`, and
+        // does NOT clear wake-only. This exercises the exact production gate.
+        let _ = try_enable_ap_user_dispatch(kernel, cpu, readiness);
+        crate::yarm_log!(
+            "{} cpu={} reason=live_trap_return_wiring_deferred_to_189c",
+            ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
+            cpu.0
+        );
+    }
+}

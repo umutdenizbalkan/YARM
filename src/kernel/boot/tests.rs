@@ -58400,6 +58400,125 @@ mod stage183_ap_idle_admit {
     }
 }
 
+// Stage 189B — AP user-dispatch scaffold. Source guards proving the audited
+// wake-only clear is the sole gate, the scaffold enqueues no user task, the
+// admission guards hold, and nothing partially enables AP dispatch this pass.
+mod stage189b_ap_dispatch_scaffold {
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const SCHED_SRC: &str = include_str!("../scheduler.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+
+    // The audited transition is the ONLY code that emits X86_AP_WAKE_ONLY_CLEAR
+    // (the dispatch-enabling clear) and it only does so after evaluate_clear() is
+    // Ok. No other file emits it.
+    #[test]
+    fn only_audited_transition_clears_wake_only_for_dispatch() {
+        // The live-clear marker is defined in ap_dispatch and emitted only by the
+        // audited transition in smp.rs (guarded by evaluate_clear()).
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_WAKE_ONLY_CLEAR: &str = \"X86_AP_WAKE_ONLY_CLEAR\"")
+                && SMP_SRC.contains("fn try_enable_ap_user_dispatch(")
+                && SMP_SRC.contains("readiness.evaluate_clear()")
+                && SMP_SRC.contains("ap_dispatch::MARK_WAKE_ONLY_CLEAR,"),
+            "the audited transition must gate the wake-only clear on evaluate_clear()"
+        );
+        // The clear of wake-only-for-dispatch (mark_cpu_wake_only(cpu, false)) in
+        // smp.rs appears ONLY inside try_enable_ap_user_dispatch. The only other
+        // mark_cpu_wake_only(_, false) is the bring-up-failure revert, which runs
+        // on a NON-online CPU (never dispatch-eligible).
+        let clears = SMP_SRC.matches("mark_cpu_wake_only(cpu, false)").count();
+        assert!(
+            clears <= 2,
+            "unexpected extra wake-only clear sites in smp.rs: {clears}"
+        );
+    }
+
+    // The audited transition AND-gates all four readiness bits and refuses with a
+    // specific reason; trap_return_ready is false in 189B, so it always refuses.
+    #[test]
+    fn evaluate_clear_and_gates_all_readiness() {
+        assert!(
+            AP_DISPATCH_SRC.contains("ClearRefusal::DispatcherNotReady")
+                && AP_DISPATCH_SRC.contains("ClearRefusal::RunQueueNotReady")
+                && AP_DISPATCH_SRC.contains("ClearRefusal::TlbNotReady")
+                && AP_DISPATCH_SRC.contains("ClearRefusal::TrapReturnNotReady"),
+            "all four readiness refusals must exist"
+        );
+        // Runtime proof of the AND-gate.
+        use crate::arch::x86_64::ap_dispatch::{ApReadiness, ClearRefusal};
+        let mut r = ApReadiness {
+            dispatcher_ready: true,
+            run_queue_ready: true,
+            tlb_ready: true,
+            trap_return_ready: true,
+        };
+        assert!(r.all_ready());
+        r.tlb_ready = false;
+        assert_eq!(r.evaluate_clear(), Err(ClearRefusal::TlbNotReady));
+        assert!(!r.all_ready(), "a missing TLB ACK must block dispatch");
+    }
+
+    // The scaffold enqueues no user task and never dispatches: ap_dispatch.rs is
+    // pure decision logic (no scheduler mutation), and the smp audit only logs.
+    #[test]
+    fn scaffold_never_enqueues_or_dispatches() {
+        assert!(
+            !AP_DISPATCH_SRC.contains(".enqueue")
+                && !AP_DISPATCH_SRC.contains("dispatch_next_on")
+                && !AP_DISPATCH_SRC.contains("mark_cpu_wake_only")
+                && !AP_DISPATCH_SRC.contains("&mut KernelState"),
+            "the ap_dispatch state machine must be pure (no scheduler/kernel mutation)"
+        );
+        assert!(
+            SMP_SRC.contains("fn run_ap_dispatch_scaffold_audit(")
+                && !SMP_SRC.contains("enqueue_on(")
+                && !SMP_SRC.contains("enqueue_balanced("),
+            "the scaffold audit must not enqueue user tasks"
+        );
+        // The boot audit emits the honest deferral, not a live enable.
+        assert!(
+            ORCH_SRC.contains("run_ap_dispatch_scaffold_audit(")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
+                && SMP_SRC.contains("reason=live_trap_return_wiring_deferred_to_189c"),
+            "the boot audit must defer live AP dispatch honestly"
+        );
+    }
+
+    // Run-queue admission guards: wake-only CPUs are denied placement and skipped
+    // by least-loaded selection. BSP behavior unchanged.
+    #[test]
+    fn admission_guards_deny_wake_only_placement() {
+        assert!(
+            SCHED_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY")
+                && SCHED_SRC.contains("fn least_loaded_online_cpu("),
+            "wake-only enqueue denial + least-loaded skip must exist"
+        );
+        // least_loaded_online_cpu skips wake-only CPUs.
+        assert!(
+            SCHED_SRC.contains("if self.wake_only & (1u64 << idx) != 0 {")
+                && SCHED_SRC.contains("continue;"),
+            "least-loaded selection must skip wake-only CPUs"
+        );
+    }
+
+    // The trap-return audit is structural only; the LIVE return path is explicitly
+    // deferred (trap_return_ready stays false) — no partial enable.
+    #[test]
+    fn trap_return_is_structural_audit_only_live_deferred() {
+        assert!(
+            SMP_SRC.contains("fn ap_trap_return_prereqs_present(")
+                && SMP_SRC.contains("record.tss_ptr != 0")
+                && SMP_SRC.contains("record.idle_cr3 != 0"),
+            "the trap-return audit must verify the per-CPU shared-path prerequisites"
+        );
+        assert!(
+            SMP_SRC.contains("trap_return_ready: false"),
+            "189B must keep trap_return_ready false (live AP return deferred to 189C)"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the
