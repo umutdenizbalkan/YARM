@@ -4,7 +4,7 @@
 
 - ABI Version: `10`
 - Public syscall count: `16` (`0..=15`)
-- Kernel dispatch table count: `31` (`SYSCALL_COUNT`, slots `0..=30`)
+- Kernel dispatch table count: `32` (`SYSCALL_COUNT`, slots `0..=31`)
 
 ## Public ABI v10 syscall numbers
 
@@ -76,7 +76,8 @@ Status terms used by this matrix:
 | `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v10 count. |
 | `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v10 count. |
 | `30` | `RecvSharedV3` | non-blocking recv extension | any user task | Stage 42+43: non-blocking `recv_shared_v3` (NR 30); `timeout_ticks=0` only; no mapped receive. See `KERNEL_LOCKING.md §58`. |
-| `31+` | — | removed/invalid | none | Outside `SYSCALL_COUNT = 31`; not dispatched. |
+| `31` | `ReapFaultedTask` | privileged PM restart-cleanup extension | PM TID `3` only | SUP-L7K-A: reaps an old terminal Faulted/Exited/Dead task after PM has successfully spawned and recorded a restart replacement. `arg0=target_tid`; self-target returns `InvalidArgs`; non-PM returns `MissingRight`; Running/Runnable/Blocked targets return `WrongObject`; missing targets are treated as already gone and return success. Uses the no-allocation terminal-task reap cleanup path (`reap_faulted_task_noalloc_cleanup`) for VM/task/cnode release; not a kill-running-task syscall. |
+| `32+` | — | removed/invalid | none | Outside `SYSCALL_COUNT = 32`; not dispatched. |
 
 ## ABI versioning and deprecation policy
 
@@ -126,13 +127,14 @@ They are not reserved gaps and are covered by the public ABI v10 matrix above.
 - `25`: reserved/unassigned in ABI v10. `Syscall::decode` rejects this number
   with `InvalidNumber`.
 - `30`: `RecvSharedV3` — Stage 42+43 live non-blocking recv_shared_v3 extension (NR 30).
-- `31+`: outside the current kernel dispatch table and rejected with
+- `31`: `ReapFaultedTask` — SUP-L7K-A PM-only terminal-task cleanup extension.
+- `32+`: outside the current kernel dispatch table and rejected with
   `InvalidNumber`.
 
 ## Privileged kernel extensions
 
-The kernel currently declares `SYSCALL_COUNT = 31`, so dispatch-table slots
-`0..=30` are in range. This is deliberately a different concept from the
+The kernel currently declares `SYSCALL_COUNT = 32`, so dispatch-table slots
+`0..=31` are in range. This is deliberately a different concept from the
 public ABI count above: slots `23`, `24`, `26`, `27`, `28`, `29`, and `30` are
 non-public kernel extensions used by PM, SystemServer, and bootstrap service
 plumbing. They are documented here so integrators can distinguish reserved

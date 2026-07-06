@@ -1050,3 +1050,76 @@ SUP-L7H makes managed-record mode fault-priority before any blocking or bounded 
 SUP-L7H also avoids normal empty RecvSharedV3 fault-drain probes in the runtime hot loop. User QEMU showed empty nonblocking nr=30 probes could emit `BLOCKED_WOULDBLOCK_FATAL`; without kernel changes, the userspace fix is to stop using that empty probe as a normal polling heartbeat and rely on the bounded fault wait in managed mode. The smoke script treats `BLOCKED_WOULDBLOCK_FATAL` as a failure and requires either `SUPERVISOR_FAULT_WAIT_RECV tid=10008` or `SUPERVISOR_FAULT_DRAIN_RECV tid=10008` plus the functional attempt-1 markers.
 
 Pending replay remains a bounded startup-race fallback, not an unconditional requirement. PM remains the restart execution authority, the supervisor remains the policy/state owner, and SUP-L7H does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM trusted-supervisor validation, PM reply validation, broad restart policy, local supervisor spawn behavior, or PM restart codec/opcode counts.
+
+## SUP-L7I — supervisor record-token precedence and PM fallback boundary
+
+SUP-L7I is a supervisor-side restart-token handling fix that preserves the PM
+restart contract. PM remains the restart authority and continues to validate the
+trusted supervisor, scoped token fingerprint, request shape, attempt limits, and
+Accepted reply fields exactly as before. No PM restart opcode, PM request/reply
+layout, syscall ABI, kernel/arch path, CapRights value, RPi5 path, or DRS path is
+changed.
+
+The CAPABILITY_MODEL constraints are explicit for this path: CapIDs are
+cspace-local and are not copied from logs or payloads as authority; reply caps are
+one-shot and must not be stored, reused, or delegated; and capability failures
+such as `WrongObject`, `StaleCapability`, and `MissingRight` are real hard
+failures. Restart-token source precedence is now managed-record first and bounded
+PM query fallback second. The supervisor does not schedule a restart without a
+valid token from one of those sources.
+
+For the gated crash-test service, `SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY` now
+means the supervisor managed record contains the crash-test restart token for the
+current TID before any fault replay or scheduling path runs. If that record token
+is present, the supervisor does not send `PROC_OP_TASK_RESTART_TOKEN`; if it is
+missing, the bounded PM query remains a fail-closed fallback and returned tokens
+are stored back into the record only after a successful PM reply. Accepted PM
+replacement replies continue to carry replacement lineage, and the supervisor
+reseeds the crash-test record token for the replacement TID so attempt 2 keeps a
+valid token while PM remains responsible for actual restart execution.
+
+## SUP-L7J — rolled-back ResourceUnavailable retry and PM spawn-failure markers
+
+SUP-L7J keeps PM as the restart authority and changes only the supervisor's
+classification of one PM reply shape: `RolledBack + ResourceUnavailable` is now
+retryable/deferred instead of permanent rejection. Permanent validation and
+capability failures remain fail-closed: bad sender, missing authorization, bad or
+unscoped token, wrong token owner, unsupported startup-cap policy, bad image or
+unsupported service, `WrongObject`, `StaleCapability`, and `MissingRight` do not
+map to success or to a fabricated restart.
+
+The supervisor reschedules the same already-counted restart attempt when PM
+returns retryable resource unavailability, with a bounded retry counter and a
+minimum one-tick retry delay when PM provides no future retry tick. This prevents
+a tight loop and avoids incrementing restart attempts for PM resource retries.
+After the bound is exhausted the record remains fail-closed in the resource
+unavailable state rather than spawning locally or pretending success.
+
+PM now exposes rollback source markers around failed restart spawn work:
+`PM_RESTART_SPAWN_FAIL request_id=... target_tid=... reason=...`,
+`PM_RESTART_RESOURCE_STATE ... action=rollback`,
+`PM_RESTART_SPAWN_ROLLBACK_BEGIN ...`, and
+`PM_RESTART_SPAWN_ROLLBACK_DONE ...`. These markers expose the real source of a
+`ResourceUnavailable` rollback between `PM_RESTART_SPAWN_BEGIN` and the rolled
+back reply; they do not fake `PM_RESTART_SPAWN_OK` and do not broaden
+restart-any-image support.
+
+No kernel, arch, syscall ABI, CapRights, RPi5, or DRS path changes are made.
+CapIDs remain cspace-local, reply caps remain one-shot, and PM request/reply
+validation remains unchanged except for the supervisor-side retryable mapping of
+this specific rolled-back resource-unavailable reply.
+
+## SUP-L7K-B — PM old-target reap after accepted replacement
+
+SUP-L7K-B wires the SUP-L7K-A PM-only `ReapFaultedTask` syscall into the live PM restart accepted path. After PM has successfully spawned the replacement, recorded the replacement lifecycle/token state, and completed restart accounting, PM calls `reap_faulted_task(request.target_tid)` before emitting `PM_RESTART_SPAWN_OK` or `PM_RESTART_REPLY_ACCEPTED`.
+
+The teardown target is always the old request target (`request.target_tid`), never the accepted `replacement_tid`. The rollback path is unchanged: if spawn, lifecycle recording, reply construction, or accounting fails before acceptance, PM returns the existing rolled-back/resource-unavailable reply and does not reap the old target. Unexpected teardown syscall failure is logged with `PM_RESTART_TEARDOWN_OLD_FAIL old_tid=... err=...` and PM continues the accepted reply so it does not kill or discard the already-spawned replacement.
+
+The syscall used here is the narrow SUP-L7K-A kernel primitive: syscall nr `31`, `SYSCALL_COUNT = 32`, PM bootstrap TID `3` only, terminal `Faulted`/`Exited`/`Dead` targets only, and cleanup via the SUP-L7K-C no-allocation reap path (`KernelState::reap_faulted_task_noalloc_cleanup`), avoiding the allocation-heavy `mark_task_dead` cnode cleanup. This path does not introduce CapID payload authority, does not store or reuse reply caps, does not alter PM trusted-supervisor validation, and does not broaden restart-any-image support.
+
+
+## SUP-L7K-C — ReapFaultedTask no-allocation cleanup
+
+SUP-L7K-C changes the kernel side of `ReapFaultedTask` so the PM restart accepted path no longer enters the allocation-heavy `mark_task_dead` cleanup. The QEMU failure was the old process-cnode cleanup allocating an 81920-byte delegation-link snapshot while resources were already exhausted. The reap syscall now uses a narrow no-allocation cleanup helper that marks the terminal target Dead, clears restart token state, revokes reply records in place, clears IPC waiters, releases kernel context, destroys user address spaces, clears transfer bookkeeping in place, prunes delegation links by indexed in-place iteration, and removes the process cnode record without `Vec`/`Box` snapshots.
+
+The syscall still rejects non-PM callers, self-targets, and Running/Runnable/Blocked tasks before cleanup. `TASK_REAP_FAULTED_NOALLOC_CLEANUP_BEGIN`, per-step `TASK_REAP_FAULTED_CLEANUP_STEP`, and `TASK_REAP_FAULTED_NOALLOC_CLEANUP_OK` markers make the no-allocation path visible before `TASK_REAP_FAULTED_OK`. CAPABILITY_MODEL semantics are unchanged: no CapID is copied across cspaces as authority and reply caps remain one-shot records cleared in place.

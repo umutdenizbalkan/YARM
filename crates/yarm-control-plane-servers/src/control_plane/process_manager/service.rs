@@ -40,7 +40,6 @@ use yarm_user_rt::process::{
 };
 #[cfg(test)]
 use yarm_user_rt::runtime::{KernelIpcError, RuntimeStateAccess, TrapIpcError};
-#[cfg(test)]
 use yarm_user_rt::syscall::SyscallError;
 use yarm_user_rt::task::TaskClass;
 #[cfg(not(test))]
@@ -2481,9 +2480,27 @@ impl ProcessService {
         target_tid: u64,
         reason: &'static str,
     ) -> Result<Message, ProcessManagerError> {
+        yarm_user_rt::user_log!(
+            "PM_RESTART_RESOURCE_STATE request_id={} target_tid={} reason={} reserved=1 action=rollback",
+            request_id,
+            target_tid,
+            reason
+        );
+        yarm_user_rt::user_log!(
+            "PM_RESTART_SPAWN_ROLLBACK_BEGIN request_id={} target_tid={} reason={}",
+            request_id,
+            target_tid,
+            reason
+        );
         yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason={}", reason);
         self.clear_pm_restart_reservation(request_id);
         yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason={}", reason);
+        yarm_user_rt::user_log!(
+            "PM_RESTART_SPAWN_ROLLBACK_DONE request_id={} target_tid={} reason={}",
+            request_id,
+            target_tid,
+            reason
+        );
         yarm_user_rt::user_log!("PM_RESTART_REPLY_ROLLED_BACK reason={}", reason);
         Self::pm_restart_reply(
             AbiPmRestartReplyStatus::RolledBack,
@@ -2492,6 +2509,45 @@ impl ProcessService {
             target_tid,
             0,
         )
+    }
+
+    #[cfg(not(test))]
+    fn teardown_old_restart_target(old_tid: u64, replacement_tid: u64) -> Result<(), SyscallError> {
+        yarm_user_rt::user_log!(
+            "PM_RESTART_TEARDOWN_OLD_BEGIN old_tid={} replacement_tid={}",
+            old_tid,
+            replacement_tid
+        );
+        // SAFETY: SUP-L7K-A makes this syscall PM-only and terminal-task-only.
+        // This PM accepted path calls it after a replacement TID has been spawned
+        // and recorded, and it passes the old request.target_tid, never the
+        // replacement_tid. The kernel rejects non-PM callers, self-targets, and
+        // non-terminal targets.
+        match unsafe { yarm_user_rt::syscall::reap_faulted_task(old_tid) } {
+            Ok(()) => {
+                yarm_user_rt::user_log!("PM_RESTART_TEARDOWN_OLD_OK old_tid={}", old_tid);
+                Ok(())
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_TEARDOWN_OLD_FAIL old_tid={} err={:?}",
+                    old_tid,
+                    err
+                );
+                Err(err)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn teardown_old_restart_target(old_tid: u64, replacement_tid: u64) -> Result<(), SyscallError> {
+        yarm_user_rt::user_log!(
+            "PM_RESTART_TEARDOWN_OLD_BEGIN old_tid={} replacement_tid={}",
+            old_tid,
+            replacement_tid
+        );
+        yarm_user_rt::user_log!("PM_RESTART_TEARDOWN_OLD_OK old_tid={}", old_tid);
+        Ok(())
     }
 
     fn spawn_sup_l4_replacement(
@@ -2758,11 +2814,30 @@ impl ProcessService {
         if self.sup_l4_pm_restart_rollback_injection
             == SupL4PmRestartRollbackInjection::SpawnFailure
         {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_SPAWN_FAIL request_id={} target_tid={} reason=injected_spawn_failure",
+                request.request_id,
+                request.target_tid
+            );
             return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
         }
         let replacement_tid = match self.spawn_sup_l4_replacement(target_record) {
             Ok(tid) if tid != 0 => tid,
-            _ => {
+            Ok(_) => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_SPAWN_FAIL request_id={} target_tid={} reason=zero_replacement_tid",
+                    request.request_id,
+                    request.target_tid
+                );
+                return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_SPAWN_FAIL request_id={} target_tid={} reason={:?}",
+                    request.request_id,
+                    request.target_tid,
+                    err
+                );
                 return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
             }
         };
@@ -2827,6 +2902,14 @@ impl ProcessService {
             .is_err()
         {
             return self.rollback_pm_restart(request.request_id, request.target_tid, "accounting");
+        }
+        if let Err(err) = Self::teardown_old_restart_target(request.target_tid, replacement_tid) {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_TEARDOWN_OLD_CONTINUE_ACCEPTED old_tid={} replacement_tid={} err={:?}",
+                request.target_tid,
+                replacement_tid,
+                err
+            );
         }
         yarm_user_rt::user_log!(
             "PM_RESTART_SPAWN_OK target_tid={} replacement_tid={}",

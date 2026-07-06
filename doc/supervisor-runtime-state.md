@@ -723,3 +723,55 @@ SUP-L7H makes managed-record mode fault-priority before any blocking or bounded 
 SUP-L7H also avoids normal empty RecvSharedV3 fault-drain probes in the runtime hot loop. User QEMU showed empty nonblocking nr=30 probes could emit `BLOCKED_WOULDBLOCK_FATAL`; without kernel changes, the userspace fix is to stop using that empty probe as a normal polling heartbeat and rely on the bounded fault wait in managed mode. The smoke script treats `BLOCKED_WOULDBLOCK_FATAL` as a failure and requires either `SUPERVISOR_FAULT_WAIT_RECV tid=10008` or `SUPERVISOR_FAULT_DRAIN_RECV tid=10008` plus the functional attempt-1 markers.
 
 Pending replay remains a bounded startup-race fallback, not an unconditional requirement. PM remains the restart execution authority, the supervisor remains the policy/state owner, and SUP-L7H does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM trusted-supervisor validation, PM reply validation, broad restart policy, local supervisor spawn behavior, or PM restart codec/opcode counts.
+
+## SUP-L7I — record-first restart-token source for crash-test faults
+
+SUP-L7I fixes the supervisor-side restart-token source order without changing
+capability numbers, kernel code, architecture code, syscall ABI, CapRights, RPi5,
+DRS, PM trusted-supervisor validation, or PM restart reply validation. The
+CAPABILITY_MODEL rules were followed: CapIDs are cspace-local and are not copied
+from logs or payloads as authority, reply caps remain one-shot and are not stored
+or reused, and `WrongObject`, `StaleCapability`, and `MissingRight` stay hard
+failures rather than success cases.
+
+For the gated crash-test registration, the supervisor now stores the same
+scoped/redacted restart-token fingerprint that PM uses for the crash-test TID in
+the `ManagedServiceRecord` before emitting
+`SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY`. The marker now means the managed
+record actually contains a restart token for the current crash-test TID; before
+SUP-L7I it only meant the registration path had reached the marker, even though
+`pending_restart_token` could still be empty.
+
+Fault handling now uses token source precedence of record first and PM query
+fallback second. It emits `SUPERVISOR_RESTART_TOKEN_RECORD_CHECK`, then
+`SUPERVISOR_RESTART_TOKEN_RECORD_HIT ... fingerprint=<low16>` when the managed
+record already has a token, followed by
+`SUPERVISOR_RESTART_TOKEN_STATE ... present=1 source=record`; in that case no PM
+restart-token query is sent. If the record token is absent, the existing bounded
+PM query remains the fallback, still fail-closed and still without scheduling
+unless a valid token is returned. The fallback does not use blocking
+`ipc_recv_v2`, does not read from a one-shot reply object after `ipc_reply`
+consumes it, and does not treat PM-local cap IDs or payload cap IDs as supervisor
+authority.
+
+Accepted PM replacement replies still update the managed record lineage to the
+replacement TID. For the gated crash-test lineage, the supervisor reseeds the
+record token for the replacement TID so the next replacement fault can schedule
+attempt 2 through the same record-first path while PM remains the only restart
+execution authority.
+
+## SUP-L7K-B — accepted PM replacements reap old faulted targets
+
+The crash-restart runtime now expects PM to clean up old faulted targets after a successful replacement. PM uses the SUP-L7K-A PM-only `ReapFaultedTask` syscall (`nr=31`, `SYSCALL_COUNT=32`) after it records the replacement lifecycle/token state and before it emits the accepted spawn/reply markers. The expected PM markers are `PM_RESTART_TEARDOWN_OLD_BEGIN old_tid=... replacement_tid=...` followed by `PM_RESTART_TEARDOWN_OLD_OK old_tid=...` on the normal path.
+
+The replacement TID is never the teardown target, and rollback paths for failed replacement spawn do not reap the old target. This preserves the supervisor's SUP-L7J retry mapping for genuine resource-unavailable rollbacks while preventing successful restart chains from leaking old faulted task VM/task resources. Capability model rules are unchanged: no local CapID is copied as authority, reply caps remain one-shot, and capability failures remain hard failures.
+
+## SUP-L7O — terminal degraded optional-hook handling
+
+After the restart limit is exceeded, `SUPERVISOR_SERVICE_DEGRADED_FINAL` is the terminal handled state for the crash-restart profile. The runtime still attempts the legacy task-exit and init-alert hooks, but those hooks are optional in this profile because the production crash-restart path does not wire a supervisor-local task-death operation or init-alert endpoint through `RuntimeSupervisorTaskExitOps`. If either hook returns `InvalidCapability` in the terminal degraded branch, the supervisor logs `SUPERVISOR_DEGRADED_TERMINAL_OPTIONAL_SKIP op=task_exit reason=unavailable` or `SUPERVISOR_DEGRADED_TERMINAL_OPTIONAL_SKIP op=init_alert reason=unavailable`, then emits `SUPERVISOR_DEGRADED_TERMINAL_APPLY_OK tid=...` and completes the handled degraded decision.
+
+This optional skip is limited to the post-`SUPERVISOR_SERVICE_DEGRADED_FINAL` side-effect hooks. PM restart, restart-token lookup, IPC/reply-cap operations, ReapFaultedTask, and non-terminal capability failures continue to fail closed; no CapID or reply-cap authority rules change.
+
+## SUP-L7P — cross-arch crash-restart smoke plumbing
+
+The supervisor crash-restart smoke script now supports both `x86_64` and `aarch64`. The x86_64 path keeps the existing `build-x86_64-crash-restart` layout and QEMU defaults, while the aarch64 path uses the existing aarch64 core-smoke layout defaults (`virt`, `cortex-a72`, `qemu-system-aarch64-hwe` with fallback to `qemu-system-aarch64`) and `scripts/build-qemu-aarch64-artifacts.sh` to stage `build-aarch64-crash-restart`. The same supervisor restart-test gates and arch-neutral SUP-L7O oracle are used for both architectures. AArch64 QEMU execution remains pending user local run.

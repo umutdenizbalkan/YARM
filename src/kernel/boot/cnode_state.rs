@@ -2,8 +2,6 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::*;
-use alloc::boxed::Box;
-
 impl KernelState {
     pub fn current_task_cnode(&self) -> Option<CNodeId> {
         let tid = self.current_tid()?;
@@ -137,12 +135,10 @@ impl KernelState {
             }
         }
 
-        let link_snapshot = Box::new(
-            self.with_capability_state(|capability| capability.delegated_capability_links.clone()),
-        );
-        let mut remove_links = Box::new([false; MAX_DELEGATED_CAPABILITY_LINKS]);
         let mut removed_delegation_links = 0usize;
-        for (idx, maybe_record) in link_snapshot.iter().enumerate() {
+        for idx in 0..MAX_DELEGATED_CAPABILITY_LINKS {
+            let maybe_record =
+                self.with_capability_state(|capability| capability.delegated_capability_links[idx]);
             let Some(record) = maybe_record else {
                 continue;
             };
@@ -151,17 +147,12 @@ impl KernelState {
                 .unwrap_or(record.source_tid);
             let dest_pid = self.process_id(record.dest_tid).unwrap_or(record.dest_tid);
             if source_pid == pid || dest_pid == pid {
-                remove_links[idx] = true;
+                self.with_capability_state_mut(|capability| {
+                    capability.delegated_capability_links[idx] = None;
+                });
                 removed_delegation_links = removed_delegation_links.saturating_add(1);
             }
         }
-        self.with_capability_state_mut(|capability| {
-            for (idx, remove) in remove_links.iter().enumerate() {
-                if *remove {
-                    capability.delegated_capability_links[idx] = None;
-                }
-            }
-        });
         telemetry.removed_delegation_links = telemetry
             .removed_delegation_links
             .saturating_add(removed_delegation_links);
@@ -195,6 +186,125 @@ impl KernelState {
             telemetry.removed_cnode_space as u8,
             telemetry.removed_process_record as u8
         );
+    }
+
+    pub(crate) fn maybe_cleanup_process_cnode_for_pid_noalloc_reap(&mut self, pid: u64) -> bool {
+        let has_live_threads = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .any(|tcb| tcb.thread_group_id.0 == pid && tcb.status != TaskStatus::Dead)
+        });
+        if has_live_threads {
+            return false;
+        }
+
+        let mut reclaimed_asids = [None; MAX_TASKS];
+        let mut reclaimed_asid_len = 0usize;
+        self.with_tcbs(|tcbs| {
+            for tcb in tcbs.iter().flatten() {
+                if tcb.thread_group_id.0 != pid {
+                    continue;
+                }
+                let Some(asid) = tcb.asid else {
+                    continue;
+                };
+                if reclaimed_asids
+                    .iter()
+                    .take(reclaimed_asid_len)
+                    .flatten()
+                    .any(|candidate| *candidate == asid)
+                {
+                    continue;
+                }
+                if reclaimed_asid_len < reclaimed_asids.len() {
+                    reclaimed_asids[reclaimed_asid_len] = Some(asid);
+                    reclaimed_asid_len += 1;
+                }
+            }
+        });
+        for asid in reclaimed_asids
+            .into_iter()
+            .take(reclaimed_asid_len)
+            .flatten()
+        {
+            let _ = self.destroy_user_address_space_by_asid(asid);
+        }
+
+        self.purge_transfer_envelopes_for_pid(pid);
+        for idx in 0..MAX_TRANSFER_ENVELOPES {
+            let mapping = self.with_ipc_state(|ipc| ipc.active_transfer_mappings[idx]);
+            let Some(mapping) = mapping else {
+                continue;
+            };
+            let owner_pid = self
+                .process_id(mapping.owner_tid.0)
+                .unwrap_or(mapping.owner_tid.0);
+            if owner_pid != pid && mapping.owner_tid.0 != pid {
+                continue;
+            }
+            if let Some(asid) = self.task_asid(mapping.owner_tid.0) {
+                self.unmap_range_two_phase(asid, mapping.base.0 as usize, mapping.len);
+            }
+            self.with_ipc_state_mut(|ipc| ipc.active_transfer_mappings[idx] = None);
+            self.note_shared_mem_released(mapping.len);
+            self.note_transfer_record_revoked();
+        }
+        let Some(cnode) = self.process_cnode_for_pid(pid) else {
+            return true;
+        };
+        let cnode_slot_capacity = self.cnode_slot_capacity(cnode).unwrap_or(0);
+
+        let mut removed_delegation_links = 0usize;
+        for idx in 0..MAX_DELEGATED_CAPABILITY_LINKS {
+            let maybe_record =
+                self.with_capability_state(|capability| capability.delegated_capability_links[idx]);
+            let Some(record) = maybe_record else {
+                continue;
+            };
+            let source_pid = self
+                .process_id(record.source_tid)
+                .unwrap_or(record.source_tid);
+            let dest_pid = self.process_id(record.dest_tid).unwrap_or(record.dest_tid);
+            if source_pid == pid || dest_pid == pid {
+                self.with_capability_state_mut(|capability| {
+                    capability.delegated_capability_links[idx] = None;
+                });
+                removed_delegation_links = removed_delegation_links.saturating_add(1);
+            }
+        }
+
+        let mut removed_cnode_space = false;
+        let mut removed_process_record = false;
+        self.with_capability_state_mut(|capability| {
+            if let Some(slot) = capability
+                .cnode_spaces
+                .iter_mut()
+                .find(|slot| slot.as_ref().is_some_and(|space| space.id == cnode))
+            {
+                *slot = None;
+                removed_cnode_space = true;
+            }
+
+            if let Some(slot) = capability
+                .process_cnodes
+                .iter_mut()
+                .find(|slot| slot.is_some_and(|record| record.pid == pid))
+            {
+                *slot = None;
+                removed_process_record = true;
+            }
+        });
+
+        crate::yarm_log!(
+            "YARM_PROC_CNODE_CLEANUP_NOALLOC pid={} cnode={} slots={} removed_links={} removed_cspace={} removed_record={}",
+            pid,
+            cnode.0,
+            cnode_slot_capacity,
+            removed_delegation_links,
+            removed_cnode_space as u8,
+            removed_process_record as u8
+        );
+        true
     }
 
     pub(crate) fn purge_transfer_envelopes_for_pid(&mut self, pid: u64) {

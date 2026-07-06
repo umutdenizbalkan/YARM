@@ -851,3 +851,40 @@ SUP-L7H makes managed-record mode fault-priority before any blocking or bounded 
 SUP-L7H also avoids normal empty RecvSharedV3 fault-drain probes in the runtime hot loop. User QEMU showed empty nonblocking nr=30 probes could emit `BLOCKED_WOULDBLOCK_FATAL`; without kernel changes, the userspace fix is to stop using that empty probe as a normal polling heartbeat and rely on the bounded fault wait in managed mode. The smoke script treats `BLOCKED_WOULDBLOCK_FATAL` as a failure and requires either `SUPERVISOR_FAULT_WAIT_RECV tid=10008` or `SUPERVISOR_FAULT_DRAIN_RECV tid=10008` plus the functional attempt-1 markers.
 
 Pending replay remains a bounded startup-race fallback, not an unconditional requirement. PM remains the restart execution authority, the supervisor remains the policy/state owner, and SUP-L7H does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM trusted-supervisor validation, PM reply validation, broad restart policy, local supervisor spawn behavior, or PM restart codec/opcode counts.
+
+## SUP-L7J — retryable rolled-back resource unavailability
+
+SUP-L7J updates the live supervisor/PM restart contract at the reply-classification
+boundary. A PM reply with status `RolledBack` and failure
+`ResourceUnavailable` means PM reached the restart mechanism, had to roll back
+resource/spawn work, and is asking the supervisor to retry policy later. The
+supervisor therefore maps that exact shape to Deferred, logs
+`SUPERVISOR_PM_RESTART_REPLY_DEFERRED ... source=rolled_back`, and reschedules
+the same attempt with a bounded retry counter and at least one logical tick of
+backoff if PM does not provide a future retry tick.
+
+All other rolled-back, rejected, no-such-target, unsupported-version, and
+already-restarting replies keep fail-closed rejection semantics. The supervisor
+still validates reply request/target identity and rejects unexpected replacement
+handles on non-Accepted replies. PM remains the only component that may spawn or
+restart replacements; the supervisor only schedules retry policy.
+
+PM emits spawn-failure and rollback-resource markers before returning the rolled
+back resource-unavailable reply, so the smoke log can distinguish a true spawn
+failure from validation failures and from successful `PM_RESTART_SPAWN_OK`.
+
+## SUP-L7K-B accepted replacement cleanup boundary
+
+PM now reaps the old faulted target after an accepted replacement spawn using the SUP-L7K-A PM-only `ReapFaultedTask` syscall (`nr=31`; kernel `SYSCALL_COUNT=32`). The call is placed in PM after replacement lifecycle/token state is recorded and restart accounting succeeds, but before `PM_RESTART_SPAWN_OK`, `PM_RESTART_REPLY_ACCEPTED`, and the Accepted reply are emitted.
+
+The old target is the request target TID, while the replacement TID is passed only for logging and is never reaped. Rollback remains separate: failed spawn or failed replacement accounting still uses the rolled-back/resource-unavailable path and does not tear down the old target. This preserves the SUP-L7J retry behavior for real resource failures while allowing successful chains such as `10008 -> 10009 -> 10010 -> 10011` to release old VM/task resources between attempts.
+
+No CapID or reply-cap authority changes are introduced. CapIDs remain cspace-local, reply caps remain one-shot, PM remains the restart execution authority, the supervisor remains policy/state owner, and trusted-supervisor plus PM-reply validation stay unchanged.
+
+## SUP-L7O terminal degraded completion
+
+The PM restart contract remains unchanged for attempts 1/2/3 and old-target teardown. After the fourth crash-test incarnation exceeds the restart limit, `SUPERVISOR_SERVICE_DEGRADED_FINAL` is terminal and handled. The supervisor may attempt task-exit and init-alert side effects, but in the crash-restart runtime those hooks are optional/unwired; `InvalidCapability` from those terminal side effects is logged as `SUPERVISOR_DEGRADED_TERMINAL_OPTIONAL_SKIP ... reason=unavailable` and the terminal decision completes with `SUPERVISOR_DEGRADED_TERMINAL_APPLY_OK`. Real PM restart, token, IPC, reply-cap, and ReapFaultedTask failures remain fail-closed.
+
+## SUP-L7P aarch64 crash-restart smoke plumbing
+
+`scripts/qemu-supervisor-crash-restart-smoke.sh` now accepts `x86_64` and `aarch64`. The aarch64 mode reuses the existing aarch64 QEMU/build plumbing from the core smoke (`scripts/build-qemu-aarch64-artifacts.sh`, `virt`, `cortex-a72`, and the aarch64 QEMU binary fallback) while preserving the same arch-neutral supervisor/PM/reap oracle: four crash-test entries, three accepted PM restarts, old-target reap markers, restart-limit degraded final state, and terminal degraded apply OK. No supervisor, PM, ReapFaultedTask, syscall ABI, kernel, or arch behavior is changed by this plumbing.
