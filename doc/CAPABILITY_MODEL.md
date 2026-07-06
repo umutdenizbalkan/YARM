@@ -329,6 +329,15 @@ sender-local CapId as authority. The reply cap stays one-shot (envelope consumed
 recorded once), with mint + record rollback on any failure. Only the `ipc_call` reply-cap path is
 converted. Guarded by `stage188e_ipc_call_reply_cap_blocked_waiter_live`.
 
+**ipc_reply blocked-caller delivery is boundary-split (Stage 188F).** `ipc_reply`'s delivery to a
+blocked recv-v2 caller is dispatched through the 188B/188C/188D dispatch-return producers via a
+single boundary helper. Under the broad borrow `ipc_reply` consumes the replier's reply-cap record
+once and fast-revokes the caller/replier cnode slots (legacy semantics), then the producer consumes
+the blocked state + any transfer/reply envelope once and stashes by value; the cap materialization,
+reply-cap mint/record, and user copy all run on the dispatch-return seams after the borrow drops —
+never under `ipc_state_lock`, never as sender-local CapId authority. Reply caps and transfer
+envelopes stay one-shot with full rollback on failure. Guarded by `stage188f_ipc_reply_boundary_live`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

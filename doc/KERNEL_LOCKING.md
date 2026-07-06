@@ -367,6 +367,21 @@ fault; sender-wake ordering preserved. Only the `ipc_call` reply-cap path is con
 / fault / unrelated `ipc_send`/`ipc_reply` remain deferred; does not enable AP user-task scheduling,
 does not fully retire the global lock. Guarded by `stage188e_ipc_call_reply_cap_blocked_waiter_live`.
 
+### 0.17) Stage 188F (IPC-REPLY-BOUNDARY-LIVE-RETRY) — ipc_reply boundary split (supersedes 187C)
+
+Retries the `ipc_reply` conversion (a 187C hard stop) now that the cap-transfer and reply-cap
+blockers are solved. `ipc_reply`'s blocked recv-v2 delivery is dispatched through a single boundary
+helper, `try_ipc_reply_boundary_split`, which tries the 188B/188C/188D producers (plain →
+ordinary-cap → reply-cap) in order and emits the `IPC_REPLY_BOUNDARY_*` markers. The helper reuses
+the existing producers (no duplicated delivery logic); `ipc_reply` itself calls no seam. Under the
+broad borrow, `ipc_reply` validates + consumes the replier's reply-cap record once and the producer
+consumes the blocked state + envelope once and stashes a by-value `DispatchPostWork`; the seam mint
++ 186E user copy + slot-clear + wake all run in the trap-entry drain after the borrow drops — no
+cap materialization or user copy under `ipc_state_lock`, no seam under the broad borrow. Shared-region
+replies and the no-drainer case defer to the legacy path. Only the `ipc_reply` blocked recv-v2
+delivery is converted; does not enable AP user-task scheduling, does not fully retire the global
+lock. Guarded by `stage188f_ipc_reply_boundary_live`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

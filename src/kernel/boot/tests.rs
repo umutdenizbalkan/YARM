@@ -48530,7 +48530,10 @@ mod stage187c_ipc_reply_retry_hard_stop {
 
     // ipc_reply itself calls NO post-boundary split seam (it is a &mut KernelState
     // method — calling a data_ptr()-derived seam would alias the broad borrow,
-    // Stage 186D4). No IPC_REPLY_BOUNDARY_* boundary was built.
+    // Stage 186D4). NOTE: Stage 188F later wired the ipc_reply blocked recv-v2
+    // delivery to the 188B/188C/188D dispatch-return producers, which STASH work
+    // (no seam) under the broad borrow; the seams still run only in the trap-entry
+    // drain after the borrow drops, so this invariant is unchanged.
     #[test]
     fn stage187c_ipc_reply_calls_no_split_seam() {
         let body = IPC_STATE_SRC
@@ -48554,24 +48557,10 @@ mod stage187c_ipc_reply_retry_hard_stop {
         }
     }
 
-    // No IPC_REPLY_BOUNDARY_* success/fail marker exists anywhere — no dishonest
-    // marker on the legacy ipc_reply path, and no half-converted boundary.
-    #[test]
-    fn stage187c_no_reply_boundary_marker_in_src() {
-        for (name, src) in [
-            ("ipc_state.rs", IPC_STATE_SRC),
-            ("syscall.rs", SYSCALL_SRC),
-            ("syscall/ipc.rs", IPC_SRC),
-            ("runtime.rs", RUNTIME_SRC),
-        ] {
-            assert!(
-                !src.contains("IPC_REPLY_BOUNDARY_SPLIT")
-                    && !src.contains("IPC_REPLY_BOUNDARY_REPLY_CAP_CONSUME_OK"),
-                "`{name}` must not emit any IPC_REPLY_BOUNDARY_* marker — no live ipc_reply \
-                 boundary split was implemented (Stage 187C hard stop)"
-            );
-        }
-    }
+    // (Stage 187C's `no_reply_boundary_marker_in_src` guard was retired by Stage
+    // 188F, which legitimately implements the ipc_reply boundary split and its
+    // IPC_REPLY_BOUNDARY_* markers. The honest-marker invariant now lives in
+    // `stage188f_ipc_reply_boundary_live::stage188f_reply_boundary_markers_in_ipc_state_only`.)
 
     // The reply-cap materialization arm (D5) still carries the documented rank
     // inversion (mint at rank 4, then set_reply_cap_waiter_cap at rank 3): the
@@ -50643,6 +50632,298 @@ mod stage188e_ipc_call_reply_cap_blocked_waiter_live {
             assert!(
                 UNLOCK_DOC.contains(required),
                 "docs must state 188E `{required}`"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Stage 188F — IPC-REPLY-BOUNDARY-LIVE-RETRY
+//
+// Retries the ipc_reply conversion (a Stage 187C hard stop) now that its
+// blockers are solved: ipc_reply's blocked recv-v2 delivery is dispatched
+// through the 188B/188C/188D dispatch-return producers via a single boundary
+// helper (try_ipc_reply_boundary_split), emitting the IPC_REPLY_BOUNDARY_*
+// marker family. No delivery logic is duplicated — the helper reuses the
+// existing producers; the seam mint + 186E copy + wake still run only in the
+// trap-entry drain after the broad borrow drops.
+//
+// Functional test drives a real ipc_reply to a blocked recv-v2 caller (plain)
+// and confirms it stashes dispatch-return work, consumes the reply-cap record
+// once, and the drain delivers + wakes. Source guards pin: the helper tries all
+// three producers with no seam in Phase A; the boundary markers are honest
+// (SPLIT_DONE only on a stash) and live only in ipc_state.rs.
+// ===========================================================================
+#[cfg(test)]
+mod stage188f_ipc_reply_boundary_live {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const CPU0: CpuId = CpuId(0);
+
+    fn set_trap_drainer(active: bool) {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+            .store(active, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // A real ipc_reply to a blocked recv-v2 caller (plain reply) is stack-heavy —
+    // run on a dedicated thread. Proves ipc_reply dispatches to the plain
+    // dispatch-return producer, consumes the reply-cap record once, and the drain
+    // delivers the reply + wakes the caller.
+    #[test]
+    fn stage188f_ipc_reply_plain_uses_dispatch_return() {
+        std::thread::Builder::new()
+            .name("stage188f_ipc_reply_plain".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_stage188f_ipc_reply_plain)
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    fn run_stage188f_ipc_reply_plain() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        state.register_task(1).expect("register caller");
+        state.enqueue_current_cpu(1).expect("enqueue caller");
+
+        // Reply endpoint E: task 1 (client) waits on it; task 0 (server, current)
+        // holds a Reply cap referencing it.
+        let (eidx, _send_e, recv_e) = state.create_endpoint(2).expect("endpoint E");
+        let recv_e_task1 = state
+            .grant_capability_task_to_task(0, recv_e, 1)
+            .expect("grant recv E to task1");
+        // Mint a Reply cap into task 0 (current) for a record whose reply_endpoint
+        // is E and whose responder is task 0.
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_e_task1, Some(ThreadId(0)))
+            .expect("create reply cap");
+        let reply_slot = match state
+            .resolve_capability_for_task(0, reply_cap)
+            .expect("resolve reply")
+            .object
+        {
+            CapObject::Reply { index, .. } => index,
+            other => panic!("expected Reply object, got {other:?}"),
+        };
+
+        // Task 1 user memory: payload + meta pages.
+        let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind task1 asid");
+        state
+            .map_user_page(
+                aspace1,
+                VirtAddr(0x3000),
+                Mapping {
+                    phys: PhysAddr(0x9000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map payload page");
+        state
+            .map_user_page(
+                aspace1,
+                VirtAddr(0x4000),
+                Mapping {
+                    phys: PhysAddr(0xA000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map meta page");
+
+        // Block task 1 in recv-v2 on E (registers it as the endpoint waiter).
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+        let mut recv_frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [
+                recv_e_task1.0 as usize,
+                0x3000,
+                Message::MAX_PAYLOAD,
+                0x4000,
+                40,
+                0,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+            .expect("recv blocks");
+        assert_eq!(
+            state.current_tid(),
+            Some(0),
+            "server (task 0) current after client blocks"
+        );
+
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // Server replies (plain payload). ipc_reply dispatches to the plain
+        // dispatch-return producer.
+        let reply_msg = Message::new(0, b"reply-data").expect("reply msg");
+        state.ipc_reply(reply_cap, reply_msg).expect("ipc_reply");
+
+        // Reply-cap record consumed once (a second reply is stale).
+        assert!(
+            state.with_ipc_state(|ipc| ipc.reply_caps[reply_slot].is_none()),
+            "ipc_reply must consume the reply-cap record once"
+        );
+        // Caller's blocked state consumed by the producer (deferred delivery).
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_none(),
+            "ipc_reply must dispatch to a producer that consumes the caller's blocked state"
+        );
+
+        // Drain: deliver payload + wake.
+        let _ = eidx;
+        let shared = SharedKernel::new(*state);
+        assert!(
+            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            "the drain must deliver the stashed ipc_reply plain work"
+        );
+        set_trap_drainer(false);
+
+        let body = shared
+            .with(|k| k.copy_from_user(asid1, VirtAddr(0x3000), 10))
+            .expect("read payload");
+        assert_eq!(
+            &body[..10],
+            b"reply-data",
+            "the reply payload must reach the caller"
+        );
+        assert!(
+            matches!(
+                shared.with(|k| k.task_status(1)),
+                Some(TaskStatus::Runnable | TaskStatus::Running)
+            ),
+            "the caller must be woken after the reply delivery"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "the drain must consume the stashed work"
+        );
+    }
+
+    // Guard: the ipc_reply boundary helper tries all three producers in order and
+    // calls NO seam / user-copy / cap-materialization in Phase A.
+    #[test]
+    fn stage188f_boundary_helper_tries_all_producers_no_seam() {
+        let body = IPC_STATE_SRC
+            .split("fn try_ipc_reply_boundary_split(")
+            .nth(1)
+            .and_then(|r| r.split("\n    pub fn ipc_reply(").next())
+            .expect("boundary helper body");
+        for producer in [
+            "produce_blocked_waiter_plain_delivery",
+            "produce_blocked_waiter_ordinary_cap_delivery",
+            "produce_blocked_waiter_reply_cap_delivery",
+        ] {
+            assert!(
+                body.contains(producer),
+                "the boundary helper must dispatch to `{producer}`"
+            );
+        }
+        for seam in [
+            "copy_to_user_split",
+            "mint_capability_with_memory_ref_split",
+            "materialize_received_cap_snapshot_split",
+            "try_record_reply_waiter_cap_split",
+            "with_ipc_split_mut",
+            "with_capability_state_split_mut",
+        ] {
+            assert!(
+                !body.contains(seam),
+                "the boundary helper must call NO seam in Phase A (`{seam}`) — the producers stash"
+            );
+        }
+    }
+
+    // Guard: the boundary markers are honest — SPLIT_DONE result=ok appears only
+    // on the Ok(true) (stash) arm, and SPLIT_FAIL only on the Err arm.
+    #[test]
+    fn stage188f_boundary_markers_honest() {
+        let body = IPC_STATE_SRC
+            .split("fn try_ipc_reply_boundary_split(")
+            .nth(1)
+            .and_then(|r| r.split("\n    pub fn ipc_reply(").next())
+            .expect("boundary helper body");
+        // SPLIT_DONE result=ok must be reachable only after a POST_WORK_STASH_OK
+        // (i.e. an Ok(true) producer result) — it sits in the same arm.
+        let done_at = body
+            .find("IPC_REPLY_BOUNDARY_SPLIT_DONE result=ok")
+            .expect("SPLIT_DONE marker");
+        let stash_at = body
+            .find("IPC_REPLY_BOUNDARY_POST_WORK_STASH_OK")
+            .expect("STASH_OK marker");
+        assert!(
+            stash_at < done_at,
+            "SPLIT_DONE must be emitted only after POST_WORK_STASH_OK (the stash arm)"
+        );
+        // SPLIT_FAIL must sit on an error-return path.
+        for (idx, _) in body.match_indices("IPC_REPLY_BOUNDARY_SPLIT_FAIL") {
+            let after = &body[idx..];
+            let ret_err = after.find("return Err(").unwrap_or(usize::MAX);
+            let ret_ok = after.find("return Ok(").unwrap_or(usize::MAX);
+            assert!(
+                ret_err < ret_ok,
+                "every IPC_REPLY_BOUNDARY_SPLIT_FAIL must be on an error-return path"
+            );
+        }
+        // ipc_reply delegates to the helper (single dispatch, no inline triplicate).
+        let reply_body = IPC_STATE_SRC
+            .split("pub fn ipc_reply(")
+            .nth(1)
+            .and_then(|r| r.split("\n    pub fn ").next())
+            .expect("ipc_reply body");
+        assert!(
+            reply_body.contains("try_ipc_reply_boundary_split("),
+            "ipc_reply must delegate its blocked recv-v2 delivery to the boundary helper"
+        );
+    }
+
+    // Guard: the IPC_REPLY_BOUNDARY_* markers live ONLY in ipc_state.rs (the
+    // ipc_reply path). The delivery seams/producers carry their own
+    // DISPATCH_POST_WORK_* / REPLY_CAP_RANK_SEAM_* markers, not these.
+    #[test]
+    fn stage188f_reply_boundary_markers_in_ipc_state_only() {
+        assert!(
+            IPC_STATE_SRC.contains("IPC_REPLY_BOUNDARY_SPLIT_DONE result=ok")
+                && IPC_STATE_SRC.contains("IPC_REPLY_BOUNDARY_REPLY_CAP_CONSUME_OK"),
+            "ipc_state.rs must emit the 188F ipc_reply boundary markers"
+        );
+        for (name, src) in [
+            ("syscall.rs", SYSCALL_SRC),
+            ("syscall/ipc.rs", IPC_SRC),
+            ("runtime.rs", RUNTIME_SRC),
+        ] {
+            assert!(
+                !src.contains("IPC_REPLY_BOUNDARY_"),
+                "`{name}` must not emit ipc_reply boundary markers (they belong to the ipc_reply path)"
+            );
+        }
+    }
+
+    // Docs record 188F honestly.
+    #[test]
+    fn stage188f_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 188F"),
+            "docs must document Stage 188F"
+        );
+        for required in [
+            "does not duplicate",
+            "does not enable AP user-task scheduling",
+            "does not fully retire the global lock",
+        ] {
+            assert!(
+                UNLOCK_DOC.contains(required),
+                "docs must state 188F `{required}`"
             );
         }
     }

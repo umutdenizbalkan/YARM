@@ -8223,6 +8223,46 @@ stashes reply-cap work and the drain mints + records + delivers a fresh receiver
 and wakes the receiver; handle_ipc_call tries the producer before the legacy path, on the recv-v2
 blocked branch only).
 
+**Stage 188F (IPC-REPLY-BOUNDARY-LIVE-RETRY) — DONE (ipc_reply boundary split, superseding the
+187C hard stop).** Stage 187C hard-stopped the `ipc_reply` conversion because its blocked-waiter
+delivery blockers (cap-transfer seam aliasing, reply-cap rank inversion) were unsolved. Stages
+188B/188C/188D/188E solved them; 188F retries and lands the `ipc_reply` boundary split.
+
+*What changed.* The `ipc_reply` blocked recv-v2 delivery — which the 188B/188C/188D producers were
+already wired into as three sequential matches — is now dispatched through a single boundary helper,
+`try_ipc_reply_boundary_split`, that tries the plain → ordinary-cap → reply-cap producers in order
+and emits the `IPC_REPLY_BOUNDARY_*` marker family
+(`IPC_REPLY_BOUNDARY_SPLIT_BEGIN` / `IPC_REPLY_BOUNDARY_REPLY_CAP_CONSUME_OK` /
+`IPC_REPLY_BOUNDARY_POST_WORK_STASH_OK kind=<plain|ordinary_cap|reply_cap>` /
+`IPC_REPLY_BOUNDARY_SPLIT_DONE result=ok` / `IPC_REPLY_BOUNDARY_SPLIT_DEFERRED reason=…` /
+`IPC_REPLY_BOUNDARY_SPLIT_FAIL reason=…`). This **does not duplicate** any 188B/188C/188D helper —
+the helper reuses the existing producers; the seam mint + 186E user copy + slot-clear + wake still
+run only in the trap-entry drain after the broad borrow drops. `ipc_reply` itself calls no seam
+(guard-pinned).
+
+*Phase A / one-shot.* Under the broad borrow `ipc_reply` already validates + consumes the replier's
+reply-cap record once (`reply_caps[slot] = None`) and fast-revokes the caller/replier cnode slots,
+exactly as the legacy path requires; the boundary helper then runs each producer's Phase A (consume
+blocked state + any transfer/reply envelope once, pre-validate buffers, stash a by-value
+`DispatchPostWork`). No seam / user-copy / cap-materialization runs under `ipc_state_lock` or the
+broad borrow. Shared-region replies and the no-drainer case return `Ok(false)` →
+`IPC_REPLY_BOUNDARY_SPLIT_DEFERRED` → the unchanged legacy `complete_blocked_recv_for_waiter` path.
+The delivery inherits the 188B/188C/188D rollback (mint/refcount/delegation/waiter-cap) and
+wake-once semantics; sender-wake ordering is preserved.
+
+*Live markers.* Because the boot's blocked-recv-v2 replies flow through `ipc_reply`, this makes
+`IPC_REPLY_BOUNDARY_SPLIT_DONE result=ok` live alongside the 41 plain and 10 ordinary-cap
+`DISPATCH_POST_WORK_DONE` deliveries already produced by this path.
+
+*Scope honesty.* Converts **only** the `ipc_reply` blocked recv-v2 delivery; shared-region transfer,
+fault delivery, and unrelated `ipc_send`/`ipc_call` conversions remain deferred; **does not enable
+AP user-task scheduling** and **does not fully retire the global lock**. No ABI/count change
+(`SYSCALL_COUNT=31`, `Syscall::VARIANT_COUNT=23`, x86_64 `MAX_ADDRESS_SPACES=32`). Guarded by
+`stage188f_ipc_reply_boundary_live` (a real ipc_reply to a blocked recv-v2 caller stashes
+dispatch-return work, consumes the reply-cap record once, and the drain delivers + wakes; the helper
+tries all three producers with no seam in Phase A; SPLIT_DONE is honest, only on a stash; the
+boundary markers live only in `ipc_state.rs`).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

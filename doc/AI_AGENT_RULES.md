@@ -522,6 +522,19 @@ enables AP user-task scheduling or retires the global lock. Pinned by
 `stage188e_ipc_call_reply_cap_blocked_waiter_live`. See `doc/KERNEL_UNLOCKING.md` (Stage 188E) and
 `doc/KERNEL_LOCKING.md §0.16`.
 
+**Stage 188F (IPC-REPLY-BOUNDARY-LIVE-RETRY) status — ipc_reply boundary split, supersedes 187C.**
+The 187C hard stop is retired: `ipc_reply`'s blocked recv-v2 delivery is dispatched through a single
+boundary helper `try_ipc_reply_boundary_split` that tries the 188B/188C/188D producers (plain →
+ordinary-cap → reply-cap) and emits the `IPC_REPLY_BOUNDARY_*` markers
+(`IPC_REPLY_BOUNDARY_SPLIT_DONE result=ok` on a stash; `_SPLIT_DEFERRED` for shared-region /
+no-drainer; `_SPLIT_FAIL` only on error). Do **not** reintroduce the retired
+`stage187c_no_reply_boundary_marker_in_src` guard — the IPC_REPLY_BOUNDARY_* markers are now
+legitimate and live in `ipc_state.rs` only. The helper **does not duplicate** any producer, calls no
+seam in Phase A, and the seam mint + 186E copy + wake still run only in the trap-entry drain. Do
+**not** extend this to shared-region / fault / `ipc_send`/`ipc_call`, and do **not** claim it enables
+AP user-task scheduling or retires the global lock. Pinned by `stage188f_ipc_reply_boundary_live`.
+See `doc/KERNEL_UNLOCKING.md` (Stage 188F) and `doc/KERNEL_LOCKING.md §0.17`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the
