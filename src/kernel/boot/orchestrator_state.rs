@@ -393,6 +393,16 @@ impl KernelState {
             #[cfg(not(target_arch = "x86_64"))]
             let (cow_tlb_ok, unmap_tlb_ok) = (false, false);
 
+            // Stage 189B: AP user-dispatch scaffold audit. Reports readiness and
+            // emits the honest deferral markers; NEVER clears a wake-only bit and
+            // NEVER schedules a user task. `tlb_ready` is bound to the genuine
+            // Stage 189A remote-ACK proof above.
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::smp::run_ap_dispatch_scaffold_audit(
+                self,
+                cow_tlb_ok && unmap_tlb_ok,
+            );
+
             // Final Stage 183.6 verdict. D6/D2 out-of-lock dispatch under real SMP is
             // proven by the per-event `D6_SMP_DISPATCH_OK` / sender-wake-oracle
             // markers on the trap path (single-dispatcher topology); the TLB ACK is

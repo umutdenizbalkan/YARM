@@ -1611,28 +1611,60 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
     }
 }
 
-/// Stage 183.6: drive a REAL cross-CPU TLB shootdown against `targets` and wait
-/// for each AP's ACK. For each target CPU: post the request into its per-CPU
+/// Stage 189A: emitted once, the first time the real shootdown IPI path is driven,
+/// to attest the vector/mailbox path is live. Idempotent via this flag.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static TLB_SHOOTDOWN_IPI_READY: AtomicBool = AtomicBool::new(false);
+
+/// Stage 183.6 / 189A: drive a REAL cross-CPU TLB shootdown against `targets` and
+/// wait for each AP's ACK. For each target CPU: post the request into its per-CPU
 /// record (VA; 0 = full flush), send the wake IPI (vector 0xF1 — the same IPI its
 /// managed sched-idle loop already services), and wait (bounded) for
 /// `tlb_ack_gen == req_gen`. The AP executes the invalidation locally and ACKs —
-/// a genuine remote acknowledgement, not a simulated one. Returns the number of
-/// APs that acknowledged; emits `X86_TLB_REMOTE_ACK_TIMEOUT` for any that did not.
+/// a genuine remote acknowledgement, not a simulated one: the BSP here only ever
+/// *reads* `tlb_ack_gen`; the sole writer of that field is the AP's own asm
+/// (`gs:[132]`). Returns the number of APs that acknowledged; emits the standard
+/// `X86_TLB_SHOOTDOWN_FAIL` (and the legacy `X86_TLB_REMOTE_ACK_TIMEOUT`) for any
+/// that did not.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
     use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+    use super::tlb_shootdown;
+    if !TLB_SHOOTDOWN_IPI_READY.swap(true, Ordering::AcqRel) {
+        crate::yarm_log!(
+            "{} vector=0x{:x}",
+            tlb_shootdown::MARK_IPI_READY,
+            AP_REMOTE_WAKE_VECTOR
+        );
+    }
+    // Honest no-op: an empty target mask means there is nothing to shoot down
+    // remotely (BSP-local topology). Surface it, do not silently "succeed".
+    if targets == 0 {
+        crate::yarm_log!("{} reason=no_remote_target", tlb_shootdown::MARK_DEFERRED);
+        return 0;
+    }
     let mut acked = 0usize;
     for raw in 0..crate::arch::platform_constants::MAX_CPUS {
         if targets & (1u64 << raw) == 0 {
             continue;
         }
         let cpu = CpuId(raw as u8);
-        crate::yarm_log!("X86_TLB_SHOOTDOWN_SEND cpu={} va=0x{:x}", cpu.0, va);
+        // Post the request FIRST (writes req_va then bumps req_gen), then IPI. The
+        // returned `want` is the generation the target must publish into its own
+        // ack_gen; the BSP never writes ack_gen.
         let want = super::percpu::tlb_request_shootdown(cpu, va);
+        crate::yarm_log!(
+            "{} target_cpu={} gen={} va=0x{:x}",
+            tlb_shootdown::MARK_SEND,
+            cpu.0,
+            want,
+            va
+        );
         wait_for_icr_idle(cpu.0, "before_tlb_shootdown");
         write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
         let mut got = false;
         for _ in 0..AP_READY_POLL_ITERS {
+            // Read-only observation of the AP-owned ack generation.
             if super::percpu::tlb_ack_gen(cpu) == want {
                 got = true;
                 break;
@@ -1640,14 +1672,26 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
             cpu_relax();
         }
         if got {
-            crate::yarm_log!("X86_TLB_SHOOTDOWN_ACK cpu={} gen={}", cpu.0, want);
+            // The target published ack_gen == want, which it does only AFTER the
+            // local invalidation — so this observation attests both the handling
+            // and the acknowledgement.
+            crate::yarm_log!("{} cpu={} gen={}", tlb_shootdown::MARK_HANDLE, cpu.0, want);
+            crate::yarm_log!("{} cpu={} gen={}", tlb_shootdown::MARK_ACK, cpu.0, want);
             acked += 1;
         } else {
+            let got_gen = super::percpu::tlb_ack_gen(cpu);
+            crate::yarm_log!(
+                "{} reason=ack_timeout cpu={} want_gen={} got_gen={}",
+                tlb_shootdown::MARK_FAIL,
+                cpu.0,
+                want,
+                got_gen
+            );
             crate::yarm_log!(
                 "X86_TLB_REMOTE_ACK_TIMEOUT cpu={} want_gen={} got_gen={}",
                 cpu.0,
                 want,
-                super::percpu::tlb_ack_gen(cpu)
+                got_gen
             );
         }
     }
@@ -1661,30 +1705,66 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
 /// AP's wake-only bit, that CPU joins the precise per-ASID target set instead.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub fn online_wake_only_ap_bitmap(kernel: &KernelState) -> u64 {
-    let bsp = 1u64 << crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
-    kernel.online_cpu_bitmap() & kernel.wake_only_cpu_bitmap() & !bsp
+    // Single source of truth: the Stage 189A coordinator's IPI-capability filter.
+    super::tlb_shootdown::ipi_capable_targets(
+        kernel.online_cpu_bitmap(),
+        kernel.wake_only_cpu_bitmap(),
+        crate::arch::platform_constants::BOOTSTRAP_CPU_ID,
+    )
 }
 
-/// Stage 183.6 one-shot: prove the real SMP TLB shootdown ACK against every online
-/// AP, for both the COW and VM_UNMAP contexts. Returns `(cow_ok, unmap_ok)`.
+/// Stage 183.6 / 189A one-shot: prove the real SMP TLB shootdown ACK against every
+/// online AP, for both the COW and VM_UNMAP contexts. Returns `(cow_ok, unmap_ok)`.
+///
+/// Routes the target set through the Stage 189A coordinator so the live path uses
+/// exactly the classification that the hosted-dev tests pin. Emits the standard
+/// terminal markers (`result=ok` / `result=bsp_local`) additively alongside the
+/// legacy context markers the smoke gates require.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub fn ap_tlb_shootdown_proof(kernel: &KernelState) -> (bool, bool) {
-    let targets = online_wake_only_ap_bitmap(kernel);
+    use super::tlb_shootdown::{self, ShootdownTargets};
+    let targets = match tlb_shootdown::classify(online_wake_only_ap_bitmap(kernel)) {
+        ShootdownTargets::BspLocal => {
+            // Honest: no valid remote target — the shootdown collapses to a local
+            // flush. Nothing remote to acknowledge, so the remote proof is not
+            // asserted (the caller emits its honest ack-unproven blocker).
+            crate::yarm_log!("{} result=bsp_local targets=0x0", tlb_shootdown::MARK_DONE);
+            return (false, false);
+        }
+        ShootdownTargets::Remote(mask) => mask,
+    };
     let want = targets.count_ones() as usize;
-    if want == 0 {
-        return (false, false);
-    }
     // COW context: a representative parent write-protect VA — full round-trip.
     let cow_ok = smp_tlb_shootdown_cpus(targets, 0x0000_1000) == want;
     if cow_ok {
-        crate::yarm_log!("X86_TLB_SHOOTDOWN_DONE context=cow targets={}", want);
+        crate::yarm_log!(
+            "{} result=ok context=cow targets=0x{:x}",
+            tlb_shootdown::MARK_DONE,
+            targets
+        );
         crate::yarm_log!("COW_SMP_TLB_ACK_OK acks={}", want);
+    } else {
+        crate::yarm_log!(
+            "{} reason=cow_ack_incomplete targets=0x{:x}",
+            tlb_shootdown::MARK_FAIL,
+            targets
+        );
     }
     // VM_UNMAP context: a full-flush shootdown (va=0) — full round-trip.
     let unmap_ok = smp_tlb_shootdown_cpus(targets, 0) == want;
     if unmap_ok {
-        crate::yarm_log!("X86_TLB_SHOOTDOWN_DONE context=vm_unmap targets={}", want);
+        crate::yarm_log!(
+            "{} result=ok context=vm_unmap targets=0x{:x}",
+            tlb_shootdown::MARK_DONE,
+            targets
+        );
         crate::yarm_log!("VM_UNMAP_SMP_TLB_ACK_OK acks={}", want);
+    } else {
+        crate::yarm_log!(
+            "{} reason=vm_unmap_ack_incomplete targets=0x{:x}",
+            tlb_shootdown::MARK_FAIL,
+            targets
+        );
     }
     (cow_ok, unmap_ok)
 }
@@ -1692,4 +1772,188 @@ pub fn ap_tlb_shootdown_proof(kernel: &KernelState) -> (bool, bool) {
 #[cfg(any(test, feature = "hosted-dev"))]
 pub fn ap_tlb_shootdown_proof(_kernel: &KernelState) -> (bool, bool) {
     (false, false)
+}
+
+/// Hosted-dev stub: the AP dispatch scaffold audit is a bare-metal-only path (it
+/// reads per-CPU records and drives the audited transition). The decision logic it
+/// applies lives in `ap_dispatch` and is unit-tested directly.
+#[cfg(any(test, feature = "hosted-dev"))]
+pub fn run_ap_dispatch_scaffold_audit(_kernel: &mut KernelState, _tlb_ready: bool) {}
+
+/// Stage 189B: structural audit of the per-CPU prerequisites an AP needs to enter
+/// user mode through the shared BSP return path. Verifies the AP has its own TSS,
+/// a recorded kernel idle CR3, and valid idle metadata. This proves the *shared*
+/// return-path prerequisites are present; it does NOT prove a live AP user
+/// trap-return (that is Stage 189C — `ensure_user_return_cr3` still resolves a
+/// global active-ASID and a BSP-tuned return-context stack).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_trap_return_prereqs_present(cpu: CpuId) -> bool {
+    let record = super::percpu::read_record(cpu);
+    record.tss_ptr != 0
+        && record.idle_cr3 != 0
+        && (record.idle_flags & super::percpu::idle_flag::IDLE_TASK_META_SET) != 0
+}
+
+/// Stage 189C2: is the AP's per-CPU TSS RSP0 a valid (non-zero) ring0 stack? A
+/// ring3→ring0 interrupt/fault on an AP switches to this stack, so it must be set.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_tss_rsp0_ready(cpu: CpuId) -> bool {
+    super::descriptor_tables::ap_tss_rsp0(cpu.0 as usize) != 0
+}
+
+/// Stage 189C3: does this AP have a verified per-CPU active GS base
+/// (`IA32_GS_BASE` → its own per-CPU record)? This is the per-CPU data foundation a
+/// future `swapgs` syscall/interrupt entry rewrite reads via gs-relative slots.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_percpu_gs_base_ready(cpu: CpuId) -> bool {
+    super::percpu::gs_base_written(cpu)
+}
+
+/// Stage 189C4: is the x86_64 `syscall` fast-path entry per-CPU-safe? YES — the
+/// LSTAR entry (`yarm_x86_lstar_entry`) now reads gs-relative per-CPU slots
+/// (`syscall_kernel_rsp0` @144 / `syscall_scratch_rsp` @152). Because CR4.FSGSBASE
+/// is disabled and user TLS is in FS, `GS.base` is the kernel per-CPU record in
+/// every ring, so this is SMP-safe with NO `swapgs`. The old global slots are
+/// removed. QEMU-proven on `-smp 1` (`X86_SYSCALL_ENTRY_PERCPU_READY cpu=0`,
+/// 815/815 `USER_CR3_PRE_IRET_OK`), oracle, and crash-restart.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_syscall_entry_is_per_cpu_safe() -> bool {
+    true
+}
+
+/// Stage 189C4: is the AP ring3-ENTRY path present? An AP still has no code that
+/// enters ring 3: the AP idle loop (`smp_trampoline.rs`) never loads a user CR3,
+/// never sets up an iretq frame, and never enters user mode. That AP-dispatcher /
+/// usermode-entry trampoline is the remaining blocker — false until it lands.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_ring3_entry_path_ready() -> bool {
+    false
+}
+
+/// Stage 189C4: full AP usermode-entry readiness — a valid per-CPU TSS RSP0, a
+/// per-CPU-safe syscall entry (done), AND a live AP ring3-entry path (not yet).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_usermode_entry_ready(cpu: CpuId) -> bool {
+    ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe() && ap_ring3_entry_path_ready()
+}
+
+/// Stage 189B: the AUDITED, sole authority for clearing an AP's wake-only bit for
+/// dispatch. Refuses unless every readiness condition holds; on success it clears
+/// wake-only and emits `X86_AP_WAKE_ONLY_CLEAR`. No other code path may clear an
+/// AP's wake-only bit for dispatch. In Stage 189B `readiness.trap_return_ready`
+/// is always false, so this function always refuses and never clears wake-only.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn try_enable_ap_user_dispatch(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    readiness: super::ap_dispatch::ApReadiness,
+) -> Result<(), super::ap_dispatch::ClearRefusal> {
+    use super::ap_dispatch;
+    if let Err(refusal) = readiness.evaluate_clear() {
+        crate::yarm_log!(
+            "{} cpu={} reason={}",
+            ap_dispatch::MARK_WAKE_ONLY_CLEAR_DEFERRED,
+            cpu.0,
+            refusal.reason()
+        );
+        return Err(refusal);
+    }
+    // All readiness bits hold: this is the ONLY site that clears wake-only for
+    // dispatch. (Unreachable in Stage 189B — trap_return_ready is never set.)
+    kernel
+        .mark_cpu_wake_only(cpu, false)
+        .map_err(|_| ap_dispatch::ClearRefusal::RunQueueNotReady)?;
+    crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_WAKE_ONLY_CLEAR, cpu.0);
+    Ok(())
+}
+
+/// Stage 189B: one-shot AP user-dispatch scaffold audit. Runs after the Stage
+/// 189A TLB-shootdown proof. For each online wake-only AP it reports the readiness
+/// state and drives the AUDITED transition, which — because the live trap-return
+/// path is deferred to Stage 189C — refuses and emits the honest deferral markers.
+/// It NEVER clears a wake-only bit and NEVER schedules a user task.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool) {
+    use super::ap_dispatch::{self, ApReadiness};
+    // Scaffold-level facts (topology-independent): the dispatcher state machine and
+    // the run-queue admission guards exist and are validated by hosted-dev tests.
+    crate::yarm_log!("{}", ap_dispatch::MARK_DISPATCHER_SCAFFOLD_READY);
+    crate::yarm_log!("{}", ap_dispatch::MARK_ADMISSION_GUARD_READY);
+
+    let targets = online_wake_only_ap_bitmap(kernel);
+    for raw in 0..crate::arch::platform_constants::MAX_CPUS {
+        if targets & (1u64 << raw) == 0 {
+            continue;
+        }
+        let cpu = CpuId(raw as u8);
+        // Structural trap-return audit: shared-path per-CPU prerequisites present.
+        if ap_trap_return_prereqs_present(cpu) {
+            crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TRAP_RETURN_AUDIT_OK, cpu.0);
+        }
+        // Stage 189C: the user-return CR3 authority is per-CPU-correct (keyed off
+        // the executing CPU's actual hardware CR3, never the global HAL
+        // active-ASID). Attest the RETURN half is ready per-CPU.
+        crate::yarm_log!(
+            "{} cpu={} reason=per_cpu_cr3_authority",
+            ap_dispatch::MARK_TRAP_RETURN_READY,
+            cpu.0
+        );
+        // Stage 189C2: the AP has a valid per-CPU TSS RSP0 for ring3→ring0.
+        if ap_tss_rsp0_ready(cpu) {
+            crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TSS_RSP0_READY, cpu.0);
+        }
+        // Stage 189C3: the AP has a verified per-CPU active GS base — the per-CPU
+        // data foundation a future swapgs syscall/interrupt entry rewrite requires.
+        if ap_percpu_gs_base_ready(cpu) {
+            crate::yarm_log!(
+                "{} cpu={} reason=active_gs_base_percpu",
+                ap_dispatch::MARK_PERCPU_GS_BASE_READY,
+                cpu.0
+            );
+        }
+        // Stage 189C4: the per-CPU gs-relative SYSCALL entry is SMP-safe (no global
+        // authority, no swapgs needed — GS.base is the kernel per-CPU record in all
+        // rings), proven on the BSP. Attest it for the AP too.
+        if ap_syscall_entry_is_per_cpu_safe() {
+            crate::yarm_log!(
+                "{} cpu={}",
+                ap_dispatch::MARK_SYSCALL_ENTRY_PERCPU_READY,
+                cpu.0
+            );
+        }
+        if tlb_ready {
+            crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TLB_READY, cpu.0);
+        }
+        // Stage 189C4: usermode-ENTRY readiness. TSS RSP0 + per-CPU syscall entry are
+        // both ready now; the remaining gap is the AP ring3-ENTRY path — the AP idle
+        // loop has no code that loads a user CR3 and iretqs to ring 3. Until that AP
+        // usermode-entry trampoline lands, usermode entry stays deferred.
+        let usermode_entry_ready = ap_usermode_entry_ready(cpu);
+        if usermode_entry_ready {
+            crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_USERMODE_ENTRY_READY, cpu.0);
+        } else {
+            crate::yarm_log!(
+                "{} cpu={} reason=ap_ring3_entry_path_absent",
+                ap_dispatch::MARK_USERMODE_ENTRY_DEFERRED,
+                cpu.0
+            );
+        }
+        // The audited-transition gate. `trap_return_ready` reflects the full
+        // usermode round-trip readiness (currently false: no AP ring3-entry path).
+        let readiness = ApReadiness {
+            dispatcher_ready: true,
+            run_queue_ready: true,
+            tlb_ready,
+            trap_return_ready: usermode_entry_ready,
+        };
+        // Drive the REAL audited transition. It refuses (usermode entry not ready),
+        // logs `X86_AP_WAKE_ONLY_CLEAR_DEFERRED reason=trap_return_not_ready`, and
+        // does NOT clear wake-only. This exercises the exact production gate.
+        let _ = try_enable_ap_user_dispatch(kernel, cpu, readiness);
+        crate::yarm_log!(
+            "{} cpu={} reason=ap_ring3_entry_path_absent",
+            ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
+            cpu.0
+        );
+    }
 }

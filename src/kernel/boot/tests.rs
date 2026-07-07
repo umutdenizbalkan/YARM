@@ -37246,9 +37246,11 @@ mod stage132_post_cleanup_pf_diagnosis {
             DESCRIPTOR_SRC.contains("fn read_boot_tss_rsp0"),
             "descriptor_tables.rs must declare read_boot_tss_rsp0"
         );
+        // Stage 189C4: the global YARM_X86_SYSCALL_RSP0 is removed; read_boot_tss_rsp0
+        // now reads the per-CPU record's syscall_kernel_rsp0 for the executing CPU.
         assert!(
-            DESCRIPTOR_SRC.contains("YARM_X86_SYSCALL_RSP0"),
-            "read_boot_tss_rsp0 must read YARM_X86_SYSCALL_RSP0"
+            DESCRIPTOR_SRC.contains("super::percpu::syscall_kernel_rsp0(current_cpu_id())"),
+            "read_boot_tss_rsp0 must read the per-CPU syscall kernel RSP0"
         );
     }
 
@@ -57486,6 +57488,7 @@ mod stage183_ap_idle_admit {
     const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
     const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
     const TRAMP_SRC: &str = include_str!("../../arch/x86_64/smp_trampoline.rs");
+    const TLB_SRC: &str = include_str!("../../arch/x86_64/tlb_shootdown.rs");
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
 
@@ -58264,17 +58267,35 @@ mod stage183_ap_idle_admit {
                 "AP TLB-mailbox service step must exist: {a}"
             );
         }
-        // The BSP driver sends + waits for a REAL ack, timing out (not hanging) on failure.
+        // The BSP driver sends + waits for a REAL ack, timing out (not hanging) on
+        // failure. Stage 189A: the standard marker vocabulary is owned by the
+        // `tlb_shootdown` coordinator; the driver emits it via the MARK_* constants
+        // and keeps the legacy smoke markers additively.
         assert!(
             SMP_SRC.contains("fn smp_tlb_shootdown_cpus(")
-                && SMP_SRC.contains("X86_TLB_SHOOTDOWN_SEND")
-                && SMP_SRC.contains("X86_TLB_SHOOTDOWN_ACK")
+                && SMP_SRC.contains("tlb_shootdown::MARK_SEND")
+                && SMP_SRC.contains("tlb_shootdown::MARK_ACK")
+                && SMP_SRC.contains("tlb_shootdown::MARK_HANDLE")
                 && SMP_SRC.contains("X86_TLB_REMOTE_ACK_TIMEOUT")
                 && SMP_SRC.contains("fn ap_tlb_shootdown_proof(")
                 && SMP_SRC.contains("COW_SMP_TLB_ACK_OK")
                 && SMP_SRC.contains("VM_UNMAP_SMP_TLB_ACK_OK")
-                && SMP_SRC.contains("X86_TLB_SHOOTDOWN_DONE"),
+                && SMP_SRC.contains("tlb_shootdown::MARK_DONE"),
             "the BSP TLB shootdown driver + COW/UNMAP proof must exist"
+        );
+        // Stage 189A: the coordinator defines the full standard marker vocabulary
+        // and the anti-fake-ACK generation model.
+        assert!(
+            TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_IPI_READY\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_SEND\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_HANDLE\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_ACK\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_DONE\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_DEFERRED\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_FAIL\"")
+                && TLB_SRC.contains("fn ipi_capable_targets(")
+                && TLB_SRC.contains("fn observe_target_ack("),
+            "tlb_shootdown coordinator must own the standard marker vocabulary + ack model"
         );
         // dispatching_cpu_count excludes wake-only; the seams use it.
         assert!(
@@ -58310,6 +58331,61 @@ mod stage183_ap_idle_admit {
         );
     }
 
+    // Stage 189A: the real TLB-shootdown ACK infra must never let the initiator
+    // fabricate a remote ACK. The AP asm (`gs:[132]`) is the sole writer of
+    // `tlb_ack_gen`; the BSP driver only ever READS it. This is a source guard
+    // against a future "self-ack" regression.
+    #[test]
+    fn stage189a_bsp_never_writes_ap_tlb_ack() {
+        // The ONLY ack_gen writer is the AP's own asm store.
+        assert!(
+            TRAMP_SRC.contains("mov dword ptr gs:[132], r10d"),
+            "the AP asm must publish its own ack (gs:[132] = req_gen)"
+        );
+        // The BSP driver must observe the AP-owned ack via the READ accessor only,
+        // and must contain no store to the mailbox ack slot (`gs:[132]`).
+        assert!(
+            SMP_SRC.contains("super::percpu::tlb_ack_gen(cpu)") && !SMP_SRC.contains("gs:[132],"),
+            "the BSP driver must only READ the AP-owned ack (no fake/self-ack)"
+        );
+        // The percpu BSP-side request helper writes only req_va/req_gen, never ack.
+        const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+        assert!(
+            PERCPU_SRC.contains("fn tlb_request_shootdown(")
+                && !PERCPU_SRC.contains("fn tlb_ack_shootdown(")
+                && !PERCPU_SRC
+                    .contains("write_volatile(core::ptr::addr_of_mut!((*base).tlb_ack_gen)"),
+            "no BSP-side helper may write an AP's tlb_ack_gen"
+        );
+        // The coordinator's only ack writer is the target-modeling method, and it
+        // exposes no initiator-side ack writer.
+        assert!(
+            TLB_SRC.contains("fn observe_target_ack(")
+                && !TLB_SRC.contains("fn initiator_ack(")
+                && !TLB_SRC.contains("fn force_ack("),
+            "the coordinator must expose no initiator-side ack writer"
+        );
+    }
+
+    // Stage 189A: AP scheduling remains disabled — no wake-only bit is cleared for
+    // scheduling, and the shootdown coordinator never enables AP dispatch.
+    #[test]
+    fn stage189a_no_ap_user_dispatch_enabled() {
+        // The shootdown coordinator must not touch the wake-only bit or schedule.
+        assert!(
+            !TLB_SRC.contains("set_cpu_wake_only")
+                && !TLB_SRC.contains("mark_cpu_wake_only")
+                && !TLB_SRC.contains("enqueue")
+                && !TLB_SRC.contains("dispatch_next"),
+            "the TLB shootdown coordinator must not enable AP dispatch or clear wake-only"
+        );
+        // Placement on wake-only CPUs stays denied.
+        assert!(
+            include_str!("../scheduler.rs").contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
+            "wake-only placement denial must remain"
+        );
+    }
+
     // Counts/limits unchanged (no ABI/limit drift from the SMP bring-up).
     #[test]
     fn stage183_inc2_counts_unchanged() {
@@ -58322,6 +58398,373 @@ mod stage183_ap_idle_admit {
             include_str!("../../arch/x86_64/vm_layout.rs")
                 .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
             "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+    }
+}
+
+// Stage 189B — AP user-dispatch scaffold. Source guards proving the audited
+// wake-only clear is the sole gate, the scaffold enqueues no user task, the
+// admission guards hold, and nothing partially enables AP dispatch this pass.
+mod stage189b_ap_dispatch_scaffold {
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const SCHED_SRC: &str = include_str!("../scheduler.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+
+    // The audited transition is the ONLY code that emits X86_AP_WAKE_ONLY_CLEAR
+    // (the dispatch-enabling clear) and it only does so after evaluate_clear() is
+    // Ok. No other file emits it.
+    #[test]
+    fn only_audited_transition_clears_wake_only_for_dispatch() {
+        // The live-clear marker is defined in ap_dispatch and emitted only by the
+        // audited transition in smp.rs (guarded by evaluate_clear()).
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_WAKE_ONLY_CLEAR: &str = \"X86_AP_WAKE_ONLY_CLEAR\"")
+                && SMP_SRC.contains("fn try_enable_ap_user_dispatch(")
+                && SMP_SRC.contains("readiness.evaluate_clear()")
+                && SMP_SRC.contains("ap_dispatch::MARK_WAKE_ONLY_CLEAR,"),
+            "the audited transition must gate the wake-only clear on evaluate_clear()"
+        );
+        // The clear of wake-only-for-dispatch (mark_cpu_wake_only(cpu, false)) in
+        // smp.rs appears ONLY inside try_enable_ap_user_dispatch. The only other
+        // mark_cpu_wake_only(_, false) is the bring-up-failure revert, which runs
+        // on a NON-online CPU (never dispatch-eligible).
+        let clears = SMP_SRC.matches("mark_cpu_wake_only(cpu, false)").count();
+        assert!(
+            clears <= 2,
+            "unexpected extra wake-only clear sites in smp.rs: {clears}"
+        );
+    }
+
+    // The audited transition AND-gates all four readiness bits and refuses with a
+    // specific reason; trap_return_ready is false in 189B, so it always refuses.
+    #[test]
+    fn evaluate_clear_and_gates_all_readiness() {
+        assert!(
+            AP_DISPATCH_SRC.contains("ClearRefusal::DispatcherNotReady")
+                && AP_DISPATCH_SRC.contains("ClearRefusal::RunQueueNotReady")
+                && AP_DISPATCH_SRC.contains("ClearRefusal::TlbNotReady")
+                && AP_DISPATCH_SRC.contains("ClearRefusal::TrapReturnNotReady"),
+            "all four readiness refusals must exist"
+        );
+        // Runtime proof of the AND-gate.
+        use crate::arch::x86_64::ap_dispatch::{ApReadiness, ClearRefusal};
+        let mut r = ApReadiness {
+            dispatcher_ready: true,
+            run_queue_ready: true,
+            tlb_ready: true,
+            trap_return_ready: true,
+        };
+        assert!(r.all_ready());
+        r.tlb_ready = false;
+        assert_eq!(r.evaluate_clear(), Err(ClearRefusal::TlbNotReady));
+        assert!(!r.all_ready(), "a missing TLB ACK must block dispatch");
+    }
+
+    // The scaffold enqueues no user task and never dispatches: ap_dispatch.rs is
+    // pure decision logic (no scheduler mutation), and the smp audit only logs.
+    #[test]
+    fn scaffold_never_enqueues_or_dispatches() {
+        assert!(
+            !AP_DISPATCH_SRC.contains(".enqueue")
+                && !AP_DISPATCH_SRC.contains("dispatch_next_on")
+                && !AP_DISPATCH_SRC.contains("mark_cpu_wake_only")
+                && !AP_DISPATCH_SRC.contains("&mut KernelState"),
+            "the ap_dispatch state machine must be pure (no scheduler/kernel mutation)"
+        );
+        assert!(
+            SMP_SRC.contains("fn run_ap_dispatch_scaffold_audit(")
+                && !SMP_SRC.contains("enqueue_on(")
+                && !SMP_SRC.contains("enqueue_balanced("),
+            "the scaffold audit must not enqueue user tasks"
+        );
+        // The boot audit emits the honest deferral, not a live enable.
+        assert!(
+            ORCH_SRC.contains("run_ap_dispatch_scaffold_audit(")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
+                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent"),
+            "the boot audit must defer live AP dispatch honestly"
+        );
+    }
+
+    // Run-queue admission guards: wake-only CPUs are denied placement and skipped
+    // by least-loaded selection. BSP behavior unchanged.
+    #[test]
+    fn admission_guards_deny_wake_only_placement() {
+        assert!(
+            SCHED_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY")
+                && SCHED_SRC.contains("fn least_loaded_online_cpu("),
+            "wake-only enqueue denial + least-loaded skip must exist"
+        );
+        // least_loaded_online_cpu skips wake-only CPUs.
+        assert!(
+            SCHED_SRC.contains("if self.wake_only & (1u64 << idx) != 0 {")
+                && SCHED_SRC.contains("continue;"),
+            "least-loaded selection must skip wake-only CPUs"
+        );
+    }
+
+    // The trap-return audit is structural only; the LIVE return path is explicitly
+    // deferred (trap_return_ready stays false) — no partial enable.
+    #[test]
+    fn trap_return_is_structural_audit_only_live_deferred() {
+        assert!(
+            SMP_SRC.contains("fn ap_trap_return_prereqs_present(")
+                && SMP_SRC.contains("record.tss_ptr != 0")
+                && SMP_SRC.contains("record.idle_cr3 != 0"),
+            "the trap-return audit must verify the per-CPU shared-path prerequisites"
+        );
+        assert!(
+            SMP_SRC.contains("trap_return_ready: usermode_entry_ready"),
+            "the gate must reflect the usermode-entry readiness (false until per-CPU syscall entry)"
+        );
+    }
+}
+
+// Stage 189C — the AP user-return CR3 authority is made per-CPU-correct. The live
+// AP user-dispatch ENTRY path remains deferred (AP idle loop never enters ring 3),
+// so no wake-only is cleared and no AP user task runs; these guards pin the
+// per-CPU return correctness and the absence of any live-dispatch enable.
+mod stage189c_ap_user_return_percpu {
+    const TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+
+    // ensure_user_return_cr3 must NOT use the global d6_diag_active_asid_num as the
+    // AP return authority; the switch decision keys off the per-CPU hardware CR3.
+    #[test]
+    fn user_return_cr3_is_per_cpu_not_global_active_asid() {
+        let start = TRAP_SRC
+            .find("pub(crate) fn ensure_user_return_cr3(")
+            .expect("ensure_user_return_cr3 must exist");
+        // Bound the search to the function body (up to the next top-level fn).
+        let rest = &TRAP_SRC[start..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .or_else(|| rest[1..].find("\npub(crate) fn "))
+            .map(|e| e + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains(".d6_diag_active_asid_num()"),
+            "ensure_user_return_cr3 must not CALL the global d6_diag_active_asid_num"
+        );
+        assert!(
+            body.contains("read_hw_cr3()") && body.contains("if hw_cr3 != task_cr3"),
+            "the return switch authority must be the per-CPU hardware CR3"
+        );
+        assert!(
+            body.contains(".current_tid()") && body.contains(".task_asid(cur)"),
+            "the active ASID must be derived from the executing CPU's current task"
+        );
+    }
+
+    // The return-context stack selection samples the executing CPU's real RSP
+    // (per-CPU-safe), not a BSP-hardcoded stack.
+    #[test]
+    fn return_context_stack_selection_is_per_cpu() {
+        assert!(
+            TRAP_SRC.contains("fn find_kernel_stack_bounds_containing_rsp(")
+                && TRAP_SRC.contains("rsp >= base && rsp < top"),
+            "return-context selection must match the sampled per-CPU RSP against TCB stacks"
+        );
+    }
+
+    // No live AP user dispatch was enabled: the live-only markers appear ONLY in
+    // the audited transition guarded by evaluate_clear(), never in the scaffold
+    // audit, and the audit still emits the honest deferral.
+    #[test]
+    fn no_live_ap_user_dispatch_enabled() {
+        // The scaffold audit emits the deferral with the precise blocker reason.
+        assert!(
+            SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
+                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent"),
+            "the audit must defer live dispatch with the AP-ring3-entry blocker reason"
+        );
+        // The live begin/return/done markers are defined but emitted by NOTHING in
+        // this pass (no producer): they exist only as vocabulary constants.
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && AP_DISPATCH_SRC.contains("MARK_USER_TRAP_RETURN_OK"),
+            "the live-dispatch marker vocabulary must exist for 189D"
+        );
+        assert!(
+            !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
+            "no live AP user-dispatch marker may be emitted this pass"
+        );
+    }
+
+    // The per-CPU return-readiness attestation exists and is scoped honestly.
+    #[test]
+    fn trap_return_ready_marker_is_scoped_to_cr3_authority() {
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_TRAP_RETURN_READY: &str = \"X86_AP_TRAP_RETURN_READY\"")
+                && SMP_SRC.contains("MARK_TRAP_RETURN_READY")
+                && SMP_SRC.contains("reason=per_cpu_cr3_authority"),
+            "the trap-return-ready attestation must be scoped to the per-CPU CR3 authority"
+        );
+    }
+}
+
+// Stage 189C2 — AP usermode-entry readiness. The per-CPU TSS RSP0 is detected, but
+// the x86_64 `syscall` fast-path still uses GLOBAL (not SMP-safe) RSP0/scratch
+// slots, so an AP user task's syscall would load the BSP's kernel stack. Usermode
+// entry is therefore NOT enabled: no wake-only cleared, no ring3 entry, no live
+// marker. These guards pin the blocker detection and the absence of any live enable.
+mod stage189c2_ap_usermode_entry {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    // Stage 189C4: the x86_64 syscall fast-path entry is now PER-CPU (gs-relative,
+    // no global authority, no swapgs). The old global slots are removed.
+    #[test]
+    fn syscall_entry_is_now_per_cpu_gs_relative() {
+        assert!(
+            !DESC_SRC.contains("static YARM_X86_SYSCALL_RSP0")
+                && !DESC_SRC.contains("static YARM_X86_SYSCALL_SCRATCH_RSP"),
+            "the global syscall RSP0/scratch statics must be removed"
+        );
+        // The LSTAR entry reads the per-CPU gs-relative slots (144/152).
+        assert!(
+            DESC_SRC.contains("mov qword ptr gs:[152], rsp")
+                && DESC_SRC.contains("mov rsp, qword ptr gs:[144]")
+                && DESC_SRC.contains("mov rcx, qword ptr gs:[152]"),
+            "the LSTAR entry must use the per-CPU gs-relative RSP0/scratch slots"
+        );
+        // The detector reports the syscall entry as per-CPU-safe; usermode entry now
+        // additionally requires the AP ring3-entry path.
+        assert!(
+            SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    true\n}")
+                && SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}")
+                && SMP_SRC.contains(
+                    "ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe() && ap_ring3_entry_path_ready()",
+                ),
+            "usermode-entry readiness must require TSS RSP0 + per-CPU syscall entry + AP ring3-entry path"
+        );
+    }
+
+    // Usermode entry is deferred with the precise remaining blocker (AP ring3-entry
+    // path absent); the gate reflects it.
+    #[test]
+    fn usermode_entry_deferred_with_precise_reason() {
+        assert!(
+            SMP_SRC.contains("MARK_USERMODE_ENTRY_DEFERRED")
+                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent")
+                && SMP_SRC.contains("trap_return_ready: usermode_entry_ready"),
+            "the audit must defer usermode entry with the AP-ring3-entry-path-absent reason"
+        );
+        // The per-CPU TSS RSP0 and per-CPU syscall entry readiness are both attested.
+        assert!(
+            SMP_SRC.contains("fn ap_tss_rsp0_ready(")
+                && SMP_SRC.contains("MARK_TSS_RSP0_READY")
+                && SMP_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY"),
+            "the per-CPU TSS RSP0 + syscall-entry readiness must be detected and attested"
+        );
+    }
+
+    // No live AP user dispatch / ring3 entry was performed: the entry/re-entry
+    // live markers are vocabulary-only, emitted by nothing this pass.
+    #[test]
+    fn no_live_ap_usermode_entry_performed() {
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_USERMODE_ENTRY_READY")
+                && AP_DISPATCH_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK"),
+            "the live-entry marker vocabulary must exist for the future per-CPU-entry stage"
+        );
+        // The AP-run live markers are never referenced by the audit at all.
+        assert!(
+            !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
+            "no AP-run live marker may be emitted this pass"
+        );
+        // The USERMODE_ENTRY_READY emit exists only inside the `if usermode_entry_ready`
+        // branch, which stays false because the AP ring3-entry path is absent — so
+        // USERMODE_ENTRY_READY is never emitted at runtime this pass.
+        assert!(
+            SMP_SRC.contains("if usermode_entry_ready {")
+                && SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}"),
+            "usermode-entry readiness must be gated false (AP ring3-entry path absent)"
+        );
+        // Wake-only is still only cleared by the audited transition (unreached).
+        assert!(
+            SMP_SRC.contains("fn try_enable_ap_user_dispatch(")
+                && SMP_SRC.contains("readiness.evaluate_clear()"),
+            "wake-only clear must remain gated by the audited transition"
+        );
+    }
+}
+
+// Stage 189C3 — per-CPU GS base attested (safest audited subset). The full swapgs
+// syscall/interrupt entry rewrite is DEFERRED (triple-fault risk), so the syscall
+// entry stays global, usermode entry stays deferred, no wake-only is cleared, and
+// NO swapgs is added to the entry asm (no partial/unbalanced rewrite).
+mod stage189c3_percpu_entry_exit {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    // The per-CPU active GS base is detected and attested from real per-CPU state.
+    #[test]
+    fn percpu_gs_base_is_detected_and_attested() {
+        assert!(
+            PERCPU_SRC.contains("fn gs_base_written(")
+                && PERCPU_SRC.contains("flag::GS_BASE_WRITTEN"),
+            "the per-CPU GS-base-written state must be readable"
+        );
+        assert!(
+            SMP_SRC.contains("fn ap_percpu_gs_base_ready(")
+                && SMP_SRC.contains("super::percpu::gs_base_written(cpu)")
+                && SMP_SRC.contains("MARK_PERCPU_GS_BASE_READY")
+                && SMP_SRC.contains("reason=active_gs_base_percpu"),
+            "the audit must attest the per-CPU active GS base"
+        );
+        assert!(
+            AP_DISPATCH_SRC
+                .contains("MARK_PERCPU_GS_BASE_READY: &str = \"X86_PERCPU_GS_BASE_READY\""),
+            "the per-CPU GS-base marker vocabulary must exist"
+        );
+    }
+
+    // SAFETY: no swapgs was added to the entry asm this pass — the swapgs rewrite is
+    // deferred as a whole, so there is no partial/unbalanced swapgs to trip on.
+    #[test]
+    fn entry_is_per_cpu_gs_relative_no_swapgs_needed() {
+        // Stage 189C4: the entry is per-CPU gs-relative; swapgs is not required
+        // because CR4.FSGSBASE is disabled and TLS is in FS (GS.base is the kernel
+        // per-CPU record in all rings). The design attests this explicitly.
+        assert!(
+            DESC_SRC.contains("X86_SWAPGS_ENTRY_READY reason=not_required_gs_kernel_percpu")
+                && DESC_SRC.contains(
+                    "X86_INTERRUPT_ENTRY_SWAPGS_READY reason=not_required_gs_kernel_percpu"
+                ),
+            "the swapgs-not-required attestation must be emitted"
+        );
+        assert!(
+            SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    true\n}"),
+            "the syscall entry is now per-CPU-safe"
+        );
+    }
+
+    // Progress markers ARE emitted (per-CPU syscall entry ready), but no AP-run live
+    // dispatch marker is emitted and no wake-only is cleared this pass.
+    #[test]
+    fn percpu_entry_progress_but_no_live_ap_dispatch() {
+        assert!(
+            SMP_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY"),
+            "the per-CPU syscall-entry readiness is attested for APs"
+        );
+        assert!(
+            !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
+                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
+            "no AP-run live dispatch marker may be emitted this pass"
         );
     }
 }

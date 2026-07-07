@@ -51,6 +51,185 @@ remove implicit global-lock coupling from syscall/trap paths.
     carries no `&mut KernelState` and no single-dispatcher assumption, so it is
     already per-CPU-safe. Pinned by
     `stage188h_reap_faulted_task_excluded_from_split_dispatch`.
+- **Stage 189A (X86_64-REAL-TLB-SHOOTDOWN-ACK-INFRA) — infra only, AP dispatch
+  still OFF.** x86_64 now has a real cross-CPU TLB-shootdown IPI + **genuine**
+  remote ACK, so a future AP dispatcher has the shootdown primitive it needs.
+  This stage does **not** clear any wake-only bit, schedule any user task on an
+  AP, retire the global lock, or change the syscall ABI.
+  * **Coordinator (single source of truth):** `arch/x86_64/tlb_shootdown.rs` owns
+    the target-set policy (`ipi_capable_targets = online & wake_only & !bsp`),
+    the `BspLocal`/`Remote` classification, the generation/ack model
+    (`GenTracker`), and the standard marker vocabulary. It is pure and
+    hosted-dev-unit-tested; the bare-metal driver in `smp.rs` uses exactly this
+    logic.
+  * **Genuine ACK, no fakes.** For each target the BSP posts `tlb_req_va` then
+    bumps `tlb_req_gen` (`percpu::tlb_request_shootdown`) and sends vector `0xF1`.
+    The **target AP** services the mailbox in its managed sched-idle loop
+    (`smp_trampoline.rs`), executes `invlpg`/CR3-reload locally, then publishes
+    `tlb_ack_gen = req_gen` via `gs:[132]`. The BSP only ever **reads**
+    `tlb_ack_gen`; it is the sole non-AP-owned field it never writes. A missing
+    ack is a visible `X86_TLB_SHOOTDOWN_FAIL reason=ack_timeout`, never hidden.
+  * **Generation, not boolean.** Acks are matched by generation, so a stale ack
+    from an earlier shootdown cannot satisfy a newer request. Guarded by
+    `arch::x86_64::tlb_shootdown::tests::ack_uses_generation_not_boolean_stale_state`
+    and `initiator_cannot_fabricate_a_remote_ack`; source-guarded by
+    `stage189a_bsp_never_writes_ap_tlb_ack`.
+  * **Wake-only policy.** Online wake-only APs *do* participate in the ACK: they
+    idle on the kernel CR3, hold no user ASID (over-invalidation is always safe),
+    and can service the mailbox IPI — so the ACK is real, not a shortcut. The
+    per-ASID VM liveness filter (`live_cpu_bitmap_for_asid`) is unchanged and
+    still excludes wake-only APs; `ipi_capable_targets` is the IPI-capability
+    filter, distinct from that per-ASID set. Markers (real 2-/4-CPU SMP):
+    `X86_TLB_SHOOTDOWN_IPI_READY`, `..._SEND target_cpu=N gen=g`,
+    `..._HANDLE cpu=N gen=g`, `..._ACK cpu=N gen=g`,
+    `..._DONE result=ok targets=0x…`; and the honest `..._DONE result=bsp_local`
+    / `..._DEFERRED reason=no_remote_target` when no remote target exists.
+- **Stage 189B (AP-DISPATCHER + ADMISSION + TRAP-RETURN SCAFFOLD) — inert, no
+  live AP user dispatch.** APs remain wake-only; no wake-only bit is cleared, no
+  user task is scheduled on an AP, the global lock stays authoritative, and the
+  ABI is unchanged. This pass builds the complete gate for a future first live
+  AP dispatch (Stage 189C):
+  * **Readiness state machine (`arch/x86_64/ap_dispatch.rs`, pure + unit-tested):**
+    `ApReadiness { dispatcher_ready, run_queue_ready, tlb_ready, trap_return_ready }`
+    with an AND-gated `evaluate_clear()` that returns a specific `ClearRefusal`
+    for the first missing bit. `UserDispatchEnabled` is reachable ONLY through the
+    audited transition when all four hold.
+  * **Audited wake-only clear is the sole authority.** `smp::try_enable_ap_user_dispatch`
+    is the only path that clears an AP's wake-only bit for dispatch, and only when
+    `evaluate_clear()` is `Ok`; it emits `X86_AP_WAKE_ONLY_CLEAR`. (The one other
+    `mark_cpu_wake_only(cpu, false)` is the bring-up-failure revert on a
+    non-online CPU — never dispatch-eligible.) Guarded by
+    `stage189b_ap_dispatch_scaffold::only_audited_transition_clears_wake_only_for_dispatch`.
+  * **Admission unchanged and sufficient:** since wake-only is cleared only by the
+    audited transition, "not wake-only" ≡ "UserDispatchEnabled"; the existing
+    `enqueue_on_with_priority` denial (`SCHED_ENQUEUE_DENIED_WAKE_ONLY`) and the
+    `least_loaded_online_cpu` wake-only skip already keep every user task off APs.
+    BSP placement is unchanged.
+  * **`tlb_ready` is bound to the Stage 189A genuine ACK** (`cow_ok && unmap_ok`);
+    a fake/absent ACK leaves it false and blocks dispatch.
+  * **`trap_return_ready` is deliberately false.** The live AP user trap-return is
+    **not** wired: `arch::x86_64::trap::ensure_user_return_cr3` still resolves a
+    global active-ASID (`d6_diag_active_asid_num`) and a BSP-tuned return-context
+    stack, so a per-CPU-correct AP return is unproven. The boot audit
+    (`run_ap_dispatch_scaffold_audit`, in the `online>1` block) emits
+    `X86_AP_DISPATCHER_SCAFFOLD_READY`, `X86_AP_ADMISSION_GUARD_READY`,
+    `X86_AP_TRAP_RETURN_AUDIT_OK cpu=N` (per-CPU shared-path prereqs present),
+    `X86_AP_TLB_READY_FOR_DISPATCH cpu=N`, then drives the real audited transition
+    which refuses with `X86_AP_WAKE_ONLY_CLEAR_DEFERRED reason=trap_return_not_ready`
+    and `X86_AP_USER_DISPATCH_DEFERRED reason=live_trap_return_wiring_deferred_to_189c`.
+    The live-only markers (`X86_AP_WAKE_ONLY_CLEAR`, `X86_AP_USER_DISPATCH_BEGIN`,
+    `X86_AP_USER_TRAP_RETURN_OK`, `X86_AP_USER_DISPATCH_DONE`) are never emitted
+    this pass.
+- **Stage 189C (FIRST-LIVE-AP-USER-DISPATCH) — partial: per-CPU return fix landed,
+  live dispatch HARD-STOPPED.** No wake-only bit is cleared, no AP user task runs,
+  the global lock stays authoritative, and the ABI is unchanged.
+  * **Required blocker fix — done.** `arch::x86_64::trap::ensure_user_return_cr3`
+    no longer calls the global `d6_diag_active_asid_num`; it derives the active
+    ASID from the executing CPU's current task (`current_tid()` is set from the
+    trapping CPU's APIC id in `current_cpu_id()`), and the switch authority is —
+    as before — the per-CPU hardware CR3 (`read_hw_cr3()`; `if hw_cr3 != task_cr3`).
+    The return-context stack selection (`find_kernel_stack_bounds_containing_rsp`)
+    matches the sampled per-CPU RSP against TCB stacks, so it is per-CPU-safe, not
+    BSP-tuned. This is a diagnostic-derivation change only; the BSP switch is
+    byte-identical (QEMU core/oracle/crash-restart green, 815 `USER_CR3_PRE_IRET_OK`
+    == 815 `..._CHECK`). The audit now emits
+    `X86_AP_TRAP_RETURN_READY cpu=N reason=per_cpu_cr3_authority`.
+  * **Hard stop — live AP user dispatch NOT enabled.** The trap-return *round trip*
+    still cannot be exercised because the AP has no usermode-**entry** path: the AP
+    idle loop (`smp_trampoline.rs`) is by design interrupt-masked and "NEVER enters
+    userspace, NEVER calls scheduler dispatch, NEVER takes a timer interrupt".
+    Enabling a first live AP user dispatch requires a new AP usermode-entry
+    trampoline (`iretq` to ring 3 under the global lock), per-CPU TSS `RSP0` for the
+    ring3→ring0 kernel re-entry, AP interrupt-enable + timer/syscall handling, and
+    a Rust AP dispatcher hook off the wake path — a deep new bare-metal path that
+    cannot be made QEMU-clean in a single safe pass. `trap_return_ready` therefore
+    stays false; the audited transition still refuses and emits
+    `X86_AP_USER_DISPATCH_DEFERRED`. No live-only marker is emitted; no wake-only
+    is cleared; nothing is faked.
+- **Stage 189C2 (AP-USERMODE-ENTRY) — blocker isolated to the per-CPU syscall
+  entry; live dispatch HARD-STOPPED (code-documented reason).** No wake-only is
+  cleared, no AP enters ring 3, no live marker is emitted, nothing is faked.
+  * **Per-CPU TSS RSP0 detected + attested.** Each AP has its own TSS with a
+    non-zero `rsp0` (`descriptor_tables::ap_tss_rsp0`), so the ring3→ring0
+    *interrupt/fault* stack switch is per-CPU. The audit emits
+    `X86_AP_TSS_RSP0_READY cpu=N`.
+  * **Decisive blocker — the `syscall` fast-path is global, not per-CPU.**
+    `yarm_x86_lstar_entry` writes/reads the RIP-relative GLOBAL slots
+    `YARM_X86_SYSCALL_SCRATCH_RSP` / `YARM_X86_SYSCALL_RSP0` (no `swapgs`), which
+    the source itself documents as **"NOT SMP-safe … replace with a per-CPU scratch
+    (SWAPGS + gs-relative) before enabling SMP on x86_64."** An AP-run user task's
+    `syscall` would load the **BSP's** kernel stack `RSP0` → guaranteed corruption.
+    Producing `X86_AP_USER_SYSCALL_REENTRY_OK` on this path would be faking. So
+    `ap_syscall_entry_is_per_cpu_safe()` is `false`, `ap_usermode_entry_ready()` is
+    false, the gate reflects it (`trap_return_ready: usermode_entry_ready`), the
+    audited transition refuses, and the audit emits
+    `X86_AP_USERMODE_ENTRY_DEFERRED cpu=N reason=global_syscall_rsp0_not_per_cpu`.
+  * **Remaining work (the real "189C2"):** rewrite the x86_64 kernel entry/exit to
+    per-CPU — set `IA32_KERNEL_GS_BASE` per AP, `swapgs` + gs-relative RSP0/scratch
+    in `yarm_x86_lstar_entry` (balanced on `sysret` and on every ring3 interrupt
+    entry), and map each AP's kernel `RSP0` stack into the user address spaces it
+    runs. That is a delicate whole-kernel entry rewrite with triple-fault risk, not
+    a minimal trampoline — deferred per the hard-stop directive.
+- **Stage 189C3 (PER-CPU-ENTRY/EXIT) — safest audited subset only; swapgs rewrite
+  HARD-STOPPED.** No wake-only cleared, no ring 3 entry, no live marker, nothing
+  faked, BSP behavior unchanged.
+  * **Entry inventory.** Ring3→ring0 entries: the `syscall`/LSTAR path
+    (`yarm_x86_lstar_entry`, global `YARM_X86_SYSCALL_RSP0`/`_SCRATCH_RSP`, no
+    `swapgs`) and the IDT trap/IRQ/#PF stubs (`yarm_x86_dispatch_trap_from_stub`,
+    `iretq`). MSRs (`configure_syscall_fast_path`): EFER.SCE, STAR, LSTAR, FMASK.
+    GS: APs set the **active** `IA32_GS_BASE` (0xC000_0101) to their per-CPU record
+    and verify it (`X86_AP_GS_OK`); there is **no** `swapgs` and no
+    `IA32_KERNEL_GS_BASE` anywhere.
+  * **Safe subset done.** The per-CPU active GS base is detected
+    (`percpu::gs_base_written`) and attested: `X86_PERCPU_GS_BASE_READY cpu=N
+    reason=active_gs_base_percpu`. This is the per-CPU data foundation a future
+    `swapgs` entry reads. Zero behavior change (attestation only).
+  * **Hard stop — swapgs entry/exit rewrite deferred.** Converting the entry model
+    is a whole-kernel change: move per-CPU data to `IA32_KERNEL_GS_BASE`, `swapgs`
+    on user→kernel `syscall` + on every CPL3 interrupt/#PF entry (and NOT on
+    kernel→kernel traps), gs-relative RSP0/scratch, balanced `swapgs` on `sysret`
+    and `iretq`, plus mapping each AP's `RSP0` stack into user CR3. A single
+    imbalance triple-faults and would break the entire BSP `-smp 1` baseline that
+    188A–189C2 depend on, so it is not attempted in one pass. `swapgs` is verified
+    ABSENT from the entry asm this pass (no partial/unbalanced rewrite);
+    `ap_syscall_entry_is_per_cpu_safe()` stays false; usermode entry stays deferred
+    (`reason=global_syscall_rsp0_not_per_cpu`); the audited transition still
+    refuses; no wake-only is cleared.
+- **Stage 189C4 (PER-CPU SYSCALL ENTRY REWRITE) — DONE and QEMU-proven; AP live
+  dispatch still deferred on the AP ring3-entry path.** The 189B/C/C2/C3 blocker
+  (global syscall stack authority) is eliminated. Global lock authoritative, ABI
+  unchanged, BSP behavior preserved.
+  * **Key finding — swapgs is NOT needed.** `CR4.FSGSBASE` is disabled (ring 3
+    cannot `wrgsbase`) and user TLS lives in **FS** (`restore_fs_base_if_needed`),
+    so `GS.base` is the kernel per-CPU record in **every** ring. The correct design
+    is therefore gs-relative per-CPU entry with **no `swapgs`** (the seL4-style
+    model), not the Linux swapgs model — swapgs would be incorrect here (there is
+    no separate user GS to swap).
+  * **Checkpoint A (per-CPU syscall entry) — done.** Added per-CPU
+    `syscall_kernel_rsp0` @144 / `syscall_scratch_rsp` @152 to the per-CPU record;
+    `configure_syscall_fast_path` sets the BSP's `IA32_GS_BASE` to its record and
+    populates its RSP0; `refresh_boot_tss_rsp0` updates the **executing** CPU's
+    per-CPU RSP0. `yarm_x86_lstar_entry` now uses `gs:[152]`/`gs:[144]` instead of
+    the RIP-relative globals, which are **removed**. Markers
+    `X86_PERCPU_ENTRY_READY cpu=0`, `X86_SYSCALL_ENTRY_PERCPU_READY cpu=N`.
+    QEMU-proven: `-smp 1` core (815/815 `USER_CR3_PRE_IRET_OK`), IPC_FINAL oracle,
+    crash-restart, and smp2/smp4 (per-AP `X86_SYSCALL_ENTRY_PERCPU_READY`).
+  * **Checkpoints B/C — swapgs not required (attested).**
+    `X86_SWAPGS_ENTRY_READY` / `X86_INTERRUPT_ENTRY_SWAPGS_READY`
+    `reason=not_required_gs_kernel_percpu`. Ring3→ring0 interrupt/#PF uses the
+    per-CPU **TSS RSP0** (`X86_AP_TSS_RSP0_READY`), already per-CPU.
+  * **Checkpoint D — deferred on the AP ring3-ENTRY path.** The syscall re-entry is
+    now SMP-safe, but the AP idle loop still has no code that loads a user CR3 and
+    `iretq`s to ring 3 (`ap_ring3_entry_path_ready()` = false). `ap_usermode_entry_ready`
+    = TSS-RSP0 ∧ per-CPU-syscall ∧ ring3-entry, so it stays false; the audited
+    transition refuses; no wake-only cleared; deferral
+    `reason=ap_ring3_entry_path_absent`. Remaining work: an AP dispatcher hook off
+    the wake path that picks an admitted task, sets the AP's per-CPU RSP0 + TSS
+    RSP0, maps that kernel stack into the user CR3, and `iretq`s to ring 3.
+  * *smp2 note:* the smoke gate is flaky on the `X86_IPI_FIXED_ICR_WRITTEN` serial
+    diagnostic (a pre-existing TCG serial-output race since 189C2, ~3/5 pass); the
+    AP functionally comes online (send/ack/TLB `result=ok`) every run. smp4 is
+    clean.
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
