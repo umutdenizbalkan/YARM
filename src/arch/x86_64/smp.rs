@@ -6,7 +6,7 @@ use crate::kernel::scheduler::CpuId;
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 // Stage 108 / Milestone 2 Pass 1: the AP trampoline (16/32/64-bit startup
 // assembly + trampoline-page encoding) lives in the sibling module
@@ -1832,16 +1832,16 @@ fn ap_ring3_entry_prereqs_present(cpu: CpuId) -> bool {
     ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe()
 }
 
-/// Stage 189C5: is the LIVE AP ring3-entry dispatcher wired and QEMU-proven? NOT
-/// yet. Wiring it means modifying the AP idle-loop `global_asm` to call a Rust
-/// dispatcher that picks an admitted task, sets the AP per-CPU RSP0 + TSS RSP0 to
-/// that task's kernel stack, maps that stack into the task CR3, loads the CR3, and
-/// `iretq`s to ring 3. That is a triple-fault-prone whole-path change requiring a
-/// dedicated QEMU-iteration cycle; it stays OFF so the accepted SMP baseline
-/// (smp2/smp4 through 189C4) is preserved. The audited transition still refuses.
+/// Stage 189C6: is the LIVE AP ring3-entry dispatcher wired and armed? The AP
+/// idle-loop hook (`smp_trampoline.rs` label `76:`) now calls the Rust dispatcher
+/// `yarm_x86_ap_user_dispatch_entry`, which sets the AP per-CPU RSP0 + TSS RSP0,
+/// loads the selected task CR3, and `iretq`s to ring 3. The wiring is permanent;
+/// whether it FIRES is the DEFAULT-OFF `yarm.ap_user_dispatch` knob (so the
+/// accepted smp2/smp4 baseline is byte-for-byte preserved unless explicitly
+/// armed). This reports the armed state that drives the audited transition.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 fn ap_ring3_entry_path_ready() -> bool {
-    false
+    crate::kernel::boot::ap_user_dispatch_enabled()
 }
 
 /// Stage 189C4: full AP usermode-entry readiness — a valid per-CPU TSS RSP0, a
@@ -1975,11 +1975,268 @@ pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool)
         // Drive the REAL audited transition. It refuses (usermode entry not ready),
         // logs `X86_AP_WAKE_ONLY_CLEAR_DEFERRED reason=trap_return_not_ready`, and
         // does NOT clear wake-only. This exercises the exact production gate.
-        let _ = try_enable_ap_user_dispatch(kernel, cpu, readiness);
+        let cleared = try_enable_ap_user_dispatch(kernel, cpu, readiness).is_ok();
+        // Stage 189C6: when the live dispatch knob is ARMED and the audited
+        // transition cleared this AP's wake-only bit, drive the FIRST live AP user
+        // dispatch on it now. When the knob is OFF this is skipped entirely and the
+        // honest deferral marker is emitted (unchanged baseline).
+        if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {
+            live_ap_user_dispatch(kernel, cpu);
+        } else {
+            crate::yarm_log!(
+                "{} cpu={} reason=ap_ring3_live_dispatcher_hook_gated",
+                ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
+                cpu.0
+            );
+        }
+    }
+}
+
+// ── Stage 189C6 LIVE AP user dispatch ────────────────────────────────────────
+
+/// Dedicated per-CPU ring-0 kernel stacks for the live AP dispatch (kernel `.bss`,
+/// higher-half → mapped in every ASID including the probe's, so it is a valid RSP0
+/// under the task CR3). Used for the AP's per-CPU syscall RSP0 and TSS RSP0.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+#[repr(align(16))]
+struct ApDispatchKStack([u8; 16384]);
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static mut AP_DISPATCH_KSTACKS: [ApDispatchKStack; crate::arch::platform_constants::MAX_CPUS] =
+    [const { ApDispatchKStack([0u8; 16384]) }; crate::arch::platform_constants::MAX_CPUS];
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_dispatch_kstack_top(cpu: CpuId) -> u64 {
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    let base = unsafe { core::ptr::addr_of!(AP_DISPATCH_KSTACKS[idx]) as u64 };
+    // Top of the stack, 16-aligned; the iretq/enter path builds down from here.
+    (base + 16384) & !0xF
+}
+
+/// The pre-built ring-3 dispatch plan the AP executes lock-free. The BSP writes all
+/// four fields, then publishes `valid` (Release); the AP reads `valid` (Acquire)
+/// before the fields, so it never observes a torn plan. One slot per CPU.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+struct ApDispatchPlan {
+    cr3: AtomicU64,
+    entry: AtomicU64,
+    user_stack_top: AtomicU64,
+    kernel_rsp0: AtomicU64,
+    valid: AtomicBool,
+}
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+impl ApDispatchPlan {
+    const fn empty() -> Self {
+        Self {
+            cr3: AtomicU64::new(0),
+            entry: AtomicU64::new(0),
+            user_stack_top: AtomicU64::new(0),
+            kernel_rsp0: AtomicU64::new(0),
+            valid: AtomicBool::new(false),
+        }
+    }
+}
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static AP_DISPATCH_PLANS: [ApDispatchPlan; crate::arch::platform_constants::MAX_CPUS] =
+    [const { ApDispatchPlan::empty() }; crate::arch::platform_constants::MAX_CPUS];
+
+/// The one-shot probe context (CR3/entry/user-stack), built once on the BSP and
+/// shared by every dispatched AP (each AP gets its own kernel RSP0). `0` cr3 = unbuilt.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static PROBE_CR3: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static PROBE_ENTRY: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static PROBE_USTACK: AtomicU64 = AtomicU64::new(0);
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static PROBE_BUILT: AtomicBool = AtomicBool::new(false);
+
+/// Stage 189C6: the LIVE AP user-dispatch entry — called from the AP idle-loop hook
+/// (`smp_trampoline.rs` label `76:`) when the BSP set this AP's per-CPU
+/// `ap_dispatch_request`. It runs ON THE AP, lock-free: the task SELECTION and plan
+/// construction happened on the BSP under the global lock; here the AP only executes
+/// the pre-built, isolated plan. Sets the AP per-CPU syscall RSP0 + TSS RSP0, loads
+/// the probe task CR3, and `iretq`s into ring 3 (never returns on success). On a
+/// missing/invalid plan it declines and returns to the idle loop.
+///
+/// # Safety
+/// Called from asm with a valid AP kernel stack, kernel CR3 active, GS.base = this
+/// CPU's per-CPU record, and CR4 synced (SSE enabled). Diverges into ring 3 on the
+/// happy path.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+#[unsafe(no_mangle)]
+pub extern "C" fn yarm_x86_ap_user_dispatch_entry() {
+    use super::ap_dispatch;
+    let cpu = super::descriptor_tables::current_cpu_id();
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+
+    super::percpu::set_ap_dispatch_stage(cpu, 1);
+    // One-shot: clear the request so a later spurious wake cannot re-enter.
+    super::percpu::set_ap_dispatch_request(cpu, 0);
+    crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_DISPATCH_HOOK_ENTER, cpu.0);
+
+    let plan = &AP_DISPATCH_PLANS[idx];
+    if !plan.valid.load(Ordering::Acquire) {
         crate::yarm_log!(
-            "{} cpu={} reason=ap_ring3_live_dispatcher_hook_gated",
-            ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
+            "{} cpu={} reason=no_plan",
+            ap_dispatch::MARK_DISPATCH_DECLINED,
             cpu.0
+        );
+        return;
+    }
+    let cr3 = plan.cr3.load(Ordering::Relaxed);
+    let entry = plan.entry.load(Ordering::Relaxed);
+    let user_stack_top = plan.user_stack_top.load(Ordering::Relaxed);
+    let kernel_rsp0 = plan.kernel_rsp0.load(Ordering::Relaxed);
+    if cr3 == 0 || entry == 0 || user_stack_top == 0 || kernel_rsp0 == 0 {
+        crate::yarm_log!(
+            "{} cpu={} reason=incomplete_plan",
+            ap_dispatch::MARK_DISPATCH_DECLINED,
+            cpu.0
+        );
+        return;
+    }
+
+    // The SYSCALL fast-path MSRs (EFER.SCE, STAR, LSTAR, FMASK) are PER-CPU: only the
+    // BSP configured them at boot, so without this the AP's ring-3 `syscall` `#UD`s on
+    // SCE=0. Configure them for THIS CPU so the probe syscall reaches the per-CPU LSTAR.
+    super::descriptor_tables::configure_syscall_msrs_for_self();
+
+    // Ring3→ring0 transitions on this AP must land on a per-CPU kernel stack that is
+    // mapped in the task CR3: the per-CPU syscall RSP0 (LSTAR reads gs:[144]) and the
+    // AP TSS RSP0 (hardware uses it on a ring3 fault/interrupt).
+    super::percpu::set_syscall_kernel_rsp0(cpu, kernel_rsp0);
+    super::descriptor_tables::set_ap_tss_rsp0(idx, kernel_rsp0);
+
+    crate::yarm_log!(
+        "{} cpu={} entry=0x{:x} stack=0x{:x} rsp0=0x{:x} cr3=0x{:x}",
+        ap_dispatch::MARK_RING3_ENTER,
+        cpu.0,
+        entry,
+        user_stack_top,
+        kernel_rsp0,
+        cr3
+    );
+    super::percpu::set_ap_dispatch_stage(cpu, 3);
+
+    // Activate the task address space. Kernel higher-half (.text/.bss, per-CPU
+    // record, serial port I/O) stays valid across the switch (shared in every ASID).
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
+    super::percpu::set_ap_dispatch_stage(cpu, 2);
+    crate::yarm_log!(
+        "{} cpu={} cr3=0x{:x}",
+        ap_dispatch::MARK_USER_CR3_LOAD_OK,
+        cpu.0,
+        cr3
+    );
+
+    // Enter ring 3. The probe stub issues the magic SYSCALL, which the LSTAR
+    // AP-probe fast path catches (setting ap_syscall_reentry_ok) — this never
+    // returns on the happy path.
+    super::descriptor_tables::enter_user_mode_iret(entry, user_stack_top, 0, 0, 0, 0, 0, 0);
+}
+
+/// Stage 189C6: BSP-side driver for the first live AP user dispatch on `cpu`. Builds
+/// the isolated ring-3 probe task once (under the global lock), publishes the per-CPU
+/// dispatch plan, posts the request, wakes the AP, and polls (bounded) for the AP's
+/// ring3 entry + probe-syscall re-entry. Emits the terminal `X86_AP_USER_DISPATCH_DONE`
+/// verdict and, on success, the live `X86_AP_USER_SYSCALL_REENTRY_OK` marker.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
+    use super::ap_dispatch;
+    use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+
+    crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_USER_DISPATCH_BEGIN, cpu.0);
+
+    // Build the probe exactly once; reuse its CR3/entry/user-stack for every AP.
+    if !PROBE_BUILT.load(Ordering::Acquire) {
+        match kernel.build_ap_ring3_probe() {
+            Ok((cr3, entry, ustack)) => {
+                PROBE_CR3.store(cr3, Ordering::Relaxed);
+                PROBE_ENTRY.store(entry, Ordering::Relaxed);
+                PROBE_USTACK.store(ustack, Ordering::Relaxed);
+                PROBE_BUILT.store(true, Ordering::Release);
+            }
+            Err(e) => {
+                crate::yarm_log!(
+                    "X86_AP_LIVE_DISPATCH_BLOCKER cpu={} phase=build_probe reason=probe_build_failed err={:?}",
+                    cpu.0,
+                    e
+                );
+                crate::yarm_log!(
+                    "{} cpu={} result=probe_build_failed",
+                    ap_dispatch::MARK_USER_DISPATCH_DONE,
+                    cpu.0
+                );
+                return;
+            }
+        }
+    }
+    let cr3 = PROBE_CR3.load(Ordering::Relaxed);
+    let entry = PROBE_ENTRY.load(Ordering::Relaxed);
+    let ustack = PROBE_USTACK.load(Ordering::Relaxed);
+    let kernel_rsp0 = ap_dispatch_kstack_top(cpu);
+
+    // Publish the plan: fields first, then `valid` (Release) so the AP never reads a
+    // torn plan.
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    let plan = &AP_DISPATCH_PLANS[idx];
+    plan.valid.store(false, Ordering::Relaxed);
+    plan.cr3.store(cr3, Ordering::Relaxed);
+    plan.entry.store(entry, Ordering::Relaxed);
+    plan.user_stack_top.store(ustack, Ordering::Relaxed);
+    plan.kernel_rsp0.store(kernel_rsp0, Ordering::Relaxed);
+    plan.valid.store(true, Ordering::Release);
+
+    // Arm: reset progress, clear any stale re-entry flag is unnecessary (fresh boot),
+    // post the request, then wake the AP with its managed-idle IPI (vector 0xF1).
+    super::percpu::set_ap_dispatch_stage(cpu, 0);
+    super::percpu::set_ap_dispatch_request(cpu, 1);
+    crate::yarm_log!(
+        "X86_AP_LIVE_DISPATCH_ARMED cpu={} cr3=0x{:x} entry=0x{:x} stack=0x{:x} rsp0=0x{:x}",
+        cpu.0,
+        cr3,
+        entry,
+        ustack,
+        kernel_rsp0
+    );
+    wait_for_icr_idle(cpu.0, "before_ap_dispatch");
+    write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
+
+    // Poll (bounded) for the AP to reach ring3 + issue the probe syscall.
+    let mut reentry = false;
+    let mut last_stage = 0u32;
+    for _ in 0..AP_READY_POLL_ITERS {
+        let st = super::percpu::ap_dispatch_stage(cpu);
+        if st != last_stage {
+            last_stage = st;
+        }
+        if super::percpu::ap_syscall_reentry_ok(cpu) != 0 {
+            reentry = true;
+            break;
+        }
+        cpu_relax();
+    }
+
+    if reentry {
+        crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_USER_SYSCALL_REENTRY_OK, cpu.0);
+        crate::yarm_log!(
+            "{} cpu={} result=ok",
+            ap_dispatch::MARK_USER_DISPATCH_DONE,
+            cpu.0
+        );
+    } else {
+        crate::yarm_log!(
+            "X86_AP_LIVE_DISPATCH_BLOCKER cpu={} phase=await_reentry last_stage={} reason=no_reentry_observed",
+            cpu.0,
+            last_stage
+        );
+        crate::yarm_log!(
+            "{} cpu={} result=timeout last_stage={}",
+            ap_dispatch::MARK_USER_DISPATCH_DONE,
+            cpu.0,
+            last_stage
         );
     }
 }

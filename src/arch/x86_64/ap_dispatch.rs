@@ -199,6 +199,18 @@ pub const MARK_USER_TRAP_RETURN_OK: &str = "X86_AP_USER_TRAP_RETURN_OK";
 /// The AP user-dispatch slice completed successfully.
 pub const MARK_USER_DISPATCH_DONE: &str = "X86_AP_USER_DISPATCH_DONE";
 
+// ── Stage 189C6 LIVE AP dispatch markers ─────────────────────────────────────
+/// The AP idle-loop live hook called the Rust dispatcher (`ap_dispatch_request`
+/// was set + observed on the AP). This is the first proof the wired hook fired.
+pub const MARK_DISPATCH_HOOK_ENTER: &str = "X86_AP_DISPATCH_HOOK_ENTER";
+/// The live dispatcher loaded the selected AP user task's CR3 on the AP.
+pub const MARK_USER_CR3_LOAD_OK: &str = "X86_AP_USER_CR3_LOAD_OK";
+/// The live dispatcher is about to `iretq` the AP into ring 3 (per-CPU RSP0/TSS
+/// set, CR3 active). The AP does not return from this on success.
+pub const MARK_RING3_ENTER: &str = "X86_AP_RING3_ENTER";
+/// The live dispatcher declined (no valid dispatch plan / knob off); carries reason.
+pub const MARK_DISPATCH_DECLINED: &str = "X86_AP_DISPATCH_DECLINED";
+
 #[cfg(test)]
 mod tests {
     use super::*;

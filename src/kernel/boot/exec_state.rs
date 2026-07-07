@@ -1309,6 +1309,73 @@ impl KernelState {
         Ok(())
     }
 
+    /// Stage 189C6 (LIVE-AP-DISPATCH): build a self-contained ring-3 probe task for
+    /// the first live AP user dispatch. Creates a fresh user address space (with the
+    /// shared kernel higher-half), maps one user code page holding the probe stub
+    /// (`mov rax, 0xA9C6; syscall; jmp .`) and one user stack page, and returns the
+    /// pieces the AP dispatcher needs: the task CR3, the ring-3 entry VA, and the
+    /// user stack top. The probe is deliberately isolated: on `syscall` the LSTAR
+    /// AP-probe fast path (magic RAX 0xA9C6) sets the per-CPU re-entry flag and
+    /// parks WITHOUT touching the shared kernel — so running it on a second CPU
+    /// races nothing. x86_64-only; returns `Unsupported` elsewhere.
+    #[cfg(target_arch = "x86_64")]
+    pub fn build_ap_ring3_probe(&mut self) -> Result<(u64, u64, u64), KernelError> {
+        const PROBE_CODE_VA: u64 = 0x0000_0000_2000_0000;
+        const PROBE_STACK_VA: u64 = 0x0000_0000_2001_0000;
+        // mov rax, 0xA9C6 (imm32, sign-extended); syscall; jmp $ (park if the LSTAR
+        // fast path ever returned — it does not). 11 bytes.
+        const PROBE_STUB: [u8; 11] = [
+            0x48, 0xC7, 0xC0, 0xC6, 0xA9, 0x00, 0x00, // mov rax, 0xA9C6
+            0x0F, 0x05, // syscall
+            0xEB, 0xFE, // jmp .
+        ];
+
+        let (asid, _cap) = self.create_user_address_space()?;
+
+        // Code page: user + read + write (so copy_to_user can stage bytes) +
+        // execute. Not W^X-clean, but this is an isolated one-page probe.
+        let code_phys = self.alloc_user_data_frame()?;
+        let code_flags = PageFlags {
+            read: true,
+            write: true,
+            execute: true,
+            user: true,
+            cache_policy: CachePolicy::WriteBack,
+        };
+        self.map_user_page_in_asid_raw(
+            asid,
+            VirtAddr(PROBE_CODE_VA),
+            Mapping {
+                phys: PhysAddr(code_phys),
+                flags: code_flags,
+            },
+        )?;
+        self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB)?;
+
+        // Stack page: user + read + write.
+        let stack_phys = self.alloc_user_data_frame()?;
+        self.map_user_page_in_asid_raw(
+            asid,
+            VirtAddr(PROBE_STACK_VA),
+            Mapping {
+                phys: PhysAddr(stack_phys),
+                flags: PageFlags::USER_RW,
+            },
+        )?;
+
+        let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)
+            .ok_or(KernelError::UserMemoryFault)?;
+        let user_stack_top = PROBE_STACK_VA + (PAGE_SIZE as u64) - 16;
+        crate::yarm_log!(
+            "X86_AP_RING3_PROBE_BUILT asid={} cr3=0x{:x} entry=0x{:x} stack_top=0x{:x}",
+            asid.0,
+            cr3,
+            PROBE_CODE_VA,
+            user_stack_top
+        );
+        Ok((cr3, PROBE_CODE_VA, user_stack_top))
+    }
+
     pub fn spawn_user_task_from_image(
         &mut self,
         mut spec: UserImageSpec,

@@ -264,6 +264,51 @@ remove implicit global-lock coupling from syscall/trap paths.
     on smp2 before enabling. All the *hard* primitives it depends on are now
     proven (189C4 per-CPU entry; 189A genuine TLB ACK).
 
+- **Stage 189C6 (FIRST LIVE AP DISPATCH) — DONE and QEMU-PROVEN.** The live AP
+  ring-3 dispatch is wired end-to-end and proven on real second/third/fourth CPUs
+  under `-smp 2` and `-smp 4`; gated behind the DEFAULT-OFF `yarm.ap_user_dispatch`
+  knob so the accepted SMP baseline is byte-for-byte preserved when unarmed.
+  * **The wired path.** The AP idle-loop `naked_asm` (`smp_trampoline.rs` label
+    `76:`) now `call`s the Rust dispatcher `yarm_x86_ap_user_dispatch_entry` — but
+    only when the BSP set this AP's per-CPU `ap_dispatch_request` (gs:[160]) AND
+    CR4 is synced (env flag, SSE on). Unarmed it is a single load+branch, so every
+    non-armed wake is inert (baseline unchanged; the hook fires 0 times with the
+    knob off, verified by the baseline smp2 run).
+  * **Task selection under the global lock; execution lock-free.** When armed, the
+    BSP (inside `run_ap_dispatch_scaffold_audit`, under the global lock, AFTER the
+    audited wake-only clear `X86_AP_WAKE_ONLY_CLEAR`) builds a self-contained ring-3
+    probe task (`KernelState::build_ap_ring3_probe`: fresh ASID + one user code page
+    holding `mov rax,0xA9C6; syscall; jmp .` + one user stack page), publishes a
+    per-CPU dispatch plan (task CR3, entry, user-stack top, a dedicated per-CPU
+    kernel RSP0 in `.bss`), posts the request, and wakes the AP with vector 0xF1.
+    The AP then runs the plan lock-free — it touches only its own per-CPU record,
+    the isolated probe pages, and CR3 — so nothing races the BSP.
+  * **The AP path.** `yarm_x86_ap_user_dispatch_entry` (on the AP): emit
+    `X86_AP_DISPATCH_HOOK_ENTER`; configure this CPU's SYSCALL MSRs
+    (`configure_syscall_msrs_for_self` — EFER.SCE/STAR/LSTAR/FMASK are PER-CPU, so
+    without this the AP's ring-3 `syscall` `#UD`s); set per-CPU `syscall_kernel_rsp0`
+    + AP TSS RSP0 to the dedicated kernel stack; `X86_AP_RING3_ENTER`; load the task
+    CR3 (`X86_AP_USER_CR3_LOAD_OK`); `enter_user_mode_iret` to ring 3. The probe stub
+    issues `syscall` with the magic RAX `0xA9C6`, which the LSTAR AP-probe fast path
+    (a compare+branch at the top of `yarm_x86_lstar_entry`, inert on every real 0..32
+    syscall) catches WITHOUT descending into the shared kernel: it sets the per-CPU
+    `ap_syscall_reentry_ok` (gs:[168]) and parks. The BSP polls that flag and emits
+    `X86_AP_USER_SYSCALL_REENTRY_OK` + `X86_AP_USER_DISPATCH_DONE result=ok`.
+  * **QEMU evidence.** `-smp 2` armed: `X86_AP_DISPATCH_HOOK_ENTER cpu=1` →
+    `X86_AP_RING3_ENTER cpu=1` → `X86_AP_USER_CR3_LOAD_OK cpu=1` →
+    `X86_AP_USER_SYSCALL_REENTRY_OK cpu=1` → `..._DISPATCH_DONE cpu=1 result=ok`.
+    `-smp 4` armed: the same full sequence independently on cpu 1, 2, and 3 (each
+    with its own per-CPU kernel RSP0). Baseline (knob off) smp2/smp4 unchanged, and
+    core/-smp1, IPC oracle, and crash-restart all still pass. Debug iterations that
+    got here: the CR4-synced gate initially read `gs:[88]` (per-CPU record
+    `idle_flags`) instead of the handoff env flag `[rdi+88]` (dispatcher never
+    called); then the AP's ring-3 `syscall` `#UD`'d because the per-CPU SYSCALL MSRs
+    were never configured on the AP (fixed by `configure_syscall_msrs_for_self`).
+  * Guarded by `stage189c6`-updated `stage189c2`/`c3`/`c5`/`c_ap_user_return_percpu`
+    modules (hook wired + knob-gated), `stage183_ap_idle_admit` (admission stays
+    knob-free; the dispatch knob is a different axis), and `percpu` (record offsets
+    160/164/168, stride 192).
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

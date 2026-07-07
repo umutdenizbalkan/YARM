@@ -83,6 +83,17 @@ pub const TLB_REQ_VA_OFFSET: usize = 136;
 /// user RSP before any GPR is touched (replacing the old global RIP-relative slot).
 pub const SYSCALL_KERNEL_RSP0_OFFSET: usize = 144;
 pub const SYSCALL_SCRATCH_RSP_OFFSET: usize = 152;
+/// Stage 189C6 LIVE AP user-dispatch signalling. `ap_dispatch_request` (@160) is
+/// BSP-written (0 = no dispatch requested; 1 = the AP idle-loop hook must call the
+/// live Rust dispatcher `yarm_x86_ap_user_dispatch_entry`). `ap_dispatch_stage`
+/// (@164) is AP-written progress (0=none,1=hook_enter,2=cr3_loaded,3=ring3_enter)
+/// polled by the BSP. `ap_syscall_reentry_ok` (@168) is set to 1 by the LSTAR
+/// AP-probe fast path when the dispatched AP user task issues its probe `syscall`,
+/// proving per-CPU syscall entry re-executed ON THE AP. Single writer per field per
+/// direction, so field-granular writes need no lock.
+pub const AP_DISPATCH_REQUEST_OFFSET: usize = 160;
+pub const AP_DISPATCH_STAGE_OFFSET: usize = 164;
+pub const AP_SYSCALL_REENTRY_OK_OFFSET: usize = 168;
 
 /// Fixed per-CPU record layout, owned by the BSP and indexed by logical
 /// CPU id. Field offsets are stable and tested.
@@ -116,8 +127,13 @@ pub const SYSCALL_SCRATCH_RSP_OFFSET: usize = 152;
 /// - `128`: tlb_req_gen      u32 (BSP: shootdown request generation)
 /// - `132`: tlb_ack_gen      u32 (AP:  shootdown ack generation, via gs:)
 /// - `136`: tlb_req_va       u64 (BSP: shootdown VA; 0 = full flush)
+/// - `144`: syscall_kernel_rsp0 u64 (Stage 189C4: per-CPU LSTAR RSP0)
+/// - `152`: syscall_scratch_rsp u64 (Stage 189C4: per-CPU LSTAR user-RSP scratch)
+/// - `160`: ap_dispatch_request u32 (Stage 189C6: BSP: 1 = run live AP dispatcher)
+/// - `164`: ap_dispatch_stage   u32 (Stage 189C6: AP: live-dispatch progress)
+/// - `168`: ap_syscall_reentry_ok u32 (Stage 189C6: LSTAR probe: 1 = AP re-entry)
 ///
-/// Explicit-field bytes = 144; struct stride = 192 (64-byte aligned).
+/// Explicit-field bytes = 172; struct stride = 192 (64-byte aligned).
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct PerCpuRecord {
@@ -151,6 +167,9 @@ pub struct PerCpuRecord {
     pub tlb_req_va: u64,
     pub syscall_kernel_rsp0: u64,
     pub syscall_scratch_rsp: u64,
+    pub ap_dispatch_request: u32,
+    pub ap_dispatch_stage: u32,
+    pub ap_syscall_reentry_ok: u32,
 }
 
 impl PerCpuRecord {
@@ -188,6 +207,9 @@ impl PerCpuRecord {
             tlb_req_va: 0,
             syscall_kernel_rsp0: 0,
             syscall_scratch_rsp: 0,
+            ap_dispatch_request: 0,
+            ap_dispatch_stage: 0,
+            ap_syscall_reentry_ok: 0,
         }
     }
 }
@@ -211,6 +233,11 @@ const _: () = {
     assert!(core::mem::offset_of!(PerCpuRecord, tlb_req_va) == TLB_REQ_VA_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, syscall_kernel_rsp0) == SYSCALL_KERNEL_RSP0_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, syscall_scratch_rsp) == SYSCALL_SCRATCH_RSP_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, ap_dispatch_request) == AP_DISPATCH_REQUEST_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, ap_dispatch_stage) == AP_DISPATCH_STAGE_OFFSET);
+    assert!(
+        core::mem::offset_of!(PerCpuRecord, ap_syscall_reentry_ok) == AP_SYSCALL_REENTRY_OK_OFFSET
+    );
     assert!(core::mem::size_of::<PerCpuRecord>() == 192);
 };
 
@@ -272,6 +299,9 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             tlb_req_va: 0,
             syscall_kernel_rsp0: 0,
             syscall_scratch_rsp: 0,
+            ap_dispatch_request: 0,
+            ap_dispatch_stage: 0,
+            ap_syscall_reentry_ok: 0,
         };
         core::ptr::write_volatile(base, record);
     }
@@ -392,6 +422,44 @@ pub fn tlb_ack_gen(cpu: CpuId) -> u32 {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_ack_gen)) }
 }
 
+/// Stage 189C6: BSP posts (or clears) the LIVE AP user-dispatch request for `cpu`.
+/// Field-granular write so it never clobbers the AP-owned `ap_dispatch_stage` /
+/// `ap_syscall_reentry_ok` fields. The AP idle-loop hook reads this via gs:[160].
+pub fn set_ap_dispatch_request(cpu: CpuId, value: u32) {
+    let base = record_base(cpu) as *mut PerCpuRecord;
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*base).ap_dispatch_request), value);
+    }
+}
+
+/// Stage 189C6: read the LIVE AP user-dispatch request flag for `cpu`.
+pub fn ap_dispatch_request(cpu: CpuId) -> u32 {
+    let base = record_base(cpu) as *const PerCpuRecord;
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).ap_dispatch_request)) }
+}
+
+/// Stage 189C6: the AP-side live dispatcher records its progress here (BSP-polled).
+/// Field-granular write (AP is the sole writer of this field).
+pub fn set_ap_dispatch_stage(cpu: CpuId, value: u32) {
+    let base = record_base(cpu) as *mut PerCpuRecord;
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*base).ap_dispatch_stage), value);
+    }
+}
+
+/// Stage 189C6: BSP reads the AP live-dispatch progress stage for `cpu`.
+pub fn ap_dispatch_stage(cpu: CpuId) -> u32 {
+    let base = record_base(cpu) as *const PerCpuRecord;
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).ap_dispatch_stage)) }
+}
+
+/// Stage 189C6: BSP reads the LSTAR AP-probe re-entry flag for `cpu` (1 = the
+/// dispatched AP user task's probe `syscall` re-entered per-CPU LSTAR on this CPU).
+pub fn ap_syscall_reentry_ok(cpu: CpuId) -> u32 {
+    let base = record_base(cpu) as *const PerCpuRecord;
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).ap_syscall_reentry_ok)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,8 +516,8 @@ mod tests {
 
     #[test]
     fn percpu_record_size_and_alignment() {
-        // Stage 189C4: 160 bytes of explicit fields (through the per-CPU SYSCALL
-        // kernel RSP0 / scratch at 144/152) round up to a 192-byte stride at
+        // Stage 189C6: 172 bytes of explicit fields (through the AP live-dispatch
+        // signalling trio at 160/164/168) round up to a 192-byte stride at
         // 64-byte align.
         assert_eq!(PerCpuRecord::SIZE, 192);
         assert_eq!(core::mem::align_of::<PerCpuRecord>(), 64);

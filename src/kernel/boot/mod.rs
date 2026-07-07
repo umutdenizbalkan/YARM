@@ -1195,6 +1195,26 @@ pub fn smp_ready_enabled() -> bool {
     SMP_READY_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, DEFAULT-OFF gate that arms the
+/// FIRST live application-processor user dispatch. When OFF (default) the AP
+/// idle-loop live hook is an inert single-load-and-branch — the AP stays in its
+/// wake-only managed idle loop and the accepted smp2/smp4 baseline is byte-for-byte
+/// preserved. When ON (`yarm.ap_user_dispatch=1`), after the audited wake-only
+/// clear the BSP builds a self-contained AP ring3 probe task, posts the per-CPU
+/// dispatch request, wakes the AP, and the AP's live hook enters ring 3 and issues
+/// the probe syscall — proving `X86_AP_RING3_ENTER` + `X86_AP_USER_SYSCALL_REENTRY_OK`
+/// on a real second CPU. VALIDATION: AP_USER_DISPATCH_ENABLED.
+pub(crate) static AP_USER_DISPATCH_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ap_user_dispatch_enabled(enabled: bool) {
+    AP_USER_DISPATCH_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ap_user_dispatch_enabled() -> bool {
+    AP_USER_DISPATCH_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Stage 177: try to claim the one-shot SMP-readiness audit (true exactly once).
 pub(crate) fn smp_ready_audit_try_start() -> bool {
     SMP_READY_AUDIT_STARTED

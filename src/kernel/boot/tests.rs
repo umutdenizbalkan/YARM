@@ -57492,6 +57492,23 @@ mod stage183_ap_idle_admit {
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
 
+    // Returns the source body of `ap_scheduler_online_admission` (from its `fn` marker
+    // to the next top-level item), so a guard can prove the AP-admission path does not
+    // read the Stage 189C6 dispatch knob.
+    fn ap_admission_body(src: &str) -> &str {
+        let start = src
+            .find("fn ap_scheduler_online_admission(")
+            .expect("ap_scheduler_online_admission must exist");
+        let rest = &src[start..];
+        // Bound the body at the next top-level function definition.
+        let end = rest[1..]
+            .find("\npub fn ")
+            .or_else(|| rest[1..].find("\nfn "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
     // The AP entry admits via an internal compile-time proof const (not a user knob) and
     // writes IA32_GS_BASE from the handoff (no higher-half .bss access) then idles.
     #[test]
@@ -57513,10 +57530,19 @@ mod stage183_ap_idle_admit {
             TRAMP_SRC.contains("hlt") && TRAMP_SRC.contains("cli"),
             "AP idle loop must remain a cli/hlt interrupt-masked loop"
         );
-        // NOT a user boot knob: the const is internal; no yarm.* AP-admit knob exists.
+        // NOT a user boot knob: AP *admission* is internal (the trampoline asm carries
+        // no yarm.* knob). Stage 189C6 adds a *dispatch* knob on a DIFFERENT axis
+        // (`yarm.ap_user_dispatch`) — it gates whether an already-admitted AP runs a
+        // user task, never whether an AP is admitted. The admission path
+        // (`ap_scheduler_online_admission`) never reads that knob.
         assert!(
-            !TRAMP_SRC.contains("yarm.ap_") && !SMP_SRC.contains("yarm.ap_"),
-            "AP admission must not be selectable by a user boot knob"
+            !TRAMP_SRC.contains("yarm.ap_"),
+            "the AP admission trampoline must carry no user boot knob"
+        );
+        assert!(
+            SMP_SRC.contains("fn ap_scheduler_online_admission(")
+                && !ap_admission_body(SMP_SRC).contains("ap_user_dispatch_enabled"),
+            "AP admission must not be selectable by the dispatch knob"
         );
     }
 
@@ -58570,29 +58596,29 @@ mod stage189c_ap_user_return_percpu {
         );
     }
 
-    // No live AP user dispatch was enabled: the live-only markers appear ONLY in
-    // the audited transition guarded by evaluate_clear(), never in the scaffold
-    // audit, and the audit still emits the honest deferral.
+    // Stage 189C6: the live AP user dispatch IS enabled now, but ONLY under the
+    // default-off knob. When the knob is OFF the scaffold audit still emits the
+    // honest deferral; when ON (and the audited clear fired) it runs the live path.
     #[test]
-    fn no_live_ap_user_dispatch_enabled() {
-        // The scaffold audit emits the deferral with the precise blocker reason.
+    fn live_ap_user_dispatch_is_knob_gated() {
+        // With the knob OFF, the audit emits the honest deferral with the reason.
         assert!(
             SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
                 && SMP_SRC.contains("reason=ap_ring3_live_dispatcher_hook_gated"),
-            "the audit must defer live dispatch with the AP-ring3-entry blocker reason"
+            "with the knob off the audit must still defer live dispatch with the reason"
         );
-        // The live begin/return/done markers are defined but emitted by NOTHING in
-        // this pass (no producer): they exist only as vocabulary constants.
+        // The live begin/return/done markers exist as vocabulary constants.
         assert!(
             AP_DISPATCH_SRC.contains("MARK_USER_DISPATCH_BEGIN")
                 && AP_DISPATCH_SRC.contains("MARK_USER_TRAP_RETURN_OK"),
-            "the live-dispatch marker vocabulary must exist for 189D"
+            "the live-dispatch marker vocabulary must exist"
         );
+        // The live markers are now emitted by the knob-gated live dispatcher.
         assert!(
-            !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
-                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
-            "no live AP user-dispatch marker may be emitted this pass"
+            SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_DONE")
+                && SMP_SRC.contains("if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {"),
+            "the live dispatcher emits the markers only under the default-off knob gate"
         );
     }
 
@@ -58635,10 +58661,13 @@ mod stage189c2_ap_usermode_entry {
             "the LSTAR entry must use the per-CPU gs-relative RSP0/scratch slots"
         );
         // The detector reports the syscall entry as per-CPU-safe; usermode entry now
-        // additionally requires the AP ring3-entry path.
+        // additionally requires the AP ring3-entry path, which Stage 189C6 wired
+        // (knob-gated: `ap_ring3_entry_path_ready()` mirrors the default-off knob).
         assert!(
             SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    true\n}")
-                && SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}")
+                && SMP_SRC.contains(
+                    "fn ap_ring3_entry_path_ready() -> bool {\n    crate::kernel::boot::ap_user_dispatch_enabled()\n}"
+                )
                 && SMP_SRC.contains(
                     "ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe() && ap_ring3_entry_path_ready()",
                 ),
@@ -58665,32 +58694,32 @@ mod stage189c2_ap_usermode_entry {
         );
     }
 
-    // No live AP user dispatch / ring3 entry was performed: the entry/re-entry
-    // live markers are vocabulary-only, emitted by nothing this pass.
+    // Stage 189C6: the live AP usermode-entry path IS wired now — the AP-run live
+    // markers are emitted by the knob-gated live dispatcher, never by the default
+    // (knob-off) scaffold audit path. The live markers are gated behind
+    // `ap_user_dispatch_enabled()` so the accepted SMP baseline is preserved.
     #[test]
-    fn no_live_ap_usermode_entry_performed() {
+    fn live_ap_usermode_entry_is_knob_gated() {
         assert!(
             AP_DISPATCH_SRC.contains("MARK_USERMODE_ENTRY_READY")
                 && AP_DISPATCH_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK"),
-            "the live-entry marker vocabulary must exist for the future per-CPU-entry stage"
+            "the live-entry marker vocabulary must exist"
         );
-        // The AP-run live markers are never referenced by the audit at all.
+        // The AP-run live markers are now emitted by the live dispatcher.
         assert!(
-            !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
-                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
-            "no AP-run live marker may be emitted this pass"
+            SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
+            "the live dispatcher must emit the AP-run live markers"
         );
-        // The USERMODE_ENTRY_READY emit exists only inside the `if usermode_entry_ready`
-        // branch, which stays false because the AP ring3-entry path is absent — so
-        // USERMODE_ENTRY_READY is never emitted at runtime this pass.
+        // But only under the default-off knob gate — the scaffold audit only enters
+        // the live path when `ap_user_dispatch_enabled()` AND the audited clear fired.
         assert!(
-            SMP_SRC.contains("if usermode_entry_ready {")
-                && SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}"),
-            "usermode-entry readiness must be gated false (AP ring3-entry path absent)"
+            SMP_SRC.contains("if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {")
+                && SMP_SRC.contains("live_ap_user_dispatch(kernel, cpu);"),
+            "the live dispatch must be gated behind the audited clear + the default-off knob"
         );
-        // Wake-only is still only cleared by the audited transition (unreached).
+        // Wake-only is still only cleared by the audited transition.
         assert!(
             SMP_SRC.contains("fn try_enable_ap_user_dispatch(")
                 && SMP_SRC.contains("readiness.evaluate_clear()"),
@@ -58751,20 +58780,20 @@ mod stage189c3_percpu_entry_exit {
         );
     }
 
-    // Progress markers ARE emitted (per-CPU syscall entry ready), but no AP-run live
-    // dispatch marker is emitted and no wake-only is cleared this pass.
+    // Progress markers ARE emitted (per-CPU syscall entry ready). Stage 189C6 wired
+    // the live AP-run dispatch markers, but they are emitted only by the knob-gated
+    // live dispatcher, never on the default (knob-off) audit path.
     #[test]
-    fn percpu_entry_progress_but_no_live_ap_dispatch() {
+    fn percpu_entry_progress_and_knob_gated_live_dispatch() {
         assert!(
             SMP_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY"),
             "the per-CPU syscall-entry readiness is attested for APs"
         );
+        // The live markers now exist in smp.rs (the live dispatcher), gated by the knob.
         assert!(
-            !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
-                && !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
-                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
-            "no AP-run live dispatch marker may be emitted this pass"
+            SMP_SRC.contains("fn live_ap_user_dispatch(")
+                && SMP_SRC.contains("crate::kernel::boot::ap_user_dispatch_enabled()"),
+            "the live AP dispatch path must be present and gated behind the default-off knob"
         );
     }
 }
@@ -58793,15 +58822,18 @@ mod stage189c5_ap_ring3_entry {
         );
     }
 
-    // The LIVE ring3-entry dispatcher hook is gated OFF (returns false), so the
-    // usermode-entry gate stays false and no wake-only is cleared.
+    // Stage 189C6: the LIVE ring3-entry dispatcher hook is now WIRED, gated behind
+    // the default-off `yarm.ap_user_dispatch` knob (so the accepted SMP baseline is
+    // preserved unless explicitly armed). `ap_ring3_entry_path_ready()` mirrors the knob.
     #[test]
-    fn live_ring3_dispatcher_hook_is_gated_off() {
+    fn live_ring3_dispatcher_hook_is_knob_gated() {
         assert!(
-            SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}"),
-            "the live AP ring3-entry dispatcher hook must stay gated off this pass"
+            SMP_SRC.contains(
+                "fn ap_ring3_entry_path_ready() -> bool {\n    crate::kernel::boot::ap_user_dispatch_enabled()\n}"
+            ),
+            "the live AP ring3-entry dispatcher hook must be knob-gated (mirrors the default-off knob)"
         );
-        // usermode-entry readiness includes the (false) live ring3-entry gate.
+        // usermode-entry readiness includes the (knob-gated) live ring3-entry gate.
         assert!(
             SMP_SRC.contains(
                 "ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe() && ap_ring3_entry_path_ready()",
@@ -58810,22 +58842,24 @@ mod stage189c5_ap_ring3_entry {
         );
     }
 
-    // No AP-run live-dispatch marker is emitted, and the AP idle-loop asm is NOT
-    // modified to call into a dispatcher this pass (baseline preserved).
+    // Stage 189C6: the AP idle-loop asm IS now wired to call the live dispatcher, and
+    // the live dispatcher emits the AP-run markers. Both are gated behind the
+    // default-off knob (the hook is a cheap inert load+branch when unarmed).
     #[test]
-    fn no_live_ap_ring3_entry_or_asm_hook() {
+    fn live_ap_ring3_entry_and_asm_hook_are_wired() {
         assert!(
-            !SMP_SRC.contains("MARK_KERNEL_STACK_MAPPED")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
-                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
-                && !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK"),
-            "no live AP ring3-entry / dispatch marker may be emitted this pass"
+            SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
+                && SMP_SRC.contains("MARK_RING3_ENTER")
+                && SMP_SRC.contains("MARK_USER_CR3_LOAD_OK"),
+            "the live dispatcher must emit the AP ring3-entry / re-entry markers"
         );
-        // The AP idle-loop trampoline must not call a user-dispatch entry.
+        // The AP idle-loop trampoline calls the live dispatcher at label 76:, gated on
+        // the per-CPU ap_dispatch_request (gs:[160]) so unarmed wakes stay inert.
+        let tramp = include_str!("../../arch/x86_64/smp_trampoline.rs");
         assert!(
-            !include_str!("../../arch/x86_64/smp_trampoline.rs")
-                .contains("yarm_x86_ap_user_dispatch_entry"),
-            "the AP idle loop must not be wired to a live ring3-entry dispatcher this pass"
+            tramp.contains("call yarm_x86_ap_user_dispatch_entry")
+                && tramp.contains("mov eax, dword ptr gs:[160]"),
+            "the AP idle loop must call the live dispatcher, gated on the per-CPU dispatch request"
         );
     }
 }

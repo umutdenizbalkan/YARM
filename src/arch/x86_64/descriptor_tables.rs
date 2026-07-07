@@ -346,6 +346,17 @@ fn configure_syscall_fast_path(rsp0: u64) {
     crate::yarm_log!("X86_SWAPGS_ENTRY_READY reason=not_required_gs_kernel_percpu");
     crate::yarm_log!("X86_INTERRUPT_ENTRY_SWAPGS_READY reason=not_required_gs_kernel_percpu");
     // STAR[47:32] = kernel CS selector; STAR[63:48] = SYSRET CS base (CS-16).
+    configure_syscall_msrs_for_self();
+}
+
+/// Configure the EXECUTING CPU's SYSCALL fast-path MSRs (EFER.SCE, STAR, LSTAR,
+/// FMASK). These are PER-CPU MSRs, so every CPU that will service a ring-3
+/// `syscall` must run this itself. The BSP calls it from `configure_syscall_fast_path`;
+/// Stage 189C6 calls it on an AP before dispatching a ring-3 task there, so the AP's
+/// `syscall` reaches the same per-CPU LSTAR entry instead of `#UD`-ing on SCE=0.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn configure_syscall_msrs_for_self() {
+    // STAR[47:32] = kernel CS selector; STAR[63:48] = SYSRET CS base (CS-16).
     let star = ((KERNEL_CODE_SELECTOR as u64) << 32) | (((USER_CODE_SELECTOR as u64) - 16) << 48);
     let mut efer = read_msr(IA32_EFER_MSR);
     efer |= IA32_EFER_SCE;
@@ -492,7 +503,7 @@ pub fn register_apic_cpu_mapping(apic_id: u8, cpu: crate::kernel::scheduler::Cpu
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn current_cpu_id() -> crate::kernel::scheduler::CpuId {
+pub(crate) fn current_cpu_id() -> crate::kernel::scheduler::CpuId {
     let apic = raw_current_apic_id() as usize;
     if let Some(mapped) = APIC_TO_CPU_ID
         .get(apic)
@@ -1287,6 +1298,32 @@ core::arch::global_asm!(
     .type yarm_x86_lstar_entry, @function
 yarm_x86_lstar_entry:
     // -----------------------------------------------------------------------
+    // Stage 189C6 LIVE AP-DISPATCH probe fast path.
+    //
+    // A live AP user task dispatched by yarm_x86_ap_user_dispatch_entry enters
+    // ring 3 running a tiny stub that loads RAX = 0xA9C6 and issues SYSCALL.
+    // Real YARM syscall numbers are 0..32, so this compare NEVER matches a
+    // production (BSP) syscall — the fast path is inert on every non-probe entry
+    // and adds one compare+branch to the proven baseline.
+    //
+    // On a match we do NOT descend into the shared kernel dispatch (that would
+    // run the whole global-lock kernel on the AP without the lock). Instead we
+    // prove per-CPU LSTAR entry executed ON THIS CPU by setting the per-CPU
+    // ap_syscall_reentry_ok flag (gs:[168], kernel .bss addressable under the
+    // task CR3) and parking. The BSP polls the flag and emits the marker. RAX
+    // and the serial scratch registers are safe to clobber here — the probe
+    // path never returns to userspace.
+    cmp rax, 0xA9C6
+    jne 2f
+    mov dword ptr gs:[168], 1        // ap_syscall_reentry_ok = 1 (persistent)
+    mov dx, 0x3f8
+    mov al, 0x52                     // 'R' — AP ring3 SYSCALL re-entry observed
+    out dx, al
+3:
+    hlt
+    jmp 3b
+2:
+    // -----------------------------------------------------------------------
     // SYSCALL fast-path entry.
     //
     // On SYSCALL the CPU places:
@@ -1856,6 +1893,17 @@ pub(crate) fn ap_tss_rsp0(cpu: usize) -> u64 {
     unsafe {
         let tss = core::ptr::read_volatile(core::ptr::addr_of!(AP_TSSS[idx]));
         tss.rsp0
+    }
+}
+
+/// Stage 189C6: set the ring-0 `rsp0` in this AP's TSS — the kernel stack the CPU
+/// switches to on a ring3→ring0 interrupt/fault while a live AP user task runs.
+/// Field-granular write to `AP_TSSS[cpu].rsp0` only.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn set_ap_tss_rsp0(cpu: usize, rsp0: u64) {
+    let idx = cpu.min(crate::arch::platform_constants::MAX_CPUS - 1);
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(AP_TSSS[idx].rsp0), rsp0);
     }
 }
 
