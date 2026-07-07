@@ -122,6 +122,18 @@ impl KernelState {
             .map(|tid| tid.0)
     }
 
+    /// Stage 190A: take the current task off a SPECIFIC `cpu` (return it to the
+    /// scheduler / clear `current`) without re-dispatching. Used after the AP probe's
+    /// `Yield` so the AP run queue is left consistent and `current` becomes `None`,
+    /// routing the AP to its interruptible idle loop (return-to-idle). Returns the tid
+    /// that was blocked, if any.
+    pub fn block_current_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {
+        let mut sched = self.scheduler_state();
+        kernel_mut(&mut sched.scheduler)
+            .block_current_on(cpu)
+            .map(|tid| tid.0)
+    }
+
     /// Stage 107 / D6 first live step — typed local-CPU dispatch step.
     ///
     /// VALIDATION: D6_LIVE_SPLIT — called from

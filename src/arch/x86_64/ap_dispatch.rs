@@ -229,6 +229,18 @@ pub const MARK_ADMIT_PLACED: &str = "X86_AP_ADMIT_PLACED";
 /// An attempt to place a task on a still-wake-only AP was DENIED (admission guard).
 pub const MARK_ADMIT_DENIED_WAKE_ONLY: &str = "X86_AP_ADMIT_DENIED_WAKE_ONLY";
 
+// ── Stage 190A markers (AP scheduler loop + return-to-idle) ──────────────────
+/// The AP scheduler loop is set up for this dispatch (before entering ring 3).
+pub const MARK_SCHED_LOOP_READY: &str = "X86_AP_SCHED_LOOP_READY";
+/// After the admitted task's `Yield`, control returned to the AP scheduler (the task
+/// was blocked / the run queue advanced), rather than re-running it or parking.
+pub const MARK_YIELD_RETURN_TO_SCHED_OK: &str = "X86_AP_YIELD_RETURN_TO_SCHED_OK";
+/// The AP scheduler found no further admitted task and returned to the interruptible
+/// idle loop (honest idle, wake-capable) — NOT a permanent park.
+pub const MARK_RETURN_TO_IDLE_OK: &str = "X86_AP_RETURN_TO_IDLE_OK";
+/// The AP scheduler-loop slice completed successfully.
+pub const MARK_SCHED_LOOP_DONE: &str = "X86_AP_SCHED_LOOP_DONE";
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2083,9 +2083,10 @@ pub(crate) fn ap_seal_syscall_begin(cpu: CpuId, nr: u64) {
     // Emit SYNCHRONOUSLY (bypassing the drop-prone shared ring) so these required
     // proof markers are never lost to concurrent AP+BSP ring overflow.
     crate::kernel::printk::printk_emit_sync(format_args!(
-        "{} cpu={}",
+        "{} cpu={} tid={}",
         ap_dispatch::MARK_USER_SYSCALL_REENTRY_OK,
-        cpu.0
+        cpu.0,
+        tid
     ));
     crate::kernel::printk::printk_emit_sync(format_args!(
         "{} cpu={} tid={} nr={}",
@@ -2128,6 +2129,44 @@ pub(crate) fn ap_seal_syscall_ok(cpu: CpuId, nr: u64) {
         nr
     ));
     set_ap_seal_probe_active(cpu, false);
+}
+
+/// Stage 190A: after the admitted AP probe's `Yield` completed through the global
+/// lock, RETURN it to the AP scheduler — block the probe on this CPU so nothing is
+/// left running (its `current` becomes `None`), leaving the AP run queue consistent.
+/// The trap dispatch then routes the AP to its interruptible idle loop
+/// (return-to-idle) instead of re-running the one-shot probe or parking. Runs under
+/// the global lock via `with_cpu`. Emits `X86_AP_YIELD_RETURN_TO_SCHED_OK`.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn ap_seal_return_to_idle(shared: &crate::runtime::SharedKernel, cpu: CpuId, _nr: u64) {
+    use super::ap_dispatch;
+    let blocked = shared
+        .with_cpu(cpu, |k| k.block_current_on_cpu(cpu))
+        .unwrap_or(None);
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "{} cpu={} tid={}",
+        ap_dispatch::MARK_YIELD_RETURN_TO_SCHED_OK,
+        cpu.0,
+        blocked.unwrap_or(0)
+    ));
+}
+
+/// Stage 190A: emitted from the trap dispatch's idle path when the AP scheduler found
+/// no further admitted task after the probe yielded — the AP honestly returns to its
+/// interruptible idle loop (wake-capable, NOT a permanent park).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn ap_sched_return_to_idle_markers(cpu: CpuId) {
+    use super::ap_dispatch;
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "{} cpu={}",
+        ap_dispatch::MARK_RETURN_TO_IDLE_OK,
+        cpu.0
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "{} result=ok cpu={}",
+        ap_dispatch::MARK_SCHED_LOOP_DONE,
+        cpu.0
+    ));
 }
 
 /// Stage 189C6: the LIVE AP user-dispatch entry — called from the AP idle-loop hook
@@ -2187,6 +2226,10 @@ pub extern "C" fn yarm_x86_ap_user_dispatch_entry() {
     super::percpu::set_syscall_kernel_rsp0(cpu, kernel_rsp0);
     super::descriptor_tables::set_ap_tss_rsp0(idx, kernel_rsp0);
 
+    // Stage 190A: the AP scheduler loop is set up (per-CPU MSRs + RSP0/TSS + an
+    // admitted current task); it will run the task, and after its `Yield` return the
+    // AP to its idle loop rather than parking.
+    crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_SCHED_LOOP_READY, cpu.0);
     crate::yarm_log!(
         "{} cpu={} entry=0x{:x} stack=0x{:x} rsp0=0x{:x} cr3=0x{:x}",
         ap_dispatch::MARK_RING3_ENTER,
@@ -2231,11 +2274,15 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     use super::ap_dispatch;
     use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
 
-    crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_USER_DISPATCH_BEGIN, cpu.0);
-
     // Build a DISTINCT probe task per AP (own TID + own ASID). A shared task can NOT
     // be `current` on multiple CPUs at once, so each AP gets its own (idempotent).
     let probe_tid = PROBE_TID_BASE + cpu.0 as u64;
+    crate::yarm_log!(
+        "{} cpu={} tid={}",
+        ap_dispatch::MARK_USER_DISPATCH_BEGIN,
+        cpu.0,
+        probe_tid
+    );
     let (tid, cr3, entry, ustack) = match kernel.build_ap_ring3_probe(probe_tid) {
         Ok(built) => built,
         Err(e) => {

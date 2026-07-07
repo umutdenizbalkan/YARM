@@ -356,6 +356,45 @@ remove implicit global-lock coupling from syscall/trap paths.
     bracket gated per-CPU, per-CPU `TRAP_DISPATCH_DEPTH`, audited per-AP admission,
     drop-safe emit, no under-lock wait).
 
+- **Stage 190A (AP SCHEDULER LOOP + RETURN-TO-IDLE) — DONE and QEMU-PROVEN.** The
+  one-shot 189D probe that PARKED after the seal now RETURNS to the AP scheduler and
+  falls through to the interruptible idle loop — the AP no longer parks forever.
+  Still global-lock-authoritative; admission still audited; no global-lock retirement.
+  * **Return-to-idle mechanism.** After the admitted probe's `Yield` completes through
+    the global-lock dispatch (`X86_AP_USER_DISPATCH_SEAL_DONE result=ok`, preserved),
+    the trap dispatch calls `smp::ap_seal_return_to_idle`, which BLOCKS the probe on the
+    AP under `with_cpu` (`KernelState::block_current_on_cpu` → `SmpScheduler::block_current_on`,
+    removing run-queue membership). The AP's `current` becomes `None`, so the EXISTING
+    idle path (`exiting_tid == None|Some(0)` → `idle_halt_loop()`, a wake-capable
+    `loop { sti; hlt }`) fires — the honest return-to-idle. No new idle machinery.
+  * **Markers (armed, per AP):** `X86_AP_SCHED_LOOP_READY` (before ring 3) →
+    `X86_AP_USER_DISPATCH_BEGIN cpu tid` → `X86_AP_USER_SYSCALL_REENTRY_OK cpu tid` →
+    the 189D seal markers → `X86_AP_YIELD_RETURN_TO_SCHED_OK cpu tid` (probe blocked) →
+    `X86_AP_RETURN_TO_IDLE_OK cpu` + `X86_AP_SCHED_LOOP_DONE result=ok cpu` →
+    `SCHED_ENTER_IDLE_HLT cpu`. All gated on the per-CPU `ap_seal` flag (the trap-local
+    variable that already brackets the seal), so the BSP and non-armed boots are inert.
+  * **Run-queue consistency + no duplicate dispatch.** The probe is placed as the AP's
+    `current` exactly once (189D admission after the audited wake-only clear) and
+    removed exactly once via `block_current_on`; it is never left runnable on two CPUs
+    (each AP has its own probe TID) and is not re-dispatched after blocking.
+  * **QEMU evidence.** `-smp 2` armed: full ordered sequence on cpu 1 ending in
+    `SCHED_LOOP_DONE result=ok` + `SCHED_ENTER_IDLE_HLT cpu=1`. `-smp 4` armed: all of
+    cpu 1/2/3 reach `SCHED_LOOP_DONE result=ok` + `RETURN_TO_IDLE_OK` (each also
+    `SEAL_DONE result=ok`). Baseline (knob off) smp2/smp4 inert (0 scheduler-loop
+    markers); core/-smp1 + IPC oracle + crash-restart + riscv64 core pass; aarch64 core
+    carries its unchanged pre-existing `WrongObject` caveat. TLB ACK unchanged (genuine
+    189A remote ACK, gates the seal). No forbidden markers (no `!BN`/`!F`, no duplicate
+    dispatch, no lost wake, no lock-retirement claim).
+  * **Go/no-go for controlled AP workload placement:** GO, but still behind the
+    default-off `yarm.ap_user_dispatch` knob. The AP can now run an admitted task and
+    return to idle; the next step (controlled AP workload placement) can build on this
+    return-to-idle loop. Not yet a general AP scheduler policy — the probe is a single
+    controlled task and the AP does not yet re-dispatch a *next* admitted task (it
+    honestly idles). `yarm.ap_user_dispatch` stays EXPERIMENTAL / default-off.
+  * Guarded by `stage190a_ap_sched_loop` (marker vocabulary, return-to-scheduler-then-
+    idle wiring, `block_current_on` run-queue consistency, interruptible idle not a
+    park, no global-lock retirement).
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

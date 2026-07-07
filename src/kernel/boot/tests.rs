@@ -58990,6 +58990,103 @@ mod stage189d_seal {
     }
 }
 
+// Stage 190A — AP SCHEDULER LOOP + RETURN-TO-IDLE. After the admitted probe task's
+// Yield seals through the global lock, the AP RETURNS to the scheduler (the probe is
+// blocked, run queue left consistent) and falls through to the interruptible idle
+// loop — it no longer parks forever. Still global-lock-authoritative, admission still
+// audited, no global-lock retirement.
+mod stage190a_ap_sched_loop {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const SCHED_STATE_SRC: &str = include_str!("scheduler_state.rs");
+
+    // The scheduler-loop / return-to-idle marker vocabulary exists.
+    #[test]
+    fn sched_loop_marker_vocabulary_exists() {
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_SCHED_LOOP_READY: &str = \"X86_AP_SCHED_LOOP_READY\"")
+                && AP_DISPATCH_SRC.contains(
+                    "MARK_YIELD_RETURN_TO_SCHED_OK: &str = \"X86_AP_YIELD_RETURN_TO_SCHED_OK\""
+                )
+                && AP_DISPATCH_SRC
+                    .contains("MARK_RETURN_TO_IDLE_OK: &str = \"X86_AP_RETURN_TO_IDLE_OK\"")
+                && AP_DISPATCH_SRC
+                    .contains("MARK_SCHED_LOOP_DONE: &str = \"X86_AP_SCHED_LOOP_DONE\""),
+            "the Stage 190A scheduler-loop marker vocabulary must exist"
+        );
+    }
+
+    // After the seal, the AP RETURNS to the scheduler (blocks the probe) and then the
+    // trap dispatch routes it to the interruptible idle loop — NOT a permanent park.
+    #[test]
+    fn ap_returns_to_scheduler_then_idle_after_yield() {
+        // The trap dispatch blocks the probe right after the seal completes, gated on
+        // the per-CPU ap_seal flag.
+        assert!(
+            DESC_SRC.contains("crate::arch::x86_64::smp::ap_seal_syscall_ok(cpu, ap_seal_nr);")
+                && DESC_SRC.contains(
+                    "crate::arch::x86_64::smp::ap_seal_return_to_idle(shared, cpu, ap_seal_nr);"
+                ),
+            "the trap dispatch must return the AP probe to the scheduler after the seal"
+        );
+        // The idle path emits the return-to-idle markers (gated on ap_seal) and then
+        // enters the interruptible idle loop (sti;hlt) — not a park.
+        assert!(
+            DESC_SRC.contains("crate::arch::x86_64::smp::ap_sched_return_to_idle_markers(cpu);")
+                && DESC_SRC.contains("idle_halt_loop();"),
+            "the AP must fall through to the interruptible idle loop, emitting return-to-idle"
+        );
+        assert!(
+            SMP_SRC.contains("fn ap_seal_return_to_idle(")
+                && SMP_SRC.contains("k.block_current_on_cpu(cpu)")
+                && SMP_SRC.contains("MARK_YIELD_RETURN_TO_SCHED_OK"),
+            "return-to-idle must block the probe on the AP (run-queue-consistent) + mark it"
+        );
+    }
+
+    // Run-queue consistency: the probe is taken off the AP via the scheduler's
+    // block_current_on (removes membership), not by ad-hoc mutation.
+    #[test]
+    fn return_to_idle_uses_scheduler_block_for_consistency() {
+        assert!(
+            SCHED_STATE_SRC.contains("pub fn block_current_on_cpu(&mut self, cpu: CpuId)")
+                && SCHED_STATE_SRC.contains(".block_current_on(cpu)"),
+            "the AP probe must be removed via the scheduler's block_current_on (consistent run queue)"
+        );
+    }
+
+    // The probe no longer parks as the only success path: the interruptible idle loop
+    // (sti;hlt) is the return target, reachable via the None/idle exiting-tid path.
+    #[test]
+    fn probe_no_longer_parks_as_only_success_path() {
+        assert!(
+            DESC_SRC.contains("fn idle_halt_loop() -> ! {")
+                && DESC_SRC.contains("\"sti\", \"hlt\""),
+            "the AP idle loop must be interruptible (sti;hlt), a real return-to-idle not a park"
+        );
+        // The seal-loop readiness is emitted before ring3 entry.
+        assert!(
+            SMP_SRC.contains("MARK_SCHED_LOOP_READY"),
+            "the AP dispatcher must announce the scheduler loop before entering ring 3"
+        );
+    }
+
+    // No global-lock retirement claim: the AP still enters the global lock for its
+    // syscall; return-to-idle blocks under `with_cpu` (the global lock).
+    #[test]
+    fn no_global_lock_retirement() {
+        assert!(
+            SMP_SRC.contains(".with_cpu(cpu, |k| k.block_current_on_cpu(cpu))"),
+            "return-to-idle must operate under the global lock (with_cpu); lock is not retired"
+        );
+        assert!(
+            !SMP_SRC.contains("UNLOCK_GRADUATED_FALLBACK") && !SMP_SRC.contains("emergency_optout"),
+            "no global-lock retirement / fallback markers"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

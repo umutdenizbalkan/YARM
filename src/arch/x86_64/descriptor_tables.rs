@@ -1167,9 +1167,13 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         }
         // Stage 189D: the AP probe's normal syscall reached the global-lock dispatch
         // and returned Ok — emit the seal completion markers (one-shot; clears the
-        // per-CPU seal-probe flag).
+        // per-CPU seal-probe flag). Stage 190A: then RETURN the probe to the AP
+        // scheduler (block it so nothing is left running on the AP), so the AP does
+        // NOT re-run the one-shot probe forever nor park — it falls through to the
+        // interruptible idle loop below (return-to-idle).
         if ap_seal {
             crate::arch::x86_64::smp::ap_seal_syscall_ok(cpu, ap_seal_nr);
+            crate::arch::x86_64::smp::ap_seal_return_to_idle(shared, cpu, ap_seal_nr);
         }
         // Stage 4T+6R: reverted to conservative with_cpu→current_tid path.
         // See entering_tid comment above for the revert rationale.
@@ -1181,6 +1185,11 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             // user trap frame would resume the task that just blocked and form
             // a hot block/yield/retry loop.  Park the CPU with interrupts
             // enabled instead, so timer and external IRQs still wake from HLT.
+            // Stage 190A: for the AP scheduler-loop probe, this is the honest
+            // return-to-idle after the probe yielded and the AP run queue is empty.
+            if ap_seal {
+                crate::arch::x86_64::smp::ap_sched_return_to_idle_markers(cpu);
+            }
             crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", cpu.0);
             TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
             idle_halt_loop();
