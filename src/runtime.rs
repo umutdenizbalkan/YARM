@@ -2164,6 +2164,86 @@ impl SharedKernel {
         count as u32
     }
 
+    /// Stage 191C (GLOBAL-LOCK-RETIRE class=InitramfsReadChunk): copy the kernel slice
+    /// `src` into user VA `user_ptr` in address space `asid_raw`, OFF the broad global
+    /// lock. Byte-identical in end-state to the legacy `KernelState::
+    /// copy_to_current_user_from_slice` / `copy_slice_to_task` (per-page validate +
+    /// bulk `copy_nonoverlapping`), but driven through the rank-5 VM seam
+    /// (`validate_user_access_for_asid_split`) + the direct map instead of a broad
+    /// `&mut KernelState`. No IPC (rank 3) / capability (rank 4) / scheduler (rank 1) /
+    /// task (rank 2) lock is taken.
+    ///
+    /// TWO-PASS (all-or-nothing) so a partial write can never happen on the split path:
+    /// * Pass 1 validates EVERY destination page is user-writable and performs NO write.
+    ///   If any page is unmapped / not user-writable it returns `Err(UserMemoryFault)`
+    ///   BEFORE a single byte is written — so the caller can safely fall back to the
+    ///   unchanged global-lock handler for the canonical error with zero user mutation.
+    /// * Pass 2 runs only after every page validated, so it cannot fault; it bulk-copies
+    ///   each page-aligned chunk through the direct map.
+    ///
+    /// Returns `Err(UserMemoryFault)` on any validation miss (same error class the legacy
+    /// path raises; the legacy path never faults-in / COWs either — it only validates
+    /// flags). The single-dispatcher trap point runs this with no concurrent mutator, so
+    /// Pass 2's re-resolve observes the same mappings Pass 1 validated. Available in both
+    /// configs (the two-pass structure is config-independent; only the leaf byte write
+    /// differs — direct-map `copy_nonoverlapping` bare-metal, `write_user_byte_split`
+    /// hosted — so the hosted build can unit-test the no-partial-write guarantee directly).
+    pub fn copy_slice_to_user_asid_split_write(
+        &self,
+        asid_raw: u64,
+        user_ptr: usize,
+        src: &[u8],
+    ) -> Result<(), KernelError> {
+        use crate::kernel::vm::{Asid, PAGE_SIZE};
+        let asid = Asid(u16::try_from(asid_raw).map_err(|_| KernelError::UserMemoryFault)?);
+        let len = src.len();
+        // Pass 1: validate every destination page is user-writable (NO write). A fault
+        // here returns BEFORE a single byte is written.
+        let mut done = 0usize;
+        while done < len {
+            let va = user_ptr
+                .checked_add(done)
+                .ok_or(KernelError::UserMemoryFault)?;
+            let page_off = va & (PAGE_SIZE - 1);
+            let chunk = (len - done).min(PAGE_SIZE - page_off);
+            self.validate_user_access_for_asid_split(asid, va, true)?;
+            done += chunk;
+        }
+        // Pass 2: every page validated ⇒ the copy cannot fault. Same per-page walk as the
+        // legacy bulk copy path; the leaf write is the config-appropriate primitive.
+        let mut done = 0usize;
+        while done < len {
+            let va = user_ptr
+                .checked_add(done)
+                .ok_or(KernelError::UserMemoryFault)?;
+            let page_off = va & (PAGE_SIZE - 1);
+            let chunk = (len - done).min(PAGE_SIZE - page_off);
+            let phys = self.validate_user_access_for_asid_split(asid, va, true)?;
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let dst_ptr = crate::kernel::boot::KernelState::phys_to_direct_map_ptr(phys)
+                    .ok_or(KernelError::UserMemoryFault)?;
+                // SAFETY: `phys` is within a validated user-writable mapping; `chunk`
+                // never exceeds the bytes left in that page; `src` has ≥ `len` bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src[done..].as_ptr(), dst_ptr, chunk);
+                }
+            }
+            #[cfg(feature = "hosted-dev")]
+            {
+                for j in 0..chunk {
+                    self.write_user_byte_split(
+                        asid,
+                        crate::kernel::vm::VirtAddr(phys + j as u64),
+                        src[done + j],
+                    )?;
+                }
+            }
+            done += chunk;
+        }
+        Ok(())
+    }
+
     pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot {
         // Stage 4T+7 split-read: pre-read diagnostic data for the fatal-trap log.
         // Acquires scheduler lock (rank 1) for current_tid, then task lock (rank 2)

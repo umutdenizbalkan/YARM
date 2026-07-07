@@ -562,6 +562,69 @@ remove implicit global-lock coupling from syscall/trap paths.
     `stage29_whitelist_exhaustive`/`stage29_futex_not_eligible` (NR 11 FutexWake eligible,
     FutexWait still not).
 
+- **Stage 191C (INITRAMFSREADCHUNK GLOBAL-LOCK RETIREMENT) — DONE and QEMU-PROVEN.** The
+  broad global `SpinLock<KernelState>` is NOT retired. Stage 191C converts one more class
+  — `InitramfsReadChunk` (NR 27), the FIRST read-only USER-COPY class — to the
+  split-dispatch (no-global-lock) seam, on top of the 191A `DebugLog` and 191B `FutexWake`
+  retirements (all preserved). `CreateInitramfsFileSliceMo` (NR 28) stays global-lock-only
+  (it MINTS a capability); `Yield`/`FutexWait`/all VM/spawn/IPC-send classes stay locked.
+  * **Path + touched-state inventory.** `InitramfsReadChunk(name_ptr, name_len, offset,
+    dst_ptr, max_len, target_tid)` is effectively a READ: SystemServer-only gate → read
+    the file name from the caller's ASID → look up the immutable initramfs CPIO blob
+    (`Bootstrap::boot_initrd_bytes()`, a static — no lock) → copy up to 4096 bytes of file
+    data into the caller's own ASID (`target_tid=0`) or PM's ASID (`target_tid=3`, the
+    Phase 2B bridge). Touched state: current CPU/task binding (read), task class + ASID
+    (rank 2 reads), user memory (caller read for the name, destination write). It mutates
+    NO task/scheduler/IPC/cap/VM STRUCTURAL state, blocks/yields/switches nothing, and
+    ALLOCATES nothing — the only write is to the destination user buffer.
+  * **Lock/rank + user-copy proof.** The success path holds NO broad `&mut KernelState`:
+    `current_tid_authoritative(cpu)` (binds current_cpu) → `task_class_split_read` (rank 2)
+    → `copy_from_user_asid_split_read` (VM user-spaces lock + direct map, for the name) →
+    `copy_slice_to_user_asid_split_write` (rank-5 VM seam
+    `validate_user_access_for_asid_split` + direct map, for the data). The new write seam
+    is TWO-PASS: Pass 1 validates EVERY destination page is user-writable and writes
+    nothing; Pass 2 (reached only after all pages validate) bulk-copies each page-aligned
+    chunk — byte-identical in end-state to the legacy `copy_to_current_user_from_slice` /
+    `copy_slice_to_task`, but a fault leaves ZERO bytes written. Empirically guarded
+    (`initramfs_read_chunk_split_is_two_pass_no_partial_write`: a write spanning into an
+    unmapped page returns `UserMemoryFault` and the mapped prefix is untouched).
+  * **Error-semantics proof (no masking).** The helper services only the SUCCESS outcomes
+    off the global lock (a completed copy → `set_ok(0, to_copy, 0)`, and the EOF
+    short-circuit → `set_ok(0,0,0)`). EVERY error outcome returns `None`, so the unchanged
+    global-lock `handle_initramfs_read_chunk` produces the CANONICAL error and its exact
+    diagnostic log — `MissingRight` (+ `INITRAMFS_READ_CHUNK_DENIED`) for a non-SystemServer
+    / invalid target, `InvalidArgs` for bad args / name copy / non-UTF-8 / bad CPIO,
+    `Internal` (+ `INITRAMFS_READ_CHUNK_NOT_FOUND`) for a missing file, `UserMemoryFault` /
+    `PageFault` for an unwritable destination. Because the write seam is two-pass, a `None`
+    on an unwritable destination means zero user bytes were written on the split path, so
+    the fallback re-run equals the legacy path alone. `UserMemoryFault` is preserved, never
+    hidden as success (`initramfs_read_chunk_split_preserves_user_memory_fault`).
+  * **Live QEMU proof.** x86_64 crash-restart: all 20 `InitramfsReadChunk` syscalls route
+    through the split path (`YARM_LOCK_SPLIT_DISPATCH nr=27 result=ok`), 20 paired
+    `INITRAMFS_READ_CHUNK_SPLIT_BEGIN`/`_DONE`, `GLOBAL_LOCK_RETIRE_CLASS_BEGIN`/`DONE
+    class=InitramfsReadChunk result=ok` once, ZERO global-lock fallback traces — and the
+    supervisor crash-restart (driver reload via the PM bridge, `to_copy=4096
+    target_tid=3`) PASSES, so the split copy is byte-identical live. core + IPC oracle +
+    smp2/smp4 (armed and knob-off) pass with 191A/191B retirements + AP scheduler seal +
+    all 188–190 markers preserved.
+  * **Scope + cross-arch.** x86_64-effective, non-hosted only (hosted-dev stays on the
+    global-lock handler; the split copy uses the direct map). riscv64 does not enter
+    `handle_trap_entry_shared` and aarch64 only imports the split ABI under the IPC-recv
+    proof knob, so InitramfsReadChunk stays global-lock-only on both (0 `nr=27` split
+    markers; riscv64 carries its unchanged pre-existing idle-halt and aarch64 its unchanged
+    pre-existing `WrongObject`, both byte-identical to baseline).
+  * **The broad global lock is NOT retired.** Only `DebugLog` (191A), `FutexWake` (191B),
+    and `InitramfsReadChunk` (191C, success path) are split-eligible; every other class
+    still routes through `with_cpu → handle_trap → syscall::dispatch`, and `ReapFaultedTask`
+    stays global-lock-only. This is a three-class conversion, not a lock-retirement claim.
+  * **Go/no-go for Stage 191D:** GO for a further narrow read-only/query class only with a
+    complete lock/rank proof. NOT `CreateInitramfsFileSliceMo` (mints a capability), NOT
+    `FutexWait` (blocks), NOT `Yield` (task switch), NOT any VM/spawn/IPC-send class.
+  * Guarded by `stage191c_initramfs_read_chunk_retire` (eligibility, marker vocabulary,
+    user-copy seam usage + no broad lock, error-path fallback, empirical two-pass
+    no-partial-write + `UserMemoryFault` preservation, non-selected classes stay locked) +
+    the updated `stage29_whitelist_exhaustive` (NR 27 now eligible, NR 28 not).
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

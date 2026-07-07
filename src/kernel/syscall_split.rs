@@ -283,6 +283,17 @@ pub(crate) fn try_split_dispatch_into_frame(
         return try_split_futex_wake_into_frame(shared, cpu, frame);
     }
 
+    // Stage 191C (GLOBAL-LOCK-RETIRE, third class): InitramfsReadChunk (NR 27) — a
+    // read-only user-copy syscall. It reads immutable initramfs/CPIO data and copies it
+    // into the caller's (or PM's) user buffer; it never mutates task/scheduler/IPC/cap/VM
+    // structural state and never allocates. The helper services the SUCCESS path off the
+    // global lock; ANY error case (access gate, bad args, not-found, unwritable dest)
+    // returns `None` → unchanged global-lock fallback, which produces the CANONICAL error
+    // + diagnostic logs exactly as before (no silent success masking).
+    if matches!(syscall, Syscall::InitramfsReadChunk) {
+        return try_split_initramfs_read_chunk_into_frame(shared, cpu, frame);
+    }
+
     // The requester TID is what the global-lock handler reads via
     // `current_tid(kernel)` (i.e. `kernel.current_tid()`).
     //
@@ -495,6 +506,181 @@ fn try_split_futex_wake_into_frame(
     None
 }
 
+/// One-shot latch so the InitramfsReadChunk retirement markers are emitted exactly once.
+#[cfg(not(feature = "hosted-dev"))]
+static INITRAMFS_READ_CHUNK_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 191C: service `InitramfsReadChunk` (NR 27) through the split (no-global-lock)
+/// path.
+///
+/// InitramfsReadChunk is the THIRD retired global-lock class and the FIRST read-only
+/// USER-COPY class. It is effectively a read: it copies immutable initramfs/CPIO file
+/// bytes into the caller's own ASID (or PM's, for the Phase 2B bridge). It never
+/// blocks/yields/schedules, never switches tasks, never allocates, and mutates NO
+/// task/scheduler/IPC/cap/VM structural state — the only write is to the destination
+/// user buffer, through the same validated user-copy authority the legacy handler uses.
+///
+/// This helper mirrors the global `handle_initramfs_read_chunk` and services only the
+/// SUCCESS outcomes off the global lock (a completed copy, and the EOF short-circuit
+/// `set_ok(0,0,0)`). EVERY error outcome returns `None`, so the unchanged global-lock
+/// handler produces the CANONICAL error and its exact diagnostic log
+/// (`INITRAMFS_READ_CHUNK_DENIED` / `INITRAMFS_READ_CHUNK_NOT_FOUND`, `MissingRight` /
+/// `InvalidArgs` / `Internal` / `UserMemoryFault` / `PageFault`) — never a silent
+/// success. Because the user-copy seam is TWO-PASS (validate-all then write), a `None`
+/// on an unwritable destination means ZERO user-memory bytes were written on the split
+/// path, so the fallback re-run is equivalent to the legacy path alone.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_initramfs_read_chunk_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::validate_user_region;
+    use crate::kernel::task::TaskClass;
+    use yarm_srv_common::cpio::CpioArchive;
+
+    // Must match `PM_BOOTSTRAP_TID` in `kernel::syscall` (the Phase 2B bridge target).
+    const PM_BOOTSTRAP_TID: u64 = 3;
+
+    // Authoritative requester TID (binds current_cpu; same task the global handler
+    // sees). Unavailable → fall back to the global-lock path (canonical `Internal`).
+    let caller_tid = shared.current_tid_authoritative(cpu)?;
+
+    // ── Access gate: SystemServer only. Any other class → fall back so the global
+    //    handler emits `INITRAMFS_READ_CHUNK_DENIED` + `MissingRight`. ────────────────
+    if shared.task_class_split_read(caller_tid) != Some(TaskClass::SystemServer) {
+        return None;
+    }
+
+    // Decode args identically to `handle_initramfs_read_chunk`.
+    let name_ptr = frame.arg(0);
+    let name_len = frame.arg(1);
+    let offset = frame.arg(2) as u64;
+    let dst_ptr = frame.arg(3);
+    let max_len = core::cmp::min(frame.arg(4), 4096);
+    let target_tid_arg = frame.arg(5) as u64;
+
+    // Arg validation — mirror the global handler. On any miss fall back (no mutation),
+    // so the global path produces the canonical `InvalidArgs` / `MissingRight`.
+    if name_len == 0 || name_len > 128 {
+        return None; // legacy: InvalidArgs
+    }
+    if dst_ptr == 0 {
+        return None; // legacy: InvalidArgs
+    }
+    if target_tid_arg != 0 && target_tid_arg != PM_BOOTSTRAP_TID {
+        return None; // legacy: DENIED log + MissingRight
+    }
+
+    // Read the file name from the caller's ASID (read-only user copy). A copy miss /
+    // non-UTF-8 name falls back to the canonical `InvalidArgs`.
+    let caller_asid = shared.task_asid_for_tid_split_read(caller_tid);
+    let name_buf = shared.copy_from_user_asid_split_read(caller_asid, name_ptr, name_len)?;
+    let raw_name = core::str::from_utf8(&name_buf[..name_len]).ok()?;
+    // Accept "sbin/x", "/sbin/x", "/initramfs/sbin/x" — identical normalization.
+    let name = raw_name.trim_start_matches('/');
+    let name = name.strip_prefix("initramfs/").unwrap_or(name);
+    let name = name.trim_start_matches('/');
+
+    // Immutable initramfs blob (static accessor; no lock) + pure CPIO parse.
+    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?; // None → InvalidArgs
+    let entry = CpioArchive::new(initrd).find(name).ok()?; // Err → InvalidArgs
+    let data = match entry {
+        Some(e) => e.file_data(),
+        // File not found: fall back so the global handler logs
+        // `INITRAMFS_READ_CHUNK_NOT_FOUND` and returns the canonical `Internal`.
+        None => return None,
+    };
+
+    let offset_usize = offset as usize;
+    if offset_usize >= data.len() {
+        // EOF (file exists, offset past end) — same as the global handler: OK, no copy.
+        frame.set_ok(0, 0, 0);
+        maybe_log_initramfs_read_chunk_retired();
+        return Some(Ok(()));
+    }
+    let available = data.len() - offset_usize;
+    let to_copy = core::cmp::min(available, max_len);
+    let src = &data[offset_usize..offset_usize + to_copy];
+
+    // Resolve the destination ASID: caller's own (target 0) or PM's (Phase 2B bridge).
+    let dst_asid_raw = if target_tid_arg == 0 {
+        caller_asid
+    } else {
+        shared.task_asid_for_tid_split_read(target_tid_arg)
+    };
+    if dst_asid_raw == 0 {
+        return None; // task ASID unavailable → canonical UserMemoryFault / PageFault
+    }
+
+    // For the caller's own ASID, mirror the legacy `validate_user_region(dst_ptr,
+    // to_copy)` bounds check (the PM bridge does not perform it). On failure fall back
+    // (no write) → canonical `InvalidArgs`.
+    if target_tid_arg == 0 && validate_user_region(dst_ptr as u64, to_copy as u64).is_err() {
+        return None;
+    }
+
+    // Two-pass user-copy: validates every destination page BEFORE writing any byte, so a
+    // fault leaves zero bytes written and we can fall back with no mutation. On success
+    // every byte is written, byte-identical to the legacy bulk copy.
+    if shared
+        .copy_slice_to_user_asid_split_write(dst_asid_raw, dst_ptr, src)
+        .is_err()
+    {
+        // Unwritable destination — fall back so the global handler produces the exact
+        // error (`UserMemoryFault` → `PageFault` for the PM bridge; `SyscallError::from`
+        // for the caller's ASID). No user-memory byte was written on the split path.
+        return None;
+    }
+
+    crate::yarm_log!(
+        "INITRAMFS_READ_CHUNK_SPLIT_BEGIN name_len={} to_copy={} target_tid={}",
+        name_len,
+        to_copy,
+        target_tid_arg
+    );
+    frame.set_ok(0, to_copy, 0);
+    crate::yarm_log!(
+        "INITRAMFS_READ_CHUNK_SPLIT_DONE to_copy={} result=ok",
+        to_copy
+    );
+    maybe_log_initramfs_read_chunk_retired();
+    Some(Ok(()))
+}
+
+/// Emit the InitramfsReadChunk retirement markers exactly once (first off-global-lock
+/// service).
+#[cfg(not(feature = "hosted-dev"))]
+fn maybe_log_initramfs_read_chunk_retired() {
+    if INITRAMFS_READ_CHUNK_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("{} class=InitramfsReadChunk", MARK_RETIRE_CLASS_BEGIN);
+        crate::yarm_log!(
+            "{} class=InitramfsReadChunk result=ok",
+            MARK_RETIRE_CLASS_DONE
+        );
+    }
+}
+
+/// Hosted-dev: InitramfsReadChunk stays on the unchanged global-lock path (the split
+/// user-copy uses the direct map, which only exists on real targets).
+#[cfg(feature = "hosted-dev")]
+fn try_split_initramfs_read_chunk_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
 /// # Validation status
 /// - LIVE_TRAP_SMOKE_X86_64 (Stage 32B) — wired into the live trap seam:
 ///   `try_split_dispatch_into_frame` routes IpcRecv (NR 2) here BEFORE the global
@@ -597,6 +783,15 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // blocks the caller — stays global-lock-only). Ineligible cases (invalid addr)
         // return `None` → unchanged global-lock fallback, which produces the exact error.
         Syscall::FutexWake => Some(syscall),
+        // Stage 191C (GLOBAL-LOCK-RETIRE, third class): InitramfsReadChunk (NR 27) is a
+        // read-only user-copy syscall — it copies immutable initramfs/CPIO bytes into a
+        // user buffer and mutates NO task/scheduler/IPC/cap/VM structural state. Its
+        // SUCCESS path is serviced off the global lock via
+        // `try_split_initramfs_read_chunk_into_frame`; every error case returns `None` →
+        // unchanged global-lock fallback (canonical error + diagnostic logs). NOT
+        // CreateInitramfsFileSliceMo (NR 28), which MINTS a capability (cap-state
+        // mutation) and stays global-lock-only.
+        Syscall::InitramfsReadChunk => Some(syscall),
         _ => None,
     }
 }
@@ -1143,9 +1338,10 @@ mod tests {
     #[test]
     fn stage29_whitelist_exhaustive() {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
-        // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A), and
-        // NR 11 (FutexWake, Stage 191B) may pass the NR-only split-eligibility gate.
-        // Every other syscall stays global-lock-only.
+        // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A),
+        // NR 11 (FutexWake, Stage 191B), and NR 27 (InitramfsReadChunk, Stage 191C)
+        // may pass the NR-only split-eligibility gate. Every other syscall stays
+        // global-lock-only.
         for nr in 0..SYSCALL_COUNT {
             let Ok(syscall) = Syscall::decode(nr) else {
                 continue;
@@ -1156,6 +1352,7 @@ mod tests {
                 || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
                 || nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
                 || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+                || nr == crate::kernel::syscall::SYSCALL_INITRAMFS_READ_CHUNK_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {

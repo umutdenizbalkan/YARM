@@ -633,9 +633,12 @@ impl crate::runtime::SharedKernel {
         Ok(unsafe { core::ptr::read_volatile(ptr) })
     }
 
+    // Stage 191C: `pub(crate)` so the `SharedKernel::copy_slice_to_user_asid_split_write`
+    // seam in `runtime.rs` can use it as the hosted leaf byte-write (the bare-metal seam
+    // writes the direct map directly).
     #[cfg(feature = "hosted-dev")]
     #[cfg_attr(not(test), allow(dead_code))]
-    fn write_user_byte_split(
+    pub(crate) fn write_user_byte_split(
         &self,
         asid: Asid,
         va: VirtAddr,
@@ -649,7 +652,7 @@ impl crate::runtime::SharedKernel {
 
     #[cfg(not(feature = "hosted-dev"))]
     #[cfg_attr(not(test), allow(dead_code))]
-    fn write_user_byte_split(
+    pub(crate) fn write_user_byte_split(
         &self,
         _asid: Asid,
         va: VirtAddr,

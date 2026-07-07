@@ -59513,6 +59513,240 @@ mod stage191b_futex_wake_retire {
     }
 }
 
+// Stage 191C — INITRAMFSREADCHUNK GLOBAL-LOCK RETIREMENT. InitramfsReadChunk (NR 27)
+// becomes the THIRD retired global-lock class and the FIRST read-only USER-COPY class:
+// it copies immutable initramfs/CPIO bytes into the caller's (or PM's) user buffer,
+// mutating NO task/scheduler/IPC/cap/VM structural state and allocating nothing. The
+// SUCCESS path is serviced off the global lock via a two-pass user-copy seam
+// (validate-all-then-write-all, so a fault leaves ZERO bytes written); every error path
+// falls back to the unchanged global-lock handler for the canonical error + logs.
+// CreateInitramfsFileSliceMo (NR 28) stays global-lock-only (it MINTS a capability).
+mod stage191c_initramfs_read_chunk_retire {
+    use super::*;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn handler_body() -> &'static str {
+        let start = SPLIT_SRC
+            .find("fn try_split_initramfs_read_chunk_into_frame(")
+            .expect("initramfs split fn must exist");
+        let rest = &SPLIT_SRC[start..];
+        let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    // INVENTORY / eligibility: InitramfsReadChunk (NR 27) is whitelisted and routed to
+    // its helper; CreateInitramfsFileSliceMo (NR 28) is NOT (it mints a capability).
+    #[test]
+    fn initramfs_read_chunk_split_eligible_but_slice_mo_stays_locked() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),")
+                && SPLIT_SRC.contains("fn try_split_initramfs_read_chunk_into_frame("),
+            "InitramfsReadChunk must be split-eligible and routed to its helper"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some"),
+            "CreateInitramfsFileSliceMo must stay global-lock-only (it mints a capability)"
+        );
+        // The functional NR-gate check (NR 27 eligible, NR 28 not) is covered by
+        // `syscall_split::tests::stage29_whitelist_exhaustive`, which iterates the whole
+        // NR space against the real classifier.
+    }
+
+    // The InitramfsReadChunk split + one-shot retire markers exist.
+    #[test]
+    fn initramfs_read_chunk_split_markers_exist() {
+        assert!(
+            SPLIT_SRC.contains(
+                "\"INITRAMFS_READ_CHUNK_SPLIT_BEGIN name_len={} to_copy={} target_tid={}\""
+            ) && SPLIT_SRC.contains("\"INITRAMFS_READ_CHUNK_SPLIT_DONE to_copy={} result=ok\"")
+                && SPLIT_SRC.contains("{} class=InitramfsReadChunk result=ok"),
+            "the InitramfsReadChunk split + retirement markers must exist"
+        );
+    }
+
+    // USER-COPY + NO BROAD LOCK: the handler resolves the requester via the authoritative
+    // tid + task-class split-read, reads the name via the split-read copy, and writes the
+    // data via the dedicated two-pass user-copy seam — never `with(` / `with_cpu(`.
+    #[test]
+    fn initramfs_read_chunk_split_uses_user_copy_seam_and_no_global_lock() {
+        let body = handler_body();
+        assert!(
+            body.contains("shared.current_tid_authoritative(cpu)?")
+                && body.contains("shared.task_class_split_read(caller_tid)")
+                && body.contains(
+                    "shared.copy_from_user_asid_split_read(caller_asid, name_ptr, name_len)"
+                )
+                && body.contains("shared.task_asid_for_tid_split_read(target_tid_arg)")
+                && body
+                    .contains(".copy_slice_to_user_asid_split_write(dst_asid_raw, dst_ptr, src)"),
+            "the InitramfsReadChunk split must use the authoritative-tid + split-read + user-copy seams"
+        );
+        // The handler takes NO broad global lock.
+        assert!(
+            !body.contains(".with(|") && !body.contains(".with_cpu("),
+            "the InitramfsReadChunk split path must not take the broad global lock"
+        );
+        // The write seam uses ONLY the VM split accessor (rank 5) + the config leaf write,
+        // never a broad `&mut KernelState`.
+        assert!(
+            RUNTIME_SRC.contains("pub fn copy_slice_to_user_asid_split_write(")
+                && RUNTIME_SRC
+                    .contains("self.validate_user_access_for_asid_split(asid, va, true)?")
+                && RUNTIME_SRC
+                    .contains("crate::kernel::boot::KernelState::phys_to_direct_map_ptr(phys)"),
+            "the user-copy seam must resolve via the VM split accessor + direct map"
+        );
+    }
+
+    // ERROR SEMANTICS: every error outcome falls back (`return None`) so the global-lock
+    // handler produces the canonical error + diagnostic log — no silent success masking.
+    #[test]
+    fn initramfs_read_chunk_split_error_paths_fall_back() {
+        let body = handler_body();
+        // Access gate → fallback.
+        assert!(
+            body.contains("!= Some(TaskClass::SystemServer)")
+                && body.contains("if name_len == 0 || name_len > 128")
+                && body.contains("if dst_ptr == 0")
+                && body.contains("if target_tid_arg != 0 && target_tid_arg != PM_BOOTSTRAP_TID"),
+            "the split handler must mirror the legacy access gate + arg validation"
+        );
+        // Unwritable destination → fallback (no partial write, canonical fault).
+        assert!(
+            body.contains(".copy_slice_to_user_asid_split_write(dst_asid_raw, dst_ptr, src)")
+                && body.contains(".is_err()")
+                && body.contains("return None;"),
+            "an unwritable destination must fall back to the global-lock canonical error"
+        );
+        // The success encoding matches the legacy handler exactly.
+        assert!(
+            body.contains("frame.set_ok(0, to_copy, 0);")
+                && body.contains("frame.set_ok(0, 0, 0);"),
+            "success (copy) and EOF encodings must match the legacy handler"
+        );
+    }
+
+    // Map one writable user page in a valid ASID (phys 0x6000 @ VA 0x2000).
+    fn shared_with_mapped_page() -> (SharedKernel, Asid) {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, cap) = state.create_user_address_space().expect("aspace");
+        state
+            .map_user_page(
+                cap,
+                VirtAddr(0x2000),
+                Mapping {
+                    phys: PhysAddr(0x6000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map page");
+        (SharedKernel::new(state), asid)
+    }
+
+    // EMPIRICAL: the two-pass user-copy seam round-trips into a mapped page, and on a
+    // fault it writes ZERO bytes (validate-all before write-all) — the no-partial-write
+    // guarantee the split fallback relies on.
+    #[test]
+    fn initramfs_read_chunk_split_is_two_pass_no_partial_write() {
+        let (shared, asid) = shared_with_mapped_page();
+
+        // Success round-trip: write 5 bytes into the mapped page, read them back.
+        shared
+            .copy_slice_to_user_asid_split_write(asid.0 as u64, 0x2000, &[1u8, 2, 3, 4, 5])
+            .expect("write into mapped page must succeed");
+        let back = shared
+            .copy_from_user_split(asid, VirtAddr(0x2000), 5)
+            .expect("read back");
+        assert_eq!(
+            &back[..5],
+            &[1u8, 2, 3, 4, 5],
+            "round-trip bytes must match"
+        );
+
+        // Pre-write a known 0xAA pattern to the tail of the mapped page (0x2FF8..0x3000).
+        shared
+            .copy_slice_to_user_asid_split_write(asid.0 as u64, 0x2FF8, &[0xAAu8; 8])
+            .expect("tail pre-write");
+
+        // Attempt a write spanning into the UNMAPPED next page (0x3000). Pass 1 validates
+        // 0x2FFC (mapped) then 0x3000 (unmapped) → Err BEFORE any byte is written.
+        let spanning =
+            shared.copy_slice_to_user_asid_split_write(asid.0 as u64, 0x2FFC, &[0xBBu8; 8]);
+        assert!(
+            matches!(
+                spanning,
+                Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "a spanning write into an unmapped page must be UserMemoryFault: {spanning:?}"
+        );
+        // The 4 bytes of the mapped tail (0x2FFC..0x3000) must STILL be 0xAA — the failed
+        // spanning write wrote nothing (no partial write).
+        let tail = shared
+            .copy_from_user_split(asid, VirtAddr(0x2FFC), 4)
+            .expect("read tail");
+        assert_eq!(
+            &tail[..4],
+            &[0xAAu8; 4],
+            "a faulting write must not partially write the mapped prefix"
+        );
+    }
+
+    // EMPIRICAL: the seam preserves UserMemoryFault (never masks it as success) on an
+    // unknown ASID and on a valid-but-unmapped VA.
+    #[test]
+    fn initramfs_read_chunk_split_preserves_user_memory_fault() {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        let unknown = shared.copy_slice_to_user_asid_split_write(9999, 0x1000, &[1u8, 2, 3, 4]);
+        assert!(
+            matches!(
+                unknown,
+                Err(crate::kernel::boot::KernelError::Vm(_))
+                    | Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "write to an unknown ASID must return a real fault, not success: {unknown:?}"
+        );
+        let (shared2, asid) = shared_with_mapped_page();
+        let unmapped =
+            shared2.copy_slice_to_user_asid_split_write(asid.0 as u64, 0xDEAD_0000, &[1u8, 2]);
+        assert!(
+            matches!(
+                unmapped,
+                Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "write to a valid ASID but unmapped VA must be UserMemoryFault: {unmapped:?}"
+        );
+    }
+
+    // The other read-only / query-ish and dangerous classes stay global-lock-only
+    // (default-deny `_ => None`; none appears as a split-eligible `=> Some` arm).
+    #[test]
+    fn non_selected_classes_remain_locked() {
+        for locked in [
+            "Syscall::CreateInitramfsFileSliceMo => Some",
+            "Syscall::IpcSend => Some",
+            "Syscall::IpcCall => Some",
+            "Syscall::IpcReply => Some",
+            "Syscall::VmMap => Some",
+            "Syscall::VmAnonMap => Some",
+            "Syscall::Fork => Some",
+            "Syscall::SpawnThread => Some",
+            "Syscall::SpawnProcess => Some",
+            "Syscall::ReapFaultedTask => Some",
+            "Syscall::FutexWait => Some",
+            "Syscall::Yield => Some",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(locked),
+                "{locked} must NOT be split-eligible (stays global-lock-only)"
+            );
+        }
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the
