@@ -58688,6 +58688,76 @@ mod stage189c2_ap_usermode_entry {
     }
 }
 
+// Stage 189C3 — per-CPU GS base attested (safest audited subset). The full swapgs
+// syscall/interrupt entry rewrite is DEFERRED (triple-fault risk), so the syscall
+// entry stays global, usermode entry stays deferred, no wake-only is cleared, and
+// NO swapgs is added to the entry asm (no partial/unbalanced rewrite).
+mod stage189c3_percpu_entry_exit {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    // The per-CPU active GS base is detected and attested from real per-CPU state.
+    #[test]
+    fn percpu_gs_base_is_detected_and_attested() {
+        assert!(
+            PERCPU_SRC.contains("fn gs_base_written(")
+                && PERCPU_SRC.contains("flag::GS_BASE_WRITTEN"),
+            "the per-CPU GS-base-written state must be readable"
+        );
+        assert!(
+            SMP_SRC.contains("fn ap_percpu_gs_base_ready(")
+                && SMP_SRC.contains("super::percpu::gs_base_written(cpu)")
+                && SMP_SRC.contains("MARK_PERCPU_GS_BASE_READY")
+                && SMP_SRC.contains("reason=active_gs_base_percpu"),
+            "the audit must attest the per-CPU active GS base"
+        );
+        assert!(
+            AP_DISPATCH_SRC
+                .contains("MARK_PERCPU_GS_BASE_READY: &str = \"X86_PERCPU_GS_BASE_READY\""),
+            "the per-CPU GS-base marker vocabulary must exist"
+        );
+    }
+
+    // SAFETY: no swapgs was added to the entry asm this pass — the swapgs rewrite is
+    // deferred as a whole, so there is no partial/unbalanced swapgs to trip on.
+    #[test]
+    fn no_partial_swapgs_rewrite_in_entry_asm() {
+        // The lowercase `swapgs` INSTRUCTION must be absent (uppercase "SWAPGS" in
+        // the NOT-SMP-safe comments is the documented future fix, not an instruction).
+        assert!(
+            !DESC_SRC.contains("swapgs"),
+            "no swapgs instruction may be added until the full balanced entry/exit rewrite lands"
+        );
+        // The syscall entry is still the documented global path; the per-CPU-safe
+        // detector still returns false, so usermode entry stays deferred.
+        assert!(
+            SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    false\n}")
+                && SMP_SRC.contains("reason=global_syscall_rsp0_not_per_cpu"),
+            "the syscall entry must remain global (swapgs rewrite deferred)"
+        );
+    }
+
+    // The swapgs-dependent readiness markers exist as vocabulary but are emitted by
+    // NOTHING this pass; no live AP dispatch / wake-only clear occurs.
+    #[test]
+    fn swapgs_readiness_and_live_markers_not_emitted() {
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY")
+                && AP_DISPATCH_SRC.contains("MARK_INTERRUPT_ENTRY_SWAPGS_READY"),
+            "the future swapgs-readiness vocabulary must exist"
+        );
+        assert!(
+            !SMP_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY")
+                && !SMP_SRC.contains("MARK_INTERRUPT_ENTRY_SWAPGS_READY")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK"),
+            "no swapgs-readiness or AP-run live marker may be emitted this pass"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

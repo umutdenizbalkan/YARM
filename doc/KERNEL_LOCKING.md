@@ -170,6 +170,31 @@ remove implicit global-lock coupling from syscall/trap paths.
     entry), and map each AP's kernel `RSP0` stack into the user address spaces it
     runs. That is a delicate whole-kernel entry rewrite with triple-fault risk, not
     a minimal trampoline — deferred per the hard-stop directive.
+- **Stage 189C3 (PER-CPU-ENTRY/EXIT) — safest audited subset only; swapgs rewrite
+  HARD-STOPPED.** No wake-only cleared, no ring 3 entry, no live marker, nothing
+  faked, BSP behavior unchanged.
+  * **Entry inventory.** Ring3→ring0 entries: the `syscall`/LSTAR path
+    (`yarm_x86_lstar_entry`, global `YARM_X86_SYSCALL_RSP0`/`_SCRATCH_RSP`, no
+    `swapgs`) and the IDT trap/IRQ/#PF stubs (`yarm_x86_dispatch_trap_from_stub`,
+    `iretq`). MSRs (`configure_syscall_fast_path`): EFER.SCE, STAR, LSTAR, FMASK.
+    GS: APs set the **active** `IA32_GS_BASE` (0xC000_0101) to their per-CPU record
+    and verify it (`X86_AP_GS_OK`); there is **no** `swapgs` and no
+    `IA32_KERNEL_GS_BASE` anywhere.
+  * **Safe subset done.** The per-CPU active GS base is detected
+    (`percpu::gs_base_written`) and attested: `X86_PERCPU_GS_BASE_READY cpu=N
+    reason=active_gs_base_percpu`. This is the per-CPU data foundation a future
+    `swapgs` entry reads. Zero behavior change (attestation only).
+  * **Hard stop — swapgs entry/exit rewrite deferred.** Converting the entry model
+    is a whole-kernel change: move per-CPU data to `IA32_KERNEL_GS_BASE`, `swapgs`
+    on user→kernel `syscall` + on every CPL3 interrupt/#PF entry (and NOT on
+    kernel→kernel traps), gs-relative RSP0/scratch, balanced `swapgs` on `sysret`
+    and `iretq`, plus mapping each AP's `RSP0` stack into user CR3. A single
+    imbalance triple-faults and would break the entire BSP `-smp 1` baseline that
+    188A–189C2 depend on, so it is not attempted in one pass. `swapgs` is verified
+    ABSENT from the entry asm this pass (no partial/unbalanced rewrite);
+    `ap_syscall_entry_is_per_cpu_safe()` stays false; usermode entry stays deferred
+    (`reason=global_syscall_rsp0_not_per_cpu`); the audited transition still
+    refuses; no wake-only is cleared.
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 

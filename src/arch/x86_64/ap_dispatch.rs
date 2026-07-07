@@ -156,6 +156,16 @@ pub const MARK_TRAP_RETURN_AUDIT_OK: &str = "X86_AP_TRAP_RETURN_AUDIT_OK";
 pub const MARK_TRAP_RETURN_READY: &str = "X86_AP_TRAP_RETURN_READY";
 /// Stage 189C2: the AP has a valid per-CPU TSS RSP0 for ring3→ring0 transitions.
 pub const MARK_TSS_RSP0_READY: &str = "X86_AP_TSS_RSP0_READY";
+/// Stage 189C3: this CPU has a per-CPU active GS base (`IA32_GS_BASE` → its own
+/// per-CPU record), verified by wrmsr+rdmsr readback.
+pub const MARK_PERCPU_GS_BASE_READY: &str = "X86_PERCPU_GS_BASE_READY";
+/// Stage 189C3 (future): the `syscall` LSTAR entry reads per-CPU RSP0/scratch via
+/// `swapgs` + gs-relative slots (no global authority). Live-only — not emitted
+/// until the entry/exit swapgs rewrite lands.
+pub const MARK_SYSCALL_ENTRY_PERCPU_READY: &str = "X86_SYSCALL_ENTRY_PERCPU_READY";
+/// Stage 189C3 (future): the ring3→ring0 interrupt/fault stubs `swapgs` on CPL3
+/// entry (and only then). Live-only — not emitted until the swapgs rewrite lands.
+pub const MARK_INTERRUPT_ENTRY_SWAPGS_READY: &str = "X86_INTERRUPT_ENTRY_SWAPGS_READY";
 /// Stage 189C2: the AP usermode-entry path (ring3 entry + per-CPU syscall/interrupt
 /// re-entry) is proven safe. Live-only — never emitted while the syscall entry uses
 /// the global (non-per-CPU) RSP0/scratch slots.

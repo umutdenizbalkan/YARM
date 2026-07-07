@@ -1801,6 +1801,14 @@ fn ap_tss_rsp0_ready(cpu: CpuId) -> bool {
     super::descriptor_tables::ap_tss_rsp0(cpu.0 as usize) != 0
 }
 
+/// Stage 189C3: does this AP have a verified per-CPU active GS base
+/// (`IA32_GS_BASE` → its own per-CPU record)? This is the per-CPU data foundation a
+/// future `swapgs` syscall/interrupt entry rewrite reads via gs-relative slots.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_percpu_gs_base_ready(cpu: CpuId) -> bool {
+    super::percpu::gs_base_written(cpu)
+}
+
 /// Stage 189C2: is the x86_64 `syscall` fast-path entry per-CPU-safe? It is NOT:
 /// `yarm_x86_lstar_entry` writes/reads the GLOBAL `YARM_X86_SYSCALL_SCRATCH_RSP` /
 /// `YARM_X86_SYSCALL_RSP0` slots (documented "NOT SMP-safe"), so an AP-run user
@@ -1884,6 +1892,15 @@ pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool)
         // Stage 189C2: the AP has a valid per-CPU TSS RSP0 for ring3→ring0.
         if ap_tss_rsp0_ready(cpu) {
             crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TSS_RSP0_READY, cpu.0);
+        }
+        // Stage 189C3: the AP has a verified per-CPU active GS base — the per-CPU
+        // data foundation a future swapgs syscall/interrupt entry rewrite requires.
+        if ap_percpu_gs_base_ready(cpu) {
+            crate::yarm_log!(
+                "{} cpu={} reason=active_gs_base_percpu",
+                ap_dispatch::MARK_PERCPU_GS_BASE_READY,
+                cpu.0
+            );
         }
         if tlb_ready {
             crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TLB_READY, cpu.0);

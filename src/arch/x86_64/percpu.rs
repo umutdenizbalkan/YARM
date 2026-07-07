@@ -309,6 +309,14 @@ pub fn mark_gs_base_written(cpu: CpuId) {
     }
 }
 
+/// Stage 189C3: has this CPU established (and verified) a per-CPU active GS base
+/// (`IA32_GS_BASE` → this CPU's per-CPU record)? Set by `mark_gs_base_written`
+/// after the AP's `wrmsr`+`rdmsr` readback succeeds (`X86_AP_GS_OK`).
+pub fn gs_base_written(cpu: CpuId) -> bool {
+    let base = record_base(cpu) as *const PerCpuRecord;
+    unsafe { (core::ptr::read_volatile(base).flags & flag::GS_BASE_WRITTEN) != 0 }
+}
+
 /// Stage 183.6: BSP posts a TLB shootdown request for `cpu` (VA `va`; 0 = full
 /// flush) and returns the new request generation. Writes `tlb_req_va` BEFORE
 /// bumping `tlb_req_gen` so the AP — which reads gen first, then va — always sees
