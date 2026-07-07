@@ -237,8 +237,15 @@ struct X86InterruptStackFrameHeader {
     rflags: u64,
 }
 
+// Stage 189D: the nested-trap guard is PER-CPU. It catches a trap that re-enters
+// the dispatch on the SAME CPU (the real bug: a fault inside the fault handler),
+// which is a per-CPU stack/reentrancy condition. A trap on a DIFFERENT CPU is NOT
+// nesting — the global `with_cpu` lock serializes the actual KernelState access —
+// so a single global counter would false-positive (`!BN` + halt) when the BSP and
+// an AP dispatch concurrently. Indexed by logical CPU id.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-static TRAP_DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static TRAP_DISPATCH_DEPTH: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::arch::platform_constants::MAX_CPUS];
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static FATAL_LOG_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -1065,7 +1072,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         "x86_64 trap/timer ISR fired during boot raw-borrow window — aliasing &mut KernelState risk"
     );
     let cpu_apic = raw_current_apic_id() as u64;
-    let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
+    // Stage 189D: per-CPU nested-trap guard index (see TRAP_DISPATCH_DEPTH doc).
+    let depth_idx =
+        (current_cpu_id().0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    let previous_depth = TRAP_DISPATCH_DEPTH[depth_idx].fetch_add(1, Ordering::AcqRel);
     let frame = unsafe { &*interrupt_frame };
     let mut fault_addr = 0u64;
     if vector as usize == VEC_PAGE_FAULT {
@@ -1121,6 +1131,17 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // is the acceptance criterion. Both entering_tid and exiting_tid reads
         // are restored to the global-lock with_cpu path (Class F).
         let entering_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
+        // Stage 189D: AP user-dispatch SEAL — a normal syscall issued by a live AP
+        // probe task entering the NORMAL global-lock dispatch path (not the magic
+        // probe fast path). Gated on the per-CPU seal-probe flag so this is inert on
+        // the BSP and on every non-armed boot. Emits the seal markers around the real
+        // global-lock dispatch below.
+        let ap_seal =
+            vector as usize == VEC_SYSCALL && crate::arch::x86_64::smp::ap_seal_probe_active(cpu);
+        let ap_seal_nr = if ap_seal { unsafe { (*regs).rax } } else { 0 };
+        if ap_seal {
+            crate::arch::x86_64::smp::ap_seal_syscall_begin(cpu, ap_seal_nr);
+        }
         let mut trap_frame =
             unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
         if let Err(err) = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
@@ -1144,6 +1165,12 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
             halt_forever();
         }
+        // Stage 189D: the AP probe's normal syscall reached the global-lock dispatch
+        // and returned Ok — emit the seal completion markers (one-shot; clears the
+        // per-CPU seal-probe flag).
+        if ap_seal {
+            crate::arch::x86_64::smp::ap_seal_syscall_ok(cpu, ap_seal_nr);
+        }
         // Stage 4T+6R: reverted to conservative with_cpu→current_tid path.
         // See entering_tid comment above for the revert rationale.
         let exiting_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
@@ -1155,7 +1182,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             // a hot block/yield/retry loop.  Park the CPU with interrupts
             // enabled instead, so timer and external IRQs still wake from HLT.
             crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", cpu.0);
-            TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+            TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
             idle_halt_loop();
         }
         if task_switched {
@@ -1164,7 +1191,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             write_trap_returns_to_saved_regs(regs, &trap_frame);
         }
         unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
-        TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
         return;
     }
 
@@ -1177,10 +1204,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             let fault_rip = frame.rip;
             log_decoded_fatal_trap(None, vector, error_code, frame, fault_addr);
             debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
-            TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+            TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
             halt_forever();
         }
-        TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
         return;
     };
     let fault_rip = frame.rip;
@@ -1210,7 +1237,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // installed.  TID 0 is idle-only on x86_64 and must not iretq through
         // the stale user frame that entered the kernel.
         crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", current_cpu_id().0);
-        TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
         idle_halt_loop();
     }
     if task_switched {
@@ -1219,7 +1246,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         write_trap_returns_to_saved_regs(regs, &trap_frame);
     }
     unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
-    TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+    TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
 }
 
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]

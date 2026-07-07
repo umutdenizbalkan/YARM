@@ -2021,6 +2021,7 @@ struct ApDispatchPlan {
     entry: AtomicU64,
     user_stack_top: AtomicU64,
     kernel_rsp0: AtomicU64,
+    tid: AtomicU64,
     valid: AtomicBool,
 }
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -2031,6 +2032,7 @@ impl ApDispatchPlan {
             entry: AtomicU64::new(0),
             user_stack_top: AtomicU64::new(0),
             kernel_rsp0: AtomicU64::new(0),
+            tid: AtomicU64::new(0),
             valid: AtomicBool::new(false),
         }
     }
@@ -2039,16 +2041,94 @@ impl ApDispatchPlan {
 static AP_DISPATCH_PLANS: [ApDispatchPlan; crate::arch::platform_constants::MAX_CPUS] =
     [const { ApDispatchPlan::empty() }; crate::arch::platform_constants::MAX_CPUS];
 
-/// The one-shot probe context (CR3/entry/user-stack), built once on the BSP and
-/// shared by every dispatched AP (each AP gets its own kernel RSP0). `0` cr3 = unbuilt.
+/// Base TID for the per-AP seal probe tasks; the probe on CPU N has TID
+/// `PROBE_TID_BASE + N` (a distinct task + ASID per AP, so it can be `current` on
+/// that AP without racing another CPU).
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
-static PROBE_CR3: AtomicU64 = AtomicU64::new(0);
+const PROBE_TID_BASE: u64 = 20_189;
+
+/// Stage 189D: per-CPU flag marking that a live AP probe task is running on this
+/// CPU and its NORMAL syscall should emit the seal markers as it enters the
+/// global-lock dispatch. Set by the BSP before waking the AP; cleared by the seal
+/// completion (one-shot). Read by the trap dispatch (`descriptor_tables`).
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
-static PROBE_ENTRY: AtomicU64 = AtomicU64::new(0);
+static AP_SEAL_PROBE_ACTIVE: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::arch::platform_constants::MAX_CPUS];
+
+/// Stage 189D: is a live AP seal probe active on `cpu` (its normal syscall should
+/// emit the seal markers)? Read by the trap dispatch to gate the AP seal hook.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
-static PROBE_USTACK: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn ap_seal_probe_active(cpu: CpuId) -> bool {
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    AP_SEAL_PROBE_ACTIVE[idx].load(Ordering::Acquire)
+}
+
+/// Stage 189D: arm/disarm the AP seal probe for `cpu`.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
-static PROBE_BUILT: AtomicBool = AtomicBool::new(false);
+fn set_ap_seal_probe_active(cpu: CpuId, active: bool) {
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    AP_SEAL_PROBE_ACTIVE[idx].store(active, Ordering::Release);
+}
+
+/// Stage 189D: emitted by the trap dispatch just BEFORE the AP probe's normal
+/// syscall enters the global-lock dispatch (`with_cpu` → `handle_trap`). Proves the
+/// AP re-entered per-CPU LSTAR and is entering the NORMAL (non-magic) dispatch path.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn ap_seal_syscall_begin(cpu: CpuId, nr: u64) {
+    use super::ap_dispatch;
+    let tid = AP_DISPATCH_PLANS
+        [(cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1)]
+    .tid
+    .load(Ordering::Relaxed);
+    // Emit SYNCHRONOUSLY (bypassing the drop-prone shared ring) so these required
+    // proof markers are never lost to concurrent AP+BSP ring overflow.
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "{} cpu={}",
+        ap_dispatch::MARK_USER_SYSCALL_REENTRY_OK,
+        cpu.0
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "{} cpu={} tid={} nr={}",
+        ap_dispatch::MARK_NORMAL_SYSCALL_BEGIN,
+        cpu.0,
+        tid,
+        nr
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "{} cpu={} tid={} nr={}",
+        ap_dispatch::MARK_GLOBAL_LOCK_DISPATCH_ENTER,
+        cpu.0,
+        tid,
+        nr
+    ));
+}
+
+/// Stage 189D: emitted by the trap dispatch AFTER the AP probe's normal syscall
+/// completed OK through the global-lock dispatch. Emits the seal-done verdict and
+/// disarms the one-shot seal probe for this CPU.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn ap_seal_syscall_ok(cpu: CpuId, nr: u64) {
+    use super::ap_dispatch;
+    let tid = AP_DISPATCH_PLANS
+        [(cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1)]
+    .tid
+    .load(Ordering::Relaxed);
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "{} cpu={} tid={} nr={}",
+        ap_dispatch::MARK_NORMAL_SYSCALL_OK,
+        cpu.0,
+        tid,
+        nr
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "{} result=ok cpu={} tid={} nr={}",
+        ap_dispatch::MARK_USER_DISPATCH_SEAL_DONE,
+        cpu.0,
+        tid,
+        nr
+    ));
+    set_ap_seal_probe_active(cpu, false);
+}
 
 /// Stage 189C6: the LIVE AP user-dispatch entry — called from the AP idle-loop hook
 /// (`smp_trampoline.rs` label `76:`) when the BSP set this AP's per-CPU
@@ -2137,11 +2217,15 @@ pub extern "C" fn yarm_x86_ap_user_dispatch_entry() {
     super::descriptor_tables::enter_user_mode_iret(entry, user_stack_top, 0, 0, 0, 0, 0, 0);
 }
 
-/// Stage 189C6: BSP-side driver for the first live AP user dispatch on `cpu`. Builds
-/// the isolated ring-3 probe task once (under the global lock), publishes the per-CPU
-/// dispatch plan, posts the request, wakes the AP, and polls (bounded) for the AP's
-/// ring3 entry + probe-syscall re-entry. Emits the terminal `X86_AP_USER_DISPATCH_DONE`
-/// verdict and, on success, the live `X86_AP_USER_SYSCALL_REENTRY_OK` marker.
+/// Stage 189D (SEAL): BSP-side driver for the live AP user-dispatch SEAL on `cpu`.
+/// Builds a REAL registered probe task, PLACES it on the AP (proving admission only
+/// after the wake-only clear), publishes the per-CPU dispatch plan, posts the
+/// request, and wakes the AP. It does NOT poll while holding the global lock — the
+/// AP's probe now issues a NORMAL syscall that takes the SAME global lock, so the BSP
+/// must release it. The BSP only polls (lock-free-safe) for the AP to reach ring 3
+/// (a per-CPU stage the AP publishes BEFORE it touches the global lock), then returns
+/// so its trap-dispatch drops the lock. The seal markers are emitted by the AP's
+/// syscall as it enters the global-lock dispatch (see `ap_seal_syscall_*`).
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     use super::ap_dispatch;
@@ -2149,34 +2233,59 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
 
     crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_USER_DISPATCH_BEGIN, cpu.0);
 
-    // Build the probe exactly once; reuse its CR3/entry/user-stack for every AP.
-    if !PROBE_BUILT.load(Ordering::Acquire) {
-        match kernel.build_ap_ring3_probe() {
-            Ok((cr3, entry, ustack)) => {
-                PROBE_CR3.store(cr3, Ordering::Relaxed);
-                PROBE_ENTRY.store(entry, Ordering::Relaxed);
-                PROBE_USTACK.store(ustack, Ordering::Relaxed);
-                PROBE_BUILT.store(true, Ordering::Release);
-            }
-            Err(e) => {
-                crate::yarm_log!(
-                    "X86_AP_LIVE_DISPATCH_BLOCKER cpu={} phase=build_probe reason=probe_build_failed err={:?}",
-                    cpu.0,
-                    e
-                );
-                crate::yarm_log!(
-                    "{} cpu={} result=probe_build_failed",
-                    ap_dispatch::MARK_USER_DISPATCH_DONE,
-                    cpu.0
-                );
-                return;
-            }
+    // Build a DISTINCT probe task per AP (own TID + own ASID). A shared task can NOT
+    // be `current` on multiple CPUs at once, so each AP gets its own (idempotent).
+    let probe_tid = PROBE_TID_BASE + cpu.0 as u64;
+    let (tid, cr3, entry, ustack) = match kernel.build_ap_ring3_probe(probe_tid) {
+        Ok(built) => built,
+        Err(e) => {
+            crate::yarm_log!(
+                "X86_AP_LIVE_DISPATCH_BLOCKER cpu={} phase=build_probe reason=probe_build_failed err={:?}",
+                cpu.0,
+                e
+            );
+            crate::yarm_log!(
+                "{} cpu={} result=probe_build_failed",
+                ap_dispatch::MARK_USER_DISPATCH_DONE,
+                cpu.0
+            );
+            return;
+        }
+    };
+    let kernel_rsp0 = ap_dispatch_kstack_top(cpu);
+
+    // ADMISSION: the caller already ran the AUDITED wake-only clear for this AP, so it
+    // is now `UserDispatchEnabled`. Placement (`enqueue_on_cpu` — the same guard that
+    // emits SCHED_ENQUEUE_DENIED_WAKE_ONLY while wake-only) must therefore SUCCEED,
+    // and we make the probe the AP's scheduler `current` so its syscall dispatches for
+    // a real TID. If placement is refused, the seal is aborted (no task lands blindly).
+    match kernel.enqueue_on_cpu(cpu, tid) {
+        Ok(()) => {
+            let placed = kernel.dispatch_next_on_cpu(cpu);
+            crate::yarm_log!(
+                "{} cpu={} tid={} current={:?}",
+                ap_dispatch::MARK_ADMIT_PLACED,
+                cpu.0,
+                tid,
+                placed
+            );
+        }
+        Err(e) => {
+            crate::yarm_log!(
+                "{} cpu={} tid={} err={:?}",
+                ap_dispatch::MARK_ADMIT_DENIED_WAKE_ONLY,
+                cpu.0,
+                tid,
+                e
+            );
+            crate::yarm_log!(
+                "{} cpu={} result=admission_denied",
+                ap_dispatch::MARK_USER_DISPATCH_DONE,
+                cpu.0
+            );
+            return;
         }
     }
-    let cr3 = PROBE_CR3.load(Ordering::Relaxed);
-    let entry = PROBE_ENTRY.load(Ordering::Relaxed);
-    let ustack = PROBE_USTACK.load(Ordering::Relaxed);
-    let kernel_rsp0 = ap_dispatch_kstack_top(cpu);
 
     // Publish the plan: fields first, then `valid` (Release) so the AP never reads a
     // torn plan.
@@ -2187,15 +2296,18 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     plan.entry.store(entry, Ordering::Relaxed);
     plan.user_stack_top.store(ustack, Ordering::Relaxed);
     plan.kernel_rsp0.store(kernel_rsp0, Ordering::Relaxed);
+    plan.tid.store(tid, Ordering::Relaxed);
     plan.valid.store(true, Ordering::Release);
 
-    // Arm: reset progress, clear any stale re-entry flag is unnecessary (fresh boot),
-    // post the request, then wake the AP with its managed-idle IPI (vector 0xF1).
+    // Arm the seal probe + dispatch request, then wake the AP (vector 0xF1). The seal
+    // markers fire from the AP's syscall as it enters the global-lock dispatch.
+    set_ap_seal_probe_active(cpu, true);
     super::percpu::set_ap_dispatch_stage(cpu, 0);
     super::percpu::set_ap_dispatch_request(cpu, 1);
     crate::yarm_log!(
-        "X86_AP_LIVE_DISPATCH_ARMED cpu={} cr3=0x{:x} entry=0x{:x} stack=0x{:x} rsp0=0x{:x}",
+        "X86_AP_LIVE_DISPATCH_ARMED cpu={} tid={} cr3=0x{:x} entry=0x{:x} stack=0x{:x} rsp0=0x{:x}",
         cpu.0,
+        tid,
         cr3,
         entry,
         ustack,
@@ -2204,39 +2316,14 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     wait_for_icr_idle(cpu.0, "before_ap_dispatch");
     write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
 
-    // Poll (bounded) for the AP to reach ring3 + issue the probe syscall.
-    let mut reentry = false;
-    let mut last_stage = 0u32;
-    for _ in 0..AP_READY_POLL_ITERS {
-        let st = super::percpu::ap_dispatch_stage(cpu);
-        if st != last_stage {
-            last_stage = st;
-        }
-        if super::percpu::ap_syscall_reentry_ok(cpu) != 0 {
-            reentry = true;
-            break;
-        }
+    // Do NOT poll here. The AP's probe issues a NORMAL syscall that takes the SAME
+    // global lock this audit currently holds — so the BSP must RELEASE it promptly.
+    // We return immediately (a very short settle so the wake IPI is observed but the
+    // lock is not held long); the audit unwinds, its `with_cpu` drops the global lock,
+    // and the armed AP(s) then run their seals concurrently, contending for the lock
+    // exactly as any real SMP syscall would. The seal verdict is emitted by the AP's
+    // own syscall (X86_AP_USER_DISPATCH_SEAL_DONE result=ok), not by the BSP.
+    for _ in 0..50_000 {
         cpu_relax();
-    }
-
-    if reentry {
-        crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_USER_SYSCALL_REENTRY_OK, cpu.0);
-        crate::yarm_log!(
-            "{} cpu={} result=ok",
-            ap_dispatch::MARK_USER_DISPATCH_DONE,
-            cpu.0
-        );
-    } else {
-        crate::yarm_log!(
-            "X86_AP_LIVE_DISPATCH_BLOCKER cpu={} phase=await_reentry last_stage={} reason=no_reentry_observed",
-            cpu.0,
-            last_stage
-        );
-        crate::yarm_log!(
-            "{} cpu={} result=timeout last_stage={}",
-            ap_dispatch::MARK_USER_DISPATCH_DONE,
-            cpu.0,
-            last_stage
-        );
     }
 }

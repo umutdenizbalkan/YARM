@@ -309,6 +309,53 @@ remove implicit global-lock coupling from syscall/trap paths.
     knob-free; the dispatch knob is a different axis), and `percpu` (record offsets
     160/164/168, stride 192).
 
+- **Stage 189D (SEAL) — DONE and QEMU-PROVEN. Stage 189 is sealed.** The AP user
+  dispatch now proves that AP user execution can safely enter the STILL-GLOBAL-lock
+  syscall path — not only the isolated magic probe. The global lock is NOT retired;
+  this proves it is SMP-safe for an AP to contend for and enter it.
+  * **Real syscall through the global lock.** The 189C6 probe stub is replaced by a
+    stub that issues `Yield` (syscall NR 0 — the normal number range, not the magic
+    `0xA9C6`) FIRST, then the magic syscall only to PARK the AP. The `Yield` takes the
+    normal LSTAR → `yarm_x86_dispatch_trap_from_stub` → `dispatch_trap_entry_with_shared_kernel`
+    → `with_cpu` (the global `SpinLock<KernelState>`) → `handle_yield` path and returns
+    Ok. Markers (emitted from the trap dispatch, gated on a per-CPU seal-probe flag so
+    inert on the BSP / non-armed boots): `X86_AP_USER_SYSCALL_REENTRY_OK` →
+    `X86_AP_NORMAL_SYSCALL_BEGIN cpu tid nr=0` → `X86_AP_GLOBAL_LOCK_DISPATCH_ENTER` →
+    `X86_AP_NORMAL_SYSCALL_OK` → `X86_AP_USER_DISPATCH_SEAL_DONE result=ok`.
+  * **Real admission.** The probe is now a REAL registered task (its own TID + TCB +
+    ASID, one PER AP so no task is `current` on two CPUs). It is PLACED on the AP only
+    AFTER the audited wake-only clear, through the wake-only-guarded `enqueue_on_cpu`
+    (the same guard that denies with `SCHED_ENQUEUE_DENIED_WAKE_ONLY` while wake-only) —
+    `X86_AP_ADMIT_PLACED cpu tid`. It is registered WITHOUT the balanced enqueue so the
+    BSP can never dispatch it (its magic park would otherwise park the BSP).
+  * **No lock-held wait; per-CPU nested-trap guard.** The AP's `Yield` takes the SAME
+    global lock the audit holds, so the live dispatcher arms + wakes and RETURNS
+    (releasing the lock via its trap unwind) rather than polling under it. `TRAP_DISPATCH_DEPTH`
+    became a PER-CPU array: a concurrent BSP+AP dispatch is not nesting (the global lock
+    serializes the real state access), so the `!BN` nested-trap halt no longer
+    false-trips. Required seal markers are emitted via `printk_emit_sync` (bypassing the
+    drop-prone shared printk ring, which overflows under concurrent AP+BSP logging).
+  * **TLB unchanged.** The genuine 189A remote-ACK proof (`X86_TLB_SHOOTDOWN_DONE
+    result=ok context=cow|vm_unmap`, AP-produced ACKs) runs BEFORE the seal and gates
+    it; no BSP-written ACK, no fake ACK.
+  * **QEMU evidence.** `-smp 2` armed: full seal on cpu 1 (tid 20190). `-smp 4` armed:
+    full seal INDEPENDENTLY on cpu 1/2/3 (tids 20190/20191/20192), each `result=ok`,
+    with `SMP_READY_PROOF_DONE` intact. Baseline (knob off) smp2/smp4 inert (0 hook
+    fires), and core/-smp1 + IPC oracle + crash-restart + riscv64 core all still pass;
+    aarch64 core carries its unchanged pre-existing `SUPERVISOR_LIFECYCLE_QUERY_ERR
+    WrongObject` (byte-identical with/without this change). The `-smp 2` armed run
+    occasionally trips the pre-existing `X86_IPI_FIXED_ICR_WRITTEN` TCG serial flake
+    (unrelated; the seal itself still completes). Debug path to here: a shared probe
+    task can't be `current` on 3 CPUs (fixed → per-AP probe); and the under-lock ring3
+    poll starved the APs' own `Yield` of the global lock on smp4 (fixed → arm+wake+return).
+  * **Decision: `yarm.ap_user_dispatch` stays EXPERIMENTAL / DEFAULT-OFF.** It is a
+    one-shot bring-up probe (a parked probe task per AP), not a scheduler policy — no
+    real workload is placed on APs and the APs do not run a dispatch loop. Graduating
+    it needs a real AP scheduler dispatch loop + return-to-idle, which is a later stage.
+  * Guarded by `stage189d_seal` (real-Yield-not-magic success, global-lock dispatch
+    bracket gated per-CPU, per-CPU `TRAP_DISPATCH_DEPTH`, audited per-AP admission,
+    drop-safe emit, no under-lock wait).
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

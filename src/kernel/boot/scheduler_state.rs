@@ -111,6 +111,17 @@ impl KernelState {
         next
     }
 
+    /// Stage 189D: pop the next runnable task on a SPECIFIC `cpu` into that CPU's
+    /// scheduler `current`. Used to PLACE the live AP probe task on the AP after its
+    /// wake-only bit is cleared (so the AP's syscall dispatches for a real current
+    /// task). Returns the tid made current, if any.
+    pub fn dispatch_next_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {
+        let mut sched = self.scheduler_state();
+        kernel_mut(&mut sched.scheduler)
+            .dispatch_next_on(cpu)
+            .map(|tid| tid.0)
+    }
+
     /// Stage 107 / D6 first live step — typed local-CPU dispatch step.
     ///
     /// VALIDATION: D6_LIVE_SPLIT — called from

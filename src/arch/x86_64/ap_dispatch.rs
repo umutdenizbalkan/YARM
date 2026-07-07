@@ -211,6 +211,24 @@ pub const MARK_RING3_ENTER: &str = "X86_AP_RING3_ENTER";
 /// The live dispatcher declined (no valid dispatch plan / knob off); carries reason.
 pub const MARK_DISPATCH_DECLINED: &str = "X86_AP_DISPATCH_DECLINED";
 
+// ── Stage 189D SEAL markers (AP normal syscall through the global lock) ───────
+/// A live AP probe task's NORMAL syscall (not the magic probe) is entering the
+/// dispatch. Carries cpu/tid/nr.
+pub const MARK_NORMAL_SYSCALL_BEGIN: &str = "X86_AP_NORMAL_SYSCALL_BEGIN";
+/// The AP's normal syscall is entering the NORMAL global-lock dispatch path
+/// (`with_cpu` → `handle_trap` → `syscall::dispatch`). Carries cpu/tid/nr.
+pub const MARK_GLOBAL_LOCK_DISPATCH_ENTER: &str = "X86_AP_GLOBAL_LOCK_DISPATCH_ENTER";
+/// The AP's normal syscall completed OK through the global-lock dispatch. cpu/tid/nr.
+pub const MARK_NORMAL_SYSCALL_OK: &str = "X86_AP_NORMAL_SYSCALL_OK";
+/// Stage 189 is sealed: an AP executed real user code that entered the global-lock
+/// syscall path and succeeded.
+pub const MARK_USER_DISPATCH_SEAL_DONE: &str = "X86_AP_USER_DISPATCH_SEAL_DONE";
+/// A live AP probe task was admitted (placed) on the AP AFTER its wake-only bit was
+/// cleared by the audited transition. Carries cpu/tid.
+pub const MARK_ADMIT_PLACED: &str = "X86_AP_ADMIT_PLACED";
+/// An attempt to place a task on a still-wake-only AP was DENIED (admission guard).
+pub const MARK_ADMIT_DENIED_WAKE_ONLY: &str = "X86_AP_ADMIT_DENIED_WAKE_ONLY";
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1309,32 +1309,53 @@ impl KernelState {
         Ok(())
     }
 
-    /// Stage 189C6 (LIVE-AP-DISPATCH): build a self-contained ring-3 probe task for
-    /// the first live AP user dispatch. Creates a fresh user address space (with the
-    /// shared kernel higher-half), maps one user code page holding the probe stub
-    /// (`mov rax, 0xA9C6; syscall; jmp .`) and one user stack page, and returns the
-    /// pieces the AP dispatcher needs: the task CR3, the ring-3 entry VA, and the
-    /// user stack top. The probe is deliberately isolated: on `syscall` the LSTAR
-    /// AP-probe fast path (magic RAX 0xA9C6) sets the per-CPU re-entry flag and
-    /// parks WITHOUT touching the shared kernel — so running it on a second CPU
-    /// races nothing. x86_64-only; returns `Unsupported` elsewhere.
+    /// Stage 189D (SEAL): build a REAL, registered ring-3 probe task for the live AP
+    /// user-dispatch seal. Creates a fresh user address space, maps one user code page
+    /// with the seal stub — `Yield` (syscall NR 0, the normal number range) then a
+    /// magic park — and one user stack page, then registers the task via the normal
+    /// `spawn_user_task_from_image` path so it has a real TID + TCB + bound ASID. The
+    /// AP dispatches it after its wake-only bit is cleared: its `Yield` enters the
+    /// NORMAL global-lock dispatch (`with_cpu` → `handle_trap` → `handle_yield`),
+    /// proving AP user execution can safely take the global lock. The trailing magic
+    /// syscall only PARKS the AP cleanly (early diagnostic; not the success proof).
+    /// Returns `(tid, cr3, entry, user_stack_top)`. x86_64-only.
     #[cfg(target_arch = "x86_64")]
-    pub fn build_ap_ring3_probe(&mut self) -> Result<(u64, u64, u64), KernelError> {
+    pub fn build_ap_ring3_probe(
+        &mut self,
+        probe_tid: u64,
+    ) -> Result<(u64, u64, u64, u64), KernelError> {
         const PROBE_CODE_VA: u64 = 0x0000_0000_2000_0000;
         const PROBE_STACK_VA: u64 = 0x0000_0000_2001_0000;
-        // mov rax, 0xA9C6 (imm32, sign-extended); syscall; jmp $ (park if the LSTAR
-        // fast path ever returned — it does not). 11 bytes.
-        const PROBE_STUB: [u8; 11] = [
-            0x48, 0xC7, 0xC0, 0xC6, 0xA9, 0x00, 0x00, // mov rax, 0xA9C6
+        // Seal stub (normal syscall FIRST, magic park SECOND):
+        //   xor eax, eax        ; RAX = 0  (SYSCALL_YIELD_NR — normal range)
+        //   syscall             ; → normal global-lock dispatch (handle_yield), returns
+        //   mov eax, 0xA9C6     ; magic park number (early diagnostic only)
+        //   syscall             ; → LSTAR magic fast path: set flag + hlt (parks)
+        //   jmp .
+        const PROBE_STUB: [u8; 13] = [
+            0x31, 0xC0, // xor eax, eax  (RAX = 0 = Yield)
+            0x0F, 0x05, // syscall
+            0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6
             0x0F, 0x05, // syscall
             0xEB, 0xFE, // jmp .
         ];
 
+        // Idempotent: reuse an already-built probe (a second AP shares the same task).
+        if self.task_asid(probe_tid).is_some() {
+            let asid = self.task_asid(probe_tid).ok_or(KernelError::TaskMissing)?;
+            let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)
+                .ok_or(KernelError::UserMemoryFault)?;
+            return Ok((
+                probe_tid,
+                cr3,
+                PROBE_CODE_VA,
+                PROBE_STACK_VA + (PAGE_SIZE as u64) - 16,
+            ));
+        }
+
         let (asid, _cap) = self.create_user_address_space()?;
 
-        // Code page: user + read + write (so copy_to_user can stage bytes) +
-        // execute. Not W^X-clean, but this is an isolated one-page probe.
-        let code_phys = self.alloc_user_data_frame()?;
+        // Code page: user + read + write (so copy_to_user can stage bytes) + execute.
         let code_flags = PageFlags {
             read: true,
             write: true,
@@ -1342,6 +1363,7 @@ impl KernelState {
             user: true,
             cache_policy: CachePolicy::WriteBack,
         };
+        let code_phys = self.alloc_user_data_frame()?;
         self.map_user_page_in_asid_raw(
             asid,
             VirtAddr(PROBE_CODE_VA),
@@ -1363,17 +1385,36 @@ impl KernelState {
             },
         )?;
 
+        // Register a REAL task (TCB + default kernel context) bound to this ASID, but
+        // do NOT enqueue it: the full spawn path would balance-place it on a run
+        // queue where the BSP could dispatch it (and its magic-park `hlt` would park
+        // the BSP). The live dispatcher instead PLACES it explicitly on the AP after
+        // the audited wake-only clear. A genuine TID + TCB is all the AP's `Yield`
+        // dispatch needs.
+        self.register_task_with_class(probe_tid, crate::kernel::task::TaskClass::App)?;
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == probe_tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.asid = Some(asid);
+            tcb.status = TaskStatus::Runnable;
+            Ok::<_, KernelError>(())
+        })?;
+
         let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)
             .ok_or(KernelError::UserMemoryFault)?;
         let user_stack_top = PROBE_STACK_VA + (PAGE_SIZE as u64) - 16;
         crate::yarm_log!(
-            "X86_AP_RING3_PROBE_BUILT asid={} cr3=0x{:x} entry=0x{:x} stack_top=0x{:x}",
+            "X86_AP_RING3_PROBE_BUILT tid={} asid={} cr3=0x{:x} entry=0x{:x} stack_top=0x{:x}",
+            probe_tid,
             asid.0,
             cr3,
             PROBE_CODE_VA,
             user_stack_top
         );
-        Ok((cr3, PROBE_CODE_VA, user_stack_top))
+        Ok((probe_tid, cr3, PROBE_CODE_VA, user_stack_top))
     }
 
     pub fn spawn_user_task_from_image(

@@ -58617,7 +58617,8 @@ mod stage189c_ap_user_return_percpu {
         assert!(
             SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
                 && SMP_SRC.contains("MARK_USER_DISPATCH_DONE")
-                && SMP_SRC.contains("if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {"),
+                && SMP_SRC
+                    .contains("if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {"),
             "the live dispatcher emits the markers only under the default-off knob gate"
         );
     }
@@ -58860,6 +58861,131 @@ mod stage189c5_ap_ring3_entry {
             tramp.contains("call yarm_x86_ap_user_dispatch_entry")
                 && tramp.contains("mov eax, dword ptr gs:[160]"),
             "the AP idle loop must call the live dispatcher, gated on the per-CPU dispatch request"
+        );
+    }
+}
+
+// Stage 189D — SEAL. The AP user-dispatch probe now runs a REAL syscall (Yield, NR 0
+// — the normal number range, not the magic probe) that enters the NORMAL global-lock
+// dispatch, proving AP user execution can safely take the still-global lock. The
+// magic probe is retained only to PARK the AP after the real syscall. Admission is
+// audited (placement only after the wake-only clear), and the nested-trap guard is
+// per-CPU so concurrent BSP+AP dispatch never false-trips `!BN`.
+mod stage189d_seal {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const PRINTK_SRC: &str = include_str!("../printk.rs");
+
+    // The seal marker vocabulary exists.
+    #[test]
+    fn seal_marker_vocabulary_exists() {
+        assert!(
+            AP_DISPATCH_SRC
+                .contains("MARK_NORMAL_SYSCALL_BEGIN: &str = \"X86_AP_NORMAL_SYSCALL_BEGIN\"")
+                && AP_DISPATCH_SRC.contains(
+                    "MARK_GLOBAL_LOCK_DISPATCH_ENTER: &str = \"X86_AP_GLOBAL_LOCK_DISPATCH_ENTER\""
+                )
+                && AP_DISPATCH_SRC
+                    .contains("MARK_NORMAL_SYSCALL_OK: &str = \"X86_AP_NORMAL_SYSCALL_OK\"")
+                && AP_DISPATCH_SRC.contains(
+                    "MARK_USER_DISPATCH_SEAL_DONE: &str = \"X86_AP_USER_DISPATCH_SEAL_DONE\""
+                ),
+            "the Stage 189D seal marker vocabulary must exist"
+        );
+    }
+
+    // The probe task's success path is a REAL syscall (Yield NR 0), NOT the magic
+    // probe. The magic (0xA9C6) syscall is present ONLY as the trailing park.
+    #[test]
+    fn seal_probe_uses_real_yield_not_magic_for_success() {
+        assert!(
+            EXEC_SRC.contains("0x31, 0xC0, // xor eax, eax  (RAX = 0 = Yield)")
+                && EXEC_SRC.contains("0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6"),
+            "the probe stub must issue Yield (NR 0) first, then the magic park second"
+        );
+        // The seal completion is driven by the NORMAL syscall dispatch hook, not the
+        // magic fast path. The magic fast path only sets the re-entry flag + parks.
+        assert!(
+            SMP_SRC.contains("fn ap_seal_syscall_ok(")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_SEAL_DONE"),
+            "the seal-done verdict must be emitted from the normal-syscall dispatch hook"
+        );
+    }
+
+    // The AP's normal syscall enters the NORMAL global-lock dispatch path: the trap
+    // stub calls the seal hook around `dispatch_trap_entry_with_shared_kernel`,
+    // gated on the per-CPU seal-probe flag (inert on the BSP / non-armed boots).
+    #[test]
+    fn seal_enters_global_lock_dispatch_gated_per_cpu() {
+        assert!(
+            DESC_SRC.contains("crate::arch::x86_64::smp::ap_seal_probe_active(cpu)")
+                && DESC_SRC.contains("ap_seal_syscall_begin(cpu, ap_seal_nr)")
+                && DESC_SRC.contains("ap_seal_syscall_ok(cpu, ap_seal_nr)")
+                && DESC_SRC
+                    .contains("crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel("),
+            "the AP seal markers must bracket the real global-lock trap dispatch, gated per-CPU"
+        );
+    }
+
+    // The nested-trap guard is PER-CPU (an array), so a concurrent BSP+AP dispatch
+    // never false-trips the `!BN` nested-trap halt.
+    #[test]
+    fn trap_dispatch_depth_is_per_cpu() {
+        assert!(
+            DESC_SRC.contains(
+                "static TRAP_DISPATCH_DEPTH: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS]"
+            )
+                && DESC_SRC.contains("TRAP_DISPATCH_DEPTH[depth_idx].fetch_add(1, Ordering::AcqRel)"),
+            "the nested-trap guard must be per-CPU to be SMP-safe under concurrent dispatch"
+        );
+    }
+
+    // Admission: the probe is PLACED on the AP only after the audited wake-only clear,
+    // through the wake-only-guarded enqueue (which denies while wake-only). Each AP
+    // gets its OWN probe task (distinct TID), so no task is `current` on two CPUs.
+    #[test]
+    fn seal_admission_is_audited_and_per_cpu() {
+        assert!(
+            SMP_SRC.contains("if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {")
+                && SMP_SRC.contains("kernel.enqueue_on_cpu(cpu, tid)")
+                && SMP_SRC.contains("MARK_ADMIT_PLACED")
+                && SMP_SRC.contains("MARK_ADMIT_DENIED_WAKE_ONLY"),
+            "placement must go through the wake-only-guarded enqueue after the audited clear"
+        );
+        assert!(
+            SMP_SRC.contains("let probe_tid = PROBE_TID_BASE + cpu.0 as u64;"),
+            "each AP must get its own distinct probe TID (no task current on two CPUs)"
+        );
+    }
+
+    // The seal markers are emitted via the drop-safe synchronous emitter (bypassing
+    // the shared printk ring, which can overflow under concurrent AP+BSP logging).
+    #[test]
+    fn seal_markers_emitted_drop_safe() {
+        assert!(
+            PRINTK_SRC.contains("pub fn printk_emit_sync(")
+                && SMP_SRC.contains("crate::kernel::printk::printk_emit_sync(format_args!("),
+            "required seal markers must use the synchronous (ring-bypassing) emitter"
+        );
+    }
+
+    // The BSP does NOT hold the global lock while waiting on the AP's normal syscall
+    // (which takes the SAME lock) — the live dispatcher arms + wakes and returns; the
+    // AP emits the seal verdict itself.
+    #[test]
+    fn seal_does_not_hold_global_lock_awaiting_ap_syscall() {
+        assert!(
+            SMP_SRC.contains(
+                "The seal verdict is emitted by the AP's\n    // own syscall (X86_AP_USER_DISPATCH_SEAL_DONE result=ok), not by the BSP."
+            ),
+            "the live dispatcher must not poll under the global lock for the AP's syscall"
+        );
+        // The old under-lock re-entry poll (`ap_syscall_reentry_ok` spin) must be gone.
+        assert!(
+            !SMP_SRC.contains("if super::percpu::ap_syscall_reentry_ok(cpu) != 0 {"),
+            "the under-lock reentry poll must be removed (it would deadlock the AP's syscall)"
         );
     }
 }
