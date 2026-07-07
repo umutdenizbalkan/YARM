@@ -75,6 +75,14 @@ pub const WAKE_REENTER_MIRROR_OFFSET: usize = 124;
 pub const TLB_REQ_GEN_OFFSET: usize = 128;
 pub const TLB_ACK_GEN_OFFSET: usize = 132;
 pub const TLB_REQ_VA_OFFSET: usize = 136;
+/// Stage 189C4 per-CPU SYSCALL fast-path state. Because CR4.FSGSBASE is DISABLED
+/// and user TLS lives in FS, `GS.base` is the kernel per-CPU record in ALL rings
+/// (ring 3 cannot alter it) — so the LSTAR entry reads these gs-relative slots
+/// directly, no `swapgs` required. `syscall_kernel_rsp0` is the ring-0 stack the
+/// entry switches to; `syscall_scratch_rsp` is the per-CPU scratch that holds the
+/// user RSP before any GPR is touched (replacing the old global RIP-relative slot).
+pub const SYSCALL_KERNEL_RSP0_OFFSET: usize = 144;
+pub const SYSCALL_SCRATCH_RSP_OFFSET: usize = 152;
 
 /// Fixed per-CPU record layout, owned by the BSP and indexed by logical
 /// CPU id. Field offsets are stable and tested.
@@ -141,6 +149,8 @@ pub struct PerCpuRecord {
     pub tlb_req_gen: u32,
     pub tlb_ack_gen: u32,
     pub tlb_req_va: u64,
+    pub syscall_kernel_rsp0: u64,
+    pub syscall_scratch_rsp: u64,
 }
 
 impl PerCpuRecord {
@@ -176,6 +186,8 @@ impl PerCpuRecord {
             tlb_req_gen: 0,
             tlb_ack_gen: 0,
             tlb_req_va: 0,
+            syscall_kernel_rsp0: 0,
+            syscall_scratch_rsp: 0,
         }
     }
 }
@@ -197,6 +209,8 @@ const _: () = {
     assert!(core::mem::offset_of!(PerCpuRecord, tlb_req_gen) == TLB_REQ_GEN_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, tlb_ack_gen) == TLB_ACK_GEN_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, tlb_req_va) == TLB_REQ_VA_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, syscall_kernel_rsp0) == SYSCALL_KERNEL_RSP0_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, syscall_scratch_rsp) == SYSCALL_SCRATCH_RSP_OFFSET);
     assert!(core::mem::size_of::<PerCpuRecord>() == 192);
 };
 
@@ -256,6 +270,8 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             tlb_req_gen: 0,
             tlb_ack_gen: 0,
             tlb_req_va: 0,
+            syscall_kernel_rsp0: 0,
+            syscall_scratch_rsp: 0,
         };
         core::ptr::write_volatile(base, record);
     }
@@ -315,6 +331,43 @@ pub fn mark_gs_base_written(cpu: CpuId) {
 pub fn gs_base_written(cpu: CpuId) -> bool {
     let base = record_base(cpu) as *const PerCpuRecord;
     unsafe { (core::ptr::read_volatile(base).flags & flag::GS_BASE_WRITTEN) != 0 }
+}
+
+/// Stage 189C4: BSP-populate a CPU's per-CPU SYSCALL kernel RSP0 (the ring-0 stack
+/// the LSTAR entry switches to). Writes only that field.
+pub fn set_syscall_kernel_rsp0(cpu: CpuId, rsp0: u64) {
+    let base = record_base(cpu) as *mut PerCpuRecord;
+    unsafe {
+        let mut record = core::ptr::read_volatile(base);
+        record.syscall_kernel_rsp0 = rsp0;
+        core::ptr::write_volatile(base, record);
+    }
+}
+
+/// Stage 189C4: read a CPU's per-CPU SYSCALL kernel RSP0.
+pub fn syscall_kernel_rsp0(cpu: CpuId) -> u64 {
+    let base = record_base(cpu) as *const PerCpuRecord;
+    unsafe { core::ptr::read_volatile(base).syscall_kernel_rsp0 }
+}
+
+/// Stage 189C4: set the EXECUTING CPU's active `IA32_GS_BASE` (0xC000_0101) to its
+/// per-CPU record, so the gs-relative LSTAR entry resolves to per-CPU state. Must
+/// run ON `cpu`. Idempotent; sets `GS_BASE_WRITTEN`.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn write_gs_base_for_self(cpu: CpuId) {
+    let base = record_base(cpu) as u64;
+    let low = base as u32;
+    let high = (base >> 32) as u32;
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0101u32,
+            in("eax") low,
+            in("edx") high,
+            options(nostack, preserves_flags),
+        );
+    }
+    mark_gs_base_written(cpu);
 }
 
 /// Stage 183.6: BSP posts a TLB shootdown request for `cpu` (VA `va`; 0 = full
@@ -395,8 +448,9 @@ mod tests {
 
     #[test]
     fn percpu_record_size_and_alignment() {
-        // Stage 183.6: 144 bytes of explicit fields (through the TLB shootdown
-        // mailbox at 128/132/136) round up to a 192-byte stride at 64-byte align.
+        // Stage 189C4: 160 bytes of explicit fields (through the per-CPU SYSCALL
+        // kernel RSP0 / scratch at 144/152) round up to a 192-byte stride at
+        // 64-byte align.
         assert_eq!(PerCpuRecord::SIZE, 192);
         assert_eq!(core::mem::align_of::<PerCpuRecord>(), 64);
     }

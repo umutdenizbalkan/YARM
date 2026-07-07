@@ -195,6 +195,41 @@ remove implicit global-lock coupling from syscall/trap paths.
     `ap_syscall_entry_is_per_cpu_safe()` stays false; usermode entry stays deferred
     (`reason=global_syscall_rsp0_not_per_cpu`); the audited transition still
     refuses; no wake-only is cleared.
+- **Stage 189C4 (PER-CPU SYSCALL ENTRY REWRITE) — DONE and QEMU-proven; AP live
+  dispatch still deferred on the AP ring3-entry path.** The 189B/C/C2/C3 blocker
+  (global syscall stack authority) is eliminated. Global lock authoritative, ABI
+  unchanged, BSP behavior preserved.
+  * **Key finding — swapgs is NOT needed.** `CR4.FSGSBASE` is disabled (ring 3
+    cannot `wrgsbase`) and user TLS lives in **FS** (`restore_fs_base_if_needed`),
+    so `GS.base` is the kernel per-CPU record in **every** ring. The correct design
+    is therefore gs-relative per-CPU entry with **no `swapgs`** (the seL4-style
+    model), not the Linux swapgs model — swapgs would be incorrect here (there is
+    no separate user GS to swap).
+  * **Checkpoint A (per-CPU syscall entry) — done.** Added per-CPU
+    `syscall_kernel_rsp0` @144 / `syscall_scratch_rsp` @152 to the per-CPU record;
+    `configure_syscall_fast_path` sets the BSP's `IA32_GS_BASE` to its record and
+    populates its RSP0; `refresh_boot_tss_rsp0` updates the **executing** CPU's
+    per-CPU RSP0. `yarm_x86_lstar_entry` now uses `gs:[152]`/`gs:[144]` instead of
+    the RIP-relative globals, which are **removed**. Markers
+    `X86_PERCPU_ENTRY_READY cpu=0`, `X86_SYSCALL_ENTRY_PERCPU_READY cpu=N`.
+    QEMU-proven: `-smp 1` core (815/815 `USER_CR3_PRE_IRET_OK`), IPC_FINAL oracle,
+    crash-restart, and smp2/smp4 (per-AP `X86_SYSCALL_ENTRY_PERCPU_READY`).
+  * **Checkpoints B/C — swapgs not required (attested).**
+    `X86_SWAPGS_ENTRY_READY` / `X86_INTERRUPT_ENTRY_SWAPGS_READY`
+    `reason=not_required_gs_kernel_percpu`. Ring3→ring0 interrupt/#PF uses the
+    per-CPU **TSS RSP0** (`X86_AP_TSS_RSP0_READY`), already per-CPU.
+  * **Checkpoint D — deferred on the AP ring3-ENTRY path.** The syscall re-entry is
+    now SMP-safe, but the AP idle loop still has no code that loads a user CR3 and
+    `iretq`s to ring 3 (`ap_ring3_entry_path_ready()` = false). `ap_usermode_entry_ready`
+    = TSS-RSP0 ∧ per-CPU-syscall ∧ ring3-entry, so it stays false; the audited
+    transition refuses; no wake-only cleared; deferral
+    `reason=ap_ring3_entry_path_absent`. Remaining work: an AP dispatcher hook off
+    the wake path that picks an admitted task, sets the AP's per-CPU RSP0 + TSS
+    RSP0, maps that kernel stack into the user CR3, and `iretq`s to ring 3.
+  * *smp2 note:* the smoke gate is flaky on the `X86_IPI_FIXED_ICR_WRITTEN` serial
+    diagnostic (a pre-existing TCG serial-output race since 189C2, ~3/5 pass); the
+    AP functionally comes online (send/ack/TLB `result=ok`) every run. smp4 is
+    clean.
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 

@@ -4,8 +4,6 @@
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 use core::sync::atomic::AtomicU8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-use core::sync::atomic::AtomicU64;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -290,27 +288,11 @@ pub fn bootstrap_scheduler_is_ready() -> bool {
 const DEBUG_UART_DATA_PORT: u16 = 0x3F8;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const DEBUG_UART_LINE_STATUS_PORT: u16 = 0x3FD;
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-#[unsafe(no_mangle)]
-static YARM_X86_SYSCALL_RSP0: AtomicU64 = AtomicU64::new(0);
-
-/// Temporary single-core scratch slot for the user RSP at SYSCALL entry.
-///
-/// The x86-64 SYSCALL instruction does not switch stacks; we need to save
-/// the user RSP before switching to the kernel stack, but we cannot use any
-/// GPR as a temporary because all user GPRs must be saved before they are
-/// reused.  Writing user RSP here before touching any register solves the
-/// problem for single-core boots.
-///
-/// # NOT SMP-SAFE
-/// This is a global (not per-CPU) slot.  Two cores arriving at SYSCALL
-/// simultaneously would race on this field.  Acceptable only for the current
-/// -smp 1 x86_64 bring-up; replace with a per-CPU scratch (e.g. via SWAPGS /
-/// gs-relative pointer) before enabling SMP on x86_64.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-#[unsafe(no_mangle)]
-static YARM_X86_SYSCALL_SCRATCH_RSP: AtomicU64 = AtomicU64::new(0);
-
+// Stage 189C4: the SYSCALL entry kernel-RSP0 and user-RSP scratch are now PER-CPU
+// (gs-relative `syscall_kernel_rsp0` @144 / `syscall_scratch_rsp` @152 in the
+// per-CPU record). The old global RIP-relative slots (`YARM_X86_SYSCALL_RSP0` /
+// `YARM_X86_SYSCALL_SCRATCH_RSP`) — which were documented NOT SMP-safe — are
+// removed: there is no global syscall stack authority any more.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe extern "C" {
     fn yarm_x86_lstar_entry();
@@ -349,7 +331,20 @@ fn write_msr(msr: u32, value: u64) {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn configure_syscall_fast_path(rsp0: u64) {
-    YARM_X86_SYSCALL_RSP0.store(rsp0, Ordering::Release);
+    // Stage 189C4: establish the BSP's per-CPU SYSCALL state BEFORE arming LSTAR.
+    // Set the BSP's active GS.base to its per-CPU record (so the gs-relative entry
+    // resolves), then populate that record's per-CPU kernel RSP0. No global slot.
+    let bsp = crate::kernel::scheduler::CpuId(crate::arch::platform_layout::BOOTSTRAP_CPU_ID);
+    super::percpu::set_syscall_kernel_rsp0(bsp, rsp0);
+    super::percpu::write_gs_base_for_self(bsp);
+    crate::yarm_log!("X86_PERCPU_ENTRY_READY cpu={} rsp0=0x{:x}", bsp.0, rsp0);
+    crate::yarm_log!("X86_SYSCALL_ENTRY_PERCPU_READY cpu={}", bsp.0);
+    // Stage 189C4 — swapgs is NOT required by this design: CR4.FSGSBASE is disabled
+    // (ring 3 cannot alter GS.base) and user TLS is in FS, so GS.base is the kernel
+    // per-CPU record in EVERY ring. The syscall/interrupt entries read gs-relative
+    // per-CPU state directly with no swapgs and therefore nothing to unbalance.
+    crate::yarm_log!("X86_SWAPGS_ENTRY_READY reason=not_required_gs_kernel_percpu");
+    crate::yarm_log!("X86_INTERRUPT_ENTRY_SWAPGS_READY reason=not_required_gs_kernel_percpu");
     // STAR[47:32] = kernel CS selector; STAR[63:48] = SYSRET CS base (CS-16).
     let star = ((KERNEL_CODE_SELECTOR as u64) << 32) | (((USER_CODE_SELECTOR as u64) - 16) << 48);
     let mut efer = read_msr(IA32_EFER_MSR);
@@ -1306,22 +1301,26 @@ yarm_x86_lstar_entry:
     //
     // We need to switch to the kernel stack, but we need user RSP for the
     // synthetic IRETQ frame and cannot load it into a register first.
-    // Solution: write user RSP directly to YARM_X86_SYSCALL_SCRATCH_RSP
-    // (a RIP-relative store — no GPR touched).
+    // Solution: write user RSP directly to the PER-CPU scratch slot at
+    // gs:[152] (a gs-relative store — no GPR touched).
     //
-    // NOTE: YARM_X86_SYSCALL_SCRATCH_RSP is NOT SMP-safe.
-    //       Safe only for single-core (-smp 1) x86_64 bring-up.
-    //       For SMP: replace with a per-CPU scratch (SWAPGS + gs-relative).
+    // Stage 189C4 — PER-CPU, SMP-safe, NO swapgs. CR4.FSGSBASE is DISABLED and
+    // user TLS is in FS, so GS.base is the kernel per-CPU record in every ring
+    // (ring 3 cannot change it). gs:[152] = syscall_scratch_rsp and
+    // gs:[144] = syscall_kernel_rsp0 therefore resolve to THIS CPU's own
+    // per-CPU record — no global authority, no cross-CPU race, no swapgs.
+    // (Offsets 152/144 are locked by percpu SYSCALL_SCRATCH_RSP_OFFSET /
+    //  SYSCALL_KERNEL_RSP0_OFFSET + offset_of asserts.)
     // -----------------------------------------------------------------------
 
-    // Step 1 — save user RSP without touching any GPR.
-    mov qword ptr [rip + YARM_X86_SYSCALL_SCRATCH_RSP], rsp
+    // Step 1 — save user RSP without touching any GPR (per-CPU scratch).
+    mov qword ptr gs:[152], rsp
 
-    // Step 2 — switch to the kernel stack (RSP0).
-    mov rsp, qword ptr [rip + YARM_X86_SYSCALL_RSP0]
+    // Step 2 — switch to the per-CPU kernel stack (RSP0).
+    mov rsp, qword ptr gs:[144]
     test rsp, rsp
     jnz 1f
-    // RSP0 == 0: descriptor/TSS setup broken before first SYSCALL.  Halt.
+    // RSP0 == 0: per-CPU GS base / RSP0 setup broken before first SYSCALL.  Halt.
     ud2
 1:
     // Step 3 — build a synthetic 5-word IRETQ frame on the kernel stack.
@@ -1338,7 +1337,7 @@ yarm_x86_lstar_entry:
     mov qword ptr [rsp +  0], rcx    // user RIP  (SYSCALL saved this for us)
     mov qword ptr [rsp +  8], 0x23   // user CS   (ring-3 code)
     mov qword ptr [rsp + 16], r11    // user RFLAGS (SYSCALL saved this for us)
-    mov rcx, qword ptr [rip + YARM_X86_SYSCALL_SCRATCH_RSP]
+    mov rcx, qword ptr gs:[152]      // user RSP (from PER-CPU scratch slot)
     mov qword ptr [rsp + 24], rcx    // user RSP  (from scratch slot)
     mov qword ptr [rsp + 32], 0x1b   // user SS   (ring-3 data)
 
@@ -2112,7 +2111,10 @@ pub fn refresh_boot_tss_rsp0(rsp0: u64) {
     unsafe {
         BOOT_TSS.rsp0 = rsp0;
     }
-    YARM_X86_SYSCALL_RSP0.store(rsp0, Ordering::Release);
+    // Stage 189C4: update the EXECUTING CPU's per-CPU SYSCALL kernel RSP0 (the
+    // gs-relative slot the LSTAR entry reads), not a global. On the BSP path this
+    // is CPU 0; on an AP it is that AP's own record.
+    super::percpu::set_syscall_kernel_rsp0(current_cpu_id(), rsp0);
 }
 
 #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
@@ -2120,7 +2122,7 @@ pub fn refresh_boot_tss_rsp0(_rsp0: u64) {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub(crate) fn read_boot_tss_rsp0() -> u64 {
-    YARM_X86_SYSCALL_RSP0.load(core::sync::atomic::Ordering::Acquire)
+    super::percpu::syscall_kernel_rsp0(current_cpu_id())
 }
 #[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
 pub(crate) fn read_boot_tss_rsp0() -> u64 {

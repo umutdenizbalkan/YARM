@@ -37246,9 +37246,11 @@ mod stage132_post_cleanup_pf_diagnosis {
             DESCRIPTOR_SRC.contains("fn read_boot_tss_rsp0"),
             "descriptor_tables.rs must declare read_boot_tss_rsp0"
         );
+        // Stage 189C4: the global YARM_X86_SYSCALL_RSP0 is removed; read_boot_tss_rsp0
+        // now reads the per-CPU record's syscall_kernel_rsp0 for the executing CPU.
         assert!(
-            DESCRIPTOR_SRC.contains("YARM_X86_SYSCALL_RSP0"),
-            "read_boot_tss_rsp0 must read YARM_X86_SYSCALL_RSP0"
+            DESCRIPTOR_SRC.contains("super::percpu::syscall_kernel_rsp0(current_cpu_id())"),
+            "read_boot_tss_rsp0 must read the per-CPU syscall kernel RSP0"
         );
     }
 
@@ -58480,7 +58482,7 @@ mod stage189b_ap_dispatch_scaffold {
         assert!(
             ORCH_SRC.contains("run_ap_dispatch_scaffold_audit(")
                 && SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
-                && SMP_SRC.contains("reason=global_syscall_rsp0_not_per_cpu"),
+                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent"),
             "the boot audit must defer live AP dispatch honestly"
         );
     }
@@ -58576,8 +58578,8 @@ mod stage189c_ap_user_return_percpu {
         // The scaffold audit emits the deferral with the precise blocker reason.
         assert!(
             SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
-                && SMP_SRC.contains("reason=global_syscall_rsp0_not_per_cpu"),
-            "the audit must defer live dispatch with the entry-trampoline blocker reason"
+                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent"),
+            "the audit must defer live dispatch with the AP-ring3-entry blocker reason"
         );
         // The live begin/return/done markers are defined but emitted by NOTHING in
         // this pass (no producer): they exist only as vocabulary constants.
@@ -58616,40 +58618,50 @@ mod stage189c2_ap_usermode_entry {
     const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
     const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
 
-    // The x86_64 syscall fast-path entry is still GLOBAL (not per-CPU): the entry
-    // asm uses the RIP-relative global RSP0/scratch, documented NOT SMP-safe. The
-    // readiness detector must therefore report the syscall entry as unsafe.
+    // Stage 189C4: the x86_64 syscall fast-path entry is now PER-CPU (gs-relative,
+    // no global authority, no swapgs). The old global slots are removed.
     #[test]
-    fn syscall_entry_is_still_global_not_per_cpu() {
+    fn syscall_entry_is_now_per_cpu_gs_relative() {
         assert!(
-            DESC_SRC.contains("static YARM_X86_SYSCALL_RSP0")
-                && DESC_SRC.contains("static YARM_X86_SYSCALL_SCRATCH_RSP")
-                && DESC_SRC.contains("mov qword ptr [rip + YARM_X86_SYSCALL_SCRATCH_RSP], rsp")
-                && DESC_SRC.contains("NOT SMP-safe"),
-            "the syscall entry must still be the documented global (pre-SWAPGS) path"
+            !DESC_SRC.contains("static YARM_X86_SYSCALL_RSP0")
+                && !DESC_SRC.contains("static YARM_X86_SYSCALL_SCRATCH_RSP"),
+            "the global syscall RSP0/scratch statics must be removed"
         );
-        // The detector hard-reports the syscall entry as not-per-CPU-safe.
+        // The LSTAR entry reads the per-CPU gs-relative slots (144/152).
         assert!(
-            SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe()")
-                && SMP_SRC.contains("fn ap_usermode_entry_ready(")
-                && SMP_SRC.contains("ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe()"),
-            "usermode-entry readiness must require BOTH a per-CPU TSS RSP0 and a per-CPU syscall entry"
+            DESC_SRC.contains("mov qword ptr gs:[152], rsp")
+                && DESC_SRC.contains("mov rsp, qword ptr gs:[144]")
+                && DESC_SRC.contains("mov rcx, qword ptr gs:[152]"),
+            "the LSTAR entry must use the per-CPU gs-relative RSP0/scratch slots"
+        );
+        // The detector reports the syscall entry as per-CPU-safe; usermode entry now
+        // additionally requires the AP ring3-entry path.
+        assert!(
+            SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    true\n}")
+                && SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}")
+                && SMP_SRC.contains(
+                    "ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe() && ap_ring3_entry_path_ready()",
+                ),
+            "usermode-entry readiness must require TSS RSP0 + per-CPU syscall entry + AP ring3-entry path"
         );
     }
 
-    // Usermode entry is deferred with the precise blocker; the gate reflects it.
+    // Usermode entry is deferred with the precise remaining blocker (AP ring3-entry
+    // path absent); the gate reflects it.
     #[test]
     fn usermode_entry_deferred_with_precise_reason() {
         assert!(
             SMP_SRC.contains("MARK_USERMODE_ENTRY_DEFERRED")
-                && SMP_SRC.contains("reason=global_syscall_rsp0_not_per_cpu")
+                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent")
                 && SMP_SRC.contains("trap_return_ready: usermode_entry_ready"),
-            "the audit must defer usermode entry with the global-syscall-RSP0 reason"
+            "the audit must defer usermode entry with the AP-ring3-entry-path-absent reason"
         );
-        // A valid per-CPU TSS RSP0 is still detected and attested.
+        // The per-CPU TSS RSP0 and per-CPU syscall entry readiness are both attested.
         assert!(
-            SMP_SRC.contains("fn ap_tss_rsp0_ready(") && SMP_SRC.contains("MARK_TSS_RSP0_READY"),
-            "the per-CPU TSS RSP0 readiness must be detected and attested"
+            SMP_SRC.contains("fn ap_tss_rsp0_ready(")
+                && SMP_SRC.contains("MARK_TSS_RSP0_READY")
+                && SMP_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY"),
+            "the per-CPU TSS RSP0 + syscall-entry readiness must be detected and attested"
         );
     }
 
@@ -58670,14 +58682,13 @@ mod stage189c2_ap_usermode_entry {
                 && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
             "no AP-run live marker may be emitted this pass"
         );
-        // The USERMODE_ENTRY_READY emit exists only inside the always-false
-        // `if usermode_entry_ready` branch (syscall entry is global), so it is
-        // never emitted at runtime; and the syscall-safety detector returns false.
+        // The USERMODE_ENTRY_READY emit exists only inside the `if usermode_entry_ready`
+        // branch, which stays false because the AP ring3-entry path is absent — so
+        // USERMODE_ENTRY_READY is never emitted at runtime this pass.
         assert!(
             SMP_SRC.contains("if usermode_entry_ready {")
-                && SMP_SRC
-                    .contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    false\n}"),
-            "usermode-entry readiness must be gated false (global syscall entry)"
+                && SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}"),
+            "usermode-entry readiness must be gated false (AP ring3-entry path absent)"
         );
         // Wake-only is still only cleared by the audited transition (unreached).
         assert!(
@@ -58723,37 +58734,37 @@ mod stage189c3_percpu_entry_exit {
     // SAFETY: no swapgs was added to the entry asm this pass — the swapgs rewrite is
     // deferred as a whole, so there is no partial/unbalanced swapgs to trip on.
     #[test]
-    fn no_partial_swapgs_rewrite_in_entry_asm() {
-        // The lowercase `swapgs` INSTRUCTION must be absent (uppercase "SWAPGS" in
-        // the NOT-SMP-safe comments is the documented future fix, not an instruction).
+    fn entry_is_per_cpu_gs_relative_no_swapgs_needed() {
+        // Stage 189C4: the entry is per-CPU gs-relative; swapgs is not required
+        // because CR4.FSGSBASE is disabled and TLS is in FS (GS.base is the kernel
+        // per-CPU record in all rings). The design attests this explicitly.
         assert!(
-            !DESC_SRC.contains("swapgs"),
-            "no swapgs instruction may be added until the full balanced entry/exit rewrite lands"
+            DESC_SRC.contains("X86_SWAPGS_ENTRY_READY reason=not_required_gs_kernel_percpu")
+                && DESC_SRC.contains(
+                    "X86_INTERRUPT_ENTRY_SWAPGS_READY reason=not_required_gs_kernel_percpu"
+                ),
+            "the swapgs-not-required attestation must be emitted"
         );
-        // The syscall entry is still the documented global path; the per-CPU-safe
-        // detector still returns false, so usermode entry stays deferred.
         assert!(
-            SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    false\n}")
-                && SMP_SRC.contains("reason=global_syscall_rsp0_not_per_cpu"),
-            "the syscall entry must remain global (swapgs rewrite deferred)"
+            SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    true\n}"),
+            "the syscall entry is now per-CPU-safe"
         );
     }
 
-    // The swapgs-dependent readiness markers exist as vocabulary but are emitted by
-    // NOTHING this pass; no live AP dispatch / wake-only clear occurs.
+    // Progress markers ARE emitted (per-CPU syscall entry ready), but no AP-run live
+    // dispatch marker is emitted and no wake-only is cleared this pass.
     #[test]
-    fn swapgs_readiness_and_live_markers_not_emitted() {
+    fn percpu_entry_progress_but_no_live_ap_dispatch() {
         assert!(
-            AP_DISPATCH_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY")
-                && AP_DISPATCH_SRC.contains("MARK_INTERRUPT_ENTRY_SWAPGS_READY"),
-            "the future swapgs-readiness vocabulary must exist"
+            SMP_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY"),
+            "the per-CPU syscall-entry readiness is attested for APs"
         );
         assert!(
-            !SMP_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY")
-                && !SMP_SRC.contains("MARK_INTERRUPT_ENTRY_SWAPGS_READY")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
-                && !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK"),
-            "no swapgs-readiness or AP-run live marker may be emitted this pass"
+            !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
+                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
+            "no AP-run live dispatch marker may be emitted this pass"
         );
     }
 }

@@ -1809,23 +1809,32 @@ fn ap_percpu_gs_base_ready(cpu: CpuId) -> bool {
     super::percpu::gs_base_written(cpu)
 }
 
-/// Stage 189C2: is the x86_64 `syscall` fast-path entry per-CPU-safe? It is NOT:
-/// `yarm_x86_lstar_entry` writes/reads the GLOBAL `YARM_X86_SYSCALL_SCRATCH_RSP` /
-/// `YARM_X86_SYSCALL_RSP0` slots (documented "NOT SMP-safe"), so an AP-run user
-/// task's `syscall` would load the BSP's kernel stack. Making this true requires
-/// the SWAPGS + gs-relative per-CPU entry rewrite (a prerequisite infrastructure
-/// change, not a minimal trampoline). Until then, no AP may enter user mode.
+/// Stage 189C4: is the x86_64 `syscall` fast-path entry per-CPU-safe? YES — the
+/// LSTAR entry (`yarm_x86_lstar_entry`) now reads gs-relative per-CPU slots
+/// (`syscall_kernel_rsp0` @144 / `syscall_scratch_rsp` @152). Because CR4.FSGSBASE
+/// is disabled and user TLS is in FS, `GS.base` is the kernel per-CPU record in
+/// every ring, so this is SMP-safe with NO `swapgs`. The old global slots are
+/// removed. QEMU-proven on `-smp 1` (`X86_SYSCALL_ENTRY_PERCPU_READY cpu=0`,
+/// 815/815 `USER_CR3_PRE_IRET_OK`), oracle, and crash-restart.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 fn ap_syscall_entry_is_per_cpu_safe() -> bool {
+    true
+}
+
+/// Stage 189C4: is the AP ring3-ENTRY path present? An AP still has no code that
+/// enters ring 3: the AP idle loop (`smp_trampoline.rs`) never loads a user CR3,
+/// never sets up an iretq frame, and never enters user mode. That AP-dispatcher /
+/// usermode-entry trampoline is the remaining blocker — false until it lands.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_ring3_entry_path_ready() -> bool {
     false
 }
 
-/// Stage 189C2: full AP usermode-entry readiness — a valid per-CPU TSS RSP0 AND a
-/// per-CPU-safe syscall/interrupt re-entry. Both are required before an AP may run
-/// a user task; the second is currently false (global syscall RSP0).
+/// Stage 189C4: full AP usermode-entry readiness — a valid per-CPU TSS RSP0, a
+/// per-CPU-safe syscall entry (done), AND a live AP ring3-entry path (not yet).
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 fn ap_usermode_entry_ready(cpu: CpuId) -> bool {
-    ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe()
+    ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe() && ap_ring3_entry_path_ready()
 }
 
 /// Stage 189B: the AUDITED, sole authority for clearing an AP's wake-only bit for
@@ -1902,40 +1911,47 @@ pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool)
                 cpu.0
             );
         }
+        // Stage 189C4: the per-CPU gs-relative SYSCALL entry is SMP-safe (no global
+        // authority, no swapgs needed — GS.base is the kernel per-CPU record in all
+        // rings), proven on the BSP. Attest it for the AP too.
+        if ap_syscall_entry_is_per_cpu_safe() {
+            crate::yarm_log!(
+                "{} cpu={}",
+                ap_dispatch::MARK_SYSCALL_ENTRY_PERCPU_READY,
+                cpu.0
+            );
+        }
         if tlb_ready {
             crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TLB_READY, cpu.0);
         }
-        // Stage 189C2: usermode-ENTRY readiness. A valid per-CPU TSS RSP0 is
-        // present, but the `syscall` fast-path entry still uses GLOBAL RSP0/scratch
-        // slots (`YARM_X86_SYSCALL_RSP0` — documented NOT SMP-safe), so an AP-run
-        // user task's syscall would load the BSP's kernel stack. Until the SWAPGS +
-        // gs-relative per-CPU entry rewrite lands, usermode entry is NOT safe.
+        // Stage 189C4: usermode-ENTRY readiness. TSS RSP0 + per-CPU syscall entry are
+        // both ready now; the remaining gap is the AP ring3-ENTRY path — the AP idle
+        // loop has no code that loads a user CR3 and iretqs to ring 3. Until that AP
+        // usermode-entry trampoline lands, usermode entry stays deferred.
         let usermode_entry_ready = ap_usermode_entry_ready(cpu);
         if usermode_entry_ready {
             crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_USERMODE_ENTRY_READY, cpu.0);
         } else {
             crate::yarm_log!(
-                "{} cpu={} reason=global_syscall_rsp0_not_per_cpu",
+                "{} cpu={} reason=ap_ring3_entry_path_absent",
                 ap_dispatch::MARK_USERMODE_ENTRY_DEFERRED,
                 cpu.0
             );
         }
-        // The audited-transition gate: dispatcher + run-queue + TLB ready. The
-        // return-side is per-CPU-correct, but the full trap-return ROUND TRIP is
-        // gated on the usermode-ENTRY path being per-CPU-safe, so `trap_return_ready`
-        // reflects `usermode_entry_ready` (currently false).
+        // The audited-transition gate. `trap_return_ready` reflects the full
+        // usermode round-trip readiness (currently false: no AP ring3-entry path).
         let readiness = ApReadiness {
             dispatcher_ready: true,
             run_queue_ready: true,
             tlb_ready,
             trap_return_ready: usermode_entry_ready,
         };
-        // Drive the REAL audited transition. It refuses (usermode entry not safe),
+        // Drive the REAL audited transition. It refuses (usermode entry not ready),
         // logs `X86_AP_WAKE_ONLY_CLEAR_DEFERRED reason=trap_return_not_ready`, and
         // does NOT clear wake-only. This exercises the exact production gate.
         let _ = try_enable_ap_user_dispatch(kernel, cpu, readiness);
         crate::yarm_log!(
-            "{} cpu={} reason=global_syscall_rsp0_not_per_cpu",
+            "{} cpu={} reason=ap_ring3_entry_path_absent",
             ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
             cpu.0
         );
