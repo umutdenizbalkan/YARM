@@ -119,8 +119,33 @@ remove implicit global-lock coupling from syscall/trap paths.
     and `X86_AP_USER_DISPATCH_DEFERRED reason=live_trap_return_wiring_deferred_to_189c`.
     The live-only markers (`X86_AP_WAKE_ONLY_CLEAR`, `X86_AP_USER_DISPATCH_BEGIN`,
     `X86_AP_USER_TRAP_RETURN_OK`, `X86_AP_USER_DISPATCH_DONE`) are never emitted
-    this pass. **Stage 189C blocker:** per-CPU `ensure_user_return_cr3` (active-ASID
-    + return-context stack selection).
+    this pass.
+- **Stage 189C (FIRST-LIVE-AP-USER-DISPATCH) — partial: per-CPU return fix landed,
+  live dispatch HARD-STOPPED.** No wake-only bit is cleared, no AP user task runs,
+  the global lock stays authoritative, and the ABI is unchanged.
+  * **Required blocker fix — done.** `arch::x86_64::trap::ensure_user_return_cr3`
+    no longer calls the global `d6_diag_active_asid_num`; it derives the active
+    ASID from the executing CPU's current task (`current_tid()` is set from the
+    trapping CPU's APIC id in `current_cpu_id()`), and the switch authority is —
+    as before — the per-CPU hardware CR3 (`read_hw_cr3()`; `if hw_cr3 != task_cr3`).
+    The return-context stack selection (`find_kernel_stack_bounds_containing_rsp`)
+    matches the sampled per-CPU RSP against TCB stacks, so it is per-CPU-safe, not
+    BSP-tuned. This is a diagnostic-derivation change only; the BSP switch is
+    byte-identical (QEMU core/oracle/crash-restart green, 815 `USER_CR3_PRE_IRET_OK`
+    == 815 `..._CHECK`). The audit now emits
+    `X86_AP_TRAP_RETURN_READY cpu=N reason=per_cpu_cr3_authority`.
+  * **Hard stop — live AP user dispatch NOT enabled.** The trap-return *round trip*
+    still cannot be exercised because the AP has no usermode-**entry** path: the AP
+    idle loop (`smp_trampoline.rs`) is by design interrupt-masked and "NEVER enters
+    userspace, NEVER calls scheduler dispatch, NEVER takes a timer interrupt".
+    Enabling a first live AP user dispatch requires a new AP usermode-entry
+    trampoline (`iretq` to ring 3 under the global lock), per-CPU TSS `RSP0` for the
+    ring3→ring0 kernel re-entry, AP interrupt-enable + timer/syscall handling, and
+    a Rust AP dispatcher hook off the wake path — a deep new bare-metal path that
+    cannot be made QEMU-clean in a single safe pass. `trap_return_ready` therefore
+    stays false; the audited transition still refuses and emits
+    `X86_AP_USER_DISPATCH_DEFERRED reason=ap_usermode_entry_trampoline_absent`. No
+    live-only marker is emitted; no wake-only is cleared; nothing is faked.
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 

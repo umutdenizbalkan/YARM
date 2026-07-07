@@ -58480,7 +58480,7 @@ mod stage189b_ap_dispatch_scaffold {
         assert!(
             ORCH_SRC.contains("run_ap_dispatch_scaffold_audit(")
                 && SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
-                && SMP_SRC.contains("reason=live_trap_return_wiring_deferred_to_189c"),
+                && SMP_SRC.contains("reason=ap_usermode_entry_trampoline_absent"),
             "the boot audit must defer live AP dispatch honestly"
         );
     }
@@ -58514,7 +58514,94 @@ mod stage189b_ap_dispatch_scaffold {
         );
         assert!(
             SMP_SRC.contains("trap_return_ready: false"),
-            "189B must keep trap_return_ready false (live AP return deferred to 189C)"
+            "189B/189C must keep trap_return_ready false (live AP dispatch deferred)"
+        );
+    }
+}
+
+// Stage 189C — the AP user-return CR3 authority is made per-CPU-correct. The live
+// AP user-dispatch ENTRY path remains deferred (AP idle loop never enters ring 3),
+// so no wake-only is cleared and no AP user task runs; these guards pin the
+// per-CPU return correctness and the absence of any live-dispatch enable.
+mod stage189c_ap_user_return_percpu {
+    const TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+
+    // ensure_user_return_cr3 must NOT use the global d6_diag_active_asid_num as the
+    // AP return authority; the switch decision keys off the per-CPU hardware CR3.
+    #[test]
+    fn user_return_cr3_is_per_cpu_not_global_active_asid() {
+        let start = TRAP_SRC
+            .find("pub(crate) fn ensure_user_return_cr3(")
+            .expect("ensure_user_return_cr3 must exist");
+        // Bound the search to the function body (up to the next top-level fn).
+        let rest = &TRAP_SRC[start..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .or_else(|| rest[1..].find("\npub(crate) fn "))
+            .map(|e| e + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains(".d6_diag_active_asid_num()"),
+            "ensure_user_return_cr3 must not CALL the global d6_diag_active_asid_num"
+        );
+        assert!(
+            body.contains("read_hw_cr3()") && body.contains("if hw_cr3 != task_cr3"),
+            "the return switch authority must be the per-CPU hardware CR3"
+        );
+        assert!(
+            body.contains(".current_tid()") && body.contains(".task_asid(cur)"),
+            "the active ASID must be derived from the executing CPU's current task"
+        );
+    }
+
+    // The return-context stack selection samples the executing CPU's real RSP
+    // (per-CPU-safe), not a BSP-hardcoded stack.
+    #[test]
+    fn return_context_stack_selection_is_per_cpu() {
+        assert!(
+            TRAP_SRC.contains("fn find_kernel_stack_bounds_containing_rsp(")
+                && TRAP_SRC.contains("rsp >= base && rsp < top"),
+            "return-context selection must match the sampled per-CPU RSP against TCB stacks"
+        );
+    }
+
+    // No live AP user dispatch was enabled: the live-only markers appear ONLY in
+    // the audited transition guarded by evaluate_clear(), never in the scaffold
+    // audit, and the audit still emits the honest deferral.
+    #[test]
+    fn no_live_ap_user_dispatch_enabled() {
+        // The scaffold audit emits the deferral with the precise blocker reason.
+        assert!(
+            SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
+                && SMP_SRC.contains("reason=ap_usermode_entry_trampoline_absent"),
+            "the audit must defer live dispatch with the entry-trampoline blocker reason"
+        );
+        // The live begin/return/done markers are defined but emitted by NOTHING in
+        // this pass (no producer): they exist only as vocabulary constants.
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && AP_DISPATCH_SRC.contains("MARK_USER_TRAP_RETURN_OK"),
+            "the live-dispatch marker vocabulary must exist for 189D"
+        );
+        assert!(
+            !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
+            "no live AP user-dispatch marker may be emitted this pass"
+        );
+    }
+
+    // The per-CPU return-readiness attestation exists and is scoped honestly.
+    #[test]
+    fn trap_return_ready_marker_is_scoped_to_cr3_authority() {
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_TRAP_RETURN_READY: &str = \"X86_AP_TRAP_RETURN_READY\"")
+                && SMP_SRC.contains("MARK_TRAP_RETURN_READY")
+                && SMP_SRC.contains("reason=per_cpu_cr3_authority"),
+            "the trap-return-ready attestation must be scoped to the per-CPU CR3 authority"
         );
     }
 }

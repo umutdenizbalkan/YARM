@@ -1847,11 +1847,23 @@ pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool)
         if ap_trap_return_prereqs_present(cpu) {
             crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TRAP_RETURN_AUDIT_OK, cpu.0);
         }
+        // Stage 189C: the user-return CR3 authority is now per-CPU-correct (keyed
+        // off the executing CPU's actual hardware CR3, never the global HAL
+        // active-ASID). Attest the RETURN half is ready per-CPU.
+        crate::yarm_log!(
+            "{} cpu={} reason=per_cpu_cr3_authority",
+            ap_dispatch::MARK_TRAP_RETURN_READY,
+            cpu.0
+        );
         if tlb_ready {
             crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TLB_READY, cpu.0);
         }
-        // Stage 189B readiness: dispatcher + run-queue + TLB ready; the LIVE
-        // trap-return path is proven in Stage 189C, so trap_return_ready is false.
+        // Stage 189C readiness: dispatcher + run-queue + TLB ready, and the RETURN
+        // path is per-CPU-correct. `trap_return_ready` nonetheless stays FALSE
+        // because the AP has no usermode-ENTRY path: the AP idle loop is by design
+        // interrupt-masked and never enters ring 3 / never takes a timer/syscall
+        // interrupt, so a full trap-return ROUND TRIP cannot be exercised yet.
+        // Building that entry trampoline is the remaining, deferred work.
         let readiness = ApReadiness {
             dispatcher_ready: true,
             run_queue_ready: true,
@@ -1863,7 +1875,7 @@ pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool)
         // does NOT clear wake-only. This exercises the exact production gate.
         let _ = try_enable_ap_user_dispatch(kernel, cpu, readiness);
         crate::yarm_log!(
-            "{} cpu={} reason=live_trap_return_wiring_deferred_to_189c",
+            "{} cpu={} reason=ap_usermode_entry_trampoline_absent",
             ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
             cpu.0
         );

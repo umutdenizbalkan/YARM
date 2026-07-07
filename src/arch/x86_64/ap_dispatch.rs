@@ -151,6 +151,9 @@ pub const MARK_DISPATCHER_SCAFFOLD_READY: &str = "X86_AP_DISPATCHER_SCAFFOLD_REA
 pub const MARK_ADMISSION_GUARD_READY: &str = "X86_AP_ADMISSION_GUARD_READY";
 /// The AP trap-return structural audit passed (shared BSP path + per-CPU prereqs).
 pub const MARK_TRAP_RETURN_AUDIT_OK: &str = "X86_AP_TRAP_RETURN_AUDIT_OK";
+/// Stage 189C: the AP user-return CR3 authority is per-CPU-correct (keyed off the
+/// executing CPU's actual hardware CR3, not the global HAL active-ASID).
+pub const MARK_TRAP_RETURN_READY: &str = "X86_AP_TRAP_RETURN_READY";
 /// The Stage 189A genuine remote ACK is available for this CPU's shootdown.
 pub const MARK_TLB_READY: &str = "X86_AP_TLB_READY_FOR_DISPATCH";
 /// A wake-only clear was NOT performed; carries the refusal reason.

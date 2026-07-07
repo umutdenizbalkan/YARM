@@ -87,11 +87,21 @@ pub(crate) fn ensure_user_return_cr3(
             Some(c) => c,
             None => return,
         };
-        let active_asid_num = kernel.d6_diag_active_asid_num();
-        let active_asid = crate::kernel::vm::Asid(active_asid_num as u16);
-        let active_cr3 =
-            crate::arch::x86_64::page_table::cr3_for_asid(active_asid).unwrap_or(u64::MAX);
+        // Stage 189C — per-CPU-correct return authority. The active root is THIS
+        // CPU's ACTUAL hardware CR3, never the global HAL "active ASID"
+        // (`d6_diag_active_asid_num`), which is a single BSP-centric value and is
+        // wrong on an AP. We reverse-derive the active ASID from the executing
+        // CPU's current task (`current_tid()` is set from the trapping CPU's APIC
+        // id at entry), so nothing global leaks into an AP's return reasoning. The
+        // switch decision below already keys off `hw_cr3`, so this changes only the
+        // diagnostic derivation, not the switch — BSP behavior is unchanged.
         let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+        let active_asid = kernel
+            .current_tid()
+            .and_then(|cur| kernel.task_asid(cur))
+            .unwrap_or(task_asid);
+        let active_cr3 =
+            crate::arch::x86_64::page_table::cr3_for_asid(active_asid).unwrap_or(hw_cr3);
         crate::yarm_log!(
             "USER_CR3_PRE_IRET_CHECK tid={} task_asid={} task_cr3=0x{:016x} active_asid={} active_cr3=0x{:016x} hw_cr3=0x{:016x}",
             tid,
