@@ -267,6 +267,14 @@ pub(crate) fn try_split_dispatch_into_frame(
         return try_split_vm_brk_shrink_into_frame(shared, cpu, frame);
     }
 
+    // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) — a pure read
+    // serviced off the global lock. The helper returns `None` for any case it cannot
+    // service (hosted-dev, unavailable requester), which propagates UNCHANGED back to
+    // the global-lock fallback below.
+    if matches!(syscall, Syscall::DebugLog) {
+        return try_split_debug_log_into_frame(shared, cpu, frame);
+    }
+
     // The requester TID is what the global-lock handler reads via
     // `current_tid(kernel)` (i.e. `kernel.current_tid()`).
     //
@@ -300,6 +308,96 @@ pub(crate) fn try_split_dispatch_into_frame(
         }
         Err(err) => Some(Err(TrapHandleError::Syscall(SyscallError::from(err)))),
     }
+}
+
+// ── Stage 191A GLOBAL-LOCK-RETIRE markers (first class) ──────────────────────
+/// Emitted once, the first time a class is serviced off the global lock this boot.
+pub const MARK_RETIRE_CLASS_BEGIN: &str = "GLOBAL_LOCK_RETIRE_CLASS_BEGIN";
+/// Emitted once, after the first off-global-lock service of a class succeeds.
+pub const MARK_RETIRE_CLASS_DONE: &str = "GLOBAL_LOCK_RETIRE_CLASS_DONE";
+/// A class was inspected for retirement but kept global-lock-only; carries a reason.
+pub const MARK_RETIRE_CLASS_DEFERRED: &str = "GLOBAL_LOCK_RETIRE_CLASS_DEFERRED";
+
+/// One-shot latch so the DebugLog retirement markers are emitted exactly once.
+#[cfg(not(feature = "hosted-dev"))]
+static DEBUG_LOG_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 191A: service `DebugLog` (NR 15) through the split (no-global-lock) path.
+///
+/// DebugLog is the FIRST retired global-lock class. It is a pure READ: it resolves
+/// the requester task, copies the user message bytes, logs `USER_LOG`, and writes
+/// `set_ok(0,0,0)`. It never blocks/yields/schedules, never switches tasks, and never
+/// mutates `KernelState` (`task_switched == false` stays observable). The copy runs
+/// off the global lock via `SharedKernel::copy_from_user_asid_split_read` (VM
+/// user-spaces lock + direct map). Behaviorally identical to the global-lock
+/// `handle_debug_log` (same null/empty short-circuit, same copy-fail silent path,
+/// same `USER_LOG` line, same `set_ok(0,0,0)`). Returns `None` only when the requester
+/// TID is unavailable, so that case falls back to the unchanged global-lock path.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_debug_log_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::ipc::Message;
+    // DebugLog ABI: arg0 = user ptr, arg1 = len (no cap slot).
+    let user_ptr = frame.arg(0);
+    let raw_len = frame.arg(1) as u64;
+    let len = (raw_len as usize).min(Message::MAX_PAYLOAD);
+
+    // Authoritative requester TID (binds current_cpu; same task the global handler
+    // sees). Unavailable → fall back to the global-lock path.
+    let tid = shared.current_tid_authoritative(cpu)?;
+
+    if user_ptr == 0 || len == 0 {
+        // Same short-circuit as the global handler: OK, no log.
+        frame.set_ok(0, 0, 0);
+        maybe_log_debug_log_retired();
+        return Some(Ok(()));
+    }
+
+    let asid = shared.task_asid_for_tid_split_read(tid);
+    match shared.copy_from_user_asid_split_read(asid, user_ptr, len) {
+        Some(payload) => {
+            let msg = core::str::from_utf8(&payload[..len]).unwrap_or("<utf8_err>");
+            crate::yarm_log!("USER_LOG tid={} msg={}", tid, msg);
+        }
+        // Copy failed (no mapping / not user-readable) — same as the global handler's
+        // `DEBUG_LOG_COPY_FAIL` path: OK, no log.
+        None => {}
+    }
+    frame.set_ok(0, 0, 0);
+    maybe_log_debug_log_retired();
+    Some(Ok(()))
+}
+
+/// Emit the DebugLog retirement markers exactly once (first off-global-lock service).
+#[cfg(not(feature = "hosted-dev"))]
+fn maybe_log_debug_log_retired() {
+    if DEBUG_LOG_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("{} class=DebugLog", MARK_RETIRE_CLASS_BEGIN);
+        crate::yarm_log!("{} class=DebugLog result=ok", MARK_RETIRE_CLASS_DONE);
+    }
+}
+
+/// Hosted-dev: DebugLog stays on the unchanged global-lock path (the split copy uses
+/// the direct map, which only exists on real targets).
+#[cfg(feature = "hosted-dev")]
+fn try_split_debug_log_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
 }
 
 /// # Validation status
@@ -391,6 +489,12 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // eligibility (group leader, page-crossing shrink, single CPU online) is
         // decided inside that helper; ineligible cases return `None` → fallback.
         Syscall::VmBrk => Some(syscall),
+        // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) is a pure READ
+        // syscall — it resolves the current task, copies user bytes, logs, and never
+        // blocks/yields/switches tasks or mutates KernelState. It is serviced off the
+        // global lock via `try_split_debug_log_into_frame`. Any case it cannot service
+        // returns `None` → unchanged global-lock fallback.
+        Syscall::DebugLog => Some(syscall),
         _ => None,
     }
 }
@@ -934,8 +1038,9 @@ mod tests {
     #[test]
     fn stage29_whitelist_exhaustive() {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
-        // Stage 32B), and NR 14 (VmBrk, Stage 114) may pass the NR-only
-        // split-eligibility gate.
+        // Stage 32B), NR 14 (VmBrk, Stage 114), and NR 15 (DebugLog, Stage 191A —
+        // the first retired global-lock class) may pass the NR-only
+        // split-eligibility gate. Every other syscall stays global-lock-only.
         for nr in 0..SYSCALL_COUNT {
             let Ok(syscall) = Syscall::decode(nr) else {
                 continue;
@@ -944,6 +1049,7 @@ mod tests {
             if nr == SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR
                 || nr == SYSCALL_IPC_RECV_NR
                 || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
+                || nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {

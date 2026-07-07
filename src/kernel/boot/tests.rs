@@ -59201,6 +59201,134 @@ mod stage190b_controlled_workload {
     }
 }
 
+// Stage 191A — GLOBAL-LOCK RETIREMENT INVENTORY + FIRST SAFE CLASS. The split-dispatch
+// whitelist is the ONLY set of syscalls serviced off the global `SpinLock<KernelState>`.
+// Stage 191A adds exactly ONE class — DebugLog (NR 15), a pure read — to it, and pins
+// that every other class (all IPC/VM/spawn/fork/futex/reap paths) stays global-lock-only.
+// The global lock is NOT retired; this is a first-class-only conversion.
+mod stage191a_lock_retire_inventory {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_LOCKING.md");
+
+    // The retirement marker vocabulary exists.
+    #[test]
+    fn retire_marker_vocabulary_exists() {
+        assert!(
+            SPLIT_SRC
+                .contains("MARK_RETIRE_CLASS_BEGIN: &str = \"GLOBAL_LOCK_RETIRE_CLASS_BEGIN\"")
+                && SPLIT_SRC
+                    .contains("MARK_RETIRE_CLASS_DONE: &str = \"GLOBAL_LOCK_RETIRE_CLASS_DONE\"")
+                && SPLIT_SRC.contains(
+                    "MARK_RETIRE_CLASS_DEFERRED: &str = \"GLOBAL_LOCK_RETIRE_CLASS_DEFERRED\""
+                ),
+            "the Stage 191A retirement marker vocabulary must exist"
+        );
+    }
+
+    // INVENTORY: the split whitelist is EXACTLY {ControlPlaneSetCnodeSlots, IpcRecv,
+    // VmBrk, DebugLog}. DebugLog is the newly retired class; the rest predate 191A.
+    #[test]
+    fn split_whitelist_is_exactly_the_four_classes() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::ControlPlaneSetCnodeSlots => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::IpcRecv => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::VmBrk => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),"),
+            "the NR-only split gate must whitelist exactly the four classes"
+        );
+        // Dangerous classes must NOT appear as split-eligible (default-deny `_ => None`).
+        for dangerous in [
+            "Syscall::VmMap => Some",
+            "Syscall::VmAnonMap => Some",
+            "Syscall::Fork => Some",
+            "Syscall::SpawnThread => Some",
+            "Syscall::SpawnProcess => Some",
+            "Syscall::ReapFaultedTask => Some",
+            "Syscall::IpcSend => Some",
+            "Syscall::IpcCall => Some",
+            "Syscall::IpcReply => Some",
+            "Syscall::FutexWait => Some",
+            "Syscall::FutexWake => Some",
+            "Syscall::Yield => Some",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(dangerous),
+                "{dangerous} must NOT be split-eligible (stays global-lock-only)"
+            );
+        }
+    }
+
+    // SELECTED CLASS (DebugLog) bypasses the broad global lock only via proven
+    // split-read primitives: authoritative tid → task-asid split-read → vm-user-spaces
+    // split resolve → direct-map read. No broad `with(` / `with_cpu(` domain work.
+    #[test]
+    fn debug_log_split_uses_split_read_primitives_only() {
+        assert!(
+            SPLIT_SRC.contains("fn try_split_debug_log_into_frame(")
+                && SPLIT_SRC.contains("shared.current_tid_authoritative(cpu)?")
+                && SPLIT_SRC.contains("shared.task_asid_for_tid_split_read(tid)")
+                && SPLIT_SRC.contains("shared.copy_from_user_asid_split_read(asid, user_ptr, len)"),
+            "DebugLog split must use the authoritative-tid + split-read + split-copy primitives"
+        );
+        // The split copy reads the VM user-spaces subsystem under its own lock (rank),
+        // NOT the global lock, and reads bytes via the direct map.
+        assert!(
+            RUNTIME_SRC.contains("pub fn copy_from_user_asid_split_read(")
+                && RUNTIME_SRC.contains("self.with_vm_user_spaces_split_mut(|spaces| {")
+                && RUNTIME_SRC
+                    .contains("crate::kernel::boot::KernelState::phys_to_direct_map_ptr(phys)?"),
+            "the split copy must resolve via the VM user-spaces split accessor + direct map"
+        );
+        // The DebugLog split path never blocks/yields/switches tasks (pure read).
+        assert!(
+            !SPLIT_SRC.contains("fn try_split_debug_log_into_frame(")
+                || !split_debug_log_body_contains_scheduling(),
+            "the DebugLog split path must not schedule/yield/switch tasks"
+        );
+    }
+
+    fn split_debug_log_body_contains_scheduling() -> bool {
+        // Extract the try_split_debug_log_into_frame body and check it does not
+        // dispatch/yield/switch (it is a pure read + log + set_ok).
+        let start = SPLIT_SRC
+            .find("fn try_split_debug_log_into_frame(")
+            .expect("debug-log split fn must exist");
+        let rest = &SPLIT_SRC[start..];
+        let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[..end];
+        body.contains("dispatch_next")
+            || body.contains("yield_current")
+            || body.contains("block_current")
+            || body.contains("switch_frames")
+    }
+
+    // ReapFaultedTask stays GLOBAL-LOCK-ONLY (explicitly excluded from split dispatch).
+    #[test]
+    fn reap_faulted_task_stays_global_lock_only() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+        // The dedicated exclusion guard still exists in syscall_split tests.
+        assert!(
+            SPLIT_SRC.contains("fn stage188h_reap_faulted_task_excluded_from_split_dispatch()"),
+            "the ReapFaultedTask split-exclusion guard must remain"
+        );
+    }
+
+    // The docs must NOT claim the global lock is fully retired.
+    #[test]
+    fn docs_do_not_claim_full_retirement() {
+        assert!(
+            !DOC_SRC.contains("global lock is fully retired")
+                && !DOC_SRC.contains("global lock retired")
+                && !DOC_SRC.contains("SpinLock<KernelState> retired"),
+            "docs must not claim full global-lock retirement"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

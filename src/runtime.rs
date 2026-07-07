@@ -2032,6 +2032,59 @@ impl SharedKernel {
         unsafe { KernelState::task_asid_for_tid_from_raw(self.state.data_ptr() as *const _, tid) }
     }
 
+    /// Stage 191A (GLOBAL-LOCK-RETIRE class=DebugLog): copy `len` bytes from user VA
+    /// `user_ptr` in address space `asid_raw`, reading the VM `user_spaces` subsystem
+    /// under the VM lock (rank via `with_vm_user_spaces_split_mut`) and the physical
+    /// bytes via the direct map — WITHOUT the global `SpinLock<KernelState>`. Mirrors
+    /// `KernelState::copy_from_user`'s validation (mapping present, user+read) exactly,
+    /// so the split path is behaviorally identical to the global-lock `DebugLog`
+    /// handler. Returns `None` on any validation/mapping failure (the caller then
+    /// emits nothing, exactly like the global handler's `DEBUG_LOG_COPY_FAIL` path).
+    ///
+    /// Lock order: vm user-spaces (per page, held transiently and released before the
+    /// direct-map read). No global lock; no scheduler/task lock held across the copy.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub fn copy_from_user_asid_split_read(
+        &self,
+        asid_raw: u64,
+        user_ptr: usize,
+        len: usize,
+    ) -> Option<[u8; crate::kernel::ipc::Message::MAX_PAYLOAD]> {
+        use crate::kernel::vm::{Asid, PAGE_SIZE, VirtAddr};
+        if asid_raw == 0 || len == 0 || len > crate::kernel::ipc::Message::MAX_PAYLOAD {
+            return None;
+        }
+        let asid = Asid(u16::try_from(asid_raw).ok()?);
+        let mut out = [0u8; crate::kernel::ipc::Message::MAX_PAYLOAD];
+        let mut done = 0usize;
+        while done < len {
+            let va = user_ptr.checked_add(done)?;
+            let page_base = va & !(PAGE_SIZE - 1);
+            let page_off = va - page_base;
+            let chunk = (len - done).min(PAGE_SIZE - page_off);
+            // Resolve the page's physical base under the VM user-spaces lock (no
+            // global lock), validating user+read exactly like
+            // `validate_user_access_for_asid`.
+            let phys_base = self.with_vm_user_spaces_split_mut(|spaces| {
+                let aspace = spaces.get(asid)?;
+                let mapping = aspace.resolve(VirtAddr(page_base as u64))?;
+                if !mapping.flags.user || !mapping.flags.read {
+                    return None;
+                }
+                Some(mapping.phys.0)
+            })?;
+            for i in 0..chunk {
+                let phys = phys_base.checked_add((page_off + i) as u64)?;
+                let ptr = crate::kernel::boot::KernelState::phys_to_direct_map_ptr(phys)?;
+                // SAFETY: `phys` is within a validated user-readable mapping; the
+                // direct-map pointer is bounds-checked by `phys_to_direct_map_ptr`.
+                out[done + i] = unsafe { core::ptr::read_volatile(ptr) };
+            }
+            done += chunk;
+        }
+        Some(out)
+    }
+
     pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot {
         // Stage 4T+7 split-read: pre-read diagnostic data for the fatal-trap log.
         // Acquires scheduler lock (rank 1) for current_tid, then task lock (rank 2)

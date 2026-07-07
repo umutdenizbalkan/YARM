@@ -443,6 +443,64 @@ remove implicit global-lock coupling from syscall/trap paths.
     load balancing, audited one-at-a-time repeated dispatch, distinct per-CPU TIDs +
     single dispatch count, policy-seal-then-idle under the global lock).
 
+- **Stage 191A (GLOBAL-LOCK-RETIREMENT INVENTORY + FIRST SAFE CLASS) — DONE and
+  QEMU-PROVEN.** The broad global `SpinLock<KernelState>` is NOT retired. Stage 191A
+  audits every syscall for retirement readiness and converts exactly ONE clearly safe
+  class — `DebugLog` (NR 15) — to the existing split-dispatch (no-global-lock) seam.
+  * **Full syscall inventory (23 variants).**
+    - *Already split/live (pre-191A):* `ControlPlaneSetCnodeSlots` (NR 8, split-mut),
+      `IpcRecv` kernel-task queued-plain seam (NR 2), `VmBrk` page-crossing-shrink (NR 14).
+    - *Dispatch-return live (Stage 188):* `IpcRecv`/`IpcCall`/`IpcReply` blocked-waiter
+      delivery (out-of-lock post-work, not a syscall-class retirement).
+    - *Retired in 191A:* `DebugLog` (NR 15).
+    - *Global-lock-only, safe-but-not-converted:* `Yield` (NR 0) — REJECTED: it
+      switches tasks + address space (`yield_current` → `on_preempt` + `switch_address_space`
+      + `maybe_switch_kernel_context`), so `task_switched != false` violates the split
+      seam's no-task-switch invariant. `FutexWake`/`FutexWait` — deferred: Futex mutates
+      scheduler wait/run-queue state (and `FutexWait` blocks), needing a scheduler
+      split-mut + wake-order proof.
+    - *Global-lock-only, DANGEROUS (untouched):* `VmMap`, `VmAnonMap`, `Fork`,
+      `SpawnThread`, `SpawnProcess`/`SpawnProcessFromUserBuf`/`SpawnFromInitramfsFile`/
+      `SpawnFromMemoryObject`, `ReapFaultedTask`, `TransferRelease`, `RecvSharedV3`,
+      `IpcSend`/`IpcCall`/`IpcReply` (broad), `IpcRecvTimeout`, `InitramfsReadChunk`,
+      `CreateInitramfsFileSliceMo`.
+  * **Why DebugLog is the first safe class.** It is a PURE READ: resolve the requester
+    task, copy the user message bytes, log `USER_LOG`, `set_ok(0,0,0)`. It never
+    blocks/yields/schedules, never switches tasks, never mutates `KernelState`
+    (`task_switched == false` stays observable), and it has a COMPLETE lock/rank proof
+    with EXISTING split primitives — `current_tid_authoritative(cpu)` (binds current_cpu)
+    → `task_asid_for_tid_split_read(tid)` (task lock, rank 2) →
+    `copy_from_user_asid_split_read` (VM user-spaces lock via `with_vm_user_spaces_split_mut`
+    + direct-map byte read). Each domain lock is held transiently and released before
+    the next (ascending, non-nested); no broad global lock is taken for the copy.
+  * **Behavioral identity.** `try_split_debug_log_into_frame` mirrors the global-lock
+    `handle_debug_log` exactly: same null/empty short-circuit → `set_ok(0,0,0)` no log;
+    same copy-fail silent path; same `USER_LOG tid=.. msg=..` line; same `set_ok(0,0,0)`.
+    QEMU x86_64 core: all 571 DebugLog syscalls route through the split path
+    (`YARM_LOCK_SPLIT_DISPATCH nr=15`), all 571 `USER_LOG` lines intact, and
+    `GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=DebugLog` + `GLOBAL_LOCK_RETIRE_CLASS_DONE
+    class=DebugLog result=ok` are emitted once.
+  * **Scope + cross-arch.** x86_64-effective. The split copy is gated to non-hosted
+    (the direct map only exists on real targets); hosted-dev DebugLog stays on the
+    global-lock handler. riscv64 does not enter `handle_trap_entry_shared`, and aarch64
+    only imports the split ABI under the IPC-recv proof knob, so DebugLog stays
+    global-lock-only on both (0 retire markers, byte-identical boots). AP scheduler
+    policy seal (190B), TLB ACK (189A), and 188 dispatch-return all preserved; core +
+    oracle + crash-restart + smp2/smp4 (armed and knob-off) + riscv64 pass; aarch64
+    carries its unchanged pre-existing `WrongObject` caveat.
+  * **The broad global lock is NOT retired.** Every non-DebugLog class still routes
+    through `SharedKernel::with_cpu` → `KernelState::handle_trap` → `syscall::dispatch`.
+    `ReapFaultedTask` stays global-lock-only (default-deny + the Stage 188H exclusion
+    guard). This is a first-class-only conversion, not a lock-retirement claim.
+  * **Go/no-go for Stage 191B:** GO for the next narrow class. Candidate:
+    `FutexWake` (scheduler-only mutation, no task switch, no user memory) once a
+    scheduler split-mut + wake-order proof exists; alternatively broaden the read-only
+    class family. NOT `Yield` (task switch) and NOT any VM-mutating/spawn/IPC-send class.
+  * Guarded by `stage191a_lock_retire_inventory` (retire marker vocabulary, whitelist
+    is exactly the four classes, DebugLog uses split-read primitives only + no
+    scheduling, ReapFaultedTask stays global-lock-only, docs make no full-retirement
+    claim) + the updated `stage29_whitelist_exhaustive` (NR 15 now eligible).
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

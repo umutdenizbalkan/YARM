@@ -46,7 +46,7 @@ impl KernelState {
     }
 
     #[cfg(not(feature = "hosted-dev"))]
-    pub(super) fn phys_to_direct_map_ptr(phys: u64) -> Option<*mut u8> {
+    pub(crate) fn phys_to_direct_map_ptr(phys: u64) -> Option<*mut u8> {
         if phys >= crate::arch::platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES {
             return None;
         }
