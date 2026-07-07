@@ -501,6 +501,67 @@ remove implicit global-lock coupling from syscall/trap paths.
     scheduling, ReapFaultedTask stays global-lock-only, docs make no full-retirement
     claim) + the updated `stage29_whitelist_exhaustive` (NR 15 now eligible).
 
+- **Stage 191B (FUTEXWAKE GLOBAL-LOCK RETIREMENT) — DONE.** The broad global
+  `SpinLock<KernelState>` is NOT retired. Stage 191B converts exactly ONE more class —
+  `FutexWake` (NR 11) — to the split-dispatch (no-global-lock) seam, on top of the
+  191A `DebugLog` retirement (both preserved). `FutexWait` (blocks), `Yield` (task
+  switch), and every VM/spawn/IPC-send class stay global-lock-only.
+  * **FutexWake path + touched state.** `FutexWake(addr, max_wake)` is a wake-only
+    operation: the futex "wait queue" is *implicit* — the set of TCBs whose
+    `status == Blocked(WaitReason::Futex(VirtAddr(addr)))`. Waking touches (1) blocked
+    task TCB status (rank 2, task lock), (2) scheduler run queues (rank 1, scheduler
+    lock, via the SmpScheduler enqueue methods), and (3) the current CPU/task binding
+    (read-only — the caller does NOT task-switch). It never touches VM/user-memory
+    mapping state (only a 4-byte user-readability probe of `addr`), never blocks, never
+    yields, never spawns.
+  * **Lock/rank proof.** `futex_wake_split_mut(cpu, addr, max_wake)` runs in two
+    ascending, non-nested lock windows and holds NO broad `&mut KernelState`:
+    (Phase A) one `with_task_tcbs_split_mut` (rank 2) scan flips at most `max_wake`
+    matching TCBs `Blocked(Futex) → Runnable`, recording `(tid, cpu_affinity)` in a
+    fixed 512-slot buffer; (Phase B) per woken tid, a `task_class_split_read` (rank 2)
+    picks priority (SystemServer → High else Normal) and lazily assigns driver
+    affinity, then `with_scheduler_split_mut` (rank 1) enqueues via the *same*
+    `enqueue_on_with_priority` / `enqueue_balanced` SmpScheduler methods the global-lock
+    path uses. Task lock (2) is always released before the scheduler lock (1) is taken
+    per iteration; no lock is nested inside another.
+  * **Wake-order / count identity + no lost/dup/orphan.** The split scan visits TCBs in
+    the same slot order as the legacy `futex_wake_inner`, uses the byte-identical
+    predicate, and caps at `max_wake` — so the woken set, count, and order match legacy.
+    `max_wake == 0` is a no-op (returns 0). Each woken TCB is set Runnable exactly once
+    and enqueued exactly once (no double-wake: a second FutexWake finds them already
+    Runnable, not `Blocked(Futex)`); no waiter is left Runnable-but-unqueued (no orphan);
+    non-futex blocked tasks are untouched. Proven empirically by
+    `stage191b_futex_wake_retire::futex_wake_split_semantics_are_correct` (4 futex waiters
+    + 1 non-futex Blocked(Poll): wake 2 → exactly 2 Runnable + enqueued, current_tid
+    unchanged, wake rest → 2, third wake → 0) and `..._zero_max_is_noop`.
+  * **Caller does not task-switch.** The split path returns `set_ok(woke, 0, 0)` and the
+    dispatcher observes `task_switched == false` — identical to the global-lock
+    `handle_futex_wake`, which also only wakes and returns to the caller.
+  * **Scope + cross-arch.** x86_64-effective, non-hosted only (hosted-dev FutexWake stays
+    on the global-lock handler; the split copy/probe needs the real-target direct map).
+    riscv64 does not enter `handle_trap_entry_shared` and aarch64 only imports the split
+    ABI under the IPC-recv proof knob, so FutexWake stays global-lock-only on both
+    (0 `FUTEX_WAKE_SPLIT`/`class=FutexWake` markers, boots byte-identical to baseline).
+    Markers `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE class=FutexWake`, `FUTEX_WAKE_SPLIT_BEGIN`,
+    `FUTEX_WAKE_SPLIT_WAKE_OK count=<n>`, `FUTEX_WAKE_SPLIT_DONE result=ok` fire only when
+    a userspace FutexWake is actually dispatched (not exercised by the current boot
+    workloads — proven by the host semantics test instead). 191A DebugLog retirement, AP
+    scheduler policy seal (190B), TLB ACK (189A), and 188 dispatch-return are all
+    preserved; x86_64 core + IPC oracle + crash-restart + smp2/smp4 (armed and knob-off)
+    pass; riscv64 carries its unchanged pre-existing idle-halt and aarch64 its unchanged
+    pre-existing `WrongObject`, both byte-identical to baseline.
+  * **The broad global lock is NOT retired.** Only `DebugLog` (191A) and `FutexWake`
+    (191B) are split-eligible; every other class still routes through
+    `with_cpu → handle_trap → syscall::dispatch`, and `ReapFaultedTask` stays
+    global-lock-only. This is a two-class conversion, not a lock-retirement claim.
+  * **Go/no-go for Stage 191C:** GO for a further narrow class only with a complete
+    lock/rank proof. NOT `FutexWait` (it blocks the caller — needs the block-publish
+    seam), NOT `Yield` (task switch), NOT any VM-mutating/spawn/IPC-send class.
+  * Guarded by `stage191b_futex_wake_retire` (eligibility, marker vocabulary, seam usage
+    matching the legacy scan, empirical wake semantics + zero-max no-op) + the updated
+    `stage29_whitelist_exhaustive`/`stage29_futex_not_eligible` (NR 11 FutexWake eligible,
+    FutexWait still not).
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

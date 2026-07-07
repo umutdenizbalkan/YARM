@@ -275,6 +275,14 @@ pub(crate) fn try_split_dispatch_into_frame(
         return try_split_debug_log_into_frame(shared, cpu, frame);
     }
 
+    // Stage 191B (GLOBAL-LOCK-RETIRE, second class): FutexWake (NR 11) — waiter/
+    // run-queue mutation only, no caller task-switch. The helper returns `None` for any
+    // case it cannot service (invalid addr, hosted-dev, unavailable requester), which
+    // propagates UNCHANGED to the global-lock fallback (producing the exact error).
+    if matches!(syscall, Syscall::FutexWake) {
+        return try_split_futex_wake_into_frame(shared, cpu, frame);
+    }
+
     // The requester TID is what the global-lock handler reads via
     // `current_tid(kernel)` (i.e. `kernel.current_tid()`).
     //
@@ -400,6 +408,93 @@ fn try_split_debug_log_into_frame(
     None
 }
 
+/// One-shot latch so the FutexWake retirement markers are emitted exactly once.
+#[cfg(not(feature = "hosted-dev"))]
+static FUTEX_WAKE_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 191B: service `FutexWake` (NR 11) through the split (no-global-lock) path.
+///
+/// FutexWake is the SECOND retired global-lock class. The CALLER never task-switches;
+/// the syscall only mutates waiter/run-queue state. This helper validates the futex
+/// word EXACTLY like the global `validate_current_user_futex_word` (addr != 0, addr+3
+/// below `KERNEL_SPACE_BASE`, 4 bytes user-readable), then wakes off the global lock
+/// via `SharedKernel::futex_wake_split_mut` (task split-mut wake scan + scheduler
+/// split-mut enqueue). It preserves the legacy return value (number of waiters woken)
+/// and encodes it with `set_ok(woke, 0, 0)`. Any case it cannot service (invalid addr,
+/// non-`u32` max_wake, unavailable requester) returns `None` → unchanged global-lock
+/// fallback, which produces the CANONICAL error (WrongObject / UserMemoryFault /
+/// InvalidArgs) exactly as before — no silent success masking.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_futex_wake_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_PTR};
+    // FutexWake ABI: arg(CAP) = futex addr, arg(PTR) = max_wake.
+    let addr = frame.arg(SYSCALL_ARG_CAP);
+    // Non-`u32` max_wake → the global handler returns InvalidArgs; fall back.
+    let max_wake = u32::try_from(frame.arg(SYSCALL_ARG_PTR) as u64).ok()?;
+
+    let tid = shared.current_tid_authoritative(cpu)?;
+
+    // Validate the futex word exactly like `validate_current_user_futex_word`. On ANY
+    // validation miss, fall back so the global-lock path produces the canonical error.
+    if addr == 0 {
+        return None; // legacy: WrongObject
+    }
+    let end = addr.checked_add(core::mem::size_of::<u32>() - 1)?;
+    if end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE {
+        return None; // legacy: UserMemoryFault
+    }
+    let asid = shared.task_asid_for_tid_split_read(tid);
+    if shared
+        .copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())
+        .is_none()
+    {
+        return None; // legacy: UserMemoryFault
+    }
+
+    // Validation passed — wake off the global lock.
+    crate::yarm_log!("FUTEX_WAKE_SPLIT_BEGIN");
+    let woke = shared.futex_wake_split_mut(cpu, addr, max_wake);
+    crate::yarm_log!("FUTEX_WAKE_SPLIT_WAKE_OK count={}", woke);
+    frame.set_ok(woke as usize, 0, 0);
+    crate::yarm_log!("FUTEX_WAKE_SPLIT_DONE result=ok");
+    maybe_log_futex_wake_retired();
+    Some(Ok(()))
+}
+
+/// Emit the FutexWake retirement markers exactly once (first off-global-lock service).
+#[cfg(not(feature = "hosted-dev"))]
+fn maybe_log_futex_wake_retired() {
+    if FUTEX_WAKE_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("{} class=FutexWake", MARK_RETIRE_CLASS_BEGIN);
+        crate::yarm_log!("{} class=FutexWake result=ok", MARK_RETIRE_CLASS_DONE);
+    }
+}
+
+/// Hosted-dev: FutexWake stays on the unchanged global-lock path (the futex-word
+/// validation uses the direct map, which only exists on real targets). The wake logic
+/// itself (`futex_wake_split_mut`) is arch-neutral and unit-tested directly.
+#[cfg(feature = "hosted-dev")]
+fn try_split_futex_wake_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
 /// # Validation status
 /// - LIVE_TRAP_SMOKE_X86_64 (Stage 32B) — wired into the live trap seam:
 ///   `try_split_dispatch_into_frame` routes IpcRecv (NR 2) here BEFORE the global
@@ -495,6 +590,13 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // global lock via `try_split_debug_log_into_frame`. Any case it cannot service
         // returns `None` → unchanged global-lock fallback.
         Syscall::DebugLog => Some(syscall),
+        // Stage 191B (GLOBAL-LOCK-RETIRE, second class): FutexWake (NR 11) — the CALLER
+        // never task-switches; it only mutates waiter/run-queue state (Blocked→Runnable
+        // + enqueue). Serviced off the global lock via `try_split_futex_wake_into_frame`
+        // (task split-mut wake scan + scheduler split-mut enqueue). NOT FutexWait (which
+        // blocks the caller — stays global-lock-only). Ineligible cases (invalid addr)
+        // return `None` → unchanged global-lock fallback, which produces the exact error.
+        Syscall::FutexWake => Some(syscall),
         _ => None,
     }
 }
@@ -1009,9 +1111,9 @@ mod tests {
     #[test]
     fn stage29_futex_not_eligible() {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
-        // Stage 32B: IpcRecv is now NR-eligible, so it can no longer stand in for a
-        // blocking syscall here. Use futex (which is genuinely never split-eligible)
-        // both by frame and by number.
+        // FutexWait (NR 10) is genuinely never split-eligible — it BLOCKS the caller,
+        // so it stays global-lock-only. (Stage 191B split-retired FutexWake (NR 11),
+        // which does NOT block the caller; that eligibility is pinned separately.)
         let mut frame = TrapFrame::new(
             crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR,
             [1, 2, 3, 4, 5, 6],
@@ -1022,11 +1124,14 @@ mod tests {
         );
         assert!(
             classify_split_eligible_nr_only(decode(crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR))
-                .is_none()
+                .is_none(),
+            "FutexWait must stay global-lock-only (it blocks the caller)"
         );
+        // Stage 191B: FutexWake IS now split-eligible.
         assert!(
             classify_split_eligible_nr_only(decode(crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR))
-                .is_none()
+                .is_some(),
+            "FutexWake must be split-eligible (Stage 191B)"
         );
     }
 
@@ -1038,9 +1143,9 @@ mod tests {
     #[test]
     fn stage29_whitelist_exhaustive() {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
-        // Stage 32B), NR 14 (VmBrk, Stage 114), and NR 15 (DebugLog, Stage 191A —
-        // the first retired global-lock class) may pass the NR-only
-        // split-eligibility gate. Every other syscall stays global-lock-only.
+        // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A), and
+        // NR 11 (FutexWake, Stage 191B) may pass the NR-only split-eligibility gate.
+        // Every other syscall stays global-lock-only.
         for nr in 0..SYSCALL_COUNT {
             let Ok(syscall) = Syscall::decode(nr) else {
                 continue;
@@ -1050,6 +1155,7 @@ mod tests {
                 || nr == SYSCALL_IPC_RECV_NR
                 || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
                 || nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
+                || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {

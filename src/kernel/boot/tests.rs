@@ -59234,10 +59234,13 @@ mod stage191a_lock_retire_inventory {
             SPLIT_SRC.contains("Syscall::ControlPlaneSetCnodeSlots => Some(syscall),")
                 && SPLIT_SRC.contains("Syscall::IpcRecv => Some(syscall),")
                 && SPLIT_SRC.contains("Syscall::VmBrk => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),"),
-            "the NR-only split gate must whitelist exactly the four classes"
+                && SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
+                // Stage 191B added FutexWake as the fifth split class.
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
+            "the NR-only split gate must whitelist exactly the accepted classes"
         );
         // Dangerous classes must NOT appear as split-eligible (default-deny `_ => None`).
+        // FutexWake is INTENTIONALLY absent here (retired in 191B); FutexWait stays.
         for dangerous in [
             "Syscall::VmMap => Some",
             "Syscall::VmAnonMap => Some",
@@ -59249,7 +59252,6 @@ mod stage191a_lock_retire_inventory {
             "Syscall::IpcCall => Some",
             "Syscall::IpcReply => Some",
             "Syscall::FutexWait => Some",
-            "Syscall::FutexWake => Some",
             "Syscall::Yield => Some",
         ] {
             assert!(
@@ -59326,6 +59328,188 @@ mod stage191a_lock_retire_inventory {
                 && !DOC_SRC.contains("SpinLock<KernelState> retired"),
             "docs must not claim full global-lock retirement"
         );
+    }
+}
+
+// Stage 191B — FUTEXWAKE GLOBAL-LOCK RETIREMENT. FutexWake (NR 11) becomes the SECOND
+// retired global-lock class: the caller never task-switches; the syscall only mutates
+// waiter/run-queue state (Blocked(Futex)→Runnable + enqueue), done via the task
+// split-mut (rank 2) + scheduler split-mut (rank 1) seams. FutexWait/Yield/ReapFaultedTask
+// stay global-lock-only. The wake scan + enqueue is proven identical to legacy.
+mod stage191b_futex_wake_retire {
+    use super::*;
+    use crate::kernel::scheduler::{CpuId, MAX_CPUS};
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::runtime::SharedKernel;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+
+    // INVENTORY / eligibility: FutexWake is whitelisted; FutexWait and Yield are NOT.
+    #[test]
+    fn futex_wake_split_eligible_but_wait_and_yield_are_not() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
+                && SPLIT_SRC.contains("fn try_split_futex_wake_into_frame("),
+            "FutexWake must be split-eligible and routed to its helper"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::FutexWait => Some")
+                && !SPLIT_SRC.contains("Syscall::Yield => Some"),
+            "FutexWait and Yield must stay global-lock-only"
+        );
+    }
+
+    // The FutexWake split marker vocabulary + one-shot retire markers exist.
+    #[test]
+    fn futex_wake_split_markers_exist() {
+        assert!(
+            SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_BEGIN\"")
+                && SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_WAKE_OK count={}\"")
+                && SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_DONE result=ok\"")
+                && SPLIT_SRC.contains("{} class=FutexWake result=ok"),
+            "the FutexWake split + retirement markers must exist"
+        );
+    }
+
+    // LOCK/RANK: the split uses the task split-mut wake scan + scheduler split-mut
+    // enqueue (existing seams), NOT a broad `&mut KernelState`, and reuses the SAME
+    // SmpScheduler enqueue methods legacy uses. The scan iteration/predicate/cutoff is
+    // identical to legacy `futex_wake_inner` (so count + order match by construction).
+    #[test]
+    fn futex_wake_split_uses_seams_and_matches_legacy_scan() {
+        assert!(
+            RUNTIME_SRC.contains("pub fn futex_wake_split_mut(")
+                && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
+                && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
+                && RUNTIME_SRC.contains("sm.enqueue_on_with_priority(c, ThreadId(tid), priority)")
+                && RUNTIME_SRC.contains("sm.enqueue_balanced(ThreadId(tid), priority)"),
+            "the split wake must use the task + scheduler split-mut seams and the same enqueue"
+        );
+        // Same wake predicate + Runnable transition as legacy futex_wake_inner.
+        assert!(
+            EXEC_SRC.contains(
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"
+            ) && RUNTIME_SRC.contains(
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"
+            ),
+            "the split wake scan predicate must match legacy futex_wake_inner"
+        );
+    }
+
+    fn total_runnable(k: &crate::kernel::boot::KernelState) -> usize {
+        (0..MAX_CPUS)
+            .map(|c| k.runnable_count_on_cpu(CpuId(c as u8)))
+            .sum()
+    }
+
+    // EMPIRICAL: the split wake matches legacy semantics — correct count, only
+    // futex-blocked tasks woken, in-order, no double-wake, no orphaned waiter (each
+    // woken task is enqueued), and the caller does NOT task-switch.
+    #[test]
+    fn futex_wake_split_semantics_are_correct() {
+        let addr = 0x1000usize;
+        let waiters = [10101u64, 10102, 10103, 10104];
+        let mut state = Bootstrap::init().expect("init");
+        for &t in &waiters {
+            state
+                .register_task_with_class(t, TaskClass::App)
+                .expect("reg");
+        }
+        // A non-futex task to prove selectivity (blocked on a different reason).
+        state
+            .register_task_with_class(10200, TaskClass::App)
+            .expect("reg200");
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if waiters.contains(&tcb.tid.0) {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                } else if tcb.tid.0 == 10200 {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Poll);
+                }
+            }
+        });
+        let before_current = state.current_tid();
+        let shared = SharedKernel::new(state);
+        let before_runnable = shared.with(|k| total_runnable(k));
+
+        // Wake at most 2 → exactly 2 of the 4 waiters.
+        let woke = shared.futex_wake_split_mut(CpuId(0), addr, 2);
+        assert_eq!(woke, 2, "wake count must be min(waiters, max_wake)");
+        shared.with(|k| {
+            let runnable = waiters
+                .iter()
+                .filter(|&&t| k.task_status(t) == Some(TaskStatus::Runnable))
+                .count();
+            let still_blocked = waiters
+                .iter()
+                .filter(|&&t| {
+                    k.task_status(t)
+                        == Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                            addr as u64,
+                        ))))
+                })
+                .count();
+            assert_eq!(runnable, 2, "exactly 2 waiters woken");
+            assert_eq!(still_blocked, 2, "the other 2 waiters remain blocked");
+            // Selectivity: the non-futex task is untouched.
+            assert_eq!(
+                k.task_status(10200),
+                Some(TaskStatus::Blocked(WaitReason::Poll))
+            );
+            // No orphaned waiter: each woken task is enqueued.
+            assert_eq!(
+                total_runnable(k),
+                before_runnable + 2,
+                "woken tasks are enqueued"
+            );
+            // Caller did NOT task-switch.
+            assert_eq!(
+                k.current_tid(),
+                before_current,
+                "FutexWake must not task-switch"
+            );
+        });
+
+        // Wake the remaining 2.
+        let woke2 = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        assert_eq!(woke2, 2, "remaining 2 waiters woken");
+        // A third wake finds none — no double-wake, no orphaned waiter.
+        let woke3 = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        assert_eq!(woke3, 0, "no double-wake once all waiters are runnable");
+        shared.with(|k| {
+            for &t in &waiters {
+                assert_eq!(k.task_status(t), Some(TaskStatus::Runnable));
+            }
+        });
+    }
+
+    // max_wake == 0 is a no-op (matches legacy).
+    #[test]
+    fn futex_wake_split_zero_max_is_noop() {
+        let addr = 0x2000usize;
+        let mut state = Bootstrap::init().expect("init");
+        state
+            .register_task_with_class(10301, TaskClass::App)
+            .expect("reg");
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == 10301 {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                }
+            }
+        });
+        let shared = SharedKernel::new(state);
+        assert_eq!(shared.futex_wake_split_mut(CpuId(0), addr, 0), 0);
+        shared.with(|k| {
+            assert_eq!(
+                k.task_status(10301),
+                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                    addr as u64
+                ))))
+            );
+        });
     }
 }
 

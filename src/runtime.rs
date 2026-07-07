@@ -2085,6 +2085,85 @@ impl SharedKernel {
         Some(out)
     }
 
+    /// Stage 191B (GLOBAL-LOCK-RETIRE class=FutexWake): wake up to `max_wake` tasks
+    /// blocked on futex `addr`, OFF the broad global lock. Mirrors the legacy
+    /// `KernelState::futex_wake_inner` + `enqueue_task` EXACTLY, but via the task
+    /// split-mut (rank 2) and scheduler split-mut (rank 1) seams instead of a broad
+    /// `&mut KernelState`.
+    ///
+    /// * WAKE SCAN — under the task lock (one atomic critical section, same as
+    ///   `with_tcbs_mut`): iterate TCBs in array order, and for each
+    ///   `Blocked(Futex(addr))` up to `max_wake`, set `Runnable` and record the tid +
+    ///   its affinity. Same iteration order, same predicate, same `max_wake` cutoff as
+    ///   legacy, so the woken SET, COUNT, and ORDER are identical (a task cannot be
+    ///   woken twice — the predicate only matches `Blocked`; none is orphaned — every
+    ///   woken tid is enqueued below).
+    /// * ENQUEUE — per woken tid, mirroring `enqueue_task`: driver-affinity pin (only a
+    ///   `Driver` with no affinity, pinned to `cpu`), priority from class
+    ///   (`SystemServer` = High, else Normal), then the SAME `SmpScheduler` methods
+    ///   (`enqueue_on_with_priority` for an affinity, else `enqueue_balanced`) via the
+    ///   scheduler split-mut seam.
+    ///
+    /// Lock order: task (rank 2) then scheduler (rank 1), each held transiently and
+    /// released before the next — non-nested; no broad global lock. The caller does
+    /// NOT task-switch. Returns the number of tasks woken (== legacy return value).
+    pub fn futex_wake_split_mut(&self, cpu: CpuId, addr: usize, max_wake: u32) -> u32 {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+        use crate::kernel::vm::VirtAddr;
+        // Bound matches kernel::boot MAX_TASKS (the TCB array length); a task can be
+        // woken at most once, so the collected count never exceeds it.
+        const CAP: usize = 512;
+        if max_wake == 0 {
+            return 0;
+        }
+        // 1. Atomic wake scan under the task lock — identical to `futex_wake_inner`.
+        let mut woken: [(u64, Option<CpuId>); CAP] = [(0u64, None); CAP];
+        let count = self.with_task_tcbs_split_mut(|tcbs| {
+            let mut n = 0usize;
+            for tcb in tcbs.iter_mut().flatten() {
+                if n >= max_wake as usize || n >= CAP {
+                    break;
+                }
+                if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {
+                    continue;
+                }
+                tcb.status = TaskStatus::Runnable;
+                woken[n] = (tcb.tid.0, tcb.cpu_affinity);
+                n += 1;
+            }
+            n
+        });
+        // 2. Enqueue each woken task, mirroring `enqueue_task` (driver-affinity pin +
+        //    class priority + the SAME SmpScheduler enqueue).
+        for &(tid, mut affinity) in woken.iter().take(count) {
+            let class = self.task_class_split_read(tid);
+            let priority = match class {
+                Some(TaskClass::SystemServer) => TaskPriority::High,
+                _ => TaskPriority::Normal,
+            };
+            if class == Some(TaskClass::Driver) && affinity.is_none() {
+                self.with_task_tcbs_split_mut(|tcbs| {
+                    if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                        if tcb.cpu_affinity.is_none() {
+                            tcb.cpu_affinity = Some(cpu);
+                        }
+                        affinity = tcb.cpu_affinity;
+                    }
+                });
+            }
+            self.with_scheduler_split_mut(|sched| {
+                let sm = kernel_mut(&mut sched.scheduler);
+                let _ = match affinity {
+                    Some(c) => sm.enqueue_on_with_priority(c, ThreadId(tid), priority),
+                    None => sm.enqueue_balanced(ThreadId(tid), priority).map(|_| ()),
+                };
+            });
+        }
+        count as u32
+    }
+
     pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot {
         // Stage 4T+7 split-read: pre-read diagnostic data for the fatal-trap log.
         // Acquires scheduler lock (rank 1) for current_tid, then task lock (rank 2)
