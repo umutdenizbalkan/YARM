@@ -241,6 +241,20 @@ pub const MARK_RETURN_TO_IDLE_OK: &str = "X86_AP_RETURN_TO_IDLE_OK";
 /// The AP scheduler-loop slice completed successfully.
 pub const MARK_SCHED_LOOP_DONE: &str = "X86_AP_SCHED_LOOP_DONE";
 
+// ── Stage 190B markers (controlled AP workload + scheduler policy seal) ───────
+/// A controlled per-AP workload (a fixed sequence of admitted tasks) is built and
+/// ready to be placed on the AP after the audited wake-only clear.
+pub const MARK_WORKLOAD_PLACEMENT_READY: &str = "X86_AP_WORKLOAD_PLACEMENT_READY";
+/// The AP scheduler loop is dispatching the NEXT admitted task after the previous one
+/// yielded and was blocked (repeated dispatch). Carries cpu/tid.
+pub const MARK_NEXT_TASK_DISPATCH_BEGIN: &str = "X86_AP_NEXT_TASK_DISPATCH_BEGIN";
+/// The AP ran a sequence of `count` admitted tasks via repeated dispatch, each
+/// returning to the scheduler between tasks. Carries cpu/count.
+pub const MARK_REPEATED_DISPATCH_OK: &str = "X86_AP_REPEATED_DISPATCH_OK";
+/// The AP SMP scheduler-policy seal completed: repeated controlled dispatch +
+/// return-to-idle with a consistent run queue, under the still-global lock.
+pub const MARK_SCHED_POLICY_SEAL_DONE: &str = "X86_AP_SCHED_POLICY_SEAL_DONE";
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -395,6 +395,54 @@ remove implicit global-lock coupling from syscall/trap paths.
     idle wiring, `block_current_on` run-queue consistency, interruptible idle not a
     park, no global-lock retirement).
 
+- **Stage 190B (CONTROLLED AP WORKLOAD + SCHEDULER POLICY SEAL) — DONE and
+  QEMU-PROVEN.** The AP scheduler loop now runs a small deterministic SEQUENCE of
+  admitted tasks (A then B) per AP, returning to the scheduler between them and to
+  idle at the end — repeated dispatch with a consistent run queue. Still
+  global-lock-authoritative; a fixed controlled workload, NOT arbitrary load balancing.
+  * **Workload build.** `KernelState::build_ap_workload(base_tid, count)` creates ONE
+    per-AP user address space (code + stack) and registers `count` (=`AP_WORKLOAD_TASKS`
+    = 2) tasks bound to that shared ASID — each runs the same seal stub. The tasks run
+    SEQUENTIALLY on one AP (never concurrently), so sharing the ASID/stack is safe. Each
+    AP has its own TID range (`PROBE_TID_BASE + cpu*16 + i`) so no task is ever
+    `current` on two CPUs.
+  * **One-at-a-time placement (the key correctness point).** `Yield` ROTATES the run
+    queue, so pre-enqueuing A+B would make `Yield` rotate `current` to B before B ran,
+    then block the wrong task. Instead exactly ONE task is runnable on the AP at a time:
+    the BSP places only task A (audited `enqueue_on_cpu` → `X86_AP_ADMIT_PLACED`, made
+    `current`); after A `Yield`s (A is the sole runnable → same-task re-run), the trap
+    dispatch blocks A (`X86_AP_YIELD_RETURN_TO_SCHED_OK tid=A`) and
+    `smp::ap_sched_next_or_idle` places the NEXT task by index under `with_cpu`
+    (audited enqueue → `X86_AP_ADMIT_PLACED tid=B` → `X86_AP_NEXT_TASK_DISPATCH_BEGIN`)
+    and enters ring 3 for it. When the workload index is exhausted it emits
+    `X86_AP_REPEATED_DISPATCH_OK count=N` + `X86_AP_SCHED_POLICY_SEAL_DONE result=ok
+    count=N` and returns to the interruptible idle loop.
+  * **Run-queue consistency + no duplicate dispatch.** Each task is placed once
+    (audited), run once (`AP_DISPATCH_COUNT` advances once per `ap_enter_task_ring3`),
+    and removed once via `block_current_on`. QEMU shows each `X86_AP_RING3_ENTER` TID
+    exactly once per CPU (cpu 1: 20205/20206; cpu 2: 20221/20222; cpu 3: 20237/20238) —
+    distinct per-CPU ranges, no task current on two CPUs, no re-dispatch of an instance.
+  * **QEMU evidence.** `-smp 2` armed: ordered A→(block)→B→(block)→`REPEATED_DISPATCH_OK
+    count=2`→`SCHED_POLICY_SEAL_DONE count=2`→idle on cpu 1. `-smp 4` armed: all of cpu
+    1/2/3 reach `SCHED_POLICY_SEAL_DONE result=ok count=2`. Baseline (knob off)
+    smp2/smp4 inert (0 workload markers); core/-smp1 + oracle + crash-restart + riscv64
+    core pass; aarch64 core unchanged pre-existing `WrongObject`. TLB ACK unchanged
+    (genuine 189A remote ACK). No forbidden markers (no `!BN`/`!F`, no duplicate
+    dispatch, no lost wake, no lock-retirement claim). Debug path: pre-enqueuing both
+    tasks let `Yield` rotate to the not-yet-run task and blocked the wrong one (task A
+    ran twice, B never) → fixed by one-at-a-time placement by index.
+  * **Go/no-go for Stage 191 (global-lock retirement):** NO-GO for now. 190B proves an
+    AP can run a controlled task SEQUENCE under the STILL-GLOBAL lock with consistent
+    run-queue state — a scheduler-policy seal, not lock retirement. Retiring the global
+    `SpinLock<KernelState>` needs per-subsystem locks with rank ordering across the whole
+    syscall/IPC/scheduler/cap/VM/fault surface (the multi-stage rewrite this document's
+    *Current status* disclaims). 190B is a prerequisite datapoint (AP dispatch is
+    SMP-safe under the lock), not that rewrite. `yarm.ap_user_dispatch` stays
+    experimental / default-off.
+  * Guarded by `stage190b_controlled_workload` (marker vocabulary, fixed workload not
+    load balancing, audited one-at-a-time repeated dispatch, distinct per-CPU TIDs +
+    single dispatch count, policy-seal-then-idle under the global lock).
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

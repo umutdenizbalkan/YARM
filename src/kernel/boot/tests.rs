@@ -58949,14 +58949,17 @@ mod stage189d_seal {
     fn seal_admission_is_audited_and_per_cpu() {
         assert!(
             SMP_SRC.contains("if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {")
-                && SMP_SRC.contains("kernel.enqueue_on_cpu(cpu, tid)")
+                && SMP_SRC.contains("kernel.enqueue_on_cpu(cpu, first_tid)")
                 && SMP_SRC.contains("MARK_ADMIT_PLACED")
                 && SMP_SRC.contains("MARK_ADMIT_DENIED_WAKE_ONLY"),
             "placement must go through the wake-only-guarded enqueue after the audited clear"
         );
+        // Stage 190B: each AP has its own workload TID range (distinct per (cpu, task)),
+        // so no task is ever `current` on two CPUs.
         assert!(
-            SMP_SRC.contains("let probe_tid = PROBE_TID_BASE + cpu.0 as u64;"),
-            "each AP must get its own distinct probe TID (no task current on two CPUs)"
+            SMP_SRC.contains("fn ap_workload_base_tid(cpu: CpuId)")
+                && SMP_SRC.contains("PROBE_TID_BASE + (cpu.0 as u64) * 16"),
+            "each AP must get its own distinct workload TID range (no task current on two CPUs)"
         );
     }
 
@@ -59030,12 +59033,19 @@ mod stage190a_ap_sched_loop {
                 ),
             "the trap dispatch must return the AP probe to the scheduler after the seal"
         );
-        // The idle path emits the return-to-idle markers (gated on ap_seal) and then
-        // enters the interruptible idle loop (sti;hlt) — not a park.
+        // Stage 190B: the idle path routes through the AP scheduler loop
+        // (`ap_sched_next_or_idle`, gated on ap_seal), which runs the next admitted
+        // task or emits the return-to-idle markers and enters the interruptible idle
+        // loop (sti;hlt) — not a park. The return-to-idle markers are emitted there.
         assert!(
-            DESC_SRC.contains("crate::arch::x86_64::smp::ap_sched_return_to_idle_markers(cpu);")
+            DESC_SRC.contains("crate::arch::x86_64::smp::ap_sched_next_or_idle(shared, cpu);")
                 && DESC_SRC.contains("idle_halt_loop();"),
-            "the AP must fall through to the interruptible idle loop, emitting return-to-idle"
+            "the AP must route through the scheduler loop then fall through to interruptible idle"
+        );
+        assert!(
+            SMP_SRC.contains("ap_sched_return_to_idle_markers(cpu);")
+                && SMP_SRC.contains("super::descriptor_tables::ap_idle_halt_loop();"),
+            "the scheduler loop must emit return-to-idle markers + enter the interruptible idle"
         );
         assert!(
             SMP_SRC.contains("fn ap_seal_return_to_idle(")
@@ -59083,6 +59093,110 @@ mod stage190a_ap_sched_loop {
         assert!(
             !SMP_SRC.contains("UNLOCK_GRADUATED_FALLBACK") && !SMP_SRC.contains("emergency_optout"),
             "no global-lock retirement / fallback markers"
+        );
+    }
+}
+
+// Stage 190B — CONTROLLED AP WORKLOAD + SCHEDULER POLICY SEAL. The AP scheduler loop
+// runs a small deterministic SEQUENCE of admitted tasks (A then B), placing each ONE
+// AT A TIME (audited), running it, blocking it after its Yield, and dispatching the
+// next — proving repeated dispatch + run-queue consistency, then returning to idle.
+// Still global-lock-authoritative; NOT arbitrary load balancing.
+mod stage190b_controlled_workload {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+
+    // The workload / repeated-dispatch / policy-seal marker vocabulary exists.
+    #[test]
+    fn workload_marker_vocabulary_exists() {
+        assert!(
+            AP_DISPATCH_SRC.contains(
+                "MARK_WORKLOAD_PLACEMENT_READY: &str = \"X86_AP_WORKLOAD_PLACEMENT_READY\""
+            ) && AP_DISPATCH_SRC.contains(
+                "MARK_NEXT_TASK_DISPATCH_BEGIN: &str = \"X86_AP_NEXT_TASK_DISPATCH_BEGIN\""
+            ) && AP_DISPATCH_SRC
+                .contains("MARK_REPEATED_DISPATCH_OK: &str = \"X86_AP_REPEATED_DISPATCH_OK\"")
+                && AP_DISPATCH_SRC.contains(
+                    "MARK_SCHED_POLICY_SEAL_DONE: &str = \"X86_AP_SCHED_POLICY_SEAL_DONE\""
+                ),
+            "the Stage 190B controlled-workload marker vocabulary must exist"
+        );
+    }
+
+    // A CONTROLLED, deterministic workload (>= 2 tasks) — not arbitrary load balancing.
+    #[test]
+    fn controlled_deterministic_workload_not_load_balancing() {
+        assert!(
+            SMP_SRC.contains("const AP_WORKLOAD_TASKS: u64 = 2;")
+                && EXEC_SRC.contains("pub fn build_ap_workload("),
+            "the AP workload must be a fixed small count of registered tasks"
+        );
+        // No arbitrary/production balancing is CALLED for APs (enqueue_balanced is not
+        // invoked to place AP workload — placement is explicit per-CPU + audited).
+        assert!(
+            !SMP_SRC.contains("enqueue_balanced("),
+            "AP workload placement must not call arbitrary balanced placement"
+        );
+    }
+
+    // Repeated dispatch: the AP scheduler loop runs the NEXT admitted task after the
+    // previous one blocks, one at a time (so no task is current on two CPUs and no
+    // rotate-to-unrun-task). Each placement is audited (enqueue_on_cpu wake-only guard).
+    #[test]
+    fn repeated_dispatch_places_next_task_audited_one_at_a_time() {
+        assert!(
+            SMP_SRC.contains("fn ap_sched_next_or_idle(")
+                && SMP_SRC.contains("(n as u64) < AP_WORKLOAD_TASKS")
+                && SMP_SRC.contains("let next_tid = ap_workload_base_tid(cpu) + n as u64;"),
+            "the scheduler loop must place the next workload task by index, one at a time"
+        );
+        // Placement is via the audited wake-only-guarded enqueue.
+        assert!(
+            SMP_SRC.contains("k.enqueue_on_cpu(cpu, next_tid)")
+                && SMP_SRC.contains("MARK_ADMIT_PLACED")
+                && SMP_SRC.contains("MARK_NEXT_TASK_DISPATCH_BEGIN"),
+            "each next-task placement must be audited + marked"
+        );
+        // The BSP places ONLY the first task; the rest are placed one at a time.
+        assert!(
+            SMP_SRC.contains("let first_tid = base_tid;")
+                && SMP_SRC.contains("kernel.enqueue_on_cpu(cpu, first_tid)"),
+            "the BSP must place only the first task; the loop places the rest"
+        );
+    }
+
+    // No-duplicate-current / distinct TIDs: each AP has its own workload TID range, and
+    // the dispatch count drives distinct per-task TIDs.
+    #[test]
+    fn distinct_per_cpu_workload_tids() {
+        assert!(
+            SMP_SRC.contains("PROBE_TID_BASE + (cpu.0 as u64) * 16")
+                && SMP_SRC.contains("fn ap_workload_base_tid(cpu: CpuId)"),
+            "each AP must have its own workload TID range (no task current on two CPUs)"
+        );
+        // The per-CPU dispatch count is incremented once per ring-3 entry (no double
+        // dispatch of the same instance).
+        assert!(
+            SMP_SRC.contains("AP_DISPATCH_COUNT[idx].fetch_add(1, Ordering::AcqRel)"),
+            "the dispatch count must advance once per task entry (no duplicate dispatch)"
+        );
+    }
+
+    // The policy seal is emitted with a count and the loop returns to idle; still under
+    // the global lock (no retirement).
+    #[test]
+    fn policy_seal_then_return_to_idle_under_global_lock() {
+        assert!(
+            SMP_SRC.contains("MARK_SCHED_POLICY_SEAL_DONE")
+                && SMP_SRC.contains("MARK_REPEATED_DISPATCH_OK")
+                && SMP_SRC.contains("ap_sched_return_to_idle_markers(cpu);")
+                && SMP_SRC.contains("super::descriptor_tables::ap_idle_halt_loop();"),
+            "the seal must emit repeated-dispatch + policy-seal, then return to idle"
+        );
+        assert!(
+            SMP_SRC.contains(".with_cpu(cpu, |k| match k.enqueue_on_cpu(cpu, next_tid)"),
+            "next-task placement must run under the global lock (with_cpu); not retired"
         );
     }
 }

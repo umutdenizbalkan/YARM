@@ -544,6 +544,14 @@ fn idle_halt_loop() -> ! {
     }
 }
 
+/// Stage 190B: enter the interruptible idle loop from the AP scheduler loop
+/// (`smp::ap_sched_next_or_idle`) once its run queue is empty. Same wake-capable
+/// `sti; hlt` idle the trap dispatch uses for a task that yields to nothing.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_idle_halt_loop() -> ! {
+    idle_halt_loop()
+}
+
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 const fn should_halt_without_kernel_state(vector: usize) -> bool {
     vector < 32 && vector != VEC_SYSCALL
@@ -1185,10 +1193,13 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             // user trap frame would resume the task that just blocked and form
             // a hot block/yield/retry loop.  Park the CPU with interrupts
             // enabled instead, so timer and external IRQs still wake from HLT.
-            // Stage 190A: for the AP scheduler-loop probe, this is the honest
-            // return-to-idle after the probe yielded and the AP run queue is empty.
+            // Stage 190B: for the AP scheduler loop, run the NEXT admitted task if the
+            // run queue still has one, else return to the interruptible idle loop.
+            // `ap_sched_next_or_idle` diverges (re-enters ring 3 or idles), so the
+            // depth counter is reset first for the possible fresh ring-3 syscall.
             if ap_seal {
-                crate::arch::x86_64::smp::ap_sched_return_to_idle_markers(cpu);
+                TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
+                crate::arch::x86_64::smp::ap_sched_next_or_idle(shared, cpu);
             }
             crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", cpu.0);
             TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
