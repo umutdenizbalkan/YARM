@@ -1821,10 +1821,24 @@ fn ap_syscall_entry_is_per_cpu_safe() -> bool {
     true
 }
 
-/// Stage 189C4: is the AP ring3-ENTRY path present? An AP still has no code that
-/// enters ring 3: the AP idle loop (`smp_trampoline.rs`) never loads a user CR3,
-/// never sets up an iretq frame, and never enters user mode. That AP-dispatcher /
-/// usermode-entry trampoline is the remaining blocker — false until it lands.
+/// Stage 189C5: are the AP ring3-ENTRY PREREQUISITES present? YES — the reusable
+/// ring3 entry (`enter_user_mode_iret`), the per-CPU-safe syscall re-entry (189C4),
+/// the per-CPU TSS RSP0 (189C2), and the kernel-return-context mapper
+/// (`page_table::ensure_kernel_return_context_mapped_for_asid`, which maps the
+/// selected task's kernel stack into its own CR3 for the ring3→ring0 switch) all
+/// exist. This attests the pieces are in place; it is NOT the live-dispatch gate.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_ring3_entry_prereqs_present(cpu: CpuId) -> bool {
+    ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe()
+}
+
+/// Stage 189C5: is the LIVE AP ring3-entry dispatcher wired and QEMU-proven? NOT
+/// yet. Wiring it means modifying the AP idle-loop `global_asm` to call a Rust
+/// dispatcher that picks an admitted task, sets the AP per-CPU RSP0 + TSS RSP0 to
+/// that task's kernel stack, maps that stack into the task CR3, loads the CR3, and
+/// `iretq`s to ring 3. That is a triple-fault-prone whole-path change requiring a
+/// dedicated QEMU-iteration cycle; it stays OFF so the accepted SMP baseline
+/// (smp2/smp4 through 189C4) is preserved. The audited transition still refuses.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 fn ap_ring3_entry_path_ready() -> bool {
     false
@@ -1924,16 +1938,28 @@ pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool)
         if tlb_ready {
             crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_TLB_READY, cpu.0);
         }
-        // Stage 189C4: usermode-ENTRY readiness. TSS RSP0 + per-CPU syscall entry are
-        // both ready now; the remaining gap is the AP ring3-ENTRY path — the AP idle
-        // loop has no code that loads a user CR3 and iretqs to ring 3. Until that AP
-        // usermode-entry trampoline lands, usermode entry stays deferred.
+        // Stage 189C5: the AP ring3-entry PREREQUISITES are present (reusable iret
+        // entry + per-CPU syscall re-entry + per-CPU TSS RSP0 + kernel-return-context
+        // mapper). Attest them; the LIVE dispatcher hook remains gated (see below).
+        if ap_ring3_entry_prereqs_present(cpu) {
+            crate::yarm_log!(
+                "{} cpu={} reason=prereqs_present_live_hook_gated",
+                ap_dispatch::MARK_RING3_ENTRY_READY,
+                cpu.0
+            );
+        }
+        // Stage 189C5: usermode-ENTRY readiness. TSS RSP0, per-CPU syscall entry, and
+        // the ring3-entry prerequisites are all present; the remaining gap is the
+        // LIVE AP ring3-entry dispatcher hook (`ap_ring3_entry_path_ready()` = false),
+        // which needs a dedicated QEMU-iteration cycle and is kept OFF to preserve the
+        // accepted SMP baseline. Until it is wired + proven, usermode entry stays
+        // deferred.
         let usermode_entry_ready = ap_usermode_entry_ready(cpu);
         if usermode_entry_ready {
             crate::yarm_log!("{} cpu={}", ap_dispatch::MARK_USERMODE_ENTRY_READY, cpu.0);
         } else {
             crate::yarm_log!(
-                "{} cpu={} reason=ap_ring3_entry_path_absent",
+                "{} cpu={} reason=ap_ring3_live_dispatcher_hook_gated",
                 ap_dispatch::MARK_USERMODE_ENTRY_DEFERRED,
                 cpu.0
             );
@@ -1951,7 +1977,7 @@ pub fn run_ap_dispatch_scaffold_audit(kernel: &mut KernelState, tlb_ready: bool)
         // does NOT clear wake-only. This exercises the exact production gate.
         let _ = try_enable_ap_user_dispatch(kernel, cpu, readiness);
         crate::yarm_log!(
-            "{} cpu={} reason=ap_ring3_entry_path_absent",
+            "{} cpu={} reason=ap_ring3_live_dispatcher_hook_gated",
             ap_dispatch::MARK_USER_DISPATCH_DEFERRED,
             cpu.0
         );

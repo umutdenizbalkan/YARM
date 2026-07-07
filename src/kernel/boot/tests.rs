@@ -58482,7 +58482,7 @@ mod stage189b_ap_dispatch_scaffold {
         assert!(
             ORCH_SRC.contains("run_ap_dispatch_scaffold_audit(")
                 && SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
-                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent"),
+                && SMP_SRC.contains("reason=ap_ring3_live_dispatcher_hook_gated"),
             "the boot audit must defer live AP dispatch honestly"
         );
     }
@@ -58578,7 +58578,7 @@ mod stage189c_ap_user_return_percpu {
         // The scaffold audit emits the deferral with the precise blocker reason.
         assert!(
             SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
-                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent"),
+                && SMP_SRC.contains("reason=ap_ring3_live_dispatcher_hook_gated"),
             "the audit must defer live dispatch with the AP-ring3-entry blocker reason"
         );
         // The live begin/return/done markers are defined but emitted by NOTHING in
@@ -58652,7 +58652,7 @@ mod stage189c2_ap_usermode_entry {
     fn usermode_entry_deferred_with_precise_reason() {
         assert!(
             SMP_SRC.contains("MARK_USERMODE_ENTRY_DEFERRED")
-                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent")
+                && SMP_SRC.contains("reason=ap_ring3_live_dispatcher_hook_gated")
                 && SMP_SRC.contains("trap_return_ready: usermode_entry_ready"),
             "the audit must defer usermode entry with the AP-ring3-entry-path-absent reason"
         );
@@ -58765,6 +58765,67 @@ mod stage189c3_percpu_entry_exit {
                 && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
                 && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
             "no AP-run live dispatch marker may be emitted this pass"
+        );
+    }
+}
+
+// Stage 189C5 — AP ring3-entry prerequisites attested; the LIVE ring3-entry
+// dispatcher hook stays gated OFF to preserve the accepted SMP baseline. No
+// wake-only cleared, no ring 3 entry, no live-dispatch marker emitted.
+mod stage189c5_ap_ring3_entry {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+
+    // The ring3-entry prerequisites are detected and attested; the reusable
+    // entry + kernel-return-context mapper are referenced in the detector docs.
+    #[test]
+    fn ring3_entry_prereqs_detected_and_attested() {
+        assert!(
+            SMP_SRC.contains("fn ap_ring3_entry_prereqs_present(")
+                && SMP_SRC.contains("ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe()")
+                && SMP_SRC.contains("MARK_RING3_ENTRY_READY"),
+            "the ring3-entry prerequisites must be detected and attested"
+        );
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_RING3_ENTRY_READY: &str = \"X86_AP_RING3_ENTRY_READY\"")
+                && AP_DISPATCH_SRC.contains("MARK_KERNEL_STACK_MAPPED"),
+            "the ring3-entry marker vocabulary must exist"
+        );
+    }
+
+    // The LIVE ring3-entry dispatcher hook is gated OFF (returns false), so the
+    // usermode-entry gate stays false and no wake-only is cleared.
+    #[test]
+    fn live_ring3_dispatcher_hook_is_gated_off() {
+        assert!(
+            SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}"),
+            "the live AP ring3-entry dispatcher hook must stay gated off this pass"
+        );
+        // usermode-entry readiness includes the (false) live ring3-entry gate.
+        assert!(
+            SMP_SRC.contains(
+                "ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe() && ap_ring3_entry_path_ready()",
+            ),
+            "usermode entry must require the live ring3-entry path"
+        );
+    }
+
+    // No AP-run live-dispatch marker is emitted, and the AP idle-loop asm is NOT
+    // modified to call into a dispatcher this pass (baseline preserved).
+    #[test]
+    fn no_live_ap_ring3_entry_or_asm_hook() {
+        assert!(
+            !SMP_SRC.contains("MARK_KERNEL_STACK_MAPPED")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
+                && !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK"),
+            "no live AP ring3-entry / dispatch marker may be emitted this pass"
+        );
+        // The AP idle-loop trampoline must not call a user-dispatch entry.
+        assert!(
+            !include_str!("../../arch/x86_64/smp_trampoline.rs")
+                .contains("yarm_x86_ap_user_dispatch_entry"),
+            "the AP idle loop must not be wired to a live ring3-entry dispatcher this pass"
         );
     }
 }

@@ -175,6 +175,12 @@ pub const MARK_USERMODE_ENTRY_DEFERRED: &str = "X86_AP_USERMODE_ENTRY_DEFERRED";
 /// Live-only: an AP user task made a syscall and re-entered the global-lock
 /// dispatch through a per-CPU entry path. Never emitted while the entry is global.
 pub const MARK_USER_SYSCALL_REENTRY_OK: &str = "X86_AP_USER_SYSCALL_REENTRY_OK";
+/// Stage 189C5: the AP ring3-entry PREREQUISITES are present (reusable iret entry,
+/// per-CPU syscall re-entry, per-CPU TSS RSP0, kernel-return-context mapper).
+pub const MARK_RING3_ENTRY_READY: &str = "X86_AP_RING3_ENTRY_READY";
+/// Live-only: the selected AP task's kernel stack is mapped in its CR3 for the
+/// ring3→ring0 switch. Emitted only by a live dispatch (not this pass).
+pub const MARK_KERNEL_STACK_MAPPED: &str = "X86_AP_KERNEL_STACK_MAPPED";
 /// The Stage 189A genuine remote ACK is available for this CPU's shootdown.
 pub const MARK_TLB_READY: &str = "X86_AP_TLB_READY_FOR_DISPATCH";
 /// A wake-only clear was NOT performed; carries the refusal reason.

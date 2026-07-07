@@ -230,6 +230,39 @@ remove implicit global-lock coupling from syscall/trap paths.
     diagnostic (a pre-existing TCG serial-output race since 189C2, ~3/5 pass); the
     AP functionally comes online (send/ack/TLB `result=ok`) every run. smp4 is
     clean.
+- **Stage 189C5 (AP-RING3-ENTRY) — prerequisites attested; live dispatcher hook
+  GATED OFF to preserve the accepted SMP baseline.** No wake-only cleared, no AP
+  ring 3 entry, no live-dispatch marker, nothing faked; global lock authoritative,
+  ABI unchanged.
+  * **Ring3-entry prerequisites present + attested.** The reusable ring3 entry
+    (`descriptor_tables::enter_user_mode_iret`), the per-CPU-safe syscall re-entry
+    (189C4), the per-CPU TSS RSP0 (189C2), and the kernel-return-context mapper
+    (`page_table::ensure_kernel_return_context_mapped_for_asid`, which maps a task's
+    kernel stack into its own CR3 for the ring3→ring0 switch) all exist.
+    `ap_ring3_entry_prereqs_present()` → `X86_AP_RING3_ENTRY_READY cpu=N
+    reason=prereqs_present_live_hook_gated` (smp4: cpu 1/2/3).
+  * **Why the live hook is gated OFF.** Wiring a live AP ring 3 entry means
+    modifying the AP idle-loop `global_asm` to `call` a Rust dispatcher that, on
+    wake, picks an admitted task, sets the AP per-CPU `syscall_kernel_rsp0` + TSS
+    RSP0 to that task's kernel stack, maps that stack into the task CR3, loads the
+    CR3, and `iretq`s to ring 3. Any error there triple-faults, which resets the
+    machine and breaks **every** SMP smoke — i.e. it would regress the accepted
+    baseline (smp2/smp4 through 189C4). A first-attempt ring 3 entry realistically
+    needs several QEMU-debug iterations, so per the "keep QEMU-proven work / do not
+    weaken the baseline" constraints the live hook stays off:
+    `ap_ring3_entry_path_ready()` = false, `ap_usermode_entry_ready` = false, the
+    audited transition refuses, and the audit emits
+    `X86_AP_USER_DISPATCH_DEFERRED reason=ap_ring3_live_dispatcher_hook_gated`.
+    Guarded by `stage189c5_ap_ring3_entry` (the AP idle-loop trampoline contains no
+    `yarm_x86_ap_user_dispatch_entry` call).
+  * **Remaining live-integration work (its own debug cycle):** the AP idle-loop
+    asm `call` hook (no-op unless a per-CPU dispatch-request flag is set by the
+    audited transition), the Rust `ap_user_dispatch_once(cpu)` (lock → `dispatch_next_on`
+    → set per-CPU RSP0/TSS + map kernel stack into task CR3 → `activate_asid` →
+    `enter_user_mode_iret`), then prove `X86_AP_USER_DISPATCH_BEGIN` /
+    `..._TRAP_RETURN_OK` / `..._SYSCALL_REENTRY_OK` / `..._DISPATCH_DONE result=ok`
+    on smp2 before enabling. All the *hard* primitives it depends on are now
+    proven (189C4 per-CPU entry; 189A genuine TLB ACK).
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
