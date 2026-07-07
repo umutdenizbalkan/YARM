@@ -144,8 +144,32 @@ remove implicit global-lock coupling from syscall/trap paths.
     a Rust AP dispatcher hook off the wake path — a deep new bare-metal path that
     cannot be made QEMU-clean in a single safe pass. `trap_return_ready` therefore
     stays false; the audited transition still refuses and emits
-    `X86_AP_USER_DISPATCH_DEFERRED reason=ap_usermode_entry_trampoline_absent`. No
-    live-only marker is emitted; no wake-only is cleared; nothing is faked.
+    `X86_AP_USER_DISPATCH_DEFERRED`. No live-only marker is emitted; no wake-only
+    is cleared; nothing is faked.
+- **Stage 189C2 (AP-USERMODE-ENTRY) — blocker isolated to the per-CPU syscall
+  entry; live dispatch HARD-STOPPED (code-documented reason).** No wake-only is
+  cleared, no AP enters ring 3, no live marker is emitted, nothing is faked.
+  * **Per-CPU TSS RSP0 detected + attested.** Each AP has its own TSS with a
+    non-zero `rsp0` (`descriptor_tables::ap_tss_rsp0`), so the ring3→ring0
+    *interrupt/fault* stack switch is per-CPU. The audit emits
+    `X86_AP_TSS_RSP0_READY cpu=N`.
+  * **Decisive blocker — the `syscall` fast-path is global, not per-CPU.**
+    `yarm_x86_lstar_entry` writes/reads the RIP-relative GLOBAL slots
+    `YARM_X86_SYSCALL_SCRATCH_RSP` / `YARM_X86_SYSCALL_RSP0` (no `swapgs`), which
+    the source itself documents as **"NOT SMP-safe … replace with a per-CPU scratch
+    (SWAPGS + gs-relative) before enabling SMP on x86_64."** An AP-run user task's
+    `syscall` would load the **BSP's** kernel stack `RSP0` → guaranteed corruption.
+    Producing `X86_AP_USER_SYSCALL_REENTRY_OK` on this path would be faking. So
+    `ap_syscall_entry_is_per_cpu_safe()` is `false`, `ap_usermode_entry_ready()` is
+    false, the gate reflects it (`trap_return_ready: usermode_entry_ready`), the
+    audited transition refuses, and the audit emits
+    `X86_AP_USERMODE_ENTRY_DEFERRED cpu=N reason=global_syscall_rsp0_not_per_cpu`.
+  * **Remaining work (the real "189C2"):** rewrite the x86_64 kernel entry/exit to
+    per-CPU — set `IA32_KERNEL_GS_BASE` per AP, `swapgs` + gs-relative RSP0/scratch
+    in `yarm_x86_lstar_entry` (balanced on `sysret` and on every ring3 interrupt
+    entry), and map each AP's kernel `RSP0` stack into the user address spaces it
+    runs. That is a delicate whole-kernel entry rewrite with triple-fault risk, not
+    a minimal trampoline — deferred per the hard-stop directive.
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 

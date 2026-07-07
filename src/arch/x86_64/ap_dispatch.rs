@@ -154,6 +154,17 @@ pub const MARK_TRAP_RETURN_AUDIT_OK: &str = "X86_AP_TRAP_RETURN_AUDIT_OK";
 /// Stage 189C: the AP user-return CR3 authority is per-CPU-correct (keyed off the
 /// executing CPU's actual hardware CR3, not the global HAL active-ASID).
 pub const MARK_TRAP_RETURN_READY: &str = "X86_AP_TRAP_RETURN_READY";
+/// Stage 189C2: the AP has a valid per-CPU TSS RSP0 for ring3→ring0 transitions.
+pub const MARK_TSS_RSP0_READY: &str = "X86_AP_TSS_RSP0_READY";
+/// Stage 189C2: the AP usermode-entry path (ring3 entry + per-CPU syscall/interrupt
+/// re-entry) is proven safe. Live-only — never emitted while the syscall entry uses
+/// the global (non-per-CPU) RSP0/scratch slots.
+pub const MARK_USERMODE_ENTRY_READY: &str = "X86_AP_USERMODE_ENTRY_READY";
+/// Stage 189C2: the AP usermode-entry path is NOT yet safe; carries the reason.
+pub const MARK_USERMODE_ENTRY_DEFERRED: &str = "X86_AP_USERMODE_ENTRY_DEFERRED";
+/// Live-only: an AP user task made a syscall and re-entered the global-lock
+/// dispatch through a per-CPU entry path. Never emitted while the entry is global.
+pub const MARK_USER_SYSCALL_REENTRY_OK: &str = "X86_AP_USER_SYSCALL_REENTRY_OK";
 /// The Stage 189A genuine remote ACK is available for this CPU's shootdown.
 pub const MARK_TLB_READY: &str = "X86_AP_TLB_READY_FOR_DISPATCH";
 /// A wake-only clear was NOT performed; carries the refusal reason.

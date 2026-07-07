@@ -58480,7 +58480,7 @@ mod stage189b_ap_dispatch_scaffold {
         assert!(
             ORCH_SRC.contains("run_ap_dispatch_scaffold_audit(")
                 && SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
-                && SMP_SRC.contains("reason=ap_usermode_entry_trampoline_absent"),
+                && SMP_SRC.contains("reason=global_syscall_rsp0_not_per_cpu"),
             "the boot audit must defer live AP dispatch honestly"
         );
     }
@@ -58513,8 +58513,8 @@ mod stage189b_ap_dispatch_scaffold {
             "the trap-return audit must verify the per-CPU shared-path prerequisites"
         );
         assert!(
-            SMP_SRC.contains("trap_return_ready: false"),
-            "189B/189C must keep trap_return_ready false (live AP dispatch deferred)"
+            SMP_SRC.contains("trap_return_ready: usermode_entry_ready"),
+            "the gate must reflect the usermode-entry readiness (false until per-CPU syscall entry)"
         );
     }
 }
@@ -58576,7 +58576,7 @@ mod stage189c_ap_user_return_percpu {
         // The scaffold audit emits the deferral with the precise blocker reason.
         assert!(
             SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
-                && SMP_SRC.contains("reason=ap_usermode_entry_trampoline_absent"),
+                && SMP_SRC.contains("reason=global_syscall_rsp0_not_per_cpu"),
             "the audit must defer live dispatch with the entry-trampoline blocker reason"
         );
         // The live begin/return/done markers are defined but emitted by NOTHING in
@@ -58602,6 +58602,88 @@ mod stage189c_ap_user_return_percpu {
                 && SMP_SRC.contains("MARK_TRAP_RETURN_READY")
                 && SMP_SRC.contains("reason=per_cpu_cr3_authority"),
             "the trap-return-ready attestation must be scoped to the per-CPU CR3 authority"
+        );
+    }
+}
+
+// Stage 189C2 — AP usermode-entry readiness. The per-CPU TSS RSP0 is detected, but
+// the x86_64 `syscall` fast-path still uses GLOBAL (not SMP-safe) RSP0/scratch
+// slots, so an AP user task's syscall would load the BSP's kernel stack. Usermode
+// entry is therefore NOT enabled: no wake-only cleared, no ring3 entry, no live
+// marker. These guards pin the blocker detection and the absence of any live enable.
+mod stage189c2_ap_usermode_entry {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    // The x86_64 syscall fast-path entry is still GLOBAL (not per-CPU): the entry
+    // asm uses the RIP-relative global RSP0/scratch, documented NOT SMP-safe. The
+    // readiness detector must therefore report the syscall entry as unsafe.
+    #[test]
+    fn syscall_entry_is_still_global_not_per_cpu() {
+        assert!(
+            DESC_SRC.contains("static YARM_X86_SYSCALL_RSP0")
+                && DESC_SRC.contains("static YARM_X86_SYSCALL_SCRATCH_RSP")
+                && DESC_SRC.contains("mov qword ptr [rip + YARM_X86_SYSCALL_SCRATCH_RSP], rsp")
+                && DESC_SRC.contains("NOT SMP-safe"),
+            "the syscall entry must still be the documented global (pre-SWAPGS) path"
+        );
+        // The detector hard-reports the syscall entry as not-per-CPU-safe.
+        assert!(
+            SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe()")
+                && SMP_SRC.contains("fn ap_usermode_entry_ready(")
+                && SMP_SRC.contains("ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe()"),
+            "usermode-entry readiness must require BOTH a per-CPU TSS RSP0 and a per-CPU syscall entry"
+        );
+    }
+
+    // Usermode entry is deferred with the precise blocker; the gate reflects it.
+    #[test]
+    fn usermode_entry_deferred_with_precise_reason() {
+        assert!(
+            SMP_SRC.contains("MARK_USERMODE_ENTRY_DEFERRED")
+                && SMP_SRC.contains("reason=global_syscall_rsp0_not_per_cpu")
+                && SMP_SRC.contains("trap_return_ready: usermode_entry_ready"),
+            "the audit must defer usermode entry with the global-syscall-RSP0 reason"
+        );
+        // A valid per-CPU TSS RSP0 is still detected and attested.
+        assert!(
+            SMP_SRC.contains("fn ap_tss_rsp0_ready(") && SMP_SRC.contains("MARK_TSS_RSP0_READY"),
+            "the per-CPU TSS RSP0 readiness must be detected and attested"
+        );
+    }
+
+    // No live AP user dispatch / ring3 entry was performed: the entry/re-entry
+    // live markers are vocabulary-only, emitted by nothing this pass.
+    #[test]
+    fn no_live_ap_usermode_entry_performed() {
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_USERMODE_ENTRY_READY")
+                && AP_DISPATCH_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK"),
+            "the live-entry marker vocabulary must exist for the future per-CPU-entry stage"
+        );
+        // The AP-run live markers are never referenced by the audit at all.
+        assert!(
+            !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
+                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
+            "no AP-run live marker may be emitted this pass"
+        );
+        // The USERMODE_ENTRY_READY emit exists only inside the always-false
+        // `if usermode_entry_ready` branch (syscall entry is global), so it is
+        // never emitted at runtime; and the syscall-safety detector returns false.
+        assert!(
+            SMP_SRC.contains("if usermode_entry_ready {")
+                && SMP_SRC
+                    .contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    false\n}"),
+            "usermode-entry readiness must be gated false (global syscall entry)"
+        );
+        // Wake-only is still only cleared by the audited transition (unreached).
+        assert!(
+            SMP_SRC.contains("fn try_enable_ap_user_dispatch(")
+                && SMP_SRC.contains("readiness.evaluate_clear()"),
+            "wake-only clear must remain gated by the audited transition"
         );
     }
 }
