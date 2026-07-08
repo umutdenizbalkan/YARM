@@ -980,6 +980,34 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "78:",
         "mov dword ptr gs:[132], r10d", // tlb_ack_gen = req_gen (ACK published)
         "76:",
+        // Stage 189C6 LIVE AP user-dispatch hook. Inert unless the BSP set this AP's
+        // per-CPU ap_dispatch_request (gs:[160]) AND CR4 is synced (env flag
+        // gs:[88] & 32 — SSE enabled, required to run the compiled-Rust dispatcher).
+        // On every non-armed wake this is a cheap load+branch, so the accepted
+        // smp2/smp4 baseline is byte-for-byte preserved. When armed it calls the
+        // Rust dispatcher, which on success `iretq`s into ring 3 and NEVER returns;
+        // on decline it returns and the AP resumes its managed idle loop.
+        "mov eax, dword ptr gs:[160]", // ap_dispatch_request
+        "test eax, eax",
+        "jz 79f",
+        "test dword ptr [rdi + 88], 32", // env CR4_SYNCED (SSE on this AP; [rdi+88])
+        "jz 79f",
+        // SysV call: preserve the idle loop's live registers (rdi = per-CPU record
+        // ptr, rdx = serial port, r9 = last observed remote_wake_count) and 16-align
+        // rsp across the call (SSE spills in the dispatcher require it).
+        "push rdi",
+        "push rdx",
+        "push r9",
+        "push rbp",
+        "mov rbp, rsp",
+        "and rsp, -16",
+        "call yarm_x86_ap_user_dispatch_entry",
+        "mov rsp, rbp",
+        "pop rbp",
+        "pop r9",
+        "pop rdx",
+        "pop rdi",
+        "79:",
         "mov r8d, dword ptr gs:[108]", // remote_wake_count (wake stub increments)
         "cmp r8d, r9d",
         "je 75b", // hlt woke without a new remote wake -> re-idle

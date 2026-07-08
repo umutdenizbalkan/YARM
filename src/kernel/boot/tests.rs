@@ -57492,6 +57492,23 @@ mod stage183_ap_idle_admit {
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
 
+    // Returns the source body of `ap_scheduler_online_admission` (from its `fn` marker
+    // to the next top-level item), so a guard can prove the AP-admission path does not
+    // read the Stage 189C6 dispatch knob.
+    fn ap_admission_body(src: &str) -> &str {
+        let start = src
+            .find("fn ap_scheduler_online_admission(")
+            .expect("ap_scheduler_online_admission must exist");
+        let rest = &src[start..];
+        // Bound the body at the next top-level function definition.
+        let end = rest[1..]
+            .find("\npub fn ")
+            .or_else(|| rest[1..].find("\nfn "))
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
     // The AP entry admits via an internal compile-time proof const (not a user knob) and
     // writes IA32_GS_BASE from the handoff (no higher-half .bss access) then idles.
     #[test]
@@ -57513,10 +57530,19 @@ mod stage183_ap_idle_admit {
             TRAMP_SRC.contains("hlt") && TRAMP_SRC.contains("cli"),
             "AP idle loop must remain a cli/hlt interrupt-masked loop"
         );
-        // NOT a user boot knob: the const is internal; no yarm.* AP-admit knob exists.
+        // NOT a user boot knob: AP *admission* is internal (the trampoline asm carries
+        // no yarm.* knob). Stage 189C6 adds a *dispatch* knob on a DIFFERENT axis
+        // (`yarm.ap_user_dispatch`) — it gates whether an already-admitted AP runs a
+        // user task, never whether an AP is admitted. The admission path
+        // (`ap_scheduler_online_admission`) never reads that knob.
         assert!(
-            !TRAMP_SRC.contains("yarm.ap_") && !SMP_SRC.contains("yarm.ap_"),
-            "AP admission must not be selectable by a user boot knob"
+            !TRAMP_SRC.contains("yarm.ap_"),
+            "the AP admission trampoline must carry no user boot knob"
+        );
+        assert!(
+            SMP_SRC.contains("fn ap_scheduler_online_admission(")
+                && !ap_admission_body(SMP_SRC).contains("ap_user_dispatch_enabled"),
+            "AP admission must not be selectable by the dispatch knob"
         );
     }
 
@@ -58482,7 +58508,7 @@ mod stage189b_ap_dispatch_scaffold {
         assert!(
             ORCH_SRC.contains("run_ap_dispatch_scaffold_audit(")
                 && SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
-                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent"),
+                && SMP_SRC.contains("reason=ap_ring3_live_dispatcher_hook_gated"),
             "the boot audit must defer live AP dispatch honestly"
         );
     }
@@ -58570,29 +58596,30 @@ mod stage189c_ap_user_return_percpu {
         );
     }
 
-    // No live AP user dispatch was enabled: the live-only markers appear ONLY in
-    // the audited transition guarded by evaluate_clear(), never in the scaffold
-    // audit, and the audit still emits the honest deferral.
+    // Stage 189C6: the live AP user dispatch IS enabled now, but ONLY under the
+    // default-off knob. When the knob is OFF the scaffold audit still emits the
+    // honest deferral; when ON (and the audited clear fired) it runs the live path.
     #[test]
-    fn no_live_ap_user_dispatch_enabled() {
-        // The scaffold audit emits the deferral with the precise blocker reason.
+    fn live_ap_user_dispatch_is_knob_gated() {
+        // With the knob OFF, the audit emits the honest deferral with the reason.
         assert!(
             SMP_SRC.contains("MARK_USER_DISPATCH_DEFERRED")
-                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent"),
-            "the audit must defer live dispatch with the AP-ring3-entry blocker reason"
+                && SMP_SRC.contains("reason=ap_ring3_live_dispatcher_hook_gated"),
+            "with the knob off the audit must still defer live dispatch with the reason"
         );
-        // The live begin/return/done markers are defined but emitted by NOTHING in
-        // this pass (no producer): they exist only as vocabulary constants.
+        // The live begin/return/done markers exist as vocabulary constants.
         assert!(
             AP_DISPATCH_SRC.contains("MARK_USER_DISPATCH_BEGIN")
                 && AP_DISPATCH_SRC.contains("MARK_USER_TRAP_RETURN_OK"),
-            "the live-dispatch marker vocabulary must exist for 189D"
+            "the live-dispatch marker vocabulary must exist"
         );
+        // The live markers are now emitted by the knob-gated live dispatcher.
         assert!(
-            !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
-                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
-            "no live AP user-dispatch marker may be emitted this pass"
+            SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_DONE")
+                && SMP_SRC
+                    .contains("if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {"),
+            "the live dispatcher emits the markers only under the default-off knob gate"
         );
     }
 
@@ -58635,10 +58662,13 @@ mod stage189c2_ap_usermode_entry {
             "the LSTAR entry must use the per-CPU gs-relative RSP0/scratch slots"
         );
         // The detector reports the syscall entry as per-CPU-safe; usermode entry now
-        // additionally requires the AP ring3-entry path.
+        // additionally requires the AP ring3-entry path, which Stage 189C6 wired
+        // (knob-gated: `ap_ring3_entry_path_ready()` mirrors the default-off knob).
         assert!(
             SMP_SRC.contains("fn ap_syscall_entry_is_per_cpu_safe() -> bool {\n    true\n}")
-                && SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}")
+                && SMP_SRC.contains(
+                    "fn ap_ring3_entry_path_ready() -> bool {\n    crate::kernel::boot::ap_user_dispatch_enabled()\n}"
+                )
                 && SMP_SRC.contains(
                     "ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe() && ap_ring3_entry_path_ready()",
                 ),
@@ -58652,7 +58682,7 @@ mod stage189c2_ap_usermode_entry {
     fn usermode_entry_deferred_with_precise_reason() {
         assert!(
             SMP_SRC.contains("MARK_USERMODE_ENTRY_DEFERRED")
-                && SMP_SRC.contains("reason=ap_ring3_entry_path_absent")
+                && SMP_SRC.contains("reason=ap_ring3_live_dispatcher_hook_gated")
                 && SMP_SRC.contains("trap_return_ready: usermode_entry_ready"),
             "the audit must defer usermode entry with the AP-ring3-entry-path-absent reason"
         );
@@ -58665,32 +58695,32 @@ mod stage189c2_ap_usermode_entry {
         );
     }
 
-    // No live AP user dispatch / ring3 entry was performed: the entry/re-entry
-    // live markers are vocabulary-only, emitted by nothing this pass.
+    // Stage 189C6: the live AP usermode-entry path IS wired now — the AP-run live
+    // markers are emitted by the knob-gated live dispatcher, never by the default
+    // (knob-off) scaffold audit path. The live markers are gated behind
+    // `ap_user_dispatch_enabled()` so the accepted SMP baseline is preserved.
     #[test]
-    fn no_live_ap_usermode_entry_performed() {
+    fn live_ap_usermode_entry_is_knob_gated() {
         assert!(
             AP_DISPATCH_SRC.contains("MARK_USERMODE_ENTRY_READY")
                 && AP_DISPATCH_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK"),
-            "the live-entry marker vocabulary must exist for the future per-CPU-entry stage"
+            "the live-entry marker vocabulary must exist"
         );
-        // The AP-run live markers are never referenced by the audit at all.
+        // The AP-run live markers are now emitted by the live dispatcher.
         assert!(
-            !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
-                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
-            "no AP-run live marker may be emitted this pass"
+            SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
+            "the live dispatcher must emit the AP-run live markers"
         );
-        // The USERMODE_ENTRY_READY emit exists only inside the `if usermode_entry_ready`
-        // branch, which stays false because the AP ring3-entry path is absent — so
-        // USERMODE_ENTRY_READY is never emitted at runtime this pass.
+        // But only under the default-off knob gate — the scaffold audit only enters
+        // the live path when `ap_user_dispatch_enabled()` AND the audited clear fired.
         assert!(
-            SMP_SRC.contains("if usermode_entry_ready {")
-                && SMP_SRC.contains("fn ap_ring3_entry_path_ready() -> bool {\n    false\n}"),
-            "usermode-entry readiness must be gated false (AP ring3-entry path absent)"
+            SMP_SRC.contains("if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {")
+                && SMP_SRC.contains("live_ap_user_dispatch(kernel, cpu);"),
+            "the live dispatch must be gated behind the audited clear + the default-off knob"
         );
-        // Wake-only is still only cleared by the audited transition (unreached).
+        // Wake-only is still only cleared by the audited transition.
         assert!(
             SMP_SRC.contains("fn try_enable_ap_user_dispatch(")
                 && SMP_SRC.contains("readiness.evaluate_clear()"),
@@ -58751,20 +58781,1784 @@ mod stage189c3_percpu_entry_exit {
         );
     }
 
-    // Progress markers ARE emitted (per-CPU syscall entry ready), but no AP-run live
-    // dispatch marker is emitted and no wake-only is cleared this pass.
+    // Progress markers ARE emitted (per-CPU syscall entry ready). Stage 189C6 wired
+    // the live AP-run dispatch markers, but they are emitted only by the knob-gated
+    // live dispatcher, never on the default (knob-off) audit path.
     #[test]
-    fn percpu_entry_progress_but_no_live_ap_dispatch() {
+    fn percpu_entry_progress_and_knob_gated_live_dispatch() {
         assert!(
             SMP_SRC.contains("MARK_SYSCALL_ENTRY_PERCPU_READY"),
             "the per-CPU syscall-entry readiness is attested for APs"
         );
+        // The live markers now exist in smp.rs (the live dispatcher), gated by the knob.
         assert!(
-            !SMP_SRC.contains("MARK_USER_DISPATCH_BEGIN")
-                && !SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
-                && !SMP_SRC.contains("MARK_USER_TRAP_RETURN_OK")
-                && !SMP_SRC.contains("MARK_USER_DISPATCH_DONE"),
-            "no AP-run live dispatch marker may be emitted this pass"
+            SMP_SRC.contains("fn live_ap_user_dispatch(")
+                && SMP_SRC.contains("crate::kernel::boot::ap_user_dispatch_enabled()"),
+            "the live AP dispatch path must be present and gated behind the default-off knob"
+        );
+    }
+}
+
+// Stage 189C5 — AP ring3-entry prerequisites attested; the LIVE ring3-entry
+// dispatcher hook stays gated OFF to preserve the accepted SMP baseline. No
+// wake-only cleared, no ring 3 entry, no live-dispatch marker emitted.
+mod stage189c5_ap_ring3_entry {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+
+    // The ring3-entry prerequisites are detected and attested; the reusable
+    // entry + kernel-return-context mapper are referenced in the detector docs.
+    #[test]
+    fn ring3_entry_prereqs_detected_and_attested() {
+        assert!(
+            SMP_SRC.contains("fn ap_ring3_entry_prereqs_present(")
+                && SMP_SRC.contains("ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe()")
+                && SMP_SRC.contains("MARK_RING3_ENTRY_READY"),
+            "the ring3-entry prerequisites must be detected and attested"
+        );
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_RING3_ENTRY_READY: &str = \"X86_AP_RING3_ENTRY_READY\"")
+                && AP_DISPATCH_SRC.contains("MARK_KERNEL_STACK_MAPPED"),
+            "the ring3-entry marker vocabulary must exist"
+        );
+    }
+
+    // Stage 189C6: the LIVE ring3-entry dispatcher hook is now WIRED, gated behind
+    // the default-off `yarm.ap_user_dispatch` knob (so the accepted SMP baseline is
+    // preserved unless explicitly armed). `ap_ring3_entry_path_ready()` mirrors the knob.
+    #[test]
+    fn live_ring3_dispatcher_hook_is_knob_gated() {
+        assert!(
+            SMP_SRC.contains(
+                "fn ap_ring3_entry_path_ready() -> bool {\n    crate::kernel::boot::ap_user_dispatch_enabled()\n}"
+            ),
+            "the live AP ring3-entry dispatcher hook must be knob-gated (mirrors the default-off knob)"
+        );
+        // usermode-entry readiness includes the (knob-gated) live ring3-entry gate.
+        assert!(
+            SMP_SRC.contains(
+                "ap_tss_rsp0_ready(cpu) && ap_syscall_entry_is_per_cpu_safe() && ap_ring3_entry_path_ready()",
+            ),
+            "usermode entry must require the live ring3-entry path"
+        );
+    }
+
+    // Stage 189C6: the AP idle-loop asm IS now wired to call the live dispatcher, and
+    // the live dispatcher emits the AP-run markers. Both are gated behind the
+    // default-off knob (the hook is a cheap inert load+branch when unarmed).
+    #[test]
+    fn live_ap_ring3_entry_and_asm_hook_are_wired() {
+        assert!(
+            SMP_SRC.contains("MARK_USER_SYSCALL_REENTRY_OK")
+                && SMP_SRC.contains("MARK_RING3_ENTER")
+                && SMP_SRC.contains("MARK_USER_CR3_LOAD_OK"),
+            "the live dispatcher must emit the AP ring3-entry / re-entry markers"
+        );
+        // The AP idle-loop trampoline calls the live dispatcher at label 76:, gated on
+        // the per-CPU ap_dispatch_request (gs:[160]) so unarmed wakes stay inert.
+        let tramp = include_str!("../../arch/x86_64/smp_trampoline.rs");
+        assert!(
+            tramp.contains("call yarm_x86_ap_user_dispatch_entry")
+                && tramp.contains("mov eax, dword ptr gs:[160]"),
+            "the AP idle loop must call the live dispatcher, gated on the per-CPU dispatch request"
+        );
+    }
+}
+
+// Stage 189D — SEAL. The AP user-dispatch probe now runs a REAL syscall (Yield, NR 0
+// — the normal number range, not the magic probe) that enters the NORMAL global-lock
+// dispatch, proving AP user execution can safely take the still-global lock. The
+// magic probe is retained only to PARK the AP after the real syscall. Admission is
+// audited (placement only after the wake-only clear), and the nested-trap guard is
+// per-CPU so concurrent BSP+AP dispatch never false-trips `!BN`.
+mod stage189d_seal {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const PRINTK_SRC: &str = include_str!("../printk.rs");
+
+    // The seal marker vocabulary exists.
+    #[test]
+    fn seal_marker_vocabulary_exists() {
+        assert!(
+            AP_DISPATCH_SRC
+                .contains("MARK_NORMAL_SYSCALL_BEGIN: &str = \"X86_AP_NORMAL_SYSCALL_BEGIN\"")
+                && AP_DISPATCH_SRC.contains(
+                    "MARK_GLOBAL_LOCK_DISPATCH_ENTER: &str = \"X86_AP_GLOBAL_LOCK_DISPATCH_ENTER\""
+                )
+                && AP_DISPATCH_SRC
+                    .contains("MARK_NORMAL_SYSCALL_OK: &str = \"X86_AP_NORMAL_SYSCALL_OK\"")
+                && AP_DISPATCH_SRC.contains(
+                    "MARK_USER_DISPATCH_SEAL_DONE: &str = \"X86_AP_USER_DISPATCH_SEAL_DONE\""
+                ),
+            "the Stage 189D seal marker vocabulary must exist"
+        );
+    }
+
+    // The probe task's success path is a REAL syscall (Yield NR 0), NOT the magic
+    // probe. The magic (0xA9C6) syscall is present ONLY as the trailing park.
+    #[test]
+    fn seal_probe_uses_real_yield_not_magic_for_success() {
+        assert!(
+            EXEC_SRC.contains("0x31, 0xC0, // xor eax, eax  (RAX = 0 = Yield)")
+                && EXEC_SRC.contains("0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6"),
+            "the probe stub must issue Yield (NR 0) first, then the magic park second"
+        );
+        // The seal completion is driven by the NORMAL syscall dispatch hook, not the
+        // magic fast path. The magic fast path only sets the re-entry flag + parks.
+        assert!(
+            SMP_SRC.contains("fn ap_seal_syscall_ok(")
+                && SMP_SRC.contains("MARK_USER_DISPATCH_SEAL_DONE"),
+            "the seal-done verdict must be emitted from the normal-syscall dispatch hook"
+        );
+    }
+
+    // The AP's normal syscall enters the NORMAL global-lock dispatch path: the trap
+    // stub calls the seal hook around `dispatch_trap_entry_with_shared_kernel`,
+    // gated on the per-CPU seal-probe flag (inert on the BSP / non-armed boots).
+    #[test]
+    fn seal_enters_global_lock_dispatch_gated_per_cpu() {
+        assert!(
+            DESC_SRC.contains("crate::arch::x86_64::smp::ap_seal_probe_active(cpu)")
+                && DESC_SRC.contains("ap_seal_syscall_begin(cpu, ap_seal_nr)")
+                && DESC_SRC.contains("ap_seal_syscall_ok(cpu, ap_seal_nr)")
+                && DESC_SRC
+                    .contains("crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel("),
+            "the AP seal markers must bracket the real global-lock trap dispatch, gated per-CPU"
+        );
+    }
+
+    // The nested-trap guard is PER-CPU (an array), so a concurrent BSP+AP dispatch
+    // never false-trips the `!BN` nested-trap halt.
+    #[test]
+    fn trap_dispatch_depth_is_per_cpu() {
+        assert!(
+            DESC_SRC.contains(
+                "static TRAP_DISPATCH_DEPTH: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS]"
+            )
+                && DESC_SRC.contains("TRAP_DISPATCH_DEPTH[depth_idx].fetch_add(1, Ordering::AcqRel)"),
+            "the nested-trap guard must be per-CPU to be SMP-safe under concurrent dispatch"
+        );
+    }
+
+    // Admission: the probe is PLACED on the AP only after the audited wake-only clear,
+    // through the wake-only-guarded enqueue (which denies while wake-only). Each AP
+    // gets its OWN probe task (distinct TID), so no task is `current` on two CPUs.
+    #[test]
+    fn seal_admission_is_audited_and_per_cpu() {
+        assert!(
+            SMP_SRC.contains("if cleared && crate::kernel::boot::ap_user_dispatch_enabled() {")
+                && SMP_SRC.contains("kernel.enqueue_on_cpu(cpu, first_tid)")
+                && SMP_SRC.contains("MARK_ADMIT_PLACED")
+                && SMP_SRC.contains("MARK_ADMIT_DENIED_WAKE_ONLY"),
+            "placement must go through the wake-only-guarded enqueue after the audited clear"
+        );
+        // Stage 190B: each AP has its own workload TID range (distinct per (cpu, task)),
+        // so no task is ever `current` on two CPUs.
+        assert!(
+            SMP_SRC.contains("fn ap_workload_base_tid(cpu: CpuId)")
+                && SMP_SRC.contains("PROBE_TID_BASE + (cpu.0 as u64) * 16"),
+            "each AP must get its own distinct workload TID range (no task current on two CPUs)"
+        );
+    }
+
+    // The seal markers are emitted via the drop-safe synchronous emitter (bypassing
+    // the shared printk ring, which can overflow under concurrent AP+BSP logging).
+    #[test]
+    fn seal_markers_emitted_drop_safe() {
+        assert!(
+            PRINTK_SRC.contains("pub fn printk_emit_sync(")
+                && SMP_SRC.contains("crate::kernel::printk::printk_emit_sync(format_args!("),
+            "required seal markers must use the synchronous (ring-bypassing) emitter"
+        );
+    }
+
+    // The BSP does NOT hold the global lock while waiting on the AP's normal syscall
+    // (which takes the SAME lock) — the live dispatcher arms + wakes and returns; the
+    // AP emits the seal verdict itself.
+    #[test]
+    fn seal_does_not_hold_global_lock_awaiting_ap_syscall() {
+        assert!(
+            SMP_SRC.contains(
+                "The seal verdict is emitted by the AP's\n    // own syscall (X86_AP_USER_DISPATCH_SEAL_DONE result=ok), not by the BSP."
+            ),
+            "the live dispatcher must not poll under the global lock for the AP's syscall"
+        );
+        // The old under-lock re-entry poll (`ap_syscall_reentry_ok` spin) must be gone.
+        assert!(
+            !SMP_SRC.contains("if super::percpu::ap_syscall_reentry_ok(cpu) != 0 {"),
+            "the under-lock reentry poll must be removed (it would deadlock the AP's syscall)"
+        );
+    }
+}
+
+// Stage 190A — AP SCHEDULER LOOP + RETURN-TO-IDLE. After the admitted probe task's
+// Yield seals through the global lock, the AP RETURNS to the scheduler (the probe is
+// blocked, run queue left consistent) and falls through to the interruptible idle
+// loop — it no longer parks forever. Still global-lock-authoritative, admission still
+// audited, no global-lock retirement.
+mod stage190a_ap_sched_loop {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const SCHED_STATE_SRC: &str = include_str!("scheduler_state.rs");
+
+    // The scheduler-loop / return-to-idle marker vocabulary exists.
+    #[test]
+    fn sched_loop_marker_vocabulary_exists() {
+        assert!(
+            AP_DISPATCH_SRC.contains("MARK_SCHED_LOOP_READY: &str = \"X86_AP_SCHED_LOOP_READY\"")
+                && AP_DISPATCH_SRC.contains(
+                    "MARK_YIELD_RETURN_TO_SCHED_OK: &str = \"X86_AP_YIELD_RETURN_TO_SCHED_OK\""
+                )
+                && AP_DISPATCH_SRC
+                    .contains("MARK_RETURN_TO_IDLE_OK: &str = \"X86_AP_RETURN_TO_IDLE_OK\"")
+                && AP_DISPATCH_SRC
+                    .contains("MARK_SCHED_LOOP_DONE: &str = \"X86_AP_SCHED_LOOP_DONE\""),
+            "the Stage 190A scheduler-loop marker vocabulary must exist"
+        );
+    }
+
+    // After the seal, the AP RETURNS to the scheduler (blocks the probe) and then the
+    // trap dispatch routes it to the interruptible idle loop — NOT a permanent park.
+    #[test]
+    fn ap_returns_to_scheduler_then_idle_after_yield() {
+        // The trap dispatch blocks the probe right after the seal completes, gated on
+        // the per-CPU ap_seal flag.
+        assert!(
+            DESC_SRC.contains("crate::arch::x86_64::smp::ap_seal_syscall_ok(cpu, ap_seal_nr);")
+                && DESC_SRC.contains(
+                    "crate::arch::x86_64::smp::ap_seal_return_to_idle(shared, cpu, ap_seal_nr);"
+                ),
+            "the trap dispatch must return the AP probe to the scheduler after the seal"
+        );
+        // Stage 190B: the idle path routes through the AP scheduler loop
+        // (`ap_sched_next_or_idle`, gated on ap_seal), which runs the next admitted
+        // task or emits the return-to-idle markers and enters the interruptible idle
+        // loop (sti;hlt) — not a park. The return-to-idle markers are emitted there.
+        assert!(
+            DESC_SRC.contains("crate::arch::x86_64::smp::ap_sched_next_or_idle(shared, cpu);")
+                && DESC_SRC.contains("idle_halt_loop();"),
+            "the AP must route through the scheduler loop then fall through to interruptible idle"
+        );
+        assert!(
+            SMP_SRC.contains("ap_sched_return_to_idle_markers(cpu);")
+                && SMP_SRC.contains("super::descriptor_tables::ap_idle_halt_loop();"),
+            "the scheduler loop must emit return-to-idle markers + enter the interruptible idle"
+        );
+        assert!(
+            SMP_SRC.contains("fn ap_seal_return_to_idle(")
+                && SMP_SRC.contains("k.block_current_on_cpu(cpu)")
+                && SMP_SRC.contains("MARK_YIELD_RETURN_TO_SCHED_OK"),
+            "return-to-idle must block the probe on the AP (run-queue-consistent) + mark it"
+        );
+    }
+
+    // Run-queue consistency: the probe is taken off the AP via the scheduler's
+    // block_current_on (removes membership), not by ad-hoc mutation.
+    #[test]
+    fn return_to_idle_uses_scheduler_block_for_consistency() {
+        assert!(
+            SCHED_STATE_SRC.contains("pub fn block_current_on_cpu(&mut self, cpu: CpuId)")
+                && SCHED_STATE_SRC.contains(".block_current_on(cpu)"),
+            "the AP probe must be removed via the scheduler's block_current_on (consistent run queue)"
+        );
+    }
+
+    // The probe no longer parks as the only success path: the interruptible idle loop
+    // (sti;hlt) is the return target, reachable via the None/idle exiting-tid path.
+    #[test]
+    fn probe_no_longer_parks_as_only_success_path() {
+        assert!(
+            DESC_SRC.contains("fn idle_halt_loop() -> ! {")
+                && DESC_SRC.contains("\"sti\", \"hlt\""),
+            "the AP idle loop must be interruptible (sti;hlt), a real return-to-idle not a park"
+        );
+        // The seal-loop readiness is emitted before ring3 entry.
+        assert!(
+            SMP_SRC.contains("MARK_SCHED_LOOP_READY"),
+            "the AP dispatcher must announce the scheduler loop before entering ring 3"
+        );
+    }
+
+    // No global-lock retirement claim: the AP still enters the global lock for its
+    // syscall; return-to-idle blocks under `with_cpu` (the global lock).
+    #[test]
+    fn no_global_lock_retirement() {
+        assert!(
+            SMP_SRC.contains(".with_cpu(cpu, |k| k.block_current_on_cpu(cpu))"),
+            "return-to-idle must operate under the global lock (with_cpu); lock is not retired"
+        );
+        assert!(
+            !SMP_SRC.contains("UNLOCK_GRADUATED_FALLBACK") && !SMP_SRC.contains("emergency_optout"),
+            "no global-lock retirement / fallback markers"
+        );
+    }
+}
+
+// Stage 190B — CONTROLLED AP WORKLOAD + SCHEDULER POLICY SEAL. The AP scheduler loop
+// runs a small deterministic SEQUENCE of admitted tasks (A then B), placing each ONE
+// AT A TIME (audited), running it, blocking it after its Yield, and dispatching the
+// next — proving repeated dispatch + run-queue consistency, then returning to idle.
+// Still global-lock-authoritative; NOT arbitrary load balancing.
+mod stage190b_controlled_workload {
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const AP_DISPATCH_SRC: &str = include_str!("../../arch/x86_64/ap_dispatch.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+
+    // The workload / repeated-dispatch / policy-seal marker vocabulary exists.
+    #[test]
+    fn workload_marker_vocabulary_exists() {
+        assert!(
+            AP_DISPATCH_SRC.contains(
+                "MARK_WORKLOAD_PLACEMENT_READY: &str = \"X86_AP_WORKLOAD_PLACEMENT_READY\""
+            ) && AP_DISPATCH_SRC.contains(
+                "MARK_NEXT_TASK_DISPATCH_BEGIN: &str = \"X86_AP_NEXT_TASK_DISPATCH_BEGIN\""
+            ) && AP_DISPATCH_SRC
+                .contains("MARK_REPEATED_DISPATCH_OK: &str = \"X86_AP_REPEATED_DISPATCH_OK\"")
+                && AP_DISPATCH_SRC.contains(
+                    "MARK_SCHED_POLICY_SEAL_DONE: &str = \"X86_AP_SCHED_POLICY_SEAL_DONE\""
+                ),
+            "the Stage 190B controlled-workload marker vocabulary must exist"
+        );
+    }
+
+    // A CONTROLLED, deterministic workload (>= 2 tasks) — not arbitrary load balancing.
+    #[test]
+    fn controlled_deterministic_workload_not_load_balancing() {
+        assert!(
+            SMP_SRC.contains("const AP_WORKLOAD_TASKS: u64 = 2;")
+                && EXEC_SRC.contains("pub fn build_ap_workload("),
+            "the AP workload must be a fixed small count of registered tasks"
+        );
+        // No arbitrary/production balancing is CALLED for APs (enqueue_balanced is not
+        // invoked to place AP workload — placement is explicit per-CPU + audited).
+        assert!(
+            !SMP_SRC.contains("enqueue_balanced("),
+            "AP workload placement must not call arbitrary balanced placement"
+        );
+    }
+
+    // Repeated dispatch: the AP scheduler loop runs the NEXT admitted task after the
+    // previous one blocks, one at a time (so no task is current on two CPUs and no
+    // rotate-to-unrun-task). Each placement is audited (enqueue_on_cpu wake-only guard).
+    #[test]
+    fn repeated_dispatch_places_next_task_audited_one_at_a_time() {
+        assert!(
+            SMP_SRC.contains("fn ap_sched_next_or_idle(")
+                && SMP_SRC.contains("(n as u64) < AP_WORKLOAD_TASKS")
+                && SMP_SRC.contains("let next_tid = ap_workload_base_tid(cpu) + n as u64;"),
+            "the scheduler loop must place the next workload task by index, one at a time"
+        );
+        // Placement is via the audited wake-only-guarded enqueue.
+        assert!(
+            SMP_SRC.contains("k.enqueue_on_cpu(cpu, next_tid)")
+                && SMP_SRC.contains("MARK_ADMIT_PLACED")
+                && SMP_SRC.contains("MARK_NEXT_TASK_DISPATCH_BEGIN"),
+            "each next-task placement must be audited + marked"
+        );
+        // The BSP places ONLY the first task; the rest are placed one at a time.
+        assert!(
+            SMP_SRC.contains("let first_tid = base_tid;")
+                && SMP_SRC.contains("kernel.enqueue_on_cpu(cpu, first_tid)"),
+            "the BSP must place only the first task; the loop places the rest"
+        );
+    }
+
+    // No-duplicate-current / distinct TIDs: each AP has its own workload TID range, and
+    // the dispatch count drives distinct per-task TIDs.
+    #[test]
+    fn distinct_per_cpu_workload_tids() {
+        assert!(
+            SMP_SRC.contains("PROBE_TID_BASE + (cpu.0 as u64) * 16")
+                && SMP_SRC.contains("fn ap_workload_base_tid(cpu: CpuId)"),
+            "each AP must have its own workload TID range (no task current on two CPUs)"
+        );
+        // The per-CPU dispatch count is incremented once per ring-3 entry (no double
+        // dispatch of the same instance).
+        assert!(
+            SMP_SRC.contains("AP_DISPATCH_COUNT[idx].fetch_add(1, Ordering::AcqRel)"),
+            "the dispatch count must advance once per task entry (no duplicate dispatch)"
+        );
+    }
+
+    // The policy seal is emitted with a count and the loop returns to idle; still under
+    // the global lock (no retirement).
+    #[test]
+    fn policy_seal_then_return_to_idle_under_global_lock() {
+        assert!(
+            SMP_SRC.contains("MARK_SCHED_POLICY_SEAL_DONE")
+                && SMP_SRC.contains("MARK_REPEATED_DISPATCH_OK")
+                && SMP_SRC.contains("ap_sched_return_to_idle_markers(cpu);")
+                && SMP_SRC.contains("super::descriptor_tables::ap_idle_halt_loop();"),
+            "the seal must emit repeated-dispatch + policy-seal, then return to idle"
+        );
+        assert!(
+            SMP_SRC.contains(".with_cpu(cpu, |k| match k.enqueue_on_cpu(cpu, next_tid)"),
+            "next-task placement must run under the global lock (with_cpu); not retired"
+        );
+    }
+}
+
+// Stage 191A — GLOBAL-LOCK RETIREMENT INVENTORY + FIRST SAFE CLASS. The split-dispatch
+// whitelist is the ONLY set of syscalls serviced off the global `SpinLock<KernelState>`.
+// Stage 191A adds exactly ONE class — DebugLog (NR 15), a pure read — to it, and pins
+// that every other class (all IPC/VM/spawn/fork/futex/reap paths) stays global-lock-only.
+// The global lock is NOT retired; this is a first-class-only conversion.
+mod stage191a_lock_retire_inventory {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_LOCKING.md");
+
+    // The retirement marker vocabulary exists.
+    #[test]
+    fn retire_marker_vocabulary_exists() {
+        assert!(
+            SPLIT_SRC
+                .contains("MARK_RETIRE_CLASS_BEGIN: &str = \"GLOBAL_LOCK_RETIRE_CLASS_BEGIN\"")
+                && SPLIT_SRC
+                    .contains("MARK_RETIRE_CLASS_DONE: &str = \"GLOBAL_LOCK_RETIRE_CLASS_DONE\"")
+                && SPLIT_SRC.contains(
+                    "MARK_RETIRE_CLASS_DEFERRED: &str = \"GLOBAL_LOCK_RETIRE_CLASS_DEFERRED\""
+                ),
+            "the Stage 191A retirement marker vocabulary must exist"
+        );
+    }
+
+    // INVENTORY: the split whitelist is EXACTLY {ControlPlaneSetCnodeSlots, IpcRecv,
+    // VmBrk, DebugLog}. DebugLog is the newly retired class; the rest predate 191A.
+    #[test]
+    fn split_whitelist_is_exactly_the_four_classes() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::ControlPlaneSetCnodeSlots => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::IpcRecv => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::VmBrk => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
+                // Stage 191B added FutexWake as the fifth split class.
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
+            "the NR-only split gate must whitelist exactly the accepted classes"
+        );
+        // Dangerous classes must NOT appear as split-eligible (default-deny `_ => None`).
+        // FutexWake is INTENTIONALLY absent here (retired in 191B); FutexWait stays.
+        for dangerous in [
+            "Syscall::VmMap => Some",
+            "Syscall::VmAnonMap => Some",
+            "Syscall::Fork => Some",
+            "Syscall::SpawnThread => Some",
+            "Syscall::SpawnProcess => Some",
+            "Syscall::ReapFaultedTask => Some",
+            "Syscall::IpcSend => Some",
+            "Syscall::IpcCall => Some",
+            "Syscall::IpcReply => Some",
+            "Syscall::FutexWait => Some",
+            "Syscall::Yield => Some",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(dangerous),
+                "{dangerous} must NOT be split-eligible (stays global-lock-only)"
+            );
+        }
+    }
+
+    // SELECTED CLASS (DebugLog) bypasses the broad global lock only via proven
+    // split-read primitives: authoritative tid → task-asid split-read → vm-user-spaces
+    // split resolve → direct-map read. No broad `with(` / `with_cpu(` domain work.
+    #[test]
+    fn debug_log_split_uses_split_read_primitives_only() {
+        assert!(
+            SPLIT_SRC.contains("fn try_split_debug_log_into_frame(")
+                && SPLIT_SRC.contains("shared.current_tid_authoritative(cpu)?")
+                && SPLIT_SRC.contains("shared.task_asid_for_tid_split_read(tid)")
+                && SPLIT_SRC.contains("shared.copy_from_user_asid_split_read(asid, user_ptr, len)"),
+            "DebugLog split must use the authoritative-tid + split-read + split-copy primitives"
+        );
+        // The split copy reads the VM user-spaces subsystem under its own lock (rank),
+        // NOT the global lock, and reads bytes via the direct map.
+        assert!(
+            RUNTIME_SRC.contains("pub fn copy_from_user_asid_split_read(")
+                && RUNTIME_SRC.contains("self.with_vm_user_spaces_split_mut(|spaces| {")
+                && RUNTIME_SRC
+                    .contains("crate::kernel::boot::KernelState::phys_to_direct_map_ptr(phys)?"),
+            "the split copy must resolve via the VM user-spaces split accessor + direct map"
+        );
+        // The DebugLog split path never blocks/yields/switches tasks (pure read).
+        assert!(
+            !SPLIT_SRC.contains("fn try_split_debug_log_into_frame(")
+                || !split_debug_log_body_contains_scheduling(),
+            "the DebugLog split path must not schedule/yield/switch tasks"
+        );
+    }
+
+    fn split_debug_log_body_contains_scheduling() -> bool {
+        // Extract the try_split_debug_log_into_frame body and check it does not
+        // dispatch/yield/switch (it is a pure read + log + set_ok).
+        let start = SPLIT_SRC
+            .find("fn try_split_debug_log_into_frame(")
+            .expect("debug-log split fn must exist");
+        let rest = &SPLIT_SRC[start..];
+        let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
+        let body = &rest[..end];
+        body.contains("dispatch_next")
+            || body.contains("yield_current")
+            || body.contains("block_current")
+            || body.contains("switch_frames")
+    }
+
+    // ReapFaultedTask stays GLOBAL-LOCK-ONLY (explicitly excluded from split dispatch).
+    #[test]
+    fn reap_faulted_task_stays_global_lock_only() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+        // The dedicated exclusion guard still exists in syscall_split tests.
+        assert!(
+            SPLIT_SRC.contains("fn stage188h_reap_faulted_task_excluded_from_split_dispatch()"),
+            "the ReapFaultedTask split-exclusion guard must remain"
+        );
+    }
+
+    // The docs must NOT claim the global lock is fully retired.
+    #[test]
+    fn docs_do_not_claim_full_retirement() {
+        assert!(
+            !DOC_SRC.contains("global lock is fully retired")
+                && !DOC_SRC.contains("global lock retired")
+                && !DOC_SRC.contains("SpinLock<KernelState> retired"),
+            "docs must not claim full global-lock retirement"
+        );
+    }
+}
+
+// Stage 191B — FUTEXWAKE GLOBAL-LOCK RETIREMENT. FutexWake (NR 11) becomes the SECOND
+// retired global-lock class: the caller never task-switches; the syscall only mutates
+// waiter/run-queue state (Blocked(Futex)→Runnable + enqueue), done via the task
+// split-mut (rank 2) + scheduler split-mut (rank 1) seams. FutexWait/Yield/ReapFaultedTask
+// stay global-lock-only. The wake scan + enqueue is proven identical to legacy.
+mod stage191b_futex_wake_retire {
+    use super::*;
+    use crate::kernel::scheduler::{CpuId, MAX_CPUS};
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::runtime::SharedKernel;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+
+    // INVENTORY / eligibility: FutexWake is whitelisted; FutexWait and Yield are NOT.
+    #[test]
+    fn futex_wake_split_eligible_but_wait_and_yield_are_not() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
+                && SPLIT_SRC.contains("fn try_split_futex_wake_into_frame("),
+            "FutexWake must be split-eligible and routed to its helper"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::FutexWait => Some")
+                && !SPLIT_SRC.contains("Syscall::Yield => Some"),
+            "FutexWait and Yield must stay global-lock-only"
+        );
+    }
+
+    // The FutexWake split marker vocabulary + one-shot retire markers exist.
+    #[test]
+    fn futex_wake_split_markers_exist() {
+        assert!(
+            SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_BEGIN\"")
+                && SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_WAKE_OK count={}\"")
+                && SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_DONE result=ok\"")
+                && SPLIT_SRC.contains("{} class=FutexWake result=ok"),
+            "the FutexWake split + retirement markers must exist"
+        );
+    }
+
+    // LOCK/RANK: the split uses the task split-mut wake scan + scheduler split-mut
+    // enqueue (existing seams), NOT a broad `&mut KernelState`, and reuses the SAME
+    // SmpScheduler enqueue methods legacy uses. The scan iteration/predicate/cutoff is
+    // identical to legacy `futex_wake_inner` (so count + order match by construction).
+    #[test]
+    fn futex_wake_split_uses_seams_and_matches_legacy_scan() {
+        assert!(
+            RUNTIME_SRC.contains("pub fn futex_wake_split_mut(")
+                && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
+                && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
+                && RUNTIME_SRC.contains("sm.enqueue_on_with_priority(c, ThreadId(tid), priority)")
+                && RUNTIME_SRC.contains("sm.enqueue_balanced(ThreadId(tid), priority)"),
+            "the split wake must use the task + scheduler split-mut seams and the same enqueue"
+        );
+        // Same wake predicate + Runnable transition as legacy futex_wake_inner.
+        assert!(
+            EXEC_SRC.contains(
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"
+            ) && RUNTIME_SRC.contains(
+                "if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"
+            ),
+            "the split wake scan predicate must match legacy futex_wake_inner"
+        );
+    }
+
+    fn total_runnable(k: &crate::kernel::boot::KernelState) -> usize {
+        (0..MAX_CPUS)
+            .map(|c| k.runnable_count_on_cpu(CpuId(c as u8)))
+            .sum()
+    }
+
+    // EMPIRICAL: the split wake matches legacy semantics — correct count, only
+    // futex-blocked tasks woken, in-order, no double-wake, no orphaned waiter (each
+    // woken task is enqueued), and the caller does NOT task-switch.
+    #[test]
+    fn futex_wake_split_semantics_are_correct() {
+        let addr = 0x1000usize;
+        let waiters = [10101u64, 10102, 10103, 10104];
+        let mut state = Bootstrap::init().expect("init");
+        for &t in &waiters {
+            state
+                .register_task_with_class(t, TaskClass::App)
+                .expect("reg");
+        }
+        // A non-futex task to prove selectivity (blocked on a different reason).
+        state
+            .register_task_with_class(10200, TaskClass::App)
+            .expect("reg200");
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if waiters.contains(&tcb.tid.0) {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                } else if tcb.tid.0 == 10200 {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Poll);
+                }
+            }
+        });
+        let before_current = state.current_tid();
+        let shared = SharedKernel::new(state);
+        let before_runnable = shared.with(|k| total_runnable(k));
+
+        // Wake at most 2 → exactly 2 of the 4 waiters.
+        let woke = shared.futex_wake_split_mut(CpuId(0), addr, 2);
+        assert_eq!(woke, 2, "wake count must be min(waiters, max_wake)");
+        shared.with(|k| {
+            let runnable = waiters
+                .iter()
+                .filter(|&&t| k.task_status(t) == Some(TaskStatus::Runnable))
+                .count();
+            let still_blocked = waiters
+                .iter()
+                .filter(|&&t| {
+                    k.task_status(t)
+                        == Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                            addr as u64,
+                        ))))
+                })
+                .count();
+            assert_eq!(runnable, 2, "exactly 2 waiters woken");
+            assert_eq!(still_blocked, 2, "the other 2 waiters remain blocked");
+            // Selectivity: the non-futex task is untouched.
+            assert_eq!(
+                k.task_status(10200),
+                Some(TaskStatus::Blocked(WaitReason::Poll))
+            );
+            // No orphaned waiter: each woken task is enqueued.
+            assert_eq!(
+                total_runnable(k),
+                before_runnable + 2,
+                "woken tasks are enqueued"
+            );
+            // Caller did NOT task-switch.
+            assert_eq!(
+                k.current_tid(),
+                before_current,
+                "FutexWake must not task-switch"
+            );
+        });
+
+        // Wake the remaining 2.
+        let woke2 = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        assert_eq!(woke2, 2, "remaining 2 waiters woken");
+        // A third wake finds none — no double-wake, no orphaned waiter.
+        let woke3 = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        assert_eq!(woke3, 0, "no double-wake once all waiters are runnable");
+        shared.with(|k| {
+            for &t in &waiters {
+                assert_eq!(k.task_status(t), Some(TaskStatus::Runnable));
+            }
+        });
+    }
+
+    // max_wake == 0 is a no-op (matches legacy).
+    #[test]
+    fn futex_wake_split_zero_max_is_noop() {
+        let addr = 0x2000usize;
+        let mut state = Bootstrap::init().expect("init");
+        state
+            .register_task_with_class(10301, TaskClass::App)
+            .expect("reg");
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == 10301 {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                }
+            }
+        });
+        let shared = SharedKernel::new(state);
+        assert_eq!(shared.futex_wake_split_mut(CpuId(0), addr, 0), 0);
+        shared.with(|k| {
+            assert_eq!(
+                k.task_status(10301),
+                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                    addr as u64
+                ))))
+            );
+        });
+    }
+}
+
+// Stage 191C — INITRAMFSREADCHUNK GLOBAL-LOCK RETIREMENT. InitramfsReadChunk (NR 27)
+// becomes the THIRD retired global-lock class and the FIRST read-only USER-COPY class:
+// it copies immutable initramfs/CPIO bytes into the caller's (or PM's) user buffer,
+// mutating NO task/scheduler/IPC/cap/VM structural state and allocating nothing. The
+// SUCCESS path is serviced off the global lock via a two-pass user-copy seam
+// (validate-all-then-write-all, so a fault leaves ZERO bytes written); every error path
+// falls back to the unchanged global-lock handler for the canonical error + logs.
+// CreateInitramfsFileSliceMo (NR 28) stays global-lock-only (it MINTS a capability).
+mod stage191c_initramfs_read_chunk_retire {
+    use super::*;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    fn handler_body() -> &'static str {
+        let start = SPLIT_SRC
+            .find("fn try_split_initramfs_read_chunk_into_frame(")
+            .expect("initramfs split fn must exist");
+        let rest = &SPLIT_SRC[start..];
+        let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    // INVENTORY / eligibility: InitramfsReadChunk (NR 27) is whitelisted and routed to
+    // its helper; CreateInitramfsFileSliceMo (NR 28) is NOT (it mints a capability).
+    #[test]
+    fn initramfs_read_chunk_split_eligible_but_slice_mo_stays_locked() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),")
+                && SPLIT_SRC.contains("fn try_split_initramfs_read_chunk_into_frame("),
+            "InitramfsReadChunk must be split-eligible and routed to its helper"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some"),
+            "CreateInitramfsFileSliceMo must stay global-lock-only (it mints a capability)"
+        );
+        // The functional NR-gate check (NR 27 eligible, NR 28 not) is covered by
+        // `syscall_split::tests::stage29_whitelist_exhaustive`, which iterates the whole
+        // NR space against the real classifier.
+    }
+
+    // The InitramfsReadChunk split + one-shot retire markers exist.
+    #[test]
+    fn initramfs_read_chunk_split_markers_exist() {
+        assert!(
+            SPLIT_SRC.contains(
+                "\"INITRAMFS_READ_CHUNK_SPLIT_BEGIN name_len={} to_copy={} target_tid={}\""
+            ) && SPLIT_SRC.contains("\"INITRAMFS_READ_CHUNK_SPLIT_DONE to_copy={} result=ok\"")
+                && SPLIT_SRC.contains("{} class=InitramfsReadChunk result=ok"),
+            "the InitramfsReadChunk split + retirement markers must exist"
+        );
+    }
+
+    // USER-COPY + NO BROAD LOCK: the handler resolves the requester via the authoritative
+    // tid + task-class split-read, reads the name via the split-read copy, and writes the
+    // data via the dedicated two-pass user-copy seam — never `with(` / `with_cpu(`.
+    #[test]
+    fn initramfs_read_chunk_split_uses_user_copy_seam_and_no_global_lock() {
+        let body = handler_body();
+        assert!(
+            body.contains("shared.current_tid_authoritative(cpu)?")
+                && body.contains("shared.task_class_split_read(caller_tid)")
+                && body.contains(
+                    "shared.copy_from_user_asid_split_read(caller_asid, name_ptr, name_len)"
+                )
+                && body.contains("shared.task_asid_for_tid_split_read(target_tid_arg)")
+                && body
+                    .contains(".copy_slice_to_user_asid_split_write(dst_asid_raw, dst_ptr, src)"),
+            "the InitramfsReadChunk split must use the authoritative-tid + split-read + user-copy seams"
+        );
+        // The handler takes NO broad global lock.
+        assert!(
+            !body.contains(".with(|") && !body.contains(".with_cpu("),
+            "the InitramfsReadChunk split path must not take the broad global lock"
+        );
+        // The write seam uses ONLY the VM split accessor (rank 5) + the config leaf write,
+        // never a broad `&mut KernelState`.
+        assert!(
+            RUNTIME_SRC.contains("pub fn copy_slice_to_user_asid_split_write(")
+                && RUNTIME_SRC
+                    .contains("self.validate_user_access_for_asid_split(asid, va, true)?")
+                && RUNTIME_SRC
+                    .contains("crate::kernel::boot::KernelState::phys_to_direct_map_ptr(phys)"),
+            "the user-copy seam must resolve via the VM split accessor + direct map"
+        );
+    }
+
+    // ERROR SEMANTICS: every error outcome falls back (`return None`) so the global-lock
+    // handler produces the canonical error + diagnostic log — no silent success masking.
+    #[test]
+    fn initramfs_read_chunk_split_error_paths_fall_back() {
+        let body = handler_body();
+        // Access gate → fallback.
+        assert!(
+            body.contains("!= Some(TaskClass::SystemServer)")
+                && body.contains("if name_len == 0 || name_len > 128")
+                && body.contains("if dst_ptr == 0")
+                && body.contains("if target_tid_arg != 0 && target_tid_arg != PM_BOOTSTRAP_TID"),
+            "the split handler must mirror the legacy access gate + arg validation"
+        );
+        // Unwritable destination → fallback (no partial write, canonical fault).
+        assert!(
+            body.contains(".copy_slice_to_user_asid_split_write(dst_asid_raw, dst_ptr, src)")
+                && body.contains(".is_err()")
+                && body.contains("return None;"),
+            "an unwritable destination must fall back to the global-lock canonical error"
+        );
+        // The success encoding matches the legacy handler exactly.
+        assert!(
+            body.contains("frame.set_ok(0, to_copy, 0);")
+                && body.contains("frame.set_ok(0, 0, 0);"),
+            "success (copy) and EOF encodings must match the legacy handler"
+        );
+    }
+
+    // Map one writable user page in a valid ASID (phys 0x6000 @ VA 0x2000).
+    fn shared_with_mapped_page() -> (SharedKernel, Asid) {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, cap) = state.create_user_address_space().expect("aspace");
+        state
+            .map_user_page(
+                cap,
+                VirtAddr(0x2000),
+                Mapping {
+                    phys: PhysAddr(0x6000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map page");
+        (SharedKernel::new(state), asid)
+    }
+
+    // EMPIRICAL: the two-pass user-copy seam round-trips into a mapped page, and on a
+    // fault it writes ZERO bytes (validate-all before write-all) — the no-partial-write
+    // guarantee the split fallback relies on.
+    #[test]
+    fn initramfs_read_chunk_split_is_two_pass_no_partial_write() {
+        let (shared, asid) = shared_with_mapped_page();
+
+        // Success round-trip: write 5 bytes into the mapped page, read them back.
+        shared
+            .copy_slice_to_user_asid_split_write(asid.0 as u64, 0x2000, &[1u8, 2, 3, 4, 5])
+            .expect("write into mapped page must succeed");
+        let back = shared
+            .copy_from_user_split(asid, VirtAddr(0x2000), 5)
+            .expect("read back");
+        assert_eq!(
+            &back[..5],
+            &[1u8, 2, 3, 4, 5],
+            "round-trip bytes must match"
+        );
+
+        // Pre-write a known 0xAA pattern to the tail of the mapped page (0x2FF8..0x3000).
+        shared
+            .copy_slice_to_user_asid_split_write(asid.0 as u64, 0x2FF8, &[0xAAu8; 8])
+            .expect("tail pre-write");
+
+        // Attempt a write spanning into the UNMAPPED next page (0x3000). Pass 1 validates
+        // 0x2FFC (mapped) then 0x3000 (unmapped) → Err BEFORE any byte is written.
+        let spanning =
+            shared.copy_slice_to_user_asid_split_write(asid.0 as u64, 0x2FFC, &[0xBBu8; 8]);
+        assert!(
+            matches!(
+                spanning,
+                Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "a spanning write into an unmapped page must be UserMemoryFault: {spanning:?}"
+        );
+        // The 4 bytes of the mapped tail (0x2FFC..0x3000) must STILL be 0xAA — the failed
+        // spanning write wrote nothing (no partial write).
+        let tail = shared
+            .copy_from_user_split(asid, VirtAddr(0x2FFC), 4)
+            .expect("read tail");
+        assert_eq!(
+            &tail[..4],
+            &[0xAAu8; 4],
+            "a faulting write must not partially write the mapped prefix"
+        );
+    }
+
+    // EMPIRICAL: the seam preserves UserMemoryFault (never masks it as success) on an
+    // unknown ASID and on a valid-but-unmapped VA.
+    #[test]
+    fn initramfs_read_chunk_split_preserves_user_memory_fault() {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        let unknown = shared.copy_slice_to_user_asid_split_write(9999, 0x1000, &[1u8, 2, 3, 4]);
+        assert!(
+            matches!(
+                unknown,
+                Err(crate::kernel::boot::KernelError::Vm(_))
+                    | Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "write to an unknown ASID must return a real fault, not success: {unknown:?}"
+        );
+        let (shared2, asid) = shared_with_mapped_page();
+        let unmapped =
+            shared2.copy_slice_to_user_asid_split_write(asid.0 as u64, 0xDEAD_0000, &[1u8, 2]);
+        assert!(
+            matches!(
+                unmapped,
+                Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "write to a valid ASID but unmapped VA must be UserMemoryFault: {unmapped:?}"
+        );
+    }
+
+    // The other read-only / query-ish and dangerous classes stay global-lock-only
+    // (default-deny `_ => None`; none appears as a split-eligible `=> Some` arm).
+    #[test]
+    fn non_selected_classes_remain_locked() {
+        for locked in [
+            "Syscall::CreateInitramfsFileSliceMo => Some",
+            "Syscall::IpcSend => Some",
+            "Syscall::IpcCall => Some",
+            "Syscall::IpcReply => Some",
+            "Syscall::VmMap => Some",
+            "Syscall::VmAnonMap => Some",
+            "Syscall::Fork => Some",
+            "Syscall::SpawnThread => Some",
+            "Syscall::SpawnProcess => Some",
+            "Syscall::ReapFaultedTask => Some",
+            "Syscall::FutexWait => Some",
+            "Syscall::Yield => Some",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(locked),
+                "{locked} must NOT be split-eligible (stays global-lock-only)"
+            );
+        }
+    }
+}
+
+// Stage 191D — FUTEXWAIT BLOCK-PUBLISH SEAM. FutexWait (NR 1) blocks the caller and must
+// dispatch a DIFFERENT runnable task — the queue-ADVANCING "switch_required" case that
+// `dispatch_next_task` performs; the kernel's own out-of-lock dispatch relocation
+// (D6-GENUINE) explicitly excludes it and falls back to the global lock. So FutexWait's
+// LIVE retirement is DEFERRED: Stage 191D lands + proves the block-publish seam (Phase A
+// value-check `futex_wait_would_block_split_read`, Phase B block-publish
+// `futex_wait_publish_block_split_mut`) as HELPER-ONLY and keeps FutexWait fully
+// global-lock-only. The published waiter is Blocked(Futex), not enqueued, current on no
+// CPU, and wakeable by the 191B FutexWake split (no lost/duplicate/orphaned waiter).
+mod stage191d_futex_wait_block_publish {
+    use super::*;
+    use crate::kernel::scheduler::{CpuId, MAX_CPUS};
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::kernel::vm::VirtAddr;
+    use crate::runtime::SharedKernel;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+
+    // DEFERRED: FutexWait stays FULLY global-lock-only — NOT in the split whitelist and
+    // NOT routed in `try_split_dispatch_into_frame`. The concrete blocker (the matched
+    // wait's queue-advancing dispatch is the global-lock `switch_required` case) is
+    // recorded as the deferred-reason marker.
+    #[test]
+    fn futex_wait_stays_locked_block_publish_deferred() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::FutexWait => Some"),
+            "FutexWait must NOT be split-eligible (blocking dispatch deferred)"
+        );
+        assert!(
+            !SPLIT_SRC.contains("matches!(syscall, Syscall::FutexWait)"),
+            "FutexWait must NOT be routed into a live split helper"
+        );
+        assert!(
+            SPLIT_SRC.contains("reason=block_dispatch_switch_required_needs_global_lock"),
+            "the FutexWait deferral must record the switch_required dispatch blocker"
+        );
+        // The blocker is real: dispatch_next_task's out-of-lock relocation excludes the
+        // switch-required (queue-advancing) case — exactly what a matched FutexWait needs.
+        assert!(
+            EXEC_SRC.contains("D6_GENUINE_MUT_DISPATCH_FALLBACK reason={}")
+                && EXEC_SRC.contains("\"switch_required\""),
+            "dispatch_next_task must fall back to the global lock for the switch_required case"
+        );
+    }
+
+    // The FutexWait split marker vocabulary + the block-publish marker exist.
+    #[test]
+    fn futex_wait_split_marker_vocabulary_exists() {
+        assert!(
+            SPLIT_SRC.contains("MARK_FUTEX_WAIT_SPLIT_BEGIN: &str = \"FUTEX_WAIT_SPLIT_BEGIN\"")
+                && SPLIT_SRC.contains(
+                    "MARK_FUTEX_WAIT_SPLIT_VALUE_CHECK_OK: &str = \"FUTEX_WAIT_SPLIT_VALUE_CHECK_OK\""
+                )
+                && SPLIT_SRC.contains(
+                    "MARK_FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK: &str = \"FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK\""
+                )
+                && SPLIT_SRC.contains(
+                    "MARK_FUTEX_WAIT_SPLIT_DONE_BLOCKED: &str = \"FUTEX_WAIT_SPLIT_DONE result=blocked\""
+                ),
+            "the FutexWait split marker vocabulary must exist"
+        );
+        assert!(
+            RUNTIME_SRC.contains("\"FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={}\""),
+            "the block-publish seam must emit FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK"
+        );
+    }
+
+    // Phase A value-check seam mirrors legacy validate_current_user_futex_word + the
+    // expected/observed comparison exactly.
+    #[test]
+    fn futex_wait_value_check_seam_mirrors_legacy() {
+        assert!(
+            RUNTIME_SRC.contains("pub fn futex_wait_would_block_split_read(")
+                && RUNTIME_SRC.contains("return None; // legacy: WrongObject")
+                && RUNTIME_SRC.contains("return None; // legacy: UserMemoryFault")
+                && RUNTIME_SRC.contains(
+                    "self.copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())?"
+                )
+                && RUNTIME_SRC.contains("Some(expected == observed)"),
+            "the value-check seam must mirror validate_current_user_futex_word + arg compare"
+        );
+        // Same address-validation shape as legacy futex validation.
+        assert!(
+            EXEC_SRC.contains("if addr == 0 {")
+                && EXEC_SRC.contains("return Err(KernelError::WrongObject);")
+                && EXEC_SRC.contains(">= crate::kernel::vm::KERNEL_SPACE_BASE"),
+            "legacy validate_current_user_futex_word must have the mirrored checks"
+        );
+    }
+
+    // Phase B block-publish seam uses ONLY the task (rank 2) + scheduler (rank 1) split-mut
+    // seams and mirrors futex_wait_current's block + block_current_cpu — no broad lock, no
+    // dispatch.
+    #[test]
+    fn futex_wait_block_publish_seam_uses_split_mut() {
+        assert!(
+            RUNTIME_SRC.contains("pub fn futex_wait_publish_block_split_mut(")
+                && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
+                && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
+                && RUNTIME_SRC.contains("kernel_mut(&mut sched.scheduler).block_current_on(cpu)")
+                && RUNTIME_SRC.contains("sched.timer.reset_quantum();"),
+            "the block-publish seam must use the task + scheduler split-mut seams + block_current_on"
+        );
+        // Same Blocked(Futex(addr)) transition as legacy futex_wait_current.
+        assert!(
+            EXEC_SRC.contains(
+                "tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));"
+            ) && RUNTIME_SRC.contains(
+                "tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));"
+            ),
+            "the block-publish transition must match legacy futex_wait_current"
+        );
+        // The seam must NOT dispatch (that is the deferred switch_required case).
+        let start = RUNTIME_SRC
+            .find("pub fn futex_wait_publish_block_split_mut(")
+            .expect("seam must exist");
+        let rest = &RUNTIME_SRC[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains("dispatch_next_task") && !body.contains("dispatch_next_on"),
+            "the block-publish seam must NOT dispatch (switch is deferred to the global lock)"
+        );
+    }
+
+    // Make `tid` the current task on `cpu`.
+    fn make_current(state: &mut crate::kernel::boot::KernelState, tid: u64, cpu: CpuId) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        state.enqueue_on_cpu(cpu, tid).expect("enqueue");
+        state.set_current_cpu(cpu).expect("set cpu");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(
+            state.current_tid_on_cpu(cpu),
+            Some(tid),
+            "task must be current after dispatch"
+        );
+    }
+
+    // EMPIRICAL: the block-publish seam publishes Blocked(Futex(addr)), removes the caller
+    // from the current slot (current on NO CPU → not on two), leaves it un-enqueued (no
+    // duplicate/orphan), and the 191B FutexWake split then wakes it (no lost wake).
+    #[test]
+    fn futex_wait_publish_blocks_and_is_woken_by_split_wake() {
+        let addr = 0x5000usize;
+        let tid = 20001u64;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, tid, CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        let published = shared.futex_wait_publish_block_split_mut(CpuId(0), tid, addr);
+        assert!(published, "publish must succeed");
+        shared.with(|k| {
+            assert_eq!(
+                k.task_status(tid),
+                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                    addr as u64
+                )))),
+                "caller must be published Blocked(Futex)"
+            );
+            // Removed from the current slot on every CPU (current on no CPU).
+            for c in 0..MAX_CPUS {
+                assert_ne!(
+                    k.current_tid_on_cpu(CpuId(c as u8)),
+                    Some(tid),
+                    "blocked caller must not be current on any CPU"
+                );
+            }
+        });
+
+        // 191B FutexWake split observes and wakes the split-published waiter exactly once.
+        let woke = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        assert_eq!(
+            woke, 1,
+            "FutexWake split must wake the published waiter (no lost wake)"
+        );
+        shared.with(|k| {
+            assert_eq!(
+                k.task_status(tid),
+                Some(TaskStatus::Runnable),
+                "woken waiter must be Runnable"
+            );
+        });
+        // A second wake finds nothing — no duplicate wake / no orphaned re-enqueue.
+        let woke2 = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        assert_eq!(woke2, 0, "no duplicate wake once the waiter is Runnable");
+    }
+
+    // EMPIRICAL: with two CPUs online, publishing on CPU0 leaves the caller current on
+    // NEITHER CPU — pinning the "task not current on two CPUs" invariant.
+    #[test]
+    fn futex_wait_publish_not_current_on_two_cpus() {
+        let addr = 0x6000usize;
+        let tid = 20002u64;
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        make_current(&mut state, tid, CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        assert!(shared.futex_wait_publish_block_split_mut(CpuId(0), tid, addr));
+        shared.with(|k| {
+            assert_ne!(k.current_tid_on_cpu(CpuId(0)), Some(tid));
+            assert_ne!(k.current_tid_on_cpu(CpuId(1)), Some(tid));
+            assert_eq!(
+                k.task_status(tid),
+                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                    addr as u64
+                ))))
+            );
+        });
+    }
+
+    // The prior retirements + ReapFaultedTask exclusion are intact.
+    #[test]
+    fn prior_retirements_and_reap_exclusion_intact() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
+            "191A/191B/191C retirements must remain whitelisted"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must stay global-lock-only"
+        );
+    }
+}
+
+// Stage 191E — NEXT SAFE GLOBAL-LOCK RETIREMENT SLICE. Inventory finding: NO safe live
+// syscall-class retirement remains (every remaining global-lock-only class is either
+// explicitly out of scope, needs the queue-advancing out-of-lock dispatch rewrite
+// (FutexWait/Yield), needs capability/VM/spawn mutation, or is broad-IPC). Deliverable
+// per preferred-target #3: a HELPER-ONLY, READ-ONLY seam for the next blocker — peek the
+// next-runnable dispatch candidate off the global lock (the SELECTION half of the deferred
+// FutexWait Phase C queue-advancing dispatch), complementing the 191D Phase A/B seams. No
+// new class is wired live; the split whitelist is unchanged.
+mod stage191e_dispatch_next_candidate_seam {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SCHED_SRC: &str = include_str!("../../kernel/scheduler.rs");
+
+    // INVENTORY: no NEW class became split-eligible this stage; the whitelist is exactly
+    // the accepted classes, and every out-of-scope class stays global-lock-only.
+    #[test]
+    fn split_whitelist_unchanged_no_new_class() {
+        for accepted in [
+            "Syscall::ControlPlaneSetCnodeSlots => Some(syscall),",
+            "Syscall::IpcRecv => Some(syscall),",
+            "Syscall::VmBrk => Some(syscall),",
+            "Syscall::DebugLog => Some(syscall),",
+            "Syscall::FutexWake => Some(syscall),",
+            "Syscall::InitramfsReadChunk => Some(syscall),",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(accepted),
+                "accepted class {accepted} must remain"
+            );
+        }
+        for locked in [
+            "Syscall::Yield => Some",
+            "Syscall::FutexWait => Some",
+            "Syscall::IpcSend => Some",
+            "Syscall::IpcCall => Some",
+            "Syscall::IpcReply => Some",
+            "Syscall::IpcRecvTimeout => Some",
+            "Syscall::VmMap => Some",
+            "Syscall::VmAnonMap => Some",
+            "Syscall::TransferRelease => Some",
+            "Syscall::Fork => Some",
+            "Syscall::SpawnThread => Some",
+            "Syscall::SpawnProcess => Some",
+            "Syscall::SpawnFromMemoryObject => Some",
+            "Syscall::CreateInitramfsFileSliceMo => Some",
+            "Syscall::RecvSharedV3 => Some",
+            "Syscall::ReapFaultedTask => Some",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(locked),
+                "{locked} must NOT be split-eligible (Stage 191E adds no live class)"
+            );
+        }
+    }
+
+    // The candidate seam is READ-ONLY and HELPER-ONLY: it uses the scheduler split seam +
+    // the non-mutating peek, takes no broad lock, and is NOT routed into try_split_dispatch.
+    #[test]
+    fn candidate_seam_is_read_only_and_helper_only() {
+        assert!(
+            RUNTIME_SRC.contains("pub fn dispatch_next_candidate_split_read(")
+                && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
+                && RUNTIME_SRC.contains(".peek_next_runnable_on(cpu)"),
+            "the candidate seam must peek via the scheduler split seam"
+        );
+        // Read-only: the seam body must not dequeue / block / enqueue / set current.
+        let start = RUNTIME_SRC
+            .find("pub fn dispatch_next_candidate_split_read(")
+            .expect("seam exists");
+        let rest = &RUNTIME_SRC[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        // Scan the body AFTER the signature line (the fn's own name contains
+        // "dispatch_next", which is not a mutating call).
+        let sig_end = rest.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body = &rest[sig_end..end];
+        for mutating in [
+            "dispatch_next_on",
+            "dispatch_next_task",
+            ".dispatch_next(",
+            "dequeue",
+            "block_current",
+            "enqueue",
+            "on_preempt",
+            "set_current",
+            ".pop(",
+        ] {
+            assert!(
+                !body.contains(mutating),
+                "the candidate seam must be read-only (found `{mutating}`)"
+            );
+        }
+        // Helper-only: never wired into the live split dispatcher.
+        assert!(
+            !SPLIT_SRC.contains("dispatch_next_candidate_split_read"),
+            "the candidate seam must stay helper-only (not in the live split dispatch)"
+        );
+        // The underlying peek is a non-mutating twin of dequeue_highest.
+        assert!(
+            SCHED_SRC.contains("fn peek_highest(&self) -> Option<ThreadId>")
+                && SCHED_SRC.contains("pub fn peek_next_runnable_on(&self, cpu: CpuId)"),
+            "the non-mutating peek_highest / peek_next_runnable_on must exist"
+        );
+    }
+
+    // EMPIRICAL: the seam returns the SAME TID the authoritative dispatch selects from a
+    // cleared current, and it never mutates the run queue (idempotent; dispatch still works).
+    #[test]
+    fn candidate_matches_authoritative_dispatch_and_is_idempotent() {
+        let mut state = Bootstrap::init().expect("init");
+        state
+            .register_task_with_class(30001, crate::kernel::task::TaskClass::App)
+            .expect("reg1");
+        state
+            .register_task_with_class(30002, crate::kernel::task::TaskClass::App)
+            .expect("reg2");
+        state.set_current_cpu(CpuId(0)).expect("cpu0");
+        state.enqueue_on_cpu(CpuId(0), 30001).expect("enq1");
+        state.enqueue_on_cpu(CpuId(0), 30002).expect("enq2");
+        // Clear the current slot so the seam models the FutexWait-block Phase C selection.
+        let _ = state.block_current_cpu();
+        let runnable_before = state.runnable_count_on_cpu(CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        let cand = shared.dispatch_next_candidate_split_read(CpuId(0));
+        assert_eq!(
+            cand,
+            Some(30001),
+            "candidate must be the FIFO head (highest priority)"
+        );
+        // Idempotent / non-mutating: a second peek is identical, run queue unchanged.
+        assert_eq!(
+            shared.dispatch_next_candidate_split_read(CpuId(0)),
+            Some(30001)
+        );
+        shared.with(|k| {
+            assert_eq!(
+                k.runnable_count_on_cpu(CpuId(0)),
+                runnable_before,
+                "the peek must not dequeue"
+            );
+        });
+        // Matches the authoritative mutating dispatch.
+        shared.with(|k| {
+            k.dispatch_next_task().expect("dispatch");
+            assert_eq!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(30001),
+                "authoritative dispatch must select the peeked candidate"
+            );
+        });
+    }
+
+    // EMPIRICAL: with nothing runnable, the seam returns None (the caller would idle).
+    #[test]
+    fn candidate_is_none_when_idle() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_current_cpu(CpuId(0)).expect("cpu0");
+        let _ = state.block_current_cpu();
+        let shared = SharedKernel::new(state);
+        assert_eq!(shared.dispatch_next_candidate_split_read(CpuId(0)), None);
+    }
+}
+
+// Stage 192A — QUEUE-ADVANCING OUT-OF-LOCK DISPATCH (FutexWait live Phase C). FutexWait's
+// blocking wait now publishes Blocked(Futex) + block_current IN-LOCK, then defers the
+// queue-advancing dispatch OUT of the global lock to the trap-entry drain — the direct
+// analogue of the accepted, default-on Stage 168B/169 D2-GENUINE recv/send out-of-lock
+// dispatch. The out-of-lock drain runs the authoritative dispatch_next_on under only the
+// rank-1 scheduler seam, marks the incoming task Running (rank-2), and a brief with_cpu
+// re-acquire performs only the arch restore (incoming ASID/CR3 + trap-frame). x86_64-only.
+mod stage192a_queue_advancing_dispatch {
+    use super::*;
+    use crate::kernel::scheduler::{CpuId, MAX_CPUS};
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::kernel::vm::VirtAddr;
+    use crate::runtime::SharedKernel;
+
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+
+    // INVENTORY: the in-lock futex_wait_current defers the dispatch (mirroring D2 recv),
+    // and the trap-entry drain performs the out-of-lock queue-advancing dispatch. FutexWait
+    // is NOT added to try_split_dispatch (it uses the D2-style in-lock-commit path).
+    #[test]
+    fn futex_wait_defers_dispatch_and_trap_drain_exists() {
+        assert!(
+            EXEC_SRC.contains("crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid)")
+                && EXEC_SRC.contains("return Ok(true);"),
+            "futex_wait_current must defer the queue-advancing dispatch when eligible"
+        );
+        // The in-lock fallback (dispatch_next_task) is preserved for ineligible cases.
+        assert!(
+            EXEC_SRC.contains("FUTEX_WAIT_INLOCK_DISPATCH_FALLBACK")
+                && EXEC_SRC.contains("self.dispatch_next_task()?;"),
+            "the in-lock dispatch fallback must be preserved"
+        );
+        // The trap-entry drain mirrors the D2 recv drain.
+        assert!(
+            TRAP_SRC.contains("futex_wait_was_deferred")
+                && TRAP_SRC.contains("shared.futex_wait_reverify_blocked(t)")
+                && TRAP_SRC.contains("shared.futex_wait_dispatch_step_mut(cpu)")
+                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
+            "the trap-entry futex drain must reverify + dispatch-step + mark-running + restore"
+        );
+    }
+
+    // MARKERS exist (queue-advancing + FutexWait-live + retirement).
+    #[test]
+    fn queue_advancing_and_futex_markers_exist() {
+        for m in [
+            "QUEUE_ADVANCING_DISPATCH_BEGIN",
+            "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK",
+            "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK",
+            "QUEUE_ADVANCING_DISPATCH_FRAME_OK",
+            "QUEUE_ADVANCING_DISPATCH_DONE result=ok",
+            "FUTEX_WAIT_SPLIT_DISPATCH_OK",
+            "FUTEX_WAIT_SPLIT_DONE result=blocked",
+        ] {
+            assert!(
+                TRAP_SRC.contains(m),
+                "queue-advancing / futex marker `{m}` must exist"
+            );
+        }
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok"),
+            "the FutexWait retirement marker must exist"
+        );
+        // ReapFaultedTask stays global-lock-only.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must stay global-lock-only"
+        );
+    }
+
+    // The dispatch-step seam is the authoritative dispatch_next_on via the scheduler seam.
+    #[test]
+    fn dispatch_step_uses_authoritative_dispatch_next_on() {
+        assert!(
+            RUNTIME_SRC.contains("pub(crate) fn futex_wait_dispatch_step_mut(")
+                && RUNTIME_SRC.contains(".dispatch_next_on(dispatch_cpu)")
+                && RUNTIME_SRC.contains("pub(crate) fn futex_wait_reverify_blocked("),
+            "the futex dispatch-step must use the authoritative dispatch_next_on + reverify"
+        );
+    }
+
+    // Make `tid` current on `cpu`.
+    fn make_current(state: &mut crate::kernel::boot::KernelState, tid: u64, cpu: CpuId) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        state.enqueue_on_cpu(cpu, tid).expect("enq");
+        state.set_current_cpu(cpu).expect("cpu");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(state.current_tid_on_cpu(cpu), Some(tid));
+    }
+
+    // EMPIRICAL: the deferral defer/clear cycle is single-shot; the dispatch-step dequeues
+    // the next runnable exactly once, sets it current, and the old task is no longer current.
+    #[test]
+    fn futex_dispatch_step_advances_queue_exactly_once() {
+        let blocked = 40001u64;
+        let next = 40002u64;
+        let addr = 0x7000usize;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, blocked, CpuId(0));
+        // Enqueue a real next-runnable task behind the current one.
+        state
+            .register_task_with_class(next, TaskClass::App)
+            .expect("reg-next");
+        state.enqueue_on_cpu(CpuId(0), next).expect("enq-next");
+        // Publish Blocked(Futex) + clear current (mirrors the in-lock futex block).
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == blocked {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                }
+            }
+        });
+        let _ = state.block_current_cpu();
+        let runnable_before = state.runnable_count_on_cpu(CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        // Reverify passes (still Blocked(Futex)).
+        assert!(shared.futex_wait_reverify_blocked(blocked));
+        // Queue-advancing dispatch: dequeues `next`, sets it current.
+        let incoming = shared.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            incoming,
+            Some(next),
+            "dispatch must select the next runnable task"
+        );
+        shared.with(|k| {
+            assert_eq!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(next),
+                "new task is current"
+            );
+            assert_ne!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(blocked),
+                "old (blocked) task is no longer current"
+            );
+            // Dequeued exactly once: run queue shrank by one.
+            assert_eq!(
+                k.runnable_count_on_cpu(CpuId(0)),
+                runnable_before - 1,
+                "dequeue mutates the run queue exactly once"
+            );
+            // New task not current on any OTHER CPU (single-CPU: current on none but cpu0).
+            for c in 1..MAX_CPUS {
+                assert_ne!(k.current_tid_on_cpu(CpuId(c as u8)), Some(next));
+            }
+            // The blocked task stays Blocked(Futex) (not re-enqueued / orphaned).
+            assert_eq!(
+                k.task_status(blocked),
+                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                    addr as u64
+                ))))
+            );
+        });
+    }
+
+    // EMPIRICAL: a futex-blocked waiter published this way is woken by the 191B FutexWake
+    // split (no lost wake), integrating the block + dispatch + wake path.
+    #[test]
+    fn futex_blocked_waiter_woken_by_split_wake() {
+        let waiter = 40010u64;
+        let addr = 0x8000usize;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, waiter, CpuId(0));
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == waiter {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                }
+            }
+        });
+        let _ = state.block_current_cpu();
+        let shared = SharedKernel::new(state);
+        // No other runnable ⇒ dispatch idles (the init-park case).
+        assert_eq!(shared.futex_wait_dispatch_step_mut(CpuId(0)), None);
+        // FutexWake split wakes the waiter exactly once.
+        assert_eq!(shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX), 1);
+        shared.with(|k| assert_eq!(k.task_status(waiter), Some(TaskStatus::Runnable)));
+    }
+
+    // The per-CPU deferral discipline is single-shot (no nested deferral).
+    #[test]
+    fn deferral_is_single_shot() {
+        use crate::kernel::boot::{
+            futex_wait_dispatch_clear, futex_wait_dispatch_is_deferred,
+            futex_wait_dispatch_outgoing, futex_wait_dispatch_try_defer,
+        };
+        futex_wait_dispatch_clear(0);
+        assert!(!futex_wait_dispatch_is_deferred(0));
+        assert!(futex_wait_dispatch_try_defer(0, 4242));
+        assert!(futex_wait_dispatch_is_deferred(0));
+        assert_eq!(futex_wait_dispatch_outgoing(0), Some(4242));
+        // A second defer while one is pending is declined (no nesting).
+        assert!(!futex_wait_dispatch_try_defer(0, 9999));
+        futex_wait_dispatch_clear(0);
+        assert!(!futex_wait_dispatch_is_deferred(0));
+        assert_eq!(futex_wait_dispatch_outgoing(0), None);
+    }
+}
+
+// Stage 192B — YIELD QUEUE-ADVANCING OUT-OF-LOCK DISPATCH. Yield is the preempt sibling of
+// FutexWait (192A): instead of blocking, the in-lock yield_current sets the caller Runnable,
+// RE-ENQUEUES it, and clears `current` (the re-enqueue half of on_preempt), then defers the
+// queue-advancing dispatch to the trap-entry drain, which runs dispatch_next_on off the
+// global lock + marks incoming Running + restores ASID/CR3/frame. x86_64-only.
+mod stage192b_yield_queue_advancing_dispatch {
+    use super::*;
+    use crate::kernel::scheduler::{CpuId, MAX_CPUS};
+    use crate::kernel::task::{TaskClass, TaskStatus};
+    use crate::runtime::SharedKernel;
+
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SCHED_SRC: &str = include_str!("../../kernel/scheduler.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+
+    // INVENTORY: yield_current re-enqueues + defers; the trap drain does the out-of-lock
+    // dispatch; the in-lock on_preempt fallback is preserved.
+    #[test]
+    fn yield_defers_dispatch_and_trap_drain_exists() {
+        assert!(
+            EXEC_SRC.contains("self.preempt_reenqueue_current_cpu()")
+                && EXEC_SRC
+                    .contains("crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)"),
+            "yield_current must re-enqueue + defer the queue-advancing dispatch when eligible"
+        );
+        assert!(
+            EXEC_SRC.contains("YIELD_INLOCK_DISPATCH_FALLBACK")
+                && EXEC_SRC.contains("let next_tid = self.on_preempt_current_cpu();"),
+            "the in-lock on_preempt fallback must be preserved"
+        );
+        assert!(
+            TRAP_SRC.contains("yield_was_deferred")
+                && TRAP_SRC.contains("shared.yield_reverify_ready(cpu)")
+                && TRAP_SRC.contains("shared.yield_dispatch_step_mut(cpu)")
+                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
+            "the trap-entry yield drain must reverify + dispatch-step + mark-running + restore"
+        );
+    }
+
+    // MARKERS exist; the re-enqueue-only split is a non-dispatching twin of on_preempt.
+    #[test]
+    fn yield_markers_and_reenqueue_split_exist() {
+        for m in [
+            "YIELD_DISPATCH_DEFER_BEGIN",
+            "YIELD_DISPATCH_REENQUEUE_OK",
+            "YIELD_DISPATCH_DEQUEUE_OK",
+            "YIELD_DISPATCH_CURRENT_SET_OK",
+            "YIELD_DISPATCH_FRAME_OK",
+            "YIELD_DISPATCH_DONE result=ok",
+        ] {
+            assert!(
+                TRAP_SRC.contains(m) || EXEC_SRC.contains(m) || RUNTIME_SRC.contains(m),
+                "yield marker `{m}` must exist"
+            );
+        }
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok"),
+            "the Yield retirement marker must exist"
+        );
+        assert!(
+            SCHED_SRC.contains("pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId>")
+                && RUNTIME_SRC.contains("pub(crate) fn yield_dispatch_step_mut(")
+                && RUNTIME_SRC.contains(".dispatch_next_on(dispatch_cpu)"),
+            "the re-enqueue-only split + authoritative dispatch-step must exist"
+        );
+        // ReapFaultedTask stays global-lock-only.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+    }
+
+    fn make_current(state: &mut crate::kernel::boot::KernelState, tid: u64, cpu: CpuId) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        state.enqueue_on_cpu(cpu, tid).expect("enq");
+        state.set_current_cpu(cpu).expect("cpu");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(state.current_tid_on_cpu(cpu), Some(tid));
+    }
+
+    // EMPIRICAL: re-enqueue-only re-enqueues the caller EXACTLY once (clears current), then
+    // the out-of-lock dispatch selects the FIFO head, sets it current, and the yielding task
+    // is NOT lost (stays runnable) and is not current on any other CPU.
+    #[test]
+    fn yield_reenqueues_once_then_dispatches_next() {
+        let caller = 50001u64;
+        let other = 50002u64;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, caller, CpuId(0));
+        // Enqueue another runnable task behind the current one.
+        state
+            .register_task_with_class(other, TaskClass::App)
+            .expect("reg-other");
+        state.enqueue_on_cpu(CpuId(0), other).expect("enq-other");
+        // Caller is Runnable (yield sets it so before the preempt).
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == caller {
+                    tcb.status = TaskStatus::Runnable;
+                }
+            }
+        });
+        let runnable_before = state.runnable_count_on_cpu(CpuId(0)); // just `other`
+        // Re-enqueue half: caller re-enqueued, current cleared.
+        let reenq = state.preempt_reenqueue_current_cpu();
+        assert_eq!(reenq, Some(caller), "the caller is re-enqueued");
+        assert_eq!(
+            state.current_tid_on_cpu(CpuId(0)),
+            None,
+            "current is cleared after re-enqueue"
+        );
+        assert_eq!(
+            state.runnable_count_on_cpu(CpuId(0)),
+            runnable_before + 1,
+            "the caller is re-enqueued EXACTLY once"
+        );
+        let shared = SharedKernel::new(state);
+        // Reverify passes (current cleared) and the dispatch selects the FIFO head (other).
+        assert!(shared.yield_reverify_ready(CpuId(0)));
+        let incoming = shared.yield_dispatch_step_mut(CpuId(0));
+        assert_eq!(incoming, Some(other), "dispatch selects the FIFO head");
+        shared.with(|k| {
+            assert_eq!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(other),
+                "new task is current"
+            );
+            assert_ne!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(caller),
+                "caller is no longer current after the switch"
+            );
+            // The yielding caller is NOT lost — still runnable in the queue.
+            assert_eq!(
+                k.task_status(caller),
+                Some(TaskStatus::Runnable),
+                "the yielding task is not lost"
+            );
+            assert_eq!(
+                k.runnable_count_on_cpu(CpuId(0)),
+                runnable_before,
+                "exactly one dequeue: run queue holds the re-enqueued caller"
+            );
+            for c in 1..MAX_CPUS {
+                assert_ne!(k.current_tid_on_cpu(CpuId(c as u8)), Some(other));
+            }
+        });
+    }
+
+    // EMPIRICAL: a lone yielder is re-enqueued and dispatched back to ITSELF (same-task
+    // yield) — no lost task, no idle.
+    #[test]
+    fn lone_yielder_redispatches_itself() {
+        let solo = 50010u64;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, solo, CpuId(0));
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == solo {
+                    tcb.status = TaskStatus::Runnable;
+                }
+            }
+        });
+        assert_eq!(state.preempt_reenqueue_current_cpu(), Some(solo));
+        let shared = SharedKernel::new(state);
+        assert_eq!(shared.yield_dispatch_step_mut(CpuId(0)), Some(solo));
+        shared.with(|k| assert_eq!(k.current_tid_on_cpu(CpuId(0)), Some(solo)));
+    }
+
+    // The per-CPU deferral is single-shot.
+    #[test]
+    fn yield_deferral_is_single_shot() {
+        use crate::kernel::boot::{
+            yield_dispatch_clear, yield_dispatch_is_deferred, yield_dispatch_outgoing,
+            yield_dispatch_try_defer,
+        };
+        yield_dispatch_clear(0);
+        assert!(yield_dispatch_try_defer(0, 7777));
+        assert!(yield_dispatch_is_deferred(0));
+        assert_eq!(yield_dispatch_outgoing(0), Some(7777));
+        assert!(!yield_dispatch_try_defer(0, 8888)); // no nesting
+        yield_dispatch_clear(0);
+        assert!(!yield_dispatch_is_deferred(0));
+    }
+
+    // 192A FutexWait retirement + prior split retirements are intact.
+    #[test]
+    fn prior_retirements_intact() {
+        assert!(
+            MOD_SRC.contains("class=FutexWait result=ok"),
+            "192A FutexWait retirement must remain"
+        );
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(
+            SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
+            "191A/191B/191C retirements must remain"
         );
     }
 }

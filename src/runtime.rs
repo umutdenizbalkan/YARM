@@ -706,6 +706,98 @@ impl SharedKernel {
         })
     }
 
+    /// Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): re-verify — out of the global
+    /// lock, through the rank-2 task seam — that the deferred FutexWait task is STILL
+    /// `Blocked(Futex(_))` before the out-of-lock queue-advancing dispatch drain runs.
+    /// Same correctness fence as the D2 recv/send reverify: guards against a stale deferral
+    /// (e.g. a FutexWake woke the task, or an in-lock fallback superseded it) so a woken
+    /// waiter is never displaced from the run queue. Single-CPU + IRQ-off means nothing
+    /// mutates between the in-lock commit and this check.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| {
+                    matches!(
+                        tcb.status,
+                        crate::kernel::task::TaskStatus::Blocked(
+                            crate::kernel::task::WaitReason::Futex(_)
+                        )
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): the authoritative queue-advancing
+    /// dispatch for a committed FutexWait block, run through the rank-1 scheduler seam with
+    /// the global `SpinLock<KernelState>` already dropped by the trap-entry drain. The
+    /// blocked waiter was removed from `current` (in-lock `block_current`), so
+    /// `dispatch_next_on` genuinely DEQUEUES the next runnable task here (or returns `None`
+    /// ⇒ idle) — the queue-advancing "switch_required" step. Identical body to
+    /// `d2_recv_dispatch_step_mut`; emits the QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK marker.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            let dispatch_cpu = sched.current_cpu;
+            let incoming = kernel_mut(&mut sched.scheduler)
+                .dispatch_next_on(dispatch_cpu)
+                .map(|tid| tid.0);
+            match incoming {
+                Some(tid) => crate::yarm_log!(
+                    "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu={} tid={}",
+                    cpu.0,
+                    tid
+                ),
+                None => {
+                    crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu={} tid=idle", cpu.0)
+                }
+            }
+            incoming
+        })
+    }
+
+    /// Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): re-verify — out of the global lock,
+    /// through the rank-1 scheduler seam — that the `current` slot on `cpu` is still cleared
+    /// (the in-lock `yield_current` re-enqueued the caller and cleared `current`). Guards the
+    /// out-of-lock dispatch against a stale deferral (e.g. an in-lock fallback already
+    /// dispatched). Single-CPU + IRQ-off means nothing mutates between the in-lock commit and
+    /// this check; the re-verify is the correctness fence before dispatching.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn yield_reverify_ready(&self, cpu: CpuId) -> bool {
+        self.with_scheduler_split_mut(|sched| {
+            // `cpu` is the trap CPU == the authoritative dispatch CPU under the
+            // single-dispatcher gate; check its `current` slot is still cleared.
+            let _ = sched.current_cpu;
+            kernel_ref(&sched.scheduler).current_tid_on(cpu).is_none()
+        })
+    }
+
+    /// Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): the authoritative queue-advancing
+    /// dispatch for a committed Yield, run through the rank-1 scheduler seam with the global
+    /// `SpinLock<KernelState>` already dropped by the trap-entry drain. The caller was
+    /// re-enqueued and removed from `current` (in-lock `preempt_reenqueue_only`), so
+    /// `dispatch_next_on` genuinely DEQUEUES the next runnable task here (the FIFO head — the
+    /// re-enqueued caller itself when it is alone). Emits `YIELD_DISPATCH_DEQUEUE_OK`.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn yield_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            let dispatch_cpu = sched.current_cpu;
+            let incoming = kernel_mut(&mut sched.scheduler)
+                .dispatch_next_on(dispatch_cpu)
+                .map(|tid| tid.0);
+            match incoming {
+                Some(tid) => {
+                    crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid={}", cpu.0, tid)
+                }
+                None => crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid=idle", cpu.0),
+            }
+            incoming
+        })
+    }
+
     /// Stage 168B (D2-GENUINE-RECV): does the incoming task have an initialized
     /// kernel switch context (a wired kernel thread)? Read out of the global
     /// lock through the rank-2 task seam. Blocking recv is done by USER tasks,
@@ -2030,6 +2122,323 @@ impl SharedKernel {
         // without creating a whole-KernelState reference; the task lock serializes
         // access to the TCB array.
         unsafe { KernelState::task_asid_for_tid_from_raw(self.state.data_ptr() as *const _, tid) }
+    }
+
+    /// Stage 191A (GLOBAL-LOCK-RETIRE class=DebugLog): copy `len` bytes from user VA
+    /// `user_ptr` in address space `asid_raw`, reading the VM `user_spaces` subsystem
+    /// under the VM lock (rank via `with_vm_user_spaces_split_mut`) and the physical
+    /// bytes via the direct map — WITHOUT the global `SpinLock<KernelState>`. Mirrors
+    /// `KernelState::copy_from_user`'s validation (mapping present, user+read) exactly,
+    /// so the split path is behaviorally identical to the global-lock `DebugLog`
+    /// handler. Returns `None` on any validation/mapping failure (the caller then
+    /// emits nothing, exactly like the global handler's `DEBUG_LOG_COPY_FAIL` path).
+    ///
+    /// Lock order: vm user-spaces (per page, held transiently and released before the
+    /// direct-map read). No global lock; no scheduler/task lock held across the copy.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub fn copy_from_user_asid_split_read(
+        &self,
+        asid_raw: u64,
+        user_ptr: usize,
+        len: usize,
+    ) -> Option<[u8; crate::kernel::ipc::Message::MAX_PAYLOAD]> {
+        use crate::kernel::vm::{Asid, PAGE_SIZE, VirtAddr};
+        if asid_raw == 0 || len == 0 || len > crate::kernel::ipc::Message::MAX_PAYLOAD {
+            return None;
+        }
+        let asid = Asid(u16::try_from(asid_raw).ok()?);
+        let mut out = [0u8; crate::kernel::ipc::Message::MAX_PAYLOAD];
+        let mut done = 0usize;
+        while done < len {
+            let va = user_ptr.checked_add(done)?;
+            let page_base = va & !(PAGE_SIZE - 1);
+            let page_off = va - page_base;
+            let chunk = (len - done).min(PAGE_SIZE - page_off);
+            // Resolve the page's physical base under the VM user-spaces lock (no
+            // global lock), validating user+read exactly like
+            // `validate_user_access_for_asid`.
+            let phys_base = self.with_vm_user_spaces_split_mut(|spaces| {
+                let aspace = spaces.get(asid)?;
+                let mapping = aspace.resolve(VirtAddr(page_base as u64))?;
+                if !mapping.flags.user || !mapping.flags.read {
+                    return None;
+                }
+                Some(mapping.phys.0)
+            })?;
+            for i in 0..chunk {
+                let phys = phys_base.checked_add((page_off + i) as u64)?;
+                let ptr = crate::kernel::boot::KernelState::phys_to_direct_map_ptr(phys)?;
+                // SAFETY: `phys` is within a validated user-readable mapping; the
+                // direct-map pointer is bounds-checked by `phys_to_direct_map_ptr`.
+                out[done + i] = unsafe { core::ptr::read_volatile(ptr) };
+            }
+            done += chunk;
+        }
+        Some(out)
+    }
+
+    /// Stage 191B (GLOBAL-LOCK-RETIRE class=FutexWake): wake up to `max_wake` tasks
+    /// blocked on futex `addr`, OFF the broad global lock. Mirrors the legacy
+    /// `KernelState::futex_wake_inner` + `enqueue_task` EXACTLY, but via the task
+    /// split-mut (rank 2) and scheduler split-mut (rank 1) seams instead of a broad
+    /// `&mut KernelState`.
+    ///
+    /// * WAKE SCAN — under the task lock (one atomic critical section, same as
+    ///   `with_tcbs_mut`): iterate TCBs in array order, and for each
+    ///   `Blocked(Futex(addr))` up to `max_wake`, set `Runnable` and record the tid +
+    ///   its affinity. Same iteration order, same predicate, same `max_wake` cutoff as
+    ///   legacy, so the woken SET, COUNT, and ORDER are identical (a task cannot be
+    ///   woken twice — the predicate only matches `Blocked`; none is orphaned — every
+    ///   woken tid is enqueued below).
+    /// * ENQUEUE — per woken tid, mirroring `enqueue_task`: driver-affinity pin (only a
+    ///   `Driver` with no affinity, pinned to `cpu`), priority from class
+    ///   (`SystemServer` = High, else Normal), then the SAME `SmpScheduler` methods
+    ///   (`enqueue_on_with_priority` for an affinity, else `enqueue_balanced`) via the
+    ///   scheduler split-mut seam.
+    ///
+    /// Lock order: task (rank 2) then scheduler (rank 1), each held transiently and
+    /// released before the next — non-nested; no broad global lock. The caller does
+    /// NOT task-switch. Returns the number of tasks woken (== legacy return value).
+    pub fn futex_wake_split_mut(&self, cpu: CpuId, addr: usize, max_wake: u32) -> u32 {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+        use crate::kernel::vm::VirtAddr;
+        // Bound matches kernel::boot MAX_TASKS (the TCB array length); a task can be
+        // woken at most once, so the collected count never exceeds it.
+        const CAP: usize = 512;
+        if max_wake == 0 {
+            return 0;
+        }
+        // 1. Atomic wake scan under the task lock — identical to `futex_wake_inner`.
+        let mut woken: [(u64, Option<CpuId>); CAP] = [(0u64, None); CAP];
+        let count = self.with_task_tcbs_split_mut(|tcbs| {
+            let mut n = 0usize;
+            for tcb in tcbs.iter_mut().flatten() {
+                if n >= max_wake as usize || n >= CAP {
+                    break;
+                }
+                if tcb.status != TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64))) {
+                    continue;
+                }
+                tcb.status = TaskStatus::Runnable;
+                woken[n] = (tcb.tid.0, tcb.cpu_affinity);
+                n += 1;
+            }
+            n
+        });
+        // 2. Enqueue each woken task, mirroring `enqueue_task` (driver-affinity pin +
+        //    class priority + the SAME SmpScheduler enqueue).
+        for &(tid, mut affinity) in woken.iter().take(count) {
+            let class = self.task_class_split_read(tid);
+            let priority = match class {
+                Some(TaskClass::SystemServer) => TaskPriority::High,
+                _ => TaskPriority::Normal,
+            };
+            if class == Some(TaskClass::Driver) && affinity.is_none() {
+                self.with_task_tcbs_split_mut(|tcbs| {
+                    if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                        if tcb.cpu_affinity.is_none() {
+                            tcb.cpu_affinity = Some(cpu);
+                        }
+                        affinity = tcb.cpu_affinity;
+                    }
+                });
+            }
+            self.with_scheduler_split_mut(|sched| {
+                let sm = kernel_mut(&mut sched.scheduler);
+                let _ = match affinity {
+                    Some(c) => sm.enqueue_on_with_priority(c, ThreadId(tid), priority),
+                    None => sm.enqueue_balanced(ThreadId(tid), priority).map(|_| ()),
+                };
+            });
+        }
+        count as u32
+    }
+
+    /// Stage 191C (GLOBAL-LOCK-RETIRE class=InitramfsReadChunk): copy the kernel slice
+    /// `src` into user VA `user_ptr` in address space `asid_raw`, OFF the broad global
+    /// lock. Byte-identical in end-state to the legacy `KernelState::
+    /// copy_to_current_user_from_slice` / `copy_slice_to_task` (per-page validate +
+    /// bulk `copy_nonoverlapping`), but driven through the rank-5 VM seam
+    /// (`validate_user_access_for_asid_split`) + the direct map instead of a broad
+    /// `&mut KernelState`. No IPC (rank 3) / capability (rank 4) / scheduler (rank 1) /
+    /// task (rank 2) lock is taken.
+    ///
+    /// TWO-PASS (all-or-nothing) so a partial write can never happen on the split path:
+    /// * Pass 1 validates EVERY destination page is user-writable and performs NO write.
+    ///   If any page is unmapped / not user-writable it returns `Err(UserMemoryFault)`
+    ///   BEFORE a single byte is written — so the caller can safely fall back to the
+    ///   unchanged global-lock handler for the canonical error with zero user mutation.
+    /// * Pass 2 runs only after every page validated, so it cannot fault; it bulk-copies
+    ///   each page-aligned chunk through the direct map.
+    ///
+    /// Returns `Err(UserMemoryFault)` on any validation miss (same error class the legacy
+    /// path raises; the legacy path never faults-in / COWs either — it only validates
+    /// flags). The single-dispatcher trap point runs this with no concurrent mutator, so
+    /// Pass 2's re-resolve observes the same mappings Pass 1 validated. Available in both
+    /// configs (the two-pass structure is config-independent; only the leaf byte write
+    /// differs — direct-map `copy_nonoverlapping` bare-metal, `write_user_byte_split`
+    /// hosted — so the hosted build can unit-test the no-partial-write guarantee directly).
+    pub fn copy_slice_to_user_asid_split_write(
+        &self,
+        asid_raw: u64,
+        user_ptr: usize,
+        src: &[u8],
+    ) -> Result<(), KernelError> {
+        use crate::kernel::vm::{Asid, PAGE_SIZE};
+        let asid = Asid(u16::try_from(asid_raw).map_err(|_| KernelError::UserMemoryFault)?);
+        let len = src.len();
+        // Pass 1: validate every destination page is user-writable (NO write). A fault
+        // here returns BEFORE a single byte is written.
+        let mut done = 0usize;
+        while done < len {
+            let va = user_ptr
+                .checked_add(done)
+                .ok_or(KernelError::UserMemoryFault)?;
+            let page_off = va & (PAGE_SIZE - 1);
+            let chunk = (len - done).min(PAGE_SIZE - page_off);
+            self.validate_user_access_for_asid_split(asid, va, true)?;
+            done += chunk;
+        }
+        // Pass 2: every page validated ⇒ the copy cannot fault. Same per-page walk as the
+        // legacy bulk copy path; the leaf write is the config-appropriate primitive.
+        let mut done = 0usize;
+        while done < len {
+            let va = user_ptr
+                .checked_add(done)
+                .ok_or(KernelError::UserMemoryFault)?;
+            let page_off = va & (PAGE_SIZE - 1);
+            let chunk = (len - done).min(PAGE_SIZE - page_off);
+            let phys = self.validate_user_access_for_asid_split(asid, va, true)?;
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let dst_ptr = crate::kernel::boot::KernelState::phys_to_direct_map_ptr(phys)
+                    .ok_or(KernelError::UserMemoryFault)?;
+                // SAFETY: `phys` is within a validated user-writable mapping; `chunk`
+                // never exceeds the bytes left in that page; `src` has ≥ `len` bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(src[done..].as_ptr(), dst_ptr, chunk);
+                }
+            }
+            #[cfg(feature = "hosted-dev")]
+            {
+                for j in 0..chunk {
+                    self.write_user_byte_split(
+                        asid,
+                        crate::kernel::vm::VirtAddr(phys + j as u64),
+                        src[done + j],
+                    )?;
+                }
+            }
+            done += chunk;
+        }
+        Ok(())
+    }
+
+    /// Stage 191D (FUTEXWAIT BLOCK-PUBLISH SEAM), Phase A: validate the futex word and
+    /// decide whether the caller `tid` WOULD block, OFF the broad global lock. Mirrors the
+    /// read/validate portion of `KernelState::futex_wait_current` /
+    /// `validate_current_user_futex_word` EXACTLY:
+    /// * `addr == 0` → `None` (legacy `WrongObject`).
+    /// * `addr + 3 >= KERNEL_SPACE_BASE` → `None` (legacy `UserMemoryFault`).
+    /// * 4-byte user read fails → `None` (legacy `UserMemoryFault`).
+    ///
+    /// On a validated address returns `Some(would_block)` where `would_block ==
+    /// (expected == observed)` — identical to `futex_wait_current`'s `expected != observed
+    /// → Ok(false)` decision (the futex value comparison uses the caller-provided `expected`
+    /// / `observed` syscall args; the memory read only proves the address is user-readable).
+    /// Read-only: no TCB / scheduler / IPC / cap / VM structural mutation. `None` lets a
+    /// caller fall back to the global-lock handler for the canonical error (never masked).
+    #[cfg(not(feature = "hosted-dev"))]
+    pub fn futex_wait_would_block_split_read(
+        &self,
+        tid: u64,
+        addr: usize,
+        expected: u32,
+        observed: u32,
+    ) -> Option<bool> {
+        if addr == 0 {
+            return None; // legacy: WrongObject
+        }
+        let end = addr.checked_add(core::mem::size_of::<u32>() - 1)?;
+        if end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE {
+            return None; // legacy: UserMemoryFault
+        }
+        let asid = self.task_asid_for_tid_split_read(tid);
+        self.copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())?;
+        Some(expected == observed)
+    }
+
+    /// Stage 191D (FUTEXWAIT BLOCK-PUBLISH SEAM), Phase B: publish the caller `tid` as
+    /// `Blocked(Futex(addr))` and clear the current-CPU slot, OFF the broad global lock —
+    /// mirroring the block portion of `KernelState::futex_wait_current` (the TCB status
+    /// set) + `block_current_cpu` (`block_current_on` + `timer.reset_quantum`), WITHOUT the
+    /// subsequent `dispatch_next_task`. Task lock (rank 2) then scheduler lock (rank 1),
+    /// each held transiently and released before the next — non-nested; no broad
+    /// `&mut KernelState`. The published waiter is left `Blocked` and NOT enqueued (so no
+    /// duplicate enqueue and no orphaned runnable), removed from the current slot (so it is
+    /// current on NO CPU), and observable to `futex_wake_split_mut` on the same `addr` (so
+    /// no lost wake). Requires `tid` to be the current task on `cpu` (the live caller is).
+    /// Returns `true` iff the caller was published `Blocked` and removed from current.
+    ///
+    /// DEFERRED / HELPER-ONLY: this is the block-publish half of a split FutexWait. It does
+    /// NOT dispatch — the queue-ADVANCING switch to the next runnable task
+    /// (`dispatch_next_task`'s "switch_required" case) requires the global-lock dispatch /
+    /// context-switch machinery and is the documented multi-stage rewrite, so FutexWait's
+    /// LIVE retirement is deferred and this seam is not wired into `try_split_dispatch`.
+    pub fn futex_wait_publish_block_split_mut(&self, cpu: CpuId, tid: u64, addr: usize) -> bool {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        use crate::kernel::vm::VirtAddr;
+        // Phase B1: publish Blocked(Futex(addr)) on the caller's TCB (task lock, rank 2) —
+        // identical transition to `futex_wait_current`'s `with_tcbs_mut` block.
+        let published = self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                Some(tcb) => {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                    true
+                }
+                None => false,
+            }
+        });
+        if !published {
+            return false;
+        }
+        // Phase B2: clear the current-CPU slot (scheduler lock, rank 1) — identical to
+        // `block_current_cpu` (block_current_on + reset_quantum). NO dispatch here.
+        self.with_scheduler_split_mut(|sched| {
+            let blocked = kernel_mut(&mut sched.scheduler).block_current_on(cpu);
+            if blocked.is_some() {
+                sched.timer.reset_quantum();
+            }
+        });
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={}",
+            tid,
+            addr
+        );
+        true
+    }
+
+    /// Stage 191E (FUTEXWAIT PHASE-C SELECTION SEAM): peek the next-runnable dispatch
+    /// candidate on `cpu` — the TID the authoritative per-CPU dispatch would select once
+    /// the current slot is idle/cleared — OFF the broad global lock, through the scheduler split seam
+    /// (rank 1) ONLY. READ-ONLY: it never dequeues, never sets current, never mutates any
+    /// scheduler/task state; the run queue is unchanged (two calls return the same TID).
+    ///
+    /// This is the non-mutating SELECTION half of the deferred FutexWait "switch_required"
+    /// Phase C (queue-advancing dispatch), complementing the 191D Phase A value-check
+    /// (`futex_wait_would_block_split_read`) + Phase B block-publish
+    /// (`futex_wait_publish_block_split_mut`). It proves the next-task DECISION is available
+    /// off the global lock; the mutating dequeue + arch context switch remain the deferred
+    /// hard part, so this seam is HELPER-ONLY (not wired into `try_split_dispatch`).
+    /// Returns `None` when no task is runnable on `cpu` (the caller would idle).
+    pub fn dispatch_next_candidate_split_read(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .peek_next_runnable_on(cpu)
+                .map(|tid| tid.0)
+        })
     }
 
     pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot {

@@ -276,6 +276,27 @@ pub fn printk_flush() -> usize {
     }
 }
 
+/// Stage 189D: emit a line to the console SYNCHRONOUSLY, bypassing the ring buffer.
+/// Under concurrent multi-CPU logging the shared ring can overflow and DROP a pushed
+/// message before it is flushed; a required proof marker must not be lost that way.
+/// This formats into a stack buffer, takes the drain lock (serializing against
+/// concurrent flushes so the line is not byte-interleaved), drains any pending ring
+/// messages first to preserve ordering, then writes the line directly (the console
+/// writer polls THR-empty per byte, so no byte-level drop). Use SPARINGLY — it blocks
+/// on the UART. Intended for a handful of AP user-dispatch seal markers.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn printk_emit_sync(args: fmt::Arguments<'_>) {
+    let mut sb = StackBuf::new();
+    let _ = fmt::write(&mut sb, args);
+    let _drain_guard = PRINTK_DRAIN_LOCK.lock();
+    let _ = threaded_drain_to(|_lvl, _ctx, msg| crate::arch::console::write_line(msg));
+    if let Ok(line) = core::str::from_utf8(&sb.buf[..sb.len]) {
+        crate::arch::console::write_line(line);
+    }
+}
+#[cfg(feature = "hosted-dev")]
+pub fn printk_emit_sync(_args: fmt::Arguments<'_>) {}
+
 #[macro_export]
 macro_rules! printk {
     ($lvl:expr, $ctx:expr, $($arg:tt)*) => {{

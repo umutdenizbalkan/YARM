@@ -270,6 +270,15 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_ipc_recv_proof_sender_wake_enabled(enabled);
         crate::yarm_log!("YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.ap_user_dispatch {
+        // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
+        // first live AP user dispatch. No-op on other arches; when OFF the AP
+        // idle-loop hook is inert and the SMP baseline is preserved.
+        crate::kernel::boot::set_ap_user_dispatch_enabled(enabled);
+        if enabled {
+            crate::yarm_log!("AP_USER_DISPATCH_ENABLED");
+        }
+    }
 }
 
 pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
@@ -424,6 +433,10 @@ pub struct YarmBootOptions<'a> {
     /// coordination hook + workload, isolating it from the green queued-split +
     /// rollback proof boots.
     pub ipc_recv_proof_sender_wake: Option<bool>,
+    /// Stage 189C6: `yarm.ap_user_dispatch=1` DEFAULT-OFF gate that arms the first
+    /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
+    /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
+    pub ap_user_dispatch: Option<bool>,
 }
 
 /// Parse a `yarm.loglevel=` value: digit 0–7 or a level name.
@@ -546,6 +559,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.ipc_recv_proof_sender_wake" {
             options.ipc_recv_proof_sender_wake = parse_bool_knob(value);
+        }
+        if key == b"yarm.ap_user_dispatch" {
+            options.ap_user_dispatch = parse_bool_knob(value);
         }
     }
     options

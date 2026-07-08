@@ -230,6 +230,595 @@ remove implicit global-lock coupling from syscall/trap paths.
     diagnostic (a pre-existing TCG serial-output race since 189C2, ~3/5 pass); the
     AP functionally comes online (send/ack/TLB `result=ok`) every run. smp4 is
     clean.
+- **Stage 189C5 (AP-RING3-ENTRY) — prerequisites attested; live dispatcher hook
+  GATED OFF to preserve the accepted SMP baseline.** No wake-only cleared, no AP
+  ring 3 entry, no live-dispatch marker, nothing faked; global lock authoritative,
+  ABI unchanged.
+  * **Ring3-entry prerequisites present + attested.** The reusable ring3 entry
+    (`descriptor_tables::enter_user_mode_iret`), the per-CPU-safe syscall re-entry
+    (189C4), the per-CPU TSS RSP0 (189C2), and the kernel-return-context mapper
+    (`page_table::ensure_kernel_return_context_mapped_for_asid`, which maps a task's
+    kernel stack into its own CR3 for the ring3→ring0 switch) all exist.
+    `ap_ring3_entry_prereqs_present()` → `X86_AP_RING3_ENTRY_READY cpu=N
+    reason=prereqs_present_live_hook_gated` (smp4: cpu 1/2/3).
+  * **Why the live hook is gated OFF.** Wiring a live AP ring 3 entry means
+    modifying the AP idle-loop `global_asm` to `call` a Rust dispatcher that, on
+    wake, picks an admitted task, sets the AP per-CPU `syscall_kernel_rsp0` + TSS
+    RSP0 to that task's kernel stack, maps that stack into the task CR3, loads the
+    CR3, and `iretq`s to ring 3. Any error there triple-faults, which resets the
+    machine and breaks **every** SMP smoke — i.e. it would regress the accepted
+    baseline (smp2/smp4 through 189C4). A first-attempt ring 3 entry realistically
+    needs several QEMU-debug iterations, so per the "keep QEMU-proven work / do not
+    weaken the baseline" constraints the live hook stays off:
+    `ap_ring3_entry_path_ready()` = false, `ap_usermode_entry_ready` = false, the
+    audited transition refuses, and the audit emits
+    `X86_AP_USER_DISPATCH_DEFERRED reason=ap_ring3_live_dispatcher_hook_gated`.
+    Guarded by `stage189c5_ap_ring3_entry` (the AP idle-loop trampoline contains no
+    `yarm_x86_ap_user_dispatch_entry` call).
+  * **Remaining live-integration work (its own debug cycle):** the AP idle-loop
+    asm `call` hook (no-op unless a per-CPU dispatch-request flag is set by the
+    audited transition), the Rust `ap_user_dispatch_once(cpu)` (lock → `dispatch_next_on`
+    → set per-CPU RSP0/TSS + map kernel stack into task CR3 → `activate_asid` →
+    `enter_user_mode_iret`), then prove `X86_AP_USER_DISPATCH_BEGIN` /
+    `..._TRAP_RETURN_OK` / `..._SYSCALL_REENTRY_OK` / `..._DISPATCH_DONE result=ok`
+    on smp2 before enabling. All the *hard* primitives it depends on are now
+    proven (189C4 per-CPU entry; 189A genuine TLB ACK).
+
+- **Stage 189C6 (FIRST LIVE AP DISPATCH) — DONE and QEMU-PROVEN.** The live AP
+  ring-3 dispatch is wired end-to-end and proven on real second/third/fourth CPUs
+  under `-smp 2` and `-smp 4`; gated behind the DEFAULT-OFF `yarm.ap_user_dispatch`
+  knob so the accepted SMP baseline is byte-for-byte preserved when unarmed.
+  * **The wired path.** The AP idle-loop `naked_asm` (`smp_trampoline.rs` label
+    `76:`) now `call`s the Rust dispatcher `yarm_x86_ap_user_dispatch_entry` — but
+    only when the BSP set this AP's per-CPU `ap_dispatch_request` (gs:[160]) AND
+    CR4 is synced (env flag, SSE on). Unarmed it is a single load+branch, so every
+    non-armed wake is inert (baseline unchanged; the hook fires 0 times with the
+    knob off, verified by the baseline smp2 run).
+  * **Task selection under the global lock; execution lock-free.** When armed, the
+    BSP (inside `run_ap_dispatch_scaffold_audit`, under the global lock, AFTER the
+    audited wake-only clear `X86_AP_WAKE_ONLY_CLEAR`) builds a self-contained ring-3
+    probe task (`KernelState::build_ap_ring3_probe`: fresh ASID + one user code page
+    holding `mov rax,0xA9C6; syscall; jmp .` + one user stack page), publishes a
+    per-CPU dispatch plan (task CR3, entry, user-stack top, a dedicated per-CPU
+    kernel RSP0 in `.bss`), posts the request, and wakes the AP with vector 0xF1.
+    The AP then runs the plan lock-free — it touches only its own per-CPU record,
+    the isolated probe pages, and CR3 — so nothing races the BSP.
+  * **The AP path.** `yarm_x86_ap_user_dispatch_entry` (on the AP): emit
+    `X86_AP_DISPATCH_HOOK_ENTER`; configure this CPU's SYSCALL MSRs
+    (`configure_syscall_msrs_for_self` — EFER.SCE/STAR/LSTAR/FMASK are PER-CPU, so
+    without this the AP's ring-3 `syscall` `#UD`s); set per-CPU `syscall_kernel_rsp0`
+    + AP TSS RSP0 to the dedicated kernel stack; `X86_AP_RING3_ENTER`; load the task
+    CR3 (`X86_AP_USER_CR3_LOAD_OK`); `enter_user_mode_iret` to ring 3. The probe stub
+    issues `syscall` with the magic RAX `0xA9C6`, which the LSTAR AP-probe fast path
+    (a compare+branch at the top of `yarm_x86_lstar_entry`, inert on every real 0..32
+    syscall) catches WITHOUT descending into the shared kernel: it sets the per-CPU
+    `ap_syscall_reentry_ok` (gs:[168]) and parks. The BSP polls that flag and emits
+    `X86_AP_USER_SYSCALL_REENTRY_OK` + `X86_AP_USER_DISPATCH_DONE result=ok`.
+  * **QEMU evidence.** `-smp 2` armed: `X86_AP_DISPATCH_HOOK_ENTER cpu=1` →
+    `X86_AP_RING3_ENTER cpu=1` → `X86_AP_USER_CR3_LOAD_OK cpu=1` →
+    `X86_AP_USER_SYSCALL_REENTRY_OK cpu=1` → `..._DISPATCH_DONE cpu=1 result=ok`.
+    `-smp 4` armed: the same full sequence independently on cpu 1, 2, and 3 (each
+    with its own per-CPU kernel RSP0). Baseline (knob off) smp2/smp4 unchanged, and
+    core/-smp1, IPC oracle, and crash-restart all still pass. Debug iterations that
+    got here: the CR4-synced gate initially read `gs:[88]` (per-CPU record
+    `idle_flags`) instead of the handoff env flag `[rdi+88]` (dispatcher never
+    called); then the AP's ring-3 `syscall` `#UD`'d because the per-CPU SYSCALL MSRs
+    were never configured on the AP (fixed by `configure_syscall_msrs_for_self`).
+  * Guarded by `stage189c6`-updated `stage189c2`/`c3`/`c5`/`c_ap_user_return_percpu`
+    modules (hook wired + knob-gated), `stage183_ap_idle_admit` (admission stays
+    knob-free; the dispatch knob is a different axis), and `percpu` (record offsets
+    160/164/168, stride 192).
+
+- **Stage 189D (SEAL) — DONE and QEMU-PROVEN. Stage 189 is sealed.** The AP user
+  dispatch now proves that AP user execution can safely enter the STILL-GLOBAL-lock
+  syscall path — not only the isolated magic probe. The global lock is NOT retired;
+  this proves it is SMP-safe for an AP to contend for and enter it.
+  * **Real syscall through the global lock.** The 189C6 probe stub is replaced by a
+    stub that issues `Yield` (syscall NR 0 — the normal number range, not the magic
+    `0xA9C6`) FIRST, then the magic syscall only to PARK the AP. The `Yield` takes the
+    normal LSTAR → `yarm_x86_dispatch_trap_from_stub` → `dispatch_trap_entry_with_shared_kernel`
+    → `with_cpu` (the global `SpinLock<KernelState>`) → `handle_yield` path and returns
+    Ok. Markers (emitted from the trap dispatch, gated on a per-CPU seal-probe flag so
+    inert on the BSP / non-armed boots): `X86_AP_USER_SYSCALL_REENTRY_OK` →
+    `X86_AP_NORMAL_SYSCALL_BEGIN cpu tid nr=0` → `X86_AP_GLOBAL_LOCK_DISPATCH_ENTER` →
+    `X86_AP_NORMAL_SYSCALL_OK` → `X86_AP_USER_DISPATCH_SEAL_DONE result=ok`.
+  * **Real admission.** The probe is now a REAL registered task (its own TID + TCB +
+    ASID, one PER AP so no task is `current` on two CPUs). It is PLACED on the AP only
+    AFTER the audited wake-only clear, through the wake-only-guarded `enqueue_on_cpu`
+    (the same guard that denies with `SCHED_ENQUEUE_DENIED_WAKE_ONLY` while wake-only) —
+    `X86_AP_ADMIT_PLACED cpu tid`. It is registered WITHOUT the balanced enqueue so the
+    BSP can never dispatch it (its magic park would otherwise park the BSP).
+  * **No lock-held wait; per-CPU nested-trap guard.** The AP's `Yield` takes the SAME
+    global lock the audit holds, so the live dispatcher arms + wakes and RETURNS
+    (releasing the lock via its trap unwind) rather than polling under it. `TRAP_DISPATCH_DEPTH`
+    became a PER-CPU array: a concurrent BSP+AP dispatch is not nesting (the global lock
+    serializes the real state access), so the `!BN` nested-trap halt no longer
+    false-trips. Required seal markers are emitted via `printk_emit_sync` (bypassing the
+    drop-prone shared printk ring, which overflows under concurrent AP+BSP logging).
+  * **TLB unchanged.** The genuine 189A remote-ACK proof (`X86_TLB_SHOOTDOWN_DONE
+    result=ok context=cow|vm_unmap`, AP-produced ACKs) runs BEFORE the seal and gates
+    it; no BSP-written ACK, no fake ACK.
+  * **QEMU evidence.** `-smp 2` armed: full seal on cpu 1 (tid 20190). `-smp 4` armed:
+    full seal INDEPENDENTLY on cpu 1/2/3 (tids 20190/20191/20192), each `result=ok`,
+    with `SMP_READY_PROOF_DONE` intact. Baseline (knob off) smp2/smp4 inert (0 hook
+    fires), and core/-smp1 + IPC oracle + crash-restart + riscv64 core all still pass;
+    aarch64 core carries its unchanged pre-existing `SUPERVISOR_LIFECYCLE_QUERY_ERR
+    WrongObject` (byte-identical with/without this change). The `-smp 2` armed run
+    occasionally trips the pre-existing `X86_IPI_FIXED_ICR_WRITTEN` TCG serial flake
+    (unrelated; the seal itself still completes). Debug path to here: a shared probe
+    task can't be `current` on 3 CPUs (fixed → per-AP probe); and the under-lock ring3
+    poll starved the APs' own `Yield` of the global lock on smp4 (fixed → arm+wake+return).
+  * **Decision: `yarm.ap_user_dispatch` stays EXPERIMENTAL / DEFAULT-OFF.** It is a
+    one-shot bring-up probe (a parked probe task per AP), not a scheduler policy — no
+    real workload is placed on APs and the APs do not run a dispatch loop. Graduating
+    it needs a real AP scheduler dispatch loop + return-to-idle, which is a later stage.
+  * Guarded by `stage189d_seal` (real-Yield-not-magic success, global-lock dispatch
+    bracket gated per-CPU, per-CPU `TRAP_DISPATCH_DEPTH`, audited per-AP admission,
+    drop-safe emit, no under-lock wait).
+
+- **Stage 190A (AP SCHEDULER LOOP + RETURN-TO-IDLE) — DONE and QEMU-PROVEN.** The
+  one-shot 189D probe that PARKED after the seal now RETURNS to the AP scheduler and
+  falls through to the interruptible idle loop — the AP no longer parks forever.
+  Still global-lock-authoritative; admission still audited; no global-lock retirement.
+  * **Return-to-idle mechanism.** After the admitted probe's `Yield` completes through
+    the global-lock dispatch (`X86_AP_USER_DISPATCH_SEAL_DONE result=ok`, preserved),
+    the trap dispatch calls `smp::ap_seal_return_to_idle`, which BLOCKS the probe on the
+    AP under `with_cpu` (`KernelState::block_current_on_cpu` → `SmpScheduler::block_current_on`,
+    removing run-queue membership). The AP's `current` becomes `None`, so the EXISTING
+    idle path (`exiting_tid == None|Some(0)` → `idle_halt_loop()`, a wake-capable
+    `loop { sti; hlt }`) fires — the honest return-to-idle. No new idle machinery.
+  * **Markers (armed, per AP):** `X86_AP_SCHED_LOOP_READY` (before ring 3) →
+    `X86_AP_USER_DISPATCH_BEGIN cpu tid` → `X86_AP_USER_SYSCALL_REENTRY_OK cpu tid` →
+    the 189D seal markers → `X86_AP_YIELD_RETURN_TO_SCHED_OK cpu tid` (probe blocked) →
+    `X86_AP_RETURN_TO_IDLE_OK cpu` + `X86_AP_SCHED_LOOP_DONE result=ok cpu` →
+    `SCHED_ENTER_IDLE_HLT cpu`. All gated on the per-CPU `ap_seal` flag (the trap-local
+    variable that already brackets the seal), so the BSP and non-armed boots are inert.
+  * **Run-queue consistency + no duplicate dispatch.** The probe is placed as the AP's
+    `current` exactly once (189D admission after the audited wake-only clear) and
+    removed exactly once via `block_current_on`; it is never left runnable on two CPUs
+    (each AP has its own probe TID) and is not re-dispatched after blocking.
+  * **QEMU evidence.** `-smp 2` armed: full ordered sequence on cpu 1 ending in
+    `SCHED_LOOP_DONE result=ok` + `SCHED_ENTER_IDLE_HLT cpu=1`. `-smp 4` armed: all of
+    cpu 1/2/3 reach `SCHED_LOOP_DONE result=ok` + `RETURN_TO_IDLE_OK` (each also
+    `SEAL_DONE result=ok`). Baseline (knob off) smp2/smp4 inert (0 scheduler-loop
+    markers); core/-smp1 + IPC oracle + crash-restart + riscv64 core pass; aarch64 core
+    carries its unchanged pre-existing `WrongObject` caveat. TLB ACK unchanged (genuine
+    189A remote ACK, gates the seal). No forbidden markers (no `!BN`/`!F`, no duplicate
+    dispatch, no lost wake, no lock-retirement claim).
+  * **Go/no-go for controlled AP workload placement:** GO, but still behind the
+    default-off `yarm.ap_user_dispatch` knob. The AP can now run an admitted task and
+    return to idle; the next step (controlled AP workload placement) can build on this
+    return-to-idle loop. Not yet a general AP scheduler policy — the probe is a single
+    controlled task and the AP does not yet re-dispatch a *next* admitted task (it
+    honestly idles). `yarm.ap_user_dispatch` stays EXPERIMENTAL / default-off.
+  * Guarded by `stage190a_ap_sched_loop` (marker vocabulary, return-to-scheduler-then-
+    idle wiring, `block_current_on` run-queue consistency, interruptible idle not a
+    park, no global-lock retirement).
+
+- **Stage 190B (CONTROLLED AP WORKLOAD + SCHEDULER POLICY SEAL) — DONE and
+  QEMU-PROVEN.** The AP scheduler loop now runs a small deterministic SEQUENCE of
+  admitted tasks (A then B) per AP, returning to the scheduler between them and to
+  idle at the end — repeated dispatch with a consistent run queue. Still
+  global-lock-authoritative; a fixed controlled workload, NOT arbitrary load balancing.
+  * **Workload build.** `KernelState::build_ap_workload(base_tid, count)` creates ONE
+    per-AP user address space (code + stack) and registers `count` (=`AP_WORKLOAD_TASKS`
+    = 2) tasks bound to that shared ASID — each runs the same seal stub. The tasks run
+    SEQUENTIALLY on one AP (never concurrently), so sharing the ASID/stack is safe. Each
+    AP has its own TID range (`PROBE_TID_BASE + cpu*16 + i`) so no task is ever
+    `current` on two CPUs.
+  * **One-at-a-time placement (the key correctness point).** `Yield` ROTATES the run
+    queue, so pre-enqueuing A+B would make `Yield` rotate `current` to B before B ran,
+    then block the wrong task. Instead exactly ONE task is runnable on the AP at a time:
+    the BSP places only task A (audited `enqueue_on_cpu` → `X86_AP_ADMIT_PLACED`, made
+    `current`); after A `Yield`s (A is the sole runnable → same-task re-run), the trap
+    dispatch blocks A (`X86_AP_YIELD_RETURN_TO_SCHED_OK tid=A`) and
+    `smp::ap_sched_next_or_idle` places the NEXT task by index under `with_cpu`
+    (audited enqueue → `X86_AP_ADMIT_PLACED tid=B` → `X86_AP_NEXT_TASK_DISPATCH_BEGIN`)
+    and enters ring 3 for it. When the workload index is exhausted it emits
+    `X86_AP_REPEATED_DISPATCH_OK count=N` + `X86_AP_SCHED_POLICY_SEAL_DONE result=ok
+    count=N` and returns to the interruptible idle loop.
+  * **Run-queue consistency + no duplicate dispatch.** Each task is placed once
+    (audited), run once (`AP_DISPATCH_COUNT` advances once per `ap_enter_task_ring3`),
+    and removed once via `block_current_on`. QEMU shows each `X86_AP_RING3_ENTER` TID
+    exactly once per CPU (cpu 1: 20205/20206; cpu 2: 20221/20222; cpu 3: 20237/20238) —
+    distinct per-CPU ranges, no task current on two CPUs, no re-dispatch of an instance.
+  * **QEMU evidence.** `-smp 2` armed: ordered A→(block)→B→(block)→`REPEATED_DISPATCH_OK
+    count=2`→`SCHED_POLICY_SEAL_DONE count=2`→idle on cpu 1. `-smp 4` armed: all of cpu
+    1/2/3 reach `SCHED_POLICY_SEAL_DONE result=ok count=2`. Baseline (knob off)
+    smp2/smp4 inert (0 workload markers); core/-smp1 + oracle + crash-restart + riscv64
+    core pass; aarch64 core unchanged pre-existing `WrongObject`. TLB ACK unchanged
+    (genuine 189A remote ACK). No forbidden markers (no `!BN`/`!F`, no duplicate
+    dispatch, no lost wake, no lock-retirement claim). Debug path: pre-enqueuing both
+    tasks let `Yield` rotate to the not-yet-run task and blocked the wrong one (task A
+    ran twice, B never) → fixed by one-at-a-time placement by index.
+  * **Go/no-go for Stage 191 (global-lock retirement):** NO-GO for now. 190B proves an
+    AP can run a controlled task SEQUENCE under the STILL-GLOBAL lock with consistent
+    run-queue state — a scheduler-policy seal, not lock retirement. Retiring the global
+    `SpinLock<KernelState>` needs per-subsystem locks with rank ordering across the whole
+    syscall/IPC/scheduler/cap/VM/fault surface (the multi-stage rewrite this document's
+    *Current status* disclaims). 190B is a prerequisite datapoint (AP dispatch is
+    SMP-safe under the lock), not that rewrite. `yarm.ap_user_dispatch` stays
+    experimental / default-off.
+  * Guarded by `stage190b_controlled_workload` (marker vocabulary, fixed workload not
+    load balancing, audited one-at-a-time repeated dispatch, distinct per-CPU TIDs +
+    single dispatch count, policy-seal-then-idle under the global lock).
+
+- **Stage 191A (GLOBAL-LOCK-RETIREMENT INVENTORY + FIRST SAFE CLASS) — DONE and
+  QEMU-PROVEN.** The broad global `SpinLock<KernelState>` is NOT retired. Stage 191A
+  audits every syscall for retirement readiness and converts exactly ONE clearly safe
+  class — `DebugLog` (NR 15) — to the existing split-dispatch (no-global-lock) seam.
+  * **Full syscall inventory (23 variants).**
+    - *Already split/live (pre-191A):* `ControlPlaneSetCnodeSlots` (NR 8, split-mut),
+      `IpcRecv` kernel-task queued-plain seam (NR 2), `VmBrk` page-crossing-shrink (NR 14).
+    - *Dispatch-return live (Stage 188):* `IpcRecv`/`IpcCall`/`IpcReply` blocked-waiter
+      delivery (out-of-lock post-work, not a syscall-class retirement).
+    - *Retired in 191A:* `DebugLog` (NR 15).
+    - *Global-lock-only, safe-but-not-converted:* `Yield` (NR 0) — REJECTED: it
+      switches tasks + address space (`yield_current` → `on_preempt` + `switch_address_space`
+      + `maybe_switch_kernel_context`), so `task_switched != false` violates the split
+      seam's no-task-switch invariant. `FutexWake`/`FutexWait` — deferred: Futex mutates
+      scheduler wait/run-queue state (and `FutexWait` blocks), needing a scheduler
+      split-mut + wake-order proof.
+    - *Global-lock-only, DANGEROUS (untouched):* `VmMap`, `VmAnonMap`, `Fork`,
+      `SpawnThread`, `SpawnProcess`/`SpawnProcessFromUserBuf`/`SpawnFromInitramfsFile`/
+      `SpawnFromMemoryObject`, `ReapFaultedTask`, `TransferRelease`, `RecvSharedV3`,
+      `IpcSend`/`IpcCall`/`IpcReply` (broad), `IpcRecvTimeout`, `InitramfsReadChunk`,
+      `CreateInitramfsFileSliceMo`.
+  * **Why DebugLog is the first safe class.** It is a PURE READ: resolve the requester
+    task, copy the user message bytes, log `USER_LOG`, `set_ok(0,0,0)`. It never
+    blocks/yields/schedules, never switches tasks, never mutates `KernelState`
+    (`task_switched == false` stays observable), and it has a COMPLETE lock/rank proof
+    with EXISTING split primitives — `current_tid_authoritative(cpu)` (binds current_cpu)
+    → `task_asid_for_tid_split_read(tid)` (task lock, rank 2) →
+    `copy_from_user_asid_split_read` (VM user-spaces lock via `with_vm_user_spaces_split_mut`
+    + direct-map byte read). Each domain lock is held transiently and released before
+    the next (ascending, non-nested); no broad global lock is taken for the copy.
+  * **Behavioral identity.** `try_split_debug_log_into_frame` mirrors the global-lock
+    `handle_debug_log` exactly: same null/empty short-circuit → `set_ok(0,0,0)` no log;
+    same copy-fail silent path; same `USER_LOG tid=.. msg=..` line; same `set_ok(0,0,0)`.
+    QEMU x86_64 core: all 571 DebugLog syscalls route through the split path
+    (`YARM_LOCK_SPLIT_DISPATCH nr=15`), all 571 `USER_LOG` lines intact, and
+    `GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=DebugLog` + `GLOBAL_LOCK_RETIRE_CLASS_DONE
+    class=DebugLog result=ok` are emitted once.
+  * **Scope + cross-arch.** x86_64-effective. The split copy is gated to non-hosted
+    (the direct map only exists on real targets); hosted-dev DebugLog stays on the
+    global-lock handler. riscv64 does not enter `handle_trap_entry_shared`, and aarch64
+    only imports the split ABI under the IPC-recv proof knob, so DebugLog stays
+    global-lock-only on both (0 retire markers, byte-identical boots). AP scheduler
+    policy seal (190B), TLB ACK (189A), and 188 dispatch-return all preserved; core +
+    oracle + crash-restart + smp2/smp4 (armed and knob-off) + riscv64 pass; aarch64
+    carries its unchanged pre-existing `WrongObject` caveat.
+  * **The broad global lock is NOT retired.** Every non-DebugLog class still routes
+    through `SharedKernel::with_cpu` → `KernelState::handle_trap` → `syscall::dispatch`.
+    `ReapFaultedTask` stays global-lock-only (default-deny + the Stage 188H exclusion
+    guard). This is a first-class-only conversion, not a lock-retirement claim.
+  * **Go/no-go for Stage 191B:** GO for the next narrow class. Candidate:
+    `FutexWake` (scheduler-only mutation, no task switch, no user memory) once a
+    scheduler split-mut + wake-order proof exists; alternatively broaden the read-only
+    class family. NOT `Yield` (task switch) and NOT any VM-mutating/spawn/IPC-send class.
+  * Guarded by `stage191a_lock_retire_inventory` (retire marker vocabulary, whitelist
+    is exactly the four classes, DebugLog uses split-read primitives only + no
+    scheduling, ReapFaultedTask stays global-lock-only, docs make no full-retirement
+    claim) + the updated `stage29_whitelist_exhaustive` (NR 15 now eligible).
+
+- **Stage 191B (FUTEXWAKE GLOBAL-LOCK RETIREMENT) — DONE.** The broad global
+  `SpinLock<KernelState>` is NOT retired. Stage 191B converts exactly ONE more class —
+  `FutexWake` (NR 11) — to the split-dispatch (no-global-lock) seam, on top of the
+  191A `DebugLog` retirement (both preserved). `FutexWait` (blocks), `Yield` (task
+  switch), and every VM/spawn/IPC-send class stay global-lock-only.
+  * **FutexWake path + touched state.** `FutexWake(addr, max_wake)` is a wake-only
+    operation: the futex "wait queue" is *implicit* — the set of TCBs whose
+    `status == Blocked(WaitReason::Futex(VirtAddr(addr)))`. Waking touches (1) blocked
+    task TCB status (rank 2, task lock), (2) scheduler run queues (rank 1, scheduler
+    lock, via the SmpScheduler enqueue methods), and (3) the current CPU/task binding
+    (read-only — the caller does NOT task-switch). It never touches VM/user-memory
+    mapping state (only a 4-byte user-readability probe of `addr`), never blocks, never
+    yields, never spawns.
+  * **Lock/rank proof.** `futex_wake_split_mut(cpu, addr, max_wake)` runs in two
+    ascending, non-nested lock windows and holds NO broad `&mut KernelState`:
+    (Phase A) one `with_task_tcbs_split_mut` (rank 2) scan flips at most `max_wake`
+    matching TCBs `Blocked(Futex) → Runnable`, recording `(tid, cpu_affinity)` in a
+    fixed 512-slot buffer; (Phase B) per woken tid, a `task_class_split_read` (rank 2)
+    picks priority (SystemServer → High else Normal) and lazily assigns driver
+    affinity, then `with_scheduler_split_mut` (rank 1) enqueues via the *same*
+    `enqueue_on_with_priority` / `enqueue_balanced` SmpScheduler methods the global-lock
+    path uses. Task lock (2) is always released before the scheduler lock (1) is taken
+    per iteration; no lock is nested inside another.
+  * **Wake-order / count identity + no lost/dup/orphan.** The split scan visits TCBs in
+    the same slot order as the legacy `futex_wake_inner`, uses the byte-identical
+    predicate, and caps at `max_wake` — so the woken set, count, and order match legacy.
+    `max_wake == 0` is a no-op (returns 0). Each woken TCB is set Runnable exactly once
+    and enqueued exactly once (no double-wake: a second FutexWake finds them already
+    Runnable, not `Blocked(Futex)`); no waiter is left Runnable-but-unqueued (no orphan);
+    non-futex blocked tasks are untouched. Proven empirically by
+    `stage191b_futex_wake_retire::futex_wake_split_semantics_are_correct` (4 futex waiters
+    + 1 non-futex Blocked(Poll): wake 2 → exactly 2 Runnable + enqueued, current_tid
+    unchanged, wake rest → 2, third wake → 0) and `..._zero_max_is_noop`.
+  * **Caller does not task-switch.** The split path returns `set_ok(woke, 0, 0)` and the
+    dispatcher observes `task_switched == false` — identical to the global-lock
+    `handle_futex_wake`, which also only wakes and returns to the caller.
+  * **Scope + cross-arch.** x86_64-effective, non-hosted only (hosted-dev FutexWake stays
+    on the global-lock handler; the split copy/probe needs the real-target direct map).
+    riscv64 does not enter `handle_trap_entry_shared` and aarch64 only imports the split
+    ABI under the IPC-recv proof knob, so FutexWake stays global-lock-only on both
+    (0 `FUTEX_WAKE_SPLIT`/`class=FutexWake` markers, boots byte-identical to baseline).
+    Markers `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE class=FutexWake`, `FUTEX_WAKE_SPLIT_BEGIN`,
+    `FUTEX_WAKE_SPLIT_WAKE_OK count=<n>`, `FUTEX_WAKE_SPLIT_DONE result=ok` fire only when
+    a userspace FutexWake is actually dispatched (not exercised by the current boot
+    workloads — proven by the host semantics test instead). 191A DebugLog retirement, AP
+    scheduler policy seal (190B), TLB ACK (189A), and 188 dispatch-return are all
+    preserved; x86_64 core + IPC oracle + crash-restart + smp2/smp4 (armed and knob-off)
+    pass; riscv64 carries its unchanged pre-existing idle-halt and aarch64 its unchanged
+    pre-existing `WrongObject`, both byte-identical to baseline.
+  * **The broad global lock is NOT retired.** Only `DebugLog` (191A) and `FutexWake`
+    (191B) are split-eligible; every other class still routes through
+    `with_cpu → handle_trap → syscall::dispatch`, and `ReapFaultedTask` stays
+    global-lock-only. This is a two-class conversion, not a lock-retirement claim.
+  * **Go/no-go for Stage 191C:** GO for a further narrow class only with a complete
+    lock/rank proof. NOT `FutexWait` (it blocks the caller — needs the block-publish
+    seam), NOT `Yield` (task switch), NOT any VM-mutating/spawn/IPC-send class.
+  * Guarded by `stage191b_futex_wake_retire` (eligibility, marker vocabulary, seam usage
+    matching the legacy scan, empirical wake semantics + zero-max no-op) + the updated
+    `stage29_whitelist_exhaustive`/`stage29_futex_not_eligible` (NR 11 FutexWake eligible,
+    FutexWait still not).
+
+- **Stage 191C (INITRAMFSREADCHUNK GLOBAL-LOCK RETIREMENT) — DONE and QEMU-PROVEN.** The
+  broad global `SpinLock<KernelState>` is NOT retired. Stage 191C converts one more class
+  — `InitramfsReadChunk` (NR 27), the FIRST read-only USER-COPY class — to the
+  split-dispatch (no-global-lock) seam, on top of the 191A `DebugLog` and 191B `FutexWake`
+  retirements (all preserved). `CreateInitramfsFileSliceMo` (NR 28) stays global-lock-only
+  (it MINTS a capability); `Yield`/`FutexWait`/all VM/spawn/IPC-send classes stay locked.
+  * **Path + touched-state inventory.** `InitramfsReadChunk(name_ptr, name_len, offset,
+    dst_ptr, max_len, target_tid)` is effectively a READ: SystemServer-only gate → read
+    the file name from the caller's ASID → look up the immutable initramfs CPIO blob
+    (`Bootstrap::boot_initrd_bytes()`, a static — no lock) → copy up to 4096 bytes of file
+    data into the caller's own ASID (`target_tid=0`) or PM's ASID (`target_tid=3`, the
+    Phase 2B bridge). Touched state: current CPU/task binding (read), task class + ASID
+    (rank 2 reads), user memory (caller read for the name, destination write). It mutates
+    NO task/scheduler/IPC/cap/VM STRUCTURAL state, blocks/yields/switches nothing, and
+    ALLOCATES nothing — the only write is to the destination user buffer.
+  * **Lock/rank + user-copy proof.** The success path holds NO broad `&mut KernelState`:
+    `current_tid_authoritative(cpu)` (binds current_cpu) → `task_class_split_read` (rank 2)
+    → `copy_from_user_asid_split_read` (VM user-spaces lock + direct map, for the name) →
+    `copy_slice_to_user_asid_split_write` (rank-5 VM seam
+    `validate_user_access_for_asid_split` + direct map, for the data). The new write seam
+    is TWO-PASS: Pass 1 validates EVERY destination page is user-writable and writes
+    nothing; Pass 2 (reached only after all pages validate) bulk-copies each page-aligned
+    chunk — byte-identical in end-state to the legacy `copy_to_current_user_from_slice` /
+    `copy_slice_to_task`, but a fault leaves ZERO bytes written. Empirically guarded
+    (`initramfs_read_chunk_split_is_two_pass_no_partial_write`: a write spanning into an
+    unmapped page returns `UserMemoryFault` and the mapped prefix is untouched).
+  * **Error-semantics proof (no masking).** The helper services only the SUCCESS outcomes
+    off the global lock (a completed copy → `set_ok(0, to_copy, 0)`, and the EOF
+    short-circuit → `set_ok(0,0,0)`). EVERY error outcome returns `None`, so the unchanged
+    global-lock `handle_initramfs_read_chunk` produces the CANONICAL error and its exact
+    diagnostic log — `MissingRight` (+ `INITRAMFS_READ_CHUNK_DENIED`) for a non-SystemServer
+    / invalid target, `InvalidArgs` for bad args / name copy / non-UTF-8 / bad CPIO,
+    `Internal` (+ `INITRAMFS_READ_CHUNK_NOT_FOUND`) for a missing file, `UserMemoryFault` /
+    `PageFault` for an unwritable destination. Because the write seam is two-pass, a `None`
+    on an unwritable destination means zero user bytes were written on the split path, so
+    the fallback re-run equals the legacy path alone. `UserMemoryFault` is preserved, never
+    hidden as success (`initramfs_read_chunk_split_preserves_user_memory_fault`).
+  * **Live QEMU proof.** x86_64 crash-restart: all 20 `InitramfsReadChunk` syscalls route
+    through the split path (`YARM_LOCK_SPLIT_DISPATCH nr=27 result=ok`), 20 paired
+    `INITRAMFS_READ_CHUNK_SPLIT_BEGIN`/`_DONE`, `GLOBAL_LOCK_RETIRE_CLASS_BEGIN`/`DONE
+    class=InitramfsReadChunk result=ok` once, ZERO global-lock fallback traces — and the
+    supervisor crash-restart (driver reload via the PM bridge, `to_copy=4096
+    target_tid=3`) PASSES, so the split copy is byte-identical live. core + IPC oracle +
+    smp2/smp4 (armed and knob-off) pass with 191A/191B retirements + AP scheduler seal +
+    all 188–190 markers preserved.
+  * **Scope + cross-arch.** x86_64-effective, non-hosted only (hosted-dev stays on the
+    global-lock handler; the split copy uses the direct map). riscv64 does not enter
+    `handle_trap_entry_shared` and aarch64 only imports the split ABI under the IPC-recv
+    proof knob, so InitramfsReadChunk stays global-lock-only on both (0 `nr=27` split
+    markers; riscv64 carries its unchanged pre-existing idle-halt and aarch64 its unchanged
+    pre-existing `WrongObject`, both byte-identical to baseline).
+  * **The broad global lock is NOT retired.** Only `DebugLog` (191A), `FutexWake` (191B),
+    and `InitramfsReadChunk` (191C, success path) are split-eligible; every other class
+    still routes through `with_cpu → handle_trap → syscall::dispatch`, and `ReapFaultedTask`
+    stays global-lock-only. This is a three-class conversion, not a lock-retirement claim.
+  * **Go/no-go for Stage 191D:** GO for a further narrow read-only/query class only with a
+    complete lock/rank proof. NOT `CreateInitramfsFileSliceMo` (mints a capability), NOT
+    `FutexWait` (blocks), NOT `Yield` (task switch), NOT any VM/spawn/IPC-send class.
+  * Guarded by `stage191c_initramfs_read_chunk_retire` (eligibility, marker vocabulary,
+    user-copy seam usage + no broad lock, error-path fallback, empirical two-pass
+    no-partial-write + `UserMemoryFault` preservation, non-selected classes stay locked) +
+    the updated `stage29_whitelist_exhaustive` (NR 27 now eligible, NR 28 not).
+
+- **Stage 191D (FUTEXWAIT BLOCK-PUBLISH SEAM) — DEFERRED (seam landed + proven).** The
+  broad global `SpinLock<KernelState>` is NOT retired, and `FutexWait` (NR 1) is NOT
+  converted: it stays FULLY global-lock-only. Stage 191D builds and proves the required
+  block-publish seam but does NOT wire FutexWait live, because the blocking wait's dispatch
+  is a concrete blocker (below). 191A/191B/191C retirements are preserved.
+  * **Why FutexWait is harder + the concrete blocker.** `FutexWait(addr, expected, observed)`
+    validates the futex word, and when `expected == observed` it BLOCKS the caller:
+    caller TCB → `Blocked(Futex(addr))`, `block_current_cpu` clears the current slot, then
+    **`dispatch_next_task`** switches to a DIFFERENT runnable task. That switch is the
+    queue-ADVANCING "switch_required" case — and the kernel's own out-of-lock dispatch
+    relocation (`exec_state.rs::dispatch_next_task`, D6-GENUINE) explicitly restricts itself
+    to the queue-NEUTRAL case and falls back to the in-lock (global-lock) path with
+    `reason=switch_required` for exactly this scenario. So the futex-wait block+dispatch
+    cannot be serviced off the global lock without the disclaimed multi-stage dispatch
+    rewrite. This is the concrete blocker; the live conversion is DEFERRED with reason
+    `block_dispatch_switch_required_needs_global_lock`.
+  * **What landed (helper-only, proven).** Two seams, guarded + empirically tested, ready
+    for the future dispatch-rewrite stage but NOT live-wired:
+    - *Phase A* `SharedKernel::futex_wait_would_block_split_read(tid, addr, expected,
+      observed)` — validates the futex word off the global lock exactly like
+      `validate_current_user_futex_word` (`addr==0` → `None`/WrongObject; `addr+3 ≥
+      KERNEL_SPACE_BASE` → `None`/UserMemoryFault; 4-byte user read via the split-read seam)
+      and returns `Some(expected == observed)` (== the legacy `expected != observed →
+      Ok(false)` decision). Read-only; `None` preserves the canonical error.
+    - *Phase B* `SharedKernel::futex_wait_publish_block_split_mut(cpu, tid, addr)` —
+      publishes the caller `Blocked(Futex(addr))` via the task split-mut (rank 2) and clears
+      the current slot via the scheduler split-mut (rank 1, `block_current_on` +
+      `reset_quantum`), mirroring `futex_wait_current`'s block + `block_current_cpu`, WITHOUT
+      the dispatch. Ascending, non-nested; no broad `&mut KernelState`.
+  * **Publish-correctness proof (empirical).** After Phase B the caller is `Blocked(Futex)`,
+    removed from the current slot (current on NO CPU → not current on two CPUs), and NOT
+    enqueued (no duplicate enqueue, no orphaned runnable); the 191B `futex_wake_split_mut`
+    then wakes it exactly once (Runnable + enqueued — no lost wake), and a second wake finds
+    nothing (no duplicate wake). Guarded by `stage191d_futex_wait_block_publish`
+    (deferral + switch_required blocker, marker vocabulary, value-check + block-publish seam
+    shape vs legacy, `futex_wait_publish_blocks_and_is_woken_by_split_wake`,
+    `futex_wait_publish_not_current_on_two_cpus`, prior retirements + ReapFaultedTask
+    exclusion intact).
+  * **Scope + cross-arch.** No live behavior change on any arch: FutexWait stays
+    global-lock-only everywhere (0 `nr=1` split dispatches, 0 `FUTEX_WAIT_SPLIT` markers in
+    boot). x86_64 core + IPC oracle + crash-restart (InitramfsReadChunk still live, 20
+    `nr=27` splits) + smp2/smp4 (armed and knob-off) pass with 191A/191C retirements + AP
+    scheduler seal + all 188–190 markers preserved; riscv64 idle-halt and aarch64
+    WrongObject unchanged pre-existing.
+  * **The broad global lock is NOT retired.** Still only `DebugLog` (191A), `FutexWake`
+    (191B), and `InitramfsReadChunk` (191C, success path) are split-eligible. FutexWait,
+    `Yield`, `ReapFaultedTask`, and all VM/spawn/IPC-send classes stay global-lock-only.
+  * **Go/no-go for Stage 191E:** the FutexWait block-publish seam is ready; a live FutexWait
+    conversion needs the queue-advancing out-of-lock DISPATCH (the switch_required case),
+    which is a distinct multi-stage effort. GO to either (a) tackle that dispatch rewrite as
+    its own stage, or (b) retire another narrow read-only/query class with a complete proof.
+
+- **Stage 191E (NEXT SAFE RETIREMENT SLICE) — NO-GO on live retirement; Phase-C selection
+  seam landed.** After a full inventory of every remaining global-lock-only syscall, NO safe
+  live class retirement remains this stage: each is either explicitly out of scope, needs the
+  queue-advancing out-of-lock dispatch rewrite (`Yield`, live `FutexWait`), needs capability
+  mutation (`TransferRelease`, `CreateInitramfsFileSliceMo` cap-mint), needs VM/ASID/TLB
+  mutation (`VmMap`, `VmAnonMap`), needs spawn/task mutation (`Fork`, all `Spawn*`), is broad
+  IPC (`IpcSend`/`IpcCall`/`IpcReply`/`IpcRecvTimeout`/`RecvSharedV3`), or must remain
+  global-lock-only (`ReapFaultedTask`). The one clean non-blocking slice — FutexWait's
+  value-mismatch (`expected != observed → Ok(false)`, no dispatch) — is intentionally NOT
+  wired, honoring the constraint that no `FutexWait` live work happens before the
+  queue-advancing dispatch is solved. `IpcRecvTimeout`'s kernel-task queued-plain slice is a
+  no-go: near-zero live occurrence + it touches the recv path just stabilized for cross-arch
+  parity.
+  * **Deliverable (helper-only):** `SharedKernel::dispatch_next_candidate_split_read(cpu)` —
+    a READ-ONLY peek of the next-runnable dispatch candidate (the TID the authoritative
+    per-CPU dispatch would select from a cleared current) through the scheduler split seam
+    (rank 1) ONLY, backed by non-mutating `SmpScheduler::peek_next_runnable_on` /
+    `PriorityScheduler::peek_highest` (twins of `dispatch_next_on`/`dequeue_highest`). It
+    NEVER dequeues/blocks/enqueues/sets-current (run queue unchanged; idempotent). This is
+    the SELECTION half of the deferred FutexWait "switch_required" Phase C, complementing the
+    191D Phase A value-check + Phase B block-publish — it proves the next-task DECISION is
+    available off the broad global lock; the mutating dequeue + arch context switch remain the
+    deferred hard part. NOT wired into `try_split_dispatch` (helper-only); the split whitelist
+    is unchanged (no new live class). Guarded by `stage191e_dispatch_next_candidate_seam`
+    (whitelist-unchanged, read-only + helper-only source scan, empirical match-vs-authoritative
+    dispatch + idempotence, none-when-idle).
+  * **The broad global lock is NOT retired.** Still exactly `DebugLog` (191A), `FutexWake`
+    (191B), and `InitramfsReadChunk` (191C, success path) are split-eligible.
+  * **Go/no-go for Stage 191F:** the remaining classes all require one of the big rewrites —
+    (a) queue-advancing out-of-lock dispatch (unblocks `FutexWait`/`Yield`; 191D block-publish
+    + 191E candidate-selection are the landed halves), or (b) broad-IPC vertical decomposition.
+    No further narrow safe class exists; the next stage must commit to one of those tracks.
+
+- **Stage 192A (QUEUE-ADVANCING OUT-OF-LOCK DISPATCH — FutexWait live) — DONE and
+  QEMU-PROVEN.** Track (a) landed: `FutexWait`'s blocking wait now runs its queue-advancing
+  DISPATCH off the broad global lock, so `FUTEX_WAIT` is live — the switch_required blocker
+  that deferred 191D is resolved. The broad `SpinLock<KernelState>` is NOT retired.
+  * **Model (mirrors the accepted, default-on D2-GENUINE recv/send).** The mechanism is the
+    existing Stage 168B/169 out-of-lock queue-advancing dispatch — proven and default-on on
+    x86_64 single-dispatcher for blocking IPC recv/send. FutexWait-block is structurally
+    identical, so 192A reuses it: **in-lock** (`futex_wait_current`, Phase A/B) validate the
+    futex word, publish the caller `Blocked(Futex(addr))`, `block_current` (remove from
+    `current`), then — when eligible (x86_64, `d6_genuine_enabled`, trap-path active,
+    `dispatching_cpu_count() <= 1`, not already deferred) — record a per-CPU deferral and
+    DECLINE the in-lock dispatch (`FUTEX_WAIT_SPLIT_BEGIN` / `FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK`
+    / `QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required`). Every ineligible
+    case keeps the unchanged in-lock `dispatch_next_task` fallback
+    (`FUTEX_WAIT_INLOCK_DISPATCH_FALLBACK`). **Out-of-lock** (trap-entry drain, global lock
+    dropped, Phase C): re-verify the waiter is still `Blocked(Futex)`
+    (`futex_wait_reverify_blocked`, rank-2), run the authoritative `dispatch_next_on` under
+    ONLY the rank-1 scheduler seam (`futex_wait_dispatch_step_mut` →
+    `QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK`), mark the incoming task `Running`
+    (`d6_genuine_mark_running_via_task_seam`, rank-2 →
+    `QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK`), then a brief `with_cpu` re-acquire performs
+    ONLY the arch restore (incoming ASID/CR3 switch + trap-frame restore via the hardened
+    D6-SWITCH-A path → `QUEUE_ADVANCING_DISPATCH_FRAME_OK`). Emits `FUTEX_WAIT_SPLIT_DISPATCH_OK`,
+    `QUEUE_ADVANCING_DISPATCH_DONE result=ok`, `FUTEX_WAIT_SPLIT_DONE result=blocked`, and the
+    one-shot `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE class=FutexWait result=ok`.
+  * **What "FutexWait live" means (honest scope).** Like the D2-GENUINE recv/send it mirrors,
+    the block-publish + value-check remain IN-LOCK; only the queue-advancing DISPATCH (the
+    switch_required case — the defining blocker) is relocated off the global lock. FutexWait
+    is NOT serviced through `try_split_dispatch` (it is not a whitelist split class); it is an
+    out-of-lock *dispatch* retirement, not a whole-handler split retirement.
+  * **Correctness (no lost wake / no double-dequeue / no orphan / not-current-on-two-CPUs).**
+    Same discipline as D2: the waiter is `Blocked` before the deferral is visible; the
+    re-verify fence skips the dispatch if a `FutexWake` already re-ran the waiter Runnable
+    (`QUEUE_ADVANCING_DISPATCH_DEFERRED reason=state_changed`, no displacement); the single
+    per-CPU deferral is one-shot (`futex_wait_dispatch_try_defer` compare-exchange); the
+    dequeue is the authoritative `dispatch_next_on` (advances the queue exactly once);
+    `block_current` removed the caller so it is current on no CPU. Empirically guarded by
+    `stage192a_queue_advancing_dispatch` (defer + trap-drain inventory, marker vocabulary,
+    dispatch-step uses authoritative `dispatch_next_on` + reverify, queue-advances-exactly-once
+    + old-not-current + new-current + blocked-stays-blocked, split-wake integration, single-shot
+    deferral).
+  * **QEMU (live, both branches).** x86_64 core: init's idle-park futex block runs the
+    out-of-lock dispatch to idle (`QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=idle`,
+    `DONE result=ok`, retire marker once). x86_64 crash-restart: a real switch case
+    (`QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu=0 tid=10008`) — futex block dispatches to a
+    live next task. core + oracle + crash-restart + smp2/smp4 (armed and knob-off) pass, zero
+    `QUEUE_ADVANCING_DISPATCH_FAIL`, all 188–191 retirements + AP seal + reap markers preserved.
+  * **Scope + cross-arch.** x86_64-only (all seams `#[cfg(target_arch = "x86_64")]`); riscv64 /
+    aarch64 keep FutexWait fully global-lock-only (0 `FUTEX_WAIT_SPLIT` / `QUEUE_ADVANCING_DISPATCH`
+    markers) and retain full server-chain parity. Under SMP AP-workload the futex defer falls
+    back to the in-lock dispatch (dispatching_cpu_count check), preserving the AP seal.
+  * **The broad global lock is NOT retired.** DebugLog/FutexWake/InitramfsReadChunk stay split;
+    FutexWait's dispatch is now out-of-lock (joining D2 recv/send). `Yield` is NOT unlocked (it
+    needs its own proof); `ReapFaultedTask` stays global-lock-only.
+  * **Go/no-go for Stage 192B:** the queue-advancing out-of-lock dispatch is proven for
+    FutexWait. GO to (a) retire `Yield` on the same mechanism (it task-switches but does NOT
+    block — re-enqueues current then dispatches; needs its own re-enqueue-then-defer proof), or
+    (b) start broad-IPC vertical decomposition. Full global-lock retirement is NOT claimed.
+
+- **Stage 192B (QUEUE-ADVANCING OUT-OF-LOCK DISPATCH — Yield live) — DONE and QEMU-PROVEN.**
+  `Yield`'s task-switch DISPATCH now runs off the broad global lock. Yield is the PREEMPT
+  sibling of FutexWait (192A): instead of blocking the caller, it re-enqueues the caller
+  Runnable, then dispatches the next task. The broad `SpinLock<KernelState>` is NOT retired.
+  * **Re-enqueue split.** `on_preempt` couples re-enqueue + dispatch; 192B splits it. New
+    `PriorityScheduler::preempt_reenqueue_only` (+ `SmpScheduler::preempt_reenqueue_only_on`,
+    `KernelState::preempt_reenqueue_current_cpu`) is the re-enqueue HALF: it re-enqueues the
+    current task at its priority-queue tail and clears `current`, WITHOUT dispatching —
+    returning `Some(tid)` on success (caller defers) or `None` (no current / re-enqueue
+    failed → caller falls back to the legacy in-lock `on_preempt`). The caller is re-enqueued
+    exactly once (single `enqueue_with_priority`; on `AlreadyQueued` it restores `current` and
+    returns `None`).
+  * **In-lock (Phase A/B) + out-of-lock (Phase C), mirroring the default-on D2/192A model.**
+    `yield_current` sets the caller `Runnable`, then — when eligible (x86_64,
+    `d6_genuine_enabled`, trap-path active, `dispatching_cpu_count() <= 1`, not already
+    deferred) — calls `preempt_reenqueue_current_cpu` (re-enqueue + clear current), records a
+    per-CPU deferral, and RETURNS (`YIELD_DISPATCH_DEFER_BEGIN` / `YIELD_DISPATCH_REENQUEUE_OK`),
+    skipping the in-lock dispatch. Every ineligible case keeps the unchanged in-lock
+    `on_preempt_current_cpu` fallback (`YIELD_INLOCK_DISPATCH_FALLBACK`). The trap-entry drain
+    (global lock dropped): re-verify `current` is still cleared (`yield_reverify_ready`, rank-1);
+    run the authoritative `dispatch_next_on` under only the rank-1 scheduler seam
+    (`yield_dispatch_step_mut` → `YIELD_DISPATCH_DEQUEUE_OK`); mark incoming `Running` (rank-2 →
+    `YIELD_DISPATCH_CURRENT_SET_OK`); brief `with_cpu` re-acquire for the arch restore only
+    (incoming ASID/CR3 + trap-frame → `YIELD_DISPATCH_FRAME_OK`); then `YIELD_DISPATCH_DONE
+    result=ok` + one-shot `GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok`.
+  * **Correctness.** Caller re-enqueued exactly once (in-lock); dequeued exactly once
+    (authoritative `dispatch_next_on`, out-of-lock); the yielding task is never lost (it is a
+    runnable candidate — a lone yielder re-dispatches to itself, no idle); caller is not current
+    after the switch (`current` cleared then set to incoming); reverify fence skips the drain if
+    an in-lock fallback already dispatched (`YIELD_DISPATCH_DEFERRED reason=state_changed`);
+    single-shot per-CPU deferral. Guarded by `stage192b_yield_queue_advancing_dispatch`
+    (inventory, markers + re-enqueue-only split, empirical re-enqueue-once + dispatch-next +
+    caller-not-lost + not-current-on-two-CPUs, lone-yielder-redispatches-itself, single-shot
+    deferral, prior retirements intact).
+  * **QEMU (live).** x86_64 crash-restart drives 512 Yield switches through the out-of-lock
+    dispatch (e.g. `tid=10008` yields → `YIELD_DISPATCH_DEQUEUE_OK/CURRENT_SET_OK/FRAME_OK
+    tid=1`), retirement marker once, zero `YIELD_DISPATCH_FAIL`. core + oracle + crash-restart +
+    smp2/smp4 (armed and knob-off) pass; 192A FutexWait + 191A/191B/191C retirements + AP seal +
+    reap markers all preserved.
+  * **Scope + cross-arch.** x86_64-only (seams `#[cfg(target_arch = "x86_64")]`); riscv64 /
+    aarch64 keep Yield fully global-lock-only (0 `YIELD_DISPATCH` markers) with full server-chain
+    parity. Under SMP AP-workload the yield defer falls back to the in-lock dispatch
+    (dispatching_cpu_count check), preserving the AP seal.
+  * **The broad global lock is NOT retired.** DebugLog/FutexWake/InitramfsReadChunk stay split;
+    FutexWait (192A) + Yield (192B) dispatch out-of-lock (joining D2 recv/send). ReapFaultedTask
+    stays global-lock-only; broad IPC / VM / spawn / cap classes untouched.
+  * **Go/no-go for the next stage:** the queue-advancing out-of-lock dispatch now covers all the
+    scheduler-only task-switch classes (D2 recv/send, FutexWait, Yield). The remaining classes
+    need broad-IPC vertical decomposition or capability/VM/spawn mutation seams — a distinct,
+    larger track. Full global-lock retirement is NOT claimed.
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 

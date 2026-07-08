@@ -237,8 +237,15 @@ struct X86InterruptStackFrameHeader {
     rflags: u64,
 }
 
+// Stage 189D: the nested-trap guard is PER-CPU. It catches a trap that re-enters
+// the dispatch on the SAME CPU (the real bug: a fault inside the fault handler),
+// which is a per-CPU stack/reentrancy condition. A trap on a DIFFERENT CPU is NOT
+// nesting — the global `with_cpu` lock serializes the actual KernelState access —
+// so a single global counter would false-positive (`!BN` + halt) when the BSP and
+// an AP dispatch concurrently. Indexed by logical CPU id.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-static TRAP_DISPATCH_DEPTH: AtomicUsize = AtomicUsize::new(0);
+static TRAP_DISPATCH_DEPTH: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; crate::arch::platform_constants::MAX_CPUS];
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static FATAL_LOG_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -345,6 +352,17 @@ fn configure_syscall_fast_path(rsp0: u64) {
     // per-CPU state directly with no swapgs and therefore nothing to unbalance.
     crate::yarm_log!("X86_SWAPGS_ENTRY_READY reason=not_required_gs_kernel_percpu");
     crate::yarm_log!("X86_INTERRUPT_ENTRY_SWAPGS_READY reason=not_required_gs_kernel_percpu");
+    // STAR[47:32] = kernel CS selector; STAR[63:48] = SYSRET CS base (CS-16).
+    configure_syscall_msrs_for_self();
+}
+
+/// Configure the EXECUTING CPU's SYSCALL fast-path MSRs (EFER.SCE, STAR, LSTAR,
+/// FMASK). These are PER-CPU MSRs, so every CPU that will service a ring-3
+/// `syscall` must run this itself. The BSP calls it from `configure_syscall_fast_path`;
+/// Stage 189C6 calls it on an AP before dispatching a ring-3 task there, so the AP's
+/// `syscall` reaches the same per-CPU LSTAR entry instead of `#UD`-ing on SCE=0.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn configure_syscall_msrs_for_self() {
     // STAR[47:32] = kernel CS selector; STAR[63:48] = SYSRET CS base (CS-16).
     let star = ((KERNEL_CODE_SELECTOR as u64) << 32) | (((USER_CODE_SELECTOR as u64) - 16) << 48);
     let mut efer = read_msr(IA32_EFER_MSR);
@@ -492,7 +510,7 @@ pub fn register_apic_cpu_mapping(apic_id: u8, cpu: crate::kernel::scheduler::Cpu
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn current_cpu_id() -> crate::kernel::scheduler::CpuId {
+pub(crate) fn current_cpu_id() -> crate::kernel::scheduler::CpuId {
     let apic = raw_current_apic_id() as usize;
     if let Some(mapped) = APIC_TO_CPU_ID
         .get(apic)
@@ -524,6 +542,14 @@ fn idle_halt_loop() -> ! {
             core::arch::asm!("sti", "hlt", options(nomem, nostack));
         }
     }
+}
+
+/// Stage 190B: enter the interruptible idle loop from the AP scheduler loop
+/// (`smp::ap_sched_next_or_idle`) once its run queue is empty. Same wake-capable
+/// `sti; hlt` idle the trap dispatch uses for a task that yields to nothing.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_idle_halt_loop() -> ! {
+    idle_halt_loop()
 }
 
 #[cfg(any(test, all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
@@ -1054,7 +1080,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         "x86_64 trap/timer ISR fired during boot raw-borrow window — aliasing &mut KernelState risk"
     );
     let cpu_apic = raw_current_apic_id() as u64;
-    let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
+    // Stage 189D: per-CPU nested-trap guard index (see TRAP_DISPATCH_DEPTH doc).
+    let depth_idx =
+        (current_cpu_id().0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    let previous_depth = TRAP_DISPATCH_DEPTH[depth_idx].fetch_add(1, Ordering::AcqRel);
     let frame = unsafe { &*interrupt_frame };
     let mut fault_addr = 0u64;
     if vector as usize == VEC_PAGE_FAULT {
@@ -1110,6 +1139,17 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // is the acceptance criterion. Both entering_tid and exiting_tid reads
         // are restored to the global-lock with_cpu path (Class F).
         let entering_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
+        // Stage 189D: AP user-dispatch SEAL — a normal syscall issued by a live AP
+        // probe task entering the NORMAL global-lock dispatch path (not the magic
+        // probe fast path). Gated on the per-CPU seal-probe flag so this is inert on
+        // the BSP and on every non-armed boot. Emits the seal markers around the real
+        // global-lock dispatch below.
+        let ap_seal =
+            vector as usize == VEC_SYSCALL && crate::arch::x86_64::smp::ap_seal_probe_active(cpu);
+        let ap_seal_nr = if ap_seal { unsafe { (*regs).rax } } else { 0 };
+        if ap_seal {
+            crate::arch::x86_64::smp::ap_seal_syscall_begin(cpu, ap_seal_nr);
+        }
         let mut trap_frame =
             unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
         if let Err(err) = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
@@ -1133,6 +1173,16 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             debug_uart_trap_breadcrumb(b'T', vector, error_code, fault_addr, fault_rip, cpu_apic);
             halt_forever();
         }
+        // Stage 189D: the AP probe's normal syscall reached the global-lock dispatch
+        // and returned Ok — emit the seal completion markers (one-shot; clears the
+        // per-CPU seal-probe flag). Stage 190A: then RETURN the probe to the AP
+        // scheduler (block it so nothing is left running on the AP), so the AP does
+        // NOT re-run the one-shot probe forever nor park — it falls through to the
+        // interruptible idle loop below (return-to-idle).
+        if ap_seal {
+            crate::arch::x86_64::smp::ap_seal_syscall_ok(cpu, ap_seal_nr);
+            crate::arch::x86_64::smp::ap_seal_return_to_idle(shared, cpu, ap_seal_nr);
+        }
         // Stage 4T+6R: reverted to conservative with_cpu→current_tid path.
         // See entering_tid comment above for the revert rationale.
         let exiting_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
@@ -1143,8 +1193,16 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             // user trap frame would resume the task that just blocked and form
             // a hot block/yield/retry loop.  Park the CPU with interrupts
             // enabled instead, so timer and external IRQs still wake from HLT.
+            // Stage 190B: for the AP scheduler loop, run the NEXT admitted task if the
+            // run queue still has one, else return to the interruptible idle loop.
+            // `ap_sched_next_or_idle` diverges (re-enters ring 3 or idles), so the
+            // depth counter is reset first for the possible fresh ring-3 syscall.
+            if ap_seal {
+                TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
+                crate::arch::x86_64::smp::ap_sched_next_or_idle(shared, cpu);
+            }
             crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", cpu.0);
-            TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+            TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
             idle_halt_loop();
         }
         if task_switched {
@@ -1153,7 +1211,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             write_trap_returns_to_saved_regs(regs, &trap_frame);
         }
         unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
-        TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
         return;
     }
 
@@ -1166,10 +1224,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             let fault_rip = frame.rip;
             log_decoded_fatal_trap(None, vector, error_code, frame, fault_addr);
             debug_uart_trap_breadcrumb(b'E', vector, error_code, fault_addr, fault_rip, cpu_apic);
-            TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+            TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
             halt_forever();
         }
-        TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
         return;
     };
     let fault_rip = frame.rip;
@@ -1199,7 +1257,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // installed.  TID 0 is idle-only on x86_64 and must not iretq through
         // the stale user frame that entered the kernel.
         crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", current_cpu_id().0);
-        TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
         idle_halt_loop();
     }
     if task_switched {
@@ -1208,7 +1266,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         write_trap_returns_to_saved_regs(regs, &trap_frame);
     }
     unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
-    TRAP_DISPATCH_DEPTH.store(0, Ordering::Release);
+    TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
 }
 
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
@@ -1286,6 +1344,32 @@ core::arch::global_asm!(
     .global yarm_x86_lstar_entry
     .type yarm_x86_lstar_entry, @function
 yarm_x86_lstar_entry:
+    // -----------------------------------------------------------------------
+    // Stage 189C6 LIVE AP-DISPATCH probe fast path.
+    //
+    // A live AP user task dispatched by yarm_x86_ap_user_dispatch_entry enters
+    // ring 3 running a tiny stub that loads RAX = 0xA9C6 and issues SYSCALL.
+    // Real YARM syscall numbers are 0..32, so this compare NEVER matches a
+    // production (BSP) syscall — the fast path is inert on every non-probe entry
+    // and adds one compare+branch to the proven baseline.
+    //
+    // On a match we do NOT descend into the shared kernel dispatch (that would
+    // run the whole global-lock kernel on the AP without the lock). Instead we
+    // prove per-CPU LSTAR entry executed ON THIS CPU by setting the per-CPU
+    // ap_syscall_reentry_ok flag (gs:[168], kernel .bss addressable under the
+    // task CR3) and parking. The BSP polls the flag and emits the marker. RAX
+    // and the serial scratch registers are safe to clobber here — the probe
+    // path never returns to userspace.
+    cmp rax, 0xA9C6
+    jne 2f
+    mov dword ptr gs:[168], 1        // ap_syscall_reentry_ok = 1 (persistent)
+    mov dx, 0x3f8
+    mov al, 0x52                     // 'R' — AP ring3 SYSCALL re-entry observed
+    out dx, al
+3:
+    hlt
+    jmp 3b
+2:
     // -----------------------------------------------------------------------
     // SYSCALL fast-path entry.
     //
@@ -1856,6 +1940,17 @@ pub(crate) fn ap_tss_rsp0(cpu: usize) -> u64 {
     unsafe {
         let tss = core::ptr::read_volatile(core::ptr::addr_of!(AP_TSSS[idx]));
         tss.rsp0
+    }
+}
+
+/// Stage 189C6: set the ring-0 `rsp0` in this AP's TSS — the kernel stack the CPU
+/// switches to on a ring3→ring0 interrupt/fault while a live AP user task runs.
+/// Field-granular write to `AP_TSSS[cpu].rsp0` only.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn set_ap_tss_rsp0(cpu: usize, rsp0: u64) {
+    let idx = cpu.min(crate::arch::platform_constants::MAX_CPUS - 1);
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(AP_TSSS[idx].rsp0), rsp0);
     }
 }
 

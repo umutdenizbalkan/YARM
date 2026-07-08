@@ -267,6 +267,33 @@ pub(crate) fn try_split_dispatch_into_frame(
         return try_split_vm_brk_shrink_into_frame(shared, cpu, frame);
     }
 
+    // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) — a pure read
+    // serviced off the global lock. The helper returns `None` for any case it cannot
+    // service (hosted-dev, unavailable requester), which propagates UNCHANGED back to
+    // the global-lock fallback below.
+    if matches!(syscall, Syscall::DebugLog) {
+        return try_split_debug_log_into_frame(shared, cpu, frame);
+    }
+
+    // Stage 191B (GLOBAL-LOCK-RETIRE, second class): FutexWake (NR 11) — waiter/
+    // run-queue mutation only, no caller task-switch. The helper returns `None` for any
+    // case it cannot service (invalid addr, hosted-dev, unavailable requester), which
+    // propagates UNCHANGED to the global-lock fallback (producing the exact error).
+    if matches!(syscall, Syscall::FutexWake) {
+        return try_split_futex_wake_into_frame(shared, cpu, frame);
+    }
+
+    // Stage 191C (GLOBAL-LOCK-RETIRE, third class): InitramfsReadChunk (NR 27) — a
+    // read-only user-copy syscall. It reads immutable initramfs/CPIO data and copies it
+    // into the caller's (or PM's) user buffer; it never mutates task/scheduler/IPC/cap/VM
+    // structural state and never allocates. The helper services the SUCCESS path off the
+    // global lock; ANY error case (access gate, bad args, not-found, unwritable dest)
+    // returns `None` → unchanged global-lock fallback, which produces the CANONICAL error
+    // + diagnostic logs exactly as before (no silent success masking).
+    if matches!(syscall, Syscall::InitramfsReadChunk) {
+        return try_split_initramfs_read_chunk_into_frame(shared, cpu, frame);
+    }
+
     // The requester TID is what the global-lock handler reads via
     // `current_tid(kernel)` (i.e. `kernel.current_tid()`).
     //
@@ -301,6 +328,383 @@ pub(crate) fn try_split_dispatch_into_frame(
         Err(err) => Some(Err(TrapHandleError::Syscall(SyscallError::from(err)))),
     }
 }
+
+// ── Stage 191A GLOBAL-LOCK-RETIRE markers (first class) ──────────────────────
+/// Emitted once, the first time a class is serviced off the global lock this boot.
+pub const MARK_RETIRE_CLASS_BEGIN: &str = "GLOBAL_LOCK_RETIRE_CLASS_BEGIN";
+/// Emitted once, after the first off-global-lock service of a class succeeds.
+pub const MARK_RETIRE_CLASS_DONE: &str = "GLOBAL_LOCK_RETIRE_CLASS_DONE";
+/// A class was inspected for retirement but kept global-lock-only; carries a reason.
+pub const MARK_RETIRE_CLASS_DEFERRED: &str = "GLOBAL_LOCK_RETIRE_CLASS_DEFERRED";
+
+/// One-shot latch so the DebugLog retirement markers are emitted exactly once.
+#[cfg(not(feature = "hosted-dev"))]
+static DEBUG_LOG_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 191A: service `DebugLog` (NR 15) through the split (no-global-lock) path.
+///
+/// DebugLog is the FIRST retired global-lock class. It is a pure READ: it resolves
+/// the requester task, copies the user message bytes, logs `USER_LOG`, and writes
+/// `set_ok(0,0,0)`. It never blocks/yields/schedules, never switches tasks, and never
+/// mutates `KernelState` (`task_switched == false` stays observable). The copy runs
+/// off the global lock via `SharedKernel::copy_from_user_asid_split_read` (VM
+/// user-spaces lock + direct map). Behaviorally identical to the global-lock
+/// `handle_debug_log` (same null/empty short-circuit, same copy-fail silent path,
+/// same `USER_LOG` line, same `set_ok(0,0,0)`). Returns `None` only when the requester
+/// TID is unavailable, so that case falls back to the unchanged global-lock path.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_debug_log_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::ipc::Message;
+    // DebugLog ABI: arg0 = user ptr, arg1 = len (no cap slot).
+    let user_ptr = frame.arg(0);
+    let raw_len = frame.arg(1) as u64;
+    let len = (raw_len as usize).min(Message::MAX_PAYLOAD);
+
+    // Authoritative requester TID (binds current_cpu; same task the global handler
+    // sees). Unavailable → fall back to the global-lock path.
+    let tid = shared.current_tid_authoritative(cpu)?;
+
+    if user_ptr == 0 || len == 0 {
+        // Same short-circuit as the global handler: OK, no log.
+        frame.set_ok(0, 0, 0);
+        maybe_log_debug_log_retired();
+        return Some(Ok(()));
+    }
+
+    let asid = shared.task_asid_for_tid_split_read(tid);
+    match shared.copy_from_user_asid_split_read(asid, user_ptr, len) {
+        Some(payload) => {
+            let msg = core::str::from_utf8(&payload[..len]).unwrap_or("<utf8_err>");
+            crate::yarm_log!("USER_LOG tid={} msg={}", tid, msg);
+        }
+        // Copy failed (no mapping / not user-readable) — same as the global handler's
+        // `DEBUG_LOG_COPY_FAIL` path: OK, no log.
+        None => {}
+    }
+    frame.set_ok(0, 0, 0);
+    maybe_log_debug_log_retired();
+    Some(Ok(()))
+}
+
+/// Emit the DebugLog retirement markers exactly once (first off-global-lock service).
+#[cfg(not(feature = "hosted-dev"))]
+fn maybe_log_debug_log_retired() {
+    if DEBUG_LOG_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("{} class=DebugLog", MARK_RETIRE_CLASS_BEGIN);
+        crate::yarm_log!("{} class=DebugLog result=ok", MARK_RETIRE_CLASS_DONE);
+    }
+}
+
+/// Hosted-dev: DebugLog stays on the unchanged global-lock path (the split copy uses
+/// the direct map, which only exists on real targets).
+#[cfg(feature = "hosted-dev")]
+fn try_split_debug_log_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
+/// One-shot latch so the FutexWake retirement markers are emitted exactly once.
+#[cfg(not(feature = "hosted-dev"))]
+static FUTEX_WAKE_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 191B: service `FutexWake` (NR 11) through the split (no-global-lock) path.
+///
+/// FutexWake is the SECOND retired global-lock class. The CALLER never task-switches;
+/// the syscall only mutates waiter/run-queue state. This helper validates the futex
+/// word EXACTLY like the global `validate_current_user_futex_word` (addr != 0, addr+3
+/// below `KERNEL_SPACE_BASE`, 4 bytes user-readable), then wakes off the global lock
+/// via `SharedKernel::futex_wake_split_mut` (task split-mut wake scan + scheduler
+/// split-mut enqueue). It preserves the legacy return value (number of waiters woken)
+/// and encodes it with `set_ok(woke, 0, 0)`. Any case it cannot service (invalid addr,
+/// non-`u32` max_wake, unavailable requester) returns `None` → unchanged global-lock
+/// fallback, which produces the CANONICAL error (WrongObject / UserMemoryFault /
+/// InvalidArgs) exactly as before — no silent success masking.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_futex_wake_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_PTR};
+    // FutexWake ABI: arg(CAP) = futex addr, arg(PTR) = max_wake.
+    let addr = frame.arg(SYSCALL_ARG_CAP);
+    // Non-`u32` max_wake → the global handler returns InvalidArgs; fall back.
+    let max_wake = u32::try_from(frame.arg(SYSCALL_ARG_PTR) as u64).ok()?;
+
+    let tid = shared.current_tid_authoritative(cpu)?;
+
+    // Validate the futex word exactly like `validate_current_user_futex_word`. On ANY
+    // validation miss, fall back so the global-lock path produces the canonical error.
+    if addr == 0 {
+        return None; // legacy: WrongObject
+    }
+    let end = addr.checked_add(core::mem::size_of::<u32>() - 1)?;
+    if end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE {
+        return None; // legacy: UserMemoryFault
+    }
+    let asid = shared.task_asid_for_tid_split_read(tid);
+    if shared
+        .copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())
+        .is_none()
+    {
+        return None; // legacy: UserMemoryFault
+    }
+
+    // Validation passed — wake off the global lock.
+    crate::yarm_log!("FUTEX_WAKE_SPLIT_BEGIN");
+    let woke = shared.futex_wake_split_mut(cpu, addr, max_wake);
+    crate::yarm_log!("FUTEX_WAKE_SPLIT_WAKE_OK count={}", woke);
+    frame.set_ok(woke as usize, 0, 0);
+    crate::yarm_log!("FUTEX_WAKE_SPLIT_DONE result=ok");
+    maybe_log_futex_wake_retired();
+    Some(Ok(()))
+}
+
+/// Emit the FutexWake retirement markers exactly once (first off-global-lock service).
+#[cfg(not(feature = "hosted-dev"))]
+fn maybe_log_futex_wake_retired() {
+    if FUTEX_WAKE_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("{} class=FutexWake", MARK_RETIRE_CLASS_BEGIN);
+        crate::yarm_log!("{} class=FutexWake result=ok", MARK_RETIRE_CLASS_DONE);
+    }
+}
+
+/// Hosted-dev: FutexWake stays on the unchanged global-lock path (the futex-word
+/// validation uses the direct map, which only exists on real targets). The wake logic
+/// itself (`futex_wake_split_mut`) is arch-neutral and unit-tested directly.
+#[cfg(feature = "hosted-dev")]
+fn try_split_futex_wake_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
+/// One-shot latch so the InitramfsReadChunk retirement markers are emitted exactly once.
+#[cfg(not(feature = "hosted-dev"))]
+static INITRAMFS_READ_CHUNK_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 191C: service `InitramfsReadChunk` (NR 27) through the split (no-global-lock)
+/// path.
+///
+/// InitramfsReadChunk is the THIRD retired global-lock class and the FIRST read-only
+/// USER-COPY class. It is effectively a read: it copies immutable initramfs/CPIO file
+/// bytes into the caller's own ASID (or PM's, for the Phase 2B bridge). It never
+/// blocks/yields/schedules, never switches tasks, never allocates, and mutates NO
+/// task/scheduler/IPC/cap/VM structural state — the only write is to the destination
+/// user buffer, through the same validated user-copy authority the legacy handler uses.
+///
+/// This helper mirrors the global `handle_initramfs_read_chunk` and services only the
+/// SUCCESS outcomes off the global lock (a completed copy, and the EOF short-circuit
+/// `set_ok(0,0,0)`). EVERY error outcome returns `None`, so the unchanged global-lock
+/// handler produces the CANONICAL error and its exact diagnostic log
+/// (`INITRAMFS_READ_CHUNK_DENIED` / `INITRAMFS_READ_CHUNK_NOT_FOUND`, `MissingRight` /
+/// `InvalidArgs` / `Internal` / `UserMemoryFault` / `PageFault`) — never a silent
+/// success. Because the user-copy seam is TWO-PASS (validate-all then write), a `None`
+/// on an unwritable destination means ZERO user-memory bytes were written on the split
+/// path, so the fallback re-run is equivalent to the legacy path alone.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_initramfs_read_chunk_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::syscall::validate_user_region;
+    use crate::kernel::task::TaskClass;
+    use yarm_srv_common::cpio::CpioArchive;
+
+    // Must match `PM_BOOTSTRAP_TID` in `kernel::syscall` (the Phase 2B bridge target).
+    const PM_BOOTSTRAP_TID: u64 = 3;
+
+    // Authoritative requester TID (binds current_cpu; same task the global handler
+    // sees). Unavailable → fall back to the global-lock path (canonical `Internal`).
+    let caller_tid = shared.current_tid_authoritative(cpu)?;
+
+    // ── Access gate: SystemServer only. Any other class → fall back so the global
+    //    handler emits `INITRAMFS_READ_CHUNK_DENIED` + `MissingRight`. ────────────────
+    if shared.task_class_split_read(caller_tid) != Some(TaskClass::SystemServer) {
+        return None;
+    }
+
+    // Decode args identically to `handle_initramfs_read_chunk`.
+    let name_ptr = frame.arg(0);
+    let name_len = frame.arg(1);
+    let offset = frame.arg(2) as u64;
+    let dst_ptr = frame.arg(3);
+    let max_len = core::cmp::min(frame.arg(4), 4096);
+    let target_tid_arg = frame.arg(5) as u64;
+
+    // Arg validation — mirror the global handler. On any miss fall back (no mutation),
+    // so the global path produces the canonical `InvalidArgs` / `MissingRight`.
+    if name_len == 0 || name_len > 128 {
+        return None; // legacy: InvalidArgs
+    }
+    if dst_ptr == 0 {
+        return None; // legacy: InvalidArgs
+    }
+    if target_tid_arg != 0 && target_tid_arg != PM_BOOTSTRAP_TID {
+        return None; // legacy: DENIED log + MissingRight
+    }
+
+    // Read the file name from the caller's ASID (read-only user copy). A copy miss /
+    // non-UTF-8 name falls back to the canonical `InvalidArgs`.
+    let caller_asid = shared.task_asid_for_tid_split_read(caller_tid);
+    let name_buf = shared.copy_from_user_asid_split_read(caller_asid, name_ptr, name_len)?;
+    let raw_name = core::str::from_utf8(&name_buf[..name_len]).ok()?;
+    // Accept "sbin/x", "/sbin/x", "/initramfs/sbin/x" — identical normalization.
+    let name = raw_name.trim_start_matches('/');
+    let name = name.strip_prefix("initramfs/").unwrap_or(name);
+    let name = name.trim_start_matches('/');
+
+    // Immutable initramfs blob (static accessor; no lock) + pure CPIO parse.
+    let initrd = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?; // None → InvalidArgs
+    let entry = CpioArchive::new(initrd).find(name).ok()?; // Err → InvalidArgs
+    let data = match entry {
+        Some(e) => e.file_data(),
+        // File not found: fall back so the global handler logs
+        // `INITRAMFS_READ_CHUNK_NOT_FOUND` and returns the canonical `Internal`.
+        None => return None,
+    };
+
+    let offset_usize = offset as usize;
+    if offset_usize >= data.len() {
+        // EOF (file exists, offset past end) — same as the global handler: OK, no copy.
+        frame.set_ok(0, 0, 0);
+        maybe_log_initramfs_read_chunk_retired();
+        return Some(Ok(()));
+    }
+    let available = data.len() - offset_usize;
+    let to_copy = core::cmp::min(available, max_len);
+    let src = &data[offset_usize..offset_usize + to_copy];
+
+    // Resolve the destination ASID: caller's own (target 0) or PM's (Phase 2B bridge).
+    let dst_asid_raw = if target_tid_arg == 0 {
+        caller_asid
+    } else {
+        shared.task_asid_for_tid_split_read(target_tid_arg)
+    };
+    if dst_asid_raw == 0 {
+        return None; // task ASID unavailable → canonical UserMemoryFault / PageFault
+    }
+
+    // For the caller's own ASID, mirror the legacy `validate_user_region(dst_ptr,
+    // to_copy)` bounds check (the PM bridge does not perform it). On failure fall back
+    // (no write) → canonical `InvalidArgs`.
+    if target_tid_arg == 0 && validate_user_region(dst_ptr as u64, to_copy as u64).is_err() {
+        return None;
+    }
+
+    // Two-pass user-copy: validates every destination page BEFORE writing any byte, so a
+    // fault leaves zero bytes written and we can fall back with no mutation. On success
+    // every byte is written, byte-identical to the legacy bulk copy.
+    if shared
+        .copy_slice_to_user_asid_split_write(dst_asid_raw, dst_ptr, src)
+        .is_err()
+    {
+        // Unwritable destination — fall back so the global handler produces the exact
+        // error (`UserMemoryFault` → `PageFault` for the PM bridge; `SyscallError::from`
+        // for the caller's ASID). No user-memory byte was written on the split path.
+        return None;
+    }
+
+    crate::yarm_log!(
+        "INITRAMFS_READ_CHUNK_SPLIT_BEGIN name_len={} to_copy={} target_tid={}",
+        name_len,
+        to_copy,
+        target_tid_arg
+    );
+    frame.set_ok(0, to_copy, 0);
+    crate::yarm_log!(
+        "INITRAMFS_READ_CHUNK_SPLIT_DONE to_copy={} result=ok",
+        to_copy
+    );
+    maybe_log_initramfs_read_chunk_retired();
+    Some(Ok(()))
+}
+
+/// Emit the InitramfsReadChunk retirement markers exactly once (first off-global-lock
+/// service).
+#[cfg(not(feature = "hosted-dev"))]
+fn maybe_log_initramfs_read_chunk_retired() {
+    if INITRAMFS_READ_CHUNK_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("{} class=InitramfsReadChunk", MARK_RETIRE_CLASS_BEGIN);
+        crate::yarm_log!(
+            "{} class=InitramfsReadChunk result=ok",
+            MARK_RETIRE_CLASS_DONE
+        );
+    }
+}
+
+/// Hosted-dev: InitramfsReadChunk stays on the unchanged global-lock path (the split
+/// user-copy uses the direct map, which only exists on real targets).
+#[cfg(feature = "hosted-dev")]
+fn try_split_initramfs_read_chunk_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
+// ── Stage 191D FUTEXWAIT BLOCK-PUBLISH SEAM markers + deferral ─────────────────────────
+//
+// FutexWait (NR 1) is DEFERRED: it is NOT added to `classify_split_eligible_nr_only` and
+// stays FULLY global-lock-only. Unlike DebugLog/FutexWake/InitramfsReadChunk, a matched
+// FutexWait BLOCKS the caller and must dispatch a DIFFERENT runnable task — the
+// queue-ADVANCING "switch_required" case that `dispatch_next_task` performs. The kernel's
+// own out-of-lock dispatch relocation (D6-GENUINE, `exec_state.rs::dispatch_next_task`)
+// explicitly restricts itself to the queue-NEUTRAL case and falls back to the in-lock
+// (global-lock) path with `reason=switch_required` for exactly this scenario, so the
+// futex-wait block+dispatch cannot be serviced off the global lock without the disclaimed
+// multi-stage dispatch rewrite. Stage 191D therefore LANDS + proves the block-publish seam
+// (`SharedKernel::futex_wait_would_block_split_read` = Phase A value-check,
+// `SharedKernel::futex_wait_publish_block_split_mut` = Phase B block-publish) as
+// HELPER-ONLY, ready for that future stage, but does NOT wire FutexWait live.
+//
+/// FutexWait split marker vocabulary (emitted only if/when FutexWait is wired live; the
+/// block-publish seam emits `FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK` today from its Phase B).
+pub const MARK_FUTEX_WAIT_SPLIT_BEGIN: &str = "FUTEX_WAIT_SPLIT_BEGIN";
+pub const MARK_FUTEX_WAIT_SPLIT_VALUE_CHECK_OK: &str = "FUTEX_WAIT_SPLIT_VALUE_CHECK_OK";
+pub const MARK_FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK: &str = "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK";
+pub const MARK_FUTEX_WAIT_SPLIT_DONE_BLOCKED: &str = "FUTEX_WAIT_SPLIT_DONE result=blocked";
+/// The one concrete blocker that keeps FutexWait's LIVE retirement deferred: the matched
+/// wait's queue-advancing dispatch is the global-lock `switch_required` case.
+pub const MARK_FUTEX_WAIT_DEFERRED_REASON: &str = "GLOBAL_LOCK_RETIRE_CLASS_DEFERRED class=FutexWait reason=block_dispatch_switch_required_needs_global_lock";
 
 /// # Validation status
 /// - LIVE_TRAP_SMOKE_X86_64 (Stage 32B) — wired into the live trap seam:
@@ -391,6 +795,28 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // eligibility (group leader, page-crossing shrink, single CPU online) is
         // decided inside that helper; ineligible cases return `None` → fallback.
         Syscall::VmBrk => Some(syscall),
+        // Stage 191A (GLOBAL-LOCK-RETIRE, first class): DebugLog (NR 15) is a pure READ
+        // syscall — it resolves the current task, copies user bytes, logs, and never
+        // blocks/yields/switches tasks or mutates KernelState. It is serviced off the
+        // global lock via `try_split_debug_log_into_frame`. Any case it cannot service
+        // returns `None` → unchanged global-lock fallback.
+        Syscall::DebugLog => Some(syscall),
+        // Stage 191B (GLOBAL-LOCK-RETIRE, second class): FutexWake (NR 11) — the CALLER
+        // never task-switches; it only mutates waiter/run-queue state (Blocked→Runnable
+        // + enqueue). Serviced off the global lock via `try_split_futex_wake_into_frame`
+        // (task split-mut wake scan + scheduler split-mut enqueue). NOT FutexWait (which
+        // blocks the caller — stays global-lock-only). Ineligible cases (invalid addr)
+        // return `None` → unchanged global-lock fallback, which produces the exact error.
+        Syscall::FutexWake => Some(syscall),
+        // Stage 191C (GLOBAL-LOCK-RETIRE, third class): InitramfsReadChunk (NR 27) is a
+        // read-only user-copy syscall — it copies immutable initramfs/CPIO bytes into a
+        // user buffer and mutates NO task/scheduler/IPC/cap/VM structural state. Its
+        // SUCCESS path is serviced off the global lock via
+        // `try_split_initramfs_read_chunk_into_frame`; every error case returns `None` →
+        // unchanged global-lock fallback (canonical error + diagnostic logs). NOT
+        // CreateInitramfsFileSliceMo (NR 28), which MINTS a capability (cap-state
+        // mutation) and stays global-lock-only.
+        Syscall::InitramfsReadChunk => Some(syscall),
         _ => None,
     }
 }
@@ -905,9 +1331,9 @@ mod tests {
     #[test]
     fn stage29_futex_not_eligible() {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
-        // Stage 32B: IpcRecv is now NR-eligible, so it can no longer stand in for a
-        // blocking syscall here. Use futex (which is genuinely never split-eligible)
-        // both by frame and by number.
+        // FutexWait (NR 10) is genuinely never split-eligible — it BLOCKS the caller,
+        // so it stays global-lock-only. (Stage 191B split-retired FutexWake (NR 11),
+        // which does NOT block the caller; that eligibility is pinned separately.)
         let mut frame = TrapFrame::new(
             crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR,
             [1, 2, 3, 4, 5, 6],
@@ -918,11 +1344,14 @@ mod tests {
         );
         assert!(
             classify_split_eligible_nr_only(decode(crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR))
-                .is_none()
+                .is_none(),
+            "FutexWait must stay global-lock-only (it blocks the caller)"
         );
+        // Stage 191B: FutexWake IS now split-eligible.
         assert!(
             classify_split_eligible_nr_only(decode(crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR))
-                .is_none()
+                .is_some(),
+            "FutexWake must be split-eligible (Stage 191B)"
         );
     }
 
@@ -934,8 +1363,10 @@ mod tests {
     #[test]
     fn stage29_whitelist_exhaustive() {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
-        // Stage 32B), and NR 14 (VmBrk, Stage 114) may pass the NR-only
-        // split-eligibility gate.
+        // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A),
+        // NR 11 (FutexWake, Stage 191B), and NR 27 (InitramfsReadChunk, Stage 191C)
+        // may pass the NR-only split-eligibility gate. Every other syscall stays
+        // global-lock-only.
         for nr in 0..SYSCALL_COUNT {
             let Ok(syscall) = Syscall::decode(nr) else {
                 continue;
@@ -944,6 +1375,9 @@ mod tests {
             if nr == SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR
                 || nr == SYSCALL_IPC_RECV_NR
                 || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
+                || nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
+                || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+                || nr == crate::kernel::syscall::SYSCALL_INITRAMFS_READ_CHUNK_NR
             {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {

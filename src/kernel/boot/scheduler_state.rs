@@ -111,6 +111,29 @@ impl KernelState {
         next
     }
 
+    /// Stage 189D: pop the next runnable task on a SPECIFIC `cpu` into that CPU's
+    /// scheduler `current`. Used to PLACE the live AP probe task on the AP after its
+    /// wake-only bit is cleared (so the AP's syscall dispatches for a real current
+    /// task). Returns the tid made current, if any.
+    pub fn dispatch_next_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {
+        let mut sched = self.scheduler_state();
+        kernel_mut(&mut sched.scheduler)
+            .dispatch_next_on(cpu)
+            .map(|tid| tid.0)
+    }
+
+    /// Stage 190A: take the current task off a SPECIFIC `cpu` (return it to the
+    /// scheduler / clear `current`) without re-dispatching. Used after the AP probe's
+    /// `Yield` so the AP run queue is left consistent and `current` becomes `None`,
+    /// routing the AP to its interruptible idle loop (return-to-idle). Returns the tid
+    /// that was blocked, if any.
+    pub fn block_current_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {
+        let mut sched = self.scheduler_state();
+        kernel_mut(&mut sched.scheduler)
+            .block_current_on(cpu)
+            .map(|tid| tid.0)
+    }
+
     /// Stage 107 / D6 first live step — typed local-CPU dispatch step.
     ///
     /// VALIDATION: D6_LIVE_SPLIT — called from
@@ -203,6 +226,18 @@ impl KernelState {
         let mut sched = self.scheduler_state();
         kernel_mut(&mut sched.scheduler)
             .on_preempt_on(cpu)
+            .map(|tid| tid.0)
+    }
+
+    /// Stage 192B: re-enqueue the current task on the current CPU and clear the current
+    /// slot WITHOUT dispatching (the re-enqueue half of `on_preempt_current_cpu`). Returns
+    /// the re-enqueued TID (`current` now cleared) on success, or `None` (leaving `current`
+    /// unchanged) when there was no current task or the re-enqueue failed.
+    pub(crate) fn preempt_reenqueue_current_cpu(&mut self) -> Option<u64> {
+        let cpu = self.current_cpu();
+        let mut sched = self.scheduler_state();
+        kernel_mut(&mut sched.scheduler)
+            .preempt_reenqueue_only_on(cpu)
             .map(|tid| tid.0)
     }
 

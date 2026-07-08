@@ -86,6 +86,14 @@ impl RingQueue {
         Some(tid)
     }
 
+    /// Non-mutating peek of the head (the TID `pop` would return next). Read-only.
+    fn peek(&self) -> Option<ThreadId> {
+        if self.len == 0 {
+            return None;
+        }
+        Some(self.tids[self.head])
+    }
+
     /// Remove `tid` from any position in the ring buffer.
     /// Compacts the elements after the removed slot toward the head.
     /// Returns `true` if `tid` was found and removed, `false` otherwise.
@@ -255,6 +263,18 @@ impl PriorityScheduler {
         None
     }
 
+    /// Non-mutating twin of [`dequeue_highest`]: return the TID that would be
+    /// dispatched next from an idle/cleared current (highest-priority queue head),
+    /// WITHOUT dequeuing it. Read-only — same priority scan order as `dequeue_highest`.
+    fn peek_highest(&self) -> Option<ThreadId> {
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            if let Some(tid) = self.queues[Self::priority_index(priority)].peek() {
+                return Some(tid);
+            }
+        }
+        None
+    }
+
     pub fn dispatch_next(&mut self) -> Option<ThreadId> {
         if let Some(current) = self.current {
             if current.tid.0 == 0 && self.runnable_count() > 0 {
@@ -295,6 +315,33 @@ impl PriorityScheduler {
             }
         }
         self.dispatch_next()
+    }
+
+    /// Stage 192B: the RE-ENQUEUE half of [`on_preempt`] — re-enqueue the current task at
+    /// the tail of its priority queue and CLEAR the current slot, WITHOUT dispatching. The
+    /// out-of-lock trap-entry drain then runs the authoritative `dispatch_next` (queue-
+    /// advancing) with the global lock dropped.
+    ///
+    /// Returns `Some(tid)` of the re-enqueued task (current now `None`) on success — the
+    /// caller records a deferral and skips the in-lock dispatch. Returns `None` (leaving
+    /// `current` UNCHANGED) when there is no current task, or the re-enqueue failed
+    /// (e.g. `AlreadyQueued`); the caller then falls back to the legacy in-lock `on_preempt`.
+    pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId> {
+        let running = self.current.take()?;
+        if !self.membership_tracking_exhausted {
+            self.membership_remove(running.tid);
+        }
+        if let Err(_err) = self.enqueue_with_priority(running.tid, running.priority) {
+            // Re-enqueue failed — restore as current and signal the caller to fall back.
+            if !self.membership_tracking_exhausted {
+                let _ = self.membership_insert(running.tid);
+            }
+            self.current = Some(running);
+            return None;
+        }
+        // `current` is now None; the task is re-enqueued exactly once and awaits the
+        // out-of-lock queue-advancing dispatch.
+        Some(running.tid)
     }
 
     /// Like `on_preempt`, but prefers dispatching `preferred` as the next task.
@@ -600,6 +647,14 @@ impl SmpScheduler {
         self.schedulers[idx].on_preempt()
     }
 
+    /// Stage 192B: the re-enqueue half of `on_preempt_on` — re-enqueue the current task on
+    /// `cpu` and clear the current slot WITHOUT dispatching. See
+    /// `PriorityScheduler::preempt_reenqueue_only`.
+    pub fn preempt_reenqueue_only_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
+        let idx = self.check_online_cpu(cpu).ok()?;
+        self.schedulers[idx].preempt_reenqueue_only()
+    }
+
     /// Preempt current task on `cpu`, preferring `preferred` as the next task.
     /// See `PriorityScheduler::on_preempt_prefer` for semantics.
     pub fn on_preempt_prefer_on(&mut self, cpu: CpuId, preferred: ThreadId) -> Option<ThreadId> {
@@ -627,6 +682,14 @@ impl SmpScheduler {
             return 0;
         };
         self.schedulers[idx].runnable_count()
+    }
+
+    /// Non-mutating peek of the next-runnable dispatch candidate on `cpu`: the TID
+    /// that `dispatch_next_on` would select when the current slot is idle/cleared
+    /// (highest-priority queue head), WITHOUT dequeuing or setting current. Read-only.
+    pub fn peek_next_runnable_on(&self, cpu: CpuId) -> Option<ThreadId> {
+        let idx = self.check_online_cpu(cpu).ok()?;
+        self.schedulers[idx].peek_highest()
     }
 }
 

@@ -1242,6 +1242,54 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let _ = self.block_current_cpu();
+        // Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): the caller is now
+        // `Blocked(Futex)` and removed from `current`, so the dispatch that follows
+        // genuinely advances the run queue (the "switch_required" case). Mirror the
+        // Stage 168B/169 D2-GENUINE recv/send model (default-on on x86_64
+        // single-dispatcher): defer the queue-advancing dispatch OUT of the global lock to
+        // the trap-entry drain and SKIP the in-lock dispatch. Every ineligible case (no
+        // trap drainer, multi-dispatcher, proof/switch-a knobs, already deferred) keeps the
+        // unchanged in-lock `dispatch_next_task` fallback.
+        #[cfg(target_arch = "x86_64")]
+        if crate::kernel::boot::d6_genuine_enabled() {
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            let already = crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
+            if trap_path
+                && single_cpu
+                && !already
+                && crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid)
+            {
+                crate::yarm_log!("FUTEX_WAIT_SPLIT_BEGIN");
+                crate::yarm_log!(
+                    "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={}",
+                    tid,
+                    addr
+                );
+                crate::yarm_log!(
+                    "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid={} cpu={}",
+                    tid,
+                    cpu_idx
+                );
+                // The out-of-lock trap-entry drain performs the authoritative
+                // queue-advancing dispatch; do NOT dispatch in-lock here.
+                return Ok(true);
+            }
+            crate::yarm_log!(
+                "FUTEX_WAIT_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
+                if !trap_path {
+                    "no_trap_drainer"
+                } else if !single_cpu {
+                    "multi_cpu"
+                } else {
+                    "already_deferred"
+                },
+                tid
+            );
+        }
         self.dispatch_next_task()?;
         Ok(true)
     }
@@ -1307,6 +1355,111 @@ impl KernelState {
         let asid = self.task_asid(tid).ok_or(KernelError::UserMemoryFault)?;
         let _ = self.copy_from_user(asid, VirtAddr(addr as u64), core::mem::size_of::<u32>())?;
         Ok(())
+    }
+
+    /// Stage 190B (CONTROLLED AP WORKLOAD): build a small, deterministic SEQUENCE of
+    /// registered ring-3 probe tasks for the AP scheduler-policy seal. Creates ONE
+    /// per-AP user address space (code + stack), then registers `count` tasks
+    /// (`base_tid .. base_tid+count`) all bound to that shared ASID — each runs the
+    /// same seal stub: `Yield` (syscall NR 0, normal range) then a magic park. The
+    /// tasks run SEQUENTIALLY on one AP (never concurrently), so sharing the ASID +
+    /// stack is safe. The AP scheduler loop dispatches them one at a time, blocking
+    /// each after its `Yield` and returning to the scheduler/idle path between them.
+    /// This is a fixed controlled workload — NOT arbitrary load balancing. Returns the
+    /// shared `(cr3, entry, user_stack_top)`. Idempotent per `base_tid`. x86_64-only.
+    #[cfg(target_arch = "x86_64")]
+    pub fn build_ap_workload(
+        &mut self,
+        base_tid: u64,
+        count: u64,
+    ) -> Result<(u64, u64, u64), KernelError> {
+        const PROBE_CODE_VA: u64 = 0x0000_0000_2000_0000;
+        const PROBE_STACK_VA: u64 = 0x0000_0000_2001_0000;
+        // Seal stub (normal syscall FIRST, magic park SECOND):
+        //   xor eax, eax        ; RAX = 0  (SYSCALL_YIELD_NR — normal range)
+        //   syscall             ; → normal global-lock dispatch (handle_yield), returns
+        //   mov eax, 0xA9C6     ; magic park number (early diagnostic only)
+        //   syscall             ; → LSTAR magic fast path: set flag + hlt (parks)
+        //   jmp .
+        const PROBE_STUB: [u8; 13] = [
+            0x31, 0xC0, // xor eax, eax  (RAX = 0 = Yield)
+            0x0F, 0x05, // syscall
+            0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6
+            0x0F, 0x05, // syscall
+            0xEB, 0xFE, // jmp .
+        ];
+        let user_stack_top = PROBE_STACK_VA + (PAGE_SIZE as u64) - 16;
+
+        // Idempotent: reuse an already-built per-AP workload ASID.
+        let asid = if let Some(existing) = self.task_asid(base_tid) {
+            existing
+        } else {
+            let (asid, _cap) = self.create_user_address_space()?;
+            // Code page: user + read + write (copy_to_user staging) + execute.
+            let code_flags = PageFlags {
+                read: true,
+                write: true,
+                execute: true,
+                user: true,
+                cache_policy: CachePolicy::WriteBack,
+            };
+            let code_phys = self.alloc_user_data_frame()?;
+            self.map_user_page_in_asid_raw(
+                asid,
+                VirtAddr(PROBE_CODE_VA),
+                Mapping {
+                    phys: PhysAddr(code_phys),
+                    flags: code_flags,
+                },
+            )?;
+            self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB)?;
+            // Stack page: user + read + write (sequential single-AP use).
+            let stack_phys = self.alloc_user_data_frame()?;
+            self.map_user_page_in_asid_raw(
+                asid,
+                VirtAddr(PROBE_STACK_VA),
+                Mapping {
+                    phys: PhysAddr(stack_phys),
+                    flags: PageFlags::USER_RW,
+                },
+            )?;
+            asid
+        };
+
+        // Register the `count` controlled workload tasks bound to the shared ASID, but
+        // do NOT enqueue them here: the full spawn path would balance-place them on a
+        // run queue where the BSP could dispatch them. The live dispatcher PLACES them
+        // explicitly on the AP after the audited wake-only clear.
+        for i in 0..count {
+            let tid = base_tid + i;
+            if self.task_status(tid).is_some() {
+                continue; // idempotent
+            }
+            self.register_task_with_class(tid, crate::kernel::task::TaskClass::App)?;
+            self.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid)
+                    .ok_or(KernelError::TaskMissing)?;
+                tcb.asid = Some(asid);
+                tcb.status = TaskStatus::Runnable;
+                Ok::<_, KernelError>(())
+            })?;
+        }
+
+        let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)
+            .ok_or(KernelError::UserMemoryFault)?;
+        crate::yarm_log!(
+            "X86_AP_WORKLOAD_BUILT base_tid={} count={} asid={} cr3=0x{:x} entry=0x{:x} stack_top=0x{:x}",
+            base_tid,
+            count,
+            asid.0,
+            cr3,
+            PROBE_CODE_VA,
+            user_stack_top
+        );
+        Ok((cr3, PROBE_CODE_VA, user_stack_top))
     }
 
     pub fn spawn_user_task_from_image(
@@ -2195,6 +2348,65 @@ impl KernelState {
                 tcb.status = TaskStatus::Runnable;
                 Ok::<_, KernelError>(())
             })?;
+        }
+
+        // Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): the caller is now Runnable. Mirror
+        // the Stage 192A FutexWait model (itself the D2-GENUINE recv/send model, default-on
+        // on x86_64 single-dispatcher): RE-ENQUEUE the caller + clear `current` in-lock
+        // (the re-enqueue half of on_preempt), record a per-CPU deferral, and SKIP the
+        // in-lock dispatch — the trap-entry drain runs the authoritative queue-advancing
+        // `dispatch_next_on` off the global lock. Every ineligible case keeps the unchanged
+        // in-lock `on_preempt_current_cpu` fallback below.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(out_tid) = outgoing_tid {
+            if crate::kernel::boot::d6_genuine_enabled() {
+                let cpu_idx = self.current_cpu().0 as usize;
+                let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                    && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                let single_cpu = self.dispatching_cpu_count() <= 1;
+                let already = crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
+                if trap_path
+                    && single_cpu
+                    && !already
+                    && crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)
+                {
+                    // Re-enqueue the caller + clear `current` (exactly once); on success the
+                    // out-of-lock drain performs the authoritative dispatch.
+                    match self.preempt_reenqueue_current_cpu() {
+                        Some(reenq_tid) => {
+                            crate::yarm_log!(
+                                "YIELD_DISPATCH_DEFER_BEGIN cpu={} tid={}",
+                                cpu_idx,
+                                out_tid
+                            );
+                            crate::yarm_log!(
+                                "YIELD_DISPATCH_REENQUEUE_OK cpu={} tid={}",
+                                cpu_idx,
+                                reenq_tid
+                            );
+                            return Ok(());
+                        }
+                        None => {
+                            // No current / re-enqueue failed — nothing was deferred; clear
+                            // the intent and fall back to the legacy in-lock path.
+                            crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                        }
+                    }
+                } else {
+                    crate::yarm_log!(
+                        "YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
+                        if !trap_path {
+                            "no_trap_drainer"
+                        } else if !single_cpu {
+                            "multi_cpu"
+                        } else {
+                            "already_deferred"
+                        },
+                        out_tid
+                    );
+                }
+            }
         }
 
         let next_tid = self.on_preempt_current_cpu();

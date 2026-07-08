@@ -175,6 +175,12 @@ pub const MARK_USERMODE_ENTRY_DEFERRED: &str = "X86_AP_USERMODE_ENTRY_DEFERRED";
 /// Live-only: an AP user task made a syscall and re-entered the global-lock
 /// dispatch through a per-CPU entry path. Never emitted while the entry is global.
 pub const MARK_USER_SYSCALL_REENTRY_OK: &str = "X86_AP_USER_SYSCALL_REENTRY_OK";
+/// Stage 189C5: the AP ring3-entry PREREQUISITES are present (reusable iret entry,
+/// per-CPU syscall re-entry, per-CPU TSS RSP0, kernel-return-context mapper).
+pub const MARK_RING3_ENTRY_READY: &str = "X86_AP_RING3_ENTRY_READY";
+/// Live-only: the selected AP task's kernel stack is mapped in its CR3 for the
+/// ring3→ring0 switch. Emitted only by a live dispatch (not this pass).
+pub const MARK_KERNEL_STACK_MAPPED: &str = "X86_AP_KERNEL_STACK_MAPPED";
 /// The Stage 189A genuine remote ACK is available for this CPU's shootdown.
 pub const MARK_TLB_READY: &str = "X86_AP_TLB_READY_FOR_DISPATCH";
 /// A wake-only clear was NOT performed; carries the refusal reason.
@@ -192,6 +198,62 @@ pub const MARK_USER_DISPATCH_BEGIN: &str = "X86_AP_USER_DISPATCH_BEGIN";
 pub const MARK_USER_TRAP_RETURN_OK: &str = "X86_AP_USER_TRAP_RETURN_OK";
 /// The AP user-dispatch slice completed successfully.
 pub const MARK_USER_DISPATCH_DONE: &str = "X86_AP_USER_DISPATCH_DONE";
+
+// ── Stage 189C6 LIVE AP dispatch markers ─────────────────────────────────────
+/// The AP idle-loop live hook called the Rust dispatcher (`ap_dispatch_request`
+/// was set + observed on the AP). This is the first proof the wired hook fired.
+pub const MARK_DISPATCH_HOOK_ENTER: &str = "X86_AP_DISPATCH_HOOK_ENTER";
+/// The live dispatcher loaded the selected AP user task's CR3 on the AP.
+pub const MARK_USER_CR3_LOAD_OK: &str = "X86_AP_USER_CR3_LOAD_OK";
+/// The live dispatcher is about to `iretq` the AP into ring 3 (per-CPU RSP0/TSS
+/// set, CR3 active). The AP does not return from this on success.
+pub const MARK_RING3_ENTER: &str = "X86_AP_RING3_ENTER";
+/// The live dispatcher declined (no valid dispatch plan / knob off); carries reason.
+pub const MARK_DISPATCH_DECLINED: &str = "X86_AP_DISPATCH_DECLINED";
+
+// ── Stage 189D SEAL markers (AP normal syscall through the global lock) ───────
+/// A live AP probe task's NORMAL syscall (not the magic probe) is entering the
+/// dispatch. Carries cpu/tid/nr.
+pub const MARK_NORMAL_SYSCALL_BEGIN: &str = "X86_AP_NORMAL_SYSCALL_BEGIN";
+/// The AP's normal syscall is entering the NORMAL global-lock dispatch path
+/// (`with_cpu` → `handle_trap` → `syscall::dispatch`). Carries cpu/tid/nr.
+pub const MARK_GLOBAL_LOCK_DISPATCH_ENTER: &str = "X86_AP_GLOBAL_LOCK_DISPATCH_ENTER";
+/// The AP's normal syscall completed OK through the global-lock dispatch. cpu/tid/nr.
+pub const MARK_NORMAL_SYSCALL_OK: &str = "X86_AP_NORMAL_SYSCALL_OK";
+/// Stage 189 is sealed: an AP executed real user code that entered the global-lock
+/// syscall path and succeeded.
+pub const MARK_USER_DISPATCH_SEAL_DONE: &str = "X86_AP_USER_DISPATCH_SEAL_DONE";
+/// A live AP probe task was admitted (placed) on the AP AFTER its wake-only bit was
+/// cleared by the audited transition. Carries cpu/tid.
+pub const MARK_ADMIT_PLACED: &str = "X86_AP_ADMIT_PLACED";
+/// An attempt to place a task on a still-wake-only AP was DENIED (admission guard).
+pub const MARK_ADMIT_DENIED_WAKE_ONLY: &str = "X86_AP_ADMIT_DENIED_WAKE_ONLY";
+
+// ── Stage 190A markers (AP scheduler loop + return-to-idle) ──────────────────
+/// The AP scheduler loop is set up for this dispatch (before entering ring 3).
+pub const MARK_SCHED_LOOP_READY: &str = "X86_AP_SCHED_LOOP_READY";
+/// After the admitted task's `Yield`, control returned to the AP scheduler (the task
+/// was blocked / the run queue advanced), rather than re-running it or parking.
+pub const MARK_YIELD_RETURN_TO_SCHED_OK: &str = "X86_AP_YIELD_RETURN_TO_SCHED_OK";
+/// The AP scheduler found no further admitted task and returned to the interruptible
+/// idle loop (honest idle, wake-capable) — NOT a permanent park.
+pub const MARK_RETURN_TO_IDLE_OK: &str = "X86_AP_RETURN_TO_IDLE_OK";
+/// The AP scheduler-loop slice completed successfully.
+pub const MARK_SCHED_LOOP_DONE: &str = "X86_AP_SCHED_LOOP_DONE";
+
+// ── Stage 190B markers (controlled AP workload + scheduler policy seal) ───────
+/// A controlled per-AP workload (a fixed sequence of admitted tasks) is built and
+/// ready to be placed on the AP after the audited wake-only clear.
+pub const MARK_WORKLOAD_PLACEMENT_READY: &str = "X86_AP_WORKLOAD_PLACEMENT_READY";
+/// The AP scheduler loop is dispatching the NEXT admitted task after the previous one
+/// yielded and was blocked (repeated dispatch). Carries cpu/tid.
+pub const MARK_NEXT_TASK_DISPATCH_BEGIN: &str = "X86_AP_NEXT_TASK_DISPATCH_BEGIN";
+/// The AP ran a sequence of `count` admitted tasks via repeated dispatch, each
+/// returning to the scheduler between tasks. Carries cpu/count.
+pub const MARK_REPEATED_DISPATCH_OK: &str = "X86_AP_REPEATED_DISPATCH_OK";
+/// The AP SMP scheduler-policy seal completed: repeated controlled dispatch +
+/// return-to-idle with a consistent run queue, under the still-global lock.
+pub const MARK_SCHED_POLICY_SEAL_DONE: &str = "X86_AP_SCHED_POLICY_SEAL_DONE";
 
 #[cfg(test)]
 mod tests {

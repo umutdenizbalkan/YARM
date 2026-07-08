@@ -912,6 +912,193 @@ pub(crate) fn d2_recv_dispatch_clear(cpu_idx: usize) {
     D2_RECV_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }
 
+// ── Stage 192A (QUEUE-ADVANCING OUT-OF-LOCK DISPATCH for FutexWait) ─────────────────
+//
+// FutexWait's blocking wait is structurally identical to blocking IPC recv/send: the
+// in-lock path publishes `Blocked(Futex(addr))` + `block_current` (removes the caller
+// from `current`), then DEFERS the queue-advancing dispatch out of the global lock to the
+// trap-entry drain — exactly the Stage 168B/169 D2-GENUINE recv/send model (default-on on
+// x86_64 single-dispatcher). Same per-CPU deferral discipline: one intent at a time; the
+// outgoing (blocked) TID is recorded so the drain re-verifies `Blocked(Futex)` before the
+// out-of-lock `dispatch_next_on`.
+
+/// Stage 192A: global count of FutexWait queue-advancing dispatches run through the
+/// scheduler seam OUTSIDE the global lock. Emitted as `FUTEX_WAIT_SPLIT_DISPATCH_OK`.
+pub(crate) static FUTEX_WAIT_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 192A: per-CPU "FutexWait dispatch deferred" flag. Set by the in-lock
+/// `futex_wait_current` when it commits the block and defers the queue-advancing dispatch;
+/// cleared by the trap-entry drain.
+pub(crate) static FUTEX_WAIT_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 192A: per-CPU blocked (outgoing) FutexWait TID recorded with the deferral, so the
+/// drain can re-verify the task is still `Blocked(Futex)` before dispatching (`u64::MAX`
+/// sentinel = unset).
+pub(crate) static FUTEX_WAIT_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 192A: record a deferred FutexWait dispatch intent for `cpu`. Returns false
+/// (decline; caller falls back to the in-lock dispatch) if an intent is already pending.
+pub(crate) fn futex_wait_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    if FUTEX_WAIT_DISPATCH_DEFERRED[cpu_idx]
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    FUTEX_WAIT_DISPATCH_OUTGOING[cpu_idx].store(outgoing, core::sync::atomic::Ordering::Release);
+    true
+}
+
+/// Stage 192A: is a deferred FutexWait dispatch pending for `cpu`?
+pub(crate) fn futex_wait_dispatch_is_deferred(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && FUTEX_WAIT_DISPATCH_DEFERRED[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 192A: read the deferred FutexWait outgoing TID for `cpu` (`None` if unset).
+pub(crate) fn futex_wait_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let v = FUTEX_WAIT_DISPATCH_OUTGOING[cpu_idx].load(core::sync::atomic::Ordering::Acquire);
+    if v == u64::MAX { None } else { Some(v) }
+}
+
+/// Stage 192A: clear the FutexWait dispatch deferral for `cpu`.
+pub(crate) fn futex_wait_dispatch_clear(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    FUTEX_WAIT_DISPATCH_OUTGOING[cpu_idx].store(u64::MAX, core::sync::atomic::Ordering::Release);
+    FUTEX_WAIT_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Stage 192A: one-shot latch for the FutexWait retirement markers (queue-advancing
+/// dispatch now runs off the global lock; the block-publish stays in-lock, mirroring the
+/// accepted D2-GENUINE recv/send out-of-lock dispatch model).
+static FUTEX_WAIT_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 192A: emit the FutexWait retirement markers exactly once (first off-global-lock
+/// queue-advancing dispatch).
+pub(crate) fn maybe_log_futex_wait_retired() {
+    if FUTEX_WAIT_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=FutexWait");
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok");
+    }
+}
+
+// ── Stage 192B (QUEUE-ADVANCING OUT-OF-LOCK DISPATCH for Yield) ─────────────────────
+//
+// Yield is the preempt sibling of FutexWait: instead of blocking the caller, it
+// RE-ENQUEUES the caller as Runnable then dispatches the next task. The in-lock path sets
+// the caller Runnable + re-enqueues it + clears `current` (the re-enqueue half of
+// on_preempt), records a per-CPU deferral, and declines the in-lock dispatch; the
+// trap-entry drain runs the authoritative `dispatch_next_on` out of the global lock. Same
+// per-CPU deferral discipline as the Stage 168B/192A models.
+
+/// Stage 192B: global count of Yield queue-advancing dispatches run through the scheduler
+/// seam OUTSIDE the global lock. Emitted as `YIELD_DISPATCH_DONE`.
+pub(crate) static YIELD_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 192B: per-CPU "Yield dispatch deferred" flag.
+pub(crate) static YIELD_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 192B: per-CPU re-enqueued (outgoing) Yield TID recorded with the deferral
+/// (`u64::MAX` sentinel = unset).
+pub(crate) static YIELD_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 192B: record a deferred Yield dispatch intent for `cpu`. Returns false (decline;
+/// caller falls back to the in-lock dispatch) if an intent is already pending.
+pub(crate) fn yield_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    if YIELD_DISPATCH_DEFERRED[cpu_idx]
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    YIELD_DISPATCH_OUTGOING[cpu_idx].store(outgoing, core::sync::atomic::Ordering::Release);
+    true
+}
+
+/// Stage 192B: is a deferred Yield dispatch pending for `cpu`?
+pub(crate) fn yield_dispatch_is_deferred(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && YIELD_DISPATCH_DEFERRED[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 192B: read the deferred Yield outgoing TID for `cpu` (`None` if unset).
+pub(crate) fn yield_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let v = YIELD_DISPATCH_OUTGOING[cpu_idx].load(core::sync::atomic::Ordering::Acquire);
+    if v == u64::MAX { None } else { Some(v) }
+}
+
+/// Stage 192B: clear the Yield dispatch deferral for `cpu`.
+pub(crate) fn yield_dispatch_clear(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    YIELD_DISPATCH_OUTGOING[cpu_idx].store(u64::MAX, core::sync::atomic::Ordering::Release);
+    YIELD_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Stage 192B: one-shot latch for the Yield retirement markers.
+static YIELD_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 192B: emit the Yield retirement markers exactly once.
+pub(crate) fn maybe_log_yield_retired() {
+    if YIELD_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=Yield");
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok");
+    }
+}
+
 /// Stage 169 (D2-GENUINE-SEND): x86_64-only, default-off gate that runs the
 /// blocking-SEND path (endpoint full / synchronous no-waiter) through explicit
 /// rank-clean scheduler/task/IPC phase markers and relocates its queue-advancing
@@ -1193,6 +1380,26 @@ pub fn set_smp_ready_enabled(enabled: bool) {
 
 pub fn smp_ready_enabled() -> bool {
     SMP_READY_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, DEFAULT-OFF gate that arms the
+/// FIRST live application-processor user dispatch. When OFF (default) the AP
+/// idle-loop live hook is an inert single-load-and-branch — the AP stays in its
+/// wake-only managed idle loop and the accepted smp2/smp4 baseline is byte-for-byte
+/// preserved. When ON (`yarm.ap_user_dispatch=1`), after the audited wake-only
+/// clear the BSP builds a self-contained AP ring3 probe task, posts the per-CPU
+/// dispatch request, wakes the AP, and the AP's live hook enters ring 3 and issues
+/// the probe syscall — proving `X86_AP_RING3_ENTER` + `X86_AP_USER_SYSCALL_REENTRY_OK`
+/// on a real second CPU. VALIDATION: AP_USER_DISPATCH_ENABLED.
+pub(crate) static AP_USER_DISPATCH_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_ap_user_dispatch_enabled(enabled: bool) {
+    AP_USER_DISPATCH_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ap_user_dispatch_enabled() -> bool {
+    AP_USER_DISPATCH_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Stage 177: try to claim the one-shot SMP-readiness audit (true exactly once).
