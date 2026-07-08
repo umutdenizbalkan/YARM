@@ -107,6 +107,24 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     fault_bookkeeping_mode: FaultBookkeepingMode,
 ) -> Result<(), TrapHandleError> {
     let _ = kernel.set_current_cpu(cpu);
+    // XARCH-SRV-PARITY (RISC-V): the RISC-V trap bridge calls this handler DIRECTLY
+    // (raw `&mut KernelState`), never through `handle_trap_entry_shared`, so RISC-V has
+    // NO post-`with_cpu` dispatch-return drainer (`drain_dispatch_post_work` runs only on
+    // the shared path). `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` is the producers' signal
+    // that "a trap-entry drainer WILL run and complete the deferred blocked-waiter
+    // delivery"; that is definitively FALSE on RISC-V's direct path. The flag can read
+    // stale-true here (it is a cross-arch static and is not owned by the RISC-V path), so
+    // force it false BEFORE handling the trap. This makes the blocked-waiter delivery
+    // producers (`produce_blocked_waiter_{plain,ordinary_cap,reply_cap}_delivery`) take the
+    // LEGACY inline wake path — which clears the waiter slot and wakes the receiver under
+    // this same single-dispatcher borrow — instead of stashing a snapshot for a drainer
+    // that never runs (which left woken receivers un-enqueued → the boot server chain
+    // stalled at `kernel_idle_awaiting_io` with all services blocked).
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+    }
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
     kernel.handle_trap_event_with_fault_bookkeeping_mode(
         decode_trap_context(context),

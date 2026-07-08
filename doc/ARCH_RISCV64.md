@@ -343,7 +343,34 @@ RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked
 ```
 
 Terminal state is **event-driven idle waiting for I/O / timer / IRQ**
-(no scope yet), reported deterministically.
+(no scope yet), reported deterministically — reached **after** the full
+server chain is resident (never before, which would be a stall).
+
+### 9.1 XARCH-SRV-PARITY fix — blocked-waiter delivery on the direct trap path
+
+The RISC-V trap bridge (`yarm_riscv64_trap_bridge` → `handle_trap_entry`)
+runs the trap under a raw `&mut KernelState` and, unlike x86_64/aarch64,
+does **not** go through `handle_trap_entry_shared`, so it has **no**
+post-`with_cpu` `drain_dispatch_post_work` stage. The blocked-waiter
+delivery producers (`produce_blocked_waiter_{plain,ordinary_cap,reply_cap}_delivery`)
+only stash a *deferred* snapshot when `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]`
+signals that such a drainer will run. That flag is a cross-arch static that
+RISC-V does not own; it was observed reading stale-true on RISC-V, so a
+producer stashed a snapshot that **no drainer ever executed** — the woken
+receiver (e.g. PM after `init`'s SpawnV5 `IPC_CALL`) was left un-enqueued.
+The result: `init` blocked on its reply, PM was never re-dispatched to service
+the spawn, and the boot stalled at `RISCV_KERNEL_IDLE_WAITING_FOR_IO
+reason=no_runnable_task all_services_blocked` **before** any of
+initramfs/devfs/vfs/driver_manager/blkcache/virtio_blk spawned.
+
+Fix: `arch/riscv64/trap.rs::handle_trap_entry_with_fault_bookkeeping_mode`
+forces `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu] = false` at the top of every
+RISC-V trap (its true semantic value — RISC-V has no shared-path drainer), so
+the producers take the **legacy inline wake** path, which clears the waiter
+slot and wakes the receiver under the same single-dispatcher borrow. The
+server chain then loads to parity with x86_64 (`PM_RECV_GOT_MSG opcode=11` ×N,
+all `*_SRV_ENTRY`/`*_SRV_READY`, `CROSS_ARCH_LIVE_DONE arch=riscv64 result=ok`),
+and `all_services_blocked` idle is reached only afterwards.
 
 ---
 
