@@ -677,6 +677,39 @@ remove implicit global-lock coupling from syscall/trap paths.
     which is a distinct multi-stage effort. GO to either (a) tackle that dispatch rewrite as
     its own stage, or (b) retire another narrow read-only/query class with a complete proof.
 
+- **Stage 191E (NEXT SAFE RETIREMENT SLICE) — NO-GO on live retirement; Phase-C selection
+  seam landed.** After a full inventory of every remaining global-lock-only syscall, NO safe
+  live class retirement remains this stage: each is either explicitly out of scope, needs the
+  queue-advancing out-of-lock dispatch rewrite (`Yield`, live `FutexWait`), needs capability
+  mutation (`TransferRelease`, `CreateInitramfsFileSliceMo` cap-mint), needs VM/ASID/TLB
+  mutation (`VmMap`, `VmAnonMap`), needs spawn/task mutation (`Fork`, all `Spawn*`), is broad
+  IPC (`IpcSend`/`IpcCall`/`IpcReply`/`IpcRecvTimeout`/`RecvSharedV3`), or must remain
+  global-lock-only (`ReapFaultedTask`). The one clean non-blocking slice — FutexWait's
+  value-mismatch (`expected != observed → Ok(false)`, no dispatch) — is intentionally NOT
+  wired, honoring the constraint that no `FutexWait` live work happens before the
+  queue-advancing dispatch is solved. `IpcRecvTimeout`'s kernel-task queued-plain slice is a
+  no-go: near-zero live occurrence + it touches the recv path just stabilized for cross-arch
+  parity.
+  * **Deliverable (helper-only):** `SharedKernel::dispatch_next_candidate_split_read(cpu)` —
+    a READ-ONLY peek of the next-runnable dispatch candidate (the TID the authoritative
+    per-CPU dispatch would select from a cleared current) through the scheduler split seam
+    (rank 1) ONLY, backed by non-mutating `SmpScheduler::peek_next_runnable_on` /
+    `PriorityScheduler::peek_highest` (twins of `dispatch_next_on`/`dequeue_highest`). It
+    NEVER dequeues/blocks/enqueues/sets-current (run queue unchanged; idempotent). This is
+    the SELECTION half of the deferred FutexWait "switch_required" Phase C, complementing the
+    191D Phase A value-check + Phase B block-publish — it proves the next-task DECISION is
+    available off the broad global lock; the mutating dequeue + arch context switch remain the
+    deferred hard part. NOT wired into `try_split_dispatch` (helper-only); the split whitelist
+    is unchanged (no new live class). Guarded by `stage191e_dispatch_next_candidate_seam`
+    (whitelist-unchanged, read-only + helper-only source scan, empirical match-vs-authoritative
+    dispatch + idempotence, none-when-idle).
+  * **The broad global lock is NOT retired.** Still exactly `DebugLog` (191A), `FutexWake`
+    (191B), and `InitramfsReadChunk` (191C, success path) are split-eligible.
+  * **Go/no-go for Stage 191F:** the remaining classes all require one of the big rewrites —
+    (a) queue-advancing out-of-lock dispatch (unblocks `FutexWait`/`Yield`; 191D block-publish
+    + 191E candidate-selection are the landed halves), or (b) broad-IPC vertical decomposition.
+    No further narrow safe class exists; the next stage must commit to one of those tracks.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

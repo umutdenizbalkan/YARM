@@ -59981,6 +59981,176 @@ mod stage191d_futex_wait_block_publish {
     }
 }
 
+// Stage 191E — NEXT SAFE GLOBAL-LOCK RETIREMENT SLICE. Inventory finding: NO safe live
+// syscall-class retirement remains (every remaining global-lock-only class is either
+// explicitly out of scope, needs the queue-advancing out-of-lock dispatch rewrite
+// (FutexWait/Yield), needs capability/VM/spawn mutation, or is broad-IPC). Deliverable
+// per preferred-target #3: a HELPER-ONLY, READ-ONLY seam for the next blocker — peek the
+// next-runnable dispatch candidate off the global lock (the SELECTION half of the deferred
+// FutexWait Phase C queue-advancing dispatch), complementing the 191D Phase A/B seams. No
+// new class is wired live; the split whitelist is unchanged.
+mod stage191e_dispatch_next_candidate_seam {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SCHED_SRC: &str = include_str!("../../kernel/scheduler.rs");
+
+    // INVENTORY: no NEW class became split-eligible this stage; the whitelist is exactly
+    // the accepted classes, and every out-of-scope class stays global-lock-only.
+    #[test]
+    fn split_whitelist_unchanged_no_new_class() {
+        for accepted in [
+            "Syscall::ControlPlaneSetCnodeSlots => Some(syscall),",
+            "Syscall::IpcRecv => Some(syscall),",
+            "Syscall::VmBrk => Some(syscall),",
+            "Syscall::DebugLog => Some(syscall),",
+            "Syscall::FutexWake => Some(syscall),",
+            "Syscall::InitramfsReadChunk => Some(syscall),",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(accepted),
+                "accepted class {accepted} must remain"
+            );
+        }
+        for locked in [
+            "Syscall::Yield => Some",
+            "Syscall::FutexWait => Some",
+            "Syscall::IpcSend => Some",
+            "Syscall::IpcCall => Some",
+            "Syscall::IpcReply => Some",
+            "Syscall::IpcRecvTimeout => Some",
+            "Syscall::VmMap => Some",
+            "Syscall::VmAnonMap => Some",
+            "Syscall::TransferRelease => Some",
+            "Syscall::Fork => Some",
+            "Syscall::SpawnThread => Some",
+            "Syscall::SpawnProcess => Some",
+            "Syscall::SpawnFromMemoryObject => Some",
+            "Syscall::CreateInitramfsFileSliceMo => Some",
+            "Syscall::RecvSharedV3 => Some",
+            "Syscall::ReapFaultedTask => Some",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(locked),
+                "{locked} must NOT be split-eligible (Stage 191E adds no live class)"
+            );
+        }
+    }
+
+    // The candidate seam is READ-ONLY and HELPER-ONLY: it uses the scheduler split seam +
+    // the non-mutating peek, takes no broad lock, and is NOT routed into try_split_dispatch.
+    #[test]
+    fn candidate_seam_is_read_only_and_helper_only() {
+        assert!(
+            RUNTIME_SRC.contains("pub fn dispatch_next_candidate_split_read(")
+                && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
+                && RUNTIME_SRC.contains(".peek_next_runnable_on(cpu)"),
+            "the candidate seam must peek via the scheduler split seam"
+        );
+        // Read-only: the seam body must not dequeue / block / enqueue / set current.
+        let start = RUNTIME_SRC
+            .find("pub fn dispatch_next_candidate_split_read(")
+            .expect("seam exists");
+        let rest = &RUNTIME_SRC[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        // Scan the body AFTER the signature line (the fn's own name contains
+        // "dispatch_next", which is not a mutating call).
+        let sig_end = rest.find('\n').map(|i| i + 1).unwrap_or(0);
+        let body = &rest[sig_end..end];
+        for mutating in [
+            "dispatch_next_on",
+            "dispatch_next_task",
+            ".dispatch_next(",
+            "dequeue",
+            "block_current",
+            "enqueue",
+            "on_preempt",
+            "set_current",
+            ".pop(",
+        ] {
+            assert!(
+                !body.contains(mutating),
+                "the candidate seam must be read-only (found `{mutating}`)"
+            );
+        }
+        // Helper-only: never wired into the live split dispatcher.
+        assert!(
+            !SPLIT_SRC.contains("dispatch_next_candidate_split_read"),
+            "the candidate seam must stay helper-only (not in the live split dispatch)"
+        );
+        // The underlying peek is a non-mutating twin of dequeue_highest.
+        assert!(
+            SCHED_SRC.contains("fn peek_highest(&self) -> Option<ThreadId>")
+                && SCHED_SRC.contains("pub fn peek_next_runnable_on(&self, cpu: CpuId)"),
+            "the non-mutating peek_highest / peek_next_runnable_on must exist"
+        );
+    }
+
+    // EMPIRICAL: the seam returns the SAME TID the authoritative dispatch selects from a
+    // cleared current, and it never mutates the run queue (idempotent; dispatch still works).
+    #[test]
+    fn candidate_matches_authoritative_dispatch_and_is_idempotent() {
+        let mut state = Bootstrap::init().expect("init");
+        state
+            .register_task_with_class(30001, crate::kernel::task::TaskClass::App)
+            .expect("reg1");
+        state
+            .register_task_with_class(30002, crate::kernel::task::TaskClass::App)
+            .expect("reg2");
+        state.set_current_cpu(CpuId(0)).expect("cpu0");
+        state.enqueue_on_cpu(CpuId(0), 30001).expect("enq1");
+        state.enqueue_on_cpu(CpuId(0), 30002).expect("enq2");
+        // Clear the current slot so the seam models the FutexWait-block Phase C selection.
+        let _ = state.block_current_cpu();
+        let runnable_before = state.runnable_count_on_cpu(CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        let cand = shared.dispatch_next_candidate_split_read(CpuId(0));
+        assert_eq!(
+            cand,
+            Some(30001),
+            "candidate must be the FIFO head (highest priority)"
+        );
+        // Idempotent / non-mutating: a second peek is identical, run queue unchanged.
+        assert_eq!(
+            shared.dispatch_next_candidate_split_read(CpuId(0)),
+            Some(30001)
+        );
+        shared.with(|k| {
+            assert_eq!(
+                k.runnable_count_on_cpu(CpuId(0)),
+                runnable_before,
+                "the peek must not dequeue"
+            );
+        });
+        // Matches the authoritative mutating dispatch.
+        shared.with(|k| {
+            k.dispatch_next_task().expect("dispatch");
+            assert_eq!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(30001),
+                "authoritative dispatch must select the peeked candidate"
+            );
+        });
+    }
+
+    // EMPIRICAL: with nothing runnable, the seam returns None (the caller would idle).
+    #[test]
+    fn candidate_is_none_when_idle() {
+        let mut state = Bootstrap::init().expect("init");
+        state.set_current_cpu(CpuId(0)).expect("cpu0");
+        let _ = state.block_current_cpu();
+        let shared = SharedKernel::new(state);
+        assert_eq!(shared.dispatch_next_candidate_split_read(CpuId(0)), None);
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

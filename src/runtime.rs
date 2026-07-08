@@ -2328,6 +2328,27 @@ impl SharedKernel {
         true
     }
 
+    /// Stage 191E (FUTEXWAIT PHASE-C SELECTION SEAM): peek the next-runnable dispatch
+    /// candidate on `cpu` — the TID the authoritative per-CPU dispatch would select once
+    /// the current slot is idle/cleared — OFF the broad global lock, through the scheduler split seam
+    /// (rank 1) ONLY. READ-ONLY: it never dequeues, never sets current, never mutates any
+    /// scheduler/task state; the run queue is unchanged (two calls return the same TID).
+    ///
+    /// This is the non-mutating SELECTION half of the deferred FutexWait "switch_required"
+    /// Phase C (queue-advancing dispatch), complementing the 191D Phase A value-check
+    /// (`futex_wait_would_block_split_read`) + Phase B block-publish
+    /// (`futex_wait_publish_block_split_mut`). It proves the next-task DECISION is available
+    /// off the global lock; the mutating dequeue + arch context switch remain the deferred
+    /// hard part, so this seam is HELPER-ONLY (not wired into `try_split_dispatch`).
+    /// Returns `None` when no task is runnable on `cpu` (the caller would idle).
+    pub fn dispatch_next_candidate_split_read(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler)
+                .peek_next_runnable_on(cpu)
+                .map(|tid| tid.0)
+        })
+    }
+
     pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot {
         // Stage 4T+7 split-read: pre-read diagnostic data for the fatal-trap log.
         // Acquires scheduler lock (rank 1) for current_tid, then task lock (rank 2)

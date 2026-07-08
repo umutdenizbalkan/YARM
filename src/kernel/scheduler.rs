@@ -86,6 +86,14 @@ impl RingQueue {
         Some(tid)
     }
 
+    /// Non-mutating peek of the head (the TID `pop` would return next). Read-only.
+    fn peek(&self) -> Option<ThreadId> {
+        if self.len == 0 {
+            return None;
+        }
+        Some(self.tids[self.head])
+    }
+
     /// Remove `tid` from any position in the ring buffer.
     /// Compacts the elements after the removed slot toward the head.
     /// Returns `true` if `tid` was found and removed, `false` otherwise.
@@ -250,6 +258,18 @@ impl PriorityScheduler {
         for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
             if let Some(tid) = self.queues[Self::priority_index(priority)].pop() {
                 return Some(ScheduledTask { tid, priority });
+            }
+        }
+        None
+    }
+
+    /// Non-mutating twin of [`dequeue_highest`]: return the TID that would be
+    /// dispatched next from an idle/cleared current (highest-priority queue head),
+    /// WITHOUT dequeuing it. Read-only — same priority scan order as `dequeue_highest`.
+    fn peek_highest(&self) -> Option<ThreadId> {
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            if let Some(tid) = self.queues[Self::priority_index(priority)].peek() {
+                return Some(tid);
             }
         }
         None
@@ -627,6 +647,14 @@ impl SmpScheduler {
             return 0;
         };
         self.schedulers[idx].runnable_count()
+    }
+
+    /// Non-mutating peek of the next-runnable dispatch candidate on `cpu`: the TID
+    /// that `dispatch_next_on` would select when the current slot is idle/cleared
+    /// (highest-priority queue head), WITHOUT dequeuing or setting current. Read-only.
+    pub fn peek_next_runnable_on(&self, cpu: CpuId) -> Option<ThreadId> {
+        let idx = self.check_online_cpu(cpu).ok()?;
+        self.schedulers[idx].peek_highest()
     }
 }
 
