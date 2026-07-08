@@ -2244,6 +2244,90 @@ impl SharedKernel {
         Ok(())
     }
 
+    /// Stage 191D (FUTEXWAIT BLOCK-PUBLISH SEAM), Phase A: validate the futex word and
+    /// decide whether the caller `tid` WOULD block, OFF the broad global lock. Mirrors the
+    /// read/validate portion of `KernelState::futex_wait_current` /
+    /// `validate_current_user_futex_word` EXACTLY:
+    /// * `addr == 0` → `None` (legacy `WrongObject`).
+    /// * `addr + 3 >= KERNEL_SPACE_BASE` → `None` (legacy `UserMemoryFault`).
+    /// * 4-byte user read fails → `None` (legacy `UserMemoryFault`).
+    ///
+    /// On a validated address returns `Some(would_block)` where `would_block ==
+    /// (expected == observed)` — identical to `futex_wait_current`'s `expected != observed
+    /// → Ok(false)` decision (the futex value comparison uses the caller-provided `expected`
+    /// / `observed` syscall args; the memory read only proves the address is user-readable).
+    /// Read-only: no TCB / scheduler / IPC / cap / VM structural mutation. `None` lets a
+    /// caller fall back to the global-lock handler for the canonical error (never masked).
+    #[cfg(not(feature = "hosted-dev"))]
+    pub fn futex_wait_would_block_split_read(
+        &self,
+        tid: u64,
+        addr: usize,
+        expected: u32,
+        observed: u32,
+    ) -> Option<bool> {
+        if addr == 0 {
+            return None; // legacy: WrongObject
+        }
+        let end = addr.checked_add(core::mem::size_of::<u32>() - 1)?;
+        if end as u64 >= crate::kernel::vm::KERNEL_SPACE_BASE {
+            return None; // legacy: UserMemoryFault
+        }
+        let asid = self.task_asid_for_tid_split_read(tid);
+        self.copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())?;
+        Some(expected == observed)
+    }
+
+    /// Stage 191D (FUTEXWAIT BLOCK-PUBLISH SEAM), Phase B: publish the caller `tid` as
+    /// `Blocked(Futex(addr))` and clear the current-CPU slot, OFF the broad global lock —
+    /// mirroring the block portion of `KernelState::futex_wait_current` (the TCB status
+    /// set) + `block_current_cpu` (`block_current_on` + `timer.reset_quantum`), WITHOUT the
+    /// subsequent `dispatch_next_task`. Task lock (rank 2) then scheduler lock (rank 1),
+    /// each held transiently and released before the next — non-nested; no broad
+    /// `&mut KernelState`. The published waiter is left `Blocked` and NOT enqueued (so no
+    /// duplicate enqueue and no orphaned runnable), removed from the current slot (so it is
+    /// current on NO CPU), and observable to `futex_wake_split_mut` on the same `addr` (so
+    /// no lost wake). Requires `tid` to be the current task on `cpu` (the live caller is).
+    /// Returns `true` iff the caller was published `Blocked` and removed from current.
+    ///
+    /// DEFERRED / HELPER-ONLY: this is the block-publish half of a split FutexWait. It does
+    /// NOT dispatch — the queue-ADVANCING switch to the next runnable task
+    /// (`dispatch_next_task`'s "switch_required" case) requires the global-lock dispatch /
+    /// context-switch machinery and is the documented multi-stage rewrite, so FutexWait's
+    /// LIVE retirement is deferred and this seam is not wired into `try_split_dispatch`.
+    pub fn futex_wait_publish_block_split_mut(&self, cpu: CpuId, tid: u64, addr: usize) -> bool {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        use crate::kernel::vm::VirtAddr;
+        // Phase B1: publish Blocked(Futex(addr)) on the caller's TCB (task lock, rank 2) —
+        // identical transition to `futex_wait_current`'s `with_tcbs_mut` block.
+        let published = self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                Some(tcb) => {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                    true
+                }
+                None => false,
+            }
+        });
+        if !published {
+            return false;
+        }
+        // Phase B2: clear the current-CPU slot (scheduler lock, rank 1) — identical to
+        // `block_current_cpu` (block_current_on + reset_quantum). NO dispatch here.
+        self.with_scheduler_split_mut(|sched| {
+            let blocked = kernel_mut(&mut sched.scheduler).block_current_on(cpu);
+            if blocked.is_some() {
+                sched.timer.reset_quantum();
+            }
+        });
+        crate::yarm_log!(
+            "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={}",
+            tid,
+            addr
+        );
+        true
+    }
+
     pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot {
         // Stage 4T+7 split-read: pre-read diagnostic data for the fatal-trap log.
         // Acquires scheduler lock (rank 1) for current_tid, then task lock (rank 2)

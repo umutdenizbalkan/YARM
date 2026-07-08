@@ -681,6 +681,31 @@ fn try_split_initramfs_read_chunk_into_frame(
     None
 }
 
+// ── Stage 191D FUTEXWAIT BLOCK-PUBLISH SEAM markers + deferral ─────────────────────────
+//
+// FutexWait (NR 1) is DEFERRED: it is NOT added to `classify_split_eligible_nr_only` and
+// stays FULLY global-lock-only. Unlike DebugLog/FutexWake/InitramfsReadChunk, a matched
+// FutexWait BLOCKS the caller and must dispatch a DIFFERENT runnable task — the
+// queue-ADVANCING "switch_required" case that `dispatch_next_task` performs. The kernel's
+// own out-of-lock dispatch relocation (D6-GENUINE, `exec_state.rs::dispatch_next_task`)
+// explicitly restricts itself to the queue-NEUTRAL case and falls back to the in-lock
+// (global-lock) path with `reason=switch_required` for exactly this scenario, so the
+// futex-wait block+dispatch cannot be serviced off the global lock without the disclaimed
+// multi-stage dispatch rewrite. Stage 191D therefore LANDS + proves the block-publish seam
+// (`SharedKernel::futex_wait_would_block_split_read` = Phase A value-check,
+// `SharedKernel::futex_wait_publish_block_split_mut` = Phase B block-publish) as
+// HELPER-ONLY, ready for that future stage, but does NOT wire FutexWait live.
+//
+/// FutexWait split marker vocabulary (emitted only if/when FutexWait is wired live; the
+/// block-publish seam emits `FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK` today from its Phase B).
+pub const MARK_FUTEX_WAIT_SPLIT_BEGIN: &str = "FUTEX_WAIT_SPLIT_BEGIN";
+pub const MARK_FUTEX_WAIT_SPLIT_VALUE_CHECK_OK: &str = "FUTEX_WAIT_SPLIT_VALUE_CHECK_OK";
+pub const MARK_FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK: &str = "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK";
+pub const MARK_FUTEX_WAIT_SPLIT_DONE_BLOCKED: &str = "FUTEX_WAIT_SPLIT_DONE result=blocked";
+/// The one concrete blocker that keeps FutexWait's LIVE retirement deferred: the matched
+/// wait's queue-advancing dispatch is the global-lock `switch_required` case.
+pub const MARK_FUTEX_WAIT_DEFERRED_REASON: &str = "GLOBAL_LOCK_RETIRE_CLASS_DEFERRED class=FutexWait reason=block_dispatch_switch_required_needs_global_lock";
+
 /// # Validation status
 /// - LIVE_TRAP_SMOKE_X86_64 (Stage 32B) — wired into the live trap seam:
 ///   `try_split_dispatch_into_frame` routes IpcRecv (NR 2) here BEFORE the global

@@ -59747,6 +59747,240 @@ mod stage191c_initramfs_read_chunk_retire {
     }
 }
 
+// Stage 191D — FUTEXWAIT BLOCK-PUBLISH SEAM. FutexWait (NR 1) blocks the caller and must
+// dispatch a DIFFERENT runnable task — the queue-ADVANCING "switch_required" case that
+// `dispatch_next_task` performs; the kernel's own out-of-lock dispatch relocation
+// (D6-GENUINE) explicitly excludes it and falls back to the global lock. So FutexWait's
+// LIVE retirement is DEFERRED: Stage 191D lands + proves the block-publish seam (Phase A
+// value-check `futex_wait_would_block_split_read`, Phase B block-publish
+// `futex_wait_publish_block_split_mut`) as HELPER-ONLY and keeps FutexWait fully
+// global-lock-only. The published waiter is Blocked(Futex), not enqueued, current on no
+// CPU, and wakeable by the 191B FutexWake split (no lost/duplicate/orphaned waiter).
+mod stage191d_futex_wait_block_publish {
+    use super::*;
+    use crate::kernel::scheduler::{CpuId, MAX_CPUS};
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::kernel::vm::VirtAddr;
+    use crate::runtime::SharedKernel;
+
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+
+    // DEFERRED: FutexWait stays FULLY global-lock-only — NOT in the split whitelist and
+    // NOT routed in `try_split_dispatch_into_frame`. The concrete blocker (the matched
+    // wait's queue-advancing dispatch is the global-lock `switch_required` case) is
+    // recorded as the deferred-reason marker.
+    #[test]
+    fn futex_wait_stays_locked_block_publish_deferred() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::FutexWait => Some"),
+            "FutexWait must NOT be split-eligible (blocking dispatch deferred)"
+        );
+        assert!(
+            !SPLIT_SRC.contains("matches!(syscall, Syscall::FutexWait)"),
+            "FutexWait must NOT be routed into a live split helper"
+        );
+        assert!(
+            SPLIT_SRC.contains("reason=block_dispatch_switch_required_needs_global_lock"),
+            "the FutexWait deferral must record the switch_required dispatch blocker"
+        );
+        // The blocker is real: dispatch_next_task's out-of-lock relocation excludes the
+        // switch-required (queue-advancing) case — exactly what a matched FutexWait needs.
+        assert!(
+            EXEC_SRC.contains("D6_GENUINE_MUT_DISPATCH_FALLBACK reason={}")
+                && EXEC_SRC.contains("\"switch_required\""),
+            "dispatch_next_task must fall back to the global lock for the switch_required case"
+        );
+    }
+
+    // The FutexWait split marker vocabulary + the block-publish marker exist.
+    #[test]
+    fn futex_wait_split_marker_vocabulary_exists() {
+        assert!(
+            SPLIT_SRC.contains("MARK_FUTEX_WAIT_SPLIT_BEGIN: &str = \"FUTEX_WAIT_SPLIT_BEGIN\"")
+                && SPLIT_SRC.contains(
+                    "MARK_FUTEX_WAIT_SPLIT_VALUE_CHECK_OK: &str = \"FUTEX_WAIT_SPLIT_VALUE_CHECK_OK\""
+                )
+                && SPLIT_SRC.contains(
+                    "MARK_FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK: &str = \"FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK\""
+                )
+                && SPLIT_SRC.contains(
+                    "MARK_FUTEX_WAIT_SPLIT_DONE_BLOCKED: &str = \"FUTEX_WAIT_SPLIT_DONE result=blocked\""
+                ),
+            "the FutexWait split marker vocabulary must exist"
+        );
+        assert!(
+            RUNTIME_SRC.contains("\"FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={}\""),
+            "the block-publish seam must emit FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK"
+        );
+    }
+
+    // Phase A value-check seam mirrors legacy validate_current_user_futex_word + the
+    // expected/observed comparison exactly.
+    #[test]
+    fn futex_wait_value_check_seam_mirrors_legacy() {
+        assert!(
+            RUNTIME_SRC.contains("pub fn futex_wait_would_block_split_read(")
+                && RUNTIME_SRC.contains("return None; // legacy: WrongObject")
+                && RUNTIME_SRC.contains("return None; // legacy: UserMemoryFault")
+                && RUNTIME_SRC.contains(
+                    "self.copy_from_user_asid_split_read(asid, addr, core::mem::size_of::<u32>())?"
+                )
+                && RUNTIME_SRC.contains("Some(expected == observed)"),
+            "the value-check seam must mirror validate_current_user_futex_word + arg compare"
+        );
+        // Same address-validation shape as legacy futex validation.
+        assert!(
+            EXEC_SRC.contains("if addr == 0 {")
+                && EXEC_SRC.contains("return Err(KernelError::WrongObject);")
+                && EXEC_SRC.contains(">= crate::kernel::vm::KERNEL_SPACE_BASE"),
+            "legacy validate_current_user_futex_word must have the mirrored checks"
+        );
+    }
+
+    // Phase B block-publish seam uses ONLY the task (rank 2) + scheduler (rank 1) split-mut
+    // seams and mirrors futex_wait_current's block + block_current_cpu — no broad lock, no
+    // dispatch.
+    #[test]
+    fn futex_wait_block_publish_seam_uses_split_mut() {
+        assert!(
+            RUNTIME_SRC.contains("pub fn futex_wait_publish_block_split_mut(")
+                && RUNTIME_SRC.contains("self.with_task_tcbs_split_mut(|tcbs| {")
+                && RUNTIME_SRC.contains("self.with_scheduler_split_mut(|sched| {")
+                && RUNTIME_SRC.contains("kernel_mut(&mut sched.scheduler).block_current_on(cpu)")
+                && RUNTIME_SRC.contains("sched.timer.reset_quantum();"),
+            "the block-publish seam must use the task + scheduler split-mut seams + block_current_on"
+        );
+        // Same Blocked(Futex(addr)) transition as legacy futex_wait_current.
+        assert!(
+            EXEC_SRC.contains(
+                "tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));"
+            ) && RUNTIME_SRC.contains(
+                "tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));"
+            ),
+            "the block-publish transition must match legacy futex_wait_current"
+        );
+        // The seam must NOT dispatch (that is the deferred switch_required case).
+        let start = RUNTIME_SRC
+            .find("pub fn futex_wait_publish_block_split_mut(")
+            .expect("seam must exist");
+        let rest = &RUNTIME_SRC[start..];
+        let end = rest[1..]
+            .find("\n    pub fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            !body.contains("dispatch_next_task") && !body.contains("dispatch_next_on"),
+            "the block-publish seam must NOT dispatch (switch is deferred to the global lock)"
+        );
+    }
+
+    // Make `tid` the current task on `cpu`.
+    fn make_current(state: &mut crate::kernel::boot::KernelState, tid: u64, cpu: CpuId) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        state.enqueue_on_cpu(cpu, tid).expect("enqueue");
+        state.set_current_cpu(cpu).expect("set cpu");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(
+            state.current_tid_on_cpu(cpu),
+            Some(tid),
+            "task must be current after dispatch"
+        );
+    }
+
+    // EMPIRICAL: the block-publish seam publishes Blocked(Futex(addr)), removes the caller
+    // from the current slot (current on NO CPU → not on two), leaves it un-enqueued (no
+    // duplicate/orphan), and the 191B FutexWake split then wakes it (no lost wake).
+    #[test]
+    fn futex_wait_publish_blocks_and_is_woken_by_split_wake() {
+        let addr = 0x5000usize;
+        let tid = 20001u64;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, tid, CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        let published = shared.futex_wait_publish_block_split_mut(CpuId(0), tid, addr);
+        assert!(published, "publish must succeed");
+        shared.with(|k| {
+            assert_eq!(
+                k.task_status(tid),
+                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                    addr as u64
+                )))),
+                "caller must be published Blocked(Futex)"
+            );
+            // Removed from the current slot on every CPU (current on no CPU).
+            for c in 0..MAX_CPUS {
+                assert_ne!(
+                    k.current_tid_on_cpu(CpuId(c as u8)),
+                    Some(tid),
+                    "blocked caller must not be current on any CPU"
+                );
+            }
+        });
+
+        // 191B FutexWake split observes and wakes the split-published waiter exactly once.
+        let woke = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        assert_eq!(
+            woke, 1,
+            "FutexWake split must wake the published waiter (no lost wake)"
+        );
+        shared.with(|k| {
+            assert_eq!(
+                k.task_status(tid),
+                Some(TaskStatus::Runnable),
+                "woken waiter must be Runnable"
+            );
+        });
+        // A second wake finds nothing — no duplicate wake / no orphaned re-enqueue.
+        let woke2 = shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX);
+        assert_eq!(woke2, 0, "no duplicate wake once the waiter is Runnable");
+    }
+
+    // EMPIRICAL: with two CPUs online, publishing on CPU0 leaves the caller current on
+    // NEITHER CPU — pinning the "task not current on two CPUs" invariant.
+    #[test]
+    fn futex_wait_publish_not_current_on_two_cpus() {
+        let addr = 0x6000usize;
+        let tid = 20002u64;
+        let mut state = Bootstrap::init().expect("init");
+        state.bring_up_cpu(CpuId(1)).expect("cpu1");
+        make_current(&mut state, tid, CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        assert!(shared.futex_wait_publish_block_split_mut(CpuId(0), tid, addr));
+        shared.with(|k| {
+            assert_ne!(k.current_tid_on_cpu(CpuId(0)), Some(tid));
+            assert_ne!(k.current_tid_on_cpu(CpuId(1)), Some(tid));
+            assert_eq!(
+                k.task_status(tid),
+                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                    addr as u64
+                ))))
+            );
+        });
+    }
+
+    // The prior retirements + ReapFaultedTask exclusion are intact.
+    #[test]
+    fn prior_retirements_and_reap_exclusion_intact() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
+            "191A/191B/191C retirements must remain whitelisted"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must stay global-lock-only"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

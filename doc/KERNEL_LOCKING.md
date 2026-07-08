@@ -625,6 +625,58 @@ remove implicit global-lock coupling from syscall/trap paths.
     no-partial-write + `UserMemoryFault` preservation, non-selected classes stay locked) +
     the updated `stage29_whitelist_exhaustive` (NR 27 now eligible, NR 28 not).
 
+- **Stage 191D (FUTEXWAIT BLOCK-PUBLISH SEAM) — DEFERRED (seam landed + proven).** The
+  broad global `SpinLock<KernelState>` is NOT retired, and `FutexWait` (NR 1) is NOT
+  converted: it stays FULLY global-lock-only. Stage 191D builds and proves the required
+  block-publish seam but does NOT wire FutexWait live, because the blocking wait's dispatch
+  is a concrete blocker (below). 191A/191B/191C retirements are preserved.
+  * **Why FutexWait is harder + the concrete blocker.** `FutexWait(addr, expected, observed)`
+    validates the futex word, and when `expected == observed` it BLOCKS the caller:
+    caller TCB → `Blocked(Futex(addr))`, `block_current_cpu` clears the current slot, then
+    **`dispatch_next_task`** switches to a DIFFERENT runnable task. That switch is the
+    queue-ADVANCING "switch_required" case — and the kernel's own out-of-lock dispatch
+    relocation (`exec_state.rs::dispatch_next_task`, D6-GENUINE) explicitly restricts itself
+    to the queue-NEUTRAL case and falls back to the in-lock (global-lock) path with
+    `reason=switch_required` for exactly this scenario. So the futex-wait block+dispatch
+    cannot be serviced off the global lock without the disclaimed multi-stage dispatch
+    rewrite. This is the concrete blocker; the live conversion is DEFERRED with reason
+    `block_dispatch_switch_required_needs_global_lock`.
+  * **What landed (helper-only, proven).** Two seams, guarded + empirically tested, ready
+    for the future dispatch-rewrite stage but NOT live-wired:
+    - *Phase A* `SharedKernel::futex_wait_would_block_split_read(tid, addr, expected,
+      observed)` — validates the futex word off the global lock exactly like
+      `validate_current_user_futex_word` (`addr==0` → `None`/WrongObject; `addr+3 ≥
+      KERNEL_SPACE_BASE` → `None`/UserMemoryFault; 4-byte user read via the split-read seam)
+      and returns `Some(expected == observed)` (== the legacy `expected != observed →
+      Ok(false)` decision). Read-only; `None` preserves the canonical error.
+    - *Phase B* `SharedKernel::futex_wait_publish_block_split_mut(cpu, tid, addr)` —
+      publishes the caller `Blocked(Futex(addr))` via the task split-mut (rank 2) and clears
+      the current slot via the scheduler split-mut (rank 1, `block_current_on` +
+      `reset_quantum`), mirroring `futex_wait_current`'s block + `block_current_cpu`, WITHOUT
+      the dispatch. Ascending, non-nested; no broad `&mut KernelState`.
+  * **Publish-correctness proof (empirical).** After Phase B the caller is `Blocked(Futex)`,
+    removed from the current slot (current on NO CPU → not current on two CPUs), and NOT
+    enqueued (no duplicate enqueue, no orphaned runnable); the 191B `futex_wake_split_mut`
+    then wakes it exactly once (Runnable + enqueued — no lost wake), and a second wake finds
+    nothing (no duplicate wake). Guarded by `stage191d_futex_wait_block_publish`
+    (deferral + switch_required blocker, marker vocabulary, value-check + block-publish seam
+    shape vs legacy, `futex_wait_publish_blocks_and_is_woken_by_split_wake`,
+    `futex_wait_publish_not_current_on_two_cpus`, prior retirements + ReapFaultedTask
+    exclusion intact).
+  * **Scope + cross-arch.** No live behavior change on any arch: FutexWait stays
+    global-lock-only everywhere (0 `nr=1` split dispatches, 0 `FUTEX_WAIT_SPLIT` markers in
+    boot). x86_64 core + IPC oracle + crash-restart (InitramfsReadChunk still live, 20
+    `nr=27` splits) + smp2/smp4 (armed and knob-off) pass with 191A/191C retirements + AP
+    scheduler seal + all 188–190 markers preserved; riscv64 idle-halt and aarch64
+    WrongObject unchanged pre-existing.
+  * **The broad global lock is NOT retired.** Still only `DebugLog` (191A), `FutexWake`
+    (191B), and `InitramfsReadChunk` (191C, success path) are split-eligible. FutexWait,
+    `Yield`, `ReapFaultedTask`, and all VM/spawn/IPC-send classes stay global-lock-only.
+  * **Go/no-go for Stage 191E:** the FutexWait block-publish seam is ready; a live FutexWait
+    conversion needs the queue-advancing out-of-lock DISPATCH (the switch_required case),
+    which is a distinct multi-stage effort. GO to either (a) tackle that dispatch rewrite as
+    its own stage, or (b) retire another narrow read-only/query class with a complete proof.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so
