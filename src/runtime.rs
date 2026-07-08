@@ -706,6 +706,59 @@ impl SharedKernel {
         })
     }
 
+    /// Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): re-verify — out of the global
+    /// lock, through the rank-2 task seam — that the deferred FutexWait task is STILL
+    /// `Blocked(Futex(_))` before the out-of-lock queue-advancing dispatch drain runs.
+    /// Same correctness fence as the D2 recv/send reverify: guards against a stale deferral
+    /// (e.g. a FutexWake woke the task, or an in-lock fallback superseded it) so a woken
+    /// waiter is never displaced from the run queue. Single-CPU + IRQ-off means nothing
+    /// mutates between the in-lock commit and this check.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| {
+                    matches!(
+                        tcb.status,
+                        crate::kernel::task::TaskStatus::Blocked(
+                            crate::kernel::task::WaitReason::Futex(_)
+                        )
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): the authoritative queue-advancing
+    /// dispatch for a committed FutexWait block, run through the rank-1 scheduler seam with
+    /// the global `SpinLock<KernelState>` already dropped by the trap-entry drain. The
+    /// blocked waiter was removed from `current` (in-lock `block_current`), so
+    /// `dispatch_next_on` genuinely DEQUEUES the next runnable task here (or returns `None`
+    /// ⇒ idle) — the queue-advancing "switch_required" step. Identical body to
+    /// `d2_recv_dispatch_step_mut`; emits the QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK marker.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            let dispatch_cpu = sched.current_cpu;
+            let incoming = kernel_mut(&mut sched.scheduler)
+                .dispatch_next_on(dispatch_cpu)
+                .map(|tid| tid.0);
+            match incoming {
+                Some(tid) => crate::yarm_log!(
+                    "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu={} tid={}",
+                    cpu.0,
+                    tid
+                ),
+                None => {
+                    crate::yarm_log!("QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu={} tid=idle", cpu.0)
+                }
+            }
+            incoming
+        })
+    }
+
     /// Stage 168B (D2-GENUINE-RECV): does the incoming task have an initialized
     /// kernel switch context (a wired kernel thread)? Read out of the global
     /// lock through the rank-2 task seam. Blocking recv is done by USER tasks,

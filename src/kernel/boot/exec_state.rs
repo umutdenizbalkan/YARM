@@ -1242,6 +1242,54 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let _ = self.block_current_cpu();
+        // Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): the caller is now
+        // `Blocked(Futex)` and removed from `current`, so the dispatch that follows
+        // genuinely advances the run queue (the "switch_required" case). Mirror the
+        // Stage 168B/169 D2-GENUINE recv/send model (default-on on x86_64
+        // single-dispatcher): defer the queue-advancing dispatch OUT of the global lock to
+        // the trap-entry drain and SKIP the in-lock dispatch. Every ineligible case (no
+        // trap drainer, multi-dispatcher, proof/switch-a knobs, already deferred) keeps the
+        // unchanged in-lock `dispatch_next_task` fallback.
+        #[cfg(target_arch = "x86_64")]
+        if crate::kernel::boot::d6_genuine_enabled() {
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            let already = crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
+            if trap_path
+                && single_cpu
+                && !already
+                && crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid)
+            {
+                crate::yarm_log!("FUTEX_WAIT_SPLIT_BEGIN");
+                crate::yarm_log!(
+                    "FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK tid={} addr={}",
+                    tid,
+                    addr
+                );
+                crate::yarm_log!(
+                    "QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required tid={} cpu={}",
+                    tid,
+                    cpu_idx
+                );
+                // The out-of-lock trap-entry drain performs the authoritative
+                // queue-advancing dispatch; do NOT dispatch in-lock here.
+                return Ok(true);
+            }
+            crate::yarm_log!(
+                "FUTEX_WAIT_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
+                if !trap_path {
+                    "no_trap_drainer"
+                } else if !single_cpu {
+                    "multi_cpu"
+                } else {
+                    "already_deferred"
+                },
+                tid
+            );
+        }
         self.dispatch_next_task()?;
         Ok(true)
     }

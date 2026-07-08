@@ -710,6 +710,65 @@ remove implicit global-lock coupling from syscall/trap paths.
     + 191E candidate-selection are the landed halves), or (b) broad-IPC vertical decomposition.
     No further narrow safe class exists; the next stage must commit to one of those tracks.
 
+- **Stage 192A (QUEUE-ADVANCING OUT-OF-LOCK DISPATCH — FutexWait live) — DONE and
+  QEMU-PROVEN.** Track (a) landed: `FutexWait`'s blocking wait now runs its queue-advancing
+  DISPATCH off the broad global lock, so `FUTEX_WAIT` is live — the switch_required blocker
+  that deferred 191D is resolved. The broad `SpinLock<KernelState>` is NOT retired.
+  * **Model (mirrors the accepted, default-on D2-GENUINE recv/send).** The mechanism is the
+    existing Stage 168B/169 out-of-lock queue-advancing dispatch — proven and default-on on
+    x86_64 single-dispatcher for blocking IPC recv/send. FutexWait-block is structurally
+    identical, so 192A reuses it: **in-lock** (`futex_wait_current`, Phase A/B) validate the
+    futex word, publish the caller `Blocked(Futex(addr))`, `block_current` (remove from
+    `current`), then — when eligible (x86_64, `d6_genuine_enabled`, trap-path active,
+    `dispatching_cpu_count() <= 1`, not already deferred) — record a per-CPU deferral and
+    DECLINE the in-lock dispatch (`FUTEX_WAIT_SPLIT_BEGIN` / `FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK`
+    / `QUEUE_ADVANCING_DISPATCH_DEFERRED reason=futex_wait_switch_required`). Every ineligible
+    case keeps the unchanged in-lock `dispatch_next_task` fallback
+    (`FUTEX_WAIT_INLOCK_DISPATCH_FALLBACK`). **Out-of-lock** (trap-entry drain, global lock
+    dropped, Phase C): re-verify the waiter is still `Blocked(Futex)`
+    (`futex_wait_reverify_blocked`, rank-2), run the authoritative `dispatch_next_on` under
+    ONLY the rank-1 scheduler seam (`futex_wait_dispatch_step_mut` →
+    `QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK`), mark the incoming task `Running`
+    (`d6_genuine_mark_running_via_task_seam`, rank-2 →
+    `QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK`), then a brief `with_cpu` re-acquire performs
+    ONLY the arch restore (incoming ASID/CR3 switch + trap-frame restore via the hardened
+    D6-SWITCH-A path → `QUEUE_ADVANCING_DISPATCH_FRAME_OK`). Emits `FUTEX_WAIT_SPLIT_DISPATCH_OK`,
+    `QUEUE_ADVANCING_DISPATCH_DONE result=ok`, `FUTEX_WAIT_SPLIT_DONE result=blocked`, and the
+    one-shot `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE class=FutexWait result=ok`.
+  * **What "FutexWait live" means (honest scope).** Like the D2-GENUINE recv/send it mirrors,
+    the block-publish + value-check remain IN-LOCK; only the queue-advancing DISPATCH (the
+    switch_required case — the defining blocker) is relocated off the global lock. FutexWait
+    is NOT serviced through `try_split_dispatch` (it is not a whitelist split class); it is an
+    out-of-lock *dispatch* retirement, not a whole-handler split retirement.
+  * **Correctness (no lost wake / no double-dequeue / no orphan / not-current-on-two-CPUs).**
+    Same discipline as D2: the waiter is `Blocked` before the deferral is visible; the
+    re-verify fence skips the dispatch if a `FutexWake` already re-ran the waiter Runnable
+    (`QUEUE_ADVANCING_DISPATCH_DEFERRED reason=state_changed`, no displacement); the single
+    per-CPU deferral is one-shot (`futex_wait_dispatch_try_defer` compare-exchange); the
+    dequeue is the authoritative `dispatch_next_on` (advances the queue exactly once);
+    `block_current` removed the caller so it is current on no CPU. Empirically guarded by
+    `stage192a_queue_advancing_dispatch` (defer + trap-drain inventory, marker vocabulary,
+    dispatch-step uses authoritative `dispatch_next_on` + reverify, queue-advances-exactly-once
+    + old-not-current + new-current + blocked-stays-blocked, split-wake integration, single-shot
+    deferral).
+  * **QEMU (live, both branches).** x86_64 core: init's idle-park futex block runs the
+    out-of-lock dispatch to idle (`QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK cpu=0 tid=idle`,
+    `DONE result=ok`, retire marker once). x86_64 crash-restart: a real switch case
+    (`QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK cpu=0 tid=10008`) — futex block dispatches to a
+    live next task. core + oracle + crash-restart + smp2/smp4 (armed and knob-off) pass, zero
+    `QUEUE_ADVANCING_DISPATCH_FAIL`, all 188–191 retirements + AP seal + reap markers preserved.
+  * **Scope + cross-arch.** x86_64-only (all seams `#[cfg(target_arch = "x86_64")]`); riscv64 /
+    aarch64 keep FutexWait fully global-lock-only (0 `FUTEX_WAIT_SPLIT` / `QUEUE_ADVANCING_DISPATCH`
+    markers) and retain full server-chain parity. Under SMP AP-workload the futex defer falls
+    back to the in-lock dispatch (dispatching_cpu_count check), preserving the AP seal.
+  * **The broad global lock is NOT retired.** DebugLog/FutexWake/InitramfsReadChunk stay split;
+    FutexWait's dispatch is now out-of-lock (joining D2 recv/send). `Yield` is NOT unlocked (it
+    needs its own proof); `ReapFaultedTask` stays global-lock-only.
+  * **Go/no-go for Stage 192B:** the queue-advancing out-of-lock dispatch is proven for
+    FutexWait. GO to (a) retire `Yield` on the same mechanism (it task-switches but does NOT
+    block — re-enqueues current then dispatches; needs its own re-enqueue-then-defer proof), or
+    (b) start broad-IPC vertical decomposition. Full global-lock retirement is NOT claimed.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

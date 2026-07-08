@@ -912,6 +912,103 @@ pub(crate) fn d2_recv_dispatch_clear(cpu_idx: usize) {
     D2_RECV_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }
 
+// ── Stage 192A (QUEUE-ADVANCING OUT-OF-LOCK DISPATCH for FutexWait) ─────────────────
+//
+// FutexWait's blocking wait is structurally identical to blocking IPC recv/send: the
+// in-lock path publishes `Blocked(Futex(addr))` + `block_current` (removes the caller
+// from `current`), then DEFERS the queue-advancing dispatch out of the global lock to the
+// trap-entry drain — exactly the Stage 168B/169 D2-GENUINE recv/send model (default-on on
+// x86_64 single-dispatcher). Same per-CPU deferral discipline: one intent at a time; the
+// outgoing (blocked) TID is recorded so the drain re-verifies `Blocked(Futex)` before the
+// out-of-lock `dispatch_next_on`.
+
+/// Stage 192A: global count of FutexWait queue-advancing dispatches run through the
+/// scheduler seam OUTSIDE the global lock. Emitted as `FUTEX_WAIT_SPLIT_DISPATCH_OK`.
+pub(crate) static FUTEX_WAIT_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 192A: per-CPU "FutexWait dispatch deferred" flag. Set by the in-lock
+/// `futex_wait_current` when it commits the block and defers the queue-advancing dispatch;
+/// cleared by the trap-entry drain.
+pub(crate) static FUTEX_WAIT_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 192A: per-CPU blocked (outgoing) FutexWait TID recorded with the deferral, so the
+/// drain can re-verify the task is still `Blocked(Futex)` before dispatching (`u64::MAX`
+/// sentinel = unset).
+pub(crate) static FUTEX_WAIT_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 192A: record a deferred FutexWait dispatch intent for `cpu`. Returns false
+/// (decline; caller falls back to the in-lock dispatch) if an intent is already pending.
+pub(crate) fn futex_wait_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    if FUTEX_WAIT_DISPATCH_DEFERRED[cpu_idx]
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    FUTEX_WAIT_DISPATCH_OUTGOING[cpu_idx].store(outgoing, core::sync::atomic::Ordering::Release);
+    true
+}
+
+/// Stage 192A: is a deferred FutexWait dispatch pending for `cpu`?
+pub(crate) fn futex_wait_dispatch_is_deferred(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && FUTEX_WAIT_DISPATCH_DEFERRED[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 192A: read the deferred FutexWait outgoing TID for `cpu` (`None` if unset).
+pub(crate) fn futex_wait_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let v = FUTEX_WAIT_DISPATCH_OUTGOING[cpu_idx].load(core::sync::atomic::Ordering::Acquire);
+    if v == u64::MAX { None } else { Some(v) }
+}
+
+/// Stage 192A: clear the FutexWait dispatch deferral for `cpu`.
+pub(crate) fn futex_wait_dispatch_clear(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    FUTEX_WAIT_DISPATCH_OUTGOING[cpu_idx].store(u64::MAX, core::sync::atomic::Ordering::Release);
+    FUTEX_WAIT_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Stage 192A: one-shot latch for the FutexWait retirement markers (queue-advancing
+/// dispatch now runs off the global lock; the block-publish stays in-lock, mirroring the
+/// accepted D2-GENUINE recv/send out-of-lock dispatch model).
+static FUTEX_WAIT_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 192A: emit the FutexWait retirement markers exactly once (first off-global-lock
+/// queue-advancing dispatch).
+pub(crate) fn maybe_log_futex_wait_retired() {
+    if FUTEX_WAIT_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=FutexWait");
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok");
+    }
+}
+
 /// Stage 169 (D2-GENUINE-SEND): x86_64-only, default-off gate that runs the
 /// blocking-SEND path (endpoint full / synchronous no-waiter) through explicit
 /// rank-clean scheduler/task/IPC phase markers and relocates its queue-advancing

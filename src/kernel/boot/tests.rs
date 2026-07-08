@@ -60151,6 +60151,213 @@ mod stage191e_dispatch_next_candidate_seam {
     }
 }
 
+// Stage 192A — QUEUE-ADVANCING OUT-OF-LOCK DISPATCH (FutexWait live Phase C). FutexWait's
+// blocking wait now publishes Blocked(Futex) + block_current IN-LOCK, then defers the
+// queue-advancing dispatch OUT of the global lock to the trap-entry drain — the direct
+// analogue of the accepted, default-on Stage 168B/169 D2-GENUINE recv/send out-of-lock
+// dispatch. The out-of-lock drain runs the authoritative dispatch_next_on under only the
+// rank-1 scheduler seam, marks the incoming task Running (rank-2), and a brief with_cpu
+// re-acquire performs only the arch restore (incoming ASID/CR3 + trap-frame). x86_64-only.
+mod stage192a_queue_advancing_dispatch {
+    use super::*;
+    use crate::kernel::scheduler::{CpuId, MAX_CPUS};
+    use crate::kernel::task::{TaskClass, TaskStatus, WaitReason};
+    use crate::kernel::vm::VirtAddr;
+    use crate::runtime::SharedKernel;
+
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+
+    // INVENTORY: the in-lock futex_wait_current defers the dispatch (mirroring D2 recv),
+    // and the trap-entry drain performs the out-of-lock queue-advancing dispatch. FutexWait
+    // is NOT added to try_split_dispatch (it uses the D2-style in-lock-commit path).
+    #[test]
+    fn futex_wait_defers_dispatch_and_trap_drain_exists() {
+        assert!(
+            EXEC_SRC.contains("crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid)")
+                && EXEC_SRC.contains("return Ok(true);"),
+            "futex_wait_current must defer the queue-advancing dispatch when eligible"
+        );
+        // The in-lock fallback (dispatch_next_task) is preserved for ineligible cases.
+        assert!(
+            EXEC_SRC.contains("FUTEX_WAIT_INLOCK_DISPATCH_FALLBACK")
+                && EXEC_SRC.contains("self.dispatch_next_task()?;"),
+            "the in-lock dispatch fallback must be preserved"
+        );
+        // The trap-entry drain mirrors the D2 recv drain.
+        assert!(
+            TRAP_SRC.contains("futex_wait_was_deferred")
+                && TRAP_SRC.contains("shared.futex_wait_reverify_blocked(t)")
+                && TRAP_SRC.contains("shared.futex_wait_dispatch_step_mut(cpu)")
+                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
+            "the trap-entry futex drain must reverify + dispatch-step + mark-running + restore"
+        );
+    }
+
+    // MARKERS exist (queue-advancing + FutexWait-live + retirement).
+    #[test]
+    fn queue_advancing_and_futex_markers_exist() {
+        for m in [
+            "QUEUE_ADVANCING_DISPATCH_BEGIN",
+            "QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK",
+            "QUEUE_ADVANCING_DISPATCH_CURRENT_SET_OK",
+            "QUEUE_ADVANCING_DISPATCH_FRAME_OK",
+            "QUEUE_ADVANCING_DISPATCH_DONE result=ok",
+            "FUTEX_WAIT_SPLIT_DISPATCH_OK",
+            "FUTEX_WAIT_SPLIT_DONE result=blocked",
+        ] {
+            assert!(
+                TRAP_SRC.contains(m),
+                "queue-advancing / futex marker `{m}` must exist"
+            );
+        }
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok"),
+            "the FutexWait retirement marker must exist"
+        );
+        // ReapFaultedTask stays global-lock-only.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must stay global-lock-only"
+        );
+    }
+
+    // The dispatch-step seam is the authoritative dispatch_next_on via the scheduler seam.
+    #[test]
+    fn dispatch_step_uses_authoritative_dispatch_next_on() {
+        assert!(
+            RUNTIME_SRC.contains("pub(crate) fn futex_wait_dispatch_step_mut(")
+                && RUNTIME_SRC.contains(".dispatch_next_on(dispatch_cpu)")
+                && RUNTIME_SRC.contains("pub(crate) fn futex_wait_reverify_blocked("),
+            "the futex dispatch-step must use the authoritative dispatch_next_on + reverify"
+        );
+    }
+
+    // Make `tid` current on `cpu`.
+    fn make_current(state: &mut crate::kernel::boot::KernelState, tid: u64, cpu: CpuId) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        state.enqueue_on_cpu(cpu, tid).expect("enq");
+        state.set_current_cpu(cpu).expect("cpu");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(state.current_tid_on_cpu(cpu), Some(tid));
+    }
+
+    // EMPIRICAL: the deferral defer/clear cycle is single-shot; the dispatch-step dequeues
+    // the next runnable exactly once, sets it current, and the old task is no longer current.
+    #[test]
+    fn futex_dispatch_step_advances_queue_exactly_once() {
+        let blocked = 40001u64;
+        let next = 40002u64;
+        let addr = 0x7000usize;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, blocked, CpuId(0));
+        // Enqueue a real next-runnable task behind the current one.
+        state
+            .register_task_with_class(next, TaskClass::App)
+            .expect("reg-next");
+        state.enqueue_on_cpu(CpuId(0), next).expect("enq-next");
+        // Publish Blocked(Futex) + clear current (mirrors the in-lock futex block).
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == blocked {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                }
+            }
+        });
+        let _ = state.block_current_cpu();
+        let runnable_before = state.runnable_count_on_cpu(CpuId(0));
+        let shared = SharedKernel::new(state);
+
+        // Reverify passes (still Blocked(Futex)).
+        assert!(shared.futex_wait_reverify_blocked(blocked));
+        // Queue-advancing dispatch: dequeues `next`, sets it current.
+        let incoming = shared.futex_wait_dispatch_step_mut(CpuId(0));
+        assert_eq!(
+            incoming,
+            Some(next),
+            "dispatch must select the next runnable task"
+        );
+        shared.with(|k| {
+            assert_eq!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(next),
+                "new task is current"
+            );
+            assert_ne!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(blocked),
+                "old (blocked) task is no longer current"
+            );
+            // Dequeued exactly once: run queue shrank by one.
+            assert_eq!(
+                k.runnable_count_on_cpu(CpuId(0)),
+                runnable_before - 1,
+                "dequeue mutates the run queue exactly once"
+            );
+            // New task not current on any OTHER CPU (single-CPU: current on none but cpu0).
+            for c in 1..MAX_CPUS {
+                assert_ne!(k.current_tid_on_cpu(CpuId(c as u8)), Some(next));
+            }
+            // The blocked task stays Blocked(Futex) (not re-enqueued / orphaned).
+            assert_eq!(
+                k.task_status(blocked),
+                Some(TaskStatus::Blocked(WaitReason::Futex(VirtAddr(
+                    addr as u64
+                ))))
+            );
+        });
+    }
+
+    // EMPIRICAL: a futex-blocked waiter published this way is woken by the 191B FutexWake
+    // split (no lost wake), integrating the block + dispatch + wake path.
+    #[test]
+    fn futex_blocked_waiter_woken_by_split_wake() {
+        let waiter = 40010u64;
+        let addr = 0x8000usize;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, waiter, CpuId(0));
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == waiter {
+                    tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)));
+                }
+            }
+        });
+        let _ = state.block_current_cpu();
+        let shared = SharedKernel::new(state);
+        // No other runnable ⇒ dispatch idles (the init-park case).
+        assert_eq!(shared.futex_wait_dispatch_step_mut(CpuId(0)), None);
+        // FutexWake split wakes the waiter exactly once.
+        assert_eq!(shared.futex_wake_split_mut(CpuId(0), addr, u32::MAX), 1);
+        shared.with(|k| assert_eq!(k.task_status(waiter), Some(TaskStatus::Runnable)));
+    }
+
+    // The per-CPU deferral discipline is single-shot (no nested deferral).
+    #[test]
+    fn deferral_is_single_shot() {
+        use crate::kernel::boot::{
+            futex_wait_dispatch_clear, futex_wait_dispatch_is_deferred,
+            futex_wait_dispatch_outgoing, futex_wait_dispatch_try_defer,
+        };
+        futex_wait_dispatch_clear(0);
+        assert!(!futex_wait_dispatch_is_deferred(0));
+        assert!(futex_wait_dispatch_try_defer(0, 4242));
+        assert!(futex_wait_dispatch_is_deferred(0));
+        assert_eq!(futex_wait_dispatch_outgoing(0), Some(4242));
+        // A second defer while one is pending is declined (no nesting).
+        assert!(!futex_wait_dispatch_try_defer(0, 9999));
+        futex_wait_dispatch_clear(0);
+        assert!(!futex_wait_dispatch_is_deferred(0));
+        assert_eq!(futex_wait_dispatch_outgoing(0), None);
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the
