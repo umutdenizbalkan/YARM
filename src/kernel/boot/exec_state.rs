@@ -2350,6 +2350,65 @@ impl KernelState {
             })?;
         }
 
+        // Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): the caller is now Runnable. Mirror
+        // the Stage 192A FutexWait model (itself the D2-GENUINE recv/send model, default-on
+        // on x86_64 single-dispatcher): RE-ENQUEUE the caller + clear `current` in-lock
+        // (the re-enqueue half of on_preempt), record a per-CPU deferral, and SKIP the
+        // in-lock dispatch — the trap-entry drain runs the authoritative queue-advancing
+        // `dispatch_next_on` off the global lock. Every ineligible case keeps the unchanged
+        // in-lock `on_preempt_current_cpu` fallback below.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(out_tid) = outgoing_tid {
+            if crate::kernel::boot::d6_genuine_enabled() {
+                let cpu_idx = self.current_cpu().0 as usize;
+                let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                    && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                let single_cpu = self.dispatching_cpu_count() <= 1;
+                let already = crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
+                if trap_path
+                    && single_cpu
+                    && !already
+                    && crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)
+                {
+                    // Re-enqueue the caller + clear `current` (exactly once); on success the
+                    // out-of-lock drain performs the authoritative dispatch.
+                    match self.preempt_reenqueue_current_cpu() {
+                        Some(reenq_tid) => {
+                            crate::yarm_log!(
+                                "YIELD_DISPATCH_DEFER_BEGIN cpu={} tid={}",
+                                cpu_idx,
+                                out_tid
+                            );
+                            crate::yarm_log!(
+                                "YIELD_DISPATCH_REENQUEUE_OK cpu={} tid={}",
+                                cpu_idx,
+                                reenq_tid
+                            );
+                            return Ok(());
+                        }
+                        None => {
+                            // No current / re-enqueue failed — nothing was deferred; clear
+                            // the intent and fall back to the legacy in-lock path.
+                            crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                        }
+                    }
+                } else {
+                    crate::yarm_log!(
+                        "YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
+                        if !trap_path {
+                            "no_trap_drainer"
+                        } else if !single_cpu {
+                            "multi_cpu"
+                        } else {
+                            "already_deferred"
+                        },
+                        out_tid
+                    );
+                }
+            }
+        }
+
         let next_tid = self.on_preempt_current_cpu();
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);

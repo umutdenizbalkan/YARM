@@ -1009,6 +1009,96 @@ pub(crate) fn maybe_log_futex_wait_retired() {
     }
 }
 
+// ── Stage 192B (QUEUE-ADVANCING OUT-OF-LOCK DISPATCH for Yield) ─────────────────────
+//
+// Yield is the preempt sibling of FutexWait: instead of blocking the caller, it
+// RE-ENQUEUES the caller as Runnable then dispatches the next task. The in-lock path sets
+// the caller Runnable + re-enqueues it + clears `current` (the re-enqueue half of
+// on_preempt), records a per-CPU deferral, and declines the in-lock dispatch; the
+// trap-entry drain runs the authoritative `dispatch_next_on` out of the global lock. Same
+// per-CPU deferral discipline as the Stage 168B/192A models.
+
+/// Stage 192B: global count of Yield queue-advancing dispatches run through the scheduler
+/// seam OUTSIDE the global lock. Emitted as `YIELD_DISPATCH_DONE`.
+pub(crate) static YIELD_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 192B: per-CPU "Yield dispatch deferred" flag.
+pub(crate) static YIELD_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 192B: per-CPU re-enqueued (outgoing) Yield TID recorded with the deferral
+/// (`u64::MAX` sentinel = unset).
+pub(crate) static YIELD_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 192B: record a deferred Yield dispatch intent for `cpu`. Returns false (decline;
+/// caller falls back to the in-lock dispatch) if an intent is already pending.
+pub(crate) fn yield_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    if YIELD_DISPATCH_DEFERRED[cpu_idx]
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    YIELD_DISPATCH_OUTGOING[cpu_idx].store(outgoing, core::sync::atomic::Ordering::Release);
+    true
+}
+
+/// Stage 192B: is a deferred Yield dispatch pending for `cpu`?
+pub(crate) fn yield_dispatch_is_deferred(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && YIELD_DISPATCH_DEFERRED[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 192B: read the deferred Yield outgoing TID for `cpu` (`None` if unset).
+pub(crate) fn yield_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let v = YIELD_DISPATCH_OUTGOING[cpu_idx].load(core::sync::atomic::Ordering::Acquire);
+    if v == u64::MAX { None } else { Some(v) }
+}
+
+/// Stage 192B: clear the Yield dispatch deferral for `cpu`.
+pub(crate) fn yield_dispatch_clear(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    YIELD_DISPATCH_OUTGOING[cpu_idx].store(u64::MAX, core::sync::atomic::Ordering::Release);
+    YIELD_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Stage 192B: one-shot latch for the Yield retirement markers.
+static YIELD_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 192B: emit the Yield retirement markers exactly once.
+pub(crate) fn maybe_log_yield_retired() {
+    if YIELD_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=Yield");
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok");
+    }
+}
+
 /// Stage 169 (D2-GENUINE-SEND): x86_64-only, default-off gate that runs the
 /// blocking-SEND path (endpoint full / synchronous no-waiter) through explicit
 /// rank-clean scheduler/task/IPC phase markers and relocates its queue-advancing

@@ -759,6 +759,45 @@ impl SharedKernel {
         })
     }
 
+    /// Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): re-verify — out of the global lock,
+    /// through the rank-1 scheduler seam — that the `current` slot on `cpu` is still cleared
+    /// (the in-lock `yield_current` re-enqueued the caller and cleared `current`). Guards the
+    /// out-of-lock dispatch against a stale deferral (e.g. an in-lock fallback already
+    /// dispatched). Single-CPU + IRQ-off means nothing mutates between the in-lock commit and
+    /// this check; the re-verify is the correctness fence before dispatching.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn yield_reverify_ready(&self, cpu: CpuId) -> bool {
+        self.with_scheduler_split_mut(|sched| {
+            // `cpu` is the trap CPU == the authoritative dispatch CPU under the
+            // single-dispatcher gate; check its `current` slot is still cleared.
+            let _ = sched.current_cpu;
+            kernel_ref(&sched.scheduler).current_tid_on(cpu).is_none()
+        })
+    }
+
+    /// Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): the authoritative queue-advancing
+    /// dispatch for a committed Yield, run through the rank-1 scheduler seam with the global
+    /// `SpinLock<KernelState>` already dropped by the trap-entry drain. The caller was
+    /// re-enqueued and removed from `current` (in-lock `preempt_reenqueue_only`), so
+    /// `dispatch_next_on` genuinely DEQUEUES the next runnable task here (the FIFO head — the
+    /// re-enqueued caller itself when it is alone). Emits `YIELD_DISPATCH_DEQUEUE_OK`.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn yield_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            let dispatch_cpu = sched.current_cpu;
+            let incoming = kernel_mut(&mut sched.scheduler)
+                .dispatch_next_on(dispatch_cpu)
+                .map(|tid| tid.0);
+            match incoming {
+                Some(tid) => {
+                    crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid={}", cpu.0, tid)
+                }
+                None => crate::yarm_log!("YIELD_DISPATCH_DEQUEUE_OK cpu={} tid=idle", cpu.0),
+            }
+            incoming
+        })
+    }
+
     /// Stage 168B (D2-GENUINE-RECV): does the incoming task have an initialized
     /// kernel switch context (a wired kernel thread)? Read out of the global
     /// lock through the rank-2 task seam. Blocking recv is done by USER tasks,

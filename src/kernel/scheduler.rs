@@ -317,6 +317,33 @@ impl PriorityScheduler {
         self.dispatch_next()
     }
 
+    /// Stage 192B: the RE-ENQUEUE half of [`on_preempt`] — re-enqueue the current task at
+    /// the tail of its priority queue and CLEAR the current slot, WITHOUT dispatching. The
+    /// out-of-lock trap-entry drain then runs the authoritative `dispatch_next` (queue-
+    /// advancing) with the global lock dropped.
+    ///
+    /// Returns `Some(tid)` of the re-enqueued task (current now `None`) on success — the
+    /// caller records a deferral and skips the in-lock dispatch. Returns `None` (leaving
+    /// `current` UNCHANGED) when there is no current task, or the re-enqueue failed
+    /// (e.g. `AlreadyQueued`); the caller then falls back to the legacy in-lock `on_preempt`.
+    pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId> {
+        let running = self.current.take()?;
+        if !self.membership_tracking_exhausted {
+            self.membership_remove(running.tid);
+        }
+        if let Err(_err) = self.enqueue_with_priority(running.tid, running.priority) {
+            // Re-enqueue failed — restore as current and signal the caller to fall back.
+            if !self.membership_tracking_exhausted {
+                let _ = self.membership_insert(running.tid);
+            }
+            self.current = Some(running);
+            return None;
+        }
+        // `current` is now None; the task is re-enqueued exactly once and awaits the
+        // out-of-lock queue-advancing dispatch.
+        Some(running.tid)
+    }
+
     /// Like `on_preempt`, but prefers dispatching `preferred` as the next task.
     ///
     /// Re-enqueues the current task at the tail of its priority queue, then:
@@ -618,6 +645,14 @@ impl SmpScheduler {
     pub fn on_preempt_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
         let idx = self.check_online_cpu(cpu).ok()?;
         self.schedulers[idx].on_preempt()
+    }
+
+    /// Stage 192B: the re-enqueue half of `on_preempt_on` — re-enqueue the current task on
+    /// `cpu` and clear the current slot WITHOUT dispatching. See
+    /// `PriorityScheduler::preempt_reenqueue_only`.
+    pub fn preempt_reenqueue_only_on(&mut self, cpu: CpuId) -> Option<ThreadId> {
+        let idx = self.check_online_cpu(cpu).ok()?;
+        self.schedulers[idx].preempt_reenqueue_only()
     }
 
     /// Preempt current task on `cpu`, preferring `preferred` as the next task.

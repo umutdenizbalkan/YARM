@@ -60358,6 +60358,211 @@ mod stage192a_queue_advancing_dispatch {
     }
 }
 
+// Stage 192B — YIELD QUEUE-ADVANCING OUT-OF-LOCK DISPATCH. Yield is the preempt sibling of
+// FutexWait (192A): instead of blocking, the in-lock yield_current sets the caller Runnable,
+// RE-ENQUEUES it, and clears `current` (the re-enqueue half of on_preempt), then defers the
+// queue-advancing dispatch to the trap-entry drain, which runs dispatch_next_on off the
+// global lock + marks incoming Running + restores ASID/CR3/frame. x86_64-only.
+mod stage192b_yield_queue_advancing_dispatch {
+    use super::*;
+    use crate::kernel::scheduler::{CpuId, MAX_CPUS};
+    use crate::kernel::task::{TaskClass, TaskStatus};
+    use crate::runtime::SharedKernel;
+
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SCHED_SRC: &str = include_str!("../../kernel/scheduler.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+
+    // INVENTORY: yield_current re-enqueues + defers; the trap drain does the out-of-lock
+    // dispatch; the in-lock on_preempt fallback is preserved.
+    #[test]
+    fn yield_defers_dispatch_and_trap_drain_exists() {
+        assert!(
+            EXEC_SRC.contains("self.preempt_reenqueue_current_cpu()")
+                && EXEC_SRC
+                    .contains("crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)"),
+            "yield_current must re-enqueue + defer the queue-advancing dispatch when eligible"
+        );
+        assert!(
+            EXEC_SRC.contains("YIELD_INLOCK_DISPATCH_FALLBACK")
+                && EXEC_SRC.contains("let next_tid = self.on_preempt_current_cpu();"),
+            "the in-lock on_preempt fallback must be preserved"
+        );
+        assert!(
+            TRAP_SRC.contains("yield_was_deferred")
+                && TRAP_SRC.contains("shared.yield_reverify_ready(cpu)")
+                && TRAP_SRC.contains("shared.yield_dispatch_step_mut(cpu)")
+                && TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && TRAP_SRC.contains("kernel.d2_recv_switch_incoming_asid(inc)"),
+            "the trap-entry yield drain must reverify + dispatch-step + mark-running + restore"
+        );
+    }
+
+    // MARKERS exist; the re-enqueue-only split is a non-dispatching twin of on_preempt.
+    #[test]
+    fn yield_markers_and_reenqueue_split_exist() {
+        for m in [
+            "YIELD_DISPATCH_DEFER_BEGIN",
+            "YIELD_DISPATCH_REENQUEUE_OK",
+            "YIELD_DISPATCH_DEQUEUE_OK",
+            "YIELD_DISPATCH_CURRENT_SET_OK",
+            "YIELD_DISPATCH_FRAME_OK",
+            "YIELD_DISPATCH_DONE result=ok",
+        ] {
+            assert!(
+                TRAP_SRC.contains(m) || EXEC_SRC.contains(m) || RUNTIME_SRC.contains(m),
+                "yield marker `{m}` must exist"
+            );
+        }
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok"),
+            "the Yield retirement marker must exist"
+        );
+        assert!(
+            SCHED_SRC.contains("pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId>")
+                && RUNTIME_SRC.contains("pub(crate) fn yield_dispatch_step_mut(")
+                && RUNTIME_SRC.contains(".dispatch_next_on(dispatch_cpu)"),
+            "the re-enqueue-only split + authoritative dispatch-step must exist"
+        );
+        // ReapFaultedTask stays global-lock-only.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+    }
+
+    fn make_current(state: &mut crate::kernel::boot::KernelState, tid: u64, cpu: CpuId) {
+        state
+            .register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        state.enqueue_on_cpu(cpu, tid).expect("enq");
+        state.set_current_cpu(cpu).expect("cpu");
+        state.dispatch_next_task().expect("dispatch");
+        assert_eq!(state.current_tid_on_cpu(cpu), Some(tid));
+    }
+
+    // EMPIRICAL: re-enqueue-only re-enqueues the caller EXACTLY once (clears current), then
+    // the out-of-lock dispatch selects the FIFO head, sets it current, and the yielding task
+    // is NOT lost (stays runnable) and is not current on any other CPU.
+    #[test]
+    fn yield_reenqueues_once_then_dispatches_next() {
+        let caller = 50001u64;
+        let other = 50002u64;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, caller, CpuId(0));
+        // Enqueue another runnable task behind the current one.
+        state
+            .register_task_with_class(other, TaskClass::App)
+            .expect("reg-other");
+        state.enqueue_on_cpu(CpuId(0), other).expect("enq-other");
+        // Caller is Runnable (yield sets it so before the preempt).
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == caller {
+                    tcb.status = TaskStatus::Runnable;
+                }
+            }
+        });
+        let runnable_before = state.runnable_count_on_cpu(CpuId(0)); // just `other`
+        // Re-enqueue half: caller re-enqueued, current cleared.
+        let reenq = state.preempt_reenqueue_current_cpu();
+        assert_eq!(reenq, Some(caller), "the caller is re-enqueued");
+        assert_eq!(
+            state.current_tid_on_cpu(CpuId(0)),
+            None,
+            "current is cleared after re-enqueue"
+        );
+        assert_eq!(
+            state.runnable_count_on_cpu(CpuId(0)),
+            runnable_before + 1,
+            "the caller is re-enqueued EXACTLY once"
+        );
+        let shared = SharedKernel::new(state);
+        // Reverify passes (current cleared) and the dispatch selects the FIFO head (other).
+        assert!(shared.yield_reverify_ready(CpuId(0)));
+        let incoming = shared.yield_dispatch_step_mut(CpuId(0));
+        assert_eq!(incoming, Some(other), "dispatch selects the FIFO head");
+        shared.with(|k| {
+            assert_eq!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(other),
+                "new task is current"
+            );
+            assert_ne!(
+                k.current_tid_on_cpu(CpuId(0)),
+                Some(caller),
+                "caller is no longer current after the switch"
+            );
+            // The yielding caller is NOT lost — still runnable in the queue.
+            assert_eq!(
+                k.task_status(caller),
+                Some(TaskStatus::Runnable),
+                "the yielding task is not lost"
+            );
+            assert_eq!(
+                k.runnable_count_on_cpu(CpuId(0)),
+                runnable_before,
+                "exactly one dequeue: run queue holds the re-enqueued caller"
+            );
+            for c in 1..MAX_CPUS {
+                assert_ne!(k.current_tid_on_cpu(CpuId(c as u8)), Some(other));
+            }
+        });
+    }
+
+    // EMPIRICAL: a lone yielder is re-enqueued and dispatched back to ITSELF (same-task
+    // yield) — no lost task, no idle.
+    #[test]
+    fn lone_yielder_redispatches_itself() {
+        let solo = 50010u64;
+        let mut state = Bootstrap::init().expect("init");
+        make_current(&mut state, solo, CpuId(0));
+        state.with_tcbs_mut(|tcbs| {
+            for tcb in tcbs.iter_mut().flatten() {
+                if tcb.tid.0 == solo {
+                    tcb.status = TaskStatus::Runnable;
+                }
+            }
+        });
+        assert_eq!(state.preempt_reenqueue_current_cpu(), Some(solo));
+        let shared = SharedKernel::new(state);
+        assert_eq!(shared.yield_dispatch_step_mut(CpuId(0)), Some(solo));
+        shared.with(|k| assert_eq!(k.current_tid_on_cpu(CpuId(0)), Some(solo)));
+    }
+
+    // The per-CPU deferral is single-shot.
+    #[test]
+    fn yield_deferral_is_single_shot() {
+        use crate::kernel::boot::{
+            yield_dispatch_clear, yield_dispatch_is_deferred, yield_dispatch_outgoing,
+            yield_dispatch_try_defer,
+        };
+        yield_dispatch_clear(0);
+        assert!(yield_dispatch_try_defer(0, 7777));
+        assert!(yield_dispatch_is_deferred(0));
+        assert_eq!(yield_dispatch_outgoing(0), Some(7777));
+        assert!(!yield_dispatch_try_defer(0, 8888)); // no nesting
+        yield_dispatch_clear(0);
+        assert!(!yield_dispatch_is_deferred(0));
+    }
+
+    // 192A FutexWait retirement + prior split retirements are intact.
+    #[test]
+    fn prior_retirements_intact() {
+        assert!(
+            MOD_SRC.contains("class=FutexWait result=ok"),
+            "192A FutexWait retirement must remain"
+        );
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(
+            SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
+            "191A/191B/191C retirements must remain"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

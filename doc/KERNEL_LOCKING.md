@@ -769,6 +769,57 @@ remove implicit global-lock coupling from syscall/trap paths.
     block — re-enqueues current then dispatches; needs its own re-enqueue-then-defer proof), or
     (b) start broad-IPC vertical decomposition. Full global-lock retirement is NOT claimed.
 
+- **Stage 192B (QUEUE-ADVANCING OUT-OF-LOCK DISPATCH — Yield live) — DONE and QEMU-PROVEN.**
+  `Yield`'s task-switch DISPATCH now runs off the broad global lock. Yield is the PREEMPT
+  sibling of FutexWait (192A): instead of blocking the caller, it re-enqueues the caller
+  Runnable, then dispatches the next task. The broad `SpinLock<KernelState>` is NOT retired.
+  * **Re-enqueue split.** `on_preempt` couples re-enqueue + dispatch; 192B splits it. New
+    `PriorityScheduler::preempt_reenqueue_only` (+ `SmpScheduler::preempt_reenqueue_only_on`,
+    `KernelState::preempt_reenqueue_current_cpu`) is the re-enqueue HALF: it re-enqueues the
+    current task at its priority-queue tail and clears `current`, WITHOUT dispatching —
+    returning `Some(tid)` on success (caller defers) or `None` (no current / re-enqueue
+    failed → caller falls back to the legacy in-lock `on_preempt`). The caller is re-enqueued
+    exactly once (single `enqueue_with_priority`; on `AlreadyQueued` it restores `current` and
+    returns `None`).
+  * **In-lock (Phase A/B) + out-of-lock (Phase C), mirroring the default-on D2/192A model.**
+    `yield_current` sets the caller `Runnable`, then — when eligible (x86_64,
+    `d6_genuine_enabled`, trap-path active, `dispatching_cpu_count() <= 1`, not already
+    deferred) — calls `preempt_reenqueue_current_cpu` (re-enqueue + clear current), records a
+    per-CPU deferral, and RETURNS (`YIELD_DISPATCH_DEFER_BEGIN` / `YIELD_DISPATCH_REENQUEUE_OK`),
+    skipping the in-lock dispatch. Every ineligible case keeps the unchanged in-lock
+    `on_preempt_current_cpu` fallback (`YIELD_INLOCK_DISPATCH_FALLBACK`). The trap-entry drain
+    (global lock dropped): re-verify `current` is still cleared (`yield_reverify_ready`, rank-1);
+    run the authoritative `dispatch_next_on` under only the rank-1 scheduler seam
+    (`yield_dispatch_step_mut` → `YIELD_DISPATCH_DEQUEUE_OK`); mark incoming `Running` (rank-2 →
+    `YIELD_DISPATCH_CURRENT_SET_OK`); brief `with_cpu` re-acquire for the arch restore only
+    (incoming ASID/CR3 + trap-frame → `YIELD_DISPATCH_FRAME_OK`); then `YIELD_DISPATCH_DONE
+    result=ok` + one-shot `GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok`.
+  * **Correctness.** Caller re-enqueued exactly once (in-lock); dequeued exactly once
+    (authoritative `dispatch_next_on`, out-of-lock); the yielding task is never lost (it is a
+    runnable candidate — a lone yielder re-dispatches to itself, no idle); caller is not current
+    after the switch (`current` cleared then set to incoming); reverify fence skips the drain if
+    an in-lock fallback already dispatched (`YIELD_DISPATCH_DEFERRED reason=state_changed`);
+    single-shot per-CPU deferral. Guarded by `stage192b_yield_queue_advancing_dispatch`
+    (inventory, markers + re-enqueue-only split, empirical re-enqueue-once + dispatch-next +
+    caller-not-lost + not-current-on-two-CPUs, lone-yielder-redispatches-itself, single-shot
+    deferral, prior retirements intact).
+  * **QEMU (live).** x86_64 crash-restart drives 512 Yield switches through the out-of-lock
+    dispatch (e.g. `tid=10008` yields → `YIELD_DISPATCH_DEQUEUE_OK/CURRENT_SET_OK/FRAME_OK
+    tid=1`), retirement marker once, zero `YIELD_DISPATCH_FAIL`. core + oracle + crash-restart +
+    smp2/smp4 (armed and knob-off) pass; 192A FutexWait + 191A/191B/191C retirements + AP seal +
+    reap markers all preserved.
+  * **Scope + cross-arch.** x86_64-only (seams `#[cfg(target_arch = "x86_64")]`); riscv64 /
+    aarch64 keep Yield fully global-lock-only (0 `YIELD_DISPATCH` markers) with full server-chain
+    parity. Under SMP AP-workload the yield defer falls back to the in-lock dispatch
+    (dispatching_cpu_count check), preserving the AP seal.
+  * **The broad global lock is NOT retired.** DebugLog/FutexWake/InitramfsReadChunk stay split;
+    FutexWait (192A) + Yield (192B) dispatch out-of-lock (joining D2 recv/send). ReapFaultedTask
+    stays global-lock-only; broad IPC / VM / spawn / cap classes untouched.
+  * **Go/no-go for the next stage:** the queue-advancing out-of-lock dispatch now covers all the
+    scheduler-only task-switch classes (D2 recv/send, FutexWait, Yield). The remaining classes
+    need broad-IPC vertical decomposition or capability/VM/spawn mutation seams — a distinct,
+    larger track. Full global-lock retirement is NOT claimed.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

@@ -338,6 +338,10 @@ pub fn handle_trap_entry_shared(
     // in-lock `futex_wait_current`); its drain below clears it.
     #[cfg(target_arch = "x86_64")]
     let futex_wait_was_deferred = crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
+    // Stage 192B: capture the Yield queue-advancing dispatch deferral state (set by the
+    // in-lock `yield_current`); its drain below clears it.
+    #[cfg(target_arch = "x86_64")]
+    let yield_was_deferred = crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
 
     // Stage 169 (D2-GENUINE-SEND): drain the deferred blocking-SEND queue-
     // advancing dispatch OUTSIDE the global lock (mirrors the recv drain below).
@@ -554,6 +558,59 @@ pub fn handle_trap_entry_shared(
         }
     }
 
+    // Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): drain the deferred Yield queue-advancing
+    // dispatch OUTSIDE the global lock — the preempt sibling of the FutexWait drain above.
+    // The in-lock `yield_current` set the caller Runnable, RE-ENQUEUED it, and cleared
+    // `current`, so `dispatch_next_on` here genuinely dequeues the next runnable task (the
+    // FIFO head — the re-enqueued caller itself when alone). We re-verify `current` is still
+    // cleared, run the authoritative dispatch under only the rank-1 scheduler seam, mark the
+    // incoming task Running (rank-2), then a brief `with_cpu` re-acquire performs ONLY the
+    // arch restore (incoming ASID/CR3 switch + trap-frame restore) via the D6-SWITCH-A path.
+    #[cfg(target_arch = "x86_64")]
+    if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+        && !crate::kernel::boot::d6_switch_a_enabled()
+        && yield_was_deferred
+    {
+        crate::yarm_log!("YIELD_DISPATCH_DEFER_BEGIN cpu={} drain=1", cpu.0);
+        let reverify_ok = shared.yield_reverify_ready(cpu);
+        if reverify_ok {
+            let incoming = shared.yield_dispatch_step_mut(cpu);
+            if let Some(inc) = incoming {
+                shared.d6_genuine_mark_running_via_task_seam(incoming);
+                crate::yarm_log!("YIELD_DISPATCH_CURRENT_SET_OK cpu={} tid={}", cpu.0, inc);
+                let restore = shared
+                    .with_cpu(cpu, |kernel| {
+                        kernel.d2_recv_switch_incoming_asid(inc);
+                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
+                    })
+                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                restore??;
+                crate::yarm_log!("YIELD_DISPATCH_FRAME_OK cpu={} tid={}", cpu.0, inc);
+                let n = crate::kernel::boot::YIELD_DISPATCH_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                crate::yarm_log!(
+                    "YIELD_DISPATCH_DONE result=ok cpu={} incoming={} count={}",
+                    cpu.0,
+                    inc,
+                    n
+                );
+                crate::kernel::boot::maybe_log_yield_retired();
+            } else {
+                // Unreachable in practice (the re-enqueued caller is always a candidate),
+                // but handle idle defensively.
+                crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                crate::yarm_log!("YIELD_DISPATCH_DONE result=ok cpu={} incoming=idle", cpu.0);
+                crate::kernel::boot::maybe_log_yield_retired();
+            }
+        } else {
+            // An in-lock fallback already dispatched — do NOT double-dispatch.
+            crate::yarm_log!("YIELD_DISPATCH_DEFERRED reason=state_changed cpu={}", cpu.0);
+            crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         let d6_genuine_mode = crate::kernel::boot::d6_genuine_enabled()
@@ -563,7 +620,9 @@ pub fn handle_trap_entry_shared(
             && !d2_send_was_deferred
             // Stage 192A: a FutexWait drain ran the authoritative dispatch this cycle;
             // skip the spurious d6 observation (mirrors the D2 recv/send exclusion).
-            && !futex_wait_was_deferred;
+            && !futex_wait_was_deferred
+            // Stage 192B: same exclusion for a Yield drain cycle.
+            && !yield_was_deferred;
         if d6_genuine_mode {
             if crate::kernel::boot::d6_genuine_dispatch_is_deferred(cpu_idx) {
                 // Stage 168 (D6-GENUINE-B): the in-lock `dispatch_next_task`

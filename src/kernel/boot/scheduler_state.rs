@@ -229,6 +229,18 @@ impl KernelState {
             .map(|tid| tid.0)
     }
 
+    /// Stage 192B: re-enqueue the current task on the current CPU and clear the current
+    /// slot WITHOUT dispatching (the re-enqueue half of `on_preempt_current_cpu`). Returns
+    /// the re-enqueued TID (`current` now cleared) on success, or `None` (leaving `current`
+    /// unchanged) when there was no current task or the re-enqueue failed.
+    pub(crate) fn preempt_reenqueue_current_cpu(&mut self) -> Option<u64> {
+        let cpu = self.current_cpu();
+        let mut sched = self.scheduler_state();
+        kernel_mut(&mut sched.scheduler)
+            .preempt_reenqueue_only_on(cpu)
+            .map(|tid| tid.0)
+    }
+
     /// Preempt the current task on the current CPU, preferring `preferred` as the
     /// next task.  Returns the TID of the new current task (which is `preferred`
     /// when it was runnable, or the FIFO head otherwise).
