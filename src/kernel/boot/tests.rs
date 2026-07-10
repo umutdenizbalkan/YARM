@@ -60978,9 +60978,15 @@ mod stage193b_ipc_send_plain_oracle {
                 ),
             "init must dispatch the oracle on the slot-14/empty-slot-13 pattern"
         );
+        // Bound the extraction to the plain oracle's OWN body (end at its terminal
+        // marker) so it never bleeds into the sibling 193C cap-oracle doc/code.
         let oracle = INIT_SRC
             .split_once("fn run_ipc_send_plain_oracle(")
-            .map(|(_, rest)| rest.split_once("\nfn ").map(|(b, _)| b).unwrap_or(rest))
+            .map(|(_, rest)| {
+                rest.split_once("IPC_SEND_PLAIN_ORACLE_PARENT_DONE")
+                    .map(|(b, _)| b)
+                    .unwrap_or(rest)
+            })
             .unwrap_or("");
         assert!(!oracle.is_empty(), "the oracle workload must exist");
         // PLAIN message: flags=0, no transfer handle. No cap-transfer / reply-cap flags.
@@ -61038,6 +61044,226 @@ mod stage193b_ipc_send_plain_oracle {
             MOD_SRC.contains("fn proof_sender_wake_coordination_target(")
                 && MOD_SRC.contains("fn provision_init_ipc_recv_proof_sender_wake_e2("),
             "the sender-wake coordination infrastructure must remain"
+        );
+    }
+}
+
+// Stage 193C — IPCSEND ORDINARY-CAP BOUNDARY SPLIT. Extends the IpcSend boundary
+// decomposition to ordinary cap-transfer sends to an already-recv-v2-blocked
+// receiver, reusing the SAME 188C ordinary-cap producer + executor `ipc_reply` uses
+// and the 193B live-oracle harness. Phase A consumes the transfer envelope once +
+// snapshots object/rights/delegation by value; the trap-entry drain materializes a
+// FRESH receiver-local cap (186D2/186D3), copies (186E), and wakes once. The broad
+// global lock is NOT retired.
+mod stage193c_ipc_send_ordinary_cap {
+    use super::*;
+    const IPC_SRC: &str = include_str!("../../kernel/syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    // INVENTORY: handle_ipc_send tries the ordinary-cap boundary split AFTER the plain
+    // slice declines and BEFORE the legacy in-broad-lock path — reusing the SAME 188C
+    // ordinary-cap producer.
+    #[test]
+    fn ipc_send_wires_ordinary_cap_boundary_after_plain_before_legacy() {
+        assert!(
+            IPC_SRC.contains("try_ipc_send_boundary_split_ordinary_cap_pub("),
+            "handle_ipc_send must try the ordinary-cap boundary split"
+        );
+        // Ordering: plain split → ordinary-cap split → legacy.
+        let plain = IPC_SRC
+            .find("try_ipc_send_boundary_split_plain_pub(")
+            .unwrap();
+        let cap = IPC_SRC
+            .find("try_ipc_send_boundary_split_ordinary_cap_pub(")
+            .unwrap();
+        let legacy = IPC_SRC
+            .find("complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg)")
+            .unwrap();
+        assert!(
+            plain < cap && cap < legacy,
+            "order must be plain → ordinary-cap → legacy"
+        );
+        // The boundary wrapper reuses the 188C ordinary-cap producer.
+        assert!(
+            IPC_STATE_SRC.contains("fn try_ipc_send_boundary_split_ordinary_cap(")
+                && IPC_STATE_SRC.contains("produce_blocked_waiter_ordinary_cap_delivery(self, waiter_tid, endpoint_idx, msg)"),
+            "the cap boundary must reuse the 188C ordinary-cap producer"
+        );
+    }
+
+    // MARKERS + one-shot retirement exist; the executor emits the cap markers only for
+    // send-origin deliveries (reply-origin leaves the flag unset).
+    #[test]
+    fn ipc_send_cap_boundary_markers_exist() {
+        for m in [
+            "IPC_SEND_CAP_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_CAP_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_CAP_BOUNDARY_SPLIT_DEFERRED",
+            "IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL",
+        ] {
+            assert!(
+                IPC_STATE_SRC.contains(m),
+                "cap boundary marker `{m}` must exist"
+            );
+        }
+        assert!(
+            RUNTIME_SRC.contains("IPC_SEND_CAP_BOUNDARY_MATERIALIZE_OK")
+                && RUNTIME_SRC.contains("IPC_SEND_CAP_BOUNDARY_USER_COPY_OK")
+                && RUNTIME_SRC.contains("IPC_SEND_CAP_BOUNDARY_WAKE_OK")
+                && RUNTIME_SRC.contains("IPC_SEND_CAP_BOUNDARY_SPLIT_DONE result=ok")
+                && RUNTIME_SRC.contains("ipc_send_cap_boundary_origin_take("),
+            "the executor must emit the cap materialize/copy/wake/done markers gated on origin"
+        );
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok"),
+            "the IpcSendOrdinaryCap retirement marker must exist"
+        );
+        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+    }
+
+    // The cap-origin flag helpers are a clean set/peek/take cycle, independent of the
+    // 193A plain origin flag.
+    #[test]
+    fn cap_origin_flag_cycle_independent_of_plain() {
+        use crate::kernel::boot::{
+            ipc_send_boundary_origin_is_set, ipc_send_cap_boundary_origin_is_set,
+            ipc_send_cap_boundary_origin_set, ipc_send_cap_boundary_origin_take,
+        };
+        let _ = ipc_send_cap_boundary_origin_take(0);
+        assert!(!ipc_send_cap_boundary_origin_is_set(0));
+        ipc_send_cap_boundary_origin_set(0);
+        assert!(ipc_send_cap_boundary_origin_is_set(0));
+        // Independent of the plain flag.
+        assert!(
+            !ipc_send_boundary_origin_is_set(0),
+            "cap flag must not alias the plain flag"
+        );
+        assert!(ipc_send_cap_boundary_origin_take(0));
+        assert!(!ipc_send_cap_boundary_origin_is_set(0));
+        assert!(!ipc_send_cap_boundary_origin_take(0));
+    }
+
+    // The executor rolls the fresh cap back on a user-copy fault (no leak) and emits
+    // the FAIL marker — the existing 188C ordinary-cap executor rollback, now surfaced.
+    #[test]
+    fn executor_rolls_back_on_copy_fault() {
+        assert!(
+            RUNTIME_SRC.contains(
+                "rollback_materialized_recv_cap(snap.waiter_tid, CapId(local_cap), false)"
+            ) && RUNTIME_SRC.contains("IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL reason=user_copy"),
+            "a user-copy fault must roll the minted cap back and emit the cap FAIL marker"
+        );
+        assert!(
+            RUNTIME_SRC.contains("IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL reason=materialize"),
+            "a materialize fault must emit the cap FAIL marker"
+        );
+        // The fresh receiver-local cap is minted via the seam (NOT a sender-local CapId).
+        assert!(
+            RUNTIME_SRC.contains("materialize_received_message_cap_routed_with_delegation_split("),
+            "the receiver-local cap must be minted through the cap-transfer seam with delegation"
+        );
+    }
+
+    // The producer snapshots by value and does NOT mint / copy / wake under the broad
+    // borrow (188C Phase A discipline).
+    #[test]
+    fn producer_phase_a_no_mint_no_copy_no_wake() {
+        let body = SYSCALL_SRC
+            .split_once("fn produce_blocked_waiter_ordinary_cap_delivery(")
+            .map(|(_, r)| {
+                r.split_once("\npub(crate) fn ")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(!body.is_empty());
+        // No user copy, no wake, no mint under the broad borrow (those are the executor's).
+        assert!(
+            !body.contains("copy_to_user_split(")
+                && !body.contains("apply_scheduler_wake_plan(")
+                && !body.contains("mint_capability"),
+            "the producer must not copy/wake/mint under the broad borrow"
+        );
+    }
+
+    // Knob + provisioning wiring: cap oracle uses slot 13 (coord), plain uses slot 14,
+    // sender-wake uses 13+14 — mutually exclusive presence patterns.
+    #[test]
+    fn cap_oracle_knob_and_slot13_wiring() {
+        assert!(
+            CMDLINE_SRC.contains("yarm.ipc_send_cap_oracle")
+                && CMDLINE_SRC.contains("set_ipc_send_cap_oracle_enabled("),
+            "the `yarm.ipc_send_cap_oracle` knob must parse + apply"
+        );
+        assert!(
+            MOD_SRC.contains("fn ipc_send_cap_oracle_active()")
+                && MOD_SRC.contains("fn provision_init_ipc_send_cap_oracle_coord(")
+                && MOD_SRC
+                    .contains("ipc_send_plain_oracle_active() || ipc_send_cap_oracle_active()"),
+            "the cap oracle must have an active predicate + coord provision + shared hook gate"
+        );
+        assert!(
+            X86_BOOT_SRC.contains("provision_init_ipc_send_cap_oracle_coord(")
+                && X86_BOOT_SRC.contains("init_args[13] = coord_recv_cap as u64;"),
+            "x86_64 boot must provision the cap oracle coord cap into slot 13"
+        );
+        assert!(
+            INIT_SRC
+                .contains("run_ipc_send_cap_oracle(proof_send, proof_recv, e2_recv, ctx.task_id)"),
+            "init must dispatch the cap oracle on the slot-13-only pattern"
+        );
+    }
+
+    // The cap oracle sends exactly ONE ordinary cap (FLAG_CAP_TRANSFER, one handle,
+    // NOT reply-cap, NOT shared) and verifies the child gets a FRESH cap id.
+    #[test]
+    fn cap_oracle_is_single_ordinary_cap_transfer() {
+        let oracle = INIT_SRC
+            .split_once("fn run_ipc_send_cap_oracle(")
+            .map(|(_, r)| {
+                r.split_once("IPC_SEND_CAP_ORACLE_PARENT_DONE")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(!oracle.is_empty(), "the cap oracle workload must exist");
+        assert!(
+            oracle.contains("Message::FLAG_CAP_TRANSFER")
+                && oracle.contains("Some(e1_send as u64)"),
+            "the oracle send must carry exactly one ordinary transferred cap"
+        );
+        assert!(
+            !oracle.contains("FLAG_REPLY_CAP") && !oracle.contains("OPCODE_SHARED"),
+            "the oracle must NOT use a reply-cap or shared-region transfer"
+        );
+        assert!(
+            oracle.contains("cap_is_fresh") && oracle.contains("c != e1_send"),
+            "the child must verify the received cap id is fresh (not the sender-local handle)"
+        );
+    }
+
+    // 193A/193B + prior retirements intact; the plain send boundary is unchanged.
+    #[test]
+    fn prior_guarantees_intact() {
+        assert!(
+            MOD_SRC.contains("class=IpcSendPlain")
+                && MOD_SRC.contains("class=FutexWait result=ok")
+                && MOD_SRC.contains("class=Yield result=ok"),
+            "193A plain + 192A/192B retirements must remain"
+        );
+        assert!(
+            IPC_STATE_SRC.contains("fn try_ipc_send_boundary_split_plain(")
+                && INIT_SRC.contains("fn run_ipc_send_plain_oracle("),
+            "the 193A/193B plain send boundary + oracle must remain"
         );
     }
 }

@@ -1821,11 +1821,27 @@ impl SharedKernel {
                     "DISPATCH_POST_WORK_CAP_TRANSFER_SEAM_OK kind=blocked_waiter_ordinary_cap local_cap={}",
                     cap.0
                 );
+                // Stage 193C: IpcSend-origin ordinary-cap deliveries emit the boundary
+                // materialize marker here (peek — the flag is consumed after the wake
+                // below). Reply-origin deliveries leave the flag unset (silent).
+                if crate::kernel::boot::ipc_send_cap_boundary_origin_is_set(cpu.0 as usize) {
+                    crate::yarm_log!(
+                        "IPC_SEND_CAP_BOUNDARY_MATERIALIZE_OK waiter_tid={} local_cap={}",
+                        snap.waiter_tid,
+                        cap.0
+                    );
+                }
                 cap.0
             }
             Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => {
                 // Cannot occur: the producer excludes reply caps AND non-Reply
                 // objects only reach here. Surface a real error rather than drop.
+                if crate::kernel::boot::ipc_send_cap_boundary_origin_take(cpu.0 as usize) {
+                    crate::yarm_log!(
+                        "IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL reason=unexpected_reply_object waiter_tid={}",
+                        snap.waiter_tid
+                    );
+                }
                 crate::yarm_log!(
                     "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap reason=unexpected_reply_object"
                 );
@@ -1835,6 +1851,12 @@ impl SharedKernel {
                 // Same real error the legacy router would raise (CapabilityFull,
                 // WrongObject, StaleCapability, MissingRight, …). The envelope was
                 // already consumed in Phase A — identical to the legacy arm.
+                if crate::kernel::boot::ipc_send_cap_boundary_origin_take(cpu.0 as usize) {
+                    crate::yarm_log!(
+                        "IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL reason=materialize waiter_tid={}",
+                        snap.waiter_tid
+                    );
+                }
                 crate::yarm_log!(
                     "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap reason=materialize"
                 );
@@ -1881,12 +1903,29 @@ impl SharedKernel {
                 "IPC_RECV_V2_ROLLBACK_OK site=blocked_ordinary_cap tid={} reply=false",
                 snap.waiter_tid
             );
+            // Stage 193C: the fresh receiver-local cap was rolled all the way back
+            // (revoke + delegation-link removal + refcount drop) above, so nothing
+            // leaks; surface the IpcSend-cap FAIL marker (consume the origin flag).
+            if crate::kernel::boot::ipc_send_cap_boundary_origin_take(cpu.0 as usize) {
+                crate::yarm_log!(
+                    "IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL reason=user_copy waiter_tid={}",
+                    snap.waiter_tid
+                );
+            }
             crate::yarm_log!(
                 "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_ordinary_cap reason=user_copy"
             );
             return Err(TrapHandleError::Syscall(SyscallError::InvalidArgs));
         }
         crate::yarm_log!("DISPATCH_POST_WORK_USER_COPY_OK kind=blocked_waiter_ordinary_cap");
+        // Stage 193C: IpcSend-origin ordinary-cap deliveries emit the boundary user-copy
+        // marker here (peek — the flag is consumed after the wake below).
+        if crate::kernel::boot::ipc_send_cap_boundary_origin_is_set(cpu.0 as usize) {
+            crate::yarm_log!(
+                "IPC_SEND_CAP_BOUNDARY_USER_COPY_OK waiter_tid={}",
+                snap.waiter_tid
+            );
+        }
 
         // Phase C — completion via a brief global re-entry (no seam inside),
         // preserving the legacy order copy → clear GPRs → clear waiter slot →
@@ -1901,6 +1940,19 @@ impl SharedKernel {
             }
         });
         crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_ordinary_cap");
+        // Stage 193C: for an IpcSend-origin ordinary-cap delivery, emit the IpcSend-cap
+        // boundary wake/done markers + the one-shot retirement, and consume the origin flag.
+        if crate::kernel::boot::ipc_send_cap_boundary_origin_take(cpu.0 as usize) {
+            crate::yarm_log!(
+                "IPC_SEND_CAP_BOUNDARY_WAKE_OK waiter_tid={}",
+                snap.waiter_tid
+            );
+            crate::yarm_log!(
+                "IPC_SEND_CAP_BOUNDARY_SPLIT_DONE result=ok waiter_tid={}",
+                snap.waiter_tid
+            );
+            crate::kernel::boot::maybe_log_ipc_send_ordinary_cap_retired();
+        }
         crate::yarm_log!(
             "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
             snap.waiter_tid

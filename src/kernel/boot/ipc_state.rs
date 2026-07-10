@@ -1770,6 +1770,75 @@ impl KernelState {
         self.try_ipc_send_boundary_split_plain(waiter_tid, endpoint_idx, msg)
     }
 
+    /// Stage 193C (BROAD-IPC DECOMPOSITION): the IpcSend ORDINARY cap-transfer
+    /// waiting-receiver boundary split. Reuses the SAME 188C ordinary-cap producer +
+    /// trap-entry executor as [`try_ipc_reply_boundary_split`], but ONLY for the ordinary
+    /// cap-transfer slice — the producer returns `Ok(false)` for any plain / reply-cap /
+    /// shared-region message (those fall back to the legacy in-broad-lock path). Phase A
+    /// consumes the transfer envelope ONCE and snapshots object/rights/delegation-parent +
+    /// payload/meta by value (NO mint, NO user copy, NO `ipc_state_lock` across a copy); the
+    /// drain materializes the fresh receiver-local cap through the 186D2/186D3 seam, copies
+    /// payload/meta through the 186E seam, and wakes the receiver once AFTER the broad borrow
+    /// drops. Tags the stash origin so the drain emits the IpcSend-cap boundary markers.
+    ///
+    /// `Ok(true)` — snapshotted (envelope consumed once); the drain completes materialize +
+    ///   copy + wake (sender returns Ok).
+    /// `Ok(false)` — not the ordinary cap-transfer slice / no drainer; caller uses the legacy
+    ///   path (the producer consumed NOTHING before returning false).
+    /// `Err(_)` — a real Phase-A error (undersized/unmapped waiter buffer, missing/dead
+    ///   envelope, source-cap resolution) → `UserMemoryFault`, exactly as the legacy delivery
+    ///   failure (the envelope disposition matches the legacy arm).
+    fn try_ipc_send_boundary_split_ordinary_cap(
+        &mut self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &Message,
+    ) -> Result<bool, KernelError> {
+        use crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery;
+        crate::yarm_log!(
+            "IPC_SEND_CAP_BOUNDARY_SPLIT_BEGIN waiter_tid={} endpoint={}",
+            waiter_tid,
+            endpoint_idx
+        );
+        match produce_blocked_waiter_ordinary_cap_delivery(self, waiter_tid, endpoint_idx, msg) {
+            Ok(true) => {
+                let cpu_idx = self.current_cpu().0 as usize;
+                crate::kernel::boot::ipc_send_cap_boundary_origin_set(cpu_idx);
+                crate::yarm_log!(
+                    "IPC_SEND_CAP_BOUNDARY_SNAPSHOT_OK waiter_tid={}",
+                    waiter_tid
+                );
+                Ok(true)
+            }
+            Ok(false) => {
+                crate::yarm_log!(
+                    "IPC_SEND_CAP_BOUNDARY_SPLIT_DEFERRED reason=unsupported_or_no_drainer waiter_tid={}",
+                    waiter_tid
+                );
+                Ok(false)
+            }
+            Err(e) => {
+                crate::yarm_log!(
+                    "IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL reason=producer_error waiter_tid={} err={:?}",
+                    waiter_tid,
+                    e
+                );
+                Err(KernelError::UserMemoryFault)
+            }
+        }
+    }
+
+    /// Stage 193C: `pub(crate)` entry the IpcSend syscall handler calls for the ordinary
+    /// cap-transfer waiting-receiver boundary split.
+    pub(crate) fn try_ipc_send_boundary_split_ordinary_cap_pub(
+        &mut self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &Message,
+    ) -> Result<bool, KernelError> {
+        self.try_ipc_send_boundary_split_ordinary_cap(waiter_tid, endpoint_idx, msg)
+    }
+
     pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message) -> Result<(), KernelError> {
         let current_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
         crate::yarm_log!("IPC_REPLY_ENTER tid={}", current_tid);
