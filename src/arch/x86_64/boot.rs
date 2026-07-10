@@ -942,6 +942,18 @@ pub fn bootstrap_first_user_task(
     {
         init_args[13] = coord_recv_cap as u64;
     }
+    // Stage 193D: sub-knob-gated (`yarm.ipc_send_reply_cap_oracle=1`) coordination
+    // endpoint recv cap in slot 13 + a kernel-provisioned transferable reply cap in
+    // slot 14 + a discriminator in slot 17 (init never uses slot 17). The (13 + 14 +
+    // 17) pattern tells init to run the IpcSend reply-cap live oracle, distinct from
+    // sender-wake (13 + 14, no slot 17). x86_64-only live target.
+    else if let Some((coord_recv_cap, reply_cap)) =
+        crate::kernel::boot::provision_init_ipc_send_reply_cap_oracle(kernel, RING3_INIT_SERVER_TID)
+    {
+        init_args[13] = coord_recv_cap as u64;
+        init_args[14] = reply_cap as u64;
+        init_args[17] = 1; // reply-cap oracle discriminator (init otherwise leaves slot 17 zero)
+    }
     // Stage 193B: sub-knob-gated (`yarm.ipc_send_plain_oracle=1`) coordination
     // endpoint E2 recv cap in slot 14 (service_extra_cap_1), with slot 13 LEFT
     // EMPTY. That presence pattern (slot 13 empty + slot 14 set) tells init to run

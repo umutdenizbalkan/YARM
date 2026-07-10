@@ -99,6 +99,28 @@ impl KernelState {
         Some(envelope)
     }
 
+    /// Stage 193D: non-consuming peek at a transfer envelope's source object type.
+    ///
+    /// Returns the `source_object` of the envelope named by `handle` (idx +
+    /// generation), WITHOUT taking/transitioning the envelope or touching any
+    /// refcount — a pure read used by the IpcSend reply-cap boundary split to route
+    /// on object type (Reply vs ordinary), since the userspace IpcSend ABI carries
+    /// no `FLAG_REPLY_CAP` and the kernel tags every transfer as `FLAG_CAP_TRANSFER`.
+    /// `None` for an out-of-range / stale / vacant handle.
+    pub(crate) fn peek_transfer_envelope_source_object(&self, handle: u64) -> Option<CapObject> {
+        let idx = usize::try_from(handle & 0xFFFF).ok()?;
+        if idx >= MAX_TRANSFER_ENVELOPES {
+            return None;
+        }
+        let generation = handle >> 16;
+        if generation == 0
+            || self.with_ipc_state(|ipc| ipc.transfer_envelope_generations[idx]) != generation
+        {
+            return None;
+        }
+        self.with_ipc_state(|ipc| ipc.transfer_envelopes[idx].map(|e| e.source_object))
+    }
+
     /// Stage 20: roll back a Reply/transfer cap that was just materialized into a
     /// receiver's cnode when a *subsequent* user-memory copy in the recv-delivery
     /// path fails.

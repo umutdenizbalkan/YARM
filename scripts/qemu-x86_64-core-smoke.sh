@@ -246,6 +246,14 @@ IPC_SEND_CAP_ORACLE=${IPC_SEND_CAP_ORACLE:-0}
 if [[ "$IPC_SEND_CAP_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_cap_oracle="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.ipc_send_cap_oracle=1"
 fi
+# Stage 193D: the IpcSend reply-cap transfer live oracle needs the sub-knob
+# yarm.ipc_send_reply_cap_oracle=1 (gates the coordination hook + the reply-cap oracle
+# workload + the transferable reply-cap provisioning). Mutually exclusive with the
+# plain / ordinary-cap oracles + sender-wake.
+IPC_SEND_REPLY_CAP_ORACLE=${IPC_SEND_REPLY_CAP_ORACLE:-0}
+if [[ "$IPC_SEND_REPLY_CAP_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_reply_cap_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.ipc_send_reply_cap_oracle=1"
+fi
 
 if [[ "$KERNEL_CMDLINE" != *"console="* ]] || [[ "${#KERNEL_CMDLINE}" -lt 12 ]]; then
   echo "[warn] suspicious KERNEL_CMDLINE override detected: '$KERNEL_CMDLINE'"

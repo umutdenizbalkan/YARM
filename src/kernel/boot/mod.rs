@@ -1213,6 +1213,67 @@ pub(crate) fn maybe_log_ipc_send_ordinary_cap_retired() {
     }
 }
 
+// ── Stage 193D (BROAD-IPC DECOMPOSITION — IpcSend reply-cap transfer slice) ─────────
+//
+// IpcSend of a REPLY-CAP transfer message (FLAG_REPLY_CAP + exactly one transferred cap)
+// to an already-recv-v2-blocked receiver reuses the SAME 188D reply-cap producer +
+// executor `ipc_reply` carries: Phase A snapshots the reply object's registry
+// coordinates (reply_index, reply_generation) + payload/meta by value (NO mint, NO IPC
+// record, NO user copy, NO wake) and consumes the reply-cap transfer envelope ONCE under
+// the broad borrow; the trap-entry drain mints the fresh receiver-local one-shot reply
+// cap through the rank-4 seam, records the waiter-cap through the rank-3 IPC seam, copies
+// payload/meta through the 186E seam, and wakes the receiver once — all AFTER the broad
+// borrow drops. This per-CPU flag tags the stashed reply-cap delivery as originating from
+// `ipc_send` so the drain emits the IpcSend-reply-cap-specific boundary markers (the
+// reply-cap executor arm is shared with `ipc_reply`, which leaves the flag unset).
+
+/// Stage 193D: per-CPU "the pending reply-cap delivery originated from ipc_send" flag.
+pub(crate) static IPC_SEND_REPLY_CAP_BOUNDARY_ORIGIN: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 193D: tag the just-stashed reply-cap delivery on `cpu` as an ipc_send split.
+pub(crate) fn ipc_send_reply_cap_boundary_origin_set(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        IPC_SEND_REPLY_CAP_BOUNDARY_ORIGIN[cpu_idx]
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Stage 193D: is the pending reply-cap delivery on `cpu` an ipc_send split? (peek)
+pub(crate) fn ipc_send_reply_cap_boundary_origin_is_set(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && IPC_SEND_REPLY_CAP_BOUNDARY_ORIGIN[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 193D: consume the ipc_send reply-cap origin flag for `cpu` (clear + return prior).
+pub(crate) fn ipc_send_reply_cap_boundary_origin_take(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && IPC_SEND_REPLY_CAP_BOUNDARY_ORIGIN[cpu_idx]
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// Stage 193D: one-shot latch for the IpcSendReplyCap boundary retirement markers.
+static IPC_SEND_REPLY_CAP_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 193D: emit the IpcSendReplyCap retirement markers exactly once (first reply-cap
+/// waiting-receiver delivery completed through the out-of-broad-lock boundary drain).
+pub(crate) fn maybe_log_ipc_send_reply_cap_retired() {
+    if IPC_SEND_REPLY_CAP_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendReplyCap");
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendReplyCap result=ok");
+    }
+}
+
 /// Stage 169 (D2-GENUINE-SEND): x86_64-only, default-off gate that runs the
 /// blocking-SEND path (endpoint full / synchronous no-waiter) through explicit
 /// rank-clean scheduler/task/IPC phase markers and relocates its queue-advancing
@@ -1962,10 +2023,34 @@ pub fn ipc_send_cap_oracle_active() -> bool {
     ipc_recv_oracle_proof_enabled() && ipc_send_cap_oracle_enabled()
 }
 
-/// True when EITHER IpcSend live oracle (plain 193B or ordinary-cap 193C) is active —
-/// the precondition for the shared receiver-block coordination hook to fire.
+/// Stage 193D: `yarm.ipc_send_reply_cap_oracle=1` SUB-knob (layered on the base proof
+/// knob, independent of the plain + ordinary-cap oracles). Gates the IpcSend reply-cap
+/// transfer live oracle, which shares the SAME receiver-block coordination mechanism.
+/// Coordination-slot pattern: reply-cap oracle uses init startup slots 13 (coord) + 14
+/// (a kernel-provisioned transferable reply cap) + 17 (a discriminator that separates it
+/// from sender-wake, which also uses slots 13+14).
+pub(crate) static IPC_SEND_REPLY_CAP_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_ipc_send_reply_cap_oracle_enabled(enabled: bool) {
+    IPC_SEND_REPLY_CAP_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ipc_send_reply_cap_oracle_enabled() -> bool {
+    IPC_SEND_REPLY_CAP_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// True only when BOTH the base proof knob and the send-reply-cap-oracle sub-knob are set.
+pub fn ipc_send_reply_cap_oracle_active() -> bool {
+    ipc_recv_oracle_proof_enabled() && ipc_send_reply_cap_oracle_enabled()
+}
+
+/// True when ANY IpcSend live oracle (plain 193B / ordinary-cap 193C / reply-cap 193D) is
+/// active — the precondition for the shared receiver-block coordination hook to fire.
 pub fn ipc_send_oracle_coordination_active() -> bool {
-    ipc_send_plain_oracle_active() || ipc_send_cap_oracle_active()
+    ipc_send_plain_oracle_active()
+        || ipc_send_cap_oracle_active()
+        || ipc_send_reply_cap_oracle_active()
 }
 
 /// If `endpoint_idx` is the provisioned proof loopback E1 (and EITHER IpcSend live
@@ -2082,6 +2167,97 @@ pub fn provision_init_ipc_send_cap_oracle_coord(
         recv_cap.0
     );
     Some(recv_cap.0 as u32)
+}
+
+/// Stage 193D: provision the reply-cap live oracle. Under BOTH the base proof knob and
+/// the send-reply-cap sub-knob, this (a) creates the coordination endpoint + grants init
+/// a RECV cap (slot 13), and (b) mints a transferable one-shot Reply cap directly into
+/// init's cnode (slot 14) via the EXISTING `create_reply_cap_for_caller_in_cnode` seam —
+/// so init can transfer it to the recv-v2-blocked child, exercising the 193D reply-cap
+/// boundary split. Returns `(coord_recv_cap, reply_cap)`. The reply cap's reply endpoint
+/// is a fresh endpoint whose RECV cap stays with task 0 (the synthetic caller); the
+/// oracle only needs the fresh receiver-local reply cap to be materialized + observed,
+/// not actually replied through.
+pub fn provision_init_ipc_send_reply_cap_oracle(
+    kernel: &mut KernelState,
+    init_tid: u64,
+) -> Option<(u32, u32)> {
+    if !ipc_send_reply_cap_oracle_active() {
+        return None;
+    }
+    // (a) Coordination endpoint (init RECV cap → slot 13).
+    let (e2_idx, _e2_send, e2_recv_root) = match kernel.create_endpoint(8) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPC_SEND_REPLY_CAP_ORACLE_FAIL step=create_coord err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    let coord_recv = match kernel.grant_capability_task_to_task_with_rights(
+        0,
+        e2_recv_root,
+        init_tid,
+        crate::kernel::capabilities::CapRights::RECEIVE,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPC_SEND_REPLY_CAP_ORACLE_FAIL step=grant_coord err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    IPC_RECV_PROOF_SENDER_WAKE_E2_IDX.store(e2_idx, core::sync::atomic::Ordering::Release);
+
+    // (b) Reply endpoint (task 0 keeps the RECV cap — the synthetic caller) + a
+    // transferable Reply cap minted DIRECTLY into init's cnode via the existing seam.
+    let (_reply_eidx, _reply_send, reply_recv_root) = match kernel.create_endpoint(2) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPC_SEND_REPLY_CAP_ORACLE_FAIL step=create_reply_ep err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    let init_cnode = match kernel.task_cnode(init_tid) {
+        Some(c) => c,
+        None => {
+            crate::yarm_log!("IPC_SEND_REPLY_CAP_ORACLE_FAIL step=init_cnode");
+            return None;
+        }
+    };
+    // caller = task 0 (holds the reply endpoint RECV cap); responder = init; mint the
+    // Reply cap into init's cnode so init can transfer it.
+    let reply_cap = match kernel.create_reply_cap_for_caller_in_cnode(
+        crate::kernel::ipc::ThreadId(0),
+        reply_recv_root,
+        Some(crate::kernel::ipc::ThreadId(init_tid)),
+        Some(init_cnode),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPC_SEND_REPLY_CAP_ORACLE_FAIL step=mint_reply_cap err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    crate::yarm_log!(
+        "IPC_SEND_REPLY_CAP_ORACLE_PROVISION_OK init_tid={} e1_idx={} e2_idx={} coord_recv={} reply_cap={}",
+        init_tid,
+        IPC_RECV_PROOF_SENDER_WAKE_E1_IDX.load(core::sync::atomic::Ordering::Acquire),
+        e2_idx,
+        coord_recv.0,
+        reply_cap.0
+    );
+    Some((coord_recv.0 as u32, reply_cap.0 as u32))
 }
 
 /// Stage 193B: push the deterministic "receiver blocked on E1" coordination

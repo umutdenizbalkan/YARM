@@ -60585,9 +60585,17 @@ mod stage193a_ipc_send_boundary_plain {
     #[test]
     fn ipc_send_wires_plain_boundary_split_with_legacy_fallback() {
         assert!(
-            IPC_SRC.contains("kernel.try_ipc_send_boundary_split_plain_pub(")
+            IPC_SRC.contains("kernel.try_ipc_send_boundary_split_any_pub(")
                 && IPC_SRC.contains("Ok(true) => (Some(Ok(())), IpcSchedulerPlan::None),"),
-            "handle_ipc_send must try the plain boundary split (drain wakes; no in-lock wake)"
+            "handle_ipc_send must try the boundary splits (drain wakes; no in-lock wake)"
+        );
+        // The chaining helper tries the plain split first.
+        assert!(
+            IPC_STATE_SRC.contains("fn try_ipc_send_boundary_split_any_pub(")
+                && IPC_STATE_SRC.contains(
+                    "self.try_ipc_send_boundary_split_plain(waiter_tid, endpoint_idx, msg)?"
+                ),
+            "the chaining helper must try the plain split first"
         );
         assert!(
             IPC_SRC.contains("Ok(false) => {")
@@ -61075,22 +61083,26 @@ mod stage193c_ipc_send_ordinary_cap {
     #[test]
     fn ipc_send_wires_ordinary_cap_boundary_after_plain_before_legacy() {
         assert!(
-            IPC_SRC.contains("try_ipc_send_boundary_split_ordinary_cap_pub("),
-            "handle_ipc_send must try the ordinary-cap boundary split"
+            IPC_SRC.contains("try_ipc_send_boundary_split_any_pub(")
+                && IPC_SRC
+                    .contains("complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg)"),
+            "handle_ipc_send must try the chaining boundary split then fall back to legacy"
         );
-        // Ordering: plain split → ordinary-cap split → legacy.
-        let plain = IPC_SRC
-            .find("try_ipc_send_boundary_split_plain_pub(")
+        // Ordering WITHIN the chaining helper body: plain → reply-cap → ordinary-cap.
+        let chain = IPC_STATE_SRC
+            .split_once("fn try_ipc_send_boundary_split_any_pub(")
+            .and_then(|(_, r)| r.split_once("pub fn ipc_reply(").map(|(b, _)| b))
+            .expect("chaining helper body");
+        let plain = chain.find("try_ipc_send_boundary_split_plain(").unwrap();
+        let reply = chain
+            .find("try_ipc_send_boundary_split_reply_cap(")
             .unwrap();
-        let cap = IPC_SRC
-            .find("try_ipc_send_boundary_split_ordinary_cap_pub(")
-            .unwrap();
-        let legacy = IPC_SRC
-            .find("complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg)")
+        let cap = chain
+            .find("try_ipc_send_boundary_split_ordinary_cap(")
             .unwrap();
         assert!(
-            plain < cap && cap < legacy,
-            "order must be plain → ordinary-cap → legacy"
+            plain < reply && reply < cap,
+            "chaining order must be plain → reply-cap → ordinary-cap (reply-cap before ordinary so a Reply object is not mis-consumed)"
         );
         // The boundary wrapper reuses the 188C ordinary-cap producer.
         assert!(
@@ -61207,8 +61219,8 @@ mod stage193c_ipc_send_ordinary_cap {
         assert!(
             MOD_SRC.contains("fn ipc_send_cap_oracle_active()")
                 && MOD_SRC.contains("fn provision_init_ipc_send_cap_oracle_coord(")
-                && MOD_SRC
-                    .contains("ipc_send_plain_oracle_active() || ipc_send_cap_oracle_active()"),
+                && MOD_SRC.contains("fn ipc_send_oracle_coordination_active()")
+                && MOD_SRC.contains("ipc_send_cap_oracle_active()"),
             "the cap oracle must have an active predicate + coord provision + shared hook gate"
         );
         assert!(
@@ -61264,6 +61276,242 @@ mod stage193c_ipc_send_ordinary_cap {
             IPC_STATE_SRC.contains("fn try_ipc_send_boundary_split_plain(")
                 && INIT_SRC.contains("fn run_ipc_send_plain_oracle("),
             "the 193A/193B plain send boundary + oracle must remain"
+        );
+    }
+}
+
+// Stage 193D — IPCSEND REPLY-CAP BOUNDARY SPLIT. Extends the IpcSend boundary
+// decomposition to reply-cap transfer sends to an already-recv-v2-blocked receiver,
+// reusing the 188D reply-cap producer + executor `ipc_reply` carries. Because the
+// userspace IpcSend ABI carries no FLAG_REPLY_CAP (handle_ipc_send tags every transfer
+// as FLAG_CAP_TRANSFER), the reply-cap slice routes on the transferred cap's OBJECT
+// type (Reply), peeking the envelope WITHOUT consuming it and running BEFORE the
+// ordinary-cap slice. The broad global lock is NOT retired.
+mod stage193d_ipc_send_reply_cap {
+    use super::*;
+    const IPC_SRC: &str = include_str!("../../kernel/syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRANSFER_SRC: &str = include_str!("transfer_state.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    // INVENTORY: the reply-cap boundary split is OBJECT-based (peek the envelope's
+    // source object; only a Reply object takes it) and runs BEFORE the ordinary-cap
+    // slice — reusing the SAME 188D reply-cap producer.
+    #[test]
+    fn reply_cap_boundary_is_object_based_before_ordinary() {
+        assert!(
+            IPC_STATE_SRC.contains("fn try_ipc_send_boundary_split_reply_cap(")
+                && IPC_STATE_SRC.contains("peek_transfer_envelope_source_object(handle.0)")
+                && IPC_STATE_SRC.contains("Some(CapObject::Reply { .. })"),
+            "the reply-cap slice must route on the transferred object being a Reply (object-based)"
+        );
+        // Reuses the 188D reply-cap producer.
+        assert!(
+            IPC_STATE_SRC.contains(
+                "produce_blocked_waiter_reply_cap_delivery(self, waiter_tid, endpoint_idx, &reply_msg)"
+            ),
+            "the reply-cap slice must reuse the 188D reply-cap producer"
+        );
+        // The peek is non-consuming (read-only).
+        assert!(
+            TRANSFER_SRC.contains("fn peek_transfer_envelope_source_object(&self")
+                && !TRANSFER_SRC
+                    .split_once("fn peek_transfer_envelope_source_object(&self")
+                    .map(|(_, r)| r.split_once("\n    pub").map(|(b, _)| b).unwrap_or(r))
+                    .unwrap_or("")
+                    .contains("transition"),
+            "the envelope-object peek must be non-consuming (no state transition)"
+        );
+        // Ordering WITHIN the chaining helper body: reply-cap → ordinary-cap.
+        let chain = IPC_STATE_SRC
+            .split_once("fn try_ipc_send_boundary_split_any_pub(")
+            .and_then(|(_, r)| r.split_once("pub fn ipc_reply(").map(|(b, _)| b))
+            .expect("chaining helper body");
+        let reply = chain
+            .find("try_ipc_send_boundary_split_reply_cap(")
+            .unwrap();
+        let cap = chain
+            .find("try_ipc_send_boundary_split_ordinary_cap(")
+            .unwrap();
+        assert!(reply < cap, "reply-cap must be tried before ordinary-cap");
+    }
+
+    // MARKERS + one-shot retirement exist; the executor emits the reply-cap markers
+    // only for send-origin deliveries (reply-origin leaves the flag unset).
+    #[test]
+    fn reply_cap_boundary_markers_exist() {
+        for m in [
+            "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_REPLY_CAP_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_DEFERRED",
+            "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_FAIL",
+        ] {
+            assert!(
+                IPC_STATE_SRC.contains(m),
+                "reply-cap boundary marker `{m}` must exist"
+            );
+        }
+        assert!(
+            RUNTIME_SRC.contains("IPC_SEND_REPLY_CAP_BOUNDARY_MATERIALIZE_OK")
+                && RUNTIME_SRC.contains("IPC_SEND_REPLY_CAP_BOUNDARY_USER_COPY_OK")
+                && RUNTIME_SRC.contains("IPC_SEND_REPLY_CAP_BOUNDARY_WAKE_OK")
+                && RUNTIME_SRC.contains("IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_DONE result=ok")
+                && RUNTIME_SRC.contains("ipc_send_reply_cap_boundary_origin_take("),
+            "the executor must emit the reply-cap materialize/copy/wake/done markers gated on origin"
+        );
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendReplyCap result=ok"),
+            "the IpcSendReplyCap retirement marker must exist"
+        );
+        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+    }
+
+    // The reply-cap-origin flag is a clean set/peek/take cycle, independent of the
+    // plain (193A) and ordinary-cap (193C) origin flags.
+    #[test]
+    fn reply_cap_origin_flag_independent() {
+        use crate::kernel::boot::{
+            ipc_send_boundary_origin_is_set, ipc_send_cap_boundary_origin_is_set,
+            ipc_send_reply_cap_boundary_origin_is_set, ipc_send_reply_cap_boundary_origin_set,
+            ipc_send_reply_cap_boundary_origin_take,
+        };
+        let _ = ipc_send_reply_cap_boundary_origin_take(0);
+        assert!(!ipc_send_reply_cap_boundary_origin_is_set(0));
+        ipc_send_reply_cap_boundary_origin_set(0);
+        assert!(ipc_send_reply_cap_boundary_origin_is_set(0));
+        assert!(
+            !ipc_send_boundary_origin_is_set(0),
+            "must not alias the plain flag"
+        );
+        assert!(
+            !ipc_send_cap_boundary_origin_is_set(0),
+            "must not alias the ordinary-cap flag"
+        );
+        assert!(ipc_send_reply_cap_boundary_origin_take(0));
+        assert!(!ipc_send_reply_cap_boundary_origin_is_set(0));
+        assert!(!ipc_send_reply_cap_boundary_origin_take(0));
+    }
+
+    // The executor mints a FRESH receiver-local reply cap (rank-4 seam), records it
+    // (rank-3), and rolls BOTH back on a user-copy fault (no reply-cap/refcount leak);
+    // the reply cap is identified by (reply_index, reply_generation), never a
+    // sender-local CapId.
+    #[test]
+    fn executor_mints_fresh_and_rolls_back() {
+        assert!(
+            RUNTIME_SRC.contains("mint_capability_with_memory_ref_split(")
+                && RUNTIME_SRC.contains("try_record_reply_waiter_cap_split("),
+            "the reply cap must be minted fresh + recorded through the rank-clean seams"
+        );
+        assert!(
+            RUNTIME_SRC
+                .contains("clear_reply_waiter_cap_split(snap.reply_index, snap.reply_generation)")
+                && RUNTIME_SRC
+                    .contains("rollback_minted_cap_split(snap.receiver_cnode, CapId(local_cap)")
+                && RUNTIME_SRC.contains("IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_FAIL reason=user_copy"),
+            "a user-copy fault must roll BOTH the record and the mint back + emit the FAIL marker"
+        );
+        assert!(
+            RUNTIME_SRC.contains("IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_FAIL reason=mint")
+                && RUNTIME_SRC
+                    .contains("IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_FAIL reason=stale_record"),
+            "mint + stale-record faults must emit the reply-cap FAIL marker"
+        );
+    }
+
+    // The reply cap is provisioned into init's cnode via the EXISTING seam (reused, not
+    // duplicated): create_reply_cap_for_caller delegates to the _in_cnode variant.
+    #[test]
+    fn reply_cap_provisioned_via_reused_seam() {
+        assert!(
+            IPC_STATE_SRC.contains("fn create_reply_cap_for_caller_in_cnode(")
+                && IPC_STATE_SRC.contains("self.create_reply_cap_for_caller_in_cnode(")
+                && IPC_STATE_SRC
+                    .contains("dest_cnode: Option<crate::kernel::capabilities::CNodeId>"),
+            "create_reply_cap_for_caller must delegate to the _in_cnode variant (reused seam)"
+        );
+        assert!(
+            MOD_SRC.contains("fn provision_init_ipc_send_reply_cap_oracle(")
+                && MOD_SRC.contains("create_reply_cap_for_caller_in_cnode("),
+            "the reply-cap oracle provisioning must reuse the reply-cap seam into init's cnode"
+        );
+    }
+
+    // Knob + slot-13/14/17 wiring + init dispatch on the reply-cap presence pattern.
+    #[test]
+    fn reply_cap_oracle_knob_and_slot_wiring() {
+        assert!(
+            CMDLINE_SRC.contains("yarm.ipc_send_reply_cap_oracle")
+                && CMDLINE_SRC.contains("set_ipc_send_reply_cap_oracle_enabled("),
+            "the `yarm.ipc_send_reply_cap_oracle` knob must parse + apply"
+        );
+        assert!(
+            MOD_SRC.contains("fn ipc_send_reply_cap_oracle_active()")
+                && MOD_SRC.contains("ipc_send_reply_cap_oracle_active()"),
+            "the reply-cap oracle active predicate must gate the shared coordination hook"
+        );
+        assert!(
+            X86_BOOT_SRC.contains("provision_init_ipc_send_reply_cap_oracle(")
+                && X86_BOOT_SRC.contains("init_args[14] = reply_cap as u64;")
+                && X86_BOOT_SRC.contains("init_args[17] = 1;"),
+            "x86_64 boot must provision coord(13) + reply cap(14) + discriminator(17)"
+        );
+        assert!(
+            INIT_SRC.contains("run_ipc_send_reply_cap_oracle(")
+                && INIT_SRC.contains("ctx.pm_request_recv_cap.is_some()"),
+            "init must dispatch the reply-cap oracle on the slot-17 discriminator"
+        );
+    }
+
+    // The oracle child verifies it received a FRESH receiver-local reply cap (via the
+    // separate reply_cap meta field), NOT the sender-local handle.
+    #[test]
+    fn oracle_verifies_fresh_reply_cap() {
+        let oracle = INIT_SRC
+            .split_once("fn run_ipc_send_reply_cap_oracle(")
+            .map(|(_, r)| {
+                r.split_once("IPC_SEND_REPLY_CAP_ORACLE_PARENT_DONE")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(
+            !oracle.is_empty(),
+            "the reply-cap oracle workload must exist"
+        );
+        assert!(
+            oracle.contains("received.reply_cap")
+                && oracle.contains("reply_is_fresh")
+                && oracle.contains("c != reply_cap"),
+            "the child must verify the received reply cap is fresh (not the sender-local handle)"
+        );
+        assert!(
+            !oracle.contains("FLAG_REPLY_CAP"),
+            "the oracle send is a plain FLAG_CAP_TRANSFER (kernel routes on object type; no user reply flag)"
+        );
+    }
+
+    // 193A/193B/193C + prior retirements intact.
+    #[test]
+    fn prior_guarantees_intact() {
+        assert!(
+            MOD_SRC.contains("class=IpcSendPlain")
+                && MOD_SRC.contains("class=IpcSendOrdinaryCap")
+                && MOD_SRC.contains("class=FutexWait result=ok")
+                && MOD_SRC.contains("class=Yield result=ok"),
+            "193A/193C + 192A/192B retirements must remain"
+        );
+        assert!(
+            INIT_SRC.contains("fn run_ipc_send_plain_oracle(")
+                && INIT_SRC.contains("fn run_ipc_send_cap_oracle("),
+            "the 193B/193C oracles must remain"
         );
     }
 }

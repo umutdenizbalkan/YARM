@@ -434,17 +434,18 @@ pub(super) fn handle_ipc_send(
                             _ => (None, IpcSchedulerPlan::None),
                         }
                     } else {
-                        // Stage 193A (BROAD-IPC DECOMPOSITION): try the PLAIN waiting-receiver
-                        // boundary split FIRST. On Ok(true) the payload/meta were snapshotted
-                        // by value under the broad borrow; the trap-entry drain does the user
-                        // copy + endpoint-slot clear + wake AFTER the broad borrow drops (no
-                        // ipc_state_lock across the copy, no cap materialization), so NO
-                        // in-lock wake plan here (the drain wakes exactly once). On Ok(false)
-                        // (cap-transfer / reply-cap / no drainer) the plain producer consumed
-                        // NOTHING, so the legacy in-broad-lock path below runs. On Err the
-                        // producer consumed the blocked state then hit a real buffer fault →
-                        // map to UserMemoryFault (do NOT re-run the legacy delivery).
-                        match kernel.try_ipc_send_boundary_split_plain_pub(
+                        // Stage 193A/193C/193D (BROAD-IPC DECOMPOSITION): try the IpcSend
+                        // boundary splits in order — plain → reply-cap object → ordinary cap
+                        // (see `try_ipc_send_boundary_split_any_pub`). On Ok(true) a producer
+                        // snapshotted by value under the broad borrow (consuming any transfer
+                        // envelope ONCE); the trap-entry drain does the user copy / cap
+                        // materialize + wake AFTER the broad borrow drops (no ipc_state_lock
+                        // across the copy/mint), so NO in-lock wake plan here (the drain wakes
+                        // exactly once). On Ok(false) (shared-region / no drainer) nothing was
+                        // consumed → the legacy in-broad-lock path below runs. On Err a
+                        // producer consumed state then hit a real Phase-A fault → map to
+                        // UserMemoryFault (do NOT re-run the legacy delivery).
+                        match kernel.try_ipc_send_boundary_split_any_pub(
                             receiver_tid.0,
                             endpoint_idx,
                             &msg,
@@ -455,58 +456,28 @@ pub(super) fn handle_ipc_send(
                                 IpcSchedulerPlan::None,
                             ),
                             Ok(false) => {
-                                // Stage 193C (BROAD-IPC DECOMPOSITION): the plain slice
-                                // declined; try the ORDINARY cap-transfer boundary split
-                                // next. On Ok(true) Phase A consumed the transfer envelope
-                                // ONCE and snapshotted object/rights/delegation + payload/meta
-                                // by value; the trap-entry drain materializes the fresh
-                                // receiver-local cap + copies + wakes AFTER the broad borrow
-                                // drops (no ipc_state_lock across the mint/copy), so NO in-lock
-                                // wake plan here. On Ok(false) (reply-cap / shared-region / no
-                                // drainer) nothing was consumed → legacy path. On Err the
-                                // envelope was consumed then a Phase-A fault → UserMemoryFault.
-                                match kernel.try_ipc_send_boundary_split_ordinary_cap_pub(
-                                    receiver_tid.0,
-                                    endpoint_idx,
-                                    &msg,
-                                ) {
-                                    Ok(true) => (Some(Ok(())), IpcSchedulerPlan::None),
-                                    Err(_e) => (
+                                // Stage 4K/4O legacy: recv-v2 blocked receiver — deliver
+                                // directly outside ipc_state_lock (still under the broad
+                                // borrow). Handles the shared-region variant all boundary
+                                // slices decline. Return Some(Err) on failure (not ?) so the
+                                // outer error path can release the transfer envelope.
+                                match complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg)
+                                {
+                                    Ok(()) => {
+                                        kernel.ipc_clear_plain_receiver_waiter_only(
+                                            endpoint_idx,
+                                            receiver_tid,
+                                        );
+                                        kernel.note_split_recv_v2_delivery();
+                                        if transfer_cap.is_some() {
+                                            kernel.note_cap_transfer_recv_v2_delivery();
+                                        }
+                                        (Some(Ok(())), IpcSchedulerPlan::WakeReceiver(receiver_tid))
+                                    }
+                                    Err(_err) => (
                                         Some(Err(KernelError::UserMemoryFault)),
                                         IpcSchedulerPlan::None,
                                     ),
-                                    Ok(false) => {
-                                        // Stage 4K/4O legacy: recv-v2 blocked receiver —
-                                        // deliver directly outside ipc_state_lock (still under
-                                        // the broad borrow). Handles the reply-cap / shared
-                                        // variants both boundary slices decline. Return
-                                        // Some(Err) on failure (not ?) so the outer error path
-                                        // can release the transfer envelope.
-                                        match complete_blocked_recv_for_waiter(
-                                            kernel,
-                                            receiver_tid.0,
-                                            &msg,
-                                        ) {
-                                            Ok(()) => {
-                                                kernel.ipc_clear_plain_receiver_waiter_only(
-                                                    endpoint_idx,
-                                                    receiver_tid,
-                                                );
-                                                kernel.note_split_recv_v2_delivery();
-                                                if transfer_cap.is_some() {
-                                                    kernel.note_cap_transfer_recv_v2_delivery();
-                                                }
-                                                (
-                                                    Some(Ok(())),
-                                                    IpcSchedulerPlan::WakeReceiver(receiver_tid),
-                                                )
-                                            }
-                                            Err(_err) => (
-                                                Some(Err(KernelError::UserMemoryFault)),
-                                                IpcSchedulerPlan::None,
-                                            ),
-                                        }
-                                    }
                                 }
                             }
                         }

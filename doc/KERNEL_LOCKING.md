@@ -959,6 +959,68 @@ remove implicit global-lock coupling from syscall/trap paths.
     ReapFaultedTask stay global-lock-only.
   * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
 
+- **Stage 193D (IPCSEND REPLY-CAP BOUNDARY SPLIT) — DONE and QEMU-PROVEN (controlled
+  oracle).** Extends the IpcSend boundary decomposition to a REPLY-CAP transfer to an
+  already-recv-v2-blocked receiver, reusing the SAME 188D reply-cap producer + executor
+  `ipc_reply` carries. The broad `SpinLock<KernelState>` is NOT retired.
+  * **Object-based routing (key finding).** The userspace IpcSend ABI carries no message
+    flags — `handle_ipc_send` tags every transfer as `FLAG_CAP_TRANSFER`, never
+    `FLAG_REPLY_CAP` (which only `ipc_call` / `ipc_reply` set). So a "reply-cap transfer via
+    IpcSend" is a transfer whose *object* is a `Reply`, identified by inspecting the cap, not
+    a flag. The reply-cap slice PEEKS the transfer envelope's `source_object`
+    (`peek_transfer_envelope_source_object`, read-only — no take, no refcount) and only a
+    `Reply` object takes it; it runs BEFORE the ordinary-cap slice so a Reply object is never
+    mis-consumed by the ordinary producer. On a match it synthesizes a `FLAG_REPLY_CAP` view
+    of the message (same sender/opcode/payload/handle) so the 188D producer's flag gate
+    accepts it, then drives the producer unchanged. Non-Reply transfers decline (`Ok(false)`)
+    and fall straight through to the ordinary-cap slice. Chaining:
+    `try_ipc_send_boundary_split_any_pub` = plain → reply-cap → ordinary-cap → (caller) legacy.
+  * **Phase A (broad borrow) — no mint/copy/wake.** The 188D producer consumes the reply-cap
+    transfer envelope ONCE and snapshots the reply object's registry coordinates
+    `(reply_index, reply_generation)` + receiver cnode + payload/meta BY VALUE. No cap is
+    minted, no IPC record is written, nothing is copied to user, the receiver is not woken.
+  * **Phase B/C (trap-entry drain, global lock dropped).** The 188D executor solves the
+    reply-cap rank inversion by phase separation: mint the FRESH receiver-local reply cap via
+    the rank-4 seam (no IPC lock); record the waiter-cap via the rank-3 IPC seam (disjoint
+    critical section, rolling the mint back on a stale record); encode the recv-v2 meta with
+    the fresh CapId + the reply-cap meta flag; 186E user copy; then clear regs + waiter slot
+    and wake once. A user-copy fault rolls BOTH the recorded waiter-cap and the mint back
+    (no reply-cap / refcount / delegation leak).
+  * **One-shot + authority + wake-once (proven live).** The receiver-local reply cap is minted
+    fresh — identified by `(reply_index, reply_generation)`, never the sender-local handle:
+    the oracle child observes a fresh `reply_cap` id (`65549`) distinct from the sender-local
+    handle it transferred (`65542`), via the separate recv-meta reply-cap field
+    (`reply_is_fresh=1`). The reply cap keeps its one-shot registry semantics (recorded as a
+    reply-cap in the reply registry, consumed by the eventual `ipc_reply`); the transfer
+    envelope is consumed exactly once (Phase A); the in-lock plan stays
+    `IpcSchedulerPlan::None`, so only the drain wakes (wake-once). Byte-identical payload
+    (`payload_match=1`).
+  * **Live — controlled oracle.** No natural boot IpcSend transfers a reply cap (reply caps
+    flow via `ipc_call`), so `class=IpcSendReplyCap` fires only under the
+    `yarm.ipc_send_reply_cap_oracle=1` sub-knob. The bootstrap mints a transferable one-shot
+    reply cap directly into init's cnode via the EXISTING seam
+    (`create_reply_cap_for_caller_in_cnode` — the historical `create_reply_cap_for_caller`
+    now delegates to it with `dest_cnode=None`, unchanged for every other caller). init then
+    reuses the 193B fork + atomic receiver-block coordination harness (coord cap in init slot
+    13, the reply cap in slot 14, a slot-17 discriminator that separates it from sender-wake).
+    `YARM_IPC_SEND_REPLY_CAP_ORACLE=1` oracle smoke observes the full marker chain
+    (`SPLIT_BEGIN → SNAPSHOT_OK → MATERIALIZE_OK → USER_COPY_OK → WAKE_OK → SPLIT_DONE
+    result=ok → GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendReplyCap result=ok →
+    IPC_SEND_REPLY_CAP_LIVE_ORACLE_DONE result=ok`) + the child's fresh-reply-cap
+    byte-identical recv; rejects `IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_FAIL` /
+    `DISPATCH_POST_WORK_FAIL`.
+  * **IPC_FINAL parity fix.** The 193C ordinary-cap boundary executor now also emits the
+    Stage 156 recv-side `IPC_TRANSFER_CAP_MATERIALIZE_OK` marker it replaced (the boundary
+    split had diverted the boot's natural cap transfer off the legacy
+    `materialize_received_message_cap` path, silently dropping that marker from the IPC_FINAL
+    extended profile). Restored for parity; IPC_FINAL passes again.
+  * **Scope.** core + IPC_FINAL + crash-restart + IpcSendPlain / IpcSendOrdinaryCap /
+    IpcSendReplyCap oracles + smp2/smp4 (armed and knob-off) pass; riscv64 + aarch64 core keep
+    full server-chain parity. IpcCall / IpcReply broad paths, shared-region IpcSend, the
+    no-waiter enqueue path, RecvSharedV3, VM / spawn / fork / cap-mint, and ReapFaultedTask
+    stay global-lock-only.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

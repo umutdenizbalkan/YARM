@@ -1511,6 +1511,28 @@ impl KernelState {
         caller_reply_recv_cap: CapId,
         responder_tid: Option<ThreadId>,
     ) -> Result<CapId, KernelError> {
+        self.create_reply_cap_for_caller_in_cnode(
+            caller_tid,
+            caller_reply_recv_cap,
+            responder_tid,
+            None,
+        )
+    }
+
+    /// Stage 193D: `create_reply_cap_for_caller` with an explicit destination cnode
+    /// for the minted Reply cap. `dest_cnode == None` mints into the ACTIVE cnode
+    /// (byte-identical to the historical behavior every existing caller relies on);
+    /// `Some(cnode)` mints into that cnode instead (used to provision a transferable
+    /// reply cap into init's cnode at boot for the reply-cap live oracle). The
+    /// one-shot reply record reservation / rollback / Phase-3 persist is UNCHANGED —
+    /// only the mint target is parameterized.
+    pub fn create_reply_cap_for_caller_in_cnode(
+        &mut self,
+        caller_tid: ThreadId,
+        caller_reply_recv_cap: CapId,
+        responder_tid: Option<ThreadId>,
+        dest_cnode: Option<crate::kernel::capabilities::CNodeId>,
+    ) -> Result<CapId, KernelError> {
         let reply_capability =
             self.resolve_capability_for_task(caller_tid.0, caller_reply_recv_cap)?;
         if !reply_capability.has_right(CapRights::RECEIVE) {
@@ -1559,14 +1581,21 @@ impl KernelState {
                 err
             })?;
 
-        // Phase 2: Mint the Reply cap into the caller's (current) cnode.
-        let cap_id = match self.mint_capability_for_active_cnode(Capability::new(
+        // Phase 2: Mint the Reply cap into the destination cnode (the caller's active
+        // cnode when dest_cnode is None — the historical default; an explicit cnode
+        // for the Stage 193D reply-cap oracle provisioning).
+        let reply_capability_to_mint = Capability::new(
             CapObject::Reply {
                 index: slot,
                 generation,
             },
             CapRights::SEND,
-        )) {
+        );
+        let mint_result = match dest_cnode {
+            Some(cnode) => self.mint_capability_in_cnode(cnode, reply_capability_to_mint),
+            None => self.mint_capability_for_active_cnode(reply_capability_to_mint),
+        };
+        let cap_id = match mint_result {
             Ok(id) => id,
             Err(err) => {
                 let active_cnode = self.current_task_cnode().map(|c| c.0).unwrap_or(u64::MAX);
@@ -1836,6 +1865,141 @@ impl KernelState {
         endpoint_idx: usize,
         msg: &Message,
     ) -> Result<bool, KernelError> {
+        self.try_ipc_send_boundary_split_ordinary_cap(waiter_tid, endpoint_idx, msg)
+    }
+
+    /// Stage 193D (BROAD-IPC DECOMPOSITION): the IpcSend REPLY-CAP transfer
+    /// waiting-receiver boundary split. Reuses the SAME 188D reply-cap producer +
+    /// trap-entry executor as [`try_ipc_reply_boundary_split`], but ONLY for the reply-cap
+    /// slice — the producer returns `Ok(false)` for any plain / ordinary-cap / shared
+    /// message (those fall back to the legacy in-broad-lock path). Phase A consumes the
+    /// reply-cap transfer envelope ONCE and snapshots the reply object's registry
+    /// coordinates (reply_index, reply_generation) + payload/meta by value (NO mint, NO IPC
+    /// record, NO user copy, NO `ipc_state_lock` across a copy); the drain mints the fresh
+    /// receiver-local one-shot reply cap through the rank-4 seam, records the waiter-cap
+    /// through the rank-3 IPC seam, copies payload/meta through the 186E seam, and wakes the
+    /// receiver once AFTER the broad borrow drops. Tags the stash origin so the drain emits
+    /// the IpcSend-reply-cap boundary markers.
+    ///
+    /// `Ok(true)` — snapshotted (envelope consumed once); the drain completes mint + record
+    ///   + copy + wake (sender returns Ok).
+    /// `Ok(false)` — not the reply-cap slice / no drainer; caller uses the legacy path (the
+    ///   producer consumed NOTHING before returning false).
+    /// `Err(_)` — a real Phase-A error (undersized/unmapped waiter buffer, missing/dead
+    ///   envelope, non-`Reply` object) → `UserMemoryFault`, exactly as the legacy delivery
+    ///   failure (the envelope disposition matches the legacy arm).
+    fn try_ipc_send_boundary_split_reply_cap(
+        &mut self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &Message,
+    ) -> Result<bool, KernelError> {
+        use crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery;
+        // OBJECT-BASED routing: the userspace IpcSend ABI carries no FLAG_REPLY_CAP
+        // (handle_ipc_send tags every transfer as FLAG_CAP_TRANSFER), so a reply-cap
+        // transfer is identified by the transferred cap's OBJECT being a `Reply`, not
+        // by a message flag. Peek the envelope's source object WITHOUT consuming it;
+        // anything but a Reply object declines (Ok(false)) so the ordinary-cap slice /
+        // legacy path handles it. This runs BEFORE the ordinary-cap slice so a Reply
+        // object is never mis-consumed by the ordinary producer.
+        let Some(handle) = msg.transferred_cap() else {
+            return Ok(false);
+        };
+        let is_reply_object = matches!(
+            self.peek_transfer_envelope_source_object(handle.0),
+            Some(CapObject::Reply { .. })
+        );
+        if !is_reply_object {
+            return Ok(false);
+        }
+        crate::yarm_log!(
+            "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_BEGIN waiter_tid={} endpoint={}",
+            waiter_tid,
+            endpoint_idx
+        );
+        // The 188D producer gates on FLAG_REPLY_CAP; synthesize a reply-flagged view
+        // of this message (same sender/opcode/payload/handle) so it takes the reply-cap
+        // envelope + reply-object snapshot path. `Message::with_header` re-validates the
+        // flag/handle pairing (a reply-cap flag requires a transfer handle — present).
+        let reply_msg = match Message::with_header(
+            msg.sender_tid.0,
+            msg.opcode,
+            Message::FLAG_REPLY_CAP,
+            Some(handle.0),
+            msg.as_slice(),
+        ) {
+            Ok(m) => m,
+            Err(_) => {
+                crate::yarm_log!(
+                    "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_FAIL reason=synth_msg waiter_tid={}",
+                    waiter_tid
+                );
+                return Err(KernelError::UserMemoryFault);
+            }
+        };
+        match produce_blocked_waiter_reply_cap_delivery(self, waiter_tid, endpoint_idx, &reply_msg)
+        {
+            Ok(true) => {
+                let cpu_idx = self.current_cpu().0 as usize;
+                crate::kernel::boot::ipc_send_reply_cap_boundary_origin_set(cpu_idx);
+                crate::yarm_log!(
+                    "IPC_SEND_REPLY_CAP_BOUNDARY_SNAPSHOT_OK waiter_tid={}",
+                    waiter_tid
+                );
+                Ok(true)
+            }
+            Ok(false) => {
+                crate::yarm_log!(
+                    "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_DEFERRED reason=unsupported_or_no_drainer waiter_tid={}",
+                    waiter_tid
+                );
+                Ok(false)
+            }
+            Err(e) => {
+                crate::yarm_log!(
+                    "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_FAIL reason=producer_error waiter_tid={} err={:?}",
+                    waiter_tid,
+                    e
+                );
+                Err(KernelError::UserMemoryFault)
+            }
+        }
+    }
+
+    /// Stage 193D: `pub(crate)` entry the IpcSend syscall handler calls for the reply-cap
+    /// transfer waiting-receiver boundary split.
+    pub(crate) fn try_ipc_send_boundary_split_reply_cap_pub(
+        &mut self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &Message,
+    ) -> Result<bool, KernelError> {
+        self.try_ipc_send_boundary_split_reply_cap(waiter_tid, endpoint_idx, msg)
+    }
+
+    /// Stage 193D: try every IpcSend boundary split in the ONE correct order for a
+    /// recv-v2-blocked receiver: plain (193A) → reply-cap object (193D) → ordinary
+    /// cap (193C). Reply-cap runs BEFORE ordinary-cap because a transferred `Reply`
+    /// object must not be mis-consumed by the ordinary producer (the object-based
+    /// reply-cap split peeks WITHOUT consuming, so a non-Reply transfer declines and
+    /// falls straight through to the ordinary slice). Returns `Ok(true)` if any slice
+    /// produced a boundary snapshot (the drain completes copy/materialize + wake),
+    /// `Ok(false)` if none applied (caller uses the legacy in-broad-lock path — the
+    /// producers consumed NOTHING), or `Err` on a real Phase-A fault.
+    pub(crate) fn try_ipc_send_boundary_split_any_pub(
+        &mut self,
+        waiter_tid: u64,
+        endpoint_idx: usize,
+        msg: &Message,
+    ) -> Result<bool, KernelError> {
+        match self.try_ipc_send_boundary_split_plain(waiter_tid, endpoint_idx, msg)? {
+            true => return Ok(true),
+            false => {}
+        }
+        match self.try_ipc_send_boundary_split_reply_cap(waiter_tid, endpoint_idx, msg)? {
+            true => return Ok(true),
+            false => {}
+        }
         self.try_ipc_send_boundary_split_ordinary_cap(waiter_tid, endpoint_idx, msg)
     }
 
