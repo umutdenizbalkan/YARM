@@ -1306,6 +1306,39 @@ pub(crate) fn maybe_log_ipc_send_plain_enqueue_retired() {
     }
 }
 
+// ── Stage 193F (BROAD-IPC DECOMPOSITION — IpcSend ordinary-cap no-waiter enqueue slice) ─
+//
+// IpcSend of an ORDINARY cap-transfer message (FLAG_CAP_TRANSFER / FLAG_CAP_TRANSFER_PLAIN,
+// exactly one transferred cap whose OBJECT is ordinary — not a Reply, not a shared-region)
+// to a buffered endpoint with NO blocked receiver enqueues via the endpoint-only Stage 4E
+// seam. Like 193E there is NO deferred Phase B/C work and NO receiver user-copy / cap
+// materialization / wake / sender block AT ENQUEUE TIME: the transfer envelope is PRESERVED
+// in the envelope table (the queued message carries only its numeric handle), and the
+// receiver's LATER recv_v2 consumes the envelope + materializes a fresh receiver-local cap
+// (`IPC_TRANSFER_CAP_MATERIALIZE_OK`). This class formalizes the ORDINARY-object no-waiter
+// cap enqueue (reply-cap / shared-region enqueue stay on the legacy path, NOT retired).
+
+/// Stage 193F: one-shot latch for the IpcSendOrdinaryCapEnqueue retirement markers.
+static IPC_SEND_ORDINARY_CAP_ENQUEUE_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 193F: emit the IpcSendOrdinaryCapEnqueue retirement markers exactly once (first
+/// ordinary-cap no-waiter enqueue completed through the endpoint-only boundary seam).
+pub(crate) fn maybe_log_ipc_send_ordinary_cap_enqueue_retired() {
+    if IPC_SEND_ORDINARY_CAP_ENQUEUE_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendOrdinaryCapEnqueue");
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCapEnqueue result=ok");
+    }
+}
+
 /// Stage 169 (D2-GENUINE-SEND): x86_64-only, default-off gate that runs the
 /// blocking-SEND path (endpoint full / synchronous no-waiter) through explicit
 /// rank-clean scheduler/task/IPC phase markers and relocates its queue-advancing
@@ -2096,6 +2129,28 @@ pub fn ipc_send_enqueue_oracle_enabled() -> bool {
 /// True only when BOTH the base proof knob and the send-enqueue-oracle sub-knob are set.
 pub fn ipc_send_enqueue_oracle_active() -> bool {
     ipc_recv_oracle_proof_enabled() && ipc_send_enqueue_oracle_enabled()
+}
+
+/// Stage 193F: `yarm.ipc_send_cap_enqueue_oracle=1` SUB-knob (layered on the base proof
+/// knob). Gates the IpcSend ordinary-cap no-waiter enqueue live oracle. Like the 193E plain
+/// enqueue oracle it needs NO fork / coordination endpoint — init sends a cap-transfer to
+/// the loopback with no blocked receiver, then recv-drains it to materialize a fresh cap. It
+/// shares the slot-17 discriminator with 193E: slot 17 == 1 selects the plain enqueue oracle,
+/// slot 17 == 2 selects this ordinary-cap enqueue oracle (slots 13 + 14 empty for both).
+pub(crate) static IPC_SEND_CAP_ENQUEUE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_ipc_send_cap_enqueue_oracle_enabled(enabled: bool) {
+    IPC_SEND_CAP_ENQUEUE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ipc_send_cap_enqueue_oracle_enabled() -> bool {
+    IPC_SEND_CAP_ENQUEUE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.
+pub fn ipc_send_cap_enqueue_oracle_active() -> bool {
+    ipc_recv_oracle_proof_enabled() && ipc_send_cap_enqueue_oracle_enabled()
 }
 
 /// True when ANY blocked-waiter IpcSend live oracle (plain 193B / ordinary-cap 193C /

@@ -977,6 +977,13 @@ pub fn bootstrap_first_user_task(
         init_args[17] = 1; // enqueue-oracle discriminator (init otherwise leaves slot 17 zero)
         crate::yarm_log!("IPC_SEND_ENQUEUE_ORACLE_PROVISION_OK slot17=1");
     }
+    // Stage 193F: the ordinary-cap no-waiter enqueue oracle shares the slot-17 discriminator
+    // with 193E but uses value 2 (slots 13 + 14 empty). Like 193E it needs no cap beyond E1
+    // (slots 6/7, base proof knob). x86_64-only live target.
+    else if crate::kernel::boot::ipc_send_cap_enqueue_oracle_active() {
+        init_args[17] = 2; // cap-enqueue-oracle discriminator
+        crate::yarm_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_PROVISION_OK slot17=2");
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

@@ -1145,11 +1145,15 @@ pub fn run() {
             // sub-knob) selects this instead of sender-wake; the two are mutually
             // exclusive.
             run_ipc_send_plain_oracle(proof_send, proof_recv, coord_recv, ctx.task_id);
-        } else if ctx.pm_request_recv_cap.is_some() {
-            // Slots 13 + 14 empty + slot 17 discriminator set → Stage 193E IpcSend plain
-            // no-waiter enqueue live oracle. Needs no coordination cap: a plain send to E1
-            // (slots 6/7) with no blocked receiver simply enqueues.
-            run_ipc_send_enqueue_oracle(proof_send, proof_recv, ctx.task_id);
+        } else if let Some(mode) = ctx.pm_request_recv_cap {
+            // Slots 13 + 14 empty + slot 17 discriminator set → a no-waiter enqueue live
+            // oracle (needs no coordination cap; sends to E1 in slots 6/7). The slot-17 value
+            // selects which: 1 = Stage 193E plain enqueue, 2 = Stage 193F ordinary-cap enqueue.
+            if mode == 2 {
+                run_ipc_send_cap_enqueue_oracle(proof_send, proof_recv, ctx.task_id);
+            } else {
+                run_ipc_send_enqueue_oracle(proof_send, proof_recv, ctx.task_id);
+            }
         } else {
             // Neither sub-knob: intentionally not driven (no fake marker). The
             // queued-split + rollback proof above stands alone.
@@ -2541,6 +2545,132 @@ fn run_ipc_send_enqueue_oracle(e1_send: u32, e1_recv: u32, init_tid: u64) {
         }
     }
     yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_DONE");
+}
+
+/// Stage 193F: application opcode for the ordinary-cap enqueue oracle message.
+#[cfg(not(test))]
+const IPC_SEND_CAP_ENQUEUE_ORACLE_OPCODE: u16 = 0x0FA6;
+
+/// Stage 193F: the payload the ordinary-cap no-waiter enqueue oracle delivers.
+#[cfg(not(test))]
+const IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD: [u8; 8] = *b"CAPENQ6F";
+
+/// Stage 193F: deterministic IpcSend ordinary-cap no-waiter enqueue LIVE oracle.
+///
+/// Runs ONLY under BOTH `yarm.ipc_recv_proof=1` and `yarm.ipc_send_cap_enqueue_oracle=1`
+/// (gated by the slot-17 discriminator value 2, slots 13 + 14 empty). Fires the Stage 193F
+/// `class=IpcSendOrdinaryCapEnqueue` boundary split LIVE by driving the exact slice it
+/// decomposes: an IpcSend transferring an ORDINARY cap to the loopback endpoint E1 with NO
+/// blocked receiver.
+///
+/// No fork and no coordination endpoint are needed. init transfers its E1 SEND cap (an
+/// ordinary endpoint cap) with no receiver blocked → the message ENQUEUES with the transfer
+/// envelope PRESERVED (the 193F boundary split emits its markers + the retirement). init then
+/// recv-drains E1 (the receiver-later path): the recv consumes the envelope and materializes a
+/// FRESH receiver-local cap into init's cnode (`IPC_TRANSFER_CAP_MATERIALIZE_OK`), which the
+/// oracle verifies is NOT the sender-local handle — proving a sender-local CapId is never the
+/// receiver's authority.
+#[cfg(not(test))]
+fn run_ipc_send_cap_enqueue_oracle(e1_send: u32, e1_recv: u32, init_tid: u64) {
+    use yarm_user_rt::ipc::Message;
+
+    const PREDRAIN_MAX: usize = 512;
+
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_BEGIN");
+    yarm_user_rt::user_log!(
+        "IPC_SEND_CAP_ENQUEUE_ORACLE_SETUP e1_send={} e1_recv={} init_tid={}",
+        e1_send,
+        e1_recv,
+        init_tid
+    );
+
+    // (0) Drain E1 empty so the enqueue starts from empty and the later recv observes
+    // exactly our message.
+    let mut predrained = 0usize;
+    for _ in 0..PREDRAIN_MAX {
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e1_recv, 0) } {
+            Ok(Some(_)) => predrained += 1,
+            _ => break,
+        }
+    }
+    yarm_user_rt::user_log!(
+        "IPC_SEND_CAP_ENQUEUE_ORACLE_PREDRAIN_DONE count={}",
+        predrained
+    );
+
+    // (1) ORDINARY cap-transfer send with no blocked receiver → the message ENQUEUES (the
+    // 193F boundary split emits IPC_SEND_CAP_ENQUEUE_BOUNDARY_* + the retirement). init is
+    // running (not recv-blocked), so there is no receiver waiter on E1.
+    yarm_user_rt::user_log!(
+        "IPC_SEND_CAP_ENQUEUE_ORACLE_SEND_BEGIN transfer_cap={}",
+        e1_send
+    );
+    let Ok(msg) = Message::with_header(
+        0,
+        IPC_SEND_CAP_ENQUEUE_ORACLE_OPCODE,
+        Message::FLAG_CAP_TRANSFER,
+        Some(e1_send as u64),
+        &IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD,
+    ) else {
+        yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_MSG_BUILD_FAIL");
+        return;
+    };
+    // SAFETY: e1_send is init's SEND cap to the proof loopback; the transferred cap (also
+    // e1_send) is an ordinary endpoint cap init holds (as in the base rollback subtest).
+    let send = unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &msg) };
+    match send {
+        Ok(()) => {
+            yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_SEND_OK");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!(
+                "IPC_SEND_CAP_ENQUEUE_ORACLE_SEND_FAILED code={}",
+                e as usize
+            );
+            return;
+        }
+    }
+
+    // (2) Receiver-later dequeue: recv_v2 drains the queued cap-transfer message → the recv
+    // consumes the envelope and materializes a FRESH receiver-local cap. A cap-transfer is
+    // delivered with the 2-byte inline opcode prefix stripped; accept either framing.
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_BEGIN");
+    match unsafe { yarm_user_rt::syscall::ipc_recv_v2(e1_recv) } {
+        Ok(Some(received)) => {
+            let got = received.message.as_slice();
+            let opcode_le = IPC_SEND_CAP_ENQUEUE_ORACLE_OPCODE.to_le_bytes();
+            let stripped = got == &IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD[..];
+            let framed = got.len() == 2 + IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD.len()
+                && got[0..2] == opcode_le
+                && got[2..] == IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD[..];
+            let payload_match = stripped || framed;
+            // The receiver-local CapId MUST be fresh — a real cap that is NOT the sender-local
+            // handle (e1_send) init transferred.
+            let recv_cap_id = received.transferred_cap;
+            let has_cap = recv_cap_id.is_some();
+            let cap_is_fresh = matches!(recv_cap_id, Some(c) if c != e1_send);
+            yarm_user_rt::user_log!(
+                "IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_OK payload_match={} cap_is_fresh={} transferred_cap={} recv_cap={} sender_local_cap={} payload_len={} sender_tid={}",
+                payload_match as u8,
+                cap_is_fresh as u8,
+                has_cap as u8,
+                recv_cap_id.unwrap_or(0),
+                e1_send,
+                got.len(),
+                received.sender_tid
+            );
+            if payload_match && cap_is_fresh {
+                yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_LIVE_ORACLE_DONE result=ok");
+            }
+        }
+        Ok(None) => {
+            yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_RET code=wouldblock");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_RET code={}", e as usize);
+        }
+    }
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_DONE");
 }
 
 #[cfg(test)]

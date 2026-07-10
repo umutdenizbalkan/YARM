@@ -61557,23 +61557,27 @@ mod stage193e_ipc_send_plain_enqueue {
         let body = IPC_STATE_SRC
             .split_once("fn ipc_try_send_enqueue_boundary_split_plain(")
             .map(|(_, r)| {
-                r.split_once("\n    /// Return true if")
+                r.split_once("\n    /// Stage 193F")
                     .map(|(b, _)| b)
                     .unwrap_or(r)
             })
             .unwrap_or("");
         assert!(!body.is_empty(), "the wrapper body must exist");
         // The plain gate + non-plain delegation must appear BEFORE the BEGIN marker.
+        // Non-plain now routes to the 193F ordinary-cap enqueue boundary (which itself
+        // defers reply-cap / shared / Reply objects to the Stage 4E path).
         let plain_gate = body.find("let plain = ").expect("plain gate");
         let delegate = body
-            .find("return self.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg);")
-            .expect("non-plain delegation");
+            .find(
+                "return self.ipc_try_send_enqueue_boundary_split_ordinary_cap(endpoint_idx, msg);",
+            )
+            .expect("non-plain delegation to the 193F ordinary-cap boundary");
         let begin = body
             .find("IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN")
             .expect("begin marker");
         assert!(
             plain_gate < delegate && delegate < begin,
-            "non-plain messages must defer to the Stage 4E path BEFORE any enqueue marker"
+            "non-plain messages must route to the ordinary-cap boundary BEFORE any plain enqueue marker"
         );
         assert!(
             body.contains("FLAG_CAP_TRANSFER")
@@ -61618,7 +61622,7 @@ mod stage193e_ipc_send_plain_enqueue {
         let body = IPC_STATE_SRC
             .split_once("fn ipc_try_send_enqueue_boundary_split_plain(")
             .map(|(_, r)| {
-                r.split_once("\n    /// Return true if")
+                r.split_once("\n    /// Stage 193F")
                     .map(|(b, _)| b)
                     .unwrap_or(r)
             })
@@ -61709,6 +61713,224 @@ mod stage193e_ipc_send_plain_enqueue {
             INIT_SRC.contains("fn run_ipc_send_plain_oracle(")
                 && INIT_SRC.contains("fn run_ipc_send_reply_cap_oracle("),
             "the 193B/193D oracles must remain"
+        );
+    }
+}
+
+// Stage 193F — IPCSEND ORDINARY-CAP NO-WAITER ENQUEUE BOUNDARY SPLIT. Formalizes the
+// ordinary-cap no-waiter enqueue slice: an IpcSend transferring an ORDINARY cap (object is
+// not a Reply, not a shared-region) to a buffered endpoint with NO blocked receiver enqueues
+// via the endpoint-only Stage 4E seam with the transfer envelope PRESERVED (no cap
+// materialization at enqueue). The receiver's LATER recv_v2 consumes the envelope +
+// materializes a fresh receiver-local cap. The broad global lock is NOT retired.
+mod stage193f_ipc_send_cap_enqueue {
+    use super::*;
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RECV_CORE_SRC: &str = include_str!("../recv_core.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    fn cap_enqueue_body() -> &'static str {
+        IPC_STATE_SRC
+            .split_once("fn ipc_try_send_enqueue_boundary_split_ordinary_cap(")
+            .map(|(_, r)| {
+                r.split_once("\n    /// Return true if")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("")
+    }
+
+    // INVENTORY: the plain enqueue wrapper routes non-plain messages to the ordinary-cap
+    // enqueue boundary, which reuses the SAME Stage 4E endpoint-only enqueue seam.
+    #[test]
+    fn cap_enqueue_wraps_stage4e_seam() {
+        assert!(
+            IPC_STATE_SRC.contains(
+                "return self.ipc_try_send_enqueue_boundary_split_ordinary_cap(endpoint_idx, msg);"
+            ),
+            "the plain enqueue wrapper must route non-plain messages to the ordinary-cap boundary"
+        );
+        let body = cap_enqueue_body();
+        assert!(!body.is_empty(), "the ordinary-cap enqueue body must exist");
+        assert!(
+            body.contains("self.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg)"),
+            "the ordinary-cap enqueue must reuse the Stage 4E endpoint-only enqueue seam"
+        );
+    }
+
+    // Object-based routing: Reply objects (peeked via the non-consuming envelope peek),
+    // shared-region (OPCODE_SHARED_MEM), and reply-cap flag messages defer to Stage 4E
+    // BEFORE any marker/mutation.
+    #[test]
+    fn reply_shared_defer_before_markers() {
+        let body = cap_enqueue_body();
+        // The ordinary gate + Stage 4E delegation appear BEFORE the BEGIN marker.
+        let ordinary = body.find("let ordinary =").expect("ordinary gate");
+        let delegate = body
+            .find("return self.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg);")
+            .expect("defer delegation");
+        let begin = body
+            .find("IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_BEGIN")
+            .expect("begin marker");
+        assert!(
+            ordinary < delegate && delegate < begin,
+            "reply/shared/Reply-object transfers must defer to Stage 4E before any cap-enqueue marker"
+        );
+        assert!(
+            body.contains("peek_transfer_envelope_source_object(")
+                && body.contains("CapObject::Reply { .. }"),
+            "the ordinary gate must reject Reply objects via the non-consuming envelope peek"
+        );
+        assert!(
+            body.contains("OPCODE_SHARED_MEM") && body.contains("FLAG_REPLY_CAP"),
+            "the ordinary gate must exclude shared-region + reply-cap-flag transfers"
+        );
+    }
+
+    // MARKERS + one-shot retirement; TRANSFER_STATE marker records the envelope is preserved
+    // (NOT consumed / NO cap materialized) at enqueue.
+    #[test]
+    fn cap_enqueue_markers_exist() {
+        for m in [
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_ENQUEUE_OK",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_TRANSFER_STATE_OK",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SENDER_STATE_OK",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok",
+            "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_DEFERRED",
+        ] {
+            assert!(
+                IPC_STATE_SRC.contains(m),
+                "cap-enqueue boundary marker `{m}` must exist"
+            );
+        }
+        assert!(
+            IPC_STATE_SRC.contains("envelope=preserved")
+                && IPC_STATE_SRC.contains("sender_blocked=0"),
+            "the TRANSFER_STATE + SENDER_STATE markers must record envelope-preserved + no sender block"
+        );
+        assert!(
+            MOD_SRC.contains(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCapEnqueue result=ok"
+            ) && MOD_SRC.contains("fn maybe_log_ipc_send_ordinary_cap_enqueue_retired()"),
+            "the IpcSendOrdinaryCapEnqueue retirement marker + latch must exist"
+        );
+        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+    }
+
+    // No cap materialization / user copy at enqueue time — the envelope is preserved and the
+    // receiver materializes later.
+    #[test]
+    fn cap_enqueue_no_materialize_at_enqueue() {
+        let body = cap_enqueue_body();
+        // Check for actual CALL tokens (not the doc prose, which mentions "materialize").
+        assert!(
+            !body.contains("materialize_received_message_cap")
+                && !body.contains("copy_to_user_split")
+                && !body.contains("copy_to_current_user")
+                && !body.contains("take_transfer_envelope(")
+                && !body.contains("apply_scheduler_wake_plan("),
+            "the ordinary-cap enqueue must NOT materialize / copy / consume the envelope / wake at enqueue"
+        );
+    }
+
+    // The receiver-later recv_v2 writeback now encodes an ORDINARY materialized
+    // receiver-local cap into the recv-v2 meta (so it is not orphaned) — proving the
+    // receiver gets a fresh cap. Reply caps retain the historical hidden behavior
+    // (`!snapshot.is_reply_cap` gate) and plain messages map to NO_TRANSFER_CAP.
+    #[test]
+    fn recv_v2_writeback_encodes_materialized_cap() {
+        assert!(
+            RECV_CORE_SRC.contains("match snapshot.materialized_cap {")
+                && RECV_CORE_SRC.contains("Some(cap) if !snapshot.is_reply_cap =>")
+                && RECV_CORE_SRC.contains("SYSCALL_RECV_META_TRANSFERRED_CAP as u64")
+                && RECV_CORE_SRC.contains("_ => (Message::NO_TRANSFER_CAP, 0),"),
+            "the queued-split recv-v2 writeback must encode an ordinary materialized cap (reply/plain → NO_TRANSFER_CAP)"
+        );
+    }
+
+    // Knob + slot-17-value-2 wiring + init dispatch discriminates 193E (1) vs 193F (2).
+    #[test]
+    fn cap_enqueue_oracle_knob_and_slot17_value() {
+        assert!(
+            CMDLINE_SRC.contains("yarm.ipc_send_cap_enqueue_oracle")
+                && CMDLINE_SRC.contains("set_ipc_send_cap_enqueue_oracle_enabled("),
+            "the `yarm.ipc_send_cap_enqueue_oracle` knob must parse + apply"
+        );
+        assert!(
+            MOD_SRC.contains("fn ipc_send_cap_enqueue_oracle_active()"),
+            "the cap-enqueue oracle active predicate must exist"
+        );
+        assert!(
+            X86_BOOT_SRC.contains("ipc_send_cap_enqueue_oracle_active()")
+                && X86_BOOT_SRC.contains("init_args[17] = 2;"),
+            "x86_64 boot must signal the cap-enqueue oracle via slot 17 value 2"
+        );
+        assert!(
+            INIT_SRC
+                .contains("run_ipc_send_cap_enqueue_oracle(proof_send, proof_recv, ctx.task_id)")
+                && INIT_SRC.contains("if mode == 2 {"),
+            "init must dispatch the cap-enqueue oracle on slot-17 value 2"
+        );
+    }
+
+    // The oracle is a cap-transfer send (no fork) + a receiver-later recv that verifies a
+    // fresh receiver-local cap.
+    #[test]
+    fn cap_enqueue_oracle_is_cap_send_then_recv_fresh() {
+        let oracle = INIT_SRC
+            .split_once("fn run_ipc_send_cap_enqueue_oracle(")
+            .map(|(_, r)| {
+                r.split_once("IPC_SEND_CAP_ENQUEUE_ORACLE_DONE")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(
+            !oracle.is_empty(),
+            "the cap-enqueue oracle workload must exist"
+        );
+        assert!(
+            oracle.contains("Message::FLAG_CAP_TRANSFER")
+                && oracle.contains("Some(e1_send as u64)"),
+            "the oracle send must transfer exactly one ordinary cap"
+        );
+        assert!(
+            !oracle.contains("fork_raw"),
+            "the enqueue oracle must not fork"
+        );
+        assert!(
+            oracle.contains("ipc_recv_v2(e1_recv)")
+                && oracle.contains("cap_is_fresh")
+                && oracle.contains("c != e1_send")
+                && oracle.contains("IPC_SEND_CAP_ENQUEUE_LIVE_ORACLE_DONE result=ok"),
+            "the oracle must recv-drain + verify a FRESH receiver-local cap (not the sender handle)"
+        );
+    }
+
+    // 193A/B/C/D/E + prior retirements intact.
+    #[test]
+    fn prior_guarantees_intact() {
+        assert!(
+            MOD_SRC.contains("class=IpcSendPlain")
+                && MOD_SRC.contains("class=IpcSendOrdinaryCap")
+                && MOD_SRC.contains("class=IpcSendReplyCap")
+                && MOD_SRC.contains("class=IpcSendPlainEnqueue")
+                && MOD_SRC.contains("class=FutexWait result=ok")
+                && MOD_SRC.contains("class=Yield result=ok"),
+            "193A/193C/193D/193E + 192A/192B retirements must remain"
+        );
+        assert!(
+            INIT_SRC.contains("fn run_ipc_send_enqueue_oracle(")
+                && INIT_SRC.contains("fn run_ipc_send_reply_cap_oracle("),
+            "the 193E/193D oracles must remain"
         );
     }
 }
