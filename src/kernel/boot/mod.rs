@@ -1849,6 +1849,128 @@ pub(crate) fn proof_sender_wake_push_coordination_locked(
     }
 }
 
+// ── Stage 193B (IPCSEND-PLAIN LIVE ORACLE) ──────────────────────────────────
+//
+// `yarm.ipc_send_plain_oracle=1` SUB-knob, layered on `yarm.ipc_recv_proof=1`.
+// Default-off and INDEPENDENT of the sender-wake sub-knob. When active, the
+// bootstrap provisions a coordination endpoint E2 (init's RECV cap goes to
+// startup slot 14, and slot 13 stays empty — the presence pattern that lets init
+// pick the send-plain oracle over sender-wake), and the receiver-block publish
+// path (`publish_recv_waiter_live`) pushes a deterministic "receiver blocked on
+// E1" signal into E2 within the SAME `ipc_state_lock` section that registers the
+// waiter — an atomic proxy for "a receiver is a waiter on E1". init polls E2 and
+// plain-`ipc_send`s to E1 only after the forked child receiver is provably
+// blocked, so the send takes the 193A plain boundary split (no enqueue race).
+//
+// The coordination endpoint index reuses `IPC_RECV_PROOF_SENDER_WAKE_E2_IDX`
+// (it is just "the proof coordination endpoint index"); the two oracles never run
+// together (mutually exclusive sub-knobs), so there is no cross-firing.
+pub(crate) static IPC_SEND_PLAIN_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_ipc_send_plain_oracle_enabled(enabled: bool) {
+    IPC_SEND_PLAIN_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ipc_send_plain_oracle_enabled() -> bool {
+    IPC_SEND_PLAIN_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// True only when BOTH the base proof knob and the send-plain-oracle sub-knob are
+/// set — the precondition for any 193B coordination/workload behavior.
+pub fn ipc_send_plain_oracle_active() -> bool {
+    ipc_recv_oracle_proof_enabled() && ipc_send_plain_oracle_enabled()
+}
+
+/// If `endpoint_idx` is the provisioned proof loopback E1 (and the send-plain
+/// oracle sub-knob is active), return the coordination endpoint E2's index so the
+/// receiver-block publish path can push the deterministic "receiver blocked"
+/// signal. Returns `None` otherwise — a strict no-op on every endpoint except the
+/// proof E1, and only under the sub-knob.
+pub(crate) fn proof_send_plain_oracle_coordination_target(endpoint_idx: usize) -> Option<usize> {
+    if !ipc_send_plain_oracle_active() {
+        return None;
+    }
+    let e1 = IPC_RECV_PROOF_SENDER_WAKE_E1_IDX.load(core::sync::atomic::Ordering::Acquire);
+    let e2 = IPC_RECV_PROOF_SENDER_WAKE_E2_IDX.load(core::sync::atomic::Ordering::Acquire);
+    if e1 != usize::MAX && e2 != usize::MAX && endpoint_idx == e1 {
+        Some(e2)
+    } else {
+        None
+    }
+}
+
+/// Stage 193B: provision the coordination endpoint E2 for the send-plain live
+/// oracle, and grant init (TID 1) a RECEIVE cap to it. Returns the recv cap, which
+/// the caller wires into init's startup slot 14 (`service_extra_cap_1`) WITH slot
+/// 13 left empty — the presence pattern init uses to select the send-plain oracle.
+/// Active ONLY when BOTH the base proof knob and the send-plain-oracle sub-knob are
+/// set. Stores E2's index into the shared coordination-index static so the
+/// receiver-block push hook can find it.
+pub fn provision_init_ipc_send_plain_oracle_coord(
+    kernel: &mut KernelState,
+    init_tid: u64,
+) -> Option<u32> {
+    if !ipc_send_plain_oracle_active() {
+        return None;
+    }
+    let (e2_idx, _send_root, recv_root) = match kernel.create_endpoint(8) {
+        Ok(triple) => triple,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPC_SEND_PLAIN_ORACLE_COORD_FAIL step=create_endpoint err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    let recv_cap = match kernel.grant_capability_task_to_task_with_rights(
+        0,
+        recv_root,
+        init_tid,
+        crate::kernel::capabilities::CapRights::RECEIVE,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPC_SEND_PLAIN_ORACLE_COORD_FAIL step=grant_recv err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    IPC_RECV_PROOF_SENDER_WAKE_E2_IDX.store(e2_idx, core::sync::atomic::Ordering::Release);
+    crate::yarm_log!(
+        "IPC_SEND_PLAIN_ORACLE_COORD_OK init_tid={} e1_idx={} e2_idx={} recv_cap={}",
+        init_tid,
+        IPC_RECV_PROOF_SENDER_WAKE_E1_IDX.load(core::sync::atomic::Ordering::Acquire),
+        e2_idx,
+        recv_cap.0
+    );
+    Some(recv_cap.0 as u32)
+}
+
+/// Stage 193B: push the deterministic "receiver blocked on E1" coordination
+/// message into the coordination endpoint E2. Called from the receiver-waiter
+/// publish path (`publish_recv_waiter_live`) which already holds `ipc_state_lock`,
+/// so E2's queue — in the same IPC domain — is mutated within the SAME critical
+/// section as the waiter publish, making "E2 has the signal" an atomic proxy for
+/// "a receiver is a waiter on E1". No scheduler/cap/user-copy work is done here
+/// (init non-blocking-polls E2, so no wake is needed) → no lock-order hazard.
+/// Best-effort: a full E2 queue (already signalled) is harmless.
+pub(crate) fn proof_send_plain_oracle_push_coordination_locked(
+    ipc: &mut defs::IpcSubsystem,
+    e2_idx: usize,
+    waiter_tid: u64,
+) {
+    if let Some(Some(endpoint_storage)) = ipc.endpoints.get_mut(e2_idx) {
+        let endpoint = defs::kernel_mut(endpoint_storage);
+        if let Ok(msg) = Message::with_header(waiter_tid, 0, 0, None, &[0xB3u8]) {
+            let _ = endpoint.send(msg);
+        }
+    }
+}
+
 /// Stage 118: context for the first-resume trampoline (`yarm_kernel_thread_switch_trampoline`).
 ///
 /// Set by the Stage 117 stash drain in `handle_trap_entry_shared` immediately

@@ -60859,6 +60859,189 @@ mod stage193a_ipc_send_boundary_plain {
     }
 }
 
+// Stage 193B — IPCSEND-PLAIN LIVE ORACLE. A default-off (`yarm.ipc_send_plain_oracle=1`,
+// layered on `yarm.ipc_recv_proof=1`) controlled oracle that fires the 193A
+// IpcSendPlain boundary split LIVE in QEMU: a forked child recv-v2-blocks on the
+// proof loopback E1, the kernel pushes a receiver-blocked coordination signal
+// atomically under `ipc_state_lock`, and init plain-`ipc_send`s to the provably
+// blocked child — taking the 193A plain boundary split (no enqueue race). No
+// production policy change; the broad global lock is NOT retired.
+mod stage193b_ipc_send_plain_oracle {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    // The sub-knob parses + drives the enable accessor, layered on the base proof.
+    #[test]
+    fn subknob_wired() {
+        assert!(
+            CMDLINE_SRC.contains("yarm.ipc_send_plain_oracle")
+                && CMDLINE_SRC.contains("set_ipc_send_plain_oracle_enabled("),
+            "the `yarm.ipc_send_plain_oracle` knob must parse + apply"
+        );
+        assert!(
+            MOD_SRC.contains("fn ipc_send_plain_oracle_active()")
+                && MOD_SRC
+                    .contains("ipc_recv_oracle_proof_enabled() && ipc_send_plain_oracle_enabled()"),
+            "the oracle is active only under BOTH the base proof + the sub-knob"
+        );
+    }
+
+    // The `_active()` accessor is genuinely gated: off by default, and requires BOTH
+    // the base proof knob and the sub-knob.
+    #[test]
+    fn active_predicate_requires_both_knobs() {
+        use crate::kernel::boot::{
+            ipc_send_plain_oracle_active, set_ipc_recv_oracle_proof_enabled,
+            set_ipc_send_plain_oracle_enabled,
+        };
+        // Snapshot + restore the shared globals so sibling tests are unaffected.
+        let base0 = crate::kernel::boot::ipc_recv_oracle_proof_enabled();
+        let sub0 = crate::kernel::boot::ipc_send_plain_oracle_enabled();
+
+        set_ipc_recv_oracle_proof_enabled(false);
+        set_ipc_send_plain_oracle_enabled(false);
+        assert!(!ipc_send_plain_oracle_active(), "off by default");
+        set_ipc_send_plain_oracle_enabled(true);
+        assert!(
+            !ipc_send_plain_oracle_active(),
+            "sub-knob alone is not enough"
+        );
+        set_ipc_recv_oracle_proof_enabled(true);
+        set_ipc_send_plain_oracle_enabled(false);
+        assert!(!ipc_send_plain_oracle_active(), "base alone is not enough");
+        set_ipc_send_plain_oracle_enabled(true);
+        assert!(ipc_send_plain_oracle_active(), "both knobs → active");
+
+        set_ipc_recv_oracle_proof_enabled(base0);
+        set_ipc_send_plain_oracle_enabled(sub0);
+    }
+
+    // The receiver-blocked coordination hook is wired into the ATOMIC waiter-publish
+    // critical section, mirroring the sender-wake hook — race-free by construction.
+    #[test]
+    fn receiver_block_coordination_hook_wired() {
+        assert!(
+            MOD_SRC.contains("fn proof_send_plain_oracle_coordination_target(")
+                && MOD_SRC.contains("fn proof_send_plain_oracle_push_coordination_locked("),
+            "the coordination target + push helpers must exist"
+        );
+        // The push lives INSIDE publish_recv_waiter_live's with_ipc_state_mut closure,
+        // right after the endpoint_waiters write (atomic with the waiter publish).
+        let publish = IPC_STATE_SRC
+            .split_once("fn publish_recv_waiter_live(")
+            .and_then(|(_, rest)| rest.split_once("fn "))
+            .map(|(body, _)| body)
+            .unwrap_or("");
+        assert!(
+            publish.contains("proof_send_plain_oracle_coordination_target(endpoint_idx)")
+                && publish.contains("proof_send_plain_oracle_push_coordination_locked("),
+            "the receiver-blocked signal must be pushed inside publish_recv_waiter_live"
+        );
+    }
+
+    // Boot provisions the coordination cap into slot 14 with slot 13 LEFT EMPTY —
+    // the presence pattern init uses to select the oracle (mutually exclusive with
+    // sender-wake, which uses slot 13).
+    #[test]
+    fn boot_provisions_coord_into_slot14_pattern() {
+        assert!(
+            X86_BOOT_SRC.contains("provision_init_ipc_send_plain_oracle_coord(")
+                && X86_BOOT_SRC.contains("init_args[14] = coord_recv_cap as u64;"),
+            "x86_64 boot must provision the coord cap into slot 14"
+        );
+        // It is an `else if` on the sender-wake provision, so slot 13 stays empty.
+        assert!(
+            X86_BOOT_SRC.contains("else if let Some(coord_recv_cap) ="),
+            "the 193B provision must be mutually exclusive with the sender-wake block"
+        );
+        assert!(
+            MOD_SRC.contains("fn provision_init_ipc_send_plain_oracle_coord(")
+                && MOD_SRC.contains("if !ipc_send_plain_oracle_active()"),
+            "the coord provision must be gated on the oracle-active predicate"
+        );
+    }
+
+    // init selects the oracle on the slot-14-present / slot-13-empty pattern, and the
+    // oracle workload drives a PLAIN IpcSend only (no cap / no reply-cap / no shared).
+    #[test]
+    fn init_oracle_is_plain_send_only() {
+        assert!(
+            INIT_SRC.contains("else if let Some(coord_recv) = ctx.service_extra_cap_1 {")
+                && INIT_SRC.contains(
+                    "run_ipc_send_plain_oracle(proof_send, proof_recv, coord_recv, ctx.task_id)"
+                ),
+            "init must dispatch the oracle on the slot-14/empty-slot-13 pattern"
+        );
+        let oracle = INIT_SRC
+            .split_once("fn run_ipc_send_plain_oracle(")
+            .map(|(_, rest)| rest.split_once("\nfn ").map(|(b, _)| b).unwrap_or(rest))
+            .unwrap_or("");
+        assert!(!oracle.is_empty(), "the oracle workload must exist");
+        // PLAIN message: flags=0, no transfer handle. No cap-transfer / reply-cap flags.
+        assert!(
+            oracle.contains("IPC_SEND_PLAIN_ORACLE_OPCODE,\n        0,\n        None,"),
+            "the oracle send must be plain (flags=0, transfer handle None)"
+        );
+        assert!(
+            !oracle.contains("FLAG_CAP_TRANSFER")
+                && !oracle.contains("FLAG_REPLY_CAP")
+                && !oracle.contains("FLAG_CAP_TRANSFER_PLAIN"),
+            "the oracle must NOT set any cap-transfer / reply-cap flag"
+        );
+        // The child receiver blocks on recv-v2 BEFORE init sends (fork: child recv,
+        // parent poll-then-send).
+        assert!(
+            oracle.contains("ipc_recv_v2(e1_recv)")
+                && oracle.contains("IPC_SEND_PLAIN_ORACLE_CHILD_RECV_OK")
+                && oracle.contains("IPC_SEND_PLAIN_ORACLE_WAITER_OBSERVED"),
+            "the child must recv-v2-block and init must observe it before sending"
+        );
+    }
+
+    // The required LIVE markers are all emitted by the real path (kernel producers +
+    // drain + init workload). The oracle DONE marker is the init leg.
+    #[test]
+    fn required_live_markers_exist() {
+        // Kernel boundary-split markers (shared with 193A, fired live by the oracle).
+        assert!(IPC_STATE_SRC.contains("IPC_SEND_BOUNDARY_SPLIT_BEGIN"));
+        assert!(IPC_STATE_SRC.contains("IPC_SEND_BOUNDARY_PLAIN_SNAPSHOT_OK"));
+        let runtime = include_str!("../../runtime.rs");
+        assert!(runtime.contains("IPC_SEND_BOUNDARY_USER_COPY_OK"));
+        assert!(runtime.contains("IPC_SEND_BOUNDARY_WAKE_OK"));
+        assert!(runtime.contains("IPC_SEND_BOUNDARY_SPLIT_DONE result=ok"));
+        assert!(MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok"));
+        // The init oracle DONE marker.
+        assert!(
+            INIT_SRC.contains("IPC_SEND_PLAIN_LIVE_ORACLE_DONE result=ok"),
+            "the init oracle must emit the live-oracle DONE marker"
+        );
+    }
+
+    // 193A + prior retirements + the ReapFaultedTask split-exclusion are intact.
+    #[test]
+    fn prior_guarantees_intact() {
+        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+        assert!(
+            MOD_SRC.contains("class=IpcSendPlain")
+                && MOD_SRC.contains("class=FutexWait result=ok")
+                && MOD_SRC.contains("class=Yield result=ok"),
+            "193A + 192A/192B retirements must remain"
+        );
+        // The sender-wake coordination path is untouched (independent sub-knob).
+        assert!(
+            MOD_SRC.contains("fn proof_sender_wake_coordination_target(")
+                && MOD_SRC.contains("fn provision_init_ipc_recv_proof_sender_wake_e2("),
+            "the sender-wake coordination infrastructure must remain"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

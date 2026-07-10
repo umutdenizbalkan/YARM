@@ -270,6 +270,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_ipc_recv_proof_sender_wake_enabled(enabled);
         crate::yarm_log!("YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.ipc_send_plain_oracle {
+        // Stage 193B sub-knob: only meaningful with the base proof knob above;
+        // gates the receiver-blocked coordination hook + IpcSend-plain live oracle.
+        crate::kernel::boot::set_ipc_send_plain_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_IPC_SEND_PLAIN_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ap_user_dispatch {
         // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
         // first live AP user dispatch. No-op on other arches; when OFF the AP
@@ -433,6 +439,12 @@ pub struct YarmBootOptions<'a> {
     /// coordination hook + workload, isolating it from the green queued-split +
     /// rollback proof boots.
     pub ipc_recv_proof_sender_wake: Option<bool>,
+    /// Stage 193B: `yarm.ipc_send_plain_oracle=1` SUB-knob. Default-off and only
+    /// meaningful with `ipc_recv_proof`; gates the deterministic IpcSend-plain
+    /// live oracle (a forked child blocks on recv-v2, init plain-sends to it) that
+    /// fires the 193A `class=IpcSendPlain` boundary split in QEMU. Independent of
+    /// the sender-wake sub-knob (mutually exclusive coordination-slot pattern).
+    pub ipc_send_plain_oracle: Option<bool>,
     /// Stage 189C6: `yarm.ap_user_dispatch=1` DEFAULT-OFF gate that arms the first
     /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
     /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
@@ -559,6 +571,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.ipc_recv_proof_sender_wake" {
             options.ipc_recv_proof_sender_wake = parse_bool_knob(value);
+        }
+        if key == b"yarm.ipc_send_plain_oracle" {
+            options.ipc_send_plain_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.ap_user_dispatch" {
             options.ap_user_dispatch = parse_bool_knob(value);
@@ -929,5 +944,31 @@ mod tests {
             parse_yarm_boot_options(b"yarm.ipc_recv_proof=1 yarm.ipc_recv_proof_sender_wake=1");
         assert_eq!(both.ipc_recv_proof, Some(true));
         assert_eq!(both.ipc_recv_proof_sender_wake, Some(true));
+    }
+
+    // Stage 193B: the send-plain-oracle SUB-knob parses as a standard bool knob,
+    // defaults to None (off), is independent of the base ipc_recv_proof knob, and
+    // does NOT alias the sender-wake sub-knob.
+    #[test]
+    fn ipc_send_plain_oracle_subknob_parses_and_defaults_off() {
+        assert_eq!(parse_yarm_boot_options(b"").ipc_send_plain_oracle, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_send_plain_oracle=1").ipc_send_plain_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_send_plain_oracle=0").ipc_send_plain_oracle,
+            Some(false)
+        );
+        // The base knob alone must NOT set the sub-knob.
+        let base_only = parse_yarm_boot_options(b"yarm.ipc_recv_proof=1");
+        assert_eq!(base_only.ipc_send_plain_oracle, None);
+        // The two sub-knobs are independent (no aliasing).
+        let sw_only = parse_yarm_boot_options(b"yarm.ipc_recv_proof_sender_wake=1");
+        assert_eq!(sw_only.ipc_send_plain_oracle, None);
+        let both = parse_yarm_boot_options(b"yarm.ipc_recv_proof=1 yarm.ipc_send_plain_oracle=1");
+        assert_eq!(both.ipc_recv_proof, Some(true));
+        assert_eq!(both.ipc_send_plain_oracle, Some(true));
+        assert_eq!(both.ipc_recv_proof_sender_wake, None);
     }
 }

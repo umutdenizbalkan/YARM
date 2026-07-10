@@ -932,6 +932,20 @@ pub fn bootstrap_first_user_task(
         // so init fills E1 to exactly full with non-blocking sends and never blocks.
         init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
     }
+    // Stage 193B: sub-knob-gated (`yarm.ipc_send_plain_oracle=1`) coordination
+    // endpoint E2 recv cap in slot 14 (service_extra_cap_1), with slot 13 LEFT
+    // EMPTY. That presence pattern (slot 13 empty + slot 14 set) tells init to run
+    // the IpcSend-plain live oracle instead of the sender-wake proof. Mutually
+    // exclusive with the sender-wake block above (its knob is off here, so it left
+    // both slots zero). x86_64-only live target; other arches never set the knob.
+    else if let Some(coord_recv_cap) =
+        crate::kernel::boot::provision_init_ipc_send_plain_oracle_coord(
+            kernel,
+            RING3_INIT_SERVER_TID,
+        )
+    {
+        init_args[14] = coord_recv_cap as u64;
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

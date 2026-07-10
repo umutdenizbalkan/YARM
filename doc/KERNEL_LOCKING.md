@@ -867,6 +867,45 @@ remove implicit global-lock coupling from syscall/trap paths.
     parity; 191A–192B retirements + AP/IPC proofs preserved.
   * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
 
+- **Stage 193B (IPCSEND-PLAIN LIVE ORACLE) — DONE and QEMU-PROVEN.** A default-off
+  (`yarm.ipc_send_plain_oracle=1`, layered on `yarm.ipc_recv_proof=1`) controlled oracle now
+  fires the 193A `class=IpcSendPlain` boundary split LIVE in QEMU — closing 193A's "seam wired
+  but not live-fired" gap without broadening IpcSend or touching production policy. The broad
+  `SpinLock<KernelState>` is NOT retired.
+  * **Why it needed an oracle.** A normal boot never plain-sends to an already-recv-v2-blocked
+    receiver (the one raw boot IpcSend carries a cap → defers to legacy), so the retirement
+    marker never fired. The oracle drives exactly that slice.
+  * **Race-free coordination (symmetric to the sender-wake proof).** Under the sub-knob the
+    bootstrap provisions a coordination endpoint (init RECV cap → startup slot 14, slot 13 left
+    EMPTY — the presence pattern init uses to pick this oracle over sender-wake), and
+    `publish_recv_waiter_live` pushes a "receiver blocked on E1" signal into it WITHIN the same
+    `ipc_state_lock` section that registers the waiter (`proof_send_plain_oracle_*` in mod.rs) —
+    an atomic proxy for "a receiver is a waiter on E1". init non-blocking-polls the endpoint and
+    plain-`ipc_send`s only after the forked child receiver is provably blocked, so there is no
+    enqueue race (a too-early send would enqueue and take queued-split, not the boundary split).
+  * **Oracle shape (init, userspace).** init drains E1 empty, forks; the CHILD recv-v2-blocks on
+    E1, the parent (init) observes the coordination signal (verifying the TID is the child, never
+    init), then sends a PLAIN message (flags=0, no transfer handle) to E1. The kernel takes the
+    193A boundary split; the woken child reads the byte-identical delivery
+    (`IPC_SEND_PLAIN_ORACLE_CHILD_RECV_OK payload_match=1 transferred_cap=0`). The delivered bytes
+    are the app-level `[opcode_le(2) ++ payload]` frame `ipc_call_prepare` produces (a plain
+    inline send is NOT prefix-stripped — strip only fires for cap-transfer / reply-cap), so
+    byte-identity is checked against that exact frame.
+  * **QEMU (live).** `YARM_IPC_SEND_PLAIN_ORACLE=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh
+    x86_64` hard-requires and observes, in order: `IPC_SEND_PLAIN_ORACLE_WAITER_OBSERVED` →
+    `IPC_SEND_BOUNDARY_SPLIT_BEGIN` / `PLAIN_SNAPSHOT_OK` → (drain) `USER_COPY_OK` / `WAKE_OK` /
+    `SPLIT_DONE result=ok` → `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok` →
+    `IPC_SEND_PLAIN_LIVE_ORACLE_DONE result=ok`, plus the child's byte-identical recv; and rejects
+    `IPC_SEND_BOUNDARY_SPLIT_FAIL` / send-failed / fork-failed / waiter-unexpected. Wake-once:
+    the in-lock plan stays `IpcSchedulerPlan::None`, so only the drain wakes.
+  * **Scope + no production change.** x86_64-only live target (the boot call site is x86_64;
+    the knob is off on riscv64/aarch64). Knob-off boots are byte-identical: core + IPC_FINAL
+    (sender-wake) + crash-restart + smp2/smp4 (armed and knob-off) pass, riscv64 + aarch64 core
+    keep full server-chain parity. The receiver-block coordination hook and the coord provision
+    are strict no-ops off the sub-knob. IpcCall / IpcReply broad paths, RecvSharedV3, VM / spawn /
+    fork / cap-mint, and ReapFaultedTask stay global-lock-only.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

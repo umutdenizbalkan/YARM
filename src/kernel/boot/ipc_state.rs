@@ -2829,6 +2829,18 @@ impl KernelState {
                 receiver_tid.0,
                 recv_cap.0
             );
+            // Stage 193B: if this is the send-plain oracle loopback E1, push a
+            // deterministic "receiver blocked" signal into the coordination
+            // endpoint E2 WITHIN this same `ipc_state_lock` section (atomic with
+            // the waiter publish) so init plain-sends only after the receiver is
+            // provably a waiter — no enqueue race. Strict no-op off the sub-knob.
+            if let Some(e2_idx) = super::proof_send_plain_oracle_coordination_target(endpoint_idx) {
+                super::proof_send_plain_oracle_push_coordination_locked(
+                    ipc,
+                    e2_idx,
+                    receiver_tid.0,
+                );
+            }
             PublishWaiterOutcome::Published
         });
         if matches!(outcome, PublishWaiterOutcome::Published) {
