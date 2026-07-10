@@ -820,6 +820,437 @@ remove implicit global-lock coupling from syscall/trap paths.
     need broad-IPC vertical decomposition or capability/VM/spawn mutation seams — a distinct,
     larger track. Full global-lock retirement is NOT claimed.
 
+- **Stage 193A (BROAD-IPC VERTICAL DECOMPOSITION — IpcSend first safe slice) — SEAM WIRED,
+  empirically proven, NOT live-fired in QEMU.** The smallest safe IpcSend slice — a PLAIN
+  message (no cap transfer, no reply cap, no shared-region, no fault delivery, no timeout) sent
+  to an ALREADY-WAITING recv-v2 receiver — now takes the 188 boundary-split path instead of the
+  legacy in-broad-lock `complete_blocked_recv_for_waiter`. The broad `SpinLock<KernelState>` is
+  NOT retired; only this one send shape is decomposed.
+  * **Reuses the proven plain producer.** `handle_ipc_send`'s recv-v2 branch first calls
+    `try_ipc_send_boundary_split_plain_pub` (thin wrapper over `try_ipc_send_boundary_split_plain`
+    in `ipc_state.rs`), which delegates to the SAME `produce_blocked_waiter_plain_delivery` (188)
+    that IpcReply's plain boundary uses — no new copy/materialize code path. `Ok(true)` → the
+    send is complete (drain wakes; NO in-lock wake plan, so no duplicate wake); `Ok(false)` →
+    fall back to the unchanged legacy in-broad-lock path (cap-carrying / reply-cap sends, or no
+    trap-entry drainer active); `Err` → the blocked state was already consumed and a user buffer
+    faulted → `UserMemoryFault` (no re-run), matching the legacy consume-then-fault ordering.
+  * **In-lock (Phase A) + out-of-lock (Phase B/C).** Phase A (under the broad borrow):
+    validate + snapshot the plain payload/meta BY VALUE and consume the receiver's
+    `blocked_recv_state` — NO user copy, NO cap materialize, NO in-lock wake
+    (`IPC_SEND_BOUNDARY_SPLIT_BEGIN` / `IPC_SEND_BOUNDARY_PLAIN_SNAPSHOT_OK`; the send origin is
+    tagged via `ipc_send_boundary_origin_set(cpu)`). Phase B/C (trap-entry drain, global lock
+    dropped): the shared `execute_dispatch_post_work` copies payload + meta through the user-copy
+    seam (`IPC_SEND_BOUNDARY_USER_COPY_OK`) and wakes the receiver exactly once
+    (`IPC_SEND_BOUNDARY_WAKE_OK` → `IPC_SEND_BOUNDARY_SPLIT_DONE result=ok` + one-shot
+    `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok`), gated on
+    `ipc_send_boundary_origin_take(cpu)` so reply-origin deliveries leave the send markers unset.
+    The sender returns success (Phase C).
+  * **Correctness.** Plain-only: any cap-transfer / reply-cap / plain-cap flag or non-`None`
+    transferred cap makes the producer return `Ok(false)` before touching blocked state, so the
+    legacy path handles it (no sender-local CapId is ever copied as authority). Byte-identical
+    payload: the drain delivers the exact snapshot bytes with `status=0`, `cap_id=NO_TRANSFER_CAP`,
+    `recv_meta_flags=0` — identical to the plain branch of the legacy helper's meta encoding.
+    Wake exactly once: the in-lock plan is `IpcSchedulerPlan::None`, so only the drain wakes.
+    Guarded by `stage193a_ipc_send_boundary_plain` (inventory of the wiring + legacy fallback,
+    boundary/copy/wake/done markers exist, origin set/peek/take cycle, empirical
+    plain-send-to-blocked-receiver delivers byte-identical via the drain and wakes once,
+    cap-carrying send declines the plain slice, prior 191A–192B retirements intact).
+  * **Honest limitation — NOT live-fired in QEMU.** The x86_64 smokes do not naturally exercise a
+    PLAIN IpcSend to an already-blocked recv-v2 receiver (the one raw IpcSend in the boot path
+    carries a cap → defers to legacy), so `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain`
+    does NOT fire in the QEMU battery. The proof is the empirical hosted integration test, whose
+    drain delivery is byte-identical to the already-live-proven IpcReply plain boundary. This is
+    reported as seam-wired + empirically proven, NOT as a live retirement.
+  * **Scope.** IpcCall / IpcReply broad paths, RecvSharedV3, VM / spawn / fork / cap-mint, and
+    ReapFaultedTask are all untouched and stay global-lock-only. core + oracle + crash-restart +
+    smp2/smp4 (armed and knob-off) pass; riscv64 + aarch64 core smokes keep full server-chain
+    parity; 191A–192B retirements + AP/IPC proofs preserved.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
+- **Stage 193B (IPCSEND-PLAIN LIVE ORACLE) — DONE and QEMU-PROVEN.** A default-off
+  (`yarm.ipc_send_plain_oracle=1`, layered on `yarm.ipc_recv_proof=1`) controlled oracle now
+  fires the 193A `class=IpcSendPlain` boundary split LIVE in QEMU — closing 193A's "seam wired
+  but not live-fired" gap without broadening IpcSend or touching production policy. The broad
+  `SpinLock<KernelState>` is NOT retired.
+  * **Why it needed an oracle.** A normal boot never plain-sends to an already-recv-v2-blocked
+    receiver (the one raw boot IpcSend carries a cap → defers to legacy), so the retirement
+    marker never fired. The oracle drives exactly that slice.
+  * **Race-free coordination (symmetric to the sender-wake proof).** Under the sub-knob the
+    bootstrap provisions a coordination endpoint (init RECV cap → startup slot 14, slot 13 left
+    EMPTY — the presence pattern init uses to pick this oracle over sender-wake), and
+    `publish_recv_waiter_live` pushes a "receiver blocked on E1" signal into it WITHIN the same
+    `ipc_state_lock` section that registers the waiter (`proof_send_plain_oracle_*` in mod.rs) —
+    an atomic proxy for "a receiver is a waiter on E1". init non-blocking-polls the endpoint and
+    plain-`ipc_send`s only after the forked child receiver is provably blocked, so there is no
+    enqueue race (a too-early send would enqueue and take queued-split, not the boundary split).
+  * **Oracle shape (init, userspace).** init drains E1 empty, forks; the CHILD recv-v2-blocks on
+    E1, the parent (init) observes the coordination signal (verifying the TID is the child, never
+    init), then sends a PLAIN message (flags=0, no transfer handle) to E1. The kernel takes the
+    193A boundary split; the woken child reads the byte-identical delivery
+    (`IPC_SEND_PLAIN_ORACLE_CHILD_RECV_OK payload_match=1 transferred_cap=0`). The delivered bytes
+    are the app-level `[opcode_le(2) ++ payload]` frame `ipc_call_prepare` produces (a plain
+    inline send is NOT prefix-stripped — strip only fires for cap-transfer / reply-cap), so
+    byte-identity is checked against that exact frame.
+  * **QEMU (live).** `YARM_IPC_SEND_PLAIN_ORACLE=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh
+    x86_64` hard-requires and observes, in order: `IPC_SEND_PLAIN_ORACLE_WAITER_OBSERVED` →
+    `IPC_SEND_BOUNDARY_SPLIT_BEGIN` / `PLAIN_SNAPSHOT_OK` → (drain) `USER_COPY_OK` / `WAKE_OK` /
+    `SPLIT_DONE result=ok` → `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok` →
+    `IPC_SEND_PLAIN_LIVE_ORACLE_DONE result=ok`, plus the child's byte-identical recv; and rejects
+    `IPC_SEND_BOUNDARY_SPLIT_FAIL` / send-failed / fork-failed / waiter-unexpected. Wake-once:
+    the in-lock plan stays `IpcSchedulerPlan::None`, so only the drain wakes.
+  * **Scope + no production change.** x86_64-only live target (the boot call site is x86_64;
+    the knob is off on riscv64/aarch64). Knob-off boots are byte-identical: core + IPC_FINAL
+    (sender-wake) + crash-restart + smp2/smp4 (armed and knob-off) pass, riscv64 + aarch64 core
+    keep full server-chain parity. The receiver-block coordination hook and the coord provision
+    are strict no-ops off the sub-knob. IpcCall / IpcReply broad paths, RecvSharedV3, VM / spawn /
+    fork / cap-mint, and ReapFaultedTask stay global-lock-only.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
+- **Stage 193C (IPCSEND ORDINARY-CAP BOUNDARY SPLIT) — DONE and QEMU-PROVEN (live on the
+  default boot).** Extends the IpcSend boundary decomposition to an ORDINARY cap-transfer
+  send (exactly one transferred cap, NOT a reply cap, NOT a shared-region) to an
+  already-recv-v2-blocked receiver, reusing the SAME 188C ordinary-cap producer + executor
+  `ipc_reply` already carries. The broad `SpinLock<KernelState>` is NOT retired.
+  * **Wiring.** `handle_ipc_send`'s recv-v2 branch now tries, in order: plain split (193A) →
+    ordinary-cap split (193C, `try_ipc_send_boundary_split_ordinary_cap_pub`) → legacy
+    `complete_blocked_recv_for_waiter`. The ordinary-cap wrapper delegates to the 188C
+    `produce_blocked_waiter_ordinary_cap_delivery`; `Ok(false)` (plain / reply-cap / shared /
+    no drainer) consumes nothing and falls through, `Err` (envelope consumed + Phase-A fault)
+    → `UserMemoryFault`.
+  * **Phase A (broad borrow) — no mint/copy/wake.** The producer validates args, confirms the
+    receiver is recv-v2-blocked, confirms exactly one ordinary transferred cap, consumes the
+    transfer envelope ONCE, pre-validates the payload+meta buffers, and snapshots object /
+    rights / delegation-parent (source_tid, source_cap) + payload/meta BY VALUE. No cap is
+    materialized, nothing is copied to user, the receiver is not woken.
+  * **Phase B/C (trap-entry drain, global lock dropped).** The executor materializes the
+    FRESH receiver-local cap through the 186D2/186D3 seam
+    (`materialize_received_message_cap_routed_with_delegation_split`, atomic mint + delegation
+    link, NO `ipc_state_lock`), encodes the recv-v2 meta with that fresh CapId, copies
+    payload+meta through the 186E seam, then clears return regs + waiter slot and wakes the
+    receiver once. A user-copy fault rolls the minted cap ALL the way back
+    (`rollback_materialized_recv_cap`: revoke + delegation-link removal + refcount drop) so
+    nothing leaks; a materialize fault leaves the envelope consumed with no cap minted
+    (net-identical to the legacy meta-fault teardown).
+  * **Markers** (executor arm gated on a per-CPU `IPC_SEND_CAP_BOUNDARY_ORIGIN` flag so
+    reply-origin cap deliveries stay silent): `IPC_SEND_CAP_BOUNDARY_SPLIT_BEGIN` /
+    `SNAPSHOT_OK` (Phase A) → `MATERIALIZE_OK` → `USER_COPY_OK` → `WAKE_OK` →
+    `SPLIT_DONE result=ok` → one-shot `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap
+    result=ok`; `SPLIT_DEFERRED` / `SPLIT_FAIL reason=materialize|user_copy` on the off/fault
+    paths.
+  * **Authority + one-shot invariants (proven live).** The receiver-local CapId is minted
+    fresh through the seam — never the sender-local handle: the oracle child observes
+    `recv_cap=65548` while the sender-local handle it transferred is `65539`
+    (`cap_is_fresh=1`). The transfer envelope is consumed exactly once (Phase A); the in-lock
+    plan stays `IpcSchedulerPlan::None` so only the drain wakes (wake-once). Byte-identical
+    payload delivered (`payload_match=1`).
+  * **Live — default boot AND controlled oracle.** Unlike the plain slice, a REAL boot
+    cap-transfer to a blocked recv-v2 receiver exists, so `class=IpcSendOrdinaryCap` fires on
+    every x86_64 boot (`waiter_tid=10004`, clean `SPLIT_DONE result=ok`) with the full server
+    chain intact. The `yarm.ipc_send_cap_oracle=1` sub-knob adds a deterministic controlled
+    proof, reusing the 193B fork + atomic receiver-block coordination harness (coord cap in
+    init startup slot 13, slot 14 empty — mutually exclusive with plain-oracle slot 14 and
+    sender-wake slots 13+14). `YARM_IPC_SEND_CAP_ORACLE=1` oracle smoke observes the full
+    marker chain + the child's fresh-cap byte-identical recv; rejects
+    `IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL` / `DISPATCH_POST_WORK_FAIL`.
+  * **Scope.** core + IPC_FINAL (sender-wake) + crash-restart + IpcSendPlain oracle +
+    IpcSendOrdinaryCap oracle + smp2/smp4 (armed and knob-off) pass; riscv64 + aarch64 core
+    keep full server-chain parity. IpcCall / IpcReply broad paths, reply-cap / shared-region
+    IpcSend, the no-waiter enqueue path, RecvSharedV3, VM / spawn / fork / cap-mint, and
+    ReapFaultedTask stay global-lock-only.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
+- **Stage 193D (IPCSEND REPLY-CAP BOUNDARY SPLIT) — DONE and QEMU-PROVEN (controlled
+  oracle).** Extends the IpcSend boundary decomposition to a REPLY-CAP transfer to an
+  already-recv-v2-blocked receiver, reusing the SAME 188D reply-cap producer + executor
+  `ipc_reply` carries. The broad `SpinLock<KernelState>` is NOT retired.
+  * **Object-based routing (key finding).** The userspace IpcSend ABI carries no message
+    flags — `handle_ipc_send` tags every transfer as `FLAG_CAP_TRANSFER`, never
+    `FLAG_REPLY_CAP` (which only `ipc_call` / `ipc_reply` set). So a "reply-cap transfer via
+    IpcSend" is a transfer whose *object* is a `Reply`, identified by inspecting the cap, not
+    a flag. The reply-cap slice PEEKS the transfer envelope's `source_object`
+    (`peek_transfer_envelope_source_object`, read-only — no take, no refcount) and only a
+    `Reply` object takes it; it runs BEFORE the ordinary-cap slice so a Reply object is never
+    mis-consumed by the ordinary producer. On a match it synthesizes a `FLAG_REPLY_CAP` view
+    of the message (same sender/opcode/payload/handle) so the 188D producer's flag gate
+    accepts it, then drives the producer unchanged. Non-Reply transfers decline (`Ok(false)`)
+    and fall straight through to the ordinary-cap slice. Chaining:
+    `try_ipc_send_boundary_split_any_pub` = plain → reply-cap → ordinary-cap → (caller) legacy.
+  * **Phase A (broad borrow) — no mint/copy/wake.** The 188D producer consumes the reply-cap
+    transfer envelope ONCE and snapshots the reply object's registry coordinates
+    `(reply_index, reply_generation)` + receiver cnode + payload/meta BY VALUE. No cap is
+    minted, no IPC record is written, nothing is copied to user, the receiver is not woken.
+  * **Phase B/C (trap-entry drain, global lock dropped).** The 188D executor solves the
+    reply-cap rank inversion by phase separation: mint the FRESH receiver-local reply cap via
+    the rank-4 seam (no IPC lock); record the waiter-cap via the rank-3 IPC seam (disjoint
+    critical section, rolling the mint back on a stale record); encode the recv-v2 meta with
+    the fresh CapId + the reply-cap meta flag; 186E user copy; then clear regs + waiter slot
+    and wake once. A user-copy fault rolls BOTH the recorded waiter-cap and the mint back
+    (no reply-cap / refcount / delegation leak).
+  * **One-shot + authority + wake-once (proven live).** The receiver-local reply cap is minted
+    fresh — identified by `(reply_index, reply_generation)`, never the sender-local handle:
+    the oracle child observes a fresh `reply_cap` id (`65549`) distinct from the sender-local
+    handle it transferred (`65542`), via the separate recv-meta reply-cap field
+    (`reply_is_fresh=1`). The reply cap keeps its one-shot registry semantics (recorded as a
+    reply-cap in the reply registry, consumed by the eventual `ipc_reply`); the transfer
+    envelope is consumed exactly once (Phase A); the in-lock plan stays
+    `IpcSchedulerPlan::None`, so only the drain wakes (wake-once). Byte-identical payload
+    (`payload_match=1`).
+  * **Live — controlled oracle.** No natural boot IpcSend transfers a reply cap (reply caps
+    flow via `ipc_call`), so `class=IpcSendReplyCap` fires only under the
+    `yarm.ipc_send_reply_cap_oracle=1` sub-knob. The bootstrap mints a transferable one-shot
+    reply cap directly into init's cnode via the EXISTING seam
+    (`create_reply_cap_for_caller_in_cnode` — the historical `create_reply_cap_for_caller`
+    now delegates to it with `dest_cnode=None`, unchanged for every other caller). init then
+    reuses the 193B fork + atomic receiver-block coordination harness (coord cap in init slot
+    13, the reply cap in slot 14, a slot-17 discriminator that separates it from sender-wake).
+    `YARM_IPC_SEND_REPLY_CAP_ORACLE=1` oracle smoke observes the full marker chain
+    (`SPLIT_BEGIN → SNAPSHOT_OK → MATERIALIZE_OK → USER_COPY_OK → WAKE_OK → SPLIT_DONE
+    result=ok → GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendReplyCap result=ok →
+    IPC_SEND_REPLY_CAP_LIVE_ORACLE_DONE result=ok`) + the child's fresh-reply-cap
+    byte-identical recv; rejects `IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_FAIL` /
+    `DISPATCH_POST_WORK_FAIL`.
+  * **IPC_FINAL parity fix.** The 193C ordinary-cap boundary executor now also emits the
+    Stage 156 recv-side `IPC_TRANSFER_CAP_MATERIALIZE_OK` marker it replaced (the boundary
+    split had diverted the boot's natural cap transfer off the legacy
+    `materialize_received_message_cap` path, silently dropping that marker from the IPC_FINAL
+    extended profile). Restored for parity; IPC_FINAL passes again.
+  * **Scope.** core + IPC_FINAL + crash-restart + IpcSendPlain / IpcSendOrdinaryCap /
+    IpcSendReplyCap oracles + smp2/smp4 (armed and knob-off) pass; riscv64 + aarch64 core keep
+    full server-chain parity. IpcCall / IpcReply broad paths, shared-region IpcSend, the
+    no-waiter enqueue path, RecvSharedV3, VM / spawn / fork / cap-mint, and ReapFaultedTask
+    stay global-lock-only.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
+- **Stage 193E (IPCSEND NO-WAITER ENQUEUE BOUNDARY SPLIT) — DONE and QEMU-PROVEN
+  (controlled oracle).** Starts decomposing the *other* major IpcSend shape — no receiver is
+  blocked, so the send ENQUEUES — with the smallest slice: a PLAIN message to a buffered
+  endpoint with no blocked receiver. The broad `SpinLock<KernelState>` is NOT retired.
+  * **Inventory / finding.** The plain no-waiter enqueue was ALREADY endpoint-only: it flows
+    through the Stage 4E seam `ipc_try_send_queued_plain_endpoint_only`, which enqueues under
+    the rank-4 IPC lock only (`with_ipc_state_mut`) with NO user copy, NO cap materialization,
+    NO receiver wake, and NO sender block (a plain non-blocking send with queue space returns
+    Ok and continues; the message waits in the queue for a later receiver's dequeue). Unlike
+    the 193A–D blocked-waiter slices there is NO deferred Phase B/C work — the whole slice is
+    the in-lock endpoint enqueue. 193E formalizes this PLAIN slice as a retired class.
+  * **Boundary wrapper.** `ipc_try_send_enqueue_boundary_split_plain` is a thin
+    instrumentation wrapper over the unchanged Stage 4E seam: for a PLAIN message (no
+    cap-transfer / reply-cap / plain-cap flag, no transferred cap) it emits the enqueue
+    boundary markers around the endpoint enqueue and, on a successful `Enqueued` with no
+    blocked receiver, fires the one-shot `class=IpcSendPlainEnqueue` retirement. Non-plain
+    messages delegate straight to the unchanged Stage 4E path BEFORE any marker/mutation (so
+    cap-transfer enqueue still works and is NOT retired); `ReceiverWaiterFound` (blocked-waiter
+    deliver slice) and `Ineligible` (queue-full / non-buffered → legacy fallback) emit a
+    `SPLIT_DEFERRED` marker and return unchanged. Byte-identical to Stage 4E in every case.
+  * **Invariants (proven live).** Queued message byte-identical to legacy (the oracle's
+    receiver-later `recv_v2` observes `payload_match=1 transferred_cap=0`); enqueued exactly
+    once (`endpoint.send(msg)`); sender state matches legacy
+    (`SENDER_STATE_OK … sender_blocked=0` — not blocked, not published as a sender-waiter); the
+    receiver-later dequeue path still delivers; queue-full / non-buffered defer to the legacy
+    capacity/blocking path; cap/reply/shared cases defer before any mutation.
+  * **Live — controlled oracle (no fork).** Because "no blocked receiver" is the default
+    state of a fresh endpoint, the oracle needs neither a fork nor a coordination endpoint: it
+    is signalled by init startup slot 17 ALONE (slots 13 + 14 empty), distinct from every
+    other oracle's slot pattern, and the 193E enqueue oracle is deliberately NOT in the
+    receiver-block coordination gate. Under `yarm.ipc_send_enqueue_oracle=1` init plain-sends
+    to the loopback E1 (holding both send + recv caps, not recv-blocked) → the message
+    enqueues → `recv_v2` drains it byte-identical. `YARM_IPC_SEND_ENQUEUE_ORACLE=1` oracle
+    smoke observes `SPLIT_BEGIN → SNAPSHOT_OK → ENQUEUE_OK → SENDER_STATE_OK → SPLIT_DONE
+    result=ok → GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok →
+    IPC_SEND_ENQUEUE_LIVE_ORACLE_DONE result=ok` + the byte-identical receiver-later recv;
+    rejects `IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_FAIL`.
+  * **Scope.** core + IPC_FINAL + crash-restart + IpcSendPlain / IpcSendOrdinaryCap /
+    IpcSendReplyCap / IpcSendPlainEnqueue oracles + smp2/smp4 (armed and knob-off) pass;
+    riscv64 + aarch64 core keep full server-chain parity. Cap-transfer enqueue, reply-cap
+    enqueue, shared-region IpcSend, IpcCall / IpcReply broad paths, RecvSharedV3, VM / spawn /
+    fork / cap-mint, and ReapFaultedTask stay global-lock-only.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
+- **Stage 193F (IPCSEND ORDINARY-CAP NO-WAITER ENQUEUE BOUNDARY SPLIT) — DONE and
+  QEMU-PROVEN (controlled oracle).** Extends the no-waiter enqueue decomposition from PLAIN
+  (193E) to the ORDINARY cap-transfer shape: no receiver is blocked, so the send ENQUEUES, and
+  the message carries exactly one ordinary transferred cap. The broad `SpinLock<KernelState>`
+  is NOT retired.
+  * **Inventory / finding.** Like the 193E plain slice, the ordinary-cap no-waiter enqueue is
+    endpoint-only at enqueue time: it flows through the Stage 4E seam
+    `ipc_try_send_queued_plain_endpoint_only`, which stashes the cap in a transfer envelope and
+    enqueues the numeric handle under the rank-4 IPC lock only (`with_ipc_state_mut`) — NO user
+    copy, NO cap materialization, NO receiver wake, NO sender block at enqueue. Cap
+    materialization is deferred entirely to the receiver-later recv (the envelope is consumed
+    and a fresh receiver-local cap is minted only then).
+  * **Boundary wrapper.** `ipc_try_send_enqueue_boundary_split_ordinary_cap` is entered from
+    the 193E plain wrapper's non-plain branch. It rejects reply-cap / shared-region / multi- or
+    zero-cap shapes BEFORE any ordinary handling (delegating them to the unchanged Stage 4E
+    path with no markers/mutation), using the non-consuming
+    `peek_transfer_envelope_source_object` to reject a `CapObject::Reply` object even though the
+    userspace IpcSend ABI carries no reply flag (object-based routing, as in 193D). For a true
+    ordinary transfer it emits `IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_BEGIN → SNAPSHOT_OK`, calls
+    the Stage 4E seam, and on a successful `Enqueued` with no blocked receiver emits
+    `ENQUEUE_OK → TRANSFER_STATE_OK (envelope=preserved) → SENDER_STATE_OK (sender_blocked=0) →
+    SPLIT_DONE result=ok` and fires the one-shot `class=IpcSendOrdinaryCapEnqueue` retirement.
+    `ReceiverWaiterFound` / `EnqueuedWakeReceiver` / `Ineligible` (queue-full → legacy) emit
+    `SPLIT_DEFERRED` and return unchanged. Byte-identical to Stage 4E in every case.
+  * **Receiver-later fresh-cap proof (recv side).** The queued-split recv-v2 writeback
+    (`execute_user_asid_plain_v2_writeback_boundary`) now surfaces the receiver-local CapId that
+    Phase A materialized for an ORDINARY transfer into the recv-v2 meta
+    (`SYSCALL_RECV_META_TRANSFERRED_CAP`), so a `recv_v2` caller discovers the fresh cap instead
+    of it being orphaned in the receiver's cnode. Plain messages remain `NO_TRANSFER_CAP`/`0`
+    (byte-identical). Reply caps (`is_reply_cap`) deliberately RETAIN the historical hidden
+    split-path behavior — the supervisor fault/restart chain recvs a one-shot reply cap through
+    this same writeback and depends on the meta reporting no cap; surfacing reply caps there is
+    out of 193F scope. The sender-local CapId is proven NOT to be receiver authority: the oracle
+    observes `cap_is_fresh=1` (received cap `!=` the sender's local cap).
+  * **Invariants (proven live).** Enqueued message byte-identical to legacy
+    (`payload_match=1`); transfer envelope preserved at enqueue and consumed once at recv;
+    exactly one fresh receiver-local cap minted at recv (`IPC_TRANSFER_CAP_MATERIALIZE_OK`);
+    sender not blocked with queue space (`sender_blocked=0`); reply / shared / multi-cap cases
+    defer before any mutation.
+  * **Live — controlled oracle (no fork).** Signalled by init startup slot 17 value **2**
+    (193E plain-enqueue uses value 1; slots 13 + 14 empty), distinct from every other oracle's
+    slot pattern and deliberately NOT in the receiver-block coordination gate. Under
+    `yarm.ipc_send_cap_enqueue_oracle=1` init cap-sends to loopback E1 (holding both caps, not
+    recv-blocked) → the message enqueues → `recv_v2` drains it and materializes a fresh cap.
+    `YARM_IPC_SEND_CAP_ENQUEUE_ORACLE=1` oracle smoke observes `SPLIT_BEGIN → SNAPSHOT_OK →
+    ENQUEUE_OK → TRANSFER_STATE_OK → SENDER_STATE_OK → SPLIT_DONE result=ok →
+    GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCapEnqueue result=ok →
+    IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_OK payload_match=1 cap_is_fresh=1 →
+    IPC_SEND_CAP_ENQUEUE_LIVE_ORACLE_DONE result=ok`; rejects
+    `IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_FAIL`.
+  * **Scope.** core + IPC_FINAL + crash-restart (reply-cap split path preserved) + IpcSendPlain
+    / IpcSendOrdinaryCap / IpcSendReplyCap / IpcSendPlainEnqueue / IpcSendOrdinaryCapEnqueue
+    oracles + smp2/smp4 (armed and knob-off) pass; riscv64 + aarch64 core keep full
+    server-chain parity. Reply-cap enqueue, shared-region IpcSend, IpcCall / IpcReply broad
+    paths, RecvSharedV3, VM / spawn / fork / cap-mint, and ReapFaultedTask stay
+    global-lock-only.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
+- **Stage 193G (IPCSEND REMAINING-SHAPES AUDIT — reply-cap enqueue and shared-region) —
+  AUDIT ONLY; both shapes NO-GO, documentation + guard tests only, no retirement.** Audits the
+  two IpcSend-specific shapes left after 193A–F (reply-cap no-waiter enqueue; shared-region
+  IpcSend) and decides neither can be safely decomposed now. No live slice is implemented; the
+  broad `SpinLock<KernelState>` is NOT retired; reply-cap meta behavior is UNCHANGED; syscall
+  ABI/counts are UNCHANGED (SYSCALL_COUNT=32, VARIANT_COUNT=23).
+  * **Reply-cap no-waiter enqueue — NO-GO (recv-side misroute + supervisor-entangled meta).**
+    - *Send side already enqueues.* A reply-cap IpcSend is object-routed: `handle_ipc_send` tags
+      every transfer `FLAG_CAP_TRANSFER` (never `FLAG_REPLY_CAP`), stashing the reply cap in a
+      transfer envelope whose `source_object` is `CapObject::Reply { index, generation }`. With no
+      waiter the 193F ordinary-cap wrapper sees `is_reply_object=true` (via the non-consuming
+      `peek_transfer_envelope_source_object`), so it declines the ordinary slice and delegates to
+      the unchanged Stage 4E seam. Stage 4E's `FLAG_REPLY_CAP` reject does NOT fire (the flag is
+      `FLAG_CAP_TRANSFER`), so the message already enqueues today as a generic cap-transfer
+      envelope. No new endpoint state is needed on the send side.
+    - *Receiver-later drain misroutes the reply cap.* The recv-side reply-vs-transfer decision is
+      **flag-based**: `RecvCapTransferPlan.is_reply_cap` and `materialize_received_message_cap`
+      both branch on `msg.flags & FLAG_REPLY_CAP`. A queued IpcSend reply cap carries
+      `FLAG_CAP_TRANSFER` (not the reply flag) with a Reply *object*, so on drain it is classified
+      as an **ordinary** transfer: `syscall.rs` takes the 187B ordinary-cap seam
+      (`!is_reply_cap && !plan.is_reply_cap`), minting a delegated cap for the Reply object and
+      recording a delegation link — losing the one-shot direct-mint semantics
+      (`materialize_received_message_cap`'s `kind=="reply"` path) and risking delegation-link
+      saturation. Retiring this class would first require **object-based reply detection on the
+      recv side**, a correctness change to shared reply-cap machinery.
+    - *And the meta is supervisor-entangled.* A recv-v2 receiver reads a transferred cap only from
+      the meta (`meta.cap_id` + `SYSCALL_RECV_META_*`). Surfacing a queued reply cap so the
+      receiver could actually USE it (call `ipc_reply`) requires exposing it in the split-path
+      recv-v2 meta — exactly the change 193F proved breaks the supervisor crash-restart chain
+      (which recvs a genuine `FLAG_REPLY_CAP` reply cap through the same queued-split writeback and
+      depends on the meta reporting no cap). Preserving the hidden semantics leaves the reply cap
+      unobservable/unusable to a recv-v2 receiver, so no live oracle can prove usable one-shot
+      delivery. Both escape routes are forbidden, so this is a genuine no-go, not a deferral of
+      convenience.
+  * **Shared-region IpcSend — NO-GO (belongs to the RecvSharedV3 / VM decomposition).**
+    - *Send side is thin.* `handle_ipc_send` for a shared-region grant validates the
+      `MemoryObject`/`DmaRegion` rights, stashes a transfer envelope with
+      `shared_region: Some(TransferSharedRegion { offset, len })`, and builds an `OPCODE_SHARED_MEM`
+      `FLAG_CAP_TRANSFER` message carrying only the region descriptor + envelope handle; with no
+      waiter it already enqueues via Stage 4E. No mapping happens at send.
+    - *The value and risk are entirely on the recv/mapping side.* The receiver-later drain must MAP
+      the region into the receiver ASID (`map_shared_region_into_receiver` →
+      `map_user_page_in_asid_with_caps`, two-phase TLB-shootdown rollback), advance the envelope
+      `TransferState` lifecycle (`Created → MappedReceiver → MappedBoth → Released → Revoked`), and
+      pin/unpin the memory object (`adjust_memory_object_pin_refcount`). That is VM-mapping + TLB +
+      pin-refcount lifetime work coupled to the dedicated `RecvSharedV3` (NR 30) path — a
+      user-copy-vs-mapping boundary distinct from every 193A–F slice. A live oracle cannot prove
+      shared-region delivery without exercising that mapping path, and the task forbids unlocking
+      RecvSharedV3 or touching VM. This shape belongs to the RecvSharedV3 decomposition, not an
+      IpcSend enqueue slice.
+  * **Exit-cleanup note (audited, unchanged).** `purge_transfer_envelopes_for_pid` already drops a
+    queued (not-yet-drained) envelope on either sender or receiver exit and unpins the memory
+    object for a shared-region envelope; a queued reply envelope is simply dropped (reply authority
+    stays tracked in `reply_caps[]`/generations). No leak is introduced by leaving both shapes on
+    the legacy path.
+  * **Deliverable.** Documentation (this entry) + audit guard tests that lock in the recv-side
+    flag-based reply classification, the shared-region VM/RecvSharedV3 coupling, and the ABSENCE of
+    any `IpcSendReplyCapEnqueue` / `IpcSendSharedRegion` retirement class. No retirement marker is
+    faked; reply-cap meta behavior is byte-unchanged.
+  * **Go/no-go.** Reply-cap enqueue and shared-region IpcSend stay global-lock-only. The remaining
+    tractable broad-IPC work is NOT another IpcSend shape; the natural next target is the recv-side
+    reply-cap object/flag reconciliation (a prerequisite before reply-cap enqueue is retire-able)
+    or beginning the RecvSharedV3 decomposition — both larger than a single 193-style slice.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
+- **Stage 194 (CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT) — AUDIT/DESIGN ONLY; no
+  AArch64/RISC-V retirement enabled.** Determines exactly how the x86_64-proven retirement
+  mechanisms port to AArch64 and RISC-V. NO out-of-lock retirement is activated on either
+  architecture; `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` is not flipped true on either; the syscall
+  ABI/counts are unchanged (SYSCALL_COUNT=32, VARIANT_COUNT=23). The compiled runtime is
+  behaviorally unchanged.
+  * **Two mechanism families, two portability stories.**
+    1. *Pre-lock split-dispatch classes* (`DebugLog`, `FutexWake`, `InitramfsReadChunk`): serviced
+       entirely BEFORE `with_cpu` by `try_split_dispatch_into_frame` through `&SharedKernel` seams;
+       the caller never task-switches, so there is NO post-lock drain and NO arch return-path
+       restore. The dispatcher body is already generic. Its ONLY arch dependency is that the frame
+       must carry the DECODED syscall ABI (`frame.syscall_num()`/`arg()`): x86_64's trap stub
+       populates it; AArch64 imports it via `pre_split_import_syscall_abi` **only when the oracle
+       proof knob is on** (`ipc_recv_oracle_proof_enabled()`), so a normal AArch64 boot sees `nr=0`
+       and always falls back; RISC-V never enters the shared path at all. → classification
+       **generic_with_arch_restore_hook** but with NO restore hook needed (no switch); the port is
+       "make the ABI import unconditional + wire the handled-syscall finalize," nothing more.
+    2. *IpcSend blocked-waiter boundary classes* (193A–D) drain via the GENERIC
+       `drain_dispatch_post_work`/`execute_dispatch_post_work` (`copy_to_user_split`, ASID-based, no
+       cfg gate) on the shared path. The *enqueue* classes (193E/193F) are pure rank-4 endpoint
+       enqueues with no deferred work. → **generic_with_arch_restore_hook**: runs wherever the arch
+       is on the shared path (x86_64 + AArch64), inert on RISC-V (not on the shared path).
+    3. *Queue-advancing dispatch drains* (`D2 recv/send`, `FutexWait`, `Yield`) are DIFFERENT: their
+       drain bodies in `arch/trap_entry.rs` are `#[cfg(target_arch = "x86_64")]` and perform a real
+       context switch (`post_switch_restore_arch_thread_state`). → **x86_64_trap_entry_specific**
+       today; porting needs the drain block de-gated per arch AND a proven arch return-path restore.
+  * **Active-flag ownership (the load-bearing invariant).** `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]`
+    is the producers' contract: "a trap-entry drainer WILL run after `with_cpu` and complete my
+    stashed snapshot." It is set true by `handle_trap_entry_shared` before `with_cpu` and cleared
+    after. x86_64 and AArch64 own it correctly (both enter the shared path). RISC-V does NOT enter
+    the shared path (raw `&mut KernelState`, no `drain_dispatch_post_work`); because the flag is a
+    cross-arch static, RISC-V could read it **stale-true** (left set by another CPU/earlier boot),
+    which once caused producers to stash snapshots no drainer ran → woken receivers left un-enqueued
+    → boot stall at `kernel_idle_awaiting_io`. The fix (kept, guarded) is
+    `arch/riscv64/trap.rs` force-storing it FALSE at the top of every RISC-V trap. Design rule for
+    195/196: **an architecture may set the active flag true only once it has a registered post-lock
+    drain + return-path restore proven in QEMU.**
+  * **AArch64 readiness.** On the shared drain path already; owns the active flag; has the arch
+    restore hook (`restore_arch_thread_state_post_switch`); TTBR0/ASID switch exists. Missing to go
+    live: unconditional syscall-ABI import + handled-syscall finalize (drop the oracle-knob gate),
+    and — for the queue-advancing classes only — de-gating the drain bodies and an EL0-return-frame
+    restore proof; remote TLBI is only needed for VM/SMP classes, NOT for the recommended first
+    slices. QEMU virt and RPi5 can share the same generic drain (no board-specific drain logic).
+  * **RISC-V readiness.** NOT on the shared path — the single largest gap. It uses a raw-pointer
+    trap bridge with no `with_cpu`, so it has neither `try_split_dispatch_into_frame` (needs
+    `&SharedKernel`) nor `drain_dispatch_post_work`. Prerequisite for ANY retirement: route the
+    RISC-V trap bridge through `handle_trap_entry_shared` (or an equivalent shared wrapper), give it
+    a real post-`sret` drain location, and prove SATP/ASID restore + `SFENCE.VMA` discipline. Until
+    then RISC-V stays global-lock-only and force-false on the active flag.
+  * **Recommended first live slice.** AArch64: `DebugLog` (pure read, no switch, no drain) →
+    `InitramfsReadChunk` success path → `IpcSendPlainEnqueue`. RISC-V: none until the shared-path
+    prerequisite lands; then `DebugLog`. `FutexWait`/`Yield` are explicitly NOT first (they need a
+    proven queue-advancing drain + return-path restore).
+  * **Empirical finding (QEMU).** On AArch64 the IpcSend *boundary* family already runs live
+    (`GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok` on a normal boot) because
+    its drain is generic and AArch64 is on the shared path — this is pre-existing, not enabled by
+    194. AArch64's split-dispatch + queue-advancing classes and ALL of RISC-V's classes remain
+    inert / global-lock-only; their full userspace server chains pass; no additional class is
+    enabled by a flag flip; a real drain + return-path proof is mandatory for the rest. See
+    KERNEL_UNLOCKING.md §7.1.21 for the Stage 195/196/197 plans and seal gates.
+  * **The broad global lock is NOT retired on any architecture.** Cross-arch global-lock retirement
+    is NOT claimed.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

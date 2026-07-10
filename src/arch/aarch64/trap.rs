@@ -190,6 +190,8 @@ fn export_syscall_result_to_user_gprs(frame: &mut TrapFrame) {
 /// sees byte-identical decoded ABI.
 pub(crate) fn split_import_syscall_abi(frame: &mut TrapFrame) {
     import_syscall_abi_from_user_gprs(frame);
+    // Stage 195A: production import-OK attestation (DebugLog live acceptance).
+    crate::yarm_log!("AARCH64_SPLIT_ABI_IMPORT_OK nr={}", frame.syscall_num());
     crate::yarm_log!("AARCH64_SPLIT_ABI_IMPORT_DONE nr={}", frame.syscall_num());
 }
 
@@ -245,6 +247,20 @@ pub(crate) fn split_finalize_handled_syscall(
         frame.error_code().unwrap_or(0),
         frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0)
     );
+    // Stage 195A: finalize-OK attestation. `result=ok` for a success return;
+    // `result=error code=<code>` when the split path encoded a canonical error
+    // (e.g. an explicitly-exercised UserMemoryFault), so error parity is visible.
+    match frame.error_code() {
+        Some(code) => crate::yarm_log!(
+            "AARCH64_SPLIT_FINALIZE_OK nr={} result=error code={}",
+            frame.syscall_num(),
+            code
+        ),
+        None => crate::yarm_log!(
+            "AARCH64_SPLIT_FINALIZE_OK nr={} result=ok",
+            frame.syscall_num()
+        ),
+    }
     Ok(())
 }
 

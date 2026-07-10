@@ -6,6 +6,14 @@ use crate::kernel::boot::{FaultBookkeepingMode, KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trapframe::TrapFrame;
 
+/// Stage 195A: arch tag for the `YARM_LOCK_SPLIT_DISPATCH` marker. Empty on
+/// x86_64/riscv64 so their marker text stays byte-identical; `arch=aarch64 ` on
+/// AArch64 where the split dispatch is now a production path (DebugLog).
+#[cfg(target_arch = "aarch64")]
+const SPLIT_DISPATCH_ARCH_TAG: &str = "arch=aarch64 ";
+#[cfg(not(target_arch = "aarch64"))]
+const SPLIT_DISPATCH_ARCH_TAG: &str = "";
+
 #[cfg(target_arch = "riscv64")]
 pub type ArchTrapContext = super::riscv64::trap::Riscv64TrapContext;
 #[cfg(target_arch = "riscv64")]
@@ -172,7 +180,8 @@ pub fn handle_trap_entry_shared(
                         // return already does this from the ret lanes.
                         finalize_split_handled_syscall(shared, cpu, frame);
                         crate::yarm_log!(
-                            "YARM_LOCK_SPLIT_DISPATCH nr={} cpu={} result=ok",
+                            "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=ok",
+                            SPLIT_DISPATCH_ARCH_TAG,
                             frame.syscall_num(),
                             cpu.0,
                         );
@@ -203,7 +212,8 @@ pub fn handle_trap_entry_shared(
                         // completed syscall, not a WouldBlock retry).
                         finalize_split_handled_syscall(shared, cpu, frame);
                         crate::yarm_log!(
-                            "YARM_LOCK_SPLIT_DISPATCH nr={} cpu={} result=handled_err code={}",
+                            "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=handled_err code={}",
+                            SPLIT_DISPATCH_ARCH_TAG,
                             frame.syscall_num(),
                             cpu.0,
                             e.code(),
@@ -936,7 +946,16 @@ pub fn dispatch_trap_entry_with_shared_kernel(
 // riscv64 does not enter `handle_trap_entry_shared`.
 #[cfg(target_arch = "aarch64")]
 fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
-    if crate::kernel::boot::ipc_recv_oracle_proof_enabled() {
+    // Stage 195A: production DebugLog (NR 15) is now split-eligible on AArch64.
+    // Peek the raw syscall number from x8 WITHOUT committing the import; import the
+    // decoded ABI ONLY when it is DebugLog (or when the oracle proof knob is on for
+    // its full validation surface). Every other syscall keeps `nr=0` in the frame,
+    // so the split dispatcher declines it and it falls back to the UNCHANGED
+    // global-lock path — this is what keeps DebugLog the ONLY newly-eligible class.
+    let raw_nr = frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8);
+    if raw_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
+        || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
+    {
         super::aarch64::trap::split_import_syscall_abi(frame);
     }
 }
@@ -949,7 +968,15 @@ fn finalize_split_handled_syscall(
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) {
-    if crate::kernel::boot::ipc_recv_oracle_proof_enabled() {
+    // Stage 195A: finalize is reached ONLY when the split dispatcher HANDLED the
+    // syscall. In production the only newly-eligible AArch64 class is DebugLog, so
+    // this runs for DebugLog (nr=15) — mirroring the selective ABI import — plus the
+    // oracle-validated classes. The brief `with_cpu` here is the ARCH RETURN-PATH
+    // restore (export result to x0..x5 + advance past the SVC), NOT the DebugLog
+    // seam (which already ran lock-free via `copy_from_user_asid_split_read`).
+    if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
+        || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
+    {
         let _ = shared.with_cpu(cpu, |kernel| {
             super::aarch64::trap::split_finalize_handled_syscall(kernel, cpu, frame)
         });

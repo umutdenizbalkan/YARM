@@ -1109,20 +1109,54 @@ pub fn run() {
         // does ONLY under `yarm.ipc_recv_proof_sender_wake=1`. So queued-split +
         // rollback proof boots (base knob only) leave E2 None and skip this.
         if let Some(e2_recv) = ctx.service_extra_cap_0 {
-            // Slot 14 (service_extra_cap_1) carries E1's buffered capacity, so init
-            // can fill E1 to EXACTLY full with non-blocking sends and never become a
-            // sender-waiter itself. Default to a safe small capacity if absent.
-            let e1_capacity = ctx.service_extra_cap_1.unwrap_or(8) as usize;
-            run_ipc_recv_proof_sender_wake(
-                proof_send,
-                proof_recv,
-                e2_recv,
-                e1_capacity,
-                ctx.task_id,
-            );
+            // Slot 13 present. The slot-14 / slot-17 presence disambiguates:
+            //   slots 13 + 14 + 17 → Stage 193D IpcSend reply-cap transfer live oracle
+            //   slots 13 + 14      → sender-wake proof (Stage 163)
+            //   slot 13 only       → Stage 193C IpcSend ordinary cap-transfer live oracle
+            if let Some(slot14) = ctx.service_extra_cap_1 {
+                if ctx.pm_request_recv_cap.is_some() {
+                    // Slot 17 discriminator set → reply-cap oracle: slot 13 = coord,
+                    // slot 14 = the kernel-provisioned transferable reply cap.
+                    run_ipc_send_reply_cap_oracle(
+                        proof_send,
+                        proof_recv,
+                        e2_recv,
+                        slot14,
+                        ctx.task_id,
+                    );
+                } else {
+                    // Slot 14 carries E1's buffered capacity → sender-wake proof, so init
+                    // can fill E1 to EXACTLY full with non-blocking sends and never block.
+                    run_ipc_recv_proof_sender_wake(
+                        proof_send,
+                        proof_recv,
+                        e2_recv,
+                        slot14 as usize,
+                        ctx.task_id,
+                    );
+                }
+            } else {
+                // Slot 13 only → Stage 193C cap oracle (coord endpoint in slot 13).
+                run_ipc_send_cap_oracle(proof_send, proof_recv, e2_recv, ctx.task_id);
+            }
+        } else if let Some(coord_recv) = ctx.service_extra_cap_1 {
+            // Slot 13 empty + slot 14 present → Stage 193B IpcSend-plain live oracle.
+            // The presence pattern (set by the kernel under the send-plain-oracle
+            // sub-knob) selects this instead of sender-wake; the two are mutually
+            // exclusive.
+            run_ipc_send_plain_oracle(proof_send, proof_recv, coord_recv, ctx.task_id);
+        } else if let Some(mode) = ctx.pm_request_recv_cap {
+            // Slots 13 + 14 empty + slot 17 discriminator set → a no-waiter enqueue live
+            // oracle (needs no coordination cap; sends to E1 in slots 6/7). The slot-17 value
+            // selects which: 1 = Stage 193E plain enqueue, 2 = Stage 193F ordinary-cap enqueue.
+            if mode == 2 {
+                run_ipc_send_cap_enqueue_oracle(proof_send, proof_recv, ctx.task_id);
+            } else {
+                run_ipc_send_enqueue_oracle(proof_send, proof_recv, ctx.task_id);
+            }
         } else {
-            // Sub-knob absent: sender-wake is intentionally not driven (no fake
-            // marker). The queued-split + rollback proof above stands alone.
+            // Neither sub-knob: intentionally not driven (no fake marker). The
+            // queued-split + rollback proof above stands alone.
             yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SUBKNOB_ABSENT");
         }
     }
@@ -1748,6 +1782,895 @@ fn run_ipc_recv_proof_sender_wake(
     } else {
         yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_MSG_ABSENT");
     }
+}
+
+/// Stage 193B: the plain payload the IpcSend-plain live oracle delivers. A
+/// non-inline opcode (see `IPC_SEND_PLAIN_ORACLE_OPCODE`) so the kernel does not
+/// strip any inline prefix — the receiver observes these exact bytes.
+#[cfg(not(test))]
+const IPC_SEND_PLAIN_ORACLE_PAYLOAD: [u8; 8] = *b"SP193B!!";
+
+/// Stage 193B: application opcode for the send-plain oracle message. Arbitrary,
+/// proof-local, and deliberately NOT `OPCODE_INLINE` (0) so no inline-opcode
+/// prefix stripping occurs on the plain delivery.
+#[cfg(not(test))]
+const IPC_SEND_PLAIN_ORACLE_OPCODE: u16 = 0x0F9E;
+
+/// Stage 193B: deterministic IpcSend-plain LIVE oracle.
+///
+/// Runs ONLY under BOTH `yarm.ipc_recv_proof=1` and `yarm.ipc_send_plain_oracle=1`
+/// (gated by the presence of the kernel-provisioned coordination endpoint recv cap
+/// in startup slot 14 WITH slot 13 empty). Fires the Stage 193A `class=IpcSendPlain`
+/// boundary split LIVE in QEMU by driving the exact slice it decomposes: a PLAIN
+/// IpcSend to an already-recv-v2-blocked receiver.
+///
+/// 1. init drains E1 empty (the base subtests share E1), so the child blocks on an
+///    empty endpoint rather than draining a queued message.
+/// 2. init forks; the CHILD (fork returns 0) is the RECEIVER, the parent (init) is
+///    the plain SENDER. The child inherits init's proof caps via the COW fork.
+/// 3. the child `recv-v2`-blocks on E1. The kernel's `publish_recv_waiter_live`
+///    hook, in the SAME `ipc_state_lock` section that registers the waiter, pushes
+///    a receiver-blocked signal (carrying the child's TID) into the coordination
+///    endpoint — an atomic proxy for "a receiver is a waiter on E1".
+/// 4. init non-blocking-polls the coordination endpoint; the signal appears EXACTLY
+///    when the child is provably a recv-v2 waiter (no enqueue race). init verifies
+///    the signalled TID is the forked child (never init) before proceeding.
+/// 5. init sends a PLAIN message (no cap / no reply-cap / no shared-region) to E1.
+///    Because the child is already a recv-v2 waiter, the kernel takes the 193A
+///    plain boundary split: snapshot in-lock, then the trap-entry drain (global
+///    lock dropped) copies the payload + wakes the child exactly once — emitting
+///    IPC_SEND_BOUNDARY_* + `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain`.
+/// 6. init emits `IPC_SEND_PLAIN_LIVE_ORACLE_DONE result=ok`; the woken child reads
+///    the byte-identical payload and logs `..._CHILD_RECV_OK payload_match=1`.
+///
+/// The child parks (never returns into init's flow). All waits are bounded so a
+/// missing child (e.g. fork failure) degrades to a logged give-up, never a hang.
+#[cfg(not(test))]
+fn run_ipc_send_plain_oracle(e1_send: u32, e1_recv: u32, coord_recv: u32, init_tid: u64) {
+    use yarm_user_rt::ipc::Message;
+
+    const COORD_POLL_MAX_ITERS: usize = 100;
+    const PREDRAIN_MAX: usize = 512;
+
+    yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_BEGIN");
+    yarm_user_rt::user_log!(
+        "IPC_SEND_PLAIN_ORACLE_SETUP e1_send={} e1_recv={} coord_recv={} init_tid={}",
+        e1_send,
+        e1_recv,
+        coord_recv,
+        init_tid
+    );
+
+    // (0) Drain any leftover messages from the base subtests so the child blocks on
+    // an EMPTY endpoint (non-blocking; empty returns Ok(None)/WouldBlock).
+    let mut predrained = 0usize;
+    for _ in 0..PREDRAIN_MAX {
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e1_recv, 0) } {
+            Ok(Some(_)) => predrained += 1,
+            _ => break,
+        }
+    }
+    yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_PREDRAIN_DONE count={}", predrained);
+
+    // (1) Fork — child == receiver, parent (init) == plain sender.
+    yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_FORK_BEGIN");
+    // SAFETY: proof-only raw fork; the child inherits init's COW address space +
+    // proof caps and parks after its blocking recv (never returns into init's flow).
+    let fr = unsafe { yarm_user_rt::syscall::fork_raw() };
+    yarm_user_rt::user_log!(
+        "IPC_SEND_PLAIN_ORACLE_FORK_RET ret0={} ret1={} ret2={} err={} arch={}",
+        fr.ret0,
+        fr.ret1,
+        fr.ret2,
+        fr.err,
+        fr.arch
+    );
+    let pid = if fr.ret0 != 0 {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_PLAIN_ORACLE_FORK_DECODE code={} meaning={} role=parent",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        fr.ret0
+    } else if fr.err != 0 && fr.err < 0x100 {
+        // Genuine fork failure: abort boundedly — never spin for a missing child.
+        yarm_user_rt::user_log!(
+            "IPC_SEND_PLAIN_ORACLE_FORK_FAILED code={} meaning={}",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        return;
+    } else {
+        // ── CHILD: the real recv-v2-blocked receiver. ──
+        yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_CHILD_ENTRY");
+        yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_CHILD_RECV_BEGIN");
+        // SAFETY: e1_recv is a kernel-provisioned RECV cap to the proof loopback.
+        // The endpoint is empty (predrained), so this blocks the child as a recv-v2
+        // waiter; init's plain send wakes it via the 193A boundary drain.
+        match unsafe { yarm_user_rt::syscall::ipc_recv_v2(e1_recv) } {
+            Ok(Some(received)) => {
+                // `ipc_call_prepare` frames a sent message as [opcode_le(2) ++
+                // payload]; a PLAIN inline send is delivered WITHOUT the kernel
+                // stripping that prefix (strip only fires for cap-transfer /
+                // reply-cap messages), so the byte-identical delivery the child
+                // observes is exactly that 2-byte opcode prefix + the payload.
+                let got = received.message.as_slice();
+                let opcode_le = IPC_SEND_PLAIN_ORACLE_OPCODE.to_le_bytes();
+                let payload_match = got.len() == 2 + IPC_SEND_PLAIN_ORACLE_PAYLOAD.len()
+                    && got[0..2] == opcode_le
+                    && got[2..] == IPC_SEND_PLAIN_ORACLE_PAYLOAD[..];
+                let has_cap = received.transferred_cap.is_some();
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_PLAIN_ORACLE_CHILD_RECV_OK payload_match={} transferred_cap={} payload_len={} sender_tid={}",
+                    payload_match as u8,
+                    has_cap as u8,
+                    got.len(),
+                    received.sender_tid
+                );
+            }
+            Ok(None) => {
+                yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_CHILD_RECV_RET code=wouldblock");
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_CHILD_RECV_RET code={}", e as usize);
+            }
+        }
+        yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_CHILD_DONE");
+        // Park the child: block on the proof endpoint rather than spinning on yield.
+        yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_PARK_BEGIN role=child");
+        loop {
+            let _ = unsafe { yarm_user_rt::syscall::ipc_recv(e1_recv) };
+        }
+    };
+
+    // (2) PARENT: wait for the kernel's receiver-blocked coordination signal. Same
+    // cooperative NON-BLOCKING poll + yield the sender-wake proof uses (the kernel
+    // pushes the signal atomically inside `publish_recv_waiter_live`; the child does
+    // not signal itself). Bounded so a missing/never-scheduled child cannot hang.
+    yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_PARENT_WAIT_BEGIN child_pid={}", pid);
+    let mut waiter_tid: Option<u64> = None;
+    'coord_poll: for poll_iter in 0..COORD_POLL_MAX_ITERS {
+        // SAFETY: coord_recv is init's RECV cap to the proof coordination endpoint;
+        // timeout=0 is a non-blocking probe (never blocks the parent).
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(coord_recv, 0) } {
+            Ok(Some(sig)) => {
+                yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_COORD_HIT iter={}", poll_iter);
+                waiter_tid = Some(sig.sender_tid.0);
+                break 'coord_poll;
+            }
+            Ok(None) => {}
+            Err(yarm_user_rt::syscall::SyscallError::WouldBlock)
+            | Err(yarm_user_rt::syscall::SyscallError::TimedOut) => {}
+            Err(e) => {
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_PLAIN_ORACLE_COORD_ERR iter={} code={}",
+                    poll_iter,
+                    e as usize
+                );
+                break 'coord_poll;
+            }
+        }
+        // Hand the CPU to the child so it can reach its blocking recv and become a
+        // waiter (kernel pushes the coordination signal in that path). The parent
+        // stays Runnable, so the scheduler returns here once the child parks.
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
+    let Some(waiter_tid) = waiter_tid else {
+        yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_NO_WAITER_SIGNAL child_pid={}", pid);
+        return;
+    };
+    // The waiter MUST be the forked child, never init.
+    if waiter_tid == init_tid {
+        yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_WAITER_UNEXPECTED tid={}", waiter_tid);
+        return;
+    }
+    if waiter_tid != pid {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_PLAIN_ORACLE_WAITER_MISMATCH waiter_tid={} child_pid={}",
+            waiter_tid,
+            pid
+        );
+        return;
+    }
+    yarm_user_rt::user_log!(
+        "IPC_SEND_PLAIN_ORACLE_WAITER_OBSERVED waiter_tid={} child_pid={}",
+        waiter_tid,
+        pid
+    );
+
+    // (3) PARENT: PLAIN send → the child is a recv-v2 waiter, so this takes the 193A
+    // plain boundary split (kernel emits IPC_SEND_BOUNDARY_* + the retirement).
+    yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_SEND_BEGIN");
+    let Ok(msg) = Message::with_header(
+        0,
+        IPC_SEND_PLAIN_ORACLE_OPCODE,
+        0,
+        None,
+        &IPC_SEND_PLAIN_ORACLE_PAYLOAD,
+    ) else {
+        yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_MSG_BUILD_FAIL");
+        return;
+    };
+    // SAFETY: e1_send is init's SEND cap to the proof loopback; plain message.
+    let send = unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &msg) };
+    match send {
+        Ok(()) => {
+            yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_SEND_OK");
+            yarm_user_rt::user_log!("IPC_SEND_PLAIN_LIVE_ORACLE_DONE result=ok");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_SEND_FAILED code={}", e as usize);
+        }
+    }
+    yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_PARENT_DONE");
+    // init returns to its post-proof flow (blocks on the alert endpoint), which
+    // hands the CPU to the woken child so it can log its CHILD_RECV_OK.
+}
+
+/// Stage 193C: application opcode for the ordinary cap-transfer oracle message.
+#[cfg(not(test))]
+const IPC_SEND_CAP_ORACLE_OPCODE: u16 = 0x0FA0;
+
+/// Stage 193C: the payload the ordinary cap-transfer oracle delivers.
+#[cfg(not(test))]
+const IPC_SEND_CAP_ORACLE_PAYLOAD: [u8; 8] = *b"CAP193C!";
+
+/// Stage 193C: deterministic IpcSend ordinary cap-transfer LIVE oracle.
+///
+/// Runs ONLY under BOTH `yarm.ipc_recv_proof=1` and `yarm.ipc_send_cap_oracle=1`
+/// (gated by the coordination endpoint recv cap in startup slot 13 WITH slot 14
+/// empty). Fires the Stage 193C `class=IpcSendOrdinaryCap` boundary split LIVE by
+/// driving the exact slice it decomposes: an ORDINARY cap-transfer IpcSend to an
+/// already-recv-v2-blocked receiver.
+///
+/// Same fork + atomic receiver-block coordination as the 193B plain oracle; the
+/// only difference is the message init sends — it carries exactly ONE ordinary cap
+/// (init's E1 SEND cap, transferred via `FLAG_CAP_TRANSFER`). The kernel takes the
+/// 193C boundary split: Phase A consumes the transfer envelope once + snapshots
+/// object/rights/delegation by value (no mint, no copy, no wake); the trap-entry
+/// drain materializes a FRESH receiver-local cap through the 186D2/186D3 seam,
+/// copies payload/meta, and wakes the child once. The woken child verifies its
+/// received cap id is fresh (NOT the sender-local handle) — proving a sender-local
+/// CapId is never receiver authority.
+#[cfg(not(test))]
+fn run_ipc_send_cap_oracle(e1_send: u32, e1_recv: u32, coord_recv: u32, init_tid: u64) {
+    use yarm_user_rt::ipc::Message;
+
+    const COORD_POLL_MAX_ITERS: usize = 100;
+    const PREDRAIN_MAX: usize = 512;
+
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_BEGIN");
+    yarm_user_rt::user_log!(
+        "IPC_SEND_CAP_ORACLE_SETUP e1_send={} e1_recv={} coord_recv={} init_tid={}",
+        e1_send,
+        e1_recv,
+        coord_recv,
+        init_tid
+    );
+
+    // (0) Drain E1 empty so the child blocks on an empty endpoint.
+    let mut predrained = 0usize;
+    for _ in 0..PREDRAIN_MAX {
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e1_recv, 0) } {
+            Ok(Some(_)) => predrained += 1,
+            _ => break,
+        }
+    }
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_PREDRAIN_DONE count={}", predrained);
+
+    // (1) Fork — child == receiver, parent (init) == cap-transfer sender.
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_FORK_BEGIN");
+    // SAFETY: proof-only raw fork; the child inherits init's COW address space + caps.
+    let fr = unsafe { yarm_user_rt::syscall::fork_raw() };
+    yarm_user_rt::user_log!(
+        "IPC_SEND_CAP_ORACLE_FORK_RET ret0={} ret1={} ret2={} err={} arch={}",
+        fr.ret0,
+        fr.ret1,
+        fr.ret2,
+        fr.err,
+        fr.arch
+    );
+    let pid = if fr.ret0 != 0 {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_CAP_ORACLE_FORK_DECODE code={} meaning={} role=parent",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        fr.ret0
+    } else if fr.err != 0 && fr.err < 0x100 {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_CAP_ORACLE_FORK_FAILED code={} meaning={}",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        return;
+    } else {
+        // ── CHILD: the real recv-v2-blocked receiver. ──
+        yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_CHILD_ENTRY");
+        yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_CHILD_RECV_BEGIN");
+        // SAFETY: e1_recv is a kernel-provisioned RECV cap to the proof loopback.
+        match unsafe { yarm_user_rt::syscall::ipc_recv_v2(e1_recv) } {
+            Ok(Some(received)) => {
+                // A cap-transfer send is delivered with the 2-byte inline opcode
+                // prefix STRIPPED (the strip fires for cap-transfer), so the payload
+                // is the raw 8 bytes; accept either framing defensively.
+                let got = received.message.as_slice();
+                let opcode_le = IPC_SEND_CAP_ORACLE_OPCODE.to_le_bytes();
+                let stripped = got == &IPC_SEND_CAP_ORACLE_PAYLOAD[..];
+                let framed = got.len() == 2 + IPC_SEND_CAP_ORACLE_PAYLOAD.len()
+                    && got[0..2] == opcode_le
+                    && got[2..] == IPC_SEND_CAP_ORACLE_PAYLOAD[..];
+                let payload_match = stripped || framed;
+                // The receiver-local CapId MUST be fresh — a real cap that is NOT the
+                // sender-local handle (e1_send) init transferred.
+                let recv_cap_id = received.transferred_cap;
+                let has_cap = recv_cap_id.is_some();
+                let cap_is_fresh = matches!(recv_cap_id, Some(c) if c != e1_send);
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_CAP_ORACLE_CHILD_RECV_OK payload_match={} transferred_cap={} cap_is_fresh={} recv_cap={} sender_local_cap={} payload_len={} sender_tid={}",
+                    payload_match as u8,
+                    has_cap as u8,
+                    cap_is_fresh as u8,
+                    recv_cap_id.unwrap_or(0),
+                    e1_send,
+                    got.len(),
+                    received.sender_tid
+                );
+            }
+            Ok(None) => {
+                yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_CHILD_RECV_RET code=wouldblock");
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_CHILD_RECV_RET code={}", e as usize);
+            }
+        }
+        yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_CHILD_DONE");
+        yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_PARK_BEGIN role=child");
+        loop {
+            let _ = unsafe { yarm_user_rt::syscall::ipc_recv(e1_recv) };
+        }
+    };
+
+    // (2) PARENT: wait for the kernel's receiver-blocked coordination signal.
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_PARENT_WAIT_BEGIN child_pid={}", pid);
+    let mut waiter_tid: Option<u64> = None;
+    'coord_poll: for poll_iter in 0..COORD_POLL_MAX_ITERS {
+        // SAFETY: coord_recv is init's RECV cap to the proof coordination endpoint;
+        // timeout=0 is a non-blocking probe.
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(coord_recv, 0) } {
+            Ok(Some(sig)) => {
+                yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_COORD_HIT iter={}", poll_iter);
+                waiter_tid = Some(sig.sender_tid.0);
+                break 'coord_poll;
+            }
+            Ok(None) => {}
+            Err(yarm_user_rt::syscall::SyscallError::WouldBlock)
+            | Err(yarm_user_rt::syscall::SyscallError::TimedOut) => {}
+            Err(e) => {
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_CAP_ORACLE_COORD_ERR iter={} code={}",
+                    poll_iter,
+                    e as usize
+                );
+                break 'coord_poll;
+            }
+        }
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
+    let Some(waiter_tid) = waiter_tid else {
+        yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_NO_WAITER_SIGNAL child_pid={}", pid);
+        return;
+    };
+    if waiter_tid == init_tid {
+        yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_WAITER_UNEXPECTED tid={}", waiter_tid);
+        return;
+    }
+    if waiter_tid != pid {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_CAP_ORACLE_WAITER_MISMATCH waiter_tid={} child_pid={}",
+            waiter_tid,
+            pid
+        );
+        return;
+    }
+    yarm_user_rt::user_log!(
+        "IPC_SEND_CAP_ORACLE_WAITER_OBSERVED waiter_tid={} child_pid={}",
+        waiter_tid,
+        pid
+    );
+
+    // (3) PARENT: send an ORDINARY cap-transfer message (exactly one cap: init's E1
+    // SEND cap, delegated via FLAG_CAP_TRANSFER). The child is a recv-v2 waiter, so
+    // this takes the 193C boundary split (kernel emits IPC_SEND_CAP_BOUNDARY_* + the
+    // retirement); the child receives a FRESH receiver-local cap.
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_SEND_BEGIN transfer_cap={}", e1_send);
+    let Ok(msg) = Message::with_header(
+        0,
+        IPC_SEND_CAP_ORACLE_OPCODE,
+        Message::FLAG_CAP_TRANSFER,
+        Some(e1_send as u64),
+        &IPC_SEND_CAP_ORACLE_PAYLOAD,
+    ) else {
+        yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_MSG_BUILD_FAIL");
+        return;
+    };
+    // SAFETY: e1_send is init's SEND cap to the proof loopback; the transferred cap
+    // (also e1_send) is an ordinary endpoint cap init holds — established by the base
+    // rollback subtest, which transfers the same cap.
+    let send = unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &msg) };
+    match send {
+        Ok(()) => {
+            yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_SEND_OK");
+            yarm_user_rt::user_log!("IPC_SEND_CAP_LIVE_ORACLE_DONE result=ok");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_SEND_FAILED code={}", e as usize);
+        }
+    }
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_PARENT_DONE");
+    // init returns to its post-proof flow (blocks on the alert endpoint), handing the
+    // CPU to the woken child so it can log its CHILD_RECV_OK.
+}
+
+/// Stage 193D: application opcode for the reply-cap oracle message.
+#[cfg(not(test))]
+const IPC_SEND_REPLY_CAP_ORACLE_OPCODE: u16 = 0x0FA2;
+
+/// Stage 193D: the payload the reply-cap oracle delivers.
+#[cfg(not(test))]
+const IPC_SEND_REPLY_CAP_ORACLE_PAYLOAD: [u8; 8] = *b"REPLY93D";
+
+/// Stage 193D: deterministic IpcSend reply-cap transfer LIVE oracle.
+///
+/// Runs ONLY under BOTH `yarm.ipc_recv_proof=1` and `yarm.ipc_send_reply_cap_oracle=1`
+/// (gated by the coordination endpoint recv cap in slot 13 + the kernel-provisioned
+/// transferable reply cap in slot 14 + the slot-17 discriminator). Fires the Stage
+/// 193D `class=IpcSendReplyCap` boundary split LIVE by driving the exact slice it
+/// decomposes: an IpcSend of a message transferring a REPLY-typed cap to an
+/// already-recv-v2-blocked receiver.
+///
+/// Same fork + atomic receiver-block coordination as the 193B/193C oracles; the only
+/// difference is the transferred cap is the kernel-provisioned one-shot Reply cap
+/// (`reply_cap`). The userspace IpcSend ABI carries no reply flag, so the kernel routes
+/// on the transferred cap's OBJECT type: it detects the Reply object and takes the 193D
+/// reply-cap boundary split — Phase A snapshots the reply object's registry coordinates
+/// by value + consumes the reply-cap envelope once; the trap-entry drain mints a FRESH
+/// receiver-local one-shot reply cap, records it, copies, and wakes the child once. The
+/// woken child verifies its received reply cap id is fresh (NOT the sender-local handle).
+#[cfg(not(test))]
+fn run_ipc_send_reply_cap_oracle(
+    e1_send: u32,
+    e1_recv: u32,
+    coord_recv: u32,
+    reply_cap: u32,
+    init_tid: u64,
+) {
+    use yarm_user_rt::ipc::Message;
+
+    const COORD_POLL_MAX_ITERS: usize = 100;
+    const PREDRAIN_MAX: usize = 512;
+
+    yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_BEGIN");
+    yarm_user_rt::user_log!(
+        "IPC_SEND_REPLY_CAP_ORACLE_SETUP e1_send={} e1_recv={} coord_recv={} reply_cap={} init_tid={}",
+        e1_send,
+        e1_recv,
+        coord_recv,
+        reply_cap,
+        init_tid
+    );
+
+    // (0) Drain E1 empty so the child blocks on an empty endpoint.
+    let mut predrained = 0usize;
+    for _ in 0..PREDRAIN_MAX {
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e1_recv, 0) } {
+            Ok(Some(_)) => predrained += 1,
+            _ => break,
+        }
+    }
+    yarm_user_rt::user_log!(
+        "IPC_SEND_REPLY_CAP_ORACLE_PREDRAIN_DONE count={}",
+        predrained
+    );
+
+    // (1) Fork — child == receiver, parent (init) == reply-cap sender.
+    yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_FORK_BEGIN");
+    // SAFETY: proof-only raw fork; the child inherits init's COW address space + caps.
+    let fr = unsafe { yarm_user_rt::syscall::fork_raw() };
+    yarm_user_rt::user_log!(
+        "IPC_SEND_REPLY_CAP_ORACLE_FORK_RET ret0={} ret1={} ret2={} err={} arch={}",
+        fr.ret0,
+        fr.ret1,
+        fr.ret2,
+        fr.err,
+        fr.arch
+    );
+    let pid = if fr.ret0 != 0 {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_REPLY_CAP_ORACLE_FORK_DECODE code={} meaning={} role=parent",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        fr.ret0
+    } else if fr.err != 0 && fr.err < 0x100 {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_REPLY_CAP_ORACLE_FORK_FAILED code={} meaning={}",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        return;
+    } else {
+        // ── CHILD: the real recv-v2-blocked receiver. ──
+        yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_ENTRY");
+        yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_RECV_BEGIN");
+        // SAFETY: e1_recv is a kernel-provisioned RECV cap to the proof loopback.
+        match unsafe { yarm_user_rt::syscall::ipc_recv_v2(e1_recv) } {
+            Ok(Some(received)) => {
+                // A reply-cap delivery strips the 2-byte inline opcode prefix (strip
+                // fires for the reply-cap flag), so the payload is the raw 8 bytes;
+                // accept either framing defensively.
+                let got = received.message.as_slice();
+                let opcode_le = IPC_SEND_REPLY_CAP_ORACLE_OPCODE.to_le_bytes();
+                let stripped = got == &IPC_SEND_REPLY_CAP_ORACLE_PAYLOAD[..];
+                let framed = got.len() == 2 + IPC_SEND_REPLY_CAP_ORACLE_PAYLOAD.len()
+                    && got[0..2] == opcode_le
+                    && got[2..] == IPC_SEND_REPLY_CAP_ORACLE_PAYLOAD[..];
+                let payload_match = stripped || framed;
+                // The receiver-local reply cap MUST be fresh — a real reply cap that is
+                // NOT the sender-local handle (reply_cap) init transferred.
+                let recv_reply = received.reply_cap;
+                let has_reply_cap = recv_reply.is_some();
+                let reply_is_fresh = matches!(recv_reply, Some(c) if c != reply_cap);
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_REPLY_CAP_ORACLE_CHILD_RECV_OK payload_match={} reply_cap={} reply_is_fresh={} recv_reply_cap={} sender_local_cap={} payload_len={} sender_tid={}",
+                    payload_match as u8,
+                    has_reply_cap as u8,
+                    reply_is_fresh as u8,
+                    recv_reply.unwrap_or(0),
+                    reply_cap,
+                    got.len(),
+                    received.sender_tid
+                );
+            }
+            Ok(None) => {
+                yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_RECV_RET code=wouldblock");
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_REPLY_CAP_ORACLE_CHILD_RECV_RET code={}",
+                    e as usize
+                );
+            }
+        }
+        yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_DONE");
+        yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_PARK_BEGIN role=child");
+        loop {
+            let _ = unsafe { yarm_user_rt::syscall::ipc_recv(e1_recv) };
+        }
+    };
+
+    // (2) PARENT: wait for the kernel's receiver-blocked coordination signal.
+    yarm_user_rt::user_log!(
+        "IPC_SEND_REPLY_CAP_ORACLE_PARENT_WAIT_BEGIN child_pid={}",
+        pid
+    );
+    let mut waiter_tid: Option<u64> = None;
+    'coord_poll: for poll_iter in 0..COORD_POLL_MAX_ITERS {
+        // SAFETY: coord_recv is init's RECV cap to the proof coordination endpoint;
+        // timeout=0 is a non-blocking probe.
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(coord_recv, 0) } {
+            Ok(Some(sig)) => {
+                yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_COORD_HIT iter={}", poll_iter);
+                waiter_tid = Some(sig.sender_tid.0);
+                break 'coord_poll;
+            }
+            Ok(None) => {}
+            Err(yarm_user_rt::syscall::SyscallError::WouldBlock)
+            | Err(yarm_user_rt::syscall::SyscallError::TimedOut) => {}
+            Err(e) => {
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_REPLY_CAP_ORACLE_COORD_ERR iter={} code={}",
+                    poll_iter,
+                    e as usize
+                );
+                break 'coord_poll;
+            }
+        }
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
+    let Some(waiter_tid) = waiter_tid else {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_REPLY_CAP_ORACLE_NO_WAITER_SIGNAL child_pid={}",
+            pid
+        );
+        return;
+    };
+    if waiter_tid == init_tid {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_REPLY_CAP_ORACLE_WAITER_UNEXPECTED tid={}",
+            waiter_tid
+        );
+        return;
+    }
+    if waiter_tid != pid {
+        yarm_user_rt::user_log!(
+            "IPC_SEND_REPLY_CAP_ORACLE_WAITER_MISMATCH waiter_tid={} child_pid={}",
+            waiter_tid,
+            pid
+        );
+        return;
+    }
+    yarm_user_rt::user_log!(
+        "IPC_SEND_REPLY_CAP_ORACLE_WAITER_OBSERVED waiter_tid={} child_pid={}",
+        waiter_tid,
+        pid
+    );
+
+    // (3) PARENT: IpcSend transferring the one-shot Reply cap. The userspace ABI has no
+    // reply flag, so the kernel routes on the transferred cap's OBJECT type (Reply) and
+    // takes the 193D reply-cap boundary split; the child receives a FRESH receiver-local
+    // one-shot reply cap.
+    yarm_user_rt::user_log!(
+        "IPC_SEND_REPLY_CAP_ORACLE_SEND_BEGIN transfer_cap={}",
+        reply_cap
+    );
+    let Ok(msg) = Message::with_header(
+        0,
+        IPC_SEND_REPLY_CAP_ORACLE_OPCODE,
+        Message::FLAG_CAP_TRANSFER,
+        Some(reply_cap as u64),
+        &IPC_SEND_REPLY_CAP_ORACLE_PAYLOAD,
+    ) else {
+        yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_MSG_BUILD_FAIL");
+        return;
+    };
+    // SAFETY: e1_send is init's SEND cap to the proof loopback; the transferred cap is
+    // the kernel-provisioned one-shot Reply cap in init's cnode.
+    let send = unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &msg) };
+    match send {
+        Ok(()) => {
+            yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_SEND_OK");
+            yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_LIVE_ORACLE_DONE result=ok");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_SEND_FAILED code={}", e as usize);
+        }
+    }
+    yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_PARENT_DONE");
+    // init returns to its post-proof flow (blocks on the alert endpoint), handing the
+    // CPU to the woken child so it can log its CHILD_RECV_OK.
+}
+
+/// Stage 193E: application opcode for the enqueue oracle message.
+#[cfg(not(test))]
+const IPC_SEND_ENQUEUE_ORACLE_OPCODE: u16 = 0x0FA4;
+
+/// Stage 193E: the payload the plain no-waiter enqueue oracle delivers.
+#[cfg(not(test))]
+const IPC_SEND_ENQUEUE_ORACLE_PAYLOAD: [u8; 8] = *b"ENQ193E!";
+
+/// Stage 193E: deterministic IpcSend plain no-waiter enqueue LIVE oracle.
+///
+/// Runs ONLY under BOTH `yarm.ipc_recv_proof=1` and `yarm.ipc_send_enqueue_oracle=1`
+/// (gated by the slot-17 discriminator, slots 13 + 14 empty). Fires the Stage 193E
+/// `class=IpcSendPlainEnqueue` boundary split LIVE by driving the exact slice it
+/// decomposes: a PLAIN IpcSend to the loopback endpoint E1 with NO blocked receiver.
+///
+/// No fork and no coordination endpoint are needed — init holds BOTH the E1 send and
+/// recv caps and is NOT recv-blocked when it sends, so the send simply ENQUEUES the
+/// message (the 193E boundary split emits its markers + the retirement). init then
+/// recv-drains E1 to prove the queued message is delivered byte-identical (the
+/// receiver-later dequeue path), then emits `IPC_SEND_ENQUEUE_LIVE_ORACLE_DONE result=ok`.
+#[cfg(not(test))]
+fn run_ipc_send_enqueue_oracle(e1_send: u32, e1_recv: u32, init_tid: u64) {
+    use yarm_user_rt::ipc::Message;
+
+    const PREDRAIN_MAX: usize = 512;
+
+    yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_BEGIN");
+    yarm_user_rt::user_log!(
+        "IPC_SEND_ENQUEUE_ORACLE_SETUP e1_send={} e1_recv={} init_tid={}",
+        e1_send,
+        e1_recv,
+        init_tid
+    );
+
+    // (0) Drain E1 empty (the base subtests share it) so the enqueue starts from empty
+    // and the later recv observes exactly our message.
+    let mut predrained = 0usize;
+    for _ in 0..PREDRAIN_MAX {
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e1_recv, 0) } {
+            Ok(Some(_)) => predrained += 1,
+            _ => break,
+        }
+    }
+    yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_PREDRAIN_DONE count={}", predrained);
+
+    // (1) PLAIN send with no blocked receiver → the message ENQUEUES (the 193E boundary
+    // split emits IPC_SEND_ENQUEUE_BOUNDARY_* + the retirement). init is running (not
+    // recv-blocked), so there is no receiver waiter on E1.
+    yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_SEND_BEGIN");
+    let Ok(msg) = Message::with_header(
+        0,
+        IPC_SEND_ENQUEUE_ORACLE_OPCODE,
+        0,
+        None,
+        &IPC_SEND_ENQUEUE_ORACLE_PAYLOAD,
+    ) else {
+        yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_MSG_BUILD_FAIL");
+        return;
+    };
+    // SAFETY: e1_send is init's SEND cap to the proof loopback; plain message.
+    let send = unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &msg) };
+    match send {
+        Ok(()) => {
+            yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_SEND_OK");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_SEND_FAILED code={}", e as usize);
+            return;
+        }
+    }
+
+    // (2) Receiver-later dequeue: recv-v2 drains the queued message → prove byte-identical.
+    // A plain enqueued message is delivered with the 2-byte inline opcode prefix retained
+    // (plain sends are NOT prefix-stripped), so accept either framing defensively.
+    yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_RECV_BEGIN");
+    match unsafe { yarm_user_rt::syscall::ipc_recv_v2(e1_recv) } {
+        Ok(Some(received)) => {
+            let got = received.message.as_slice();
+            let opcode_le = IPC_SEND_ENQUEUE_ORACLE_OPCODE.to_le_bytes();
+            let stripped = got == &IPC_SEND_ENQUEUE_ORACLE_PAYLOAD[..];
+            let framed = got.len() == 2 + IPC_SEND_ENQUEUE_ORACLE_PAYLOAD.len()
+                && got[0..2] == opcode_le
+                && got[2..] == IPC_SEND_ENQUEUE_ORACLE_PAYLOAD[..];
+            let payload_match = stripped || framed;
+            let has_cap = received.transferred_cap.is_some();
+            yarm_user_rt::user_log!(
+                "IPC_SEND_ENQUEUE_ORACLE_RECV_OK payload_match={} transferred_cap={} payload_len={} sender_tid={}",
+                payload_match as u8,
+                has_cap as u8,
+                got.len(),
+                received.sender_tid
+            );
+            if payload_match {
+                yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_LIVE_ORACLE_DONE result=ok");
+            }
+        }
+        Ok(None) => {
+            yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_RECV_RET code=wouldblock");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_RECV_RET code={}", e as usize);
+        }
+    }
+    yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_ORACLE_DONE");
+}
+
+/// Stage 193F: application opcode for the ordinary-cap enqueue oracle message.
+#[cfg(not(test))]
+const IPC_SEND_CAP_ENQUEUE_ORACLE_OPCODE: u16 = 0x0FA6;
+
+/// Stage 193F: the payload the ordinary-cap no-waiter enqueue oracle delivers.
+#[cfg(not(test))]
+const IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD: [u8; 8] = *b"CAPENQ6F";
+
+/// Stage 193F: deterministic IpcSend ordinary-cap no-waiter enqueue LIVE oracle.
+///
+/// Runs ONLY under BOTH `yarm.ipc_recv_proof=1` and `yarm.ipc_send_cap_enqueue_oracle=1`
+/// (gated by the slot-17 discriminator value 2, slots 13 + 14 empty). Fires the Stage 193F
+/// `class=IpcSendOrdinaryCapEnqueue` boundary split LIVE by driving the exact slice it
+/// decomposes: an IpcSend transferring an ORDINARY cap to the loopback endpoint E1 with NO
+/// blocked receiver.
+///
+/// No fork and no coordination endpoint are needed. init transfers its E1 SEND cap (an
+/// ordinary endpoint cap) with no receiver blocked → the message ENQUEUES with the transfer
+/// envelope PRESERVED (the 193F boundary split emits its markers + the retirement). init then
+/// recv-drains E1 (the receiver-later path): the recv consumes the envelope and materializes a
+/// FRESH receiver-local cap into init's cnode (`IPC_TRANSFER_CAP_MATERIALIZE_OK`), which the
+/// oracle verifies is NOT the sender-local handle — proving a sender-local CapId is never the
+/// receiver's authority.
+#[cfg(not(test))]
+fn run_ipc_send_cap_enqueue_oracle(e1_send: u32, e1_recv: u32, init_tid: u64) {
+    use yarm_user_rt::ipc::Message;
+
+    const PREDRAIN_MAX: usize = 512;
+
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_BEGIN");
+    yarm_user_rt::user_log!(
+        "IPC_SEND_CAP_ENQUEUE_ORACLE_SETUP e1_send={} e1_recv={} init_tid={}",
+        e1_send,
+        e1_recv,
+        init_tid
+    );
+
+    // (0) Drain E1 empty so the enqueue starts from empty and the later recv observes
+    // exactly our message.
+    let mut predrained = 0usize;
+    for _ in 0..PREDRAIN_MAX {
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e1_recv, 0) } {
+            Ok(Some(_)) => predrained += 1,
+            _ => break,
+        }
+    }
+    yarm_user_rt::user_log!(
+        "IPC_SEND_CAP_ENQUEUE_ORACLE_PREDRAIN_DONE count={}",
+        predrained
+    );
+
+    // (1) ORDINARY cap-transfer send with no blocked receiver → the message ENQUEUES (the
+    // 193F boundary split emits IPC_SEND_CAP_ENQUEUE_BOUNDARY_* + the retirement). init is
+    // running (not recv-blocked), so there is no receiver waiter on E1.
+    yarm_user_rt::user_log!(
+        "IPC_SEND_CAP_ENQUEUE_ORACLE_SEND_BEGIN transfer_cap={}",
+        e1_send
+    );
+    let Ok(msg) = Message::with_header(
+        0,
+        IPC_SEND_CAP_ENQUEUE_ORACLE_OPCODE,
+        Message::FLAG_CAP_TRANSFER,
+        Some(e1_send as u64),
+        &IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD,
+    ) else {
+        yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_MSG_BUILD_FAIL");
+        return;
+    };
+    // SAFETY: e1_send is init's SEND cap to the proof loopback; the transferred cap (also
+    // e1_send) is an ordinary endpoint cap init holds (as in the base rollback subtest).
+    let send = unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &msg) };
+    match send {
+        Ok(()) => {
+            yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_SEND_OK");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!(
+                "IPC_SEND_CAP_ENQUEUE_ORACLE_SEND_FAILED code={}",
+                e as usize
+            );
+            return;
+        }
+    }
+
+    // (2) Receiver-later dequeue: recv_v2 drains the queued cap-transfer message → the recv
+    // consumes the envelope and materializes a FRESH receiver-local cap. A cap-transfer is
+    // delivered with the 2-byte inline opcode prefix stripped; accept either framing.
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_BEGIN");
+    match unsafe { yarm_user_rt::syscall::ipc_recv_v2(e1_recv) } {
+        Ok(Some(received)) => {
+            let got = received.message.as_slice();
+            let opcode_le = IPC_SEND_CAP_ENQUEUE_ORACLE_OPCODE.to_le_bytes();
+            let stripped = got == &IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD[..];
+            let framed = got.len() == 2 + IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD.len()
+                && got[0..2] == opcode_le
+                && got[2..] == IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD[..];
+            let payload_match = stripped || framed;
+            // The receiver-local CapId MUST be fresh — a real cap that is NOT the sender-local
+            // handle (e1_send) init transferred.
+            let recv_cap_id = received.transferred_cap;
+            let has_cap = recv_cap_id.is_some();
+            let cap_is_fresh = matches!(recv_cap_id, Some(c) if c != e1_send);
+            yarm_user_rt::user_log!(
+                "IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_OK payload_match={} cap_is_fresh={} transferred_cap={} recv_cap={} sender_local_cap={} payload_len={} sender_tid={}",
+                payload_match as u8,
+                cap_is_fresh as u8,
+                has_cap as u8,
+                recv_cap_id.unwrap_or(0),
+                e1_send,
+                got.len(),
+                received.sender_tid
+            );
+            if payload_match && cap_is_fresh {
+                yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_LIVE_ORACLE_DONE result=ok");
+            }
+        }
+        Ok(None) => {
+            yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_RET code=wouldblock");
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_RET code={}", e as usize);
+        }
+    }
+    yarm_user_rt::user_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_DONE");
 }
 
 #[cfg(test)]

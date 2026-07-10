@@ -1257,6 +1257,28 @@ pub(crate) fn execute_user_asid_plain_v2_writeback_boundary(
     let msg = &snapshot.msg;
     let app_payload = msg.as_slice();
 
+    // Stage 193F: surface the receiver-local cap that Phase A materialized into
+    // the recv-v2 meta so a recv_v2 caller can discover an **ordinary** transferred
+    // cap. For a PLAIN message `materialized_cap` is `None` → `NO_TRANSFER_CAP` +
+    // `recv_meta_flags = 0` (the historical plain-path constants, byte-identical).
+    // For an ordinary cap-transfer queued message the boundary seam minted a fresh
+    // receiver-local cap; without this the cap would be orphaned in the receiver's
+    // cnode with no CapId exposed to userspace.
+    //
+    // Reply caps (`is_reply_cap`) deliberately RETAIN the historical split-path
+    // behavior — the cap is hidden from the v2 meta here. The reply-cap delivery
+    // contract on this queued split (e.g. the supervisor fault/restart chain, which
+    // recvs a one-shot reply cap through this exact writeback) depends on the meta
+    // reporting no cap; surfacing it there changes that receiver's behavior and is
+    // out of 193F scope (ordinary-cap no-waiter enqueue only).
+    let (meta_cap_id, meta_recv_flags) = match snapshot.materialized_cap {
+        Some(cap) if !snapshot.is_reply_cap => (
+            cap,
+            crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
+        ),
+        _ => (Message::NO_TRANSFER_CAP, 0),
+    };
+
     // Same single pure recv-v2 codec, same plain-path constants as the
     // `&mut KernelState` sibling (§55 / Stage 155 convergence).
     let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
@@ -1264,8 +1286,8 @@ pub(crate) fn execute_user_asid_plain_v2_writeback_boundary(
         msg.opcode,
         msg.flags,
         app_payload.len() as u32,
-        Message::NO_TRANSFER_CAP,
-        0,
+        meta_cap_id,
+        meta_recv_flags,
         msg.sender_tid.0,
     );
 

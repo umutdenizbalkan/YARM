@@ -195,6 +195,34 @@ if [[ -f "$LOGFILE" ]]; then
   fi
 fi
 
+# Stage 195A: DebugLog (NR 15) is the first live AArch64 split-dispatch retirement class.
+# Verified UNCONDITIONALLY (the strict boot-shell block below is gated on a boot-shell
+# marker that AArch64 does not emit at the idle terminal). Require the
+# import/dispatch/retire/finalize markers; forbid any split fatal or AArch64
+# queue-advancing (FutexWait/Yield) / other-split-class retirement marker.
+if [[ -f "$LOGFILE" ]]; then
+  if ! check_required_patterns "$LOGFILE" \
+      "AARCH64_SPLIT_ABI_IMPORT_OK nr=15" \
+      "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=15" \
+      "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=DebugLog result=ok" \
+      "AARCH64_SPLIT_FINALIZE_OK nr=15 result=ok"; then
+    echo "[error] aarch64 Stage 195A DebugLog split-dispatch markers missing"
+    exit 1
+  fi
+  for a64_split_bad in \
+      "AARCH64_SPLIT_FINALIZE_OK nr=15 result=error" \
+      "arch=aarch64 class=FutexWait" \
+      "arch=aarch64 class=Yield" \
+      "arch=aarch64 class=FutexWake" \
+      "arch=aarch64 class=InitramfsReadChunk"; do
+    if cad_has "$a64_split_bad"; then
+      echo "[error] aarch64 Stage 195A: forbidden split marker: $a64_split_bad"
+      exit 1
+    fi
+  done
+  echo "[ok] aarch64 Stage 195A: DebugLog split-dispatch live (queue-advancing classes inert)"
+fi
+
 if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then
   if ! check_required_patterns "$LOGFILE" "${EARLY_MARKER_SEQUENCE[@]}"; then
     echo "[warn] aarch64 strict required markers are incomplete"

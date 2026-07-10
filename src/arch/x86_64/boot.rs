@@ -932,6 +932,58 @@ pub fn bootstrap_first_user_task(
         // so init fills E1 to exactly full with non-blocking sends and never blocks.
         init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
     }
+    // Stage 193C: sub-knob-gated (`yarm.ipc_send_cap_oracle=1`) coordination
+    // endpoint recv cap in slot 13 (service_extra_cap_0), with slot 14 LEFT EMPTY.
+    // That presence pattern (slot 13 set + slot 14 empty) tells init to run the
+    // IpcSend ordinary cap-transfer live oracle. Mutually exclusive with sender-wake
+    // (slots 13 + 14) and the plain oracle (slot 14 only). x86_64-only live target.
+    else if let Some(coord_recv_cap) =
+        crate::kernel::boot::provision_init_ipc_send_cap_oracle_coord(kernel, RING3_INIT_SERVER_TID)
+    {
+        init_args[13] = coord_recv_cap as u64;
+    }
+    // Stage 193D: sub-knob-gated (`yarm.ipc_send_reply_cap_oracle=1`) coordination
+    // endpoint recv cap in slot 13 + a kernel-provisioned transferable reply cap in
+    // slot 14 + a discriminator in slot 17 (init never uses slot 17). The (13 + 14 +
+    // 17) pattern tells init to run the IpcSend reply-cap live oracle, distinct from
+    // sender-wake (13 + 14, no slot 17). x86_64-only live target.
+    else if let Some((coord_recv_cap, reply_cap)) =
+        crate::kernel::boot::provision_init_ipc_send_reply_cap_oracle(kernel, RING3_INIT_SERVER_TID)
+    {
+        init_args[13] = coord_recv_cap as u64;
+        init_args[14] = reply_cap as u64;
+        init_args[17] = 1; // reply-cap oracle discriminator (init otherwise leaves slot 17 zero)
+    }
+    // Stage 193B: sub-knob-gated (`yarm.ipc_send_plain_oracle=1`) coordination
+    // endpoint E2 recv cap in slot 14 (service_extra_cap_1), with slot 13 LEFT
+    // EMPTY. That presence pattern (slot 13 empty + slot 14 set) tells init to run
+    // the IpcSend-plain live oracle instead of the sender-wake proof. Mutually
+    // exclusive with the sender-wake block above (its knob is off here, so it left
+    // both slots zero). x86_64-only live target; other arches never set the knob.
+    else if let Some(coord_recv_cap) =
+        crate::kernel::boot::provision_init_ipc_send_plain_oracle_coord(
+            kernel,
+            RING3_INIT_SERVER_TID,
+        )
+    {
+        init_args[14] = coord_recv_cap as u64;
+    }
+    // Stage 193E: sub-knob-gated (`yarm.ipc_send_enqueue_oracle=1`) plain no-waiter enqueue
+    // oracle. It needs NO coordination cap (no fork, no blocked receiver — a plain send to
+    // the loopback E1 simply enqueues), so it is signalled by slot 17 ALONE (slots 13 + 14
+    // empty), distinct from every other oracle's slot pattern. init runs it against E1
+    // (slots 6/7, provisioned under the base proof knob). x86_64-only live target.
+    else if crate::kernel::boot::ipc_send_enqueue_oracle_active() {
+        init_args[17] = 1; // enqueue-oracle discriminator (init otherwise leaves slot 17 zero)
+        crate::yarm_log!("IPC_SEND_ENQUEUE_ORACLE_PROVISION_OK slot17=1");
+    }
+    // Stage 193F: the ordinary-cap no-waiter enqueue oracle shares the slot-17 discriminator
+    // with 193E but uses value 2 (slots 13 + 14 empty). Like 193E it needs no cap beyond E1
+    // (slots 6/7, base proof knob). x86_64-only live target.
+    else if crate::kernel::boot::ipc_send_cap_enqueue_oracle_active() {
+        init_args[17] = 2; // cap-enqueue-oracle discriminator
+        crate::yarm_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_PROVISION_OK slot17=2");
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,
