@@ -42999,22 +42999,31 @@ mod stage160c_aarch64_trap_abi_bracketing {
         );
     }
 
-    // 3. The bracketing is gated behind the proof knob so normal boots are
-    //    byte-identical (import skipped → split sees nr=0 → unchanged fallback).
+    // 3. Stage 195A: the bracketing is de-gated SELECTIVELY for DebugLog (NR 15) — only
+    //    DebugLog reaches the split on a normal boot; every other syscall keeps nr=0 and
+    //    takes the unchanged fallback. The proof knob still imports its full surface. So both
+    //    hooks now gate on `DebugLog NR || oracle knob`.
     #[test]
-    fn stage160c_bracketing_gated_by_proof_knob() {
+    fn stage160c_bracketing_gated_by_debuglog_or_proof_knob() {
         for hook in &[
-            "fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {",
-            "fn finalize_split_handled_syscall(",
+            "#[cfg(target_arch = \"aarch64\")]\nfn pre_split_import_syscall_abi(frame: &mut TrapFrame) {",
+            "#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(",
         ] {
             let pos = TRAP_ENTRY_SRC
                 .find(hook)
                 .unwrap_or_else(|| panic!("hook {hook} must be defined"));
-            let end = (pos + 600).min(TRAP_ENTRY_SRC.len());
-            let body = &TRAP_ENTRY_SRC[pos..end];
+            let rest = &TRAP_ENTRY_SRC[pos..];
+            let body = rest
+                .split_once("\n#[cfg(not(target_arch = \"aarch64\"))]")
+                .map(|(b, _)| b)
+                .unwrap_or(rest);
             assert!(
                 body.contains("ipc_recv_oracle_proof_enabled()"),
-                "hook {hook} must be gated behind the proof knob"
+                "hook {hook} must still honor the proof knob"
+            );
+            assert!(
+                body.contains("SYSCALL_DEBUG_LOG_NR"),
+                "hook {hook} must be de-gated selectively for DebugLog"
             );
         }
     }
@@ -43184,15 +43193,19 @@ mod stage160d_aarch64_split_error_export_parity {
             TRAP_ENTRY_SRC.contains("maybe_run_d6_controlled_switch_proof"),
             "x86_64 D6 proof hook must remain intact"
         );
-        // The export-parity work is reached only through the proof-knob-gated
-        // finalize hook (Stage 160C), so normal boots are unaffected.
+        // Stage 195A: the export-parity work is reached through the finalize hook, now
+        // de-gated selectively for DebugLog (NR 15) plus the proof knob. Non-DebugLog,
+        // non-oracle boots are unaffected (their ABI is never imported → split declines).
         let hook = TRAP_ENTRY_SRC
-            .find("fn finalize_split_handled_syscall(")
-            .map(|p| &TRAP_ENTRY_SRC[p..(p + 600).min(TRAP_ENTRY_SRC.len())])
+            .find("#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(")
+            .map(|p| &TRAP_ENTRY_SRC[p..])
+            .and_then(|r| r.split_once("\n#[cfg(not(target_arch = \"aarch64\"))]"))
+            .map(|(b, _)| b)
             .unwrap_or("");
         assert!(
-            hook.contains("ipc_recv_oracle_proof_enabled()"),
-            "the finalize hook must stay proof-knob-gated"
+            hook.contains("ipc_recv_oracle_proof_enabled()")
+                && hook.contains("SYSCALL_DEBUG_LOG_NR"),
+            "the finalize hook must gate on DebugLog NR or the proof knob"
         );
     }
 }
@@ -62224,6 +62237,167 @@ mod stage194_cross_arch_portability_audit {
                 );
             }
         }
+    }
+}
+
+// Stage 195A — AARCH64 SPLIT-DISPATCH DEBUGLOG LIVE. DebugLog (NR 15) is the first live
+// AArch64 split-dispatch retirement class. These guards pin the selective ABI-import gate
+// (DebugLog only), byte-identical x86_64 marker text, error/success export parity, and that
+// no other class or queue-advancing drain was newly enabled on AArch64.
+mod stage195a_aarch64_debuglog_live {
+    use super::*;
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const AARCH64_DOC: &str = include_str!("../../../doc/ARCH_AARCH64.md");
+
+    fn aarch64_import_body() -> &'static str {
+        TRAP_ENTRY_SRC
+            .split_once("#[cfg(target_arch = \"aarch64\")]\nfn pre_split_import_syscall_abi(")
+            .map(|(_, r)| r.split_once("\n#[cfg(").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("")
+    }
+
+    // The AArch64 ABI import is de-gated SELECTIVELY for DebugLog (NR 15): only DebugLog
+    // reaches the split dispatcher on a normal boot, keeping it the ONLY newly-eligible class.
+    #[test]
+    fn aarch64_abi_import_is_debuglog_selective() {
+        let body = aarch64_import_body();
+        assert!(!body.is_empty(), "aarch64 pre_split_import body must exist");
+        assert!(
+            body.contains("SYSCALL_DEBUG_LOG_NR"),
+            "the AArch64 ABI import must gate on DebugLog (NR 15), not blanket-import every syscall"
+        );
+        assert!(
+            body.contains("REG_X8"),
+            "the import gate must peek the raw syscall number from x8"
+        );
+        // Must NOT separately de-gate FutexWake / InitramfsReadChunk on AArch64.
+        assert!(
+            !body.contains("SYSCALL_FUTEX_WAKE_NR")
+                && !body.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
+            "195A must not enable FutexWake / InitramfsReadChunk on AArch64"
+        );
+    }
+
+    // DebugLog passes the arch-neutral NR gate; FutexWake/InitramfsReadChunk also pass the NR
+    // gate (arch-neutral), so on AArch64 they are held back ONLY by the import gate above —
+    // proving the selectivity is the single enabling lever.
+    #[test]
+    fn debuglog_passes_nr_gate() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),"),
+            "DebugLog must pass the split NR gate"
+        );
+        assert!(
+            SPLIT_SRC.contains("if matches!(syscall, Syscall::DebugLog) {"),
+            "try_split_dispatch_into_frame must route DebugLog to its helper"
+        );
+    }
+
+    // ABI import reads x8 -> syscall_num and x0..x5 -> args (byte-identical to the global
+    // path's importer), and emits the production import-OK marker.
+    #[test]
+    fn aarch64_abi_import_reads_correct_regs() {
+        assert!(
+            AARCH64_TRAP_SRC.contains("fn import_syscall_abi_from_user_gprs(")
+                && AARCH64_TRAP_SRC.contains("frame.set_syscall_num(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8))"),
+            "import must map x8 -> syscall_num"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("AARCH64_SPLIT_ABI_IMPORT_OK nr="),
+            "import must emit the production import-OK marker"
+        );
+    }
+
+    // Finalize exports canonical success AND error registers, and emits result=ok /
+    // result=error code=<code> so error parity is visible.
+    #[test]
+    fn aarch64_finalize_exports_success_and_error() {
+        assert!(
+            AARCH64_TRAP_SRC.contains("fn export_syscall_result_to_user_gprs(")
+                && AARCH64_TRAP_SRC.contains("if let Some(error) = frame.error_code() {"),
+            "finalize export must branch on error_code for canonical error encoding"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("AARCH64_SPLIT_FINALIZE_OK nr={} result=ok")
+                && AARCH64_TRAP_SRC
+                    .contains("AARCH64_SPLIT_FINALIZE_OK nr={} result=error code={}"),
+            "finalize must emit both result=ok and result=error code=<code> markers"
+        );
+    }
+
+    // x86_64 (and riscv64) marker text stays byte-identical: the arch tag is empty off AArch64,
+    // and the untagged DebugLog retirement marker is preserved for non-aarch64.
+    #[test]
+    fn x86_64_marker_text_byte_identical() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("#[cfg(not(target_arch = \"aarch64\"))]\nconst SPLIT_DISPATCH_ARCH_TAG: &str = \"\";"),
+            "the split-dispatch arch tag must be empty on non-AArch64 (x86_64 byte-identical)"
+        );
+        assert!(
+            SPLIT_SRC.contains(
+                "crate::yarm_log!(\"{} class=DebugLog result=ok\", MARK_RETIRE_CLASS_DONE);"
+            ),
+            "the non-aarch64 DebugLog retirement marker must stay untagged/byte-identical"
+        );
+        assert!(
+            SPLIT_SRC.contains("arch=aarch64 class=DebugLog result=ok"),
+            "AArch64 must emit the arch-tagged DebugLog retirement marker"
+        );
+    }
+
+    // No queue-advancing drain body is enabled on AArch64: the D2/FutexWait/Yield drains stay
+    // x86_64-gated (re-checked here alongside the new DebugLog wiring).
+    #[test]
+    fn no_queue_advancing_drain_on_aarch64() {
+        for needle in [
+            "d2_recv_was_deferred",
+            "futex_wait_was_deferred",
+            "yield_was_deferred",
+        ] {
+            let idx = TRAP_ENTRY_SRC.find(needle).unwrap();
+            assert!(
+                TRAP_ENTRY_SRC[..idx]
+                    .rfind("#[cfg(target_arch = \"x86_64\")]")
+                    .is_some(),
+                "queue-advancing drain `{needle}` must stay x86_64-gated"
+            );
+        }
+    }
+
+    // RISC-V raw path still force-clears the active flag (unchanged this stage).
+    #[test]
+    fn riscv_still_force_clears_active_flag() {
+        assert!(
+            RISCV_TRAP_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
+                && RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
+            "RISC-V must still force the active flag false"
+        );
+    }
+
+    // ReapFaultedTask remains excluded from split dispatch.
+    #[test]
+    fn reap_faulted_task_still_excluded() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never pass the split NR gate"
+        );
+    }
+
+    // The Stage 194 active-flag wording contradiction is corrected in the arch doc.
+    #[test]
+    fn stage194_active_flag_wording_corrected() {
+        assert!(
+            AARCH64_DOC.contains("Correction to earlier Stage 194 wording")
+                && AARCH64_DOC.contains("DOES set `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`"),
+            "the arch doc must correct the Stage 194 active-flag wording"
+        );
+        assert!(
+            AARCH64_DOC.contains("DebugLog is now LIVE on AArch64 (Stage 195A)"),
+            "the arch doc must record DebugLog going live"
+        );
     }
 }
 

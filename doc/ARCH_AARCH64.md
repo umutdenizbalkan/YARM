@@ -349,21 +349,35 @@ is the core Stage 194 finding.
   and calls `dispatch_trap_entry_with_shared_kernel` → `handle_trap_entry_shared`, exactly
   like x86_64. It therefore owns `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` correctly (set
   before `with_cpu`, cleared after) and runs the generic `drain_dispatch_post_work`.
+- **Correction to earlier Stage 194 wording (do NOT read the active-flag rules as
+  "AArch64 never sets the flag").** AArch64 already owns the generic shared post-lock drain
+  and DOES set `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` true while that drain is guaranteed to
+  run — that is exactly why the generic IpcSend boundary deliveries already complete live on
+  AArch64. Only the queue-advancing, x86_64-only retirement classes (`D2`/`FutexWait`/`Yield`)
+  remain inactive on AArch64; those are the paths still awaiting a de-gated drain body + an
+  EL0-return-frame restore proof. Setting the active flag is not the blocker; the missing
+  queue-advancing drain body is.
 - **The arch restore hook exists:** `restore_arch_thread_state_post_switch` (the AArch64
   arm of `post_switch_restore_arch_thread_state`).
-- **Why the split-dispatch classes are still inert (the boundary family is not):** the
-  split-dispatch classes only fire when the trap frame carries the DECODED syscall ABI. On
-  AArch64 the import
-  (`pre_split_import_syscall_abi`) and the handled-syscall finalize
-  (`finalize_split_handled_syscall`) are gated behind the oracle proof knob
-  (`ipc_recv_oracle_proof_enabled()`), so a normal boot sees `nr=0`, the split declines,
-  and every syscall falls through to the unchanged global-lock path.
-- **First live slice (Stage 195):** de-gate the ABI import + finalize, then enable
-  `DebugLog` (pure read, no task switch, no drain, no TTBR0/ASID change), then
-  `InitramfsReadChunk` success path, then `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
-  The queue-advancing classes (`D2`/`FutexWait`/`Yield`) are deferred until their
-  `#[cfg(target_arch = "x86_64")]` drain bodies are de-gated and an EL0-return-frame restore
-  is proven under the drain.
+- **DebugLog is now LIVE on AArch64 (Stage 195A).** The ABI import
+  (`pre_split_import_syscall_abi`) and handled-syscall finalize
+  (`finalize_split_handled_syscall`) are de-gated **selectively for DebugLog (NR 15)**: the
+  import peeks the raw `x8` and imports the decoded ABI only when it is DebugLog (or when the
+  oracle knob is on), so DebugLog reaches `try_split_dispatch_into_frame` and every other
+  syscall keeps `nr=0` and falls back to the unchanged global-lock path. A normal AArch64 boot
+  now emits `AARCH64_SPLIT_ABI_IMPORT_OK nr=15`, `YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=15`,
+  `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=DebugLog result=ok`, and
+  `AARCH64_SPLIT_FINALIZE_OK nr=15 result=ok`. The DebugLog user-copy seam runs lock-free
+  (`copy_from_user_asid_split_read`); the finalize's brief `with_cpu` is the arch return-path
+  restore (export x0..x5 + advance past the SVC), not the seam. Success/error registers are
+  byte-identical to the legacy `handle_debug_log` path (same `set_ok(0,0,0)` / `set_err`, same
+  `export_syscall_result_to_user_gprs`).
+- **Still inert on AArch64 (unchanged this stage):** `FutexWake`, `InitramfsReadChunk` (split
+  classes not yet de-gated), and the queue-advancing classes (`D2`/`FutexWait`/`Yield`), which
+  remain `#[cfg(target_arch = "x86_64")]` and await a de-gated drain body + an EL0-return-frame
+  restore proof.
+- **Next AArch64 slices (Stage 195B+):** `InitramfsReadChunk` success path, then
+  `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
 - **TLB/ASID:** local TTBR0_EL1 + ASID switch with the existing `TLBI`/`DSB ISH`/`ISB`
   maintenance is sufficient for the first slices; broadcast `TLBI` is only needed for
   VM/SMP classes, which are out of scope. QEMU virt and RPi5 share the same generic drain —

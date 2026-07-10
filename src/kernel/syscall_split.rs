@@ -403,8 +403,22 @@ fn maybe_log_debug_log_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("{} class=DebugLog", MARK_RETIRE_CLASS_BEGIN);
-        crate::yarm_log!("{} class=DebugLog result=ok", MARK_RETIRE_CLASS_DONE);
+        // Stage 195A: AArch64 emits an arch-tagged retirement marker (DebugLog is the
+        // first live AArch64 split-dispatch class). x86_64/riscv64 keep the exact
+        // untagged marker text — byte-identical to Stage 191A.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!("{} arch=aarch64 class=DebugLog", MARK_RETIRE_CLASS_BEGIN);
+            crate::yarm_log!(
+                "{} arch=aarch64 class=DebugLog result=ok",
+                MARK_RETIRE_CLASS_DONE
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            crate::yarm_log!("{} class=DebugLog", MARK_RETIRE_CLASS_BEGIN);
+            crate::yarm_log!("{} class=DebugLog result=ok", MARK_RETIRE_CLASS_DONE);
+        }
     }
 }
 

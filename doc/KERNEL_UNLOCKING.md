@@ -8406,15 +8406,31 @@ register/address-space restore (`post_switch_restore_arch_thread_state`).
 - SMP: recommended first slices (DebugLog/InitramfsReadChunk/*Enqueue) require NO cross-CPU
   dispatch and NO remote shootdown, so current AArch64/RISC-V SMP maturity does not block them.
 
+#### Stage 195A — AArch64 DebugLog LIVE (DONE)
+
+DebugLog (NR 15) is now a live AArch64 split-dispatch retirement class. The ABI import +
+finalize are de-gated **selectively for DebugLog**: `pre_split_import_syscall_abi` peeks the
+raw `x8` and imports the decoded ABI only when it is `SYSCALL_DEBUG_LOG_NR` (or the oracle knob
+is on), so DebugLog is the ONLY newly-eligible class — every other syscall keeps `nr=0` and
+takes the unchanged global-lock path. `finalize_split_handled_syscall` mirrors that selectivity.
+Live markers on a normal AArch64 boot: `AARCH64_SPLIT_ABI_IMPORT_OK nr=15`,
+`YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=15`,
+`GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=DebugLog result=ok`,
+`AARCH64_SPLIT_FINALIZE_OK nr=15 result=ok`. Success/error registers are byte-identical to the
+legacy `handle_debug_log` path. Queue-advancing classes stay `#[cfg(target_arch = "x86_64")]`;
+x86_64 marker text is byte-identical (arch tag is empty off AArch64); RISC-V stays inert
+(active flag force-false). See §4.6 of `doc/ARCH_AARCH64.md`.
+
 #### Stage 195 — AArch64 first live retirement (implementation plan)
 
-1. De-gate `pre_split_import_syscall_abi` + `finalize_split_handled_syscall` from the oracle
-   knob so a normal boot carries the decoded ABI in the frame (byte-identical when the split
-   declines). Prove with the AArch64 core smoke that non-eligible syscalls still fall back.
-2. Enable **DebugLog** first (pure read, no switch, no drain, no address-space change). Expect
-   `GLOBAL_LOCK_RETIRE_CLASS_DONE class=DebugLog result=ok` on AArch64 with the server chain
-   intact. Then **InitramfsReadChunk** success path, then **IpcSendPlainEnqueue** (rank-4
-   enqueue, no drain).
+1. **[195A DONE]** De-gate `pre_split_import_syscall_abi` + `finalize_split_handled_syscall`
+   selectively for DebugLog so a normal boot carries the decoded ABI for NR 15 only
+   (byte-identical fallback for every other syscall). Proven by the AArch64 core smoke:
+   non-eligible syscalls still fall back.
+2. **[195A DONE]** Enable **DebugLog** first (pure read, no switch, no drain, no address-space
+   change): `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=DebugLog result=ok` on AArch64
+   with the server chain intact. **Next (195B+):** **InitramfsReadChunk** success path, then
+   **IpcSendPlainEnqueue** (rank-4 enqueue, no drain).
 3. Do NOT enable D2/FutexWait/Yield: those need the de-gated drain body + an EL0-return frame
    restore proof (`restore_arch_thread_state_post_switch` under the drain), deferred to a later
    stage.
