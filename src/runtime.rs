@@ -1552,6 +1552,17 @@ impl SharedKernel {
                     ));
                 }
                 crate::yarm_log!("DISPATCH_POST_WORK_USER_COPY_OK kind=blocked_waiter_plain");
+                // Stage 193A: IpcSend-origin plain deliveries emit the boundary marker
+                // here (peek — the flag is consumed after the wake below). Reply-origin
+                // deliveries leave the flag unset, so this is silent for them.
+                let ipc_send_origin =
+                    crate::kernel::boot::ipc_send_boundary_origin_is_set(cpu.0 as usize);
+                if ipc_send_origin {
+                    crate::yarm_log!(
+                        "IPC_SEND_BOUNDARY_USER_COPY_OK waiter_tid={}",
+                        snap.waiter_tid
+                    );
+                }
                 crate::yarm_log!("DISPATCH_POST_WORK_EXECUTE_OK kind=blocked_waiter_plain");
                 // Phase C — completion, via a brief global re-entry (no seam
                 // inside the closure), preserving the legacy order copy → clear
@@ -1571,6 +1582,16 @@ impl SharedKernel {
                     }
                 });
                 crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_plain");
+                // Stage 193A: for an IpcSend-origin plain delivery, emit the IpcSend boundary
+                // wake/done markers + the one-shot retirement, and consume the origin flag.
+                if crate::kernel::boot::ipc_send_boundary_origin_take(cpu.0 as usize) {
+                    crate::yarm_log!("IPC_SEND_BOUNDARY_WAKE_OK waiter_tid={}", snap.waiter_tid);
+                    crate::yarm_log!(
+                        "IPC_SEND_BOUNDARY_SPLIT_DONE result=ok waiter_tid={}",
+                        snap.waiter_tid
+                    );
+                    crate::kernel::boot::maybe_log_ipc_send_plain_retired();
+                }
                 // Stage 156 IPC oracle: blocked-waiter recv-v2 meta (40 bytes)
                 // delivered (relocated here with the writeback in Stage 188B —
                 // same live path, same meaning as the legacy helper's marker).

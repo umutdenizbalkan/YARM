@@ -1099,6 +1099,61 @@ pub(crate) fn maybe_log_yield_retired() {
     }
 }
 
+// ── Stage 193A (BROAD-IPC DECOMPOSITION — IpcSend plain waiting-receiver slice) ─────
+//
+// IpcSend of a PLAIN message to an already-recv-v2-blocked receiver reuses the 188
+// dispatch-return channel (the same producer + drain `ipc_reply` uses): Phase A snapshots
+// the payload/meta by value under the broad borrow (NO user copy, NO cap materialization),
+// and the trap-entry drain does Phase B (user copy + slot-clear + wake) AFTER the broad
+// borrow drops. This per-CPU flag tags the stashed plain delivery as originating from
+// `ipc_send` so the drain can emit the IpcSend-specific boundary markers (the plain snapshot
+// arm is shared with `ipc_reply`, which leaves the flag unset).
+
+/// Stage 193A: per-CPU "the pending plain delivery originated from ipc_send" flag.
+pub(crate) static IPC_SEND_BOUNDARY_ORIGIN: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 193A: tag the just-stashed plain delivery on `cpu` as an ipc_send boundary split.
+pub(crate) fn ipc_send_boundary_origin_set(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        IPC_SEND_BOUNDARY_ORIGIN[cpu_idx].store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Stage 193A: is the pending plain delivery on `cpu` an ipc_send boundary split? (peek)
+pub(crate) fn ipc_send_boundary_origin_is_set(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && IPC_SEND_BOUNDARY_ORIGIN[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 193A: consume the ipc_send boundary origin flag for `cpu` (clear + return prior).
+pub(crate) fn ipc_send_boundary_origin_take(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && IPC_SEND_BOUNDARY_ORIGIN[cpu_idx].swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// Stage 193A: one-shot latch for the IpcSendPlain boundary retirement markers.
+static IPC_SEND_PLAIN_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 193A: emit the IpcSendPlain retirement markers exactly once (first plain
+/// waiting-receiver delivery completed through the out-of-broad-lock boundary drain).
+pub(crate) fn maybe_log_ipc_send_plain_retired() {
+    if IPC_SEND_PLAIN_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendPlain");
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok");
+    }
+}
+
 /// Stage 169 (D2-GENUINE-SEND): x86_64-only, default-off gate that runs the
 /// blocking-SEND path (endpoint full / synchronous no-waiter) through explicit
 /// rank-clean scheduler/task/IPC phase markers and relocates its queue-advancing

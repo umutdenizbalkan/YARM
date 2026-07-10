@@ -60563,6 +60563,302 @@ mod stage192b_yield_queue_advancing_dispatch {
     }
 }
 
+// Stage 193A — BROAD-IPC DECOMPOSITION: IpcSend PLAIN waiting-receiver slice. IpcSend of a
+// plain message to an already-recv-v2-blocked receiver reuses the 188 plain-delivery
+// producer + trap-entry drain (the SAME path ipc_reply's plain boundary uses live): Phase A
+// snapshots payload/meta by value under the broad borrow (no user copy, no cap
+// materialization, no ipc_state_lock across a copy); the drain does copy + slot-clear + wake
+// AFTER the broad borrow drops. Cap-transfer / reply-cap / shared-region / no-drainer cases
+// fall back to the legacy in-broad-lock complete_blocked_recv_for_waiter path.
+mod stage193a_ipc_send_boundary_plain {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+
+    const IPC_SRC: &str = include_str!("../../kernel/syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    // INVENTORY: handle_ipc_send tries the plain boundary split first (in the recv-v2
+    // branch), falling back to the legacy complete_blocked_recv_for_waiter path.
+    #[test]
+    fn ipc_send_wires_plain_boundary_split_with_legacy_fallback() {
+        assert!(
+            IPC_SRC.contains("kernel.try_ipc_send_boundary_split_plain_pub(")
+                && IPC_SRC.contains("Ok(true) => (Some(Ok(())), IpcSchedulerPlan::None),"),
+            "handle_ipc_send must try the plain boundary split (drain wakes; no in-lock wake)"
+        );
+        assert!(
+            IPC_SRC.contains("Ok(false) => {")
+                && IPC_SRC
+                    .contains("complete_blocked_recv_for_waiter(kernel, receiver_tid.0, &msg)"),
+            "cap-transfer / non-plain cases must fall back to the legacy in-broad-lock path"
+        );
+        // The boundary wrapper reuses the SAME plain producer ipc_reply uses.
+        assert!(
+            IPC_STATE_SRC.contains("fn try_ipc_send_boundary_split_plain(")
+                && IPC_STATE_SRC.contains(
+                    "produce_blocked_waiter_plain_delivery(self, waiter_tid, endpoint_idx, msg)"
+                ),
+            "the send boundary must reuse the 188 plain-delivery producer"
+        );
+    }
+
+    // MARKERS + one-shot retirement exist; the drain emits the IpcSend markers only for
+    // send-origin deliveries (reply-origin leaves the flag unset).
+    #[test]
+    fn ipc_send_boundary_markers_exist() {
+        for m in [
+            "IPC_SEND_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_BOUNDARY_PLAIN_SNAPSHOT_OK",
+            "IPC_SEND_BOUNDARY_SPLIT_DEFERRED",
+            "IPC_SEND_BOUNDARY_SPLIT_FAIL",
+        ] {
+            assert!(
+                IPC_STATE_SRC.contains(m),
+                "boundary marker `{m}` must exist"
+            );
+        }
+        assert!(
+            RUNTIME_SRC.contains("IPC_SEND_BOUNDARY_USER_COPY_OK")
+                && RUNTIME_SRC.contains("IPC_SEND_BOUNDARY_WAKE_OK")
+                && RUNTIME_SRC.contains("IPC_SEND_BOUNDARY_SPLIT_DONE result=ok")
+                && RUNTIME_SRC.contains("crate::kernel::boot::ipc_send_boundary_origin_take("),
+            "the drain must emit the IpcSend copy/wake/done markers gated on the send origin"
+        );
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok"),
+            "the IpcSendPlain retirement marker must exist"
+        );
+        // ReapFaultedTask stays global-lock-only.
+        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+    }
+
+    // The origin flag helpers are a clean set/peek/take cycle.
+    #[test]
+    fn ipc_send_origin_flag_cycle() {
+        use crate::kernel::boot::{
+            ipc_send_boundary_origin_is_set, ipc_send_boundary_origin_set,
+            ipc_send_boundary_origin_take,
+        };
+        // Ensure clean start (other tests share the global).
+        let _ = ipc_send_boundary_origin_take(0);
+        assert!(!ipc_send_boundary_origin_is_set(0));
+        ipc_send_boundary_origin_set(0);
+        assert!(ipc_send_boundary_origin_is_set(0));
+        assert!(ipc_send_boundary_origin_take(0)); // consume
+        assert!(!ipc_send_boundary_origin_is_set(0)); // cleared
+        assert!(!ipc_send_boundary_origin_take(0)); // idempotent
+    }
+
+    // EMPIRICAL end-to-end: a PLAIN IpcSend to a recv-v2 blocked receiver goes through the
+    // boundary split (Phase A snapshot, NOT delivered in-lock), and the trap-entry drain then
+    // delivers byte-identical payload + wakes the receiver exactly once. Cleans up the shared
+    // per-CPU trap-path/origin globals it toggles.
+    #[test]
+    fn plain_send_boundary_delivers_via_drain_byte_identical() {
+        std::thread::Builder::new()
+            .name("plain_send_boundary_delivers_via_drain".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(run_plain_send_boundary_delivers_via_drain)
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    fn run_plain_send_boundary_delivers_via_drain() {
+        use crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE;
+        use crate::kernel::ipc::Message;
+        use crate::kernel::vm::{PhysAddr, VirtAddr};
+        use crate::runtime::SharedKernel;
+        use core::sync::atomic::Ordering;
+
+        // Defensive: ensure the shared per-CPU trap-path flag is clear before the
+        // recv-setup yield (a leaked `true` would make the 192B yield_current defer).
+        GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(false, Ordering::Relaxed);
+        let _ = crate::kernel::boot::ipc_send_boundary_origin_take(0);
+
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("register receiver");
+        state.enqueue_current_cpu(1).expect("enqueue receiver");
+        let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap_task1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("grant recv cap to task 1");
+
+        let (asid1, aspace_map_cap1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind task1 asid");
+        let payload_ptr = 0x3000usize;
+        let meta_ptr = 0x4000usize;
+        state
+            .map_user_page(
+                aspace_map_cap1,
+                VirtAddr(payload_ptr as u64),
+                Mapping {
+                    phys: PhysAddr(0x9000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map payload page");
+        state
+            .map_user_page(
+                aspace_map_cap1,
+                VirtAddr(meta_ptr as u64),
+                Mapping {
+                    phys: PhysAddr(0xA000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map meta page");
+
+        // Task 1 runs IpcRecv (recv-v2) and blocks with an empty queue.
+        state.yield_current().expect("switch to task 1");
+        assert_eq!(state.current_tid(), Some(1));
+        let mut recv_frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcRecv as usize,
+            [
+                recv_cap_task1.0 as usize,
+                payload_ptr,
+                Message::MAX_PAYLOAD,
+                meta_ptr,
+                40,
+                0,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+            .expect("recv blocks");
+        assert_eq!(
+            state.current_tid(),
+            Some(0),
+            "task 0 current after task 1 blocks"
+        );
+        assert_eq!(
+            state.task_status(1),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+                recv_cap_task1
+            )))
+        );
+
+        // Simulate the trap-entry drainer being active (set by handle_trap_entry_shared).
+        GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let _ = crate::kernel::boot::ipc_send_boundary_origin_take(0); // clean origin
+
+        // Build a PLAIN message (no cap, no reply-cap) and run the boundary split (Phase A).
+        let payload = *b"HELLO!";
+        let msg = Message::with_header(0, crate::kernel::syscall::OPCODE_INLINE, 0, None, &payload)
+            .expect("plain msg");
+        let produced = state
+            .try_ipc_send_boundary_split_plain_pub(1, endpoint_idx, &msg)
+            .expect("boundary split ok");
+        assert!(
+            produced,
+            "plain send to a recv-v2 waiter must produce a boundary snapshot"
+        );
+        assert!(
+            crate::kernel::boot::ipc_send_boundary_origin_is_set(0),
+            "the send origin flag must be tagged"
+        );
+        // NOT delivered in-lock: the receiver is still blocked (drain does the wake).
+        assert_eq!(
+            state.task_status(1),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+                recv_cap_task1
+            ))),
+            "the boundary split must NOT wake the receiver in-lock (Phase A only)"
+        );
+
+        // Phase B/C: the trap-entry drain (global lock dropped) delivers + wakes.
+        let shared = SharedKernel::new(state);
+        shared
+            .drain_dispatch_post_work(CpuId(0))
+            .expect("drain delivers");
+
+        shared.with(|k| {
+            // Receiver woken exactly once (Runnable), waiter slot cleared.
+            assert_eq!(
+                k.task_status(1),
+                Some(TaskStatus::Runnable),
+                "the drain must wake the receiver"
+            );
+            assert!(
+                k.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+                "the endpoint waiter slot must be cleared by the drain"
+            );
+            // Byte-identical payload delivered to the receiver's user buffer.
+            let got = k
+                .read_user_memory_for_asid(asid1, payload_ptr, payload.len())
+                .expect("read receiver payload");
+            assert_eq!(
+                &got[..payload.len()],
+                &payload,
+                "payload must be byte-identical"
+            );
+        });
+        // The origin flag was consumed by the drain.
+        assert!(
+            !crate::kernel::boot::ipc_send_boundary_origin_is_set(0),
+            "the drain must consume the send origin flag"
+        );
+
+        // Clean up the shared per-CPU trap-path global so sibling tests are unaffected.
+        GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(false, Ordering::Relaxed);
+    }
+
+    // A cap-carrying send does NOT take the plain slice (producer returns Ok(false)); no
+    // snapshot, no origin flag — the legacy path would handle it.
+    #[test]
+    fn cap_transfer_send_declines_plain_boundary() {
+        use crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE;
+        use crate::kernel::ipc::Message;
+        use core::sync::atomic::Ordering;
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("reg");
+        GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let _ = crate::kernel::boot::ipc_send_boundary_origin_take(0);
+        // A message carrying FLAG_REPLY_CAP is NOT plain → producer returns Ok(false).
+        // FLAG_REPLY_CAP requires a transfer handle, so pass a (sender-local) cap id.
+        let payload = *b"x";
+        let msg = Message::with_header(
+            0,
+            crate::kernel::syscall::OPCODE_INLINE,
+            Message::FLAG_REPLY_CAP,
+            Some(5),
+            &payload,
+        )
+        .expect("msg");
+        let produced = state
+            .try_ipc_send_boundary_split_plain_pub(1, 0, &msg)
+            .expect("no error");
+        assert!(
+            !produced,
+            "a non-plain (reply-cap) message must decline the plain slice"
+        );
+        assert!(
+            !crate::kernel::boot::ipc_send_boundary_origin_is_set(0),
+            "declined boundary must not tag the send origin"
+        );
+        GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(false, Ordering::Relaxed);
+    }
+
+    // Prior retirements (191A–192B) are intact.
+    #[test]
+    fn prior_retirements_intact() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
+                && SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
+            "191A/191B/191C split retirements must remain"
+        );
+        assert!(
+            MOD_SRC.contains("class=FutexWait result=ok")
+                && MOD_SRC.contains("class=Yield result=ok"),
+            "192A FutexWait + 192B Yield retirements must remain"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

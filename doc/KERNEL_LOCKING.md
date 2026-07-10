@@ -820,6 +820,53 @@ remove implicit global-lock coupling from syscall/trap paths.
     need broad-IPC vertical decomposition or capability/VM/spawn mutation seams — a distinct,
     larger track. Full global-lock retirement is NOT claimed.
 
+- **Stage 193A (BROAD-IPC VERTICAL DECOMPOSITION — IpcSend first safe slice) — SEAM WIRED,
+  empirically proven, NOT live-fired in QEMU.** The smallest safe IpcSend slice — a PLAIN
+  message (no cap transfer, no reply cap, no shared-region, no fault delivery, no timeout) sent
+  to an ALREADY-WAITING recv-v2 receiver — now takes the 188 boundary-split path instead of the
+  legacy in-broad-lock `complete_blocked_recv_for_waiter`. The broad `SpinLock<KernelState>` is
+  NOT retired; only this one send shape is decomposed.
+  * **Reuses the proven plain producer.** `handle_ipc_send`'s recv-v2 branch first calls
+    `try_ipc_send_boundary_split_plain_pub` (thin wrapper over `try_ipc_send_boundary_split_plain`
+    in `ipc_state.rs`), which delegates to the SAME `produce_blocked_waiter_plain_delivery` (188)
+    that IpcReply's plain boundary uses — no new copy/materialize code path. `Ok(true)` → the
+    send is complete (drain wakes; NO in-lock wake plan, so no duplicate wake); `Ok(false)` →
+    fall back to the unchanged legacy in-broad-lock path (cap-carrying / reply-cap sends, or no
+    trap-entry drainer active); `Err` → the blocked state was already consumed and a user buffer
+    faulted → `UserMemoryFault` (no re-run), matching the legacy consume-then-fault ordering.
+  * **In-lock (Phase A) + out-of-lock (Phase B/C).** Phase A (under the broad borrow):
+    validate + snapshot the plain payload/meta BY VALUE and consume the receiver's
+    `blocked_recv_state` — NO user copy, NO cap materialize, NO in-lock wake
+    (`IPC_SEND_BOUNDARY_SPLIT_BEGIN` / `IPC_SEND_BOUNDARY_PLAIN_SNAPSHOT_OK`; the send origin is
+    tagged via `ipc_send_boundary_origin_set(cpu)`). Phase B/C (trap-entry drain, global lock
+    dropped): the shared `execute_dispatch_post_work` copies payload + meta through the user-copy
+    seam (`IPC_SEND_BOUNDARY_USER_COPY_OK`) and wakes the receiver exactly once
+    (`IPC_SEND_BOUNDARY_WAKE_OK` → `IPC_SEND_BOUNDARY_SPLIT_DONE result=ok` + one-shot
+    `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok`), gated on
+    `ipc_send_boundary_origin_take(cpu)` so reply-origin deliveries leave the send markers unset.
+    The sender returns success (Phase C).
+  * **Correctness.** Plain-only: any cap-transfer / reply-cap / plain-cap flag or non-`None`
+    transferred cap makes the producer return `Ok(false)` before touching blocked state, so the
+    legacy path handles it (no sender-local CapId is ever copied as authority). Byte-identical
+    payload: the drain delivers the exact snapshot bytes with `status=0`, `cap_id=NO_TRANSFER_CAP`,
+    `recv_meta_flags=0` — identical to the plain branch of the legacy helper's meta encoding.
+    Wake exactly once: the in-lock plan is `IpcSchedulerPlan::None`, so only the drain wakes.
+    Guarded by `stage193a_ipc_send_boundary_plain` (inventory of the wiring + legacy fallback,
+    boundary/copy/wake/done markers exist, origin set/peek/take cycle, empirical
+    plain-send-to-blocked-receiver delivers byte-identical via the drain and wakes once,
+    cap-carrying send declines the plain slice, prior 191A–192B retirements intact).
+  * **Honest limitation — NOT live-fired in QEMU.** The x86_64 smokes do not naturally exercise a
+    PLAIN IpcSend to an already-blocked recv-v2 receiver (the one raw IpcSend in the boot path
+    carries a cap → defers to legacy), so `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain`
+    does NOT fire in the QEMU battery. The proof is the empirical hosted integration test, whose
+    drain delivery is byte-identical to the already-live-proven IpcReply plain boundary. This is
+    reported as seam-wired + empirically proven, NOT as a live retirement.
+  * **Scope.** IpcCall / IpcReply broad paths, RecvSharedV3, VM / spawn / fork / cap-mint, and
+    ReapFaultedTask are all untouched and stay global-lock-only. core + oracle + crash-restart +
+    smp2/smp4 (armed and knob-off) pass; riscv64 + aarch64 core smokes keep full server-chain
+    parity; 191A–192B retirements + AP/IPC proofs preserved.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so
