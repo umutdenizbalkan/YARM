@@ -1353,6 +1353,97 @@ impl KernelState {
         })
     }
 
+    /// Stage 193E (BROAD-IPC DECOMPOSITION): the IpcSend PLAIN no-waiter enqueue boundary
+    /// split. Thin instrumentation wrapper over the Stage 4E endpoint-only enqueue
+    /// [`Self::ipc_try_send_queued_plain_endpoint_only`]: for a PLAIN message (no cap
+    /// transfer, no reply cap, no shared-region, no transferred cap) it emits the enqueue
+    /// boundary markers around the endpoint-only enqueue and, on a successful `Enqueued`
+    /// with no blocked receiver, fires the one-shot IpcSendPlainEnqueue retirement. The
+    /// enqueue itself is UNCHANGED — the same rank-4 IPC-lock endpoint enqueue (NO user
+    /// copy, NO cap materialization, NO receiver wake, NO sender block): there is no
+    /// deferred Phase B/C work, so the sender returns the legacy result directly.
+    ///
+    /// Non-plain messages (cap-transfer / reply-cap) skip the markers entirely and go
+    /// straight to the unchanged Stage 4E path (which still enqueues cap-transfer messages);
+    /// the `ReceiverWaiterFound` / `Ineligible` (queue-full, non-buffered, …) outcomes emit a
+    /// DEFERRED marker and return unchanged so the caller's legacy fallback runs. Byte-
+    /// identical to the Stage 4E enqueue in every case; only additive markers differ.
+    pub(crate) fn ipc_try_send_enqueue_boundary_split_plain(
+        &mut self,
+        endpoint_idx: usize,
+        msg: Message,
+    ) -> IpcEndpointSendResult {
+        // PLAIN only: any cap-transfer / reply-cap / plain-cap flag or non-`None`
+        // transferred cap is NOT the 193E slice — take the unchanged Stage 4E path
+        // (which still enqueues cap-transfer messages) with no enqueue markers.
+        let plain = (msg.flags
+            & (Message::FLAG_CAP_TRANSFER
+                | Message::FLAG_CAP_TRANSFER_PLAIN
+                | Message::FLAG_REPLY_CAP))
+            == 0
+            && msg.transferred_cap().is_none();
+        if !plain {
+            return self.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg);
+        }
+        crate::yarm_log!(
+            "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN endpoint={} len={}",
+            endpoint_idx,
+            msg.as_slice().len()
+        );
+        // Phase A: the payload/meta are snapshotted by value (msg is Copy, passed by
+        // value into the endpoint enqueue) — no user copy, no cap materialization.
+        crate::yarm_log!(
+            "IPC_SEND_ENQUEUE_BOUNDARY_SNAPSHOT_OK endpoint={}",
+            endpoint_idx
+        );
+        let result = self.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg);
+        match result {
+            IpcEndpointSendResult::Enqueued => {
+                // Enqueued exactly once into the endpoint queue (no blocked receiver).
+                crate::yarm_log!(
+                    "IPC_SEND_ENQUEUE_BOUNDARY_ENQUEUE_OK endpoint={}",
+                    endpoint_idx
+                );
+                // Sender state matches legacy: a plain non-blocking send that enqueues does
+                // NOT block the sender and is NOT published as a sender-waiter — it returns
+                // Ok and continues.
+                crate::yarm_log!(
+                    "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK endpoint={} sender_blocked=0",
+                    endpoint_idx
+                );
+                crate::yarm_log!(
+                    "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok endpoint={}",
+                    endpoint_idx
+                );
+                crate::kernel::boot::maybe_log_ipc_send_plain_enqueue_retired();
+            }
+            IpcEndpointSendResult::ReceiverWaiterFound(_) => {
+                // A receiver waiter is present — this is the blocked-waiter deliver slice
+                // (193A/legacy), NOT the no-waiter enqueue. Defer unchanged.
+                crate::yarm_log!(
+                    "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DEFERRED reason=receiver_waiter_present endpoint={}",
+                    endpoint_idx
+                );
+            }
+            IpcEndpointSendResult::Ineligible(_) => {
+                // Queue full / non-buffered / etc. — the legacy send path handles capacity
+                // + blocking semantics. Defer unchanged (nothing was mutated wrongly).
+                crate::yarm_log!(
+                    "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DEFERRED reason=ineligible endpoint={}",
+                    endpoint_idx
+                );
+            }
+            IpcEndpointSendResult::EnqueuedWakeReceiver(_) => {
+                // The endpoint-only enqueue never returns this for the no-waiter path.
+                crate::yarm_log!(
+                    "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DEFERRED reason=wake_receiver endpoint={}",
+                    endpoint_idx
+                );
+            }
+        }
+        result
+    }
+
     /// Return true if the task identified by `tid` is blocked on a recv-v2 operation.
     /// Acquires task_state_lock (rank 3). Must be called before ipc_state_lock (rank 4).
     pub(crate) fn is_task_recv_v2_blocked(&self, tid: u64) -> bool {

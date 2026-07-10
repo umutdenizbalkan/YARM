@@ -1021,6 +1021,50 @@ remove implicit global-lock coupling from syscall/trap paths.
     stay global-lock-only.
   * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
 
+- **Stage 193E (IPCSEND NO-WAITER ENQUEUE BOUNDARY SPLIT) — DONE and QEMU-PROVEN
+  (controlled oracle).** Starts decomposing the *other* major IpcSend shape — no receiver is
+  blocked, so the send ENQUEUES — with the smallest slice: a PLAIN message to a buffered
+  endpoint with no blocked receiver. The broad `SpinLock<KernelState>` is NOT retired.
+  * **Inventory / finding.** The plain no-waiter enqueue was ALREADY endpoint-only: it flows
+    through the Stage 4E seam `ipc_try_send_queued_plain_endpoint_only`, which enqueues under
+    the rank-4 IPC lock only (`with_ipc_state_mut`) with NO user copy, NO cap materialization,
+    NO receiver wake, and NO sender block (a plain non-blocking send with queue space returns
+    Ok and continues; the message waits in the queue for a later receiver's dequeue). Unlike
+    the 193A–D blocked-waiter slices there is NO deferred Phase B/C work — the whole slice is
+    the in-lock endpoint enqueue. 193E formalizes this PLAIN slice as a retired class.
+  * **Boundary wrapper.** `ipc_try_send_enqueue_boundary_split_plain` is a thin
+    instrumentation wrapper over the unchanged Stage 4E seam: for a PLAIN message (no
+    cap-transfer / reply-cap / plain-cap flag, no transferred cap) it emits the enqueue
+    boundary markers around the endpoint enqueue and, on a successful `Enqueued` with no
+    blocked receiver, fires the one-shot `class=IpcSendPlainEnqueue` retirement. Non-plain
+    messages delegate straight to the unchanged Stage 4E path BEFORE any marker/mutation (so
+    cap-transfer enqueue still works and is NOT retired); `ReceiverWaiterFound` (blocked-waiter
+    deliver slice) and `Ineligible` (queue-full / non-buffered → legacy fallback) emit a
+    `SPLIT_DEFERRED` marker and return unchanged. Byte-identical to Stage 4E in every case.
+  * **Invariants (proven live).** Queued message byte-identical to legacy (the oracle's
+    receiver-later `recv_v2` observes `payload_match=1 transferred_cap=0`); enqueued exactly
+    once (`endpoint.send(msg)`); sender state matches legacy
+    (`SENDER_STATE_OK … sender_blocked=0` — not blocked, not published as a sender-waiter); the
+    receiver-later dequeue path still delivers; queue-full / non-buffered defer to the legacy
+    capacity/blocking path; cap/reply/shared cases defer before any mutation.
+  * **Live — controlled oracle (no fork).** Because "no blocked receiver" is the default
+    state of a fresh endpoint, the oracle needs neither a fork nor a coordination endpoint: it
+    is signalled by init startup slot 17 ALONE (slots 13 + 14 empty), distinct from every
+    other oracle's slot pattern, and the 193E enqueue oracle is deliberately NOT in the
+    receiver-block coordination gate. Under `yarm.ipc_send_enqueue_oracle=1` init plain-sends
+    to the loopback E1 (holding both send + recv caps, not recv-blocked) → the message
+    enqueues → `recv_v2` drains it byte-identical. `YARM_IPC_SEND_ENQUEUE_ORACLE=1` oracle
+    smoke observes `SPLIT_BEGIN → SNAPSHOT_OK → ENQUEUE_OK → SENDER_STATE_OK → SPLIT_DONE
+    result=ok → GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok →
+    IPC_SEND_ENQUEUE_LIVE_ORACLE_DONE result=ok` + the byte-identical receiver-later recv;
+    rejects `IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_FAIL`.
+  * **Scope.** core + IPC_FINAL + crash-restart + IpcSendPlain / IpcSendOrdinaryCap /
+    IpcSendReplyCap / IpcSendPlainEnqueue oracles + smp2/smp4 (armed and knob-off) pass;
+    riscv64 + aarch64 core keep full server-chain parity. Cap-transfer enqueue, reply-cap
+    enqueue, shared-region IpcSend, IpcCall / IpcReply broad paths, RecvSharedV3, VM / spawn /
+    fork / cap-mint, and ReapFaultedTask stay global-lock-only.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

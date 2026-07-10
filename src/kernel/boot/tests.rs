@@ -61516,6 +61516,203 @@ mod stage193d_ipc_send_reply_cap {
     }
 }
 
+// Stage 193E — IPCSEND NO-WAITER ENQUEUE BOUNDARY SPLIT. Formalizes the plain no-waiter
+// enqueue slice: an IpcSend of a PLAIN message to a buffered endpoint with NO blocked
+// receiver enqueues via the endpoint-only Stage 4E seam (rank-4 IPC lock only — no user
+// copy, no cap materialization, no receiver wake, no sender block, no deferred Phase B/C).
+// The broad global lock is NOT retired.
+mod stage193e_ipc_send_plain_enqueue {
+    use super::*;
+    const IPC_SRC: &str = include_str!("../../kernel/syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    // INVENTORY: handle_ipc_send routes the endpoint-only enqueue through the plain
+    // enqueue boundary wrapper, which reuses the Stage 4E enqueue seam unchanged.
+    #[test]
+    fn enqueue_boundary_wraps_stage4e_seam() {
+        assert!(
+            IPC_SRC.contains("kernel.ipc_try_send_enqueue_boundary_split_plain(endpoint_idx, msg)"),
+            "handle_ipc_send must route the enqueue through the 193E boundary wrapper"
+        );
+        assert!(
+            IPC_STATE_SRC.contains("fn ipc_try_send_enqueue_boundary_split_plain(")
+                && IPC_STATE_SRC
+                    .contains("self.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg)"),
+            "the boundary wrapper must reuse the Stage 4E endpoint-only enqueue seam"
+        );
+    }
+
+    // Plain-only: the wrapper checks plain (no cap-transfer / reply-cap / plain-cap flag,
+    // no transferred cap) and delegates non-plain straight to the unchanged Stage 4E path
+    // (no enqueue markers) before any marker/mutation.
+    #[test]
+    fn plain_only_gate_defers_non_plain_before_markers() {
+        let body = IPC_STATE_SRC
+            .split_once("fn ipc_try_send_enqueue_boundary_split_plain(")
+            .map(|(_, r)| {
+                r.split_once("\n    /// Return true if")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(!body.is_empty(), "the wrapper body must exist");
+        // The plain gate + non-plain delegation must appear BEFORE the BEGIN marker.
+        let plain_gate = body.find("let plain = ").expect("plain gate");
+        let delegate = body
+            .find("return self.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg);")
+            .expect("non-plain delegation");
+        let begin = body
+            .find("IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN")
+            .expect("begin marker");
+        assert!(
+            plain_gate < delegate && delegate < begin,
+            "non-plain messages must defer to the Stage 4E path BEFORE any enqueue marker"
+        );
+        assert!(
+            body.contains("FLAG_CAP_TRANSFER")
+                && body.contains("FLAG_REPLY_CAP")
+                && body.contains("msg.transferred_cap().is_none()"),
+            "the plain gate must exclude cap-transfer / reply-cap / transferred-cap messages"
+        );
+    }
+
+    // MARKERS + one-shot retirement exist; SENDER_STATE marker records sender_blocked=0.
+    #[test]
+    fn enqueue_boundary_markers_exist() {
+        for m in [
+            "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SNAPSHOT_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_ENQUEUE_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok",
+            "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DEFERRED",
+        ] {
+            assert!(
+                IPC_STATE_SRC.contains(m),
+                "enqueue boundary marker `{m}` must exist"
+            );
+        }
+        assert!(
+            IPC_STATE_SRC.contains("sender_blocked=0"),
+            "the SENDER_STATE marker must record that the sender did not block (legacy parity)"
+        );
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok")
+                && MOD_SRC.contains("fn maybe_log_ipc_send_plain_enqueue_retired()"),
+            "the IpcSendPlainEnqueue retirement marker + latch must exist"
+        );
+        assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
+    }
+
+    // The wrapper adds NO user copy / cap materialization / receiver wake / sender block —
+    // it is a pure instrumentation wrapper over the endpoint-only enqueue.
+    #[test]
+    fn enqueue_boundary_is_endpoint_only_no_deferred_work() {
+        let body = IPC_STATE_SRC
+            .split_once("fn ipc_try_send_enqueue_boundary_split_plain(")
+            .map(|(_, r)| {
+                r.split_once("\n    /// Return true if")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(
+            !body.contains("copy_to_user")
+                && !body.contains("materialize")
+                && !body.contains("apply_scheduler_wake_plan")
+                && !body.contains("DISPATCH_POST_WORK_STASH")
+                && !body.contains("block_current"),
+            "the plain enqueue wrapper must not copy/materialize/wake/block or stash deferred work"
+        );
+    }
+
+    // Knob + slot-17-only wiring + init dispatch (no coordination cap).
+    #[test]
+    fn enqueue_oracle_knob_and_slot17_wiring() {
+        assert!(
+            CMDLINE_SRC.contains("yarm.ipc_send_enqueue_oracle")
+                && CMDLINE_SRC.contains("set_ipc_send_enqueue_oracle_enabled("),
+            "the `yarm.ipc_send_enqueue_oracle` knob must parse + apply"
+        );
+        assert!(
+            MOD_SRC.contains("fn ipc_send_enqueue_oracle_active()"),
+            "the enqueue oracle active predicate must exist"
+        );
+        // The enqueue oracle is NOT in the receiver-block coordination gate (no blocked recv).
+        let coord = MOD_SRC
+            .split_once("fn ipc_send_oracle_coordination_active()")
+            .map(|(_, r)| r.split_once('}').map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("");
+        assert!(
+            !coord.contains("ipc_send_enqueue_oracle_active()"),
+            "the enqueue oracle must NOT use the receiver-block coordination hook"
+        );
+        assert!(
+            X86_BOOT_SRC.contains("ipc_send_enqueue_oracle_active()")
+                && X86_BOOT_SRC.contains("init_args[17] = 1;"),
+            "x86_64 boot must signal the enqueue oracle via slot 17 alone"
+        );
+        assert!(
+            INIT_SRC.contains("run_ipc_send_enqueue_oracle(proof_send, proof_recv, ctx.task_id)"),
+            "init must dispatch the enqueue oracle on the slot-17-only pattern"
+        );
+    }
+
+    // The oracle is a plain send (no fork, no cap) + a receiver-later recv that verifies
+    // byte-identical delivery.
+    #[test]
+    fn enqueue_oracle_is_plain_send_then_recv() {
+        let oracle = INIT_SRC
+            .split_once("fn run_ipc_send_enqueue_oracle(")
+            .map(|(_, r)| {
+                r.split_once("IPC_SEND_ENQUEUE_ORACLE_DONE")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(!oracle.is_empty(), "the enqueue oracle workload must exist");
+        assert!(
+            oracle.contains("IPC_SEND_ENQUEUE_ORACLE_OPCODE,\n        0,\n        None,"),
+            "the oracle send must be plain (flags=0, no transfer handle)"
+        );
+        assert!(
+            !oracle.contains("fork_raw") && !oracle.contains("FLAG_CAP_TRANSFER"),
+            "the enqueue oracle must not fork and must not transfer a cap"
+        );
+        assert!(
+            oracle.contains("ipc_recv_v2(e1_recv)")
+                && oracle.contains("payload_match")
+                && oracle.contains("IPC_SEND_ENQUEUE_LIVE_ORACLE_DONE result=ok"),
+            "the oracle must recv-drain the queued message + verify byte-identical delivery"
+        );
+    }
+
+    // 193A/B/C/D + prior retirements intact.
+    #[test]
+    fn prior_guarantees_intact() {
+        assert!(
+            MOD_SRC.contains("class=IpcSendPlain")
+                && MOD_SRC.contains("class=IpcSendOrdinaryCap")
+                && MOD_SRC.contains("class=IpcSendReplyCap")
+                && MOD_SRC.contains("class=FutexWait result=ok")
+                && MOD_SRC.contains("class=Yield result=ok"),
+            "193A/193C/193D + 192A/192B retirements must remain"
+        );
+        assert!(
+            INIT_SRC.contains("fn run_ipc_send_plain_oracle(")
+                && INIT_SRC.contains("fn run_ipc_send_reply_cap_oracle("),
+            "the 193B/193D oracles must remain"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

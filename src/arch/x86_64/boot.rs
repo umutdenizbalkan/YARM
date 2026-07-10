@@ -968,6 +968,15 @@ pub fn bootstrap_first_user_task(
     {
         init_args[14] = coord_recv_cap as u64;
     }
+    // Stage 193E: sub-knob-gated (`yarm.ipc_send_enqueue_oracle=1`) plain no-waiter enqueue
+    // oracle. It needs NO coordination cap (no fork, no blocked receiver — a plain send to
+    // the loopback E1 simply enqueues), so it is signalled by slot 17 ALONE (slots 13 + 14
+    // empty), distinct from every other oracle's slot pattern. init runs it against E1
+    // (slots 6/7, provisioned under the base proof knob). x86_64-only live target.
+    else if crate::kernel::boot::ipc_send_enqueue_oracle_active() {
+        init_args[17] = 1; // enqueue-oracle discriminator (init otherwise leaves slot 17 zero)
+        crate::yarm_log!("IPC_SEND_ENQUEUE_ORACLE_PROVISION_OK slot17=1");
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

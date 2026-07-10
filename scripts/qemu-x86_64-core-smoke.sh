@@ -254,6 +254,13 @@ IPC_SEND_REPLY_CAP_ORACLE=${IPC_SEND_REPLY_CAP_ORACLE:-0}
 if [[ "$IPC_SEND_REPLY_CAP_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_reply_cap_oracle="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.ipc_send_reply_cap_oracle=1"
 fi
+# Stage 193E: the IpcSend plain no-waiter enqueue live oracle needs the sub-knob
+# yarm.ipc_send_enqueue_oracle=1 (gates the enqueue oracle workload). No coordination
+# endpoint; mutually exclusive with the other send oracles + sender-wake.
+IPC_SEND_ENQUEUE_ORACLE=${IPC_SEND_ENQUEUE_ORACLE:-0}
+if [[ "$IPC_SEND_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_enqueue_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.ipc_send_enqueue_oracle=1"
+fi
 
 if [[ "$KERNEL_CMDLINE" != *"console="* ]] || [[ "${#KERNEL_CMDLINE}" -lt 12 ]]; then
   echo "[warn] suspicious KERNEL_CMDLINE override detected: '$KERNEL_CMDLINE'"

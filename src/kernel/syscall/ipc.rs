@@ -396,7 +396,12 @@ pub(super) fn handle_ipc_send(
             let endpoint_idx = kernel
                 .resolve_endpoint_index(endpoint)
                 .map_err(SyscallError::from)?;
-            match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
+            // Stage 193E (BROAD-IPC DECOMPOSITION): route the endpoint-only enqueue through
+            // the plain no-waiter enqueue boundary split. For a PLAIN message with no blocked
+            // receiver it emits the enqueue boundary markers + fires the IpcSendPlainEnqueue
+            // retirement; non-plain / waiter-present / ineligible cases are byte-identical to
+            // the unchanged Stage 4E path (same IpcEndpointSendResult).
+            match kernel.ipc_try_send_enqueue_boundary_split_plain(endpoint_idx, msg) {
                 IpcEndpointSendResult::Enqueued => {
                     kernel.note_endpoint_only_queued_send_split();
                     // Stage 4E now accepts FLAG_CAP_TRANSFER / FLAG_CAP_TRANSFER_PLAIN

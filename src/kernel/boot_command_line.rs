@@ -288,6 +288,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_ipc_send_reply_cap_oracle_enabled(enabled);
         crate::yarm_log!("YARM_IPC_SEND_REPLY_CAP_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.ipc_send_enqueue_oracle {
+        // Stage 193E sub-knob: only meaningful with the base proof knob above;
+        // gates the IpcSend plain no-waiter enqueue live oracle workload.
+        crate::kernel::boot::set_ipc_send_enqueue_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_IPC_SEND_ENQUEUE_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ap_user_dispatch {
         // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
         // first live AP user dispatch. No-op on other arches; when OFF the AP
@@ -471,6 +477,11 @@ pub struct YarmBootOptions<'a> {
     /// `class=IpcSendReplyCap` boundary split in QEMU. Independent of the plain,
     /// ordinary-cap, and sender-wake sub-knobs.
     pub ipc_send_reply_cap_oracle: Option<bool>,
+    /// Stage 193E: `yarm.ipc_send_enqueue_oracle=1` SUB-knob. Default-off and only
+    /// meaningful with `ipc_recv_proof`; gates the IpcSend plain no-waiter enqueue live
+    /// oracle (init plain-sends to the loopback with no blocked receiver → the message
+    /// enqueues) that fires the 193E `class=IpcSendPlainEnqueue` boundary split in QEMU.
+    pub ipc_send_enqueue_oracle: Option<bool>,
     /// Stage 189C6: `yarm.ap_user_dispatch=1` DEFAULT-OFF gate that arms the first
     /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
     /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
@@ -606,6 +617,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.ipc_send_reply_cap_oracle" {
             options.ipc_send_reply_cap_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.ipc_send_enqueue_oracle" {
+            options.ipc_send_enqueue_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.ap_user_dispatch" {
             options.ap_user_dispatch = parse_bool_knob(value);
@@ -1049,5 +1063,25 @@ mod tests {
             parse_yarm_boot_options(b"yarm.ipc_recv_proof=1 yarm.ipc_send_reply_cap_oracle=1");
         assert_eq!(both.ipc_recv_proof, Some(true));
         assert_eq!(both.ipc_send_reply_cap_oracle, Some(true));
+    }
+
+    // Stage 193E: the enqueue-oracle SUB-knob parses as a standard bool knob, defaults
+    // to None (off), and does NOT alias the reply-cap sub-knob.
+    #[test]
+    fn ipc_send_enqueue_oracle_subknob_parses_and_defaults_off() {
+        assert_eq!(parse_yarm_boot_options(b"").ipc_send_enqueue_oracle, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_send_enqueue_oracle=1").ipc_send_enqueue_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_send_enqueue_oracle=0").ipc_send_enqueue_oracle,
+            Some(false)
+        );
+        let reply_only = parse_yarm_boot_options(b"yarm.ipc_send_reply_cap_oracle=1");
+        assert_eq!(reply_only.ipc_send_enqueue_oracle, None);
+        let both = parse_yarm_boot_options(b"yarm.ipc_recv_proof=1 yarm.ipc_send_enqueue_oracle=1");
+        assert_eq!(both.ipc_recv_proof, Some(true));
+        assert_eq!(both.ipc_send_enqueue_oracle, Some(true));
     }
 }

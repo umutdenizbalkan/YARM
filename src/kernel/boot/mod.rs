@@ -1274,6 +1274,38 @@ pub(crate) fn maybe_log_ipc_send_reply_cap_retired() {
     }
 }
 
+// ── Stage 193E (BROAD-IPC DECOMPOSITION — IpcSend plain no-waiter enqueue slice) ────
+//
+// IpcSend of a PLAIN message to a buffered endpoint with NO blocked receiver enqueues
+// the message via the endpoint-only Stage 4E seam (`ipc_try_send_queued_plain_endpoint_only`,
+// rank-4 IPC lock only): NO user copy, NO cap materialization, NO receiver wake, NO sender
+// block (the sender returns Ok and continues; the message waits in the queue for a later
+// receiver's dequeue). Unlike the 193A–D blocked-waiter slices, there is NO deferred Phase
+// B/C work — the whole slice is the in-lock endpoint enqueue. This class formalizes the
+// PLAIN no-waiter enqueue (cap-transfer / reply-cap / shared-region enqueue stay on the
+// legacy Stage 4E path, NOT retired).
+
+/// Stage 193E: one-shot latch for the IpcSendPlainEnqueue boundary retirement markers.
+static IPC_SEND_PLAIN_ENQUEUE_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 193E: emit the IpcSendPlainEnqueue retirement markers exactly once (first plain
+/// no-waiter enqueue completed through the endpoint-only boundary seam).
+pub(crate) fn maybe_log_ipc_send_plain_enqueue_retired() {
+    if IPC_SEND_PLAIN_ENQUEUE_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendPlainEnqueue");
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok");
+    }
+}
+
 /// Stage 169 (D2-GENUINE-SEND): x86_64-only, default-off gate that runs the
 /// blocking-SEND path (endpoint full / synchronous no-waiter) through explicit
 /// rank-clean scheduler/task/IPC phase markers and relocates its queue-advancing
@@ -2045,8 +2077,31 @@ pub fn ipc_send_reply_cap_oracle_active() -> bool {
     ipc_recv_oracle_proof_enabled() && ipc_send_reply_cap_oracle_enabled()
 }
 
-/// True when ANY IpcSend live oracle (plain 193B / ordinary-cap 193C / reply-cap 193D) is
-/// active — the precondition for the shared receiver-block coordination hook to fire.
+/// Stage 193E: `yarm.ipc_send_enqueue_oracle=1` SUB-knob (layered on the base proof
+/// knob). Gates the IpcSend plain no-waiter enqueue live oracle. Unlike the blocked-waiter
+/// oracles it needs NO fork / coordination endpoint — a plain send to the loopback E1 with
+/// no blocked receiver simply enqueues — so it is signalled by init startup slot 17 alone
+/// (slots 13 + 14 empty), distinct from every other oracle's slot pattern.
+pub(crate) static IPC_SEND_ENQUEUE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_ipc_send_enqueue_oracle_enabled(enabled: bool) {
+    IPC_SEND_ENQUEUE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ipc_send_enqueue_oracle_enabled() -> bool {
+    IPC_SEND_ENQUEUE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// True only when BOTH the base proof knob and the send-enqueue-oracle sub-knob are set.
+pub fn ipc_send_enqueue_oracle_active() -> bool {
+    ipc_recv_oracle_proof_enabled() && ipc_send_enqueue_oracle_enabled()
+}
+
+/// True when ANY blocked-waiter IpcSend live oracle (plain 193B / ordinary-cap 193C /
+/// reply-cap 193D) is active — the precondition for the shared receiver-block coordination
+/// hook to fire. The 193E enqueue oracle is NOT here: it has no blocked receiver, so it
+/// never uses the receiver-block coordination hook.
 pub fn ipc_send_oracle_coordination_active() -> bool {
     ipc_send_plain_oracle_active()
         || ipc_send_cap_oracle_active()

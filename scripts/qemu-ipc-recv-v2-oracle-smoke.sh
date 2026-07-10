@@ -94,6 +94,10 @@ YARM_IPC_SEND_CAP_ORACLE="${YARM_IPC_SEND_CAP_ORACLE:-0}"
 # the 193D IpcSendReplyCap boundary-split markers to appear LIVE. Mutually exclusive with
 # the plain / ordinary-cap oracles + sender-wake.
 YARM_IPC_SEND_REPLY_CAP_ORACLE="${YARM_IPC_SEND_REPLY_CAP_ORACLE:-0}"
+# Stage 193E — IpcSend plain no-waiter enqueue LIVE oracle proof (default-off). When set,
+# boots with yarm.ipc_recv_proof=1 + yarm.ipc_send_enqueue_oracle=1 and hard-requires the
+# 193E IpcSendPlainEnqueue boundary-split markers to appear LIVE.
+YARM_IPC_SEND_ENQUEUE_ORACLE="${YARM_IPC_SEND_ENQUEUE_ORACLE:-0}"
 
 # Whenever any proof requirement is enabled, the kernel MUST be booted with
 # yarm.ipc_recv_proof=1 or the workload never runs. Export IPC_RECV_PROOF=1 so the
@@ -104,7 +108,8 @@ if [[ "$YARM_IPC_RECV_PROOF_QUEUED_SPLIT" == "1" \
    || "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" \
    || "$YARM_IPC_SEND_PLAIN_ORACLE" == "1" \
    || "$YARM_IPC_SEND_CAP_ORACLE" == "1" \
-   || "$YARM_IPC_SEND_REPLY_CAP_ORACLE" == "1" ]]; then
+   || "$YARM_IPC_SEND_REPLY_CAP_ORACLE" == "1" \
+   || "$YARM_IPC_SEND_ENQUEUE_ORACLE" == "1" ]]; then
   export IPC_RECV_PROOF=1
   echo "[info] ipc-oracle: proof env set -> booting kernel with yarm.ipc_recv_proof=1"
 fi
@@ -132,6 +137,13 @@ fi
 if [[ "$YARM_IPC_SEND_REPLY_CAP_ORACLE" == "1" ]]; then
   export IPC_SEND_REPLY_CAP_ORACLE=1
   echo "[info] ipc-oracle: send-reply-cap oracle env set -> booting kernel with yarm.ipc_send_reply_cap_oracle=1"
+fi
+# Stage 193E — the send enqueue oracle is isolated behind its own boot sub-knob
+# yarm.ipc_send_enqueue_oracle=1 (gates the plain no-waiter enqueue oracle workload).
+# Export it so the core smoke appends the sub-knob only when the enqueue oracle is proven.
+if [[ "$YARM_IPC_SEND_ENQUEUE_ORACLE" == "1" ]]; then
+  export IPC_SEND_ENQUEUE_ORACLE=1
+  echo "[info] ipc-oracle: send-enqueue oracle env set -> booting kernel with yarm.ipc_send_enqueue_oracle=1"
 fi
 # Stage 163 — the sender-wake proof is isolated behind its own boot sub-knob
 # yarm.ipc_recv_proof_sender_wake=1, which gates BOTH the kernel proof-gated
@@ -690,6 +702,57 @@ if [[ "$YARM_IPC_SEND_REPLY_CAP_ORACLE" == "1" ]]; then
   [[ "$rc" -eq 0 ]] && echo "[ok] ipc-oracle: send-reply-cap LIVE oracle PASSED ($ARCH)"
 else
   echo "[info] ipc-oracle: proof send-reply-cap oracle: not required"
+fi
+
+# Stage 193E — IpcSend plain no-waiter enqueue LIVE oracle acceptance. When
+# YARM_IPC_SEND_ENQUEUE_ORACLE=1, the boot must fire the 193E IpcSendPlainEnqueue boundary
+# split LIVE: init plain-sends to the loopback with no blocked receiver (the message
+# enqueues), then recv-drains it byte-identical. Require the userspace oracle DONE marker AND
+# the kernel enqueue-boundary + retirement markers; reject the boundary FAIL marker.
+if [[ "$YARM_IPC_SEND_ENQUEUE_ORACLE" == "1" ]]; then
+  echo "[info] ipc-oracle: proof send-enqueue oracle: REQUIRED"
+  if ! marker_present "YARM_IPC_SEND_ENQUEUE_ORACLE_SET enabled=true"; then
+    echo "[err] ipc-oracle: send-enqueue oracle requested but yarm.ipc_send_enqueue_oracle=1 did NOT reach the kernel cmdline"
+    echo "[err]   (YARM_IPC_SEND_ENQUEUE_ORACLE_SET enabled=true absent) — runner/oracle plumbing bug."
+    echo "[hint] invoke as: YARM_IPC_SEND_ENQUEUE_ORACLE=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh $ARCH"
+    exit 1
+  fi
+  echo "[ok]   ipc-oracle: send-enqueue oracle sub-knob reached the kernel"
+  SEND_ENQUEUE_REQUIRED=(
+    "IPC_SEND_ENQUEUE_ORACLE_SEND_OK"
+    "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN"
+    "IPC_SEND_ENQUEUE_BOUNDARY_SNAPSHOT_OK"
+    "IPC_SEND_ENQUEUE_BOUNDARY_ENQUEUE_OK"
+    "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK"
+    "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok"
+    "IPC_SEND_ENQUEUE_LIVE_ORACLE_DONE result=ok"
+  )
+  for m in "${SEND_ENQUEUE_REQUIRED[@]}"; do
+    if marker_present "$m"; then
+      echo "[ok]   send-enqueue oracle marker present: $m"
+    else
+      echo "[err] ipc-oracle: send-enqueue oracle marker absent: $m"
+      rc=1
+    fi
+  done
+  # The later recv must have drained the queued message byte-identical (no cap).
+  if rg -q -a -e 'IPC_SEND_ENQUEUE_ORACLE_RECV_OK payload_match=1 transferred_cap=0' "$ANALYSIS_LOG"; then
+    echo "[ok]   send-enqueue oracle: receiver-later dequeue delivered the byte-identical plain message"
+  else
+    echo "[err] ipc-oracle: send-enqueue oracle: receiver-later dequeue did NOT deliver byte-identical"
+    rc=1
+  fi
+  for f in "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_FAIL" "IPC_SEND_ENQUEUE_ORACLE_SEND_FAILED" \
+           "IPC_SEND_ENQUEUE_ORACLE_MSG_BUILD_FAIL"; do
+    if marker_present "$f"; then
+      echo "[err] ipc-oracle: send-enqueue oracle fatal marker present: $f"
+      rc=1
+    fi
+  done
+  [[ "$rc" -eq 0 ]] && echo "[ok] ipc-oracle: send-enqueue plain LIVE oracle PASSED ($ARCH)"
+else
+  echo "[info] ipc-oracle: proof send-enqueue oracle: not required"
 fi
 
 # Stage 170 (IPC-FINAL): strict frozen acceptance gate. Enabled by IPC_FINAL=1
