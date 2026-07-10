@@ -61935,6 +61935,125 @@ mod stage193f_ipc_send_cap_enqueue {
     }
 }
 
+// Stage 193G — IPCSEND REMAINING-SHAPES AUDIT (reply-cap enqueue + shared-region).
+// AUDIT ONLY: both shapes are NO-GO. These guards lock in the concrete facts that make
+// them un-retire-able now, so a future stage cannot silently fake a retirement or regress
+// the reply-cap classification / shared-region VM coupling the audit relied on.
+mod stage193g_remaining_shapes_audit {
+    use super::*;
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RECV_CORE_SRC: &str = include_str!("../recv_core.rs");
+    const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_LOCKING.md");
+
+    // FINDING 1: the recv-side reply-vs-transfer decision is FLAG-based. A queued IpcSend
+    // reply cap carries FLAG_CAP_TRANSFER (object-based routing, not FLAG_REPLY_CAP), so on
+    // drain it is classified as an ordinary transfer, not a one-shot reply — the misroute
+    // that makes reply-cap enqueue un-retire-able without object-based recv detection.
+    #[test]
+    fn reply_cap_recv_classification_is_flag_based() {
+        assert!(
+            IPC_RECV_CORE_SRC.contains("if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {"),
+            "materialize_received_message_cap must still branch reply-vs-transfer on the flag"
+        );
+        assert!(
+            RECV_CORE_SRC.contains("True when `FLAG_REPLY_CAP` is set"),
+            "RecvCapTransferPlan.is_reply_cap must still be documented as flag-derived"
+        );
+        assert!(
+            SYSCALL_SRC.contains(
+                "let is_reply_cap = (delivery.msg.flags & Message::FLAG_REPLY_CAP) != 0;"
+            ),
+            "the queued-split recv is_reply_cap must still be computed from the message flag"
+        );
+    }
+
+    // FINDING 1 (send side): a reply-cap IpcSend is tagged FLAG_CAP_TRANSFER and enqueues
+    // through the unchanged Stage 4E seam; the Stage 4E FLAG_REPLY_CAP reject does NOT catch
+    // it. So no NEW send state is missing — the gap is entirely on the recv side.
+    #[test]
+    fn stage4e_reply_flag_reject_does_not_catch_object_routed_reply_cap() {
+        assert!(
+            IPC_STATE_SRC.contains("if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {")
+                && IPC_STATE_SRC.contains("TransferOrReplyCapMessage"),
+            "Stage 4E must still reject only FLAG_REPLY_CAP-flagged messages"
+        );
+        assert!(
+            IPC_SRC.contains("transfer_flag_bits(transfer_cap)"),
+            "handle_ipc_send must still tag transfers via transfer_flag_bits (FLAG_CAP_TRANSFER)"
+        );
+    }
+
+    // FINDING 2: shared-region delivery maps into the receiver ASID via VM (map + TLB +
+    // pin refcount) at RECV time and is excluded from the ordinary split — it is
+    // RecvSharedV3/VM territory, not an IpcSend enqueue slice.
+    #[test]
+    fn shared_region_recv_is_vm_mapping_coupled() {
+        assert!(
+            IPC_SRC.contains("fn map_shared_region_into_receiver(")
+                && IPC_SRC.contains("map_user_page_in_asid_with_caps("),
+            "shared-region recv must still map pages into the receiver ASID via VM"
+        );
+        assert!(
+            SYSCALL_SRC.contains("delivery.msg.opcode != OPCODE_SHARED_MEM"),
+            "the ordinary-cap queued split must still exclude OPCODE_SHARED_MEM"
+        );
+        assert!(
+            IPC_SRC.contains("Some(TransferSharedRegion {"),
+            "shared-region send must still stash a region descriptor in the transfer envelope"
+        );
+    }
+
+    // NO-GO INVARIANT: neither shape has a retirement class, and no fake retirement marker
+    // was landed. The five accepted IpcSend classes remain; no sixth enqueue class exists.
+    #[test]
+    fn no_retirement_class_for_either_remaining_shape() {
+        assert!(
+            !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
+            "193G must NOT add an IpcSendReplyCapEnqueue retirement class"
+        );
+        assert!(
+            !MOD_SRC.contains("IpcSendSharedRegion"),
+            "193G must NOT add an IpcSendSharedRegion retirement class"
+        );
+        for class in [
+            "class=IpcSendPlain result=ok",
+            "class=IpcSendOrdinaryCap result=ok",
+            "class=IpcSendReplyCap result=ok",
+            "class=IpcSendPlainEnqueue result=ok",
+            "class=IpcSendOrdinaryCapEnqueue result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(class),
+                "accepted retirement class `{class}` must remain"
+            );
+        }
+    }
+
+    // The 193F reply-cap meta carve-out (`!snapshot.is_reply_cap`) must stay EXACTLY as-is:
+    // 193G proves reply-cap meta visibility must not change (supervisor/crash-restart).
+    #[test]
+    fn reply_cap_meta_visibility_unchanged() {
+        assert!(
+            RECV_CORE_SRC.contains("Some(cap) if !snapshot.is_reply_cap =>")
+                && RECV_CORE_SRC.contains("_ => (Message::NO_TRANSFER_CAP, 0),"),
+            "the split-path recv-v2 writeback must keep hiding reply caps from the meta"
+        );
+    }
+
+    // The audit conclusion is recorded in the locking doc as an explicit NO-GO.
+    #[test]
+    fn audit_no_go_recorded_in_doc() {
+        assert!(
+            DOC_SRC.contains("Stage 193G") && DOC_SRC.contains("both shapes NO-GO"),
+            "the 193G audit no-go must be documented in KERNEL_LOCKING.md"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

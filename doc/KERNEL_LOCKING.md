@@ -1123,6 +1123,71 @@ remove implicit global-lock coupling from syscall/trap paths.
     global-lock-only.
   * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
 
+- **Stage 193G (IPCSEND REMAINING-SHAPES AUDIT — reply-cap enqueue and shared-region) —
+  AUDIT ONLY; both shapes NO-GO, documentation + guard tests only, no retirement.** Audits the
+  two IpcSend-specific shapes left after 193A–F (reply-cap no-waiter enqueue; shared-region
+  IpcSend) and decides neither can be safely decomposed now. No live slice is implemented; the
+  broad `SpinLock<KernelState>` is NOT retired; reply-cap meta behavior is UNCHANGED; syscall
+  ABI/counts are UNCHANGED (SYSCALL_COUNT=32, VARIANT_COUNT=23).
+  * **Reply-cap no-waiter enqueue — NO-GO (recv-side misroute + supervisor-entangled meta).**
+    - *Send side already enqueues.* A reply-cap IpcSend is object-routed: `handle_ipc_send` tags
+      every transfer `FLAG_CAP_TRANSFER` (never `FLAG_REPLY_CAP`), stashing the reply cap in a
+      transfer envelope whose `source_object` is `CapObject::Reply { index, generation }`. With no
+      waiter the 193F ordinary-cap wrapper sees `is_reply_object=true` (via the non-consuming
+      `peek_transfer_envelope_source_object`), so it declines the ordinary slice and delegates to
+      the unchanged Stage 4E seam. Stage 4E's `FLAG_REPLY_CAP` reject does NOT fire (the flag is
+      `FLAG_CAP_TRANSFER`), so the message already enqueues today as a generic cap-transfer
+      envelope. No new endpoint state is needed on the send side.
+    - *Receiver-later drain misroutes the reply cap.* The recv-side reply-vs-transfer decision is
+      **flag-based**: `RecvCapTransferPlan.is_reply_cap` and `materialize_received_message_cap`
+      both branch on `msg.flags & FLAG_REPLY_CAP`. A queued IpcSend reply cap carries
+      `FLAG_CAP_TRANSFER` (not the reply flag) with a Reply *object*, so on drain it is classified
+      as an **ordinary** transfer: `syscall.rs` takes the 187B ordinary-cap seam
+      (`!is_reply_cap && !plan.is_reply_cap`), minting a delegated cap for the Reply object and
+      recording a delegation link — losing the one-shot direct-mint semantics
+      (`materialize_received_message_cap`'s `kind=="reply"` path) and risking delegation-link
+      saturation. Retiring this class would first require **object-based reply detection on the
+      recv side**, a correctness change to shared reply-cap machinery.
+    - *And the meta is supervisor-entangled.* A recv-v2 receiver reads a transferred cap only from
+      the meta (`meta.cap_id` + `SYSCALL_RECV_META_*`). Surfacing a queued reply cap so the
+      receiver could actually USE it (call `ipc_reply`) requires exposing it in the split-path
+      recv-v2 meta — exactly the change 193F proved breaks the supervisor crash-restart chain
+      (which recvs a genuine `FLAG_REPLY_CAP` reply cap through the same queued-split writeback and
+      depends on the meta reporting no cap). Preserving the hidden semantics leaves the reply cap
+      unobservable/unusable to a recv-v2 receiver, so no live oracle can prove usable one-shot
+      delivery. Both escape routes are forbidden, so this is a genuine no-go, not a deferral of
+      convenience.
+  * **Shared-region IpcSend — NO-GO (belongs to the RecvSharedV3 / VM decomposition).**
+    - *Send side is thin.* `handle_ipc_send` for a shared-region grant validates the
+      `MemoryObject`/`DmaRegion` rights, stashes a transfer envelope with
+      `shared_region: Some(TransferSharedRegion { offset, len })`, and builds an `OPCODE_SHARED_MEM`
+      `FLAG_CAP_TRANSFER` message carrying only the region descriptor + envelope handle; with no
+      waiter it already enqueues via Stage 4E. No mapping happens at send.
+    - *The value and risk are entirely on the recv/mapping side.* The receiver-later drain must MAP
+      the region into the receiver ASID (`map_shared_region_into_receiver` →
+      `map_user_page_in_asid_with_caps`, two-phase TLB-shootdown rollback), advance the envelope
+      `TransferState` lifecycle (`Created → MappedReceiver → MappedBoth → Released → Revoked`), and
+      pin/unpin the memory object (`adjust_memory_object_pin_refcount`). That is VM-mapping + TLB +
+      pin-refcount lifetime work coupled to the dedicated `RecvSharedV3` (NR 30) path — a
+      user-copy-vs-mapping boundary distinct from every 193A–F slice. A live oracle cannot prove
+      shared-region delivery without exercising that mapping path, and the task forbids unlocking
+      RecvSharedV3 or touching VM. This shape belongs to the RecvSharedV3 decomposition, not an
+      IpcSend enqueue slice.
+  * **Exit-cleanup note (audited, unchanged).** `purge_transfer_envelopes_for_pid` already drops a
+    queued (not-yet-drained) envelope on either sender or receiver exit and unpins the memory
+    object for a shared-region envelope; a queued reply envelope is simply dropped (reply authority
+    stays tracked in `reply_caps[]`/generations). No leak is introduced by leaving both shapes on
+    the legacy path.
+  * **Deliverable.** Documentation (this entry) + audit guard tests that lock in the recv-side
+    flag-based reply classification, the shared-region VM/RecvSharedV3 coupling, and the ABSENCE of
+    any `IpcSendReplyCapEnqueue` / `IpcSendSharedRegion` retirement class. No retirement marker is
+    faked; reply-cap meta behavior is byte-unchanged.
+  * **Go/no-go.** Reply-cap enqueue and shared-region IpcSend stay global-lock-only. The remaining
+    tractable broad-IPC work is NOT another IpcSend shape; the natural next target is the recv-side
+    reply-cap object/flag reconciliation (a prerequisite before reply-cap enqueue is retire-able)
+    or beginning the RecvSharedV3 decomposition — both larger than a single 193-style slice.
+  * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so
