@@ -8421,6 +8421,23 @@ legacy `handle_debug_log` path. Queue-advancing classes stay `#[cfg(target_arch 
 x86_64 marker text is byte-identical (arch tag is empty off AArch64); RISC-V stays inert
 (active flag force-false). See §4.6 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 195B — AArch64 InitramfsReadChunk LIVE (DONE)
+
+InitramfsReadChunk (NR 27) is the second live AArch64 split-dispatch class. The selective
+ABI-import gate is extended to `NR 15 || NR 27 || oracle` (the finalize gate mirrors it), so
+InitramfsReadChunk reaches `try_split_initramfs_read_chunk_into_frame`. Only the **success
+path** is retired: the helper returns `None` (unchanged global-lock fallback) for every
+access-gate / arg / not-found / unwritable-destination / ASID-unavailable case, keeping
+`MissingRight` / `InvalidArgs` / `UserMemoryFault` canonical. The destination write is a
+two-pass validated copy (`copy_slice_to_user_asid_split_write`), so a fault leaves **zero**
+bytes written (no partial user write). Immutable initramfs/CPIO data only; no mutation, no
+alloc, no cap mint, no scheduler/IPC change, no TTBR0/ASID switch. Live markers:
+`AARCH64_SPLIT_ABI_IMPORT_OK nr=27`, `YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=27`,
+`GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=InitramfsReadChunk result=ok`,
+`AARCH64_SPLIT_FINALIZE_OK nr=27 result=ok`. DebugLog byte-for-byte preserved; x86_64 marker
+text byte-identical; RISC-V inert. `CreateInitramfsFileSliceMo` (NR 28) stays global-lock-only.
+See §4.6 of `doc/ARCH_AARCH64.md`.
+
 #### Stage 195 — AArch64 first live retirement (implementation plan)
 
 1. **[195A DONE]** De-gate `pre_split_import_syscall_abi` + `finalize_split_handled_syscall`
@@ -8429,8 +8446,9 @@ x86_64 marker text is byte-identical (arch tag is empty off AArch64); RISC-V sta
    non-eligible syscalls still fall back.
 2. **[195A DONE]** Enable **DebugLog** first (pure read, no switch, no drain, no address-space
    change): `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=DebugLog result=ok` on AArch64
-   with the server chain intact. **Next (195B+):** **InitramfsReadChunk** success path, then
-   **IpcSendPlainEnqueue** (rank-4 enqueue, no drain).
+   with the server chain intact. **[195B DONE]** **InitramfsReadChunk** success path (read-only
+   user-copy, two-pass validated write). **Next (195C):** **FutexWake** (waiter/run-queue
+   mutation, no caller task-switch), then **IpcSendPlainEnqueue** (rank-4 enqueue, no drain).
 3. Do NOT enable D2/FutexWait/Yield: those need the de-gated drain body + an EL0-return frame
    restore proof (`restore_arch_thread_state_post_switch` under the drain), deferred to a later
    stage.

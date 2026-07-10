@@ -42991,11 +42991,18 @@ mod stage160c_aarch64_trap_abi_bracketing {
                 && AARCH64_TRAP_SRC.contains("AARCH64_SPLIT_SVC_ADVANCE_DONE"),
             "AArch64 finalize must export results and advance the SVC PC, with diagnostics"
         );
-        // The advance uses the same resume PC as the proven global recv-success
-        // path (raw vector ELR + 4).
+        // Stage 195B: the split resume PC is `last_vector_raw_elr()` with NO `+4` — the
+        // synchronous-exception ELR_EL1 for an SVC already points past the SVC, matching the
+        // proven global non-IpcRecv return path. The earlier `+4` over-advanced by one
+        // instruction (skipping the caller's return-register load), which InitramfsReadChunk
+        // exposed.
         assert!(
-            AARCH64_TRAP_SRC.contains("last_vector_raw_elr().wrapping_add(4)"),
-            "split SVC advance must reuse the global recv-success resume PC (raw + 4)"
+            AARCH64_TRAP_SRC.contains(
+                "let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr() as usize;"
+            ) && !AARCH64_TRAP_SRC.contains(
+                "let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr().wrapping_add(4)"
+            ),
+            "split SVC advance must use raw ELR (no +4), matching the global non-IpcRecv path"
         );
     }
 
@@ -43158,10 +43165,17 @@ mod stage160d_aarch64_split_error_export_parity {
             .nth(1)
             .and_then(|s| s.split("\npub fn ").next())
             .expect("split finalize must exist");
+        // Stage 195B: no `+4` over-advance; the resume PC is raw ELR, used exactly once.
         assert_eq!(
             f.matches("last_vector_raw_elr().wrapping_add(4)").count(),
+            0,
+            "the erroneous +4 SVC over-advance must be gone"
+        );
+        assert_eq!(
+            f.matches("crate::arch::aarch64::boot::last_vector_raw_elr() as usize")
+                .count(),
             1,
-            "SVC PC advance must occur exactly once on the handled split path"
+            "the raw-ELR resume PC must be computed exactly once on the handled split path"
         );
         assert_eq!(
             f.matches("frame.set_saved_pc(").count(),
@@ -62273,11 +62287,11 @@ mod stage195a_aarch64_debuglog_live {
             body.contains("REG_X8"),
             "the import gate must peek the raw syscall number from x8"
         );
-        // Must NOT separately de-gate FutexWake / InitramfsReadChunk on AArch64.
+        // Must NOT de-gate FutexWake on AArch64 (Stage 195C, not yet). InitramfsReadChunk is
+        // enabled in Stage 195B — checked in the stage195b module.
         assert!(
-            !body.contains("SYSCALL_FUTEX_WAKE_NR")
-                && !body.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
-            "195A must not enable FutexWake / InitramfsReadChunk on AArch64"
+            !body.contains("SYSCALL_FUTEX_WAKE_NR"),
+            "195A/195B must not enable FutexWake on AArch64"
         );
     }
 
@@ -62397,6 +62411,210 @@ mod stage195a_aarch64_debuglog_live {
         assert!(
             AARCH64_DOC.contains("DebugLog is now LIVE on AArch64 (Stage 195A)"),
             "the arch doc must record DebugLog going live"
+        );
+    }
+}
+
+// Stage 195B — AARCH64 INITRAMFSREADCHUNK SPLIT RETIREMENT. InitramfsReadChunk (NR 27) is the
+// SECOND live AArch64 split-dispatch class. These guards pin the selective ABI-import gate
+// (DebugLog + InitramfsReadChunk only), the success-only decline semantics, no-partial-write,
+// arch-tagged retirement, DebugLog preservation, and that no other class was newly enabled.
+mod stage195b_aarch64_initramfs_read_chunk {
+    use super::*;
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    fn aarch64_import_body() -> &'static str {
+        TRAP_ENTRY_SRC
+            .split_once("#[cfg(target_arch = \"aarch64\")]\nfn pre_split_import_syscall_abi(")
+            .map(|(_, r)| {
+                r.split_once("\n#[cfg(not(target_arch = \"aarch64\"))]")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("")
+    }
+
+    fn aarch64_finalize_body() -> &'static str {
+        TRAP_ENTRY_SRC
+            .split_once("#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(")
+            .map(|(_, r)| {
+                r.split_once("\n#[cfg(not(target_arch = \"aarch64\"))]")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("")
+    }
+
+    // The AArch64 selective ABI gate now includes NR 15 (DebugLog) AND NR 27
+    // (InitramfsReadChunk) — and ONLY those two (plus the oracle knob). No FutexWake/FutexWait/
+    // Yield / CreateInitramfsFileSliceMo NR.
+    #[test]
+    fn aarch64_abi_gate_includes_nr15_and_nr27_only() {
+        let import = aarch64_import_body();
+        assert!(!import.is_empty(), "aarch64 import body must exist");
+        assert!(
+            import.contains("SYSCALL_DEBUG_LOG_NR")
+                && import.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
+            "the gate must include DebugLog (NR 15) and InitramfsReadChunk (NR 27)"
+        );
+        for forbidden in [
+            "SYSCALL_FUTEX_WAKE_NR",
+            "SYSCALL_FUTEX_WAIT_NR",
+            "SYSCALL_YIELD_NR",
+            "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
+        ] {
+            assert!(
+                !import.contains(forbidden),
+                "the AArch64 gate must NOT include `{forbidden}`"
+            );
+        }
+        // Finalize mirrors the same selectivity.
+        let fin = aarch64_finalize_body();
+        assert!(
+            fin.contains("SYSCALL_DEBUG_LOG_NR") && fin.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
+            "the AArch64 finalize gate must mirror the import gate (NR 15 + NR 27)"
+        );
+    }
+
+    // InitramfsReadChunk passes the arch-neutral NR gate and is routed to its generic helper.
+    #[test]
+    fn initramfs_read_chunk_is_split_eligible() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
+            "InitramfsReadChunk must pass the split NR gate"
+        );
+        assert!(
+            SPLIT_SRC.contains("if matches!(syscall, Syscall::InitramfsReadChunk) {"),
+            "try_split_dispatch_into_frame must route InitramfsReadChunk to its helper"
+        );
+    }
+
+    // CreateInitramfsFileSliceMo (NR 28, cap-minting) stays excluded from split dispatch.
+    #[test]
+    fn create_initramfs_file_slice_mo_remains_excluded() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some")
+                && !SPLIT_SRC.contains("matches!(syscall, Syscall::CreateInitramfsFileSliceMo)"),
+            "CreateInitramfsFileSliceMo must never be split-eligible"
+        );
+    }
+
+    // The split helper services ONLY the success path: every error/unsupported case returns
+    // `None` (fall back to the canonical global handler), and the destination copy is a
+    // two-pass validated write so a fault leaves NO partial user write.
+    #[test]
+    fn initramfs_split_is_success_only_and_no_partial_write() {
+        let body = SPLIT_SRC
+            .split_once("fn try_split_initramfs_read_chunk_into_frame(\n    shared: &SharedKernel,")
+            .map(|(_, r)| {
+                r.split_once("\n/// Emit the InitramfsReadChunk")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(!body.is_empty(), "initramfs split helper body must exist");
+        // Declines (fallback) for access/arg/not-found/unwritable cases.
+        assert!(
+            body.matches("return None").count() >= 5,
+            "the split helper must decline (return None) for all non-success cases"
+        );
+        // Two-pass validated user write (validate all dest pages before writing any byte).
+        assert!(
+            body.contains("copy_slice_to_user_asid_split_write"),
+            "the destination copy must use the two-pass validated write seam"
+        );
+        assert!(
+            body.contains("No user-memory byte was written on the split path"),
+            "the helper must document no-partial-write on copy failure"
+        );
+    }
+
+    // Arch-tagged retirement marker on AArch64; byte-identical untagged marker off AArch64.
+    #[test]
+    fn initramfs_retirement_marker_arch_tagged() {
+        assert!(
+            SPLIT_SRC.contains("arch=aarch64 class=InitramfsReadChunk result=ok"),
+            "AArch64 must emit the arch-tagged InitramfsReadChunk retirement marker"
+        );
+        assert!(
+            SPLIT_SRC.contains(
+                "crate::yarm_log!(\"{} class=InitramfsReadChunk\", MARK_RETIRE_CLASS_BEGIN);"
+            ),
+            "the non-aarch64 InitramfsReadChunk marker must stay untagged/byte-identical"
+        );
+    }
+
+    // DebugLog split remains live (its arch-tagged marker + gate intact).
+    #[test]
+    fn debuglog_split_still_live() {
+        assert!(
+            SPLIT_SRC.contains("arch=aarch64 class=DebugLog result=ok"),
+            "the AArch64 DebugLog retirement marker must remain"
+        );
+    }
+
+    // No queue-advancing AArch64 drain; RISC-V still force-clears; ReapFaultedTask excluded.
+    #[test]
+    fn no_queue_advancing_and_riscv_inert_and_reap_excluded() {
+        const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        for needle in [
+            "d2_recv_was_deferred",
+            "futex_wait_was_deferred",
+            "yield_was_deferred",
+        ] {
+            let idx = TRAP_ENTRY_SRC.find(needle).unwrap();
+            assert!(
+                TRAP_ENTRY_SRC[..idx]
+                    .rfind("#[cfg(target_arch = \"x86_64\")]")
+                    .is_some(),
+                "queue-advancing drain `{needle}` must stay x86_64-gated"
+            );
+        }
+        assert!(
+            RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
+            "RISC-V must still force the active flag false"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+    }
+
+    // Stage 195B return-value parity fix: the split finalize resyncs args[0..2] to the exported
+    // x0..x2 and re-saves the TCB AFTER export (so a preemption resume reads the return value,
+    // not the original args), mirroring the proven global non-task-switched return path.
+    #[test]
+    fn split_finalize_resyncs_args_after_export() {
+        const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+        let f = AARCH64_TRAP_SRC
+            .split("fn split_finalize_handled_syscall")
+            .nth(1)
+            .and_then(|s| s.split("\npub fn ").next())
+            .expect("split finalize must exist");
+        let export_idx = f
+            .find("export_syscall_result_to_user_gprs(frame)")
+            .expect("finalize must export");
+        let after_export = &f[export_idx..];
+        assert!(
+            after_export.contains(
+                "frame.set_arg(0, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0))"
+            ) && after_export.contains("set_thread_user_context(tid, ctx)"),
+            "finalize must resync args + re-save the TCB AFTER export (return-value parity)"
+        );
+    }
+
+    // The PM boot-time NR 27 self-probe exists so the retirement fires live on a core boot
+    // (the ZC-grant load path never issues NR 27).
+    #[test]
+    fn pm_nr27_self_probe_present() {
+        const PM_SRC: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+        );
+        assert!(
+            PM_SRC.contains("initramfs_read_chunk(PM_NR27_PROBE_FILE")
+                && PM_SRC.contains("PM_NR27_SELF_PROBE_OK"),
+            "PM must issue the one-shot NR 27 self-probe so the split retirement fires live"
         );
     }
 }

@@ -372,12 +372,35 @@ is the core Stage 194 finding.
   restore (export x0..x5 + advance past the SVC), not the seam. Success/error registers are
   byte-identical to the legacy `handle_debug_log` path (same `set_ok(0,0,0)` / `set_err`, same
   `export_syscall_result_to_user_gprs`).
-- **Still inert on AArch64 (unchanged this stage):** `FutexWake`, `InitramfsReadChunk` (split
-  classes not yet de-gated), and the queue-advancing classes (`D2`/`FutexWait`/`Yield`), which
-  remain `#[cfg(target_arch = "x86_64")]` and await a de-gated drain body + an EL0-return-frame
-  restore proof.
-- **Next AArch64 slices (Stage 195B+):** `InitramfsReadChunk` success path, then
-  `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
+- **InitramfsReadChunk is now LIVE on AArch64 (Stage 195B).** The selective ABI-import gate is
+  extended to `NR 15 || NR 27 || oracle`, so InitramfsReadChunk (NR 27) reaches
+  `try_split_initramfs_read_chunk_into_frame`. Only the **success path** is retired: the helper
+  returns `None` (unchanged global-lock fallback) for every access-gate / arg / not-found /
+  unwritable-destination / ASID-unavailable case, so `MissingRight` / `InvalidArgs` /
+  `UserMemoryFault` stay canonical. The destination copy is a **two-pass validated write**
+  (`copy_slice_to_user_asid_split_write` validates every destination page before writing any
+  byte), so a fault leaves **zero** bytes written and falls back with no mutation — no partial
+  user write. Immutable initramfs/CPIO data only; no structural mutation, no allocation, no cap
+  mint, no scheduler/IPC mutation, no TTBR0/ASID switch. Live markers:
+  `AARCH64_SPLIT_ABI_IMPORT_OK nr=27`, `YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=27`,
+  `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=InitramfsReadChunk result=ok`,
+  `AARCH64_SPLIT_FINALIZE_OK nr=27 result=ok`. DebugLog behavior is byte-for-byte unchanged.
+- **Split return-value parity fix (Stage 195B).** Enabling a return-value-checking split class
+  (InitramfsReadChunk's caller reads x0/x1) surfaced a latent AArch64 split-finalize bug that
+  DebugLog had masked (it ignores its return): (a) the split resume PC used `ELR + 4`, but the
+  synchronous-exception `ELR_EL1` for an `SVC` already points at the instruction AFTER the
+  `SVC`, so the `+4` over-advanced by one instruction and skipped the caller's return-register
+  load (`mov rN, x0`) — the resume PC is now raw `ELR` (no `+4`), matching the proven global
+  non-IpcRecv path; (b) the finalize now resyncs `args[0..2]` to the exported `x0..x2` and
+  re-saves the TCB AFTER export, so a preemption resume reads the return value rather than the
+  original syscall args. Verified: PM's NR 27 self-probe returns `bytes=16` (was `Internal`),
+  DebugLog still live, x86_64/RISC-V unaffected (the fix is in `arch/aarch64/trap.rs`).
+- **Still inert on AArch64 (unchanged this stage):** `FutexWake` (Stage 195C), and the
+  queue-advancing classes (`D2`/`FutexWait`/`Yield`), which remain
+  `#[cfg(target_arch = "x86_64")]` and await a de-gated drain body + an EL0-return-frame restore
+  proof. `CreateInitramfsFileSliceMo` (NR 28, cap-minting) stays global-lock-only.
+- **Next AArch64 slice (Stage 195C):** `FutexWake` (waiter/run-queue mutation, no caller
+  task-switch), then `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
 - **TLB/ASID:** local TTBR0_EL1 + ASID switch with the existing `TLBI`/`DSB ISH`/`ISB`
   maintenance is sufficient for the first slices; broadcast `TLBI` is only needed for
   VM/SMP classes, which are out of scope. QEMU virt and RPi5 share the same generic drain —

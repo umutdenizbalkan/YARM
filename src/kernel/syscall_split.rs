@@ -676,11 +676,28 @@ fn maybe_log_initramfs_read_chunk_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("{} class=InitramfsReadChunk", MARK_RETIRE_CLASS_BEGIN);
-        crate::yarm_log!(
-            "{} class=InitramfsReadChunk result=ok",
-            MARK_RETIRE_CLASS_DONE
-        );
+        // Stage 195B: AArch64 emits an arch-tagged retirement marker (InitramfsReadChunk
+        // is the second live AArch64 split-dispatch class). x86_64/riscv64 keep the exact
+        // untagged marker text — byte-identical to Stage 191C.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!(
+                "{} arch=aarch64 class=InitramfsReadChunk",
+                MARK_RETIRE_CLASS_BEGIN
+            );
+            crate::yarm_log!(
+                "{} arch=aarch64 class=InitramfsReadChunk result=ok",
+                MARK_RETIRE_CLASS_DONE
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            crate::yarm_log!("{} class=InitramfsReadChunk", MARK_RETIRE_CLASS_BEGIN);
+            crate::yarm_log!(
+                "{} class=InitramfsReadChunk result=ok",
+                MARK_RETIRE_CLASS_DONE
+            );
+        }
     }
 }
 

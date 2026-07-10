@@ -215,7 +215,14 @@ pub(crate) fn split_finalize_handled_syscall(
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) -> Result<(), TrapHandleError> {
-    let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr().wrapping_add(4) as usize;
+    // Stage 195B fix: the resume PC is `last_vector_raw_elr()` with NO `+4`. On AArch64 the
+    // synchronous-exception ELR_EL1 for an `SVC` already points at the instruction FOLLOWING
+    // the `SVC`, exactly as the proven global non-IpcRecv return path uses it
+    // (`syscall_resume_pc = raw_vector_return_pc`, no `+4`). The earlier `+4` over-advanced by
+    // one instruction, skipping the caller's return-register load (`mov rN, x0`); DebugLog
+    // tolerated the skip (it ignores its return), but InitramfsReadChunk — whose caller reads
+    // x0 (error lane) and x1 (byte count) — returned a stale register (decoded as Internal).
+    let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr() as usize;
     frame.set_saved_pc(resume_pc);
     if let Some(tid) = kernel.current_tid() {
         let mut ctx = frame.capture_user_context();
@@ -242,6 +249,21 @@ pub(crate) fn split_finalize_handled_syscall(
     );
     restore_arch_thread_state(kernel, cpu, Some(frame), true)?;
     export_syscall_result_to_user_gprs(frame);
+    // Stage 195B fix: re-sync args[0..2] to the just-exported x0..x2 and RE-SAVE the TCB
+    // AFTER export — byte-identical to the global non-task-switched return path
+    // (`handle_trap_entry_with_fault_bookkeeping_mode`). The pre-export
+    // `set_thread_user_context` above snapshotted the ORIGINAL syscall args (x0 = arg0);
+    // without this re-save the resumed task reads the stale x0 instead of the exported
+    // return value. DebugLog masked this (it ignores its return); InitramfsReadChunk
+    // (whose caller reads x0 for the error lane and x1 for the byte count) exposed it.
+    frame.set_arg(0, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0));
+    frame.set_arg(1, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1));
+    frame.set_arg(2, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2));
+    if let Some(tid) = kernel.current_tid() {
+        let mut ctx = frame.capture_user_context();
+        ctx.instruction_ptr = crate::kernel::vm::VirtAddr(resume_pc as u64);
+        let _ = kernel.set_thread_user_context(tid, ctx);
+    }
     crate::yarm_log!(
         "AARCH64_SPLIT_ABI_EXPORT_DONE err={} x0_after=0x{:x}",
         frame.error_code().unwrap_or(0),

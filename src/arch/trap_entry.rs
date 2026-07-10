@@ -946,14 +946,17 @@ pub fn dispatch_trap_entry_with_shared_kernel(
 // riscv64 does not enter `handle_trap_entry_shared`.
 #[cfg(target_arch = "aarch64")]
 fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
-    // Stage 195A: production DebugLog (NR 15) is now split-eligible on AArch64.
-    // Peek the raw syscall number from x8 WITHOUT committing the import; import the
-    // decoded ABI ONLY when it is DebugLog (or when the oracle proof knob is on for
-    // its full validation surface). Every other syscall keeps `nr=0` in the frame,
-    // so the split dispatcher declines it and it falls back to the UNCHANGED
-    // global-lock path — this is what keeps DebugLog the ONLY newly-eligible class.
+    // Stage 195A/195B: DebugLog (NR 15) and InitramfsReadChunk (NR 27) are the live
+    // AArch64 split-dispatch classes. Peek the raw syscall number from x8 WITHOUT
+    // committing the import; import the decoded ABI ONLY for those NRs (or when the
+    // oracle proof knob is on for its full validation surface). Every other syscall
+    // keeps `nr=0` in the frame, so the split dispatcher declines it and it falls back
+    // to the UNCHANGED global-lock path — this is what keeps DebugLog + InitramfsReadChunk
+    // the ONLY newly-eligible classes. InitramfsReadChunk's split helper services only the
+    // SUCCESS path; any error case returns `None` → the same unchanged global-lock fallback.
     let raw_nr = frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8);
     if raw_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
+        || raw_nr == crate::kernel::syscall::SYSCALL_INITRAMFS_READ_CHUNK_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
     {
         super::aarch64::trap::split_import_syscall_abi(frame);
@@ -968,13 +971,14 @@ fn finalize_split_handled_syscall(
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) {
-    // Stage 195A: finalize is reached ONLY when the split dispatcher HANDLED the
-    // syscall. In production the only newly-eligible AArch64 class is DebugLog, so
-    // this runs for DebugLog (nr=15) — mirroring the selective ABI import — plus the
-    // oracle-validated classes. The brief `with_cpu` here is the ARCH RETURN-PATH
-    // restore (export result to x0..x5 + advance past the SVC), NOT the DebugLog
-    // seam (which already ran lock-free via `copy_from_user_asid_split_read`).
+    // Stage 195A/195B: finalize is reached ONLY when the split dispatcher HANDLED the
+    // syscall. In production the newly-eligible AArch64 classes are DebugLog (nr=15) and
+    // InitramfsReadChunk (nr=27), so this runs for those — mirroring the selective ABI
+    // import — plus the oracle-validated classes. The brief `with_cpu` here is the ARCH
+    // RETURN-PATH restore (export result to x0..x5 + advance past the SVC), NOT the split
+    // seam (the user copy already ran lock-free via the split helper).
     if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
+        || frame.syscall_num() == crate::kernel::syscall::SYSCALL_INITRAMFS_READ_CHUNK_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
     {
         let _ = shared.with_cpu(cpu, |kernel| {
