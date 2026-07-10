@@ -1188,6 +1188,69 @@ remove implicit global-lock coupling from syscall/trap paths.
     or beginning the RecvSharedV3 decomposition — both larger than a single 193-style slice.
   * **The broad global lock is NOT retired.** Full global-lock retirement is NOT claimed.
 
+- **Stage 194 (CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT) — AUDIT/DESIGN ONLY; no
+  AArch64/RISC-V retirement enabled.** Determines exactly how the x86_64-proven retirement
+  mechanisms port to AArch64 and RISC-V. NO out-of-lock retirement is activated on either
+  architecture; `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` is not flipped true on either; the syscall
+  ABI/counts are unchanged (SYSCALL_COUNT=32, VARIANT_COUNT=23). The compiled runtime is
+  behaviorally unchanged.
+  * **Two mechanism families, two portability stories.**
+    1. *Pre-lock split-dispatch classes* (`DebugLog`, `FutexWake`, `InitramfsReadChunk`): serviced
+       entirely BEFORE `with_cpu` by `try_split_dispatch_into_frame` through `&SharedKernel` seams;
+       the caller never task-switches, so there is NO post-lock drain and NO arch return-path
+       restore. The dispatcher body is already generic. Its ONLY arch dependency is that the frame
+       must carry the DECODED syscall ABI (`frame.syscall_num()`/`arg()`): x86_64's trap stub
+       populates it; AArch64 imports it via `pre_split_import_syscall_abi` **only when the oracle
+       proof knob is on** (`ipc_recv_oracle_proof_enabled()`), so a normal AArch64 boot sees `nr=0`
+       and always falls back; RISC-V never enters the shared path at all. → classification
+       **generic_with_arch_restore_hook** but with NO restore hook needed (no switch); the port is
+       "make the ABI import unconditional + wire the handled-syscall finalize," nothing more.
+    2. *IpcSend blocked-waiter boundary classes* (193A–D) drain via the GENERIC
+       `drain_dispatch_post_work`/`execute_dispatch_post_work` (`copy_to_user_split`, ASID-based, no
+       cfg gate) on the shared path. The *enqueue* classes (193E/193F) are pure rank-4 endpoint
+       enqueues with no deferred work. → **generic_with_arch_restore_hook**: runs wherever the arch
+       is on the shared path (x86_64 + AArch64), inert on RISC-V (not on the shared path).
+    3. *Queue-advancing dispatch drains* (`D2 recv/send`, `FutexWait`, `Yield`) are DIFFERENT: their
+       drain bodies in `arch/trap_entry.rs` are `#[cfg(target_arch = "x86_64")]` and perform a real
+       context switch (`post_switch_restore_arch_thread_state`). → **x86_64_trap_entry_specific**
+       today; porting needs the drain block de-gated per arch AND a proven arch return-path restore.
+  * **Active-flag ownership (the load-bearing invariant).** `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]`
+    is the producers' contract: "a trap-entry drainer WILL run after `with_cpu` and complete my
+    stashed snapshot." It is set true by `handle_trap_entry_shared` before `with_cpu` and cleared
+    after. x86_64 and AArch64 own it correctly (both enter the shared path). RISC-V does NOT enter
+    the shared path (raw `&mut KernelState`, no `drain_dispatch_post_work`); because the flag is a
+    cross-arch static, RISC-V could read it **stale-true** (left set by another CPU/earlier boot),
+    which once caused producers to stash snapshots no drainer ran → woken receivers left un-enqueued
+    → boot stall at `kernel_idle_awaiting_io`. The fix (kept, guarded) is
+    `arch/riscv64/trap.rs` force-storing it FALSE at the top of every RISC-V trap. Design rule for
+    195/196: **an architecture may set the active flag true only once it has a registered post-lock
+    drain + return-path restore proven in QEMU.**
+  * **AArch64 readiness.** On the shared drain path already; owns the active flag; has the arch
+    restore hook (`restore_arch_thread_state_post_switch`); TTBR0/ASID switch exists. Missing to go
+    live: unconditional syscall-ABI import + handled-syscall finalize (drop the oracle-knob gate),
+    and — for the queue-advancing classes only — de-gating the drain bodies and an EL0-return-frame
+    restore proof; remote TLBI is only needed for VM/SMP classes, NOT for the recommended first
+    slices. QEMU virt and RPi5 can share the same generic drain (no board-specific drain logic).
+  * **RISC-V readiness.** NOT on the shared path — the single largest gap. It uses a raw-pointer
+    trap bridge with no `with_cpu`, so it has neither `try_split_dispatch_into_frame` (needs
+    `&SharedKernel`) nor `drain_dispatch_post_work`. Prerequisite for ANY retirement: route the
+    RISC-V trap bridge through `handle_trap_entry_shared` (or an equivalent shared wrapper), give it
+    a real post-`sret` drain location, and prove SATP/ASID restore + `SFENCE.VMA` discipline. Until
+    then RISC-V stays global-lock-only and force-false on the active flag.
+  * **Recommended first live slice.** AArch64: `DebugLog` (pure read, no switch, no drain) →
+    `InitramfsReadChunk` success path → `IpcSendPlainEnqueue`. RISC-V: none until the shared-path
+    prerequisite lands; then `DebugLog`. `FutexWait`/`Yield` are explicitly NOT first (they need a
+    proven queue-advancing drain + return-path restore).
+  * **Empirical finding (QEMU).** On AArch64 the IpcSend *boundary* family already runs live
+    (`GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok` on a normal boot) because
+    its drain is generic and AArch64 is on the shared path — this is pre-existing, not enabled by
+    194. AArch64's split-dispatch + queue-advancing classes and ALL of RISC-V's classes remain
+    inert / global-lock-only; their full userspace server chains pass; no additional class is
+    enabled by a flag flip; a real drain + return-path proof is mandatory for the rest. See
+    KERNEL_UNLOCKING.md §7.1.21 for the Stage 195/196/197 plans and seal gates.
+  * **The broad global lock is NOT retired on any architecture.** Cross-arch global-lock retirement
+    is NOT claimed.
+
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 
 Stage 185 inventoried every global-lock site and its finding is recorded here so

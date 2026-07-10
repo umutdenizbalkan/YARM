@@ -332,6 +332,45 @@ logic.
   `.../virtio_blk_srv`) are rejected truthfully (`Unsupported`) and are
   **not** treated as successful stat/open/read sources.
 
+### 4.6 Global-lock retirement portability (Stage 194 audit)
+
+**Empirical reality (QEMU virt core smoke):** the AArch64 IpcSend *boundary* family already
+runs live — `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok` is observed on
+a normal AArch64 boot (the server chain naturally sends an ordinary cap to a blocked recv-v2
+receiver), because that class's drain is the GENERIC `drain_dispatch_post_work` and AArch64 is
+on the shared path. **The pre-lock split-dispatch classes (`DebugLog`, `FutexWake`,
+`InitramfsReadChunk`) and the queue-advancing classes (`D2`, `FutexWait`, `Yield`) remain inert
+/ global-lock-only on AArch64** — nothing there is enabled by flipping a flag. This split
+(boundary family already generic-and-live; split-dispatch + queue-advancing still arch-blocked)
+is the core Stage 194 finding.
+
+- **AArch64 IS on the shared, drain-capable trap path.** The primary vector handler
+  (`arch/aarch64/boot.rs`) marshals the EL1 exception frame into a portable `TrapFrame`
+  and calls `dispatch_trap_entry_with_shared_kernel` → `handle_trap_entry_shared`, exactly
+  like x86_64. It therefore owns `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` correctly (set
+  before `with_cpu`, cleared after) and runs the generic `drain_dispatch_post_work`.
+- **The arch restore hook exists:** `restore_arch_thread_state_post_switch` (the AArch64
+  arm of `post_switch_restore_arch_thread_state`).
+- **Why the split-dispatch classes are still inert (the boundary family is not):** the
+  split-dispatch classes only fire when the trap frame carries the DECODED syscall ABI. On
+  AArch64 the import
+  (`pre_split_import_syscall_abi`) and the handled-syscall finalize
+  (`finalize_split_handled_syscall`) are gated behind the oracle proof knob
+  (`ipc_recv_oracle_proof_enabled()`), so a normal boot sees `nr=0`, the split declines,
+  and every syscall falls through to the unchanged global-lock path.
+- **First live slice (Stage 195):** de-gate the ABI import + finalize, then enable
+  `DebugLog` (pure read, no task switch, no drain, no TTBR0/ASID change), then
+  `InitramfsReadChunk` success path, then `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
+  The queue-advancing classes (`D2`/`FutexWait`/`Yield`) are deferred until their
+  `#[cfg(target_arch = "x86_64")]` drain bodies are de-gated and an EL0-return-frame restore
+  is proven under the drain.
+- **TLB/ASID:** local TTBR0_EL1 + ASID switch with the existing `TLBI`/`DSB ISH`/`ISB`
+  maintenance is sufficient for the first slices; broadcast `TLBI` is only needed for
+  VM/SMP classes, which are out of scope. QEMU virt and RPi5 share the same generic drain —
+  no board-specific drain logic.
+
+See `doc/KERNEL_UNLOCKING.md` §7.1.21 for the Stage 195/197 plans and seal gates.
+
 ---
 
 ## 5. Hosted-dev harness note

@@ -62054,6 +62054,179 @@ mod stage193g_remaining_shapes_audit {
     }
 }
 
+// Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
+// no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
+// reality the audit relied on, so a future stage cannot silently flip an architecture
+// live merely by changing a flag, and the x86_64 retirement paths stay unchanged.
+mod stage194_cross_arch_portability_audit {
+    use super::*;
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const LOCKING_DOC: &str = include_str!("../../../doc/KERNEL_LOCKING.md");
+    const UNLOCKING_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+    const AARCH64_DOC: &str = include_str!("../../../doc/ARCH_AARCH64.md");
+    const RISCV_DOC: &str = include_str!("../../../doc/ARCH_RISCV64.md");
+
+    // RISC-V trap entry forces GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE inactive because it uses
+    // the raw &mut KernelState path with NO shared-path drainer — the drain does not exist
+    // yet, so the active flag must never read true there.
+    #[test]
+    fn riscv_trap_entry_forces_active_flag_inactive() {
+        assert!(
+            RISCV_TRAP_SRC.contains("never through `handle_trap_entry_shared`"),
+            "RISC-V must still document that it does not enter the shared drain path"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
+                && RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
+            "RISC-V trap entry must force the active flag false until a real drain exists"
+        );
+    }
+
+    // AArch64 reaches the shared drain path, but its split-dispatch is inert on a normal
+    // boot: the syscall-ABI import (and the handled-syscall finalize) are gated behind the
+    // oracle proof knob, so no retirement class is serviced off the global lock by default.
+    #[test]
+    fn aarch64_split_dispatch_is_inert_until_abi_import_enabled() {
+        assert!(
+            AARCH64_BOOT_SRC.contains("dispatch_trap_entry_with_shared_kernel"),
+            "AArch64 must still enter the shared trap path (drain-capable)"
+        );
+        let import = TRAP_ENTRY_SRC
+            .split_once("fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {")
+            .map(|(_, r)| r.split_once('}').map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("");
+        assert!(
+            import.contains("ipc_recv_oracle_proof_enabled()"),
+            "AArch64 syscall-ABI import must stay gated behind the oracle proof knob (inert by default)"
+        );
+    }
+
+    // The generic drain (drain_dispatch_post_work) and the arch restore hook both exist;
+    // the mechanism is generic_with_arch_restore_hook, not blindly copyable.
+    #[test]
+    fn generic_drain_and_arch_restore_hook_present() {
+        assert!(
+            RUNTIME_SRC.contains("fn drain_dispatch_post_work(")
+                && RUNTIME_SRC.contains("copy_to_user_split("),
+            "the generic dispatch-post-work drain must remain (ASID-based, arch-neutral)"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("fn post_switch_restore_arch_thread_state(")
+                && TRAP_ENTRY_SRC.contains("restore_arch_thread_state_post_switch"),
+            "the arch restore hook must remain wired for aarch64 (x86_64 sibling too)"
+        );
+    }
+
+    // The queue-advancing drains (D2 recv/send, FutexWait, Yield) remain x86_64-gated —
+    // they are NOT yet generic, so they cannot be ported by a flag flip.
+    #[test]
+    fn queue_advancing_drains_remain_x86_64_gated() {
+        for needle in [
+            "d2_recv_was_deferred",
+            "d2_send_was_deferred",
+            "futex_wait_was_deferred",
+            "yield_was_deferred",
+        ] {
+            let idx = TRAP_ENTRY_SRC
+                .find(needle)
+                .unwrap_or_else(|| panic!("drain state `{needle}` must exist"));
+            let prefix = &TRAP_ENTRY_SRC[..idx];
+            assert!(
+                prefix.rfind("#[cfg(target_arch = \"x86_64\")]").is_some(),
+                "drain state `{needle}` must still be inside an x86_64-gated block"
+            );
+        }
+    }
+
+    // x86_64 live retirement markers are unchanged: the three split-dispatch classes and
+    // the five IpcSend boundary classes remain.
+    #[test]
+    fn x86_64_retirement_classes_unchanged() {
+        for class in [
+            "class=DebugLog",
+            "class=FutexWake",
+            "class=InitramfsReadChunk",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(class),
+                "x86_64 split-dispatch retirement class `{class}` must remain"
+            );
+        }
+        for class in [
+            "class=IpcSendPlain result=ok",
+            "class=IpcSendOrdinaryCap result=ok",
+            "class=IpcSendReplyCap result=ok",
+            "class=IpcSendPlainEnqueue result=ok",
+            "class=IpcSendOrdinaryCapEnqueue result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(class),
+                "x86_64 IpcSend retirement class `{class}` must remain"
+            );
+        }
+    }
+
+    // ReapFaultedTask remains excluded from split dispatch (default-deny whitelist).
+    #[test]
+    fn reap_faulted_task_remains_excluded_from_split() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask =>"),
+            "ReapFaultedTask must never be a split-eligible arm"
+        );
+        assert!(
+            SPLIT_SRC.contains("// Default-deny: every other syscall falls back"),
+            "the split whitelist must stay default-deny"
+        );
+    }
+
+    // 194 adds NO new retirement class (audit only).
+    #[test]
+    fn no_new_retirement_class_added() {
+        for forbidden in [
+            "class=IpcSendReplyCapEnqueue",
+            "class=IpcSendSharedRegion",
+            "class=DebugLogAarch64",
+            "class=DebugLogRiscv",
+        ] {
+            assert!(
+                !MOD_SRC.contains(forbidden) && !SPLIT_SRC.contains(forbidden),
+                "194 must not add retirement class `{forbidden}`"
+            );
+        }
+    }
+
+    // Docs record the audit but do NOT claim cross-arch retirement.
+    #[test]
+    fn docs_record_audit_without_claiming_cross_arch_retirement() {
+        assert!(
+            LOCKING_DOC.contains("Stage 194") && UNLOCKING_DOC.contains("Stage 194"),
+            "the 194 audit must be documented in KERNEL_LOCKING.md and KERNEL_UNLOCKING.md"
+        );
+        assert!(
+            AARCH64_DOC.contains("global-lock-only") && RISCV_DOC.contains("global-lock-only"),
+            "the arch docs must state the retirement paths remain global-lock-only"
+        );
+        for doc in [LOCKING_DOC, UNLOCKING_DOC, AARCH64_DOC, RISCV_DOC] {
+            for claim in [
+                "AArch64 global lock retired",
+                "RISC-V global lock retired",
+                "cross-arch global lock retired",
+                "cross-arch global-lock retirement complete",
+            ] {
+                assert!(
+                    !doc.contains(claim),
+                    "docs must not claim cross-arch retirement (`{claim}`)"
+                );
+            }
+        }
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

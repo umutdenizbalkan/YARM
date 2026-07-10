@@ -393,6 +393,38 @@ scheduling so `online_cpus` can climb past 1.
 
 ---
 
+## 10.1 Global-lock retirement portability (Stage 194 audit)
+
+**RISC-V global-lock retirement paths are inert / global-lock-only today, and RISC-V is
+the least ready of the three architectures. No class is retired off the global lock; the
+active-flag is force-false; nothing is enabled by flipping a flag.**
+
+- **RISC-V does NOT enter the shared, drain-capable path.** The trap bridge
+  (`yarm_riscv64_trap_bridge` → `arch/riscv64/trap.rs::handle_trap_entry`) runs under a raw
+  `&mut KernelState`, never through `handle_trap_entry_shared`. Consequently it has neither
+  `try_split_dispatch_into_frame` (which needs `&SharedKernel`) nor the post-`with_cpu`
+  `drain_dispatch_post_work`. This is the single largest cross-arch retirement gap.
+- **Active-flag ownership.** Because `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` is a cross-arch
+  static and the RISC-V path never sets it, it could read **stale-true** (left set by another
+  CPU/earlier boot). The blocked-waiter producers would then stash a snapshot for a drainer
+  that never runs → woken receivers left un-enqueued → boot stall at
+  `kernel_idle_awaiting_io` (see §9.1). The fix (kept, guarded) is
+  `handle_trap_entry_with_fault_bookkeeping_mode` force-storing the flag **false** at the top
+  of every RISC-V trap — its true semantic value while RISC-V has no shared-path drainer.
+- **Prerequisite before ANY retirement (Stage 196 step 1):** route the RISC-V trap bridge
+  through a shared wrapper (`handle_trap_entry_shared` or an equivalent taking `&SharedKernel`
+  and draining after the borrow drops), preserving the existing SATP/ASID `sret` restore and
+  `SFENCE.VMA` discipline. Only after a real drain exists may the RISC-V path OWN the active
+  flag (set true in the wrapper, cleared after) instead of forcing it false.
+- **First live slice:** none until the shared-path prerequisite lands; then `DebugLog`
+  (pure read, no switch, no drain), then `InitramfsReadChunk`, then `IpcSendPlainEnqueue`.
+  Queue-advancing classes (`FutexWait`/`Yield`/`D2`) require a post-`sret` context-switch
+  drain + SATP/`SFENCE.VMA` restore proof and are deferred.
+
+See `doc/KERNEL_UNLOCKING.md` §7.1.21 for the Stage 196/197 plans and seal gates.
+
+---
+
 ## 11. Smoke commands
 
 RISC-V64 is a **regular** smoke target. The canonical entry points are

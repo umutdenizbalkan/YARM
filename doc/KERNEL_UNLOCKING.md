@@ -8363,6 +8363,94 @@ ABI/count/limit change; `SYSCALL_COUNT=31`, `VARIANT_COUNT=23`, x86_64
 QEMU acceptance: `QEMU_SMP=2 SMP_READY=1 scripts/qemu-x86_64-core-smoke.sh` (Issue A) and
 `scripts/qemu-riscv64-core-smoke.sh` (Issue B); AArch64/x86_64 cross-arch markers preserved.
 
+### 7.1.21 Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT (audit/design only)
+
+Audit-only stage: determines exactly how the x86_64-proven retirement mechanisms port to
+AArch64 and RISC-V. **Nothing is enabled.** No out-of-lock retirement is activated on
+AArch64 or RISC-V; `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` is not flipped true on either;
+`SYSCALL_COUNT=32`, `VARIANT_COUNT=23`, x86_64 `MAX_ADDRESS_SPACES=32` unchanged; the
+compiled runtime is behaviorally unchanged (guard tests only, no runtime source touched).
+
+#### Mechanism → portability classification
+
+| Mechanism | x86_64 | AArch64 support | AArch64 missing | RISC-V support | RISC-V missing | genericization | classification |
+|---|---|---|---|---|---|---|---|
+| DebugLog | live | shared path + ABI-import hook (oracle-gated) | de-gate ABI import + finalize | none (raw trap path) | route trap through shared entry | make ABI import unconditional | generic_with_arch_restore_hook (no restore needed) |
+| InitramfsReadChunk | live | same as DebugLog | same | same | same | same | generic_with_arch_restore_hook |
+| FutexWake | live | same as DebugLog | same | same | same | same | generic_with_arch_restore_hook |
+| D2 recv/send dispatch drain | live | shared path; restore hook exists | de-gate x86-only drain body + EL0-return proof | none | shared path + post-`sret` drain | de-gate `#[cfg(x86_64)]` drain block | x86_64_trap_entry_specific |
+| FutexWait dispatch drain | live | as D2 | as D2 | none | as D2 | as D2 | x86_64_trap_entry_specific |
+| Yield dispatch drain | live | as D2 | as D2 | none | as D2 | as D2 | x86_64_trap_entry_specific |
+| IpcSendPlain → blocked recv-v2 | live | **ALREADY LIVE on shared path** | none | none | shared path prerequisite | none (drain already generic) | generic_with_arch_restore_hook |
+| IpcSendOrdinaryCap → blocked | live | **ALREADY LIVE** (`class=IpcSendOrdinaryCap result=ok` observed on AArch64 core smoke) | none | none | as above | none | generic_with_arch_restore_hook |
+| IpcSendReplyCap → blocked | live | ALREADY LIVE on shared path (fires when boot exercises it) | none | none | as above | none | generic_with_arch_restore_hook |
+| IpcSendPlainEnqueue (no waiter) | live | rank-4 enqueue; no deferred work | ABI import to reach it live | none | shared path prerequisite | none | fully_generic_now (no drain at all) |
+| IpcSendOrdinaryCapEnqueue (no waiter) | live | as PlainEnqueue | as PlainEnqueue | none | as PlainEnqueue | none | fully_generic_now |
+
+Generic-vs-arch boundary: the split dispatcher (`try_split_dispatch_into_frame`), the
+IpcSend boundary drain (`drain_dispatch_post_work`/`execute_dispatch_post_work`, ASID-based
+`copy_to_user_split`), and the endpoint enqueue seams are already generic. Arch-specific:
+(a) the decoded syscall ABI in the trap frame, (b) the return-path finalize
+(`finalize_split_handled_syscall`), (c) the queue-advancing drain bodies + the post-switch
+register/address-space restore (`post_switch_restore_arch_thread_state`).
+
+#### TLB/ASID/SMP prerequisites
+
+- x86_64: CR3(/PCID) switch on `d2_*_switch_incoming_asid`; local invalidate on switch;
+  remote shootdown wired (`X86_TLB_SHOOTDOWN_*`). Only VM/SMP classes need remote shootdown.
+- AArch64: TTBR0_EL1 + ASID switch; `TLBI` + `DSB ISH`/`ISB` maintenance already used at boot;
+  a local ASID switch is sufficient for the recommended first slices; remote `TLBI` (broadcast)
+  is required only for VM/SMP classes, which are NOT in scope.
+- RISC-V: SATP(+ASID) switch on `sret`; `SFENCE.VMA` discipline; the shared-path prerequisite
+  (routing through `handle_trap_entry_shared`) must land before ANY drain.
+- SMP: recommended first slices (DebugLog/InitramfsReadChunk/*Enqueue) require NO cross-CPU
+  dispatch and NO remote shootdown, so current AArch64/RISC-V SMP maturity does not block them.
+
+#### Stage 195 — AArch64 first live retirement (implementation plan)
+
+1. De-gate `pre_split_import_syscall_abi` + `finalize_split_handled_syscall` from the oracle
+   knob so a normal boot carries the decoded ABI in the frame (byte-identical when the split
+   declines). Prove with the AArch64 core smoke that non-eligible syscalls still fall back.
+2. Enable **DebugLog** first (pure read, no switch, no drain, no address-space change). Expect
+   `GLOBAL_LOCK_RETIRE_CLASS_DONE class=DebugLog result=ok` on AArch64 with the server chain
+   intact. Then **InitramfsReadChunk** success path, then **IpcSendPlainEnqueue** (rank-4
+   enqueue, no drain).
+3. Do NOT enable D2/FutexWait/Yield: those need the de-gated drain body + an EL0-return frame
+   restore proof (`restore_arch_thread_state_post_switch` under the drain), deferred to a later
+   stage.
+4. Acceptance: AArch64 core + full server chain green; the enabled class marker present;
+   `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` still only true within `handle_trap_entry_shared`.
+
+#### Stage 196 — RISC-V shared-path prerequisite + first live retirement (implementation plan)
+
+1. Prerequisite (no retirement yet): route the RISC-V trap bridge through a shared wrapper
+   (`handle_trap_entry_shared` or an equivalent that takes `&SharedKernel` and drains after the
+   borrow drops), preserving the existing SATP/ASID `sret` restore. Prove the full server chain
+   still reaches `RISCV_KERNEL_IDLE_WAITING_FOR_IO` with no S-mode trap and no stash-without-drain.
+2. Only after the drain exists: allow the RISC-V path to own `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`
+   (set true within the shared wrapper, cleared after) instead of force-false.
+3. Enable **DebugLog** first, then **InitramfsReadChunk**, then **IpcSendPlainEnqueue**.
+4. Do NOT enable queue-advancing classes until a post-`sret` context-switch drain +
+   `SFENCE.VMA`/SATP restore proof exists.
+
+#### Stage 197 — cross-arch seal acceptance gates
+
+- Per-arch: `GLOBAL_LOCK_RETIRE_CLASS_DONE class=<enabled>` present ONLY for the classes that
+  arch has actually enabled; zero for the rest.
+- `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` provably owned per-CPU by the shared entry on every arch
+  that enables a drain; force-false on any arch still lacking one.
+- Full userspace server chains pass on x86_64, AArch64, RISC-V.
+- No fake remote TLB/TLBI/SFENCE acknowledgment; no ReapFaultedTask split; ABI/counts unchanged.
+- Docs updated to state precisely which classes are live per arch — no blanket "cross-arch
+  retirement" claim.
+
+**Current reality (194):** the IpcSend *boundary* family already runs live on AArch64 (it rides
+the generic drain on the shared path — `class=IpcSendOrdinaryCap result=ok` is observed on the
+AArch64 core smoke, pre-existing and not enabled by 194). AArch64's split-dispatch +
+queue-advancing classes, and ALL of RISC-V's classes, remain inert / global-lock-only; both
+full userspace server chains pass; no additional class is enabled by a flag flip; a real drain +
+return-path proof is mandatory before 195 (AArch64 split-dispatch) and 196 (RISC-V) land.
+
 ### 7.1.6 What must not be touched yet
 
 - D1/D5/D2 canonical fallbacks. `materialize_received_message_cap`
