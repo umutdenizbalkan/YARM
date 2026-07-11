@@ -8512,6 +8512,25 @@ first prerequisite; it is deferred rather than half-landed so the proven in-lock
 `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait`.** Yield stays a separate future
 slice (its re-enqueue proof is independent). See §4.7 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 195E — AArch64 FutexWait queue-advancing drain LIVE (DONE)
+
+The 195D blocker is resolved and the AArch64 **FutexWait (NR 9)** queue-advancing dispatch is
+live out of the broad lock under **SMP=1 and SMP=2**, porting the x86_64 192A model with **no
+CR3 logic**. Default-off behind `yarm.aarch64_futex_wait_oracle=1`. (1) **Handler bypass**
+(`arch/aarch64/trap.rs`): when `futex_wait_dispatch_is_deferred(cpu)` and `current` is None/idle,
+skip `idle_no_eret_loop()` + the in-lock restore and return cleanly (markers
+`AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN/DONE`); any other None/idle keeps the idle loop. (2)
+**In-lock deferral** (`futex_wait_current`): BSP + shared-drain-active + `dispatching_cpu_count()
+<= 1` (195D) + another-runnable-present + not-already-deferred → publish `Blocked(Futex)`, clear
+`current`, one-shot defer, skip in-lock dispatch; else legacy fallback. (3) **Post-lock drain**
+(`handle_trap_entry_shared`): generic reverify/dequeue/current/mark-Running seams (un-gated to
+AArch64) + AArch64 arch hooks — TTBR0/ASID via `hal.switch_address_space` (DSB/ISB/TLBI) + EL0
+frame via `restore_arch_thread_state_post_switch`; `state_changed` race declined, deferral cleared
+on every path. Emits `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok`. Live
+oracle: `AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid=<A> dispatched_tid=<B>
+wake_count=1` (A blocks via NR 9 → drain dispatches B → B wakes A via NR 10 → A resumes once).
+Yield stays inert. See §4.8 of `doc/ARCH_AARCH64.md`.
+
 #### Stage 195 — AArch64 first live retirement (implementation plan)
 
 1. **[195A DONE]** De-gate `pre_split_import_syscall_abi` + `finalize_split_handled_syscall`

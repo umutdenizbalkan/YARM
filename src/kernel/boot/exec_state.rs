@@ -1290,6 +1290,63 @@ impl KernelState {
                 tid
             );
         }
+        // Stage 195E (AARCH64 FUTEXWAIT QUEUE-ADVANCING DISPATCH): the AArch64 port of the
+        // x86_64 192A model. Default-off behind `yarm.aarch64_futex_wait_retire`. Eligible only
+        // on the BSP user dispatcher with the shared trap drain active and a single dispatching
+        // CPU (195D BSP affinity guarantees `dispatching_cpu_count() <= 1` under SMP=2), and no
+        // outstanding same-class deferral. On eligibility: publish (already done above), record
+        // the one-shot deferral, and SKIP the in-lock dispatch — the caller returns through the
+        // AArch64 trap-handler bypass and the trap-entry drain performs the authoritative
+        // queue-advancing dispatch + EL0 restore off the global lock. Every ineligible case
+        // falls through to the unchanged in-lock `dispatch_next_task` below.
+        #[cfg(target_arch = "aarch64")]
+        if crate::kernel::boot::aarch64_futex_wait_retire_enabled() {
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            let is_bsp = self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
+            let already = crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
+            // Only defer when there is ANOTHER runnable task for the drain to dispatch. The
+            // caller is already `Blocked(Futex)` and removed from `current`, so this counts the
+            // genuine incomings. If zero, fall back to the in-lock path (which idles correctly
+            // via `idle_no_eret_loop`) — the handler bypass never leaves a stale exception
+            // return with no incoming task.
+            let has_incoming = self.runnable_count_on_cpu(self.current_cpu()) > 0;
+            if trap_path
+                && single_cpu
+                && is_bsp
+                && has_incoming
+                && !already
+                && crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid)
+            {
+                crate::yarm_log!(
+                    "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu={} tid={}",
+                    cpu_idx,
+                    tid
+                );
+                crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid={}", tid);
+                // The AArch64 trap-handler bypass returns cleanly through `with_cpu`; the
+                // trap-entry drain performs the authoritative dispatch. Do NOT dispatch here.
+                return Ok(true);
+            }
+            crate::yarm_log!(
+                "AARCH64_FUTEX_WAIT_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
+                if !trap_path {
+                    "no_trap_drainer"
+                } else if !single_cpu {
+                    "multi_cpu"
+                } else if !is_bsp {
+                    "not_bsp"
+                } else if !has_incoming {
+                    "no_incoming"
+                } else {
+                    "already_deferred"
+                },
+                tid
+            );
+        }
         self.dispatch_next_task()?;
         Ok(true)
     }
@@ -2005,7 +2062,11 @@ impl KernelState {
     /// `self.hal.switch_address_space` step; exposed so the out-of-global-lock
     /// recv dispatch drain (in `arch/trap_entry.rs`) can perform it inside the
     /// brief hardened restore re-acquire without touching the private `hal`.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Stage 195E: un-gated to AArch64 — its live FutexWait drain switches to the incoming
+    /// task's TTBR0_EL1/ASID through this same `hal.switch_address_space` hook (which carries
+    /// the DSB/ISB/TLBI ordering). No x86_64 CR3 logic is used on AArch64.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn d2_recv_switch_incoming_asid(&mut self, incoming: u64) {
         if let Some(asid) = self.task_asid(incoming) {
             self.hal.switch_address_space(asid);

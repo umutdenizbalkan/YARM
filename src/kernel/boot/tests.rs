@@ -62863,6 +62863,233 @@ mod stage195d_aarch64_bsp_dispatch_affinity {
     }
 }
 
+// Stage 195E — AARCH64 FUTEXWAIT QUEUE-ADVANCING DRAIN (live under SMP=1 + SMP=2). FutexWait is
+// NR 9. These guards pin: the FutexWait-deferral-specific handler bypass (idle preserved
+// otherwise), the in-lock deferral eligibility (BSP + shared-drain + single-dispatcher + has
+// incoming), the post-lock drain wiring (reverify/dequeue/current/running + AArch64 TTBR0/frame
+// hooks, NO x86 CR3), the arch-tagged retirement marker, the default-off knob, and the live
+// oracle. Yield stays inert; counts unchanged.
+mod stage195e_aarch64_futex_wait_drain {
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const AARCH64_DOC: &str = include_str!("../../../doc/ARCH_AARCH64.md");
+
+    // FutexWait is NR 9 (NR 10 is FutexWake, NR 11 is SpawnThread).
+    #[test]
+    fn futex_wait_is_nr9() {
+        use crate::kernel::syscall::{
+            SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_SPAWN_THREAD_NR,
+        };
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_SPAWN_THREAD_NR, 11);
+    }
+
+    // The AArch64 handler bypass is strictly FutexWait-deferral-specific: the idle_no_eret_loop
+    // is only skipped when `futex_wait_dispatch_is_deferred(cpu)`; every other None/idle case
+    // keeps entering the idle loop.
+    #[test]
+    fn handler_bypass_requires_pending_deferral_and_preserves_idle() {
+        let body = A64_TRAP_SRC
+            .split_once("fn handle_trap_entry_with_fault_bookkeeping_mode(")
+            .map(|(_, r)| r)
+            .unwrap_or("");
+        assert!(
+            body.contains("let futex_wait_bypass = {")
+                && body.contains("futex_wait_dispatch_is_deferred(idx)"),
+            "the bypass must be gated on a pending FutexWait deferral"
+        );
+        // The idle loop is still present in the non-bypass else arm.
+        assert!(
+            body.contains("} else {\n            trap_trace!(\"AARCH64_IDLE_NO_ERET cpu={}\", cpu.0);\n            idle_no_eret_loop();"),
+            "normal None/idle must still enter idle_no_eret_loop when NOT a FutexWait bypass"
+        );
+        assert!(
+            body.contains("AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN")
+                && body.contains("AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE"),
+            "the bypass must emit its BEGIN/DONE markers"
+        );
+        // The in-lock restore is skipped on bypass (the drain does the authoritative restore).
+        assert!(
+            body.contains("if !switch_pending && !futex_wait_bypass {"),
+            "the in-lock restore must be skipped on a FutexWait bypass"
+        );
+    }
+
+    // The in-lock FutexWait deferral is AArch64/BSP/shared-drain/single-dispatcher/has-incoming
+    // gated, default-off behind the retire flag, and falls back to the legacy in-lock dispatch.
+    #[test]
+    fn in_lock_deferral_eligibility_and_fallback() {
+        let body = EXEC_SRC
+            .split_once("pub fn futex_wait_current(")
+            .map(|(_, r)| r.split_once("\n    pub ").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("");
+        assert!(!body.is_empty(), "futex_wait_current body must exist");
+        assert!(
+            body.contains("aarch64_futex_wait_retire_enabled()"),
+            "the AArch64 deferral must be gated on the default-off retire flag"
+        );
+        for needle in [
+            "GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE",
+            "dispatching_cpu_count() <= 1",
+            "BOOTSTRAP_CPU_ID",
+            "runnable_count_on_cpu",
+            "futex_wait_dispatch_try_defer",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN",
+            "AARCH64_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK",
+        ] {
+            assert!(body.contains(needle), "deferral must reference `{needle}`");
+        }
+        // Every ineligible case still reaches the unchanged in-lock dispatch fallback.
+        assert!(
+            body.contains("self.dispatch_next_task()?;"),
+            "ineligible cases must fall back to the legacy in-lock dispatch"
+        );
+    }
+
+    // The post-lock drain is wired on AArch64 with the generic seams + AArch64 arch hooks, and
+    // NO x86_64 CR3 logic.
+    #[test]
+    fn post_lock_drain_wired_with_aarch64_hooks_no_cr3() {
+        // Anchored in the AArch64 drain block.
+        let block = TRAP_ENTRY_SRC
+            .split_once("Stage 195E (AARCH64 FUTEXWAIT QUEUE-ADVANCING DISPATCH)")
+            .map(|(_, r)| {
+                r.split_once("Stage 192B (YIELD")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(
+            !block.is_empty(),
+            "the AArch64 FutexWait drain block must exist"
+        );
+        for needle in [
+            "futex_wait_reverify_blocked",
+            "futex_wait_dispatch_step_mut",
+            "d6_genuine_mark_running_via_task_seam",
+            "d2_recv_switch_incoming_asid",
+            "post_switch_restore_arch_thread_state",
+            "futex_wait_dispatch_clear",
+            "maybe_log_futex_wait_retired",
+            "AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DEQUEUE_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok",
+        ] {
+            assert!(block.contains(needle), "the drain must use/emit `{needle}`");
+        }
+        // No x86_64 CR3 switch logic — the AArch64 drain uses the generic HAL ASID hook. (Check
+        // for the x86 CR3 helper names, not the word "CR3" which appears in explanatory prose.)
+        assert!(
+            !block.contains("switch_cr3")
+                && !block.contains("write_cr3")
+                && !block.contains("load_cr3"),
+            "the AArch64 drain must NOT use x86_64 CR3 switch logic"
+        );
+        // State-changed race is declined, not stale-dispatched.
+        assert!(
+            block.contains("AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed"),
+            "a woken waiter (state_changed) must be declined, not stale-dispatched"
+        );
+    }
+
+    // The retirement marker is arch-tagged on AArch64 and the reused seams are un-gated to it.
+    #[test]
+    fn retire_marker_arch_tagged_and_seams_ungated() {
+        assert!(
+            MOD_SRC
+                .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"),
+            "AArch64 must emit the arch-tagged FutexWait retirement marker"
+        );
+        assert!(
+            RUNTIME_SRC.contains(
+                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn futex_wait_dispatch_step_mut("
+            ),
+            "futex_wait_dispatch_step_mut must be un-gated to AArch64"
+        );
+        assert!(
+            RUNTIME_SRC.contains(
+                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn futex_wait_reverify_blocked("
+            ),
+            "futex_wait_reverify_blocked must be un-gated to AArch64"
+        );
+    }
+
+    // The default-off knob enables the retire flag + provisions the init slot-5=2 sentinel and
+    // the init oracle emits the live-oracle proof marker.
+    #[test]
+    fn oracle_wired_default_off() {
+        assert!(
+            MOD_SRC.contains("aarch64_futex_wait_retire_enabled")
+                && MOD_SRC.contains("set_aarch64_futex_wait_retire_enabled"),
+            "the FutexWait retire flag + setter must exist"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.aarch64_futex_wait_oracle")
+                && BOOT_CMDLINE_SRC.contains("set_aarch64_futex_wait_retire_enabled(enabled)"),
+            "the knob must enable the retire flag"
+        );
+        assert!(
+            A64_BOOT_SRC.contains("aarch64_futex_wait_retire_enabled()")
+                && A64_BOOT_SRC.contains("init_args[5] = 2"),
+            "the bootstrap must provision slot-5=2 under the FutexWait oracle knob"
+        );
+        assert!(
+            INIT_SRC.contains(
+                "AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid={} dispatched_tid={} wake_count=1"
+            ),
+            "init must emit the FutexWait live-oracle proof marker"
+        );
+    }
+
+    // The smoke gates the FutexWait oracle acceptance and keeps `class=FutexWait` forbidden on a
+    // DEFAULT boot (proving default-off).
+    #[test]
+    fn smoke_accepts_futex_wait_oracle_and_default_off() {
+        assert!(
+            A64_SMOKE.contains("FUTEX_WAIT_ORACLE")
+                && A64_SMOKE.contains("yarm.aarch64_futex_wait_oracle=1")
+                && A64_SMOKE.contains("AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok")
+                && A64_SMOKE.contains(
+                    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"
+                ),
+            "the smoke must require the FutexWait live-oracle acceptance markers"
+        );
+        assert!(
+            A64_SMOKE.contains("a64_split_bads+=(\"arch=aarch64 class=FutexWait\")"),
+            "the smoke must forbid class=FutexWait on a default (non-oracle) boot"
+        );
+        assert!(
+            A64_SMOKE.contains("arch=aarch64 class=Yield"),
+            "the smoke must still forbid the Yield queue-advancing marker"
+        );
+    }
+
+    // Docs record the live AArch64 FutexWait drain.
+    #[test]
+    fn docs_updated() {
+        assert!(
+            AARCH64_DOC.contains("FutexWait")
+                && AARCH64_DOC.contains("queue-advancing")
+                && AARCH64_DOC.contains("195E"),
+            "ARCH_AARCH64.md must record the Stage 195E live FutexWait drain"
+        );
+    }
+}
+
 // Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
 // per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
 // the accepted graduated D2/D6/D3 correctness + syscall-error parity are the

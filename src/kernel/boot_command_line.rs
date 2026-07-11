@@ -306,6 +306,14 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_aarch64_futex_wake_oracle_enabled(enabled);
         crate::yarm_log!("YARM_AARCH64_FUTEX_WAKE_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.aarch64_futex_wait_oracle {
+        // Stage 195E: default-off AArch64 FutexWait queue-advancing live oracle knob. Enables
+        // the FutexWait out-of-lock retirement AND signals init (slot 5 = 2) to run the same
+        // parent/child flow while proving the queue-advancing drain dispatched task B.
+        crate::kernel::boot::set_aarch64_futex_wait_retire_enabled(enabled);
+        crate::kernel::boot::set_aarch64_futex_wake_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_AARCH64_FUTEX_WAIT_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ap_user_dispatch {
         // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
         // first live AP user dispatch. No-op on other arches; when OFF the AP
@@ -504,6 +512,11 @@ pub struct YarmBootOptions<'a> {
     /// IPC proof knob). Signals AArch64 init to run the parent/child FutexWake live oracle
     /// that fires the `class=FutexWake` split retirement + wake-count proof in QEMU.
     pub aarch64_futex_wake_oracle: Option<bool>,
+    /// Stage 195E: `yarm.aarch64_futex_wait_oracle=1` DEFAULT-OFF knob. Enables the AArch64
+    /// FutexWait (NR 9) queue-advancing out-of-lock retirement AND signals init (slot 5 = 2) to
+    /// run the parent/child flow proving the drain dispatched task B (kernel drain markers +
+    /// `AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE`).
+    pub aarch64_futex_wait_oracle: Option<bool>,
     /// Stage 189C6: `yarm.ap_user_dispatch=1` DEFAULT-OFF gate that arms the first
     /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
     /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
@@ -645,6 +658,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.ipc_send_cap_enqueue_oracle" {
             options.ipc_send_cap_enqueue_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.aarch64_futex_wait_oracle" {
+            options.aarch64_futex_wait_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_futex_wake_oracle" {
             options.aarch64_futex_wake_oracle = parse_bool_knob(value);
@@ -1044,6 +1060,26 @@ mod tests {
             parse_yarm_boot_options(b"yarm.ipc_recv_proof=1 yarm.aarch64_futex_wake_oracle=1");
         assert_eq!(both.ipc_recv_proof, Some(true));
         assert_eq!(both.aarch64_futex_wake_oracle, Some(true));
+    }
+
+    // Stage 195E: the AArch64 FutexWait queue-advancing oracle knob parses as a standard bool
+    // knob, defaults to None (off), and is independent of the FutexWake oracle knob.
+    #[test]
+    fn aarch64_futex_wait_oracle_knob_parses_and_defaults_off() {
+        assert_eq!(parse_yarm_boot_options(b"").aarch64_futex_wait_oracle, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.aarch64_futex_wait_oracle=1").aarch64_futex_wait_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.aarch64_futex_wait_oracle=0").aarch64_futex_wait_oracle,
+            Some(false)
+        );
+        // Independent of the FutexWake oracle knob (no prefix aliasing in either direction).
+        let wait_only = parse_yarm_boot_options(b"yarm.aarch64_futex_wait_oracle=1");
+        assert_eq!(wait_only.aarch64_futex_wake_oracle, None);
+        let wake_only = parse_yarm_boot_options(b"yarm.aarch64_futex_wake_oracle=1");
+        assert_eq!(wake_only.aarch64_futex_wait_oracle, None);
     }
 
     // Stage 193B: the send-plain-oracle SUB-knob parses as a standard bool knob,

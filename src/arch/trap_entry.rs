@@ -568,6 +568,88 @@ pub fn handle_trap_entry_shared(
         }
     }
 
+    // Stage 195E (AARCH64 FUTEXWAIT QUEUE-ADVANCING DISPATCH): the AArch64 port of the 192A
+    // drain. With the broad `with_cpu` guard dropped above, the in-lock `futex_wait_current`
+    // published `Blocked(Futex)` + cleared `current` and declined the in-lock dispatch (the
+    // caller returned through the AArch64 handler bypass). We re-verify the waiter is still
+    // `Blocked(Futex)`, run the authoritative queue-advancing dispatch through ONLY the rank-1
+    // scheduler seam, mark the incoming task Running (rank-2), then a brief `with_cpu`
+    // re-acquire performs ONLY the AArch64 arch restore: incoming TTBR0_EL1/ASID switch (via
+    // the generic HAL hook `switch_address_space`, which carries the DSB/ISB/TLBI ordering) +
+    // EL0 SPSR/ELR/GPR frame restore (`restore_arch_thread_state_post_switch`). NO x86_64 CR3
+    // logic is used. The generic seams (deferral ownership, reverify, dequeue/current, mark
+    // Running, cleanup) are shared with x86_64; only the arch restore differs.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let futex_wait_was_deferred = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
+        if futex_wait_was_deferred {
+            let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+            let reverify_ok = outgoing
+                .map(|t| shared.futex_wait_reverify_blocked(t))
+                .unwrap_or(false);
+            if reverify_ok {
+                if let Some(t) = outgoing {
+                    crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}", t);
+                }
+                // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
+                let incoming = shared.futex_wait_dispatch_step_mut(cpu);
+                if let Some(inc) = incoming {
+                    crate::yarm_log!(
+                        "AARCH64_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} tid={}",
+                        cpu.0,
+                        inc
+                    );
+                    crate::yarm_log!(
+                        "AARCH64_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu={} tid={}",
+                        cpu.0,
+                        inc
+                    );
+                    // Mark incoming Running (rank-2 task seam).
+                    shared.d6_genuine_mark_running_via_task_seam(incoming);
+                    crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK tid={}", inc);
+                    // Arch restore: TTBR0/ASID switch + EL0 frame restore under a brief
+                    // `with_cpu` re-acquire (global guard already dropped above).
+                    let restore = shared
+                        .with_cpu(cpu, |kernel| {
+                            let asid = kernel.task_asid(inc).map(|a| a.0).unwrap_or(0);
+                            kernel.d2_recv_switch_incoming_asid(inc);
+                            crate::yarm_log!(
+                                "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK tid={} asid={}",
+                                inc,
+                                asid
+                            );
+                            post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
+                        })
+                        .map_err(|err| TrapHandleError::Syscall(err.into()));
+                    crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                    restore??;
+                    crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK tid={}", inc);
+                    crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok");
+                    crate::kernel::boot::maybe_log_futex_wait_retired();
+                } else {
+                    // No incoming: the in-lock eligibility guarantees another runnable task
+                    // existed at defer time, so this is unreachable in practice. Decline
+                    // safely (do NOT claim a transition) and clear the deferral.
+                    crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                    crate::yarm_log!(
+                        "AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=no_incoming cpu={}",
+                        cpu.0
+                    );
+                }
+            } else {
+                // Split FutexWake flipped the outgoing task to Runnable before the drain ran —
+                // do NOT stale-dispatch it away; decline and clear (the trap returns to the
+                // now-re-runnable task). No duplicate enqueue, no lost waiter.
+                crate::yarm_log!(
+                    "AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed cpu={}",
+                    cpu.0
+                );
+                crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            }
+        }
+    }
+
     // Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): drain the deferred Yield queue-advancing
     // dispatch OUTSIDE the global lock — the preempt sibling of the FutexWait drain above.
     // The in-lock `yield_current` set the caller Runnable, RE-ENQUEUED it, and cleared

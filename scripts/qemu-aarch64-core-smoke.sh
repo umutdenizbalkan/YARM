@@ -55,6 +55,19 @@ if [[ "$FUTEX_WAKE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_futex_w
   QEMU_SMP=1
 fi
 
+# Stage 195E (AARCH64 FUTEXWAIT QUEUE-ADVANCING LIVE ORACLE): FUTEX_WAIT_ORACLE=1 appends
+# yarm.aarch64_futex_wait_oracle=1, which enables the FutexWait (NR 9) queue-advancing
+# out-of-lock retirement AND provisions the init slot-5 sentinel (=2). Task A (init) blocks via
+# NR 9 → the AArch64 handler bypass returns cleanly → the post-lock drain dispatches task B (the
+# child) → B wakes A via split FutexWake (NR 10) → A resumes once. Unlike the FutexWake oracle
+# this does NOT force single-CPU: 195D BSP affinity makes the drain correct under SMP=2, so this
+# runs at the requested QEMU_SMP (default 2). FutexWait is NR 9 (NR 10 is FutexWake, NR 11 is
+# SpawnThread).
+FUTEX_WAIT_ORACLE=${FUTEX_WAIT_ORACLE:-0}
+if [[ "$FUTEX_WAIT_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_futex_wait_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_futex_wait_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64-hwe}
@@ -230,21 +243,27 @@ if [[ -f "$LOGFILE" ]]; then
     echo "[error] aarch64 Stage 195A/195B split-dispatch markers missing"
     exit 1
   fi
-  # Forbid split fatals and any AArch64 queue-advancing (FutexWait/Yield) retirement marker.
-  # Stage 195C ENABLES FutexWake (NR 10) split-dispatch, so `class=FutexWake` is NO LONGER
-  # forbidden; FutexWait/Yield remain inert (queue-advancing classes are out of scope).
-  for a64_split_bad in \
-      "AARCH64_SPLIT_FINALIZE_OK nr=15 result=error" \
-      "AARCH64_SPLIT_FINALIZE_OK nr=27 result=error" \
-      "AARCH64_SPLIT_FINALIZE_OK nr=10 result=error" \
-      "arch=aarch64 class=FutexWait" \
-      "arch=aarch64 class=Yield"; do
+  # Forbid split fatals and the Yield queue-advancing retirement marker (Yield stays inert).
+  # Stage 195C ENABLES FutexWake (NR 10); Stage 195E ENABLES the FutexWait (NR 9) queue-
+  # advancing drain, but ONLY under the FutexWait oracle knob (default-off), so `class=FutexWait`
+  # is forbidden on a DEFAULT boot (proving it is genuinely off) and expected only when
+  # FUTEX_WAIT_ORACLE=1 (checked in the dedicated 195E block below).
+  a64_split_bads=(
+    "AARCH64_SPLIT_FINALIZE_OK nr=15 result=error"
+    "AARCH64_SPLIT_FINALIZE_OK nr=27 result=error"
+    "AARCH64_SPLIT_FINALIZE_OK nr=10 result=error"
+    "arch=aarch64 class=Yield"
+  )
+  if [[ "${FUTEX_WAIT_ORACLE:-0}" != "1" ]]; then
+    a64_split_bads+=("arch=aarch64 class=FutexWait")
+  fi
+  for a64_split_bad in "${a64_split_bads[@]}"; do
     if cad_has "$a64_split_bad"; then
       echo "[error] aarch64 Stage 195A/195B/195C: forbidden split marker: $a64_split_bad"
       exit 1
     fi
   done
-  echo "[ok] aarch64 Stage 195A/195B: DebugLog + InitramfsReadChunk split-dispatch live (queue-advancing inert)"
+  echo "[ok] aarch64 Stage 195A/195B: DebugLog + InitramfsReadChunk split-dispatch live (queue-advancing Yield inert)"
 fi
 
 # Stage 195C (AARCH64 FUTEXWAKE LIVE ORACLE): when booted with the oracle knob, require the
@@ -272,6 +291,41 @@ if [[ -f "$LOGFILE" && "$FUTEX_WAKE_ORACLE" == "1" ]]; then
     fi
   done
   echo "[ok] aarch64 Stage 195C: FutexWake (NR 10) split-dispatch live oracle proven (first_wake=1 second_wake=0)"
+fi
+
+# Stage 195E (AARCH64 FUTEXWAIT QUEUE-ADVANCING LIVE ORACLE): when booted with the FutexWait
+# oracle knob, require the full handler-bypass + deferral + post-lock drain + retirement marker
+# set and the live-oracle proof, and forbid any drain failure or stale-state decline.
+if [[ -f "$LOGFILE" && "$FUTEX_WAIT_ORACLE" == "1" ]]; then
+  if ! check_required_patterns "$LOGFILE" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK" \
+      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0" \
+      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu=0" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu=0" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu=0" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok" \
+      "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=FutexWait" \
+      "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok" \
+      "AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok"; then
+    echo "[error] aarch64 Stage 195E FutexWait queue-advancing live-oracle markers missing"
+    exit 1
+  fi
+  for a64_fw_bad in \
+      "AARCH64_FUTEX_WAIT_DISPATCH_FAIL" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=no_incoming" \
+      "AARCH64_BAD_USER_ELR"; do
+    if cad_has "$a64_fw_bad"; then
+      echo "[error] aarch64 Stage 195E: forbidden FutexWait drain marker: $a64_fw_bad"
+      exit 1
+    fi
+  done
+  echo "[ok] aarch64 Stage 195E: FutexWait (NR 9) queue-advancing out-of-lock drain live oracle proven"
 fi
 
 if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then

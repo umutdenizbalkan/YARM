@@ -432,9 +432,29 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         }
     }
 
+    // Stage 195E (AARCH64 FUTEXWAIT HANDLER BYPASS): a committed FutexWait deferral clears
+    // `current` on purpose (the queue-advancing dispatch is relocated OUT of the broad lock to
+    // the trap-entry drain). Without this bypass the `current == None` case would enter
+    // `idle_no_eret_loop()` INSIDE `with_cpu` and never return, so the post-lock drain could
+    // never run. The bypass is strictly FutexWait-deferral-specific — any other
+    // `current == None|Some(0)` keeps the exact idle behavior. The outgoing (blocked) caller's
+    // context is still saved by the `task_switched` block below (entering != None == exiting).
+    let futex_wait_bypass = {
+        let idx = cpu.0 as usize;
+        idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::futex_wait_dispatch_is_deferred(idx)
+    };
     if matches!(exiting_tid, None | Some(0)) {
-        trap_trace!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
-        idle_no_eret_loop();
+        if futex_wait_bypass {
+            crate::yarm_log!(
+                "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu={} outgoing_tid={}",
+                cpu.0,
+                entering_tid.unwrap_or(0)
+            );
+        } else {
+            trap_trace!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
+            idle_no_eret_loop();
+        }
     }
 
     if task_switched {
@@ -480,7 +500,10 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     let switch_pending = cpu_idx < crate::kernel::scheduler::MAX_CPUS
         && unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() };
     let syscall_return = !task_switched && matches!(event, TrapEvent::Syscall);
-    if !switch_pending {
+    // Stage 195E: on a FutexWait-deferral bypass, skip the in-lock restore entirely — `current`
+    // is None (the restore would only no-op into SCHED_ENTER_IDLE), and the authoritative EL0
+    // frame restore for the INCOMING task runs in the post-lock drain's `with_cpu` re-acquire.
+    if !switch_pending && !futex_wait_bypass {
         if let Err(err) =
             restore_arch_thread_state(kernel, cpu, frame.as_deref_mut(), syscall_return)
         {
@@ -488,6 +511,9 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
             crate::yarm_log!("AARCH64_TRAP_FAIL_REASON restore_arch_thread_state");
             return Err(err);
         }
+    }
+    if futex_wait_bypass {
+        crate::yarm_log!("AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu={}", cpu.0);
     }
 
     if !task_switched && matches!(event, TrapEvent::Syscall) {

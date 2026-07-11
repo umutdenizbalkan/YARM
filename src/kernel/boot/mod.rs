@@ -1004,8 +1004,20 @@ pub(crate) fn maybe_log_futex_wait_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=FutexWait");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok");
+        // Stage 195E: AArch64 emits the arch-tagged retirement marker (its live queue-advancing
+        // FutexWait drain); x86_64 keeps the untagged marker byte-identical.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=FutexWait");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=FutexWait");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok");
+        }
     }
 }
 
@@ -2161,6 +2173,24 @@ pub(crate) fn set_aarch64_futex_wake_oracle_enabled(enabled: bool) {
 
 pub fn aarch64_futex_wake_oracle_enabled() -> bool {
     AARCH64_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 195E: default-off AArch64 FutexWait (NR 9) queue-advancing out-of-lock retirement.
+/// When set, an eligible in-lock `futex_wait_current` (BSP, shared trap drain active,
+/// dispatching_cpu_count()<=1, no outstanding deferral) publishes `Blocked(Futex)`, clears
+/// `current`, records a one-shot per-CPU deferral, and skips the in-lock dispatch — the
+/// trap-entry drain then performs the authoritative queue-advancing dispatch + EL0 restore
+/// off the global lock. Every ineligible case keeps the unchanged in-lock `dispatch_next_task`
+/// fallback. Default-off keeps the proven in-lock FutexWait path as the production default.
+pub(crate) static AARCH64_FUTEX_WAIT_RETIRE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_futex_wait_retire_enabled(enabled: bool) {
+    AARCH64_FUTEX_WAIT_RETIRE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_futex_wait_retire_enabled() -> bool {
+    AARCH64_FUTEX_WAIT_RETIRE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.

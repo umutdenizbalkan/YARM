@@ -719,9 +719,18 @@ extern "C" fn futex_oracle_child() -> ! {
 
 /// Parent (waker): spawn the child, wake it exactly once through the split path (count must
 /// be 1), then wake again (count must be 0). Emits the live-oracle proof marker.
+///
+/// `futex_wait_mode` (Stage 195E): when true the kernel enabled the FutexWait queue-advancing
+/// retirement, so the parent's handshake `FutexWait` below is dispatched by the OUT-OF-LOCK
+/// drain (task A blocks via NR 9 → drain dispatches task B = the child → child wakes A via NR 10
+/// → A resumes). The extra `AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE` marker attests that flow.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-fn run_aarch64_futex_wake_oracle(init_tid: u64) {
-    yarm_user_rt::user_log!("AARCH64_FUTEX_WAKE_ORACLE_BEGIN init_tid={}", init_tid);
+fn run_aarch64_futex_wake_oracle(init_tid: u64, futex_wait_mode: bool) {
+    yarm_user_rt::user_log!(
+        "AARCH64_FUTEX_WAKE_ORACLE_BEGIN init_tid={} futex_wait_mode={}",
+        init_tid,
+        futex_wait_mode as u32
+    );
     let addr = FUTEX_ORACLE_WORD.as_ptr();
     // 16-byte-aligned stack top of the child's dedicated static stack.
     let stack_top = {
@@ -766,6 +775,17 @@ fn run_aarch64_futex_wake_oracle(init_tid: u64) {
         yarm_user_rt::user_log!(
             "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0"
         );
+        // Stage 195E: in FutexWait mode the parent's handshake FutexWait above was serviced by
+        // the queue-advancing OUT-OF-LOCK drain (task A blocked via NR 9, drain dispatched task
+        // B = child_tid, child woke A via NR 10, A resumed exactly once). blocked_tid = A =
+        // init, dispatched_tid = B = child, wake_count = 1.
+        if futex_wait_mode {
+            yarm_user_rt::user_log!(
+                "AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid={} dispatched_tid={} wake_count=1",
+                init_tid,
+                child_tid
+            );
+        }
     } else {
         yarm_user_rt::user_log!(
             "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail first_wake={} second_wake={}",
@@ -1217,8 +1237,12 @@ pub fn run() {
     // startup slot 5 (supervisor_control_recv_ep, unused by init) as a sentinel (=1) ONLY
     // under `yarm.aarch64_futex_wake_oracle=1`. A normal boot leaves it None and skips this.
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    if ctx.supervisor_control_recv_ep == Some(1) {
-        run_aarch64_futex_wake_oracle(ctx.task_id);
+    if ctx.supervisor_control_recv_ep == Some(1) || ctx.supervisor_control_recv_ep == Some(2) {
+        // Slot-5 sentinel: 1 = Stage 195C FutexWake oracle; 2 = Stage 195E FutexWait
+        // queue-advancing oracle (same parent/child flow, but the parent's handshake FutexWait
+        // is serviced by the out-of-lock drain).
+        let futex_wait_mode = ctx.supervisor_control_recv_ep == Some(2);
+        run_aarch64_futex_wake_oracle(ctx.task_id, futex_wait_mode);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

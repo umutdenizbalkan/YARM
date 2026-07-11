@@ -465,8 +465,45 @@ lock, x86_64 192A model) is the next slice; its first blocking return-path invar
 in-lock `idle_no_eret_loop()` (`arch/aarch64/trap.rs`), which fires when the deferred
 `futex_wait_current` leaves `current == None` and would spin **inside** the global lock before
 the out-of-lock drain can run — see `doc/KERNEL_UNLOCKING.md` Stage 195D.
-- **Next AArch64 slice:** live `FutexWait` queue-advancing drain (foundation landed here), then
-  `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
+- **Next AArch64 slice:** `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
+
+### 4.8 FutexWait queue-advancing drain — LIVE (Stage 195E)
+
+Stage 195E makes the AArch64 **FutexWait (NR 9)** queue-advancing dispatch live out of the broad
+lock, porting the proven x86_64 192A model **without any CR3 logic**. Default-off behind
+`yarm.aarch64_futex_wait_oracle=1` (which enables the retirement and runs the live oracle); the
+proven in-lock FutexWait path stays the production default. Three cooperating pieces:
+
+1. **Handler bypass** (`arch/aarch64/trap.rs`). The 195D blocker — `idle_no_eret_loop()` firing
+   inside `with_cpu` when `current == None` — is resolved by a **FutexWait-deferral-specific**
+   bypass: when `futex_wait_dispatch_is_deferred(cpu)` is true and `current` is None/idle, the
+   handler skips the idle loop **and** the in-lock restore and returns cleanly so
+   `handle_trap_entry_shared` can run the post-lock drain. Any other None/idle case keeps the
+   exact `idle_no_eret_loop()` behavior. Markers: `AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN/DONE`.
+   The blocked caller's context is still saved by the `task_switched` block (entering ≠ None).
+2. **In-lock deferral** (`futex_wait_current`). Eligible only on the **BSP** with the shared trap
+   drain active, `dispatching_cpu_count() <= 1` (195D BSP affinity guarantees this under SMP=2),
+   **another runnable task present** (so the drain always has an incoming; otherwise fall back to
+   the in-lock path which idles correctly), and no outstanding deferral. It publishes
+   `Blocked(Futex)`, clears `current`, records the one-shot deferral, and skips the in-lock
+   dispatch. Markers: `AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN`, `..._BLOCK_PUBLISH_OK`.
+3. **Post-lock drain** (`handle_trap_entry_shared`). Generic seams (deferral ownership, blocked
+   reverify `futex_wait_reverify_blocked`, rank-1 dequeue/current `futex_wait_dispatch_step_mut`,
+   mark Running `d6_genuine_mark_running_via_task_seam`, cleanup) + **AArch64 arch hooks**:
+   TTBR0_EL1/ASID switch via the generic HAL `switch_address_space` (carrying the DSB/ISB/TLBI
+   ordering) and EL0 SPSR/ELR/GPR frame restore via `restore_arch_thread_state_post_switch`.
+   Markers: `AARCH64_FUTEX_WAIT_DISPATCH_{REVERIFY_OK,DEQUEUE_OK,CURRENT_SET_OK,RUNNING_OK,
+   TTBR0_OK,FRAME_OK,DONE result=ok}` + `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE arch=aarch64
+   class=FutexWait result=ok`. **Race:** if split `FutexWake` flips the waiter to `Runnable`
+   before the drain, `futex_wait_reverify_blocked` fails → `AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED
+   reason=state_changed` (no stale/double dispatch, no lost waiter); the deferral is cleared on
+   every path (success/decline).
+
+**Live oracle** (`FUTEX_WAIT_ORACLE=1`): task A (init) blocks via NR 9 → handler bypass → the
+drain dispatches task B (the spawned child) → B wakes A via split FutexWake (NR 10) → A resumes
+once. Proof: `AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid=<A> dispatched_tid=<B>
+wake_count=1`, proven under **both** `-smp 1` and `-smp 2` (SMP=2 is the acceptance target; the
+195D BSP affinity keeps the freshly-spawned task B on the BSP dispatcher). Yield remains inert.
 - **TLB/ASID:** local TTBR0_EL1 + ASID switch with the existing `TLBI`/`DSB ISH`/`ISB`
   maintenance is sufficient for the first slices; broadcast `TLBI` is only needed for
   VM/SMP classes, which are out of scope. QEMU virt and RPi5 share the same generic drain —
