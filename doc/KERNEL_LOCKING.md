@@ -28,6 +28,22 @@ remove implicit global-lock coupling from syscall/trap paths.
   no-allocation and does not call the broad `mark_task_dead` helper. Per-stage
   history entries below that record `SYSCALL_COUNT == 30/31` describe the state at
   those earlier stages and are left as historical record.
+- **Stage 196A (RISC-V SHARED TRAP-PATH + POST-LOCK DRAIN FOUNDATION).** RISC-V
+  now enters a real shared trap path: `run_with_prepared_kernel` owns
+  `KernelState` through a boot-constructed `SharedKernel`
+  (`init_shared_static` + `borrow_kernel_for_boot`), and the trap bridge routes
+  through `arch/riscv64/trap.rs::handle_riscv_trap_entry_shared` — a
+  contract-equivalent of `handle_trap_entry_shared` that runs the unchanged
+  canonical handler inside a bounded `with_cpu` broad-lock phase and drains
+  `drain_dispatch_post_work` after the guard drops. The RISC-V path now **owns**
+  `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` (set true before the bounded phase,
+  cleared after), so the prior force-false workaround is retired. No persistent
+  raw `&mut KernelState` escapes a bounded callback; no new kernel lock is added.
+  **Zero RISC-V retirement classes are enabled** — the pre-lock split dispatcher
+  declines every RISC-V syscall (`try_split_dispatch_into_frame` is never
+  called). A default-off oracle
+  (`yarm.riscv64_post_lock_foundation_oracle=1`) proves genuine post-lock drain
+  ordering with a real `with_cpu` re-acquire. See `doc/ARCH_RISCV64.md` §9.2.
 - **Stage 188H (PRE-189-MULTI-DISPATCHER-READINESS-AUDIT) — audit-only, GO for
   189A prep.** No global-lock retirement and no AP user-task scheduling are
   enabled here. The single-**dispatcher** gates that Stage 189 must lift are all

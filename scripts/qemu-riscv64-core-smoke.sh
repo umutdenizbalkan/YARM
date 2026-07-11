@@ -53,6 +53,16 @@ if [[ "$CROSS_ARCH_D6" == "1" && "$KERNEL_CMDLINE" != *"yarm.cross_arch_d6="* ]]
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.cross_arch_d6=1"
 fi
 
+# Stage 196A (POST-LOCK DRAIN FOUNDATION): POST_LOCK_FOUNDATION_ORACLE=1 appends
+# yarm.riscv64_post_lock_foundation_oracle=1 to arm the default-off one-shot
+# drain-ordering proof (publish token in the bounded broad-lock phase, consume
+# it after the guard drops via a real with_cpu re-acquire, return to the same
+# task through sret). It enables no retirement class and does not alter boot.
+POST_LOCK_FOUNDATION_ORACLE=${POST_LOCK_FOUNDATION_ORACLE:-0}
+if [[ "$POST_LOCK_FOUNDATION_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_post_lock_foundation_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_post_lock_foundation_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 
@@ -211,6 +221,21 @@ REQUIRED_PATTERNS=(
   "CROSS_ARCH_D3_OK arch=riscv64"
   "CROSS_ARCH_SYSCALL_PARITY_OK arch=riscv64"
   "CROSS_ARCH_LIVE_DONE arch=riscv64 result=ok"
+  # Stage 196A (RISC-V SHARED TRAP-PATH + POST-LOCK DRAIN FOUNDATION): the trap
+  # bridge now routes through the shared wrapper, which owns the active-flag
+  # lifecycle (set true before the bounded broad-lock phase, cleared after) and
+  # runs a post-lock drain after the guard drops. These structural markers are
+  # one-shot latched (first trap), so they appear exactly once per boot. The
+  # split dispatcher stays inert (declines every RISC-V syscall — zero retirement).
+  "RISCV_SHARED_TRAP_ENTRY_BEGIN cpu="
+  "RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET cpu="
+  "RISCV_GLOBAL_LOCK_PHASE_DONE cpu="
+  "RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR cpu="
+  "RISCV_POST_LOCK_DRAIN_BEGIN cpu="
+  "RISCV_POST_LOCK_DRAIN_DONE cpu="
+  "RISCV_SHARED_TRAP_ENTRY_DONE cpu="
+  "RISCV_SPLIT_DISPATCH_DECLINED_ALL cpu="
+  "YARM_LOCK_SPLIT_STAGE196A_INSTALLED arch=riscv64 shared=1 raw=0"
 )
 
 # Nothing optional today: all required RAMFS/EXT4 markers above are
@@ -276,6 +301,14 @@ REJECT_PATTERNS=(
   # A healthy boot reaches RISCV_KERNEL_IDLE_WAITING_FOR_IO, never a kernel trap.
   'RISCV_TRAP_UNHANDLED'
   'reason=trap_from_s_mode'
+  # Stage 196A (zero RISC-V retirement classes): the split dispatcher is inert
+  # and no queue-advancing drain is enabled. NONE of these may appear.
+  'YARM_LOCK_SPLIT_DISPATCH arch=riscv64'
+  'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64'
+  'RISCV_FUTEX_WAIT_DISPATCH_'
+  'RISCV_YIELD_DISPATCH_'
+  # The retired raw-pointer trap path must not resurface.
+  'reason=no_trap_kernel_state'
 )
 
 failures=0
@@ -419,6 +452,31 @@ fi
 if (( QEMU_SMP >= 2 )); then
   if ! rg -n "RISCV_IRQ_SMP_TOPOLOGY_DEFERRED reason=present_topology_not_live_validated" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] multi-hart boot must emit RISCV_IRQ_SMP_TOPOLOGY_DEFERRED"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196A (POST-LOCK DRAIN FOUNDATION): when armed, the one-shot oracle must
+# prove genuine drain ordering end-to-end (publish in-lock → lock dropped →
+# consumed post-lock → sret return to the same task). All five markers required.
+if [[ "$POST_LOCK_FOUNDATION_ORACLE" == "1" ]]; then
+  POST_LOCK_ORACLE_PATTERNS=(
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu="
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_LOCK_DROPPED_OK cpu="
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_DRAIN_OK cpu="
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_USER_RETURN_OK tid="
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=ok"
+  )
+  for pat in "${POST_LOCK_ORACLE_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] post-lock foundation oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # A task-switched DONE is a proof failure: the oracle syscall must return to the
+  # same task (no scheduler mutation).
+  if rg -n "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=task_switched" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] post-lock foundation oracle returned to a different task"
     failures=$((failures + 1))
   fi
 fi

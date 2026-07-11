@@ -372,6 +372,86 @@ server chain then loads to parity with x86_64 (`PM_RECV_GOT_MSG opcode=11` ×N,
 all `*_SRV_ENTRY`/`*_SRV_READY`, `CROSS_ARCH_LIVE_DONE arch=riscv64 result=ok`),
 and `all_services_blocked` idle is reached only afterwards.
 
+### 9.2 Stage 196A — shared trap wrapper + post-lock drain foundation
+
+Stage 196A retires the §9.1 raw-trap workaround by giving RISC-V a **real**
+shared trap path, contract-equivalent to x86_64/aarch64
+`handle_trap_entry_shared`, while enabling **zero** RISC-V retirement classes.
+
+**Old raw path (retired):** boot ran `Bootstrap::init_static()` and installed a
+persistent raw `&'static mut KernelState` pointer
+(`install_riscv_trap_kernel_state` / `trap_kernel_state_mut`); the bridge held
+that `&mut` across the whole trap and called `handle_trap_entry` directly, with
+no post-`with_cpu` drainer, so the active flag was force-cleared (§9.1).
+
+**New shared path:** `run_with_prepared_kernel` now owns `KernelState` through a
+boot-constructed `SharedKernel` (`Bootstrap::init_shared_static()` +
+`borrow_kernel_for_boot()`, the same Stage-2N pattern x86_64/aarch64 use) and
+installs a `SharedKernel` pointer (`install_riscv_trap_shared_kernel` /
+`trap_shared_kernel_riscv`). The bridge (`yarm_riscv64_trap_bridge`) no longer
+holds a persistent raw `&mut KernelState`: it borrows the `SharedKernel` and
+routes through `handle_riscv_trap_entry_shared`, doing every kernel interaction
+(current-tid reads, asid lookup) through bounded `with_cpu` callbacks. The
+wrapper phases are:
+
+1. **Pre-lock** — the split dispatcher declines every RISC-V syscall
+   (`try_split_dispatch_into_frame` is never called;
+   `RISCV_SPLIT_DISPATCH_DECLINED_ALL result=inert`). Zero retirement.
+2. **Broad-lock (`with_cpu`)** — sets `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu] =
+   true` (the RISC-V path now **owns** the flag), then runs the **unchanged**
+   canonical `handle_trap_entry_with_fault_bookkeeping_mode`. No raw `&mut
+   KernelState` escapes this callback; no nested broad lock.
+3. **Post-lock** — after the guard drops, clears the flag and runs
+   `drain_dispatch_post_work` (the real drainer that now completes any deferred
+   blocked-waiter delivery a producer stashed — so the §9.1 force-false is
+   **retired**, replaced by genuine flag ownership + a real drain).
+
+**Active-flag ownership (Part 3).** The flag lifecycle is centralized in the
+wrapper: set true immediately before the bounded phase, cleared on every
+return, drained after release, never left true across `sret`/idle/fatal.
+Structural markers (one-shot latched, first trap only, to avoid per-tick
+floods): `RISCV_SHARED_TRAP_ENTRY_BEGIN`, `RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET`,
+`RISCV_GLOBAL_LOCK_PHASE_DONE`, `RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR`,
+`RISCV_POST_LOCK_DRAIN_BEGIN`, `RISCV_POST_LOCK_DRAIN_DONE result=ok`,
+`RISCV_SHARED_TRAP_ENTRY_DONE` (all `cpu=<cpu>`).
+
+**Genuine post-lock drain proof (Part 4).** A default-off oracle
+(`yarm.riscv64_post_lock_foundation_oracle=1`) publishes a one-shot post-work
+token (the requester tid) during the broad-lock phase, then after the guard
+drops consumes it and **re-acquires `with_cpu`** — a real re-acquisition that
+would deadlock if the broad guard were still held — before the trap `sret`s
+back to the same task. Markers: `RISCV_POST_LOCK_FOUNDATION_ORACLE_{PUBLISH_OK,
+LOCK_DROPPED_OK, DRAIN_OK, USER_RETURN_OK, DONE result=ok}`. It mutates no
+scheduler / capability / user-copy / task-switch state.
+
+**SATP/sret restore readiness (Part 5).** RISC-V's
+`post_switch_restore_arch_thread_state` is no longer a silent `Ok(())` no-op: it
+delegates to the documented `restore_arch_thread_state_post_switch` foundation
+(frame-side sepc/sstatus/GPR/TLS restore via `resume_current_thread_with_frame`).
+It is still uncalled in production (no queue-advancing retirement class is
+enabled), but a future switch drain would pair it with the incoming task's
+SATP/ASID activation the bridge already performs (`map_kernel_shared_into_asid`
++ `write_satp` on the resumed asid, carrying `sfence.vma` ordering).
+
+**Trap-stack sizing fix (latent bug exposed).** The S-mode trap runs the entire
+syscall dispatch on a dedicated `RISCV_TRAP_STACK` (sp←sscratch at vector entry).
+It was **16 KiB** — a pre-existing latent overflow: the deepest RISC-V dispatch
+chain (IPC cap-transfer / SpawnV5 / fork, large `no_std` on-stack temporaries)
+uses between 256 KiB and 1 MiB, so deep traps had been silently clobbering the
+`.bss` below the stack, tolerated only because the corrupted bytes landed on
+benign statics. Stage 196A's new default-off oracle flag landed in that blast
+radius and surfaced as a non-deterministic false→true flip (gone at ≥1 MiB, not
+at 256 KiB). The trap stack is now **2 MiB** (`.bss`, NOLOAD, in the gigapage) —
+a real RISC-V correctness fix, not just an oracle workaround.
+
+**All RISC-V retirement classes remain disabled.** Zero
+`YARM_LOCK_SPLIT_DISPATCH arch=riscv64`, zero `GLOBAL_LOCK_RETIRE_CLASS_DONE
+arch=riscv64`, zero `RISCV_FUTEX_WAIT_DISPATCH_*` / `RISCV_YIELD_DISPATCH_*`.
+The recommended next class (Stage 196B) is **DebugLog only** — it is a
+non-blocking, non-switching syscall that rides the pre-lock split path without
+needing the (still-absent) post-`sret` context-switch + SATP/`sfence.vma`
+restore proof.
+
 ---
 
 ## 10. Current next target
@@ -394,6 +474,14 @@ scheduling so `online_cpus` can climb past 1.
 ---
 
 ## 10.1 Global-lock retirement portability (Stage 194 audit)
+
+> **Superseded in part by Stage 196A (§9.2).** The Stage 196 step-1 prerequisite
+> below is now DONE: the RISC-V trap bridge routes through the shared wrapper
+> (`handle_riscv_trap_entry_shared`), the RISC-V path OWNS the active flag (set
+> true in the bounded phase, cleared after) with a real `drain_dispatch_post_work`,
+> and the §9.1 force-false is retired. Retirement classes are **still all
+> disabled**; the "first live slice" recommendation (DebugLog first) stands. The
+> Stage-194 text below is retained as the pre-196A audit record.
 
 **RISC-V global-lock retirement paths are inert / global-lock-only today, and RISC-V is
 the least ready of the three architectures. No class is retired off the global lock; the

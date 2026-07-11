@@ -107,24 +107,16 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     fault_bookkeeping_mode: FaultBookkeepingMode,
 ) -> Result<(), TrapHandleError> {
     let _ = kernel.set_current_cpu(cpu);
-    // XARCH-SRV-PARITY (RISC-V): the RISC-V trap bridge calls this handler DIRECTLY
-    // (raw `&mut KernelState`), never through `handle_trap_entry_shared`, so RISC-V has
-    // NO post-`with_cpu` dispatch-return drainer (`drain_dispatch_post_work` runs only on
-    // the shared path). `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` is the producers' signal
-    // that "a trap-entry drainer WILL run and complete the deferred blocked-waiter
-    // delivery"; that is definitively FALSE on RISC-V's direct path. The flag can read
-    // stale-true here (it is a cross-arch static and is not owned by the RISC-V path), so
-    // force it false BEFORE handling the trap. This makes the blocked-waiter delivery
-    // producers (`produce_blocked_waiter_{plain,ordinary_cap,reply_cap}_delivery`) take the
-    // LEGACY inline wake path — which clears the waiter slot and wakes the receiver under
-    // this same single-dispatcher borrow — instead of stashing a snapshot for a drainer
-    // that never runs (which left woken receivers un-enqueued → the boot server chain
-    // stalled at `kernel_idle_awaiting_io` with all services blocked).
-    let cpu_idx = cpu.0 as usize;
-    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
-        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
-            .store(false, core::sync::atomic::Ordering::Relaxed);
-    }
+    // Stage 196A: `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` is now OWNED by the RISC-V shared
+    // trap wrapper (`handle_riscv_trap_entry_shared`): it sets the flag TRUE before this
+    // broad-lock (`with_cpu`) phase and clears it AFTER, then runs `drain_dispatch_post_work`.
+    // Because a real post-`with_cpu` drainer now exists, the blocked-waiter delivery producers
+    // (`produce_blocked_waiter_{plain,ordinary_cap,reply_cap}_delivery`) may legitimately take
+    // the DEFERRED snapshot path — the drainer completes the wake after the guard drops, exactly
+    // as on x86_64/AArch64. The prior force-false (which forced the LEGACY inline wake because
+    // RISC-V had no drainer) is therefore RETIRED here; the wrapper owns the flag lifecycle.
+    // NOTE: the standalone `handle_trap_entry` entry (tests) leaves the flag at its default
+    // (false), so unit tests still take the inline wake path — no drainer runs there.
     let _ = kernel.process_cross_cpu_work_for_cpu(cpu);
     kernel.handle_trap_event_with_fault_bookkeeping_mode(
         decode_trap_context(context),
@@ -183,6 +175,233 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         }
     }
     Ok(())
+}
+
+// ── Stage 196A: RISC-V shared trap-entry wrapper + post-lock drain foundation ──
+//
+// One-shot latch for the structural wrapper markers (BEGIN / GLOBAL_LOCK_* /
+// POST_LOCK_DRAIN_* / DONE). RISC-V traps fire thousands of times per boot
+// (every syscall round-trip + every deferred timer/IRQ audit), so the markers
+// are emitted exactly once (first trap) to prove the shared-path structure
+// without flooding the boot log. The active-flag lifecycle itself runs on
+// EVERY trap (see `handle_riscv_trap_entry_shared`); only the log lines are
+// latched.
+static RISCV_SHARED_TRAP_MARKERS_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+// One-shot latch proving the pre-lock split dispatcher declines every RISC-V
+// syscall in this foundation stage (Part 6: zero retirement classes enabled).
+static RISCV_SPLIT_DISPATCH_DECLINED_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+// Stage 196A post-lock-drain FOUNDATION oracle state (default-off; armed by
+// `yarm.riscv64_post_lock_foundation_oracle=1`).
+//   - DONE_FLAG: one-shot guard so the oracle publishes/consumes exactly once.
+//   - TOKEN: the per-CPU post-work token published during the broad-lock phase
+//     (holds the requesting tid, +1 biased so 0 always means "empty").
+static RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN: [core::sync::atomic::AtomicU64; MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
+
+/// Stage 196A: the RISC-V shared trap-entry wrapper — the contract-equivalent
+/// of the x86_64/AArch64 `handle_trap_entry_shared`, but purpose-built for the
+/// RISC-V trap bridge and enabling **zero** retirement classes.
+///
+/// Phases (mirroring `arch/trap_entry.rs::handle_trap_entry_shared`):
+///   1. **Pre-lock phase** — the split dispatcher declines every RISC-V syscall
+///      (no `try_split_dispatch_into_frame`; no `YARM_LOCK_SPLIT_DISPATCH
+///      arch=riscv64` is ever emitted). This is the sole classification seam and
+///      it is inert by construction in this foundation stage.
+///   2. **Broad-lock phase** — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` is set
+///      TRUE (the RISC-V path now OWNS the flag, replacing the retired
+///      force-false), then the UNCHANGED canonical trap handler runs inside a
+///      single bounded `shared.with_cpu` callback. No raw `&mut KernelState`
+///      escapes this callback; there is no nested broad lock.
+///   3. **Post-lock phase** — the outer `SpinLock<KernelState>` guard is dropped,
+///      the flag is cleared, and `drain_dispatch_post_work` runs any blocked-
+///      waiter delivery the broad-lock phase stashed (the real post-`with_cpu`
+///      drainer that lets the deferred-snapshot producers wake receivers off the
+///      broad borrow). The default-off foundation oracle then proves genuine
+///      post-lock-drain ordering with a real lock-dropped re-acquire.
+///
+/// The bridge performs the RISC-V-specific frame write-back + SATP activation +
+/// `sret` AFTER this returns; this wrapper does not touch the trap frame's
+/// register lanes beyond what the canonical handler already does.
+pub fn handle_riscv_trap_entry_shared(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    context: Riscv64TrapContext,
+    frame: &mut TrapFrame,
+) -> Result<(), TrapHandleError> {
+    use core::sync::atomic::Ordering;
+    let cpu_idx = cpu.0 as usize;
+    let is_syscall = matches!(decode_trap_context(context), TrapEvent::Syscall);
+    let log_structural = !RISCV_SHARED_TRAP_MARKERS_LOGGED.swap(true, Ordering::Relaxed);
+
+    // ── Phase 1: pre-lock split-dispatch classification (inert; declines all) ──
+    // Part 6: the RISC-V split dispatcher is inert in this foundation stage. We
+    // deliberately do NOT call `try_split_dispatch_into_frame`, so no RISC-V
+    // syscall is ever serviced off the global lock and no `YARM_LOCK_SPLIT_DISPATCH
+    // arch=riscv64` marker can appear. A single latched marker attests the inertness.
+    if is_syscall && !RISCV_SPLIT_DISPATCH_DECLINED_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::yarm_log!(
+            "RISCV_SPLIT_DISPATCH_DECLINED_ALL cpu={} result=inert",
+            cpu.0
+        );
+    }
+
+    if log_structural {
+        crate::yarm_log!("RISCV_SHARED_TRAP_ENTRY_BEGIN cpu={}", cpu.0);
+    }
+
+    // ── Phase 2: own the active flag, then run the canonical handler in-lock ──
+    // Set the flag BEFORE the broad-lock phase so the blocked-waiter producers
+    // see a real drainer will run (deferred-snapshot path), and clear it AFTER.
+    if cpu_idx < MAX_CPUS {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .store(true, Ordering::Relaxed);
+    }
+    if log_structural {
+        crate::yarm_log!("RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET cpu={}", cpu.0);
+    }
+
+    // Foundation-oracle arming decision (default-off, one-shot, syscalls only).
+    let oracle_arm = is_syscall
+        && crate::kernel::boot::riscv_post_lock_foundation_oracle_enabled()
+        && !RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG.load(Ordering::Acquire);
+
+    let inner_result = shared
+        .with_cpu(cpu, |kernel| {
+            // Foundation oracle PUBLISH — during the broad-lock phase, stash a
+            // one-shot post-work token (the requester tid, +1 biased). This is a
+            // pure atomic write: it mutates NO scheduler / capability / user / task
+            // state and copies no user data. It only records "a post-lock drain is
+            // owed for this tid".
+            if oracle_arm && cpu_idx < MAX_CPUS {
+                let tid = kernel.current_tid().unwrap_or(0);
+                RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]
+                    .store(tid.wrapping_add(1), Ordering::Release);
+                crate::yarm_log!(
+                    "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu={} tid={}",
+                    cpu.0,
+                    tid
+                );
+            }
+            handle_trap_entry_with_fault_bookkeeping_mode(
+                kernel,
+                cpu,
+                context,
+                Some(frame),
+                FaultBookkeepingMode::RecordInHandleTrapEvent,
+            )
+        })
+        .map_err(|err| TrapHandleError::Syscall(err.into()));
+
+    if log_structural {
+        crate::yarm_log!("RISCV_GLOBAL_LOCK_PHASE_DONE cpu={}", cpu.0);
+    }
+    // Clear the flag now that the broad borrow has dropped; the drain below
+    // completes any stashed blocked-waiter delivery.
+    if cpu_idx < MAX_CPUS {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .store(false, Ordering::Relaxed);
+    }
+    if log_structural {
+        crate::yarm_log!("RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR cpu={}", cpu.0);
+    }
+
+    let inner_result = inner_result?;
+
+    // ── Phase 3: post-lock drain (broad guard released) ──
+    if log_structural {
+        crate::yarm_log!("RISCV_POST_LOCK_DRAIN_BEGIN cpu={}", cpu.0);
+    }
+    // The real post-`with_cpu` dispatch-return drainer: executes any blocked-
+    // waiter delivery the broad-lock phase stashed. Inert on traps that stash
+    // nothing (the common case). This is the mechanism that makes the RISC-V
+    // deferred-snapshot wake path complete AFTER the broad borrow drops.
+    shared.drain_dispatch_post_work(cpu)?;
+
+    // Foundation-oracle DRAIN — consume the token published in-lock, proving the
+    // outer guard is genuinely dropped by RE-ACQUIRING `with_cpu` here (a held
+    // guard would deadlock). Reads only `current_tid`; performs no mutation.
+    if oracle_arm && cpu_idx < MAX_CPUS {
+        let token = RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx].swap(0, Ordering::AcqRel);
+        if token != 0 {
+            let published_tid = token.wrapping_sub(1);
+            // Lock-dropped proof: this re-acquire is only possible because the
+            // broad guard above was released — a still-held guard deadlocks here.
+            let current_after = shared
+                .with_cpu(cpu, |kernel| kernel.current_tid())
+                .ok()
+                .flatten();
+            crate::yarm_log!(
+                "RISCV_POST_LOCK_FOUNDATION_ORACLE_LOCK_DROPPED_OK cpu={}",
+                cpu.0
+            );
+            crate::yarm_log!(
+                "RISCV_POST_LOCK_FOUNDATION_ORACLE_DRAIN_OK cpu={} tid={}",
+                cpu.0,
+                published_tid
+            );
+            // Same-task return: the oracle syscall neither blocks nor switches, so
+            // the trap will `sret` back to the publishing task (current == token).
+            if current_after == Some(published_tid) {
+                crate::yarm_log!(
+                    "RISCV_POST_LOCK_FOUNDATION_ORACLE_USER_RETURN_OK tid={}",
+                    published_tid
+                );
+                crate::yarm_log!("RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=ok");
+            } else {
+                crate::yarm_log!(
+                    "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=task_switched current={:?}",
+                    current_after
+                );
+            }
+            RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG.store(true, Ordering::Release);
+        }
+    }
+
+    if log_structural {
+        crate::yarm_log!("RISCV_POST_LOCK_DRAIN_DONE cpu={} result=ok", cpu.0);
+        crate::yarm_log!("RISCV_SHARED_TRAP_ENTRY_DONE cpu={}", cpu.0);
+    }
+
+    // `inner_result` is the canonical handler's `Result<(), TrapHandleError>`
+    // (the outer `with_cpu` KernelError was already propagated by the `?` above).
+    inner_result
+}
+
+/// Stage 196A (Part 5): RISC-V post-switch architecture-restore FOUNDATION.
+///
+/// This is the RISC-V analogue of x86_64 `restore_arch_thread_state` /
+/// AArch64 `restore_arch_thread_state_post_switch`: it restores the incoming
+/// task's user register context into the trap frame. On RISC-V a future
+/// queue-advancing drain (FutexWait / Yield / D2, all still deferred) would call
+/// this AFTER the authoritative out-of-lock dispatch selects an incoming task,
+/// under a brief `with_cpu` re-acquire, to complete the switch. It is NOT wired
+/// on any live RISC-V path in this foundation stage (no retirement class is
+/// enabled), so `arch/trap_entry.rs::post_switch_restore_arch_thread_state`
+/// only delegates here for its documented contract; the SATP/`sfence.vma`
+/// activation for such a switch is performed by the trap bridge today
+/// (`map_kernel_shared_into_asid` + `write_satp` on the resumed task's asid,
+/// carrying the required ordering). Replacing the prior silent `Ok(())` no-op
+/// with this documented, exercisable API is the Part 5 deliverable: a future
+/// switch drain uses the incoming task's SATP/ASID (bridge activation) together
+/// with the sepc/sstatus/GPR restore performed here via
+/// `resume_current_thread_with_frame`.
+pub fn restore_arch_thread_state_post_switch(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    // The register-context restore is identical to the same-task path: reload the
+    // incoming task's user GPRs / sepc (saved_pc) / sstatus-derived state and TLS
+    // base into the trap frame. The SATP/ASID activation that MUST precede the
+    // `sret` for a genuine cross-task switch is the caller's responsibility (the
+    // bridge does it today); this function owns only the frame-side restore.
+    restore_arch_thread_state(kernel, cpu, frame)
 }
 
 #[cfg(test)]

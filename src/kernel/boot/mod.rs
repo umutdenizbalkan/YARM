@@ -2286,6 +2286,25 @@ pub fn aarch64_yield_lone_oracle_enabled() -> bool {
     AARCH64_YIELD_LONE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 196A: default-off RISC-V post-lock-drain FOUNDATION oracle selector.
+/// When enabled, the RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`)
+/// publishes a one-shot post-work token during its broad-lock (`with_cpu`) phase
+/// and consumes it AFTER the outer `SpinLock<KernelState>` guard drops, proving
+/// genuine post-lock-drain ordering: the lock-dropped proof re-acquires
+/// `with_cpu` (which would deadlock if the guard were still held). It enables
+/// ZERO retirement classes and mutates no scheduler / capability / user-copy /
+/// task-switch state — it only reads `current_tid` and drives log markers.
+pub(crate) static RISCV_POST_LOCK_FOUNDATION_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_post_lock_foundation_oracle_enabled(enabled: bool) {
+    RISCV_POST_LOCK_FOUNDATION_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_post_lock_foundation_oracle_enabled() -> bool {
+    RISCV_POST_LOCK_FOUNDATION_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.
 pub fn ipc_send_cap_enqueue_oracle_active() -> bool {
     ipc_recv_oracle_proof_enabled() && ipc_send_cap_enqueue_oracle_enabled()

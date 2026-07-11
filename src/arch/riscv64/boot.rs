@@ -577,29 +577,37 @@ unsafe extern "C" {
     static yarm_riscv64_trap_vector: u8;
 }
 
-/// Trap-time kernel-state pointer, installed by `run_with_prepared_kernel`
-/// after `Bootstrap::init_static` has returned the &'static mut KernelState.
-/// The Rust trap bridge loads this to dispatch through the existing
-/// `handle_trap_entry` path. Null until installed; once set the pointer
-/// outlives all traps because BOOTSTRAP_KERNEL_STATE lives in .bss for the
-/// life of the kernel.
+/// Trap-time `SharedKernel` pointer, installed by `run_with_prepared_kernel`
+/// after `Bootstrap::init_shared_static` has constructed the boot-owned
+/// `SharedKernel` in `.bss` (BOOTSTRAP_SHARED_KERNEL). The Rust trap bridge
+/// loads this to dispatch through the Stage 196A RISC-V shared wrapper
+/// (`handle_riscv_trap_entry_shared`), which owns the bounded `with_cpu`
+/// broad-lock phase and the post-lock drain — the direct-call raw
+/// `&'static mut KernelState` path is retired. Null until installed; once set
+/// the pointer outlives all traps because BOOTSTRAP_SHARED_KERNEL lives in
+/// .bss (inside the kernel-shared Sv39 gigapage) for the life of the kernel.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-static RISCV_TRAP_KERNEL_STATE_PTR: core::sync::atomic::AtomicPtr<
-    crate::kernel::boot::KernelState,
-> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+static RISCV_TRAP_SHARED_KERNEL_PTR: core::sync::atomic::AtomicPtr<crate::runtime::SharedKernel> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-pub(crate) fn install_riscv_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState) {
-    RISCV_TRAP_KERNEL_STATE_PTR.store(kernel as *mut _, core::sync::atomic::Ordering::SeqCst);
+pub(crate) fn install_riscv_trap_shared_kernel(shared: &'static crate::runtime::SharedKernel) {
+    RISCV_TRAP_SHARED_KERNEL_PTR.store(
+        shared as *const _ as *mut _,
+        core::sync::atomic::Ordering::SeqCst,
+    );
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelState> {
-    let ptr = RISCV_TRAP_KERNEL_STATE_PTR.load(core::sync::atomic::Ordering::SeqCst);
+fn trap_shared_kernel_riscv() -> Option<&'static crate::runtime::SharedKernel> {
+    let ptr = RISCV_TRAP_SHARED_KERNEL_PTR.load(core::sync::atomic::Ordering::SeqCst);
     if ptr.is_null() {
         None
     } else {
-        Some(unsafe { &mut *ptr })
+        // SAFETY: the pointer was installed from a `&'static SharedKernel`
+        // (BOOTSTRAP_SHARED_KERNEL, .bss) and is never mutated after install,
+        // so re-forming a shared reference is sound.
+        Some(unsafe { &*(ptr as *const crate::runtime::SharedKernel) })
     }
 }
 
@@ -611,16 +619,31 @@ fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelSta
 static RISCV_FIRST_ROUNDTRIP_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+// Stage 196A: the S-mode trap runs the ENTIRE syscall dispatch on this dedicated
+// trap stack (the trap vector swaps sp←sscratch = `riscv_trap_stack_top`). The
+// deepest RISC-V dispatch chain (IPC cap-transfer / SpawnV5 / fork, with large
+// on-stack `no_std` temporaries) uses well over 256 KiB — the former **16 KiB**
+// stack was a PRE-EXISTING latent overflow: deep traps had been silently
+// clobbering whatever `.bss` sat below the stack, tolerated only because the
+// corrupted bytes happened to land on benign/padding statics. Stage 196A's new
+// default-off oracle flag landed in that blast radius and made the overflow
+// visible as a non-deterministic false→true flip (which vanished at ≥1 MiB but
+// not at 256 KiB — bounding the deepest dispatch between 256 KiB and 1 MiB).
+// Size the trap stack at 2 MiB for solid headroom over the observed worst case.
+// It lives in `.bss` (NOLOAD, inside the kernel-shared gigapage), so it costs
+// RAM only — not image size — and the 16 MiB boot stack dwarfs it.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 #[repr(align(16))]
-struct RiscvTrapStack([u8; 16 * 1024]);
+struct RiscvTrapStack([u8; RISCV_TRAP_STACK_SIZE]);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-static mut RISCV_TRAP_STACK: RiscvTrapStack = RiscvTrapStack([0; 16 * 1024]);
+static mut RISCV_TRAP_STACK: RiscvTrapStack = RiscvTrapStack([0; RISCV_TRAP_STACK_SIZE]);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn riscv_trap_stack_top() -> u64 {
     let base = core::ptr::addr_of!(RISCV_TRAP_STACK) as u64;
-    (base + (16 * 1024)) & !0xf
+    (base + (RISCV_TRAP_STACK_SIZE as u64)) & !0xf
 }
 
 /// S-mode trap bridge. Builds a generic `TrapFrame` from the saved RISC-V
@@ -663,12 +686,18 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         );
     }
 
-    let Some(kernel) = trap_kernel_state_mut() else {
-        early_marker!("RISCV_TRAP_HANDLE_FAILED reason=no_trap_kernel_state");
-        riscv_trap_halt("no_trap_kernel_state");
+    // Stage 196A: the bridge no longer holds a persistent raw `&'static mut
+    // KernelState`. It borrows the boot-owned `SharedKernel` and performs every
+    // kernel interaction through a bounded `with_cpu` (or the shared wrapper),
+    // so no broad `&mut KernelState` escapes a bounded callback.
+    let Some(shared) = trap_shared_kernel_riscv() else {
+        early_marker!("RISCV_TRAP_HANDLE_FAILED reason=no_trap_shared_kernel");
+        riscv_trap_halt("no_trap_shared_kernel");
     };
-    let cpu = kernel.current_cpu();
-    let entering_tid = kernel.current_tid().unwrap_or(0);
+    // RISC-V is BSP-only (`online_cpus==1`); the trapping CPU is always the
+    // bootstrap hart. `with_cpu` rebinds `current_cpu` to this value anyway.
+    let cpu = crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+    let entering_tid = shared.current_tid_authoritative(cpu).unwrap_or(0);
 
     // ── Phase: SAVE_DONE ────────────────────────────────────────────────
     if first_trap {
@@ -754,8 +783,13 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // reloads that sepc+4 into tframe.saved_pc; handle_trap_entry does NOT apply
     // its own +4 (Stage 163M fix), so the net resumed PC is sepc+4 exactly once.
     let ctx = crate::arch::riscv64::trap::Riscv64TrapContext { scause, stval };
+    // Stage 196A: route through the RISC-V shared trap-entry wrapper. It owns the
+    // `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag lifecycle, runs the UNCHANGED
+    // canonical handler inside a bounded `with_cpu` broad-lock phase, and drains
+    // post-lock work after the guard drops. The split dispatcher declines every
+    // RISC-V syscall (zero retirement classes enabled in this foundation stage).
     let handle_result =
-        crate::arch::riscv64::trap::handle_trap_entry(kernel, cpu, ctx, Some(&mut tframe));
+        crate::arch::riscv64::trap::handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe);
 
     if let Err(err) = handle_result {
         // The generic restore_arch_thread_state returns Err(Internal) when
@@ -763,7 +797,7 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         // IPC recv, init parked). For an event-driven microkernel awaiting
         // I/O this is the correct terminal state — wfi here instead of
         // treating it as a fatal trap.
-        let next_tid = kernel.current_tid().unwrap_or(0);
+        let next_tid = shared.current_tid_authoritative(cpu).unwrap_or(0);
         if next_tid == 0 {
             crate::yarm_log!(
                 "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
@@ -800,7 +834,9 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // return path (same task) or from the resumed task's saved
     // `UserRegisterContext.args` (different task; first-run on fresh spawn or
     // resume after IPC block).
-    let resume_tid = kernel.current_tid().unwrap_or(entering_tid);
+    let resume_tid = shared
+        .current_tid_authoritative(cpu)
+        .unwrap_or(entering_tid);
     let task_switched = resume_tid != entering_tid;
     if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
         crate::yarm_log!(
@@ -971,8 +1007,13 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // different task — switch_address_space currently defers on RISC-V
     // (see hal_adapters.rs) so the satp installed at enter-user is still
     // live. Activate the new task's satp here explicitly so the sret lands
-    // in the right user page table.
-    if let Some(asid) = kernel.task_asid(resume_tid) {
+    // in the right user page table. The asid lookup is a bounded read through
+    // the shared kernel (Stage 196A: no persistent raw `&mut KernelState`).
+    let resume_asid = shared
+        .with_cpu(cpu, |k| k.task_asid(resume_tid))
+        .ok()
+        .flatten();
+    if let Some(asid) = resume_asid {
         // Make sure the kernel-shared gigapage is present in the resumed
         // task's page table. Idempotent for asids that already have it.
         let _ = crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
@@ -1868,17 +1909,26 @@ pub fn enter_dispatched_user_task_if_available(
 }
 
 pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
-    // Use the in-place static initializer (writes BOOTSTRAP_KERNEL_STATE in
-    // .bss and returns a &'static mut), exactly like x86_64/AArch64. The
-    // boxed `Bootstrap::init()` path would `Box::new` the ~4.27 MiB bare-metal
-    // KernelState out of the 1 MiB page-table frame pool and OOM (silent
-    // panic-loop); init_static avoids the heap entirely.
-    let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
-    // Install the kernel-state pointer for the S-mode trap bridge before any
-    // user task runs. The trap bridge needs &mut KernelState to dispatch
-    // through handle_trap_entry; init_static returned a &'static mut, so the
-    // pointer remains valid for the life of the kernel.
-    install_riscv_trap_kernel_state(kernel);
+    // Stage 196A: own KernelState through a boot-constructed `SharedKernel`
+    // (the same Stage-2N shared trap path x86_64/AArch64 use), so the S-mode
+    // trap bridge can route through the RISC-V shared wrapper's bounded
+    // `with_cpu` broad-lock phase + post-lock drain instead of a persistent
+    // raw `&'static mut KernelState`. `init_shared_static` writes the
+    // canonical `SharedKernel` into BOOTSTRAP_SHARED_KERNEL (.bss, inside the
+    // kernel-shared Sv39 gigapage), like `init_static` did for
+    // BOOTSTRAP_KERNEL_STATE — the heap-boxing OOM path (§5) is still avoided.
+    let shared = crate::kernel::boot::Bootstrap::init_shared_static().expect("kernel init");
+    // SAFETY: single boot hart; no trap handler can race before
+    // install_riscv_trap_shared_kernel stores the pointer, and this raw boot
+    // borrow is used only for the non-returning boot/dispatch sequence below
+    // (it is never used again after the first `sret` into user space, at which
+    // point the trap bridge takes over via `shared.with_cpu`).
+    let kernel: &mut crate::kernel::boot::KernelState = unsafe { shared.borrow_kernel_for_boot() };
+    // Install the SharedKernel pointer for the S-mode trap bridge before any
+    // user task runs. BOOTSTRAP_SHARED_KERNEL lives in .bss, so the pointer
+    // remains valid for the life of the kernel.
+    install_riscv_trap_shared_kernel(shared);
+    crate::yarm_log!("YARM_LOCK_SPLIT_STAGE196A_INSTALLED arch=riscv64 shared=1 raw=0");
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),

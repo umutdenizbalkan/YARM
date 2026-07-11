@@ -8512,6 +8512,52 @@ first prerequisite; it is deferred rather than half-landed so the proven in-lock
 `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait`.** Yield stays a separate future
 slice (its re-enqueue proof is independent). See §4.7 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 196A — RISC-V shared trap-path + post-lock drain foundation (DONE)
+
+RISC-V now enters a **real shared trap path**, contract-equivalent to
+`handle_trap_entry_shared`, while enabling **zero** retirement classes — the
+Stage 196 step-1 prerequisite (§7.1.21 plan / `doc/ARCH_RISCV64.md` §9.2).
+
+- **Old raw path retired.** Boot used `Bootstrap::init_static()` + a persistent
+  raw `&'static mut KernelState` pointer (`install_riscv_trap_kernel_state` /
+  `trap_kernel_state_mut`); the bridge held that `&mut` across the whole trap
+  and called `handle_trap_entry` directly with no post-`with_cpu` drainer.
+- **New shared path.** `run_with_prepared_kernel` owns `KernelState` through a
+  boot-constructed `SharedKernel` (`init_shared_static` + `borrow_kernel_for_boot`,
+  the Stage-2N pattern) and installs a `SharedKernel` pointer
+  (`install_riscv_trap_shared_kernel`). The bridge routes through
+  `arch/riscv64/trap.rs::handle_riscv_trap_entry_shared`: **pre-lock** declines
+  every RISC-V syscall (no `try_split_dispatch_into_frame`); **broad-lock**
+  (`with_cpu`) sets `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]=true` and runs the
+  **unchanged** canonical `handle_trap_entry_with_fault_bookkeeping_mode`;
+  **post-lock** clears the flag and runs `drain_dispatch_post_work` after the
+  guard drops. Every remaining bridge kernel read (current-tid, asid) is a
+  bounded `with_cpu` — no persistent raw `&mut KernelState` escapes.
+- **Active-flag ownership** is centralized in the wrapper (§9.2 markers,
+  one-shot latched). The §9.1 force-false is **retired**: a real drainer now
+  exists, so the deferred blocked-waiter path is valid.
+- **Genuine drain proof** (default-off `yarm.riscv64_post_lock_foundation_oracle=1`):
+  publish token in-lock → drop guard → consume post-lock via a **real `with_cpu`
+  re-acquire** (deadlocks if still held) → `sret` to the same task. Markers
+  `RISCV_POST_LOCK_FOUNDATION_ORACLE_{PUBLISH_OK,LOCK_DROPPED_OK,DRAIN_OK,
+  USER_RETURN_OK,DONE result=ok}`. No scheduler/cap/user/switch mutation.
+- **Part 5 restore foundation:** RISC-V `post_switch_restore_arch_thread_state`
+  is no longer a silent no-op — it delegates to the documented
+  `restore_arch_thread_state_post_switch` (frame sepc/sstatus/GPR/TLS restore);
+  still uncalled in production (no switch class enabled), paired at call time
+  with the bridge's incoming-asid SATP activation + `sfence.vma`.
+- **Trap-stack fix:** the shared wrapper's canary flag exposed a pre-existing
+  latent overflow — the 16 KiB `RISCV_TRAP_STACK` was too small for the deepest
+  syscall dispatch (256 KiB–1 MiB), silently clobbering adjacent `.bss`. Bumped
+  to 2 MiB (a real RISC-V correctness fix).
+- **Zero retirement:** 0 `YARM_LOCK_SPLIT_DISPATCH arch=riscv64`, 0
+  `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64`, 0 `RISCV_FUTEX_WAIT_DISPATCH_*` /
+  `RISCV_YIELD_DISPATCH_*`. `SYSCALL_COUNT`/`VARIANT_COUNT` unchanged (32/23);
+  `ReapFaultedTask` excluded; NR 27 deprecation preserved. Recommended next
+  class: **DebugLog only** (Stage 196B). Full RISC-V server chain still reaches
+  `RISCV_KERNEL_IDLE_WAITING_FOR_IO` with no S-mode fault. x86_64 / AArch64
+  unchanged.
+
 #### Stage 195G — AArch64 Yield out-of-lock queue-advancing dispatch DEFAULT-ON (DONE)
 
 AArch64 **Yield (NR 0)** is now the fourth live queue-advancing out-of-lock class, **default-on**,

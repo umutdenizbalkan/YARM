@@ -133,13 +133,20 @@ pub(crate) fn post_switch_restore_arch_thread_state(
 
 #[cfg(target_arch = "riscv64")]
 pub(crate) fn post_switch_restore_arch_thread_state(
-    _kernel: &mut KernelState,
-    _cpu: CpuId,
-    _frame: Option<&mut TrapFrame>,
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
-    // RISC-V uses a raw-pointer trap path (no `with_cpu`). The stash is never
-    // populated on RISC-V, so this function is never called on that arch.
-    Ok(())
+    // Stage 196A (Part 5): RISC-V now enters the shared trap path
+    // (`handle_riscv_trap_entry_shared`), but no queue-advancing retirement class
+    // is enabled yet, so the switch-plan stash is still never populated on RISC-V
+    // and this remains uncalled in production. It is no longer a silent no-op: it
+    // delegates to the documented `restore_arch_thread_state_post_switch`
+    // FOUNDATION, so a future switch drain has a real, exercisable frame-restore
+    // API (incoming sepc/sstatus/GPR/TLS). The incoming task's SATP/ASID
+    // activation (with `sfence.vma`) is performed by the trap bridge today; a
+    // future genuine cross-task switch drain would pair that with this restore.
+    super::riscv64::trap::restore_arch_thread_state_post_switch(kernel, cpu, frame)
 }
 
 pub fn handle_trap_entry_shared(

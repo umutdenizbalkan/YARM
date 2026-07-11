@@ -62098,19 +62098,28 @@ mod stage194_cross_arch_portability_audit {
     const AARCH64_DOC: &str = include_str!("../../../doc/ARCH_AARCH64.md");
     const RISCV_DOC: &str = include_str!("../../../doc/ARCH_RISCV64.md");
 
-    // RISC-V trap entry forces GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE inactive because it uses
-    // the raw &mut KernelState path with NO shared-path drainer — the drain does not exist
-    // yet, so the active flag must never read true there.
+    // Stage 196A superseded this Stage-194 assertion: RISC-V now enters a real shared trap
+    // path (`handle_riscv_trap_entry_shared`) that OWNS the active flag (set true before the
+    // bounded broad-lock phase, cleared after) and runs a genuine `drain_dispatch_post_work`.
+    // The prior force-false (which existed only because RISC-V had no drainer) is retired.
     #[test]
     fn riscv_trap_entry_forces_active_flag_inactive() {
+        // The shared wrapper owns the flag lifecycle (true in-lock, cleared post-lock).
         assert!(
-            RISCV_TRAP_SRC.contains("never through `handle_trap_entry_shared`"),
-            "RISC-V must still document that it does not enter the shared drain path"
+            RISCV_TRAP_SRC.contains("pub fn handle_riscv_trap_entry_shared(")
+                && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
+                && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)"),
+            "RISC-V shared wrapper must own the active flag (set true in-lock, cleared post-lock)"
         );
+        // The canonical handler no longer force-clears the flag (force-false retired).
         assert!(
-            RISCV_TRAP_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
-                && RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
-            "RISC-V trap entry must force the active flag false until a real drain exists"
+            !RISCV_TRAP_SRC.contains("force it false BEFORE handling the trap"),
+            "RISC-V force-false must be retired now that the shared wrapper drains"
+        );
+        // A real post-lock drainer exists.
+        assert!(
+            RISCV_TRAP_SRC.contains("shared.drain_dispatch_post_work(cpu)"),
+            "RISC-V shared wrapper must run the post-lock drain after the guard drops"
         );
     }
 
@@ -62382,13 +62391,20 @@ mod stage195a_aarch64_debuglog_live {
         }
     }
 
-    // RISC-V raw path still force-clears the active flag (unchanged this stage).
+    // Stage 196A retired the RISC-V force-false: the shared wrapper now owns the active flag
+    // (set true before the bounded broad-lock phase, cleared after) with a real post-lock drain.
     #[test]
     fn riscv_still_force_clears_active_flag() {
         assert!(
-            RISCV_TRAP_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
-                && RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
-            "RISC-V must still force the active flag false"
+            RISCV_TRAP_SRC.contains("pub fn handle_riscv_trap_entry_shared(")
+                && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
+                && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)")
+                && RISCV_TRAP_SRC.contains("shared.drain_dispatch_post_work(cpu)"),
+            "RISC-V shared wrapper must own the active flag with a real post-lock drain"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("force it false BEFORE handling the trap"),
+            "RISC-V force-false must be retired"
         );
     }
 
@@ -62571,9 +62587,12 @@ mod stage195b_aarch64_initramfs_read_chunk {
                 "queue-advancing drain `{needle}` must stay x86_64-gated"
             );
         }
+        // Stage 196A: RISC-V now enters the shared wrapper, but its split dispatcher stays inert
+        // (declines all) and no queue-advancing RISC-V drain exists — zero retirement.
         assert!(
-            RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
-            "RISC-V must still force the active flag false"
+            !RISCV_TRAP_SRC.contains("try_split_dispatch_into_frame(shared")
+                && RISCV_TRAP_SRC.contains("RISCV_SPLIT_DISPATCH_DECLINED_ALL cpu="),
+            "RISC-V split dispatcher must remain inert (declines all syscalls)"
         );
         assert!(
             !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
@@ -63611,6 +63630,219 @@ mod stage184_cross_arch_live {
             DOC_SRC.contains("not fake remote TLB ACK")
                 && DOC_SRC.contains("not Stage 185 global-lock retirement"),
             "doc must carry the Stage 184 non-goals"
+        );
+    }
+}
+
+// Stage 196A — RISC-V SHARED TRAP-PATH + POST-LOCK DRAIN FOUNDATION. These hosted source-check
+// guards pin: the bridge routes through the shared wrapper (no persistent raw &mut KernelState);
+// the canonical handler runs inside a bounded with_cpu; the active flag is owned by the wrapper
+// (set true before the broad phase, cleared after) with the force-false retired; the post-lock
+// drain runs after the guard drops; the default-off foundation oracle proves genuine drain
+// ordering with a real lock-dropped re-acquire; the split dispatcher stays inert (zero RISC-V
+// retirement); and post_switch_restore is a documented foundation, not a silent no-op.
+mod stage196a_riscv_shared_trap_foundation {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+
+    // SYSCALL/VARIANT counts unchanged (baseline invariant for the whole series).
+    #[test]
+    fn syscall_and_variant_counts_unchanged() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+    }
+
+    // The bridge must route through the shared wrapper and no longer hold a persistent raw
+    // `&'static mut KernelState` (the old `trap_kernel_state_mut()` path is retired).
+    #[test]
+    fn bridge_routes_through_shared_wrapper_no_raw_kernel() {
+        assert!(
+            RISCV_BOOT_SRC.contains(
+                "crate::arch::riscv64::trap::handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)"
+            ),
+            "bridge must call the shared trap-entry wrapper"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("trap_shared_kernel_riscv()"),
+            "bridge must acquire the SharedKernel, not a raw &mut KernelState"
+        );
+        // The old raw-pointer trap-kernel accessor/installer must be gone.
+        assert!(
+            !RISCV_BOOT_SRC.contains("fn trap_kernel_state_mut(")
+                && !RISCV_BOOT_SRC.contains("install_riscv_trap_kernel_state"),
+            "raw &'static mut KernelState trap accessor/installer must be retired"
+        );
+        // Boot installs the SharedKernel pointer (Stage-2N shared trap path).
+        assert!(
+            RISCV_BOOT_SRC.contains("Bootstrap::init_shared_static()")
+                && RISCV_BOOT_SRC.contains("install_riscv_trap_shared_kernel(shared)")
+                && RISCV_BOOT_SRC.contains("borrow_kernel_for_boot()"),
+            "boot must own KernelState through a SharedKernel like x86_64/AArch64"
+        );
+    }
+
+    // The canonical RISC-V handler runs UNCHANGED inside the bounded with_cpu broad-lock phase.
+    #[test]
+    fn canonical_handler_runs_inside_bounded_with_cpu() {
+        assert!(
+            RISCV_TRAP_SRC.contains(".with_cpu(cpu, |kernel| {")
+                && RISCV_TRAP_SRC.contains("handle_trap_entry_with_fault_bookkeeping_mode("),
+            "wrapper must run the canonical handler inside a bounded with_cpu callback"
+        );
+    }
+
+    // Active-flag ownership: the wrapper sets true before the broad phase and clears after; the
+    // RISC-V force-false is retired (owned by the wrapper now).
+    #[test]
+    fn active_flag_owned_by_wrapper_force_false_retired() {
+        assert!(
+            RISCV_TRAP_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
+                && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
+                && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)"),
+            "wrapper must set the active flag true before the broad phase and clear it after"
+        );
+        // The canonical handler must NOT force-clear the flag anymore (the old force-false
+        // comment/store is retired; the wrapper owns the flag lifecycle).
+        assert!(
+            !RISCV_TRAP_SRC.contains("force it false BEFORE handling the trap"),
+            "the canonical handler's force-false must be retired (wrapper owns the flag)"
+        );
+        // Required structural markers present.
+        for m in [
+            "RISCV_SHARED_TRAP_ENTRY_BEGIN cpu=",
+            "RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET cpu=",
+            "RISCV_GLOBAL_LOCK_PHASE_DONE cpu=",
+            "RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR cpu=",
+            "RISCV_POST_LOCK_DRAIN_BEGIN cpu=",
+            "RISCV_POST_LOCK_DRAIN_DONE cpu=",
+            "RISCV_SHARED_TRAP_ENTRY_DONE cpu=",
+        ] {
+            assert!(
+                RISCV_TRAP_SRC.contains(m),
+                "wrapper must emit structural marker: {m}"
+            );
+        }
+        // Markers are bounded (one-shot latch), not emitted on every trap.
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_SHARED_TRAP_MARKERS_LOGGED")
+                && RISCV_TRAP_SRC
+                    .contains("let log_structural = !RISCV_SHARED_TRAP_MARKERS_LOGGED"),
+            "structural markers must be one-shot latched (no per-tick flood)"
+        );
+    }
+
+    // Post-lock drain runs AFTER the broad guard drops, and BEFORE it any deferred blocked-waiter
+    // delivery producer would have stashed work (the real drainer).
+    #[test]
+    fn post_lock_drain_runs_after_guard_release() {
+        // ordering: PHASE_DONE / ACTIVE_CLEAR must precede drain_dispatch_post_work.
+        let clear_idx = RISCV_TRAP_SRC
+            .find("RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR")
+            .expect("clear marker present");
+        let drain_idx = RISCV_TRAP_SRC
+            .find("shared.drain_dispatch_post_work(cpu)")
+            .expect("drain call present");
+        assert!(
+            clear_idx < drain_idx,
+            "the active flag must be cleared before the post-lock drain runs"
+        );
+    }
+
+    // Foundation oracle: default-off knob, genuine lock-dropped re-acquire proof, no mutation.
+    #[test]
+    fn foundation_oracle_default_off_and_genuine() {
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_post_lock_foundation_oracle")
+                && MOD_SRC.contains("fn riscv_post_lock_foundation_oracle_enabled()"),
+            "foundation oracle must be gated behind a default-off boot knob"
+        );
+        for m in [
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu=",
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_LOCK_DROPPED_OK cpu=",
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_DRAIN_OK cpu=",
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_USER_RETURN_OK tid=",
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=ok",
+        ] {
+            assert!(
+                RISCV_TRAP_SRC.contains(m),
+                "foundation oracle must emit marker: {m}"
+            );
+        }
+        // The lock-dropped proof must be a REAL re-acquire of with_cpu after the drain.
+        assert!(
+            RISCV_TRAP_SRC.contains("Lock-dropped proof: this re-acquire is only possible")
+                && RISCV_TRAP_SRC.contains(".with_cpu(cpu, |kernel| kernel.current_tid())"),
+            "lock-dropped proof must genuinely re-acquire with_cpu (deadlocks if still held)"
+        );
+        // Publish stores only the tid token (a biased atomic), and the drain consumes it via swap
+        // + a read-only current_tid re-read — no scheduler/cap/user mutation.
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]")
+                && RISCV_TRAP_SRC.contains(".store(tid.wrapping_add(1), Ordering::Release)")
+                && RISCV_TRAP_SRC.contains(
+                    "RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx].swap(0, Ordering::AcqRel)"
+                ),
+            "oracle must publish/consume a pure atomic token (no scheduler/cap/user mutation)"
+        );
+    }
+
+    // Split dispatcher stays inert: the wrapper never calls try_split_dispatch_into_frame, so no
+    // RISC-V retirement marker can appear.
+    #[test]
+    fn split_dispatcher_inert_zero_retirement() {
+        // The wrapper must never CALL the split dispatcher (call syntax uses an open paren; a bare
+        // mention in a comment is allowed and does not match).
+        assert!(
+            !RISCV_TRAP_SRC.contains("try_split_dispatch_into_frame(shared"),
+            "RISC-V wrapper must not invoke the split dispatcher (zero retirement)"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_SPLIT_DISPATCH_DECLINED_ALL cpu="),
+            "wrapper must attest the split dispatcher declines all RISC-V syscalls"
+        );
+        // Smoke must forbid RISC-V retirement / split-dispatch markers.
+        assert!(
+            RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64")
+                && RISCV_SMOKE.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64"),
+            "smoke must assert-absent RISC-V split-dispatch + retirement markers"
+        );
+    }
+
+    // Part 5: post_switch_restore is a documented foundation delegating to a real restore, not a
+    // silent no-op.
+    #[test]
+    fn post_switch_restore_is_documented_foundation() {
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "super::riscv64::trap::restore_arch_thread_state_post_switch(kernel, cpu, frame)"
+            ),
+            "riscv post_switch_restore must delegate to the documented foundation, not Ok(())"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("pub fn restore_arch_thread_state_post_switch(")
+                && RISCV_TRAP_SRC.contains("resume_current_thread_with_frame")
+                && RISCV_TRAP_SRC.contains("SATP/ASID"),
+            "foundation restore must document the incoming SATP/ASID + sepc/sstatus/GPR contract"
+        );
+    }
+
+    // The shared trap path runs the whole syscall dispatch on RISCV_TRAP_STACK; the wrapper's
+    // canary flag exposed a pre-existing 16 KiB overflow into adjacent .bss. Pin the enlarged
+    // trap stack so the regression cannot silently return.
+    #[test]
+    fn trap_stack_is_large_enough_for_shared_dispatch() {
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "RISCV_TRAP_STACK must be 2 MiB (16 KiB overflowed the deepest shared-path dispatch)"
+        );
+        // The old fixed 16 KiB literal must be gone from the trap-stack definition.
+        assert!(
+            !RISCV_BOOT_SRC.contains("struct RiscvTrapStack([u8; 16 * 1024])"),
+            "the former 16 KiB trap-stack definition must be retired"
         );
     }
 }
