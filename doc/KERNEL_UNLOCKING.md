@@ -8438,6 +8438,37 @@ alloc, no cap mint, no scheduler/IPC change, no TTBR0/ASID switch. Live markers:
 text byte-identical; RISC-V inert. `CreateInitramfsFileSliceMo` (NR 28) stays global-lock-only.
 See §4.6 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 195C — AArch64 FutexWake LIVE + live oracle (DONE)
+
+FutexWake is the third live AArch64 split-dispatch class. **FutexWake is NR 10** — the Stage
+195C task text's "NR11" is INCORRECT (NR 11 is `SpawnThread`; NR 9 is `FutexWait`). The
+selective ABI-import gate is extended to `NR 15 || NR 27 || NR 10 || oracle` (finalize mirrors
+it), so FutexWake reaches `try_split_futex_wake_into_frame`. The caller never task-switches; the
+split only mutates waiter/run-queue state via the two-seam `futex_wake_split_mut` (Phase A
+rank-2 task seam scans `Blocked(Futex)` → `Runnable`; Phase B rank-1 scheduler seam enqueues
+each waiter once). Ineligible cases (invalid addr) return `None` → unchanged global-lock
+fallback (canonical error). `FutexWait` (NR 9) stays global-lock-only — it BLOCKS the caller.
+Live markers: `AARCH64_SPLIT_ABI_IMPORT_OK nr=10`, `YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=10`,
+`FUTEX_WAKE_SPLIT_BEGIN/DONE arch=aarch64 result=ok woke=N`,
+`GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE arch=aarch64 class=FutexWake result=ok`,
+`AARCH64_SPLIT_FINALIZE_OK nr=10 result=ok`. DebugLog / InitramfsReadChunk byte-for-byte
+preserved; x86_64 marker text byte-identical; RISC-V inert.
+
+**Live oracle (default-off, `yarm.aarch64_futex_wake_oracle=1`).** Proves ACTUAL waiter
+mutation, not just marker emission. init spawns a child thread, then blocks on a handshake futex
+to hand the CPU to the never-run child — AArch64 fresh-dispatches it through the block/dispatch
+path (the same one that first enters the control-plane servers into user mode; `yield` cannot
+fresh-dispatch a never-run thread because its `kernel_context` is uninitialized). The child
+wakes init (split FutexWake) and then blocks on the oracle word through the **legacy global-lock**
+`FutexWait`; init resumes and wakes the child through the **split** path. The kernel's returned
+wake COUNT is the authoritative signal (NOT timing): `first_wake=1` (the sole waiter → `Runnable`,
+enqueued exactly once), then `second_wake=0` (no waiter remains). Proof marker:
+`AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0`. The oracle boots
+single-CPU (`FUTEX_WAKE_ORACLE=1` forces `QEMU_SMP=1` in `qemu-aarch64-core-smoke.sh`): AArch64
+dispatches user tasks on the BSP only and the freshly-spawned waiter is enqueued balanced, so on
+SMP>1 it can land on a wake-only AP and never run. This is a single-dispatcher proof; FutexWake
+*enablement* is independent of CPU count. See §4.6 of `doc/ARCH_AARCH64.md`.
+
 #### Stage 195 — AArch64 first live retirement (implementation plan)
 
 1. **[195A DONE]** De-gate `pre_split_import_syscall_abi` + `finalize_split_handled_syscall`
@@ -8447,8 +8478,9 @@ See §4.6 of `doc/ARCH_AARCH64.md`.
 2. **[195A DONE]** Enable **DebugLog** first (pure read, no switch, no drain, no address-space
    change): `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=DebugLog result=ok` on AArch64
    with the server chain intact. **[195B DONE]** **InitramfsReadChunk** success path (read-only
-   user-copy, two-pass validated write). **Next (195C):** **FutexWake** (waiter/run-queue
-   mutation, no caller task-switch), then **IpcSendPlainEnqueue** (rank-4 enqueue, no drain).
+   user-copy, two-pass validated write). **[195C DONE]** **FutexWake** (NR 10, waiter/run-queue
+   mutation, no caller task-switch) + a default-off live oracle proving real waiter mutation
+   (first_wake=1, second_wake=0). **Next:** **IpcSendPlainEnqueue** (rank-4 enqueue, no drain).
 3. Do NOT enable D2/FutexWait/Yield: those need the de-gated drain body + an EL0-return frame
    restore proof (`restore_arch_thread_state_post_switch` under the drain), deferred to a later
    stage.

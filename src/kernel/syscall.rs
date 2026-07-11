@@ -32,6 +32,14 @@ pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
 pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
 /// Phase 2 bulk-copy bridge: reads a named CPIO file chunk into caller's user buffer.
 /// TEMPORARY stepping stone — replace with page-cap zero-copy in Phase 3.
+///
+/// TODO(deprecated-legacy-ABI): NR 27 `InitramfsReadChunk` is a deprecated legacy fallback /
+/// test-only ABI. It predates the Phase 3A/3B MemoryObject zero-copy (ZC) grant loader
+/// (`CreateInitramfsFileSliceMo` NR 28 + `SpawnFromMemoryObject`), which is now the
+/// production path for all late-service ELF loads (PM_ELF_ZC_DONE, zc_pages > 0). Once the
+/// ZC-grant path is fully proven across every arch and the last non-test caller is gone,
+/// REMOVE this syscall (and its Stage 195B AArch64 split-dispatch retirement wiring). It is
+/// retained today only as a split-dispatch retirement exemplar and a bulk-copy safety net.
 pub const SYSCALL_INITRAMFS_READ_CHUNK_NR: usize = 27;
 /// Phase 3A: Create a read-only MemoryObject backed by a named CPIO file slice.
 /// Only callable by SystemServer tasks (initramfs_srv).

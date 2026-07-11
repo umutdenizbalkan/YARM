@@ -957,6 +957,7 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
     let raw_nr = frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X8);
     if raw_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || raw_nr == crate::kernel::syscall::SYSCALL_INITRAMFS_READ_CHUNK_NR
+        || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
     {
         super::aarch64::trap::split_import_syscall_abi(frame);
@@ -979,6 +980,7 @@ fn finalize_split_handled_syscall(
     // seam (the user copy already ran lock-free via the split helper).
     if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_INITRAMFS_READ_CHUNK_NR
+        || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
     {
         let _ = shared.with_cpu(cpu, |kernel| {

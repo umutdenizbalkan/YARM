@@ -2148,6 +2148,21 @@ pub fn ipc_send_cap_enqueue_oracle_enabled() -> bool {
     IPC_SEND_CAP_ENQUEUE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 195C: default-off AArch64 FutexWake live-oracle knob (`yarm.aarch64_futex_wake_oracle=1`).
+/// When set, the AArch64 boot signals init (startup slot 5, unused by init) to run a controlled
+/// parent/child FutexWake oracle: a child thread blocks via legacy FutexWait, the parent wakes it
+/// once through the split path (count must be 1), then wakes again (count must be 0).
+pub(crate) static AARCH64_FUTEX_WAKE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_futex_wake_oracle_enabled(enabled: bool) {
+    AARCH64_FUTEX_WAKE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_futex_wake_oracle_enabled() -> bool {
+    AARCH64_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.
 pub fn ipc_send_cap_enqueue_oracle_active() -> bool {
     ipc_recv_oracle_proof_enabled() && ipc_send_cap_enqueue_oracle_enabled()

@@ -62287,11 +62287,12 @@ mod stage195a_aarch64_debuglog_live {
             body.contains("REG_X8"),
             "the import gate must peek the raw syscall number from x8"
         );
-        // Must NOT de-gate FutexWake on AArch64 (Stage 195C, not yet). InitramfsReadChunk is
-        // enabled in Stage 195B — checked in the stage195b module.
+        // Must NEVER de-gate the queue-advancing FutexWait on AArch64 (it BLOCKS the caller and
+        // needs the deferred drain body). FutexWake (NR 10) IS enabled as of Stage 195C — that
+        // selectivity is pinned in the stage195c module.
         assert!(
-            !body.contains("SYSCALL_FUTEX_WAKE_NR"),
-            "195A/195B must not enable FutexWake on AArch64"
+            !body.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "AArch64 must not enable the queue-advancing FutexWait"
         );
     }
 
@@ -62446,9 +62447,9 @@ mod stage195b_aarch64_initramfs_read_chunk {
             .unwrap_or("")
     }
 
-    // The AArch64 selective ABI gate now includes NR 15 (DebugLog) AND NR 27
-    // (InitramfsReadChunk) — and ONLY those two (plus the oracle knob). No FutexWake/FutexWait/
-    // Yield / CreateInitramfsFileSliceMo NR.
+    // The AArch64 selective ABI gate includes NR 15 (DebugLog), NR 27 (InitramfsReadChunk), and
+    // — as of Stage 195C — NR 10 (FutexWake), plus the oracle knob. It must NEVER include the
+    // queue-advancing FutexWait/Yield or the cap-minting CreateInitramfsFileSliceMo NR.
     #[test]
     fn aarch64_abi_gate_includes_nr15_and_nr27_only() {
         let import = aarch64_import_body();
@@ -62459,7 +62460,6 @@ mod stage195b_aarch64_initramfs_read_chunk {
             "the gate must include DebugLog (NR 15) and InitramfsReadChunk (NR 27)"
         );
         for forbidden in [
-            "SYSCALL_FUTEX_WAKE_NR",
             "SYSCALL_FUTEX_WAIT_NR",
             "SYSCALL_YIELD_NR",
             "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
@@ -62615,6 +62615,171 @@ mod stage195b_aarch64_initramfs_read_chunk {
             PM_SRC.contains("initramfs_read_chunk(PM_NR27_PROBE_FILE")
                 && PM_SRC.contains("PM_NR27_SELF_PROBE_OK"),
             "PM must issue the one-shot NR 27 self-probe so the split retirement fires live"
+        );
+    }
+}
+
+// Stage 195C — AARCH64 FUTEXWAKE SPLIT RETIREMENT + LIVE ORACLE. FutexWake (NR 10 — the task
+// text's "NR11" is wrong; NR 11 is SpawnThread) is the third live AArch64 split-dispatch class.
+// These guards pin: the gate/finalize include NR 10, the arch-tagged FutexWake markers, the
+// default-off live-oracle wiring (init handshake + kernel slot-5 sentinel + boot knob), the
+// smoke acceptance, docs, and that no queue-advancing class was newly enabled.
+mod stage195c_aarch64_futex_wake_live {
+    use super::*;
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const BOOT_MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const AARCH64_DOC: &str = include_str!("../../../doc/ARCH_AARCH64.md");
+
+    fn aarch64_import_body() -> &'static str {
+        TRAP_ENTRY_SRC
+            .split_once("#[cfg(target_arch = \"aarch64\")]\nfn pre_split_import_syscall_abi(")
+            .map(|(_, r)| r.split_once("\n#[cfg(").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("")
+    }
+
+    // FutexWake is NR 10 (NOT 11). NR 11 is SpawnThread; NR 9 is FutexWait. Pin the identities so
+    // the task text's "NR11" mistake cannot be baked into the ABI.
+    #[test]
+    fn futex_wake_is_nr10_not_nr11() {
+        use crate::kernel::syscall::{
+            SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_SPAWN_THREAD_NR,
+        };
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_SPAWN_THREAD_NR, 11);
+    }
+
+    // The AArch64 selective ABI import + finalize gates now include FutexWake (NR 10).
+    #[test]
+    fn aarch64_gate_includes_futex_wake_nr10() {
+        let import = aarch64_import_body();
+        assert!(!import.is_empty(), "aarch64 import body must exist");
+        assert!(
+            import.contains("SYSCALL_FUTEX_WAKE_NR"),
+            "the AArch64 ABI gate must include FutexWake (NR 10) as of Stage 195C"
+        );
+        // But NEVER the queue-advancing FutexWait/Yield.
+        assert!(
+            !import.contains("SYSCALL_FUTEX_WAIT_NR") && !import.contains("SYSCALL_YIELD_NR"),
+            "the AArch64 gate must NOT enable queue-advancing FutexWait/Yield"
+        );
+    }
+
+    // FutexWake passes the arch-neutral NR gate and routes to its split helper.
+    #[test]
+    fn futex_wake_split_eligible_and_routed() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
+            "FutexWake must pass the split NR gate"
+        );
+        assert!(
+            SPLIT_SRC.contains("try_split_futex_wake_into_frame"),
+            "the dispatcher must route FutexWake to its split helper"
+        );
+    }
+
+    // Arch-tagged FutexWake markers on AArch64; the woke-count is exported.
+    #[test]
+    fn futex_wake_markers_arch_tagged() {
+        assert!(
+            SPLIT_SRC.contains("FUTEX_WAKE_SPLIT_BEGIN arch=aarch64")
+                && SPLIT_SRC.contains("FUTEX_WAKE_SPLIT_DONE arch=aarch64 result=ok woke=")
+                && SPLIT_SRC.contains("arch=aarch64 class=FutexWake"),
+            "AArch64 must emit arch-tagged FutexWake split + retirement markers"
+        );
+    }
+
+    // The default-off live oracle is fully wired: boot knob (+ monotonic apply), kernel slot-5
+    // sentinel provisioning, and the init parent/child handshake proof.
+    #[test]
+    fn futex_wake_live_oracle_wired() {
+        // Boot knob storage + accessor.
+        assert!(
+            BOOT_MOD_SRC.contains("aarch64_futex_wake_oracle_enabled")
+                && BOOT_MOD_SRC.contains("set_aarch64_futex_wake_oracle_enabled"),
+            "the AArch64 FutexWake oracle boot flag must exist"
+        );
+        // Cmdline parse + apply.
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.aarch64_futex_wake_oracle")
+                && BOOT_CMDLINE_SRC.contains("aarch64_futex_wake_oracle: Option<bool>"),
+            "the cmdline parser must expose the oracle knob"
+        );
+        // Kernel provisions the init slot-5 sentinel only under the knob.
+        assert!(
+            A64_BOOT_SRC.contains("aarch64_futex_wake_oracle_enabled()")
+                && A64_BOOT_SRC.contains("init_args[5] = 1"),
+            "the AArch64 bootstrap must provision the slot-5 oracle sentinel under the knob"
+        );
+        // Init runs the oracle behind the slot-5 sentinel and proves first=1/second=0 via the
+        // authoritative kernel wake COUNT (handshake coordination, not timing).
+        assert!(
+            INIT_SRC.contains("run_aarch64_futex_wake_oracle")
+                && INIT_SRC.contains("supervisor_control_recv_ep == Some(1)"),
+            "init must gate the oracle behind the slot-5 sentinel"
+        );
+        assert!(
+            INIT_SRC.contains("AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0")
+                && INIT_SRC.contains("FUTEX_ORACLE_HANDSHAKE"),
+            "the oracle must use the handshake coordination and emit the ok proof marker"
+        );
+        // The child blocks through the LEGACY global-lock FutexWait (the waiter path under test).
+        assert!(
+            INIT_SRC.contains("futex_wait(addr, observed, observed)"),
+            "the oracle child must block through the legacy FutexWait path"
+        );
+    }
+
+    // The smoke accepts the FutexWake oracle markers under FUTEX_WAKE_ORACLE=1 and forces SMP=1
+    // (single-dispatcher proof; the freshly-spawned waiter must land on the sole dispatching CPU).
+    #[test]
+    fn smoke_accepts_futex_wake_oracle() {
+        assert!(
+            A64_SMOKE.contains("FUTEX_WAKE_ORACLE")
+                && A64_SMOKE.contains("yarm.aarch64_futex_wake_oracle=1")
+                && A64_SMOKE.contains("QEMU_SMP=1"),
+            "the smoke must expose the oracle knob and force single-CPU"
+        );
+        assert!(
+            A64_SMOKE
+                .contains("AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0")
+                && A64_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=10"),
+            "the smoke must require the FutexWake NR 10 + live-oracle acceptance markers"
+        );
+        // The old forbid of class=FutexWake must be gone; FutexWait/Yield stay forbidden.
+        assert!(
+            A64_SMOKE.contains("arch=aarch64 class=FutexWait")
+                && A64_SMOKE.contains("arch=aarch64 class=Yield"),
+            "the smoke must still forbid queue-advancing FutexWait/Yield split markers"
+        );
+    }
+
+    // The NR 27 InitramfsReadChunk deprecation TODO is documented (remove after ZC-grant proven).
+    #[test]
+    fn nr27_deprecation_todo_documented() {
+        assert!(
+            SYSCALL_SRC.contains("TODO(deprecated-legacy-ABI)")
+                && SYSCALL_SRC.contains("InitramfsReadChunk")
+                && SYSCALL_SRC.contains("ZC-grant"),
+            "NR 27 must carry the deprecated-legacy-ABI removal TODO"
+        );
+    }
+
+    // Docs record FutexWake as live on AArch64 and note the NR-10 (not NR-11) correction.
+    #[test]
+    fn docs_updated_for_futex_wake() {
+        assert!(
+            AARCH64_DOC.contains("FutexWake is now LIVE on AArch64 (Stage 195C)")
+                && AARCH64_DOC.contains("NR 10"),
+            "ARCH_AARCH64.md must record FutexWake live on AArch64 at NR 10"
         );
     }
 }

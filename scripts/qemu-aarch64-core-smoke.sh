@@ -39,6 +39,22 @@ if [[ "$CROSS_ARCH_D6" == "1" && "$KERNEL_CMDLINE" != *"yarm.cross_arch_d6="* ]]
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.cross_arch_d6=1"
 fi
 
+# Stage 195C (AARCH64 FUTEXWAKE LIVE ORACLE): FUTEX_WAKE_ORACLE=1 appends
+# yarm.aarch64_futex_wake_oracle=1, which provisions the init slot-5 sentinel that runs the
+# default-off parent/child FutexWake live oracle. A child blocks through the LEGACY global-lock
+# FutexWait; init wakes it through the SPLIT FutexWake path and proves the authoritative wake
+# counts (first=1, second=0). The FutexWake split-dispatch class is NR 10 (the task text's
+# "NR11" is incorrect — NR 11 is SpawnThread).
+FUTEX_WAKE_ORACLE=${FUTEX_WAKE_ORACLE:-0}
+if [[ "$FUTEX_WAKE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_futex_wake_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_futex_wake_oracle=1"
+  # AArch64 dispatches user tasks on the BSP only (single-dispatcher; APs are wake-only).
+  # The freshly-spawned waiter is enqueued balanced, so on SMP>1 it can land on a
+  # non-dispatching AP and never run. The oracle is a single-dispatcher proof — boot it on a
+  # single CPU so the waiter is guaranteed to be enqueued on the sole dispatching CPU.
+  QEMU_SMP=1
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64-hwe}
@@ -214,20 +230,48 @@ if [[ -f "$LOGFILE" ]]; then
     echo "[error] aarch64 Stage 195A/195B split-dispatch markers missing"
     exit 1
   fi
-  # Forbid split fatals and any AArch64 queue-advancing (FutexWait/Yield) or not-yet-enabled
-  # (FutexWake) retirement marker.
+  # Forbid split fatals and any AArch64 queue-advancing (FutexWait/Yield) retirement marker.
+  # Stage 195C ENABLES FutexWake (NR 10) split-dispatch, so `class=FutexWake` is NO LONGER
+  # forbidden; FutexWait/Yield remain inert (queue-advancing classes are out of scope).
   for a64_split_bad in \
       "AARCH64_SPLIT_FINALIZE_OK nr=15 result=error" \
       "AARCH64_SPLIT_FINALIZE_OK nr=27 result=error" \
+      "AARCH64_SPLIT_FINALIZE_OK nr=10 result=error" \
       "arch=aarch64 class=FutexWait" \
-      "arch=aarch64 class=Yield" \
-      "arch=aarch64 class=FutexWake"; do
+      "arch=aarch64 class=Yield"; do
     if cad_has "$a64_split_bad"; then
-      echo "[error] aarch64 Stage 195A/195B: forbidden split marker: $a64_split_bad"
+      echo "[error] aarch64 Stage 195A/195B/195C: forbidden split marker: $a64_split_bad"
       exit 1
     fi
   done
   echo "[ok] aarch64 Stage 195A/195B: DebugLog + InitramfsReadChunk split-dispatch live (queue-advancing inert)"
+fi
+
+# Stage 195C (AARCH64 FUTEXWAKE LIVE ORACLE): when booted with the oracle knob, require the
+# full FutexWake split-dispatch + live-oracle marker set and forbid any oracle/split failure.
+if [[ -f "$LOGFILE" && "$FUTEX_WAKE_ORACLE" == "1" ]]; then
+  if ! check_required_patterns "$LOGFILE" \
+      "AARCH64_SPLIT_ABI_IMPORT_OK nr=10" \
+      "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=10" \
+      "FUTEX_WAKE_SPLIT_BEGIN arch=aarch64" \
+      "FUTEX_WAKE_SPLIT_DONE arch=aarch64 result=ok woke=1" \
+      "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=FutexWake" \
+      "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWake result=ok" \
+      "AARCH64_SPLIT_FINALIZE_OK nr=10 result=ok" \
+      "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0"; then
+    echo "[error] aarch64 Stage 195C FutexWake live-oracle markers missing"
+    exit 1
+  fi
+  for a64_oracle_bad in \
+      "AARCH64_FUTEX_WAKE_ORACLE_SPAWN_FAIL" \
+      "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail" \
+      "AARCH64_SPLIT_FINALIZE_OK nr=10 result=error"; do
+    if cad_has "$a64_oracle_bad"; then
+      echo "[error] aarch64 Stage 195C: forbidden oracle marker: $a64_oracle_bad"
+      exit 1
+    fi
+  done
+  echo "[ok] aarch64 Stage 195C: FutexWake (NR 10) split-dispatch live oracle proven (first_wake=1 second_wake=0)"
 fi
 
 if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then

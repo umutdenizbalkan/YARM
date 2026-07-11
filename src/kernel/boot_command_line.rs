@@ -300,6 +300,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_ipc_send_cap_enqueue_oracle_enabled(enabled);
         crate::yarm_log!("YARM_IPC_SEND_CAP_ENQUEUE_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.aarch64_futex_wake_oracle {
+        // Stage 195C: default-off AArch64 FutexWake live oracle knob (independent of the
+        // IPC proof knob). Signals init to run the parent/child FutexWake oracle.
+        crate::kernel::boot::set_aarch64_futex_wake_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_AARCH64_FUTEX_WAKE_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ap_user_dispatch {
         // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
         // first live AP user dispatch. No-op on other arches; when OFF the AP
@@ -494,6 +500,10 @@ pub struct YarmBootOptions<'a> {
     /// message enqueues; a later recv materializes a fresh receiver-local cap) that fires the
     /// 193F `class=IpcSendOrdinaryCapEnqueue` boundary split in QEMU.
     pub ipc_send_cap_enqueue_oracle: Option<bool>,
+    /// Stage 195C: `yarm.aarch64_futex_wake_oracle=1` DEFAULT-OFF knob (independent of the
+    /// IPC proof knob). Signals AArch64 init to run the parent/child FutexWake live oracle
+    /// that fires the `class=FutexWake` split retirement + wake-count proof in QEMU.
+    pub aarch64_futex_wake_oracle: Option<bool>,
     /// Stage 189C6: `yarm.ap_user_dispatch=1` DEFAULT-OFF gate that arms the first
     /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
     /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
@@ -635,6 +645,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.ipc_send_cap_enqueue_oracle" {
             options.ipc_send_cap_enqueue_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.aarch64_futex_wake_oracle" {
+            options.aarch64_futex_wake_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.ap_user_dispatch" {
             options.ap_user_dispatch = parse_bool_knob(value);
@@ -1005,6 +1018,32 @@ mod tests {
             parse_yarm_boot_options(b"yarm.ipc_recv_proof=1 yarm.ipc_recv_proof_sender_wake=1");
         assert_eq!(both.ipc_recv_proof, Some(true));
         assert_eq!(both.ipc_recv_proof_sender_wake, Some(true));
+    }
+
+    // Stage 195C: the AArch64 FutexWake live-oracle knob parses as a standard bool knob,
+    // defaults to None (off), and is fully independent of every IPC-proof knob (no aliasing).
+    #[test]
+    fn aarch64_futex_wake_oracle_knob_parses_and_defaults_off() {
+        assert_eq!(parse_yarm_boot_options(b"").aarch64_futex_wake_oracle, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.aarch64_futex_wake_oracle=1").aarch64_futex_wake_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.aarch64_futex_wake_oracle=0").aarch64_futex_wake_oracle,
+            Some(false)
+        );
+        // Independent of the IPC-proof knobs (no prefix aliasing in either direction).
+        let ipc_only = parse_yarm_boot_options(b"yarm.ipc_recv_proof=1");
+        assert_eq!(ipc_only.aarch64_futex_wake_oracle, None);
+        let oracle_only = parse_yarm_boot_options(b"yarm.aarch64_futex_wake_oracle=1");
+        assert_eq!(oracle_only.ipc_recv_proof, None);
+        assert_eq!(oracle_only.ipc_recv_proof_sender_wake, None);
+        // Both together parse independently.
+        let both =
+            parse_yarm_boot_options(b"yarm.ipc_recv_proof=1 yarm.aarch64_futex_wake_oracle=1");
+        assert_eq!(both.ipc_recv_proof, Some(true));
+        assert_eq!(both.aarch64_futex_wake_oracle, Some(true));
     }
 
     // Stage 193B: the send-plain-oracle SUB-knob parses as a standard bool knob,

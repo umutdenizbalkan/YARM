@@ -60,6 +60,8 @@ pub mod syscall {
     /// not add a syscall.
     pub const SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR: usize = 8;
     const SYSCALL_FUTEX_WAIT_NR: usize = 9;
+    const SYSCALL_FUTEX_WAKE_NR: usize = 10;
+    const SYSCALL_SPAWN_THREAD_NR: usize = 11;
     const SYSCALL_YIELD_NR: usize = 0;
     /// Stage 163 proof-only: `Fork` (NR 12). Already part of the frozen syscall
     /// ABI; this constant only re-exposes the existing number for the sender-wake
@@ -1075,6 +1077,60 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(ret.ret0 != 0)
+    }
+
+    /// Wake up to `max_wake` waiters blocked on the futex word at `addr` (NR 10).
+    /// Returns the number of waiters actually woken. On AArch64 (Stage 195C) this flows
+    /// through the split-dispatch seam (`try_split_futex_wake_into_frame`); the count is
+    /// in x0 (`ret0`), byte-identical to the legacy global-lock return.
+    #[inline]
+    pub fn futex_wake(addr: *const u32, max_wake: u32) -> core::result::Result<u32, SyscallError> {
+        // SAFETY: Uses architecture syscall ABI. The kernel validates that `addr` names a
+        // readable current-user futex word before scanning waiters.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_FUTEX_WAKE_NR,
+                [addr as usize, max_wake as usize, 0, 0, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        // AArch64/RISC-V: the split/global return puts the wake COUNT in ret0 (a small
+        // count, always well below any error-code range), and no separate error lane.
+        Ok(ret.ret0 as u32)
+    }
+
+    /// Spawn a new user thread in the caller's address space (NR 11). `entry` is the
+    /// thread entry VA, `stack_top` the top of a caller-owned stack region, `tls_base`
+    /// the thread TLS base (0 = none). Returns the new thread's TID.
+    ///
+    /// # Safety
+    /// `entry` must be a valid code VA and `stack_top` the top of a writable stack region
+    /// that outlives the thread; the thread never returns (it must loop or block).
+    #[inline]
+    pub unsafe fn spawn_thread(
+        tls_base: usize,
+        stack_top: usize,
+        entry: usize,
+    ) -> core::result::Result<u64, SyscallError> {
+        // SAFETY: caller upholds the entry/stack contract; the kernel validates the parent.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_SPAWN_THREAD_NR,
+                [tls_base, stack_top, entry, 0, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 == 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(ret.ret0 as u64)
     }
 
     #[inline]
