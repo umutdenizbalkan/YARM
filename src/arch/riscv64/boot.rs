@@ -1552,6 +1552,14 @@ pub fn bootstrap_first_user_task(
         // so init fills E1 to exactly full with non-blocking sends and never blocks.
         init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
     }
+    // Stage 196C: default-off RISC-V FutexWake live oracle. Slot 5
+    // (supervisor_control_recv_ep) is unused by init on RISC-V, so under
+    // `yarm.riscv64_futex_wake_oracle=1` we reuse it as a sentinel (=1) that tells init to
+    // run the parent/child split-FutexWake proof. A normal boot leaves it 0 and init skips it.
+    if crate::kernel::boot::riscv_futex_wake_oracle_enabled() {
+        init_args[5] = 1;
+        crate::yarm_log!("RISCV_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1");
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

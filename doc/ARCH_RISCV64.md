@@ -486,11 +486,56 @@ lock. Nothing else is retired.
   `RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK` — emitted by **init userspace** right
   after `INIT_RUN_ENTER`, proving a subsequent userspace log runs after the split
   DebugLog returns.
-- **Still excluded:** FutexWake, FutexWait, Yield, InitramfsReadChunk (NR 27,
-  deprecated — NOT ported), D2 recv/send, IpcSend boundary, VM/spawn/fork/cap-mint,
-  ReapFaultedTask. The shared-wrapper foundation markers and the default-off
-  post-lock oracle are preserved. Recommended next class: **FutexWake** (Stage
-  196C) — waiter/run-queue mutation only, no caller task-switch.
+- **Still excluded (as of 196B):** FutexWake, FutexWait, Yield, InitramfsReadChunk
+  (NR 27, deprecated — NOT ported), D2 recv/send, IpcSend boundary,
+  VM/spawn/fork/cap-mint, ReapFaultedTask. The shared-wrapper foundation markers
+  and the default-off post-lock oracle are preserved. Recommended next class:
+  **FutexWake** (Stage 196C) — waiter/run-queue mutation only, no caller task-switch.
+
+### 9.4 Stage 196C — FutexWake (NR 10) split-dispatch retirement + live oracle
+
+Stage 196C enables the **second** RISC-V split-dispatch class, **FutexWake (NR
+10)** — the first RISC-V class that mutates kernel state off the global lock.
+
+- **Selective gate.** The wrapper's Phase 1 gate is extended to
+  `nr == SYSCALL_DEBUG_LOG_NR || nr == SYSCALL_FUTEX_WAKE_NR`; every other syscall
+  still falls through to the broad-lock handler exactly once. FutexWait (NR 9)
+  stays global-lock-only. Markers are nr-templated:
+  `RISCV_SPLIT_ABI_IMPORT_OK nr={10|15}`,
+  `YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={10|15}`,
+  `RISCV_SPLIT_FINALIZE_OK nr={10|15}`.
+- **Lock/rank proof (reused 191B seam).** FutexWake reuses the accepted
+  `try_split_futex_wake_into_frame` → `SharedKernel::futex_wake_split_mut`:
+  **Phase A** scans matching TCBs under the rank-2 task seam, flips each
+  `Blocked(Futex(addr)) → Runnable`, and records the woken tids in a fixed
+  bounded buffer, then releases the task seam; **Phase B** enqueues each woken
+  tid through the rank-1 scheduler seam. No broad `&mut KernelState`, no new
+  lock, no nested task+scheduler lock. The waiter state changes once, the
+  scheduler enqueue happens once, the **caller stays `current`** (FutexWake never
+  context-switches the caller), and no SATP switch / post-lock switch drain is
+  needed.
+- **Same-task sret parity.** Like DebugLog, a handled FutexWake returns EARLY
+  from Phase 1 (before the active flag / `with_cpu`): the helper writes the wake
+  count into a0 via `set_ok(woke,0,0)`, and the bridge's same-task ecall
+  write-back finalizes it — `sepc+4` once, `sstatus` preserved, no stale args over
+  the result. Markers: `FUTEX_WAKE_SPLIT_BEGIN/DONE arch=riscv64 result=ok
+  woke=<count>`, `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE arch=riscv64 class=FutexWake
+  result=ok`.
+- **Live oracle** (`yarm.riscv64_futex_wake_oracle=1`, default-off; init slot-5
+  sentinel = 1). The child blocks through the LEGACY global-lock FutexWait (NR 9);
+  the parent (init) uses the **authoritative handshake futex** (not a delay loop)
+  to know the child is `Blocked(Futex)`, then wakes it through the SPLIT path
+  (count must be 1), wakes again (count must be 0), and the child resumes exactly
+  once. Markers: `RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1
+  second_wake=0 waiter_tid=<tid>` and the userspace return proof
+  `RISCV_FUTEX_WAKE_USER_RETURN_OK first_wake=1 second_wake=0` (emitted by
+  userspace after BOTH split wakes return).
+- **Still excluded:** FutexWait, Yield, InitramfsReadChunk (NR 27), D2, IpcSend,
+  VM/spawn/fork/cap-mint, ReapFaultedTask (0 `class=<other>` retirement markers,
+  0 `RISCV_{FUTEX_WAIT,YIELD}_DISPATCH_*`). DebugLog stays live. 2 MiB trap-stack
+  fix + measurement TODO preserved. Recommended next: **Stage 196D** — the RISC-V
+  queue-advancing foundation (post-`sret` context-switch drain + SATP/`sfence.vma`
+  restore proof) that FutexWait/Yield require.
 
 ---
 

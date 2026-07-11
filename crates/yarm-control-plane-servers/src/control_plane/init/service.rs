@@ -665,10 +665,16 @@ fn register_crash_test_with_supervisor(supervisor_send: u32, crash_tid: u64) {
 // SPLIT path and verifies the authoritative wake counts (1 then 0). Default-off (slot-5
 // sentinel). The coordination signal is authoritative — the parent retries FutexWake and
 // treats the kernel's returned wake COUNT (not any timing) as the "child is blocked" proof.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    any(target_arch = "aarch64", target_arch = "riscv64")
+))]
 static FUTEX_ORACLE_WORD: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0x5A5A);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    any(target_arch = "aarch64", target_arch = "riscv64")
+))]
 static FUTEX_ORACLE_PARK: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0x1234);
 // Handshake futex: the parent (init) blocks on this to hand the CPU to the freshly-spawned
@@ -677,7 +683,10 @@ static FUTEX_ORACLE_PARK: core::sync::atomic::AtomicU32 =
 // the child has provably reached its own legacy FutexWait on the oracle word. (AArch64 cannot
 // fresh-dispatch a never-run thread through `yield`; it CAN through the block/dispatch path,
 // exactly as the control-plane servers first enter user mode.)
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    any(target_arch = "aarch64", target_arch = "riscv64")
+))]
 static FUTEX_ORACLE_HANDSHAKE: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0x00C0);
 // Stage 195F: never-woken word for the NO-INCOMING idle oracle. The final runnable user task
@@ -689,10 +698,16 @@ static FUTEX_ORACLE_IDLE_WORD: core::sync::atomic::AtomicU32 =
 // post-lock drain dispatched it (task B) after task A (init) yielded.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static YIELD_ORACLE_FLAG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    any(target_arch = "aarch64", target_arch = "riscv64")
+))]
 static mut FUTEX_ORACLE_CHILD_STACK: [u8; 16384] = [0u8; 16384];
 // `spawn_user_thread` requires a NON-zero TLS base; a small dedicated TLS region suffices.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    any(target_arch = "aarch64", target_arch = "riscv64")
+))]
 static mut FUTEX_ORACLE_CHILD_TLS: [u8; 512] = [0u8; 512];
 
 /// Child (waiter) thread entry: block ONCE on the oracle futex through the legacy
@@ -800,6 +815,98 @@ fn run_aarch64_futex_wake_oracle(init_tid: u64, futex_wait_mode: bool) {
             "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail first_wake={} second_wake={}",
             first_wake,
             second_wake
+        );
+    }
+}
+
+// ─── Stage 196C: RISC-V FutexWake live oracle ────────────────────────────────────────
+// The RISC-V port of the 195C parent/child FutexWake (NR 10) proof. The child blocks through
+// the LEGACY global-lock FutexWait (NR 9, still global-lock-only on RISC-V); the parent (init)
+// wakes it through the SPLIT path (NR 10, retired in Stage 196C) and verifies the authoritative
+// wake counts (1 then 0). Default-off (slot-5 sentinel = 1). The handshake futex is the
+// authoritative coordination signal — when the parent's FutexWait returns, the child is provably
+// Blocked(Futex) on the oracle word (NOT a timing/delay-loop assumption).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+extern "C" fn riscv_futex_oracle_child() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    // Wake the parent (init), blocked on the handshake futex. FutexWake does NOT context-switch,
+    // so we keep the CPU and fall straight into our own FutexWait below; init is only dispatched
+    // once we are provably Blocked(Futex) on the oracle word.
+    let handshake = FUTEX_ORACLE_HANDSHAKE.as_ptr();
+    yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_CHILD_WAKE_PARENT");
+    let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+    let addr = FUTEX_ORACLE_WORD.as_ptr();
+    let observed = FUTEX_ORACLE_WORD.load(Relaxed);
+    yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_CHILD_WAIT_BEGIN observed={}", observed);
+    // Legacy global-lock FutexWait (NOT split) — blocks on Futex(addr) and hands the CPU to the
+    // now-Runnable parent.
+    let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+    yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_CHILD_WOKE");
+    // Park on an unrelated futex so a second wake on the oracle word finds no waiter.
+    let park = FUTEX_ORACLE_PARK.as_ptr();
+    loop {
+        let pv = FUTEX_ORACLE_PARK.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+    }
+}
+
+/// Stage 196C parent (waker): spawn the child, wait for the authoritative handshake that it is
+/// Blocked(Futex), wake it once through the SPLIT path (count must be 1), wake again (count must
+/// be 0). Emits the live-oracle proof marker and the userspace return-proof marker.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn run_riscv_futex_wake_oracle(init_tid: u64) {
+    yarm_user_rt::user_log!("RISCV_FUTEX_WAKE_ORACLE_BEGIN init_tid={}", init_tid);
+    let addr = FUTEX_ORACLE_WORD.as_ptr();
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = riscv_futex_oracle_child as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("RISCV_FUTEX_WAKE_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_CHILD_SPAWNED child_tid={}", child_tid);
+    // Authoritative coordination (NOT timing): block on the handshake futex to hand the CPU to the
+    // freshly-spawned child. RISC-V fresh-dispatches the never-run child through this block/dispatch
+    // path (the same one that first enters the control-plane servers into user mode). The child
+    // wakes us, then blocks on the oracle word; when THIS FutexWait returns, the child is provably
+    // Blocked(Futex) on the oracle word.
+    let handshake = FUTEX_ORACLE_HANDSHAKE.as_ptr();
+    let hv = FUTEX_ORACLE_HANDSHAKE.load(core::sync::atomic::Ordering::Relaxed);
+    yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_PARENT_HANDSHAKE_WAIT hv={}", hv);
+    let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
+    yarm_user_rt::user_log!("RISCV_FUTEX_ORACLE_PARENT_RESUMED");
+    // The child is now Blocked(Futex) on the oracle word. Wake exactly once through the SPLIT path
+    // (NR 10) — the kernel's returned wake COUNT must be 1 (waiter → Runnable, enqueued once).
+    let first_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0);
+    // Second wake: the child is now Runnable (no longer Blocked) and parks on an unrelated futex,
+    // so no waiter remains on the oracle word → count must be 0.
+    let second_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0xFFFF);
+    // Userspace return proof: BOTH split FutexWake syscalls returned to userspace (same-task sret)
+    // and this subsequent instruction runs with the correct wake counts in hand.
+    yarm_user_rt::user_log!(
+        "RISCV_FUTEX_WAKE_USER_RETURN_OK first_wake={} second_wake={}",
+        first_wake,
+        second_wake
+    );
+    if first_wake == 1 && second_wake == 0 {
+        yarm_user_rt::user_log!(
+            "RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid={}",
+            child_tid
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail first_wake={} second_wake={} waiter_tid={}",
+            first_wake,
+            second_wake,
+            child_tid
         );
     }
 }
@@ -1374,6 +1481,13 @@ pub fn run() {
     if ctx.supervisor_control_recv_ep == Some(5) {
         // Slot-5 sentinel 5 = Stage 195G lone-task Yield oracle (Proof B).
         run_aarch64_yield_lone_task_oracle(ctx.task_id);
+    }
+    // Stage 196C: default-off RISC-V FutexWake live oracle. Slot-5 sentinel 1 (set by the RISC-V
+    // boot under `yarm.riscv64_futex_wake_oracle=1`) tells init to run the parent/child split
+    // FutexWake proof. A normal boot leaves slot 5 = None and skips this entirely.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if ctx.supervisor_control_recv_ep == Some(1) {
+        run_riscv_futex_wake_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

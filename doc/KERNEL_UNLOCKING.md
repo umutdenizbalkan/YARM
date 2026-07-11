@@ -8512,6 +8512,39 @@ first prerequisite; it is deferred rather than half-landed so the proven in-lock
 `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait`.** Yield stays a separate future
 slice (its re-enqueue proof is independent). See §4.7 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 196C — RISC-V FutexWake (NR 10) split-dispatch retirement + live oracle (DONE)
+
+RISC-V enables its **second** split-dispatch class, **FutexWake (NR 10)** — the
+first RISC-V class that mutates kernel state off the global lock (§9.4 of
+`doc/ARCH_RISCV64.md`).
+
+- **Gate extended** to `nr == DEBUG_LOG_NR || nr == FUTEX_WAKE_NR`; markers
+  nr-templated. FutexWait (NR 9) stays global-lock-only. Every other syscall
+  still falls through to the broad-lock handler exactly once.
+- **Reused 191B seam** `try_split_futex_wake_into_frame` →
+  `futex_wake_split_mut`: Phase A (rank-2 task seam) flips matching
+  `Blocked(Futex)→Runnable` into a bounded buffer; Phase B (rank-1 scheduler
+  seam) enqueues each once. No broad `&mut KernelState`, no new lock, no nested
+  task+scheduler lock; waiter state changes once, enqueue once, **caller stays
+  `current`** (no context-switch, no SATP switch, no post-lock drain).
+- **Same-task sret parity:** handled FutexWake returns EARLY (before the active
+  flag / `with_cpu`); the helper writes the wake count via `set_ok(woke,0,0)`,
+  and the bridge's same-task write-back finalizes (`sepc+4` once, `sstatus`
+  preserved, a0 = wake count). Markers `FUTEX_WAKE_SPLIT_{BEGIN,DONE}
+  arch=riscv64 result=ok woke=<n>`, `GLOBAL_LOCK_RETIRE_CLASS_{BEGIN,DONE}
+  arch=riscv64 class=FutexWake result=ok`.
+- **Live oracle** (`yarm.riscv64_futex_wake_oracle=1`, default-off; init slot-5=1):
+  child blocks legacy NR 9; parent uses the authoritative handshake futex to know
+  the child is `Blocked(Futex)`, wakes via split NR 10 (count 1), wakes again
+  (count 0), child resumes once. `RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok
+  first_wake=1 second_wake=0 waiter_tid=<tid>` + userspace
+  `RISCV_FUTEX_WAKE_USER_RETURN_OK first_wake=1 second_wake=0`.
+- **Excluded:** FutexWait/Yield/InitramfsReadChunk(NR27)/D2/IpcSend/VM/spawn/fork/
+  cap-mint/ReapFaultedTask (0 `class=<other>` retirement, 0
+  `RISCV_{FUTEX_WAIT,YIELD}_DISPATCH_*`). DebugLog stays live; foundation markers +
+  post-lock oracle preserved; counts unchanged (32/23); 2 MiB trap-stack fix +
+  TODO preserved. Next: **196D** RISC-V queue-advancing foundation.
+
 #### Stage 196B — RISC-V DebugLog (NR 15) split-dispatch retirement (DONE)
 
 RISC-V enables **exactly one** split-dispatch retirement class: **DebugLog (NR

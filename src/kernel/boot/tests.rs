@@ -62587,15 +62587,15 @@ mod stage195b_aarch64_initramfs_read_chunk {
                 "queue-advancing drain `{needle}` must stay x86_64-gated"
             );
         }
-        // Stage 196B: RISC-V split dispatch is gated to DebugLog (NR 15) ONLY, and NO
-        // queue-advancing RISC-V drain exists — FutexWait/Yield stay global-lock-only. The
-        // wrapper routes ONLY NR 15 to the split dispatcher.
+        // Stage 196C: RISC-V split dispatch is gated to DebugLog (NR 15) + FutexWake (NR 10)
+        // ONLY, and NO queue-advancing RISC-V drain exists — FutexWait/Yield stay
+        // global-lock-only. The wrapper routes ONLY those two NRs to the split dispatcher.
         assert!(
-            RISCV_TRAP_SRC
-                .contains("frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR")
                 && !RISCV_TRAP_SRC.contains("RISCV_FUTEX_WAIT_DISPATCH_")
                 && !RISCV_TRAP_SRC.contains("RISCV_YIELD_DISPATCH_"),
-            "RISC-V split dispatch must be DebugLog-only with no queue-advancing drain"
+            "RISC-V split dispatch must be DebugLog+FutexWake-only with no queue-advancing drain"
         );
         assert!(
             !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
@@ -63798,30 +63798,34 @@ mod stage196a_riscv_shared_trap_foundation {
     // DebugLog wiring proof.)
     #[test]
     fn split_dispatcher_debuglog_only() {
-        // The wrapper gates split dispatch behind an explicit NR-15 check.
+        // Stage 196C: the wrapper gates split dispatch to NR 15 (DebugLog) + NR 10 (FutexWake).
         assert!(
-            RISCV_TRAP_SRC
-                .contains("frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR")
                 && RISCV_TRAP_SRC.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
-            "RISC-V wrapper must only invoke the split dispatcher for NR 15 (DebugLog)"
+            "RISC-V wrapper must invoke the split dispatcher for NR 15 + NR 10 only"
         );
-        // Smoke must class-specifically forbid every NON-DebugLog retirement class.
+        // Smoke must class-specifically forbid every NON-retired class (FutexWake is now allowed).
         for c in [
-            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake",
             "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
             "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
             "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk",
         ] {
             assert!(
                 RISCV_SMOKE.contains(c),
-                "smoke must reject non-DebugLog RISC-V retirement class: {c}"
+                "smoke must reject non-retired RISC-V retirement class: {c}"
             );
         }
-        // Smoke must require the DebugLog live markers and the nr!=15 guard.
+        // FutexWake must NOT be in the reject list anymore (it is retired in 196C).
+        assert!(
+            !RISCV_SMOKE.contains("'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake'"),
+            "smoke must NOT forbid class=FutexWake (retired in 196C)"
+        );
+        // Smoke must require the split-dispatch marker + the DebugLog/FutexWake-only guard.
         assert!(
             RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15")
-                && RISCV_SMOKE.contains("serviced a non-DebugLog syscall"),
-            "smoke must assert DebugLog-only split dispatch"
+                && RISCV_SMOKE.contains("non-DebugLog/non-FutexWake syscall"),
+            "smoke must assert DebugLog+FutexWake-only split dispatch"
         );
     }
 
@@ -63882,19 +63886,19 @@ mod stage196b_riscv_debuglog_split {
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
 
-    // DebugLog is NR 15 and it is the sole class the RISC-V wrapper routes to the split dispatcher.
+    // Stage 196C: the RISC-V wrapper gates split dispatch to NR 15 (DebugLog) + NR 10 (FutexWake).
     #[test]
     fn debuglog_is_nr15_and_only_riscv_split_class() {
         assert_eq!(crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR, 15);
-        // The wrapper's split gate is an equality check on NR 15 (no range, no other NR).
+        assert_eq!(crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR, 10);
+        // The wrapper's split gate is an equality check on NR 15 and NR 10.
         assert!(
-            RISCV_TRAP_SRC
-                .contains("frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR"),
-            "the wrapper must gate split dispatch on NR 15 exactly"
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR"),
+            "the wrapper must gate split dispatch on NR 15 + NR 10"
         );
-        // No other syscall NR constant appears as a split gate in the wrapper.
+        // No queue-advancing / blocking class NR appears as a split gate in the wrapper.
         for other in [
-            "SYSCALL_FUTEX_WAKE_NR",
             "SYSCALL_FUTEX_WAIT_NR",
             "SYSCALL_YIELD_NR",
             "SYSCALL_INITRAMFS_READ_CHUNK_NR",
@@ -63910,13 +63914,13 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn required_debuglog_markers_present() {
         for m in [
-            "RISCV_SPLIT_ABI_IMPORT_OK nr=15",
-            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu=",
-            "RISCV_SPLIT_FINALIZE_OK nr=15 result=ok",
+            "RISCV_SPLIT_ABI_IMPORT_OK nr={}",
+            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu=",
+            "RISCV_SPLIT_FINALIZE_OK nr={} result=ok",
         ] {
             assert!(
                 RISCV_TRAP_SRC.contains(m),
-                "wrapper must emit DebugLog split marker: {m}"
+                "wrapper must emit split marker: {m}"
             );
         }
         // Retirement markers are arch=riscv64 tagged (added alongside the aarch64 tag; x86 stays
@@ -63945,9 +63949,9 @@ mod stage196b_riscv_debuglog_split {
     // DebugLog: no post-lock drain is owed.
     #[test]
     fn debuglog_split_returns_early_before_broad_lock() {
-        // The NR-15 handled arm returns before the flag is set / with_cpu runs.
+        // The handled split arm returns before the flag is set / with_cpu runs.
         let gate = RISCV_TRAP_SRC
-            .find("frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+            .find("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
             .expect("gate");
         let active_set = RISCV_TRAP_SRC
             .find(".store(true, Ordering::Relaxed)")
@@ -64001,9 +64005,9 @@ mod stage196b_riscv_debuglog_split {
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
         assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
-        // Smoke rejects the non-DebugLog retirement classes + the queue-advancing drains.
+        // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
+        // retired in 196C, so it is NOT rejected).
         for bad in [
-            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake",
             "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
             "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
             "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk",
@@ -64016,6 +64020,159 @@ mod stage196b_riscv_debuglog_split {
         assert!(
             !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
             "ReapFaultedTask must never pass the split NR gate"
+        );
+    }
+}
+
+// Stage 196C — RISC-V FUTEXWAKE (NR 10) SPLIT RETIREMENT + LIVE ORACLE. FutexWake is the SECOND
+// live RISC-V split-dispatch class (after DebugLog). These hosted source-check guards pin: NR
+// identities; the wrapper gates NR 10 + NR 15 only; the FutexWake helper is used; FutexWait stays
+// excluded; the retirement/split markers are arch=riscv64 tagged; the caller is not switched
+// (set_ok result lane, no post-lock drain); the live oracle (child blocks legacy NR 9, parent
+// wakes via split NR 10, counts 1 then 0) + userspace return proof exist; the knob + slot-5
+// provision are wired; DebugLog stays live; counts unchanged; queue-advancing classes stay inert.
+mod stage196c_riscv_futex_wake_split {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // NR identities (FutexWait=9, FutexWake=10, SpawnThread=11) — FutexWake is NOT 11.
+    #[test]
+    fn nr_identities() {
+        use crate::kernel::syscall::{
+            SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_SPAWN_THREAD_NR,
+        };
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_SPAWN_THREAD_NR, 11);
+    }
+
+    // The wrapper's split gate includes NR 10 and NR 15 ONLY (FutexWait NR 9 excluded).
+    #[test]
+    fn gate_is_nr10_and_nr15_only() {
+        assert!(
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR"),
+            "wrapper must gate split dispatch on NR 15 + NR 10"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "FutexWait (NR 9) must stay global-lock-only (not in the RISC-V split gate)"
+        );
+    }
+
+    // The FutexWake split helper is reused and its markers are arch=riscv64 tagged.
+    #[test]
+    fn futex_wake_helper_used_and_arch_tagged() {
+        assert!(
+            SPLIT_SRC.contains("try_split_futex_wake_into_frame(shared, cpu, frame)"),
+            "the frame-level seam must route FutexWake to its helper"
+        );
+        // futex_wake_split_mut (rank-proof seam) is the accepted 191B implementation.
+        assert!(
+            SPLIT_SRC.contains("futex_wake_split_mut"),
+            "the FutexWake helper must use the accepted futex_wake_split_mut seam"
+        );
+        // Arch-tagged split + retirement markers for riscv64 (alongside aarch64; x86 untagged).
+        for m in [
+            "FUTEX_WAKE_SPLIT_BEGIN arch=riscv64",
+            "FUTEX_WAKE_SPLIT_DONE arch=riscv64 result=ok woke=",
+            "arch=riscv64 class=FutexWake",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(m),
+                "syscall_split must emit riscv64 marker: {m}"
+            );
+        }
+    }
+
+    // The caller is NOT switched: FutexWake writes the wake count via set_ok and returns early
+    // (no broad-lock phase, no post-lock switch drain) — the caller stays current.
+    #[test]
+    fn caller_not_switched_wake_count_in_result_lane() {
+        // The helper writes the wake count into the result lane.
+        assert!(
+            SPLIT_SRC.contains("frame.set_ok(woke as usize, 0, 0)"),
+            "FutexWake must return the wake count in the a0 result lane via set_ok"
+        );
+        // The wrapper never advances sepc (bridge does it once) and never runs a queue-advancing
+        // switch on the split path.
+        assert!(
+            !RISCV_TRAP_SRC.contains("set_saved_pc")
+                && !RISCV_TRAP_SRC.contains("RISCV_FUTEX_WAIT_DISPATCH_")
+                && !RISCV_TRAP_SRC.contains("RISCV_YIELD_DISPATCH_"),
+            "the split FutexWake must not advance sepc twice or run a queue-advancing switch"
+        );
+    }
+
+    // The live oracle exists (child + parent) with the authoritative handshake coordination and
+    // emits the required proof markers; the knob + slot-5 provision are wired.
+    #[test]
+    fn live_oracle_and_wiring_present() {
+        assert!(
+            INIT_SRC.contains("fn run_riscv_futex_wake_oracle(")
+                && INIT_SRC.contains("extern \"C\" fn riscv_futex_oracle_child()"),
+            "the RISC-V FutexWake oracle parent + child must exist"
+        );
+        // Authoritative coordination: the parent blocks on the handshake futex (not a delay loop).
+        assert!(
+            INIT_SRC.contains("FUTEX_ORACLE_HANDSHAKE")
+                && INIT_SRC.contains("RISCV_FUTEX_ORACLE_PARENT_HANDSHAKE_WAIT"),
+            "the oracle must use the authoritative handshake-futex coordination"
+        );
+        // The child blocks through the LEGACY FutexWait (NR 9), the parent wakes via split NR 10.
+        for m in [
+            "RISCV_FUTEX_WAKE_USER_RETURN_OK first_wake={} second_wake={}",
+            "RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid={}",
+        ] {
+            assert!(INIT_SRC.contains(m), "oracle must emit: {m}");
+        }
+        // Knob + boot flag + slot-5 provision.
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_futex_wake_oracle")
+                && MOD_SRC.contains("fn riscv_futex_wake_oracle_enabled()")
+                && RISCV_BOOT_SRC.contains("RISCV_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1"),
+            "the FutexWake oracle knob + flag + slot-5 provision must be wired"
+        );
+        // Smoke arms + asserts the oracle end-to-end.
+        assert!(
+            RISCV_SMOKE.contains("FUTEX_WAKE_ORACLE")
+                && RISCV_SMOKE.contains("RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid=")
+                && RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=10 cpu=0 result=ok"),
+            "smoke must arm + assert the FutexWake live oracle"
+        );
+    }
+
+    // DebugLog stays live; FutexWait/Yield/NR27 stay excluded; ReapFaultedTask excluded; counts
+    // unchanged; trap-stack fix preserved.
+    #[test]
+    fn debuglog_live_others_excluded_counts_unchanged() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert!(
+            SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
+            "DebugLog must stay a live riscv64 split class"
+        );
+        for bad in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk",
+        ] {
+            assert!(RISCV_SMOKE.contains(bad), "smoke must still reject: {bad}");
+        }
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the 2 MiB trap-stack fix must be preserved"
         );
     }
 }

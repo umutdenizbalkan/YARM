@@ -345,6 +345,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             enabled
         );
     }
+    if let Some(enabled) = parsed.riscv64_futex_wake_oracle {
+        // Stage 196C: default-off RISC-V FutexWake (NR 10) live-oracle knob. Provisions init
+        // startup slot 5 so init runs the parent/child split-FutexWake proof (counts 1 then 0).
+        crate::kernel::boot::set_riscv_futex_wake_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_RISCV64_FUTEX_WAKE_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ap_user_dispatch {
         // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
         // first live AP user dispatch. No-op on other arches; when OFF the AP
@@ -563,6 +569,11 @@ pub struct YarmBootOptions<'a> {
     /// broad-lock phase, consume it after the lock drops via a real `with_cpu` re-acquire). It
     /// enables ZERO retirement classes and mutates no scheduler / cap / user-copy / switch state.
     pub riscv64_post_lock_foundation_oracle: Option<bool>,
+    /// Stage 196C: `yarm.riscv64_futex_wake_oracle=1` DEFAULT-OFF knob. Provisions init startup
+    /// slot 5 (=1) so init runs the parent/child split-FutexWake (NR 10) live proof. The
+    /// FutexWake retirement MECHANISM is live once the class is enabled; this only selects the
+    /// proof workload. Independent of the foundation-oracle knob.
+    pub riscv64_futex_wake_oracle: Option<bool>,
     /// Stage 189C6: `yarm.ap_user_dispatch=1` DEFAULT-OFF gate that arms the first
     /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
     /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
@@ -713,6 +724,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.riscv64_post_lock_foundation_oracle" {
             options.riscv64_post_lock_foundation_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.riscv64_futex_wake_oracle" {
+            options.riscv64_futex_wake_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_yield_oracle" {
             options.aarch64_yield_oracle = parse_bool_knob(value);
@@ -1208,6 +1222,25 @@ mod tests {
         let riscv = parse_yarm_boot_options(b"yarm.riscv64_post_lock_foundation_oracle=1");
         assert_eq!(riscv.aarch64_yield_oracle, None);
         assert_eq!(riscv.aarch64_futex_wait_idle_oracle, None);
+        // The 196C FutexWake oracle knob is independent of the 196A foundation oracle knob.
+        assert_eq!(riscv.riscv64_futex_wake_oracle, None);
+    }
+
+    // Stage 196C: the RISC-V FutexWake live-oracle knob parses independently and defaults off.
+    #[test]
+    fn riscv64_futex_wake_oracle_knob_parses_and_defaults_off() {
+        assert_eq!(parse_yarm_boot_options(b"").riscv64_futex_wake_oracle, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.riscv64_futex_wake_oracle=1").riscv64_futex_wake_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.riscv64_futex_wake_oracle=0").riscv64_futex_wake_oracle,
+            Some(false)
+        );
+        // Independent of the foundation oracle knob (no prefix aliasing).
+        let fw = parse_yarm_boot_options(b"yarm.riscv64_futex_wake_oracle=1");
+        assert_eq!(fw.riscv64_post_lock_foundation_oracle, None);
     }
 
     // Stage 193B: the send-plain-oracle SUB-knob parses as a standard bool knob,

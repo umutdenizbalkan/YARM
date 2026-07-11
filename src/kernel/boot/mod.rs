@@ -2305,6 +2305,24 @@ pub fn riscv_post_lock_foundation_oracle_enabled() -> bool {
     RISCV_POST_LOCK_FOUNDATION_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 196C: default-off RISC-V FutexWake (NR 10) live-oracle selector
+/// (`yarm.riscv64_futex_wake_oracle=1`). When enabled, the RISC-V boot provisions init
+/// startup slot 5 (=1) so init runs the parent/child split-FutexWake proof: the child
+/// blocks on the LEGACY global-lock FutexWait, the parent wakes it through the SPLIT path
+/// and verifies the authoritative wake counts (1 then 0). It enables NO additional
+/// retirement class (FutexWake retirement is the split MECHANISM, live by default once the
+/// class is enabled); this flag only selects the proof workload.
+pub(crate) static RISCV_FUTEX_WAKE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_futex_wake_oracle_enabled(enabled: bool) {
+    RISCV_FUTEX_WAKE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_futex_wake_oracle_enabled() -> bool {
+    RISCV_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.
 pub fn ipc_send_cap_enqueue_oracle_active() -> bool {
     ipc_recv_oracle_proof_enabled() && ipc_send_cap_enqueue_oracle_enabled()

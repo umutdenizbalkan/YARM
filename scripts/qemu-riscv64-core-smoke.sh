@@ -63,6 +63,14 @@ if [[ "$POST_LOCK_FOUNDATION_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_post_lock_foundation_oracle=1"
 fi
 
+# Stage 196C (FUTEXWAKE LIVE ORACLE): FUTEX_WAKE_ORACLE=1 appends
+# yarm.riscv64_futex_wake_oracle=1 to arm the default-off parent/child split-FutexWake proof
+# (child blocks on legacy NR 9 FutexWait; parent wakes via split NR 10, counts 1 then 0).
+FUTEX_WAKE_ORACLE=${FUTEX_WAKE_ORACLE:-0}
+if [[ "$FUTEX_WAKE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_futex_wake_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_futex_wake_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 
@@ -309,10 +317,10 @@ REJECT_PATTERNS=(
   # A healthy boot reaches RISCV_KERNEL_IDLE_WAITING_FOR_IO, never a kernel trap.
   'RISCV_TRAP_UNHANDLED'
   'reason=trap_from_s_mode'
-  # Stage 196B (DebugLog is the ONLY retired RISC-V class): every OTHER retirement
-  # class must stay global-lock-only. DebugLog (class=DebugLog) is explicitly allowed;
-  # these class-specific rejects catch any accidental additional retirement.
-  'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake'
+  # Stage 196C (DebugLog + FutexWake are the ONLY retired RISC-V classes): every OTHER
+  # retirement class must stay global-lock-only. class=DebugLog and class=FutexWake are
+  # explicitly allowed; these class-specific rejects catch any accidental additional
+  # retirement, and the queue-advancing dispatch markers must never appear.
   'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait'
   'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield'
   'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk'
@@ -467,15 +475,18 @@ if (( QEMU_SMP >= 2 )); then
   fi
 fi
 
-# Stage 196B: the RISC-V split dispatcher may service DebugLog (NR 15) ONLY. Any
-# `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is not 15 means another
-# class was wrongly retired off the global lock. Compare total vs nr=15 counts.
+# Stage 196C: the RISC-V split dispatcher may service DebugLog (NR 15) and FutexWake
+# (NR 10) ONLY. Any `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is neither 15
+# nor 10 means another class was wrongly retired off the global lock. Compare total vs
+# allowed (nr=15 + nr=10) counts.
 riscv_split_total=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=" "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_nr15=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr10=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=10 " "$LOGFILE" 2>/dev/null || echo 0)
 riscv_split_total=${riscv_split_total:-0}
 riscv_split_nr15=${riscv_split_nr15:-0}
-if (( riscv_split_total != riscv_split_nr15 )); then
-  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog syscall (total=${riscv_split_total} nr15=${riscv_split_nr15})"
+riscv_split_nr10=${riscv_split_nr10:-0}
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 )); then
+  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog/non-FutexWake syscall (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10})"
   failures=$((failures + 1))
 fi
 
@@ -500,6 +511,33 @@ if [[ "$POST_LOCK_FOUNDATION_ORACLE" == "1" ]]; then
   # same task (no scheduler mutation).
   if rg -n "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=task_switched" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] post-lock foundation oracle returned to a different task"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196C (FUTEXWAKE LIVE ORACLE): when armed, the parent/child split-FutexWake proof
+# must complete — child blocked, first wake=1, second wake=0, userspace return, live DONE.
+if [[ "$FUTEX_WAKE_ORACLE" == "1" ]]; then
+  FUTEX_WAKE_ORACLE_PATTERNS=(
+    "RISCV_FUTEX_ORACLE_CHILD_SPAWNED child_tid="
+    "RISCV_FUTEX_ORACLE_CHILD_WAIT_BEGIN observed="
+    "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=10 cpu=0 result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake result=ok"
+    "FUTEX_WAKE_SPLIT_DONE arch=riscv64 result=ok woke=1"
+    "RISCV_SPLIT_FINALIZE_OK nr=10 result=ok"
+    "RISCV_FUTEX_WAKE_USER_RETURN_OK first_wake=1 second_wake=0"
+    "RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid="
+    "RISCV_FUTEX_ORACLE_CHILD_WOKE"
+  )
+  for pat in "${FUTEX_WAKE_ORACLE_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] FutexWake live oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # A failed oracle DONE (wrong counts) is a proof failure.
+  if rg -n "RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] FutexWake live oracle reported wrong wake counts"
     failures=$((failures + 1))
   fi
 fi

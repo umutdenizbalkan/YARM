@@ -196,6 +196,10 @@ static RISCV_SHARED_TRAP_MARKERS_LOGGED: core::sync::atomic::AtomicBool =
 static RISCV_DEBUGLOG_SPLIT_MARKERS_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+// Stage 196C: same one-shot latch for the FutexWake (NR 10) split-dispatch markers.
+static RISCV_FUTEXWAKE_SPLIT_MARKERS_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // Stage 196A post-lock-drain FOUNDATION oracle state (default-off; armed by
 // `yarm.riscv64_post_lock_foundation_oracle=1`).
 //   - DONE_FLAG: one-shot guard so the oracle publishes/consumes exactly once.
@@ -243,39 +247,51 @@ pub fn handle_riscv_trap_entry_shared(
     let is_syscall = matches!(decode_trap_context(context), TrapEvent::Syscall);
 
     // ── Phase 1: pre-lock split dispatch — DebugLog (NR 15) ONLY ──
-    // Stage 196B: RISC-V enables exactly one split-dispatch retirement class,
-    // DebugLog. The RISC-V trap bridge has ALREADY imported the syscall ABI into
-    // the portable frame (a7→nr, a0..a5→args), so the split ABI is present; we
-    // gate the split dispatcher to NR 15 explicitly here so that the shared
-    // `try_split_dispatch_into_frame` (which also knows FutexWake / IpcRecv /
-    // VmBrk / InitramfsReadChunk / ControlPlaneSetCnodeSlots) can NEVER service any
-    // other class on RISC-V. A DebugLog serviced off the global lock returns EARLY
-    // (skipping the broad-lock phase + the active flag entirely); it needs no
-    // post-lock drain and never switches tasks, so the RISC-V bridge's existing
-    // same-task ecall write-back (sepc+4 once, sstatus preserved, a0..a2 result
-    // lanes from `set_ok`) finalizes it. Every other syscall falls through to the
-    // unchanged broad-lock handler exactly once.
-    if is_syscall && frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR {
-        let log_split = !RISCV_DEBUGLOG_SPLIT_MARKERS_LOGGED.swap(true, Ordering::Relaxed);
+    // Stage 196B/196C: RISC-V enables exactly TWO split-dispatch retirement classes,
+    // DebugLog (NR 15) and FutexWake (NR 10). The RISC-V trap bridge has ALREADY
+    // imported the syscall ABI into the portable frame (a7→nr, a0..a5→args), so the
+    // split ABI is present; we gate the split dispatcher to those two NRs explicitly
+    // here so that the shared `try_split_dispatch_into_frame` (which also knows
+    // IpcRecv / VmBrk / InitramfsReadChunk / ControlPlaneSetCnodeSlots) can NEVER
+    // service any other class on RISC-V. Both classes are serviced off the global
+    // lock and return EARLY (skipping the broad-lock phase + the active flag
+    // entirely): DebugLog is a pure read, and FutexWake only mutates waiter/run-queue
+    // state without switching the CALLER (it stays `current`). Neither needs a
+    // post-lock drain, so the RISC-V bridge's existing same-task ecall write-back
+    // (sepc+4 once, sstatus preserved, a0 result lane from `set_ok`) finalizes them.
+    // Every other syscall falls through to the unchanged broad-lock handler once.
+    let nr = frame.syscall_num();
+    let split_eligible = is_syscall
+        && (nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
+            || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR);
+    if split_eligible {
+        // Per-class one-shot latch so BOTH classes' markers appear once (without
+        // flooding: DebugLog fires thousands of times, FutexWake a handful).
+        let log_split = if nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR {
+            !RISCV_DEBUGLOG_SPLIT_MARKERS_LOGGED.swap(true, Ordering::Relaxed)
+        } else {
+            !RISCV_FUTEXWAKE_SPLIT_MARKERS_LOGGED.swap(true, Ordering::Relaxed)
+        };
         if log_split {
-            crate::yarm_log!("RISCV_SPLIT_ABI_IMPORT_OK nr=15");
+            crate::yarm_log!("RISCV_SPLIT_ABI_IMPORT_OK nr={}", nr);
         }
         if let Some(result) =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
         {
             match result {
                 Ok(()) => {
-                    // The DebugLog helper already wrote the success lanes via
-                    // `set_ok(0,0,0)` and emitted the arch-tagged
-                    // GLOBAL_LOCK_RETIRE_CLASS_{BEGIN,DONE} markers. Skip the
-                    // broad-lock phase: the active flag is NOT set, so no drain is
+                    // The class helper already wrote the success lanes via `set_ok`
+                    // and emitted its arch-tagged GLOBAL_LOCK_RETIRE_CLASS_{BEGIN,DONE}
+                    // (and, for FutexWake, FUTEX_WAKE_SPLIT_{BEGIN,DONE}) markers. Skip
+                    // the broad-lock phase: the active flag is NOT set, so no drain is
                     // owed and nothing is left true across the sret.
                     if log_split {
                         crate::yarm_log!(
-                            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu={} result=ok",
+                            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu={} result=ok",
+                            nr,
                             cpu.0
                         );
-                        crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr=15 result=ok");
+                        crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr={} result=ok", nr);
                     }
                     return Ok(());
                 }
@@ -286,11 +302,12 @@ pub fn handle_riscv_trap_entry_shared(
                     frame.set_err(e.code());
                     if log_split {
                         crate::yarm_log!(
-                            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu={} result=handled_err code={}",
+                            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu={} result=handled_err code={}",
+                            nr,
                             cpu.0,
                             e.code()
                         );
-                        crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr=15 result=handled_err");
+                        crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr={} result=handled_err", nr);
                     }
                     return Ok(());
                 }
@@ -298,8 +315,9 @@ pub fn handle_riscv_trap_entry_shared(
                 Err(other) => return Err(other),
             }
         }
-        // The helper declined (None: unavailable requester) — fall through to the
-        // unchanged broad-lock handler exactly once.
+        // The helper declined (None: unavailable requester, or a FutexWake
+        // validation miss that the global-lock path must encode canonically) —
+        // fall through to the unchanged broad-lock handler exactly once.
     }
 
     // One-shot latch for the structural markers. Consumed HERE (after the DebugLog
