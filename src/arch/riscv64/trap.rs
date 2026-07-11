@@ -189,9 +189,11 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
 static RISCV_SHARED_TRAP_MARKERS_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-// One-shot latch proving the pre-lock split dispatcher declines every RISC-V
-// syscall in this foundation stage (Part 6: zero retirement classes enabled).
-static RISCV_SPLIT_DISPATCH_DECLINED_LOGGED: core::sync::atomic::AtomicBool =
+// Stage 196B: one-shot latch for the DebugLog (NR 15) split-dispatch markers
+// (RISCV_SPLIT_ABI_IMPORT_OK / YARM_LOCK_SPLIT_DISPATCH / RISCV_SPLIT_FINALIZE_OK).
+// The split dispatch itself runs on EVERY DebugLog; only the log lines are latched
+// so the thousands of boot-time DebugLog calls do not flood the log.
+static RISCV_DEBUGLOG_SPLIT_MARKERS_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 // Stage 196A post-lock-drain FOUNDATION oracle state (default-off; armed by
@@ -209,10 +211,12 @@ static RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN: [core::sync::atomic::AtomicU64; 
 /// RISC-V trap bridge and enabling **zero** retirement classes.
 ///
 /// Phases (mirroring `arch/trap_entry.rs::handle_trap_entry_shared`):
-///   1. **Pre-lock phase** — the split dispatcher declines every RISC-V syscall
-///      (no `try_split_dispatch_into_frame`; no `YARM_LOCK_SPLIT_DISPATCH
-///      arch=riscv64` is ever emitted). This is the sole classification seam and
-///      it is inert by construction in this foundation stage.
+///   1. **Pre-lock phase** — the split dispatcher services exactly ONE class,
+///      DebugLog (NR 15, Stage 196B), off the global lock and returns early
+///      (skipping the broad-lock phase entirely). EVERY other RISC-V syscall is
+///      declined here (its nr never reaches `try_split_dispatch_into_frame`) and
+///      falls through to the unchanged broad-lock handler exactly once — so no
+///      other retirement class is enabled.
 ///   2. **Broad-lock phase** — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]` is set
 ///      TRUE (the RISC-V path now OWNS the flag, replacing the retired
 ///      force-false), then the UNCHANGED canonical trap handler runs inside a
@@ -237,20 +241,72 @@ pub fn handle_riscv_trap_entry_shared(
     use core::sync::atomic::Ordering;
     let cpu_idx = cpu.0 as usize;
     let is_syscall = matches!(decode_trap_context(context), TrapEvent::Syscall);
-    let log_structural = !RISCV_SHARED_TRAP_MARKERS_LOGGED.swap(true, Ordering::Relaxed);
 
-    // ── Phase 1: pre-lock split-dispatch classification (inert; declines all) ──
-    // Part 6: the RISC-V split dispatcher is inert in this foundation stage. We
-    // deliberately do NOT call `try_split_dispatch_into_frame`, so no RISC-V
-    // syscall is ever serviced off the global lock and no `YARM_LOCK_SPLIT_DISPATCH
-    // arch=riscv64` marker can appear. A single latched marker attests the inertness.
-    if is_syscall && !RISCV_SPLIT_DISPATCH_DECLINED_LOGGED.swap(true, Ordering::Relaxed) {
-        crate::yarm_log!(
-            "RISCV_SPLIT_DISPATCH_DECLINED_ALL cpu={} result=inert",
-            cpu.0
-        );
+    // ── Phase 1: pre-lock split dispatch — DebugLog (NR 15) ONLY ──
+    // Stage 196B: RISC-V enables exactly one split-dispatch retirement class,
+    // DebugLog. The RISC-V trap bridge has ALREADY imported the syscall ABI into
+    // the portable frame (a7→nr, a0..a5→args), so the split ABI is present; we
+    // gate the split dispatcher to NR 15 explicitly here so that the shared
+    // `try_split_dispatch_into_frame` (which also knows FutexWake / IpcRecv /
+    // VmBrk / InitramfsReadChunk / ControlPlaneSetCnodeSlots) can NEVER service any
+    // other class on RISC-V. A DebugLog serviced off the global lock returns EARLY
+    // (skipping the broad-lock phase + the active flag entirely); it needs no
+    // post-lock drain and never switches tasks, so the RISC-V bridge's existing
+    // same-task ecall write-back (sepc+4 once, sstatus preserved, a0..a2 result
+    // lanes from `set_ok`) finalizes it. Every other syscall falls through to the
+    // unchanged broad-lock handler exactly once.
+    if is_syscall && frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR {
+        let log_split = !RISCV_DEBUGLOG_SPLIT_MARKERS_LOGGED.swap(true, Ordering::Relaxed);
+        if log_split {
+            crate::yarm_log!("RISCV_SPLIT_ABI_IMPORT_OK nr=15");
+        }
+        if let Some(result) =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
+        {
+            match result {
+                Ok(()) => {
+                    // The DebugLog helper already wrote the success lanes via
+                    // `set_ok(0,0,0)` and emitted the arch-tagged
+                    // GLOBAL_LOCK_RETIRE_CLASS_{BEGIN,DONE} markers. Skip the
+                    // broad-lock phase: the active flag is NOT set, so no drain is
+                    // owed and nothing is left true across the sret.
+                    if log_split {
+                        crate::yarm_log!(
+                            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu={} result=ok",
+                            cpu.0
+                        );
+                        crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr=15 result=ok");
+                    }
+                    return Ok(());
+                }
+                Err(TrapHandleError::Syscall(e)) => {
+                    // A normal syscall error produced on the split path is encoded
+                    // into the frame and returned to userspace (parity with the
+                    // global-lock path); the split path stashed no switch plan.
+                    frame.set_err(e.code());
+                    if log_split {
+                        crate::yarm_log!(
+                            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu={} result=handled_err code={}",
+                            cpu.0,
+                            e.code()
+                        );
+                        crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr=15 result=handled_err");
+                    }
+                    return Ok(());
+                }
+                // A genuine kernel-side failure (e.g. MissingTrapFrame) — propagate.
+                Err(other) => return Err(other),
+            }
+        }
+        // The helper declined (None: unavailable requester) — fall through to the
+        // unchanged broad-lock handler exactly once.
     }
 
+    // One-shot latch for the structural markers. Consumed HERE (after the DebugLog
+    // early-return), so a split-DebugLog trap — which never reaches the broad-lock
+    // phase — does NOT swallow the latch; the markers fire on the first trap that
+    // actually runs the broad-lock phase (a timer/IRQ or non-DebugLog syscall).
+    let log_structural = !RISCV_SHARED_TRAP_MARKERS_LOGGED.swap(true, Ordering::Relaxed);
     if log_structural {
         crate::yarm_log!("RISCV_SHARED_TRAP_ENTRY_BEGIN cpu={}", cpu.0);
     }

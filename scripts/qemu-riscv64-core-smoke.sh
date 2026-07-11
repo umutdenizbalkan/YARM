@@ -222,11 +222,10 @@ REQUIRED_PATTERNS=(
   "CROSS_ARCH_SYSCALL_PARITY_OK arch=riscv64"
   "CROSS_ARCH_LIVE_DONE arch=riscv64 result=ok"
   # Stage 196A (RISC-V SHARED TRAP-PATH + POST-LOCK DRAIN FOUNDATION): the trap
-  # bridge now routes through the shared wrapper, which owns the active-flag
-  # lifecycle (set true before the bounded broad-lock phase, cleared after) and
-  # runs a post-lock drain after the guard drops. These structural markers are
-  # one-shot latched (first trap), so they appear exactly once per boot. The
-  # split dispatcher stays inert (declines every RISC-V syscall — zero retirement).
+  # bridge routes through the shared wrapper, which owns the active-flag lifecycle
+  # (set true before the bounded broad-lock phase, cleared after) and runs a
+  # post-lock drain after the guard drops. These structural markers are one-shot
+  # latched (first trap), so they appear exactly once per boot.
   "RISCV_SHARED_TRAP_ENTRY_BEGIN cpu="
   "RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET cpu="
   "RISCV_GLOBAL_LOCK_PHASE_DONE cpu="
@@ -234,8 +233,17 @@ REQUIRED_PATTERNS=(
   "RISCV_POST_LOCK_DRAIN_BEGIN cpu="
   "RISCV_POST_LOCK_DRAIN_DONE cpu="
   "RISCV_SHARED_TRAP_ENTRY_DONE cpu="
-  "RISCV_SPLIT_DISPATCH_DECLINED_ALL cpu="
   "YARM_LOCK_SPLIT_STAGE196A_INSTALLED arch=riscv64 shared=1 raw=0"
+  # Stage 196B (RISC-V DEBUGLOG SPLIT-DISPATCH RETIREMENT): DebugLog (NR 15) is the
+  # ONE live RISC-V split-dispatch class. The pre-lock split path services it off the
+  # global lock and returns to the same task via `sret`; the userspace return marker
+  # is emitted by init AFTER the split DebugLog returns (proving same-task resume).
+  "RISCV_SPLIT_ABI_IMPORT_OK nr=15"
+  "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu=0 result=ok"
+  "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=DebugLog"
+  "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=DebugLog result=ok"
+  "RISCV_SPLIT_FINALIZE_OK nr=15 result=ok"
+  "RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK"
 )
 
 # Nothing optional today: all required RAMFS/EXT4 markers above are
@@ -301,10 +309,13 @@ REJECT_PATTERNS=(
   # A healthy boot reaches RISCV_KERNEL_IDLE_WAITING_FOR_IO, never a kernel trap.
   'RISCV_TRAP_UNHANDLED'
   'reason=trap_from_s_mode'
-  # Stage 196A (zero RISC-V retirement classes): the split dispatcher is inert
-  # and no queue-advancing drain is enabled. NONE of these may appear.
-  'YARM_LOCK_SPLIT_DISPATCH arch=riscv64'
-  'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64'
+  # Stage 196B (DebugLog is the ONLY retired RISC-V class): every OTHER retirement
+  # class must stay global-lock-only. DebugLog (class=DebugLog) is explicitly allowed;
+  # these class-specific rejects catch any accidental additional retirement.
+  'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake'
+  'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait'
+  'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield'
+  'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk'
   'RISCV_FUTEX_WAIT_DISPATCH_'
   'RISCV_YIELD_DISPATCH_'
   # The retired raw-pointer trap path must not resurface.
@@ -454,6 +465,18 @@ if (( QEMU_SMP >= 2 )); then
     echo "[fail] multi-hart boot must emit RISCV_IRQ_SMP_TOPOLOGY_DEFERRED"
     failures=$((failures + 1))
   fi
+fi
+
+# Stage 196B: the RISC-V split dispatcher may service DebugLog (NR 15) ONLY. Any
+# `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is not 15 means another
+# class was wrongly retired off the global lock. Compare total vs nr=15 counts.
+riscv_split_total=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr15=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_total=${riscv_split_total:-0}
+riscv_split_nr15=${riscv_split_nr15:-0}
+if (( riscv_split_total != riscv_split_nr15 )); then
+  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog syscall (total=${riscv_split_total} nr15=${riscv_split_nr15})"
+  failures=$((failures + 1))
 fi
 
 # Stage 196A (POST-LOCK DRAIN FOUNDATION): when armed, the one-shot oracle must

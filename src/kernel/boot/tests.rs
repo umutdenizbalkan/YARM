@@ -62587,12 +62587,15 @@ mod stage195b_aarch64_initramfs_read_chunk {
                 "queue-advancing drain `{needle}` must stay x86_64-gated"
             );
         }
-        // Stage 196A: RISC-V now enters the shared wrapper, but its split dispatcher stays inert
-        // (declines all) and no queue-advancing RISC-V drain exists — zero retirement.
+        // Stage 196B: RISC-V split dispatch is gated to DebugLog (NR 15) ONLY, and NO
+        // queue-advancing RISC-V drain exists — FutexWait/Yield stay global-lock-only. The
+        // wrapper routes ONLY NR 15 to the split dispatcher.
         assert!(
-            !RISCV_TRAP_SRC.contains("try_split_dispatch_into_frame(shared")
-                && RISCV_TRAP_SRC.contains("RISCV_SPLIT_DISPATCH_DECLINED_ALL cpu="),
-            "RISC-V split dispatcher must remain inert (declines all syscalls)"
+            RISCV_TRAP_SRC
+                .contains("frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && !RISCV_TRAP_SRC.contains("RISCV_FUTEX_WAIT_DISPATCH_")
+                && !RISCV_TRAP_SRC.contains("RISCV_YIELD_DISPATCH_"),
+            "RISC-V split dispatch must be DebugLog-only with no queue-advancing drain"
         );
         assert!(
             !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
@@ -63790,25 +63793,35 @@ mod stage196a_riscv_shared_trap_foundation {
         );
     }
 
-    // Split dispatcher stays inert: the wrapper never calls try_split_dispatch_into_frame, so no
-    // RISC-V retirement marker can appear.
+    // Stage 196B: the wrapper's split dispatch is gated to DebugLog (NR 15) ONLY; every other
+    // RISC-V class stays global-lock-only. (See the dedicated stage196b module for the full
+    // DebugLog wiring proof.)
     #[test]
-    fn split_dispatcher_inert_zero_retirement() {
-        // The wrapper must never CALL the split dispatcher (call syntax uses an open paren; a bare
-        // mention in a comment is allowed and does not match).
+    fn split_dispatcher_debuglog_only() {
+        // The wrapper gates split dispatch behind an explicit NR-15 check.
         assert!(
-            !RISCV_TRAP_SRC.contains("try_split_dispatch_into_frame(shared"),
-            "RISC-V wrapper must not invoke the split dispatcher (zero retirement)"
+            RISCV_TRAP_SRC
+                .contains("frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "RISC-V wrapper must only invoke the split dispatcher for NR 15 (DebugLog)"
         );
+        // Smoke must class-specifically forbid every NON-DebugLog retirement class.
+        for c in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk",
+        ] {
+            assert!(
+                RISCV_SMOKE.contains(c),
+                "smoke must reject non-DebugLog RISC-V retirement class: {c}"
+            );
+        }
+        // Smoke must require the DebugLog live markers and the nr!=15 guard.
         assert!(
-            RISCV_TRAP_SRC.contains("RISCV_SPLIT_DISPATCH_DECLINED_ALL cpu="),
-            "wrapper must attest the split dispatcher declines all RISC-V syscalls"
-        );
-        // Smoke must forbid RISC-V retirement / split-dispatch markers.
-        assert!(
-            RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64")
-                && RISCV_SMOKE.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64"),
-            "smoke must assert-absent RISC-V split-dispatch + retirement markers"
+            RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15")
+                && RISCV_SMOKE.contains("serviced a non-DebugLog syscall"),
+            "smoke must assert DebugLog-only split dispatch"
         );
     }
 
@@ -63843,6 +63856,166 @@ mod stage196a_riscv_shared_trap_foundation {
         assert!(
             !RISCV_BOOT_SRC.contains("struct RiscvTrapStack([u8; 16 * 1024])"),
             "the former 16 KiB trap-stack definition must be retired"
+        );
+        // The trap-stack debt TODO must remain documented (Stage 196B Part 7).
+        assert!(
+            RISCV_BOOT_SRC.contains("emergency correctness size")
+                || RISCV_BOOT_SRC.contains("measure maximum stack depth")
+                || RISCV_BOOT_SRC.contains("2 MiB for solid headroom"),
+            "trap-stack debt must remain documented"
+        );
+    }
+}
+
+// Stage 196B — RISC-V DEBUGLOG (NR 15) SPLIT-DISPATCH RETIREMENT. DebugLog is the FIRST and
+// ONLY live RISC-V split-dispatch class. These hosted source-check guards pin: the wrapper gates
+// split dispatch to NR 15 only; the retirement markers are arch=riscv64 tagged; the userspace
+// return-proof marker exists; the DebugLog helper is a pure read (no broad &mut / scheduler / cap
+// / IPC / switch mutation); the ABI import maps a7→nr, a0..a5→args; sepc advances once; every
+// other class stays excluded; ReapFaultedTask stays excluded; counts unchanged.
+mod stage196b_riscv_debuglog_split {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // DebugLog is NR 15 and it is the sole class the RISC-V wrapper routes to the split dispatcher.
+    #[test]
+    fn debuglog_is_nr15_and_only_riscv_split_class() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR, 15);
+        // The wrapper's split gate is an equality check on NR 15 (no range, no other NR).
+        assert!(
+            RISCV_TRAP_SRC
+                .contains("frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR"),
+            "the wrapper must gate split dispatch on NR 15 exactly"
+        );
+        // No other syscall NR constant appears as a split gate in the wrapper.
+        for other in [
+            "SYSCALL_FUTEX_WAKE_NR",
+            "SYSCALL_FUTEX_WAIT_NR",
+            "SYSCALL_YIELD_NR",
+            "SYSCALL_INITRAMFS_READ_CHUNK_NR",
+        ] {
+            assert!(
+                !RISCV_TRAP_SRC.contains(other),
+                "wrapper must not gate split dispatch on {other}"
+            );
+        }
+    }
+
+    // Required live markers are emitted by the wrapper (kernel side) + init (userspace side).
+    #[test]
+    fn required_debuglog_markers_present() {
+        for m in [
+            "RISCV_SPLIT_ABI_IMPORT_OK nr=15",
+            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu=",
+            "RISCV_SPLIT_FINALIZE_OK nr=15 result=ok",
+        ] {
+            assert!(
+                RISCV_TRAP_SRC.contains(m),
+                "wrapper must emit DebugLog split marker: {m}"
+            );
+        }
+        // Retirement markers are arch=riscv64 tagged (added alongside the aarch64 tag; x86 stays
+        // untagged).
+        assert!(
+            SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
+                && SPLIT_SRC.contains("arch=aarch64 class=DebugLog"),
+            "DebugLog retirement markers must be arch-tagged for riscv64 (and aarch64)"
+        );
+        // Userspace return proof: emitted by init AFTER INIT_RUN_ENTER's DebugLog returns.
+        assert!(
+            INIT_SRC.contains("RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK"),
+            "init must emit the userspace return-proof marker"
+        );
+        let enter = INIT_SRC.find("INIT_RUN_ENTER").expect("INIT_RUN_ENTER");
+        let ret = INIT_SRC
+            .find("RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK")
+            .expect("return marker");
+        assert!(
+            enter < ret,
+            "the userspace return marker must follow INIT_RUN_ENTER (proving the split DebugLog returned)"
+        );
+    }
+
+    // Split dispatch returns early (skips the broad-lock phase + active flag) for a handled
+    // DebugLog: no post-lock drain is owed.
+    #[test]
+    fn debuglog_split_returns_early_before_broad_lock() {
+        // The NR-15 handled arm returns before the flag is set / with_cpu runs.
+        let gate = RISCV_TRAP_SRC
+            .find("frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+            .expect("gate");
+        let active_set = RISCV_TRAP_SRC
+            .find(".store(true, Ordering::Relaxed)")
+            .expect("active-set");
+        assert!(
+            gate < active_set,
+            "the NR-15 split gate must run BEFORE the active flag is set (early return skips it)"
+        );
+        assert!(
+            RISCV_TRAP_SRC[gate..active_set].contains("return Ok(());"),
+            "a handled DebugLog must return early before the broad-lock phase"
+        );
+    }
+
+    // The DebugLog helper is a pure read (no broad &mut KernelState / scheduler / cap / IPC /
+    // address-space switch), and encodes UserMemoryFault honestly (never masked as success).
+    #[test]
+    fn debuglog_helper_is_pure_read() {
+        // The helper uses the ASID-based split read seam, not a broad borrow.
+        assert!(
+            SPLIT_SRC.contains("copy_from_user_asid_split_read")
+                && SPLIT_SRC.contains("current_tid_authoritative"),
+            "DebugLog helper must use the bounded split seams (no broad &mut KernelState)"
+        );
+        // The DebugLog split arm in try_split_dispatch_into_frame routes NR 15 to the helper.
+        assert!(
+            SPLIT_SRC.contains("try_split_debug_log_into_frame(shared, cpu, frame)"),
+            "the frame-level seam must route DebugLog to its helper"
+        );
+    }
+
+    // sepc advances exactly once: the bridge pre-advances tframe.saved_pc by +4 and the split
+    // path does NOT add a second advance (parity with the canonical handler).
+    #[test]
+    fn sepc_advances_exactly_once_on_split() {
+        // The bridge is the sole +4 pre-advance site (Stage 163L/M); the wrapper does not add one.
+        assert!(
+            RISCV_BOOT_SRC.contains("let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };")
+                && RISCV_BOOT_SRC.contains("tframe.set_saved_pc(sepc + advance);"),
+            "the bridge must be the single sepc +4 pre-advance site"
+        );
+        // The wrapper's DebugLog arm must not touch saved_pc (no second advance).
+        assert!(
+            !RISCV_TRAP_SRC.contains("set_saved_pc"),
+            "the wrapper must not advance sepc (the bridge already did, exactly once)"
+        );
+    }
+
+    // Every other RISC-V retirement class + ReapFaultedTask remain excluded; counts unchanged.
+    #[test]
+    fn other_classes_and_reap_excluded_counts_unchanged() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        // Smoke rejects the non-DebugLog retirement classes + the queue-advancing drains.
+        for bad in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk",
+            "RISCV_FUTEX_WAIT_DISPATCH_",
+            "RISCV_YIELD_DISPATCH_",
+        ] {
+            assert!(RISCV_SMOKE.contains(bad), "smoke must reject: {bad}");
+        }
+        // ReapFaultedTask must never be split-eligible.
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never pass the split NR gate"
         );
     }
 }

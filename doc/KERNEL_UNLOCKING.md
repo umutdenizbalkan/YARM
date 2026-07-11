@@ -8512,6 +8512,39 @@ first prerequisite; it is deferred rather than half-landed so the proven in-lock
 `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait`.** Yield stays a separate future
 slice (its re-enqueue proof is independent). See §4.7 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 196B — RISC-V DebugLog (NR 15) split-dispatch retirement (DONE)
+
+RISC-V enables **exactly one** split-dispatch retirement class: **DebugLog (NR
+15)** — its first and only off-global-lock class (§9.3 of `doc/ARCH_RISCV64.md`).
+
+- **Selective NR-15 gate.** The bridge imports the ABI (a7→nr, a0..a5→args); the
+  shared wrapper's Phase 1 gates the split dispatcher behind
+  `frame.syscall_num() == SYSCALL_DEBUG_LOG_NR`, so `try_split_dispatch_into_frame`
+  (which also knows FutexWake/IpcRecv/VmBrk/InitramfsReadChunk/ControlPlaneSetCnodeSlots)
+  can never service another class on RISC-V. Non-DebugLog syscalls fall through
+  to the unchanged broad-lock handler exactly once.
+- **Pure read.** Reuses `try_split_debug_log_into_frame` (bounded
+  `current_tid_authoritative` + `copy_from_user_asid_split_read` + `USER_LOG` +
+  `set_ok(0,0,0)`): no broad `&mut KernelState`, no scheduler/cap/IPC/switch
+  mutation, no post-lock deferred work; UserMemoryFault stays canonical.
+- **Same-task sret parity.** Handled DebugLog returns EARLY (before the active
+  flag / `with_cpu`), so no drain is owed and nothing is left true across `sret`.
+  The bridge's same-task ecall write-back finalizes: `sepc+4` once (bridge is the
+  sole pre-advance; split adds none), `sstatus` preserved, a0/a1/a2 = `set_ok`
+  lanes. No AArch64 ELR-over-advance analogue.
+- **Markers:** `RISCV_SPLIT_ABI_IMPORT_OK nr=15`, `YARM_LOCK_SPLIT_DISPATCH
+  arch=riscv64 nr=15 cpu=0 result=ok`, `GLOBAL_LOCK_RETIRE_CLASS_{BEGIN,DONE}
+  arch=riscv64 class=DebugLog result=ok`, `RISCV_SPLIT_FINALIZE_OK nr=15
+  result=ok` (kernel, one-shot), and `RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK`
+  (init userspace, after `INIT_RUN_ENTER` — proves userspace resumes after the
+  split return).
+- **Excluded:** FutexWake/FutexWait/Yield/InitramfsReadChunk(NR27)/D2/IpcSend/
+  VM/spawn/fork/cap-mint/ReapFaultedTask all stay global-lock-only (0
+  `class=<other>` retirement markers, 0 `RISCV_{FUTEX_WAIT,YIELD}_DISPATCH_*`).
+  Shared-wrapper foundation markers + default-off post-lock oracle preserved.
+  `SYSCALL_COUNT`/`VARIANT_COUNT` unchanged (32/23). 2 MiB trap-stack fix
+  preserved with a bounded measurement TODO. Next: **FutexWake** (196C).
+
 #### Stage 196A — RISC-V shared trap-path + post-lock drain foundation (DONE)
 
 RISC-V now enters a **real shared trap path**, contract-equivalent to

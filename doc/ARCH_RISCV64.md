@@ -444,13 +444,53 @@ radius and surfaced as a non-deterministic false→true flip (gone at ≥1 MiB, 
 at 256 KiB). The trap stack is now **2 MiB** (`.bss`, NOLOAD, in the gigapage) —
 a real RISC-V correctness fix, not just an oracle workaround.
 
-**All RISC-V retirement classes remain disabled.** Zero
+**All RISC-V retirement classes remain disabled (as of 196A).** Zero
 `YARM_LOCK_SPLIT_DISPATCH arch=riscv64`, zero `GLOBAL_LOCK_RETIRE_CLASS_DONE
 arch=riscv64`, zero `RISCV_FUTEX_WAIT_DISPATCH_*` / `RISCV_YIELD_DISPATCH_*`.
 The recommended next class (Stage 196B) is **DebugLog only** — it is a
 non-blocking, non-switching syscall that rides the pre-lock split path without
 needing the (still-absent) post-`sret` context-switch + SATP/`sfence.vma`
 restore proof.
+
+### 9.3 Stage 196B — DebugLog (NR 15) split-dispatch retirement
+
+Stage 196B enables **exactly one** RISC-V split-dispatch retirement class:
+**DebugLog (NR 15)** — the first (and only) RISC-V class serviced off the global
+lock. Nothing else is retired.
+
+- **Selective gate.** The bridge already imports the syscall ABI into the
+  portable frame (a7→nr, a0..a5→args). The shared wrapper
+  (`handle_riscv_trap_entry_shared`, Phase 1) gates the split dispatcher behind
+  an explicit `frame.syscall_num() == SYSCALL_DEBUG_LOG_NR` check, so the shared
+  `try_split_dispatch_into_frame` (which also knows FutexWake / IpcRecv / VmBrk /
+  InitramfsReadChunk / ControlPlaneSetCnodeSlots) can **never** service any other
+  class on RISC-V. Every non-DebugLog syscall falls through to the unchanged
+  broad-lock handler exactly once.
+- **Pure read helper.** DebugLog reuses the generic `try_split_debug_log_into_frame`:
+  resolve requester tid (bounded `current_tid_authoritative`), copy user bytes via
+  the ASID-based split-read seam (`copy_from_user_asid_split_read`), log `USER_LOG`,
+  write `set_ok(0,0,0)`. No broad `&mut KernelState`, no scheduler / capability /
+  IPC / address-space-switch mutation, no post-lock deferred switch. A
+  `UserMemoryFault`/copy-fail follows the canonical global handler (OK, no log —
+  never masked as a different success).
+- **Same-task sret parity.** A handled DebugLog returns EARLY from Phase 1 —
+  before the active flag is set and before `with_cpu` — so no drain is owed and
+  nothing is left true across the `sret`. The bridge's existing same-task ecall
+  write-back finalizes it: `sepc = sepc+4` (the bridge's sole +4 pre-advance;
+  the split path adds no second advance), `sstatus` untouched (preserved),
+  a0/a1/a2 = the `set_ok` result lanes, and the same task resumes.
+- **Markers.** `RISCV_SPLIT_ABI_IMPORT_OK nr=15`,
+  `YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu=0 result=ok`,
+  `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE arch=riscv64 class=DebugLog result=ok`,
+  `RISCV_SPLIT_FINALIZE_OK nr=15 result=ok` (kernel, one-shot latched), plus
+  `RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK` — emitted by **init userspace** right
+  after `INIT_RUN_ENTER`, proving a subsequent userspace log runs after the split
+  DebugLog returns.
+- **Still excluded:** FutexWake, FutexWait, Yield, InitramfsReadChunk (NR 27,
+  deprecated — NOT ported), D2 recv/send, IpcSend boundary, VM/spawn/fork/cap-mint,
+  ReapFaultedTask. The shared-wrapper foundation markers and the default-off
+  post-lock oracle are preserved. Recommended next class: **FutexWake** (Stage
+  196C) — waiter/run-queue mutation only, no caller task-switch.
 
 ---
 

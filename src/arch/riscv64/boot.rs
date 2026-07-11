@@ -632,6 +632,15 @@ static RISCV_FIRST_ROUNDTRIP_LOGGED: core::sync::atomic::AtomicBool =
 // Size the trap stack at 2 MiB for solid headroom over the observed worst case.
 // It lives in `.bss` (NOLOAD, inside the kernel-shared gigapage), so it costs
 // RAM only — not image size — and the 16 MiB boot stack dwarfs it.
+//
+// TODO(riscv-trap-stack-debt): 2 MiB is an **emergency correctness size**, not a
+// measured bound. Before RISC-V SMP scaling (a per-hart trap stack of this size
+// multiplies RAM cost), future work MUST: (1) measure the true maximum trap-time
+// stack depth (e.g. a stack-canary/watermark pass over the deepest dispatch
+// chains); (2) shrink the large on-stack `no_std` temporaries in the deepest
+// paths (IPC cap-transfer / SpawnV5 / fork) so the trap stack can be reduced;
+// (3) only then lower this size to the measured worst case + margin. Do NOT
+// reduce it before that measurement — the 16 KiB overflow was silent.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]

@@ -903,6 +903,14 @@ fn run_aarch64_yield_lone_task_oracle(init_tid: u64) {
 
 pub fn run() {
     yarm_user_rt::user_log!("INIT_RUN_ENTER");
+    // Stage 196B: this second userspace DebugLog executes ONLY if the preceding
+    // DebugLog (INIT_RUN_ENTER, NR 15) returned to userspace via `sret`. On RISC-V
+    // that DebugLog is serviced off the global lock by the split dispatcher
+    // (`YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15`), so this line's appearance is
+    // the userspace-side proof of a correct same-task split-DebugLog return
+    // (kernel does NOT emit it — it is a userspace log after the syscall returns).
+    // It is harmless/benign on x86_64/AArch64 (a plain extra USER_LOG line).
+    yarm_user_rt::user_log!("RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK");
     let ctx = yarm_user_rt::runtime::startup_context();
     let (Some(pm_send), Some(pm_recv)) = (
         ctx.process_manager_request_send_cap,
