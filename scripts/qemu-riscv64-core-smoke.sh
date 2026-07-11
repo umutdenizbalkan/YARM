@@ -71,6 +71,15 @@ if [[ "$FUTEX_WAKE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_futex_w
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_futex_wake_oracle=1"
 fi
 
+# Stage 196D (QUEUE-SWITCH FOUNDATION ORACLE): QUEUE_SWITCH_ORACLE=1 appends
+# yarm.riscv64_queue_switch_foundation_oracle=1 to arm the default-off two-task post-lock
+# context-switch proof (task A yields → real SATP/sfence/frame switch to task B → B runs →
+# A resumes). Enables NO syscall retirement class.
+QUEUE_SWITCH_ORACLE=${QUEUE_SWITCH_ORACLE:-0}
+if [[ "$QUEUE_SWITCH_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_queue_switch_foundation_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_queue_switch_foundation_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 
@@ -538,6 +547,47 @@ if [[ "$FUTEX_WAKE_ORACLE" == "1" ]]; then
   # A failed oracle DONE (wrong counts) is a proof failure.
   if rg -n "RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] FutexWake live oracle reported wrong wake counts"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196D (QUEUE-SWITCH FOUNDATION ORACLE): when armed, the two-task post-lock context
+# switch must complete end-to-end — publish/re-enqueue outgoing, handler bypass, lock dropped,
+# dequeue incoming, current set, running, real SATP + sfence.vma, frame restore, sret into B,
+# B runs in userspace, A resumes. NO Yield/FutexWait retirement marker may appear.
+if [[ "$QUEUE_SWITCH_ORACLE" == "1" ]]; then
+  QUEUE_SWITCH_PATTERNS=(
+    "RISCV_QUEUE_SWITCH_FOUNDATION_PUBLISH_BEGIN cpu=0 outgoing="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_REENQUEUE_OK tid="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_HANDLER_RETURN_OK cpu=0"
+    "RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN cpu=0"
+    "RISCV_QUEUE_SWITCH_FOUNDATION_LOCK_DROPPED_OK cpu=0"
+    "RISCV_QUEUE_SWITCH_FOUNDATION_DEQUEUE_OK cpu=0 incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_CURRENT_SET_OK cpu=0 incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_SATP_OK incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_SFENCE_OK incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_FRAME_OK incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_SRET_ARMED incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_DONE result=ok"
+    "RISCV_QUEUE_SWITCH_FOUNDATION_INCOMING_USER_OK tid="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=ok outgoing="
+  )
+  for pat in "${QUEUE_SWITCH_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] queue-switch foundation oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # outgoing_resumed=1 (round trip) is mandatory in the DONE marker. Use -a (force text): the
+  # boot log contains NUL bytes, so ripgrep would otherwise treat it as binary and skip it.
+  if ! rg -a "RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=ok .*outgoing_resumed=1" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] queue-switch foundation oracle did not prove the outgoing round-trip"
+    failures=$((failures + 1))
+  fi
+  # Any FAIL / result=fail is a proof failure.
+  if rg -n "RISCV_QUEUE_SWITCH_FOUNDATION_FAIL|RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=fail" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] queue-switch foundation oracle reported a failure"
     failures=$((failures + 1))
   fi
 fi

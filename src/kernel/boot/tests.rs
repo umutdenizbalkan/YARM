@@ -63435,15 +63435,28 @@ mod stage195g_aarch64_yield_dispatch {
                 && !block.contains("load_cr3"),
             "the AArch64 Yield drain must NOT use x86_64 CR3 logic"
         );
-        // The reused seams are un-gated to AArch64.
+        // The reused seams are un-gated to AArch64 (and, since Stage 196D, RISC-V). Check the
+        // seams exist and their cfg block admits all three arches.
         assert!(
-            RUNTIME_SRC.contains(
-                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn yield_dispatch_step_mut("
-            ) && RUNTIME_SRC.contains(
-                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn yield_reverify_ready("
-            ),
-            "yield_dispatch_step_mut + yield_reverify_ready must be un-gated to AArch64"
+            RUNTIME_SRC.contains("pub(crate) fn yield_dispatch_step_mut(")
+                && RUNTIME_SRC.contains("pub(crate) fn yield_reverify_ready("),
+            "yield_dispatch_step_mut + yield_reverify_ready must exist"
         );
+        for seam in [
+            "pub(crate) fn yield_dispatch_step_mut(",
+            "pub(crate) fn yield_reverify_ready(",
+            "pub(crate) fn d6_genuine_mark_running_via_task_seam(",
+        ] {
+            let idx = RUNTIME_SRC.find(seam).expect("seam present");
+            let before = &RUNTIME_SRC[..idx];
+            let cfg = before.rfind("#[cfg(").expect("cfg present");
+            let cfg_block = &before[cfg..];
+            assert!(
+                cfg_block.contains("target_arch = \"aarch64\"")
+                    && cfg_block.contains("target_arch = \"riscv64\""),
+                "seam {seam} must be un-gated to aarch64 + riscv64"
+            );
+        }
     }
 
     // The retirement marker is arch-tagged, and the oracle workloads are default-off + slot-5 4/5.
@@ -64166,6 +64179,255 @@ mod stage196c_riscv_futex_wake_split {
         ] {
             assert!(RISCV_SMOKE.contains(bad), "smoke must still reject: {bad}");
         }
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the 2 MiB trap-stack fix must be preserved"
+        );
+    }
+}
+
+// Stage 196D: RISC-V QUEUE-ADVANCING CONTEXT-SWITCH DRAIN FOUNDATION.
+//
+// The foundation proves a genuine RISC-V post-lock context switch: an outgoing userspace task
+// yields → the in-lock Yield handler publishes a one-shot deferral (re-enqueues the outgoing
+// task Runnable + clears `current`) → the broad `with_cpu` guard drops → the post-lock drain
+// dequeues the incoming task, activates its SATP/ASID with the required `sfence.vma`, restores
+// its saved frame, and `sret`s into it. It enables ZERO new syscall retirement classes: it is a
+// SEPARATE default-off one-shot deferral that never emits a Yield/FutexWait retirement marker.
+mod stage196d_riscv_queue_switch_foundation {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // The foundation is default-off: the knob parses, and with no knob it stays disabled. This is
+    // asserted through the run-time state (not just the source), so a regression that flipped the
+    // default to on would fail here.
+    #[test]
+    fn foundation_defaults_off() {
+        assert!(
+            !crate::kernel::boot::riscv_queue_switch_foundation_oracle_enabled(),
+            "the queue-switch foundation oracle must default OFF"
+        );
+        // `armed` is knob-gated: with the knob off it is never armed regardless of one-shot state.
+        assert!(
+            !crate::kernel::boot::riscv_queue_switch_foundation_armed(),
+            "the foundation must never be armed while the knob is off"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_queue_switch_foundation_oracle")
+                && MOD_SRC.contains("fn set_riscv_queue_switch_foundation_oracle_enabled("),
+            "the knob + setter must be wired"
+        );
+    }
+
+    // ZERO new retirement classes: counts unchanged, DebugLog + FutexWake stay the ONLY live
+    // riscv64 split classes, and the foundation emits NO retirement marker for Yield/FutexWait.
+    #[test]
+    fn zero_new_retirement_classes() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        // DebugLog + FutexWake remain live (unchanged from 196B/196C).
+        assert!(
+            SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
+                && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
+            "DebugLog + FutexWake must stay live riscv64 split classes"
+        );
+        // The foundation never advances a retirement class: no Yield/FutexWait retirement markers
+        // and no queue/futexwait DISPATCH markers in the trap or exec-state paths.
+        for bad in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
+            "RISCV_YIELD_DISPATCH_",
+            "RISCV_FUTEX_WAIT_DISPATCH_",
+        ] {
+            assert!(
+                !RISCV_TRAP_SRC.contains(bad) && !EXEC_STATE_SRC.contains(bad),
+                "queue-switch foundation must not emit retirement marker: {bad}"
+            );
+        }
+    }
+
+    // The handler bypass requires an ACTUAL pending per-CPU deferral (not a generic "skip
+    // restore" flag): it early-returns from the bounded `with_cpu` phase ONLY when
+    // `riscv_queue_switch_foundation_is_deferred` holds.
+    #[test]
+    fn handler_bypass_requires_real_deferral() {
+        assert!(
+            RISCV_TRAP_SRC.contains(
+                "if crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx) {"
+            ) && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_HANDLER_RETURN_OK cpu={}"),
+            "the handler bypass must be gated on a real per-CPU deferral + emit HANDLER_RETURN_OK"
+        );
+    }
+
+    // The switch drain is POST-LOCK: it runs after the broad `with_cpu` closure returns, and
+    // proves the lock dropped by re-acquiring the scheduler seam through the SharedKernel
+    // (`yield_reverify_ready`) before emitting LOCK_DROPPED_OK. The SATP/frame restore happens in
+    // a fresh bounded `with_cpu` re-acquire — never inside the original broad guard.
+    #[test]
+    fn drain_is_post_lock_after_broad_guard_drops() {
+        // The drain block emits DRAIN_BEGIN then LOCK_DROPPED_OK gated on yield_reverify_ready.
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN cpu={}")
+                && RISCV_TRAP_SRC.contains("let reverify_ok = shared.yield_reverify_ready(cpu);")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_LOCK_DROPPED_OK cpu={}"),
+            "the drain must reverify readiness (proving the broad guard dropped) then LOCK_DROPPED_OK"
+        );
+        // The real arch restore is a FRESH bounded re-acquire.
+        assert!(
+            RISCV_TRAP_SRC.contains(".with_cpu(cpu, |kernel| {"),
+            "the SATP/frame restore must run in a fresh bounded with_cpu re-acquire"
+        );
+    }
+
+    // In-lock invariants: the outgoing task is re-enqueued Runnable exactly once + `current`
+    // cleared via the accepted preempt seam, and the in-lock dispatch is SKIPPED (return Ok(())).
+    #[test]
+    fn reenqueue_and_current_invariants() {
+        assert!(
+            EXEC_STATE_SRC.contains("match self.preempt_reenqueue_current_cpu() {")
+                && EXEC_STATE_SRC
+                    .contains("RISCV_QUEUE_SWITCH_FOUNDATION_PUBLISH_BEGIN cpu={} outgoing={}")
+                && EXEC_STATE_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_REENQUEUE_OK tid={}"),
+            "the in-lock defer must re-enqueue the outgoing task via the accepted preempt seam"
+        );
+        // A re-enqueue failure clears the deferral and falls through to the LEGACY in-lock
+        // dispatch (never a fabricated success).
+        assert!(
+            EXEC_STATE_SRC
+                .contains("RISCV_QUEUE_SWITCH_FOUNDATION_FALLBACK reason=reenqueue_failed"),
+            "a re-enqueue failure must fall back to the legacy dispatch"
+        );
+        // The defer is one-shot AND gated to BSP + single dispatcher + trap path.
+        assert!(
+            EXEC_STATE_SRC.contains("riscv_queue_switch_foundation_armed()")
+                && EXEC_STATE_SRC.contains("&& single_cpu")
+                && EXEC_STATE_SRC.contains("&& is_bsp")
+                && EXEC_STATE_SRC
+                    .contains("riscv_queue_switch_foundation_try_defer(cpu_idx, out_tid)"),
+            "the defer must be one-shot + BSP + single-dispatcher + trap-path gated"
+        );
+    }
+
+    // The SATP/ASID activation is REAL RISC-V: it constructs the incoming task's satp
+    // (`cr3_for_asid`), installs the shared kernel mapping, and writes it via `write_satp` (which
+    // performs the `csrw satp` + `sfence.vma`). NO x86 CR3 / AArch64 TTBR0 logic is used.
+    #[test]
+    fn satp_asid_sfence_is_real_riscv() {
+        assert!(
+            RISCV_TRAP_SRC.contains("crate::arch::riscv64::page_table::cr3_for_asid(asid)")
+                && RISCV_TRAP_SRC.contains("crate::arch::riscv64::page_table::write_satp(satp)")
+                && RISCV_TRAP_SRC.contains(
+                    "crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid)"
+                ),
+            "the drain must construct + write the incoming task's SATP via the riscv64 page_table"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_SATP_OK incoming={} asid={}")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_SFENCE_OK incoming={}"),
+            "the drain must emit SATP_OK + SFENCE_OK for the incoming ASID"
+        );
+        // No cross-arch page-table CALLS leaked into the riscv64 drain: it never invokes the
+        // x86 or aarch64 page-table modules (a bare mention in a doc-comment is fine — these
+        // match call-path syntax that only appears when actually calling those modules).
+        assert!(
+            !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
+                && !RISCV_TRAP_SRC.contains("arch::aarch64::page_table")
+                && !RISCV_TRAP_SRC.contains("write_cr3(")
+                && !RISCV_TRAP_SRC.contains("set_ttbr0"),
+            "the riscv64 drain must not call x86 CR3 or AArch64 TTBR0 page-table logic"
+        );
+        // `write_satp` genuinely issues the sfence.vma (not a marker).
+        const PAGE_TABLE_SRC: &str = include_str!("../../arch/riscv64/page_table.rs");
+        assert!(
+            PAGE_TABLE_SRC.contains("sfence.vma"),
+            "write_satp's sfence.vma must be a real hardware fence"
+        );
+    }
+
+    // Frame selection + sret: the drain restores the INCOMING task's saved frame via the shared
+    // arch-restore seam (which routes through apply_user_context for the current task, now B), then
+    // emits FRAME_OK + SRET_ARMED. The bridge performs the actual sret.
+    #[test]
+    fn frame_restore_and_sret_armed() {
+        assert!(
+            RISCV_TRAP_SRC.contains("restore_arch_thread_state(kernel, cpu, Some(&mut *frame))")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_FRAME_OK incoming={}")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_SRET_ARMED incoming={}")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_DONE result=ok"),
+            "the drain must restore the incoming frame then emit FRAME_OK + SRET_ARMED + DRAIN_DONE"
+        );
+        // Before the restore, B is set current + marked Running via the accepted rank-2 task seam.
+        assert!(
+            RISCV_TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}"),
+            "the incoming task must be marked Running via the accepted task seam before restore"
+        );
+    }
+
+    // No-incoming is a GENUINE failure, never a fake success: the drain emits FAIL reason=no_incoming
+    // and does NOT fabricate an idle task or a DONE marker.
+    #[test]
+    fn no_incoming_is_failure_not_fake_success() {
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_FAIL reason=no_incoming")
+                && RISCV_TRAP_SRC
+                    .contains("RISCV_QUEUE_SWITCH_FOUNDATION_FAIL reason=state_changed"),
+            "the drain must FAIL honestly on no_incoming / state_changed"
+        );
+        // The smoke rejects any FAIL marker or a result=fail DONE.
+        assert!(
+            RISCV_SMOKE.contains("RISCV_QUEUE_SWITCH_FOUNDATION_FAIL")
+                && RISCV_SMOKE.contains("RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=fail"),
+            "the smoke must reject FAIL + result=fail"
+        );
+    }
+
+    // The live oracle + wiring: a two-task oracle (parent yields, child runs in userspace) with
+    // the round-trip proof, plus the knob + slot-5 provision + smoke arming.
+    #[test]
+    fn live_oracle_and_wiring_present() {
+        assert!(
+            INIT_SRC.contains("fn run_riscv_queue_switch_foundation_oracle(")
+                && INIT_SRC.contains("extern \"C\" fn riscv_queue_switch_foundation_child()"),
+            "the queue-switch oracle parent + child must exist"
+        );
+        assert!(
+            INIT_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_INCOMING_USER_OK tid=")
+                && INIT_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=ok"),
+            "the oracle must emit INCOMING_USER_OK (child ran) + ORACLE_DONE result=ok"
+        );
+        // Slot-5 sentinel 2 provisions the queue-switch oracle (distinct from FutexWake's 1).
+        assert!(
+            RISCV_BOOT_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_PROVISION_OK slot5=2")
+                && MOD_SRC.contains("fn riscv_queue_switch_foundation_oracle_enabled()"),
+            "the queue-switch oracle slot-5 provision (sentinel 2) must be wired"
+        );
+        // The smoke arms + asserts the full round trip (outgoing_resumed=1).
+        assert!(
+            RISCV_SMOKE.contains("QUEUE_SWITCH_ORACLE")
+                && RISCV_SMOKE.contains(
+                    "RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=ok .*outgoing_resumed=1"
+                ),
+            "the smoke must arm + assert the queue-switch round trip"
+        );
+    }
+
+    // ReapFaultedTask stays excluded from split dispatch, and the 2 MiB trap-stack fix is
+    // preserved (the switch-drain path adds no new stack debt beyond the bounded re-acquire).
+    #[test]
+    fn reap_excluded_and_trap_stack_preserved() {
         assert!(
             !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
             "ReapFaultedTask must never be split-eligible"

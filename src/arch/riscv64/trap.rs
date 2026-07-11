@@ -123,6 +123,22 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         frame.as_deref_mut(),
         fault_bookkeeping_mode,
     )?;
+    // Stage 196D (QUEUE-SWITCH FOUNDATION BYPASS): if the in-lock Yield handler recorded a
+    // one-shot foundation switch deferral (it published + re-enqueued the outgoing task and
+    // cleared `current`), the canonical in-lock restore below has NO current task to restore
+    // and would either error (→ spurious idle/halt) or restore stale state. Skip ONLY the
+    // in-lock restore + ret-lane export and return cleanly from the bounded `with_cpu` phase;
+    // the wrapper's post-lock switch drain performs the authoritative dispatch + SATP/sfence +
+    // frame restore for the INCOMING task. This bypass requires an ACTUAL pending deferral
+    // (no generic "skip restore" flag) and is inert for every normal syscall.
+    let cpu_idx = cpu.0 as usize;
+    if crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx) {
+        crate::yarm_log!(
+            "RISCV_QUEUE_SWITCH_FOUNDATION_HANDLER_RETURN_OK cpu={}",
+            cpu.0
+        );
+        return Ok(());
+    }
     // Stage 163L: restore FIRST so apply_user_context (called inside
     // resume_current_thread_with_frame) does not zero a0 (user_gprs[10])
     // from the pre-syscall TCB snapshot before we can export ret0 below.
@@ -362,11 +378,13 @@ pub fn handle_riscv_trap_entry_shared(
                     tid
                 );
             }
+            // Reborrow so `frame` stays available for the Stage 196D post-lock switch drain
+            // (which restores the INCOMING task's frame after the broad guard drops).
             handle_trap_entry_with_fault_bookkeeping_mode(
                 kernel,
                 cpu,
                 context,
-                Some(frame),
+                Some(&mut *frame),
                 FaultBookkeepingMode::RecordInHandleTrapEvent,
             )
         })
@@ -434,6 +452,96 @@ pub fn handle_riscv_trap_entry_shared(
                 );
             }
             RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE_FLAG.store(true, Ordering::Release);
+        }
+    }
+
+    // ── Stage 196D: queue-advancing context-switch FOUNDATION drain ──
+    // If the in-lock Yield handler recorded a one-shot foundation switch deferral (published +
+    // re-enqueued the outgoing task, cleared `current`), perform the authoritative post-lock
+    // switch to the INCOMING task now that the broad guard is released: dequeue B (rank-1
+    // scheduler seam), set B current, mark B Running (rank-2 task seam), then a brief `with_cpu`
+    // re-acquire does the REAL RISC-V arch restore — construct + write B's SATP (with the
+    // `sfence.vma` inside `write_satp`) and restore B's saved frame (sepc/sstatus/GPRs) into the
+    // trap frame. The bridge then `sret`s into B. NO x86 CR3 / AArch64 TTBR0 logic is used.
+    if cpu_idx < MAX_CPUS && crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx)
+    {
+        crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN cpu={}", cpu.0);
+        let outgoing = crate::kernel::boot::riscv_queue_switch_foundation_outgoing(cpu_idx);
+        // Lock-dropped proof: `yield_reverify_ready` re-acquires the scheduler seam through the
+        // SharedKernel (only possible because the broad `with_cpu` guard was released above — a
+        // still-held guard would deadlock). It also confirms `current` is still cleared.
+        let reverify_ok = shared.yield_reverify_ready(cpu);
+        crate::yarm_log!(
+            "RISCV_QUEUE_SWITCH_FOUNDATION_LOCK_DROPPED_OK cpu={}",
+            cpu.0
+        );
+        if reverify_ok {
+            // Queue-advancing dequeue of the FIFO head (the incoming task B).
+            let incoming = shared.yield_dispatch_step_mut(cpu);
+            if let Some(inc) = incoming {
+                crate::yarm_log!(
+                    "RISCV_QUEUE_SWITCH_FOUNDATION_DEQUEUE_OK cpu={} incoming={}",
+                    cpu.0,
+                    inc
+                );
+                crate::yarm_log!(
+                    "RISCV_QUEUE_SWITCH_FOUNDATION_CURRENT_SET_OK cpu={} incoming={}",
+                    cpu.0,
+                    inc
+                );
+                shared.d6_genuine_mark_running_via_task_seam(incoming);
+                crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}", inc);
+                // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore.
+                let restore = shared
+                    .with_cpu(cpu, |kernel| {
+                        // Incoming ASID / page-table root → construct + write SATP. `write_satp`
+                        // executes `csrw satp` THEN `sfence.vma x0, x0` (a global flush — see
+                        // below), so both the address-space activation and the required
+                        // ordering fence are real hardware operations, not markers.
+                        if let Some(asid) = kernel.task_asid(inc) {
+                            let _ =
+                                crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
+                            if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid)
+                            {
+                                crate::arch::riscv64::page_table::write_satp(satp);
+                                crate::yarm_log!(
+                                    "RISCV_QUEUE_SWITCH_FOUNDATION_SATP_OK incoming={} asid={}",
+                                    inc,
+                                    asid.0
+                                );
+                                crate::yarm_log!(
+                                    "RISCV_QUEUE_SWITCH_FOUNDATION_SFENCE_OK incoming={}",
+                                    inc
+                                );
+                            }
+                        }
+                        // Restore B's saved user frame (sepc/sstatus/GPRs) into the trap frame;
+                        // the bridge propagates it to the hardware frame and `sret`s into B.
+                        restore_arch_thread_state(kernel, cpu, Some(&mut *frame))
+                    })
+                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
+                restore??;
+                crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_FRAME_OK incoming={}", inc);
+                crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_SRET_ARMED incoming={}", inc);
+                crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_DONE result=ok");
+            } else {
+                // No incoming task: this is a genuine FAILURE (the oracle guarantees B exists).
+                // Do NOT fabricate an idle task or a success marker.
+                crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
+                crate::yarm_log!(
+                    "RISCV_QUEUE_SWITCH_FOUNDATION_FAIL reason=no_incoming cpu={} outgoing={:?}",
+                    cpu.0,
+                    outgoing
+                );
+            }
+        } else {
+            // An in-lock fallback superseded the deferral (current no longer cleared) — decline.
+            crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
+            crate::yarm_log!(
+                "RISCV_QUEUE_SWITCH_FOUNDATION_FAIL reason=state_changed cpu={}",
+                cpu.0
+            );
         }
     }
 

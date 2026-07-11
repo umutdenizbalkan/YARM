@@ -2541,6 +2541,56 @@ impl KernelState {
             }
         }
 
+        // Stage 196D (RISC-V QUEUE-ADVANCING CONTEXT-SWITCH FOUNDATION): default-off, one-shot,
+        // oracle-gated. This is NOT Yield retirement — it never emits a Yield retirement marker
+        // and normal Yields (knob off) fall straight through to the legacy in-lock dispatch
+        // below. When ARMED (knob on + one-shot not yet fired) and eligible (BSP, single
+        // dispatcher, shared trap drain active), publish the caller Runnable (done above),
+        // RE-ENQUEUE it exactly once + clear `current` in-lock (`preempt_reenqueue_current_cpu`),
+        // record the SEPARATE foundation deferral, and SKIP the in-lock dispatch. The canonical
+        // handler's in-lock restore is bypassed (see riscv64/trap.rs) and the post-lock switch
+        // drain performs the authoritative dispatch + real SATP/sfence.vma + frame restore.
+        #[cfg(target_arch = "riscv64")]
+        if let Some(out_tid) = outgoing_tid {
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            let is_bsp = self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
+            if crate::kernel::boot::riscv_queue_switch_foundation_armed()
+                && trap_path
+                && single_cpu
+                && is_bsp
+                && crate::kernel::boot::riscv_queue_switch_foundation_try_defer(cpu_idx, out_tid)
+            {
+                match self.preempt_reenqueue_current_cpu() {
+                    Some(reenq_tid) => {
+                        crate::yarm_log!(
+                            "RISCV_QUEUE_SWITCH_FOUNDATION_PUBLISH_BEGIN cpu={} outgoing={}",
+                            cpu_idx,
+                            out_tid
+                        );
+                        crate::yarm_log!(
+                            "RISCV_QUEUE_SWITCH_FOUNDATION_REENQUEUE_OK tid={}",
+                            reenq_tid
+                        );
+                        // Skip the in-lock dispatch; the post-lock drain switches to the incoming.
+                        return Ok(());
+                    }
+                    None => {
+                        // Re-enqueue failed (`current` left untouched): clear the deferral and
+                        // fall through to the unchanged legacy in-lock dispatch below.
+                        crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
+                        crate::yarm_log!(
+                            "RISCV_QUEUE_SWITCH_FOUNDATION_FALLBACK reason=reenqueue_failed tid={}",
+                            out_tid
+                        );
+                    }
+                }
+            }
+        }
+
         let next_tid = self.on_preempt_current_cpu();
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);

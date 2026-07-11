@@ -911,6 +911,92 @@ fn run_riscv_futex_wake_oracle(init_tid: u64) {
     }
 }
 
+// ─── Stage 196D: RISC-V queue-advancing context-switch FOUNDATION oracle ──────────────
+// A two-task proof of a GENUINE RISC-V post-lock context switch (NOT a syscall retirement).
+// Task A (init) spawns task B, then Yields. When the foundation knob is on, A's Yield is
+// deferred: A is re-enqueued once, `current` is cleared, and the post-lock drain dispatches B
+// with a REAL SATP/sfence.vma + frame restore + `sret` into B. B runs (sets the flag + emits
+// the userspace marker) and parks on a futex, so the LEGACY global-lock path re-dispatches A;
+// A resumes and confirms B ran. Default-off (slot-5 sentinel = 2).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static QUEUE_SWITCH_FOUNDATION_FLAG: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static QUEUE_SWITCH_FOUNDATION_CHILD_TID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Task B (incoming): set the ran-flag, emit the userspace proof that real U-mode execution
+/// began after the post-lock SATP/frame/sret switch, then park on a futex (leaving the runnable
+/// set) so the legacy path re-dispatches task A. Never returns.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+extern "C" fn riscv_queue_switch_foundation_child() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    QUEUE_SWITCH_FOUNDATION_FLAG.store(1, Relaxed);
+    let btid = QUEUE_SWITCH_FOUNDATION_CHILD_TID.load(Relaxed);
+    // Emitted AFTER real userspace execution begins in B (post-sret) — the incoming-user proof.
+    yarm_user_rt::user_log!(
+        "RISCV_QUEUE_SWITCH_FOUNDATION_INCOMING_USER_OK tid={}",
+        btid
+    );
+    // Park on the (never-woken) oracle futex so a legacy FutexWait re-dispatches task A.
+    let park = FUTEX_ORACLE_PARK.as_ptr();
+    loop {
+        let pv = FUTEX_ORACLE_PARK.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+    }
+}
+
+/// Task A (init/outgoing): spawn B, publish B's tid, Yield (foundation switch to B), then resume
+/// and verify B ran (round-trip proof).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn run_riscv_queue_switch_foundation_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    yarm_user_rt::user_log!(
+        "RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_BEGIN init_tid={}",
+        init_tid
+    );
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = riscv_queue_switch_foundation_child as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("RISCV_QUEUE_SWITCH_FOUNDATION_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    // Publish B's tid BEFORE yielding so B can log it once it runs.
+    QUEUE_SWITCH_FOUNDATION_CHILD_TID.store(child_tid, Relaxed);
+    yarm_user_rt::user_log!(
+        "RISCV_QUEUE_SWITCH_FOUNDATION_CHILD_SPAWNED child_tid={}",
+        child_tid
+    );
+    // A yields: re-enqueued at tail; the foundation post-lock drain dispatches B (FIFO head) via
+    // a real SATP/sfence/frame switch. A resumes here only after B has run and parked (its legacy
+    // FutexWait re-dispatches A).
+    let _ = yarm_user_rt::syscall::yield_now();
+    let ran = QUEUE_SWITCH_FOUNDATION_FLAG.load(Relaxed);
+    if ran == 1 {
+        yarm_user_rt::user_log!(
+            "RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=ok outgoing={} incoming={} outgoing_resumed=1",
+            init_tid,
+            child_tid
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=fail flag={} outgoing={} incoming={}",
+            ran,
+            init_tid,
+            child_tid
+        );
+    }
+}
+
 /// Stage 195F NO-INCOMING idle oracle: the final runnable user task (init) blocks on a
 /// never-woken futex when no other user task is runnable (every server is blocked on recv and no
 /// child is spawned). The default-on post-lock FutexWait drain therefore observes no incoming
@@ -1488,6 +1574,13 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     if ctx.supervisor_control_recv_ep == Some(1) {
         run_riscv_futex_wake_oracle(ctx.task_id);
+    }
+    // Stage 196D: default-off RISC-V queue-advancing context-switch FOUNDATION oracle. Slot-5
+    // sentinel 2 (set under `yarm.riscv64_queue_switch_foundation_oracle=1`) tells init to run the
+    // two-task post-lock switch proof. A normal boot leaves slot 5 = None and skips this.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if ctx.supervisor_control_recv_ep == Some(2) {
+        run_riscv_queue_switch_foundation_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The
