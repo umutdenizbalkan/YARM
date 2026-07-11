@@ -628,14 +628,38 @@ pub fn handle_trap_entry_shared(
                     crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok");
                     crate::kernel::boot::maybe_log_futex_wait_retired();
                 } else {
-                    // No incoming: the in-lock eligibility guarantees another runnable task
-                    // existed at defer time, so this is unreachable in practice. Decline
-                    // safely (do NOT claim a transition) and clear the deferral.
+                    // Stage 195F IDLE OUTCOME: no runnable incoming task. This is a SUCCESSFUL
+                    // idle (not a failure): the outgoing caller stays Blocked(Futex), `current`
+                    // stays None, the deferral is cleared, and the BSP enters the REAL idle loop
+                    // AFTER the broad lock is released. No frame is restored, no incoming is
+                    // fabricated, and `idle_no_eret_loop()` is NEVER entered while holding
+                    // `with_cpu` (the broad guard was dropped before this drain).
+                    crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu={}", cpu.0);
+                    crate::yarm_log!("AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu={}", cpu.0);
                     crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                    // Lock-dropped proof: re-acquiring `with_cpu` here is only possible because
+                    // the broad guard was released above (a held guard would deadlock). Inside,
+                    // confirm `current` is None/idle. We restore NO frame.
+                    let current_none = shared
+                        .with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))
+                        .unwrap_or(true);
                     crate::yarm_log!(
-                        "AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=no_incoming cpu={}",
+                        "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu={}",
                         cpu.0
                     );
+                    crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle");
+                    // The idle outcome is still a genuine off-global-lock FutexWait retirement.
+                    crate::kernel::boot::maybe_log_futex_wait_retired();
+                    // Narrowly-gated idle-oracle attestation (default-off workload knob).
+                    if crate::kernel::boot::aarch64_futex_wait_idle_oracle_enabled() {
+                        crate::yarm_log!(
+                            "AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none={}",
+                            current_none as u32
+                        );
+                    }
+                    // Enter the real BSP idle loop OUTSIDE `with_cpu` (emits
+                    // AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED, then a `wfi` loop). Never returns.
+                    super::aarch64::trap::enter_post_lock_idle(cpu);
                 }
             } else {
                 // Split FutexWake flipped the outgoing task to Runnable before the drain ran —

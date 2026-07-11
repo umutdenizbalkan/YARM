@@ -36,6 +36,19 @@ fn idle_no_eret_loop() -> ! {
     }
 }
 
+/// Stage 195F: enter the real BSP idle loop from the post-lock FutexWait drain, AFTER the broad
+/// `KernelState` lock has been released. This is the SAME proven BSP idle primitive the normal
+/// path uses (`idle_no_eret_loop`, a `wfi` loop) — NOT a second idle policy. `DAIF` is left as
+/// the trap left it (IRQs are NOT permanently masked): `wfi` wakes on an unmasked pending
+/// interrupt, the interrupt enters the normal AArch64 trap path (which re-acquires `with_cpu`
+/// freely because it is released here), and either dispatches a now-runnable task or returns to
+/// the `wfi`. `current` is None (no user task), so no stale userspace ELR/SPSR/frame is ever
+/// returned. Never returns.
+pub(crate) fn enter_post_lock_idle(cpu: CpuId) -> ! {
+    crate::yarm_log!("AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu={}", cpu.0);
+    idle_no_eret_loop();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Aarch64TrapContext {
     pub esr_el1: u32,

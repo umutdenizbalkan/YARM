@@ -504,6 +504,34 @@ drain dispatches task B (the spawned child) → B wakes A via split FutexWake (N
 once. Proof: `AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid=<A> dispatched_tid=<B>
 wake_count=1`, proven under **both** `-smp 1` and `-smp 2` (SMP=2 is the acceptance target; the
 195D BSP affinity keeps the freshly-spawned task B on the BSP dispatcher). Yield remains inert.
+
+### 4.9 FutexWait DEFAULT-ON + post-lock idle seal (Stage 195F)
+
+Stage 195F makes the FutexWait out-of-lock retirement the **default production path** on eligible
+AArch64 traps — **no enable knob**. The 195E eligibility drops the `runnable_count_on_cpu > 0`
+requirement; the post-lock drain now has **two successful outcomes**:
+
+- **Switch** (byte-identical to 195E): an incoming runnable task exists → dequeue + restore it.
+- **Idle** (new): no incoming runnable task → the outgoing caller stays `Blocked(Futex)`,
+  `current` stays None, the deferral is cleared, **no frame is restored**, and the BSP enters the
+  real idle loop (`enter_post_lock_idle` → the same `idle_no_eret_loop` `wfi` primitive) **AFTER
+  the broad `with_cpu` lock is released** — never `idle_no_eret_loop()` while holding `with_cpu`.
+  Markers: `AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING`, `..._POST_LOCK_IDLE_BEGIN`,
+  `..._POST_LOCK_IDLE_LOCK_DROPPED_OK` (a real re-acquire of the released broad lock, which would
+  deadlock if still held), `..._DISPATCH_DONE result=idle`, `..._POST_LOCK_IDLE_ENTERED`, plus the
+  `class=FutexWait result=ok` retirement. The eligible-trap attestation `AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON
+  result=ok` fires once at the first default-on deferral.
+
+**Interrupt/idle correctness:** `DAIF` is left as the trap left it (IRQs are not permanently
+masked); `wfi` wakes on a pending unmasked interrupt, which enters the normal AArch64 trap path
+(freely re-acquiring `with_cpu` because it is released here) and either dispatches a now-runnable
+task or returns to the `wfi`. `current == None`, so no stale userspace ELR/SPSR/frame is ever
+returned. This reuses the proven BSP idle primitive — not a second idle policy. The legacy in-lock
+`dispatch_next_task` fallback is retained ONLY for genuinely ineligible traps (no trap drainer,
+multi-dispatcher, non-BSP, already-deferred). Idle oracle (default-off, `FUTEX_WAIT_IDLE_ORACLE=1`):
+the last runnable user task blocks on a never-woken futex →
+`AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1`, then QEMU idles
+until the smoke timeout. Yield remains inert; AP user dispatch is not enabled.
 - **TLB/ASID:** local TTBR0_EL1 + ASID switch with the existing `TLBI`/`DSB ISH`/`ISB`
   maintenance is sufficient for the first slices; broadcast `TLBI` is only needed for
   VM/SMP classes, which are out of scope. QEMU virt and RPi5 share the same generic drain —

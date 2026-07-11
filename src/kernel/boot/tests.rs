@@ -62934,15 +62934,12 @@ mod stage195e_aarch64_futex_wait_drain {
             .map(|(_, r)| r.split_once("\n    pub ").map(|(b, _)| b).unwrap_or(r))
             .unwrap_or("");
         assert!(!body.is_empty(), "futex_wait_current body must exist");
-        assert!(
-            body.contains("aarch64_futex_wait_retire_enabled()"),
-            "the AArch64 deferral must be gated on the default-off retire flag"
-        );
+        // Stage 195F: the deferral is DEFAULT-ON (no retire-flag gate); the genuine eligibility
+        // gates remain. (Default-on + no-has_incoming are pinned in the stage195f module.)
         for needle in [
             "GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE",
             "dispatching_cpu_count() <= 1",
             "BOOTSTRAP_CPU_ID",
-            "runnable_count_on_cpu",
             "futex_wait_dispatch_try_defer",
             "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN",
             "AARCH64_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK",
@@ -63055,10 +63052,11 @@ mod stage195e_aarch64_futex_wait_drain {
         );
     }
 
-    // The smoke gates the FutexWait oracle acceptance and keeps `class=FutexWait` forbidden on a
-    // DEFAULT boot (proving default-off).
+    // The smoke gates the FutexWait switch-oracle acceptance. (Stage 195F makes the mechanism
+    // default-on, so `class=FutexWait` is NO LONGER forbidden — that guard is checked in the
+    // stage195f module; only Yield stays forbidden here.)
     #[test]
-    fn smoke_accepts_futex_wait_oracle_and_default_off() {
+    fn smoke_accepts_futex_wait_oracle() {
         assert!(
             A64_SMOKE.contains("FUTEX_WAIT_ORACLE")
                 && A64_SMOKE.contains("yarm.aarch64_futex_wait_oracle=1")
@@ -63067,10 +63065,6 @@ mod stage195e_aarch64_futex_wait_drain {
                     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"
                 ),
             "the smoke must require the FutexWait live-oracle acceptance markers"
-        );
-        assert!(
-            A64_SMOKE.contains("a64_split_bads+=(\"arch=aarch64 class=FutexWait\")"),
-            "the smoke must forbid class=FutexWait on a default (non-oracle) boot"
         );
         assert!(
             A64_SMOKE.contains("arch=aarch64 class=Yield"),
@@ -63086,6 +63080,181 @@ mod stage195e_aarch64_futex_wait_drain {
                 && AARCH64_DOC.contains("queue-advancing")
                 && AARCH64_DOC.contains("195E"),
             "ARCH_AARCH64.md must record the Stage 195E live FutexWait drain"
+        );
+    }
+}
+
+// Stage 195F — AARCH64 FUTEXWAIT DEFAULT-ON + POST-LOCK IDLE SEAL. The FutexWait retirement
+// mechanism is now default-on (no knob / no runnable_count gate), and the post-lock drain has a
+// second successful outcome: Idle (no incoming → enter the real BSP idle loop AFTER the broad
+// lock is released, keeping the caller Blocked and current None, restoring no frame). These
+// guards pin the default-on eligibility, the idle outcome, and the idle-oracle wiring.
+mod stage195f_aarch64_futex_wait_default_on {
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+
+    fn futex_wait_current_body() -> &'static str {
+        EXEC_SRC
+            .split_once("pub fn futex_wait_current(")
+            .map(|(_, r)| r.split_once("\n    pub ").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("")
+    }
+
+    // The retirement mechanism defaults ON: the AArch64 deferral is NOT gated on the oracle/retire
+    // flag, and the `runnable_count_on_cpu > 0` (has_incoming) requirement is REMOVED.
+    #[test]
+    fn mechanism_default_on_no_flag_no_has_incoming() {
+        let body = futex_wait_current_body();
+        assert!(!body.is_empty(), "futex_wait_current body must exist");
+        assert!(
+            !body.contains("aarch64_futex_wait_retire_enabled()"),
+            "the FutexWait mechanism must NOT be gated on the retire/oracle flag (default-on)"
+        );
+        // Check the actual eligibility CODE, not the explanatory comment: no `has_incoming`
+        // variable and no `self.runnable_count_on_cpu(...)` call in the gate.
+        assert!(
+            !body.contains("let has_incoming") && !body.contains("&& has_incoming"),
+            "the has_incoming (runnable_count) eligibility requirement must be removed"
+        );
+        assert!(
+            body.contains("maybe_log_futex_wait_default_on()"),
+            "an eligible default-on deferral must attest via maybe_log_futex_wait_default_on"
+        );
+        // The eligibility keeps the genuine gates + legacy fallback.
+        for needle in [
+            "GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE",
+            "dispatching_cpu_count() <= 1",
+            "BOOTSTRAP_CPU_ID",
+            "futex_wait_dispatch_try_defer",
+            "self.dispatch_next_task()?;",
+        ] {
+            assert!(body.contains(needle), "eligibility must keep `{needle}`");
+        }
+        assert!(
+            MOD_SRC.contains("AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"),
+            "the default-on attestation marker must exist"
+        );
+    }
+
+    // The post-lock drain's no-incoming branch is the Idle OUTCOME (not a decline): it emits the
+    // idle markers, clears the deferral, proves the lock is dropped, restores NO frame, and enters
+    // the real BSP idle loop OUTSIDE with_cpu.
+    #[test]
+    fn post_lock_idle_outcome_wired() {
+        let block = TRAP_ENTRY_SRC
+            .split_once("Stage 195E (AARCH64 FUTEXWAIT QUEUE-ADVANCING DISPATCH)")
+            .map(|(_, r)| {
+                r.split_once("Stage 192B (YIELD")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(
+            !block.is_empty(),
+            "the AArch64 FutexWait drain block must exist"
+        );
+        for needle in [
+            "AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=",
+            "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu=",
+            "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu=",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle",
+            "futex_wait_dispatch_clear(cpu_idx)",
+            "enter_post_lock_idle(cpu)",
+            "maybe_log_futex_wait_retired()",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the idle outcome must use/emit `{needle}`"
+            );
+        }
+        // The idle branch confirms current is None via a lock re-acquire, and does NOT restore a
+        // frame (no post_switch_restore in the no-incoming branch — that is only in the switch arm).
+        let idle_branch = block
+            .split_once("Stage 195F IDLE OUTCOME")
+            .map(|(_, r)| r)
+            .unwrap_or("");
+        assert!(
+            idle_branch.contains("kernel.current_tid(), None | Some(0)"),
+            "the idle branch must verify current is None/idle"
+        );
+        assert!(
+            !idle_branch.contains("post_switch_restore_arch_thread_state"),
+            "the idle outcome must NOT restore the blocked caller's frame"
+        );
+    }
+
+    // The BSP idle entry reuses the proven idle primitive OUTSIDE with_cpu (not a second policy),
+    // never masks interrupts permanently, and emits the ENTERED marker.
+    #[test]
+    fn enter_post_lock_idle_reuses_bsp_idle() {
+        assert!(
+            A64_TRAP_SRC.contains("pub(crate) fn enter_post_lock_idle(cpu: CpuId) -> !")
+                && A64_TRAP_SRC.contains("AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=")
+                && A64_TRAP_SRC.contains("idle_no_eret_loop();"),
+            "enter_post_lock_idle must reuse idle_no_eret_loop (the proven BSP idle) + emit ENTERED"
+        );
+    }
+
+    // The idle-oracle workload is default-off and slot-5=3 gated; the mechanism markers are
+    // separate from the (gated) idle-oracle attestation.
+    #[test]
+    fn idle_oracle_default_off_and_slot5_3() {
+        assert!(
+            MOD_SRC.contains("aarch64_futex_wait_idle_oracle_enabled")
+                && MOD_SRC.contains("set_aarch64_futex_wait_idle_oracle_enabled"),
+            "the idle-oracle workload flag must exist"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.aarch64_futex_wait_idle_oracle")
+                && BOOT_CMDLINE_SRC.contains("set_aarch64_futex_wait_idle_oracle_enabled(enabled)"),
+            "the idle-oracle knob must set the workload flag"
+        );
+        assert!(
+            A64_BOOT_SRC.contains("aarch64_futex_wait_idle_oracle_enabled()")
+                && A64_BOOT_SRC.contains("init_args[5] = 3"),
+            "the bootstrap must provision slot-5=3 under the idle-oracle knob"
+        );
+        assert!(
+            INIT_SRC.contains("run_aarch64_futex_wait_idle_oracle")
+                && INIT_SRC.contains("supervisor_control_recv_ep == Some(3)"),
+            "init must gate the idle oracle behind slot-5=3"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none="
+            ),
+            "the drain must emit the idle-oracle attestation (gated on the workload flag)"
+        );
+    }
+
+    // The smoke exposes the idle-oracle knob + acceptance and requires the default-on marker.
+    #[test]
+    fn smoke_accepts_default_on_and_idle_oracle() {
+        assert!(
+            A64_SMOKE.contains("FUTEX_WAIT_IDLE_ORACLE")
+                && A64_SMOKE.contains("yarm.aarch64_futex_wait_idle_oracle=1")
+                && A64_SMOKE.contains("AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle")
+                && A64_SMOKE.contains(
+                    "AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1"
+                ),
+            "the smoke must expose + accept the no-incoming idle oracle"
+        );
+        assert!(
+            A64_SMOKE.contains("AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"),
+            "the smoke must require the default-on attestation"
+        );
+        // class=FutexWait is no longer forbidden on a default boot (mechanism is default-on).
+        assert!(
+            !A64_SMOKE.contains("a64_split_bads+=(\"arch=aarch64 class=FutexWait\")"),
+            "class=FutexWait must NOT be forbidden (default-on)"
         );
     }
 }

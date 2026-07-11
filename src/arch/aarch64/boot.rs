@@ -7772,10 +7772,13 @@ pub fn bootstrap_first_user_task(
     // (supervisor_control_recv_ep) is unused by init, so under
     // `yarm.aarch64_futex_wake_oracle=1` we reuse it as a sentinel (=1) that tells init to
     // run the parent/child FutexWake oracle. A normal boot leaves it 0 and init skips it.
-    // Stage 195E: the FutexWait oracle (retire enabled) uses sentinel 2; the Stage 195C
-    // FutexWake oracle uses sentinel 1. The FutexWait knob sets BOTH flags, so check retire
-    // first to disambiguate.
-    if crate::kernel::boot::aarch64_futex_wait_retire_enabled() {
+    // Slot-5 oracle sentinel: 3 = Stage 195F FutexWait NO-INCOMING idle oracle; 2 = Stage 195E
+    // FutexWait switch oracle (retire flag = its discriminator); 1 = Stage 195C FutexWake oracle.
+    // Check idle first, then retire (switch), then wake.
+    if crate::kernel::boot::aarch64_futex_wait_idle_oracle_enabled() {
+        init_args[5] = 3;
+        crate::yarm_log!("AARCH64_FUTEX_WAIT_IDLE_ORACLE_PROVISION_OK slot5=3");
+    } else if crate::kernel::boot::aarch64_futex_wait_retire_enabled() {
         init_args[5] = 2;
         crate::yarm_log!("AARCH64_FUTEX_WAIT_ORACLE_PROVISION_OK slot5=2");
     } else if crate::kernel::boot::aarch64_futex_wake_oracle_enabled() {

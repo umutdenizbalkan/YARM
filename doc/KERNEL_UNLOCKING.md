@@ -8512,6 +8512,25 @@ first prerequisite; it is deferred rather than half-landed so the proven in-lock
 `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait`.** Yield stays a separate future
 slice (its re-enqueue proof is independent). See §4.7 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 195F — AArch64 FutexWait DEFAULT-ON + post-lock idle seal (DONE)
+
+The AArch64 FutexWait out-of-lock retirement is now the **default production path** (no enable
+knob) for eligible traps: eligibility = `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` + `dispatching_cpu_count()
+<= 1` + BSP + not-already-deferred (the 195E `runnable_count_on_cpu > 0` requirement is REMOVED).
+The post-lock drain has two successful outcomes: **Switch** (byte-identical to 195E) and **Idle**
+(no incoming → outgoing stays `Blocked(Futex)`, `current` None, deferral cleared, NO frame
+restored, enter the real BSP idle loop `enter_post_lock_idle`→`idle_no_eret_loop` AFTER the broad
+`with_cpu` lock is released — never while holding it). Idle markers:
+`AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING`, `..._POST_LOCK_IDLE_BEGIN`,
+`..._POST_LOCK_IDLE_LOCK_DROPPED_OK` (a real re-acquire of the released broad lock), `..._DISPATCH_DONE
+result=idle`, `..._POST_LOCK_IDLE_ENTERED` + `class=FutexWait result=ok`. Default-on attestation:
+`AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok`. IRQs are not permanently masked (`wfi` wakes on a
+pending interrupt into the normal trap path; `current == None` ⇒ no stale frame). Legacy in-lock
+fallback retained only for genuinely ineligible traps. Idle oracle (default-off,
+`yarm.aarch64_futex_wait_idle_oracle`): `AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1
+current_none=1`, then WFI idle to timeout. Yield inert; NR 27 deprecation TODO preserved. See §4.9
+of `doc/ARCH_AARCH64.md`.
+
 #### Stage 195E — AArch64 FutexWait queue-advancing drain LIVE (DONE)
 
 The 195D blocker is resolved and the AArch64 **FutexWait (NR 9)** queue-advancing dispatch is

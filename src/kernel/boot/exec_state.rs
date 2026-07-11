@@ -1299,8 +1299,14 @@ impl KernelState {
         // AArch64 trap-handler bypass and the trap-entry drain performs the authoritative
         // queue-advancing dispatch + EL0 restore off the global lock. Every ineligible case
         // falls through to the unchanged in-lock `dispatch_next_task` below.
+        // Stage 195F: the AArch64 FutexWait out-of-lock retirement mechanism is DEFAULT-ON (no
+        // knob) for eligible traps. The `runnable_count_on_cpu > 0` requirement is REMOVED — the
+        // post-lock drain now handles BOTH outcomes: a Switch (dequeue the incoming task) and an
+        // Idle (no incoming → enter the real BSP idle loop AFTER the broad lock is released). The
+        // legacy in-lock `dispatch_next_task` fallback is retained ONLY for genuinely ineligible
+        // cases (no trap drainer, multi-dispatcher, non-BSP, already deferred).
         #[cfg(target_arch = "aarch64")]
-        if crate::kernel::boot::aarch64_futex_wait_retire_enabled() {
+        {
             let cpu_idx = self.current_cpu().0 as usize;
             let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
                 && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
@@ -1308,19 +1314,13 @@ impl KernelState {
             let single_cpu = self.dispatching_cpu_count() <= 1;
             let is_bsp = self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
             let already = crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
-            // Only defer when there is ANOTHER runnable task for the drain to dispatch. The
-            // caller is already `Blocked(Futex)` and removed from `current`, so this counts the
-            // genuine incomings. If zero, fall back to the in-lock path (which idles correctly
-            // via `idle_no_eret_loop`) — the handler bypass never leaves a stale exception
-            // return with no incoming task.
-            let has_incoming = self.runnable_count_on_cpu(self.current_cpu()) > 0;
             if trap_path
                 && single_cpu
                 && is_bsp
-                && has_incoming
                 && !already
                 && crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid)
             {
+                crate::kernel::boot::maybe_log_futex_wait_default_on();
                 crate::yarm_log!(
                     "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu={} tid={}",
                     cpu_idx,
@@ -1328,7 +1328,8 @@ impl KernelState {
                 );
                 crate::yarm_log!("AARCH64_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid={}", tid);
                 // The AArch64 trap-handler bypass returns cleanly through `with_cpu`; the
-                // trap-entry drain performs the authoritative dispatch. Do NOT dispatch here.
+                // trap-entry drain performs the authoritative dispatch (Switch or Idle). Do NOT
+                // dispatch in-lock here.
                 return Ok(true);
             }
             crate::yarm_log!(
@@ -1339,8 +1340,6 @@ impl KernelState {
                     "multi_cpu"
                 } else if !is_bsp {
                     "not_bsp"
-                } else if !has_incoming {
-                    "no_incoming"
                 } else {
                     "already_deferred"
                 },

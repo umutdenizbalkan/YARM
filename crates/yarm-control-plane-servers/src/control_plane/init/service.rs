@@ -680,6 +680,11 @@ static FUTEX_ORACLE_PARK: core::sync::atomic::AtomicU32 =
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static FUTEX_ORACLE_HANDSHAKE: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0x00C0);
+// Stage 195F: never-woken word for the NO-INCOMING idle oracle. The final runnable user task
+// blocks here; nothing ever wakes it, so the default-on post-lock drain takes the Idle outcome.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static FUTEX_ORACLE_IDLE_WORD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0x1D1E);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static mut FUTEX_ORACLE_CHILD_STACK: [u8; 16384] = [0u8; 16384];
 // `spawn_user_thread` requires a NON-zero TLS base; a small dedicated TLS region suffices.
@@ -792,6 +797,30 @@ fn run_aarch64_futex_wake_oracle(init_tid: u64, futex_wait_mode: bool) {
             first_wake,
             second_wake
         );
+    }
+}
+
+/// Stage 195F NO-INCOMING idle oracle: the final runnable user task (init) blocks on a
+/// never-woken futex when no other user task is runnable (every server is blocked on recv and no
+/// child is spawned). The default-on post-lock FutexWait drain therefore observes no incoming
+/// task and takes the Idle outcome: it clears the deferral, proves the broad lock is released,
+/// keeps `current` None, restores NO frame, and enters the BSP idle loop. This call never
+/// returns — QEMU stays idle (WFI) until the smoke timeout, interrupt-responsive.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn run_aarch64_futex_wait_idle_oracle(init_tid: u64) -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    yarm_user_rt::user_log!("AARCH64_FUTEX_WAIT_IDLE_ORACLE_BEGIN init_tid={}", init_tid);
+    let addr = FUTEX_ORACLE_IDLE_WORD.as_ptr();
+    let observed = FUTEX_ORACLE_IDLE_WORD.load(Relaxed);
+    yarm_user_rt::user_log!(
+        "AARCH64_FUTEX_WAIT_IDLE_ORACLE_WAIT_BEGIN observed={}",
+        observed
+    );
+    // Legacy-shape FutexWait (NR 9) that blocks and — with nothing else runnable — drives the
+    // post-lock Idle outcome. Nothing ever wakes this word, so it does not return.
+    loop {
+        let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+        yarm_user_rt::user_log!("AARCH64_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN");
     }
 }
 
@@ -1239,10 +1268,17 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if ctx.supervisor_control_recv_ep == Some(1) || ctx.supervisor_control_recv_ep == Some(2) {
         // Slot-5 sentinel: 1 = Stage 195C FutexWake oracle; 2 = Stage 195E FutexWait
-        // queue-advancing oracle (same parent/child flow, but the parent's handshake FutexWait
-        // is serviced by the out-of-lock drain).
+        // queue-advancing SWITCH oracle (same parent/child flow, but the parent's handshake
+        // FutexWait is serviced by the out-of-lock drain).
         let futex_wait_mode = ctx.supervisor_control_recv_ep == Some(2);
         run_aarch64_futex_wake_oracle(ctx.task_id, futex_wait_mode);
+    }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    if ctx.supervisor_control_recv_ep == Some(3) {
+        // Slot-5 sentinel 3 = Stage 195F NO-INCOMING idle oracle. All servers are up and blocked
+        // on recv; init is the last runnable user task. This blocks on a never-woken futex and
+        // does not return — the default-on post-lock drain takes the Idle outcome.
+        run_aarch64_futex_wait_idle_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

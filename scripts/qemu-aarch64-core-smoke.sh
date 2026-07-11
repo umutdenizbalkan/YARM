@@ -68,6 +68,17 @@ if [[ "$FUTEX_WAIT_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_futex_w
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_futex_wait_oracle=1"
 fi
 
+# Stage 195F (AARCH64 FUTEXWAIT DEFAULT-ON — NO-INCOMING IDLE): FUTEX_WAIT_IDLE_ORACLE=1 appends
+# yarm.aarch64_futex_wait_idle_oracle=1, which provisions the init slot-5 sentinel (=3). The
+# FutexWait retirement MECHANISM is now DEFAULT-ON (no enable knob); this knob only selects the
+# idle-oracle WORKLOAD: init (the last runnable user task) blocks on a never-woken futex with no
+# other runnable user task, so the post-lock drain takes the Idle outcome and enters the BSP idle
+# loop. QEMU then stays idle (WFI) until the smoke timeout. Give it a longer timeout.
+FUTEX_WAIT_IDLE_ORACLE=${FUTEX_WAIT_IDLE_ORACLE:-0}
+if [[ "$FUTEX_WAIT_IDLE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_futex_wait_idle_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_futex_wait_idle_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64-hwe}
@@ -244,19 +255,17 @@ if [[ -f "$LOGFILE" ]]; then
     exit 1
   fi
   # Forbid split fatals and the Yield queue-advancing retirement marker (Yield stays inert).
-  # Stage 195C ENABLES FutexWake (NR 10); Stage 195E ENABLES the FutexWait (NR 9) queue-
-  # advancing drain, but ONLY under the FutexWait oracle knob (default-off), so `class=FutexWait`
-  # is forbidden on a DEFAULT boot (proving it is genuinely off) and expected only when
-  # FUTEX_WAIT_ORACLE=1 (checked in the dedicated 195E block below).
+  # Stage 195C ENABLES FutexWake (NR 10); Stage 195F makes the FutexWait (NR 9) queue-advancing
+  # drain DEFAULT-ON (no knob), so `class=FutexWait` is NO LONGER forbidden — it legitimately
+  # appears whenever any eligible FutexWait occurs (switch/idle oracles, or the FutexWake
+  # oracle's handshake waits). A plain core boot simply performs no FutexWait, so it stays 0.
+  # Only Yield remains inert (its queue-advancing retirement is out of scope).
   a64_split_bads=(
     "AARCH64_SPLIT_FINALIZE_OK nr=15 result=error"
     "AARCH64_SPLIT_FINALIZE_OK nr=27 result=error"
     "AARCH64_SPLIT_FINALIZE_OK nr=10 result=error"
     "arch=aarch64 class=Yield"
   )
-  if [[ "${FUTEX_WAIT_ORACLE:-0}" != "1" ]]; then
-    a64_split_bads+=("arch=aarch64 class=FutexWait")
-  fi
   for a64_split_bad in "${a64_split_bads[@]}"; do
     if cad_has "$a64_split_bad"; then
       echo "[error] aarch64 Stage 195A/195B/195C: forbidden split marker: $a64_split_bad"
@@ -311,8 +320,9 @@ if [[ -f "$LOGFILE" && "$FUTEX_WAIT_ORACLE" == "1" ]]; then
       "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok" \
       "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=FutexWait" \
       "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok" \
+      "AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok" \
       "AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok"; then
-    echo "[error] aarch64 Stage 195E FutexWait queue-advancing live-oracle markers missing"
+    echo "[error] aarch64 Stage 195E/195F FutexWait switch-oracle markers missing"
     exit 1
   fi
   for a64_fw_bad in \
@@ -325,7 +335,40 @@ if [[ -f "$LOGFILE" && "$FUTEX_WAIT_ORACLE" == "1" ]]; then
       exit 1
     fi
   done
-  echo "[ok] aarch64 Stage 195E: FutexWait (NR 9) queue-advancing out-of-lock drain live oracle proven"
+  echo "[ok] aarch64 Stage 195E: FutexWait (NR 9) queue-advancing switch-oracle proven (default-on)"
+fi
+
+# Stage 195F (AARCH64 FUTEXWAIT DEFAULT-ON — NO-INCOMING IDLE): when booted with the idle-oracle
+# knob, require the full default-on + no-incoming + post-lock idle marker set, and forbid any
+# drain failure, a restored blocked-caller frame, or an in-lock idle for the deferred trap.
+if [[ -f "$LOGFILE" && "$FUTEX_WAIT_IDLE_ORACLE" == "1" ]]; then
+  if ! check_required_patterns "$LOGFILE" \
+      "AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0" \
+      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0" \
+      "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu=0" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=0" \
+      "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu=0" \
+      "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu=0" \
+      "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle" \
+      "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0" \
+      "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok" \
+      "AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1"; then
+    echo "[error] aarch64 Stage 195F FutexWait no-incoming idle-oracle markers missing"
+    exit 1
+  fi
+  for a64_idle_bad in \
+      "AARCH64_FUTEX_WAIT_DISPATCH_FAIL" \
+      "AARCH64_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN" \
+      "AARCH64_BAD_USER_ELR"; do
+    if cad_has "$a64_idle_bad"; then
+      echo "[error] aarch64 Stage 195F: forbidden idle-oracle marker: $a64_idle_bad"
+      exit 1
+    fi
+  done
+  # The idle outcome must NOT restore the blocked caller's frame (no FRAME_OK for the idle trap)
+  # and must clear the deferral (idle is a genuine retirement, not a stale decline).
+  echo "[ok] aarch64 Stage 195F: FutexWait no-incoming post-lock idle proven (default-on, lock_dropped, current_none)"
 fi
 
 if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then
