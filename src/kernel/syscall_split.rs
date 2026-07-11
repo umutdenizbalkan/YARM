@@ -482,10 +482,18 @@ fn try_split_futex_wake_into_frame(
     }
 
     // Validation passed — wake off the global lock.
+    // Stage 195C: AArch64 emits arch-tagged split markers (FutexWake is the third live
+    // AArch64 split-dispatch class). x86_64/riscv64 keep the exact untagged Stage 191B text.
+    #[cfg(target_arch = "aarch64")]
+    crate::yarm_log!("FUTEX_WAKE_SPLIT_BEGIN arch=aarch64");
+    #[cfg(not(target_arch = "aarch64"))]
     crate::yarm_log!("FUTEX_WAKE_SPLIT_BEGIN");
     let woke = shared.futex_wake_split_mut(cpu, addr, max_wake);
     crate::yarm_log!("FUTEX_WAKE_SPLIT_WAKE_OK count={}", woke);
     frame.set_ok(woke as usize, 0, 0);
+    #[cfg(target_arch = "aarch64")]
+    crate::yarm_log!("FUTEX_WAKE_SPLIT_DONE arch=aarch64 result=ok woke={}", woke);
+    #[cfg(not(target_arch = "aarch64"))]
     crate::yarm_log!("FUTEX_WAKE_SPLIT_DONE result=ok");
     maybe_log_futex_wake_retired();
     Some(Ok(()))
@@ -503,8 +511,21 @@ fn maybe_log_futex_wake_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("{} class=FutexWake", MARK_RETIRE_CLASS_BEGIN);
-        crate::yarm_log!("{} class=FutexWake result=ok", MARK_RETIRE_CLASS_DONE);
+        // Stage 195C: AArch64 emits an arch-tagged retirement marker; x86_64/riscv64 keep the
+        // exact untagged Stage 191B text (byte-identical, in the preserve list).
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!("{} arch=aarch64 class=FutexWake", MARK_RETIRE_CLASS_BEGIN);
+            crate::yarm_log!(
+                "{} arch=aarch64 class=FutexWake result=ok",
+                MARK_RETIRE_CLASS_DONE
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            crate::yarm_log!("{} class=FutexWake", MARK_RETIRE_CLASS_BEGIN);
+            crate::yarm_log!("{} class=FutexWake result=ok", MARK_RETIRE_CLASS_DONE);
+        }
     }
 }
 
@@ -676,11 +697,28 @@ fn maybe_log_initramfs_read_chunk_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("{} class=InitramfsReadChunk", MARK_RETIRE_CLASS_BEGIN);
-        crate::yarm_log!(
-            "{} class=InitramfsReadChunk result=ok",
-            MARK_RETIRE_CLASS_DONE
-        );
+        // Stage 195B: AArch64 emits an arch-tagged retirement marker (InitramfsReadChunk
+        // is the second live AArch64 split-dispatch class). x86_64/riscv64 keep the exact
+        // untagged marker text — byte-identical to Stage 191C.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!(
+                "{} arch=aarch64 class=InitramfsReadChunk",
+                MARK_RETIRE_CLASS_BEGIN
+            );
+            crate::yarm_log!(
+                "{} arch=aarch64 class=InitramfsReadChunk result=ok",
+                MARK_RETIRE_CLASS_DONE
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            crate::yarm_log!("{} class=InitramfsReadChunk", MARK_RETIRE_CLASS_BEGIN);
+            crate::yarm_log!(
+                "{} class=InitramfsReadChunk result=ok",
+                MARK_RETIRE_CLASS_DONE
+            );
+        }
     }
 }
 
@@ -815,12 +853,13 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // global lock via `try_split_debug_log_into_frame`. Any case it cannot service
         // returns `None` → unchanged global-lock fallback.
         Syscall::DebugLog => Some(syscall),
-        // Stage 191B (GLOBAL-LOCK-RETIRE, second class): FutexWake (NR 11) — the CALLER
+        // Stage 191B (GLOBAL-LOCK-RETIRE, second class): FutexWake (NR 10) — the CALLER
         // never task-switches; it only mutates waiter/run-queue state (Blocked→Runnable
         // + enqueue). Serviced off the global lock via `try_split_futex_wake_into_frame`
-        // (task split-mut wake scan + scheduler split-mut enqueue). NOT FutexWait (which
-        // blocks the caller — stays global-lock-only). Ineligible cases (invalid addr)
-        // return `None` → unchanged global-lock fallback, which produces the exact error.
+        // (task split-mut wake scan + scheduler split-mut enqueue). NOT FutexWait (NR 9,
+        // which blocks the caller — stays global-lock-only). Ineligible cases (invalid
+        // addr) return `None` → unchanged global-lock fallback, which produces the exact
+        // error. (NR 11 is SpawnThread, NOT FutexWake — do not confuse the two.)
         Syscall::FutexWake => Some(syscall),
         // Stage 191C (GLOBAL-LOCK-RETIRE, third class): InitramfsReadChunk (NR 27) is a
         // read-only user-copy syscall — it copies immutable initramfs/CPIO bytes into a
@@ -1345,8 +1384,8 @@ mod tests {
     #[test]
     fn stage29_futex_not_eligible() {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
-        // FutexWait (NR 10) is genuinely never split-eligible — it BLOCKS the caller,
-        // so it stays global-lock-only. (Stage 191B split-retired FutexWake (NR 11),
+        // FutexWait (NR 9) is genuinely never split-eligible — it BLOCKS the caller,
+        // so it stays global-lock-only. (Stage 191B split-retired FutexWake (NR 10),
         // which does NOT block the caller; that eligibility is pinned separately.)
         let mut frame = TrapFrame::new(
             crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR,
@@ -1369,6 +1408,32 @@ mod tests {
         );
     }
 
+    /// Stage 195C guard: pin the exact FutexWake / FutexWait / SpawnThread NR identities so a
+    /// future edit cannot silently reintroduce the "FutexWake is NR 11" confusion (NR 11 is
+    /// SpawnThread; FutexWake is NR 10; FutexWait is NR 9). Only FutexWake (NR 10) is
+    /// split-eligible; FutexWait (NR 9) and SpawnThread (NR 11) stay global-lock-only.
+    #[test]
+    fn stage195c_futex_wake_nr10_split_eligible_wait_and_spawn_thread_excluded() {
+        use crate::kernel::syscall::{
+            SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_SPAWN_THREAD_NR,
+        };
+        // The real syscall numbers — the Stage 195C task text's "NR11" for FutexWake is wrong.
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9, "FutexWait is NR 9");
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10, "FutexWake is NR 10 (NOT 11)");
+        assert_eq!(
+            SYSCALL_SPAWN_THREAD_NR, 11,
+            "NR 11 is SpawnThread, NOT FutexWake"
+        );
+        assert!(
+            matches!(decode(SYSCALL_FUTEX_WAKE_NR), Syscall::FutexWake),
+            "NR 10 must decode to FutexWake"
+        );
+        // Only FutexWake (NR 10) passes the NR-only split gate.
+        assert!(classify_split_eligible_nr_only(decode(SYSCALL_FUTEX_WAKE_NR)).is_some());
+        assert!(classify_split_eligible_nr_only(decode(SYSCALL_FUTEX_WAIT_NR)).is_none());
+        assert!(classify_split_eligible_nr_only(decode(SYSCALL_SPAWN_THREAD_NR)).is_none());
+    }
+
     #[test]
     fn stage29_syscall_count_still_30() {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 29 must not change SYSCALL_COUNT");
@@ -1378,7 +1443,7 @@ mod tests {
     fn stage29_whitelist_exhaustive() {
         // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
         // Stage 32B), NR 14 (VmBrk, Stage 114), NR 15 (DebugLog, Stage 191A),
-        // NR 11 (FutexWake, Stage 191B), and NR 27 (InitramfsReadChunk, Stage 191C)
+        // NR 10 (FutexWake, Stage 191B), and NR 27 (InitramfsReadChunk, Stage 191C)
         // may pass the NR-only split-eligibility gate. Every other syscall stays
         // global-lock-only.
         for nr in 0..SYSCALL_COUNT {

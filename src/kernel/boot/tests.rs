@@ -42991,11 +42991,18 @@ mod stage160c_aarch64_trap_abi_bracketing {
                 && AARCH64_TRAP_SRC.contains("AARCH64_SPLIT_SVC_ADVANCE_DONE"),
             "AArch64 finalize must export results and advance the SVC PC, with diagnostics"
         );
-        // The advance uses the same resume PC as the proven global recv-success
-        // path (raw vector ELR + 4).
+        // Stage 195B: the split resume PC is `last_vector_raw_elr()` with NO `+4` — the
+        // synchronous-exception ELR_EL1 for an SVC already points past the SVC, matching the
+        // proven global non-IpcRecv return path. The earlier `+4` over-advanced by one
+        // instruction (skipping the caller's return-register load), which InitramfsReadChunk
+        // exposed.
         assert!(
-            AARCH64_TRAP_SRC.contains("last_vector_raw_elr().wrapping_add(4)"),
-            "split SVC advance must reuse the global recv-success resume PC (raw + 4)"
+            AARCH64_TRAP_SRC.contains(
+                "let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr() as usize;"
+            ) && !AARCH64_TRAP_SRC.contains(
+                "let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr().wrapping_add(4)"
+            ),
+            "split SVC advance must use raw ELR (no +4), matching the global non-IpcRecv path"
         );
     }
 
@@ -43158,10 +43165,17 @@ mod stage160d_aarch64_split_error_export_parity {
             .nth(1)
             .and_then(|s| s.split("\npub fn ").next())
             .expect("split finalize must exist");
+        // Stage 195B: no `+4` over-advance; the resume PC is raw ELR, used exactly once.
         assert_eq!(
             f.matches("last_vector_raw_elr().wrapping_add(4)").count(),
+            0,
+            "the erroneous +4 SVC over-advance must be gone"
+        );
+        assert_eq!(
+            f.matches("crate::arch::aarch64::boot::last_vector_raw_elr() as usize")
+                .count(),
             1,
-            "SVC PC advance must occur exactly once on the handled split path"
+            "the raw-ELR resume PC must be computed exactly once on the handled split path"
         );
         assert_eq!(
             f.matches("frame.set_saved_pc(").count(),
@@ -62273,11 +62287,12 @@ mod stage195a_aarch64_debuglog_live {
             body.contains("REG_X8"),
             "the import gate must peek the raw syscall number from x8"
         );
-        // Must NOT separately de-gate FutexWake / InitramfsReadChunk on AArch64.
+        // Must NEVER de-gate the queue-advancing FutexWait on AArch64 (it BLOCKS the caller and
+        // needs the deferred drain body). FutexWake (NR 10) IS enabled as of Stage 195C — that
+        // selectivity is pinned in the stage195c module.
         assert!(
-            !body.contains("SYSCALL_FUTEX_WAKE_NR")
-                && !body.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
-            "195A must not enable FutexWake / InitramfsReadChunk on AArch64"
+            !body.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "AArch64 must not enable the queue-advancing FutexWait"
         );
     }
 
@@ -62397,6 +62412,849 @@ mod stage195a_aarch64_debuglog_live {
         assert!(
             AARCH64_DOC.contains("DebugLog is now LIVE on AArch64 (Stage 195A)"),
             "the arch doc must record DebugLog going live"
+        );
+    }
+}
+
+// Stage 195B — AARCH64 INITRAMFSREADCHUNK SPLIT RETIREMENT. InitramfsReadChunk (NR 27) is the
+// SECOND live AArch64 split-dispatch class. These guards pin the selective ABI-import gate
+// (DebugLog + InitramfsReadChunk only), the success-only decline semantics, no-partial-write,
+// arch-tagged retirement, DebugLog preservation, and that no other class was newly enabled.
+mod stage195b_aarch64_initramfs_read_chunk {
+    use super::*;
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+
+    fn aarch64_import_body() -> &'static str {
+        TRAP_ENTRY_SRC
+            .split_once("#[cfg(target_arch = \"aarch64\")]\nfn pre_split_import_syscall_abi(")
+            .map(|(_, r)| {
+                r.split_once("\n#[cfg(not(target_arch = \"aarch64\"))]")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("")
+    }
+
+    fn aarch64_finalize_body() -> &'static str {
+        TRAP_ENTRY_SRC
+            .split_once("#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(")
+            .map(|(_, r)| {
+                r.split_once("\n#[cfg(not(target_arch = \"aarch64\"))]")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("")
+    }
+
+    // The AArch64 selective ABI gate includes NR 15 (DebugLog), NR 27 (InitramfsReadChunk), and
+    // — as of Stage 195C — NR 10 (FutexWake), plus the oracle knob. It must NEVER include the
+    // queue-advancing FutexWait/Yield or the cap-minting CreateInitramfsFileSliceMo NR.
+    #[test]
+    fn aarch64_abi_gate_includes_nr15_and_nr27_only() {
+        let import = aarch64_import_body();
+        assert!(!import.is_empty(), "aarch64 import body must exist");
+        assert!(
+            import.contains("SYSCALL_DEBUG_LOG_NR")
+                && import.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
+            "the gate must include DebugLog (NR 15) and InitramfsReadChunk (NR 27)"
+        );
+        for forbidden in [
+            "SYSCALL_FUTEX_WAIT_NR",
+            "SYSCALL_YIELD_NR",
+            "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
+        ] {
+            assert!(
+                !import.contains(forbidden),
+                "the AArch64 gate must NOT include `{forbidden}`"
+            );
+        }
+        // Finalize mirrors the same selectivity.
+        let fin = aarch64_finalize_body();
+        assert!(
+            fin.contains("SYSCALL_DEBUG_LOG_NR") && fin.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
+            "the AArch64 finalize gate must mirror the import gate (NR 15 + NR 27)"
+        );
+    }
+
+    // InitramfsReadChunk passes the arch-neutral NR gate and is routed to its generic helper.
+    #[test]
+    fn initramfs_read_chunk_is_split_eligible() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
+            "InitramfsReadChunk must pass the split NR gate"
+        );
+        assert!(
+            SPLIT_SRC.contains("if matches!(syscall, Syscall::InitramfsReadChunk) {"),
+            "try_split_dispatch_into_frame must route InitramfsReadChunk to its helper"
+        );
+    }
+
+    // CreateInitramfsFileSliceMo (NR 28, cap-minting) stays excluded from split dispatch.
+    #[test]
+    fn create_initramfs_file_slice_mo_remains_excluded() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some")
+                && !SPLIT_SRC.contains("matches!(syscall, Syscall::CreateInitramfsFileSliceMo)"),
+            "CreateInitramfsFileSliceMo must never be split-eligible"
+        );
+    }
+
+    // The split helper services ONLY the success path: every error/unsupported case returns
+    // `None` (fall back to the canonical global handler), and the destination copy is a
+    // two-pass validated write so a fault leaves NO partial user write.
+    #[test]
+    fn initramfs_split_is_success_only_and_no_partial_write() {
+        let body = SPLIT_SRC
+            .split_once("fn try_split_initramfs_read_chunk_into_frame(\n    shared: &SharedKernel,")
+            .map(|(_, r)| {
+                r.split_once("\n/// Emit the InitramfsReadChunk")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(!body.is_empty(), "initramfs split helper body must exist");
+        // Declines (fallback) for access/arg/not-found/unwritable cases.
+        assert!(
+            body.matches("return None").count() >= 5,
+            "the split helper must decline (return None) for all non-success cases"
+        );
+        // Two-pass validated user write (validate all dest pages before writing any byte).
+        assert!(
+            body.contains("copy_slice_to_user_asid_split_write"),
+            "the destination copy must use the two-pass validated write seam"
+        );
+        assert!(
+            body.contains("No user-memory byte was written on the split path"),
+            "the helper must document no-partial-write on copy failure"
+        );
+    }
+
+    // Arch-tagged retirement marker on AArch64; byte-identical untagged marker off AArch64.
+    #[test]
+    fn initramfs_retirement_marker_arch_tagged() {
+        assert!(
+            SPLIT_SRC.contains("arch=aarch64 class=InitramfsReadChunk result=ok"),
+            "AArch64 must emit the arch-tagged InitramfsReadChunk retirement marker"
+        );
+        assert!(
+            SPLIT_SRC.contains(
+                "crate::yarm_log!(\"{} class=InitramfsReadChunk\", MARK_RETIRE_CLASS_BEGIN);"
+            ),
+            "the non-aarch64 InitramfsReadChunk marker must stay untagged/byte-identical"
+        );
+    }
+
+    // DebugLog split remains live (its arch-tagged marker + gate intact).
+    #[test]
+    fn debuglog_split_still_live() {
+        assert!(
+            SPLIT_SRC.contains("arch=aarch64 class=DebugLog result=ok"),
+            "the AArch64 DebugLog retirement marker must remain"
+        );
+    }
+
+    // No queue-advancing AArch64 drain; RISC-V still force-clears; ReapFaultedTask excluded.
+    #[test]
+    fn no_queue_advancing_and_riscv_inert_and_reap_excluded() {
+        const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        for needle in [
+            "d2_recv_was_deferred",
+            "futex_wait_was_deferred",
+            "yield_was_deferred",
+        ] {
+            let idx = TRAP_ENTRY_SRC.find(needle).unwrap();
+            assert!(
+                TRAP_ENTRY_SRC[..idx]
+                    .rfind("#[cfg(target_arch = \"x86_64\")]")
+                    .is_some(),
+                "queue-advancing drain `{needle}` must stay x86_64-gated"
+            );
+        }
+        assert!(
+            RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
+            "RISC-V must still force the active flag false"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+    }
+
+    // Stage 195B return-value parity fix: the split finalize resyncs args[0..2] to the exported
+    // x0..x2 and re-saves the TCB AFTER export (so a preemption resume reads the return value,
+    // not the original args), mirroring the proven global non-task-switched return path.
+    #[test]
+    fn split_finalize_resyncs_args_after_export() {
+        const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+        let f = AARCH64_TRAP_SRC
+            .split("fn split_finalize_handled_syscall")
+            .nth(1)
+            .and_then(|s| s.split("\npub fn ").next())
+            .expect("split finalize must exist");
+        let export_idx = f
+            .find("export_syscall_result_to_user_gprs(frame)")
+            .expect("finalize must export");
+        let after_export = &f[export_idx..];
+        assert!(
+            after_export.contains(
+                "frame.set_arg(0, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0))"
+            ) && after_export.contains("set_thread_user_context(tid, ctx)"),
+            "finalize must resync args + re-save the TCB AFTER export (return-value parity)"
+        );
+    }
+
+    // The PM boot-time NR 27 self-probe exists so the retirement fires live on a core boot
+    // (the ZC-grant load path never issues NR 27).
+    #[test]
+    fn pm_nr27_self_probe_present() {
+        const PM_SRC: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+        );
+        assert!(
+            PM_SRC.contains("initramfs_read_chunk(PM_NR27_PROBE_FILE")
+                && PM_SRC.contains("PM_NR27_SELF_PROBE_OK"),
+            "PM must issue the one-shot NR 27 self-probe so the split retirement fires live"
+        );
+    }
+}
+
+// Stage 195C — AARCH64 FUTEXWAKE SPLIT RETIREMENT + LIVE ORACLE. FutexWake (NR 10 — the task
+// text's "NR11" is wrong; NR 11 is SpawnThread) is the third live AArch64 split-dispatch class.
+// These guards pin: the gate/finalize include NR 10, the arch-tagged FutexWake markers, the
+// default-off live-oracle wiring (init handshake + kernel slot-5 sentinel + boot knob), the
+// smoke acceptance, docs, and that no queue-advancing class was newly enabled.
+mod stage195c_aarch64_futex_wake_live {
+    use super::*;
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const BOOT_MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const AARCH64_DOC: &str = include_str!("../../../doc/ARCH_AARCH64.md");
+
+    fn aarch64_import_body() -> &'static str {
+        TRAP_ENTRY_SRC
+            .split_once("#[cfg(target_arch = \"aarch64\")]\nfn pre_split_import_syscall_abi(")
+            .map(|(_, r)| r.split_once("\n#[cfg(").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("")
+    }
+
+    // FutexWake is NR 10 (NOT 11). NR 11 is SpawnThread; NR 9 is FutexWait. Pin the identities so
+    // the task text's "NR11" mistake cannot be baked into the ABI.
+    #[test]
+    fn futex_wake_is_nr10_not_nr11() {
+        use crate::kernel::syscall::{
+            SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_SPAWN_THREAD_NR,
+        };
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_SPAWN_THREAD_NR, 11);
+    }
+
+    // The AArch64 selective ABI import + finalize gates now include FutexWake (NR 10).
+    #[test]
+    fn aarch64_gate_includes_futex_wake_nr10() {
+        let import = aarch64_import_body();
+        assert!(!import.is_empty(), "aarch64 import body must exist");
+        assert!(
+            import.contains("SYSCALL_FUTEX_WAKE_NR"),
+            "the AArch64 ABI gate must include FutexWake (NR 10) as of Stage 195C"
+        );
+        // But NEVER the queue-advancing FutexWait/Yield.
+        assert!(
+            !import.contains("SYSCALL_FUTEX_WAIT_NR") && !import.contains("SYSCALL_YIELD_NR"),
+            "the AArch64 gate must NOT enable queue-advancing FutexWait/Yield"
+        );
+    }
+
+    // FutexWake passes the arch-neutral NR gate and routes to its split helper.
+    #[test]
+    fn futex_wake_split_eligible_and_routed() {
+        assert!(
+            SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
+            "FutexWake must pass the split NR gate"
+        );
+        assert!(
+            SPLIT_SRC.contains("try_split_futex_wake_into_frame"),
+            "the dispatcher must route FutexWake to its split helper"
+        );
+    }
+
+    // Arch-tagged FutexWake markers on AArch64; the woke-count is exported.
+    #[test]
+    fn futex_wake_markers_arch_tagged() {
+        assert!(
+            SPLIT_SRC.contains("FUTEX_WAKE_SPLIT_BEGIN arch=aarch64")
+                && SPLIT_SRC.contains("FUTEX_WAKE_SPLIT_DONE arch=aarch64 result=ok woke=")
+                && SPLIT_SRC.contains("arch=aarch64 class=FutexWake"),
+            "AArch64 must emit arch-tagged FutexWake split + retirement markers"
+        );
+    }
+
+    // The default-off live oracle is fully wired: boot knob (+ monotonic apply), kernel slot-5
+    // sentinel provisioning, and the init parent/child handshake proof.
+    #[test]
+    fn futex_wake_live_oracle_wired() {
+        // Boot knob storage + accessor.
+        assert!(
+            BOOT_MOD_SRC.contains("aarch64_futex_wake_oracle_enabled")
+                && BOOT_MOD_SRC.contains("set_aarch64_futex_wake_oracle_enabled"),
+            "the AArch64 FutexWake oracle boot flag must exist"
+        );
+        // Cmdline parse + apply.
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.aarch64_futex_wake_oracle")
+                && BOOT_CMDLINE_SRC.contains("aarch64_futex_wake_oracle: Option<bool>"),
+            "the cmdline parser must expose the oracle knob"
+        );
+        // Kernel provisions the init slot-5 sentinel only under the knob.
+        assert!(
+            A64_BOOT_SRC.contains("aarch64_futex_wake_oracle_enabled()")
+                && A64_BOOT_SRC.contains("init_args[5] = 1"),
+            "the AArch64 bootstrap must provision the slot-5 oracle sentinel under the knob"
+        );
+        // Init runs the oracle behind the slot-5 sentinel and proves first=1/second=0 via the
+        // authoritative kernel wake COUNT (handshake coordination, not timing).
+        assert!(
+            INIT_SRC.contains("run_aarch64_futex_wake_oracle")
+                && INIT_SRC.contains("supervisor_control_recv_ep == Some(1)"),
+            "init must gate the oracle behind the slot-5 sentinel"
+        );
+        assert!(
+            INIT_SRC.contains(
+                "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0"
+            ) && INIT_SRC.contains("FUTEX_ORACLE_HANDSHAKE"),
+            "the oracle must use the handshake coordination and emit the ok proof marker"
+        );
+        // The child blocks through the LEGACY global-lock FutexWait (the waiter path under test).
+        assert!(
+            INIT_SRC.contains("futex_wait(addr, observed, observed)"),
+            "the oracle child must block through the legacy FutexWait path"
+        );
+    }
+
+    // The smoke accepts the FutexWake oracle markers under FUTEX_WAKE_ORACLE=1 and forces SMP=1
+    // (single-dispatcher proof; the freshly-spawned waiter must land on the sole dispatching CPU).
+    #[test]
+    fn smoke_accepts_futex_wake_oracle() {
+        assert!(
+            A64_SMOKE.contains("FUTEX_WAKE_ORACLE")
+                && A64_SMOKE.contains("yarm.aarch64_futex_wake_oracle=1")
+                && A64_SMOKE.contains("QEMU_SMP=1"),
+            "the smoke must expose the oracle knob and force single-CPU"
+        );
+        assert!(
+            A64_SMOKE.contains(
+                "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0"
+            ) && A64_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=10"),
+            "the smoke must require the FutexWake NR 10 + live-oracle acceptance markers"
+        );
+        // The old forbid of class=FutexWake must be gone; FutexWait/Yield stay forbidden.
+        assert!(
+            A64_SMOKE.contains("arch=aarch64 class=FutexWait")
+                && A64_SMOKE.contains("arch=aarch64 class=Yield"),
+            "the smoke must still forbid queue-advancing FutexWait/Yield split markers"
+        );
+    }
+
+    // The NR 27 InitramfsReadChunk deprecation TODO is documented (remove after ZC-grant proven).
+    #[test]
+    fn nr27_deprecation_todo_documented() {
+        assert!(
+            SYSCALL_SRC.contains("TODO(deprecated-legacy-ABI)")
+                && SYSCALL_SRC.contains("InitramfsReadChunk")
+                && SYSCALL_SRC.contains("ZC-grant"),
+            "NR 27 must carry the deprecated-legacy-ABI removal TODO"
+        );
+    }
+
+    // Docs record FutexWake as live on AArch64 and note the NR-10 (not NR-11) correction.
+    #[test]
+    fn docs_updated_for_futex_wake() {
+        assert!(
+            AARCH64_DOC.contains("FutexWake is now LIVE on AArch64 (Stage 195C)")
+                && AARCH64_DOC.contains("NR 10"),
+            "ARCH_AARCH64.md must record FutexWake live on AArch64 at NR 10"
+        );
+    }
+}
+
+// Stage 195D — AARCH64 BSP DISPATCH AFFINITY. The AArch64 AP bring-up must mark every AP
+// wake-only (no AP user dispatcher), so runnable user tasks route to the BSP dispatcher and
+// never strand on a non-dispatching AP. These guards pin the arch-specific bring-up + the
+// placement markers, and that x86_64/RISC-V placement policy is untouched.
+mod stage195d_aarch64_bsp_dispatch_affinity {
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const X86_SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const SCHED_STATE_SRC: &str = include_str!("scheduler_state.rs");
+    const SCHED_SRC: &str = include_str!("../scheduler.rs");
+
+    // The AArch64 secondary bring-up marks the AP wake-only BEFORE onlining it (no placement
+    // window), mirroring the x86_64 pattern, and installs the idle current afterwards.
+    #[test]
+    fn aarch64_ap_bringup_marks_wake_only_before_online() {
+        let body = A64_BOOT_SRC
+            .split_once("fn start_secondary_cpus(")
+            .map(|(_, r)| r.split_once("\n#[cfg").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("");
+        assert!(!body.is_empty(), "start_secondary_cpus body must exist");
+        let mark_idx = body
+            .find("mark_cpu_wake_only(cpu, true)")
+            .expect("AArch64 AP bring-up must mark the AP wake-only");
+        let bring_idx = body
+            .find("bring_up_cpu(cpu)")
+            .expect("AArch64 AP bring-up must online the AP");
+        assert!(
+            mark_idx < bring_idx,
+            "the AP must be marked wake-only BEFORE it is brought online (no placement window)"
+        );
+        assert!(
+            body.contains("install_ap_idle_current(cpu)"),
+            "the AArch64 AP must get the scheduler-owned idle current"
+        );
+        assert!(
+            body.contains("AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE result=ok"),
+            "the AArch64 bring-up must emit the BSP-dispatch-affinity marker"
+        );
+    }
+
+    // The placement + rejection markers are emitted on AArch64 only, on real placements.
+    #[test]
+    fn aarch64_placement_markers_present() {
+        assert!(
+            SCHED_STATE_SRC.contains("AARCH64_USER_TASK_PLACEMENT_OK tid={} cpu={}"),
+            "enqueue_task must emit the AArch64 user-task placement marker"
+        );
+        assert!(
+            SCHED_SRC.contains("AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid={} cpu={}"),
+            "a real wake-only AP rejection must emit the AArch64 reject marker"
+        );
+        // Both markers are strictly AArch64-scoped so x86_64/RISC-V logs are unchanged.
+        assert!(
+            SCHED_STATE_SRC.contains("#[cfg(target_arch = \"aarch64\")]\n        crate::yarm_log!(\"AARCH64_USER_TASK_PLACEMENT_OK"),
+            "the placement marker must be AArch64-gated"
+        );
+    }
+
+    // x86_64 AP bring-up still marks wake-only (its placement policy is untouched by 195D).
+    #[test]
+    fn x86_64_ap_bringup_policy_unchanged() {
+        assert!(
+            X86_SMP_SRC.contains("mark_cpu_wake_only(cpu, true)")
+                && X86_SMP_SRC.contains("install_ap_idle_current(cpu)"),
+            "x86_64 AP bring-up must keep its wake-only placement policy"
+        );
+    }
+
+    // The scheduler's balanced placement inherently skips wake-only CPUs (arch-neutral core).
+    #[test]
+    fn balanced_placement_skips_wake_only_core() {
+        assert!(
+            SCHED_SRC.contains("if self.wake_only & (1u64 << idx) != 0 {")
+                && SCHED_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
+            "the scheduler must deny wake-only placement (arch-neutral)"
+        );
+    }
+}
+
+// Stage 195E — AARCH64 FUTEXWAIT QUEUE-ADVANCING DRAIN (live under SMP=1 + SMP=2). FutexWait is
+// NR 9. These guards pin: the FutexWait-deferral-specific handler bypass (idle preserved
+// otherwise), the in-lock deferral eligibility (BSP + shared-drain + single-dispatcher + has
+// incoming), the post-lock drain wiring (reverify/dequeue/current/running + AArch64 TTBR0/frame
+// hooks, NO x86 CR3), the arch-tagged retirement marker, the default-off knob, and the live
+// oracle. Yield stays inert; counts unchanged.
+mod stage195e_aarch64_futex_wait_drain {
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const AARCH64_DOC: &str = include_str!("../../../doc/ARCH_AARCH64.md");
+
+    // FutexWait is NR 9 (NR 10 is FutexWake, NR 11 is SpawnThread).
+    #[test]
+    fn futex_wait_is_nr9() {
+        use crate::kernel::syscall::{
+            SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_SPAWN_THREAD_NR,
+        };
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_SPAWN_THREAD_NR, 11);
+    }
+
+    // The AArch64 handler bypass is strictly FutexWait-deferral-specific: the idle_no_eret_loop
+    // is only skipped when `futex_wait_dispatch_is_deferred(cpu)`; every other None/idle case
+    // keeps entering the idle loop.
+    #[test]
+    fn handler_bypass_requires_pending_deferral_and_preserves_idle() {
+        let body = A64_TRAP_SRC
+            .split_once("fn handle_trap_entry_with_fault_bookkeeping_mode(")
+            .map(|(_, r)| r)
+            .unwrap_or("");
+        assert!(
+            body.contains("let futex_wait_bypass = {")
+                && body.contains("futex_wait_dispatch_is_deferred(idx)"),
+            "the bypass must be gated on a pending FutexWait deferral"
+        );
+        // The idle loop is still present in the non-bypass else arm.
+        assert!(
+            body.contains("} else {\n            trap_trace!(\"AARCH64_IDLE_NO_ERET cpu={}\", cpu.0);\n            idle_no_eret_loop();"),
+            "normal None/idle must still enter idle_no_eret_loop when NOT a FutexWait bypass"
+        );
+        assert!(
+            body.contains("AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN")
+                && body.contains("AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE"),
+            "the bypass must emit its BEGIN/DONE markers"
+        );
+        // The in-lock restore is skipped on bypass (the drain does the authoritative restore).
+        assert!(
+            body.contains("if !switch_pending && !futex_wait_bypass {"),
+            "the in-lock restore must be skipped on a FutexWait bypass"
+        );
+    }
+
+    // The in-lock FutexWait deferral is AArch64/BSP/shared-drain/single-dispatcher/has-incoming
+    // gated, default-off behind the retire flag, and falls back to the legacy in-lock dispatch.
+    #[test]
+    fn in_lock_deferral_eligibility_and_fallback() {
+        let body = EXEC_SRC
+            .split_once("pub fn futex_wait_current(")
+            .map(|(_, r)| r.split_once("\n    pub ").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("");
+        assert!(!body.is_empty(), "futex_wait_current body must exist");
+        // Stage 195F: the deferral is DEFAULT-ON (no retire-flag gate); the genuine eligibility
+        // gates remain. (Default-on + no-has_incoming are pinned in the stage195f module.)
+        for needle in [
+            "GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE",
+            "dispatching_cpu_count() <= 1",
+            "BOOTSTRAP_CPU_ID",
+            "futex_wait_dispatch_try_defer",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN",
+            "AARCH64_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK",
+        ] {
+            assert!(body.contains(needle), "deferral must reference `{needle}`");
+        }
+        // Every ineligible case still reaches the unchanged in-lock dispatch fallback.
+        assert!(
+            body.contains("self.dispatch_next_task()?;"),
+            "ineligible cases must fall back to the legacy in-lock dispatch"
+        );
+    }
+
+    // The post-lock drain is wired on AArch64 with the generic seams + AArch64 arch hooks, and
+    // NO x86_64 CR3 logic.
+    #[test]
+    fn post_lock_drain_wired_with_aarch64_hooks_no_cr3() {
+        // Anchored in the AArch64 drain block.
+        let block = TRAP_ENTRY_SRC
+            .split_once("Stage 195E (AARCH64 FUTEXWAIT QUEUE-ADVANCING DISPATCH)")
+            .map(|(_, r)| {
+                r.split_once("Stage 192B (YIELD")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(
+            !block.is_empty(),
+            "the AArch64 FutexWait drain block must exist"
+        );
+        for needle in [
+            "futex_wait_reverify_blocked",
+            "futex_wait_dispatch_step_mut",
+            "d6_genuine_mark_running_via_task_seam",
+            "d2_recv_switch_incoming_asid",
+            "post_switch_restore_arch_thread_state",
+            "futex_wait_dispatch_clear",
+            "maybe_log_futex_wait_retired",
+            "AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DEQUEUE_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_RUNNING_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=ok",
+        ] {
+            assert!(block.contains(needle), "the drain must use/emit `{needle}`");
+        }
+        // No x86_64 CR3 switch logic — the AArch64 drain uses the generic HAL ASID hook. (Check
+        // for the x86 CR3 helper names, not the word "CR3" which appears in explanatory prose.)
+        assert!(
+            !block.contains("switch_cr3")
+                && !block.contains("write_cr3")
+                && !block.contains("load_cr3"),
+            "the AArch64 drain must NOT use x86_64 CR3 switch logic"
+        );
+        // State-changed race is declined, not stale-dispatched.
+        assert!(
+            block.contains("AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed"),
+            "a woken waiter (state_changed) must be declined, not stale-dispatched"
+        );
+    }
+
+    // The retirement marker is arch-tagged on AArch64 and the reused seams are un-gated to it.
+    #[test]
+    fn retire_marker_arch_tagged_and_seams_ungated() {
+        assert!(
+            MOD_SRC
+                .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"),
+            "AArch64 must emit the arch-tagged FutexWait retirement marker"
+        );
+        assert!(
+            RUNTIME_SRC.contains(
+                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn futex_wait_dispatch_step_mut("
+            ),
+            "futex_wait_dispatch_step_mut must be un-gated to AArch64"
+        );
+        assert!(
+            RUNTIME_SRC.contains(
+                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn futex_wait_reverify_blocked("
+            ),
+            "futex_wait_reverify_blocked must be un-gated to AArch64"
+        );
+    }
+
+    // The default-off knob enables the retire flag + provisions the init slot-5=2 sentinel and
+    // the init oracle emits the live-oracle proof marker.
+    #[test]
+    fn oracle_wired_default_off() {
+        assert!(
+            MOD_SRC.contains("aarch64_futex_wait_retire_enabled")
+                && MOD_SRC.contains("set_aarch64_futex_wait_retire_enabled"),
+            "the FutexWait retire flag + setter must exist"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.aarch64_futex_wait_oracle")
+                && BOOT_CMDLINE_SRC.contains("set_aarch64_futex_wait_retire_enabled(enabled)"),
+            "the knob must enable the retire flag"
+        );
+        assert!(
+            A64_BOOT_SRC.contains("aarch64_futex_wait_retire_enabled()")
+                && A64_BOOT_SRC.contains("init_args[5] = 2"),
+            "the bootstrap must provision slot-5=2 under the FutexWait oracle knob"
+        );
+        assert!(
+            INIT_SRC.contains(
+                "AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid={} dispatched_tid={} wake_count=1"
+            ),
+            "init must emit the FutexWait live-oracle proof marker"
+        );
+    }
+
+    // The smoke gates the FutexWait switch-oracle acceptance. (Stage 195F makes the mechanism
+    // default-on, so `class=FutexWait` is NO LONGER forbidden — that guard is checked in the
+    // stage195f module; only Yield stays forbidden here.)
+    #[test]
+    fn smoke_accepts_futex_wait_oracle() {
+        assert!(
+            A64_SMOKE.contains("FUTEX_WAIT_ORACLE")
+                && A64_SMOKE.contains("yarm.aarch64_futex_wait_oracle=1")
+                && A64_SMOKE.contains("AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok")
+                && A64_SMOKE.contains(
+                    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"
+                ),
+            "the smoke must require the FutexWait live-oracle acceptance markers"
+        );
+        assert!(
+            A64_SMOKE.contains("arch=aarch64 class=Yield"),
+            "the smoke must still forbid the Yield queue-advancing marker"
+        );
+    }
+
+    // Docs record the live AArch64 FutexWait drain.
+    #[test]
+    fn docs_updated() {
+        assert!(
+            AARCH64_DOC.contains("FutexWait")
+                && AARCH64_DOC.contains("queue-advancing")
+                && AARCH64_DOC.contains("195E"),
+            "ARCH_AARCH64.md must record the Stage 195E live FutexWait drain"
+        );
+    }
+}
+
+// Stage 195F — AARCH64 FUTEXWAIT DEFAULT-ON + POST-LOCK IDLE SEAL. The FutexWait retirement
+// mechanism is now default-on (no knob / no runnable_count gate), and the post-lock drain has a
+// second successful outcome: Idle (no incoming → enter the real BSP idle loop AFTER the broad
+// lock is released, keeping the caller Blocked and current None, restoring no frame). These
+// guards pin the default-on eligibility, the idle outcome, and the idle-oracle wiring.
+mod stage195f_aarch64_futex_wait_default_on {
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+
+    fn futex_wait_current_body() -> &'static str {
+        EXEC_SRC
+            .split_once("pub fn futex_wait_current(")
+            .map(|(_, r)| r.split_once("\n    pub ").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("")
+    }
+
+    // The retirement mechanism defaults ON: the AArch64 deferral is NOT gated on the oracle/retire
+    // flag, and the `runnable_count_on_cpu > 0` (has_incoming) requirement is REMOVED.
+    #[test]
+    fn mechanism_default_on_no_flag_no_has_incoming() {
+        let body = futex_wait_current_body();
+        assert!(!body.is_empty(), "futex_wait_current body must exist");
+        assert!(
+            !body.contains("aarch64_futex_wait_retire_enabled()"),
+            "the FutexWait mechanism must NOT be gated on the retire/oracle flag (default-on)"
+        );
+        // Check the actual eligibility CODE, not the explanatory comment: no `has_incoming`
+        // variable and no `self.runnable_count_on_cpu(...)` call in the gate.
+        assert!(
+            !body.contains("let has_incoming") && !body.contains("&& has_incoming"),
+            "the has_incoming (runnable_count) eligibility requirement must be removed"
+        );
+        assert!(
+            body.contains("maybe_log_futex_wait_default_on()"),
+            "an eligible default-on deferral must attest via maybe_log_futex_wait_default_on"
+        );
+        // The eligibility keeps the genuine gates + legacy fallback.
+        for needle in [
+            "GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE",
+            "dispatching_cpu_count() <= 1",
+            "BOOTSTRAP_CPU_ID",
+            "futex_wait_dispatch_try_defer",
+            "self.dispatch_next_task()?;",
+        ] {
+            assert!(body.contains(needle), "eligibility must keep `{needle}`");
+        }
+        assert!(
+            MOD_SRC.contains("AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"),
+            "the default-on attestation marker must exist"
+        );
+    }
+
+    // The post-lock drain's no-incoming branch is the Idle OUTCOME (not a decline): it emits the
+    // idle markers, clears the deferral, proves the lock is dropped, restores NO frame, and enters
+    // the real BSP idle loop OUTSIDE with_cpu.
+    #[test]
+    fn post_lock_idle_outcome_wired() {
+        let block = TRAP_ENTRY_SRC
+            .split_once("Stage 195E (AARCH64 FUTEXWAIT QUEUE-ADVANCING DISPATCH)")
+            .map(|(_, r)| {
+                r.split_once("Stage 192B (YIELD")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(
+            !block.is_empty(),
+            "the AArch64 FutexWait drain block must exist"
+        );
+        for needle in [
+            "AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=",
+            "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu=",
+            "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu=",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle",
+            "futex_wait_dispatch_clear(cpu_idx)",
+            "enter_post_lock_idle(cpu)",
+            "maybe_log_futex_wait_retired()",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the idle outcome must use/emit `{needle}`"
+            );
+        }
+        // The idle branch confirms current is None via a lock re-acquire, and does NOT restore a
+        // frame (no post_switch_restore in the no-incoming branch — that is only in the switch arm).
+        let idle_branch = block
+            .split_once("Stage 195F IDLE OUTCOME")
+            .map(|(_, r)| r)
+            .unwrap_or("");
+        assert!(
+            idle_branch.contains("kernel.current_tid(), None | Some(0)"),
+            "the idle branch must verify current is None/idle"
+        );
+        assert!(
+            !idle_branch.contains("post_switch_restore_arch_thread_state"),
+            "the idle outcome must NOT restore the blocked caller's frame"
+        );
+    }
+
+    // The BSP idle entry reuses the proven idle primitive OUTSIDE with_cpu (not a second policy),
+    // never masks interrupts permanently, and emits the ENTERED marker.
+    #[test]
+    fn enter_post_lock_idle_reuses_bsp_idle() {
+        assert!(
+            A64_TRAP_SRC.contains("pub(crate) fn enter_post_lock_idle(cpu: CpuId) -> !")
+                && A64_TRAP_SRC.contains("AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=")
+                && A64_TRAP_SRC.contains("idle_no_eret_loop();"),
+            "enter_post_lock_idle must reuse idle_no_eret_loop (the proven BSP idle) + emit ENTERED"
+        );
+    }
+
+    // The idle-oracle workload is default-off and slot-5=3 gated; the mechanism markers are
+    // separate from the (gated) idle-oracle attestation.
+    #[test]
+    fn idle_oracle_default_off_and_slot5_3() {
+        assert!(
+            MOD_SRC.contains("aarch64_futex_wait_idle_oracle_enabled")
+                && MOD_SRC.contains("set_aarch64_futex_wait_idle_oracle_enabled"),
+            "the idle-oracle workload flag must exist"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.aarch64_futex_wait_idle_oracle")
+                && BOOT_CMDLINE_SRC.contains("set_aarch64_futex_wait_idle_oracle_enabled(enabled)"),
+            "the idle-oracle knob must set the workload flag"
+        );
+        assert!(
+            A64_BOOT_SRC.contains("aarch64_futex_wait_idle_oracle_enabled()")
+                && A64_BOOT_SRC.contains("init_args[5] = 3"),
+            "the bootstrap must provision slot-5=3 under the idle-oracle knob"
+        );
+        assert!(
+            INIT_SRC.contains("run_aarch64_futex_wait_idle_oracle")
+                && INIT_SRC.contains("supervisor_control_recv_ep == Some(3)"),
+            "init must gate the idle oracle behind slot-5=3"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none="
+            ),
+            "the drain must emit the idle-oracle attestation (gated on the workload flag)"
+        );
+    }
+
+    // The smoke exposes the idle-oracle knob + acceptance and requires the default-on marker.
+    #[test]
+    fn smoke_accepts_default_on_and_idle_oracle() {
+        assert!(
+            A64_SMOKE.contains("FUTEX_WAIT_IDLE_ORACLE")
+                && A64_SMOKE.contains("yarm.aarch64_futex_wait_idle_oracle=1")
+                && A64_SMOKE.contains("AARCH64_FUTEX_WAIT_DISPATCH_DONE result=idle")
+                && A64_SMOKE.contains(
+                    "AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1"
+                ),
+            "the smoke must expose + accept the no-incoming idle oracle"
+        );
+        assert!(
+            A64_SMOKE.contains("AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"),
+            "the smoke must require the default-on attestation"
+        );
+        // class=FutexWait is no longer forbidden on a default boot (mechanism is default-on).
+        assert!(
+            !A64_SMOKE.contains("a64_split_bads+=(\"arch=aarch64 class=FutexWait\")"),
+            "class=FutexWait must NOT be forbidden (default-on)"
         );
     }
 }

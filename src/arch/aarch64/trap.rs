@@ -36,6 +36,19 @@ fn idle_no_eret_loop() -> ! {
     }
 }
 
+/// Stage 195F: enter the real BSP idle loop from the post-lock FutexWait drain, AFTER the broad
+/// `KernelState` lock has been released. This is the SAME proven BSP idle primitive the normal
+/// path uses (`idle_no_eret_loop`, a `wfi` loop) — NOT a second idle policy. `DAIF` is left as
+/// the trap left it (IRQs are NOT permanently masked): `wfi` wakes on an unmasked pending
+/// interrupt, the interrupt enters the normal AArch64 trap path (which re-acquires `with_cpu`
+/// freely because it is released here), and either dispatches a now-runnable task or returns to
+/// the `wfi`. `current` is None (no user task), so no stale userspace ELR/SPSR/frame is ever
+/// returned. Never returns.
+pub(crate) fn enter_post_lock_idle(cpu: CpuId) -> ! {
+    crate::yarm_log!("AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu={}", cpu.0);
+    idle_no_eret_loop();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Aarch64TrapContext {
     pub esr_el1: u32,
@@ -215,7 +228,14 @@ pub(crate) fn split_finalize_handled_syscall(
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) -> Result<(), TrapHandleError> {
-    let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr().wrapping_add(4) as usize;
+    // Stage 195B fix: the resume PC is `last_vector_raw_elr()` with NO `+4`. On AArch64 the
+    // synchronous-exception ELR_EL1 for an `SVC` already points at the instruction FOLLOWING
+    // the `SVC`, exactly as the proven global non-IpcRecv return path uses it
+    // (`syscall_resume_pc = raw_vector_return_pc`, no `+4`). The earlier `+4` over-advanced by
+    // one instruction, skipping the caller's return-register load (`mov rN, x0`); DebugLog
+    // tolerated the skip (it ignores its return), but InitramfsReadChunk — whose caller reads
+    // x0 (error lane) and x1 (byte count) — returned a stale register (decoded as Internal).
+    let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr() as usize;
     frame.set_saved_pc(resume_pc);
     if let Some(tid) = kernel.current_tid() {
         let mut ctx = frame.capture_user_context();
@@ -242,6 +262,21 @@ pub(crate) fn split_finalize_handled_syscall(
     );
     restore_arch_thread_state(kernel, cpu, Some(frame), true)?;
     export_syscall_result_to_user_gprs(frame);
+    // Stage 195B fix: re-sync args[0..2] to the just-exported x0..x2 and RE-SAVE the TCB
+    // AFTER export — byte-identical to the global non-task-switched return path
+    // (`handle_trap_entry_with_fault_bookkeeping_mode`). The pre-export
+    // `set_thread_user_context` above snapshotted the ORIGINAL syscall args (x0 = arg0);
+    // without this re-save the resumed task reads the stale x0 instead of the exported
+    // return value. DebugLog masked this (it ignores its return); InitramfsReadChunk
+    // (whose caller reads x0 for the error lane and x1 for the byte count) exposed it.
+    frame.set_arg(0, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0));
+    frame.set_arg(1, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1));
+    frame.set_arg(2, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2));
+    if let Some(tid) = kernel.current_tid() {
+        let mut ctx = frame.capture_user_context();
+        ctx.instruction_ptr = crate::kernel::vm::VirtAddr(resume_pc as u64);
+        let _ = kernel.set_thread_user_context(tid, ctx);
+    }
     crate::yarm_log!(
         "AARCH64_SPLIT_ABI_EXPORT_DONE err={} x0_after=0x{:x}",
         frame.error_code().unwrap_or(0),
@@ -410,9 +445,29 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         }
     }
 
+    // Stage 195E (AARCH64 FUTEXWAIT HANDLER BYPASS): a committed FutexWait deferral clears
+    // `current` on purpose (the queue-advancing dispatch is relocated OUT of the broad lock to
+    // the trap-entry drain). Without this bypass the `current == None` case would enter
+    // `idle_no_eret_loop()` INSIDE `with_cpu` and never return, so the post-lock drain could
+    // never run. The bypass is strictly FutexWait-deferral-specific — any other
+    // `current == None|Some(0)` keeps the exact idle behavior. The outgoing (blocked) caller's
+    // context is still saved by the `task_switched` block below (entering != None == exiting).
+    let futex_wait_bypass = {
+        let idx = cpu.0 as usize;
+        idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::futex_wait_dispatch_is_deferred(idx)
+    };
     if matches!(exiting_tid, None | Some(0)) {
-        trap_trace!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
-        idle_no_eret_loop();
+        if futex_wait_bypass {
+            crate::yarm_log!(
+                "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu={} outgoing_tid={}",
+                cpu.0,
+                entering_tid.unwrap_or(0)
+            );
+        } else {
+            trap_trace!("AARCH64_IDLE_NO_ERET cpu={}", cpu.0);
+            idle_no_eret_loop();
+        }
     }
 
     if task_switched {
@@ -458,7 +513,10 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     let switch_pending = cpu_idx < crate::kernel::scheduler::MAX_CPUS
         && unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() };
     let syscall_return = !task_switched && matches!(event, TrapEvent::Syscall);
-    if !switch_pending {
+    // Stage 195E: on a FutexWait-deferral bypass, skip the in-lock restore entirely — `current`
+    // is None (the restore would only no-op into SCHED_ENTER_IDLE), and the authoritative EL0
+    // frame restore for the INCOMING task runs in the post-lock drain's `with_cpu` re-acquire.
+    if !switch_pending && !futex_wait_bypass {
         if let Err(err) =
             restore_arch_thread_state(kernel, cpu, frame.as_deref_mut(), syscall_return)
         {
@@ -466,6 +524,9 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
             crate::yarm_log!("AARCH64_TRAP_FAIL_REASON restore_arch_thread_state");
             return Err(err);
         }
+    }
+    if futex_wait_bypass {
+        crate::yarm_log!("AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu={}", cpu.0);
     }
 
     if !task_switched && matches!(event, TrapEvent::Syscall) {

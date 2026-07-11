@@ -338,11 +338,13 @@ logic.
 runs live — `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok` is observed on
 a normal AArch64 boot (the server chain naturally sends an ordinary cap to a blocked recv-v2
 receiver), because that class's drain is the GENERIC `drain_dispatch_post_work` and AArch64 is
-on the shared path. **The pre-lock split-dispatch classes (`DebugLog`, `FutexWake`,
-`InitramfsReadChunk`) and the queue-advancing classes (`D2`, `FutexWait`, `Yield`) remain inert
-/ global-lock-only on AArch64** — nothing there is enabled by flipping a flag. This split
-(boundary family already generic-and-live; split-dispatch + queue-advancing still arch-blocked)
-is the core Stage 194 finding.
+on the shared path. **The pre-lock split-dispatch classes `DebugLog` (NR 15, Stage 195A),
+`InitramfsReadChunk` (NR 27, Stage 195B), and `FutexWake` (NR 10, Stage 195C) are now LIVE on
+AArch64** via the selective ABI-import gate (see below); the queue-advancing classes (`D2`,
+`FutexWait`, `Yield`) remain inert / global-lock-only on AArch64. At the time of the Stage 194
+audit none of the split-dispatch classes were enabled by flipping a flag — each required the
+selective de-gating described below. This split (boundary family already generic-and-live;
+queue-advancing still arch-blocked) is the core Stage 194 finding.
 
 - **AArch64 IS on the shared, drain-capable trap path.** The primary vector handler
   (`arch/aarch64/boot.rs`) marshals the EL1 exception frame into a portable `TrapFrame`
@@ -372,12 +374,164 @@ is the core Stage 194 finding.
   restore (export x0..x5 + advance past the SVC), not the seam. Success/error registers are
   byte-identical to the legacy `handle_debug_log` path (same `set_ok(0,0,0)` / `set_err`, same
   `export_syscall_result_to_user_gprs`).
-- **Still inert on AArch64 (unchanged this stage):** `FutexWake`, `InitramfsReadChunk` (split
-  classes not yet de-gated), and the queue-advancing classes (`D2`/`FutexWait`/`Yield`), which
-  remain `#[cfg(target_arch = "x86_64")]` and await a de-gated drain body + an EL0-return-frame
-  restore proof.
-- **Next AArch64 slices (Stage 195B+):** `InitramfsReadChunk` success path, then
-  `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
+- **InitramfsReadChunk is now LIVE on AArch64 (Stage 195B).** The selective ABI-import gate is
+  extended to `NR 15 || NR 27 || oracle`, so InitramfsReadChunk (NR 27) reaches
+  `try_split_initramfs_read_chunk_into_frame`. Only the **success path** is retired: the helper
+  returns `None` (unchanged global-lock fallback) for every access-gate / arg / not-found /
+  unwritable-destination / ASID-unavailable case, so `MissingRight` / `InvalidArgs` /
+  `UserMemoryFault` stay canonical. The destination copy is a **two-pass validated write**
+  (`copy_slice_to_user_asid_split_write` validates every destination page before writing any
+  byte), so a fault leaves **zero** bytes written and falls back with no mutation — no partial
+  user write. Immutable initramfs/CPIO data only; no structural mutation, no allocation, no cap
+  mint, no scheduler/IPC mutation, no TTBR0/ASID switch. Live markers:
+  `AARCH64_SPLIT_ABI_IMPORT_OK nr=27`, `YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=27`,
+  `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=InitramfsReadChunk result=ok`,
+  `AARCH64_SPLIT_FINALIZE_OK nr=27 result=ok`. DebugLog behavior is byte-for-byte unchanged.
+- **Split return-value parity fix (Stage 195B).** Enabling a return-value-checking split class
+  (InitramfsReadChunk's caller reads x0/x1) surfaced a latent AArch64 split-finalize bug that
+  DebugLog had masked (it ignores its return): (a) the split resume PC used `ELR + 4`, but the
+  synchronous-exception `ELR_EL1` for an `SVC` already points at the instruction AFTER the
+  `SVC`, so the `+4` over-advanced by one instruction and skipped the caller's return-register
+  load (`mov rN, x0`) — the resume PC is now raw `ELR` (no `+4`), matching the proven global
+  non-IpcRecv path; (b) the finalize now resyncs `args[0..2]` to the exported `x0..x2` and
+  re-saves the TCB AFTER export, so a preemption resume reads the return value rather than the
+  original syscall args. Verified: PM's NR 27 self-probe returns `bytes=16` (was `Internal`),
+  DebugLog still live, x86_64/RISC-V unaffected (the fix is in `arch/aarch64/trap.rs`).
+- **FutexWake is now LIVE on AArch64 (Stage 195C).** The selective ABI-import gate is extended
+  to `NR 15 || NR 27 || NR 10 || oracle`, so FutexWake reaches
+  `try_split_futex_wake_into_frame`. **FutexWake is NR 10** (the Stage 195C task text's "NR11"
+  is incorrect — NR 11 is `SpawnThread`, NR 9 is `FutexWait`). The caller never task-switches;
+  the split only mutates waiter/run-queue state via the two-seam
+  `futex_wake_split_mut` (Phase A rank-2 task seam scans `Blocked(Futex)` → `Runnable`; Phase B
+  rank-1 scheduler seam enqueues each woken waiter once). Every ineligible case (invalid addr)
+  returns `None` → unchanged global-lock fallback with the canonical error. Live markers:
+  `AARCH64_SPLIT_ABI_IMPORT_OK nr=10`, `YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=10`,
+  `FUTEX_WAKE_SPLIT_BEGIN/DONE arch=aarch64 result=ok woke=N`,
+  `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE arch=aarch64 class=FutexWake result=ok`,
+  `AARCH64_SPLIT_FINALIZE_OK nr=10 result=ok`. DebugLog / InitramfsReadChunk behavior is
+  byte-for-byte unchanged. `FutexWait` (NR 9) stays global-lock-only — it BLOCKS the caller.
+- **AArch64 FutexWake live oracle (Stage 195C, default-off).** Under
+  `yarm.aarch64_futex_wake_oracle=1` (which provisions init startup slot 5 as a sentinel), init
+  runs a controlled parent/child proof of *actual waiter mutation*: init spawns a child thread;
+  init blocks on a handshake futex to hand the CPU to the never-run child (AArch64 fresh-
+  dispatches it through the block/dispatch path — the same one that first enters the control-
+  plane servers into user mode; `yield` cannot fresh-dispatch a never-run thread because its
+  `kernel_context` is uninitialized); the child wakes init (split FutexWake) and then blocks on
+  the oracle word through the **legacy global-lock** `FutexWait`; init resumes and wakes the
+  child through the **split** path — the kernel's returned wake COUNT is the authoritative proof
+  (not timing): `first_wake=1` (the sole waiter → `Runnable`, enqueued once), then `second_wake=0`
+  (no waiter remains). Proof marker: `AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1
+  second_wake=0`. The oracle boots single-CPU (`QEMU_SMP=1`): AArch64 dispatches user tasks on
+  the BSP only, and the freshly-spawned waiter is enqueued balanced, so on SMP>1 it can land on
+  a wake-only AP and never run. This is a single-dispatcher proof; the FutexWake *enablement*
+  itself is unaffected by CPU count.
+- **Still inert on AArch64 (unchanged this stage):** the queue-advancing classes
+  (`D2`/`FutexWait`/`Yield`), which remain `#[cfg(target_arch = "x86_64")]` and await a de-gated
+  drain body + an EL0-return-frame restore proof. `CreateInitramfsFileSliceMo` (NR 28,
+  cap-minting) stays global-lock-only.
+
+### 4.7 BSP dispatch affinity (Stage 195D)
+
+Before Stage 195D the AArch64 secondary bring-up (`start_secondary_cpus`) onlined each AP via
+PSCI **without** marking it wake-only. The AArch64 AP main loop
+(`yarm_aarch64_secondary_cpu_boot`) only drains cross-CPU work and `wfe`s — it runs **no user
+dispatcher** — yet the scheduler saw it as an online, non-wake-only, empty (least-loaded) CPU.
+Two consequences followed on `-smp 2`:
+
+1. `CROSS_ARCH_DISPATCHING_CPUS arch=aarch64 online=2 wake_only=0 dispatching=2` →
+   `CROSS_ARCH_TOPOLOGY_BLOCKED reason=multi_dispatcher_unproven` (never surfaced because the
+   aarch64 core smoke's strict cross-arch block is gated behind a boot-shell marker AArch64
+   does not emit at the idle terminal).
+2. An **unpinned** runnable user task (BSP-pinned servers were unaffected) — e.g. the Stage 195C
+   `SpawnThread` oracle child — could be balanced onto the AP's queue and **strand** forever,
+   which is exactly why the 195C oracle needed `-smp 1`.
+
+Stage 195D marks every AArch64 AP **wake-only before onlining it** (mirroring the x86_64 183.5
+AP bring-up) and installs the scheduler-owned idle current. This reuses the existing wake-only
+placement infrastructure — `enqueue_balanced` → `least_loaded_online_cpu` skips wake-only CPUs,
+`enqueue_on_with_priority` denies direct placement (`SCHED_ENQUEUE_DENIED_WAKE_ONLY`), and
+`dispatching = online - wake_only` collapses to 1. No new lock; AP kernel/interrupt/cross-CPU
+work is preserved (the AP is not user-dispatching, so it is correctly excluded from user-ASID
+TLB shootdowns — it never loads a user TTBR0). Markers:
+`AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE result=ok`,
+`AARCH64_USER_TASK_PLACEMENT_OK tid=<tid> cpu=0` (every user placement lands on the BSP), and
+`AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid=<tid> cpu=<ap>` (only on a real prevented placement).
+Result: AArch64 `-smp 2` now attests `CROSS_ARCH_TOPOLOGY_OK reason=single_dispatcher`, and the
+Stage 195C FutexWake live oracle passes under **both** `-smp 1` and `-smp 2` (the SMP=1
+requirement is retired).
+
+The AArch64 queue-advancing **FutexWait** retirement (moving the dispatch phase out of the broad
+lock, x86_64 192A model) is the next slice; its first blocking return-path invariant is the
+in-lock `idle_no_eret_loop()` (`arch/aarch64/trap.rs`), which fires when the deferred
+`futex_wait_current` leaves `current == None` and would spin **inside** the global lock before
+the out-of-lock drain can run — see `doc/KERNEL_UNLOCKING.md` Stage 195D.
+- **Next AArch64 slice:** `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
+
+### 4.8 FutexWait queue-advancing drain — LIVE (Stage 195E)
+
+Stage 195E makes the AArch64 **FutexWait (NR 9)** queue-advancing dispatch live out of the broad
+lock, porting the proven x86_64 192A model **without any CR3 logic**. Default-off behind
+`yarm.aarch64_futex_wait_oracle=1` (which enables the retirement and runs the live oracle); the
+proven in-lock FutexWait path stays the production default. Three cooperating pieces:
+
+1. **Handler bypass** (`arch/aarch64/trap.rs`). The 195D blocker — `idle_no_eret_loop()` firing
+   inside `with_cpu` when `current == None` — is resolved by a **FutexWait-deferral-specific**
+   bypass: when `futex_wait_dispatch_is_deferred(cpu)` is true and `current` is None/idle, the
+   handler skips the idle loop **and** the in-lock restore and returns cleanly so
+   `handle_trap_entry_shared` can run the post-lock drain. Any other None/idle case keeps the
+   exact `idle_no_eret_loop()` behavior. Markers: `AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN/DONE`.
+   The blocked caller's context is still saved by the `task_switched` block (entering ≠ None).
+2. **In-lock deferral** (`futex_wait_current`). Eligible only on the **BSP** with the shared trap
+   drain active, `dispatching_cpu_count() <= 1` (195D BSP affinity guarantees this under SMP=2),
+   **another runnable task present** (so the drain always has an incoming; otherwise fall back to
+   the in-lock path which idles correctly), and no outstanding deferral. It publishes
+   `Blocked(Futex)`, clears `current`, records the one-shot deferral, and skips the in-lock
+   dispatch. Markers: `AARCH64_FUTEX_WAIT_DISPATCH_DEFER_BEGIN`, `..._BLOCK_PUBLISH_OK`.
+3. **Post-lock drain** (`handle_trap_entry_shared`). Generic seams (deferral ownership, blocked
+   reverify `futex_wait_reverify_blocked`, rank-1 dequeue/current `futex_wait_dispatch_step_mut`,
+   mark Running `d6_genuine_mark_running_via_task_seam`, cleanup) + **AArch64 arch hooks**:
+   TTBR0_EL1/ASID switch via the generic HAL `switch_address_space` (carrying the DSB/ISB/TLBI
+   ordering) and EL0 SPSR/ELR/GPR frame restore via `restore_arch_thread_state_post_switch`.
+   Markers: `AARCH64_FUTEX_WAIT_DISPATCH_{REVERIFY_OK,DEQUEUE_OK,CURRENT_SET_OK,RUNNING_OK,
+   TTBR0_OK,FRAME_OK,DONE result=ok}` + `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE arch=aarch64
+   class=FutexWait result=ok`. **Race:** if split `FutexWake` flips the waiter to `Runnable`
+   before the drain, `futex_wait_reverify_blocked` fails → `AARCH64_FUTEX_WAIT_DISPATCH_DEFERRED
+   reason=state_changed` (no stale/double dispatch, no lost waiter); the deferral is cleared on
+   every path (success/decline).
+
+**Live oracle** (`FUTEX_WAIT_ORACLE=1`): task A (init) blocks via NR 9 → handler bypass → the
+drain dispatches task B (the spawned child) → B wakes A via split FutexWake (NR 10) → A resumes
+once. Proof: `AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid=<A> dispatched_tid=<B>
+wake_count=1`, proven under **both** `-smp 1` and `-smp 2` (SMP=2 is the acceptance target; the
+195D BSP affinity keeps the freshly-spawned task B on the BSP dispatcher). Yield remains inert.
+
+### 4.9 FutexWait DEFAULT-ON + post-lock idle seal (Stage 195F)
+
+Stage 195F makes the FutexWait out-of-lock retirement the **default production path** on eligible
+AArch64 traps — **no enable knob**. The 195E eligibility drops the `runnable_count_on_cpu > 0`
+requirement; the post-lock drain now has **two successful outcomes**:
+
+- **Switch** (byte-identical to 195E): an incoming runnable task exists → dequeue + restore it.
+- **Idle** (new): no incoming runnable task → the outgoing caller stays `Blocked(Futex)`,
+  `current` stays None, the deferral is cleared, **no frame is restored**, and the BSP enters the
+  real idle loop (`enter_post_lock_idle` → the same `idle_no_eret_loop` `wfi` primitive) **AFTER
+  the broad `with_cpu` lock is released** — never `idle_no_eret_loop()` while holding `with_cpu`.
+  Markers: `AARCH64_FUTEX_WAIT_DISPATCH_NO_INCOMING`, `..._POST_LOCK_IDLE_BEGIN`,
+  `..._POST_LOCK_IDLE_LOCK_DROPPED_OK` (a real re-acquire of the released broad lock, which would
+  deadlock if still held), `..._DISPATCH_DONE result=idle`, `..._POST_LOCK_IDLE_ENTERED`, plus the
+  `class=FutexWait result=ok` retirement. The eligible-trap attestation `AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON
+  result=ok` fires once at the first default-on deferral.
+
+**Interrupt/idle correctness:** `DAIF` is left as the trap left it (IRQs are not permanently
+masked); `wfi` wakes on a pending unmasked interrupt, which enters the normal AArch64 trap path
+(freely re-acquiring `with_cpu` because it is released here) and either dispatches a now-runnable
+task or returns to the `wfi`. `current == None`, so no stale userspace ELR/SPSR/frame is ever
+returned. This reuses the proven BSP idle primitive — not a second idle policy. The legacy in-lock
+`dispatch_next_task` fallback is retained ONLY for genuinely ineligible traps (no trap drainer,
+multi-dispatcher, non-BSP, already-deferred). Idle oracle (default-off, `FUTEX_WAIT_IDLE_ORACLE=1`):
+the last runnable user task blocks on a never-woken futex →
+`AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1`, then QEMU idles
+until the smoke timeout. Yield remains inert; AP user dispatch is not enabled.
 - **TLB/ASID:** local TTBR0_EL1 + ASID switch with the existing `TLBI`/`DSB ISH`/`ISB`
   maintenance is sufficient for the first slices; broadcast `TLBI` is only needed for
   VM/SMP classes, which are out of scope. QEMU virt and RPi5 share the same generic drain —

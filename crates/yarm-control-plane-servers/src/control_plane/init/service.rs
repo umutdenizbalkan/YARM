@@ -659,6 +659,171 @@ fn register_crash_test_with_supervisor(supervisor_send: u32, crash_tid: u64) {
     }
 }
 
+// ─── Stage 195C: AArch64 FutexWake live oracle ────────────────────────────────────────
+// A controlled parent/child proof of the AArch64 split FutexWake (NR 10). The child thread
+// blocks through the LEGACY global-lock FutexWait; the parent (init) wakes it through the
+// SPLIT path and verifies the authoritative wake counts (1 then 0). Default-off (slot-5
+// sentinel). The coordination signal is authoritative — the parent retries FutexWake and
+// treats the kernel's returned wake COUNT (not any timing) as the "child is blocked" proof.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static FUTEX_ORACLE_WORD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0x5A5A);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static FUTEX_ORACLE_PARK: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0x1234);
+// Handshake futex: the parent (init) blocks on this to hand the CPU to the freshly-spawned
+// child; the child wakes it immediately before the child blocks on the oracle word. This is
+// the authoritative coordination signal (not timing): when the parent's FutexWait returns,
+// the child has provably reached its own legacy FutexWait on the oracle word. (AArch64 cannot
+// fresh-dispatch a never-run thread through `yield`; it CAN through the block/dispatch path,
+// exactly as the control-plane servers first enter user mode.)
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static FUTEX_ORACLE_HANDSHAKE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0x00C0);
+// Stage 195F: never-woken word for the NO-INCOMING idle oracle. The final runnable user task
+// blocks here; nothing ever wakes it, so the default-on post-lock drain takes the Idle outcome.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static FUTEX_ORACLE_IDLE_WORD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0x1D1E);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static mut FUTEX_ORACLE_CHILD_STACK: [u8; 16384] = [0u8; 16384];
+// `spawn_user_thread` requires a NON-zero TLS base; a small dedicated TLS region suffices.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static mut FUTEX_ORACLE_CHILD_TLS: [u8; 512] = [0u8; 512];
+
+/// Child (waiter) thread entry: block ONCE on the oracle futex through the legacy
+/// global-lock FutexWait, report the wake, then park on a second futex that is never woken
+/// (so it does not re-block on the oracle word and does not busy-spin). Never returns.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+extern "C" fn futex_oracle_child() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    // Wake the parent (init), which is blocked on the handshake futex. This only marks init
+    // Runnable + enqueues it (FutexWake does not context-switch); we keep the CPU and fall
+    // straight into our own FutexWait below, so init is only dispatched once we are provably
+    // Blocked(Futex) on the oracle word.
+    let handshake = FUTEX_ORACLE_HANDSHAKE.as_ptr();
+    yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_CHILD_WAKE_PARENT");
+    let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+    let addr = FUTEX_ORACLE_WORD.as_ptr();
+    let observed = FUTEX_ORACLE_WORD.load(Relaxed);
+    yarm_user_rt::user_log!(
+        "AARCH64_FUTEX_ORACLE_CHILD_WAIT_BEGIN observed={}",
+        observed
+    );
+    // Legacy global-lock FutexWait (NOT split) — blocks on Futex(addr) and hands the CPU to
+    // the now-Runnable parent.
+    let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+    yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_CHILD_WOKE");
+    // Park cleanly on an unrelated futex so a second wake on the oracle word finds no waiter.
+    let park = FUTEX_ORACLE_PARK.as_ptr();
+    loop {
+        let pv = FUTEX_ORACLE_PARK.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+    }
+}
+
+/// Parent (waker): spawn the child, wake it exactly once through the split path (count must
+/// be 1), then wake again (count must be 0). Emits the live-oracle proof marker.
+///
+/// `futex_wait_mode` (Stage 195E): when true the kernel enabled the FutexWait queue-advancing
+/// retirement, so the parent's handshake `FutexWait` below is dispatched by the OUT-OF-LOCK
+/// drain (task A blocks via NR 9 → drain dispatches task B = the child → child wakes A via NR 10
+/// → A resumes). The extra `AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE` marker attests that flow.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn run_aarch64_futex_wake_oracle(init_tid: u64, futex_wait_mode: bool) {
+    yarm_user_rt::user_log!(
+        "AARCH64_FUTEX_WAKE_ORACLE_BEGIN init_tid={} futex_wait_mode={}",
+        init_tid,
+        futex_wait_mode as u32
+    );
+    let addr = FUTEX_ORACLE_WORD.as_ptr();
+    // 16-byte-aligned stack top of the child's dedicated static stack.
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = futex_oracle_child as *const () as usize;
+    // Non-zero TLS base (spawn_user_thread rejects tls_base == 0).
+    let tls_base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("AARCH64_FUTEX_WAKE_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_CHILD_SPAWNED child_tid={}", child_tid);
+    // Authoritative coordination (NOT timing): block on the handshake futex to hand the CPU
+    // to the freshly-spawned child. AArch64 fresh-dispatches the never-run child through this
+    // block/dispatch path (the same one that first enters the control-plane servers into user
+    // mode). The child wakes us, then blocks on the oracle word; when THIS FutexWait returns,
+    // the child is provably Blocked(Futex) on the oracle word.
+    let handshake = FUTEX_ORACLE_HANDSHAKE.as_ptr();
+    let hv = FUTEX_ORACLE_HANDSHAKE.load(core::sync::atomic::Ordering::Relaxed);
+    yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_PARENT_HANDSHAKE_WAIT hv={}", hv);
+    let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
+    yarm_user_rt::user_log!("AARCH64_FUTEX_ORACLE_PARENT_RESUMED");
+    // The child is now Blocked(Futex) on the oracle word. Wake exactly once through the SPLIT
+    // path — the kernel's returned wake COUNT must be 1 (waiter → Runnable, enqueued once).
+    let first_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0);
+    // Second wake: the child is now Runnable (no longer Blocked) and does not re-block on the
+    // oracle word, so no waiter remains → count must be 0.
+    let second_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0xFFFF);
+    yarm_user_rt::user_log!(
+        "AARCH64_FUTEX_WAKE_ORACLE_COUNTS first_wake={} second_wake={}",
+        first_wake,
+        second_wake
+    );
+    if first_wake == 1 && second_wake == 0 {
+        yarm_user_rt::user_log!(
+            "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0"
+        );
+        // Stage 195E: in FutexWait mode the parent's handshake FutexWait above was serviced by
+        // the queue-advancing OUT-OF-LOCK drain (task A blocked via NR 9, drain dispatched task
+        // B = child_tid, child woke A via NR 10, A resumed exactly once). blocked_tid = A =
+        // init, dispatched_tid = B = child, wake_count = 1.
+        if futex_wait_mode {
+            yarm_user_rt::user_log!(
+                "AARCH64_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid={} dispatched_tid={} wake_count=1",
+                init_tid,
+                child_tid
+            );
+        }
+    } else {
+        yarm_user_rt::user_log!(
+            "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail first_wake={} second_wake={}",
+            first_wake,
+            second_wake
+        );
+    }
+}
+
+/// Stage 195F NO-INCOMING idle oracle: the final runnable user task (init) blocks on a
+/// never-woken futex when no other user task is runnable (every server is blocked on recv and no
+/// child is spawned). The default-on post-lock FutexWait drain therefore observes no incoming
+/// task and takes the Idle outcome: it clears the deferral, proves the broad lock is released,
+/// keeps `current` None, restores NO frame, and enters the BSP idle loop. This call never
+/// returns — QEMU stays idle (WFI) until the smoke timeout, interrupt-responsive.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn run_aarch64_futex_wait_idle_oracle(init_tid: u64) -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    yarm_user_rt::user_log!("AARCH64_FUTEX_WAIT_IDLE_ORACLE_BEGIN init_tid={}", init_tid);
+    let addr = FUTEX_ORACLE_IDLE_WORD.as_ptr();
+    let observed = FUTEX_ORACLE_IDLE_WORD.load(Relaxed);
+    yarm_user_rt::user_log!(
+        "AARCH64_FUTEX_WAIT_IDLE_ORACLE_WAIT_BEGIN observed={}",
+        observed
+    );
+    // Legacy-shape FutexWait (NR 9) that blocks and — with nothing else runnable — drives the
+    // post-lock Idle outcome. Nothing ever wakes this word, so it does not return.
+    loop {
+        let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+        yarm_user_rt::user_log!("AARCH64_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN");
+    }
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("INIT_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
@@ -1095,6 +1260,25 @@ pub fn run() {
         } else {
             yarm_user_rt::user_log!("INIT_CRASH_TEST_SPAWN_FAIL reason=pm-spawn");
         }
+    }
+
+    // Stage 195C: default-off AArch64 FutexWake live oracle. The kernel reuses init
+    // startup slot 5 (supervisor_control_recv_ep, unused by init) as a sentinel (=1) ONLY
+    // under `yarm.aarch64_futex_wake_oracle=1`. A normal boot leaves it None and skips this.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    if ctx.supervisor_control_recv_ep == Some(1) || ctx.supervisor_control_recv_ep == Some(2) {
+        // Slot-5 sentinel: 1 = Stage 195C FutexWake oracle; 2 = Stage 195E FutexWait
+        // queue-advancing SWITCH oracle (same parent/child flow, but the parent's handshake
+        // FutexWait is serviced by the out-of-lock drain).
+        let futex_wait_mode = ctx.supervisor_control_recv_ep == Some(2);
+        run_aarch64_futex_wake_oracle(ctx.task_id, futex_wait_mode);
+    }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    if ctx.supervisor_control_recv_ep == Some(3) {
+        // Slot-5 sentinel 3 = Stage 195F NO-INCOMING idle oracle. All servers are up and blocked
+        // on recv; init is the last runnable user task. This blocks on a never-woken futex and
+        // does not return — the default-on post-lock drain takes the Idle outcome.
+        run_aarch64_futex_wait_idle_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

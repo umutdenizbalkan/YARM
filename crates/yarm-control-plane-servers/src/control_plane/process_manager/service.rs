@@ -4523,6 +4523,35 @@ pub fn run() {
         }
     }
 
+    // Stage 195B boot-time self-probe: exercise the InitramfsReadChunk syscall (NR 27)
+    // ONCE through the real architecture syscall trap so the accepted read-only split
+    // success seam (`try_split_initramfs_read_chunk_into_frame`) runs live during boot
+    // (on x86_64 AND AArch64, where NR 27 is now split-eligible). The normal ZC-grant /
+    // VFS load path does not issue NR 27, so without this the retired class is never
+    // exercised on a core boot.
+    //
+    // PM (a `TaskClass::SystemServer`) reads the first bytes of a guaranteed-present core
+    // initramfs file into its OWN small buffer (target_tid = self). This mints no cap,
+    // sends no IPC, switches no task, and mutates no structural state — it only reads
+    // immutable CPIO bytes. Any miss (file absent / not SystemServer) returns `Err` and is
+    // logged without disturbing boot, exactly like the NR 8 probe.
+    {
+        const PM_NR27_PROBE_FILE: &[u8] = b"/initramfs/sbin/devfs_srv";
+        let mut probe_buf = [0u8; 16];
+        // SAFETY: direct syscall wrapper; `PM_NR27_PROBE_FILE` and `probe_buf` outlive the
+        // call; the read targets PM's own ASID (target_tid = 0) with a writable buffer.
+        match unsafe {
+            yarm_user_rt::syscall::initramfs_read_chunk(PM_NR27_PROBE_FILE, 0, &mut probe_buf)
+        } {
+            Ok(n) => {
+                yarm_user_rt::user_log!("PM_NR27_SELF_PROBE_OK pid={} bytes={}", ctx.task_id, n)
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!("PM_NR27_SELF_PROBE_ERR pid={} err={:?}", ctx.task_id, e)
+            }
+        }
+    }
+
     loop {
         // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {

@@ -409,23 +409,34 @@ impl KernelState {
         self.ensure_driver_affinity(tid)?;
         let priority = self.task_priority(tid)?;
         let mut sched = self.scheduler_state();
-        if let Some(cpu) = self.task_cpu_affinity(tid)? {
+        let cpu = if let Some(cpu) = self.task_cpu_affinity(tid)? {
             kernel_mut(&mut sched.scheduler)
                 .enqueue_on_with_priority(cpu, ThreadId(tid), priority)
                 .map_err(map_scheduler_error)?;
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
             }
-            Ok(cpu)
+            cpu
         } else {
+            // Stage 195D: `enqueue_balanced` picks the least-loaded NON-wake-only online CPU.
+            // On AArch64 every AP is wake-only (BSP dispatch affinity), so a balanced,
+            // unpinned user task (e.g. a `SpawnThread` child) is placed on the BSP dispatcher
+            // queue instead of stranding on a non-dispatching AP — the invariant that the
+            // 195C oracle needed SMP=1 to sidestep.
             let cpu = kernel_mut(&mut sched.scheduler)
                 .enqueue_balanced(ThreadId(tid), priority)
                 .map_err(map_scheduler_error)?;
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("ENQUEUE cpu={} tid={} status=Runnable", cpu.0, tid);
             }
-            Ok(cpu)
-        }
+            cpu
+        };
+        // Stage 195D (BSP DISPATCH AFFINITY): pin the placement proof for AArch64 user tasks.
+        // Under BSP-only user dispatch this must always be the BSP (cpu 0); a runnable user
+        // task is never left exclusively on a wake-only AP queue.
+        #[cfg(target_arch = "aarch64")]
+        crate::yarm_log!("AARCH64_USER_TASK_PLACEMENT_OK tid={} cpu={}", tid, cpu.0);
+        Ok(cpu)
     }
 
     pub(crate) fn enqueue_woken_task(

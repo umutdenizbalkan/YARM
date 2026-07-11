@@ -992,6 +992,27 @@ pub(crate) fn futex_wait_dispatch_clear(cpu_idx: usize) {
 static FUTEX_WAIT_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Stage 195F: one-shot latch for the AArch64 FutexWait default-on attestation.
+static FUTEX_WAIT_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 195F: emit `AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON` exactly once, at the first eligible
+/// AArch64 FutexWait deferral — proving the out-of-lock retirement mechanism is the default
+/// production path (no oracle/enable knob required).
+pub(crate) fn maybe_log_futex_wait_default_on() {
+    if FUTEX_WAIT_DEFAULT_ON_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("AARCH64_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok");
+    }
+}
+
 /// Stage 192A: emit the FutexWait retirement markers exactly once (first off-global-lock
 /// queue-advancing dispatch).
 pub(crate) fn maybe_log_futex_wait_retired() {
@@ -1004,8 +1025,20 @@ pub(crate) fn maybe_log_futex_wait_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=FutexWait");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok");
+        // Stage 195E: AArch64 emits the arch-tagged retirement marker (its live queue-advancing
+        // FutexWait drain); x86_64 keeps the untagged marker byte-identical.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=FutexWait");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"
+            );
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=FutexWait");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok");
+        }
     }
 }
 
@@ -2146,6 +2179,54 @@ pub(crate) fn set_ipc_send_cap_enqueue_oracle_enabled(enabled: bool) {
 
 pub fn ipc_send_cap_enqueue_oracle_enabled() -> bool {
     IPC_SEND_CAP_ENQUEUE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 195C: default-off AArch64 FutexWake live-oracle knob (`yarm.aarch64_futex_wake_oracle=1`).
+/// When set, the AArch64 boot signals init (startup slot 5, unused by init) to run a controlled
+/// parent/child FutexWake oracle: a child thread blocks via legacy FutexWait, the parent wakes it
+/// once through the split path (count must be 1), then wakes again (count must be 0).
+pub(crate) static AARCH64_FUTEX_WAKE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_futex_wake_oracle_enabled(enabled: bool) {
+    AARCH64_FUTEX_WAKE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_futex_wake_oracle_enabled() -> bool {
+    AARCH64_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 195E: default-off AArch64 FutexWait (NR 9) queue-advancing out-of-lock retirement.
+/// When set, an eligible in-lock `futex_wait_current` (BSP, shared trap drain active,
+/// dispatching_cpu_count()<=1, no outstanding deferral) publishes `Blocked(Futex)`, clears
+/// `current`, records a one-shot per-CPU deferral, and skips the in-lock dispatch — the
+/// trap-entry drain then performs the authoritative queue-advancing dispatch + EL0 restore
+/// off the global lock. Every ineligible case keeps the unchanged in-lock `dispatch_next_task`
+/// fallback. Default-off keeps the proven in-lock FutexWait path as the production default.
+pub(crate) static AARCH64_FUTEX_WAIT_RETIRE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_futex_wait_retire_enabled(enabled: bool) {
+    AARCH64_FUTEX_WAIT_RETIRE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_futex_wait_retire_enabled() -> bool {
+    AARCH64_FUTEX_WAIT_RETIRE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 195F: default-off AArch64 FutexWait NO-INCOMING idle-oracle WORKLOAD selector. The
+/// retirement MECHANISM is default-on (no knob); this flag only selects the narrowly-gated
+/// idle-oracle init workload (a final FutexWait with no other runnable user task) and the
+/// `AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE` attestation emitted by the post-lock idle drain.
+pub(crate) static AARCH64_FUTEX_WAIT_IDLE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_futex_wait_idle_oracle_enabled(enabled: bool) {
+    AARCH64_FUTEX_WAIT_IDLE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_futex_wait_idle_oracle_enabled() -> bool {
+    AARCH64_FUTEX_WAIT_IDLE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.

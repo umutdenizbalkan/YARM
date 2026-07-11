@@ -588,6 +588,15 @@ impl SmpScheduler {
                 cpu.0,
                 tid.0
             );
+            // Stage 195D (BSP DISPATCH AFFINITY): an actual prevented placement of a runnable
+            // user task onto a wake-only AP queue. Emitted ONLY on a real rejection (never
+            // fabricated); the caller reroutes to the BSP dispatcher.
+            #[cfg(target_arch = "aarch64")]
+            crate::yarm_log!(
+                "AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid={} cpu={}",
+                tid.0,
+                cpu.0
+            );
             return Err(SchedulerError::CpuOffline);
         }
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
@@ -767,6 +776,74 @@ mod tests {
 
         assert_eq!(cpu_a, CpuId(0));
         assert_eq!(cpu_b, CpuId(1));
+    }
+
+    // Stage 195D (BSP DISPATCH AFFINITY): a wake-only online CPU must never receive a
+    // balanced user-task placement — `enqueue_balanced` routes to the least-loaded
+    // NON-wake-only CPU (the BSP), so an unpinned user task is never stranded on a
+    // non-dispatching AP. This is the invariant the AArch64 AP bring-up now establishes.
+    #[test]
+    fn stage195d_balanced_enqueue_avoids_wake_only_ap() {
+        let mut sched = SmpScheduler::default();
+        sched.bring_up_cpu(CpuId(1)).expect("cpu1");
+        sched
+            .set_cpu_wake_only(CpuId(1), true)
+            .expect("mark ap wake-only");
+        // Even though CPU 1 is emptier than the BSP, balanced placement must pick CPU 0.
+        let a = sched
+            .enqueue_balanced(ThreadId(10), TaskPriority::Normal)
+            .expect("enqueue a");
+        let b = sched
+            .enqueue_balanced(ThreadId(11), TaskPriority::Normal)
+            .expect("enqueue b");
+        assert_eq!(a, CpuId(0), "first balanced placement must be the BSP");
+        assert_eq!(
+            b,
+            CpuId(0),
+            "second balanced placement must also be the BSP"
+        );
+    }
+
+    // Stage 195D: explicit placement onto a wake-only AP is denied (the caller reroutes to the
+    // BSP). This is what emits `AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED` on a real rejection.
+    #[test]
+    fn stage195d_explicit_enqueue_onto_wake_only_ap_denied() {
+        let mut sched = SmpScheduler::default();
+        sched.bring_up_cpu(CpuId(1)).expect("cpu1");
+        sched
+            .set_cpu_wake_only(CpuId(1), true)
+            .expect("mark ap wake-only");
+        assert!(
+            sched
+                .enqueue_on_with_priority(CpuId(1), ThreadId(20), TaskPriority::Normal)
+                .is_err(),
+            "explicit placement onto a wake-only AP must be denied"
+        );
+        // The BSP still accepts placement.
+        assert!(
+            sched
+                .enqueue_on_with_priority(CpuId(0), ThreadId(21), TaskPriority::Normal)
+                .is_ok()
+        );
+    }
+
+    // Stage 195D: with every AP wake-only, dispatching collapses to the single BSP even though
+    // two CPUs are online — the single_dispatcher topology the AArch64 SMP=2 boot now attains.
+    #[test]
+    fn stage195d_all_aps_wake_only_is_single_dispatcher() {
+        let mut sched = SmpScheduler::default();
+        sched.bring_up_cpu(CpuId(1)).expect("cpu1");
+        sched
+            .set_cpu_wake_only(CpuId(1), true)
+            .expect("mark ap wake-only");
+        assert_eq!(sched.online_cpu_count(), 2);
+        let dispatching = sched.online_cpu_bitmap() & !sched.wake_only_bitmap();
+        assert_eq!(
+            dispatching.count_ones(),
+            1,
+            "only the BSP dispatches user tasks"
+        );
+        assert_eq!(dispatching & 1, 1, "the sole dispatcher is the BSP (cpu 0)");
     }
 
     #[test]

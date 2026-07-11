@@ -597,7 +597,10 @@ impl SharedKernel {
     /// (queue-neutral, same-running-task) dispatch the target is already
     /// `Running`, so this is idempotent; it is kept for faithfulness to the
     /// in-lock path it replaces. No-op when `incoming` is `None` (idle).
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Stage 195E: un-gated to AArch64 — its live FutexWait drain marks the incoming task
+    /// Running through this same rank-2 task seam.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn d6_genuine_mark_running_via_task_seam(&self, incoming: Option<u64>) {
         let Some(tid) = incoming else {
             return;
@@ -713,7 +716,10 @@ impl SharedKernel {
     /// (e.g. a FutexWake woke the task, or an in-lock fallback superseded it) so a woken
     /// waiter is never displaced from the run queue. Single-CPU + IRQ-off means nothing
     /// mutates between the in-lock commit and this check.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Stage 195E: un-gated to AArch64 — its live FutexWait drain uses the same rank-2 task
+    /// seam to re-verify the outgoing waiter is still `Blocked(Futex)` before dispatching.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {
         self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()
@@ -738,7 +744,11 @@ impl SharedKernel {
     /// `dispatch_next_on` genuinely DEQUEUES the next runnable task here (or returns `None`
     /// ⇒ idle) — the queue-advancing "switch_required" step. Identical body to
     /// `d2_recv_dispatch_step_mut`; emits the QUEUE_ADVANCING_DISPATCH_DEQUEUE_OK marker.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Stage 195E: un-gated to AArch64 — the same rank-1 scheduler-seam dequeue drives the
+    /// AArch64 out-of-lock FutexWait drain (the AArch64 arch hooks — TTBR0/ASID + EL0 frame
+    /// restore — run in the drain's `with_cpu` re-acquire, NOT here).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
