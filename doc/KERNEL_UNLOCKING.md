@@ -8512,6 +8512,29 @@ first prerequisite; it is deferred rather than half-landed so the proven in-lock
 `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait`.** Yield stays a separate future
 slice (its re-enqueue proof is independent). See §4.7 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 195G — AArch64 Yield out-of-lock queue-advancing dispatch DEFAULT-ON (DONE)
+
+AArch64 **Yield (NR 0)** is now the fourth live queue-advancing out-of-lock class, **default-on**,
+reusing the FutexWait infrastructure. As the *preempt* sibling, publication is re-enqueue-only:
+`yield_current` sets the caller Runnable and re-enqueues it exactly once at the queue tail via
+`preempt_reenqueue_current_cpu` (192B seam) + clears `current`, records the one-shot deferral,
+skips the in-lock `on_preempt` dispatch (eligible on the BSP + shared drain + single-dispatcher +
+not-already-deferred; re-enqueue failure leaves `current` untouched → legacy fallback). A
+Yield-specific handler bypass (parallel to FutexWait; `post_lock_bypass = futex_wait_bypass ||
+yield_bypass`) returns cleanly so the post-lock Yield drain runs: `yield_reverify_ready` →
+`yield_dispatch_step_mut` (rank-1 dequeue of the FIFO head — another task, or the caller itself
+when alone; **always an incoming, NO idle outcome**) → mark Running → AArch64 TTBR0/ASID + EL0
+frame restore (same hooks as FutexWait, **no CR3**). Markers:
+`AARCH64_YIELD_DISPATCH_{DEFER_BEGIN,REENQUEUE_OK,REVERIFY_OK,DEQUEUE_OK,CURRENT_SET_OK,RUNNING_OK,
+TTBR0_OK,FRAME_OK,DONE result=ok}`, `AARCH64_YIELD_HANDLER_BYPASS_BEGIN/DONE`,
+`AARCH64_YIELD_RETIRE_DEFAULT_ON result=ok`, `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64
+class=Yield result=ok`. Oracles (default-off): two-task
+`AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=ok outgoing=<A> incoming=<B>` and lone-task
+`AARCH64_YIELD_LONE_TASK_ORACLE_DONE result=ok tid=<A> redispatched_self=1`, both under `-smp 1`
+and `-smp 2`. `yield_reverify_ready` + `yield_dispatch_step_mut` un-gated to AArch64. D2 recv/send
+drains stay inactive; AP user dispatch not enabled; NR 27 deprecation TODO preserved. See §4.10 of
+`doc/ARCH_AARCH64.md`.
+
 #### Stage 195F — AArch64 FutexWait DEFAULT-ON + post-lock idle seal (DONE)
 
 The AArch64 FutexWait out-of-lock retirement is now the **default production path** (no enable

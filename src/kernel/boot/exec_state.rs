@@ -2469,6 +2469,78 @@ impl KernelState {
             }
         }
 
+        // Stage 195G (AARCH64 YIELD QUEUE-ADVANCING DISPATCH): the AArch64 port of the x86_64
+        // 192B model — DEFAULT-ON (no knob). The caller is now Runnable (set above). Re-enqueue
+        // it exactly once at its priority queue tail + clear `current` in-lock
+        // (`preempt_reenqueue_current_cpu`, the re-enqueue half of on_preempt), record the
+        // one-shot Yield deferral, and SKIP the in-lock dispatch — the caller returns through the
+        // AArch64 Yield handler bypass and the trap-entry drain performs the authoritative
+        // queue-advancing dispatch (there is ALWAYS an incoming: another task or the caller
+        // itself, so NO idle outcome). Eligible only on the BSP with the shared trap drain active
+        // and a single dispatching CPU. Every ineligible/failed case keeps the unchanged in-lock
+        // `on_preempt_current_cpu` fallback below (on re-enqueue failure the caller's current
+        // state is left untouched by `preempt_reenqueue_current_cpu`).
+        #[cfg(target_arch = "aarch64")]
+        if let Some(out_tid) = outgoing_tid {
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            let is_bsp = self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
+            let already = crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
+            if trap_path
+                && single_cpu
+                && is_bsp
+                && !already
+                && crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)
+            {
+                match self.preempt_reenqueue_current_cpu() {
+                    Some(reenq_tid) => {
+                        crate::kernel::boot::maybe_log_yield_default_on();
+                        crate::yarm_log!(
+                            "AARCH64_YIELD_DISPATCH_DEFER_BEGIN cpu={} tid={}",
+                            cpu_idx,
+                            out_tid
+                        );
+                        crate::yarm_log!(
+                            "AARCH64_YIELD_DISPATCH_REENQUEUE_OK cpu={} tid={}",
+                            cpu_idx,
+                            reenq_tid
+                        );
+                        // The AArch64 Yield handler bypass returns cleanly through `with_cpu`;
+                        // the trap-entry drain performs the authoritative dispatch. Do NOT
+                        // dispatch in-lock here.
+                        return Ok(());
+                    }
+                    None => {
+                        // Re-enqueue failed: `preempt_reenqueue_current_cpu` left `current`
+                        // untouched, so the original current-task state is intact. Clear the
+                        // deferral intent and fall through to the legacy in-lock dispatch.
+                        crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                        crate::yarm_log!(
+                            "AARCH64_YIELD_INLOCK_DISPATCH_FALLBACK reason=reenqueue_failed tid={}",
+                            out_tid
+                        );
+                    }
+                }
+            } else {
+                crate::yarm_log!(
+                    "AARCH64_YIELD_INLOCK_DISPATCH_FALLBACK reason={} tid={}",
+                    if !trap_path {
+                        "no_trap_drainer"
+                    } else if !single_cpu {
+                        "multi_cpu"
+                    } else if !is_bsp {
+                        "not_bsp"
+                    } else {
+                        "already_deferred"
+                    },
+                    out_tid
+                );
+            }
+        }
+
         let next_tid = self.on_preempt_current_cpu();
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);

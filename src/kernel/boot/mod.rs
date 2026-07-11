@@ -1127,8 +1127,39 @@ pub(crate) fn maybe_log_yield_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=Yield");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok");
+        // Stage 195G: AArch64 emits the arch-tagged retirement marker (its live queue-advancing
+        // Yield drain); x86_64 keeps the untagged marker byte-identical.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=Yield");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok");
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=Yield");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok");
+        }
+    }
+}
+
+/// Stage 195G: one-shot latch for the AArch64 Yield default-on attestation.
+static YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 195G: emit `AARCH64_YIELD_RETIRE_DEFAULT_ON` exactly once, at the first eligible
+/// AArch64 Yield deferral — proving the out-of-lock retirement mechanism is the default
+/// production path (no oracle/enable knob required).
+pub(crate) fn maybe_log_yield_default_on() {
+    if YIELD_DEFAULT_ON_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("AARCH64_YIELD_RETIRE_DEFAULT_ON result=ok");
     }
 }
 
@@ -2227,6 +2258,32 @@ pub(crate) fn set_aarch64_futex_wait_idle_oracle_enabled(enabled: bool) {
 
 pub fn aarch64_futex_wait_idle_oracle_enabled() -> bool {
     AARCH64_FUTEX_WAIT_IDLE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 195G: default-off AArch64 Yield TWO-TASK oracle WORKLOAD selector. The Yield retirement
+/// MECHANISM is default-on (no knob); this flag only selects the init two-task oracle workload
+/// (slot 5 = 4).
+pub(crate) static AARCH64_YIELD_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_yield_oracle_enabled(enabled: bool) {
+    AARCH64_YIELD_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_yield_oracle_enabled() -> bool {
+    AARCH64_YIELD_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 195G: default-off AArch64 Yield LONE-TASK oracle WORKLOAD selector (slot 5 = 5).
+pub(crate) static AARCH64_YIELD_LONE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_yield_lone_oracle_enabled(enabled: bool) {
+    AARCH64_YIELD_LONE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_yield_lone_oracle_enabled() -> bool {
+    AARCH64_YIELD_LONE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.

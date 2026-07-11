@@ -674,6 +674,83 @@ pub fn handle_trap_entry_shared(
         }
     }
 
+    // Stage 195G (AARCH64 YIELD QUEUE-ADVANCING DISPATCH): the AArch64 port of the 192B drain —
+    // the preempt sibling of the FutexWait drain above. The in-lock `yield_current` set the
+    // caller Runnable, RE-ENQUEUED it exactly once, and cleared `current` (the caller returned
+    // through the AArch64 Yield handler bypass). We re-verify `current` is still cleared, run the
+    // authoritative queue-advancing dispatch through ONLY the rank-1 scheduler seam (which
+    // dequeues the FIFO head — another task, or the re-enqueued caller itself when alone), mark
+    // the incoming task Running (rank-2), then a brief `with_cpu` re-acquire performs ONLY the
+    // AArch64 arch restore: incoming TTBR0_EL1/ASID switch (via `switch_address_space`, carrying
+    // the DSB/ISB/TLBI ordering) + EL0 SPSR/ELR/GPR frame restore. NO x86_64 CR3 logic. There is
+    // ALWAYS an incoming for a published Yield deferral — no idle outcome.
+    #[cfg(target_arch = "aarch64")]
+    {
+        let yield_was_deferred = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
+        if yield_was_deferred {
+            let outgoing = crate::kernel::boot::yield_dispatch_outgoing(cpu_idx);
+            // Re-verify `current` is still cleared (guards against an in-lock fallback having
+            // superseded the deferral). Single-CPU + IRQ-off ⇒ the caller stays Runnable and
+            // queued exactly once between the in-lock re-enqueue and here.
+            let reverify_ok = shared.yield_reverify_ready(cpu);
+            if reverify_ok {
+                if let Some(t) = outgoing {
+                    crate::yarm_log!("AARCH64_YIELD_DISPATCH_REVERIFY_OK tid={}", t);
+                }
+                // Queue-advancing dequeue + current assignment (rank-1 scheduler seam).
+                let incoming = shared.yield_dispatch_step_mut(cpu);
+                if let Some(inc) = incoming {
+                    crate::yarm_log!(
+                        "AARCH64_YIELD_DISPATCH_DEQUEUE_OK cpu={} tid={}",
+                        cpu.0,
+                        inc
+                    );
+                    crate::yarm_log!(
+                        "AARCH64_YIELD_DISPATCH_CURRENT_SET_OK cpu={} tid={}",
+                        cpu.0,
+                        inc
+                    );
+                    shared.d6_genuine_mark_running_via_task_seam(incoming);
+                    crate::yarm_log!("AARCH64_YIELD_DISPATCH_RUNNING_OK tid={}", inc);
+                    let restore = shared
+                        .with_cpu(cpu, |kernel| {
+                            let asid = kernel.task_asid(inc).map(|a| a.0).unwrap_or(0);
+                            kernel.d2_recv_switch_incoming_asid(inc);
+                            crate::yarm_log!(
+                                "AARCH64_YIELD_DISPATCH_TTBR0_OK tid={} asid={}",
+                                inc,
+                                asid
+                            );
+                            post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
+                        })
+                        .map_err(|err| TrapHandleError::Syscall(err.into()));
+                    crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                    restore??;
+                    crate::yarm_log!("AARCH64_YIELD_DISPATCH_FRAME_OK tid={}", inc);
+                    crate::yarm_log!("AARCH64_YIELD_DISPATCH_DONE result=ok");
+                    crate::kernel::boot::maybe_log_yield_retired();
+                } else {
+                    // A published Yield deferral MUST have an incoming (the re-enqueued caller is
+                    // always a candidate). No incoming is a genuine failure — do NOT claim a
+                    // transition; clear the deferral. (This path must never fire.)
+                    crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                    crate::yarm_log!(
+                        "AARCH64_YIELD_DISPATCH_FAIL reason=no_incoming cpu={}",
+                        cpu.0
+                    );
+                }
+            } else {
+                // An in-lock fallback already dispatched — do NOT double-dispatch.
+                crate::yarm_log!(
+                    "AARCH64_YIELD_DISPATCH_DEFERRED reason=state_changed cpu={}",
+                    cpu.0
+                );
+                crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+            }
+        }
+    }
+
     // Stage 192B (YIELD QUEUE-ADVANCING DISPATCH): drain the deferred Yield queue-advancing
     // dispatch OUTSIDE the global lock — the preempt sibling of the FutexWait drain above.
     // The in-lock `yield_current` set the caller Runnable, RE-ENQUEUED it, and cleared

@@ -775,7 +775,10 @@ impl SharedKernel {
     /// out-of-lock dispatch against a stale deferral (e.g. an in-lock fallback already
     /// dispatched). Single-CPU + IRQ-off means nothing mutates between the in-lock commit and
     /// this check; the re-verify is the correctness fence before dispatching.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Stage 195G: un-gated to AArch64 — its live Yield drain re-verifies `current` is still
+    /// cleared through this same rank-1 scheduler seam before dispatching.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn yield_reverify_ready(&self, cpu: CpuId) -> bool {
         self.with_scheduler_split_mut(|sched| {
             // `cpu` is the trap CPU == the authoritative dispatch CPU under the
@@ -791,7 +794,10 @@ impl SharedKernel {
     /// re-enqueued and removed from `current` (in-lock `preempt_reenqueue_only`), so
     /// `dispatch_next_on` genuinely DEQUEUES the next runnable task here (the FIFO head — the
     /// re-enqueued caller itself when it is alone). Emits `YIELD_DISPATCH_DEQUEUE_OK`.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Stage 195G: un-gated to AArch64 — the same rank-1 dequeue drives the AArch64 out-of-lock
+    /// Yield drain (the AArch64 arch restore runs in the drain's `with_cpu` re-acquire).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn yield_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;

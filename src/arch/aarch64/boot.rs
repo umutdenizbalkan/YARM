@@ -7772,10 +7772,16 @@ pub fn bootstrap_first_user_task(
     // (supervisor_control_recv_ep) is unused by init, so under
     // `yarm.aarch64_futex_wake_oracle=1` we reuse it as a sentinel (=1) that tells init to
     // run the parent/child FutexWake oracle. A normal boot leaves it 0 and init skips it.
-    // Slot-5 oracle sentinel: 3 = Stage 195F FutexWait NO-INCOMING idle oracle; 2 = Stage 195E
-    // FutexWait switch oracle (retire flag = its discriminator); 1 = Stage 195C FutexWake oracle.
-    // Check idle first, then retire (switch), then wake.
-    if crate::kernel::boot::aarch64_futex_wait_idle_oracle_enabled() {
+    // Slot-5 oracle sentinel: 5 = Stage 195G lone-task Yield oracle; 4 = Stage 195G two-task
+    // Yield oracle; 3 = Stage 195F FutexWait NO-INCOMING idle oracle; 2 = Stage 195E FutexWait
+    // switch oracle (retire flag = its discriminator); 1 = Stage 195C FutexWake oracle.
+    if crate::kernel::boot::aarch64_yield_lone_oracle_enabled() {
+        init_args[5] = 5;
+        crate::yarm_log!("AARCH64_YIELD_LONE_ORACLE_PROVISION_OK slot5=5");
+    } else if crate::kernel::boot::aarch64_yield_oracle_enabled() {
+        init_args[5] = 4;
+        crate::yarm_log!("AARCH64_YIELD_ORACLE_PROVISION_OK slot5=4");
+    } else if crate::kernel::boot::aarch64_futex_wait_idle_oracle_enabled() {
         init_args[5] = 3;
         crate::yarm_log!("AARCH64_FUTEX_WAIT_IDLE_ORACLE_PROVISION_OK slot5=3");
     } else if crate::kernel::boot::aarch64_futex_wait_retire_enabled() {

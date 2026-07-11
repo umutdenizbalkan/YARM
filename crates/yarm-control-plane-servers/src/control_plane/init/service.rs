@@ -685,6 +685,10 @@ static FUTEX_ORACLE_HANDSHAKE: core::sync::atomic::AtomicU32 =
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static FUTEX_ORACLE_IDLE_WORD: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0x1D1E);
+// Stage 195G: the two-task Yield oracle child sets this flag before blocking, proving the Yield
+// post-lock drain dispatched it (task B) after task A (init) yielded.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+static YIELD_ORACLE_FLAG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 static mut FUTEX_ORACLE_CHILD_STACK: [u8; 16384] = [0u8; 16384];
 // `spawn_user_thread` requires a NON-zero TLS base; a small dedicated TLS region suffices.
@@ -822,6 +826,79 @@ fn run_aarch64_futex_wait_idle_oracle(init_tid: u64) -> ! {
         let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
         yarm_user_rt::user_log!("AARCH64_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN");
     }
+}
+
+/// Stage 195G two-task Yield oracle child (task B): prove it was entered by the out-of-lock Yield
+/// drain by setting the flag, then leave the runnable set (block on the never-woken idle word)
+/// so task A can re-dispatch and confirm. Never returns.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+extern "C" fn yield_oracle_child() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    YIELD_ORACLE_FLAG.store(1, Relaxed);
+    yarm_user_rt::user_log!("AARCH64_YIELD_ORACLE_CHILD_RAN");
+    let park = FUTEX_ORACLE_IDLE_WORD.as_ptr();
+    let pv = FUTEX_ORACLE_IDLE_WORD.load(Relaxed);
+    loop {
+        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+    }
+}
+
+/// Stage 195G two-task Yield oracle (Proof A): task A (init) spawns task B, then calls Yield
+/// (NR 0). A is re-enqueued exactly once at the queue tail; the post-lock Yield drain dispatches
+/// B (the FIFO head). B runs (sets the flag) and blocks, so the FutexWait drain re-dispatches A;
+/// A resumes after the Yield and confirms B ran.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn run_aarch64_yield_two_task_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    yarm_user_rt::user_log!("AARCH64_YIELD_TWO_TASK_ORACLE_BEGIN init_tid={}", init_tid);
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = yield_oracle_child as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("AARCH64_YIELD_TWO_TASK_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    yarm_user_rt::user_log!("AARCH64_YIELD_ORACLE_CHILD_SPAWNED child_tid={}", child_tid);
+    // A yields: re-enqueued at tail, the Yield drain dispatches B (FIFO head). A resumes only
+    // after B has run and blocked (its FutexWait drain re-dispatches A).
+    let _ = yarm_user_rt::syscall::yield_now();
+    let ran = YIELD_ORACLE_FLAG.load(Relaxed);
+    if ran == 1 {
+        yarm_user_rt::user_log!(
+            "AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=ok outgoing={} incoming={}",
+            init_tid,
+            child_tid
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=fail flag={}",
+            ran
+        );
+    }
+}
+
+/// Stage 195G lone-task Yield oracle (Proof B): task A (init) is the only runnable user task and
+/// calls Yield (NR 0). A is re-enqueued once; the post-lock Yield drain dequeues A ITSELF (the
+/// sole FIFO head), makes A current again, and A resumes after the syscall — proving same-task
+/// re-dispatch with NO idle outcome.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn run_aarch64_yield_lone_task_oracle(init_tid: u64) {
+    yarm_user_rt::user_log!("AARCH64_YIELD_LONE_TASK_ORACLE_BEGIN init_tid={}", init_tid);
+    // Only A is runnable; the Yield drain re-dispatches A itself. If yield_now returns, the
+    // same-task re-dispatch completed.
+    let _ = yarm_user_rt::syscall::yield_now();
+    yarm_user_rt::user_log!(
+        "AARCH64_YIELD_LONE_TASK_ORACLE_DONE result=ok tid={} redispatched_self=1",
+        init_tid
+    );
 }
 
 pub fn run() {
@@ -1279,6 +1356,16 @@ pub fn run() {
         // on recv; init is the last runnable user task. This blocks on a never-woken futex and
         // does not return — the default-on post-lock drain takes the Idle outcome.
         run_aarch64_futex_wait_idle_oracle(ctx.task_id);
+    }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    if ctx.supervisor_control_recv_ep == Some(4) {
+        // Slot-5 sentinel 4 = Stage 195G two-task Yield oracle (Proof A).
+        run_aarch64_yield_two_task_oracle(ctx.task_id);
+    }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    if ctx.supervisor_control_recv_ep == Some(5) {
+        // Slot-5 sentinel 5 = Stage 195G lone-task Yield oracle (Proof B).
+        run_aarch64_yield_lone_task_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

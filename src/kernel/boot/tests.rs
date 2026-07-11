@@ -62919,9 +62919,10 @@ mod stage195e_aarch64_futex_wait_drain {
             "the bypass must emit its BEGIN/DONE markers"
         );
         // The in-lock restore is skipped on bypass (the drain does the authoritative restore).
+        // Stage 195G generalized the guard to `!post_lock_bypass` (FutexWait OR Yield bypass).
         assert!(
-            body.contains("if !switch_pending && !futex_wait_bypass {"),
-            "the in-lock restore must be skipped on a FutexWait bypass"
+            body.contains("if !switch_pending && !post_lock_bypass {"),
+            "the in-lock restore must be skipped on a FutexWait/Yield bypass"
         );
     }
 
@@ -63177,9 +63178,15 @@ mod stage195f_aarch64_futex_wait_default_on {
         }
         // The idle branch confirms current is None via a lock re-acquire, and does NOT restore a
         // frame (no post_switch_restore in the no-incoming branch — that is only in the switch arm).
+        // Bound it to end at `enter_post_lock_idle` so the subsequent Stage 195G Yield drain
+        // (which legitimately restores its incoming frame) is excluded.
         let idle_branch = block
             .split_once("Stage 195F IDLE OUTCOME")
-            .map(|(_, r)| r)
+            .map(|(_, r)| {
+                r.split_once("enter_post_lock_idle(cpu)")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
             .unwrap_or("");
         assert!(
             idle_branch.contains("kernel.current_tid(), None | Some(0)"),
@@ -63255,6 +63262,216 @@ mod stage195f_aarch64_futex_wait_default_on {
         assert!(
             !A64_SMOKE.contains("a64_split_bads+=(\"arch=aarch64 class=FutexWait\")"),
             "class=FutexWait must NOT be forbidden (default-on)"
+        );
+    }
+}
+
+// Stage 195G — AARCH64 YIELD (NR 0) OUT-OF-LOCK QUEUE-ADVANCING DISPATCH (default-on, SMP=1 +
+// SMP=2). The preempt sibling of FutexWait: the caller is re-enqueued Runnable exactly once, so
+// there is ALWAYS an incoming (another task or the caller itself) — NO idle outcome. These guards
+// pin the Yield handler bypass, re-enqueue-only publication, post-lock drain (AArch64 hooks, no
+// CR3), default-on eligibility, and that FutexWait/idle behavior is untouched.
+mod stage195g_aarch64_yield_dispatch {
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+
+    // Yield is NR 0 (NR 9 FutexWait, NR 10 FutexWake, NR 11 SpawnThread).
+    #[test]
+    fn yield_is_nr0() {
+        use crate::kernel::syscall::{
+            SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_SPAWN_THREAD_NR, SYSCALL_YIELD_NR,
+        };
+        assert_eq!(SYSCALL_YIELD_NR, 0);
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_SPAWN_THREAD_NR, 11);
+    }
+
+    // The Yield handler bypass requires a real pending Yield deferral, is separate from the
+    // FutexWait bypass, and preserves the idle loop otherwise.
+    #[test]
+    fn yield_handler_bypass_requires_pending_deferral() {
+        let body = A64_TRAP_SRC
+            .split_once("fn handle_trap_entry_with_fault_bookkeeping_mode(")
+            .map(|(_, r)| r)
+            .unwrap_or("");
+        assert!(
+            body.contains("let yield_bypass = {")
+                && body.contains("yield_dispatch_is_deferred(idx)"),
+            "the Yield bypass must be gated on a pending Yield deferral"
+        );
+        assert!(
+            body.contains("AARCH64_YIELD_HANDLER_BYPASS_BEGIN")
+                && body.contains("AARCH64_YIELD_HANDLER_BYPASS_DONE"),
+            "the Yield bypass must emit its BEGIN/DONE markers"
+        );
+        // The FutexWait bypass + the idle loop are still present (not generalized away).
+        assert!(
+            body.contains("futex_wait_bypass") && body.contains("idle_no_eret_loop();"),
+            "the FutexWait bypass and normal idle must remain intact"
+        );
+        assert!(
+            body.contains("let post_lock_bypass = futex_wait_bypass || yield_bypass;"),
+            "the restore-skip must cover both bypasses"
+        );
+    }
+
+    // The in-lock Yield deferral is DEFAULT-ON (no knob), re-enqueues exactly once via the
+    // proven seam, and keeps the legacy on_preempt fallback.
+    #[test]
+    fn yield_deferral_default_on_reenqueue_only() {
+        let body = EXEC_SRC
+            .split_once("pub fn yield_current(")
+            .map(|(_, r)| r.split_once("\n    pub ").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("");
+        assert!(!body.is_empty(), "yield_current body must exist");
+        for needle in [
+            "GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE",
+            "dispatching_cpu_count() <= 1",
+            "BOOTSTRAP_CPU_ID",
+            "yield_dispatch_try_defer",
+            "preempt_reenqueue_current_cpu()",
+            "maybe_log_yield_default_on()",
+            "AARCH64_YIELD_DISPATCH_DEFER_BEGIN",
+            "AARCH64_YIELD_DISPATCH_REENQUEUE_OK",
+        ] {
+            assert!(
+                body.contains(needle),
+                "yield deferral must reference `{needle}`"
+            );
+        }
+        // Not gated on any enable knob (default-on) and keeps the legacy fallback.
+        assert!(
+            !body.contains("aarch64_yield_oracle_enabled()")
+                && !body.contains("aarch64_yield_retire_enabled()"),
+            "the Yield mechanism must be default-on (no enable-knob gate)"
+        );
+        assert!(
+            body.contains("self.on_preempt_current_cpu();"),
+            "ineligible/failed cases must fall back to the legacy in-lock on_preempt dispatch"
+        );
+        assert!(
+            MOD_SRC.contains("AARCH64_YIELD_RETIRE_DEFAULT_ON result=ok"),
+            "the Yield default-on attestation marker must exist"
+        );
+    }
+
+    // The post-lock Yield drain uses the generic seams (un-gated) + AArch64 arch hooks, has NO
+    // idle outcome, and no x86 CR3 logic.
+    #[test]
+    fn yield_post_lock_drain_wired_no_idle_no_cr3() {
+        let block = TRAP_ENTRY_SRC
+            .split_once("Stage 195G (AARCH64 YIELD QUEUE-ADVANCING DISPATCH)")
+            .map(|(_, r)| {
+                r.split_once("Stage 192B (YIELD")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(
+            !block.is_empty(),
+            "the AArch64 Yield drain block must exist"
+        );
+        for needle in [
+            "yield_reverify_ready",
+            "yield_dispatch_step_mut",
+            "d6_genuine_mark_running_via_task_seam",
+            "d2_recv_switch_incoming_asid",
+            "post_switch_restore_arch_thread_state",
+            "yield_dispatch_clear",
+            "maybe_log_yield_retired",
+            "AARCH64_YIELD_DISPATCH_REVERIFY_OK",
+            "AARCH64_YIELD_DISPATCH_DEQUEUE_OK",
+            "AARCH64_YIELD_DISPATCH_CURRENT_SET_OK",
+            "AARCH64_YIELD_DISPATCH_RUNNING_OK",
+            "AARCH64_YIELD_DISPATCH_TTBR0_OK",
+            "AARCH64_YIELD_DISPATCH_FRAME_OK",
+            "AARCH64_YIELD_DISPATCH_DONE result=ok",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the Yield drain must use/emit `{needle}`"
+            );
+        }
+        // No idle outcome (a published Yield always has an incoming); no CR3.
+        assert!(
+            !block.contains("enter_post_lock_idle") && !block.contains("result=idle"),
+            "the Yield drain must NOT have an idle outcome"
+        );
+        assert!(
+            !block.contains("switch_cr3")
+                && !block.contains("write_cr3")
+                && !block.contains("load_cr3"),
+            "the AArch64 Yield drain must NOT use x86_64 CR3 logic"
+        );
+        // The reused seams are un-gated to AArch64.
+        assert!(
+            RUNTIME_SRC.contains(
+                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn yield_dispatch_step_mut("
+            ) && RUNTIME_SRC.contains(
+                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn yield_reverify_ready("
+            ),
+            "yield_dispatch_step_mut + yield_reverify_ready must be un-gated to AArch64"
+        );
+    }
+
+    // The retirement marker is arch-tagged, and the oracle workloads are default-off + slot-5 4/5.
+    #[test]
+    fn yield_retire_arch_tagged_and_oracles_default_off() {
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok"),
+            "AArch64 must emit the arch-tagged Yield retirement marker"
+        );
+        assert!(
+            MOD_SRC.contains("aarch64_yield_oracle_enabled")
+                && MOD_SRC.contains("aarch64_yield_lone_oracle_enabled"),
+            "the Yield oracle workload flags must exist"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.aarch64_yield_oracle")
+                && BOOT_CMDLINE_SRC.contains("yarm.aarch64_yield_lone_oracle"),
+            "the Yield oracle knobs must parse"
+        );
+        assert!(
+            A64_BOOT_SRC.contains("init_args[5] = 4") && A64_BOOT_SRC.contains("init_args[5] = 5"),
+            "the bootstrap must provision slot-5 4 (two-task) and 5 (lone)"
+        );
+        assert!(
+            INIT_SRC.contains("AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=ok")
+                && INIT_SRC.contains(
+                    "AARCH64_YIELD_LONE_TASK_ORACLE_DONE result=ok tid={} redispatched_self=1"
+                ),
+            "init must emit both Yield oracle proof markers"
+        );
+    }
+
+    // The smoke exposes + accepts both Yield oracles and no longer forbids class=Yield.
+    #[test]
+    fn smoke_accepts_yield_oracles() {
+        assert!(
+            A64_SMOKE.contains("YIELD_ORACLE")
+                && A64_SMOKE.contains("yarm.aarch64_yield_oracle=1")
+                && A64_SMOKE.contains("AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=ok")
+                && A64_SMOKE.contains(
+                    "AARCH64_YIELD_LONE_TASK_ORACLE_DONE result=ok tid=1 redispatched_self=1"
+                )
+                && A64_SMOKE
+                    .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok"),
+            "the smoke must require the Yield two-task + lone-task acceptance markers"
+        );
+        // class=Yield is no longer forbidden (default-on).
+        assert!(
+            !A64_SMOKE.contains("\"arch=aarch64 class=Yield\""),
+            "class=Yield must NOT be forbidden (default-on)"
         );
     }
 }

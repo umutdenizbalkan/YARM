@@ -325,6 +325,17 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             enabled
         );
     }
+    if let Some(enabled) = parsed.aarch64_yield_oracle {
+        // Stage 195G: default-off AArch64 Yield TWO-TASK oracle WORKLOAD knob (slot 5 = 4). The
+        // Yield retirement MECHANISM is default-on; this knob only selects the two-task workload.
+        crate::kernel::boot::set_aarch64_yield_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_AARCH64_YIELD_ORACLE_SET enabled={}", enabled);
+    }
+    if let Some(enabled) = parsed.aarch64_yield_lone_oracle {
+        // Stage 195G: default-off AArch64 Yield LONE-TASK oracle WORKLOAD knob (slot 5 = 5).
+        crate::kernel::boot::set_aarch64_yield_lone_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_AARCH64_YIELD_LONE_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.ap_user_dispatch {
         // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
         // first live AP user dispatch. No-op on other arches; when OFF the AP
@@ -532,6 +543,12 @@ pub struct YarmBootOptions<'a> {
     /// 5 = 3) to run the NO-INCOMING idle oracle (a final FutexWait with no other runnable user
     /// task), exercising the default-on post-lock Idle outcome + BSP idle loop.
     pub aarch64_futex_wait_idle_oracle: Option<bool>,
+    /// Stage 195G: `yarm.aarch64_yield_oracle=1` DEFAULT-OFF knob (slot 5 = 4) — two-task Yield
+    /// oracle (Proof A).
+    pub aarch64_yield_oracle: Option<bool>,
+    /// Stage 195G: `yarm.aarch64_yield_lone_oracle=1` DEFAULT-OFF knob (slot 5 = 5) — lone-task
+    /// Yield oracle (Proof B).
+    pub aarch64_yield_lone_oracle: Option<bool>,
     /// Stage 189C6: `yarm.ap_user_dispatch=1` DEFAULT-OFF gate that arms the first
     /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
     /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
@@ -676,6 +693,12 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.aarch64_futex_wait_idle_oracle" {
             options.aarch64_futex_wait_idle_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.aarch64_yield_lone_oracle" {
+            options.aarch64_yield_lone_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.aarch64_yield_oracle" {
+            options.aarch64_yield_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_futex_wait_oracle" {
             options.aarch64_futex_wait_oracle = parse_bool_knob(value);
@@ -1123,6 +1146,27 @@ mod tests {
         assert_eq!(idle_only.aarch64_futex_wait_oracle, None);
         let switch_only = parse_yarm_boot_options(b"yarm.aarch64_futex_wait_oracle=1");
         assert_eq!(switch_only.aarch64_futex_wait_idle_oracle, None);
+    }
+
+    // Stage 195G: the AArch64 Yield two-task + lone-task oracle knobs parse as standard bool
+    // knobs, default to None (off), and are independent of each other.
+    #[test]
+    fn aarch64_yield_oracle_knobs_parse_and_default_off() {
+        assert_eq!(parse_yarm_boot_options(b"").aarch64_yield_oracle, None);
+        assert_eq!(parse_yarm_boot_options(b"").aarch64_yield_lone_oracle, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.aarch64_yield_oracle=1").aarch64_yield_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.aarch64_yield_lone_oracle=1").aarch64_yield_lone_oracle,
+            Some(true)
+        );
+        // Independent (no prefix aliasing in either direction).
+        let two = parse_yarm_boot_options(b"yarm.aarch64_yield_oracle=1");
+        assert_eq!(two.aarch64_yield_lone_oracle, None);
+        let lone = parse_yarm_boot_options(b"yarm.aarch64_yield_lone_oracle=1");
+        assert_eq!(lone.aarch64_yield_oracle, None);
     }
 
     // Stage 193B: the send-plain-oracle SUB-knob parses as a standard bool knob,

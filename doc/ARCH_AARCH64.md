@@ -531,7 +531,44 @@ returned. This reuses the proven BSP idle primitive — not a second idle policy
 multi-dispatcher, non-BSP, already-deferred). Idle oracle (default-off, `FUTEX_WAIT_IDLE_ORACLE=1`):
 the last runnable user task blocks on a never-woken futex →
 `AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1`, then QEMU idles
-until the smoke timeout. Yield remains inert; AP user dispatch is not enabled.
+until the smoke timeout. Yield remains inert (until Stage 195G); AP user dispatch is not enabled.
+
+### 4.10 Yield queue-advancing dispatch — DEFAULT-ON (Stage 195G)
+
+Stage 195G makes AArch64 **Yield (NR 0)** the fourth live queue-advancing out-of-lock class,
+**default-on** (no knob), reusing the FutexWait infrastructure. Yield is the *preempt* sibling of
+FutexWait, so the publication differs: the caller is set **Runnable** and **re-enqueued exactly
+once** at its priority queue tail (not Blocked), so there is **ALWAYS an incoming** task — another
+runnable task, or the yielding caller itself when alone — and therefore **NO idle outcome**.
+
+- **Handler bypass** (`arch/aarch64/trap.rs`): a Yield-deferral-specific bypass parallel to
+  FutexWait — when `yield_dispatch_is_deferred(cpu)` and `current` is None/idle, skip
+  `idle_no_eret_loop()` + the in-lock restore and return cleanly so the post-lock Yield drain
+  runs. Any other None/idle keeps the exact idle behavior (`post_lock_bypass = futex_wait_bypass
+  || yield_bypass`). Markers: `AARCH64_YIELD_HANDLER_BYPASS_BEGIN/DONE`.
+- **Re-enqueue-only publication** (`yield_current`): default-on, eligible on the BSP with the
+  shared trap drain active + `dispatching_cpu_count() <= 1` + not-already-deferred. Sets the
+  caller Runnable, re-enqueues it once via `preempt_reenqueue_current_cpu` (the proven 192B
+  seam) + clears `current`, records the one-shot deferral, skips the in-lock `on_preempt`
+  dispatch. On re-enqueue failure `preempt_reenqueue_current_cpu` leaves `current` untouched, so
+  the legacy in-lock `on_preempt_current_cpu` fallback runs cleanly. Markers:
+  `AARCH64_YIELD_DISPATCH_DEFER_BEGIN`, `..._REENQUEUE_OK`; attestation
+  `AARCH64_YIELD_RETIRE_DEFAULT_ON result=ok`.
+- **Post-lock drain** (`handle_trap_entry_shared`): generic seams un-gated to AArch64
+  (`yield_reverify_ready` — re-verify `current` still cleared; `yield_dispatch_step_mut` — rank-1
+  dequeue of the FIFO head; `d6_genuine_mark_running_via_task_seam`) + the SAME AArch64 arch
+  hooks as FutexWait — TTBR0_EL1/ASID via `switch_address_space` (DSB/ISB/TLBI) + EL0 frame via
+  `post_switch_restore_arch_thread_state`. **No CR3.** A published Yield always has an incoming,
+  so no-incoming is a genuine failure (never fires). Markers:
+  `AARCH64_YIELD_DISPATCH_{REVERIFY_OK,DEQUEUE_OK,CURRENT_SET_OK,RUNNING_OK,TTBR0_OK,FRAME_OK,DONE
+  result=ok}` + `GLOBAL_LOCK_RETIRE_CLASS_BEGIN/DONE arch=aarch64 class=Yield result=ok`.
+
+Oracles (default-off): **two-task** (`YIELD_ORACLE=1`) — A yields, drain dispatches B, B runs and
+blocks, A resumes: `AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=ok outgoing=<A> incoming=<B>`;
+**lone-task** (`YIELD_LONE_ORACLE=1`) — the sole runnable task yields and the drain re-dispatches
+it (same-task, no idle): `AARCH64_YIELD_LONE_TASK_ORACLE_DONE result=ok tid=<A>
+redispatched_self=1`. Both proven under `-smp 1` and `-smp 2`. D2 recv/send drains stay inactive;
+AP user dispatch not enabled.
 - **TLB/ASID:** local TTBR0_EL1 + ASID switch with the existing `TLBI`/`DSB ISH`/`ISB`
   maintenance is sufficient for the first slices; broadcast `TLBI` is only needed for
   VM/SMP classes, which are out of scope. QEMU virt and RPi5 share the same generic drain —
