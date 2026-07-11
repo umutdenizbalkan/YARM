@@ -8030,10 +8030,35 @@ fn start_secondary_cpus(kernel: &mut crate::kernel::boot::KernelState) -> usize 
         let cpu = crate::kernel::scheduler::CpuId(cpu_id);
         let psci_ret = psci_cpu_on(conduit, cpu.0 as u64, secondary_entry, cpu.0 as u64);
         crate::yarm_log!("YARM_SMP_PSCI cpu={} ret={}", cpu.0, psci_ret);
-        if psci_ret == 0 && kernel.bring_up_cpu(cpu).is_ok() {
-            started += 1;
+        if psci_ret != 0 {
+            continue;
         }
+        // Stage 195D (BSP DISPATCH AFFINITY): AArch64 has no AP *user* dispatcher — the
+        // secondary main loop only drains cross-CPU work and `wfe`s (see
+        // `yarm_aarch64_secondary_cpu_boot`). Mark the AP wake-only BEFORE onlining it (no
+        // placement window), mirroring the x86_64 183.5 AP bring-up. This keeps
+        // `dispatching = online - wake_only == 1` (BSP-only user dispatch, single_dispatcher),
+        // makes balanced/explicit user-task placement avoid the AP (no strand), and preserves
+        // the AP for kernel/interrupt/cross-CPU bootstrap work. We do NOT claim AP user
+        // dispatch is live.
+        if kernel.mark_cpu_wake_only(cpu, true).is_err() {
+            crate::yarm_log!("YARM_SMP_AP_WAKE_ONLY_MARK_FAIL cpu={}", cpu.0);
+            continue;
+        }
+        if kernel.bring_up_cpu(cpu).is_err() {
+            let _ = kernel.mark_cpu_wake_only(cpu, false);
+            continue;
+        }
+        // Install the scheduler-owned idle current (tid 0) on the now-online wake-only AP, so
+        // it is a valid online-but-non-dispatching CPU (same convention as x86_64 183.5).
+        if kernel.install_ap_idle_current(cpu).is_err() {
+            crate::yarm_log!("YARM_SMP_AP_IDLE_INSTALL_FAIL cpu={}", cpu.0);
+        }
+        started += 1;
     }
+    // BSP-only user-dispatch affinity is the active AArch64 policy: every AP that came online
+    // above is wake-only, so all runnable user-task placement routes to the BSP dispatcher.
+    crate::yarm_log!("AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE result=ok");
     started
 }
 

@@ -429,7 +429,44 @@ queue-advancing still arch-blocked) is the core Stage 194 finding.
   (`D2`/`FutexWait`/`Yield`), which remain `#[cfg(target_arch = "x86_64")]` and await a de-gated
   drain body + an EL0-return-frame restore proof. `CreateInitramfsFileSliceMo` (NR 28,
   cap-minting) stays global-lock-only.
-- **Next AArch64 slice:** `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
+
+### 4.7 BSP dispatch affinity (Stage 195D)
+
+Before Stage 195D the AArch64 secondary bring-up (`start_secondary_cpus`) onlined each AP via
+PSCI **without** marking it wake-only. The AArch64 AP main loop
+(`yarm_aarch64_secondary_cpu_boot`) only drains cross-CPU work and `wfe`s — it runs **no user
+dispatcher** — yet the scheduler saw it as an online, non-wake-only, empty (least-loaded) CPU.
+Two consequences followed on `-smp 2`:
+
+1. `CROSS_ARCH_DISPATCHING_CPUS arch=aarch64 online=2 wake_only=0 dispatching=2` →
+   `CROSS_ARCH_TOPOLOGY_BLOCKED reason=multi_dispatcher_unproven` (never surfaced because the
+   aarch64 core smoke's strict cross-arch block is gated behind a boot-shell marker AArch64
+   does not emit at the idle terminal).
+2. An **unpinned** runnable user task (BSP-pinned servers were unaffected) — e.g. the Stage 195C
+   `SpawnThread` oracle child — could be balanced onto the AP's queue and **strand** forever,
+   which is exactly why the 195C oracle needed `-smp 1`.
+
+Stage 195D marks every AArch64 AP **wake-only before onlining it** (mirroring the x86_64 183.5
+AP bring-up) and installs the scheduler-owned idle current. This reuses the existing wake-only
+placement infrastructure — `enqueue_balanced` → `least_loaded_online_cpu` skips wake-only CPUs,
+`enqueue_on_with_priority` denies direct placement (`SCHED_ENQUEUE_DENIED_WAKE_ONLY`), and
+`dispatching = online - wake_only` collapses to 1. No new lock; AP kernel/interrupt/cross-CPU
+work is preserved (the AP is not user-dispatching, so it is correctly excluded from user-ASID
+TLB shootdowns — it never loads a user TTBR0). Markers:
+`AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE result=ok`,
+`AARCH64_USER_TASK_PLACEMENT_OK tid=<tid> cpu=0` (every user placement lands on the BSP), and
+`AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid=<tid> cpu=<ap>` (only on a real prevented placement).
+Result: AArch64 `-smp 2` now attests `CROSS_ARCH_TOPOLOGY_OK reason=single_dispatcher`, and the
+Stage 195C FutexWake live oracle passes under **both** `-smp 1` and `-smp 2` (the SMP=1
+requirement is retired).
+
+The AArch64 queue-advancing **FutexWait** retirement (moving the dispatch phase out of the broad
+lock, x86_64 192A model) is the next slice; its first blocking return-path invariant is the
+in-lock `idle_no_eret_loop()` (`arch/aarch64/trap.rs`), which fires when the deferred
+`futex_wait_current` leaves `current == None` and would spin **inside** the global lock before
+the out-of-lock drain can run — see `doc/KERNEL_UNLOCKING.md` Stage 195D.
+- **Next AArch64 slice:** live `FutexWait` queue-advancing drain (foundation landed here), then
+  `IpcSendPlainEnqueue` (rank-4 enqueue, no drain).
 - **TLB/ASID:** local TTBR0_EL1 + ASID switch with the existing `TLBI`/`DSB ISH`/`ISB`
   maintenance is sufficient for the first slices; broadcast `TLBI` is only needed for
   VM/SMP classes, which are out of scope. QEMU virt and RPi5 share the same generic drain —

@@ -62727,8 +62727,9 @@ mod stage195c_aarch64_futex_wake_live {
             "init must gate the oracle behind the slot-5 sentinel"
         );
         assert!(
-            INIT_SRC.contains("AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0")
-                && INIT_SRC.contains("FUTEX_ORACLE_HANDSHAKE"),
+            INIT_SRC.contains(
+                "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0"
+            ) && INIT_SRC.contains("FUTEX_ORACLE_HANDSHAKE"),
             "the oracle must use the handshake coordination and emit the ok proof marker"
         );
         // The child blocks through the LEGACY global-lock FutexWait (the waiter path under test).
@@ -62749,9 +62750,9 @@ mod stage195c_aarch64_futex_wake_live {
             "the smoke must expose the oracle knob and force single-CPU"
         );
         assert!(
-            A64_SMOKE
-                .contains("AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0")
-                && A64_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=10"),
+            A64_SMOKE.contains(
+                "AARCH64_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0"
+            ) && A64_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=10"),
             "the smoke must require the FutexWake NR 10 + live-oracle acceptance markers"
         );
         // The old forbid of class=FutexWake must be gone; FutexWait/Yield stay forbidden.
@@ -62780,6 +62781,84 @@ mod stage195c_aarch64_futex_wake_live {
             AARCH64_DOC.contains("FutexWake is now LIVE on AArch64 (Stage 195C)")
                 && AARCH64_DOC.contains("NR 10"),
             "ARCH_AARCH64.md must record FutexWake live on AArch64 at NR 10"
+        );
+    }
+}
+
+// Stage 195D — AARCH64 BSP DISPATCH AFFINITY. The AArch64 AP bring-up must mark every AP
+// wake-only (no AP user dispatcher), so runnable user tasks route to the BSP dispatcher and
+// never strand on a non-dispatching AP. These guards pin the arch-specific bring-up + the
+// placement markers, and that x86_64/RISC-V placement policy is untouched.
+mod stage195d_aarch64_bsp_dispatch_affinity {
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const X86_SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const SCHED_STATE_SRC: &str = include_str!("scheduler_state.rs");
+    const SCHED_SRC: &str = include_str!("../scheduler.rs");
+
+    // The AArch64 secondary bring-up marks the AP wake-only BEFORE onlining it (no placement
+    // window), mirroring the x86_64 pattern, and installs the idle current afterwards.
+    #[test]
+    fn aarch64_ap_bringup_marks_wake_only_before_online() {
+        let body = A64_BOOT_SRC
+            .split_once("fn start_secondary_cpus(")
+            .map(|(_, r)| r.split_once("\n#[cfg").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("");
+        assert!(!body.is_empty(), "start_secondary_cpus body must exist");
+        let mark_idx = body
+            .find("mark_cpu_wake_only(cpu, true)")
+            .expect("AArch64 AP bring-up must mark the AP wake-only");
+        let bring_idx = body
+            .find("bring_up_cpu(cpu)")
+            .expect("AArch64 AP bring-up must online the AP");
+        assert!(
+            mark_idx < bring_idx,
+            "the AP must be marked wake-only BEFORE it is brought online (no placement window)"
+        );
+        assert!(
+            body.contains("install_ap_idle_current(cpu)"),
+            "the AArch64 AP must get the scheduler-owned idle current"
+        );
+        assert!(
+            body.contains("AARCH64_BSP_DISPATCH_AFFINITY_ACTIVE result=ok"),
+            "the AArch64 bring-up must emit the BSP-dispatch-affinity marker"
+        );
+    }
+
+    // The placement + rejection markers are emitted on AArch64 only, on real placements.
+    #[test]
+    fn aarch64_placement_markers_present() {
+        assert!(
+            SCHED_STATE_SRC.contains("AARCH64_USER_TASK_PLACEMENT_OK tid={} cpu={}"),
+            "enqueue_task must emit the AArch64 user-task placement marker"
+        );
+        assert!(
+            SCHED_SRC.contains("AARCH64_WAKE_ONLY_AP_QUEUE_REJECTED tid={} cpu={}"),
+            "a real wake-only AP rejection must emit the AArch64 reject marker"
+        );
+        // Both markers are strictly AArch64-scoped so x86_64/RISC-V logs are unchanged.
+        assert!(
+            SCHED_STATE_SRC.contains("#[cfg(target_arch = \"aarch64\")]\n        crate::yarm_log!(\"AARCH64_USER_TASK_PLACEMENT_OK"),
+            "the placement marker must be AArch64-gated"
+        );
+    }
+
+    // x86_64 AP bring-up still marks wake-only (its placement policy is untouched by 195D).
+    #[test]
+    fn x86_64_ap_bringup_policy_unchanged() {
+        assert!(
+            X86_SMP_SRC.contains("mark_cpu_wake_only(cpu, true)")
+                && X86_SMP_SRC.contains("install_ap_idle_current(cpu)"),
+            "x86_64 AP bring-up must keep its wake-only placement policy"
+        );
+    }
+
+    // The scheduler's balanced placement inherently skips wake-only CPUs (arch-neutral core).
+    #[test]
+    fn balanced_placement_skips_wake_only_core() {
+        assert!(
+            SCHED_SRC.contains("if self.wake_only & (1u64 << idx) != 0 {")
+                && SCHED_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
+            "the scheduler must deny wake-only placement (arch-neutral)"
         );
     }
 }
