@@ -6,13 +6,17 @@ use crate::kernel::boot::{FaultBookkeepingMode, KernelState, TrapHandleError};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trapframe::TrapFrame;
 
-/// Stage 195A: arch tag for the `YARM_LOCK_SPLIT_DISPATCH` marker. Empty on
-/// x86_64/riscv64 so their marker text stays byte-identical; `arch=aarch64 ` on
-/// AArch64 where the split dispatch is now a production path (DebugLog).
+/// Stage 197 (FIRST-COHORT SEAL): arch tag for the `YARM_LOCK_SPLIT_DISPATCH`
+/// marker — canonical `arch=<arch> ` on every architecture (x86_64 normalized from
+/// the historical untagged text). RISC-V's split dispatch runs through its own
+/// shared wrapper (which emits `arch=riscv64` directly), so this const is only
+/// live on x86_64/AArch64, but it is defined per-arch for correctness.
 #[cfg(target_arch = "aarch64")]
 const SPLIT_DISPATCH_ARCH_TAG: &str = "arch=aarch64 ";
-#[cfg(not(target_arch = "aarch64"))]
-const SPLIT_DISPATCH_ARCH_TAG: &str = "";
+#[cfg(target_arch = "x86_64")]
+const SPLIT_DISPATCH_ARCH_TAG: &str = "arch=x86_64 ";
+#[cfg(target_arch = "riscv64")]
+const SPLIT_DISPATCH_ARCH_TAG: &str = "arch=riscv64 ";
 
 #[cfg(target_arch = "riscv64")]
 pub type ArchTrapContext = super::riscv64::trap::Riscv64TrapContext;

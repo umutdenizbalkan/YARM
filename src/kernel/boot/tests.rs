@@ -59395,7 +59395,7 @@ mod stage191b_futex_wake_retire {
             SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_BEGIN\"")
                 && SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_WAKE_OK count={}\"")
                 && SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_DONE result=ok\"")
-                && SPLIT_SRC.contains("{} class=FutexWake result=ok"),
+                && SPLIT_SRC.contains("{} arch=x86_64 class=FutexWake result=ok"),
             "the FutexWake split + retirement markers must exist"
         );
     }
@@ -60242,8 +60242,8 @@ mod stage192a_queue_advancing_dispatch {
             );
         }
         assert!(
-            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok"),
-            "the FutexWait retirement marker must exist"
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=FutexWait result=ok"),
+            "the x86_64 FutexWait retirement marker must exist (Stage 197 arch-tagged)"
         );
         // ReapFaultedTask stays global-lock-only.
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
@@ -60444,8 +60444,8 @@ mod stage192b_yield_queue_advancing_dispatch {
             );
         }
         assert!(
-            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok"),
-            "the Yield retirement marker must exist"
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=Yield result=ok"),
+            "the x86_64 Yield retirement marker must exist (Stage 197 arch-tagged)"
         );
         assert!(
             SCHED_SRC.contains("pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId>")
@@ -62352,23 +62352,25 @@ mod stage195a_aarch64_debuglog_live {
         );
     }
 
-    // x86_64 (and riscv64) marker text stays byte-identical: the arch tag is empty off AArch64,
-    // and the untagged DebugLog retirement marker is preserved for non-aarch64.
+    // Stage 197 (FIRST-COHORT SEAL): x86_64 now emits the canonical arch-tagged markers (the
+    // historical untagged text is retired). The split-dispatch tag + DebugLog retirement marker
+    // both carry `arch=x86_64`, alongside the aarch64 + riscv64 tags.
     #[test]
-    fn x86_64_marker_text_byte_identical() {
+    fn x86_64_marker_text_arch_tagged() {
         assert!(
-            TRAP_ENTRY_SRC.contains("#[cfg(not(target_arch = \"aarch64\"))]\nconst SPLIT_DISPATCH_ARCH_TAG: &str = \"\";"),
-            "the split-dispatch arch tag must be empty on non-AArch64 (x86_64 byte-identical)"
-        );
-        assert!(
-            SPLIT_SRC.contains(
-                "crate::yarm_log!(\"{} class=DebugLog result=ok\", MARK_RETIRE_CLASS_DONE);"
+            TRAP_ENTRY_SRC.contains(
+                "#[cfg(target_arch = \"x86_64\")]\nconst SPLIT_DISPATCH_ARCH_TAG: &str = \"arch=x86_64 \";"
             ),
-            "the non-aarch64 DebugLog retirement marker must stay untagged/byte-identical"
+            "the split-dispatch arch tag must be arch=x86_64 on x86_64 (Stage 197)"
         );
         assert!(
-            SPLIT_SRC.contains("arch=aarch64 class=DebugLog result=ok"),
-            "AArch64 must emit the arch-tagged DebugLog retirement marker"
+            SPLIT_SRC.contains("{} arch=x86_64 class=DebugLog result=ok"),
+            "the x86_64 DebugLog retirement marker must be arch-tagged (Stage 197)"
+        );
+        assert!(
+            SPLIT_SRC.contains("arch=aarch64 class=DebugLog result=ok")
+                && SPLIT_SRC.contains("arch=riscv64 class=DebugLog result=ok"),
+            "AArch64 + RISC-V must emit their arch-tagged DebugLog retirement markers"
         );
     }
 
@@ -65239,6 +65241,292 @@ mod stage196g_riscv_yield_default_on {
         assert!(
             RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
             "the 2 MiB trap-stack fix must be preserved"
+        );
+    }
+}
+
+// Stage 197: FIRST-COHORT CROSS-ARCHITECTURE RETIREMENT SEAL.
+//
+// Seals { DebugLog, FutexWake, FutexWait, Yield } across x86_64, AArch64, RISC-V. Enables ZERO new
+// retirement classes. Guards the canonical arch-tagged marker contract, cohort identity, per-arch
+// restore-hook mapping, and the RISC-V idle-sentinel invariant.
+mod stage197_first_cohort_seal {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SEAL_SCRIPT: &str = include_str!("../../../scripts/qemu-first-cohort-retirement-seal.sh");
+    const SEAL_DOC: &str = include_str!("../../../doc/FIRST_COHORT_RETIREMENT_SEAL.md");
+
+    const ARCHES: [&str; 3] = ["x86_64", "aarch64", "riscv64"];
+    const COHORT: [&str; 4] = ["DebugLog", "FutexWake", "FutexWait", "Yield"];
+
+    // Exact NR identities.
+    #[test]
+    fn nr_identities() {
+        use crate::kernel::syscall::{
+            SYSCALL_DEBUG_LOG_NR, SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_YIELD_NR,
+        };
+        assert_eq!(SYSCALL_YIELD_NR, 0);
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_DEBUG_LOG_NR, 15);
+    }
+
+    // Exactly four cohort classes; counts unchanged.
+    #[test]
+    fn cohort_identity_and_counts() {
+        assert_eq!(COHORT.len(), 4);
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        // The doc pins the cohort + explicit exclusions.
+        assert!(
+            SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
+            "the seal doc must pin the cohort identity"
+        );
+        for excl in ["InitramfsReadChunk", "ReapFaultedTask", "IpcSend", "D2"] {
+            assert!(
+                SEAL_DOC.contains(excl),
+                "the seal doc must explicitly exclude {excl}"
+            );
+        }
+    }
+
+    // Every architecture emits the canonical arch-tagged retirement DONE marker for every cohort
+    // class — same class vocabulary, explicit arch identity, no drift.
+    #[test]
+    fn every_arch_emits_every_class_tagged() {
+        // Pre-lock split classes (DebugLog + FutexWake) live in the shared split producer.
+        for m in [
+            "arch=x86_64 class=DebugLog result=ok",
+            "arch=aarch64 class=DebugLog result=ok",
+            "arch=riscv64 class=DebugLog result=ok",
+            "arch=x86_64 class=FutexWake result=ok",
+            "arch=aarch64 class=FutexWake result=ok",
+            "arch=riscv64 class=FutexWake result=ok",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(m),
+                "syscall_split must emit the tagged marker: {m}"
+            );
+        }
+        // FutexWait + Yield: x86_64 + aarch64 via the mod.rs helpers.
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=FutexWait result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=Yield result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(m),
+                "mod.rs must emit the tagged marker: {m}"
+            );
+        }
+        // FutexWait + Yield: riscv64 inline in its drain.
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield result=ok",
+        ] {
+            assert!(
+                RISCV_TRAP_SRC.contains(m),
+                "riscv64 trap.rs must emit the tagged marker: {m}"
+            );
+        }
+    }
+
+    // No architecture emits an UNTAGGED production cohort retirement marker (x86_64 was normalized).
+    #[test]
+    fn no_untagged_production_markers() {
+        for untagged in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE class=DebugLog result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWake result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(untagged)
+                    && !MOD_SRC.contains(untagged)
+                    && !RISCV_TRAP_SRC.contains(untagged),
+                "no source may emit the untagged marker `{untagged}` (Stage 197 normalized)"
+            );
+        }
+        // The split-dispatch tag is arch-tagged on x86_64 (no empty tag).
+        assert!(
+            TRAP_ENTRY_SRC.contains("const SPLIT_DISPATCH_ARCH_TAG: &str = \"arch=x86_64 \";")
+                && !TRAP_ENTRY_SRC.contains("const SPLIT_DISPATCH_ARCH_TAG: &str = \"\";"),
+            "the split-dispatch tag must be arch=x86_64 (no empty/untagged variant)"
+        );
+    }
+
+    // DebugLog + FutexWake use the pre-lock split path; FutexWait + Yield are NOT in the pre-lock
+    // NR gate (they retire via in-lock publish + post-lock drain).
+    #[test]
+    fn prelock_split_membership() {
+        // The RISC-V wrapper's pre-lock gate is DebugLog + FutexWake only.
+        assert!(
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR")
+                && !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR")
+                && !RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_YIELD_NR"),
+            "the pre-lock split gate must be DebugLog + FutexWake only"
+        );
+        // FutexWait publishes Blocked; Yield re-enqueues Runnable.
+        assert!(
+            EXEC_STATE_SRC
+                .contains("TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"),
+            "FutexWait must publish Blocked(Futex)"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("preempt_reenqueue_current_cpu()"),
+            "Yield must re-enqueue Runnable via the preempt seam"
+        );
+    }
+
+    // FutexWait may idle safely; Yield never idles after successful publication.
+    #[test]
+    fn futexwait_may_idle_yield_never() {
+        // RISC-V: FutexWait drain has the idle outcome; the Yield drain has NONE and no-incoming is
+        // a FAIL (not idle, no Err(Internal)).
+        let fw = RISCV_TRAP_SRC
+            .split("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
+            .nth(1)
+            .unwrap()
+            .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
+            .next()
+            .unwrap();
+        assert!(
+            fw.contains("RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle"),
+            "the FutexWait drain must support the idle outcome"
+        );
+        let yld = RISCV_TRAP_SRC
+            .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
+            .nth(1)
+            .unwrap();
+        assert!(
+            !yld.contains("POST_LOCK_IDLE_BEGIN")
+                && !yld.contains("SyscallError::Internal")
+                && yld.contains("RISCV_YIELD_DISPATCH_FAIL reason=no_incoming"),
+            "the Yield drain must NEVER idle; no-incoming is a FAIL (no Err(Internal) sentinel)"
+        );
+    }
+
+    // Architecture restore-hook mapping: each arch uses its own real activation, no cross-arch logic.
+    #[test]
+    fn restore_hook_mapping() {
+        // RISC-V uses SATP + real sfence.vma; never x86 CR3 / AArch64 TTBR0.
+        assert!(
+            RISCV_TRAP_SRC.contains("crate::arch::riscv64::page_table::write_satp(satp)"),
+            "RISC-V must use write_satp"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
+                && !RISCV_TRAP_SRC.contains("arch::aarch64::page_table")
+                && !RISCV_TRAP_SRC.contains("write_cr3(")
+                && !RISCV_TRAP_SRC.contains("set_ttbr0"),
+            "RISC-V must not use x86 CR3 / AArch64 TTBR0 logic"
+        );
+        // x86_64 + AArch64 drains use the generic ASID switch seam + arch post-switch restore.
+        assert!(
+            TRAP_ENTRY_SRC.contains("d2_recv_switch_incoming_asid(inc)")
+                && TRAP_ENTRY_SRC.contains("post_switch_restore_arch_thread_state("),
+            "x86_64/AArch64 drains must use the generic ASID switch + post-switch restore"
+        );
+        // write_satp genuinely issues sfence.vma.
+        const PT: &str = include_str!("../../arch/riscv64/page_table.rs");
+        assert!(
+            PT.contains("sfence.vma"),
+            "write_satp must issue a real sfence.vma"
+        );
+    }
+
+    // RISC-V idle-sentinel regression guard: the FutexWait idle SUCCESS attestation is emitted ONLY
+    // from the attested FutexWait idle branch (gated on the idle-oracle knob), and can NEVER be
+    // produced by an unrelated Internal error. The Err(Internal) sentinel is confined to the
+    // FutexWait idle branch and is NOT used by Yield.
+    #[test]
+    fn riscv_idle_sentinel_guard() {
+        // The attestation appears exactly once, inside the 196F idle outcome block.
+        let idle = RISCV_TRAP_SRC
+            .split("Stage 196F POST-LOCK IDLE OUTCOME")
+            .nth(1)
+            .expect("196F idle block present")
+            .split("} else {")
+            .next()
+            .unwrap();
+        assert!(
+            idle.contains("RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok")
+                && idle.contains("riscv_futex_wait_idle_oracle_enabled()"),
+            "the idle attestation must be gated on the idle-oracle knob inside the idle branch"
+        );
+        assert_eq!(
+            RISCV_TRAP_SRC
+                .matches("RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok")
+                .count(),
+            1,
+            "the FutexWait idle attestation must be emitted from exactly one site"
+        );
+        // The Err(Internal) idle handoff lives ONLY in the FutexWait idle branch — the Yield drain
+        // must NOT use it (its no-incoming is a FAIL marker, not an idle handoff).
+        let yld = RISCV_TRAP_SRC
+            .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
+            .nth(1)
+            .unwrap();
+        assert!(
+            !yld.contains("SyscallError::Internal"),
+            "the Err(Internal) idle sentinel must not be used by the Yield drain"
+        );
+        // The bridge idle path only fires when current==0 (a live current task + Internal error
+        // takes the RISCV_TRAP_HANDLE_FAILED path, never the FutexWait idle attestation).
+        assert!(
+            RISCV_BOOT_SRC.contains("if next_tid == 0 {")
+                && RISCV_BOOT_SRC.contains("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
+                && RISCV_BOOT_SRC.contains("RISCV_TRAP_HANDLE_FAILED"),
+            "the bridge must idle only on current==0 and fail otherwise"
+        );
+    }
+
+    // Excluded classes stay excluded; ReapFaultedTask never split-eligible; no new kernel lock; the
+    // RISC-V 2 MiB trap-stack guard remains.
+    #[test]
+    fn exclusions_and_debts() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+        // NR27 is not sealed into the cohort.
+        assert!(
+            !COHORT.contains(&"InitramfsReadChunk"),
+            "NR27 must not be part of the sealed cohort"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the RISC-V 2 MiB trap-stack guard must remain"
+        );
+        // The seal doc keeps the NR27 + trap-stack + idle-sentinel debts open.
+        assert!(
+            SEAL_DOC.contains("Known debts")
+                && SEAL_DOC.contains("NR 27")
+                && SEAL_DOC.contains("trap stack")
+                && SEAL_DOC.contains("idle sentinel"),
+            "the seal doc must keep the known debts open"
+        );
+    }
+
+    // The combined seal script emits the canonical per-arch + cross-arch seal markers and rejects
+    // forbidden markers.
+    #[test]
+    fn seal_script_contract() {
+        assert!(
+            SEAL_SCRIPT.contains("FIRST_COHORT_SEAL arch=${arch} class=${class} result=ok")
+                && SEAL_SCRIPT
+                    .contains("FIRST_COHORT_CROSS_ARCH_SEAL arches=3 classes=4 result=ok"),
+            "the seal script must emit the canonical seal markers"
+        );
+        assert!(
+            SEAL_SCRIPT.contains("sha256sum") && SEAL_SCRIPT.contains("FORBIDDEN"),
+            "the seal script must record hashes + reject forbidden markers"
         );
     }
 }

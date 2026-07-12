@@ -403,10 +403,9 @@ fn maybe_log_debug_log_retired() {
         )
         .is_ok()
     {
-        // Stage 195A: AArch64 emits an arch-tagged retirement marker (DebugLog is the
-        // first live AArch64 split-dispatch class). Stage 196B: RISC-V likewise emits
-        // an arch=riscv64 tag (DebugLog is its first — and only — split-dispatch class).
-        // x86_64 keeps the exact untagged marker text — byte-identical to Stage 191A.
+        // Stage 197 (FIRST-COHORT SEAL): every architecture emits the canonical arch-tagged
+        // retirement marker `arch=<arch> class=DebugLog` (x86_64 normalized from the historical
+        // untagged text).
         #[cfg(target_arch = "aarch64")]
         {
             crate::yarm_log!("{} arch=aarch64 class=DebugLog", MARK_RETIRE_CLASS_BEGIN);
@@ -425,8 +424,11 @@ fn maybe_log_debug_log_retired() {
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
         {
-            crate::yarm_log!("{} class=DebugLog", MARK_RETIRE_CLASS_BEGIN);
-            crate::yarm_log!("{} class=DebugLog result=ok", MARK_RETIRE_CLASS_DONE);
+            crate::yarm_log!("{} arch=x86_64 class=DebugLog", MARK_RETIRE_CLASS_BEGIN);
+            crate::yarm_log!(
+                "{} arch=x86_64 class=DebugLog result=ok",
+                MARK_RETIRE_CLASS_DONE
+            );
         }
     }
 }
@@ -525,9 +527,9 @@ fn maybe_log_futex_wake_retired() {
         )
         .is_ok()
     {
-        // Stage 195C: AArch64 emits an arch-tagged retirement marker. Stage 196C: RISC-V
-        // likewise emits arch=riscv64 (FutexWake is its second split-dispatch class). x86_64
-        // keeps the exact untagged Stage 191B text (byte-identical, in the preserve list).
+        // Stage 197 (FIRST-COHORT SEAL): every architecture emits the canonical arch-tagged
+        // retirement marker `arch=<arch> class=FutexWake` (x86_64 normalized from the historical
+        // untagged text).
         #[cfg(target_arch = "aarch64")]
         {
             crate::yarm_log!("{} arch=aarch64 class=FutexWake", MARK_RETIRE_CLASS_BEGIN);
@@ -546,8 +548,11 @@ fn maybe_log_futex_wake_retired() {
         }
         #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
         {
-            crate::yarm_log!("{} class=FutexWake", MARK_RETIRE_CLASS_BEGIN);
-            crate::yarm_log!("{} class=FutexWake result=ok", MARK_RETIRE_CLASS_DONE);
+            crate::yarm_log!("{} arch=x86_64 class=FutexWake", MARK_RETIRE_CLASS_BEGIN);
+            crate::yarm_log!(
+                "{} arch=x86_64 class=FutexWake result=ok",
+                MARK_RETIRE_CLASS_DONE
+            );
         }
     }
 }

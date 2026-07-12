@@ -1025,8 +1025,10 @@ pub(crate) fn maybe_log_futex_wait_retired() {
         )
         .is_ok()
     {
-        // Stage 195E: AArch64 emits the arch-tagged retirement marker (its live queue-advancing
-        // FutexWait drain); x86_64 keeps the untagged marker byte-identical.
+        // Stage 197 (FIRST-COHORT SEAL): all architectures emit the canonical arch-tagged
+        // retirement marker `arch=<arch> class=FutexWait`. (This helper is called only by the
+        // x86_64 + AArch64 drains in `arch/trap_entry.rs`; the RISC-V drain emits its own
+        // `arch=riscv64` markers inline.)
         #[cfg(target_arch = "aarch64")]
         {
             crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=FutexWait");
@@ -1034,10 +1036,10 @@ pub(crate) fn maybe_log_futex_wait_retired() {
                 "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"
             );
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=FutexWait");
-            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=FutexWait");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=FutexWait result=ok");
         }
     }
 }
@@ -1287,17 +1289,19 @@ pub(crate) fn maybe_log_yield_retired() {
         )
         .is_ok()
     {
-        // Stage 195G: AArch64 emits the arch-tagged retirement marker (its live queue-advancing
-        // Yield drain); x86_64 keeps the untagged marker byte-identical.
+        // Stage 197 (FIRST-COHORT SEAL): all architectures emit the canonical arch-tagged
+        // retirement marker `arch=<arch> class=Yield`. (This helper is called only by the x86_64 +
+        // AArch64 drains in `arch/trap_entry.rs`; the RISC-V drain emits its own `arch=riscv64`
+        // markers inline.)
         #[cfg(target_arch = "aarch64")]
         {
             crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=Yield");
             crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok");
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=Yield");
-            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=Yield");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=Yield result=ok");
         }
     }
 }
