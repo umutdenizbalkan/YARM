@@ -1558,7 +1558,13 @@ pub fn bootstrap_first_user_task(
     // SWITCH oracle workload (196E/196F); 4 = FutexWait no-incoming IDLE oracle workload (196F).
     // A normal boot leaves it 0 and init skips all four. NB: these are WORKLOAD selectors only —
     // the FutexWait retirement mechanism itself is DEFAULT-ON (no knob) as of 196F.
-    if crate::kernel::boot::riscv_futex_wait_idle_oracle_enabled() {
+    if crate::kernel::boot::riscv_yield_lone_task_oracle_enabled() {
+        init_args[5] = 6;
+        crate::yarm_log!("RISCV_YIELD_LONE_TASK_ORACLE_PROVISION_OK slot5=6");
+    } else if crate::kernel::boot::riscv_yield_two_task_oracle_enabled() {
+        init_args[5] = 5;
+        crate::yarm_log!("RISCV_YIELD_TWO_TASK_ORACLE_PROVISION_OK slot5=5");
+    } else if crate::kernel::boot::riscv_futex_wait_idle_oracle_enabled() {
         init_args[5] = 4;
         crate::yarm_log!("RISCV_FUTEX_WAIT_IDLE_ORACLE_PROVISION_OK slot5=4");
     } else if crate::kernel::boot::riscv_futex_wait_oracle_enabled() {

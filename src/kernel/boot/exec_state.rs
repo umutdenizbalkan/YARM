@@ -2644,6 +2644,70 @@ impl KernelState {
             }
         }
 
+        // Stage 196G (RISC-V YIELD QUEUE-ADVANCING RETIREMENT — DEFAULT-ON): the RISC-V port of the
+        // x86_64 (192B) / AArch64 (195G) Yield model, PRODUCTION default-on (no oracle knob, no
+        // consume latch). The caller is now Runnable (set above). Re-enqueue it exactly once at its
+        // priority queue tail + clear `current` in-lock (`preempt_reenqueue_current_cpu`, the
+        // re-enqueue half of on_preempt), record the generic YIELD_DISPATCH deferral, and SKIP the
+        // in-lock dispatch — the caller returns through the RISC-V Yield handler bypass and the
+        // shared post-lock Yield drain performs the authoritative queue-advancing dispatch + real
+        // SATP/sfence.vma + frame restore + sret (there is ALWAYS an incoming: another task or the
+        // caller itself, so NO idle outcome). Eligible only on the BSP with the shared trap drain
+        // active + single dispatcher + NO pending Yield/FutexWait/196D-foundation deferral. This is
+        // a SEPARATE deferral from the 196D foundation oracle (which stays default-off + one-shot).
+        // Every ineligible/failed case keeps the unchanged in-lock `on_preempt_current_cpu` fallback.
+        #[cfg(target_arch = "riscv64")]
+        if let Some(out_tid) = outgoing_tid {
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            let is_bsp = self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
+            let yield_pending = crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx);
+            let futex_pending = crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
+            let foundation_pending =
+                crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx);
+            if trap_path
+                && single_cpu
+                && is_bsp
+                && !yield_pending
+                && !futex_pending
+                && !foundation_pending
+                && crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)
+            {
+                match self.preempt_reenqueue_current_cpu() {
+                    Some(reenq_tid) => {
+                        crate::kernel::boot::maybe_log_riscv_yield_retire_default_on();
+                        crate::yarm_log!(
+                            "RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu={} outgoing={}",
+                            cpu_idx,
+                            out_tid
+                        );
+                        crate::yarm_log!(
+                            "RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu={} outgoing={}",
+                            cpu_idx,
+                            reenq_tid
+                        );
+                        // Skip the in-lock dispatch; the post-lock Yield drain switches to the
+                        // incoming (another task, or the re-enqueued caller itself when alone).
+                        return Ok(());
+                    }
+                    None => {
+                        // Re-enqueue failed: `preempt_reenqueue_current_cpu` left `current`
+                        // untouched, so the original current-task state is intact (never
+                        // both/neither current+queued). Clear the deferral intent and fall
+                        // through to the unchanged legacy in-lock dispatch.
+                        crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                        crate::yarm_log!(
+                            "RISCV_YIELD_DISPATCH_FALLBACK reason=reenqueue_failed tid={}",
+                            out_tid
+                        );
+                    }
+                }
+            }
+        }
+
         let next_tid = self.on_preempt_current_cpu();
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);

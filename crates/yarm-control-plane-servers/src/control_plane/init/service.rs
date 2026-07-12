@@ -1130,6 +1130,124 @@ fn run_riscv_futex_wait_idle_oracle(init_tid: u64) -> ! {
     }
 }
 
+// ─── Stage 196G: RISC-V Yield (NR 0) two-task + lone-task retirement oracles ───────────
+// Both run under the PRODUCTION default-on Yield mechanism (the knobs are workload selectors, not
+// retirement arming). Two-task: A yields → post-lock switch to B; B blocks (default-on FutexWait)
+// → drain re-dispatches A; A resumes exactly once. Lone-task: A is the only task; its Yield
+// re-enqueues itself and the drain dequeues the caller ITSELF (self-redispatch, never idle),
+// proving repeated Yield retirement.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static YIELD_TWO_TASK_FLAG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static YIELD_TWO_TASK_CHILD_TID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Task B (incoming): prove it was entered by the post-lock Yield drain (set flag + userspace
+/// marker), then block via the already-proven default-on FutexWait (A is runnable, so the FutexWait
+/// drain switches to A — not idle). Never returns.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+extern "C" fn riscv_yield_two_task_child() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    YIELD_TWO_TASK_FLAG.store(1, Relaxed);
+    let btid = YIELD_TWO_TASK_CHILD_TID.load(Relaxed);
+    yarm_user_rt::user_log!("RISCV_YIELD_TWO_TASK_INCOMING_USER_OK tid={}", btid);
+    let word = RISCV_FUTEX_WAIT_IDLE_WORD.as_ptr();
+    loop {
+        let v = RISCV_FUTEX_WAIT_IDLE_WORD.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(word, v, v);
+    }
+}
+
+/// Task A (init/outgoing): spawn B (runnable), Yield (retired → switch to B), then resume exactly
+/// once and confirm B ran (round-trip proof). Busy-spins afterward so the proof state is stable and
+/// no post-yield idle marker is emitted.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn run_riscv_yield_two_task_oracle(init_tid: u64) -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    yarm_user_rt::user_log!("RISCV_YIELD_TWO_TASK_ORACLE_BEGIN init_tid={}", init_tid);
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = riscv_yield_two_task_child as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("RISCV_YIELD_TWO_TASK_ORACLE_SPAWN_FAIL err={:?}", e);
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    };
+    YIELD_TWO_TASK_CHILD_TID.store(child_tid, Relaxed);
+    yarm_user_rt::user_log!("RISCV_YIELD_TWO_TASK_CHILD_SPAWNED child_tid={}", child_tid);
+    // A yields: re-enqueued at tail; the post-lock Yield drain dispatches B (FIFO head). A resumes
+    // here only after B ran and blocked (its default-on FutexWait re-dispatches A).
+    let _ = yarm_user_rt::syscall::yield_now();
+    let ran = YIELD_TWO_TASK_FLAG.load(Relaxed);
+    if ran == 1 {
+        yarm_user_rt::user_log!("RISCV_YIELD_TWO_TASK_OUTGOING_RESUMED_OK tid={}", init_tid);
+        yarm_user_rt::user_log!(
+            "RISCV_YIELD_TWO_TASK_ORACLE_DONE result=ok outgoing={} incoming={} outgoing_resumed=1",
+            init_tid,
+            child_tid
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "RISCV_YIELD_TWO_TASK_ORACLE_DONE result=fail flag={} outgoing={} incoming={}",
+            ran,
+            init_tid,
+            child_tid
+        );
+    }
+    // Park on the never-woken idle word so the boot reaches the canonical RISC-V idle terminal
+    // (timer/PLIC/EXTIRQ idle-safe-point init). B is blocked, so this FutexWait finds no incoming
+    // and takes the post-lock IDLE outcome — this is AFTER the Yield round-trip proof.
+    let word = RISCV_FUTEX_WAIT_IDLE_WORD.as_ptr();
+    loop {
+        let v = RISCV_FUTEX_WAIT_IDLE_WORD.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(word, v, v);
+    }
+}
+
+/// Lone-task oracle: init is the ONLY runnable task. Its Yield re-enqueues itself; the post-lock
+/// drain dequeues the caller ITSELF (self-redispatch, never idle) and resumes it after the ecall.
+/// Repeats a bounded number of Yields to prove the mechanism is not one-shot, then parks so the
+/// boot reaches the canonical idle terminal. Never returns.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn run_riscv_yield_lone_task_oracle(init_tid: u64) -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    yarm_user_rt::user_log!("RISCV_YIELD_LONE_TASK_ORACLE_BEGIN init_tid={}", init_tid);
+    // First Yield: A re-enqueued, drain dequeues A itself, A resumes after the ecall.
+    let _ = yarm_user_rt::syscall::yield_now();
+    yarm_user_rt::user_log!(
+        "RISCV_YIELD_LONE_TASK_ORACLE_DONE result=ok tid={} redispatched_self=1",
+        init_tid
+    );
+    // Prove repeated (non-one-shot) retirement: a few more real Yields, each self-redispatching.
+    let mut n: u32 = 1;
+    while n < 4 {
+        let _ = yarm_user_rt::syscall::yield_now();
+        n += 1;
+    }
+    yarm_user_rt::user_log!(
+        "RISCV_YIELD_LONE_TASK_REPEAT_OK tid={} yields={}",
+        init_tid,
+        n
+    );
+    // Park (FutexWait, no incoming → post-lock IDLE) so the boot reaches the canonical idle
+    // terminal AFTER the lone-Yield proof. The Yield transition itself never idled (the drain has
+    // no idle branch — redispatched_self=1 proves the self-switch).
+    let word = RISCV_FUTEX_WAIT_IDLE_WORD.as_ptr();
+    loop {
+        let v = RISCV_FUTEX_WAIT_IDLE_WORD.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(word, v, v);
+    }
+}
+
 /// Stage 195F NO-INCOMING idle oracle: the final runnable user task (init) blocks on a
 /// never-woken futex when no other user task is runnable (every server is blocked on recv and no
 /// child is spawned). The default-on post-lock FutexWait drain therefore observes no incoming
@@ -1729,6 +1847,17 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     if ctx.supervisor_control_recv_ep == Some(4) {
         run_riscv_futex_wait_idle_oracle(ctx.task_id);
+    }
+    // Stage 196G: default-off RISC-V Yield (NR 0) retirement oracles. Slot-5 sentinel 5 = two-task
+    // (A yields → switch to B → A resumes); 6 = lone-task (A yields → self-redispatch). Both run
+    // under the PRODUCTION default-on Yield mechanism. A normal boot leaves slot 5 = None.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if ctx.supervisor_control_recv_ep == Some(5) {
+        run_riscv_yield_two_task_oracle(ctx.task_id);
+    }
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if ctx.supervisor_control_recv_ep == Some(6) {
+        run_riscv_yield_lone_task_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

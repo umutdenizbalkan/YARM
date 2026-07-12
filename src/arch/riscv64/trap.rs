@@ -157,6 +157,24 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         crate::yarm_log!("RISCV_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu={}", cpu.0);
         return Ok(());
     }
+    // Stage 196G (YIELD RETIREMENT BYPASS): the same return-path bypass for a real Yield deferral.
+    // The in-lock `yield_current` set the caller Runnable, RE-ENQUEUED it exactly once, and cleared
+    // `current`, so the canonical restore below has NO current task and would restore stale state.
+    // Skip it and return cleanly; the wrapper's post-lock Yield drain performs the authoritative
+    // queue-advancing dispatch + real SATP/sfence.vma + frame restore for the INCOMING task
+    // (another task, or the re-enqueued caller itself when alone — always an incoming, never idle).
+    // NARROW: requires an ACTUAL pending Yield deferral (no generic skip flag), independent of the
+    // FutexWait + 196D foundation bypasses above, and inert for normal syscalls + legacy Yield.
+    if crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx) {
+        let outgoing = crate::kernel::boot::yield_dispatch_outgoing(cpu_idx).unwrap_or(0);
+        crate::yarm_log!(
+            "RISCV_YIELD_HANDLER_BYPASS_BEGIN cpu={} outgoing={}",
+            cpu.0,
+            outgoing
+        );
+        crate::yarm_log!("RISCV_YIELD_HANDLER_BYPASS_DONE cpu={}", cpu.0);
+        return Ok(());
+    }
     // Stage 163L: restore FIRST so apply_user_context (called inside
     // resume_current_thread_with_frame) does not zero a0 (user_gprs[10])
     // from the pre-syscall TCB snapshot before we can export ret0 below.
@@ -691,6 +709,98 @@ pub fn handle_riscv_trap_entry_shared(
             crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
             crate::yarm_log!(
                 "RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed cpu={}",
+                cpu.0
+            );
+        }
+    }
+
+    // ── Stage 196G: queue-advancing YIELD RETIREMENT drain (DEFAULT-ON) ──
+    // If the in-lock `yield_current` recorded a Yield deferral (set the caller Runnable,
+    // re-enqueued it exactly once, cleared `current`, declined the in-lock dispatch), perform the
+    // authoritative post-lock switch now that the broad guard is released: reverify `current` is
+    // still cleared (lock-dropped proof), dequeue the FIFO head (another task, or the re-enqueued
+    // caller itself when alone), set it current, mark it Running, then a brief `with_cpu` re-acquire
+    // does the REAL RISC-V arch restore — construct + write the incoming SATP (`sfence.vma` inside
+    // `write_satp`) and restore the incoming saved frame. The bridge then `sret`s into it. Reuses
+    // the 196D–196F switch machinery; NO x86 CR3 / AArch64 TTBR0 logic. A published Yield ALWAYS
+    // has an incoming (the re-enqueued caller) — there is NO idle outcome, and no-incoming is a real
+    // invariant FAILURE (never idle, never `Err(Internal)`, never a fabricated task).
+    if cpu_idx < MAX_CPUS && crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx) {
+        crate::yarm_log!("RISCV_YIELD_DISPATCH_DRAIN_BEGIN cpu={}", cpu.0);
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=Yield");
+        let outgoing = crate::kernel::boot::yield_dispatch_outgoing(cpu_idx);
+        // Lock-dropped proof: `yield_reverify_ready` re-acquires the scheduler seam through the
+        // SharedKernel (only possible because the broad `with_cpu` guard was released above — a
+        // still-held guard would deadlock) AND confirms `current` is still cleared (the caller is
+        // Runnable + queued exactly once).
+        let reverify_ok = shared.yield_reverify_ready(cpu);
+        crate::yarm_log!("RISCV_YIELD_DISPATCH_LOCK_DROPPED_OK cpu={}", cpu.0);
+        if reverify_ok {
+            if let Some(out) = outgoing {
+                crate::yarm_log!("RISCV_YIELD_DISPATCH_REVERIFY_OK outgoing={}", out);
+            }
+            // Queue-advancing dequeue of the FIFO head.
+            let incoming = shared.yield_dispatch_step_mut(cpu);
+            if let Some(inc) = incoming {
+                crate::yarm_log!(
+                    "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
+                    cpu.0,
+                    inc
+                );
+                crate::yarm_log!(
+                    "RISCV_YIELD_DISPATCH_CURRENT_SET_OK cpu={} incoming={}",
+                    cpu.0,
+                    inc
+                );
+                shared.d6_genuine_mark_running_via_task_seam(incoming);
+                crate::yarm_log!("RISCV_YIELD_DISPATCH_RUNNING_OK incoming={}", inc);
+                // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore
+                // (reused 196D–196F machinery — no duplicate implementation).
+                let restore = shared
+                    .with_cpu(cpu, |kernel| {
+                        if let Some(asid) = kernel.task_asid(inc) {
+                            let _ =
+                                crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
+                            if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid)
+                            {
+                                crate::arch::riscv64::page_table::write_satp(satp);
+                                crate::yarm_log!(
+                                    "RISCV_YIELD_DISPATCH_SATP_OK incoming={} asid={}",
+                                    inc,
+                                    asid.0
+                                );
+                                crate::yarm_log!("RISCV_YIELD_DISPATCH_SFENCE_OK incoming={}", inc);
+                            }
+                        }
+                        restore_arch_thread_state(kernel, cpu, Some(&mut *frame))
+                    })
+                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                restore??;
+                crate::yarm_log!("RISCV_YIELD_DISPATCH_FRAME_OK incoming={}", inc);
+                crate::yarm_log!("RISCV_YIELD_DISPATCH_SRET_ARMED incoming={}", inc);
+                crate::yarm_log!("RISCV_YIELD_DISPATCH_DONE result=ok");
+                crate::yarm_log!(
+                    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield result=ok"
+                );
+            } else {
+                // A published Yield deferral MUST have an incoming (the re-enqueued caller is
+                // always a candidate). No incoming is a genuine invariant FAILURE — NOT idle, NOT a
+                // success, NO `Err(Internal)` sentinel, NO fabricated task. Clear the deferral and
+                // emit the failure marker (unreachable in practice; the smoke rejects it).
+                crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+                crate::yarm_log!(
+                    "RISCV_YIELD_DISPATCH_FAIL reason=no_incoming cpu={} outgoing={:?}",
+                    cpu.0,
+                    outgoing
+                );
+            }
+        } else {
+            // An in-lock fallback superseded the deferral (current no longer cleared) — do NOT
+            // double-dispatch. Clear and decline (unreachable single-CPU + IRQ-off).
+            crate::kernel::boot::yield_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "RISCV_YIELD_DISPATCH_DEFERRED reason=state_changed cpu={}",
                 cpu.0
             );
         }

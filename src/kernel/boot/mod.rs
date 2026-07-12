@@ -1323,6 +1323,59 @@ pub(crate) fn maybe_log_yield_default_on() {
     }
 }
 
+// ── Stage 196G: RISC-V Yield (NR 0) DEFAULT-ON out-of-lock retirement ──
+//
+// Production Yield reuses the generic per-CPU `YIELD_DISPATCH_*` deferral + `preempt_reenqueue`
+// re-enqueue seam + `yield_dispatch_step_mut` dequeue — the SAME seams x86_64 (192B) / AArch64
+// (195G) use — plus the 196D–196F RISC-V SATP/sfence/frame switch machinery. It is DEFAULT-ON for
+// eligible NR 0 traps (no oracle knob, no consume latch); the 196D foundation oracle stays a
+// SEPARATE default-off mechanism. Two userspace WORKLOAD knobs (two-task + lone-task) stay
+// default-off.
+
+/// Stage 196G: one-shot latch for the RISC-V Yield default-on informational marker. The
+/// mechanism itself is NOT one-shot (it retires every eligible Yield); only this attestation fires
+/// once.
+static RISCV_YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Emit `RISCV_YIELD_RETIRE_DEFAULT_ON result=ok` exactly once, on the first eligible production
+/// Yield retirement. Records that the production (default-on) mechanism ran — NOT a knob.
+pub(crate) fn maybe_log_riscv_yield_retire_default_on() {
+    if RISCV_YIELD_DEFAULT_ON_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("RISCV_YIELD_RETIRE_DEFAULT_ON result=ok");
+    }
+}
+
+/// Default-off two-task Yield oracle WORKLOAD selector (`yarm.riscv64_yield_two_task_oracle=1`,
+/// slot-5 = 5). Does NOT arm kernel retirement (default-on) — only creates the workload.
+pub(crate) static RISCV_YIELD_TWO_TASK_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Default-off lone-task Yield oracle WORKLOAD selector (`yarm.riscv64_yield_lone_task_oracle=1`,
+/// slot-5 = 6).
+pub(crate) static RISCV_YIELD_LONE_TASK_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_yield_two_task_oracle_enabled(enabled: bool) {
+    RISCV_YIELD_TWO_TASK_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+pub fn riscv_yield_two_task_oracle_enabled() -> bool {
+    RISCV_YIELD_TWO_TASK_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+pub(crate) fn set_riscv_yield_lone_task_oracle_enabled(enabled: bool) {
+    RISCV_YIELD_LONE_TASK_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+pub fn riscv_yield_lone_task_oracle_enabled() -> bool {
+    RISCV_YIELD_LONE_TASK_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 // ── Stage 193A (BROAD-IPC DECOMPOSITION — IpcSend plain waiting-receiver slice) ─────
 //
 // IpcSend of a PLAIN message to an already-recv-v2-blocked receiver reuses the 188

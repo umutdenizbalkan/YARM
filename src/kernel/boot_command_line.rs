@@ -379,6 +379,23 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             enabled
         );
     }
+    if let Some(enabled) = parsed.riscv64_yield_two_task_oracle {
+        // Stage 196G: default-off RISC-V Yield TWO-TASK oracle WORKLOAD knob (slot-5 = 5). A yields
+        // (retired default-on) → post-lock switch to B; B blocks (FutexWait) → drain re-dispatches
+        // A; A resumes once. Does NOT arm kernel retirement (default-on).
+        crate::kernel::boot::set_riscv_yield_two_task_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_RISCV64_YIELD_TWO_TASK_ORACLE_SET enabled={}", enabled);
+    }
+    if let Some(enabled) = parsed.riscv64_yield_lone_task_oracle {
+        // Stage 196G: default-off RISC-V Yield LONE-TASK oracle WORKLOAD knob (slot-5 = 6). Init is
+        // the only runnable task; its Yield re-enqueues itself, and the post-lock drain dequeues
+        // the caller ITSELF (self-redispatch, never idle) and resumes it after the ecall.
+        crate::kernel::boot::set_riscv_yield_lone_task_oracle_enabled(enabled);
+        crate::yarm_log!(
+            "YARM_RISCV64_YIELD_LONE_TASK_ORACLE_SET enabled={}",
+            enabled
+        );
+    }
     if let Some(enabled) = parsed.ap_user_dispatch {
         // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
         // first live AP user dispatch. No-op on other arches; when OFF the AP
@@ -617,6 +634,14 @@ pub struct YarmBootOptions<'a> {
     /// startup slot 5 (=4) so init (the last runnable user task) blocks on a never-woken futex,
     /// driving the production default-on FutexWait drain to its post-lock IDLE outcome.
     pub riscv64_futex_wait_idle_oracle: Option<bool>,
+    /// Stage 196G: `yarm.riscv64_yield_two_task_oracle=1` DEFAULT-OFF knob. Provisions init slot 5
+    /// (=5) so init runs the two-task Yield (NR 0) queue-advancing RETIREMENT proof (A yields →
+    /// post-lock switch to B → B blocks → A resumes once).
+    pub riscv64_yield_two_task_oracle: Option<bool>,
+    /// Stage 196G: `yarm.riscv64_yield_lone_task_oracle=1` DEFAULT-OFF knob. Provisions init slot 5
+    /// (=6) so init (the only runnable task) yields and self-redispatches (the drain dequeues the
+    /// re-enqueued caller itself — never idle).
+    pub riscv64_yield_lone_task_oracle: Option<bool>,
     /// Stage 189C6: `yarm.ap_user_dispatch=1` DEFAULT-OFF gate that arms the first
     /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
     /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
@@ -779,6 +804,12 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.riscv64_futex_wait_idle_oracle" {
             options.riscv64_futex_wait_idle_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.riscv64_yield_two_task_oracle" {
+            options.riscv64_yield_two_task_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.riscv64_yield_lone_task_oracle" {
+            options.riscv64_yield_lone_task_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_yield_oracle" {
             options.aarch64_yield_oracle = parse_bool_knob(value);
@@ -1361,6 +1392,35 @@ mod tests {
         );
         let idle = parse_yarm_boot_options(b"yarm.riscv64_futex_wait_idle_oracle=1");
         assert_eq!(idle.riscv64_futex_wait_oracle, None);
+    }
+
+    // Stage 196G: the RISC-V Yield two-task + lone-task oracle knobs parse independently, default
+    // off, and do not alias each other or the FutexWait knobs.
+    #[test]
+    fn riscv64_yield_oracle_knobs_parse_and_default_off() {
+        assert_eq!(
+            parse_yarm_boot_options(b"").riscv64_yield_two_task_oracle,
+            None
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"").riscv64_yield_lone_task_oracle,
+            None
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.riscv64_yield_two_task_oracle=1")
+                .riscv64_yield_two_task_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.riscv64_yield_lone_task_oracle=1")
+                .riscv64_yield_lone_task_oracle,
+            Some(true)
+        );
+        let two = parse_yarm_boot_options(b"yarm.riscv64_yield_two_task_oracle=1");
+        assert_eq!(two.riscv64_yield_lone_task_oracle, None);
+        assert_eq!(two.riscv64_futex_wait_oracle, None);
+        let lone = parse_yarm_boot_options(b"yarm.riscv64_yield_lone_task_oracle=1");
+        assert_eq!(lone.riscv64_yield_two_task_oracle, None);
     }
 
     // Stage 193B: the send-plain-oracle SUB-knob parses as a standard bool knob,

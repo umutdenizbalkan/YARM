@@ -736,6 +736,63 @@ oracle knob, no one-shot consume latch in the kernel) and adds a genuine
   Recommended next: **Stage 196G** — RISC-V Yield retirement (re-enqueue + queue-
   advancing switch on the same drain foundation).
 
+### 9.8 Stage 196G — Yield (NR 0) DEFAULT-ON out-of-lock retirement
+
+Stage 196G promotes the 196D re-enqueue + switch machinery into a **DEFAULT-ON
+RISC-V Yield (NR 0) retirement class** — the preempt sibling of FutexWait. It reuses
+the generic `YIELD_DISPATCH_*` deferral + `preempt_reenqueue_current_cpu` seam +
+`yield_dispatch_step_mut` dequeue (the SAME seams x86_64 192B / AArch64 195G use)
+plus the 196D–196F SATP/sfence/frame switch. The 196D foundation oracle stays a
+SEPARATE default-off mechanism.
+
+- **Semantic distinction from FutexWait.** Yield: the caller stays Runnable,
+  re-enqueued exactly once, and ALWAYS guarantees an incoming (another task or the
+  caller itself) — so there is **NO idle outcome** and no `Err(Internal)` sentinel.
+  No-incoming after a published Yield is a real invariant `RISCV_YIELD_DISPATCH_FAIL
+  reason=no_incoming` (never idle, never success). FutexWait's post-lock idle (196F)
+  is unchanged and independent.
+- **Default-on eligibility.** In `yield_current`, the production Yield block is gated
+  purely structurally: shared trap drain active, single dispatcher, BSP, no pending
+  Yield / FutexWait / 196D-foundation deferral. No oracle knob, no consume latch. First
+  exercise emits the one-shot `RISCV_YIELD_RETIRE_DEFAULT_ON result=ok`; the mechanism
+  itself retires **every** eligible Yield (not one-shot).
+- **In-lock re-enqueue publish.** `preempt_reenqueue_current_cpu` sets the caller
+  Runnable, enqueues it once at its FIFO tail, clears `current`; records the generic
+  Yield deferral; skips the in-lock dispatch. Markers
+  `RISCV_YIELD_DISPATCH_{DEFER_BEGIN,REENQUEUE_OK}`. Re-enqueue failure clears the
+  deferral (current untouched — never both/neither current+queued) and falls back to
+  the legacy `on_preempt_current_cpu`.
+- **Yield handler bypass.** Independent of the FutexWait + 196D bypasses; requires a
+  real Yield deferral. Markers `RISCV_YIELD_HANDLER_BYPASS_{BEGIN,DONE}`.
+- **Post-lock Yield drain.** `yield_reverify_ready` re-acquires the scheduler seam
+  (lock-dropped proof → `LOCK_DROPPED_OK`) + confirms `current` still cleared
+  (`REVERIFY_OK`); dequeue the FIFO head (`DEQUEUE_OK`), set current
+  (`CURRENT_SET_OK`), mark Running (`RUNNING_OK`), then a fresh `with_cpu` re-acquire
+  does the real `write_satp` (`csrw satp` + `sfence.vma`) + `restore_arch_thread_state`
+  → `sret`. Markers `RISCV_YIELD_DISPATCH_{SATP_OK,SFENCE_OK,FRAME_OK,SRET_ARMED,
+  DONE result=ok}` + `GLOBAL_LOCK_RETIRE_CLASS_{BEGIN,DONE} arch=riscv64 class=Yield
+  result=ok`. NO x86 CR3 / AArch64 TTBR0. State-changed race →
+  `RISCV_YIELD_DISPATCH_DEFERRED reason=state_changed` (clear + decline).
+- **Two-task oracle** (`yarm.riscv64_yield_two_task_oracle`, slot-5 = 5): A yields →
+  post-lock switch to B; B emits `RISCV_YIELD_TWO_TASK_INCOMING_USER_OK` + blocks via
+  default-on FutexWait → drain re-dispatches A; A resumes once
+  (`RISCV_YIELD_TWO_TASK_OUTGOING_RESUMED_OK` + `..._ORACLE_DONE result=ok
+  outgoing_resumed=1`). B is selected first; A stays queued once while B runs.
+- **Lone-task oracle** (`yarm.riscv64_yield_lone_task_oracle`, slot-5 = 6): init is
+  the only task; its Yield re-enqueues itself and the drain dequeues the caller ITSELF
+  (`RISCV_YIELD_LONE_TASK_ORACLE_DONE result=ok redispatched_self=1`), then repeats a
+  bounded number of Yields (`..._REPEAT_OK`) proving the mechanism is NOT one-shot.
+  Self-redispatch, never idle (zero `RISCV_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN` /
+  `RISCV_YIELD_DISPATCH_FAIL` during the transition).
+- **Trap-stack impact.** Repeated Yield switching adds only the same bounded `with_cpu`
+  re-acquire per switch (no recursion, no second frame); observed stack use is
+  unchanged. 2 MiB fix + TODO preserved.
+- **Still excluded:** NR 27, D2, IpcSend, VM/spawn/fork/cap-mint, ReapFaultedTask,
+  RISC-V AP user dispatch. DebugLog + FutexWake + FutexWait stay live; the 196D
+  foundation + FutexWait switch/idle oracles stay green. Counts unchanged (32/23), no
+  new kernel lock. **RISC-V has now retired the same first cohort as x86_64/AArch64:
+  DebugLog + FutexWake + FutexWait + Yield.**
+
 ---
 
 ## 10. Current next target
