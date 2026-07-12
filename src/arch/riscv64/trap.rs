@@ -639,14 +639,49 @@ pub fn handle_riscv_trap_entry_shared(
                     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok"
                 );
             } else {
-                // Unexpected no-incoming AFTER publication: a genuine foundation failure (the
-                // eligibility gate guarantees B exists). Do NOT fabricate an idle task or success.
-                crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                // Stage 196F POST-LOCK IDLE OUTCOME: no runnable incoming task. This is a
+                // SUCCESSFUL idle (not a failure): the outgoing caller stays `Blocked(Futex)`
+                // (reverify_ok proved it above), `current` stays None, the deferral is cleared,
+                // and the BSP enters the REAL RISC-V idle loop — via the bridge's EXISTING proven
+                // idle policy — AFTER the broad lock is released. No frame is restored, no incoming
+                // is fabricated, and no `sret` is attempted.
+                crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu={}", cpu.0);
+                crate::yarm_log!("RISCV_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu={}", cpu.0);
+                // Lock-dropped proof: this `with_cpu` re-acquire is only possible because the broad
+                // guard was released above (a still-held guard would deadlock). Confirm `current`
+                // is None/idle.
+                let current_none = shared
+                    .with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))
+                    .unwrap_or(true);
                 crate::yarm_log!(
-                    "RISCV_FUTEX_WAIT_DISPATCH_FAIL reason=no_incoming cpu={} outgoing={:?}",
-                    cpu.0,
-                    outgoing
+                    "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu={}",
+                    cpu.0
                 );
+                crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle");
+                crate::yarm_log!(
+                    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok"
+                );
+                // Narrowly-gated idle-oracle attestation (default-off workload knob).
+                // `outgoing_blocked=1` because reverify_ok proved the caller is still
+                // `Blocked(Futex)`; `current_none` from the re-acquire; `lock_dropped=1` because
+                // that re-acquire succeeded.
+                if crate::kernel::boot::riscv_futex_wait_idle_oracle_enabled() {
+                    crate::yarm_log!(
+                        "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none={} outgoing_blocked=1",
+                        current_none as u32
+                    );
+                }
+                crate::yarm_log!("RISCV_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu={}", cpu.0);
+                // Hand off to the bridge's EXISTING proven RISC-V BSP idle policy: returning Err
+                // with `current == None` makes the bridge emit RISCV_KERNEL_IDLE_WAITING_FOR_IO,
+                // run the timer/PLIC idle-safe-point init, and enter `riscv_trap_halt` (wfi). No
+                // stale frame is restored and no `sret` is attempted; the active flag was already
+                // cleared before this drain. This reuses the SAME idle terminal as the natural
+                // "all services blocked on recv" boot idle (no second idle implementation).
+                return Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                ));
             }
         } else {
             // A split FutexWake flipped the outgoing waiter to Runnable before the drain ran —

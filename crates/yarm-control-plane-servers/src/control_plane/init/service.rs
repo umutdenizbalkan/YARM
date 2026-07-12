@@ -1099,6 +1099,37 @@ fn run_riscv_futex_wait_oracle(init_tid: u64) {
     }
 }
 
+// ─── Stage 196F: RISC-V FutexWait no-incoming IDLE oracle workload ─────────────────────
+// The final runnable user task (init) blocks on a never-woken futex when no other user task is
+// runnable (every control-plane server is blocked on recv; no child is spawned). The PRODUCTION
+// default-on post-lock FutexWait drain therefore observes NO incoming task and takes the Idle
+// outcome: it clears the deferral, proves the broad lock is released, keeps `current` None,
+// restores NO frame, emits the kernel-side RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE attestation, and
+// enters the real RISC-V BSP idle loop. This call never returns — QEMU stays in `wfi` until the
+// smoke timeout, interrupt-responsive.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static RISCV_FUTEX_WAIT_IDLE_WORD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0x1D1E);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn run_riscv_futex_wait_idle_oracle(init_tid: u64) -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_IDLE_ORACLE_BEGIN init_tid={}", init_tid);
+    let addr = RISCV_FUTEX_WAIT_IDLE_WORD.as_ptr();
+    let observed = RISCV_FUTEX_WAIT_IDLE_WORD.load(Relaxed);
+    yarm_user_rt::user_log!(
+        "RISCV_FUTEX_WAIT_IDLE_ORACLE_WAIT_BEGIN observed={}",
+        observed
+    );
+    // FutexWait (NR 9) that blocks and — with nothing else runnable — drives the production
+    // default-on drain to its post-lock Idle outcome. Nothing ever wakes this word, so it does not
+    // return; a return would be a defect (the drain must never sret into the blocked caller).
+    loop {
+        let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+        yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN");
+    }
+}
+
 /// Stage 195F NO-INCOMING idle oracle: the final runnable user task (init) blocks on a
 /// never-woken futex when no other user task is runnable (every server is blocked on recv and no
 /// child is spawned). The default-on post-lock FutexWait drain therefore observes no incoming
@@ -1690,6 +1721,14 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     if ctx.supervisor_control_recv_ep == Some(3) {
         run_riscv_futex_wait_oracle(ctx.task_id);
+    }
+    // Stage 196F: default-off RISC-V FutexWait no-incoming IDLE oracle. Slot-5 sentinel 4 (set
+    // under `yarm.riscv64_futex_wait_idle_oracle=1`) tells init (the last runnable user task) to
+    // block on a never-woken futex, driving the production default-on drain to its idle outcome.
+    // This never returns. A normal boot leaves slot 5 = None and skips this.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if ctx.supervisor_control_recv_ep == Some(4) {
+        run_riscv_futex_wait_idle_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

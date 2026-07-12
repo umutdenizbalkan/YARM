@@ -1552,11 +1552,16 @@ pub fn bootstrap_first_user_task(
         // so init fills E1 to exactly full with non-blocking sends and never blocks.
         init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
     }
-    // Stage 196C/196D/196E: default-off RISC-V oracles reuse init slot 5 (supervisor_control_recv_ep,
-    // unused by init on RISC-V) as a sentinel: 1 = FutexWake live oracle (196C); 2 = queue-switch
-    // context-switch FOUNDATION oracle (196D); 3 = FutexWait queue-advancing RETIREMENT oracle
-    // (196E). A normal boot leaves it 0 and init skips all three.
-    if crate::kernel::boot::riscv_futex_wait_oracle_enabled() {
+    // Stage 196C/196D/196E/196F: default-off RISC-V oracle WORKLOADS reuse init slot 5
+    // (supervisor_control_recv_ep, unused by init on RISC-V) as a sentinel: 1 = FutexWake live
+    // oracle (196C); 2 = queue-switch context-switch FOUNDATION oracle (196D); 3 = FutexWait
+    // SWITCH oracle workload (196E/196F); 4 = FutexWait no-incoming IDLE oracle workload (196F).
+    // A normal boot leaves it 0 and init skips all four. NB: these are WORKLOAD selectors only —
+    // the FutexWait retirement mechanism itself is DEFAULT-ON (no knob) as of 196F.
+    if crate::kernel::boot::riscv_futex_wait_idle_oracle_enabled() {
+        init_args[5] = 4;
+        crate::yarm_log!("RISCV_FUTEX_WAIT_IDLE_ORACLE_PROVISION_OK slot5=4");
+    } else if crate::kernel::boot::riscv_futex_wait_oracle_enabled() {
         init_args[5] = 3;
         crate::yarm_log!("RISCV_FUTEX_WAIT_ORACLE_PROVISION_OK slot5=3");
     } else if crate::kernel::boot::riscv_queue_switch_foundation_oracle_enabled() {

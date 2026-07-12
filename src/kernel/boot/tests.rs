@@ -64281,7 +64281,7 @@ mod stage196d_riscv_queue_switch_foundation {
             .next()
             .unwrap();
         let foundation_publish = EXEC_STATE_SRC
-            .split("Stage 196E (RISC-V FUTEXWAIT")
+            .split("Stage 196E/196F (RISC-V FUTEXWAIT")
             .next()
             .unwrap();
         for bad in [
@@ -64508,40 +64508,26 @@ mod stage196e_riscv_futex_wait_retirement {
         assert_eq!(SYSCALL_DEBUG_LOG_NR, 15);
     }
 
-    // The oracle mechanism is default-off: the knob parses, and with no knob the mechanism is
-    // never armed (asserted through run-time state, not just the source).
+    // Stage 196F: the SWITCH-oracle WORKLOAD knob still parses + defaults off, but it no longer
+    // arms kernel retirement (the mechanism is default-on). The old `armed`/`try_consume` one-shot
+    // latch is REMOVED from the kernel entirely.
     #[test]
-    fn oracle_defaults_off() {
+    fn workload_knob_defaults_off_mechanism_default_on() {
         assert!(
             !crate::kernel::boot::riscv_futex_wait_oracle_enabled(),
-            "the FutexWait retirement oracle must default OFF"
-        );
-        assert!(
-            !crate::kernel::boot::riscv_futex_wait_oracle_armed(),
-            "the mechanism must never be armed while the knob is off"
+            "the FutexWait SWITCH-oracle WORKLOAD knob must default OFF"
         );
         assert!(
             BOOT_CMDLINE_SRC.contains("yarm.riscv64_futex_wait_oracle")
                 && MOD_SRC.contains("fn set_riscv_futex_wait_oracle_enabled("),
-            "the knob + setter must be wired"
+            "the workload knob + setter must be wired"
         );
-    }
-
-    // The mechanism is ONE-SHOT: `armed` is knob AND !consumed, and `try_consume` claims it
-    // exactly once (compare_exchange). A second consume returns false.
-    #[test]
-    fn mechanism_is_one_shot() {
+        // The one-shot consume latch / armed gate are GONE (Stage 196F default-on).
         assert!(
-            MOD_SRC.contains("RISCV_FUTEX_WAIT_ORACLE_CONSUMED")
-                && MOD_SRC.contains("fn riscv_futex_wait_oracle_try_consume()")
-                && MOD_SRC.contains(".compare_exchange("),
-            "the one-shot must be a compare_exchange latch"
-        );
-        // `armed` gates on !consumed.
-        assert!(
-            MOD_SRC.contains("riscv_futex_wait_oracle_enabled()")
-                && MOD_SRC.contains("!RISCV_FUTEX_WAIT_ORACLE_CONSUMED.load"),
-            "armed must require the one-shot not yet consumed"
+            !MOD_SRC.contains("RISCV_FUTEX_WAIT_ORACLE_CONSUMED")
+                && !MOD_SRC.contains("fn riscv_futex_wait_oracle_try_consume(")
+                && !MOD_SRC.contains("fn riscv_futex_wait_oracle_armed("),
+            "the one-shot consume/armed latch must be removed from the kernel"
         );
     }
 
@@ -64564,45 +64550,41 @@ mod stage196e_riscv_futex_wait_retirement {
         );
     }
 
-    // Eligibility REQUIRES an incoming runnable task; no-incoming uses the canonical legacy path
-    // and emits RETIRE_DEFERRED (without consuming the one-shot or publishing a deferral).
+    // Stage 196F: eligibility NO LONGER requires an incoming runnable task (the drain handles the
+    // no-incoming idle outcome). The `runnable_count_on_cpu` gate + RETIRE_DEFERRED fallback are
+    // REMOVED from the in-lock publish.
     #[test]
-    fn eligibility_requires_incoming_task() {
+    fn eligibility_no_longer_requires_incoming_task() {
         assert!(
-            EXEC_STATE_SRC.contains("let incoming_exists = self.runnable_count_on_cpu(cpu) > 0;"),
-            "the in-lock publish must gate on a runnable incoming task"
+            !EXEC_STATE_SRC.contains("let incoming_exists = self.runnable_count_on_cpu(cpu) > 0;"),
+            "the in-lock publish must NOT gate on a runnable incoming task (196F default-on)"
         );
         assert!(
-            EXEC_STATE_SRC.contains("RISCV_FUTEX_WAIT_RETIRE_DEFERRED reason=no_incoming"),
-            "no-incoming must emit RETIRE_DEFERRED and fall through to legacy"
-        );
-        // The no_incoming branch must NOT consume the one-shot nor publish (it precedes the
-        // try_consume + try_defer, which live in the `else if` arm).
-        assert!(
-            EXEC_STATE_SRC.contains("if !incoming_exists {")
-                && EXEC_STATE_SRC.contains(
-                    "} else if crate::kernel::boot::riscv_futex_wait_oracle_try_consume() {"
-                ),
-            "no-incoming must not reach the one-shot consume / publish"
+            !EXEC_STATE_SRC.contains("RISCV_FUTEX_WAIT_RETIRE_DEFERRED reason=no_incoming"),
+            "the no-incoming in-lock decline must be removed (the drain idles instead)"
         );
     }
 
-    // The in-lock publish is BSP + single-dispatcher + trap-path gated, requires no pending
-    // FutexWait or 196D foundation deferral, and skips the legacy dispatch (return Ok(true)).
+    // Stage 196F: the in-lock publish is DEFAULT-ON — BSP + single-dispatcher + trap-path gated,
+    // requires no pending FutexWait or 196D foundation deferral, and skips the legacy dispatch
+    // (return Ok(true)). There is NO oracle-armed gate.
     #[test]
     fn in_lock_publish_gated_and_skips_dispatch() {
         assert!(
-            EXEC_STATE_SRC.contains("crate::kernel::boot::riscv_futex_wait_oracle_armed()")
-                && EXEC_STATE_SRC.contains("&& single_cpu")
-                && EXEC_STATE_SRC.contains("&& is_bsp")
-                && EXEC_STATE_SRC.contains("&& !futex_pending")
-                && EXEC_STATE_SRC.contains("&& !foundation_pending"),
-            "the publish must be armed + BSP + single-dispatcher + trap-path + no-pending gated"
+            !EXEC_STATE_SRC.contains("riscv_futex_wait_oracle_armed()"),
+            "the publish must NOT gate on an oracle-armed flag (196F default-on)"
         );
         assert!(
-            EXEC_STATE_SRC.contains("RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu={} tid={}")
+            EXEC_STATE_SRC.contains(
+                "if trap_path && single_cpu && is_bsp && !futex_pending && !foundation_pending {"
+            ),
+            "the publish must be BSP + single-dispatcher + trap-path + no-pending gated"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("maybe_log_riscv_futex_wait_retire_default_on()")
+                && EXEC_STATE_SRC.contains("RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu={} tid={}")
                 && EXEC_STATE_SRC.contains("RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid={}"),
-            "the publish must emit DEFER_BEGIN + BLOCK_PUBLISH_OK"
+            "the publish must log DEFAULT_ON once + emit DEFER_BEGIN + BLOCK_PUBLISH_OK"
         );
         // Uses the shared generic FutexWait deferral seam (NOT the 196D foundation deferral).
         assert!(
@@ -64725,20 +64707,26 @@ mod stage196e_riscv_futex_wait_retirement {
         );
     }
 
-    // State-changed (FutexWake raced) clears the deferral and declines (no stale dispatch, no
-    // success). Unexpected no-incoming after publication is an honest FAIL (no fake success/idle).
+    // Stage 196F: state-changed (FutexWake raced) clears the deferral and declines (no stale
+    // dispatch, no success). No-incoming is NO LONGER a FAIL — it is the post-lock idle outcome.
     #[test]
-    fn race_and_failure_are_honest() {
+    fn race_declines_and_no_incoming_is_idle_not_fail() {
         let drain = RISCV_TRAP_SRC
             .split("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
             .nth(1)
-            .expect("196E drain block present");
+            .expect("FutexWait drain block present");
         assert!(
-            drain.contains("RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed")
-                && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_FAIL reason=no_incoming"),
-            "the drain must handle state_changed + no_incoming honestly"
+            drain.contains("RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed"),
+            "the drain must decline the FutexWake race (state_changed)"
         );
-        // Neither declining branch emits a retirement DONE (success must be a real transition).
+        // No-incoming is the idle outcome now — never a FAIL marker.
+        assert!(
+            !drain.contains("RISCV_FUTEX_WAIT_DISPATCH_FAIL reason=no_incoming")
+                && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING")
+                && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle"),
+            "no-incoming must be the post-lock idle outcome, not a FAIL"
+        );
+        // The state_changed decline must NOT emit retirement success.
         let state_changed_arm = drain
             .split("A split FutexWake flipped")
             .nth(1)
@@ -64814,6 +64802,201 @@ mod stage196e_riscv_futex_wait_retirement {
         assert!(
             !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
             "ReapFaultedTask must never be split-eligible"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the 2 MiB trap-stack fix must be preserved"
+        );
+    }
+}
+
+// Stage 196F: RISC-V FutexWait DEFAULT-ON + post-lock IDLE seal.
+//
+// The FutexWait retirement mechanism is now DEFAULT-ON for eligible RISC-V traps (no oracle knob,
+// no one-shot consume latch), and the post-lock drain supports a genuine no-incoming IDLE outcome
+// (caller stays Blocked, current stays None, deferral cleared, NO frame restored, real RISC-V idle
+// loop entered via the bridge's proven policy). Two userspace WORKLOAD knobs (switch + idle) stay
+// default-off.
+mod stage196f_riscv_futex_wait_default_on_idle {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // The retirement mechanism is DEFAULT-ON: the in-lock publish has no oracle-armed / consume
+    // gate, and it logs the one-shot production marker.
+    #[test]
+    fn mechanism_is_default_on_no_oracle_gate() {
+        assert!(
+            !MOD_SRC.contains("fn riscv_futex_wait_oracle_armed(")
+                && !MOD_SRC.contains("fn riscv_futex_wait_oracle_try_consume(")
+                && !MOD_SRC.contains("RISCV_FUTEX_WAIT_ORACLE_CONSUMED"),
+            "the one-shot armed/consume latch must be removed"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains(
+                "if trap_path && single_cpu && is_bsp && !futex_pending && !foundation_pending {"
+            ) && !EXEC_STATE_SRC.contains("riscv_futex_wait_oracle_armed()"),
+            "the eligibility gate must be structural only (default-on)"
+        );
+        assert!(
+            MOD_SRC.contains("fn maybe_log_riscv_futex_wait_retire_default_on()")
+                && MOD_SRC.contains("RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok")
+                && MOD_SRC.contains("RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED"),
+            "the DEFAULT_ON marker must be a one-shot latch"
+        );
+    }
+
+    // Both workload knobs (switch + idle) default off (asserted through run-time state).
+    #[test]
+    fn workload_knobs_default_off() {
+        assert!(
+            !crate::kernel::boot::riscv_futex_wait_oracle_enabled(),
+            "the switch-oracle WORKLOAD knob must default off"
+        );
+        assert!(
+            !crate::kernel::boot::riscv_futex_wait_idle_oracle_enabled(),
+            "the idle-oracle WORKLOAD knob must default off"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_futex_wait_idle_oracle")
+                && MOD_SRC.contains("fn set_riscv_futex_wait_idle_oracle_enabled("),
+            "the idle-oracle knob + setter must be wired"
+        );
+    }
+
+    // The post-lock idle outcome: no-incoming (with the caller still Blocked) is an IDLE success,
+    // not a failure. It proves lock-dropped, clears the deferral, restores NO frame, and hands off
+    // to the bridge's existing idle policy (returns Err with current==None → no sret).
+    #[test]
+    fn post_lock_idle_outcome_present_and_honest() {
+        let drain = RISCV_TRAP_SRC
+            .split("Stage 196F POST-LOCK IDLE OUTCOME")
+            .nth(1)
+            .expect("196F idle outcome present")
+            .split("} else {") // stop before the state_changed arm
+            .next()
+            .unwrap();
+        for m in [
+            "RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu={}",
+            "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu={}",
+            "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok",
+            "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu={}",
+        ] {
+            assert!(drain.contains(m), "the idle outcome must emit `{m}`");
+        }
+        // Lock-dropped proof is a real `with_cpu` re-acquire that reads `current`.
+        assert!(
+            drain.contains(
+                ".with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))"
+            ),
+            "the lock-dropped proof must be a genuine with_cpu re-acquire reading current"
+        );
+        // NO frame is restored in the idle branch (no restore_arch_thread_state, no SRET_ARMED).
+        assert!(
+            !drain.contains("restore_arch_thread_state")
+                && !drain.contains("RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED"),
+            "the idle outcome must NOT restore a userspace frame or arm an sret"
+        );
+        // Hands off via Err so the bridge enters the existing idle policy (no fabricated task).
+        assert!(
+            drain.contains("return Err(TrapHandleError::Syscall(")
+                && drain.contains("SyscallError::Internal"),
+            "the idle outcome must hand off to the bridge idle path via Err"
+        );
+        assert!(
+            drain.contains("futex_wait_dispatch_clear(cpu_idx)"),
+            "the idle outcome must clear the FutexWait deferral"
+        );
+    }
+
+    // The bridge's idle path is the REUSED terminal, not a second idle implementation.
+    #[test]
+    fn idle_reuses_bridge_terminal() {
+        assert!(
+            RISCV_BOOT_SRC.contains("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
+                && RISCV_BOOT_SRC.contains("riscv_trap_halt(\"kernel_idle_awaiting_io\")"),
+            "the bridge's existing idle terminal must be the reused idle policy"
+        );
+    }
+
+    // The switch outcome is byte-preserved (the full 196E chain markers are still emitted).
+    #[test]
+    fn switch_outcome_preserved() {
+        let drain = RISCV_TRAP_SRC
+            .split("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
+            .nth(1)
+            .expect("drain present");
+        for m in [
+            "RISCV_FUTEX_WAIT_DISPATCH_LOCK_DROPPED_OK cpu={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu={} incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_SATP_OK incoming={} asid={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_SFENCE_OK incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_DONE result=ok",
+        ] {
+            assert!(
+                drain.contains(m),
+                "the switch outcome must still emit `{m}`"
+            );
+        }
+        assert!(
+            drain.contains("crate::arch::riscv64::page_table::write_satp(satp)")
+                && !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
+                && !RISCV_TRAP_SRC.contains("arch::aarch64::page_table"),
+            "the switch must use the real riscv64 SATP write and no cross-arch logic"
+        );
+    }
+
+    // The idle oracle workload + attestation + slot-5 sentinel 4 are wired.
+    #[test]
+    fn idle_oracle_wired() {
+        assert!(
+            INIT_SRC.contains("fn run_riscv_futex_wait_idle_oracle(")
+                && INIT_SRC.contains("RISCV_FUTEX_WAIT_IDLE_ORACLE_BEGIN"),
+            "the idle oracle workload must exist"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains(
+                "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none={} outgoing_blocked=1"
+            ),
+            "the kernel drain must emit the idle-oracle attestation"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("RISCV_FUTEX_WAIT_IDLE_ORACLE_PROVISION_OK slot5=4")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(4)"),
+            "the idle oracle slot-5 provision (sentinel 4) + dispatch must be wired"
+        );
+        assert!(
+            RISCV_SMOKE.contains("FUTEX_WAIT_IDLE_ORACLE")
+                && RISCV_SMOKE.contains(
+                    "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1 outgoing_blocked=1"
+                ),
+            "the smoke must arm + assert the idle oracle"
+        );
+    }
+
+    // Counts unchanged, Yield/NR27 excluded, trap-stack preserved.
+    #[test]
+    fn invariants_preserved() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert!(
+            !RISCV_TRAP_SRC.contains("class=Yield")
+                && !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk")
+                && !RISCV_TRAP_SRC.contains("RISCV_YIELD_DISPATCH_"),
+            "Yield/NR27 must stay excluded on the RISC-V path"
         );
         assert!(
             RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),

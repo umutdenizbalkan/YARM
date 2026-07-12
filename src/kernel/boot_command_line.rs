@@ -362,12 +362,22 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         );
     }
     if let Some(enabled) = parsed.riscv64_futex_wait_oracle {
-        // Stage 196E: default-off RISC-V FutexWait (NR 9) queue-advancing retirement oracle knob.
-        // Arms the one-shot post-lock FutexWait switch (in-lock block-publish, defer, drain to the
-        // incoming task with a real SATP/sfence.vma + frame restore + sret via the 196D machinery).
-        // Provisions init startup slot 5 so init runs the parent/child FutexWait retirement proof.
+        // Stage 196E/196F: default-off RISC-V FutexWait (NR 9) SWITCH-oracle WORKLOAD knob. Runs
+        // the two-task switch workload (slot-5 = 3). As of 196F it does NOT arm kernel retirement
+        // (that is default-on) — it only creates the workload that the production drain retires.
         crate::kernel::boot::set_riscv_futex_wait_oracle_enabled(enabled);
         crate::yarm_log!("YARM_RISCV64_FUTEX_WAIT_ORACLE_SET enabled={}", enabled);
+    }
+    if let Some(enabled) = parsed.riscv64_futex_wait_idle_oracle {
+        // Stage 196F: default-off RISC-V FutexWait no-incoming IDLE-oracle WORKLOAD knob. Init (the
+        // last runnable user task) blocks on a never-woken futex (slot-5 = 4), driving the
+        // production default-on drain to its post-lock IDLE outcome (caller stays Blocked, current
+        // None, deferral cleared, broad lock released, real RISC-V idle loop entered).
+        crate::kernel::boot::set_riscv_futex_wait_idle_oracle_enabled(enabled);
+        crate::yarm_log!(
+            "YARM_RISCV64_FUTEX_WAIT_IDLE_ORACLE_SET enabled={}",
+            enabled
+        );
     }
     if let Some(enabled) = parsed.ap_user_dispatch {
         // Stage 189C6 (LIVE-AP-DISPATCH): x86_64-only, default-off gate arming the
@@ -603,6 +613,10 @@ pub struct YarmBootOptions<'a> {
     /// frame restore + sret → B wakes A via split FutexWake → A resumes). One-shot: only the
     /// single intended FutexWait is retired; later FutexWait calls use the legacy path.
     pub riscv64_futex_wait_oracle: Option<bool>,
+    /// Stage 196F: `yarm.riscv64_futex_wait_idle_oracle=1` DEFAULT-OFF knob. Provisions init
+    /// startup slot 5 (=4) so init (the last runnable user task) blocks on a never-woken futex,
+    /// driving the production default-on FutexWait drain to its post-lock IDLE outcome.
+    pub riscv64_futex_wait_idle_oracle: Option<bool>,
     /// Stage 189C6: `yarm.ap_user_dispatch=1` DEFAULT-OFF gate that arms the first
     /// live x86_64 AP user dispatch (build probe task → wake AP → ring3 entry +
     /// probe syscall re-entry). Off ⇒ the accepted smp2/smp4 baseline is preserved.
@@ -762,6 +776,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.riscv64_futex_wait_oracle" {
             options.riscv64_futex_wait_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.riscv64_futex_wait_idle_oracle" {
+            options.riscv64_futex_wait_idle_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_yield_oracle" {
             options.aarch64_yield_oracle = parse_bool_knob(value);
@@ -1320,6 +1337,30 @@ mod tests {
         let fw = parse_yarm_boot_options(b"yarm.riscv64_futex_wait_oracle=1");
         assert_eq!(fw.riscv64_futex_wake_oracle, None);
         assert_eq!(fw.riscv64_queue_switch_foundation_oracle, None);
+        // The 196F idle-oracle knob is independent of the switch-oracle knob.
+        assert_eq!(fw.riscv64_futex_wait_idle_oracle, None);
+    }
+
+    // Stage 196F: the RISC-V FutexWait no-incoming IDLE-oracle knob parses independently and
+    // defaults off, independent of the switch-oracle knob in either direction.
+    #[test]
+    fn riscv64_futex_wait_idle_oracle_knob_parses_and_defaults_off() {
+        assert_eq!(
+            parse_yarm_boot_options(b"").riscv64_futex_wait_idle_oracle,
+            None
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.riscv64_futex_wait_idle_oracle=1")
+                .riscv64_futex_wait_idle_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.riscv64_futex_wait_idle_oracle=0")
+                .riscv64_futex_wait_idle_oracle,
+            Some(false)
+        );
+        let idle = parse_yarm_boot_options(b"yarm.riscv64_futex_wait_idle_oracle=1");
+        assert_eq!(idle.riscv64_futex_wait_oracle, None);
     }
 
     // Stage 193B: the send-plain-oracle SUB-knob parses as a standard bool knob,

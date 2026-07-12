@@ -682,6 +682,60 @@ the canonical global-lock path.
   FutexWake stay live; the 196D foundation oracle stays green. Counts unchanged
   (32/23), no new kernel lock.
 
+### 9.7 Stage 196F — FutexWait DEFAULT-ON + post-lock IDLE seal
+
+Stage 196F makes the eligible RISC-V FutexWait retirement **DEFAULT-ON** (no
+oracle knob, no one-shot consume latch in the kernel) and adds a genuine
+**no-incoming post-lock IDLE outcome**. The switch chain from 196E is byte-preserved.
+
+- **Default-on eligibility.** The in-lock publish (`futex_wait_current`) is now
+  gated purely structurally: shared trap drain active, single dispatcher, BSP, no
+  FutexWait deferral pending, no 196D foundation deferral pending. The
+  `runnable_count_on_cpu > 0` requirement, the `armed()` gate, and the
+  `try_consume` one-shot latch are all REMOVED. First exercise emits the one-shot
+  informational `RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok` (records that the
+  PRODUCTION mechanism ran — not that a knob was enabled). Legacy in-lock dispatch
+  remains only for genuinely ineligible traps.
+- **Two post-lock outcomes.** The drain reverifies the caller is still
+  `Blocked(Futex)` (rank-2 seam re-acquire → `LOCK_DROPPED_OK`), then dequeues:
+  - **Switch** (incoming exists): the unchanged 196E chain — dequeue → current →
+    Running → real `write_satp` + `sfence.vma` + `restore_arch_thread_state` →
+    `sret` (`..._DONE result=ok`).
+  - **Idle** (no incoming): `RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING` →
+    `POST_LOCK_IDLE_BEGIN` → a fresh `with_cpu` re-acquire confirms `current` is
+    None (`POST_LOCK_IDLE_LOCK_DROPPED_OK`) → clear deferral → `..._DONE result=idle`
+    → `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok` →
+    `POST_LOCK_IDLE_ENTERED`. NO frame is restored and NO `sret` is attempted: the
+    drain returns `Err` with `current == None`, which hands off to the bridge's
+    EXISTING proven idle policy (`RISCV_KERNEL_IDLE_WAITING_FOR_IO` + timer/PLIC
+    idle-safe-point init + `riscv_trap_halt` wfi). No second idle implementation.
+- **Idle interrupt/lock state.** The broad `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag
+  is cleared before the drain (never true across the idle handoff or wfi); the
+  bridge's `riscv_trap_halt` performs the wfi loop, remaining interrupt-responsive
+  so a later timer/external IRQ can dispatch a newly-runnable task. No stale
+  `sepc`/`sstatus`/SP/GPR frame is returned.
+- **Race preserved.** A FutexWake that flips the caller Runnable before the drain →
+  `RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed` (clear + decline; no
+  stale dispatch, no double-enqueue, no waiter loss, no success). Genuine kernel
+  errors still propagate as `Err` (not converted to idle success).
+- **Workload oracles (both default-off).** `yarm.riscv64_futex_wait_oracle` (slot-5
+  = 3) runs the two-task SWITCH workload — now under the default-on mechanism (it no
+  longer arms retirement); `yarm.riscv64_futex_wait_idle_oracle` (slot-5 = 4) makes
+  init (the last runnable task) block on a never-woken futex, driving the IDLE
+  outcome and the kernel attestation `RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok
+  lock_dropped=1 current_none=1 outgoing_blocked=1`.
+- **Normal core boot** may show ZERO FutexWait retirement markers if no production
+  task naturally calls NR 9 — acceptable, since the mechanism is source- and
+  test-proven default-on. NR 9 is still NOT in the pre-lock split gate.
+- **Trap-stack impact.** The idle branch adds only one bounded `with_cpu` re-acquire
+  (the lock-dropped proof) on the existing trap stack — no recursion, no second
+  frame, no meaningful new usage. The 2 MiB fix + TODO are preserved.
+- **Still excluded:** Yield, NR 27, D2, IpcSend, VM/spawn/fork/cap-mint,
+  ReapFaultedTask, RISC-V AP user dispatch. DebugLog + FutexWake stay live; the 196D
+  foundation oracle stays green. Counts unchanged (32/23), no new kernel lock.
+  Recommended next: **Stage 196G** — RISC-V Yield retirement (re-enqueue + queue-
+  advancing switch on the same drain foundation).
+
 ---
 
 ## 10. Current next target

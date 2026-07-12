@@ -89,6 +89,14 @@ if [[ "$FUTEX_WAIT_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_futex_w
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_futex_wait_oracle=1"
 fi
 
+# Stage 196F (FUTEXWAIT NO-INCOMING IDLE ORACLE): FUTEX_WAIT_IDLE_ORACLE=1 appends
+# yarm.riscv64_futex_wait_idle_oracle=1 to arm the default-off last-task idle workload (init blocks
+# on a never-woken futex; the production default-on drain takes the post-lock IDLE outcome).
+FUTEX_WAIT_IDLE_ORACLE=${FUTEX_WAIT_IDLE_ORACLE:-0}
+if [[ "$FUTEX_WAIT_IDLE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_futex_wait_idle_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_futex_wait_idle_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 
@@ -335,26 +343,16 @@ REJECT_PATTERNS=(
   # A healthy boot reaches RISCV_KERNEL_IDLE_WAITING_FOR_IO, never a kernel trap.
   'RISCV_TRAP_UNHANDLED'
   'reason=trap_from_s_mode'
-  # Stage 196C/196E (DebugLog + FutexWake always live; FutexWait retired ONLY under the 196E
-  # oracle): every OTHER retirement class must stay global-lock-only. class=DebugLog and
-  # class=FutexWake are explicitly allowed; these class-specific rejects catch any accidental
-  # additional retirement. Yield/NR27 queue-advancing markers must NEVER appear.
+  # Stage 196C/196E/196F (DebugLog + FutexWake + FutexWait are the retired RISC-V classes):
+  # every OTHER retirement class must stay global-lock-only. class=DebugLog, class=FutexWake, and
+  # (as of 196F, DEFAULT-ON) class=FutexWait are allowed; these class-specific rejects catch any
+  # accidental additional retirement. Yield/NR27 queue-advancing markers must NEVER appear.
   'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield'
   'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk'
   'RISCV_YIELD_DISPATCH_'
   # The retired raw-pointer trap path must not resurface.
   'reason=no_trap_kernel_state'
 )
-
-# Stage 196E: FutexWait (NR 9) retirement + its queue-advancing dispatch markers are ALLOWED only
-# when the 196E oracle is armed. In every other boot they must stay absent (FutexWait is not a
-# default-on RISC-V retirement) — so reject them unless FUTEX_WAIT_ORACLE=1.
-if [[ "$FUTEX_WAIT_ORACLE" != "1" ]]; then
-  REJECT_PATTERNS+=(
-    'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait'
-    'RISCV_FUTEX_WAIT_DISPATCH_'
-  )
-fi
 
 failures=0
 
@@ -609,13 +607,14 @@ if [[ "$QUEUE_SWITCH_ORACLE" == "1" ]]; then
   fi
 fi
 
-# Stage 196E (FUTEXWAIT RETIREMENT ORACLE): when armed, the FIRST genuine off-global-lock RISC-V
-# syscall retirement that context-switches the blocking caller must complete end-to-end — in-lock
-# block publish, handler bypass, lock dropped, blocked-state reverify, dequeue incoming, current
-# set, running, real SATP + sfence.vma, frame restore, sret into B, B runs in userspace + wakes A
-# via split FutexWake (count 1), A resumes exactly once. NO Yield/NR27 retirement marker may appear.
+# Stage 196E/196F (FUTEXWAIT SWITCH ORACLE, run with the DEFAULT-ON mechanism): the off-global-lock
+# RISC-V retirement that context-switches the blocking caller must complete end-to-end — production
+# default-on marker, in-lock block publish, handler bypass, lock dropped, blocked-state reverify,
+# dequeue incoming, current set, running, real SATP + sfence.vma, frame restore, sret into B, B runs
+# in userspace + wakes A via split FutexWake (count 1), A resumes once. NO Yield/NR27 marker appears.
 if [[ "$FUTEX_WAIT_ORACLE" == "1" ]]; then
   FUTEX_WAIT_PATTERNS=(
+    "RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"
     "RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0 tid="
     "RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid="
     "RISCV_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0 outgoing="
@@ -654,6 +653,53 @@ if [[ "$FUTEX_WAIT_ORACLE" == "1" ]]; then
   # Zero Yield / NR27 retirement markers may appear (this stage retires ONLY FutexWait).
   if rg -n "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield|GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk|RISCV_YIELD_DISPATCH_" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] futex-wait oracle boot leaked a Yield/NR27 retirement marker"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196F (FUTEXWAIT NO-INCOMING IDLE ORACLE): the last runnable user task blocks on a
+# never-woken futex; the production default-on drain must take the post-lock IDLE outcome — no
+# incoming, real lock-dropped proof, deferral cleared, NO frame restored, NO sret, and the real
+# RISC-V idle loop entered. The blocked caller stays Blocked and current stays None.
+if [[ "$FUTEX_WAIT_IDLE_ORACLE" == "1" ]]; then
+  FUTEX_WAIT_IDLE_PATTERNS=(
+    "RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"
+    "RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0 tid="
+    "RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid="
+    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0 outgoing="
+    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu=0"
+    "RISCV_FUTEX_WAIT_DISPATCH_DRAIN_BEGIN cpu=0"
+    "RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=0"
+    "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu=0"
+    "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu=0"
+    "RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok"
+    "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0"
+  )
+  for pat in "${FUTEX_WAIT_IDLE_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] futex-wait idle oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # The idle-oracle attestation with all three flags set is mandatory. Use -a (NUL bytes in log).
+  if ! rg -a "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1 outgoing_blocked=1" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait idle oracle did not prove the idle outcome (lock_dropped/current_none/outgoing_blocked)"
+    failures=$((failures + 1))
+  fi
+  # The canonical RISC-V idle terminal must be reached (reused, not a duplicate idle impl).
+  if ! rg -n -F "RISCV_KERNEL_IDLE_WAITING_FOR_IO" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait idle oracle did not reach the canonical RISC-V idle terminal"
+    failures=$((failures + 1))
+  fi
+  # Forbidden: the blocked caller must NOT be resumed (no sret into it), and no switch markers.
+  if rg -n "RISCV_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN|RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED|RISCV_FUTEX_WAIT_DISPATCH_FAIL|RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait idle oracle took a switch/return/fail path instead of idle"
+    failures=$((failures + 1))
+  fi
+  # Zero Yield / NR27 retirement markers.
+  if rg -n "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield|GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk|RISCV_YIELD_DISPATCH_" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait idle oracle boot leaked a Yield/NR27 retirement marker"
     failures=$((failures + 1))
   fi
 fi

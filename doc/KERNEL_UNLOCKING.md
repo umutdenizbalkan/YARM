@@ -8512,6 +8512,42 @@ first prerequisite; it is deferred rather than half-landed so the proven in-lock
 `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait`.** Yield stays a separate future
 slice (its re-enqueue proof is independent). See §4.7 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 196F — RISC-V FutexWait DEFAULT-ON + post-lock IDLE seal (DONE)
+
+RISC-V FutexWait (NR 9) retirement is now **DEFAULT-ON** for eligible traps (no
+oracle knob, no one-shot consume latch in the kernel), and the post-lock drain
+gained a genuine **no-incoming IDLE outcome** (§9.7 of `doc/ARCH_RISCV64.md`). The
+196E switch chain is byte-preserved.
+
+- **Default-on eligibility:** `futex_wait_current` publishes when trap drain active
+  + single dispatcher + BSP + no FutexWait/196D deferral pending. Removed: the
+  `runnable_count_on_cpu > 0` gate, `armed()`, and the `try_consume` latch. First
+  exercise emits the one-shot `RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok`.
+- **Switch outcome (unchanged 196E):** reverify Blocked → dequeue → current →
+  Running → real `write_satp`+`sfence.vma`+`restore_arch_thread_state` → `sret`
+  (`..._DONE result=ok`).
+- **Idle outcome (new):** no incoming + caller still Blocked ⇒
+  `RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING` → `POST_LOCK_IDLE_BEGIN` → `with_cpu`
+  re-acquire confirms current None (`POST_LOCK_IDLE_LOCK_DROPPED_OK`) → clear
+  deferral → `..._DONE result=idle` → `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64
+  class=FutexWait result=ok` → `POST_LOCK_IDLE_ENTERED`. NO frame restored, NO
+  `sret`: the drain returns `Err` with `current == None`, handing off to the
+  bridge's EXISTING idle policy (`RISCV_KERNEL_IDLE_WAITING_FOR_IO` + timer/PLIC
+  safe-point + `riscv_trap_halt` wfi). The active flag was cleared before the drain
+  (never true across the idle handoff / wfi). No second idle implementation.
+- **Race preserved:** FutexWake race → `..._DEFERRED reason=state_changed` (clear +
+  decline). Genuine errors still propagate as `Err` (never idle-washed).
+- **Workload knobs (default-off):** `yarm.riscv64_futex_wait_oracle` (slot-5 = 3,
+  switch workload, now under the default-on mechanism) +
+  `yarm.riscv64_futex_wait_idle_oracle` (slot-5 = 4, last-task idle workload →
+  kernel attestation `RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1
+  current_none=1 outgoing_blocked=1`).
+- **Excluded:** Yield/NR27/D2/IpcSend/VM/spawn/fork/cap-mint/ReapFaultedTask/AP-user;
+  NR 9 not in the pre-lock split gate. DebugLog + FutexWake live; foundation oracle
+  green; counts unchanged (32/23); no new kernel lock; 2 MiB trap-stack preserved.
+  A normal core boot may show zero FutexWait markers (mechanism is source/test-proven
+  default-on). Next: **196G** RISC-V Yield retirement.
+
 #### Stage 196E — RISC-V FutexWait (NR 9) queue-advancing RETIREMENT — live controlled oracle (DONE)
 
 RISC-V enables the **first genuine off-global-lock syscall retirement that
