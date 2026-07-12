@@ -997,6 +997,108 @@ fn run_riscv_queue_switch_foundation_oracle(init_tid: u64) {
     }
 }
 
+// ─── Stage 196E: RISC-V FutexWait queue-advancing RETIREMENT live oracle ──────────────
+// A two-task proof of the FIRST genuine off-global-lock RISC-V syscall retirement that
+// context-switches the BLOCKING caller. Task A (init) spawns task B (ensuring an incoming
+// runnable task exists), then enters FutexWait NR 9 on the oracle word. Because the one-shot
+// oracle is armed and B is runnable, A's FutexWait is RETIRED: A → Blocked(Futex), `current`
+// cleared, and the post-lock drain switches to B with a REAL SATP/sfence.vma + frame restore +
+// `sret` into B. B runs (emits the incoming-user proof), wakes A through the already-retired
+// SPLIT FutexWake NR 10 (count must be 1), then parks through the LEGACY path (the one-shot was
+// consumed by A, so B's FutexWait is NOT retired) — which re-dispatches the now-Runnable A. A
+// resumes exactly once and confirms the wake count. Default-off (slot-5 sentinel = 3).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static FUTEX_WAIT_ORACLE_WAKE_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0xFFFF);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static FUTEX_WAIT_ORACLE_CHILD_TID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Task B (incoming): emit the userspace proof that real U-mode execution began after the
+/// post-lock SATP/frame/sret switch, wake task A (blocked on the oracle word) through the SPLIT
+/// FutexWake NR 10 (count must be 1), publish the count, then park through the LEGACY path (which
+/// re-dispatches the now-Runnable A). Never returns.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+extern "C" fn riscv_futex_wait_oracle_child() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    let btid = FUTEX_WAIT_ORACLE_CHILD_TID.load(Relaxed);
+    // Emitted AFTER real userspace execution begins in B (post-sret) — the incoming-user proof.
+    yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_INCOMING_USER_OK tid={}", btid);
+    // Wake A through the already-retired split FutexWake (NR 10). A is Blocked(Futex) on the
+    // oracle word, so the returned wake COUNT must be exactly 1. FutexWake does NOT context-switch,
+    // so B keeps the CPU and falls into its own park below.
+    let word = FUTEX_ORACLE_WORD.as_ptr();
+    let woke = yarm_user_rt::syscall::futex_wake(word, 1).unwrap_or(0);
+    FUTEX_WAIT_ORACLE_WAKE_COUNT.store(woke, Relaxed);
+    yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_CHILD_WOKE_PARENT woke={}", woke);
+    // Park on an unrelated futex through the LEGACY global-lock path (the one-shot retirement was
+    // consumed by A). Legacy FutexWait blocks B and dispatches the now-Runnable A.
+    let park = FUTEX_ORACLE_PARK.as_ptr();
+    loop {
+        let pv = FUTEX_ORACLE_PARK.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+    }
+}
+
+/// Task A (init/blocking caller): spawn B (ensuring an incoming runnable task exists), enter
+/// FutexWait NR 9 (retired → post-lock switch to B), then resume exactly once and verify B woke
+/// it with count 1 (the round-trip retirement proof).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn run_riscv_futex_wait_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_ORACLE_BEGIN init_tid={}", init_tid);
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = riscv_futex_wait_oracle_child as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(FUTEX_ORACLE_CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    // Publish B's tid BEFORE blocking so B can log it once it runs.
+    FUTEX_WAIT_ORACLE_CHILD_TID.store(child_tid, Relaxed);
+    yarm_user_rt::user_log!(
+        "RISCV_FUTEX_WAIT_ORACLE_CHILD_SPAWNED child_tid={}",
+        child_tid
+    );
+    // A blocks on the oracle word. B is now runnable (the mandatory incoming-task-exists gate), so
+    // this FutexWait is RETIRED: A → Blocked(Futex), the post-lock drain switches to B via a real
+    // SATP/sfence/frame/sret. A resumes here ONLY after B wakes it (split FutexWake) and parks
+    // (legacy path re-dispatches A).
+    let word = FUTEX_ORACLE_WORD.as_ptr();
+    let wv = FUTEX_ORACLE_WORD.load(Relaxed);
+    yarm_user_rt::user_log!("RISCV_FUTEX_WAIT_ORACLE_BLOCK_BEGIN word_val={}", wv);
+    let _ = yarm_user_rt::syscall::futex_wait(word, wv, wv);
+    // Userspace return proof: A's retired FutexWait returned (post-sret continuation) exactly once.
+    let wake_count = FUTEX_WAIT_ORACLE_WAKE_COUNT.load(Relaxed);
+    yarm_user_rt::user_log!(
+        "RISCV_FUTEX_WAIT_USER_RETURN_OK tid={} wake_count={}",
+        init_tid,
+        wake_count
+    );
+    if wake_count == 1 {
+        yarm_user_rt::user_log!(
+            "RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid={} dispatched_tid={} wake_count=1",
+            init_tid,
+            child_tid
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=fail blocked_tid={} dispatched_tid={} wake_count={}",
+            init_tid,
+            child_tid,
+            wake_count
+        );
+    }
+}
+
 /// Stage 195F NO-INCOMING idle oracle: the final runnable user task (init) blocks on a
 /// never-woken futex when no other user task is runnable (every server is blocked on recv and no
 /// child is spawned). The default-on post-lock FutexWait drain therefore observes no incoming
@@ -1581,6 +1683,13 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     if ctx.supervisor_control_recv_ep == Some(2) {
         run_riscv_queue_switch_foundation_oracle(ctx.task_id);
+    }
+    // Stage 196E: default-off RISC-V FutexWait (NR 9) queue-advancing RETIREMENT oracle. Slot-5
+    // sentinel 3 (set under `yarm.riscv64_futex_wait_oracle=1`) tells init to run the two-task
+    // FutexWait retirement proof. A normal boot leaves slot 5 = None and skips this.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if ctx.supervisor_control_recv_ep == Some(3) {
+        run_riscv_futex_wait_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

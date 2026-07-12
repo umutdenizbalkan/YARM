@@ -1211,6 +1211,53 @@ pub(crate) fn riscv_queue_switch_foundation_clear(cpu_idx: usize) {
         .store(false, core::sync::atomic::Ordering::Release);
 }
 
+// ── Stage 196E: RISC-V FutexWait queue-advancing retirement — one-shot controlled oracle ──
+//
+// Default-off, one-shot MECHANISM (distinct from the generic per-CPU `FUTEX_WAIT_DISPATCH_*`
+// deferral state, which this stage reuses for the actual in-lock publish + post-lock drain).
+// The knob arms the mechanism; the one-shot CONSUMED latch guarantees exactly ONE eligible
+// FutexWait is retired this stage — every subsequent FutexWait (including the child's later
+// park) stays on the unchanged legacy global-lock path.
+
+/// Default-off selector (`yarm.riscv64_futex_wait_oracle=1`). Arms the one-shot RISC-V
+/// FutexWait queue-advancing retirement (in-lock block-publish + post-lock switch drain via
+/// the 196D SATP/sfence/frame machinery). Enables NO default-on retirement.
+pub(crate) static RISCV_FUTEX_WAIT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// One-shot latch: set true when the single eligible FutexWait is claimed. `armed` is false
+/// afterwards, so later FutexWait calls use the unchanged legacy path.
+static RISCV_FUTEX_WAIT_ORACLE_CONSUMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_futex_wait_oracle_enabled(enabled: bool) {
+    RISCV_FUTEX_WAIT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_futex_wait_oracle_enabled() -> bool {
+    RISCV_FUTEX_WAIT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// True only while the knob is on AND the one-shot has not been consumed.
+pub(crate) fn riscv_futex_wait_oracle_armed() -> bool {
+    riscv_futex_wait_oracle_enabled()
+        && !RISCV_FUTEX_WAIT_ORACLE_CONSUMED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Claim the one-shot: returns true for the FIRST caller only (compare_exchange). Called by
+/// the in-lock publish AFTER all eligibility predicates (incl. incoming-task-exists) hold, so
+/// the single retirement is spent only on a genuinely dispatchable FutexWait.
+pub(crate) fn riscv_futex_wait_oracle_try_consume() -> bool {
+    RISCV_FUTEX_WAIT_ORACLE_CONSUMED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 /// Stage 192B: one-shot latch for the Yield retirement markers.
 static YIELD_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);

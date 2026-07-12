@@ -1552,10 +1552,14 @@ pub fn bootstrap_first_user_task(
         // so init fills E1 to exactly full with non-blocking sends and never blocks.
         init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
     }
-    // Stage 196C/196D: default-off RISC-V oracles reuse init slot 5 (supervisor_control_recv_ep,
+    // Stage 196C/196D/196E: default-off RISC-V oracles reuse init slot 5 (supervisor_control_recv_ep,
     // unused by init on RISC-V) as a sentinel: 1 = FutexWake live oracle (196C); 2 = queue-switch
-    // context-switch FOUNDATION oracle (196D). A normal boot leaves it 0 and init skips both.
-    if crate::kernel::boot::riscv_queue_switch_foundation_oracle_enabled() {
+    // context-switch FOUNDATION oracle (196D); 3 = FutexWait queue-advancing RETIREMENT oracle
+    // (196E). A normal boot leaves it 0 and init skips all three.
+    if crate::kernel::boot::riscv_futex_wait_oracle_enabled() {
+        init_args[5] = 3;
+        crate::yarm_log!("RISCV_FUTEX_WAIT_ORACLE_PROVISION_OK slot5=3");
+    } else if crate::kernel::boot::riscv_queue_switch_foundation_oracle_enabled() {
         init_args[5] = 2;
         crate::yarm_log!("RISCV_QUEUE_SWITCH_FOUNDATION_PROVISION_OK slot5=2");
     } else if crate::kernel::boot::riscv_futex_wake_oracle_enabled() {

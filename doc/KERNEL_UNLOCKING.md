@@ -8512,6 +8512,54 @@ first prerequisite; it is deferred rather than half-landed so the proven in-lock
 `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait`.** Yield stays a separate future
 slice (its re-enqueue proof is independent). See §4.7 of `doc/ARCH_AARCH64.md`.
 
+#### Stage 196E — RISC-V FutexWait (NR 9) queue-advancing RETIREMENT — live controlled oracle (DONE)
+
+RISC-V enables the **first genuine off-global-lock syscall retirement that
+context-switches the BLOCKING caller** — FutexWait (NR 9) — behind a **default-off,
+ONE-SHOT controlled oracle** (§9.6 of `doc/ARCH_RISCV64.md`). A live retirement
+PROOF, not the default-on seal (Stage 196F). No-incoming stays on the legacy path.
+
+- **Reused generic seams** (no duplication): the in-lock publish + per-CPU
+  `FUTEX_WAIT_DISPATCH_*` deferral + `futex_wait_reverify_blocked` +
+  `futex_wait_dispatch_step_mut` (both un-gated to RISC-V) are the SAME x86_64
+  (192A) / AArch64 (195E/F) seams; the arch restore reuses the 196D machinery
+  (`cr3_for_asid` + `map_kernel_shared_into_asid` + `write_satp` +
+  `restore_arch_thread_state`).
+- **Default-off, one-shot** (`yarm.riscv64_futex_wait_oracle=1`): a compare_exchange
+  CONSUMED latch retires exactly ONE eligible FutexWait; later calls (incl. the
+  child's park) stay legacy. `armed` = knob-on AND !consumed.
+- **Eligibility (MANDATORY incoming exists):** armed + shared trap drain + single
+  dispatcher + BSP + no FutexWait/196D deferral pending + `runnable_count_on_cpu > 0`.
+  No incoming ⇒ `RISCV_FUTEX_WAIT_RETIRE_DEFERRED reason=no_incoming`, no consume, no
+  publish, legacy path (not a failure).
+- **In-lock publish:** claim one-shot, `futex_wait_dispatch_try_defer`, skip in-lock
+  dispatch (`return Ok(true)`). Markers `RISCV_FUTEX_WAIT_DISPATCH_{DEFER_BEGIN,
+  BLOCK_PUBLISH_OK}`; publish failure → clear + `..._FALLBACK reason=defer_failed` →
+  legacy (never Blocked-and-current).
+- **Handler bypass:** `post_lock_bypass = foundation_bypass || futex_wait_bypass`;
+  the FutexWait arm requires a real `futex_wait_dispatch_is_deferred` deferral,
+  emits `RISCV_FUTEX_WAIT_HANDLER_BYPASS_{BEGIN,DONE}`, independent of the unchanged
+  196D foundation bypass.
+- **Post-lock drain:** `futex_wait_reverify_blocked` (rank-2 re-acquire proves the
+  broad guard dropped → `LOCK_DROPPED_OK`, AND confirms still `Blocked(Futex)`) →
+  dequeue B (rank-1) → set current → mark Running (rank-2) → fresh `with_cpu`: real
+  `write_satp` (`csrw satp` + `sfence.vma`) + `restore_arch_thread_state` → `sret`.
+  Markers `RISCV_FUTEX_WAIT_DISPATCH_{DRAIN_BEGIN,LOCK_DROPPED_OK,REVERIFY_OK,
+  DEQUEUE_OK,CURRENT_SET_OK,RUNNING_OK,SATP_OK,SFENCE_OK,FRAME_OK,SRET_ARMED,DONE}` +
+  `GLOBAL_LOCK_RETIRE_CLASS_{BEGIN,DONE} arch=riscv64 class=FutexWait result=ok`. NO
+  x86 CR3 / AArch64 TTBR0. Honest race/failure: `..._DEFERRED reason=state_changed`
+  (FutexWake raced) / `..._FAIL reason=no_incoming` (never fabricated).
+- **Live oracle** (slot-5=3): A spawns B, blocks on FutexWait → switch to B; B emits
+  `RISCV_FUTEX_WAIT_INCOMING_USER_OK`, wakes A via split FutexWake (count 1), parks
+  legacy; A resumes once → `RISCV_FUTEX_WAIT_USER_RETURN_OK tid=<A> wake_count=1` +
+  `RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid=<A> dispatched_tid=<B>
+  wake_count=1`.
+- **Excluded / not yet claimed:** default-on FutexWait + post-lock idle (196F); NR 9
+  NOT in the pre-lock split gate; Yield/NR27/D2/IpcSend/VM/spawn/fork/cap-mint/
+  ReapFaultedTask/AP-user-dispatch. DebugLog + FutexWake live; 196D foundation oracle
+  green; counts unchanged (32/23); no new kernel lock; 2 MiB trap-stack preserved.
+  Next: **196F** — default-on FutexWait + post-lock idle/no-incoming.
+
 #### Stage 196D — RISC-V queue-advancing context-switch drain FOUNDATION (DONE)
 
 RISC-V proves a **genuine post-lock context switch** end-to-end — outgoing

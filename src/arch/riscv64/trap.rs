@@ -139,6 +139,24 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         );
         return Ok(());
     }
+    // Stage 196E (FUTEXWAIT RETIREMENT BYPASS): the same return-path bypass for a real FutexWait
+    // deferral. The in-lock `futex_wait_current` published `Blocked(Futex)` + cleared `current`
+    // and declined the in-lock dispatch, so the canonical restore below has NO current task and
+    // would restore stale state. Skip it and return cleanly; the wrapper's post-lock FutexWait
+    // drain performs the authoritative dispatch + real SATP/sfence.vma + frame restore for the
+    // INCOMING task. This bypass is NARROW: it requires an ACTUAL pending FutexWait deferral (no
+    // generic "skip restore" flag), is independent of the 196D foundation bypass above, and is
+    // inert for normal syscalls and for legacy FutexWait (oracle off/ineligible ⇒ no deferral).
+    if crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx) {
+        let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx).unwrap_or(0);
+        crate::yarm_log!(
+            "RISCV_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu={} outgoing={}",
+            cpu.0,
+            outgoing
+        );
+        crate::yarm_log!("RISCV_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu={}", cpu.0);
+        return Ok(());
+    }
     // Stage 163L: restore FIRST so apply_user_context (called inside
     // resume_current_thread_with_frame) does not zero a0 (user_gprs[10])
     // from the pre-syscall TCB snapshot before we can export ret0 below.
@@ -540,6 +558,104 @@ pub fn handle_riscv_trap_entry_shared(
             crate::kernel::boot::riscv_queue_switch_foundation_clear(cpu_idx);
             crate::yarm_log!(
                 "RISCV_QUEUE_SWITCH_FOUNDATION_FAIL reason=state_changed cpu={}",
+                cpu.0
+            );
+        }
+    }
+
+    // ── Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain ──
+    // If the in-lock `futex_wait_current` recorded a one-shot FutexWait dispatch deferral
+    // (published `Blocked(Futex)` + cleared `current`, declined the in-lock dispatch), perform
+    // the authoritative post-lock switch to the INCOMING task now that the broad guard is
+    // released: re-verify the outgoing waiter is STILL `Blocked(Futex)` (rank-2 task seam),
+    // dequeue B (rank-1 scheduler seam), set B current, mark B Running (rank-2), then a brief
+    // `with_cpu` re-acquire does the REAL RISC-V arch restore — construct + write B's SATP (with
+    // the `sfence.vma` inside `write_satp`) and restore B's saved frame. This REUSES the 196D
+    // switch machinery (write_satp / cr3_for_asid / restore_arch_thread_state); it does NOT
+    // duplicate the SATP or frame-restore implementations. The bridge then `sret`s into B. This
+    // is the FIRST genuine off-global-lock RISC-V syscall retirement that context-switches the
+    // blocking caller. NO x86 CR3 / AArch64 TTBR0 logic is used.
+    if cpu_idx < MAX_CPUS && crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx) {
+        crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_DRAIN_BEGIN cpu={}", cpu.0);
+        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=FutexWait");
+        let outgoing = crate::kernel::boot::futex_wait_dispatch_outgoing(cpu_idx);
+        // Lock-dropped proof: `futex_wait_reverify_blocked` re-acquires the rank-2 task seam
+        // through the SharedKernel (only possible because the broad `with_cpu` guard was released
+        // above — a still-held guard would deadlock) AND confirms the waiter is still
+        // `Blocked(Futex)` (guards against a FutexWake race before dispatch).
+        let reverify_ok = outgoing
+            .map(|t| shared.futex_wait_reverify_blocked(t))
+            .unwrap_or(false);
+        crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_LOCK_DROPPED_OK cpu={}", cpu.0);
+        if reverify_ok {
+            if let Some(out) = outgoing {
+                crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}", out);
+            }
+            // Queue-advancing dequeue of the FIFO head (the incoming task B).
+            let incoming = shared.futex_wait_dispatch_step_mut(cpu);
+            if let Some(inc) = incoming {
+                crate::yarm_log!(
+                    "RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
+                    cpu.0,
+                    inc
+                );
+                crate::yarm_log!(
+                    "RISCV_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu={} incoming={}",
+                    cpu.0,
+                    inc
+                );
+                shared.d6_genuine_mark_running_via_task_seam(incoming);
+                crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming={}", inc);
+                // Brief `with_cpu` re-acquire: real SATP write + sfence.vma + frame restore
+                // (reused 196D machinery — no duplicate implementation).
+                let restore = shared
+                    .with_cpu(cpu, |kernel| {
+                        if let Some(asid) = kernel.task_asid(inc) {
+                            let _ =
+                                crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
+                            if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid)
+                            {
+                                crate::arch::riscv64::page_table::write_satp(satp);
+                                crate::yarm_log!(
+                                    "RISCV_FUTEX_WAIT_DISPATCH_SATP_OK incoming={} asid={}",
+                                    inc,
+                                    asid.0
+                                );
+                                crate::yarm_log!(
+                                    "RISCV_FUTEX_WAIT_DISPATCH_SFENCE_OK incoming={}",
+                                    inc
+                                );
+                            }
+                        }
+                        restore_arch_thread_state(kernel, cpu, Some(&mut *frame))
+                    })
+                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                restore??;
+                crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming={}", inc);
+                crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED incoming={}", inc);
+                crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_DONE result=ok");
+                crate::yarm_log!(
+                    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok"
+                );
+            } else {
+                // Unexpected no-incoming AFTER publication: a genuine foundation failure (the
+                // eligibility gate guarantees B exists). Do NOT fabricate an idle task or success.
+                crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                crate::yarm_log!(
+                    "RISCV_FUTEX_WAIT_DISPATCH_FAIL reason=no_incoming cpu={} outgoing={:?}",
+                    cpu.0,
+                    outgoing
+                );
+            }
+        } else {
+            // A split FutexWake flipped the outgoing waiter to Runnable before the drain ran —
+            // do NOT stale-dispatch it away, do NOT double-enqueue, do NOT lose it, do NOT emit
+            // retirement success. Clear the deferral and decline (unreachable in the controlled
+            // single-dispatcher oracle: nothing runs between the in-lock publish and this drain).
+            crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+            crate::yarm_log!(
+                "RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed cpu={}",
                 cpu.0
             );
         }

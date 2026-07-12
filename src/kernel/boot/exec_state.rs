@@ -1346,6 +1346,76 @@ impl KernelState {
                 tid
             );
         }
+        // Stage 196E (RISC-V FUTEXWAIT QUEUE-ADVANCING RETIREMENT): the RISC-V port of the 192A
+        // in-lock publish, gated behind a DEFAULT-OFF, ONE-SHOT controlled oracle
+        // (`yarm.riscv64_futex_wait_oracle`). The caller is already `Blocked(Futex)` + removed
+        // from `current` (above). Eligible ONLY when: the oracle is armed (knob on + one-shot not
+        // consumed), the shared trap drain is active, single dispatcher, BSP, no FutexWait
+        // deferral pending, no 196D foundation deferral pending, AND a runnable incoming task
+        // already exists (MANDATORY this stage — the no-incoming/idle outcome is out of scope).
+        // On eligibility: claim the one-shot, record the SEPARATE generic FutexWait deferral, and
+        // SKIP the in-lock dispatch — the caller returns through the RISC-V FutexWait handler
+        // bypass and the shared post-lock drain performs the authoritative dispatch + real
+        // SATP/sfence.vma + frame restore (reusing the 196D switch machinery). When no incoming
+        // task exists, emit RETIRE_DEFERRED and use the unchanged legacy path (do NOT publish, do
+        // NOT consume the one-shot). Every other ineligible case falls through to the unchanged
+        // legacy in-lock `dispatch_next_task` below.
+        #[cfg(target_arch = "riscv64")]
+        {
+            let cpu = self.current_cpu();
+            let cpu_idx = cpu.0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            let is_bsp = cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
+            let futex_pending = crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx);
+            let foundation_pending =
+                crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx);
+            if crate::kernel::boot::riscv_futex_wait_oracle_armed()
+                && trap_path
+                && single_cpu
+                && is_bsp
+                && !futex_pending
+                && !foundation_pending
+            {
+                // MANDATORY incoming-task-exists gate: a runnable task must already be enqueued
+                // (the caller is Blocked + not current, so the run-queue count is the incoming
+                // pool). No incoming ⇒ decline the retirement (no publish, no one-shot consume)
+                // and use the canonical legacy dispatch/idle path.
+                let incoming_exists = self.runnable_count_on_cpu(cpu) > 0;
+                if !incoming_exists {
+                    crate::yarm_log!(
+                        "RISCV_FUTEX_WAIT_RETIRE_DEFERRED reason=no_incoming cpu={} tid={}",
+                        cpu_idx,
+                        tid
+                    );
+                } else if crate::kernel::boot::riscv_futex_wait_oracle_try_consume() {
+                    // Claim the generic one-shot FutexWait deferral; single-CPU + IRQ-off means
+                    // nothing mutates between the `!futex_pending` check and here, so this
+                    // succeeds. A failure is a genuine rollback: clear any partial deferral and
+                    // fall through to the unchanged legacy path (the caller stays Blocked +
+                    // not-current — never Blocked-and-current — and legacy dispatch advances).
+                    if crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid) {
+                        crate::yarm_log!(
+                            "RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu={} tid={}",
+                            cpu_idx,
+                            tid
+                        );
+                        crate::yarm_log!("RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid={}", tid);
+                        // The RISC-V handler bypass returns cleanly through `with_cpu`; the shared
+                        // post-lock drain performs the authoritative dispatch. Do NOT dispatch
+                        // in-lock here.
+                        return Ok(true);
+                    }
+                    crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);
+                    crate::yarm_log!(
+                        "RISCV_FUTEX_WAIT_DISPATCH_FALLBACK reason=defer_failed tid={}",
+                        tid
+                    );
+                }
+            }
+        }
         self.dispatch_next_task()?;
         Ok(true)
     }
