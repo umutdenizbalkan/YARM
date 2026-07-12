@@ -53,6 +53,64 @@ if [[ "$CROSS_ARCH_D6" == "1" && "$KERNEL_CMDLINE" != *"yarm.cross_arch_d6="* ]]
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.cross_arch_d6=1"
 fi
 
+# Stage 196A (POST-LOCK DRAIN FOUNDATION): POST_LOCK_FOUNDATION_ORACLE=1 appends
+# yarm.riscv64_post_lock_foundation_oracle=1 to arm the default-off one-shot
+# drain-ordering proof (publish token in the bounded broad-lock phase, consume
+# it after the guard drops via a real with_cpu re-acquire, return to the same
+# task through sret). It enables no retirement class and does not alter boot.
+POST_LOCK_FOUNDATION_ORACLE=${POST_LOCK_FOUNDATION_ORACLE:-0}
+if [[ "$POST_LOCK_FOUNDATION_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_post_lock_foundation_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_post_lock_foundation_oracle=1"
+fi
+
+# Stage 196C (FUTEXWAKE LIVE ORACLE): FUTEX_WAKE_ORACLE=1 appends
+# yarm.riscv64_futex_wake_oracle=1 to arm the default-off parent/child split-FutexWake proof
+# (child blocks on legacy NR 9 FutexWait; parent wakes via split NR 10, counts 1 then 0).
+FUTEX_WAKE_ORACLE=${FUTEX_WAKE_ORACLE:-0}
+if [[ "$FUTEX_WAKE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_futex_wake_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_futex_wake_oracle=1"
+fi
+
+# Stage 196D (QUEUE-SWITCH FOUNDATION ORACLE): QUEUE_SWITCH_ORACLE=1 appends
+# yarm.riscv64_queue_switch_foundation_oracle=1 to arm the default-off two-task post-lock
+# context-switch proof (task A yields → real SATP/sfence/frame switch to task B → B runs →
+# A resumes). Enables NO syscall retirement class.
+QUEUE_SWITCH_ORACLE=${QUEUE_SWITCH_ORACLE:-0}
+if [[ "$QUEUE_SWITCH_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_queue_switch_foundation_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_queue_switch_foundation_oracle=1"
+fi
+
+# Stage 196E (FUTEXWAIT RETIREMENT ORACLE): FUTEX_WAIT_ORACLE=1 appends
+# yarm.riscv64_futex_wait_oracle=1 to arm the default-off, one-shot two-task FutexWait (NR 9)
+# queue-advancing RETIREMENT proof (task A blocks on FutexWait → real SATP/sfence/frame switch to
+# task B → B wakes A via split FutexWake NR 10 → A resumes exactly once).
+FUTEX_WAIT_ORACLE=${FUTEX_WAIT_ORACLE:-0}
+if [[ "$FUTEX_WAIT_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_futex_wait_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_futex_wait_oracle=1"
+fi
+
+# Stage 196F (FUTEXWAIT NO-INCOMING IDLE ORACLE): FUTEX_WAIT_IDLE_ORACLE=1 appends
+# yarm.riscv64_futex_wait_idle_oracle=1 to arm the default-off last-task idle workload (init blocks
+# on a never-woken futex; the production default-on drain takes the post-lock IDLE outcome).
+FUTEX_WAIT_IDLE_ORACLE=${FUTEX_WAIT_IDLE_ORACLE:-0}
+if [[ "$FUTEX_WAIT_IDLE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_futex_wait_idle_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_futex_wait_idle_oracle=1"
+fi
+
+# Stage 196G (YIELD TWO-TASK ORACLE): YIELD_TWO_TASK_ORACLE=1 appends
+# yarm.riscv64_yield_two_task_oracle=1 (A yields → post-lock switch to B → B blocks → A resumes).
+YIELD_TWO_TASK_ORACLE=${YIELD_TWO_TASK_ORACLE:-0}
+if [[ "$YIELD_TWO_TASK_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_yield_two_task_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_yield_two_task_oracle=1"
+fi
+
+# Stage 196G (YIELD LONE-TASK ORACLE): YIELD_LONE_TASK_ORACLE=1 appends
+# yarm.riscv64_yield_lone_task_oracle=1 (the only task yields and self-redispatches, never idles).
+YIELD_LONE_TASK_ORACLE=${YIELD_LONE_TASK_ORACLE:-0}
+if [[ "$YIELD_LONE_TASK_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_yield_lone_task_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_yield_lone_task_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 
@@ -211,6 +269,29 @@ REQUIRED_PATTERNS=(
   "CROSS_ARCH_D3_OK arch=riscv64"
   "CROSS_ARCH_SYSCALL_PARITY_OK arch=riscv64"
   "CROSS_ARCH_LIVE_DONE arch=riscv64 result=ok"
+  # Stage 196A (RISC-V SHARED TRAP-PATH + POST-LOCK DRAIN FOUNDATION): the trap
+  # bridge routes through the shared wrapper, which owns the active-flag lifecycle
+  # (set true before the bounded broad-lock phase, cleared after) and runs a
+  # post-lock drain after the guard drops. These structural markers are one-shot
+  # latched (first trap), so they appear exactly once per boot.
+  "RISCV_SHARED_TRAP_ENTRY_BEGIN cpu="
+  "RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET cpu="
+  "RISCV_GLOBAL_LOCK_PHASE_DONE cpu="
+  "RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR cpu="
+  "RISCV_POST_LOCK_DRAIN_BEGIN cpu="
+  "RISCV_POST_LOCK_DRAIN_DONE cpu="
+  "RISCV_SHARED_TRAP_ENTRY_DONE cpu="
+  "YARM_LOCK_SPLIT_STAGE196A_INSTALLED arch=riscv64 shared=1 raw=0"
+  # Stage 196B (RISC-V DEBUGLOG SPLIT-DISPATCH RETIREMENT): DebugLog (NR 15) is the
+  # ONE live RISC-V split-dispatch class. The pre-lock split path services it off the
+  # global lock and returns to the same task via `sret`; the userspace return marker
+  # is emitted by init AFTER the split DebugLog returns (proving same-task resume).
+  "RISCV_SPLIT_ABI_IMPORT_OK nr=15"
+  "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 cpu=0 result=ok"
+  "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=DebugLog"
+  "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=DebugLog result=ok"
+  "RISCV_SPLIT_FINALIZE_OK nr=15 result=ok"
+  "RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK"
 )
 
 # Nothing optional today: all required RAMFS/EXT4 markers above are
@@ -276,6 +357,14 @@ REJECT_PATTERNS=(
   # A healthy boot reaches RISCV_KERNEL_IDLE_WAITING_FOR_IO, never a kernel trap.
   'RISCV_TRAP_UNHANDLED'
   'reason=trap_from_s_mode'
+  # Stage 196C/196E/196F/196G (DebugLog + FutexWake + FutexWait + Yield are the retired RISC-V
+  # classes): every OTHER retirement class must stay global-lock-only. class=DebugLog,
+  # class=FutexWake, class=FutexWait (196F), and class=Yield (196G) are DEFAULT-ON and allowed;
+  # these class-specific rejects catch any accidental additional retirement. NR27/D2/IpcSend
+  # queue-advancing markers must NEVER appear.
+  'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk'
+  # The retired raw-pointer trap path must not resurface.
+  'reason=no_trap_kernel_state'
 )
 
 failures=0
@@ -419,6 +508,288 @@ fi
 if (( QEMU_SMP >= 2 )); then
   if ! rg -n "RISCV_IRQ_SMP_TOPOLOGY_DEFERRED reason=present_topology_not_live_validated" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] multi-hart boot must emit RISCV_IRQ_SMP_TOPOLOGY_DEFERRED"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196C: the RISC-V split dispatcher may service DebugLog (NR 15) and FutexWake
+# (NR 10) ONLY. Any `YARM_LOCK_SPLIT_DISPATCH arch=riscv64` line whose nr is neither 15
+# nor 10 means another class was wrongly retired off the global lock. Compare total vs
+# allowed (nr=15 + nr=10) counts.
+riscv_split_total=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=" "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr15=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_nr10=$(rg -c "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=10 " "$LOGFILE" 2>/dev/null || echo 0)
+riscv_split_total=${riscv_split_total:-0}
+riscv_split_nr15=${riscv_split_nr15:-0}
+riscv_split_nr10=${riscv_split_nr10:-0}
+if (( riscv_split_total != riscv_split_nr15 + riscv_split_nr10 )); then
+  echo "[fail] RISC-V split-dispatch serviced a non-DebugLog/non-FutexWake syscall (total=${riscv_split_total} nr15=${riscv_split_nr15} nr10=${riscv_split_nr10})"
+  failures=$((failures + 1))
+fi
+
+# Stage 196A (POST-LOCK DRAIN FOUNDATION): when armed, the one-shot oracle must
+# prove genuine drain ordering end-to-end (publish in-lock → lock dropped →
+# consumed post-lock → sret return to the same task). All five markers required.
+if [[ "$POST_LOCK_FOUNDATION_ORACLE" == "1" ]]; then
+  POST_LOCK_ORACLE_PATTERNS=(
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu="
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_LOCK_DROPPED_OK cpu="
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_DRAIN_OK cpu="
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_USER_RETURN_OK tid="
+    "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=ok"
+  )
+  for pat in "${POST_LOCK_ORACLE_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] post-lock foundation oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # A task-switched DONE is a proof failure: the oracle syscall must return to the
+  # same task (no scheduler mutation).
+  if rg -n "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=task_switched" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] post-lock foundation oracle returned to a different task"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196C (FUTEXWAKE LIVE ORACLE): when armed, the parent/child split-FutexWake proof
+# must complete — child blocked, first wake=1, second wake=0, userspace return, live DONE.
+if [[ "$FUTEX_WAKE_ORACLE" == "1" ]]; then
+  FUTEX_WAKE_ORACLE_PATTERNS=(
+    "RISCV_FUTEX_ORACLE_CHILD_SPAWNED child_tid="
+    "RISCV_FUTEX_ORACLE_CHILD_WAIT_BEGIN observed="
+    "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=10 cpu=0 result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake result=ok"
+    "FUTEX_WAKE_SPLIT_DONE arch=riscv64 result=ok woke=1"
+    "RISCV_SPLIT_FINALIZE_OK nr=10 result=ok"
+    "RISCV_FUTEX_WAKE_USER_RETURN_OK first_wake=1 second_wake=0"
+    "RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid="
+    "RISCV_FUTEX_ORACLE_CHILD_WOKE"
+  )
+  for pat in "${FUTEX_WAKE_ORACLE_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] FutexWake live oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # A failed oracle DONE (wrong counts) is a proof failure.
+  if rg -n "RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] FutexWake live oracle reported wrong wake counts"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196D (QUEUE-SWITCH FOUNDATION ORACLE): when armed, the two-task post-lock context
+# switch must complete end-to-end — publish/re-enqueue outgoing, handler bypass, lock dropped,
+# dequeue incoming, current set, running, real SATP + sfence.vma, frame restore, sret into B,
+# B runs in userspace, A resumes. NO Yield/FutexWait retirement marker may appear.
+if [[ "$QUEUE_SWITCH_ORACLE" == "1" ]]; then
+  QUEUE_SWITCH_PATTERNS=(
+    "RISCV_QUEUE_SWITCH_FOUNDATION_PUBLISH_BEGIN cpu=0 outgoing="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_REENQUEUE_OK tid="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_HANDLER_RETURN_OK cpu=0"
+    "RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN cpu=0"
+    "RISCV_QUEUE_SWITCH_FOUNDATION_LOCK_DROPPED_OK cpu=0"
+    "RISCV_QUEUE_SWITCH_FOUNDATION_DEQUEUE_OK cpu=0 incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_CURRENT_SET_OK cpu=0 incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_SATP_OK incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_SFENCE_OK incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_FRAME_OK incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_SRET_ARMED incoming="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_DONE result=ok"
+    "RISCV_QUEUE_SWITCH_FOUNDATION_INCOMING_USER_OK tid="
+    "RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=ok outgoing="
+  )
+  for pat in "${QUEUE_SWITCH_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] queue-switch foundation oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # outgoing_resumed=1 (round trip) is mandatory in the DONE marker. Use -a (force text): the
+  # boot log contains NUL bytes, so ripgrep would otherwise treat it as binary and skip it.
+  if ! rg -a "RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=ok .*outgoing_resumed=1" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] queue-switch foundation oracle did not prove the outgoing round-trip"
+    failures=$((failures + 1))
+  fi
+  # Any FAIL / result=fail is a proof failure.
+  if rg -n "RISCV_QUEUE_SWITCH_FOUNDATION_FAIL|RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=fail" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] queue-switch foundation oracle reported a failure"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196E/196F (FUTEXWAIT SWITCH ORACLE, run with the DEFAULT-ON mechanism): the off-global-lock
+# RISC-V retirement that context-switches the blocking caller must complete end-to-end — production
+# default-on marker, in-lock block publish, handler bypass, lock dropped, blocked-state reverify,
+# dequeue incoming, current set, running, real SATP + sfence.vma, frame restore, sret into B, B runs
+# in userspace + wakes A via split FutexWake (count 1), A resumes once. NO Yield/NR27 marker appears.
+if [[ "$FUTEX_WAIT_ORACLE" == "1" ]]; then
+  FUTEX_WAIT_PATTERNS=(
+    "RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"
+    "RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0 tid="
+    "RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid="
+    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0 outgoing="
+    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu=0"
+    "RISCV_FUTEX_WAIT_DISPATCH_DRAIN_BEGIN cpu=0"
+    "RISCV_FUTEX_WAIT_DISPATCH_LOCK_DROPPED_OK cpu=0"
+    "RISCV_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid="
+    "RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu=0 incoming="
+    "RISCV_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu=0 incoming="
+    "RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming="
+    "RISCV_FUTEX_WAIT_DISPATCH_SATP_OK incoming="
+    "RISCV_FUTEX_WAIT_DISPATCH_SFENCE_OK incoming="
+    "RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming="
+    "RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED incoming="
+    "RISCV_FUTEX_WAIT_DISPATCH_DONE result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok"
+    "RISCV_FUTEX_WAIT_INCOMING_USER_OK tid="
+    "RISCV_FUTEX_WAIT_USER_RETURN_OK tid="
+  )
+  for pat in "${FUTEX_WAIT_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] futex-wait retirement oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # The round-trip DONE with wake_count=1 is mandatory. Use -a (force text): NUL bytes in the log.
+  if ! rg -a "RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok .*wake_count=1" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait retirement oracle did not prove the round-trip (wake_count=1)"
+    failures=$((failures + 1))
+  fi
+  # Any FAIL / state_changed decline / result=fail is a proof failure.
+  if rg -n "RISCV_FUTEX_WAIT_DISPATCH_FAIL|RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed|RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=fail" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait retirement oracle reported a failure"
+    failures=$((failures + 1))
+  fi
+  # Zero Yield / NR27 retirement markers may appear (this stage retires ONLY FutexWait).
+  if rg -n "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait oracle boot leaked an NR27 retirement marker"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196F (FUTEXWAIT NO-INCOMING IDLE ORACLE): the last runnable user task blocks on a
+# never-woken futex; the production default-on drain must take the post-lock IDLE outcome — no
+# incoming, real lock-dropped proof, deferral cleared, NO frame restored, NO sret, and the real
+# RISC-V idle loop entered. The blocked caller stays Blocked and current stays None.
+if [[ "$FUTEX_WAIT_IDLE_ORACLE" == "1" ]]; then
+  FUTEX_WAIT_IDLE_PATTERNS=(
+    "RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok"
+    "RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu=0 tid="
+    "RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid="
+    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu=0 outgoing="
+    "RISCV_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu=0"
+    "RISCV_FUTEX_WAIT_DISPATCH_DRAIN_BEGIN cpu=0"
+    "RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu=0"
+    "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu=0"
+    "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu=0"
+    "RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok"
+    "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu=0"
+  )
+  for pat in "${FUTEX_WAIT_IDLE_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] futex-wait idle oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # The idle-oracle attestation with all three flags set is mandatory. Use -a (NUL bytes in log).
+  if ! rg -a "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1 outgoing_blocked=1" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait idle oracle did not prove the idle outcome (lock_dropped/current_none/outgoing_blocked)"
+    failures=$((failures + 1))
+  fi
+  # The canonical RISC-V idle terminal must be reached (reused, not a duplicate idle impl).
+  if ! rg -n -F "RISCV_KERNEL_IDLE_WAITING_FOR_IO" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait idle oracle did not reach the canonical RISC-V idle terminal"
+    failures=$((failures + 1))
+  fi
+  # Forbidden: the blocked caller must NOT be resumed (no sret into it), and no switch markers.
+  if rg -n "RISCV_FUTEX_WAIT_IDLE_ORACLE_UNEXPECTED_RETURN|RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED|RISCV_FUTEX_WAIT_DISPATCH_FAIL|RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait idle oracle took a switch/return/fail path instead of idle"
+    failures=$((failures + 1))
+  fi
+  # Zero Yield / NR27 retirement markers.
+  if rg -n "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] futex-wait idle oracle boot leaked an NR27 retirement marker"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196G (YIELD TWO-TASK ORACLE): the default-on Yield retirement must switch A→B and later
+# re-dispatch A — full re-enqueue + real SATP/sfence/frame/sret switch + round trip.
+if [[ "$YIELD_TWO_TASK_ORACLE" == "1" ]]; then
+  YIELD_TWO_PATTERNS=(
+    "RISCV_YIELD_RETIRE_DEFAULT_ON result=ok"
+    "RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu=0 outgoing="
+    "RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu=0 outgoing="
+    "RISCV_YIELD_HANDLER_BYPASS_BEGIN cpu=0 outgoing="
+    "RISCV_YIELD_HANDLER_BYPASS_DONE cpu=0"
+    "RISCV_YIELD_DISPATCH_DRAIN_BEGIN cpu=0"
+    "RISCV_YIELD_DISPATCH_LOCK_DROPPED_OK cpu=0"
+    "RISCV_YIELD_DISPATCH_REVERIFY_OK outgoing="
+    "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu=0 incoming="
+    "RISCV_YIELD_DISPATCH_CURRENT_SET_OK cpu=0 incoming="
+    "RISCV_YIELD_DISPATCH_RUNNING_OK incoming="
+    "RISCV_YIELD_DISPATCH_SATP_OK incoming="
+    "RISCV_YIELD_DISPATCH_SFENCE_OK incoming="
+    "RISCV_YIELD_DISPATCH_FRAME_OK incoming="
+    "RISCV_YIELD_DISPATCH_SRET_ARMED incoming="
+    "RISCV_YIELD_DISPATCH_DONE result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield result=ok"
+    "RISCV_YIELD_TWO_TASK_INCOMING_USER_OK tid="
+    "RISCV_YIELD_TWO_TASK_OUTGOING_RESUMED_OK tid="
+  )
+  for pat in "${YIELD_TWO_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] yield two-task oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # The round-trip DONE with outgoing_resumed=1 is mandatory. Use -a (NUL bytes in the log).
+  if ! rg -a "RISCV_YIELD_TWO_TASK_ORACLE_DONE result=ok .*outgoing_resumed=1" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] yield two-task oracle did not prove the round-trip (outgoing_resumed=1)"
+    failures=$((failures + 1))
+  fi
+  # No Yield FAIL / state_changed / result=fail.
+  if rg -n "RISCV_YIELD_DISPATCH_FAIL|RISCV_YIELD_DISPATCH_DEFERRED reason=state_changed|RISCV_YIELD_TWO_TASK_ORACLE_DONE result=fail" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] yield two-task oracle reported a failure"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Stage 196G (YIELD LONE-TASK ORACLE): the only runnable task yields and self-redispatches (the
+# drain dequeues the caller itself) — NEVER idle. Repeated Yields prove the mechanism is not one-shot.
+if [[ "$YIELD_LONE_TASK_ORACLE" == "1" ]]; then
+  YIELD_LONE_PATTERNS=(
+    "RISCV_YIELD_RETIRE_DEFAULT_ON result=ok"
+    "RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu=0 outgoing="
+    "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu=0 incoming="
+    "RISCV_YIELD_DISPATCH_SATP_OK incoming="
+    "RISCV_YIELD_DISPATCH_SFENCE_OK incoming="
+    "RISCV_YIELD_DISPATCH_FRAME_OK incoming="
+    "RISCV_YIELD_DISPATCH_DONE result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield result=ok"
+    "RISCV_YIELD_LONE_TASK_REPEAT_OK tid="
+  )
+  for pat in "${YIELD_LONE_PATTERNS[@]}"; do
+    if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] yield lone-task oracle marker missing: $pat"
+      failures=$((failures + 1))
+    fi
+  done
+  # redispatched_self=1 is mandatory. Use -a (NUL bytes in the log).
+  if ! rg -a "RISCV_YIELD_LONE_TASK_ORACLE_DONE result=ok .*redispatched_self=1" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] yield lone-task oracle did not prove self-redispatch (redispatched_self=1)"
+    failures=$((failures + 1))
+  fi
+  # The lone-Yield transition must NEVER fail or idle: the Yield drain has NO idle branch, so a
+  # Yield FAIL / state_changed is the failure signal (redispatched_self=1 proves the self-switch).
+  # (A parks via FutexWait AFTER the proof, which legitimately reaches the FutexWait post-lock idle
+  # terminal — that is not a Yield-transition idle and is not forbidden here.)
+  if rg -n "RISCV_YIELD_DISPATCH_FAIL|RISCV_YIELD_DISPATCH_DEFERRED reason=state_changed" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] yield lone-task oracle reported a Yield-transition failure"
     failures=$((failures + 1))
   fi
 fi

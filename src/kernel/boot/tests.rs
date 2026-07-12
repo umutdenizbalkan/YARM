@@ -59395,7 +59395,7 @@ mod stage191b_futex_wake_retire {
             SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_BEGIN\"")
                 && SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_WAKE_OK count={}\"")
                 && SPLIT_SRC.contains("\"FUTEX_WAKE_SPLIT_DONE result=ok\"")
-                && SPLIT_SRC.contains("{} class=FutexWake result=ok"),
+                && SPLIT_SRC.contains("{} arch=x86_64 class=FutexWake result=ok"),
             "the FutexWake split + retirement markers must exist"
         );
     }
@@ -60242,8 +60242,8 @@ mod stage192a_queue_advancing_dispatch {
             );
         }
         assert!(
-            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok"),
-            "the FutexWait retirement marker must exist"
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=FutexWait result=ok"),
+            "the x86_64 FutexWait retirement marker must exist (Stage 197 arch-tagged)"
         );
         // ReapFaultedTask stays global-lock-only.
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
@@ -60444,8 +60444,8 @@ mod stage192b_yield_queue_advancing_dispatch {
             );
         }
         assert!(
-            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok"),
-            "the Yield retirement marker must exist"
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=Yield result=ok"),
+            "the x86_64 Yield retirement marker must exist (Stage 197 arch-tagged)"
         );
         assert!(
             SCHED_SRC.contains("pub fn preempt_reenqueue_only(&mut self) -> Option<ThreadId>")
@@ -62098,19 +62098,28 @@ mod stage194_cross_arch_portability_audit {
     const AARCH64_DOC: &str = include_str!("../../../doc/ARCH_AARCH64.md");
     const RISCV_DOC: &str = include_str!("../../../doc/ARCH_RISCV64.md");
 
-    // RISC-V trap entry forces GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE inactive because it uses
-    // the raw &mut KernelState path with NO shared-path drainer — the drain does not exist
-    // yet, so the active flag must never read true there.
+    // Stage 196A superseded this Stage-194 assertion: RISC-V now enters a real shared trap
+    // path (`handle_riscv_trap_entry_shared`) that OWNS the active flag (set true before the
+    // bounded broad-lock phase, cleared after) and runs a genuine `drain_dispatch_post_work`.
+    // The prior force-false (which existed only because RISC-V had no drainer) is retired.
     #[test]
     fn riscv_trap_entry_forces_active_flag_inactive() {
+        // The shared wrapper owns the flag lifecycle (true in-lock, cleared post-lock).
         assert!(
-            RISCV_TRAP_SRC.contains("never through `handle_trap_entry_shared`"),
-            "RISC-V must still document that it does not enter the shared drain path"
+            RISCV_TRAP_SRC.contains("pub fn handle_riscv_trap_entry_shared(")
+                && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
+                && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)"),
+            "RISC-V shared wrapper must own the active flag (set true in-lock, cleared post-lock)"
         );
+        // The canonical handler no longer force-clears the flag (force-false retired).
         assert!(
-            RISCV_TRAP_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
-                && RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
-            "RISC-V trap entry must force the active flag false until a real drain exists"
+            !RISCV_TRAP_SRC.contains("force it false BEFORE handling the trap"),
+            "RISC-V force-false must be retired now that the shared wrapper drains"
+        );
+        // A real post-lock drainer exists.
+        assert!(
+            RISCV_TRAP_SRC.contains("shared.drain_dispatch_post_work(cpu)"),
+            "RISC-V shared wrapper must run the post-lock drain after the guard drops"
         );
     }
 
@@ -62343,23 +62352,25 @@ mod stage195a_aarch64_debuglog_live {
         );
     }
 
-    // x86_64 (and riscv64) marker text stays byte-identical: the arch tag is empty off AArch64,
-    // and the untagged DebugLog retirement marker is preserved for non-aarch64.
+    // Stage 197 (FIRST-COHORT SEAL): x86_64 now emits the canonical arch-tagged markers (the
+    // historical untagged text is retired). The split-dispatch tag + DebugLog retirement marker
+    // both carry `arch=x86_64`, alongside the aarch64 + riscv64 tags.
     #[test]
-    fn x86_64_marker_text_byte_identical() {
+    fn x86_64_marker_text_arch_tagged() {
         assert!(
-            TRAP_ENTRY_SRC.contains("#[cfg(not(target_arch = \"aarch64\"))]\nconst SPLIT_DISPATCH_ARCH_TAG: &str = \"\";"),
-            "the split-dispatch arch tag must be empty on non-AArch64 (x86_64 byte-identical)"
-        );
-        assert!(
-            SPLIT_SRC.contains(
-                "crate::yarm_log!(\"{} class=DebugLog result=ok\", MARK_RETIRE_CLASS_DONE);"
+            TRAP_ENTRY_SRC.contains(
+                "#[cfg(target_arch = \"x86_64\")]\nconst SPLIT_DISPATCH_ARCH_TAG: &str = \"arch=x86_64 \";"
             ),
-            "the non-aarch64 DebugLog retirement marker must stay untagged/byte-identical"
+            "the split-dispatch arch tag must be arch=x86_64 on x86_64 (Stage 197)"
         );
         assert!(
-            SPLIT_SRC.contains("arch=aarch64 class=DebugLog result=ok"),
-            "AArch64 must emit the arch-tagged DebugLog retirement marker"
+            SPLIT_SRC.contains("{} arch=x86_64 class=DebugLog result=ok"),
+            "the x86_64 DebugLog retirement marker must be arch-tagged (Stage 197)"
+        );
+        assert!(
+            SPLIT_SRC.contains("arch=aarch64 class=DebugLog result=ok")
+                && SPLIT_SRC.contains("arch=riscv64 class=DebugLog result=ok"),
+            "AArch64 + RISC-V must emit their arch-tagged DebugLog retirement markers"
         );
     }
 
@@ -62382,13 +62393,20 @@ mod stage195a_aarch64_debuglog_live {
         }
     }
 
-    // RISC-V raw path still force-clears the active flag (unchanged this stage).
+    // Stage 196A retired the RISC-V force-false: the shared wrapper now owns the active flag
+    // (set true before the bounded broad-lock phase, cleared after) with a real post-lock drain.
     #[test]
     fn riscv_still_force_clears_active_flag() {
         assert!(
-            RISCV_TRAP_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
-                && RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
-            "RISC-V must still force the active flag false"
+            RISCV_TRAP_SRC.contains("pub fn handle_riscv_trap_entry_shared(")
+                && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
+                && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)")
+                && RISCV_TRAP_SRC.contains("shared.drain_dispatch_post_work(cpu)"),
+            "RISC-V shared wrapper must own the active flag with a real post-lock drain"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("force it false BEFORE handling the trap"),
+            "RISC-V force-false must be retired"
         );
     }
 
@@ -62571,9 +62589,14 @@ mod stage195b_aarch64_initramfs_read_chunk {
                 "queue-advancing drain `{needle}` must stay x86_64-gated"
             );
         }
+        // Stage 196C/196E/196G: the RISC-V PRE-LOCK split gate is DebugLog (NR 15) + FutexWake
+        // (NR 10) ONLY — FutexWait (NR 9) and Yield (NR 0) are NOT in the split gate (their
+        // retirement is a post-lock deferral drain, not a split dispatch).
         assert!(
-            RISCV_TRAP_SRC.contains(".store(false, core::sync::atomic::Ordering::Relaxed)"),
-            "RISC-V must still force the active flag false"
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR")
+                && !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "RISC-V pre-lock split gate must be DebugLog+FutexWake-only (NR 9 + NR 0 not in the gate)"
         );
         assert!(
             !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
@@ -62919,9 +62942,10 @@ mod stage195e_aarch64_futex_wait_drain {
             "the bypass must emit its BEGIN/DONE markers"
         );
         // The in-lock restore is skipped on bypass (the drain does the authoritative restore).
+        // Stage 195G generalized the guard to `!post_lock_bypass` (FutexWait OR Yield bypass).
         assert!(
-            body.contains("if !switch_pending && !futex_wait_bypass {"),
-            "the in-lock restore must be skipped on a FutexWait bypass"
+            body.contains("if !switch_pending && !post_lock_bypass {"),
+            "the in-lock restore must be skipped on a FutexWait/Yield bypass"
         );
     }
 
@@ -63011,18 +63035,27 @@ mod stage195e_aarch64_futex_wait_drain {
                 .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"),
             "AArch64 must emit the arch-tagged FutexWait retirement marker"
         );
-        assert!(
-            RUNTIME_SRC.contains(
-                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn futex_wait_dispatch_step_mut("
-            ),
-            "futex_wait_dispatch_step_mut must be un-gated to AArch64"
-        );
-        assert!(
-            RUNTIME_SRC.contains(
-                "#[cfg(any(target_arch = \"x86_64\", target_arch = \"aarch64\"))]\n    pub(crate) fn futex_wait_reverify_blocked("
-            ),
-            "futex_wait_reverify_blocked must be un-gated to AArch64"
-        );
+        // The reused seams are un-gated to AArch64 (Stage 195E) — and to RISC-V (Stage 196E).
+        // The cfg gate is format-independent here: check the arch appears in the cfg block that
+        // immediately precedes each fn definition.
+        for sig in [
+            "pub(crate) fn futex_wait_dispatch_step_mut(",
+            "pub(crate) fn futex_wait_reverify_blocked(",
+        ] {
+            let fn_at = RUNTIME_SRC.find(sig).expect("seam fn must exist");
+            let cfg_at = RUNTIME_SRC[..fn_at]
+                .rfind("#[cfg(any(")
+                .expect("seam must have a cfg(any(..)) gate");
+            let gate = &RUNTIME_SRC[cfg_at..fn_at];
+            assert!(
+                gate.contains("target_arch = \"aarch64\""),
+                "seam must be un-gated to AArch64: {sig}"
+            );
+            assert!(
+                gate.contains("target_arch = \"riscv64\""),
+                "seam must be un-gated to RISC-V (Stage 196E): {sig}"
+            );
+        }
     }
 
     // The default-off knob enables the retire flag + provisions the init slot-5=2 sentinel and
@@ -63177,9 +63210,15 @@ mod stage195f_aarch64_futex_wait_default_on {
         }
         // The idle branch confirms current is None via a lock re-acquire, and does NOT restore a
         // frame (no post_switch_restore in the no-incoming branch — that is only in the switch arm).
+        // Bound it to end at `enter_post_lock_idle` so the subsequent Stage 195G Yield drain
+        // (which legitimately restores its incoming frame) is excluded.
         let idle_branch = block
             .split_once("Stage 195F IDLE OUTCOME")
-            .map(|(_, r)| r)
+            .map(|(_, r)| {
+                r.split_once("enter_post_lock_idle(cpu)")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
             .unwrap_or("");
         assert!(
             idle_branch.contains("kernel.current_tid(), None | Some(0)"),
@@ -63255,6 +63294,229 @@ mod stage195f_aarch64_futex_wait_default_on {
         assert!(
             !A64_SMOKE.contains("a64_split_bads+=(\"arch=aarch64 class=FutexWait\")"),
             "class=FutexWait must NOT be forbidden (default-on)"
+        );
+    }
+}
+
+// Stage 195G — AARCH64 YIELD (NR 0) OUT-OF-LOCK QUEUE-ADVANCING DISPATCH (default-on, SMP=1 +
+// SMP=2). The preempt sibling of FutexWait: the caller is re-enqueued Runnable exactly once, so
+// there is ALWAYS an incoming (another task or the caller itself) — NO idle outcome. These guards
+// pin the Yield handler bypass, re-enqueue-only publication, post-lock drain (AArch64 hooks, no
+// CR3), default-on eligibility, and that FutexWait/idle behavior is untouched.
+mod stage195g_aarch64_yield_dispatch {
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+
+    // Yield is NR 0 (NR 9 FutexWait, NR 10 FutexWake, NR 11 SpawnThread).
+    #[test]
+    fn yield_is_nr0() {
+        use crate::kernel::syscall::{
+            SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_SPAWN_THREAD_NR, SYSCALL_YIELD_NR,
+        };
+        assert_eq!(SYSCALL_YIELD_NR, 0);
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_SPAWN_THREAD_NR, 11);
+    }
+
+    // The Yield handler bypass requires a real pending Yield deferral, is separate from the
+    // FutexWait bypass, and preserves the idle loop otherwise.
+    #[test]
+    fn yield_handler_bypass_requires_pending_deferral() {
+        let body = A64_TRAP_SRC
+            .split_once("fn handle_trap_entry_with_fault_bookkeeping_mode(")
+            .map(|(_, r)| r)
+            .unwrap_or("");
+        assert!(
+            body.contains("let yield_bypass = {")
+                && body.contains("yield_dispatch_is_deferred(idx)"),
+            "the Yield bypass must be gated on a pending Yield deferral"
+        );
+        assert!(
+            body.contains("AARCH64_YIELD_HANDLER_BYPASS_BEGIN")
+                && body.contains("AARCH64_YIELD_HANDLER_BYPASS_DONE"),
+            "the Yield bypass must emit its BEGIN/DONE markers"
+        );
+        // The FutexWait bypass + the idle loop are still present (not generalized away).
+        assert!(
+            body.contains("futex_wait_bypass") && body.contains("idle_no_eret_loop();"),
+            "the FutexWait bypass and normal idle must remain intact"
+        );
+        assert!(
+            body.contains("let post_lock_bypass = futex_wait_bypass || yield_bypass;"),
+            "the restore-skip must cover both bypasses"
+        );
+    }
+
+    // The in-lock Yield deferral is DEFAULT-ON (no knob), re-enqueues exactly once via the
+    // proven seam, and keeps the legacy on_preempt fallback.
+    #[test]
+    fn yield_deferral_default_on_reenqueue_only() {
+        let body = EXEC_SRC
+            .split_once("pub fn yield_current(")
+            .map(|(_, r)| r.split_once("\n    pub ").map(|(b, _)| b).unwrap_or(r))
+            .unwrap_or("");
+        assert!(!body.is_empty(), "yield_current body must exist");
+        for needle in [
+            "GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE",
+            "dispatching_cpu_count() <= 1",
+            "BOOTSTRAP_CPU_ID",
+            "yield_dispatch_try_defer",
+            "preempt_reenqueue_current_cpu()",
+            "maybe_log_yield_default_on()",
+            "AARCH64_YIELD_DISPATCH_DEFER_BEGIN",
+            "AARCH64_YIELD_DISPATCH_REENQUEUE_OK",
+        ] {
+            assert!(
+                body.contains(needle),
+                "yield deferral must reference `{needle}`"
+            );
+        }
+        // Not gated on any enable knob (default-on) and keeps the legacy fallback.
+        assert!(
+            !body.contains("aarch64_yield_oracle_enabled()")
+                && !body.contains("aarch64_yield_retire_enabled()"),
+            "the Yield mechanism must be default-on (no enable-knob gate)"
+        );
+        assert!(
+            body.contains("self.on_preempt_current_cpu();"),
+            "ineligible/failed cases must fall back to the legacy in-lock on_preempt dispatch"
+        );
+        assert!(
+            MOD_SRC.contains("AARCH64_YIELD_RETIRE_DEFAULT_ON result=ok"),
+            "the Yield default-on attestation marker must exist"
+        );
+    }
+
+    // The post-lock Yield drain uses the generic seams (un-gated) + AArch64 arch hooks, has NO
+    // idle outcome, and no x86 CR3 logic.
+    #[test]
+    fn yield_post_lock_drain_wired_no_idle_no_cr3() {
+        let block = TRAP_ENTRY_SRC
+            .split_once("Stage 195G (AARCH64 YIELD QUEUE-ADVANCING DISPATCH)")
+            .map(|(_, r)| {
+                r.split_once("Stage 192B (YIELD")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .unwrap_or("");
+        assert!(
+            !block.is_empty(),
+            "the AArch64 Yield drain block must exist"
+        );
+        for needle in [
+            "yield_reverify_ready",
+            "yield_dispatch_step_mut",
+            "d6_genuine_mark_running_via_task_seam",
+            "d2_recv_switch_incoming_asid",
+            "post_switch_restore_arch_thread_state",
+            "yield_dispatch_clear",
+            "maybe_log_yield_retired",
+            "AARCH64_YIELD_DISPATCH_REVERIFY_OK",
+            "AARCH64_YIELD_DISPATCH_DEQUEUE_OK",
+            "AARCH64_YIELD_DISPATCH_CURRENT_SET_OK",
+            "AARCH64_YIELD_DISPATCH_RUNNING_OK",
+            "AARCH64_YIELD_DISPATCH_TTBR0_OK",
+            "AARCH64_YIELD_DISPATCH_FRAME_OK",
+            "AARCH64_YIELD_DISPATCH_DONE result=ok",
+        ] {
+            assert!(
+                block.contains(needle),
+                "the Yield drain must use/emit `{needle}`"
+            );
+        }
+        // No idle outcome (a published Yield always has an incoming); no CR3.
+        assert!(
+            !block.contains("enter_post_lock_idle") && !block.contains("result=idle"),
+            "the Yield drain must NOT have an idle outcome"
+        );
+        assert!(
+            !block.contains("switch_cr3")
+                && !block.contains("write_cr3")
+                && !block.contains("load_cr3"),
+            "the AArch64 Yield drain must NOT use x86_64 CR3 logic"
+        );
+        // The reused seams are un-gated to AArch64 (and, since Stage 196D, RISC-V). Check the
+        // seams exist and their cfg block admits all three arches.
+        assert!(
+            RUNTIME_SRC.contains("pub(crate) fn yield_dispatch_step_mut(")
+                && RUNTIME_SRC.contains("pub(crate) fn yield_reverify_ready("),
+            "yield_dispatch_step_mut + yield_reverify_ready must exist"
+        );
+        for seam in [
+            "pub(crate) fn yield_dispatch_step_mut(",
+            "pub(crate) fn yield_reverify_ready(",
+            "pub(crate) fn d6_genuine_mark_running_via_task_seam(",
+        ] {
+            let idx = RUNTIME_SRC.find(seam).expect("seam present");
+            let before = &RUNTIME_SRC[..idx];
+            let cfg = before.rfind("#[cfg(").expect("cfg present");
+            let cfg_block = &before[cfg..];
+            assert!(
+                cfg_block.contains("target_arch = \"aarch64\"")
+                    && cfg_block.contains("target_arch = \"riscv64\""),
+                "seam {seam} must be un-gated to aarch64 + riscv64"
+            );
+        }
+    }
+
+    // The retirement marker is arch-tagged, and the oracle workloads are default-off + slot-5 4/5.
+    #[test]
+    fn yield_retire_arch_tagged_and_oracles_default_off() {
+        assert!(
+            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok"),
+            "AArch64 must emit the arch-tagged Yield retirement marker"
+        );
+        assert!(
+            MOD_SRC.contains("aarch64_yield_oracle_enabled")
+                && MOD_SRC.contains("aarch64_yield_lone_oracle_enabled"),
+            "the Yield oracle workload flags must exist"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.aarch64_yield_oracle")
+                && BOOT_CMDLINE_SRC.contains("yarm.aarch64_yield_lone_oracle"),
+            "the Yield oracle knobs must parse"
+        );
+        assert!(
+            A64_BOOT_SRC.contains("init_args[5] = 4") && A64_BOOT_SRC.contains("init_args[5] = 5"),
+            "the bootstrap must provision slot-5 4 (two-task) and 5 (lone)"
+        );
+        assert!(
+            INIT_SRC.contains("AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=ok")
+                && INIT_SRC.contains(
+                    "AARCH64_YIELD_LONE_TASK_ORACLE_DONE result=ok tid={} redispatched_self=1"
+                ),
+            "init must emit both Yield oracle proof markers"
+        );
+    }
+
+    // The smoke exposes + accepts both Yield oracles and no longer forbids class=Yield.
+    #[test]
+    fn smoke_accepts_yield_oracles() {
+        assert!(
+            A64_SMOKE.contains("YIELD_ORACLE")
+                && A64_SMOKE.contains("yarm.aarch64_yield_oracle=1")
+                && A64_SMOKE.contains("AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=ok")
+                && A64_SMOKE.contains(
+                    "AARCH64_YIELD_LONE_TASK_ORACLE_DONE result=ok tid=1 redispatched_self=1"
+                )
+                && A64_SMOKE
+                    .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok"),
+            "the smoke must require the Yield two-task + lone-task acceptance markers"
+        );
+        // class=Yield is no longer forbidden (default-on).
+        assert!(
+            !A64_SMOKE.contains("\"arch=aarch64 class=Yield\""),
+            "class=Yield must NOT be forbidden (default-on)"
         );
     }
 }
@@ -63394,6 +63656,1877 @@ mod stage184_cross_arch_live {
             DOC_SRC.contains("not fake remote TLB ACK")
                 && DOC_SRC.contains("not Stage 185 global-lock retirement"),
             "doc must carry the Stage 184 non-goals"
+        );
+    }
+}
+
+// Stage 196A — RISC-V SHARED TRAP-PATH + POST-LOCK DRAIN FOUNDATION. These hosted source-check
+// guards pin: the bridge routes through the shared wrapper (no persistent raw &mut KernelState);
+// the canonical handler runs inside a bounded with_cpu; the active flag is owned by the wrapper
+// (set true before the broad phase, cleared after) with the force-false retired; the post-lock
+// drain runs after the guard drops; the default-off foundation oracle proves genuine drain
+// ordering with a real lock-dropped re-acquire; the split dispatcher stays inert (zero RISC-V
+// retirement); and post_switch_restore is a documented foundation, not a silent no-op.
+mod stage196a_riscv_shared_trap_foundation {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+
+    // SYSCALL/VARIANT counts unchanged (baseline invariant for the whole series).
+    #[test]
+    fn syscall_and_variant_counts_unchanged() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+    }
+
+    // The bridge must route through the shared wrapper and no longer hold a persistent raw
+    // `&'static mut KernelState` (the old `trap_kernel_state_mut()` path is retired).
+    #[test]
+    fn bridge_routes_through_shared_wrapper_no_raw_kernel() {
+        assert!(
+            RISCV_BOOT_SRC.contains(
+                "crate::arch::riscv64::trap::handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)"
+            ),
+            "bridge must call the shared trap-entry wrapper"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("trap_shared_kernel_riscv()"),
+            "bridge must acquire the SharedKernel, not a raw &mut KernelState"
+        );
+        // The old raw-pointer trap-kernel accessor/installer must be gone.
+        assert!(
+            !RISCV_BOOT_SRC.contains("fn trap_kernel_state_mut(")
+                && !RISCV_BOOT_SRC.contains("install_riscv_trap_kernel_state"),
+            "raw &'static mut KernelState trap accessor/installer must be retired"
+        );
+        // Boot installs the SharedKernel pointer (Stage-2N shared trap path).
+        assert!(
+            RISCV_BOOT_SRC.contains("Bootstrap::init_shared_static()")
+                && RISCV_BOOT_SRC.contains("install_riscv_trap_shared_kernel(shared)")
+                && RISCV_BOOT_SRC.contains("borrow_kernel_for_boot()"),
+            "boot must own KernelState through a SharedKernel like x86_64/AArch64"
+        );
+    }
+
+    // The canonical RISC-V handler runs UNCHANGED inside the bounded with_cpu broad-lock phase.
+    #[test]
+    fn canonical_handler_runs_inside_bounded_with_cpu() {
+        assert!(
+            RISCV_TRAP_SRC.contains(".with_cpu(cpu, |kernel| {")
+                && RISCV_TRAP_SRC.contains("handle_trap_entry_with_fault_bookkeeping_mode("),
+            "wrapper must run the canonical handler inside a bounded with_cpu callback"
+        );
+    }
+
+    // Active-flag ownership: the wrapper sets true before the broad phase and clears after; the
+    // RISC-V force-false is retired (owned by the wrapper now).
+    #[test]
+    fn active_flag_owned_by_wrapper_force_false_retired() {
+        assert!(
+            RISCV_TRAP_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]")
+                && RISCV_TRAP_SRC.contains(".store(true, Ordering::Relaxed)")
+                && RISCV_TRAP_SRC.contains(".store(false, Ordering::Relaxed)"),
+            "wrapper must set the active flag true before the broad phase and clear it after"
+        );
+        // The canonical handler must NOT force-clear the flag anymore (the old force-false
+        // comment/store is retired; the wrapper owns the flag lifecycle).
+        assert!(
+            !RISCV_TRAP_SRC.contains("force it false BEFORE handling the trap"),
+            "the canonical handler's force-false must be retired (wrapper owns the flag)"
+        );
+        // Required structural markers present.
+        for m in [
+            "RISCV_SHARED_TRAP_ENTRY_BEGIN cpu=",
+            "RISCV_GLOBAL_LOCK_DROP_ACTIVE_SET cpu=",
+            "RISCV_GLOBAL_LOCK_PHASE_DONE cpu=",
+            "RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR cpu=",
+            "RISCV_POST_LOCK_DRAIN_BEGIN cpu=",
+            "RISCV_POST_LOCK_DRAIN_DONE cpu=",
+            "RISCV_SHARED_TRAP_ENTRY_DONE cpu=",
+        ] {
+            assert!(
+                RISCV_TRAP_SRC.contains(m),
+                "wrapper must emit structural marker: {m}"
+            );
+        }
+        // Markers are bounded (one-shot latch), not emitted on every trap.
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_SHARED_TRAP_MARKERS_LOGGED")
+                && RISCV_TRAP_SRC
+                    .contains("let log_structural = !RISCV_SHARED_TRAP_MARKERS_LOGGED"),
+            "structural markers must be one-shot latched (no per-tick flood)"
+        );
+    }
+
+    // Post-lock drain runs AFTER the broad guard drops, and BEFORE it any deferred blocked-waiter
+    // delivery producer would have stashed work (the real drainer).
+    #[test]
+    fn post_lock_drain_runs_after_guard_release() {
+        // ordering: PHASE_DONE / ACTIVE_CLEAR must precede drain_dispatch_post_work.
+        let clear_idx = RISCV_TRAP_SRC
+            .find("RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR")
+            .expect("clear marker present");
+        let drain_idx = RISCV_TRAP_SRC
+            .find("shared.drain_dispatch_post_work(cpu)")
+            .expect("drain call present");
+        assert!(
+            clear_idx < drain_idx,
+            "the active flag must be cleared before the post-lock drain runs"
+        );
+    }
+
+    // Foundation oracle: default-off knob, genuine lock-dropped re-acquire proof, no mutation.
+    #[test]
+    fn foundation_oracle_default_off_and_genuine() {
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_post_lock_foundation_oracle")
+                && MOD_SRC.contains("fn riscv_post_lock_foundation_oracle_enabled()"),
+            "foundation oracle must be gated behind a default-off boot knob"
+        );
+        for m in [
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_PUBLISH_OK cpu=",
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_LOCK_DROPPED_OK cpu=",
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_DRAIN_OK cpu=",
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_USER_RETURN_OK tid=",
+            "RISCV_POST_LOCK_FOUNDATION_ORACLE_DONE result=ok",
+        ] {
+            assert!(
+                RISCV_TRAP_SRC.contains(m),
+                "foundation oracle must emit marker: {m}"
+            );
+        }
+        // The lock-dropped proof must be a REAL re-acquire of with_cpu after the drain.
+        assert!(
+            RISCV_TRAP_SRC.contains("Lock-dropped proof: this re-acquire is only possible")
+                && RISCV_TRAP_SRC.contains(".with_cpu(cpu, |kernel| kernel.current_tid())"),
+            "lock-dropped proof must genuinely re-acquire with_cpu (deadlocks if still held)"
+        );
+        // Publish stores only the tid token (a biased atomic), and the drain consumes it via swap
+        // + a read-only current_tid re-read — no scheduler/cap/user mutation.
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx]")
+                && RISCV_TRAP_SRC.contains(".store(tid.wrapping_add(1), Ordering::Release)")
+                && RISCV_TRAP_SRC.contains(
+                    "RISCV_POST_LOCK_FOUNDATION_ORACLE_TOKEN[cpu_idx].swap(0, Ordering::AcqRel)"
+                ),
+            "oracle must publish/consume a pure atomic token (no scheduler/cap/user mutation)"
+        );
+    }
+
+    // Stage 196B: the wrapper's split dispatch is gated to DebugLog (NR 15) ONLY; every other
+    // RISC-V class stays global-lock-only. (See the dedicated stage196b module for the full
+    // DebugLog wiring proof.)
+    #[test]
+    fn split_dispatcher_debuglog_only() {
+        // Stage 196C: the wrapper gates split dispatch to NR 15 (DebugLog) + NR 10 (FutexWake).
+        assert!(
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR")
+                && RISCV_TRAP_SRC.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "RISC-V wrapper must invoke the split dispatcher for NR 15 + NR 10 only"
+        );
+        // Smoke must class-specifically forbid every NON-retired class (FutexWake is now allowed).
+        for c in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk",
+        ] {
+            assert!(
+                RISCV_SMOKE.contains(c),
+                "smoke must reject non-retired RISC-V retirement class: {c}"
+            );
+        }
+        // FutexWake must NOT be in the reject list anymore (it is retired in 196C).
+        assert!(
+            !RISCV_SMOKE.contains("'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWake'"),
+            "smoke must NOT forbid class=FutexWake (retired in 196C)"
+        );
+        // Smoke must require the split-dispatch marker + the DebugLog/FutexWake-only guard.
+        assert!(
+            RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=15")
+                && RISCV_SMOKE.contains("non-DebugLog/non-FutexWake syscall"),
+            "smoke must assert DebugLog+FutexWake-only split dispatch"
+        );
+    }
+
+    // Part 5: post_switch_restore is a documented foundation delegating to a real restore, not a
+    // silent no-op.
+    #[test]
+    fn post_switch_restore_is_documented_foundation() {
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "super::riscv64::trap::restore_arch_thread_state_post_switch(kernel, cpu, frame)"
+            ),
+            "riscv post_switch_restore must delegate to the documented foundation, not Ok(())"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("pub fn restore_arch_thread_state_post_switch(")
+                && RISCV_TRAP_SRC.contains("resume_current_thread_with_frame")
+                && RISCV_TRAP_SRC.contains("SATP/ASID"),
+            "foundation restore must document the incoming SATP/ASID + sepc/sstatus/GPR contract"
+        );
+    }
+
+    // The shared trap path runs the whole syscall dispatch on RISCV_TRAP_STACK; the wrapper's
+    // canary flag exposed a pre-existing 16 KiB overflow into adjacent .bss. Pin the enlarged
+    // trap stack so the regression cannot silently return.
+    #[test]
+    fn trap_stack_is_large_enough_for_shared_dispatch() {
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "RISCV_TRAP_STACK must be 2 MiB (16 KiB overflowed the deepest shared-path dispatch)"
+        );
+        // The old fixed 16 KiB literal must be gone from the trap-stack definition.
+        assert!(
+            !RISCV_BOOT_SRC.contains("struct RiscvTrapStack([u8; 16 * 1024])"),
+            "the former 16 KiB trap-stack definition must be retired"
+        );
+        // The trap-stack debt TODO must remain documented (Stage 196B Part 7).
+        assert!(
+            RISCV_BOOT_SRC.contains("emergency correctness size")
+                || RISCV_BOOT_SRC.contains("measure maximum stack depth")
+                || RISCV_BOOT_SRC.contains("2 MiB for solid headroom"),
+            "trap-stack debt must remain documented"
+        );
+    }
+}
+
+// Stage 196B — RISC-V DEBUGLOG (NR 15) SPLIT-DISPATCH RETIREMENT. DebugLog is the FIRST and
+// ONLY live RISC-V split-dispatch class. These hosted source-check guards pin: the wrapper gates
+// split dispatch to NR 15 only; the retirement markers are arch=riscv64 tagged; the userspace
+// return-proof marker exists; the DebugLog helper is a pure read (no broad &mut / scheduler / cap
+// / IPC / switch mutation); the ABI import maps a7→nr, a0..a5→args; sepc advances once; every
+// other class stays excluded; ReapFaultedTask stays excluded; counts unchanged.
+mod stage196b_riscv_debuglog_split {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // Stage 196C: the RISC-V wrapper gates split dispatch to NR 15 (DebugLog) + NR 10 (FutexWake).
+    #[test]
+    fn debuglog_is_nr15_and_only_riscv_split_class() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR, 15);
+        assert_eq!(crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR, 10);
+        // The wrapper's split gate is an equality check on NR 15 and NR 10.
+        assert!(
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR"),
+            "the wrapper must gate split dispatch on NR 15 + NR 10"
+        );
+        // No queue-advancing / blocking class NR appears as a split gate in the wrapper.
+        for other in [
+            "SYSCALL_FUTEX_WAIT_NR",
+            "SYSCALL_YIELD_NR",
+            "SYSCALL_INITRAMFS_READ_CHUNK_NR",
+        ] {
+            assert!(
+                !RISCV_TRAP_SRC.contains(other),
+                "wrapper must not gate split dispatch on {other}"
+            );
+        }
+    }
+
+    // Required live markers are emitted by the wrapper (kernel side) + init (userspace side).
+    #[test]
+    fn required_debuglog_markers_present() {
+        for m in [
+            "RISCV_SPLIT_ABI_IMPORT_OK nr={}",
+            "YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr={} cpu=",
+            "RISCV_SPLIT_FINALIZE_OK nr={} result=ok",
+        ] {
+            assert!(
+                RISCV_TRAP_SRC.contains(m),
+                "wrapper must emit split marker: {m}"
+            );
+        }
+        // Retirement markers are arch=riscv64 tagged (added alongside the aarch64 tag; x86 stays
+        // untagged).
+        assert!(
+            SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
+                && SPLIT_SRC.contains("arch=aarch64 class=DebugLog"),
+            "DebugLog retirement markers must be arch-tagged for riscv64 (and aarch64)"
+        );
+        // Userspace return proof: emitted by init AFTER INIT_RUN_ENTER's DebugLog returns.
+        assert!(
+            INIT_SRC.contains("RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK"),
+            "init must emit the userspace return-proof marker"
+        );
+        let enter = INIT_SRC.find("INIT_RUN_ENTER").expect("INIT_RUN_ENTER");
+        let ret = INIT_SRC
+            .find("RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK")
+            .expect("return marker");
+        assert!(
+            enter < ret,
+            "the userspace return marker must follow INIT_RUN_ENTER (proving the split DebugLog returned)"
+        );
+    }
+
+    // Split dispatch returns early (skips the broad-lock phase + active flag) for a handled
+    // DebugLog: no post-lock drain is owed.
+    #[test]
+    fn debuglog_split_returns_early_before_broad_lock() {
+        // The handled split arm returns before the flag is set / with_cpu runs.
+        let gate = RISCV_TRAP_SRC
+            .find("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+            .expect("gate");
+        let active_set = RISCV_TRAP_SRC
+            .find(".store(true, Ordering::Relaxed)")
+            .expect("active-set");
+        assert!(
+            gate < active_set,
+            "the NR-15 split gate must run BEFORE the active flag is set (early return skips it)"
+        );
+        assert!(
+            RISCV_TRAP_SRC[gate..active_set].contains("return Ok(());"),
+            "a handled DebugLog must return early before the broad-lock phase"
+        );
+    }
+
+    // The DebugLog helper is a pure read (no broad &mut KernelState / scheduler / cap / IPC /
+    // address-space switch), and encodes UserMemoryFault honestly (never masked as success).
+    #[test]
+    fn debuglog_helper_is_pure_read() {
+        // The helper uses the ASID-based split read seam, not a broad borrow.
+        assert!(
+            SPLIT_SRC.contains("copy_from_user_asid_split_read")
+                && SPLIT_SRC.contains("current_tid_authoritative"),
+            "DebugLog helper must use the bounded split seams (no broad &mut KernelState)"
+        );
+        // The DebugLog split arm in try_split_dispatch_into_frame routes NR 15 to the helper.
+        assert!(
+            SPLIT_SRC.contains("try_split_debug_log_into_frame(shared, cpu, frame)"),
+            "the frame-level seam must route DebugLog to its helper"
+        );
+    }
+
+    // sepc advances exactly once: the bridge pre-advances tframe.saved_pc by +4 and the split
+    // path does NOT add a second advance (parity with the canonical handler).
+    #[test]
+    fn sepc_advances_exactly_once_on_split() {
+        // The bridge is the sole +4 pre-advance site (Stage 163L/M); the wrapper does not add one.
+        assert!(
+            RISCV_BOOT_SRC.contains("let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };")
+                && RISCV_BOOT_SRC.contains("tframe.set_saved_pc(sepc + advance);"),
+            "the bridge must be the single sepc +4 pre-advance site"
+        );
+        // The wrapper's DebugLog arm must not touch saved_pc (no second advance).
+        assert!(
+            !RISCV_TRAP_SRC.contains("set_saved_pc"),
+            "the wrapper must not advance sepc (the bridge already did, exactly once)"
+        );
+    }
+
+    // Every other RISC-V retirement class + ReapFaultedTask remain excluded; counts unchanged.
+    #[test]
+    fn other_classes_and_reap_excluded_counts_unchanged() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
+        // retired in 196C, so it is NOT rejected).
+        for bad in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk",
+            "RISCV_FUTEX_WAIT_DISPATCH_",
+            "RISCV_YIELD_DISPATCH_",
+        ] {
+            assert!(RISCV_SMOKE.contains(bad), "smoke must reject: {bad}");
+        }
+        // ReapFaultedTask must never be split-eligible.
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never pass the split NR gate"
+        );
+    }
+}
+
+// Stage 196C — RISC-V FUTEXWAKE (NR 10) SPLIT RETIREMENT + LIVE ORACLE. FutexWake is the SECOND
+// live RISC-V split-dispatch class (after DebugLog). These hosted source-check guards pin: NR
+// identities; the wrapper gates NR 10 + NR 15 only; the FutexWake helper is used; FutexWait stays
+// excluded; the retirement/split markers are arch=riscv64 tagged; the caller is not switched
+// (set_ok result lane, no post-lock drain); the live oracle (child blocks legacy NR 9, parent
+// wakes via split NR 10, counts 1 then 0) + userspace return proof exist; the knob + slot-5
+// provision are wired; DebugLog stays live; counts unchanged; queue-advancing classes stay inert.
+mod stage196c_riscv_futex_wake_split {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // NR identities (FutexWait=9, FutexWake=10, SpawnThread=11) — FutexWake is NOT 11.
+    #[test]
+    fn nr_identities() {
+        use crate::kernel::syscall::{
+            SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_SPAWN_THREAD_NR,
+        };
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_SPAWN_THREAD_NR, 11);
+    }
+
+    // The wrapper's split gate includes NR 10 and NR 15 ONLY (FutexWait NR 9 excluded).
+    #[test]
+    fn gate_is_nr10_and_nr15_only() {
+        assert!(
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR"),
+            "wrapper must gate split dispatch on NR 15 + NR 10"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "FutexWait (NR 9) must stay global-lock-only (not in the RISC-V split gate)"
+        );
+    }
+
+    // The FutexWake split helper is reused and its markers are arch=riscv64 tagged.
+    #[test]
+    fn futex_wake_helper_used_and_arch_tagged() {
+        assert!(
+            SPLIT_SRC.contains("try_split_futex_wake_into_frame(shared, cpu, frame)"),
+            "the frame-level seam must route FutexWake to its helper"
+        );
+        // futex_wake_split_mut (rank-proof seam) is the accepted 191B implementation.
+        assert!(
+            SPLIT_SRC.contains("futex_wake_split_mut"),
+            "the FutexWake helper must use the accepted futex_wake_split_mut seam"
+        );
+        // Arch-tagged split + retirement markers for riscv64 (alongside aarch64; x86 untagged).
+        for m in [
+            "FUTEX_WAKE_SPLIT_BEGIN arch=riscv64",
+            "FUTEX_WAKE_SPLIT_DONE arch=riscv64 result=ok woke=",
+            "arch=riscv64 class=FutexWake",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(m),
+                "syscall_split must emit riscv64 marker: {m}"
+            );
+        }
+    }
+
+    // The caller is NOT switched: FutexWake writes the wake count via set_ok and returns early
+    // (no broad-lock phase, no post-lock switch drain) — the caller stays current.
+    #[test]
+    fn caller_not_switched_wake_count_in_result_lane() {
+        // The helper writes the wake count into the result lane.
+        assert!(
+            SPLIT_SRC.contains("frame.set_ok(woke as usize, 0, 0)"),
+            "FutexWake must return the wake count in the a0 result lane via set_ok"
+        );
+        // The wrapper never advances sepc (bridge does it once). (Stages 196E/196G add SEPARATE
+        // FutexWait + Yield queue-advancing drains gated on their OWN deferrals — never reached by a
+        // split FutexWake, whose helper returns early before the broad-lock phase — so
+        // `RISCV_FUTEX_WAIT_DISPATCH_` and `RISCV_YIELD_DISPATCH_` legitimately appear in trap.rs
+        // now and are NOT part of the FutexWake path.)
+        assert!(
+            !RISCV_TRAP_SRC.contains("set_saved_pc"),
+            "the split FutexWake must not advance sepc twice"
+        );
+        // The FutexWait drain is gated on its OWN deferral (never a FutexWake).
+        assert!(
+            RISCV_TRAP_SRC.contains(
+                "if cpu_idx < MAX_CPUS && crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx)"
+            ),
+            "the 196E FutexWait drain must be gated on a FutexWait deferral, independent of FutexWake"
+        );
+    }
+
+    // The live oracle exists (child + parent) with the authoritative handshake coordination and
+    // emits the required proof markers; the knob + slot-5 provision are wired.
+    #[test]
+    fn live_oracle_and_wiring_present() {
+        assert!(
+            INIT_SRC.contains("fn run_riscv_futex_wake_oracle(")
+                && INIT_SRC.contains("extern \"C\" fn riscv_futex_oracle_child()"),
+            "the RISC-V FutexWake oracle parent + child must exist"
+        );
+        // Authoritative coordination: the parent blocks on the handshake futex (not a delay loop).
+        assert!(
+            INIT_SRC.contains("FUTEX_ORACLE_HANDSHAKE")
+                && INIT_SRC.contains("RISCV_FUTEX_ORACLE_PARENT_HANDSHAKE_WAIT"),
+            "the oracle must use the authoritative handshake-futex coordination"
+        );
+        // The child blocks through the LEGACY FutexWait (NR 9), the parent wakes via split NR 10.
+        for m in [
+            "RISCV_FUTEX_WAKE_USER_RETURN_OK first_wake={} second_wake={}",
+            "RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid={}",
+        ] {
+            assert!(INIT_SRC.contains(m), "oracle must emit: {m}");
+        }
+        // Knob + boot flag + slot-5 provision.
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_futex_wake_oracle")
+                && MOD_SRC.contains("fn riscv_futex_wake_oracle_enabled()")
+                && RISCV_BOOT_SRC.contains("RISCV_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1"),
+            "the FutexWake oracle knob + flag + slot-5 provision must be wired"
+        );
+        // Smoke arms + asserts the oracle end-to-end.
+        assert!(
+            RISCV_SMOKE.contains("FUTEX_WAKE_ORACLE")
+                && RISCV_SMOKE.contains("RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid=")
+                && RISCV_SMOKE.contains("YARM_LOCK_SPLIT_DISPATCH arch=riscv64 nr=10 cpu=0 result=ok"),
+            "smoke must arm + assert the FutexWake live oracle"
+        );
+    }
+
+    // DebugLog stays live; FutexWait/Yield/NR27 stay excluded; ReapFaultedTask excluded; counts
+    // unchanged; trap-stack fix preserved.
+    #[test]
+    fn debuglog_live_others_excluded_counts_unchanged() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert!(
+            SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
+            "DebugLog must stay a live riscv64 split class"
+        );
+        for bad in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=InitramfsReadChunk",
+        ] {
+            assert!(RISCV_SMOKE.contains(bad), "smoke must still reject: {bad}");
+        }
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the 2 MiB trap-stack fix must be preserved"
+        );
+    }
+}
+
+// Stage 196D: RISC-V QUEUE-ADVANCING CONTEXT-SWITCH DRAIN FOUNDATION.
+//
+// The foundation proves a genuine RISC-V post-lock context switch: an outgoing userspace task
+// yields → the in-lock Yield handler publishes a one-shot deferral (re-enqueues the outgoing
+// task Runnable + clears `current`) → the broad `with_cpu` guard drops → the post-lock drain
+// dequeues the incoming task, activates its SATP/ASID with the required `sfence.vma`, restores
+// its saved frame, and `sret`s into it. It enables ZERO new syscall retirement classes: it is a
+// SEPARATE default-off one-shot deferral that never emits a Yield/FutexWait retirement marker.
+mod stage196d_riscv_queue_switch_foundation {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // The foundation is default-off: the knob parses, and with no knob it stays disabled. This is
+    // asserted through the run-time state (not just the source), so a regression that flipped the
+    // default to on would fail here.
+    #[test]
+    fn foundation_defaults_off() {
+        assert!(
+            !crate::kernel::boot::riscv_queue_switch_foundation_oracle_enabled(),
+            "the queue-switch foundation oracle must default OFF"
+        );
+        // `armed` is knob-gated: with the knob off it is never armed regardless of one-shot state.
+        assert!(
+            !crate::kernel::boot::riscv_queue_switch_foundation_armed(),
+            "the foundation must never be armed while the knob is off"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_queue_switch_foundation_oracle")
+                && MOD_SRC.contains("fn set_riscv_queue_switch_foundation_oracle_enabled("),
+            "the knob + setter must be wired"
+        );
+    }
+
+    // ZERO new retirement classes: counts unchanged, DebugLog + FutexWake stay the ONLY live
+    // riscv64 split classes, and the foundation emits NO retirement marker for Yield/FutexWait.
+    #[test]
+    fn zero_new_retirement_classes() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        // DebugLog + FutexWake remain live (unchanged from 196B/196C).
+        assert!(
+            SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
+                && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
+            "DebugLog + FutexWake must stay live riscv64 split classes"
+        );
+        // The 196D FOUNDATION code itself enables ZERO retirement: neither the foundation drain
+        // (trap.rs, scoped between the 196D header and the 196E FutexWait drain) nor the foundation
+        // in-lock publish (exec_state.rs, scoped between the 196D header and the 196G Yield block)
+        // emits a FutexWait/Yield retirement marker. (Stages 196E/196F/196G add SEPARATE retirement
+        // drains — scoped OUT here.)
+        let foundation_drain = RISCV_TRAP_SRC
+            .split("Stage 196D: queue-advancing context-switch FOUNDATION drain")
+            .nth(1)
+            .unwrap()
+            .split("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
+            .next()
+            .unwrap();
+        let foundation_publish = EXEC_STATE_SRC
+            .split("Stage 196D (RISC-V QUEUE-ADVANCING CONTEXT-SWITCH FOUNDATION)")
+            .nth(1)
+            .unwrap()
+            .split("Stage 196G (RISC-V YIELD QUEUE-ADVANCING RETIREMENT")
+            .next()
+            .unwrap();
+        for bad in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait",
+            "RISCV_FUTEX_WAIT_DISPATCH_",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield",
+            "RISCV_YIELD_DISPATCH_",
+        ] {
+            assert!(
+                !foundation_drain.contains(bad) && !foundation_publish.contains(bad),
+                "queue-switch foundation must not emit retirement marker: {bad}"
+            );
+        }
+    }
+
+    // The handler bypass requires an ACTUAL pending per-CPU deferral (not a generic "skip
+    // restore" flag): it early-returns from the bounded `with_cpu` phase ONLY when
+    // `riscv_queue_switch_foundation_is_deferred` holds.
+    #[test]
+    fn handler_bypass_requires_real_deferral() {
+        assert!(
+            RISCV_TRAP_SRC.contains(
+                "if crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx) {"
+            ) && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_HANDLER_RETURN_OK cpu={}"),
+            "the handler bypass must be gated on a real per-CPU deferral + emit HANDLER_RETURN_OK"
+        );
+    }
+
+    // The switch drain is POST-LOCK: it runs after the broad `with_cpu` closure returns, and
+    // proves the lock dropped by re-acquiring the scheduler seam through the SharedKernel
+    // (`yield_reverify_ready`) before emitting LOCK_DROPPED_OK. The SATP/frame restore happens in
+    // a fresh bounded `with_cpu` re-acquire — never inside the original broad guard.
+    #[test]
+    fn drain_is_post_lock_after_broad_guard_drops() {
+        // The drain block emits DRAIN_BEGIN then LOCK_DROPPED_OK gated on yield_reverify_ready.
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN cpu={}")
+                && RISCV_TRAP_SRC.contains("let reverify_ok = shared.yield_reverify_ready(cpu);")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_LOCK_DROPPED_OK cpu={}"),
+            "the drain must reverify readiness (proving the broad guard dropped) then LOCK_DROPPED_OK"
+        );
+        // The real arch restore is a FRESH bounded re-acquire.
+        assert!(
+            RISCV_TRAP_SRC.contains(".with_cpu(cpu, |kernel| {"),
+            "the SATP/frame restore must run in a fresh bounded with_cpu re-acquire"
+        );
+    }
+
+    // In-lock invariants: the outgoing task is re-enqueued Runnable exactly once + `current`
+    // cleared via the accepted preempt seam, and the in-lock dispatch is SKIPPED (return Ok(())).
+    #[test]
+    fn reenqueue_and_current_invariants() {
+        assert!(
+            EXEC_STATE_SRC.contains("match self.preempt_reenqueue_current_cpu() {")
+                && EXEC_STATE_SRC
+                    .contains("RISCV_QUEUE_SWITCH_FOUNDATION_PUBLISH_BEGIN cpu={} outgoing={}")
+                && EXEC_STATE_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_REENQUEUE_OK tid={}"),
+            "the in-lock defer must re-enqueue the outgoing task via the accepted preempt seam"
+        );
+        // A re-enqueue failure clears the deferral and falls through to the LEGACY in-lock
+        // dispatch (never a fabricated success).
+        assert!(
+            EXEC_STATE_SRC
+                .contains("RISCV_QUEUE_SWITCH_FOUNDATION_FALLBACK reason=reenqueue_failed"),
+            "a re-enqueue failure must fall back to the legacy dispatch"
+        );
+        // The defer is one-shot AND gated to BSP + single dispatcher + trap path.
+        assert!(
+            EXEC_STATE_SRC.contains("riscv_queue_switch_foundation_armed()")
+                && EXEC_STATE_SRC.contains("&& single_cpu")
+                && EXEC_STATE_SRC.contains("&& is_bsp")
+                && EXEC_STATE_SRC
+                    .contains("riscv_queue_switch_foundation_try_defer(cpu_idx, out_tid)"),
+            "the defer must be one-shot + BSP + single-dispatcher + trap-path gated"
+        );
+    }
+
+    // The SATP/ASID activation is REAL RISC-V: it constructs the incoming task's satp
+    // (`cr3_for_asid`), installs the shared kernel mapping, and writes it via `write_satp` (which
+    // performs the `csrw satp` + `sfence.vma`). NO x86 CR3 / AArch64 TTBR0 logic is used.
+    #[test]
+    fn satp_asid_sfence_is_real_riscv() {
+        assert!(
+            RISCV_TRAP_SRC.contains("crate::arch::riscv64::page_table::cr3_for_asid(asid)")
+                && RISCV_TRAP_SRC.contains("crate::arch::riscv64::page_table::write_satp(satp)")
+                && RISCV_TRAP_SRC.contains(
+                    "crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid)"
+                ),
+            "the drain must construct + write the incoming task's SATP via the riscv64 page_table"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_SATP_OK incoming={} asid={}")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_SFENCE_OK incoming={}"),
+            "the drain must emit SATP_OK + SFENCE_OK for the incoming ASID"
+        );
+        // No cross-arch page-table CALLS leaked into the riscv64 drain: it never invokes the
+        // x86 or aarch64 page-table modules (a bare mention in a doc-comment is fine — these
+        // match call-path syntax that only appears when actually calling those modules).
+        assert!(
+            !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
+                && !RISCV_TRAP_SRC.contains("arch::aarch64::page_table")
+                && !RISCV_TRAP_SRC.contains("write_cr3(")
+                && !RISCV_TRAP_SRC.contains("set_ttbr0"),
+            "the riscv64 drain must not call x86 CR3 or AArch64 TTBR0 page-table logic"
+        );
+        // `write_satp` genuinely issues the sfence.vma (not a marker).
+        const PAGE_TABLE_SRC: &str = include_str!("../../arch/riscv64/page_table.rs");
+        assert!(
+            PAGE_TABLE_SRC.contains("sfence.vma"),
+            "write_satp's sfence.vma must be a real hardware fence"
+        );
+    }
+
+    // Frame selection + sret: the drain restores the INCOMING task's saved frame via the shared
+    // arch-restore seam (which routes through apply_user_context for the current task, now B), then
+    // emits FRAME_OK + SRET_ARMED. The bridge performs the actual sret.
+    #[test]
+    fn frame_restore_and_sret_armed() {
+        assert!(
+            RISCV_TRAP_SRC.contains("restore_arch_thread_state(kernel, cpu, Some(&mut *frame))")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_FRAME_OK incoming={}")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_SRET_ARMED incoming={}")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_DONE result=ok"),
+            "the drain must restore the incoming frame then emit FRAME_OK + SRET_ARMED + DRAIN_DONE"
+        );
+        // Before the restore, B is set current + marked Running via the accepted rank-2 task seam.
+        assert!(
+            RISCV_TRAP_SRC.contains("shared.d6_genuine_mark_running_via_task_seam(incoming)")
+                && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_RUNNING_OK incoming={}"),
+            "the incoming task must be marked Running via the accepted task seam before restore"
+        );
+    }
+
+    // No-incoming is a GENUINE failure, never a fake success: the drain emits FAIL reason=no_incoming
+    // and does NOT fabricate an idle task or a DONE marker.
+    #[test]
+    fn no_incoming_is_failure_not_fake_success() {
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_FAIL reason=no_incoming")
+                && RISCV_TRAP_SRC
+                    .contains("RISCV_QUEUE_SWITCH_FOUNDATION_FAIL reason=state_changed"),
+            "the drain must FAIL honestly on no_incoming / state_changed"
+        );
+        // The smoke rejects any FAIL marker or a result=fail DONE.
+        assert!(
+            RISCV_SMOKE.contains("RISCV_QUEUE_SWITCH_FOUNDATION_FAIL")
+                && RISCV_SMOKE.contains("RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=fail"),
+            "the smoke must reject FAIL + result=fail"
+        );
+    }
+
+    // The live oracle + wiring: a two-task oracle (parent yields, child runs in userspace) with
+    // the round-trip proof, plus the knob + slot-5 provision + smoke arming.
+    #[test]
+    fn live_oracle_and_wiring_present() {
+        assert!(
+            INIT_SRC.contains("fn run_riscv_queue_switch_foundation_oracle(")
+                && INIT_SRC.contains("extern \"C\" fn riscv_queue_switch_foundation_child()"),
+            "the queue-switch oracle parent + child must exist"
+        );
+        assert!(
+            INIT_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_INCOMING_USER_OK tid=")
+                && INIT_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=ok"),
+            "the oracle must emit INCOMING_USER_OK (child ran) + ORACLE_DONE result=ok"
+        );
+        // Slot-5 sentinel 2 provisions the queue-switch oracle (distinct from FutexWake's 1).
+        assert!(
+            RISCV_BOOT_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_PROVISION_OK slot5=2")
+                && MOD_SRC.contains("fn riscv_queue_switch_foundation_oracle_enabled()"),
+            "the queue-switch oracle slot-5 provision (sentinel 2) must be wired"
+        );
+        // The smoke arms + asserts the full round trip (outgoing_resumed=1).
+        assert!(
+            RISCV_SMOKE.contains("QUEUE_SWITCH_ORACLE")
+                && RISCV_SMOKE.contains(
+                    "RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_DONE result=ok .*outgoing_resumed=1"
+                ),
+            "the smoke must arm + assert the queue-switch round trip"
+        );
+    }
+
+    // ReapFaultedTask stays excluded from split dispatch, and the 2 MiB trap-stack fix is
+    // preserved (the switch-drain path adds no new stack debt beyond the bounded re-acquire).
+    #[test]
+    fn reap_excluded_and_trap_stack_preserved() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the 2 MiB trap-stack fix must be preserved"
+        );
+    }
+}
+
+// Stage 196E: RISC-V FutexWait (NR 9) queue-advancing RETIREMENT — live controlled oracle.
+//
+// The FIRST genuine off-global-lock RISC-V syscall retirement that context-switches the BLOCKING
+// caller. Behind a DEFAULT-OFF, ONE-SHOT oracle: an eligible FutexWait publishes `Blocked(Futex)`
+// + clears `current` in-lock, returns through the RISC-V FutexWait handler bypass, and the shared
+// post-lock drain switches to the incoming task with a REAL SATP/sfence.vma + frame restore + sret
+// (reusing the 196D machinery). Eligibility REQUIRES an incoming runnable task; no-incoming keeps
+// the canonical legacy path. Enables NO default-on retirement and does NOT retire Yield.
+mod stage196e_riscv_futex_wait_retirement {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // NR identities: FutexWait=9, FutexWake=10, DebugLog=15 (FutexWait is NOT 10).
+    #[test]
+    fn nr_identities() {
+        use crate::kernel::syscall::{
+            SYSCALL_DEBUG_LOG_NR, SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR,
+        };
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_DEBUG_LOG_NR, 15);
+    }
+
+    // Stage 196F: the SWITCH-oracle WORKLOAD knob still parses + defaults off, but it no longer
+    // arms kernel retirement (the mechanism is default-on). The old `armed`/`try_consume` one-shot
+    // latch is REMOVED from the kernel entirely.
+    #[test]
+    fn workload_knob_defaults_off_mechanism_default_on() {
+        assert!(
+            !crate::kernel::boot::riscv_futex_wait_oracle_enabled(),
+            "the FutexWait SWITCH-oracle WORKLOAD knob must default OFF"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_futex_wait_oracle")
+                && MOD_SRC.contains("fn set_riscv_futex_wait_oracle_enabled("),
+            "the workload knob + setter must be wired"
+        );
+        // The one-shot consume latch / armed gate are GONE (Stage 196F default-on).
+        assert!(
+            !MOD_SRC.contains("RISCV_FUTEX_WAIT_ORACLE_CONSUMED")
+                && !MOD_SRC.contains("fn riscv_futex_wait_oracle_try_consume(")
+                && !MOD_SRC.contains("fn riscv_futex_wait_oracle_armed("),
+            "the one-shot consume/armed latch must be removed from the kernel"
+        );
+    }
+
+    // NR 9 is NOT added to the pre-lock selective split-dispatch gate (that stays NR 15 + NR 10).
+    // FutexWait's retirement is via the broad-lock handler + post-lock deferral, NOT try_split.
+    #[test]
+    fn nr9_not_in_prelock_split_gate() {
+        assert!(
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR"),
+            "the pre-lock split gate must stay NR 15 + NR 10"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR"),
+            "FutexWait (NR 9) must NOT be in the RISC-V pre-lock split gate"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::FutexWait => Some"),
+            "FutexWait must not be handled by try_split_dispatch_into_frame"
+        );
+    }
+
+    // Stage 196F: eligibility NO LONGER requires an incoming runnable task (the drain handles the
+    // no-incoming idle outcome). The `runnable_count_on_cpu` gate + RETIRE_DEFERRED fallback are
+    // REMOVED from the in-lock publish.
+    #[test]
+    fn eligibility_no_longer_requires_incoming_task() {
+        assert!(
+            !EXEC_STATE_SRC.contains("let incoming_exists = self.runnable_count_on_cpu(cpu) > 0;"),
+            "the in-lock publish must NOT gate on a runnable incoming task (196F default-on)"
+        );
+        assert!(
+            !EXEC_STATE_SRC.contains("RISCV_FUTEX_WAIT_RETIRE_DEFERRED reason=no_incoming"),
+            "the no-incoming in-lock decline must be removed (the drain idles instead)"
+        );
+    }
+
+    // Stage 196F: the in-lock publish is DEFAULT-ON — BSP + single-dispatcher + trap-path gated,
+    // requires no pending FutexWait or 196D foundation deferral, and skips the legacy dispatch
+    // (return Ok(true)). There is NO oracle-armed gate.
+    #[test]
+    fn in_lock_publish_gated_and_skips_dispatch() {
+        assert!(
+            !EXEC_STATE_SRC.contains("riscv_futex_wait_oracle_armed()"),
+            "the publish must NOT gate on an oracle-armed flag (196F default-on)"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains(
+                "if trap_path && single_cpu && is_bsp && !futex_pending && !foundation_pending {"
+            ),
+            "the publish must be BSP + single-dispatcher + trap-path + no-pending gated"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("maybe_log_riscv_futex_wait_retire_default_on()")
+                && EXEC_STATE_SRC.contains("RISCV_FUTEX_WAIT_DISPATCH_DEFER_BEGIN cpu={} tid={}")
+                && EXEC_STATE_SRC.contains("RISCV_FUTEX_WAIT_DISPATCH_BLOCK_PUBLISH_OK tid={}"),
+            "the publish must log DEFAULT_ON once + emit DEFER_BEGIN + BLOCK_PUBLISH_OK"
+        );
+        // Uses the shared generic FutexWait deferral seam (NOT the 196D foundation deferral).
+        assert!(
+            EXEC_STATE_SRC
+                .contains("crate::kernel::boot::futex_wait_dispatch_try_defer(cpu_idx, tid)"),
+            "the publish must record the generic FutexWait deferral (not the 196D foundation one)"
+        );
+    }
+
+    // A deferral-publication failure after consuming the one-shot rolls back to the canonical
+    // legacy path (clears the partial deferral, falls through to dispatch_next_task).
+    #[test]
+    fn deferral_failure_restores_canonical_state() {
+        assert!(
+            EXEC_STATE_SRC.contains("crate::kernel::boot::futex_wait_dispatch_clear(cpu_idx);")
+                && EXEC_STATE_SRC
+                    .contains("RISCV_FUTEX_WAIT_DISPATCH_FALLBACK reason=defer_failed tid={}"),
+            "a publish failure must clear the deferral and fall back to legacy dispatch"
+        );
+        // The legacy `dispatch_next_task()` remains the fall-through for every ineligible case.
+        assert!(
+            EXEC_STATE_SRC.contains("self.dispatch_next_task()?;"),
+            "the unchanged legacy in-lock dispatch must remain the fall-through"
+        );
+    }
+
+    // The handler bypass requires a REAL FutexWait deferral and is INDEPENDENT of the 196D
+    // foundation bypass (both present, distinct gates + markers).
+    #[test]
+    fn handler_bypass_requires_real_deferral_independent_of_foundation() {
+        assert!(
+            RISCV_TRAP_SRC
+                .contains("if crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx) {")
+                && RISCV_TRAP_SRC
+                    .contains("RISCV_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu={} outgoing={}")
+                && RISCV_TRAP_SRC.contains("RISCV_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu={}"),
+            "the FutexWait bypass must be gated on a real FutexWait deferral + emit its markers"
+        );
+        // The 196D foundation bypass is still present and independent.
+        assert!(
+            RISCV_TRAP_SRC.contains(
+                "if crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx) {"
+            ) && RISCV_TRAP_SRC.contains("RISCV_QUEUE_SWITCH_FOUNDATION_HANDLER_RETURN_OK cpu={}"),
+            "the 196D foundation bypass must remain independent"
+        );
+    }
+
+    // The post-lock drain: broad lock dropped (reverify seam re-acquire) BEFORE dequeue, and the
+    // blocked-state reverify precedes the dequeue.
+    #[test]
+    fn drain_lock_dropped_and_reverify_before_dequeue() {
+        // reverify (Blocked) → LOCK_DROPPED_OK → dequeue, in that order.
+        let drain = RISCV_TRAP_SRC
+            .split("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
+            .nth(1)
+            .expect("196E drain block present");
+        let reverify = drain
+            .find("futex_wait_reverify_blocked")
+            .expect("reverify present");
+        let lock_dropped = drain
+            .find("RISCV_FUTEX_WAIT_DISPATCH_LOCK_DROPPED_OK")
+            .expect("lock-dropped present");
+        let dequeue = drain
+            .find("futex_wait_dispatch_step_mut")
+            .expect("dequeue present");
+        assert!(
+            reverify < lock_dropped && lock_dropped < dequeue,
+            "reverify (Blocked) must precede LOCK_DROPPED_OK, which must precede the dequeue"
+        );
+        assert!(
+            drain.contains("RISCV_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}"),
+            "the drain must emit REVERIFY_OK before dispatching"
+        );
+    }
+
+    // Real SATP/ASID + sfence + frame restore reuse the 196D machinery; NO x86 CR3 / AArch64
+    // TTBR0 logic; incoming (not outgoing) frame is restored; DONE + retirement marker emitted.
+    #[test]
+    fn real_satp_sfence_frame_and_retirement() {
+        let drain = RISCV_TRAP_SRC
+            .split("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
+            .nth(1)
+            .expect("196E drain block present");
+        assert!(
+            drain.contains("crate::arch::riscv64::page_table::cr3_for_asid(asid)")
+                && drain.contains("crate::arch::riscv64::page_table::write_satp(satp)")
+                && drain.contains(
+                    "crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid)"
+                ),
+            "the drain must construct + write the incoming task's SATP via the riscv64 page_table"
+        );
+        assert!(
+            drain.contains("RISCV_FUTEX_WAIT_DISPATCH_SATP_OK incoming={} asid={}")
+                && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_SFENCE_OK incoming={}")
+                && drain.contains("restore_arch_thread_state(kernel, cpu, Some(&mut *frame))")
+                && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming={}")
+                && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED incoming={}"),
+            "the drain must emit SATP_OK/SFENCE_OK + restore the incoming frame + SRET_ARMED"
+        );
+        assert!(
+            drain.contains("RISCV_FUTEX_WAIT_DISPATCH_DONE result=ok")
+                && drain.contains(
+                    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok"
+                ),
+            "the drain must emit the FutexWait retirement DONE marker"
+        );
+        // No cross-arch page-table CALLS leaked into the riscv64 drain.
+        assert!(
+            !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
+                && !RISCV_TRAP_SRC.contains("arch::aarch64::page_table")
+                && !RISCV_TRAP_SRC.contains("write_cr3(")
+                && !RISCV_TRAP_SRC.contains("set_ttbr0"),
+            "the riscv64 drain must not call x86 CR3 or AArch64 TTBR0 logic"
+        );
+        // write_satp genuinely issues the sfence.vma (not a marker).
+        const PAGE_TABLE_SRC: &str = include_str!("../../arch/riscv64/page_table.rs");
+        assert!(
+            PAGE_TABLE_SRC.contains("sfence.vma"),
+            "write_satp's sfence.vma must be a real hardware fence"
+        );
+    }
+
+    // Stage 196F: state-changed (FutexWake raced) clears the deferral and declines (no stale
+    // dispatch, no success). No-incoming is NO LONGER a FAIL — it is the post-lock idle outcome.
+    #[test]
+    fn race_declines_and_no_incoming_is_idle_not_fail() {
+        let drain = RISCV_TRAP_SRC
+            .split("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
+            .nth(1)
+            .expect("FutexWait drain block present");
+        assert!(
+            drain.contains("RISCV_FUTEX_WAIT_DISPATCH_DEFERRED reason=state_changed"),
+            "the drain must decline the FutexWake race (state_changed)"
+        );
+        // No-incoming is the idle outcome now — never a FAIL marker.
+        assert!(
+            !drain.contains("RISCV_FUTEX_WAIT_DISPATCH_FAIL reason=no_incoming")
+                && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING")
+                && drain.contains("RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle"),
+            "no-incoming must be the post-lock idle outcome, not a FAIL"
+        );
+        // The state_changed decline must NOT emit retirement success.
+        let state_changed_arm = drain
+            .split("A split FutexWake flipped")
+            .nth(1)
+            .unwrap_or("");
+        assert!(
+            !state_changed_arm.contains("class=FutexWait result=ok"),
+            "the state_changed decline must NOT emit retirement success"
+        );
+    }
+
+    // The reverify + dispatch-step seams were un-gated to riscv64 (shared with x86/aarch64).
+    #[test]
+    fn futex_wait_seams_ungated_to_riscv() {
+        assert!(
+            RUNTIME_SRC.contains("Stage 196E: un-gated to RISC-V")
+                && RUNTIME_SRC.contains("target_arch = \"riscv64\""),
+            "futex_wait_reverify_blocked + futex_wait_dispatch_step_mut must include riscv64"
+        );
+    }
+
+    // The live oracle + wiring: two-task oracle (A blocks on FutexWait, B dispatched + wakes A),
+    // slot-5 sentinel 3, smoke arming + round-trip assertion.
+    #[test]
+    fn live_oracle_and_wiring_present() {
+        assert!(
+            INIT_SRC.contains("fn run_riscv_futex_wait_oracle(")
+                && INIT_SRC.contains("extern \"C\" fn riscv_futex_wait_oracle_child()"),
+            "the FutexWait oracle parent + child must exist"
+        );
+        assert!(
+            INIT_SRC.contains("RISCV_FUTEX_WAIT_INCOMING_USER_OK tid=")
+                && INIT_SRC.contains("RISCV_FUTEX_WAIT_USER_RETURN_OK tid={} wake_count={}")
+                && INIT_SRC.contains(
+                    "RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok blocked_tid={} dispatched_tid={} wake_count=1"
+                ),
+            "the oracle must emit INCOMING_USER_OK + USER_RETURN_OK + LIVE_ORACLE_DONE"
+        );
+        // The child wakes A through the already-retired SPLIT FutexWake (NR 10).
+        assert!(
+            INIT_SRC.contains("yarm_user_rt::syscall::futex_wake(word, 1)"),
+            "the child must wake A through split FutexWake"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("RISCV_FUTEX_WAIT_ORACLE_PROVISION_OK slot5=3")
+                && MOD_SRC.contains("fn riscv_futex_wait_oracle_enabled()"),
+            "the FutexWait oracle slot-5 provision (sentinel 3) must be wired"
+        );
+        assert!(
+            RISCV_SMOKE.contains("FUTEX_WAIT_ORACLE")
+                && RISCV_SMOKE
+                    .contains("RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok .*wake_count=1"),
+            "the smoke must arm + assert the FutexWait round trip"
+        );
+    }
+
+    // Preserved classes + counts: DebugLog + FutexWake stay live; Yield/NR27 excluded;
+    // ReapFaultedTask excluded; counts unchanged; 2 MiB trap-stack preserved.
+    #[test]
+    fn preserved_classes_and_counts() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert!(
+            SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
+                && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
+            "DebugLog + FutexWake must stay live riscv64 split classes"
+        );
+        // NR 27 (InitramfsReadChunk) is never retired on the RISC-V path (Yield IS retired as of
+        // 196G, so it is no longer checked here).
+        assert!(
+            !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
+            "NR 27 must never be a retired RISC-V class"
+        );
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the 2 MiB trap-stack fix must be preserved"
+        );
+    }
+}
+
+// Stage 196F: RISC-V FutexWait DEFAULT-ON + post-lock IDLE seal.
+//
+// The FutexWait retirement mechanism is now DEFAULT-ON for eligible RISC-V traps (no oracle knob,
+// no one-shot consume latch), and the post-lock drain supports a genuine no-incoming IDLE outcome
+// (caller stays Blocked, current stays None, deferral cleared, NO frame restored, real RISC-V idle
+// loop entered via the bridge's proven policy). Two userspace WORKLOAD knobs (switch + idle) stay
+// default-off.
+mod stage196f_riscv_futex_wait_default_on_idle {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // The retirement mechanism is DEFAULT-ON: the in-lock publish has no oracle-armed / consume
+    // gate, and it logs the one-shot production marker.
+    #[test]
+    fn mechanism_is_default_on_no_oracle_gate() {
+        assert!(
+            !MOD_SRC.contains("fn riscv_futex_wait_oracle_armed(")
+                && !MOD_SRC.contains("fn riscv_futex_wait_oracle_try_consume(")
+                && !MOD_SRC.contains("RISCV_FUTEX_WAIT_ORACLE_CONSUMED"),
+            "the one-shot armed/consume latch must be removed"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains(
+                "if trap_path && single_cpu && is_bsp && !futex_pending && !foundation_pending {"
+            ) && !EXEC_STATE_SRC.contains("riscv_futex_wait_oracle_armed()"),
+            "the eligibility gate must be structural only (default-on)"
+        );
+        assert!(
+            MOD_SRC.contains("fn maybe_log_riscv_futex_wait_retire_default_on()")
+                && MOD_SRC.contains("RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok")
+                && MOD_SRC.contains("RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED"),
+            "the DEFAULT_ON marker must be a one-shot latch"
+        );
+    }
+
+    // Both workload knobs (switch + idle) default off (asserted through run-time state).
+    #[test]
+    fn workload_knobs_default_off() {
+        assert!(
+            !crate::kernel::boot::riscv_futex_wait_oracle_enabled(),
+            "the switch-oracle WORKLOAD knob must default off"
+        );
+        assert!(
+            !crate::kernel::boot::riscv_futex_wait_idle_oracle_enabled(),
+            "the idle-oracle WORKLOAD knob must default off"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_futex_wait_idle_oracle")
+                && MOD_SRC.contains("fn set_riscv_futex_wait_idle_oracle_enabled("),
+            "the idle-oracle knob + setter must be wired"
+        );
+    }
+
+    // The post-lock idle outcome: no-incoming (with the caller still Blocked) is an IDLE success,
+    // not a failure. It proves lock-dropped, clears the deferral, restores NO frame, and hands off
+    // to the bridge's existing idle policy (returns Err with current==None → no sret).
+    #[test]
+    fn post_lock_idle_outcome_present_and_honest() {
+        let drain = RISCV_TRAP_SRC
+            .split("Stage 196F POST-LOCK IDLE OUTCOME")
+            .nth(1)
+            .expect("196F idle outcome present")
+            .split("} else {") // stop before the state_changed arm
+            .next()
+            .unwrap();
+        for m in [
+            "RISCV_FUTEX_WAIT_DISPATCH_NO_INCOMING cpu={}",
+            "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN cpu={}",
+            "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_LOCK_DROPPED_OK cpu={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok",
+            "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu={}",
+        ] {
+            assert!(drain.contains(m), "the idle outcome must emit `{m}`");
+        }
+        // Lock-dropped proof is a real `with_cpu` re-acquire that reads `current`.
+        assert!(
+            drain.contains(
+                ".with_cpu(cpu, |kernel| matches!(kernel.current_tid(), None | Some(0)))"
+            ),
+            "the lock-dropped proof must be a genuine with_cpu re-acquire reading current"
+        );
+        // NO frame is restored in the idle branch (no restore_arch_thread_state, no SRET_ARMED).
+        assert!(
+            !drain.contains("restore_arch_thread_state")
+                && !drain.contains("RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED"),
+            "the idle outcome must NOT restore a userspace frame or arm an sret"
+        );
+        // Hands off via Err so the bridge enters the existing idle policy (no fabricated task).
+        assert!(
+            drain.contains("return Err(TrapHandleError::Syscall(")
+                && drain.contains("SyscallError::Internal"),
+            "the idle outcome must hand off to the bridge idle path via Err"
+        );
+        assert!(
+            drain.contains("futex_wait_dispatch_clear(cpu_idx)"),
+            "the idle outcome must clear the FutexWait deferral"
+        );
+    }
+
+    // The bridge's idle path is the REUSED terminal, not a second idle implementation.
+    #[test]
+    fn idle_reuses_bridge_terminal() {
+        assert!(
+            RISCV_BOOT_SRC.contains("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
+                && RISCV_BOOT_SRC.contains("riscv_trap_halt(\"kernel_idle_awaiting_io\")"),
+            "the bridge's existing idle terminal must be the reused idle policy"
+        );
+    }
+
+    // The switch outcome is byte-preserved (the full 196E chain markers are still emitted).
+    #[test]
+    fn switch_outcome_preserved() {
+        let drain = RISCV_TRAP_SRC
+            .split("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
+            .nth(1)
+            .expect("drain present");
+        for m in [
+            "RISCV_FUTEX_WAIT_DISPATCH_LOCK_DROPPED_OK cpu={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_REVERIFY_OK tid={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_CURRENT_SET_OK cpu={} incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_RUNNING_OK incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_SATP_OK incoming={} asid={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_SFENCE_OK incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_FRAME_OK incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED incoming={}",
+            "RISCV_FUTEX_WAIT_DISPATCH_DONE result=ok",
+        ] {
+            assert!(
+                drain.contains(m),
+                "the switch outcome must still emit `{m}`"
+            );
+        }
+        assert!(
+            drain.contains("crate::arch::riscv64::page_table::write_satp(satp)")
+                && !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
+                && !RISCV_TRAP_SRC.contains("arch::aarch64::page_table"),
+            "the switch must use the real riscv64 SATP write and no cross-arch logic"
+        );
+    }
+
+    // The idle oracle workload + attestation + slot-5 sentinel 4 are wired.
+    #[test]
+    fn idle_oracle_wired() {
+        assert!(
+            INIT_SRC.contains("fn run_riscv_futex_wait_idle_oracle(")
+                && INIT_SRC.contains("RISCV_FUTEX_WAIT_IDLE_ORACLE_BEGIN"),
+            "the idle oracle workload must exist"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains(
+                "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none={} outgoing_blocked=1"
+            ),
+            "the kernel drain must emit the idle-oracle attestation"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("RISCV_FUTEX_WAIT_IDLE_ORACLE_PROVISION_OK slot5=4")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(4)"),
+            "the idle oracle slot-5 provision (sentinel 4) + dispatch must be wired"
+        );
+        assert!(
+            RISCV_SMOKE.contains("FUTEX_WAIT_IDLE_ORACLE")
+                && RISCV_SMOKE.contains(
+                    "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1 outgoing_blocked=1"
+                ),
+            "the smoke must arm + assert the idle oracle"
+        );
+    }
+
+    // Counts unchanged, Yield/NR27 excluded, trap-stack preserved.
+    #[test]
+    fn invariants_preserved() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
+        assert!(
+            !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
+            "NR 27 must stay excluded on the RISC-V path"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the 2 MiB trap-stack fix must be preserved"
+        );
+    }
+}
+
+// Stage 196G: RISC-V Yield (NR 0) DEFAULT-ON out-of-lock retirement.
+//
+// Production Yield reuses the generic YIELD_DISPATCH deferral + preempt_reenqueue seam + the
+// 196D–196F SATP/sfence/frame switch machinery, DEFAULT-ON (no oracle knob, not one-shot). The
+// caller is re-enqueued exactly once and always has an incoming (another task or itself) — NO idle
+// outcome. Two userspace WORKLOAD knobs (two-task + lone-task) stay default-off.
+mod stage196g_riscv_yield_default_on {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // Yield identity is NR 0.
+    #[test]
+    fn yield_identity_nr0() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_YIELD_NR, 0);
+    }
+
+    // Production Yield is DEFAULT-ON (no oracle/foundation gate, not one-shot) and logs the
+    // one-shot informational marker. It does NOT depend on the 196D foundation oracle latch.
+    #[test]
+    fn yield_default_on_no_oracle_dependency() {
+        let block = EXEC_STATE_SRC
+            .split("Stage 196G (RISC-V YIELD QUEUE-ADVANCING RETIREMENT")
+            .nth(1)
+            .expect("196G production Yield block present")
+            .split("let next_tid = self.on_preempt_current_cpu();")
+            .next()
+            .unwrap();
+        assert!(
+            block.contains("&& !yield_pending")
+                && block.contains("&& !futex_pending")
+                && block.contains("&& !foundation_pending")
+                && block
+                    .contains("crate::kernel::boot::yield_dispatch_try_defer(cpu_idx, out_tid)"),
+            "the Yield publish must be structurally gated (no oracle) + exclude conflicting deferrals"
+        );
+        assert!(
+            !block.contains("riscv_queue_switch_foundation_armed()")
+                && !block.contains("_try_consume(")
+                && !block.contains("_oracle_armed()"),
+            "production Yield must NOT depend on the foundation/oracle latch"
+        );
+        assert!(
+            MOD_SRC.contains("fn maybe_log_riscv_yield_retire_default_on()")
+                && MOD_SRC.contains("RISCV_YIELD_RETIRE_DEFAULT_ON result=ok")
+                && MOD_SRC.contains("RISCV_YIELD_DEFAULT_ON_LOGGED"),
+            "the DEFAULT_ON marker must be a one-shot latch"
+        );
+        assert!(
+            block.contains("maybe_log_riscv_yield_retire_default_on()"),
+            "the Yield publish must log the DEFAULT_ON marker"
+        );
+    }
+
+    // The workload knobs default off (run-time state) and are wired.
+    #[test]
+    fn workload_knobs_default_off() {
+        assert!(
+            !crate::kernel::boot::riscv_yield_two_task_oracle_enabled()
+                && !crate::kernel::boot::riscv_yield_lone_task_oracle_enabled(),
+            "both Yield workload knobs must default off"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.riscv64_yield_two_task_oracle")
+                && BOOT_CMDLINE_SRC.contains("yarm.riscv64_yield_lone_task_oracle")
+                && MOD_SRC.contains("fn set_riscv_yield_two_task_oracle_enabled(")
+                && MOD_SRC.contains("fn set_riscv_yield_lone_task_oracle_enabled("),
+            "the Yield workload knobs + setters must be wired"
+        );
+    }
+
+    // In-lock re-enqueue publication: caller re-enqueued exactly once + current cleared via the
+    // accepted preempt seam; publish failure clears + falls back to legacy.
+    #[test]
+    fn reenqueue_publication_and_fallback() {
+        assert!(
+            EXEC_STATE_SRC.contains("match self.preempt_reenqueue_current_cpu() {")
+                && EXEC_STATE_SRC.contains("RISCV_YIELD_DISPATCH_DEFER_BEGIN cpu={} outgoing={}")
+                && EXEC_STATE_SRC.contains("RISCV_YIELD_DISPATCH_REENQUEUE_OK cpu={} outgoing={}"),
+            "the in-lock publish must re-enqueue via the accepted preempt seam"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("RISCV_YIELD_DISPATCH_FALLBACK reason=reenqueue_failed")
+                && EXEC_STATE_SRC.contains("self.on_preempt_current_cpu();"),
+            "a re-enqueue failure must clear + fall back to the legacy on_preempt path"
+        );
+    }
+
+    // The Yield handler bypass requires a real Yield deferral, independent of the FutexWait + 196D
+    // foundation bypasses.
+    #[test]
+    fn handler_bypass_independent() {
+        assert!(
+            RISCV_TRAP_SRC
+                .contains("if crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx) {")
+                && RISCV_TRAP_SRC.contains("RISCV_YIELD_HANDLER_BYPASS_BEGIN cpu={} outgoing={}")
+                && RISCV_TRAP_SRC.contains("RISCV_YIELD_HANDLER_BYPASS_DONE cpu={}"),
+            "the Yield bypass must be gated on a real Yield deferral + emit its markers"
+        );
+        assert!(
+            RISCV_TRAP_SRC
+                .contains("if crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx) {")
+                && RISCV_TRAP_SRC.contains(
+                    "if crate::kernel::boot::riscv_queue_switch_foundation_is_deferred(cpu_idx) {"
+                ),
+            "the FutexWait + foundation bypasses must remain independent"
+        );
+    }
+
+    // The post-lock Yield drain: lock-dropped proof (reverify current cleared) → dequeue → current
+    // → Running → real SATP/sfence/frame/sret → retirement DONE. No-incoming is a FAIL (not idle,
+    // no Err(Internal) sentinel), state_changed declines.
+    #[test]
+    fn post_lock_drain_full_and_no_idle() {
+        let drain = RISCV_TRAP_SRC
+            .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
+            .nth(1)
+            .expect("196G Yield drain present");
+        for m in [
+            "RISCV_YIELD_DISPATCH_DRAIN_BEGIN cpu={}",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=Yield",
+            "shared.yield_reverify_ready(cpu)",
+            "RISCV_YIELD_DISPATCH_LOCK_DROPPED_OK cpu={}",
+            "RISCV_YIELD_DISPATCH_REVERIFY_OK outgoing={}",
+            "shared.yield_dispatch_step_mut(cpu)",
+            "RISCV_YIELD_DISPATCH_DEQUEUE_OK cpu={} incoming={}",
+            "RISCV_YIELD_DISPATCH_CURRENT_SET_OK cpu={} incoming={}",
+            "RISCV_YIELD_DISPATCH_RUNNING_OK incoming={}",
+            "crate::arch::riscv64::page_table::write_satp(satp)",
+            "RISCV_YIELD_DISPATCH_SATP_OK incoming={} asid={}",
+            "RISCV_YIELD_DISPATCH_SFENCE_OK incoming={}",
+            "restore_arch_thread_state(kernel, cpu, Some(&mut *frame))",
+            "RISCV_YIELD_DISPATCH_FRAME_OK incoming={}",
+            "RISCV_YIELD_DISPATCH_SRET_ARMED incoming={}",
+            "RISCV_YIELD_DISPATCH_DONE result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield result=ok",
+        ] {
+            assert!(drain.contains(m), "the Yield drain must contain `{m}`");
+        }
+        assert!(
+            !drain.contains("POST_LOCK_IDLE_BEGIN")
+                && !drain.contains("SyscallError::Internal")
+                && drain.contains("RISCV_YIELD_DISPATCH_FAIL reason=no_incoming")
+                && drain.contains("RISCV_YIELD_DISPATCH_DEFERRED reason=state_changed"),
+            "no-incoming must be a FAIL (not idle / not Err(Internal)); state_changed declines"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
+                && !RISCV_TRAP_SRC.contains("arch::aarch64::page_table")
+                && !RISCV_TRAP_SRC.contains("write_cr3(")
+                && !RISCV_TRAP_SRC.contains("set_ttbr0"),
+            "the riscv64 Yield drain must not call x86 CR3 / AArch64 TTBR0 logic"
+        );
+    }
+
+    // The two-task + lone-task oracles + slot-5 sentinels 5/6 + smoke are wired.
+    #[test]
+    fn oracles_and_wiring_present() {
+        assert!(
+            INIT_SRC.contains("fn run_riscv_yield_two_task_oracle(")
+                && INIT_SRC.contains("extern \"C\" fn riscv_yield_two_task_child()")
+                && INIT_SRC.contains("fn run_riscv_yield_lone_task_oracle("),
+            "the two-task + lone-task Yield oracle fns must exist"
+        );
+        assert!(
+            INIT_SRC.contains("RISCV_YIELD_TWO_TASK_INCOMING_USER_OK tid=")
+                && INIT_SRC.contains("RISCV_YIELD_TWO_TASK_OUTGOING_RESUMED_OK tid=")
+                && INIT_SRC.contains(
+                    "RISCV_YIELD_TWO_TASK_ORACLE_DONE result=ok outgoing={} incoming={} outgoing_resumed=1"
+                )
+                && INIT_SRC.contains(
+                    "RISCV_YIELD_LONE_TASK_ORACLE_DONE result=ok tid={} redispatched_self=1"
+                ),
+            "the oracle proof markers must be emitted"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("RISCV_YIELD_TWO_TASK_ORACLE_PROVISION_OK slot5=5")
+                && RISCV_BOOT_SRC.contains("RISCV_YIELD_LONE_TASK_ORACLE_PROVISION_OK slot5=6")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(5)")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(6)"),
+            "the slot-5 sentinels 5/6 + dispatch must be wired"
+        );
+        assert!(
+            RISCV_SMOKE.contains("YIELD_TWO_TASK_ORACLE")
+                && RISCV_SMOKE.contains("YIELD_LONE_TASK_ORACLE")
+                && RISCV_SMOKE
+                    .contains("RISCV_YIELD_TWO_TASK_ORACLE_DONE result=ok .*outgoing_resumed=1")
+                && RISCV_SMOKE
+                    .contains("RISCV_YIELD_LONE_TASK_ORACLE_DONE result=ok .*redispatched_self=1"),
+            "the smoke must arm + assert both Yield oracles"
+        );
+    }
+
+    // The smoke no longer forbids class=Yield / RISCV_YIELD_DISPATCH_ (default-on now).
+    #[test]
+    fn smoke_no_longer_forbids_yield() {
+        assert!(
+            !RISCV_SMOKE.contains("'GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield'")
+                && !RISCV_SMOKE.contains("'RISCV_YIELD_DISPATCH_'"),
+            "class=Yield / RISCV_YIELD_DISPATCH_ must NOT be in the reject list (default-on)"
+        );
+    }
+
+    // FutexWait switch + idle behavior remains intact.
+    #[test]
+    fn futex_wait_switch_and_idle_preserved() {
+        assert!(
+            RISCV_TRAP_SRC.contains("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
+                && RISCV_TRAP_SRC.contains("Stage 196F POST-LOCK IDLE OUTCOME")
+                && RISCV_TRAP_SRC.contains("RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle"),
+            "the FutexWait switch + idle outcome must remain intact"
+        );
+    }
+
+    // Counts unchanged; DebugLog + FutexWake live; NR27 + ReapFaultedTask excluded; trap-stack.
+    #[test]
+    fn invariants_preserved() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert!(
+            SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
+                && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
+            "DebugLog + FutexWake must stay live"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk")
+                && !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "NR27 + ReapFaultedTask must stay excluded"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the 2 MiB trap-stack fix must be preserved"
+        );
+    }
+}
+
+// Stage 197: FIRST-COHORT CROSS-ARCHITECTURE RETIREMENT SEAL.
+//
+// Seals { DebugLog, FutexWake, FutexWait, Yield } across x86_64, AArch64, RISC-V. Enables ZERO new
+// retirement classes. Guards the canonical arch-tagged marker contract, cohort identity, per-arch
+// restore-hook mapping, and the RISC-V idle-sentinel invariant.
+mod stage197_first_cohort_seal {
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SEAL_SCRIPT: &str = include_str!("../../../scripts/qemu-first-cohort-retirement-seal.sh");
+    const SEAL_DOC: &str = include_str!("../../../doc/FIRST_COHORT_RETIREMENT_SEAL.md");
+
+    const ARCHES: [&str; 3] = ["x86_64", "aarch64", "riscv64"];
+    const COHORT: [&str; 4] = ["DebugLog", "FutexWake", "FutexWait", "Yield"];
+
+    // Exact NR identities.
+    #[test]
+    fn nr_identities() {
+        use crate::kernel::syscall::{
+            SYSCALL_DEBUG_LOG_NR, SYSCALL_FUTEX_WAIT_NR, SYSCALL_FUTEX_WAKE_NR, SYSCALL_YIELD_NR,
+        };
+        assert_eq!(SYSCALL_YIELD_NR, 0);
+        assert_eq!(SYSCALL_FUTEX_WAIT_NR, 9);
+        assert_eq!(SYSCALL_FUTEX_WAKE_NR, 10);
+        assert_eq!(SYSCALL_DEBUG_LOG_NR, 15);
+    }
+
+    // Exactly four cohort classes; counts unchanged.
+    #[test]
+    fn cohort_identity_and_counts() {
+        assert_eq!(COHORT.len(), 4);
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        // The doc pins the cohort + explicit exclusions.
+        assert!(
+            SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
+            "the seal doc must pin the cohort identity"
+        );
+        for excl in ["InitramfsReadChunk", "ReapFaultedTask", "IpcSend", "D2"] {
+            assert!(
+                SEAL_DOC.contains(excl),
+                "the seal doc must explicitly exclude {excl}"
+            );
+        }
+    }
+
+    // Every architecture emits the canonical arch-tagged retirement DONE marker for every cohort
+    // class — same class vocabulary, explicit arch identity, no drift.
+    #[test]
+    fn every_arch_emits_every_class_tagged() {
+        // Pre-lock split classes (DebugLog + FutexWake) live in the shared split producer.
+        for m in [
+            "arch=x86_64 class=DebugLog result=ok",
+            "arch=aarch64 class=DebugLog result=ok",
+            "arch=riscv64 class=DebugLog result=ok",
+            "arch=x86_64 class=FutexWake result=ok",
+            "arch=aarch64 class=FutexWake result=ok",
+            "arch=riscv64 class=FutexWake result=ok",
+        ] {
+            assert!(
+                SPLIT_SRC.contains(m),
+                "syscall_split must emit the tagged marker: {m}"
+            );
+        }
+        // FutexWait + Yield: x86_64 + aarch64 via the mod.rs helpers.
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=FutexWait result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=Yield result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(m),
+                "mod.rs must emit the tagged marker: {m}"
+            );
+        }
+        // FutexWait + Yield: riscv64 inline in its drain.
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield result=ok",
+        ] {
+            assert!(
+                RISCV_TRAP_SRC.contains(m),
+                "riscv64 trap.rs must emit the tagged marker: {m}"
+            );
+        }
+    }
+
+    // No architecture emits an UNTAGGED production cohort retirement marker (x86_64 was normalized).
+    #[test]
+    fn no_untagged_production_markers() {
+        for untagged in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE class=DebugLog result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWake result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(untagged)
+                    && !MOD_SRC.contains(untagged)
+                    && !RISCV_TRAP_SRC.contains(untagged),
+                "no source may emit the untagged marker `{untagged}` (Stage 197 normalized)"
+            );
+        }
+        // The split-dispatch tag is arch-tagged on x86_64 (no empty tag).
+        assert!(
+            TRAP_ENTRY_SRC.contains("const SPLIT_DISPATCH_ARCH_TAG: &str = \"arch=x86_64 \";")
+                && !TRAP_ENTRY_SRC.contains("const SPLIT_DISPATCH_ARCH_TAG: &str = \"\";"),
+            "the split-dispatch tag must be arch=x86_64 (no empty/untagged variant)"
+        );
+    }
+
+    // DebugLog + FutexWake use the pre-lock split path; FutexWait + Yield are NOT in the pre-lock
+    // NR gate (they retire via in-lock publish + post-lock drain).
+    #[test]
+    fn prelock_split_membership() {
+        // The RISC-V wrapper's pre-lock gate is DebugLog + FutexWake only.
+        assert!(
+            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
+                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR")
+                && !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR")
+                && !RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_YIELD_NR"),
+            "the pre-lock split gate must be DebugLog + FutexWake only"
+        );
+        // FutexWait publishes Blocked; Yield re-enqueues Runnable.
+        assert!(
+            EXEC_STATE_SRC
+                .contains("TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))"),
+            "FutexWait must publish Blocked(Futex)"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("preempt_reenqueue_current_cpu()"),
+            "Yield must re-enqueue Runnable via the preempt seam"
+        );
+    }
+
+    // FutexWait may idle safely; Yield never idles after successful publication.
+    #[test]
+    fn futexwait_may_idle_yield_never() {
+        // RISC-V: FutexWait drain has the idle outcome; the Yield drain has NONE and no-incoming is
+        // a FAIL (not idle, no Err(Internal)).
+        let fw = RISCV_TRAP_SRC
+            .split("Stage 196E: queue-advancing FUTEXWAIT RETIREMENT drain")
+            .nth(1)
+            .unwrap()
+            .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
+            .next()
+            .unwrap();
+        assert!(
+            fw.contains("RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle"),
+            "the FutexWait drain must support the idle outcome"
+        );
+        let yld = RISCV_TRAP_SRC
+            .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
+            .nth(1)
+            .unwrap();
+        assert!(
+            !yld.contains("POST_LOCK_IDLE_BEGIN")
+                && !yld.contains("SyscallError::Internal")
+                && yld.contains("RISCV_YIELD_DISPATCH_FAIL reason=no_incoming"),
+            "the Yield drain must NEVER idle; no-incoming is a FAIL (no Err(Internal) sentinel)"
+        );
+    }
+
+    // Architecture restore-hook mapping: each arch uses its own real activation, no cross-arch logic.
+    #[test]
+    fn restore_hook_mapping() {
+        // RISC-V uses SATP + real sfence.vma; never x86 CR3 / AArch64 TTBR0.
+        assert!(
+            RISCV_TRAP_SRC.contains("crate::arch::riscv64::page_table::write_satp(satp)"),
+            "RISC-V must use write_satp"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("arch::x86_64::page_table")
+                && !RISCV_TRAP_SRC.contains("arch::aarch64::page_table")
+                && !RISCV_TRAP_SRC.contains("write_cr3(")
+                && !RISCV_TRAP_SRC.contains("set_ttbr0"),
+            "RISC-V must not use x86 CR3 / AArch64 TTBR0 logic"
+        );
+        // x86_64 + AArch64 drains use the generic ASID switch seam + arch post-switch restore.
+        assert!(
+            TRAP_ENTRY_SRC.contains("d2_recv_switch_incoming_asid(inc)")
+                && TRAP_ENTRY_SRC.contains("post_switch_restore_arch_thread_state("),
+            "x86_64/AArch64 drains must use the generic ASID switch + post-switch restore"
+        );
+        // write_satp genuinely issues sfence.vma.
+        const PT: &str = include_str!("../../arch/riscv64/page_table.rs");
+        assert!(
+            PT.contains("sfence.vma"),
+            "write_satp must issue a real sfence.vma"
+        );
+    }
+
+    // RISC-V idle-sentinel regression guard: the FutexWait idle SUCCESS attestation is emitted ONLY
+    // from the attested FutexWait idle branch (gated on the idle-oracle knob), and can NEVER be
+    // produced by an unrelated Internal error. The Err(Internal) sentinel is confined to the
+    // FutexWait idle branch and is NOT used by Yield.
+    #[test]
+    fn riscv_idle_sentinel_guard() {
+        // The attestation appears exactly once, inside the 196F idle outcome block.
+        let idle = RISCV_TRAP_SRC
+            .split("Stage 196F POST-LOCK IDLE OUTCOME")
+            .nth(1)
+            .expect("196F idle block present")
+            .split("} else {")
+            .next()
+            .unwrap();
+        assert!(
+            idle.contains("RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok")
+                && idle.contains("riscv_futex_wait_idle_oracle_enabled()"),
+            "the idle attestation must be gated on the idle-oracle knob inside the idle branch"
+        );
+        assert_eq!(
+            RISCV_TRAP_SRC
+                .matches("RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok")
+                .count(),
+            1,
+            "the FutexWait idle attestation must be emitted from exactly one site"
+        );
+        // The Err(Internal) idle handoff lives ONLY in the FutexWait idle branch — the Yield drain
+        // must NOT use it (its no-incoming is a FAIL marker, not an idle handoff).
+        let yld = RISCV_TRAP_SRC
+            .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
+            .nth(1)
+            .unwrap();
+        assert!(
+            !yld.contains("SyscallError::Internal"),
+            "the Err(Internal) idle sentinel must not be used by the Yield drain"
+        );
+        // The bridge idle path only fires when current==0 (a live current task + Internal error
+        // takes the RISCV_TRAP_HANDLE_FAILED path, never the FutexWait idle attestation).
+        assert!(
+            RISCV_BOOT_SRC.contains("if next_tid == 0 {")
+                && RISCV_BOOT_SRC.contains("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
+                && RISCV_BOOT_SRC.contains("RISCV_TRAP_HANDLE_FAILED"),
+            "the bridge must idle only on current==0 and fail otherwise"
+        );
+    }
+
+    // Excluded classes stay excluded; ReapFaultedTask never split-eligible; no new kernel lock; the
+    // RISC-V 2 MiB trap-stack guard remains.
+    #[test]
+    fn exclusions_and_debts() {
+        assert!(
+            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
+            "ReapFaultedTask must never be split-eligible"
+        );
+        // NR27 is not sealed into the cohort.
+        assert!(
+            !COHORT.contains(&"InitramfsReadChunk"),
+            "NR27 must not be part of the sealed cohort"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("const RISCV_TRAP_STACK_SIZE: usize = 2 * 1024 * 1024;"),
+            "the RISC-V 2 MiB trap-stack guard must remain"
+        );
+        // The seal doc keeps the NR27 + trap-stack + idle-sentinel debts open.
+        assert!(
+            SEAL_DOC.contains("Known debts")
+                && SEAL_DOC.contains("NR 27")
+                && SEAL_DOC.contains("trap stack")
+                && SEAL_DOC.contains("idle sentinel"),
+            "the seal doc must keep the known debts open"
+        );
+    }
+
+    // The combined seal script emits the canonical per-arch + cross-arch seal markers and rejects
+    // forbidden markers.
+    #[test]
+    fn seal_script_contract() {
+        assert!(
+            SEAL_SCRIPT.contains("FIRST_COHORT_SEAL arch=${arch} class=${class} result=ok")
+                && SEAL_SCRIPT
+                    .contains("FIRST_COHORT_CROSS_ARCH_SEAL arches=3 classes=4 result=ok"),
+            "the seal script must emit the canonical seal markers"
+        );
+        assert!(
+            SEAL_SCRIPT.contains("sha256sum") && SEAL_SCRIPT.contains("FORBIDDEN"),
+            "the seal script must record hashes + reject forbidden markers"
         );
     }
 }

@@ -6813,15 +6813,24 @@ mod tests {
 
     #[test]
     fn riscv_trap_bridge_calls_existing_handle_trap_entry() {
-        // The bridge must dispatch through the existing
-        // `arch::riscv64::trap::handle_trap_entry` Rust path so the syscall
-        // and page-fault handlers are shared with the rest of the kernel.
+        // Stage 196A: the bridge dispatches through the RISC-V shared trap-entry
+        // wrapper, which runs the UNCHANGED canonical `handle_trap_entry` path
+        // inside a bounded `with_cpu` broad-lock phase (so the syscall and
+        // page-fault handlers stay shared with the rest of the kernel) and drains
+        // post-lock work after the guard drops.
         let src = include_str!("../arch/riscv64/boot.rs");
         assert!(
             src.contains(
-                "crate::arch::riscv64::trap::handle_trap_entry(kernel, cpu, ctx, Some(&mut tframe))"
+                "crate::arch::riscv64::trap::handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)"
             ),
-            "trap bridge must call the existing handle_trap_entry"
+            "trap bridge must call the shared trap-entry wrapper"
+        );
+        // The wrapper itself must run the canonical handler inside `with_cpu`.
+        let wrapper_src = include_str!("../arch/riscv64/trap.rs");
+        assert!(
+            wrapper_src.contains("handle_trap_entry_with_fault_bookkeeping_mode(")
+                && wrapper_src.contains(".with_cpu(cpu, |kernel| {"),
+            "shared wrapper must run the canonical handler inside a bounded with_cpu"
         );
         // syscall ABI mapping: a7 -> syscall_num, a0..a5 -> args.
         assert!(

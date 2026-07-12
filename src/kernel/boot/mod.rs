@@ -1025,8 +1025,10 @@ pub(crate) fn maybe_log_futex_wait_retired() {
         )
         .is_ok()
     {
-        // Stage 195E: AArch64 emits the arch-tagged retirement marker (its live queue-advancing
-        // FutexWait drain); x86_64 keeps the untagged marker byte-identical.
+        // Stage 197 (FIRST-COHORT SEAL): all architectures emit the canonical arch-tagged
+        // retirement marker `arch=<arch> class=FutexWait`. (This helper is called only by the
+        // x86_64 + AArch64 drains in `arch/trap_entry.rs`; the RISC-V drain emits its own
+        // `arch=riscv64` markers inline.)
         #[cfg(target_arch = "aarch64")]
         {
             crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=FutexWait");
@@ -1034,10 +1036,10 @@ pub(crate) fn maybe_log_futex_wait_retired() {
                 "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=FutexWait result=ok"
             );
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         {
-            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=FutexWait");
-            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=FutexWait result=ok");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=FutexWait");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=FutexWait result=ok");
         }
     }
 }
@@ -1112,6 +1114,166 @@ pub(crate) fn yield_dispatch_clear(cpu_idx: usize) {
     YIELD_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }
 
+// ─── Stage 196D: RISC-V queue-advancing context-switch FOUNDATION deferral ───
+// A SEPARATE, default-off, one-shot deferral used ONLY by the RISC-V queue-switch
+// foundation oracle. It is deliberately distinct from `YIELD_DISPATCH_*` so it can
+// NEVER be confused with (or accidentally enable) Yield retirement: it emits only
+// RISCV_QUEUE_SWITCH_FOUNDATION_* markers and is gated by its own default-off knob.
+pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+/// One-shot latch: the foundation switch fires exactly once per boot (the oracle needs
+/// a single proven switch; every later yield takes the unchanged legacy path).
+static RISCV_QUEUE_SWITCH_FOUNDATION_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Default-off selector (`yarm.riscv64_queue_switch_foundation_oracle=1`). Arms the
+/// one-shot RISC-V post-lock context-switch foundation (publish/re-enqueue outgoing,
+/// clear current, defer the dispatch; post-lock drain switches to the incoming task
+/// with a real SATP/sfence.vma + frame restore + sret). Enables NO syscall retirement.
+pub(crate) static RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_queue_switch_foundation_oracle_enabled(enabled: bool) {
+    RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_ENABLED
+        .store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_queue_switch_foundation_oracle_enabled() -> bool {
+    RISCV_QUEUE_SWITCH_FOUNDATION_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// True only while the one-shot foundation switch has not yet fired (armed by the knob).
+pub(crate) fn riscv_queue_switch_foundation_armed() -> bool {
+    riscv_queue_switch_foundation_oracle_enabled()
+        && !RISCV_QUEUE_SWITCH_FOUNDATION_DONE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Record the one-shot foundation switch deferral for `cpu`. Returns false (decline;
+/// caller keeps the legacy path) if one is already pending OR the one-shot already fired.
+pub(crate) fn riscv_queue_switch_foundation_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    // Claim the one-shot first so a second yield can never re-arm the foundation.
+    if RISCV_QUEUE_SWITCH_FOUNDATION_DONE
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    if RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED[cpu_idx]
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING[cpu_idx]
+        .store(outgoing, core::sync::atomic::Ordering::Release);
+    true
+}
+
+pub(crate) fn riscv_queue_switch_foundation_is_deferred(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED[cpu_idx]
+            .load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn riscv_queue_switch_foundation_outgoing(cpu_idx: usize) -> Option<u64> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let v =
+        RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING[cpu_idx].load(core::sync::atomic::Ordering::Acquire);
+    if v == u64::MAX { None } else { Some(v) }
+}
+
+/// Clear the per-CPU deferral (does NOT reset the one-shot DONE latch — the foundation
+/// fires exactly once per boot).
+pub(crate) fn riscv_queue_switch_foundation_clear(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    RISCV_QUEUE_SWITCH_FOUNDATION_OUTGOING[cpu_idx]
+        .store(u64::MAX, core::sync::atomic::Ordering::Release);
+    RISCV_QUEUE_SWITCH_FOUNDATION_DEFERRED[cpu_idx]
+        .store(false, core::sync::atomic::Ordering::Release);
+}
+
+// ── Stage 196E/196F: RISC-V FutexWait queue-advancing retirement ──
+//
+// As of Stage 196F the retirement MECHANISM is DEFAULT-ON for eligible RISC-V traps: there is NO
+// oracle knob and NO one-shot consume latch in the kernel eligibility path (both removed). The
+// generic per-CPU `FUTEX_WAIT_DISPATCH_*` deferral state drives the in-lock publish + post-lock
+// drain. Two userspace WORKLOAD knobs remain default-off (they create the two-task switch scenario
+// / the last-task idle scenario; they do NOT arm kernel retirement):
+//   * `yarm.riscv64_futex_wait_oracle`      → switch oracle workload (slot-5 = 3)
+//   * `yarm.riscv64_futex_wait_idle_oracle` → no-incoming idle oracle workload (slot-5 = 4)
+
+/// Default-off SWITCH-oracle WORKLOAD selector (`yarm.riscv64_futex_wait_oracle=1`). Provisions
+/// init slot 5 (=3) so init runs the two-task FutexWait switch workload. Does NOT arm kernel
+/// retirement (that is default-on) — only creates the workload.
+pub(crate) static RISCV_FUTEX_WAIT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Default-off IDLE-oracle WORKLOAD selector (`yarm.riscv64_futex_wait_idle_oracle=1`). Provisions
+/// init slot 5 (=4) so init (the last runnable user task) blocks on a never-woken futex, driving
+/// the production default-on drain to its post-lock IDLE outcome. Also gates the kernel-side
+/// idle-oracle attestation marker.
+pub(crate) static RISCV_FUTEX_WAIT_IDLE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_futex_wait_oracle_enabled(enabled: bool) {
+    RISCV_FUTEX_WAIT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_futex_wait_oracle_enabled() -> bool {
+    RISCV_FUTEX_WAIT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn set_riscv_futex_wait_idle_oracle_enabled(enabled: bool) {
+    RISCV_FUTEX_WAIT_IDLE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_futex_wait_idle_oracle_enabled() -> bool {
+    RISCV_FUTEX_WAIT_IDLE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 196F: one-shot latch for the DEFAULT-ON informational marker. Records that the
+/// production (default-on) FutexWait retirement mechanism was exercised — NOT that an oracle knob
+/// was enabled.
+static RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Emit `RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok` exactly once, on the first eligible
+/// production FutexWait retirement.
+pub(crate) fn maybe_log_riscv_futex_wait_retire_default_on() {
+    if RISCV_FUTEX_WAIT_DEFAULT_ON_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("RISCV_FUTEX_WAIT_RETIRE_DEFAULT_ON result=ok");
+    }
+}
+
 /// Stage 192B: one-shot latch for the Yield retirement markers.
 static YIELD_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -1127,9 +1289,95 @@ pub(crate) fn maybe_log_yield_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=Yield");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=Yield result=ok");
+        // Stage 197 (FIRST-COHORT SEAL): all architectures emit the canonical arch-tagged
+        // retirement marker `arch=<arch> class=Yield`. (This helper is called only by the x86_64 +
+        // AArch64 drains in `arch/trap_entry.rs`; the RISC-V drain emits its own `arch=riscv64`
+        // markers inline.)
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=Yield");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok");
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=Yield");
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=Yield result=ok");
+        }
     }
+}
+
+/// Stage 195G: one-shot latch for the AArch64 Yield default-on attestation.
+static YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 195G: emit `AARCH64_YIELD_RETIRE_DEFAULT_ON` exactly once, at the first eligible
+/// AArch64 Yield deferral — proving the out-of-lock retirement mechanism is the default
+/// production path (no oracle/enable knob required).
+pub(crate) fn maybe_log_yield_default_on() {
+    if YIELD_DEFAULT_ON_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("AARCH64_YIELD_RETIRE_DEFAULT_ON result=ok");
+    }
+}
+
+// ── Stage 196G: RISC-V Yield (NR 0) DEFAULT-ON out-of-lock retirement ──
+//
+// Production Yield reuses the generic per-CPU `YIELD_DISPATCH_*` deferral + `preempt_reenqueue`
+// re-enqueue seam + `yield_dispatch_step_mut` dequeue — the SAME seams x86_64 (192B) / AArch64
+// (195G) use — plus the 196D–196F RISC-V SATP/sfence/frame switch machinery. It is DEFAULT-ON for
+// eligible NR 0 traps (no oracle knob, no consume latch); the 196D foundation oracle stays a
+// SEPARATE default-off mechanism. Two userspace WORKLOAD knobs (two-task + lone-task) stay
+// default-off.
+
+/// Stage 196G: one-shot latch for the RISC-V Yield default-on informational marker. The
+/// mechanism itself is NOT one-shot (it retires every eligible Yield); only this attestation fires
+/// once.
+static RISCV_YIELD_DEFAULT_ON_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Emit `RISCV_YIELD_RETIRE_DEFAULT_ON result=ok` exactly once, on the first eligible production
+/// Yield retirement. Records that the production (default-on) mechanism ran — NOT a knob.
+pub(crate) fn maybe_log_riscv_yield_retire_default_on() {
+    if RISCV_YIELD_DEFAULT_ON_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!("RISCV_YIELD_RETIRE_DEFAULT_ON result=ok");
+    }
+}
+
+/// Default-off two-task Yield oracle WORKLOAD selector (`yarm.riscv64_yield_two_task_oracle=1`,
+/// slot-5 = 5). Does NOT arm kernel retirement (default-on) — only creates the workload.
+pub(crate) static RISCV_YIELD_TWO_TASK_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Default-off lone-task Yield oracle WORKLOAD selector (`yarm.riscv64_yield_lone_task_oracle=1`,
+/// slot-5 = 6).
+pub(crate) static RISCV_YIELD_LONE_TASK_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_yield_two_task_oracle_enabled(enabled: bool) {
+    RISCV_YIELD_TWO_TASK_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+pub fn riscv_yield_two_task_oracle_enabled() -> bool {
+    RISCV_YIELD_TWO_TASK_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+pub(crate) fn set_riscv_yield_lone_task_oracle_enabled(enabled: bool) {
+    RISCV_YIELD_LONE_TASK_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+pub fn riscv_yield_lone_task_oracle_enabled() -> bool {
+    RISCV_YIELD_LONE_TASK_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 // ── Stage 193A (BROAD-IPC DECOMPOSITION — IpcSend plain waiting-receiver slice) ─────
@@ -2227,6 +2475,69 @@ pub(crate) fn set_aarch64_futex_wait_idle_oracle_enabled(enabled: bool) {
 
 pub fn aarch64_futex_wait_idle_oracle_enabled() -> bool {
     AARCH64_FUTEX_WAIT_IDLE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 195G: default-off AArch64 Yield TWO-TASK oracle WORKLOAD selector. The Yield retirement
+/// MECHANISM is default-on (no knob); this flag only selects the init two-task oracle workload
+/// (slot 5 = 4).
+pub(crate) static AARCH64_YIELD_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_yield_oracle_enabled(enabled: bool) {
+    AARCH64_YIELD_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_yield_oracle_enabled() -> bool {
+    AARCH64_YIELD_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 195G: default-off AArch64 Yield LONE-TASK oracle WORKLOAD selector (slot 5 = 5).
+pub(crate) static AARCH64_YIELD_LONE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_yield_lone_oracle_enabled(enabled: bool) {
+    AARCH64_YIELD_LONE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn aarch64_yield_lone_oracle_enabled() -> bool {
+    AARCH64_YIELD_LONE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 196A: default-off RISC-V post-lock-drain FOUNDATION oracle selector.
+/// When enabled, the RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`)
+/// publishes a one-shot post-work token during its broad-lock (`with_cpu`) phase
+/// and consumes it AFTER the outer `SpinLock<KernelState>` guard drops, proving
+/// genuine post-lock-drain ordering: the lock-dropped proof re-acquires
+/// `with_cpu` (which would deadlock if the guard were still held). It enables
+/// ZERO retirement classes and mutates no scheduler / capability / user-copy /
+/// task-switch state — it only reads `current_tid` and drives log markers.
+pub(crate) static RISCV_POST_LOCK_FOUNDATION_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_post_lock_foundation_oracle_enabled(enabled: bool) {
+    RISCV_POST_LOCK_FOUNDATION_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_post_lock_foundation_oracle_enabled() -> bool {
+    RISCV_POST_LOCK_FOUNDATION_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 196C: default-off RISC-V FutexWake (NR 10) live-oracle selector
+/// (`yarm.riscv64_futex_wake_oracle=1`). When enabled, the RISC-V boot provisions init
+/// startup slot 5 (=1) so init runs the parent/child split-FutexWake proof: the child
+/// blocks on the LEGACY global-lock FutexWait, the parent wakes it through the SPLIT path
+/// and verifies the authoritative wake counts (1 then 0). It enables NO additional
+/// retirement class (FutexWake retirement is the split MECHANISM, live by default once the
+/// class is enabled); this flag only selects the proof workload.
+pub(crate) static RISCV_FUTEX_WAKE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_futex_wake_oracle_enabled(enabled: bool) {
+    RISCV_FUTEX_WAKE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_futex_wake_oracle_enabled() -> bool {
+    RISCV_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.

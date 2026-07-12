@@ -79,6 +79,21 @@ if [[ "$FUTEX_WAIT_IDLE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_fu
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_futex_wait_idle_oracle=1"
 fi
 
+# Stage 195G (AARCH64 YIELD OUT-OF-LOCK DISPATCH — DEFAULT-ON): the Yield (NR 0) retirement
+# MECHANISM is DEFAULT-ON. YIELD_ORACLE=1 selects the two-task workload (slot 5 = 4): task A
+# (init) yields, the post-lock drain dispatches task B (a spawned child), B runs and blocks, A
+# resumes. YIELD_LONE_ORACLE=1 selects the lone-task workload (slot 5 = 5): the sole runnable
+# task yields and the drain re-dispatches it (same-task, no idle). Both run at the requested
+# QEMU_SMP (default 2). Yield is NR 0.
+YIELD_ORACLE=${YIELD_ORACLE:-0}
+if [[ "$YIELD_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_yield_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_yield_oracle=1"
+fi
+YIELD_LONE_ORACLE=${YIELD_LONE_ORACLE:-0}
+if [[ "$YIELD_LONE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.aarch64_yield_lone_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.aarch64_yield_lone_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64-hwe}
@@ -257,14 +272,14 @@ if [[ -f "$LOGFILE" ]]; then
   # Forbid split fatals and the Yield queue-advancing retirement marker (Yield stays inert).
   # Stage 195C ENABLES FutexWake (NR 10); Stage 195F makes the FutexWait (NR 9) queue-advancing
   # drain DEFAULT-ON (no knob), so `class=FutexWait` is NO LONGER forbidden — it legitimately
-  # appears whenever any eligible FutexWait occurs (switch/idle oracles, or the FutexWake
-  # oracle's handshake waits). A plain core boot simply performs no FutexWait, so it stays 0.
-  # Only Yield remains inert (its queue-advancing retirement is out of scope).
+  # appears whenever any eligible FutexWait occurs. Stage 195G makes the Yield (NR 0)
+  # queue-advancing drain DEFAULT-ON too, so `class=Yield` is likewise NOT forbidden (it appears
+  # whenever an eligible Yield occurs; a plain core boot performs no Yield, so it stays 0). Only
+  # split-finalize ERRORS remain forbidden.
   a64_split_bads=(
     "AARCH64_SPLIT_FINALIZE_OK nr=15 result=error"
     "AARCH64_SPLIT_FINALIZE_OK nr=27 result=error"
     "AARCH64_SPLIT_FINALIZE_OK nr=10 result=error"
-    "arch=aarch64 class=Yield"
   )
   for a64_split_bad in "${a64_split_bads[@]}"; do
     if cad_has "$a64_split_bad"; then
@@ -369,6 +384,61 @@ if [[ -f "$LOGFILE" && "$FUTEX_WAIT_IDLE_ORACLE" == "1" ]]; then
   # The idle outcome must NOT restore the blocked caller's frame (no FRAME_OK for the idle trap)
   # and must clear the deferral (idle is a genuine retirement, not a stale decline).
   echo "[ok] aarch64 Stage 195F: FutexWait no-incoming post-lock idle proven (default-on, lock_dropped, current_none)"
+fi
+
+# Stage 195G (AARCH64 YIELD OUT-OF-LOCK DISPATCH): two-task oracle — require the default-on
+# attestation + handler bypass + re-enqueue publication + post-lock drain + retirement, the
+# two-task proof, and forbid any Yield drain failure.
+if [[ -f "$LOGFILE" && "$YIELD_ORACLE" == "1" ]]; then
+  if ! check_required_patterns "$LOGFILE" \
+      "AARCH64_YIELD_RETIRE_DEFAULT_ON result=ok" \
+      "AARCH64_YIELD_DISPATCH_DEFER_BEGIN cpu=0" \
+      "AARCH64_YIELD_DISPATCH_REENQUEUE_OK cpu=0" \
+      "AARCH64_YIELD_HANDLER_BYPASS_BEGIN cpu=0" \
+      "AARCH64_YIELD_HANDLER_BYPASS_DONE cpu=0" \
+      "AARCH64_YIELD_DISPATCH_REVERIFY_OK" \
+      "AARCH64_YIELD_DISPATCH_DEQUEUE_OK cpu=0" \
+      "AARCH64_YIELD_DISPATCH_CURRENT_SET_OK cpu=0" \
+      "AARCH64_YIELD_DISPATCH_RUNNING_OK" \
+      "AARCH64_YIELD_DISPATCH_TTBR0_OK" \
+      "AARCH64_YIELD_DISPATCH_FRAME_OK" \
+      "AARCH64_YIELD_DISPATCH_DONE result=ok" \
+      "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=Yield" \
+      "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok" \
+      "AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=ok"; then
+    echo "[error] aarch64 Stage 195G Yield two-task oracle markers missing"
+    exit 1
+  fi
+  for a64_y_bad in "AARCH64_YIELD_DISPATCH_FAIL" "AARCH64_YIELD_TWO_TASK_ORACLE_DONE result=fail" \
+      "AARCH64_BAD_USER_ELR"; do
+    if cad_has "$a64_y_bad"; then
+      echo "[error] aarch64 Stage 195G: forbidden Yield marker: $a64_y_bad"
+      exit 1
+    fi
+  done
+  echo "[ok] aarch64 Stage 195G: Yield (NR 0) two-task queue-advancing oracle proven (default-on)"
+fi
+
+# Stage 195G lone-task oracle — the sole runnable task yields and is re-dispatched to ITSELF
+# (same-task, NO idle outcome for a valid Yield deferral).
+if [[ -f "$LOGFILE" && "$YIELD_LONE_ORACLE" == "1" ]]; then
+  if ! check_required_patterns "$LOGFILE" \
+      "AARCH64_YIELD_RETIRE_DEFAULT_ON result=ok" \
+      "AARCH64_YIELD_DISPATCH_REENQUEUE_OK cpu=0" \
+      "AARCH64_YIELD_DISPATCH_DEQUEUE_OK cpu=0 tid=1" \
+      "AARCH64_YIELD_DISPATCH_DONE result=ok" \
+      "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=Yield result=ok" \
+      "AARCH64_YIELD_LONE_TASK_ORACLE_DONE result=ok tid=1 redispatched_self=1"; then
+    echo "[error] aarch64 Stage 195G Yield lone-task oracle markers missing"
+    exit 1
+  fi
+  for a64_yl_bad in "AARCH64_YIELD_DISPATCH_FAIL" "AARCH64_BAD_USER_ELR"; do
+    if cad_has "$a64_yl_bad"; then
+      echo "[error] aarch64 Stage 195G: forbidden lone-Yield marker: $a64_yl_bad"
+      exit 1
+    fi
+  done
+  echo "[ok] aarch64 Stage 195G: Yield (NR 0) lone-task self-redispatch proven (default-on, no idle)"
 fi
 
 if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then

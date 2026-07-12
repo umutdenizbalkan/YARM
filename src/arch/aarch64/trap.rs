@@ -457,10 +457,26 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         idx < crate::kernel::scheduler::MAX_CPUS
             && crate::kernel::boot::futex_wait_dispatch_is_deferred(idx)
     };
+    // Stage 195G: the parallel Yield-deferral-specific bypass. A committed Yield deferral
+    // re-enqueued the caller (Runnable) and cleared `current`, so `current == None` here too;
+    // the post-lock Yield drain performs the authoritative dispatch (always an incoming — the
+    // caller itself when alone; NO idle outcome). Strictly Yield-deferral-specific.
+    let yield_bypass = {
+        let idx = cpu.0 as usize;
+        idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::yield_dispatch_is_deferred(idx)
+    };
+    let post_lock_bypass = futex_wait_bypass || yield_bypass;
     if matches!(exiting_tid, None | Some(0)) {
         if futex_wait_bypass {
             crate::yarm_log!(
                 "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu={} outgoing_tid={}",
+                cpu.0,
+                entering_tid.unwrap_or(0)
+            );
+        } else if yield_bypass {
+            crate::yarm_log!(
+                "AARCH64_YIELD_HANDLER_BYPASS_BEGIN cpu={} outgoing_tid={}",
                 cpu.0,
                 entering_tid.unwrap_or(0)
             );
@@ -516,7 +532,7 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     // Stage 195E: on a FutexWait-deferral bypass, skip the in-lock restore entirely — `current`
     // is None (the restore would only no-op into SCHED_ENTER_IDLE), and the authoritative EL0
     // frame restore for the INCOMING task runs in the post-lock drain's `with_cpu` re-acquire.
-    if !switch_pending && !futex_wait_bypass {
+    if !switch_pending && !post_lock_bypass {
         if let Err(err) =
             restore_arch_thread_state(kernel, cpu, frame.as_deref_mut(), syscall_return)
         {
@@ -527,6 +543,8 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     }
     if futex_wait_bypass {
         crate::yarm_log!("AARCH64_FUTEX_WAIT_HANDLER_BYPASS_DONE cpu={}", cpu.0);
+    } else if yield_bypass {
+        crate::yarm_log!("AARCH64_YIELD_HANDLER_BYPASS_DONE cpu={}", cpu.0);
     }
 
     if !task_switched && matches!(event, TrapEvent::Syscall) {

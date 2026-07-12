@@ -599,8 +599,13 @@ impl SharedKernel {
     /// in-lock path it replaces. No-op when `incoming` is `None` (idle).
     ///
     /// Stage 195E: un-gated to AArch64 — its live FutexWait drain marks the incoming task
-    /// Running through this same rank-2 task seam.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    /// Running through this same rank-2 task seam. Stage 196D: un-gated to RISC-V — its
+    /// queue-switch foundation drain marks the incoming task Running through this seam.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     pub(crate) fn d6_genuine_mark_running_via_task_seam(&self, incoming: Option<u64>) {
         let Some(tid) = incoming else {
             return;
@@ -719,7 +724,13 @@ impl SharedKernel {
     ///
     /// Stage 195E: un-gated to AArch64 — its live FutexWait drain uses the same rank-2 task
     /// seam to re-verify the outgoing waiter is still `Blocked(Futex)` before dispatching.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    /// Stage 196E: un-gated to RISC-V — its queue-advancing FutexWait retirement drain
+    /// re-verifies the outgoing waiter is still `Blocked(Futex)` through this same seam.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     pub(crate) fn futex_wait_reverify_blocked(&self, tid: u64) -> bool {
         self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()
@@ -748,7 +759,14 @@ impl SharedKernel {
     /// Stage 195E: un-gated to AArch64 — the same rank-1 scheduler-seam dequeue drives the
     /// AArch64 out-of-lock FutexWait drain (the AArch64 arch hooks — TTBR0/ASID + EL0 frame
     /// restore — run in the drain's `with_cpu` re-acquire, NOT here).
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    /// Stage 196E: un-gated to RISC-V — the same rank-1 dequeue drives the RISC-V out-of-lock
+    /// FutexWait drain (the RISC-V arch hooks — SATP/ASID + sfence + trap-frame restore — run
+    /// in the drain's `with_cpu` re-acquire, reusing the 196D switch machinery, NOT here).
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     pub(crate) fn futex_wait_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
@@ -775,7 +793,15 @@ impl SharedKernel {
     /// out-of-lock dispatch against a stale deferral (e.g. an in-lock fallback already
     /// dispatched). Single-CPU + IRQ-off means nothing mutates between the in-lock commit and
     /// this check; the re-verify is the correctness fence before dispatching.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Stage 195G: un-gated to AArch64 — its live Yield drain re-verifies `current` is still
+    /// cleared through this same rank-1 scheduler seam before dispatching. Stage 196D: un-gated
+    /// to RISC-V — its queue-switch foundation drain re-verifies `current` cleared here.
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     pub(crate) fn yield_reverify_ready(&self, cpu: CpuId) -> bool {
         self.with_scheduler_split_mut(|sched| {
             // `cpu` is the trap CPU == the authoritative dispatch CPU under the
@@ -791,7 +817,16 @@ impl SharedKernel {
     /// re-enqueued and removed from `current` (in-lock `preempt_reenqueue_only`), so
     /// `dispatch_next_on` genuinely DEQUEUES the next runnable task here (the FIFO head — the
     /// re-enqueued caller itself when it is alone). Emits `YIELD_DISPATCH_DEQUEUE_OK`.
-    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Stage 195G: un-gated to AArch64 — the same rank-1 dequeue drives the AArch64 out-of-lock
+    /// Yield drain (the AArch64 arch restore runs in the drain's `with_cpu` re-acquire).
+    /// Stage 196D: un-gated to RISC-V — the same rank-1 dequeue drives the RISC-V queue-switch
+    /// foundation drain (the RISC-V SATP/sfence + frame restore run in its `with_cpu` re-acquire).
+    #[cfg(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))]
     pub(crate) fn yield_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
         self.with_scheduler_split_mut(|sched| {
             let dispatch_cpu = sched.current_cpu;
