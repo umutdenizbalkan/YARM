@@ -600,13 +600,11 @@ fn decode_u32_at(bytes: &[u8], offset: usize) -> Result<u32, VfsCodecError> {
 ///                                was "reserved=0" before Phase 2B — wire-compatible)
 /// ```
 ///
-/// Phase 2B transfer-buffer bridge: PM fills `dst_ptr` with its own stack buffer VA.
-/// initramfs_srv calls the kernel (syscall nr=27 with target_tid=PM_TID) to write
-/// CPIO data directly into PM's buffer.  PM reads from its stack buffer after the
-/// IPC round trip completes.
-///
-/// Missing primitive for pure page-cap: `MemoryObject` capability grant that lets
-/// initramfs_srv write to PM's page without kernel-mediated cross-ASID copy.
+/// Legacy transfer-buffer bulk-read args. This opcode drove kernel syscall NR 27
+/// (InitramfsReadChunk), removed in Stage 197A; `initramfs_srv` now declines
+/// `VFS_OP_READ_BULK`. The `MemoryObject` capability-grant zero-copy path
+/// (`VFS_OP_FILE_GRANT_RO` + `SpawnFromMemoryObject`) is the mandatory ELF-load path. The
+/// struct is retained for wire/codec completeness and its unit tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BulkReadArgs {
     pub fd: u64,

@@ -226,8 +226,7 @@ impl InitramfsBackend {
     }
 
     /// Returns the bare CPIO entry name for an open fd (strips `/initramfs/` prefix).
-    /// Used by the Phase 2B `VFS_OP_READ_BULK` handler to pass to the kernel bulk copy
-    /// primitive (`initramfs_write_to_pm_buf` / syscall nr=27 with arg5=PM_TID).
+    /// (The Stage 197A-removed NR 27 bulk-copy path used this; retained for fd introspection.)
     pub fn cpio_name_for_fd(&self, fd: u64) -> Option<&'static [u8]> {
         let inode = self.inode_for_fd(fd).ok()?;
         Some(

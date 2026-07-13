@@ -30,17 +30,11 @@ pub const SYSCALL_DEBUG_LOG_NR: usize = 15;
 pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
 pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
 pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
-/// Phase 2 bulk-copy bridge: reads a named CPIO file chunk into caller's user buffer.
-/// TEMPORARY stepping stone — replace with page-cap zero-copy in Phase 3.
-///
-/// TODO(deprecated-legacy-ABI): NR 27 `InitramfsReadChunk` is a deprecated legacy fallback /
-/// test-only ABI. It predates the Phase 3A/3B MemoryObject zero-copy (ZC) grant loader
-/// (`CreateInitramfsFileSliceMo` NR 28 + `SpawnFromMemoryObject`), which is now the
-/// production path for all late-service ELF loads (PM_ELF_ZC_DONE, zc_pages > 0). Once the
-/// ZC-grant path is fully proven across every arch and the last non-test caller is gone,
-/// REMOVE this syscall (and its Stage 195B AArch64 split-dispatch retirement wiring). It is
-/// retained today only as a split-dispatch retirement exemplar and a bulk-copy safety net.
-pub const SYSCALL_INITRAMFS_READ_CHUNK_NR: usize = 27;
+// NR 27 (formerly `InitramfsReadChunk`, a Phase-2 bulk-copy byte-copy bridge) was removed in
+// Stage 197A once the MemoryObject zero-copy (ZC) grant loader (`CreateInitramfsFileSliceMo`
+// NR 28 + `SpawnFromMemoryObject` NR 29) became the sole, mandatory ELF-load path on every
+// architecture. NR 27 is now an unused syscall number (no tombstone constant) and is reusable
+// by a future syscall; `Syscall::decode(27)` returns the canonical `InvalidNumber` error.
 /// Phase 3A: Create a read-only MemoryObject backed by a named CPIO file slice.
 /// Only callable by SystemServer tasks (initramfs_srv).
 pub const SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR: usize = 28;
@@ -81,10 +75,6 @@ pub const OPCODE_SHARED_MEM: u16 = 1;
 
 const AARCH64_SYSCALL_TRACE: bool = false;
 macro_rules! syscall_trace { ($($arg:tt)*) => { if AARCH64_SYSCALL_TRACE { crate::yarm_log!($($arg)*); } }; }
-
-/// Gate for per-chunk `INITRAMFS_READ_CHUNK` logs (hot-path).
-/// Set true to trace every chunk read for debugging.
-const INITRAMFS_READ_CHUNK_TRACE: bool = false;
 
 /// PM is always TID 3 (RING3_PM_SERVER_TID in both aarch64 and x86_64 boot).
 /// Temporary Phase 2B bridge constant — replace with page-cap grant in Phase 3.
@@ -275,7 +265,7 @@ pub(crate) use self::helpers::{round_up_page, validate_user_region};
 // Stage 150: IPC frame ABI codec re-import so split-recv seam, dispatch, and
 // complete_blocked_recv_for_waiter keep their existing call sites unchanged.
 use self::debug::handle_debug_log;
-use self::initramfs::{handle_create_initramfs_file_slice_mo, handle_initramfs_read_chunk};
+use self::initramfs::handle_create_initramfs_file_slice_mo;
 use self::ipc_abi::{
     decode_ipc_send_timeout_ticks, encode_transfer_cap_ret, sender_tid_to_ret,
     should_strip_inline_opcode_prefix, transfer_cap_arg,
@@ -303,8 +293,7 @@ pub enum Syscall {
     SpawnProcess = SYSCALL_SPAWN_PROCESS_NR,
     SpawnProcessFromUserBuf = SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR,
     SpawnFromInitramfsFile = SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR,
-    /// Phase 2 bulk-copy bridge. TEMPORARY — replace with page-cap in Phase 3.
-    InitramfsReadChunk = SYSCALL_INITRAMFS_READ_CHUNK_NR,
+    // NR 27 (InitramfsReadChunk) removed in Stage 197A — the number is now unused.
     /// Phase 3A: Create a read-only MemoryObject for a named CPIO file slice.
     CreateInitramfsFileSliceMo = SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR,
     /// Phase 3A: Spawn a process from a MemoryObject capability.
@@ -316,7 +305,7 @@ pub enum Syscall {
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 23;
+    pub const VARIANT_COUNT: usize = 22;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -342,7 +331,6 @@ impl Syscall {
             SYSCALL_SPAWN_PROCESS_NR => Ok(Self::SpawnProcess),
             SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR => Ok(Self::SpawnProcessFromUserBuf),
             SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR => Ok(Self::SpawnFromInitramfsFile),
-            SYSCALL_INITRAMFS_READ_CHUNK_NR => Ok(Self::InitramfsReadChunk),
             SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR => Ok(Self::CreateInitramfsFileSliceMo),
             SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR => Ok(Self::SpawnFromMemoryObject),
             SYSCALL_RECV_SHARED_V3_NR => Ok(Self::RecvSharedV3),
@@ -1725,7 +1713,6 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::SpawnProcess => handle_spawn_process(kernel, frame),
         Syscall::SpawnProcessFromUserBuf => handle_spawn_process_from_user_buf(kernel, frame),
         Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame),
-        Syscall::InitramfsReadChunk => handle_initramfs_read_chunk(kernel, frame),
         Syscall::CreateInitramfsFileSliceMo => handle_create_initramfs_file_slice_mo(kernel, frame),
         Syscall::SpawnFromMemoryObject => handle_spawn_from_memory_object(kernel, frame),
         Syscall::RecvSharedV3 => handle_recv_shared_v3(kernel, frame),
@@ -1906,7 +1893,7 @@ mod tests {
         assert_eq!(SYSCALL_VM_ANON_MAP_NR, 13);
         assert_eq!(SYSCALL_VM_BRK_NR, 14);
         assert_eq!(SYSCALL_SPAWN_PROCESS_NR, 23);
-        assert_eq!(SYSCALL_INITRAMFS_READ_CHUNK_NR, 27);
+        // NR 27 (InitramfsReadChunk) removed in Stage 197A — number now unused.
         assert_eq!(SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR, 28);
         assert_eq!(SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR, 29);
         assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 30);
@@ -4505,136 +4492,28 @@ mod tests {
         assert!(!should_strip_inline_opcode_prefix(&plain_cap_msg));
     }
 
-    // ── Phase 2A/2B syscall nr=27 unit tests ─────────────────────────────────
+    // ── Stage 197A: NR 27 (InitramfsReadChunk) removed ───────────────────────
 
-    /// Verify that syscall nr=27 ABI number is stable (Phase 2A/2B bootstrap bridge).
-    /// This test does NOT use Bootstrap::init() so no large stack is needed.
+    /// After Stage 197A the former NR 27 `InitramfsReadChunk` byte-copy bridge is gone.
+    /// `Syscall::decode(27)` must now return the canonical unknown-syscall error, and no
+    /// enum variant maps to 27 (28..=31 keep their explicit discriminants).
     #[test]
-    fn initramfs_read_chunk_syscall_nr_is_frozen_at_27() {
-        assert_eq!(SYSCALL_INITRAMFS_READ_CHUNK_NR, 27);
-        assert_eq!(
-            Syscall::decode(27).expect("decode nr=27"),
-            Syscall::InitramfsReadChunk
+    fn nr27_is_removed_and_decodes_to_invalid_number() {
+        assert!(matches!(
+            Syscall::decode(27),
+            Err(SyscallError::InvalidNumber)
+        ));
+        // Adjacent numbers are unaffected — no renumbering of NR 28..=31.
+        assert_eq!(SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR, 28);
+        assert_eq!(SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR, 29);
+        assert_eq!(SYSCALL_REAP_FAULTED_TASK_NR, 31);
+        // No `pub const` declaration of the NR 27 constant remains (the string below is
+        // deliberately split so this assertion does not match itself via include_str!).
+        let decl = concat!("pub const SYSCALL_INITRAMFS_READ", "_CHUNK_NR");
+        assert!(
+            !include_str!("syscall.rs").contains(decl),
+            "the NR 27 constant declaration must be fully removed (no tombstone)"
         );
-    }
-
-    /// Access gate: a non-SystemServer (App) task must receive MissingRight immediately.
-    /// Uses a 4 MiB thread stack because Bootstrap::init() needs significant stack space.
-    #[test]
-    fn initramfs_read_chunk_denied_for_non_system_server() {
-        std::thread::Builder::new()
-            .name("initramfs_read_chunk_denied_for_non_system_server".into())
-            .stack_size(4 * 1024 * 1024)
-            .spawn(|| {
-                let mut state = Bootstrap::init().expect("kernel");
-                state
-                    .register_task_with_class(150, crate::kernel::task::TaskClass::App)
-                    .expect("register app task");
-                state.enqueue_current_cpu(150).expect("enqueue");
-                state.dispatch_next_task().expect("dispatch");
-                if state.current_tid() != Some(150) {
-                    state.yield_current().expect("switch to app task");
-                }
-                let mut frame = TrapFrame::new(
-                    Syscall::InitramfsReadChunk as usize,
-                    [0x1000, 5, 0, 0x2000, 64, 0],
-                );
-                let err =
-                    dispatch(&mut state, &mut frame).expect_err("non-SystemServer must be denied");
-                assert_eq!(err, SyscallError::MissingRight);
-            })
-            .expect("spawn test thread")
-            .join()
-            .expect("join test thread");
-    }
-
-    /// Phase 2B arg5 gate: SystemServer with arg5 != 0 and != PM_BOOTSTRAP_TID → MissingRight.
-    /// The gate fires before the user-memory name read, so no address space setup needed.
-    /// Uses a 4 MiB thread stack because Bootstrap::init() needs significant stack space.
-    #[test]
-    fn initramfs_read_chunk_denied_for_invalid_target_tid() {
-        std::thread::Builder::new()
-            .name("initramfs_read_chunk_denied_for_invalid_target_tid".into())
-            .stack_size(4 * 1024 * 1024)
-            .spawn(|| {
-                let mut state = Bootstrap::init().expect("kernel");
-                state
-                    .register_task_with_class(151, crate::kernel::task::TaskClass::SystemServer)
-                    .expect("register system server");
-                state.enqueue_current_cpu(151).expect("enqueue");
-                state.dispatch_next_task().expect("dispatch");
-                if state.current_tid() != Some(151) {
-                    state.yield_current().expect("switch to system server");
-                }
-                // arg5 = 42 is neither 0 (self) nor PM_BOOTSTRAP_TID (3) — must be denied.
-                let mut frame = TrapFrame::new(
-                    Syscall::InitramfsReadChunk as usize,
-                    [0x1000, 5, 0, 0x2000, 64, 42],
-                );
-                let err = dispatch(&mut state, &mut frame)
-                    .expect_err("invalid target_tid must be denied");
-                assert_eq!(err, SyscallError::MissingRight);
-            })
-            .expect("spawn test thread")
-            .join()
-            .expect("join test thread");
-    }
-
-    /// File-not-found must return `Internal` (not 0/EOF and not silently 0 bytes).
-    /// Sets up user memory for the name pointer and a minimal CPIO without the file.
-    /// Uses a 4 MiB thread stack because Bootstrap::init() and address-space setup are heavy.
-    #[test]
-    fn initramfs_read_chunk_not_found_returns_internal_error() {
-        std::thread::Builder::new()
-            .name("initramfs_read_chunk_not_found_returns_internal_error".into())
-            .stack_size(4 * 1024 * 1024)
-            .spawn(|| {
-                let mut state = Bootstrap::init().expect("kernel");
-                state
-                    .register_task_with_class(152, crate::kernel::task::TaskClass::SystemServer)
-                    .expect("register system server");
-                // Map a user page for the name buffer.
-                let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
-                state.bind_task_asid(152, asid).expect("bind asid to task");
-                state
-                    .map_user_page(
-                        aspace_cap,
-                        crate::kernel::vm::VirtAddr(0x4000),
-                        crate::kernel::vm::Mapping {
-                            phys: crate::kernel::vm::PhysAddr(0x8000),
-                            flags: crate::kernel::vm::PageFlags::USER_RW,
-                        },
-                    )
-                    .expect("map name page");
-                // Write the file name bytes into user memory.
-                let name = b"sbin/no_such_file_exists";
-                state
-                    .write_user_memory(152, 0x4000, name)
-                    .expect("write name into user memory");
-                // Install a minimal CPIO that does NOT contain the requested file.
-                let mut cpio = alloc::vec::Vec::new();
-                push_cpio_entry(&mut cpio, "TRAILER!!!", 0, &[]);
-                let cpio_bytes: &'static [u8] = Box::leak(cpio.into_boxed_slice());
-                crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(cpio_bytes);
-
-                state.enqueue_current_cpu(152).expect("enqueue");
-                state.dispatch_next_task().expect("dispatch");
-                if state.current_tid() != Some(152) {
-                    state.yield_current().expect("switch to system server");
-                }
-                let mut frame = TrapFrame::new(
-                    Syscall::InitramfsReadChunk as usize,
-                    // arg0=name_ptr, arg1=name_len, arg2=offset=0, arg3=dst_ptr(non-zero), arg4=64, arg5=0
-                    [0x4000, name.len(), 0, 0x9000, 64, 0],
-                );
-                let err =
-                    dispatch(&mut state, &mut frame).expect_err("not-found must be Internal error");
-                // MUST be Internal, NOT 0/EOF — critical Phase 2A safety constraint.
-                assert_eq!(err, SyscallError::Internal);
-            })
-            .expect("spawn test thread")
-            .join()
-            .expect("join test thread");
     }
 
     // ── Stage 81A: syscall-error parity and nonfatal dispatch ─────────────────
@@ -5068,7 +4947,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 2 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "D4 step 2 must not change syscall variant count"
         );
         assert!(
@@ -5132,7 +5011,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 3 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "D4 step 3 must not change syscall variant count"
         );
         assert!(
@@ -5201,7 +5080,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 4 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "D4 step 4 must not change syscall variant count"
         );
         assert!(
@@ -5261,9 +5140,10 @@ mod tests {
 
     #[test]
     fn stage102_split_modules_exist_and_host_moved_handlers() {
-        // The Stage 102 mechanical split moved NR 15 (DebugLog) and NR 27/28
-        // (InitramfsReadChunk / CreateInitramfsFileSliceMo) handler bodies into
-        // child modules. The bodies must live there and ONLY there.
+        // The Stage 102 mechanical split moved NR 15 (DebugLog) and NR 28
+        // (CreateInitramfsFileSliceMo) handler bodies into child modules. The bodies must
+        // live there and ONLY there. (Stage 197A removed the former NR 27
+        // InitramfsReadChunk handler entirely.)
         let debug_src = include_str!("syscall/debug.rs");
         let initramfs_src = include_str!("syscall/initramfs.rs");
         let parent_src = include_str!("syscall.rs");
@@ -5273,22 +5153,21 @@ mod tests {
             "syscall/debug.rs must define handle_debug_log with pub(super) visibility"
         );
         assert!(
-            initramfs_src.contains("pub(super) fn handle_initramfs_read_chunk"),
-            "syscall/initramfs.rs must define handle_initramfs_read_chunk"
-        );
-        assert!(
             initramfs_src.contains("pub(super) fn handle_create_initramfs_file_slice_mo"),
             "syscall/initramfs.rs must define handle_create_initramfs_file_slice_mo"
+        );
+        // The removed NR 27 handler must be gone from every module. (The needle is split so
+        // this assertion does not match itself via include_str! of syscall.rs.)
+        let handler = concat!("fn handle_initramfs", "_read_chunk");
+        assert!(
+            !initramfs_src.contains(handler) && !parent_src.contains(handler),
+            "the removed NR 27 handler must not appear in any syscall module"
         );
 
         // The parent must no longer define the moved bodies (only `use` them).
         assert!(
             !parent_src.contains("\nfn handle_debug_log"),
             "handle_debug_log body must not remain in syscall.rs"
-        );
-        assert!(
-            !parent_src.contains("\nfn handle_initramfs_read_chunk"),
-            "handle_initramfs_read_chunk body must not remain in syscall.rs"
         );
         assert!(
             !parent_src.contains("\nfn handle_create_initramfs_file_slice_mo"),
@@ -5307,9 +5186,7 @@ mod tests {
             "debug handler re-import missing"
         );
         assert!(
-            parent_src.contains(
-                "use self::initramfs::{handle_create_initramfs_file_slice_mo, handle_initramfs_read_chunk};"
-            ),
+            parent_src.contains("use self::initramfs::handle_create_initramfs_file_slice_mo;"),
             "initramfs handler re-import missing"
         );
     }
@@ -5321,12 +5198,6 @@ mod tests {
         assert!(
             src.contains("Syscall::DebugLog => handle_debug_log(kernel, frame)"),
             "NR 15 dispatch arm must be unchanged"
-        );
-        assert!(
-            src.contains(
-                "Syscall::InitramfsReadChunk => handle_initramfs_read_chunk(kernel, frame)"
-            ),
-            "NR 27 dispatch arm must be unchanged"
         );
         assert!(
             src.contains(
@@ -5372,12 +5243,15 @@ mod tests {
         dispatch(&mut kernel, &mut frame).expect("debug_log dispatch");
         assert_eq!(frame.ret0(), 0, "NR 15 null-ptr fast path returns ok(0)");
 
-        // NR 27 InitramfsReadChunk from a non-SystemServer task must be denied
-        // with MissingRight — same access-gate behavior as before the move.
-        // args: name_ptr=0, name_len=8, offset=0, dst_ptr=0x1000, max_len=64, target=0
-        let mut frame27 = TrapFrame::new(SYSCALL_INITRAMFS_READ_CHUNK_NR, [0, 8, 0, 0x1000, 64, 0]);
+        // NR 28 CreateInitramfsFileSliceMo from a non-SystemServer task must be denied
+        // with MissingRight — the moved handler's access gate is still reachable through
+        // dispatch(). (Stage 197A removed the former NR 27 InitramfsReadChunk handler.)
+        let mut frame28 = TrapFrame::new(
+            SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR,
+            [0x1000, 8, 0, 0, 0, 0],
+        );
         let err =
-            dispatch(&mut kernel, &mut frame27).expect_err("NR 27 must deny non-system-server");
+            dispatch(&mut kernel, &mut frame28).expect_err("NR 28 must deny non-system-server");
         assert_eq!(err, SyscallError::MissingRight);
     }
 

@@ -256,38 +256,36 @@ fi
 # import/dispatch/retire/finalize markers; forbid any split fatal or AArch64
 # queue-advancing (FutexWait/Yield) / other-split-class retirement marker.
 if [[ -f "$LOGFILE" ]]; then
-  # Stage 195A (DebugLog NR 15) + Stage 195B (InitramfsReadChunk NR 27) live acceptance.
+  # Stage 195A (DebugLog NR 15) live acceptance. (Stage 197A removed the NR 27
+  # InitramfsReadChunk split class along with the syscall; FutexWake NR 10 below covers the
+  # second live AArch64 pre-lock split class.)
   if ! check_required_patterns "$LOGFILE" \
       "AARCH64_SPLIT_ABI_IMPORT_OK nr=15" \
       "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=15" \
       "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=DebugLog result=ok" \
-      "AARCH64_SPLIT_FINALIZE_OK nr=15 result=ok" \
-      "AARCH64_SPLIT_ABI_IMPORT_OK nr=27" \
-      "YARM_LOCK_SPLIT_DISPATCH arch=aarch64 nr=27" \
-      "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=InitramfsReadChunk result=ok" \
-      "AARCH64_SPLIT_FINALIZE_OK nr=27 result=ok"; then
-    echo "[error] aarch64 Stage 195A/195B split-dispatch markers missing"
+      "AARCH64_SPLIT_FINALIZE_OK nr=15 result=ok"; then
+    echo "[error] aarch64 Stage 195A split-dispatch markers missing"
     exit 1
   fi
-  # Forbid split fatals and the Yield queue-advancing retirement marker (Yield stays inert).
-  # Stage 195C ENABLES FutexWake (NR 10); Stage 195F makes the FutexWait (NR 9) queue-advancing
-  # drain DEFAULT-ON (no knob), so `class=FutexWait` is NO LONGER forbidden — it legitimately
-  # appears whenever any eligible FutexWait occurs. Stage 195G makes the Yield (NR 0)
-  # queue-advancing drain DEFAULT-ON too, so `class=Yield` is likewise NOT forbidden (it appears
-  # whenever an eligible Yield occurs; a plain core boot performs no Yield, so it stays 0). Only
-  # split-finalize ERRORS remain forbidden.
+  # The removed NR 27 InitramfsReadChunk retirement marker must NOT appear.
+  if cad_has "class=InitramfsReadChunk"; then
+    echo "[error] aarch64: removed NR 27 InitramfsReadChunk retirement marker present"
+    exit 1
+  fi
+  # Forbid split fatals. Stage 195C ENABLES FutexWake (NR 10); Stage 195F/195G make the
+  # FutexWait (NR 9) + Yield (NR 0) queue-advancing drains DEFAULT-ON, so `class=FutexWait` /
+  # `class=Yield` are NOT forbidden. Only split-finalize ERRORS remain forbidden.
   a64_split_bads=(
     "AARCH64_SPLIT_FINALIZE_OK nr=15 result=error"
-    "AARCH64_SPLIT_FINALIZE_OK nr=27 result=error"
     "AARCH64_SPLIT_FINALIZE_OK nr=10 result=error"
   )
   for a64_split_bad in "${a64_split_bads[@]}"; do
     if cad_has "$a64_split_bad"; then
-      echo "[error] aarch64 Stage 195A/195B/195C: forbidden split marker: $a64_split_bad"
+      echo "[error] aarch64 Stage 195A/195C: forbidden split marker: $a64_split_bad"
       exit 1
     fi
   done
-  echo "[ok] aarch64 Stage 195A/195B: DebugLog + InitramfsReadChunk split-dispatch live (queue-advancing Yield inert)"
+  echo "[ok] aarch64 Stage 195A: DebugLog split-dispatch live (NR 27 removed; queue-advancing Yield inert)"
 fi
 
 # Stage 195C (AARCH64 FUTEXWAKE LIVE ORACLE): when booted with the oracle knob, require the

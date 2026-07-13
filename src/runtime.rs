@@ -2440,9 +2440,11 @@ impl SharedKernel {
         count as u32
     }
 
-    /// Stage 191C (GLOBAL-LOCK-RETIRE class=InitramfsReadChunk): copy the kernel slice
-    /// `src` into user VA `user_ptr` in address space `asid_raw`, OFF the broad global
-    /// lock. Byte-identical in end-state to the legacy `KernelState::
+    /// Off-global-lock, all-or-nothing user-copy primitive (introduced Stage 191C; its
+    /// original NR 27 InitramfsReadChunk caller was removed in Stage 197A, but this remains a
+    /// generic split-path write seam with dedicated no-partial-write unit tests): copy the
+    /// kernel slice `src` into user VA `user_ptr` in address space `asid_raw`, OFF the broad
+    /// global lock. Byte-identical in end-state to the legacy `KernelState::
     /// copy_to_current_user_from_slice` / `copy_slice_to_task` (per-page validate +
     /// bulk `copy_nonoverlapping`), but driven through the rank-5 VM seam
     /// (`validate_user_access_for_asid_split`) + the direct map instead of a broad

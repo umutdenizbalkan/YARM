@@ -2361,7 +2361,7 @@ dispatch" (dispatch.rs) or require the D1/D5 cap-slot/lock-ordering audit
 | `syscall/cap.rs` | **landed** D4 step 4 (TransferRelease / CNode slot control handlers) |
 | `syscall/sched.rs` | **landed** D4 step 3 (yield/futex scheduler handlers) |
 | `syscall/process.rs` | **landed** D4 step 2 (process-domain spawn/fork handlers) |
-| `syscall/initramfs.rs` | **landed** Stage 102 (NR 27/28) |
+| `syscall/initramfs.rs` | **landed** Stage 102 (NR 28; NR 27 handler removed in Stage 197A) |
 | `syscall/debug.rs` | **landed** Stage 102 (NR 15) |
 | `syscall/recv_shared_v3.rs` | **landed** D4 step 1 (NR 30) |
 
@@ -8376,7 +8376,7 @@ compiled runtime is behaviorally unchanged (guard tests only, no runtime source 
 | Mechanism | x86_64 | AArch64 support | AArch64 missing | RISC-V support | RISC-V missing | genericization | classification |
 |---|---|---|---|---|---|---|---|
 | DebugLog | live | shared path + ABI-import hook (oracle-gated) | de-gate ABI import + finalize | none (raw trap path) | route trap through shared entry | make ABI import unconditional | generic_with_arch_restore_hook (no restore needed) |
-| InitramfsReadChunk | live | same as DebugLog | same | same | same | same | generic_with_arch_restore_hook |
+| ~~InitramfsReadChunk~~ | **removed (Stage 197A)** — NR 27 syscall + split class deleted; zero-copy grant (NR 28/29) is the sole ELF-load path | — | — | — | — | — |
 | FutexWake | live | same as DebugLog | same | same | same | same | generic_with_arch_restore_hook |
 | D2 recv/send dispatch drain | live | shared path; restore hook exists | de-gate x86-only drain body + EL0-return proof | none | shared path + post-`sret` drain | de-gate `#[cfg(x86_64)]` drain block | x86_64_trap_entry_specific |
 | FutexWait dispatch drain | live | as D2 | as D2 | none | as D2 | as D2 | x86_64_trap_entry_specific |
@@ -8421,7 +8421,13 @@ legacy `handle_debug_log` path. Queue-advancing classes stay `#[cfg(target_arch 
 x86_64 marker text is byte-identical (arch tag is empty off AArch64); RISC-V stays inert
 (active flag force-false). See §4.6 of `doc/ARCH_AARCH64.md`.
 
-#### Stage 195B — AArch64 InitramfsReadChunk LIVE (DONE)
+#### Stage 195B — AArch64 InitramfsReadChunk LIVE (DONE — superseded by Stage 197A removal)
+
+> **Historical.** Stage 197A removed the NR 27 `InitramfsReadChunk` syscall and its
+> split-dispatch retirement entirely (the zero-copy MemoryObject grant is now the sole ELF-load
+> path). The AArch64 pre-lock split gate is now `NR 15 || NR 10 (FutexWake) || oracle`. The
+> record below is retained for history; the AArch64 return-path (`+4`/re-save) bug fix it drove
+> is preserved and now guards every return-consuming split class (e.g. FutexWake).
 
 InitramfsReadChunk (NR 27) is the second live AArch64 split-dispatch class. The selective
 ABI-import gate is extended to `NR 15 || NR 27 || oracle` (the finalize gate mirrors it), so
