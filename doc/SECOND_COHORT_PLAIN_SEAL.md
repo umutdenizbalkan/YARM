@@ -14,7 +14,7 @@ built from the current source (not copied from prior stage reports).
 > markers, (b) **replicates the x86-only oracle slot provisioning** into AArch64
 > and RISC-V `boot.rs`, and (c) makes the arch-neutral oracle workloads emit
 > **canonical per-arch attestations**. Zero ABI change (`SYSCALL_COUNT = 32`,
-> `Syscall::VARIANT_COUNT = 23`), zero new kernel lock, NR 27 stays absent.
+> `Syscall::VARIANT_COUNT = 22`), zero new kernel lock, NR 27 stays absent.
 
 > **Preserves the first cohort.** `FIRST_COHORT_LIVE_MATRIX arches=3 classes=4
 > live_cells=12 result=ok` and `FIRST_COHORT_CROSS_ARCH_SEAL arches=3 classes=4
@@ -72,34 +72,52 @@ and `sret`s back to itself. It is **never** `EnterKernelIdle` (no idle) and **ne
 RISC-V NR15/NR10 selective pre-lock gate — the generic canonical-handler +
 boundary-drain design already covers it.
 
-### RISC-V recv-block terminal-idle fix (pre-existing gap, required for the seal)
+### RISC-V blocking-syscall terminal idle from AUTHORITATIVE PROVENANCE (Stage 198A1)
 
-Bringing the oracle live on RISC-V surfaced a **pre-existing** defect unrelated to
-the plain-IpcSend mechanism: the `ipc_recv_proof` scaffolding the oracle rides on
-had **never** booted cleanly on RISC-V. When a syscall BLOCKS the last runnable task
-(a `recv-v2` with no incoming message) it succeeds (`Ok`) while clearing `current`,
-leaving nothing runnable. Stage 197B wired `ExistingTerminalIdle` only on the `Err`
-channel, so this `Ok`-path case fell through to `ReturnToCurrent`; the bridge then
-`sret`'d a stale frame as tid 0 and **hot-spun** re-entering the blocked recv
-(observed as an `IPC_RECV_ENTER tid=0` busy loop that never reached WFI idle). The
-targeted fix adds a terminal-idle branch on the wrapper's `Ok` path, gated on
-`!switched` AND the SAME positive scheduler-state predicate the `Err` path uses
-(`current` is `None|Some(0)` AND zero runnable on this CPU) → return
-`EnterKernelIdle { ExistingTerminalIdle }`. This is **audited and reported** per the
-stage's RISC-V return-outcome rule: it does **not** touch the plain IpcSend sender
-(which keeps `current` non-zero → `ReturnToCurrent`), and it never fires after a
-Yield (Yield switches → `switched=true`, or keeps `current` non-zero) or a FutexWait
-no-incoming (which returns `EnterKernelIdle` from its own explicit branch earlier).
-First-cohort DebugLog/FutexWake/FutexWait/Yield retirements are preserved live.
+Bringing the oracle live on RISC-V surfaced a **pre-existing** defect: the
+`ipc_recv_proof` scaffolding had **never** booted cleanly on RISC-V. When a syscall
+BLOCKS the last runnable task (a `recv-v2` with no incoming message) it succeeds
+(`Ok`) while clearing `current`, leaving nothing runnable, and the bridge `sret`'d a
+stale frame as tid 0 and **hot-spun** re-entering the blocked recv (an
+`IPC_RECV_ENTER tid=0` loop that never reached WFI idle).
 
-> **Environment note.** The AArch64 core-smoke *wrapper* exits non-zero in this
-> specific CI environment even at BASELINE (a normal boot with no proof and none of
-> this stage's code times out at the smoke's short `TIMEOUT_SECS` and trips its
-> verdict logic) — an environment/harness limitation, not a mechanism defect. The
-> AArch64 boot itself is clean (reaches `SCHED_ENTER_IDLE_HLT`, all retirements fire)
-> and the plain-IpcSend retirement + attestation markers are proven firing live, so
-> the seal (which keys on the genuinely-firing markers from a clean boot with a
-> forbidden-marker guard) seals all six cells.
+Stage 198A first stopped the spin with a state-inferred `Ok`-path idle branch
+(`current None|0` + zero runnable → idle). **Stage 198A1 replaces that inference
+with AUTHORITATIVE PROVENANCE.** The arch-neutral canonical blocking seam
+(`handle_trap_event`'s `blocking_syscall && caller_blocked` branch — IpcRecv /
+IpcCall / IpcSend) publishes a per-CPU token
+(`BLOCKED_SYSCALL_IDLE_PROVENANCE`) recording the tid it just blocked and
+dispatched away from. The RISC-V wrapper **consumes** that token on its `Ok` tail:
+
+* **provenance present + terminal** (`current None|Some(0)` AND zero runnable) →
+  typed `EnterKernelIdle { BlockedRecvNoRunnable }` +
+  `RISCV_BLOCKED_RECV_IDLE_PROVENANCE_OK tid=<tid>`.
+* **terminal state WITHOUT provenance** → a **defensive failure**
+  (`RISCV_BLOCKED_IDLE_NO_PROVENANCE` + the canonical `Err(Internal)` path →
+  `RISCV_TRAP_HANDLE_FAILED`), **never** silent idle. The bridge no longer infers
+  intentional idle from scheduler state alone on either channel.
+* **not terminal** → the token is consumed and the tail returns same-task
+  (`ReturnToCurrent`) / incoming (`ReturnToIncoming`).
+
+The former state-inferred `ExistingTerminalIdle` reclassification is **removed** from
+both the `Ok` and `Err` paths; a genuine `Err` always stays on the `Err` channel
+(preserving Stage 197B). This never touches the plain IpcSend **sender** (keeps
+`current` non-zero → `ReturnToCurrent`); never fires after a Yield (switches or keeps
+current); and FutexWait no-incoming keeps its own `FutexWaitNoIncoming` typed idle.
+Blocking-path inventory: only IpcRecv / IpcCall / IpcSend reach the `Ok` terminal
+idle (all covered by the provenance seam); no Exit/Terminate/NotificationWait syscall
+exists; `IpcRecvTimeout` / `RecvSharedV3` blocks go to a fatal `Err`.
+
+### AArch64 smoke idle-aware completion (Stage 198A1)
+
+The AArch64 core-smoke and oracle wrappers now terminate deterministically on
+canonical terminal idle instead of always running out the wall-clock timeout: once
+all required positive markers have fired and the terminal-idle marker
+(`SCHED_ENTER_IDLE_HLT`) is observed with no forbidden marker, the harness kills
+QEMU intentionally and returns exit 0. A missing proof marker, a forbidden/fatal
+marker, or an early silent hang (idle before the proof completes) still fails. No
+production kernel behavior is changed for the harness. The former "nonzero AArch64
+wrapper is an accepted permanent caveat" note is retired.
 
 ## 3. Authoritative 3×2 implementation matrix
 

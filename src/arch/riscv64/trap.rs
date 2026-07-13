@@ -32,10 +32,12 @@ pub enum RiscvIdleReason {
     /// The default-on FutexWait queue-advancing drain found no runnable incoming task while the
     /// outgoing caller stays `Blocked(Futex)` — the retired-class post-lock idle outcome.
     FutexWaitNoIncoming,
-    /// The pre-existing terminal idle: the broad-lock handler produced no resumable current task
-    /// AND the scheduler has no runnable task on this CPU (all services blocked). This is a
-    /// positive terminal-state assertion, NOT an inference from an error code.
-    ExistingTerminalIdle,
+    /// Stage 198A1: a canonical BLOCKING syscall (IpcRecv / IpcCall / IpcSend) blocked the caller
+    /// and dispatched away leaving no runnable task. The provenance is AUTHORITATIVE — published
+    /// by the arch-neutral blocking seam (`BLOCKED_SYSCALL_IDLE_PROVENANCE`) and consumed here — so
+    /// idle is a POSITIVE outcome of a real blocking operation, never inferred from `current == None`
+    /// + zero-runnable scheduler state alone.
+    BlockedRecvNoRunnable,
 }
 
 /// Stage 197B: the explicit, typed result of the RISC-V shared trap-entry wrapper. It replaces the
@@ -495,26 +497,13 @@ pub fn handle_riscv_trap_entry_shared(
         crate::yarm_log!("RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR cpu={}", cpu.0);
     }
 
-    // Stage 197B: classify the broad-lock handler's outcome with an EXPLICIT type — never an
-    // `Err(Internal)`-shaped idle sentinel. On error, distinguish the pre-existing TERMINAL IDLE
-    // (all services blocked: no resumable current task AND no runnable task on this CPU — a
-    // POSITIVE scheduler-state assertion, corroborated by the current==None invariant) from a
-    // GENUINE internal failure (a live/current task still exists). Terminal idle is a typed
-    // SUCCESS outcome; a genuine failure stays on the `Err` channel and can never be read as idle.
-    if let Err(e) = inner_result {
-        let terminal_idle = shared
-            .with_cpu(cpu, |kernel| {
-                matches!(kernel.current_tid(), None | Some(0))
-                    && kernel.runnable_count_on_cpu(cpu) == 0
-            })
-            .unwrap_or(false);
-        if terminal_idle {
-            return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
-                reason: RiscvIdleReason::ExistingTerminalIdle,
-            });
-        }
-        return Err(e);
-    }
+    // Stage 197B / 198A1: a GENUINE internal failure ALWAYS stays on the `Err` channel — it can
+    // never be read as idle. Stage 198A1 removes the former state-inferred terminal-idle
+    // reclassification on this Err path (it inferred intentional idle from `current == None` + zero
+    // runnable, which is now forbidden): intentional idle is produced ONLY from explicit typed
+    // provenance (FutexWaitNoIncoming on the FutexWait drain, BlockedRecvNoRunnable on the Ok tail).
+    // An Err here takes the fatal `RISCV_TRAP_HANDLE_FAILED` bridge path regardless of `current`.
+    inner_result?;
 
     // `switched` becomes true iff a post-lock switch drain (FutexWait switch / Yield switch) armed
     // an incoming task; it selects `ReturnToIncoming` vs `ReturnToCurrent` at the single tail
@@ -897,27 +886,49 @@ pub fn handle_riscv_trap_entry_shared(
         crate::yarm_log!("RISCV_SHARED_TRAP_ENTRY_DONE cpu={}", cpu.0);
     }
 
-    // Stage 198A: recv-block TERMINAL-IDLE on the Ok path. Stage 197B wired `ExistingTerminalIdle`
-    // only on the Err channel, but a syscall that BLOCKS the last runnable task — a recv-v2 with no
-    // incoming message — succeeds (`Ok`) while clearing `current`, leaving nothing to run. Without
-    // this branch the bridge would `sret` a stale frame as tid 0 and hot-spin re-entering the
-    // blocked recv syscall instead of reaching WFI idle (observed as an `IPC_RECV_ENTER tid=0`
-    // busy loop). When NO switch drain armed an incoming task AND the scheduler is genuinely
-    // quiescent (current is `None|Some(0)` AND zero runnable tasks on this CPU — the SAME positive
-    // scheduler-state predicate the Err terminal-idle path uses), enter the typed terminal idle.
-    // This NEVER fires while any task stays current: a plain IpcSend sender, DebugLog, FutexWake,
-    // etc. keep `current` non-zero and return same-task `ReturnToCurrent` unchanged.
+    // Stage 198A1: blocking-syscall TERMINAL-IDLE on the Ok path, from AUTHORITATIVE PROVENANCE —
+    // NOT from scheduler state alone. A canonical blocking syscall (IpcRecv / IpcCall / IpcSend)
+    // that blocks the last runnable task succeeds (`Ok`) while clearing `current`; the arch-neutral
+    // blocking seam published `BLOCKED_SYSCALL_IDLE_PROVENANCE` for the tid it blocked. We CONSUME
+    // that token here (always, so it never leaks to the next trap) and combine it with the terminal
+    // scheduler state:
+    //   * provenance present + terminal (current None|Some(0) AND zero runnable) → typed
+    //     `EnterKernelIdle { BlockedRecvNoRunnable }`. Without this the bridge would `sret` a stale
+    //     frame as tid 0 and hot-spin re-entering the blocked recv (an `IPC_RECV_ENTER tid=0` loop).
+    //   * terminal state WITHOUT provenance → a BUG (spurious `current == None`): emit a defensive
+    //     marker and take the canonical `Err` path (RISCV_TRAP_HANDLE_FAILED). NEVER silent idle.
+    //   * not terminal → the provenance (if any) is simply consumed; fall through to the same-task /
+    //     incoming tail return. A plain IpcSend SENDER keeps `current` non-zero → ReturnToCurrent.
+    // FutexWait no-incoming produced its own typed idle earlier and never reaches here; Yield either
+    // switches (`switched=true`) or keeps `current` and never idles.
     if !switched {
+        let provenance = crate::kernel::boot::blocked_syscall_idle_provenance_take(cpu_idx);
         let terminal_idle = shared
             .with_cpu(cpu, |kernel| {
                 matches!(kernel.current_tid(), None | Some(0))
                     && kernel.runnable_count_on_cpu(cpu) == 0
             })
             .unwrap_or(false);
-        if terminal_idle {
-            return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
-                reason: RiscvIdleReason::ExistingTerminalIdle,
-            });
+        match (provenance, terminal_idle) {
+            (Some(blocked_tid), true) => {
+                crate::yarm_log!("RISCV_BLOCKED_RECV_IDLE_PROVENANCE_OK tid={}", blocked_tid);
+                return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                    reason: RiscvIdleReason::BlockedRecvNoRunnable,
+                });
+            }
+            (None, true) => {
+                // DEFENSIVE: terminal-idle scheduler state with NO authoritative blocking-syscall
+                // provenance must NEVER be read as intentional idle — it is a bug (a non-blocking
+                // syscall left `current == None`). Take the canonical error path.
+                crate::yarm_log!(
+                    "RISCV_BLOCKED_IDLE_NO_PROVENANCE cpu={} current_none=1 runnable=0 result=defensive_err",
+                    cpu.0
+                );
+                return Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                ));
+            }
+            _ => {}
         }
     }
 

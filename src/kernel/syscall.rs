@@ -1749,6 +1749,18 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
             if kernel.current_tid() == caller_tid {
                 let _ = kernel.dispatch_next_task().map_err(SyscallError::from)?;
             }
+            // Stage 198A1: publish AUTHORITATIVE idle provenance. A canonical blocking syscall
+            // (IpcRecv / IpcCall / IpcSend) just blocked `caller_tid` and dispatched away from it
+            // (`current` is now the next runnable task, or None if none). The RISC-V trap wrapper
+            // consumes this token to decide typed `EnterKernelIdle { BlockedRecvNoRunnable }` from a
+            // POSITIVE signal — never from scheduler state alone. Arch-neutral: x86_64 / AArch64
+            // set it but never read it (they own their own idle bridges).
+            if let Some(blocked_tid) = caller_tid {
+                crate::kernel::boot::blocked_syscall_idle_provenance_set(
+                    kernel.current_cpu().0 as usize,
+                    blocked_tid,
+                );
+            }
             syscall_trace!(
                 "AARCH64_BLOCKED_RETURN_DISPATCH trapped_tid={} next_tid={}",
                 caller_tid.unwrap_or(0),

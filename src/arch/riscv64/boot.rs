@@ -827,7 +827,7 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             }
             let reason_str = match reason {
                 RiscvIdleReason::FutexWaitNoIncoming => "FutexWaitNoIncoming",
-                RiscvIdleReason::ExistingTerminalIdle => "ExistingTerminalIdle",
+                RiscvIdleReason::BlockedRecvNoRunnable => "BlockedRecvNoRunnable",
             };
             crate::yarm_log!("RISCV_TYPED_IDLE_OUTCOME result=ok reason={}", reason_str);
             crate::yarm_log!(

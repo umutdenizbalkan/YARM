@@ -13850,7 +13850,9 @@ The RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`) now returns an
 explicit typed result, `Result<RiscvTrapEntryOutcome, TrapHandleError>`, where
 `RiscvTrapEntryOutcome ∈ { ReturnToCurrent, ReturnToIncoming, EnterKernelIdle {
 reason: RiscvIdleReason } }` and `RiscvIdleReason ∈ { FutexWaitNoIncoming,
-ExistingTerminalIdle }`.
+BlockedRecvNoRunnable }` (Stage 198A1 replaced the state-inferred
+`ExistingTerminalIdle` with the authoritative `BlockedRecvNoRunnable` provenance —
+see the Stage 198A1 section below).
 
 - **Intentional post-lock idle is a first-class SUCCESS outcome**, not the former
   `Err(SyscallError::Internal)` + `current == None` sentinel. The FutexWait
@@ -13895,14 +13897,32 @@ enqueue discriminator) into AArch64 and RISC-V `boot.rs`. RISC-V plain `IpcSend`
 stays on the canonical handler and returns `RiscvTrapEntryOutcome::ReturnToCurrent`
 (the drain wakes the receiver but never sets `switched`), so it is **not** added to
 the RISC-V selective pre-lock gate. No ABI change (`SYSCALL_COUNT = 32`,
-`VARIANT_COUNT = 23`); no new kernel lock; no new retirement class.
+`VARIANT_COUNT = 22`); no new kernel lock; no new retirement class.
 
-Bringing the oracle live on RISC-V also required fixing a **pre-existing** idle-path
-gap (the `ipc_recv_proof` scaffolding had never booted cleanly on RISC-V): a
-`recv-v2` that blocks the last runnable task succeeds (`Ok`) and clears `current`
-with nothing runnable, but Stage 197B only wired `ExistingTerminalIdle` on the `Err`
-path, so the bridge `sret`'d a stale frame as tid 0 and hot-spun. The wrapper now
-also enters the typed terminal idle on the `Ok` path when `!switched` AND the same
-`current None|0` + zero-runnable quiescence predicate holds. This never affects the
-plain IpcSend sender (keeps `current` → `ReturnToCurrent`) and preserves the
-first-cohort retirements. Full record in `doc/SECOND_COHORT_PLAIN_SEAL.md`.
+Bringing the oracle live on RISC-V also surfaced a **pre-existing** idle-path gap
+(the `ipc_recv_proof` scaffolding had never booted cleanly on RISC-V): a `recv-v2`
+that blocks the last runnable task succeeds (`Ok`) and clears `current` with nothing
+runnable, and the bridge `sret`'d a stale frame as tid 0 and hot-spun. Stage 198A1
+resolves this with **authoritative provenance** (not state inference) — see the
+Stage 198A1 section below and `doc/SECOND_COHORT_PLAIN_SEAL.md`.
+
+## Stage 198A1 — RISC-V typed blocking-idle provenance + AArch64 smoke stabilization
+
+Stage 198A's `Ok`-path idle branch inferred intentional idle from scheduler state
+(`current None|0` + zero runnable). **Stage 198A1 replaces that inference with an
+authoritative per-CPU token.** The arch-neutral canonical blocking seam
+(`handle_trap_event`'s `blocking_syscall && caller_blocked` branch — IpcRecv /
+IpcCall / IpcSend) publishes `BLOCKED_SYSCALL_IDLE_PROVENANCE` (the tid it blocked
+and dispatched away from). The RISC-V wrapper consumes it: **provenance + terminal
+state → typed `EnterKernelIdle { BlockedRecvNoRunnable }`**; **terminal state without
+provenance → a defensive `Err(Internal)`** (`RISCV_BLOCKED_IDLE_NO_PROVENANCE` →
+`RISCV_TRAP_HANDLE_FAILED`), never silent idle. The state-inferred
+`ExistingTerminalIdle` reclassification is removed from both the `Ok` and `Err`
+paths, so a genuine `Err` always stays on the `Err` channel. The plain IpcSend
+**sender** still returns `ReturnToCurrent`; Yield never idles; FutexWait keeps its
+`FutexWaitNoIncoming` typed idle. No ABI change (`SYSCALL_COUNT = 32`,
+`VARIANT_COUNT = 22`); no new kernel lock; no new retirement class. The AArch64
+core-smoke and oracle wrappers also gain deterministic idle-aware completion (kill
+QEMU + exit 0 once the required proof markers + `SCHED_ENTER_IDLE_HLT` are observed
+with no forbidden marker), so a clean terminal-idle boot no longer fails on the
+wall-clock timeout. Full record in `doc/SECOND_COHORT_PLAIN_SEAL.md`.

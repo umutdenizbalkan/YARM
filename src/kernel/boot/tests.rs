@@ -64849,10 +64849,15 @@ mod stage196g_riscv_yield_default_on {
     // no Err(Internal) sentinel), state_changed declines.
     #[test]
     fn post_lock_drain_full_and_no_idle() {
+        // Bound to the Yield drain section (ends at the structural RISCV_POST_LOCK_DRAIN_DONE marker)
+        // so the Stage 198A1 tail idle/defensive branches are not swept into the Yield drain slice.
         let drain = RISCV_TRAP_SRC
             .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
             .nth(1)
-            .expect("196G Yield drain present");
+            .expect("196G Yield drain present")
+            .split("RISCV_POST_LOCK_DRAIN_DONE")
+            .next()
+            .unwrap();
         for m in [
             "RISCV_YIELD_DISPATCH_DRAIN_BEGIN cpu={}",
             "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=Yield",
@@ -65126,9 +65131,14 @@ mod stage197_first_cohort_seal {
             fw.contains("RISCV_FUTEX_WAIT_DISPATCH_DONE result=idle"),
             "the FutexWait drain must support the idle outcome"
         );
+        // Bound to the Yield drain section (ends at the structural RISCV_POST_LOCK_DRAIN_DONE marker)
+        // so the Stage 198A1 tail idle/defensive branches are not swept into the Yield drain slice.
         let yld = RISCV_TRAP_SRC
             .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
             .nth(1)
+            .unwrap()
+            .split("RISCV_POST_LOCK_DRAIN_DONE")
+            .next()
             .unwrap();
         assert!(
             !yld.contains("POST_LOCK_IDLE_BEGIN")
@@ -65200,17 +65210,19 @@ mod stage197_first_cohort_seal {
                 && !idle.contains("SyscallError::Internal"),
             "the FutexWait idle branch must return the typed EnterKernelIdle (no Err(Internal))"
         );
-        // The ONLY `SyscallError::Internal` remaining in the RISC-V trap wrapper is the default-off
-        // NEGATIVE oracle's GENUINE forced error (a real error, never an idle sentinel). It is
-        // co-located with the ORACLE_BEGIN marker and is not in any idle branch.
+        // The only `SyscallError::Internal` uses in the RISC-V trap wrapper are GENUINE errors,
+        // never idle sentinels: (1) the default-off NEGATIVE oracle's forced error, and (2) the
+        // Stage 198A1 DEFENSIVE no-provenance path (terminal scheduler state without authoritative
+        // blocking-syscall provenance → canonical error path, NOT silent idle).
         assert_eq!(
             RISCV_TRAP_SRC.matches("SyscallError::Internal").count(),
-            1,
-            "only the negative-oracle genuine error may use SyscallError::Internal"
+            2,
+            "Internal may only be the negative-oracle error + the defensive no-provenance error"
         );
         assert!(
-            RISCV_TRAP_SRC.contains("RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_BEGIN"),
-            "the remaining Internal must be the default-off negative (genuine error) oracle"
+            RISCV_TRAP_SRC.contains("RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_BEGIN")
+                && RISCV_TRAP_SRC.contains("RISCV_BLOCKED_IDLE_NO_PROVENANCE"),
+            "the two Internals are the negative oracle + the defensive no-provenance path"
         );
         // The Yield drain never idles (its no-incoming is a FAIL marker) and never returns Internal.
         // Bound to the Yield drain section only (ends at the structural `RISCV_POST_LOCK_DRAIN_DONE`
@@ -65623,7 +65635,7 @@ mod stage197b_riscv_typed_idle_outcome {
         assert!(
             RISCV_TRAP_SRC.contains("pub enum RiscvIdleReason {")
                 && RISCV_TRAP_SRC.contains("FutexWaitNoIncoming,")
-                && RISCV_TRAP_SRC.contains("ExistingTerminalIdle,"),
+                && RISCV_TRAP_SRC.contains("BlockedRecvNoRunnable,"),
             "the idle reason enum must enumerate both typed provenances"
         );
         // The outcome enum has exactly three variants (ReturnToCurrent / ReturnToIncoming /
@@ -65657,7 +65669,7 @@ mod stage197b_riscv_typed_idle_outcome {
         // The reason match in the bridge names both idle provenances (no catch-all `_`).
         assert!(
             RISCV_BOOT_SRC.contains("RiscvIdleReason::FutexWaitNoIncoming =>")
-                && RISCV_BOOT_SRC.contains("RiscvIdleReason::ExistingTerminalIdle =>"),
+                && RISCV_BOOT_SRC.contains("RiscvIdleReason::BlockedRecvNoRunnable =>"),
             "the bridge must name both typed idle reasons"
         );
     }
@@ -65791,8 +65803,8 @@ mod stage197b_riscv_typed_idle_outcome {
         );
         assert_eq!(
             RISCV_TRAP_SRC.matches("SyscallError::Internal").count(),
-            1,
-            "the only SyscallError::Internal is the negative-oracle genuine error"
+            2,
+            "SyscallError::Internal is only the negative-oracle error + defensive no-provenance error"
         );
         // Its knob is default-off (absent → None) and wired.
         use crate::kernel::boot_command_line::parse_yarm_boot_options;
@@ -66009,34 +66021,58 @@ mod stage198a_second_cohort_plain_parity {
         );
     }
 
-    // (7b) The RISC-V wrapper reaches WFI idle when a syscall BLOCKS the last runnable task (a
-    // recv-v2 with no incoming): a terminal-idle branch on the Ok path, gated on `!switched` AND
-    // the SAME positive scheduler-state predicate the Err terminal-idle path uses (current None|0
-    // AND zero runnable). Without it the bridge would sret a stale frame as tid 0 and hot-spin
-    // re-entering the blocked recv. This does NOT change the plain IpcSend sender (keeps current
-    // non-zero → ReturnToCurrent).
+    // (7b) Stage 198A1: the RISC-V wrapper reaches WFI idle when a canonical blocking syscall blocks
+    // the last runnable task — from AUTHORITATIVE PROVENANCE, not scheduler state alone. The Ok-path
+    // idle branch is gated on `!switched`, CONSUMES the blocking-syscall provenance token, and only
+    // idles with typed `BlockedRecvNoRunnable` when provenance is present AND the state is terminal.
     #[test]
-    fn riscv_recv_block_reaches_terminal_idle_not_spin() {
-        // The Ok-path terminal-idle branch is present and gated on `!switched`.
+    fn riscv_blocked_recv_idle_requires_typed_provenance() {
+        // The Ok-path idle branch is present, gated on `!switched`, and consumes the provenance.
         assert!(
             RISCV_TRAP_SRC.contains("if !switched {")
-                && RISCV_TRAP_SRC.contains("recv-block TERMINAL-IDLE"),
-            "the wrapper must have the Ok-path recv-block terminal-idle branch, gated on !switched"
+                && RISCV_TRAP_SRC.contains("blocked_syscall_idle_provenance_take(cpu_idx)"),
+            "the Ok-path idle branch must consume the authoritative blocking-syscall provenance"
         );
-        // It reuses the ExistingTerminalIdle reason + the current-None|0 + zero-runnable predicate.
+        // Typed idle uses the BlockedRecvNoRunnable provenance + the terminal quiescence predicate.
         assert!(
-            RISCV_TRAP_SRC.contains("RiscvIdleReason::ExistingTerminalIdle")
+            RISCV_TRAP_SRC.contains("RiscvIdleReason::BlockedRecvNoRunnable")
+                && RISCV_TRAP_SRC.contains("RISCV_BLOCKED_RECV_IDLE_PROVENANCE_OK tid=")
                 && RISCV_TRAP_SRC.contains("runnable_count_on_cpu(cpu) == 0"),
-            "the Ok-path idle branch must reuse the ExistingTerminalIdle reason + quiescence predicate"
+            "typed idle must combine BlockedRecvNoRunnable provenance with the quiescence predicate"
         );
-        // The same current-None|0 quiescence predicate appears on BOTH the Err terminal-idle path
-        // and the new Ok recv-block path (>= 2 sites; a third pre-existing use also exists).
+        // Terminal state WITHOUT provenance takes the defensive canonical error path, NEVER idle.
+        // Scope to the no-provenance match arm so the defensive marker + Err are co-located.
+        let no_prov = RISCV_TRAP_SRC
+            .split("(None, true) =>")
+            .nth(1)
+            .expect("no-provenance arm")
+            .split("_ => {}")
+            .next()
+            .unwrap();
         assert!(
-            RISCV_TRAP_SRC
-                .matches("matches!(kernel.current_tid(), None | Some(0))")
-                .count()
-                >= 2,
-            "terminal-idle predicate must appear on BOTH the Err and the Ok recv-block paths"
+            no_prov.contains("RISCV_BLOCKED_IDLE_NO_PROVENANCE")
+                && no_prov.contains("SyscallError::Internal")
+                && !no_prov.contains("EnterKernelIdle"),
+            "no-provenance terminal state must take the defensive Err path, not silent idle"
+        );
+    }
+
+    // (7c) The provenance is published by the ARCH-NEUTRAL blocking seam (not the RISC-V wrapper),
+    // exactly at the canonical `blocking_syscall && caller_blocked` branch, so the signal is a
+    // POSITIVE product of a real blocking operation. x86_64/AArch64 set it too but never read it.
+    #[test]
+    fn blocked_syscall_idle_provenance_is_published_authoritatively() {
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        assert!(
+            SYSCALL_SRC.contains("blocked_syscall_idle_provenance_set(")
+                && SYSCALL_SRC.contains("if blocking_syscall && caller_blocked {"),
+            "the blocking seam must publish idle provenance at the canonical blocking branch"
+        );
+        assert!(
+            MOD_SRC.contains("fn blocked_syscall_idle_provenance_set(")
+                && MOD_SRC.contains("fn blocked_syscall_idle_provenance_take(")
+                && MOD_SRC.contains("BLOCKED_SYSCALL_IDLE_PROVENANCE"),
+            "the per-CPU provenance token + set/take helpers must exist"
         );
     }
 
