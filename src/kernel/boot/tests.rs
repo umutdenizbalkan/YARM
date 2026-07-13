@@ -65415,3 +65415,120 @@ mod stage197b_nr27_removed_zc_mandatory {
         );
     }
 }
+
+// Stage 197A-C: synthetic init ELF fallback removed + fail-fast init loading. A missing
+// initramfs, malformed CPIO, missing `/init`, malformed init ELF, or forced ZC fault must halt
+// boot with an explicit BOOT_FATAL_* diagnostic — never a synthetic/placeholder init.
+#[cfg(test)]
+mod stage197c_init_fail_fast {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const NEG_SCRIPT: &str =
+        include_str!("../../../scripts/qemu-x86_64-init-fail-fast-negative.sh");
+
+    // The synthetic init ELF generator and its "synthetic" fallback selection are gone from every
+    // arch boot path (needle split so this assertion does not match itself via include_str!).
+    #[test]
+    fn synthetic_init_elf_generator_removed_everywhere() {
+        let generator = concat!("fn initramfs_static_hello", "_world_elf");
+        let synth = concat!("\"synth", "etic\")");
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                !src.contains(generator),
+                "{arch} boot must not define the synthetic init ELF generator"
+            );
+            assert!(
+                !src.contains(synth),
+                "{arch} boot must not select a synthetic init fallback"
+            );
+        }
+    }
+
+    // The arch-neutral required-init loader + fatal-reason logger exist and enumerate every reason.
+    #[test]
+    fn required_init_loader_and_fatal_reasons_exist() {
+        assert!(
+            MOD_SRC.contains("pub fn load_required_init_elf_bytes()")
+                && MOD_SRC.contains("pub fn log_init_load_fatal(")
+                && MOD_SRC.contains("pub enum InitLoadFatal"),
+            "mod.rs must expose the required-init loader + fatal-reason logger + enum"
+        );
+        for marker in [
+            "BOOT_FATAL_INITRAMFS_MISSING",
+            "BOOT_FATAL_NO_CPIO",
+            "BOOT_FATAL_CPIO_INVALID",
+            "BOOT_FATAL_INIT_NOT_FOUND path=/init",
+        ] {
+            assert!(
+                MOD_SRC.contains(marker),
+                "log_init_load_fatal must emit {marker}"
+            );
+        }
+    }
+
+    // Every arch bootstrap halts on the fatal init conditions (no fallback), and the ELF-invalid /
+    // ZC-load-failed markers are emitted at the parse + segment-load steps.
+    #[test]
+    fn every_arch_bootstrap_halts_on_fatal_init() {
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains("load_required_init_elf_bytes()")
+                    && src.contains("log_init_load_fatal(reason)")
+                    && src.contains("BOOT_FATAL_INIT_ELF_INVALID")
+                    && src.contains("BOOT_FATAL_INIT_ZC_LOAD_FAILED")
+                    && src.contains("force_init_zc_load_fail()"),
+                "{arch} bootstrap must fail-fast on every mandatory init-load failure"
+            );
+        }
+    }
+
+    // The default-off fault-injection knob is wired (parses to None by default).
+    #[test]
+    fn force_init_zc_load_fail_knob_defaults_off() {
+        use crate::kernel::boot_command_line::parse_yarm_boot_options;
+        assert_eq!(
+            parse_yarm_boot_options(b"").force_init_zc_load_fail,
+            None,
+            "the force-init-zc-load-fail knob must default OFF"
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.force_init_zc_load_fail=1").force_init_zc_load_fail,
+            Some(true)
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("set_force_init_zc_load_fail"),
+            "boot_command_line must apply the fault-injection knob"
+        );
+    }
+
+    // The negative QEMU harness covers all four fatal conditions.
+    #[test]
+    fn negative_harness_covers_all_fatal_conditions() {
+        for marker in [
+            "BOOT_FATAL_INIT_ZC_LOAD_FAILED reason=fault_injection",
+            "BOOT_FATAL_INITRAMFS_MISSING",
+            "BOOT_FATAL_INIT_NOT_FOUND path=/init",
+            "BOOT_FATAL_INIT_ELF_INVALID",
+        ] {
+            assert!(
+                NEG_SCRIPT.contains(marker),
+                "the negative harness must assert {marker}"
+            );
+        }
+        assert!(
+            NEG_SCRIPT.contains("INIT_FAIL_FAST_NEGATIVE arch=x86_64 cases=4 result=ok"),
+            "the negative harness must emit the final pass marker"
+        );
+    }
+}

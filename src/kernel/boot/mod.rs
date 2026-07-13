@@ -2556,6 +2556,86 @@ pub fn x86_futex_wake_oracle_enabled() -> bool {
     X86_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+// ─── Stage 197A-C: mandatory init ELF loading (no synthetic fallback) ──────────────────
+//
+// Why an init load can be fatal. There is NO synthetic/placeholder init ELF fallback anymore
+// (Stage 197A removed it): a missing initramfs, a malformed CPIO, a missing `/init`, an
+// oversized/malformed init ELF, or a forced-fault ZC load MUST halt boot with an explicit
+// `BOOT_FATAL_*` diagnostic instead of silently limping on (or booting a fake init).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitLoadFatal {
+    /// No boot initramfs blob was provided (`boot_initrd_bytes()` is None).
+    InitramfsMissing,
+    /// The initramfs blob is not a parseable CPIO archive.
+    CpioInvalid,
+    /// The CPIO archive parses but contains no `/init` (or `init`) entry.
+    InitNotFound,
+    /// The `/init` entry exceeds the maximum init ELF size.
+    TooLarge,
+}
+
+/// Default-off fault-injection knob (`yarm.force_init_zc_load_fail=1`): forces the required init
+/// ELF load to fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path can be exercised
+/// under QEMU without corrupting the initramfs. NEVER set on a normal boot.
+pub(crate) static FORCE_INIT_ZC_LOAD_FAIL: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_force_init_zc_load_fail(enabled: bool) {
+    FORCE_INIT_ZC_LOAD_FAIL.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn force_init_zc_load_fail() -> bool {
+    FORCE_INIT_ZC_LOAD_FAIL.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Maximum accepted init ELF size (16 MiB) — shared across architectures.
+pub const INIT_ELF_MAX_SIZE: usize = 16 * 1024 * 1024;
+
+/// Load the REQUIRED `/init` ELF bytes from the boot initramfs, distinguishing every fatal
+/// failure reason. Arch-neutral: it reads the immutable boot CPIO blob and locates `/init`
+/// (or `init`). There is no fallback — a `None`/error here is a boot-fatal condition.
+pub fn load_required_init_elf_bytes() -> Result<alloc::vec::Vec<u8>, InitLoadFatal> {
+    let bytes = Bootstrap::boot_initrd_bytes().ok_or(InitLoadFatal::InitramfsMissing)?;
+    let archive = yarm_srv_common::cpio::CpioArchive::new(bytes);
+    // A CPIO parse error (bad magic / truncated header) is distinct from "parsed but no /init".
+    let entry = match archive.find("/init") {
+        Ok(Some(e)) => e,
+        Ok(None) => match yarm_srv_common::cpio::CpioArchive::new(bytes).find("init") {
+            Ok(Some(e)) => e,
+            Ok(None) => return Err(InitLoadFatal::InitNotFound),
+            Err(_) => return Err(InitLoadFatal::CpioInvalid),
+        },
+        Err(_) => return Err(InitLoadFatal::CpioInvalid),
+    };
+    let file_data = entry.file_data();
+    crate::yarm_log!("YARM_INITRD_INIT_FOUND len={}", file_data.len());
+    if file_data.len() > INIT_ELF_MAX_SIZE {
+        return Err(InitLoadFatal::TooLarge);
+    }
+    Ok(alloc::vec::Vec::from(file_data))
+}
+
+/// Emit the canonical `BOOT_FATAL_*` diagnostic(s) for an init-load fatal reason. The caller
+/// follows this with the arch's fatal halt (reused, not a new mechanism), so boot stops here
+/// rather than continuing with no user tasks.
+pub fn log_init_load_fatal(reason: InitLoadFatal) {
+    match reason {
+        InitLoadFatal::InitramfsMissing => {
+            crate::yarm_log!("BOOT_FATAL_INITRAMFS_MISSING");
+            crate::yarm_log!("BOOT_FATAL_NO_CPIO");
+        }
+        InitLoadFatal::CpioInvalid => {
+            crate::yarm_log!("BOOT_FATAL_CPIO_INVALID");
+        }
+        InitLoadFatal::InitNotFound => {
+            crate::yarm_log!("BOOT_FATAL_INIT_NOT_FOUND path=/init");
+        }
+        InitLoadFatal::TooLarge => {
+            crate::yarm_log!("BOOT_FATAL_INIT_ELF_INVALID reason=too_large");
+        }
+    }
+}
+
 /// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.
 pub fn ipc_send_cap_enqueue_oracle_active() -> bool {
     ipc_recv_oracle_proof_enabled() && ipc_send_cap_enqueue_oracle_enabled()

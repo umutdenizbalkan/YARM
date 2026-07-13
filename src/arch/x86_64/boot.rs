@@ -457,70 +457,13 @@ const AP_STACK_PHYS_BASE: u64 = 0x0200_0000; // 32 MiB, above kernel image+BSS, 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const AP_STACK_BYTES: u64 = 16 * 1024;
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn initramfs_static_hello_world_elf() -> [u8; 256] {
-    let mut image = [0u8; 256];
-    // ELF header.
-    image[..4].copy_from_slice(b"\x7FELF");
-    image[4] = 2; // ELFCLASS64
-    image[5] = 1; // little-endian
-    image[6] = 1; // EV_CURRENT
-    image[7] = 0; // SYSV ABI
-    image[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
-    image[18..20].copy_from_slice(&0x3Eu16.to_le_bytes()); // EM_X86_64
-    image[20..24].copy_from_slice(&1u32.to_le_bytes()); // EV_CURRENT
-    let entry = 0x0040_1000u64;
-    image[24..32].copy_from_slice(&entry.to_le_bytes());
-    image[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
-    image[52..54].copy_from_slice(&(64u16).to_le_bytes()); // e_ehsize
-    image[54..56].copy_from_slice(&(56u16).to_le_bytes()); // e_phentsize
-    image[56..58].copy_from_slice(&(1u16).to_le_bytes()); // e_phnum
-
-    // Single PT_LOAD segment.
-    let ph = 64usize;
-    image[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
-    image[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // RX
-    image[ph + 8..ph + 16].copy_from_slice(&128u64.to_le_bytes()); // p_offset
-    image[ph + 16..ph + 24].copy_from_slice(&(entry & !0xFFF).to_le_bytes()); // p_vaddr
-    image[ph + 24..ph + 32].copy_from_slice(&0u64.to_le_bytes()); // p_paddr
-    image[ph + 32..ph + 40].copy_from_slice(&9u64.to_le_bytes()); // p_filesz
-    image[ph + 40..ph + 48].copy_from_slice(&16u64.to_le_bytes()); // p_memsz
-    image[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes()); // p_align
-
-    // mov eax, SYSCALL_YIELD_NR; syscall; jmp syscall.
-    // Use the production LSTAR syscall fast path for bring-up.
-    image[128..137].copy_from_slice(&[0xB8, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFC]);
-    image
-}
+// Stage 197A removed the synthetic `initramfs_static_hello_world_elf` fallback and the
+// `load_init_elf_from_initramfs_vfs` Option-collapsing loader. The required `/init` ELF is now
+// loaded via the arch-neutral `crate::kernel::boot::load_required_init_elf_bytes()`, which
+// distinguishes every fatal reason; a failure halts boot with an explicit `BOOT_FATAL_*` marker.
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const INITRD_INIT_ELF_MAX_SIZE: usize = 16 * 1024 * 1024;
-
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
-    let bytes = crate::kernel::boot::Bootstrap::boot_initrd_bytes()?;
-    let entry = yarm_srv_common::cpio::CpioArchive::new(bytes)
-        .find("/init")
-        .ok()
-        .flatten()
-        .or_else(|| {
-            yarm_srv_common::cpio::CpioArchive::new(bytes)
-                .find("init")
-                .ok()
-                .flatten()
-        })?;
-    let file_data = entry.file_data();
-    crate::yarm_log!("YARM_INITRD_INIT_FOUND len={}", file_data.len());
-    if file_data.len() > INITRD_INIT_ELF_MAX_SIZE {
-        crate::yarm_log!(
-            "YARM_INITRD_INIT_TOO_LARGE len={} cap={}",
-            file_data.len(),
-            INITRD_INIT_ELF_MAX_SIZE
-        );
-        return None;
-    }
-    Some(alloc::vec::Vec::from(file_data))
-}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn load_supervisor_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
@@ -566,22 +509,39 @@ pub fn bootstrap_first_user_task(
         crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e);
         e
     })?;
-    let init_image = load_init_elf_from_initramfs_vfs();
-    let init_fallback = initramfs_static_hello_world_elf();
-    let (init_bytes, init_source): (&[u8], &str) = match init_image.as_deref() {
-        Some(img) => (img, "initrd"),
-        None => (&init_fallback, "synthetic"),
+    // Stage 197A: the `/init` ELF is MANDATORY — no synthetic fallback. Any load failure halts
+    // boot with an explicit `BOOT_FATAL_*` diagnostic via the shared per-arch fatal-halt path.
+    if crate::kernel::boot::force_init_zc_load_fail() {
+        crate::yarm_log!("BOOT_FATAL_INIT_ZC_LOAD_FAILED reason=fault_injection");
+        panic!("BOOT_FATAL_INIT_ZC_LOAD_FAILED: forced init load fault injection");
+    }
+    let init_owned = match crate::kernel::boot::load_required_init_elf_bytes() {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            crate::kernel::boot::log_init_load_fatal(reason);
+            panic!("init load fatal: {:?}", reason);
+        }
     };
-    let init_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(0, init_bytes).map_err(|e| {
-        crate::yarm_log!("BOOTSTRAP_ERROR parse_init_elf_header: {:?}", e);
-        crate::kernel::boot::KernelError::WrongObject
-    })?;
-    let (_, init_first_pt_load, init_heap) = kernel
-        .load_elf_pt_load_segments(init_asid, init_bytes)
-        .map_err(|e| {
-            crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e);
-            e
-        })?;
+    let init_bytes: &[u8] = &init_owned;
+    let init_source = "initrd";
+    let init_elf_info = match yarm_srv_common::elf::ElfImageInfo::parse(0, init_bytes) {
+        Ok(info) => info,
+        Err(e) => {
+            crate::yarm_log!(
+                "BOOT_FATAL_INIT_ELF_INVALID reason=parse_header err={:?}",
+                e
+            );
+            panic!("BOOT_FATAL_INIT_ELF_INVALID: {:?}", e);
+        }
+    };
+    let (_, init_first_pt_load, init_heap) =
+        match kernel.load_elf_pt_load_segments(init_asid, init_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                crate::yarm_log!("BOOT_FATAL_INIT_ZC_LOAD_FAILED reason=pt_load err={:?}", e);
+                panic!("BOOT_FATAL_INIT_ZC_LOAD_FAILED: {:?}", e);
+            }
+        };
     let init_entry = init_elf_info.entry as usize;
     crate::yarm_log!("INIT_ELF_HEADER_ENTRY value={:#x}", init_elf_info.entry);
     crate::yarm_log!("INIT_FIRST_PT_LOAD_VADDR value={:#x}", init_first_pt_load);
