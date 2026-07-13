@@ -13843,3 +13843,33 @@ set the D2/D3/D6 lock-window conversions need. The x86_64 AP trampoline is
 split into `arch/x86_64/smp_trampoline.rs` (mechanical, zero behavior
 change); the AP still parks in assembly — the per-CPU AP environment is the
 remaining SMP blocker (`doc/KERNEL_UNLOCKING.md` §3).
+
+## Stage 197B — RISC-V typed post-lock idle outcome (no `Err(Internal)` sentinel)
+
+The RISC-V shared trap wrapper (`handle_riscv_trap_entry_shared`) now returns an
+explicit typed result, `Result<RiscvTrapEntryOutcome, TrapHandleError>`, where
+`RiscvTrapEntryOutcome ∈ { ReturnToCurrent, ReturnToIncoming, EnterKernelIdle {
+reason: RiscvIdleReason } }` and `RiscvIdleReason ∈ { FutexWaitNoIncoming,
+ExistingTerminalIdle }`.
+
+- **Intentional post-lock idle is a first-class SUCCESS outcome**, not the former
+  `Err(SyscallError::Internal)` + `current == None` sentinel. The FutexWait
+  no-incoming drain returns `EnterKernelIdle { reason: FutexWaitNoIncoming }`; the
+  bridge matches that variant, emits `RISCV_TYPED_IDLE_OUTCOME result=ok` +
+  `RISCV_KERNEL_IDLE_WAITING_FOR_IO`, and enters the WFI idle terminal.
+- **`current == None` is an INVARIANT check, not the control-flow discriminator.** The
+  bridge asserts it inside the idle arm; a live current there is a fatal invariant
+  violation, never idle-into-a-live-task.
+- **A genuine internal trap error stays on the `Err` channel** and always takes the
+  fatal `RISCV_TRAP_HANDLE_FAILED` path (distinct WFI reason
+  `handle_trap_entry_err`) — it can never be read as idle. A default-off negative
+  oracle (`yarm.riscv_typed_outcome_internal_error_oracle=1`) proves this directly.
+- **Yield has no idle outcome** (a published Yield always dispatches an incoming);
+  DebugLog / FutexWake same-task returns are `ReturnToCurrent`.
+
+**Lock invariants preserved.** The typed cleanup adds no new synchronization: only a
+plain arch-neutral enum plus one one-shot `AtomicBool` latch for the default-off
+negative oracle. The broad `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag is still cleared
+before the post-lock drain (never true across the idle handoff or WFI), and the
+switch/idle branches keep the existing rank-1 scheduler / rank-2 task seam ordering.
+No ABI change (`SYSCALL_COUNT = 32`, `VARIANT_COUNT = 22`); no new retirement class.

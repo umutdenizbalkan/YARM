@@ -2588,6 +2588,22 @@ pub fn force_init_zc_load_fail() -> bool {
     FORCE_INIT_ZC_LOAD_FAIL.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 197B default-off NEGATIVE oracle knob (`yarm.riscv_typed_outcome_internal_error_oracle=1`):
+/// forces the RISC-V trap wrapper to return a GENUINE internal trap-handling error on the first
+/// syscall from a LIVE current task, proving the bridge takes the fatal `RISCV_TRAP_HANDLE_FAILED`
+/// path and NEVER the FutexWait typed-idle-success path. NEVER set on a normal boot.
+pub(crate) static RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_ENABLED:
+    core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_typed_outcome_internal_error_oracle_enabled(enabled: bool) {
+    RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_ENABLED
+        .store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_typed_outcome_internal_error_oracle_enabled() -> bool {
+    RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Maximum accepted init ELF size (16 MiB) — shared across architectures.
 pub const INIT_ELF_MAX_SIZE: usize = 16 * 1024 * 1024;
 

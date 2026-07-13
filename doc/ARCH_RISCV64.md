@@ -705,10 +705,16 @@ oracle knob, no one-shot consume latch in the kernel) and adds a genuine
     `POST_LOCK_IDLE_BEGIN` → a fresh `with_cpu` re-acquire confirms `current` is
     None (`POST_LOCK_IDLE_LOCK_DROPPED_OK`) → clear deferral → `..._DONE result=idle`
     → `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok` →
-    `POST_LOCK_IDLE_ENTERED`. NO frame is restored and NO `sret` is attempted: the
-    drain returns `Err` with `current == None`, which hands off to the bridge's
-    EXISTING proven idle policy (`RISCV_KERNEL_IDLE_WAITING_FOR_IO` + timer/PLIC
-    idle-safe-point init + `riscv_trap_halt` wfi). No second idle implementation.
+    `POST_LOCK_IDLE_ENTERED`. NO frame is restored and NO `sret` is attempted.
+    **Stage 197B (typed idle):** the drain returns the explicit typed outcome
+    `RiscvTrapEntryOutcome::EnterKernelIdle { reason: FutexWaitNoIncoming }` — a
+    first-class SUCCESS, NOT an `Err(Internal)` sentinel. The bridge matches that
+    variant, asserts the `current == None|Some(0)` **invariant** (not the
+    discriminator), emits `RISCV_TYPED_IDLE_OUTCOME result=ok reason=FutexWaitNoIncoming`
+    + `RISCV_KERNEL_IDLE_WAITING_FOR_IO`, runs the timer/PLIC idle-safe-point init, and
+    enters `riscv_trap_halt` (wfi). No second idle implementation. A genuine internal
+    error stays on the `Err` channel and always fatals (`RISCV_TRAP_HANDLE_FAILED`) —
+    it can never be read as idle.
 - **Idle interrupt/lock state.** The broad `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag
   is cleared before the drain (never true across the idle handoff or wfi); the
   bridge's `riscv_trap_halt` performs the wfi loop, remaining interrupt-responsive

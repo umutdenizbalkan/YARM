@@ -63676,8 +63676,9 @@ mod stage196b_riscv_debuglog_split {
             "the NR-15 split gate must run BEFORE the active flag is set (early return skips it)"
         );
         assert!(
-            RISCV_TRAP_SRC[gate..active_set].contains("return Ok(());"),
-            "a handled DebugLog must return early before the broad-lock phase"
+            RISCV_TRAP_SRC[gate..active_set]
+                .contains("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);"),
+            "a handled DebugLog must return early (typed same-task outcome) before the broad-lock phase"
         );
     }
 
@@ -64595,11 +64596,17 @@ mod stage196f_riscv_futex_wait_default_on_idle {
                 && !drain.contains("RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED"),
             "the idle outcome must NOT restore a userspace frame or arm an sret"
         );
-        // Hands off via Err so the bridge enters the existing idle policy (no fabricated task).
+        // Stage 197B: the idle outcome is now an EXPLICIT typed success — NOT an `Err(Internal)`
+        // sentinel. It returns `EnterKernelIdle { reason: FutexWaitNoIncoming }` (no fabricated
+        // task, no frame, no sret), and the idle branch contains no `Err(Internal)` at all.
         assert!(
-            drain.contains("return Err(TrapHandleError::Syscall(")
-                && drain.contains("SyscallError::Internal"),
-            "the idle outcome must hand off to the bridge idle path via Err"
+            drain.contains("return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {")
+                && drain.contains("reason: RiscvIdleReason::FutexWaitNoIncoming"),
+            "the idle outcome must return the typed EnterKernelIdle success"
+        );
+        assert!(
+            !drain.contains("SyscallError::Internal") && !drain.contains("return Err("),
+            "Stage 197B: the FutexWait idle branch must contain no Err(Internal) sentinel"
         );
         assert!(
             drain.contains("futex_wait_dispatch_clear(cpu_idx)"),
@@ -65133,13 +65140,13 @@ mod stage197_first_cohort_seal {
         );
     }
 
-    // RISC-V idle-sentinel regression guard: the FutexWait idle SUCCESS attestation is emitted ONLY
-    // from the attested FutexWait idle branch (gated on the idle-oracle knob), and can NEVER be
-    // produced by an unrelated Internal error. The Err(Internal) sentinel is confined to the
-    // FutexWait idle branch and is NOT used by Yield.
+    // Stage 197B RISC-V TYPED IDLE guard: intentional idle is an explicit typed SUCCESS outcome,
+    // NOT an `Err(Internal)` sentinel. The FutexWait idle branch returns `EnterKernelIdle`, the
+    // Yield drain never idles, and the bridge decides idle from the typed variant — never from an
+    // error code + `current == None`.
     #[test]
     fn riscv_idle_sentinel_guard() {
-        // The attestation appears exactly once, inside the 196F idle outcome block.
+        // The idle-oracle attestation appears exactly once, inside the FutexWait idle block.
         let idle = RISCV_TRAP_SRC
             .split("Stage 196F POST-LOCK IDLE OUTCOME")
             .nth(1)
@@ -65159,23 +65166,47 @@ mod stage197_first_cohort_seal {
             1,
             "the FutexWait idle attestation must be emitted from exactly one site"
         );
-        // The Err(Internal) idle handoff lives ONLY in the FutexWait idle branch — the Yield drain
-        // must NOT use it (its no-incoming is a FAIL marker, not an idle handoff).
+        // The FutexWait idle branch returns the typed idle outcome — no Err(Internal) sentinel.
+        assert!(
+            idle.contains("return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {")
+                && idle.contains("reason: RiscvIdleReason::FutexWaitNoIncoming")
+                && !idle.contains("SyscallError::Internal"),
+            "the FutexWait idle branch must return the typed EnterKernelIdle (no Err(Internal))"
+        );
+        // The ONLY `SyscallError::Internal` remaining in the RISC-V trap wrapper is the default-off
+        // NEGATIVE oracle's GENUINE forced error (a real error, never an idle sentinel). It is
+        // co-located with the ORACLE_BEGIN marker and is not in any idle branch.
+        assert_eq!(
+            RISCV_TRAP_SRC.matches("SyscallError::Internal").count(),
+            1,
+            "only the negative-oracle genuine error may use SyscallError::Internal"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_BEGIN"),
+            "the remaining Internal must be the default-off negative (genuine error) oracle"
+        );
+        // The Yield drain never idles (its no-incoming is a FAIL marker) and never returns Internal.
         let yld = RISCV_TRAP_SRC
             .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
             .nth(1)
             .unwrap();
         assert!(
-            !yld.contains("SyscallError::Internal"),
-            "the Err(Internal) idle sentinel must not be used by the Yield drain"
+            !yld.contains("SyscallError::Internal") && !yld.contains("EnterKernelIdle"),
+            "the Yield drain must never idle and never use an Internal sentinel"
         );
-        // The bridge idle path only fires when current==0 (a live current task + Internal error
-        // takes the RISCV_TRAP_HANDLE_FAILED path, never the FutexWait idle attestation).
+        // The bridge decides idle from the TYPED variant, and keeps genuine errors on the fatal
+        // path. `current == None` is only an INVARIANT check inside the idle arm, never the
+        // discriminator (no `if next_tid == 0` idle gate remains).
         assert!(
-            RISCV_BOOT_SRC.contains("if next_tid == 0 {")
+            RISCV_BOOT_SRC.contains("Ok(RiscvTrapEntryOutcome::EnterKernelIdle { reason })")
+                && RISCV_BOOT_SRC.contains("RISCV_TYPED_IDLE_OUTCOME result=ok reason=")
                 && RISCV_BOOT_SRC.contains("RISCV_KERNEL_IDLE_WAITING_FOR_IO")
                 && RISCV_BOOT_SRC.contains("RISCV_TRAP_HANDLE_FAILED"),
-            "the bridge must idle only on current==0 and fail otherwise"
+            "the bridge must match the typed idle outcome + keep the fatal-error path"
+        );
+        assert!(
+            !RISCV_BOOT_SRC.contains("if next_tid == 0 {"),
+            "Stage 197B removed the `current == None` idle discriminator from the bridge"
         );
     }
 
@@ -65529,6 +65560,246 @@ mod stage197c_init_fail_fast {
         assert!(
             NEG_SCRIPT.contains("INIT_FAIL_FAST_NEGATIVE arch=x86_64 cases=4 result=ok"),
             "the negative harness must emit the final pass marker"
+        );
+    }
+}
+
+// Stage 197B: RISC-V TYPED POST-LOCK IDLE OUTCOME. Intentional idle is an explicit typed success
+// variant; a genuine internal error stays on the error channel and can never be read as idle.
+#[cfg(test)]
+mod stage197b_riscv_typed_idle_outcome {
+    // The RISC-V trap module is `#[cfg(target_arch = "riscv64")]`, so these hosted guards are
+    // source-scans (the established pattern for RISC-V trap-path tests). The real compile-time
+    // exhaustiveness proof is the wrapper + bridge `match`es themselves, which only build when the
+    // enum has exactly the three named variants.
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+
+    // Intentional idle is represented by an EXPLICIT enum variant carrying a typed reason — not an
+    // Err, a magic number, `current==None`, or a global boolean. The reason enum enumerates both
+    // provenances, and the outcome enum has exactly the three named success variants.
+    #[test]
+    fn intentional_idle_is_an_explicit_typed_variant() {
+        assert!(
+            RISCV_TRAP_SRC.contains("pub enum RiscvTrapEntryOutcome {")
+                && RISCV_TRAP_SRC.contains("EnterKernelIdle { reason: RiscvIdleReason }"),
+            "idle must be an explicit typed enum variant carrying a reason"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("pub enum RiscvIdleReason {")
+                && RISCV_TRAP_SRC.contains("FutexWaitNoIncoming,")
+                && RISCV_TRAP_SRC.contains("ExistingTerminalIdle,"),
+            "the idle reason enum must enumerate both typed provenances"
+        );
+        // The outcome enum has exactly three variants (ReturnToCurrent / ReturnToIncoming /
+        // EnterKernelIdle) — no boolean/magic/Err encoding of idle.
+        let decl = RISCV_TRAP_SRC
+            .split("pub enum RiscvTrapEntryOutcome {")
+            .nth(1)
+            .expect("outcome enum")
+            .split('}')
+            .next()
+            .unwrap();
+        assert!(
+            decl.contains("ReturnToCurrent,")
+                && decl.contains("ReturnToIncoming,")
+                && decl.contains("EnterKernelIdle {"),
+            "the outcome enum must have the three named variants"
+        );
+    }
+
+    // Exhaustiveness (source form): the bridge `match` names all three outcome arms; adding a
+    // variant without updating the match would fail to compile the riscv64 target.
+    #[test]
+    fn outcome_match_is_exhaustive() {
+        assert!(
+            RISCV_BOOT_SRC.contains("RiscvTrapEntryOutcome::ReturnToCurrent")
+                && RISCV_BOOT_SRC.contains("RiscvTrapEntryOutcome::ReturnToIncoming")
+                && RISCV_BOOT_SRC.contains("RiscvTrapEntryOutcome::EnterKernelIdle { reason }")
+                && RISCV_BOOT_SRC.contains("Err(err) =>"),
+            "the bridge match must name all three outcome variants + the error channel"
+        );
+        // The reason match in the bridge names both idle provenances (no catch-all `_`).
+        assert!(
+            RISCV_BOOT_SRC.contains("RiscvIdleReason::FutexWaitNoIncoming =>")
+                && RISCV_BOOT_SRC.contains("RiscvIdleReason::ExistingTerminalIdle =>"),
+            "the bridge must name both typed idle reasons"
+        );
+    }
+
+    // The wrapper returns the typed outcome; the FutexWait no-incoming branch produces the typed
+    // idle (FutexWaitNoIncoming); the switch branches set `switched` (→ ReturnToIncoming).
+    #[test]
+    fn futex_wait_no_incoming_produces_typed_idle_switch_produces_incoming() {
+        assert!(
+            RISCV_TRAP_SRC.contains(
+                "pub fn handle_riscv_trap_entry_shared(\n    shared: &crate::runtime::SharedKernel,"
+            ) && RISCV_TRAP_SRC.contains(") -> Result<RiscvTrapEntryOutcome, TrapHandleError> {"),
+            "the wrapper must return the typed outcome Result"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {")
+                && RISCV_TRAP_SRC.contains("reason: RiscvIdleReason::FutexWaitNoIncoming"),
+            "the FutexWait no-incoming branch must return the typed idle outcome"
+        );
+        // Both switch success branches set `switched = true` (→ ReturnToIncoming), and the tail
+        // return selects ReturnToIncoming/ReturnToCurrent — never idle.
+        assert_eq!(
+            RISCV_TRAP_SRC.matches("switched = true;").count(),
+            2,
+            "the FutexWait switch + Yield switch success branches must set switched=true"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToIncoming")
+                && RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToCurrent"),
+            "the tail return must select the typed same-task / incoming outcome"
+        );
+    }
+
+    // Yield never idles; DebugLog/FutexWake split returns are same-task (ReturnToCurrent), not idle.
+    #[test]
+    fn yield_and_prelock_split_never_idle() {
+        let yld = RISCV_TRAP_SRC
+            .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
+            .nth(1)
+            .unwrap();
+        assert!(
+            !yld.contains("EnterKernelIdle") && !yld.contains("SyscallError::Internal"),
+            "the Yield drain must never idle nor use an Internal sentinel"
+        );
+        // The pre-lock split section (inside the wrapper, before the broad-lock phase) returns
+        // ReturnToCurrent, never an idle outcome. Scope to the function body so the enum
+        // definition earlier in the file does not leak into the slice.
+        let fn_body = RISCV_TRAP_SRC
+            .split("pub fn handle_riscv_trap_entry_shared")
+            .nth(1)
+            .expect("wrapper fn");
+        let prelock = fn_body
+            .split("Phase 2: own the active flag")
+            .next()
+            .unwrap();
+        assert!(
+            prelock.contains("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);")
+                && !prelock.contains("EnterKernelIdle"),
+            "DebugLog/FutexWake split returns are same-task, never idle"
+        );
+    }
+
+    // The bridge matches the typed outcome exhaustively: same-task/incoming fall through; idle is a
+    // typed success (with a current==None INVARIANT, not the discriminator); Err is always fatal.
+    #[test]
+    fn bridge_matches_typed_outcome_and_never_infers_idle_from_error() {
+        // (rustfmt may wrap the combined same-task/incoming arm across lines, so check each arm.)
+        assert!(
+            RISCV_BOOT_SRC.contains("Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
+                && RISCV_BOOT_SRC.contains("Ok(RiscvTrapEntryOutcome::ReturnToIncoming) => {}")
+                && RISCV_BOOT_SRC.contains("Ok(RiscvTrapEntryOutcome::EnterKernelIdle { reason })")
+                && RISCV_BOOT_SRC.contains("Err(err) => {"),
+            "the bridge must match all three typed arms"
+        );
+        // Idle is decided by the typed variant; current==None is only an INVARIANT check inside the
+        // idle arm (a live current there is a fatal violation, never idle-into-a-live-task).
+        assert!(
+            RISCV_BOOT_SRC.contains("RISCV_TYPED_IDLE_INVARIANT_VIOLATION")
+                && RISCV_BOOT_SRC.contains("RISCV_TYPED_IDLE_OUTCOME result=ok reason="),
+            "the idle arm must assert the current==None invariant + emit the typed marker"
+        );
+        // The old `current==None → idle` discriminator is gone; the Err arm is always fatal.
+        assert!(
+            !RISCV_BOOT_SRC.contains("if next_tid == 0 {"),
+            "the current==None idle discriminator must be removed from the bridge"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("Err(err) => {")
+                && RISCV_BOOT_SRC.contains("RISCV_TRAP_HANDLE_FAILED reason=handle_trap_entry_err"),
+            "a genuine error must always take the fatal path (never idle)"
+        );
+    }
+
+    // The idle outcome restores no frame and arms no sret, and runs after the active flag is
+    // cleared (post-lock). The active-flag clear precedes the FutexWait drain in source order.
+    #[test]
+    fn idle_has_no_frame_no_sret_and_active_flag_cleared_first() {
+        let clear_pos = RISCV_TRAP_SRC
+            .find("RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR")
+            .expect("active-clear marker");
+        let idle_pos = RISCV_TRAP_SRC
+            .find("Stage 196F POST-LOCK IDLE OUTCOME")
+            .expect("idle branch");
+        assert!(
+            clear_pos < idle_pos,
+            "the active flag must be cleared BEFORE the FutexWait post-lock idle branch runs"
+        );
+        let idle = RISCV_TRAP_SRC[idle_pos..].split("} else {").next().unwrap();
+        assert!(
+            !idle.contains("restore_arch_thread_state")
+                && !idle.contains("RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED"),
+            "the idle outcome must restore no frame and arm no sret"
+        );
+    }
+
+    // A genuine Internal error remains on the ERROR channel (the default-off negative oracle), and
+    // is the ONLY Internal use — it is never an idle sentinel.
+    #[test]
+    fn genuine_internal_error_stays_in_error_channel() {
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_BEGIN")
+                && RISCV_TRAP_SRC.contains("riscv_typed_outcome_internal_error_oracle_enabled()"),
+            "the default-off negative (genuine error) oracle must exist"
+        );
+        assert_eq!(
+            RISCV_TRAP_SRC.matches("SyscallError::Internal").count(),
+            1,
+            "the only SyscallError::Internal is the negative-oracle genuine error"
+        );
+        // Its knob is default-off (absent → None) and wired.
+        use crate::kernel::boot_command_line::parse_yarm_boot_options;
+        assert_eq!(
+            parse_yarm_boot_options(b"").riscv_typed_outcome_internal_error_oracle,
+            None
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.riscv_typed_outcome_internal_error_oracle=1")
+                .riscv_typed_outcome_internal_error_oracle,
+            Some(true)
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("set_riscv_typed_outcome_internal_error_oracle_enabled"),
+            "boot_command_line must apply the negative-oracle knob"
+        );
+        // The negative smoke asserts genuine error → fatal, zero idle.
+        assert!(
+            RISCV_SMOKE.contains(
+                "RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_DONE result=ok idle_entered=0"
+            ) && RISCV_SMOKE.contains("RISCV_TRAP_HANDLE_FAILED reason=handle_trap_entry_err"),
+            "the negative smoke must require the fatal markers + emit the pass attestation"
+        );
+    }
+
+    // Baseline preservation: counts stay 32/22, NR27 stays absent, first cohort unchanged, and no
+    // new kernel lock (typed cleanup adds no synchronization).
+    #[test]
+    fn baseline_and_cohort_preserved() {
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert!(matches!(
+            crate::kernel::syscall::Syscall::decode(27),
+            Err(crate::kernel::syscall::SyscallError::InvalidNumber)
+        ));
+        // The four first-cohort RISC-V retirement DONE markers are still emitted by the drain.
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield result=ok",
+        ] {
+            assert!(RISCV_TRAP_SRC.contains(m), "cohort marker must remain: {m}");
+        }
+        // No new kernel lock: the typed outcome adds only a plain enum + one one-shot AtomicBool
+        // latch for the default-off oracle (no Mutex/RwLock/SpinLock introduced here).
+        assert!(
+            !RISCV_TRAP_SRC.contains("Mutex::new") && !RISCV_TRAP_SRC.contains("RwLock::new"),
+            "the typed cleanup must introduce no new kernel lock"
         );
     }
 }
