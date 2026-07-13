@@ -65530,3 +65530,124 @@ mod stage197_first_cohort_seal {
         );
     }
 }
+
+// Stage 197A-A: x86_64 FutexWake LIVE oracle closes the first-cohort matrix at 12/12 live. There is
+// no longer any source-guard substitute for the x86_64/FutexWake cell — it is proven by a fresh
+// QEMU boot exactly like the other 11 cells.
+#[cfg(test)]
+mod stage197a_x86_futexwake_live {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const SEAL_SCRIPT: &str = include_str!("../../../scripts/qemu-first-cohort-retirement-seal.sh");
+    const X86_SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    // The x86_64 FutexWake oracle knob is DEFAULT-OFF (absent parses to None; a normal boot never
+    // sets it).
+    #[test]
+    fn x86_futex_wake_oracle_knob_defaults_off() {
+        use crate::kernel::boot_command_line::parse_yarm_boot_options;
+        assert_eq!(
+            parse_yarm_boot_options(b"").x86_64_futex_wake_oracle,
+            None,
+            "the x86_64 FutexWake oracle must default OFF (no knob → None)"
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.x86_64_futex_wake_oracle=1").x86_64_futex_wake_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.x86_64_futex_wake_oracle=0").x86_64_futex_wake_oracle,
+            Some(false)
+        );
+    }
+
+    // The kernel exposes the runtime flag + accessor, and the x86_64 boot provisions slot-5 = 1
+    // only when the flag is set.
+    #[test]
+    fn x86_flag_and_slot5_provision() {
+        assert!(
+            MOD_SRC.contains("X86_FUTEX_WAKE_ORACLE_ENABLED")
+                && MOD_SRC.contains("pub fn x86_futex_wake_oracle_enabled() -> bool")
+                && MOD_SRC.contains("set_x86_futex_wake_oracle_enabled"),
+            "mod.rs must expose the x86_64 FutexWake oracle flag + accessors"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("set_x86_futex_wake_oracle_enabled"),
+            "boot_command_line must apply the x86_64 FutexWake oracle knob"
+        );
+        // The x86 boot provisions slot 5 (init_args[5]) = 1 under the flag, gated on the accessor.
+        assert!(
+            X86_BOOT_SRC.contains("x86_futex_wake_oracle_enabled()")
+                && X86_BOOT_SRC.contains("X86_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1"),
+            "x86_64 boot must provision slot-5=1 only under the FutexWake oracle flag"
+        );
+    }
+
+    // The init service runs the parent/child split-FutexWake oracle when slot-5 == 1, and its
+    // success attestation pins the authoritative counts (first=1, second=0) and the single waiter
+    // resume (waiter_resumes=1).
+    #[test]
+    fn x86_live_oracle_attestation() {
+        // Dispatch is gated on the slot-5 sentinel (== Some(1)) and the x86_64 target.
+        assert!(
+            SERVICE_SRC.contains("run_x86_futex_wake_oracle(ctx.task_id)"),
+            "init must dispatch the x86_64 FutexWake oracle on slot-5==1"
+        );
+        // Wake counts: first wake returns 1 (waiter → Runnable); second wake returns 0 (no waiter).
+        assert!(
+            SERVICE_SRC.contains("X86_FUTEX_WAKE_USER_RETURN_OK first_wake={} second_wake={}"),
+            "the oracle must report the authoritative wake counts"
+        );
+        // The waiter publishes its resume proof exactly once.
+        assert!(
+            SERVICE_SRC.contains("X86_FUTEX_WAKE_WAITER_RESUMED_OK tid={}")
+                && SERVICE_SRC.contains("X86_FW_WAITER_RESUMED.store(1, Relaxed)"),
+            "the waiter must publish exactly one resume proof"
+        );
+        // Success is asserted only when first==1 && second==0 && waiter_resumes==1.
+        assert!(
+            SERVICE_SRC.contains("if first_wake == 1 && second_wake == 0 && waiter_resumes == 1")
+                && SERVICE_SRC.contains(
+                    "X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid={} waiter_resumes=1"
+                ),
+            "the live-oracle success marker must pin counts 1/0 and a single waiter resume"
+        );
+        // The failure branch is real (result=fail), never fabricated ok.
+        assert!(
+            SERVICE_SRC.contains("X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail"),
+            "the oracle must have a genuine failure branch"
+        );
+    }
+
+    // The combined seal script demands all 12 cells LIVE and no longer accepts a source-guard
+    // substitute for x86_64/FutexWake.
+    #[test]
+    fn seal_requires_12_live_cells_no_source_guard() {
+        assert!(
+            SEAL_SCRIPT
+                .contains("FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok"),
+            "the seal script must require the 12/12 live matrix marker"
+        );
+        // The x86 FutexWake oracle boot is part of the matrix run.
+        assert!(
+            SEAL_SCRIPT.contains("X86_FUTEX_WAKE_ORACLE=1"),
+            "the seal script must boot the x86_64 FutexWake live oracle"
+        );
+        // No source-guard fallback survives (no proof=source_guard, no syscall_split.rs grep).
+        assert!(
+            !SEAL_SCRIPT.contains("proof=source_guard")
+                && !SEAL_SCRIPT.contains("no_live_x86_futexwake_trigger"),
+            "the seal script must NOT accept a source-guard substitute for x86_64/FutexWake"
+        );
+        // The x86 smoke script accepts the live-oracle proof.
+        assert!(
+            X86_SMOKE.contains("X86_FUTEX_WAKE_LIVE_ORACLE_DONE")
+                && X86_SMOKE.contains("X86_FUTEX_WAKE_ORACLE"),
+            "the x86 smoke must accept the FutexWake live-oracle proof under its toggle"
+        );
+    }
+}

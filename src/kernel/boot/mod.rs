@@ -2540,6 +2540,22 @@ pub fn riscv_futex_wake_oracle_enabled() -> bool {
     RISCV_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 197A: default-off x86_64 FutexWake live-oracle WORKLOAD selector
+/// (`yarm.x86_64_futex_wake_oracle=1`). Provisions init startup slot 5 (=1) so init runs the
+/// parent/child split-FutexWake proof (counts 1 then 0, waiter resumes once) — closing the
+/// first-cohort matrix at 12/12 LIVE. Selects the proof workload only; the FutexWake retirement
+/// MECHANISM is already live by default.
+pub(crate) static X86_FUTEX_WAKE_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_futex_wake_oracle_enabled(enabled: bool) {
+    X86_FUTEX_WAKE_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn x86_futex_wake_oracle_enabled() -> bool {
+    X86_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// True only when BOTH the base proof knob and the send-cap-enqueue-oracle sub-knob are set.
 pub fn ipc_send_cap_enqueue_oracle_active() -> bool {
     ipc_recv_oracle_proof_enabled() && ipc_send_cap_enqueue_oracle_enabled()

@@ -269,6 +269,14 @@ if [[ "$IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_s
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.ipc_send_cap_enqueue_oracle=1"
 fi
 
+# Stage 197A (X86 FUTEXWAKE LIVE ORACLE): X86_FUTEX_WAKE_ORACLE=1 appends
+# yarm.x86_64_futex_wake_oracle=1 to arm the default-off parent/child split-FutexWake proof
+# (counts 1 then 0, waiter resumes once) — closes the first-cohort matrix at 12/12 LIVE.
+X86_FUTEX_WAKE_ORACLE=${X86_FUTEX_WAKE_ORACLE:-0}
+if [[ "$X86_FUTEX_WAKE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.x86_64_futex_wake_oracle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.x86_64_futex_wake_oracle=1"
+fi
+
 if [[ "$KERNEL_CMDLINE" != *"console="* ]] || [[ "${#KERNEL_CMDLINE}" -lt 12 ]]; then
   echo "[warn] suspicious KERNEL_CMDLINE override detected: '$KERNEL_CMDLINE'"
   echo "[hint] resetting to default kernel cmdline: '$DEFAULT_KERNEL_CMDLINE'"
@@ -2097,6 +2105,36 @@ for f in \
   fi
 done
 echo "[ok] CROSS-ARCH-LIVE: x86_64 cross-arch-live markers present (mode=out_of_lock)"
+
+# Stage 197A (X86 FUTEXWAKE LIVE ORACLE): when armed, the parent/child split-FutexWake proof must
+# complete — split dispatch (nr=10), arch-tagged retirement, wake counts 1 then 0, waiter resumes.
+if [[ "$X86_FUTEX_WAKE_ORACLE" == "1" ]]; then
+  x86_fw_fail=0
+  for pat in \
+    "YARM_LOCK_SPLIT_DISPATCH arch=x86_64 nr=10" \
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=FutexWake result=ok" \
+    "X86_FUTEX_WAKE_USER_RETURN_OK first_wake=1 second_wake=0" \
+    "X86_FUTEX_WAKE_WAITER_RESUMED_OK tid=" \
+    "X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid=" ; do
+    if ! log_has_pattern "$pat"; then
+      echo "[fail] x86 FutexWake oracle marker missing: $pat"
+      x86_fw_fail=1
+    fi
+  done
+  if ! log_has_pattern "X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok .*waiter_resumes=1"; then
+    echo "[fail] x86 FutexWake oracle did not prove waiter_resumes=1"
+    x86_fw_fail=1
+  fi
+  if log_has_pattern "X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail"; then
+    echo "[fail] x86 FutexWake oracle reported a failure"
+    x86_fw_fail=1
+  fi
+  if (( x86_fw_fail )); then
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+  else
+    echo "[ok] x86 FutexWake live oracle passed (first=1 second=0 waiter_resumes=1)"
+  fi
+fi
 
 if log_has_pattern "YARM_BOOT_OK"; then
   echo "[ok] x86_64 boot markers detected"

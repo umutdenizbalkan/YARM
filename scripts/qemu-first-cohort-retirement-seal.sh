@@ -9,10 +9,12 @@
 #
 #   GLOBAL_LOCK_RETIRE_CLASS_DONE arch=<arch> class=<class> result=ok
 #
-# For each (arch, class) the seal is "live" when the marker appears in a fresh QEMU boot, or
-# "source_guard" when no live boot trigger exists on that architecture (currently only
-# x86_64/FutexWake — x86_64 has no slot-5 oracle wiring; the identical retired `futex_wake_split_mut`
-# seam IS live-proven on AArch64 + RISC-V, and the x86_64 arch-tagged emission is source-verified).
+# For each (arch, class) the seal is "live" when the marker appears in a fresh QEMU boot. All 12
+# cells (3 arches × 4 classes) must be live-proven — there is NO source-guard substitute. x86_64's
+# FutexWake cell is proven by the slot-5 FutexWake live oracle (X86_FUTEX_WAKE_ORACLE=1). The final
+# seal requires:
+#   FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok
+#   FIRST_COHORT_CROSS_ARCH_SEAL arches=3 classes=4 result=ok
 #
 # The seal markers below are emitted BY THIS SCRIPT from the per-arch logs — no kernel markers were
 # added to fabricate the matrix. Exits non-zero on any missing proof or any forbidden marker.
@@ -61,9 +63,11 @@ run "$LOGDIR/arm_idle.log"  FUTEX_WAIT_IDLE_ORACLE=1   scripts/qemu-aarch64-core
 run "$LOGDIR/arm_ytwo.log"  YIELD_ORACLE=1             scripts/qemu-aarch64-core-smoke.sh
 run "$LOGDIR/arm_ylone.log" YIELD_LONE_ORACLE=1        scripts/qemu-aarch64-core-smoke.sh
 
-# x86_64: core + IPC cap-enqueue + SMP=2 + SMP=4 + crash-restart (DebugLog/FutexWait/Yield natural).
+# x86_64: core + IPC cap-enqueue + FutexWake oracle + SMP=2 + SMP=4 + crash-restart.
+# (DebugLog/FutexWait/Yield are natural on boot; FutexWake is proven by the slot-5 live oracle.)
 run "$LOGDIR/x86_core.log"  scripts/qemu-x86_64-core-smoke.sh
 run "$LOGDIR/x86_ipc.log"   IPC_SEND_CAP_ENQUEUE_ORACLE=1 scripts/qemu-x86_64-core-smoke.sh
+run "$LOGDIR/x86_fw.log"    X86_FUTEX_WAKE_ORACLE=1    scripts/qemu-x86_64-core-smoke.sh
 run "$LOGDIR/x86_smp2.log"  QEMU_SMP=2                 scripts/qemu-x86_64-core-smoke.sh
 run "$LOGDIR/x86_smp4.log"  QEMU_SMP=4                 scripts/qemu-x86_64-core-smoke.sh
 run "$LOGDIR/x86_crash.log" scripts/qemu-supervisor-crash-restart-smoke.sh
@@ -80,23 +84,20 @@ for log in "$LOGDIR"/rv_*.log "$LOGDIR"/arm_*.log "$LOGDIR"/x86_*.log; do
   fi
 done
 
-# ── 4. Per-arch / per-class seal (live marker across the arch's aggregated logs) ──
+# ── 4. Per-arch / per-class seal (LIVE marker across the arch's aggregated logs) ──
+# Every one of the 12 cells must be proven by a fresh QEMU boot — there is no source-guard
+# substitute. x86_64/FutexWake is now live-proven by the slot-5 FutexWake oracle (x86_fw.log).
+live_cells=0
 seal_class() { # seal_class <arch> <class> <logglob>
   local arch="$1" class="$2"; shift 2
   local marker="GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=${class} result=ok"
   if rg -a -N "$marker" "$@" >/dev/null 2>&1; then
     echo "FIRST_COHORT_SEAL arch=${arch} class=${class} result=ok proof=live"
-    return 0
-  fi
-  # x86_64/FutexWake has no live boot trigger; fall back to a source guard (the arch-tagged emission
-  # exists in the shared split producer, and the identical seam is live on AArch64 + RISC-V).
-  if [[ "$arch" == "x86_64" && "$class" == "FutexWake" ]] \
-     && rg -F "arch=x86_64 class=FutexWake result=ok" src/kernel/syscall_split.rs >/dev/null 2>&1; then
-    echo "FIRST_COHORT_SEAL arch=${arch} class=${class} result=ok proof=source_guard note=no_live_x86_futexwake_trigger"
+    live_cells=$((live_cells+1))
     return 0
   fi
   echo "FIRST_COHORT_SEAL arch=${arch} class=${class} result=MISSING"
-  die "no proof for arch=${arch} class=${class}"
+  die "no live proof for arch=${arch} class=${class}"
   return 1
 }
 
@@ -122,8 +123,15 @@ rg -a -N "AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok" "$LOGDIR"/arm_idle.log 
 rg -a -N "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1 outgoing_blocked=1" \
   "$LOGDIR"/rv_idle.log >/dev/null 2>&1 || die "riscv64 FutexWait idle oracle proof missing"
 
-# ── 6. Final cross-architecture seal ──
-if [[ $arches_ok -eq 3 && $fail -eq 0 ]]; then
+# ── 6. Final cross-architecture seal (require all 12 cells live) ──
+if [[ $live_cells -eq 12 ]]; then
+  echo "FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok"
+else
+  echo "FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=${live_cells} result=fail"
+  die "expected 12 live cells, found ${live_cells}"
+fi
+
+if [[ $arches_ok -eq 3 && $live_cells -eq 12 && $fail -eq 0 ]]; then
   echo "FIRST_COHORT_CROSS_ARCH_SEAL arches=3 classes=4 result=ok"
   exit 0
 else

@@ -351,6 +351,13 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_riscv_futex_wake_oracle_enabled(enabled);
         crate::yarm_log!("YARM_RISCV64_FUTEX_WAKE_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.x86_64_futex_wake_oracle {
+        // Stage 197A: default-off x86_64 FutexWake (NR 10) live-oracle knob. Provisions init
+        // startup slot 5 so init runs the parent/child split-FutexWake proof (counts 1 then 0,
+        // waiter resumes once) — closing the first-cohort matrix at 12/12 LIVE.
+        crate::kernel::boot::set_x86_futex_wake_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_X86_64_FUTEX_WAKE_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.riscv64_queue_switch_foundation_oracle {
         // Stage 196D: default-off RISC-V queue-advancing context-switch FOUNDATION oracle knob.
         // Arms the one-shot post-lock switch (publish/re-enqueue outgoing, defer, drain to
@@ -619,6 +626,11 @@ pub struct YarmBootOptions<'a> {
     /// FutexWake retirement MECHANISM is live once the class is enabled; this only selects the
     /// proof workload. Independent of the foundation-oracle knob.
     pub riscv64_futex_wake_oracle: Option<bool>,
+    /// Stage 197A: `yarm.x86_64_futex_wake_oracle=1` DEFAULT-OFF knob. Provisions init startup
+    /// slot 5 (=1) so init runs the parent/child split-FutexWake (NR 10) live proof (counts 1
+    /// then 0, waiter resumes once). Selects the proof workload only; the FutexWake retirement
+    /// MECHANISM is already live by default. Closes the first-cohort matrix at 12/12 LIVE.
+    pub x86_64_futex_wake_oracle: Option<bool>,
     /// Stage 196D: `yarm.riscv64_queue_switch_foundation_oracle=1` DEFAULT-OFF knob. Provisions
     /// init startup slot 5 (=2) so init runs the two-task queue-advancing context-switch
     /// FOUNDATION proof (task A yields → post-lock switch to task B with a real SATP/sfence.vma +
@@ -795,6 +807,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.riscv64_futex_wake_oracle" {
             options.riscv64_futex_wake_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.x86_64_futex_wake_oracle" {
+            options.x86_64_futex_wake_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.riscv64_queue_switch_foundation_oracle" {
             options.riscv64_queue_switch_foundation_oracle = parse_bool_knob(value);
@@ -1307,6 +1322,23 @@ mod tests {
         assert_eq!(riscv.aarch64_futex_wait_idle_oracle, None);
         // The 196C FutexWake oracle knob is independent of the 196A foundation oracle knob.
         assert_eq!(riscv.riscv64_futex_wake_oracle, None);
+    }
+
+    // Stage 197A: the x86_64 FutexWake live-oracle knob parses independently and defaults off.
+    #[test]
+    fn x86_64_futex_wake_oracle_knob_parses_and_defaults_off() {
+        assert_eq!(parse_yarm_boot_options(b"").x86_64_futex_wake_oracle, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.x86_64_futex_wake_oracle=1").x86_64_futex_wake_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.x86_64_futex_wake_oracle=0").x86_64_futex_wake_oracle,
+            Some(false)
+        );
+        // Independent of the RISC-V FutexWake knob (no cross-arch aliasing).
+        let x = parse_yarm_boot_options(b"yarm.x86_64_futex_wake_oracle=1");
+        assert_eq!(x.riscv64_futex_wake_oracle, None);
     }
 
     // Stage 196C: the RISC-V FutexWake live-oracle knob parses independently and defaults off.

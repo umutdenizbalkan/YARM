@@ -984,6 +984,13 @@ pub fn bootstrap_first_user_task(
         init_args[17] = 2; // cap-enqueue-oracle discriminator
         crate::yarm_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_PROVISION_OK slot17=2");
     }
+    // Stage 197A: default-off x86_64 FutexWake live oracle. init startup slot 5
+    // (supervisor_control_recv_ep, unused by init) is reused as a sentinel (=1) ONLY under
+    // `yarm.x86_64_futex_wake_oracle=1`. A normal boot leaves it 0 and init skips this.
+    if crate::kernel::boot::x86_futex_wake_oracle_enabled() {
+        init_args[5] = 1;
+        crate::yarm_log!("X86_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1");
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,
