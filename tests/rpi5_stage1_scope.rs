@@ -1422,6 +1422,81 @@ fn rpi5_boot4_physmap_bridge_is_gated_and_preserves_default_identity() {
 }
 
 #[test]
+fn rpi5_boot5a_audit_and_handoff_bridge_markers_are_guarded() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+    let fixture = include_str!("../scripts/test-create-rpi5-stage1-boot-dir.sh");
+
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    let highmap_ok = hh5
+        .find("RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK_MARKER")
+        .expect("BOOT-4 highmap marker");
+    let audit_begin = hh5
+        .find("RPI5_BOOT5_KERNELSTATE_AUDIT_BEGIN_MARKER")
+        .expect("BOOT-5 audit marker");
+    let bridge_ok = hh5
+        .find("RPI5_BOOT5_HANDOFF_BRIDGE_OK_MARKER")
+        .expect("BOOT-5 handoff marker");
+    let defer = hh5
+        .find("kernel_state_requires_scheduler_init")
+        .expect("precise BOOT-5A deferral");
+    assert!(highmap_ok < audit_begin && audit_begin < bridge_ok && bridge_ok < defer);
+
+    for marker in [
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_BEGIN",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_STORAGE",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_CPU0",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_SCHEDULER",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_TASK",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_IPC",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_CAP",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_VM",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_DONE",
+        "RPI5_BOOT5_HANDOFF_BRIDGE_BEGIN",
+        "RPI5_BOOT5_HANDOFF_DTB_OK",
+        "RPI5_BOOT5_HANDOFF_INITRD_OK",
+        "RPI5_BOOT5_HANDOFF_MEMORY_OK",
+        "RPI5_BOOT5_HANDOFF_RESERVED_OK",
+        "RPI5_BOOT5_HANDOFF_HEAP_OK",
+        "RPI5_BOOT5_HANDOFF_PHYSMAP_OK",
+        "RPI5_BOOT5_HANDOFF_BRIDGE_OK",
+        "RPI5_BOOT5_HANDOFF_FAILED reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits BOOT-5 marker {marker}");
+        assert!(build.contains(marker), "build omits BOOT-5 marker {marker}");
+        assert!(
+            fixture.contains(marker),
+            "fixture omits BOOT-5 marker {marker}"
+        );
+    }
+
+    // BOOT-5A is an audited bridge only: it must not fake KernelState, a
+    // scheduler, user TTBR0, NR27, synthetic init, or an ERET marker.
+    for forbidden in [
+        "SYSCALL_INITRAMFS_READ_CHUNK_NR",
+        "InitramfsReadChunk",
+        "PM_NR27_SELF_PROBE",
+        "RPI5_ENTER_USER_ERET",
+        "synthetic init",
+        "core::arch::asm!(\"eret\"",
+        "start_secondary_cpus",
+        "psci_cpu_on",
+        "init_gic",
+        "timer_irq_enable",
+    ] {
+        assert!(!hh5.contains(forbidden), "BOOT-5A bridge added {forbidden}");
+    }
+}
+
+#[test]
 fn rpi5_boot4_global_allocator_pt_init_is_markered_and_bss_is_zeroed() {
     let boot = include_str!("../src/arch/aarch64/boot.rs");
     let frame = include_str!("../src/kernel/frame_allocator.rs");

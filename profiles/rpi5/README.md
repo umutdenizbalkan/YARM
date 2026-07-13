@@ -50,8 +50,9 @@ path did not, so the frame-allocator spin-lock had a garbage state that hung the
 first allocator lock; the global-allocator bring-up now emits per-step markers
 (`RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_OK`,
 `…_PT_ZERO_DONE`, `…_PT_INIT_DONE`, `…_PROBE_ALLOC_OK`,
-`…_PROBE_SENTINEL_OK`). The remaining blocker is now narrowed
-to the scheduler/IRQ subsystem that `KernelState` bootstrap needs
+`…_PROBE_SENTINEL_OK`). BOOT-5A now records a source-audited KernelState/CPU0/scheduler prerequisite
+ladder (`RPI5_BOOT5_KERNELSTATE_AUDIT_*`) and validates the HH5 handoff bridge
+through `RPI5_BOOT5_HANDOFF_BRIDGE_OK` before the same precise deferral
 (`RPI5_HH5_DEFERRED reason=kernel_state_requires_scheduler_init`, or
 `reason=initrd_missing` when no initrd is present). This still needs a hardware
 run to confirm. See `doc/RPI5_BRINGUP.md` and
@@ -60,10 +61,11 @@ run to confirm. See `doc/RPI5_BRINGUP.md` and
 ## First userspace target
 
 Normal kernel bootstrap, `ENTER_USER`, and `/sbin/initramfs_srv` are **not yet
-reached on RPi5**. The blocker is that the normal kernel bootstrap still requires
-a low-physical frame allocator and low identity mappings that HH4 deliberately
-retired. The next milestone is a high-half handoff into normal kernel init; see
-the milestone ladder in [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
+reached on RPi5**. BOOT-4 has retired the low-physical allocator blocker with the
+gated high physmap; BOOT-5A now stops at the concrete normal-bootstrap blocker:
+CPU0/per-CPU plus scheduler initialization for the canonical `KernelState` /
+`SharedKernel` path. CPIO and `/init` are mandatory, the synthetic init fallback
+and NR27 loader are gone, and ZC ELF loading remains mandatory.
 
 ## `services-core.manifest`
 

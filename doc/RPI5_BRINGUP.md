@@ -640,7 +640,7 @@ service-chain component.
 
 ---
 
-## 12. HH-4 — Low-identity retirement; HH-5 deferral
+## 12. HH-4 and BOOT-5 ladder
 
 After HH-3 validates the high PC, stack, VBAR, TTBR roots, TCR, and
 UART, HH-4 uses a distinct linker-reserved, page-aligned empty TTBR0
@@ -652,33 +652,73 @@ with `DSB ISH` plus `ISB`. The post-replacement path reads back TTBR0
 and proves PC, SP, VBAR, and the bounded UART remain usable solely
 through TTBR1 high aliases.
 
-HH-5 starts only with the private readiness token returned by
-successful HH-4. The current HH target does not yet reuse the Stage 2C
-loader because that loader consumes a low-physical allocator and
-firmware DTB / initrd pointers. Accessing those after the empty TTBR0
-replacement would violate HH-4's no-low-VA contract. HH-5 therefore
-reports `RPI5_HH5_DEFERRED reason=high_half_initrd_allocator_bridge_not_ready`
-and halts with `RPI5_HH5_DONE status=deferred`. It retains future
-load/attempt marker bytes for artifact auditing but does not emit the
-attempt marker, install a user root, compile an EL0 ERET path, or
-claim EL0 success.
+The accepted RPi5 boot ladder is now:
 
----
+| Stage | Scope | Status |
+|-------|-------|--------|
+| BOOT-1 | raw entry/UART | live diagnostic |
+| BOOT-2 | DTB/platform/initrd discovery | live diagnostic |
+| BOOT-3 | high-half execution and TTBR0 removal | live diagnostic |
+| BOOT-4 | high physmap, frame allocator, global allocator | live diagnostic |
+| BOOT-5A | CPU0/scheduler/KernelState audit and HH5 bridge | in progress; currently audited/deferred |
+| BOOT-5B | real `/init` and first EL0 | future |
+| BOOT-5C | complete userspace server chain | future |
+| future | GIC/timer, RP1/PCIe, physical drivers, SMP | not part of BOOT-5 |
+
+Current BOOT-5A source audit records the normal bootstrap prerequisites with
+`RPI5_BOOT5_KERNELSTATE_AUDIT_*` markers after
+`RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK`. The audit found that canonical storage
+is `BOOTSTRAP_KERNEL_STATE` plus `BOOTSTRAP_SHARED_KERNEL` in
+`src/kernel/boot/bootstrap_state.rs`; `init_shared_static_with_boot_memory_map`
+initializes `KernelState` in static `MaybeUninit`, then performs a `ptr::read`
+into `SharedKernel::new`. That means BOOT-5 must remove the remaining large
+move/constructor risk before constructing it on hardware. The fields requiring
+allocation include address-space managers, IPC, task tables, capability state,
+memory, driver, telemetry, boot-config, fault, and restart subsystems. CPU0,
+per-CPU state, the scheduler run queue, idle/bootstrap representation, current
+state before ERET, ASID/user address-space state, and boot initrd publication are
+normal-bootstrap prerequisites. No timer IRQ, GIC, SMP, RP1, PCIe, DMA, or
+physical driver initialization is permitted in BOOT-5.
+
+The HH5 handoff bridge now validates the DTB high alias, mandatory initrd high
+alias, usable memory window alignment, reserved-range exclusion for kernel/DTB
+/initrd, high-half heap alias, and RPi5-gated physmap offset, then emits
+`RPI5_BOOT5_HANDOFF_BRIDGE_OK`. It still defers precisely at
+`RPI5_HH5_DEFERRED reason=kernel_state_requires_scheduler_init`; it does not emit
+`RPI5_ENTER_USER_ERET`, install a user TTBR0, create a synthetic init, use NR27,
+or start a byte-copy ELF fallback.
+
+BOOT-5 policy updates:
+
+- NR27 no longer exists; do not reintroduce `InitramfsReadChunk` or any NR27
+  loader/probe marker.
+- The synthetic init fallback no longer exists.
+- A real CPIO and real `/init` are mandatory; missing or malformed boot resources
+  must use canonical `BOOT_FATAL_*` markers.
+- Zero-copy ELF loading is mandatory; ZC failure is fatal and must not retry with
+  a byte-copy loader.
+- Hardware boot failures after BOOT-4 must emit precise failure/deferred/fatal
+  markers rather than silently hanging.
+- BOOT-5 is single-core and interrupt-masked: CPU0 only, no timer IRQ, no GIC,
+  no SMP/PSCI CPU_ON.
+- Full userspace startup precedes real RPi5 driver bring-up; driver services must
+  start inertly and wait for explicit resource assignment.
 
 ## 13. Current RPi5 HH state and next target
 
 | Stage | Status |
 |-------|--------|
-| Stage 1 UART / DTB / MMU / allocator / read-only timer+GIC | LIVE diagnostic |
-| Stage 2A–2D | LIVE diagnostic; EL0 entry deferred at Stage 2D |
-| HH-2 (TTBR split, MMU on, branch to high) | LIVE diagnostic; non-default `rpi5-highhalf` feature |
-| HH-3 (high-linked Rust continuation) | LIVE diagnostic |
-| HH-4 (low-identity retirement) | LIVE diagnostic |
-| HH-5 (real userspace) | DEFERRED — high-half initrd/allocator bridge not ready |
+| BOOT-1 raw UART | LIVE diagnostic |
+| BOOT-2 DTB/platform/initrd discovery | LIVE diagnostic |
+| BOOT-3 high-half execution + TTBR0 removal | LIVE diagnostic |
+| BOOT-4 high physmap + allocators | LIVE diagnostic |
+| BOOT-5A KernelState/CPU0/scheduler | AUDITED bridge; deferred at scheduler bootstrap |
+| BOOT-5B `/init` + first EL0 | not reached |
+| BOOT-5C full userspace chain | not reached |
 
-**Next target:** build the high-half initrd / allocator bridge so HH-5
-can consume the existing Stage 2C loader without violating HH-4's
-no-low-VA contract.
+**Next target:** invoke the current generic AArch64 CPU0/per-CPU and scheduler
+bootstrap from the validated HH5 handoff without enabling interrupts, GIC, timer,
+SMP, RP1/PCIe, physical drivers, NR27, or synthetic-init fallbacks.
 
 ### 13.1 Hardware artifact build
 

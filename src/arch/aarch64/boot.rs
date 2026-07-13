@@ -2022,6 +2022,166 @@ rpi5_hh_retained_marker!(
     RPI5_KERNEL_GLOBAL_ALLOCATOR_FAILED_MARKER,
     b"RPI5_KERNEL_GLOBAL_ALLOCATOR_FAILED reason="
 );
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_KERNELSTATE_AUDIT_BEGIN_MARKER,
+    b"RPI5_BOOT5_KERNELSTATE_AUDIT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_BOOT5_KERNELSTATE_AUDIT_STORAGE_MARKER, b"RPI5_BOOT5_KERNELSTATE_AUDIT_STORAGE static=BOOTSTRAP_KERNEL_STATE shared=BOOTSTRAP_SHARED_KERNEL init=in_place_then_ptr_read");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_KERNELSTATE_AUDIT_CPU0_MARKER,
+    b"RPI5_BOOT5_KERNELSTATE_AUDIT_CPU0 cpu=0 max_cpus=1 tpidr_el1_required"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_KERNELSTATE_AUDIT_SCHEDULER_MARKER,
+    b"RPI5_BOOT5_KERNELSTATE_AUDIT_SCHEDULER requires_scheduler_state_runqueue_idle"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_KERNELSTATE_AUDIT_TASK_MARKER,
+    b"RPI5_BOOT5_KERNELSTATE_AUDIT_TASK requires_tcb_tables_current_before_eret"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_KERNELSTATE_AUDIT_IPC_MARKER,
+    b"RPI5_BOOT5_KERNELSTATE_AUDIT_IPC uses_generic_ipc_subsystem_no_rpi5_fork"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_KERNELSTATE_AUDIT_CAP_MARKER,
+    b"RPI5_BOOT5_KERNELSTATE_AUDIT_CAP root_cnode_and_capability_subsystem_required"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_KERNELSTATE_AUDIT_VM_MARKER,
+    b"RPI5_BOOT5_KERNELSTATE_AUDIT_VM address_space_manager_asid_and_bootinfo_required"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_KERNELSTATE_AUDIT_DONE_MARKER,
+    b"RPI5_BOOT5_KERNELSTATE_AUDIT_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_HANDOFF_BRIDGE_BEGIN_MARKER,
+    b"RPI5_BOOT5_HANDOFF_BRIDGE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_HANDOFF_DTB_OK_MARKER,
+    b"RPI5_BOOT5_HANDOFF_DTB_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_HANDOFF_INITRD_OK_MARKER,
+    b"RPI5_BOOT5_HANDOFF_INITRD_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_HANDOFF_MEMORY_OK_MARKER,
+    b"RPI5_BOOT5_HANDOFF_MEMORY_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_HANDOFF_RESERVED_OK_MARKER,
+    b"RPI5_BOOT5_HANDOFF_RESERVED_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_HANDOFF_HEAP_OK_MARKER,
+    b"RPI5_BOOT5_HANDOFF_HEAP_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_HANDOFF_PHYSMAP_OK_MARKER,
+    b"RPI5_BOOT5_HANDOFF_PHYSMAP_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_HANDOFF_BRIDGE_OK_MARKER,
+    b"RPI5_BOOT5_HANDOFF_BRIDGE_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5_HANDOFF_FAILED_MARKER,
+    b"RPI5_BOOT5_HANDOFF_FAILED reason="
+);
 // Devicetree reference names compared via raw-pointer reads (no anonymous
 // literals, no slice iterators) so the lookup stays on the proven HH path.
 #[cfg(all(
@@ -3980,6 +4140,104 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
     // is not exercised at this bring-up stage.
     hh5_hex_line!(RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_OK_MARKER, probe_va);
     if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // BOOT-5A Task A — audited handoff to the current generic KernelState path.
+    // These markers are emitted only after the global allocator high-map probe
+    // succeeds and after validating the concrete prerequisites below; they do
+    // not claim KernelState construction, CPU0 publication, scheduler start, or
+    // EL0 entry.
+    if !rpi5_hh_write_line(&RPI5_BOOT5_KERNELSTATE_AUDIT_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let kernel_state_size = core::mem::size_of::<crate::kernel::boot::KernelState>() as u64;
+    let shared_size = core::mem::size_of::<crate::runtime::SharedKernel>() as u64;
+    if kernel_state_size == 0 || shared_size == 0 {
+        let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_HANDOFF_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"kernel_state_layout");
+        hh5_fault!(b"boot5_kernelstate_audit");
+    }
+    if !rpi5_hh_write_line(&RPI5_BOOT5_KERNELSTATE_AUDIT_STORAGE_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5_KERNELSTATE_AUDIT_CPU0_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5_KERNELSTATE_AUDIT_SCHEDULER_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5_KERNELSTATE_AUDIT_TASK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5_KERNELSTATE_AUDIT_IPC_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5_KERNELSTATE_AUDIT_CAP_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5_KERNELSTATE_AUDIT_VM_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5_KERNELSTATE_AUDIT_DONE_MARKER)
+    {
+        rpi5_hh_halt();
+    }
+
+    // BOOT-5A Task B — HH5-to-normal-bootstrap bridge validation.  The actual
+    // entry remains deferred until the generic CPU0/per-CPU scheduler bootstrap
+    // can be invoked without enabling timer/GIC/SMP or constructing large values
+    // on the early stack.
+    if !rpi5_hh_write_line(&RPI5_BOOT5_HANDOFF_BRIDGE_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let page_mask = 0xfffu64;
+    if dtb_size == 0 || dtb_phys >= dtb_phys + dtb_size || dtb_virt != dtb_phys + RPI5_HH_VA_OFFSET
+    {
+        let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_HANDOFF_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"dtb_range_or_alias");
+        hh5_fault!(b"boot5_handoff_dtb");
+    }
+    if !rpi5_hh_write_line(&RPI5_BOOT5_HANDOFF_DTB_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+    if initrd_phys_start >= initrd_phys_end
+        || initrd_virt_start != initrd_phys_start + RPI5_HH_VA_OFFSET
+        || initrd_virt_end != initrd_phys_end + RPI5_HH_VA_OFFSET
+    {
+        let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_HANDOFF_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"initrd_range_or_alias");
+        hh5_fault!(b"boot5_handoff_initrd");
+    }
+    if !rpi5_hh_write_line(&RPI5_BOOT5_HANDOFF_INITRD_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+    if usable_start >= usable_end
+        || (usable_start & page_mask) != 0
+        || (usable_end & page_mask) != 0
+    {
+        let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_HANDOFF_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"memory_range");
+        hh5_fault!(b"boot5_handoff_memory");
+    }
+    if !rpi5_hh_write_line(&RPI5_BOOT5_HANDOFF_MEMORY_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+    if hh5_overlaps(usable_start, usable_end, kernel_phys_start, kernel_phys_end)
+        || hh5_overlaps(usable_start, usable_end, dtb_phys, dtb_phys + dtb_size)
+        || hh5_overlaps(usable_start, usable_end, initrd_phys_start, initrd_phys_end)
+    {
+        let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_HANDOFF_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"reserved_overlap");
+        hh5_fault!(b"boot5_handoff_reserved");
+    }
+    if !rpi5_hh_write_line(&RPI5_BOOT5_HANDOFF_RESERVED_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+    if kheap_phys_start >= kheap_phys_end
+        || kheap_virt_start != kheap_phys_start + RPI5_HH_VA_OFFSET
+    {
+        let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_HANDOFF_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"heap_range_or_alias");
+        hh5_fault!(b"boot5_handoff_heap");
+    }
+    if !rpi5_hh_write_line(&RPI5_BOOT5_HANDOFF_HEAP_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+    if crate::kernel::global_allocator::highmap_offset() != RPI5_HH_VA_OFFSET {
+        let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_HANDOFF_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"physmap_offset");
+        hh5_fault!(b"boot5_handoff_physmap");
+    }
+    if !rpi5_hh_write_line(&RPI5_BOOT5_HANDOFF_PHYSMAP_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5_HANDOFF_BRIDGE_OK_MARKER)
+    {
         rpi5_hh_halt();
     }
 
