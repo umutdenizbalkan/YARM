@@ -1699,3 +1699,57 @@ fn rpi5_boot4_global_allocator_pt_init_is_markered_and_bss_is_zeroed() {
         );
     }
 }
+
+#[test]
+fn rpi5_highhalf_exports_generic_kernel_range_and_reserves_physical_extent() {
+    let ld = include_str!("../targets/aarch64-rpi5-stage2-highhalf-none.ld");
+    let bootstrap = include_str!("../src/kernel/boot/bootstrap_state.rs");
+
+    assert!(
+        ld.contains("__kernel_start = __kernel_virt_start;"),
+        "RPi5 high-half linker script must alias generic start to high-half kernel VA start"
+    );
+    assert!(
+        ld.contains(
+            ". = ALIGN(4096);\n    __kernel_virt_end = .;\n    __kernel_end = __kernel_virt_end;"
+        ),
+        "generic kernel end must be page-aligned and alias the high-half kernel VA end"
+    );
+    assert!(
+        ld.contains("__kernel_phys_end = __kernel_virt_end - __kernel_va_offset;"),
+        "physical kernel end must remain derived from the high VA end and VA offset"
+    );
+    assert!(
+        ld.contains("ASSERT(__kernel_start == __kernel_virt_start"),
+        "linker script should assert the generic start alias cannot diverge"
+    );
+    assert!(
+        ld.contains("ASSERT(__kernel_end == __kernel_virt_end"),
+        "linker script should assert the generic end alias cannot diverge"
+    );
+
+    assert!(
+        bootstrap.contains("const RPI5_HIGH_HALF_LINK_BASE: u64 = 0xffff_ff80_0000_0000;"),
+        "RPi5 high-half bootstrap must define the VA->PA link offset used for reservations"
+    );
+    assert!(
+        bootstrap.contains("fn kernel_link_base_for_reserved_range() -> u64"),
+        "bootstrap reservation code must centralize target-specific linker VA translation"
+    );
+    assert!(
+        bootstrap.contains("feature = \"rpi5-highhalf\"")
+            && bootstrap.contains("RPI5_HIGH_HALF_LINK_BASE")
+            && bootstrap.contains("platform_constants::KERNEL_LINK_VIRT_BASE"),
+        "RPi5 high-half must override the generic AArch64 zero link base without changing other targets"
+    );
+    assert!(
+        bootstrap.contains("let link_base = Self::kernel_link_base_for_reserved_range();"),
+        "default_reserved_ranges must translate linker-symbol VAs through the target-specific helper"
+    );
+    assert!(
+        bootstrap.contains("let kernel_start_phys = kernel_start_virt.saturating_sub(link_base);")
+            && bootstrap
+                .contains("let kernel_end_phys = kernel_end_virt.saturating_sub(link_base);"),
+        "kernel reservation must subtract the link base before publishing physical ranges"
+    );
+}

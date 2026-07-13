@@ -75,6 +75,7 @@ SECTIONS {
     __kernel_phys_start = __boot_low_end;
     . = KERNEL_VIRT_BASE + __kernel_phys_start;
     __kernel_virt_start = .;
+    __kernel_start = __kernel_virt_start;
 
     .text : AT(__kernel_phys_start) ALIGN(4096) {
         *(.text*)
@@ -104,12 +105,17 @@ SECTIONS {
     __bss_end = .;
     . = ALIGN(4096);
     __kernel_virt_end = .;
+    __kernel_end = __kernel_virt_end;
     __kernel_phys_end = __kernel_virt_end - __kernel_va_offset;
 
     ASSERT(KERNEL_VIRT_LOAD_BASE == KERNEL_VIRT_BASE + KERNEL_PHYS_LOAD_BASE,
            "RPi5 high-half load bases violate the VA/PA offset contract")
     ASSERT(__kernel_virt_start == __kernel_va_offset + __kernel_phys_start,
            "RPi5 high-half section placement violates the VA/PA offset contract")
+    ASSERT(__kernel_start == __kernel_virt_start,
+           "RPi5 high-half generic kernel-start alias diverged")
+    ASSERT(__kernel_end == __kernel_virt_end,
+           "RPi5 high-half generic kernel-end alias diverged")
 
     /DISCARD/ : {
         *(.eh_frame*)

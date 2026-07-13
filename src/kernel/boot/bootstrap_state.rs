@@ -39,6 +39,9 @@ static BOOT_EXTRA_RESERVED_ENDS: [core::sync::atomic::AtomicU64; MAX_BOOT_EXTRA_
 static BOOT_INITRD_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static BOOT_INITRD_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(all(target_arch = "aarch64", feature = "rpi5-highhalf"))]
+const RPI5_HIGH_HALF_LINK_BASE: u64 = 0xffff_ff80_0000_0000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Boot5A1SchedulerProbe {
     pub present_bitmap: u64,
@@ -49,6 +52,24 @@ pub struct Boot5A1SchedulerProbe {
 }
 
 impl Bootstrap {
+    #[cfg(not(feature = "hosted-dev"))]
+    fn kernel_link_base_for_reserved_range() -> u64 {
+        #[cfg(all(target_arch = "aarch64", feature = "rpi5-highhalf"))]
+        {
+            // The RPi5 high-half stage2 linker script exports generic kernel
+            // symbols at their high virtual addresses, while the frame
+            // allocator reserves physical ranges.  The generic AArch64
+            // platform layout keeps KERNEL_LINK_VIRT_BASE at zero for QEMU
+            // and the low stage1 image, so the high-half diagnostic profile
+            // supplies the VA->PA offset explicitly here.
+            RPI5_HIGH_HALF_LINK_BASE
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "rpi5-highhalf")))]
+        {
+            platform_constants::KERNEL_LINK_VIRT_BASE
+        }
+    }
+
     #[inline(never)]
     fn default_boot_memory_map() -> ([MemoryRegion; MAX_BOOT_MEMORY_REGIONS], usize) {
         let mut staged = [MemoryRegion {
@@ -85,7 +106,7 @@ impl Bootstrap {
             // reserved. On targets that link the kernel at PA = VMA
             // (aarch64, riscv64) KERNEL_LINK_VIRT_BASE is 0 and this
             // becomes a no-op subtraction.
-            let link_base = platform_constants::KERNEL_LINK_VIRT_BASE;
+            let link_base = Self::kernel_link_base_for_reserved_range();
             let kernel_start_virt = core::ptr::addr_of!(__kernel_start) as u64;
             let kernel_end_virt = core::ptr::addr_of!(__kernel_end) as u64;
             let kernel_start_phys = kernel_start_virt.saturating_sub(link_base);
