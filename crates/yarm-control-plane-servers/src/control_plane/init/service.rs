@@ -819,6 +819,135 @@ fn run_aarch64_futex_wake_oracle(init_tid: u64, futex_wait_mode: bool) {
     }
 }
 
+// ─── Stage 197A: x86_64 FutexWake live oracle (closes the first-cohort matrix at 12/12) ──
+// The x86_64 port of the parent/child split-FutexWake (NR 10) proof. Parent A spawns child B and
+// blocks on a handshake futex; B wakes A (handshake) then blocks on the target futex; A resumes
+// (B provably Blocked(Futex(target))), wakes B once through the SPLIT path (count must be 1), wakes
+// again (count must be 0), then YIELDS so B resumes exactly once and publishes the resume proof; A
+// then confirms `waiter_resumes=1`. Authoritative coordination (handshake + resume flag) — never
+// timing-only. Default-off (slot-5 sentinel = 1).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static X86_FW_WORD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x00A5);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static X86_FW_HANDSHAKE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x00C0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static X86_FW_PARK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x00D0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static X86_FW_WAITER_RESUMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static X86_FW_CHILD_TID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut X86_FW_CHILD_STACK: [u8; 16384] = [0u8; 16384];
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut X86_FW_CHILD_TLS: [u8; 512] = [0u8; 512];
+
+/// Naked entry trampoline for child B. `spawn_user_thread` requires a 16-byte-aligned initial
+/// user stack top and installs it as RSP verbatim, but the x86-64 SysV ABI expects a function to
+/// be reached by a `call` (so its entry RSP ≡ 8 (mod 16)). Entering a normal Rust `extern "C" fn`
+/// directly with a 16-aligned RSP violates that and faults with #GP on the prologue's first
+/// 16-byte SSE spill. This naked shim has no compiler prologue, so it is safe to enter with a
+/// 16-aligned RSP; it then `call`s the real body, which restores the ABI-required alignment.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[unsafe(naked)]
+extern "C" fn x86_futex_wake_oracle_child() -> ! {
+    // RSP is 16-aligned on entry; `call` pushes the 8-byte return address so the body observes
+    // RSP ≡ 8 (mod 16) exactly as the SysV ABI requires. The body never returns; `ud2` guards
+    // against an unexpected return.
+    core::arch::naked_asm!(
+        "call {body}",
+        "ud2",
+        body = sym x86_futex_wake_oracle_child_body,
+    )
+}
+
+/// Child B body: wake the parent on the handshake futex, block on the target futex (legacy
+/// FutexWait), then — once woken exactly once by the parent's split FutexWake — publish the resume
+/// proof and park on an unrelated futex. Never returns.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn x86_futex_wake_oracle_child_body() -> ! {
+    use core::sync::atomic::Ordering::Relaxed;
+    let handshake = X86_FW_HANDSHAKE.as_ptr();
+    yarm_user_rt::user_log!("X86_FUTEX_ORACLE_CHILD_WAKE_PARENT");
+    let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+    let addr = X86_FW_WORD.as_ptr();
+    let observed = X86_FW_WORD.load(Relaxed);
+    yarm_user_rt::user_log!("X86_FUTEX_ORACLE_CHILD_WAIT_BEGIN observed={}", observed);
+    let _ = yarm_user_rt::syscall::futex_wait(addr, observed, observed);
+    // Woken exactly once by the parent's first split FutexWake.
+    X86_FW_WAITER_RESUMED.store(1, Relaxed);
+    let btid = X86_FW_CHILD_TID.load(Relaxed);
+    yarm_user_rt::user_log!("X86_FUTEX_WAKE_WAITER_RESUMED_OK tid={}", btid);
+    let park = X86_FW_PARK.as_ptr();
+    loop {
+        let pv = X86_FW_PARK.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+    }
+}
+
+/// Parent A: spawn B, block on the handshake (B is provably Blocked(Futex(target)) when this
+/// returns), wake B once (count 1) then again (count 0), YIELD so B resumes once, then confirm
+/// `waiter_resumes=1` and emit the live-oracle proof.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn run_x86_futex_wake_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    yarm_user_rt::user_log!("X86_FUTEX_WAKE_ORACLE_BEGIN init_tid={}", init_tid);
+    let addr = X86_FW_WORD.as_ptr();
+    // 16-byte-aligned stack top (spawn_user_thread requires it and installs it as the initial
+    // RSP verbatim). The naked `x86_futex_wake_oracle_child` trampoline re-establishes the
+    // SysV `RSP ≡ 8 (mod 16)` entry convention via its `call` into the real body.
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(X86_FW_CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = x86_futex_wake_oracle_child as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(X86_FW_CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("X86_FUTEX_WAKE_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    X86_FW_CHILD_TID.store(child_tid, Relaxed);
+    yarm_user_rt::user_log!("X86_FUTEX_ORACLE_CHILD_SPAWNED child_tid={}", child_tid);
+    // Authoritative handshake: hand the CPU to the freshly-spawned child; when this returns the
+    // child has woken us and is provably Blocked(Futex) on the target word.
+    let handshake = X86_FW_HANDSHAKE.as_ptr();
+    let hv = X86_FW_HANDSHAKE.load(Relaxed);
+    yarm_user_rt::user_log!("X86_FUTEX_ORACLE_PARENT_HANDSHAKE_WAIT hv={}", hv);
+    let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
+    yarm_user_rt::user_log!("X86_FUTEX_ORACLE_PARENT_RESUMED");
+    // Wake B once through the SPLIT path — count must be 1 (waiter → Runnable, enqueued once).
+    let first_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0);
+    // Second wake: B is no longer Blocked on the target word → count must be 0.
+    let second_wake = yarm_user_rt::syscall::futex_wake(addr, 1).unwrap_or(0xFFFF);
+    yarm_user_rt::user_log!(
+        "X86_FUTEX_WAKE_USER_RETURN_OK first_wake={} second_wake={}",
+        first_wake,
+        second_wake
+    );
+    // Hand the CPU to the now-Runnable B (Yield re-enqueues A) so B resumes exactly once and
+    // publishes X86_FW_WAITER_RESUMED; A is re-dispatched when B parks.
+    let _ = yarm_user_rt::syscall::yield_now();
+    let waiter_resumes = X86_FW_WAITER_RESUMED.load(Relaxed);
+    if first_wake == 1 && second_wake == 0 && waiter_resumes == 1 {
+        yarm_user_rt::user_log!(
+            "X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid={} waiter_resumes=1",
+            child_tid
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail first_wake={} second_wake={} waiter_resumes={} waiter_tid={}",
+            first_wake,
+            second_wake,
+            waiter_resumes,
+            child_tid
+        );
+    }
+}
+
 // ─── Stage 196C: RISC-V FutexWake live oracle ────────────────────────────────────────
 // The RISC-V port of the 195C parent/child FutexWake (NR 10) proof. The child blocks through
 // the LEGACY global-lock FutexWait (NR 9, still global-lock-only on RISC-V); the parent (init)
@@ -1789,6 +1918,14 @@ pub fn run() {
         } else {
             yarm_user_rt::user_log!("INIT_CRASH_TEST_SPAWN_FAIL reason=pm-spawn");
         }
+    }
+
+    // Stage 197A: default-off x86_64 FutexWake live oracle. Slot-5 sentinel 1 (set under
+    // `yarm.x86_64_futex_wake_oracle=1`) tells init to run the parent/child split-FutexWake proof
+    // (counts 1 then 0, waiter resumes once). A normal boot leaves slot 5 = None and skips this.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    if ctx.supervisor_control_recv_ep == Some(1) {
+        run_x86_futex_wake_oracle(ctx.task_id);
     }
 
     // Stage 195C: default-off AArch64 FutexWake live oracle. The kernel reuses init

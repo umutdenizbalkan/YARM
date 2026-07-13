@@ -304,7 +304,7 @@ pub fn handle_riscv_trap_entry_shared(
     // imported the syscall ABI into the portable frame (a7→nr, a0..a5→args), so the
     // split ABI is present; we gate the split dispatcher to those two NRs explicitly
     // here so that the shared `try_split_dispatch_into_frame` (which also knows
-    // IpcRecv / VmBrk / InitramfsReadChunk / ControlPlaneSetCnodeSlots) can NEVER
+    // IpcRecv / VmBrk / ControlPlaneSetCnodeSlots) can NEVER
     // service any other class on RISC-V. Both classes are serviced off the global
     // lock and return EARLY (skipping the broad-lock phase + the active flag
     // entirely): DebugLog is a pure read, and FutexWake only mutates waiter/run-queue

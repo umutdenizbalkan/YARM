@@ -87,12 +87,12 @@ pub fn build_close_message(fd: u64) -> Result<Message, VfsClientError> {
         .map_err(|_| VfsClientError::MessageFailed)
 }
 
-/// Build a `VFS_OP_READ_BULK` [`Message`] for a Phase 2B transfer-buffer bulk read.
+/// Build a `VFS_OP_READ_BULK` [`Message`] (legacy transfer-buffer bulk-read codec).
 ///
-/// `dst_ptr` is PM's local stack buffer VA — initramfs will use kernel
-/// syscall nr=27 (target_tid=PM) to fill it directly.
-///
-/// Phase 2B temporary transfer-buffer bridge.  Replace with page-cap grant in Phase 3.
+/// This codec is retained for its unit tests and ABI completeness, but the bulk-read path it
+/// drove was serviced by kernel syscall NR 27 (InitramfsReadChunk), which was removed in Stage
+/// 197A. `initramfs_srv` now declines `VFS_OP_READ_BULK`; PM loads every late-service ELF via the
+/// mandatory MemoryObject zero-copy grant (`VFS_OP_FILE_GRANT_RO` + `SpawnFromMemoryObject`).
 pub fn build_bulk_read_message(
     fd: u64,
     requested_len: u64,

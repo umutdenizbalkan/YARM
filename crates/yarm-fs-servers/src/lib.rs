@@ -799,9 +799,11 @@ mod stage88_tests {
         let spawn_ok_pos = src
             .find("INIT_EXT4_SPAWN_OK")
             .expect("INIT_EXT4_SPAWN_OK must be present");
-        // Search for the call site specifically (not the function definition).
+        // Search for the call site specifically (not the function definition). Match on the
+        // first call-site argument so the check is robust to rustfmt line-wrapping of the
+        // `let _ = register_ext4_mount_with_vfs(...)` statement.
         let register_pos = src
-            .find("let _ = register_ext4_mount_with_vfs(")
+            .find("register_ext4_mount_with_vfs(vfs_recv_cap")
             .expect("register_ext4_mount_with_vfs call site must be present");
         assert!(
             spawn_ok_pos < register_pos,

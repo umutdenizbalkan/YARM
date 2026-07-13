@@ -1,10 +1,17 @@
-# First-Cohort Global-Lock Retirement Seal (Stage 197)
+# First-Cohort Global-Lock Retirement Seal (Stage 197 / 197A)
 
 This document is the authoritative record of the **first four global-lock
 retirement classes** sealed across all three architectures. It is built from the
 current source (not copied from prior stage reports). It **enables zero new
 retirement classes** — it audits, normalizes, tests, documents, and seals what is
 already live.
+
+> **Stage 197A — 12/12 LIVE.** Stage 197 sealed 11 of the 12 (arch × class) cells
+> with a live QEMU boot and left the x86_64 **FutexWake** cell on a source guard (no
+> live boot trigger existed on x86_64). Stage 197A adds a deterministic **live**
+> x86_64 FutexWake oracle (`yarm.x86_64_futex_wake_oracle=1`) and removes the source
+> guard entirely, so **all 12 cells are now live-proven**. The combined seal now
+> requires `FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok`.
 
 > **Scope caveat.** This seal covers exactly the four classes below. It does **not**
 > claim the broad global `KernelState` lock is fully retired — every non-cohort
@@ -61,7 +68,7 @@ drain; **restore** = arch activation hook.
 | restore | none (caller stays current) | none | none |
 | user return | same-task, wake count in a0/x0 | same | bridge same-task write-back |
 | idle | n/a | n/a | n/a |
-| proof | FutexWake oracle (first=1/second=0) | oracle | oracle (`RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0`) |
+| proof | **live** FutexWake oracle (`X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_resumes=1`, Stage 197A) | oracle | oracle (`RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0`) |
 | marker | `YARM_LOCK_SPLIT_DISPATCH arch=x86_64 nr=10` + `class=FutexWake` | `arch=aarch64` | `arch=riscv64` |
 
 ### FutexWait (NR 9) — in-lock Blocked publish, current cleared, post-lock switch, idle possible
@@ -199,17 +206,44 @@ workload that never invokes NR 9/NR 0 is **not** evidence the mechanism is disab
 the mechanism is proven default-on by **hosted source guards** + **live oracles**
 together.
 
+## 8A. x86_64 FutexWake live oracle (Stage 197A)
+
+`yarm.x86_64_futex_wake_oracle=1` provisions init startup slot 5 (`init_args[5] = 1`;
+unused by init on x86_64) so the init service runs a parent/child split-FutexWake proof:
+
+1. init (parent A) spawns child B and blocks on a handshake futex (NR 9). The
+   freshly-spawned B is fresh-dispatched by the **queue-advancing FutexWait drain**.
+2. B wakes A on the handshake (**split FutexWake NR 10** →
+   `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=FutexWake result=ok`), then blocks
+   on the target word (NR 9). When A's handshake FutexWait returns, B is provably
+   `Blocked(Futex(target))` — authoritative coordination, not timing.
+3. A wakes B once through the split path (count **1**), then again (count **0**),
+   emitting `X86_FUTEX_WAKE_USER_RETURN_OK first_wake=1 second_wake=0`.
+4. A `yield_now()`s so B resumes exactly once, publishes
+   `X86_FUTEX_WAKE_WAITER_RESUMED_OK`, and parks; A then confirms
+   `X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_resumes=1`.
+
+**Fresh-dispatch alignment note.** B is entered directly at a Rust `extern "C" fn` via
+the queue-advancing frame restore (not the alignment-tolerant `_start` asm the servers
+use). `spawn_user_thread` requires a 16-byte-aligned initial RSP and installs it
+verbatim, but the x86-64 SysV ABI expects a function to be reached by a `call`
+(entry `RSP ≡ 8 (mod 16)`). B's entry is therefore a `#[naked]` trampoline that `call`s
+the real body, restoring the ABI alignment; without it the first 16-byte SSE spill in
+the body's prologue faults with #GP on B's very first instruction.
+
 ## 9. Seal result
 
 The combined validation script `scripts/qemu-first-cohort-retirement-seal.sh` runs
-the full fresh matrix and emits:
+the full fresh matrix (now including the x86_64 FutexWake live oracle boot) and emits:
 
 ```
 FIRST_COHORT_SEAL arch=x86_64  classes=4 result=ok
 FIRST_COHORT_SEAL arch=aarch64 classes=4 result=ok
 FIRST_COHORT_SEAL arch=riscv64 classes=4 result=ok
+FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok
 FIRST_COHORT_CROSS_ARCH_SEAL arches=3 classes=4 result=ok
 ```
 
-These are **validation-script** markers derived from the per-arch QEMU logs — no
-kernel markers were added solely to fabricate the matrix.
+All 12 (arch × class) cells are proven `proof=live` — there is **no** source-guard
+substitute for any cell. These are **validation-script** markers derived from the
+per-arch QEMU logs — no kernel markers were added solely to fabricate the matrix.

@@ -72,7 +72,7 @@ Status terms used by this matrix:
 | `24` | `SpawnProcessFromUserBuf` | privileged extension | privileged/control-plane staging use | Implemented kernel dispatch slot; not part of public v10 count. |
 | `25` | — | reserved gap | none | `Syscall::decode` rejects this with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
 | `26` | `SpawnFromInitramfsFile` | privileged extension | PM/VFS-backed spawn path | Implemented kernel dispatch slot; not part of public v10 count. |
-| `27` | `InitramfsReadChunk` | privileged extension | SystemServer only | Phase 2A/2B bootstrap bridge; not part of public v10 count. |
+| `27` | — | reserved gap (removed) | none | Formerly `InitramfsReadChunk` (Phase 2A/2B byte-copy bridge), removed in Stage 197A. `Syscall::decode` rejects `27` with `InvalidNumber`; the number is unused and reusable by a future ABI. |
 | `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v10 count. |
 | `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v10 count. |
 | `30` | `RecvSharedV3` | non-blocking recv extension | any user task | Stage 42+43: non-blocking `recv_shared_v3` (NR 30); `timeout_ticks=0` only; no mapped receive. See `KERNEL_LOCKING.md §58`. |
@@ -135,17 +135,18 @@ They are not reserved gaps and are covered by the public ABI v10 matrix above.
 
 The kernel currently declares `SYSCALL_COUNT = 32`, so dispatch-table slots
 `0..=31` are in range. This is deliberately a different concept from the
-public ABI count above: slots `23`, `24`, `26`, `27`, `28`, `29`, and `30` are
+public ABI count above: slots `23`, `24`, `26`, `28`, `29`, and `30` are
 non-public kernel extensions used by PM, SystemServer, and bootstrap service
-plumbing. They are documented here so integrators can distinguish reserved
-holes from implemented privileged paths.
+plumbing. (Slot `27`, formerly `InitramfsReadChunk`, was removed in Stage 197A and
+is now a reserved hole.) They are documented here so integrators can distinguish
+reserved holes from implemented privileged paths.
 
 | Nr | Name | Caller restriction | Args | Returns | Failure / denial | Related docs |
 |----|------|--------------------|------|---------|------------------|--------------|
 | `23` | `SpawnProcess` | Privileged/bootstrap spawn extension intended for PM/control-plane bootstrap use. The current handler does not perform a class/TID gate before loading from the boot initrd. | `arg0=image_id`, `arg1=parent_pid`, `arg2=startup_args_ptr`, `arg3=startup_args_count`, `arg4..arg5` reserved/unused. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | Invalid image IDs, malformed startup args, missing initrd entries, ELF/load failures, task/capacity exhaustion, or user-copy failures return the corresponding syscall error; no access-denial error is emitted by this handler today. | `doc/PROCESS_AND_SPAWN.md` bootstrap boundary |
 | `24` | `SpawnProcessFromUserBuf` | Privileged staging extension intended for PM/control-plane use. The current handler does not perform a class/TID gate before copying the caller-supplied ELF buffer. | `arg0=image_id`, `arg1=elf_user_ptr`, `arg2=elf_len`, `arg3=parent_pid`, `arg4=startup_args_ptr`, `arg5=startup_args_count`. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | `elf_user_ptr == 0`, `elf_len == 0`, `elf_len > 128 KiB`, invalid user memory, malformed ELF/startup args, or spawn/load/capacity failures return an error; no access-denial error is emitted by this handler today. | PM spawn staging/history |
 | `26` | `SpawnFromInitramfsFile` | PM/VFS-backed spawn extension used by PM for image IDs `>= 4` through `pm_vfs_spawn_inline`. The current handler does not perform a class/TID gate before reading the named initramfs file. | `arg0=image_id`, `arg1=name_ptr`, `arg2=name_len`, `arg3=parent_pid`, `arg4=startup_args_ptr`, `arg5=startup_args_count`. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | Empty/overlong names, invalid user memory/UTF-8, missing initrd entries, invalid image IDs, malformed ELF/startup args, or spawn/load/capacity failures return an error; no access-denial error is emitted by this handler today. | `doc/PROCESS_AND_SPAWN.md` (`pm_vfs_spawn_inline`) |
-| `27` | `InitramfsReadChunk` | SystemServer-only Phase 2A/2B bootstrap bridge. Non-`TaskClass::SystemServer` callers receive `MissingRight`. `arg5` target writes are limited to `0` (self) or PM TID `3`; other targets receive `MissingRight`. | `arg0=name_ptr`, `arg1=name_len`, `arg2=offset`, `arg3=dst_ptr`, `arg4=max_len` (clamped to `4096`), `arg5=target_tid` (`0` self, `3` PM). | On success, `ret0=0`, `ret1=bytes_copied`, `ret2=0`. EOF returns success with `ret1=0`. | Non-SystemServer or invalid target receives `MissingRight`; invalid names/pointers/UTF-8/initrd access return errors; file-not-found returns `Internal` rather than EOF. | Phase 2A/2B bootstrap bridge notes below |
+| `27` | — (removed) | Formerly `InitramfsReadChunk`, removed in Stage 197A. `Syscall::decode(27)` returns `InvalidNumber`; the number is unused and reusable by a future ABI. | — | — | Raw `nr=27` is a normal unknown-syscall error encoded into the trap frame (non-fatal), not a privileged path. | Removed: MemoryObject zero-copy grant (NR 28/29) is the sole ELF-load path |
 | `28` | `CreateInitramfsFileSliceMo` | SystemServer-only (`initramfs_srv`) Phase 3A bridge. Non-`TaskClass::SystemServer` callers receive `MissingRight`. | `arg0=name_ptr`, `arg1=name_len`, `arg2=flags` (reserved, must be `0`), `arg3..arg5` reserved/unused. | On success, `ret0=0`, `ret1=cap_id`, `ret2=file_len`. | Non-SystemServer receives `MissingRight`; empty/overlong names, nonzero flags, invalid user memory/UTF-8, missing/empty files, bounds failures, or MemoryObject/capability allocation failures return errors. | MemoryObject-backed initramfs spawn path |
 | `29` | `SpawnFromMemoryObject` | PM-only Phase 3A zero-copy spawn path. Caller TID must be PM bootstrap TID `3`; other callers receive `MissingRight`. | `arg0=image_id`, `arg1=mo_cap`, `arg2=parent_pid`, `arg3=startup_args_ptr`, `arg4=startup_args_count`, `arg5` reserved/unused. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | Non-PM callers receive `MissingRight`; invalid caps, wrong object type/kind, invalid initrd slice bounds, malformed ELF/startup args, or spawn/load/capacity failures return errors. | Phase 3A MemoryObject zero-copy spawn path |
 | `30` | `RecvSharedV3` | Any user task with a RECEIVE-right capability. No class/TID gate. | `arg0=req_ptr` (ptr to `RecvSharedV3Request`, ≥64 bytes), `arg1=req_len`. Output written to `metadata_ptr` field inside the request struct. `timeout_ticks` must be 0 (non-blocking only). `map_intent`: `0x0`=no mapping, `0x1`=MAP_READ, `0x3`=MAP_READ\|MAP_WRITE; `0x2` (WRITE-only) is invalid. When `map_intent != 0`, `metadata_ptr` must be non-zero and `metadata_len >= V3_LIVE_OUTPUT_LEN`. | On success (message delivered): `ret0=V3_STATUS_OK(0)`, `ret1=sender_tid`, `ret2=0`; `RecvSharedV3Output` (80 bytes) written to `metadata_ptr`: `version=3`, `record_len=80`, `abi_version=10`, `result_status`, `sender_tid`, `message_len`, `message_flags`, `transferred_cap` (cap ID or `RECV_V3_NO_TRANSFER_CAP`). When `map_intent != 0`: `mapped_base` (offset 88), `actual_mapping_perm` (offset 104; `1`=RO, `3`=RW), `cleanup_token` (offset 112). FUTURE fields are 0. | `req_len < 64` → `InvalidArgs`; `timeout_ticks != 0` → `WouldBlock`; `map_intent=0x2` (WRITE-only) → `InvalidArgs`; unknown `map_intent` bits → `InvalidArgs`; `map_intent != 0` with `metadata_len < V3_LIVE_OUTPUT_LEN` → `InvalidArgs`; cap lacks `CAP_RIGHT_WRITE` but `map_intent=0x3` → `InvalidArgs`; invalid/wrong-type cap → `WrongObject`/`InvalidCapability`; empty queue → `WouldBlock`; cap materialization failure → `InvalidCapability`; user-copy fault to `metadata_ptr` → rollback + `InvalidArgs`. See `KERNEL_LOCKING.md §58`. | Stage 42+43+72 recv_shared_v3 |
@@ -473,75 +474,16 @@ Portability boundary:
 
 ---
 
-## Syscall `27`: `InitramfsReadChunk` (SystemServer-only Phase 2A/2B Bootstrap Bridge)
+## Syscall `27`: removed (formerly `InitramfsReadChunk`)
 
-**Access gate**: `TaskClass::SystemServer` only.  Any other caller receives `MissingRight` and the
-kernel logs `INITRAMFS_READ_CHUNK_DENIED tid=<tid> name=<name>`.
+Stage 197A removed the NR 27 `InitramfsReadChunk` byte-copy bridge along with its kernel handler,
+split-dispatch retirement wiring, userspace wrappers, and every fallback that used it. Late-service
+ELF loading is now exclusively the MemoryObject **zero-copy grant** path (`CreateInitramfsFileSliceMo`
+NR 28 + `SpawnFromMemoryObject` NR 29); a required zero-copy load failure is fatal
+(`PM_ELF_ZC_REQUIRED_FAIL` + `BOOT_FATAL_ZC_ELF_LOAD_FAILED`) and never falls back to a byte copy.
 
-**Purpose**: Temporary bootstrap bridge called by `TaskClass::SystemServer` initramfs/VFS
-plumbing to bulk-copy CPIO file data for itself (`arg5=0`) or into PM (`arg5=3`) before the
-page-cap zero-copy path fully replaces this transfer primitive.  This syscall bridges the gap
-between the single-page initramfs-copy prototype (Phase 2A) and the full shared-4KiB
-transfer-buffer VFS path (Phase 2B), while the MemoryObject-based spawn helpers occupy slots
-`28` and `29`.
-
-### Argument layout
-
-| Register | Field        | Description                                                                 |
-|----------|--------------|-----------------------------------------------------------------------------|
-| `arg0`   | `name_ptr`   | User-space pointer to the CPIO entry name byte slice                        |
-| `arg1`   | `name_len`   | Length in bytes of the CPIO entry name                                      |
-| `arg2`   | `offset`     | Byte offset within the file (absolute; 0 = start of file)                  |
-| `arg3`   | `dst_ptr`    | Destination user-space VA.  Phase 2A: caller's own VA.  Phase 2B: PM's VA. |
-| `arg4`   | `max_len`    | Maximum bytes to copy (clamped to 4096 by kernel)                          |
-| `arg5`   | `target_tid` | **Phase 2A**: `0` (copy to caller's ASID). **Phase 2B**: `3` (PM_BOOTSTRAP_TID — copy to PM's ASID). Any other value → `MissingRight`. |
-
-### Return values
-
-| Return    | Meaning                                             |
-|-----------|-----------------------------------------------------|
-| `ret0`    | `0` on success, non-zero error code on failure      |
-| `ret1`    | Number of bytes actually copied (0 at EOF)          |
-
-### Errors
-
-| Error            | Meaning                                                          |
-|------------------|------------------------------------------------------------------|
-| `MissingRight`   | Caller is not `TaskClass::SystemServer`, or `target_tid` is not 0 or `PM_BOOTSTRAP_TID` |
-| `Internal`       | File not found in CPIO archive                                   |
-| `InvalidArgs`    | Kernel does not have a boot CPIO loaded (bridge unavailable)     |
-| `PageFault`      | `dst_ptr` or the target ASID memory access failed               |
-
-### Phase 2A behavior (`arg5 = 0`)
-
-- Kernel finds the named file in the boot CPIO and copies `min(max_len, remaining)` bytes
-  to `dst_ptr` in the **caller's** address space.
-- Returns `Ok(0)` when `offset >= file_len` (EOF; file exists).
-- Returns `Err(Internal)` when the file is not present in CPIO.
-
-### Phase 2B extension (`arg5 = PM_BOOTSTRAP_TID = 3`)
-
-- Used by `initramfs_srv` when servicing `VFS_OP_READ_BULK` requests forwarded from PM.
-- Kernel performs a **cross-ASID copy**: finds the named CPIO entry and writes
-  `min(max_len, remaining)` bytes to `dst_ptr` in **PM's** address space (ASID of TID 3).
-- PM passes its stack `bulk_buf[4096]` VA as `BulkReadArgs.dst_ptr` in the IPC message.
-- After the IPC round-trip completes, PM reads the filled data from `bulk_buf`.
-- This is a temporary kernel-mediated transfer primitive.  The MemoryObject-backed
-  zero-copy spawn helpers exist at slots `28` and `29`; this bridge remains documented
-  only for the older bulk-read copy path until that path no longer needs cross-ASID copy mediation.
-
-### Lifecycle / removal gate
-
-- **Phase 2A / Phase 2B**: active, SystemServer-only; `arg5=3` targets PM memory for the Phase 2B bridge.
-- **Phase 3 target**: retire this bridge after the MemoryObject/page-cap path no longer needs `arg5=PM_TID` cross-ASID copy mediation.
-- **Removal condition**: VFS bulk-read path uses page-cap zero-copy and does not need kernel
-  cross-ASID copy mediation.
-
-### Syscall trace gates (hot-path, default `false`)
-
-- `INITRAMFS_READ_CHUNK_TRACE` in `src/kernel/syscall.rs` — per-chunk success/EOF log.
-- `PM_VFS_BULK_READ_CHUNK_TRACE` in PM service — Phase 2A per-chunk PM log.
-- `PM_VFS_BULK_READ_TRANSFER_CHUNK_TRACE` in PM service — Phase 2B per-chunk PM log.
+`Syscall::decode(27)` returns `InvalidNumber`; a raw `nr=27` trap is encoded into the frame as a
+normal unknown-syscall error (non-fatal), and the number is unused and reusable by a future ABI.
 
 ---
 

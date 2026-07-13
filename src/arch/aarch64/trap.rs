@@ -233,8 +233,10 @@ pub(crate) fn split_finalize_handled_syscall(
     // the `SVC`, exactly as the proven global non-IpcRecv return path uses it
     // (`syscall_resume_pc = raw_vector_return_pc`, no `+4`). The earlier `+4` over-advanced by
     // one instruction, skipping the caller's return-register load (`mov rN, x0`); DebugLog
-    // tolerated the skip (it ignores its return), but InitramfsReadChunk — whose caller reads
-    // x0 (error lane) and x1 (byte count) — returned a stale register (decoded as Internal).
+    // tolerated the skip (it ignores its return), but a multi-return-lane split class — the
+    // now-removed NR 27 InitramfsReadChunk, whose caller read x0 (error lane) and x1 (byte
+    // count) — returned a stale register (decoded as Internal). The fix is retained: it guards
+    // every split-dispatched class whose caller consumes a return value (e.g. FutexWake's count).
     let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr() as usize;
     frame.set_saved_pc(resume_pc);
     if let Some(tid) = kernel.current_tid() {
@@ -267,8 +269,9 @@ pub(crate) fn split_finalize_handled_syscall(
     // (`handle_trap_entry_with_fault_bookkeeping_mode`). The pre-export
     // `set_thread_user_context` above snapshotted the ORIGINAL syscall args (x0 = arg0);
     // without this re-save the resumed task reads the stale x0 instead of the exported
-    // return value. DebugLog masked this (it ignores its return); InitramfsReadChunk
-    // (whose caller reads x0 for the error lane and x1 for the byte count) exposed it.
+    // return value. DebugLog masked this (it ignores its return); the now-removed NR 27
+    // InitramfsReadChunk (whose caller read x0 for the error lane and x1 for the byte count)
+    // exposed it. The re-save is retained for every return-consuming split class (e.g. FutexWake).
     frame.set_arg(0, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0));
     frame.set_arg(1, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1));
     frame.set_arg(2, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2));

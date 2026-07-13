@@ -26844,7 +26844,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -33982,7 +33982,7 @@ mod stage116_solution1_lock_drop_before_switch {
         );
         // The VARIANT_COUNT must be exactly 23 (Stage 115 baseline).
         assert!(
-            syscall_src.contains("pub const VARIANT_COUNT: usize = 23"),
+            syscall_src.contains("pub const VARIANT_COUNT: usize = 22"),
             "Syscall::VARIANT_COUNT must still equal 23 (Stage 115 baseline; no new syscalls)"
         );
     }
@@ -34266,7 +34266,7 @@ mod stage117_global_lock_drop_before_switch {
     fn stage117_syscall_count_unchanged() {
         let syscall_src = include_str!("../syscall.rs");
         assert!(
-            syscall_src.contains("pub const VARIANT_COUNT: usize = 23"),
+            syscall_src.contains("pub const VARIANT_COUNT: usize = 22"),
             "Syscall::VARIANT_COUNT must still equal 23 (Stage 115 baseline)"
         );
     }
@@ -34875,7 +34875,7 @@ mod stage120_controlled_switch_proof {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35015,7 +35015,7 @@ mod stage121_first_resume_abi_diagnostics {
                 && SYSCALL_SRC.contains("mod sched;")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "D4 module split and syscall counts must remain intact"
         );
     }
@@ -35167,7 +35167,7 @@ mod stage122_first_instruction_proof {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35245,7 +35245,7 @@ mod stage123_no_pre_rust_marker_bridge_call {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35345,7 +35345,7 @@ mod stage124_rust_tail_jump_stack_shape {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35460,7 +35460,7 @@ mod stage125_first_resume_rust_entry_bridge {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35613,7 +35613,7 @@ mod stage126_kernel_switch_stack_mapping_backing {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -35766,7 +35766,7 @@ mod stage127_target_asid_switch_stack_mapping {
     fn stage127_d4_and_syscall_counts_remain_intact() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -35906,11 +35906,11 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "VARIANT_COUNT source must remain 23"
         );
     }
@@ -36173,7 +36173,7 @@ mod stage129_active_root_repair {
     fn stage129_d4_modules_and_syscall_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -36358,7 +36358,7 @@ mod stage128_active_cr3_switch_stack_mapping {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -36652,7 +36652,7 @@ mod stage130_d6_proof_cleanup {
     fn stage130_d4_modules_and_syscall_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -37914,7 +37914,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38041,7 +38041,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38216,7 +38216,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38373,7 +38373,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38506,7 +38506,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38669,7 +38669,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38851,7 +38851,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39075,7 +39075,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39285,7 +39285,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39402,7 +39402,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39537,7 +39537,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39733,7 +39733,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            22,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40162,11 +40162,11 @@ mod stage148_decomposition_map {
         );
     }
 
-    // 5. VARIANT_COUNT == 23 compile-time declaration is present in syscall.rs.
+    // 5. VARIANT_COUNT == 22 compile-time declaration is present in syscall.rs.
     #[test]
     fn stage148_variant_count_declaration() {
         assert!(
-            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 23"),
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 22"),
             "VARIANT_COUNT must be 23 in syscall.rs"
         );
     }
@@ -40607,7 +40607,7 @@ mod stage150_ipc_abi_extraction {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 23"),
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 22"),
             "VARIANT_COUNT must remain 23"
         );
     }
@@ -40835,7 +40835,7 @@ mod stage151_ipc_abi_boundary_audit {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 23"),
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 22"),
             "VARIANT_COUNT must remain 23"
         );
     }
@@ -40971,11 +40971,11 @@ mod stage152_syscall_decomposition_completeness_audit {
         );
     }
 
-    // 5. Syscall::VARIANT_COUNT == 23 preserved.
+    // 5. Syscall::VARIANT_COUNT == 22 preserved.
     #[test]
     fn stage152_variant_count_is_23() {
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -41471,7 +41471,7 @@ mod stage153_ipc_cap_boundary_audit {
             "compile-time SYSCALL_COUNT==32 assertion must remain"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -41618,7 +41618,7 @@ mod stage154_ipc_recv_core_boundary {
             "compile-time SYSCALL_COUNT==32 assertion must remain"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -41982,7 +41982,7 @@ mod stage155_recv_v2_codec_convergence {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42231,7 +42231,7 @@ mod stage156_ipc_smoke_oracle {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42714,7 +42714,7 @@ mod stage159bcd_ipc_recv_proof_workload {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42848,7 +42848,7 @@ mod stage160_aarch64_split_recv_routing {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -42931,7 +42931,7 @@ mod stage160b_aarch64_recv_split_dispatch_audit {
     fn stage160b_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -43065,7 +43065,7 @@ mod stage160c_aarch64_trap_abi_bracketing {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts must be unchanged"
         );
         // The x86_64 D6 proof hook lives in the same trap-entry file I edited; it
@@ -43200,7 +43200,7 @@ mod stage160d_aarch64_split_error_export_parity {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts must be unchanged"
         );
         assert!(
@@ -43352,7 +43352,7 @@ mod stage161_sender_wake_deferred {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -43476,7 +43476,7 @@ mod stage162_sender_wake_infra_deferred {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -43721,7 +43721,7 @@ mod stage163_sender_wake_proven {
     fn stage163_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts must be unchanged"
         );
         assert!(
@@ -44182,7 +44182,7 @@ mod stage163_sender_wake_proven {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;")
                 && USER_RT_SRC.contains("const SYSCALL_FORK_NR: usize = 12;"),
             "counts unchanged and fork still NR 12"
         );
@@ -44274,7 +44274,7 @@ mod stage163_sender_wake_proven {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts unchanged"
         );
         // The vm_layout bump touches only the address-space bound — not RPi5 boot
@@ -44390,7 +44390,7 @@ mod stage163_sender_wake_proven {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts unchanged"
         );
         // The COW clone change is confined to VM state — it must not reference RPi5
@@ -44512,7 +44512,7 @@ mod stage163g_cow_pagefault {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -44646,7 +44646,7 @@ mod stage163h_fork_child_pte_mismatch {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -44854,7 +44854,7 @@ mod stage163i_stale_tlb_recovery {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -45056,7 +45056,7 @@ mod stage163j_fork_return_lane {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -45193,7 +45193,7 @@ mod stage163k_no_smoke_interference {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -45437,7 +45437,7 @@ mod stage163l_nonx86_fork_return {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -51958,7 +51958,7 @@ mod stage166_d6_switch_a {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -52184,7 +52184,7 @@ mod stage167_d6_genuine {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -52541,7 +52541,7 @@ mod stage168_d6_genuine_b_and_d2_recv {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -52791,7 +52791,7 @@ mod stage168b_d2_recv_genuine_completion {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -53146,7 +53146,7 @@ mod stage169_d2_send_genuine {
     fn stage169_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -53385,7 +53385,7 @@ mod stage170_ipc_final {
     fn stage170_invariants_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -53702,7 +53702,7 @@ mod stage171_sched_timeout {
     fn stage171_invariants_and_no_scope_creep() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -54080,7 +54080,7 @@ mod stage172_vm_cow {
     fn stage172_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -54363,7 +54363,7 @@ mod stage173_cap_cnode {
     fn stage173_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -54733,7 +54733,7 @@ mod stage174_fault_delivery {
     fn stage174_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -54955,7 +54955,7 @@ mod stage175_spawn_lifecycle {
     fn stage175_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55077,7 +55077,7 @@ mod stage175b_duplicate_tid_gate {
     fn stage175b_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
     }
@@ -55291,7 +55291,7 @@ mod stage176_global_state {
     fn stage176_invariants_and_fallbacks_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55571,7 +55571,7 @@ mod stage177_smp_ready {
     fn stage177_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55854,7 +55854,7 @@ mod stage178_cross_arch_d6 {
     fn stage178_invariants_and_x86_d6_untouched() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56003,7 +56003,7 @@ mod stage178b_cross_arch_d6_hook {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56228,7 +56228,7 @@ mod stage179_d3_full {
     fn stage179_invariants_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56436,7 +56436,7 @@ mod stage180_ci_profiles {
     fn stage180_counts_and_docs() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56694,7 +56694,7 @@ mod stage181_graduate_knobs {
     fn stage181_counts_and_docs() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56813,7 +56813,7 @@ mod stage181b_sender_wake_plumbing {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57174,7 +57174,7 @@ mod stage181c_fork_internal {
     fn stage181c_counts_and_graduation_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57317,7 +57317,7 @@ mod stage182_remove_fallbacks {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57492,7 +57492,7 @@ mod stage183_smp_live {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -58444,7 +58444,7 @@ mod stage183_ap_idle_admit {
     fn stage183_inc2_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -59540,122 +59540,18 @@ mod stage191b_futex_wake_retire {
     }
 }
 
-// Stage 191C — INITRAMFSREADCHUNK GLOBAL-LOCK RETIREMENT. InitramfsReadChunk (NR 27)
-// becomes the THIRD retired global-lock class and the FIRST read-only USER-COPY class:
-// it copies immutable initramfs/CPIO bytes into the caller's (or PM's) user buffer,
-// mutating NO task/scheduler/IPC/cap/VM structural state and allocating nothing. The
-// SUCCESS path is serviced off the global lock via a two-pass user-copy seam
-// (validate-all-then-write-all, so a fault leaves ZERO bytes written); every error path
-// falls back to the unchanged global-lock handler for the canonical error + logs.
-// CreateInitramfsFileSliceMo (NR 28) stays global-lock-only (it MINTS a capability).
-mod stage191c_initramfs_read_chunk_retire {
+// Stage 191C / 197A — generic off-global-lock user-copy seam guards. The original NR 27
+// InitramfsReadChunk split class (which owned this seam) was removed in Stage 197A, but the
+// two-pass validate-all-then-write-all primitive it introduced
+// (`copy_slice_to_user_asid_split_write`) remains a generic split-path write seam. These tests
+// pin its no-partial-write / fault-preservation guarantees, plus the default-deny invariant that
+// no dangerous class is split-eligible.
+mod stage191c_split_user_copy_seam {
     use super::*;
     use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
     use crate::runtime::SharedKernel;
 
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
-    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
-
-    fn handler_body() -> &'static str {
-        let start = SPLIT_SRC
-            .find("fn try_split_initramfs_read_chunk_into_frame(")
-            .expect("initramfs split fn must exist");
-        let rest = &SPLIT_SRC[start..];
-        let end = rest[1..].find("\nfn ").map(|i| i + 1).unwrap_or(rest.len());
-        &rest[..end]
-    }
-
-    // INVENTORY / eligibility: InitramfsReadChunk (NR 27) is whitelisted and routed to
-    // its helper; CreateInitramfsFileSliceMo (NR 28) is NOT (it mints a capability).
-    #[test]
-    fn initramfs_read_chunk_split_eligible_but_slice_mo_stays_locked() {
-        assert!(
-            SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),")
-                && SPLIT_SRC.contains("fn try_split_initramfs_read_chunk_into_frame("),
-            "InitramfsReadChunk must be split-eligible and routed to its helper"
-        );
-        assert!(
-            !SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some"),
-            "CreateInitramfsFileSliceMo must stay global-lock-only (it mints a capability)"
-        );
-        // The functional NR-gate check (NR 27 eligible, NR 28 not) is covered by
-        // `syscall_split::tests::stage29_whitelist_exhaustive`, which iterates the whole
-        // NR space against the real classifier.
-    }
-
-    // The InitramfsReadChunk split + one-shot retire markers exist.
-    #[test]
-    fn initramfs_read_chunk_split_markers_exist() {
-        assert!(
-            SPLIT_SRC.contains(
-                "\"INITRAMFS_READ_CHUNK_SPLIT_BEGIN name_len={} to_copy={} target_tid={}\""
-            ) && SPLIT_SRC.contains("\"INITRAMFS_READ_CHUNK_SPLIT_DONE to_copy={} result=ok\"")
-                && SPLIT_SRC.contains("{} class=InitramfsReadChunk result=ok"),
-            "the InitramfsReadChunk split + retirement markers must exist"
-        );
-    }
-
-    // USER-COPY + NO BROAD LOCK: the handler resolves the requester via the authoritative
-    // tid + task-class split-read, reads the name via the split-read copy, and writes the
-    // data via the dedicated two-pass user-copy seam — never `with(` / `with_cpu(`.
-    #[test]
-    fn initramfs_read_chunk_split_uses_user_copy_seam_and_no_global_lock() {
-        let body = handler_body();
-        assert!(
-            body.contains("shared.current_tid_authoritative(cpu)?")
-                && body.contains("shared.task_class_split_read(caller_tid)")
-                && body.contains(
-                    "shared.copy_from_user_asid_split_read(caller_asid, name_ptr, name_len)"
-                )
-                && body.contains("shared.task_asid_for_tid_split_read(target_tid_arg)")
-                && body
-                    .contains(".copy_slice_to_user_asid_split_write(dst_asid_raw, dst_ptr, src)"),
-            "the InitramfsReadChunk split must use the authoritative-tid + split-read + user-copy seams"
-        );
-        // The handler takes NO broad global lock.
-        assert!(
-            !body.contains(".with(|") && !body.contains(".with_cpu("),
-            "the InitramfsReadChunk split path must not take the broad global lock"
-        );
-        // The write seam uses ONLY the VM split accessor (rank 5) + the config leaf write,
-        // never a broad `&mut KernelState`.
-        assert!(
-            RUNTIME_SRC.contains("pub fn copy_slice_to_user_asid_split_write(")
-                && RUNTIME_SRC
-                    .contains("self.validate_user_access_for_asid_split(asid, va, true)?")
-                && RUNTIME_SRC
-                    .contains("crate::kernel::boot::KernelState::phys_to_direct_map_ptr(phys)"),
-            "the user-copy seam must resolve via the VM split accessor + direct map"
-        );
-    }
-
-    // ERROR SEMANTICS: every error outcome falls back (`return None`) so the global-lock
-    // handler produces the canonical error + diagnostic log — no silent success masking.
-    #[test]
-    fn initramfs_read_chunk_split_error_paths_fall_back() {
-        let body = handler_body();
-        // Access gate → fallback.
-        assert!(
-            body.contains("!= Some(TaskClass::SystemServer)")
-                && body.contains("if name_len == 0 || name_len > 128")
-                && body.contains("if dst_ptr == 0")
-                && body.contains("if target_tid_arg != 0 && target_tid_arg != PM_BOOTSTRAP_TID"),
-            "the split handler must mirror the legacy access gate + arg validation"
-        );
-        // Unwritable destination → fallback (no partial write, canonical fault).
-        assert!(
-            body.contains(".copy_slice_to_user_asid_split_write(dst_asid_raw, dst_ptr, src)")
-                && body.contains(".is_err()")
-                && body.contains("return None;"),
-            "an unwritable destination must fall back to the global-lock canonical error"
-        );
-        // The success encoding matches the legacy handler exactly.
-        assert!(
-            body.contains("frame.set_ok(0, to_copy, 0);")
-                && body.contains("frame.set_ok(0, 0, 0);"),
-            "success (copy) and EOF encodings must match the legacy handler"
-        );
-    }
 
     // Map one writable user page in a valid ASID (phys 0x6000 @ VA 0x2000).
     fn shared_with_mapped_page() -> (SharedKernel, Asid) {
@@ -59676,9 +59572,9 @@ mod stage191c_initramfs_read_chunk_retire {
 
     // EMPIRICAL: the two-pass user-copy seam round-trips into a mapped page, and on a
     // fault it writes ZERO bytes (validate-all before write-all) — the no-partial-write
-    // guarantee the split fallback relies on.
+    // guarantee any split write path relies on.
     #[test]
-    fn initramfs_read_chunk_split_is_two_pass_no_partial_write() {
+    fn split_user_copy_is_two_pass_no_partial_write() {
         let (shared, asid) = shared_with_mapped_page();
 
         // Success round-trip: write 5 bytes into the mapped page, read them back.
@@ -59700,7 +59596,7 @@ mod stage191c_initramfs_read_chunk_retire {
             .expect("tail pre-write");
 
         // Attempt a write spanning into the UNMAPPED next page (0x3000). Pass 1 validates
-        // 0x2FFC (mapped) then 0x3000 (unmapped) → Err BEFORE any byte is written.
+        // 0x2FFC (mapped) then 0x3000 (unmapped) -> Err BEFORE any byte is written.
         let spanning =
             shared.copy_slice_to_user_asid_split_write(asid.0 as u64, 0x2FFC, &[0xBBu8; 8]);
         assert!(
@@ -59725,7 +59621,7 @@ mod stage191c_initramfs_read_chunk_retire {
     // EMPIRICAL: the seam preserves UserMemoryFault (never masks it as success) on an
     // unknown ASID and on a valid-but-unmapped VA.
     #[test]
-    fn initramfs_read_chunk_split_preserves_user_memory_fault() {
+    fn split_user_copy_preserves_user_memory_fault() {
         let shared = SharedKernel::new(Bootstrap::init().expect("init"));
         let unknown = shared.copy_slice_to_user_asid_split_write(9999, 0x1000, &[1u8, 2, 3, 4]);
         assert!(
@@ -59748,12 +59644,14 @@ mod stage191c_initramfs_read_chunk_retire {
         );
     }
 
-    // The other read-only / query-ish and dangerous classes stay global-lock-only
-    // (default-deny `_ => None`; none appears as a split-eligible `=> Some` arm).
+    // The dangerous / capability-minting classes stay global-lock-only (default-deny
+    // `_ => None`; none appears as a split-eligible `=> Some` arm). The removed NR 27
+    // InitramfsReadChunk must not reappear either.
     #[test]
     fn non_selected_classes_remain_locked() {
         for locked in [
             "Syscall::CreateInitramfsFileSliceMo => Some",
+            "Syscall::InitramfsReadChunk => Some",
             "Syscall::IpcSend => Some",
             "Syscall::IpcCall => Some",
             "Syscall::IpcReply => Some",
@@ -59997,9 +59895,13 @@ mod stage191d_futex_wait_block_publish {
     fn prior_retirements_and_reap_exclusion_intact() {
         assert!(
             SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
-            "191A/191B/191C retirements must remain whitelisted"
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
+            "191A/191B retirements must remain whitelisted"
+        );
+        // Stage 197A removed the NR 27 InitramfsReadChunk split class entirely.
+        assert!(
+            !SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
+            "the removed NR 27 InitramfsReadChunk split class must not be whitelisted"
         );
         assert!(
             !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
@@ -60035,7 +59937,6 @@ mod stage191e_dispatch_next_candidate_seam {
             "Syscall::VmBrk => Some(syscall),",
             "Syscall::DebugLog => Some(syscall),",
             "Syscall::FutexWake => Some(syscall),",
-            "Syscall::InitramfsReadChunk => Some(syscall),",
         ] {
             assert!(
                 SPLIT_SRC.contains(accepted),
@@ -60583,9 +60484,8 @@ mod stage192b_yield_queue_advancing_dispatch {
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
         assert!(
             SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
-            "191A/191B/191C retirements must remain"
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
+            "191A/191B retirements must remain"
         );
     }
 }
@@ -60882,9 +60782,8 @@ mod stage193a_ipc_send_boundary_plain {
     fn prior_retirements_intact() {
         assert!(
             SPLIT_SRC.contains("Syscall::DebugLog => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),")
-                && SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
-            "191A/191B/191C split retirements must remain"
+                && SPLIT_SRC.contains("Syscall::FutexWake => Some(syscall),"),
+            "191A/191B split retirements must remain"
         );
         assert!(
             MOD_SRC.contains("class=FutexWait result=ok")
@@ -62179,20 +62078,21 @@ mod stage194_cross_arch_portability_audit {
         }
     }
 
-    // x86_64 live retirement markers are unchanged: the three split-dispatch classes and
-    // the five IpcSend boundary classes remain.
+    // x86_64 live retirement markers are unchanged: the two pre-lock split-dispatch classes
+    // and the five IpcSend boundary classes remain. (Stage 197A removed the NR 27
+    // InitramfsReadChunk split class.)
     #[test]
     fn x86_64_retirement_classes_unchanged() {
-        for class in [
-            "class=DebugLog",
-            "class=FutexWake",
-            "class=InitramfsReadChunk",
-        ] {
+        for class in ["class=DebugLog", "class=FutexWake"] {
             assert!(
                 SPLIT_SRC.contains(class),
                 "x86_64 split-dispatch retirement class `{class}` must remain"
             );
         }
+        assert!(
+            !SPLIT_SRC.contains("class=InitramfsReadChunk"),
+            "the removed NR 27 InitramfsReadChunk retirement marker must be gone"
+        );
         for class in [
             "class=IpcSendPlain result=ok",
             "class=IpcSendOrdinaryCap result=ok",
@@ -62434,214 +62334,6 @@ mod stage195a_aarch64_debuglog_live {
     }
 }
 
-// Stage 195B — AARCH64 INITRAMFSREADCHUNK SPLIT RETIREMENT. InitramfsReadChunk (NR 27) is the
-// SECOND live AArch64 split-dispatch class. These guards pin the selective ABI-import gate
-// (DebugLog + InitramfsReadChunk only), the success-only decline semantics, no-partial-write,
-// arch-tagged retirement, DebugLog preservation, and that no other class was newly enabled.
-mod stage195b_aarch64_initramfs_read_chunk {
-    use super::*;
-    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
-    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
-
-    fn aarch64_import_body() -> &'static str {
-        TRAP_ENTRY_SRC
-            .split_once("#[cfg(target_arch = \"aarch64\")]\nfn pre_split_import_syscall_abi(")
-            .map(|(_, r)| {
-                r.split_once("\n#[cfg(not(target_arch = \"aarch64\"))]")
-                    .map(|(b, _)| b)
-                    .unwrap_or(r)
-            })
-            .unwrap_or("")
-    }
-
-    fn aarch64_finalize_body() -> &'static str {
-        TRAP_ENTRY_SRC
-            .split_once("#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(")
-            .map(|(_, r)| {
-                r.split_once("\n#[cfg(not(target_arch = \"aarch64\"))]")
-                    .map(|(b, _)| b)
-                    .unwrap_or(r)
-            })
-            .unwrap_or("")
-    }
-
-    // The AArch64 selective ABI gate includes NR 15 (DebugLog), NR 27 (InitramfsReadChunk), and
-    // — as of Stage 195C — NR 10 (FutexWake), plus the oracle knob. It must NEVER include the
-    // queue-advancing FutexWait/Yield or the cap-minting CreateInitramfsFileSliceMo NR.
-    #[test]
-    fn aarch64_abi_gate_includes_nr15_and_nr27_only() {
-        let import = aarch64_import_body();
-        assert!(!import.is_empty(), "aarch64 import body must exist");
-        assert!(
-            import.contains("SYSCALL_DEBUG_LOG_NR")
-                && import.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
-            "the gate must include DebugLog (NR 15) and InitramfsReadChunk (NR 27)"
-        );
-        for forbidden in [
-            "SYSCALL_FUTEX_WAIT_NR",
-            "SYSCALL_YIELD_NR",
-            "SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR",
-        ] {
-            assert!(
-                !import.contains(forbidden),
-                "the AArch64 gate must NOT include `{forbidden}`"
-            );
-        }
-        // Finalize mirrors the same selectivity.
-        let fin = aarch64_finalize_body();
-        assert!(
-            fin.contains("SYSCALL_DEBUG_LOG_NR") && fin.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
-            "the AArch64 finalize gate must mirror the import gate (NR 15 + NR 27)"
-        );
-    }
-
-    // InitramfsReadChunk passes the arch-neutral NR gate and is routed to its generic helper.
-    #[test]
-    fn initramfs_read_chunk_is_split_eligible() {
-        assert!(
-            SPLIT_SRC.contains("Syscall::InitramfsReadChunk => Some(syscall),"),
-            "InitramfsReadChunk must pass the split NR gate"
-        );
-        assert!(
-            SPLIT_SRC.contains("if matches!(syscall, Syscall::InitramfsReadChunk) {"),
-            "try_split_dispatch_into_frame must route InitramfsReadChunk to its helper"
-        );
-    }
-
-    // CreateInitramfsFileSliceMo (NR 28, cap-minting) stays excluded from split dispatch.
-    #[test]
-    fn create_initramfs_file_slice_mo_remains_excluded() {
-        assert!(
-            !SPLIT_SRC.contains("Syscall::CreateInitramfsFileSliceMo => Some")
-                && !SPLIT_SRC.contains("matches!(syscall, Syscall::CreateInitramfsFileSliceMo)"),
-            "CreateInitramfsFileSliceMo must never be split-eligible"
-        );
-    }
-
-    // The split helper services ONLY the success path: every error/unsupported case returns
-    // `None` (fall back to the canonical global handler), and the destination copy is a
-    // two-pass validated write so a fault leaves NO partial user write.
-    #[test]
-    fn initramfs_split_is_success_only_and_no_partial_write() {
-        let body = SPLIT_SRC
-            .split_once("fn try_split_initramfs_read_chunk_into_frame(\n    shared: &SharedKernel,")
-            .map(|(_, r)| {
-                r.split_once("\n/// Emit the InitramfsReadChunk")
-                    .map(|(b, _)| b)
-                    .unwrap_or(r)
-            })
-            .unwrap_or("");
-        assert!(!body.is_empty(), "initramfs split helper body must exist");
-        // Declines (fallback) for access/arg/not-found/unwritable cases.
-        assert!(
-            body.matches("return None").count() >= 5,
-            "the split helper must decline (return None) for all non-success cases"
-        );
-        // Two-pass validated user write (validate all dest pages before writing any byte).
-        assert!(
-            body.contains("copy_slice_to_user_asid_split_write"),
-            "the destination copy must use the two-pass validated write seam"
-        );
-        assert!(
-            body.contains("No user-memory byte was written on the split path"),
-            "the helper must document no-partial-write on copy failure"
-        );
-    }
-
-    // Arch-tagged retirement marker on AArch64; byte-identical untagged marker off AArch64.
-    #[test]
-    fn initramfs_retirement_marker_arch_tagged() {
-        assert!(
-            SPLIT_SRC.contains("arch=aarch64 class=InitramfsReadChunk result=ok"),
-            "AArch64 must emit the arch-tagged InitramfsReadChunk retirement marker"
-        );
-        assert!(
-            SPLIT_SRC.contains(
-                "crate::yarm_log!(\"{} class=InitramfsReadChunk\", MARK_RETIRE_CLASS_BEGIN);"
-            ),
-            "the non-aarch64 InitramfsReadChunk marker must stay untagged/byte-identical"
-        );
-    }
-
-    // DebugLog split remains live (its arch-tagged marker + gate intact).
-    #[test]
-    fn debuglog_split_still_live() {
-        assert!(
-            SPLIT_SRC.contains("arch=aarch64 class=DebugLog result=ok"),
-            "the AArch64 DebugLog retirement marker must remain"
-        );
-    }
-
-    // No queue-advancing AArch64 drain; RISC-V still force-clears; ReapFaultedTask excluded.
-    #[test]
-    fn no_queue_advancing_and_riscv_inert_and_reap_excluded() {
-        const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
-        for needle in [
-            "d2_recv_was_deferred",
-            "futex_wait_was_deferred",
-            "yield_was_deferred",
-        ] {
-            let idx = TRAP_ENTRY_SRC.find(needle).unwrap();
-            assert!(
-                TRAP_ENTRY_SRC[..idx]
-                    .rfind("#[cfg(target_arch = \"x86_64\")]")
-                    .is_some(),
-                "queue-advancing drain `{needle}` must stay x86_64-gated"
-            );
-        }
-        // Stage 196C/196E/196G: the RISC-V PRE-LOCK split gate is DebugLog (NR 15) + FutexWake
-        // (NR 10) ONLY — FutexWait (NR 9) and Yield (NR 0) are NOT in the split gate (their
-        // retirement is a post-lock deferral drain, not a split dispatch).
-        assert!(
-            RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR")
-                && RISCV_TRAP_SRC.contains("nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR")
-                && !RISCV_TRAP_SRC.contains("SYSCALL_FUTEX_WAIT_NR"),
-            "RISC-V pre-lock split gate must be DebugLog+FutexWake-only (NR 9 + NR 0 not in the gate)"
-        );
-        assert!(
-            !SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"),
-            "ReapFaultedTask must never be split-eligible"
-        );
-    }
-
-    // Stage 195B return-value parity fix: the split finalize resyncs args[0..2] to the exported
-    // x0..x2 and re-saves the TCB AFTER export (so a preemption resume reads the return value,
-    // not the original args), mirroring the proven global non-task-switched return path.
-    #[test]
-    fn split_finalize_resyncs_args_after_export() {
-        const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
-        let f = AARCH64_TRAP_SRC
-            .split("fn split_finalize_handled_syscall")
-            .nth(1)
-            .and_then(|s| s.split("\npub fn ").next())
-            .expect("split finalize must exist");
-        let export_idx = f
-            .find("export_syscall_result_to_user_gprs(frame)")
-            .expect("finalize must export");
-        let after_export = &f[export_idx..];
-        assert!(
-            after_export.contains(
-                "frame.set_arg(0, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0))"
-            ) && after_export.contains("set_thread_user_context(tid, ctx)"),
-            "finalize must resync args + re-save the TCB AFTER export (return-value parity)"
-        );
-    }
-
-    // The PM boot-time NR 27 self-probe exists so the retirement fires live on a core boot
-    // (the ZC-grant load path never issues NR 27).
-    #[test]
-    fn pm_nr27_self_probe_present() {
-        const PM_SRC: &str = include_str!(
-            "../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
-        );
-        assert!(
-            PM_SRC.contains("initramfs_read_chunk(PM_NR27_PROBE_FILE")
-                && PM_SRC.contains("PM_NR27_SELF_PROBE_OK"),
-            "PM must issue the one-shot NR 27 self-probe so the split retirement fires live"
-        );
-    }
-}
-
 // Stage 195C — AARCH64 FUTEXWAKE SPLIT RETIREMENT + LIVE ORACLE. FutexWake (NR 10 — the task
 // text's "NR11" is wrong; NR 11 is SpawnThread) is the third live AArch64 split-dispatch class.
 // These guards pin: the gate/finalize include NR 10, the arch-tagged FutexWake markers, the
@@ -62786,14 +62478,14 @@ mod stage195c_aarch64_futex_wake_live {
         );
     }
 
-    // The NR 27 InitramfsReadChunk deprecation TODO is documented (remove after ZC-grant proven).
+    // Stage 197A removed NR 27 InitramfsReadChunk entirely — no enum variant, no NR constant,
+    // and no split-eligibility arm may remain in the syscall sources.
     #[test]
-    fn nr27_deprecation_todo_documented() {
+    fn nr27_fully_removed_from_syscall_sources() {
         assert!(
-            SYSCALL_SRC.contains("TODO(deprecated-legacy-ABI)")
-                && SYSCALL_SRC.contains("InitramfsReadChunk")
-                && SYSCALL_SRC.contains("ZC-grant"),
-            "NR 27 must carry the deprecated-legacy-ABI removal TODO"
+            !SYSCALL_SRC.contains("InitramfsReadChunk = ")
+                && !SPLIT_SRC.contains("Syscall::InitramfsReadChunk"),
+            "NR 27 InitramfsReadChunk must be fully removed from the syscall + split sources"
         );
     }
 
@@ -63679,7 +63371,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -64027,7 +63719,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -64185,7 +63877,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -64254,7 +63946,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -64785,7 +64477,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -64989,7 +64681,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -65227,7 +64919,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -65280,7 +64972,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -65527,6 +65219,316 @@ mod stage197_first_cohort_seal {
         assert!(
             SEAL_SCRIPT.contains("sha256sum") && SEAL_SCRIPT.contains("FORBIDDEN"),
             "the seal script must record hashes + reject forbidden markers"
+        );
+    }
+}
+
+// Stage 197A-A: x86_64 FutexWake LIVE oracle closes the first-cohort matrix at 12/12 live. There is
+// no longer any source-guard substitute for the x86_64/FutexWake cell — it is proven by a fresh
+// QEMU boot exactly like the other 11 cells.
+#[cfg(test)]
+mod stage197a_x86_futexwake_live {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const SEAL_SCRIPT: &str = include_str!("../../../scripts/qemu-first-cohort-retirement-seal.sh");
+    const X86_SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    // The x86_64 FutexWake oracle knob is DEFAULT-OFF (absent parses to None; a normal boot never
+    // sets it).
+    #[test]
+    fn x86_futex_wake_oracle_knob_defaults_off() {
+        use crate::kernel::boot_command_line::parse_yarm_boot_options;
+        assert_eq!(
+            parse_yarm_boot_options(b"").x86_64_futex_wake_oracle,
+            None,
+            "the x86_64 FutexWake oracle must default OFF (no knob → None)"
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.x86_64_futex_wake_oracle=1").x86_64_futex_wake_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.x86_64_futex_wake_oracle=0").x86_64_futex_wake_oracle,
+            Some(false)
+        );
+    }
+
+    // The kernel exposes the runtime flag + accessor, and the x86_64 boot provisions slot-5 = 1
+    // only when the flag is set.
+    #[test]
+    fn x86_flag_and_slot5_provision() {
+        assert!(
+            MOD_SRC.contains("X86_FUTEX_WAKE_ORACLE_ENABLED")
+                && MOD_SRC.contains("pub fn x86_futex_wake_oracle_enabled() -> bool")
+                && MOD_SRC.contains("set_x86_futex_wake_oracle_enabled"),
+            "mod.rs must expose the x86_64 FutexWake oracle flag + accessors"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("set_x86_futex_wake_oracle_enabled"),
+            "boot_command_line must apply the x86_64 FutexWake oracle knob"
+        );
+        // The x86 boot provisions slot 5 (init_args[5]) = 1 under the flag, gated on the accessor.
+        assert!(
+            X86_BOOT_SRC.contains("x86_futex_wake_oracle_enabled()")
+                && X86_BOOT_SRC.contains("X86_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1"),
+            "x86_64 boot must provision slot-5=1 only under the FutexWake oracle flag"
+        );
+    }
+
+    // The init service runs the parent/child split-FutexWake oracle when slot-5 == 1, and its
+    // success attestation pins the authoritative counts (first=1, second=0) and the single waiter
+    // resume (waiter_resumes=1).
+    #[test]
+    fn x86_live_oracle_attestation() {
+        // Dispatch is gated on the slot-5 sentinel (== Some(1)) and the x86_64 target.
+        assert!(
+            SERVICE_SRC.contains("run_x86_futex_wake_oracle(ctx.task_id)"),
+            "init must dispatch the x86_64 FutexWake oracle on slot-5==1"
+        );
+        // Wake counts: first wake returns 1 (waiter → Runnable); second wake returns 0 (no waiter).
+        assert!(
+            SERVICE_SRC.contains("X86_FUTEX_WAKE_USER_RETURN_OK first_wake={} second_wake={}"),
+            "the oracle must report the authoritative wake counts"
+        );
+        // The waiter publishes its resume proof exactly once.
+        assert!(
+            SERVICE_SRC.contains("X86_FUTEX_WAKE_WAITER_RESUMED_OK tid={}")
+                && SERVICE_SRC.contains("X86_FW_WAITER_RESUMED.store(1, Relaxed)"),
+            "the waiter must publish exactly one resume proof"
+        );
+        // Success is asserted only when first==1 && second==0 && waiter_resumes==1.
+        assert!(
+            SERVICE_SRC.contains("if first_wake == 1 && second_wake == 0 && waiter_resumes == 1")
+                && SERVICE_SRC.contains(
+                    "X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0 waiter_tid={} waiter_resumes=1"
+                ),
+            "the live-oracle success marker must pin counts 1/0 and a single waiter resume"
+        );
+        // The failure branch is real (result=fail), never fabricated ok.
+        assert!(
+            SERVICE_SRC.contains("X86_FUTEX_WAKE_LIVE_ORACLE_DONE result=fail"),
+            "the oracle must have a genuine failure branch"
+        );
+    }
+
+    // The combined seal script demands all 12 cells LIVE and no longer accepts a source-guard
+    // substitute for x86_64/FutexWake.
+    #[test]
+    fn seal_requires_12_live_cells_no_source_guard() {
+        assert!(
+            SEAL_SCRIPT
+                .contains("FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok"),
+            "the seal script must require the 12/12 live matrix marker"
+        );
+        // The x86 FutexWake oracle boot is part of the matrix run.
+        assert!(
+            SEAL_SCRIPT.contains("X86_FUTEX_WAKE_ORACLE=1"),
+            "the seal script must boot the x86_64 FutexWake live oracle"
+        );
+        // No source-guard fallback survives (no proof=source_guard, no syscall_split.rs grep).
+        assert!(
+            !SEAL_SCRIPT.contains("proof=source_guard")
+                && !SEAL_SCRIPT.contains("no_live_x86_futexwake_trigger"),
+            "the seal script must NOT accept a source-guard substitute for x86_64/FutexWake"
+        );
+        // The x86 smoke script accepts the live-oracle proof.
+        assert!(
+            X86_SMOKE.contains("X86_FUTEX_WAKE_LIVE_ORACLE_DONE")
+                && X86_SMOKE.contains("X86_FUTEX_WAKE_ORACLE"),
+            "the x86 smoke must accept the FutexWake live-oracle proof under its toggle"
+        );
+    }
+}
+
+// Stage 197A-B: NR 27 InitramfsReadChunk removed + zero-copy ELF loading mandatory. There is no
+// byte-copy fallback anywhere; a required ZC-grant failure is fatal.
+#[cfg(test)]
+mod stage197b_nr27_removed_zc_mandatory {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const INITRAMFS_SYSCALL_SRC: &str = include_str!("../syscall/initramfs.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const PM_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+    );
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const FS_INITRAMFS_SRC: &str =
+        include_str!("../../../crates/yarm-fs-servers/src/fs/initramfs/service.rs");
+
+    // NR 27 decodes to the canonical unknown-syscall error; no enum variant / NR constant / split
+    // arm / handler / userspace wrapper remains. NR 28..=31 keep their explicit discriminants.
+    #[test]
+    fn nr27_syscall_fully_removed() {
+        use crate::kernel::syscall::{Syscall, SyscallError};
+        assert!(matches!(
+            Syscall::decode(27),
+            Err(SyscallError::InvalidNumber)
+        ));
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(Syscall::VARIANT_COUNT, 22);
+        // Needles are split so these assertions do not match themselves via include_str!.
+        let variant_decl = concat!("InitramfsRead", "Chunk = ");
+        let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
+        let handler = concat!("handle_initramfs", "_read_chunk");
+        let wrapper = concat!("fn initramfs", "_read_chunk");
+        assert!(
+            !SYSCALL_SRC.contains(variant_decl)
+                && !SPLIT_SRC.contains(split_arm)
+                && !INITRAMFS_SYSCALL_SRC.contains(handler)
+                && !USER_RT_SRC.contains(wrapper),
+            "no NR 27 enum variant / split arm / handler / userspace wrapper may remain"
+        );
+        // The AArch64 pre-lock split gate keeps DebugLog + FutexWake only (NR 27 dropped).
+        assert!(
+            TRAP_ENTRY_SRC.contains("SYSCALL_DEBUG_LOG_NR")
+                && TRAP_ENTRY_SRC.contains("SYSCALL_FUTEX_WAKE_NR")
+                && !TRAP_ENTRY_SRC.contains("SYSCALL_INITRAMFS_READ_CHUNK_NR"),
+            "the AArch64 split gate must no longer reference NR 27"
+        );
+    }
+
+    // Zero-copy grant loading is mandatory: the PM emits the required-fail + boot-fatal markers
+    // and there is no byte-copy fallback (`pm_read_all_via_vfs_bulk` / NR 27 self-probe are gone).
+    #[test]
+    fn zero_copy_elf_load_is_mandatory_no_byte_copy_fallback() {
+        assert!(
+            PM_SRC.contains("PM_ELF_ZC_REQUIRED_FAIL")
+                && PM_SRC.contains("BOOT_FATAL_ZC_ELF_LOAD_FAILED"),
+            "PM must emit the mandatory-ZC required-fail + boot-fatal markers"
+        );
+        let bulk_fn = concat!("fn pm_read_all_via", "_vfs_bulk");
+        let self_probe = concat!("PM_NR27", "_SELF_PROBE");
+        assert!(
+            !PM_SRC.contains(bulk_fn) && !PM_SRC.contains(self_probe),
+            "the NR 27 byte-copy bulk loader + self-probe must be removed from PM"
+        );
+        // initramfs_srv declines the legacy bulk opcode and still serves the mandatory ZC grant.
+        assert!(
+            FS_INITRAMFS_SRC.contains("INITRAMFS_READ_BULK_UNSUPPORTED")
+                && FS_INITRAMFS_SRC.contains("VFS_OP_FILE_GRANT_RO")
+                && FS_INITRAMFS_SRC.contains("create_initramfs_file_slice_mo"),
+            "initramfs_srv must decline the bulk path and keep the mandatory ZC grant handler"
+        );
+    }
+}
+
+// Stage 197A-C: synthetic init ELF fallback removed + fail-fast init loading. A missing
+// initramfs, malformed CPIO, missing `/init`, malformed init ELF, or forced ZC fault must halt
+// boot with an explicit BOOT_FATAL_* diagnostic — never a synthetic/placeholder init.
+#[cfg(test)]
+mod stage197c_init_fail_fast {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const NEG_SCRIPT: &str =
+        include_str!("../../../scripts/qemu-x86_64-init-fail-fast-negative.sh");
+
+    // The synthetic init ELF generator and its "synthetic" fallback selection are gone from every
+    // arch boot path (needle split so this assertion does not match itself via include_str!).
+    #[test]
+    fn synthetic_init_elf_generator_removed_everywhere() {
+        let generator = concat!("fn initramfs_static_hello", "_world_elf");
+        let synth = concat!("\"synth", "etic\")");
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                !src.contains(generator),
+                "{arch} boot must not define the synthetic init ELF generator"
+            );
+            assert!(
+                !src.contains(synth),
+                "{arch} boot must not select a synthetic init fallback"
+            );
+        }
+    }
+
+    // The arch-neutral required-init loader + fatal-reason logger exist and enumerate every reason.
+    #[test]
+    fn required_init_loader_and_fatal_reasons_exist() {
+        assert!(
+            MOD_SRC.contains("pub fn load_required_init_elf_bytes()")
+                && MOD_SRC.contains("pub fn log_init_load_fatal(")
+                && MOD_SRC.contains("pub enum InitLoadFatal"),
+            "mod.rs must expose the required-init loader + fatal-reason logger + enum"
+        );
+        for marker in [
+            "BOOT_FATAL_INITRAMFS_MISSING",
+            "BOOT_FATAL_NO_CPIO",
+            "BOOT_FATAL_CPIO_INVALID",
+            "BOOT_FATAL_INIT_NOT_FOUND path=/init",
+        ] {
+            assert!(
+                MOD_SRC.contains(marker),
+                "log_init_load_fatal must emit {marker}"
+            );
+        }
+    }
+
+    // Every arch bootstrap halts on the fatal init conditions (no fallback), and the ELF-invalid /
+    // ZC-load-failed markers are emitted at the parse + segment-load steps.
+    #[test]
+    fn every_arch_bootstrap_halts_on_fatal_init() {
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains("load_required_init_elf_bytes()")
+                    && src.contains("log_init_load_fatal(reason)")
+                    && src.contains("BOOT_FATAL_INIT_ELF_INVALID")
+                    && src.contains("BOOT_FATAL_INIT_ZC_LOAD_FAILED")
+                    && src.contains("force_init_zc_load_fail()"),
+                "{arch} bootstrap must fail-fast on every mandatory init-load failure"
+            );
+        }
+    }
+
+    // The default-off fault-injection knob is wired (parses to None by default).
+    #[test]
+    fn force_init_zc_load_fail_knob_defaults_off() {
+        use crate::kernel::boot_command_line::parse_yarm_boot_options;
+        assert_eq!(
+            parse_yarm_boot_options(b"").force_init_zc_load_fail,
+            None,
+            "the force-init-zc-load-fail knob must default OFF"
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.force_init_zc_load_fail=1").force_init_zc_load_fail,
+            Some(true)
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("set_force_init_zc_load_fail"),
+            "boot_command_line must apply the fault-injection knob"
+        );
+    }
+
+    // The negative QEMU harness covers all four fatal conditions.
+    #[test]
+    fn negative_harness_covers_all_fatal_conditions() {
+        for marker in [
+            "BOOT_FATAL_INIT_ZC_LOAD_FAILED reason=fault_injection",
+            "BOOT_FATAL_INITRAMFS_MISSING",
+            "BOOT_FATAL_INIT_NOT_FOUND path=/init",
+            "BOOT_FATAL_INIT_ELF_INVALID",
+        ] {
+            assert!(
+                NEG_SCRIPT.contains(marker),
+                "the negative harness must assert {marker}"
+            );
+        }
+        assert!(
+            NEG_SCRIPT.contains("INIT_FAIL_FAST_NEGATIVE arch=x86_64 cases=4 result=ok"),
+            "the negative harness must emit the final pass marker"
         );
     }
 }

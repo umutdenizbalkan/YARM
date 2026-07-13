@@ -121,13 +121,32 @@ Current recognized keys:
 
 Linux-style options are **captured but not policy**:
 
-- `rdinit=/init` is ignored. `/init` is selected because each
-  architecture's `load_init_elf_from_initramfs_vfs` searches the CPIO for
-  `/init` and then `init`.
+- `rdinit=/init` is ignored. `/init` is selected because the arch-neutral
+  `crate::kernel::boot::load_required_init_elf_bytes()` searches the boot CPIO
+  for `/init` and then `init`.
 - `console=ttyS0` is ignored. Serial selection remains architecture /
   platform / QEMU decisions.
 
-### 2.4 Responsibility boundary
+### 2.4 Mandatory init loading (fail-fast, no synthetic fallback)
+
+Stage 197A removed the synthetic/placeholder init ELF fallback. The `/init` ELF
+is **mandatory**: every fatal load condition halts boot with an explicit
+`BOOT_FATAL_*` diagnostic (via each architecture's existing fatal-halt path),
+never a fake init or a silent limp-on:
+
+| Condition | Marker |
+|---|---|
+| No boot initramfs / CPIO | `BOOT_FATAL_INITRAMFS_MISSING` + `BOOT_FATAL_NO_CPIO` |
+| Initramfs is not a valid CPIO | `BOOT_FATAL_CPIO_INVALID` |
+| CPIO has no `/init` (or `init`) | `BOOT_FATAL_INIT_NOT_FOUND path=/init` |
+| `/init` is malformed / oversized ELF | `BOOT_FATAL_INIT_ELF_INVALID` |
+| Required init ELF segment load fails | `BOOT_FATAL_INIT_ZC_LOAD_FAILED` |
+
+A default-off fault-injection knob `yarm.force_init_zc_load_fail=1` forces the
+required init load to fail so the fatal halt path is exercisable under QEMU
+(`scripts/qemu-x86_64-init-fail-fast-negative.sh` covers all four conditions).
+
+### 2.5 Responsibility boundary
 
 - **Kernel:** capture bounded raw bytes, retain status, apply knobs at the
   capture chokepoint.
