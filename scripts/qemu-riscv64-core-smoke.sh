@@ -111,6 +111,33 @@ if [[ "$YIELD_LONE_TASK_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv64_yi
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv64_yield_lone_task_oracle=1"
 fi
 
+# Stage 197B (TYPED-OUTCOME NEGATIVE / genuine-Internal oracle): TYPED_INTERNAL_ERROR_ORACLE=1
+# appends yarm.riscv_typed_outcome_internal_error_oracle=1 to force a GENUINE internal
+# trap-handling error on the first syscall from a live task. The bridge must fatal
+# (RISCV_TRAP_HANDLE_FAILED) and NEVER enter FutexWait typed idle.
+TYPED_INTERNAL_ERROR_ORACLE=${TYPED_INTERNAL_ERROR_ORACLE:-0}
+if [[ "$TYPED_INTERNAL_ERROR_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv_typed_outcome_internal_error_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv_typed_outcome_internal_error_oracle=1"
+fi
+
+# Stage 198A (SECOND-COHORT PLAIN PARITY): the plain-IpcSend live oracles are arch-neutral, so
+# RISC-V honors the same env-var -> cmdline knob translations the x86_64 core smoke does. The
+# oracle wrapper (qemu-ipc-recv-v2-oracle-smoke.sh) exports IPC_RECV_PROOF / IPC_SEND_PLAIN_ORACLE
+# / IPC_SEND_ENQUEUE_ORACLE; without these translations the knobs never reach the RISC-V kernel
+# cmdline and the oracle workload never runs.
+IPC_RECV_PROOF=${IPC_RECV_PROOF:-0}
+if [[ "$IPC_RECV_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_recv_proof="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_recv_proof=1"
+fi
+IPC_SEND_PLAIN_ORACLE=${IPC_SEND_PLAIN_ORACLE:-0}
+if [[ "$IPC_SEND_PLAIN_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_plain_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_plain_oracle=1"
+fi
+IPC_SEND_ENQUEUE_ORACLE=${IPC_SEND_ENQUEUE_ORACLE:-0}
+if [[ "$IPC_SEND_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_enqueue_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_enqueue_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 
@@ -211,6 +238,43 @@ if [[ "$CROSS_ARCH_D6" == "1" ]]; then
     exit 1
   fi
   echo "[ok] CROSS-ARCH-D6: RISC-V D6 restore-path audit diagnostics clean (live restore DEFERRED)"
+fi
+
+# Stage 197B negative (genuine-Internal) oracle acceptance: a forced GENUINE internal
+# trap-handling error must fatal via RISCV_TRAP_HANDLE_FAILED (distinct WFI reason
+# handle_trap_entry_err) and NEVER enter FutexWait typed idle. This boot halts early (before
+# services come up), so short-circuit the normal boot-ok acceptance below.
+if [[ "$TYPED_INTERNAL_ERROR_ORACLE" == "1" ]]; then
+  neg_fail=0
+  for pat in \
+    "RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_BEGIN" \
+    "RISCV_TRAP_HANDLE_FAILED reason=handle_trap_entry_err" \
+    "RISCV_TRAP_HALTED reason=handle_trap_entry_err"; do
+    if ! tr '\r' '\n' <"$LOGFILE" | rg -a -F -q -- "$pat"; then
+      echo "[fail] TYPED-INTERNAL-ERROR: required marker missing: $pat"
+      neg_fail=1
+    fi
+  done
+  # A genuine error must produce ZERO idle-success markers (no typed idle, no FutexWait idle
+  # attestation, no idle terminal). The fatal WFI halt uses a DISTINCT reason (above).
+  for forbidden in \
+    "RISCV_TYPED_IDLE_OUTCOME" \
+    "RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE" \
+    "RISCV_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED" \
+    "RISCV_KERNEL_IDLE_WAITING_FOR_IO" \
+    "RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io"; do
+    if tr '\r' '\n' <"$LOGFILE" | rg -a -F -q -- "$forbidden"; then
+      echo "[fail] TYPED-INTERNAL-ERROR: genuine error emitted idle marker: $forbidden"
+      neg_fail=1
+    fi
+  done
+  if [[ "$neg_fail" -eq 0 ]]; then
+    echo "RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_DONE result=ok idle_entered=0"
+    echo "[ok] RISC-V typed-outcome negative oracle: genuine Internal error -> fatal, zero idle"
+    exit 0
+  fi
+  echo "RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_DONE result=fail"
+  exit 1
 fi
 
 REQUIRED_PATTERNS=(

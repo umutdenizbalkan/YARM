@@ -8575,10 +8575,14 @@ gained a genuine **no-incoming IDLE outcome** (§9.7 of `doc/ARCH_RISCV64.md`). 
   re-acquire confirms current None (`POST_LOCK_IDLE_LOCK_DROPPED_OK`) → clear
   deferral → `..._DONE result=idle` → `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64
   class=FutexWait result=ok` → `POST_LOCK_IDLE_ENTERED`. NO frame restored, NO
-  `sret`: the drain returns `Err` with `current == None`, handing off to the
-  bridge's EXISTING idle policy (`RISCV_KERNEL_IDLE_WAITING_FOR_IO` + timer/PLIC
-  safe-point + `riscv_trap_halt` wfi). The active flag was cleared before the drain
-  (never true across the idle handoff / wfi). No second idle implementation.
+  `sret`. **Stage 197B (typed idle):** the drain returns the explicit typed
+  `RiscvTrapEntryOutcome::EnterKernelIdle { reason: FutexWaitNoIncoming }` (a SUCCESS,
+  not an `Err(Internal)` sentinel); the bridge matches that variant, asserts the
+  `current == None|Some(0)` invariant, emits `RISCV_TYPED_IDLE_OUTCOME result=ok`
+  + `RISCV_KERNEL_IDLE_WAITING_FOR_IO` + timer/PLIC safe-point + `riscv_trap_halt` wfi.
+  `current == None` is an invariant check, NOT the control-flow discriminator. The
+  active flag was cleared before the drain (never true across the idle handoff / wfi).
+  No second idle implementation.
 - **Race preserved:** FutexWake race → `..._DEFERRED reason=state_changed` (clear +
   decline). Genuine errors still propagate as `Err` (never idle-washed).
 - **Workload knobs (default-off):** `yarm.riscv64_futex_wait_oracle` (slot-5 = 3,

@@ -800,31 +800,55 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     let handle_result =
         crate::arch::riscv64::trap::handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe);
 
-    if let Err(err) = handle_result {
-        // The generic restore_arch_thread_state returns Err(Internal) when
-        // there is no runnable user task to resume (all services blocked on
-        // IPC recv, init parked). For an event-driven microkernel awaiting
-        // I/O this is the correct terminal state — wfi here instead of
-        // treating it as a fatal trap.
-        let next_tid = shared.current_tid_authoritative(cpu).unwrap_or(0);
-        if next_tid == 0 {
+    // Stage 197B: match the EXPLICIT typed trap-entry outcome. Intentional idle is a first-class
+    // SUCCESS variant (`EnterKernelIdle`) tagged with a typed reason — it is no longer inferred
+    // from an `Err(Internal)` + `current == None` sentinel. A genuine failure stays on the `Err`
+    // channel and can NEVER be read as idle: it always takes the fatal `RISCV_TRAP_HANDLE_FAILED`
+    // path regardless of `current`.
+    use crate::arch::riscv64::trap::{RiscvIdleReason, RiscvTrapEntryOutcome};
+    match handle_result {
+        // Same-task return or an incoming-task switch: fall through to the normal register
+        // write-back + `sret` path below (which re-derives the resumed task from `current`).
+        Ok(RiscvTrapEntryOutcome::ReturnToCurrent)
+        | Ok(RiscvTrapEntryOutcome::ReturnToIncoming) => {}
+        // Intentional kernel idle (FutexWait no-incoming, or the terminal all-blocked idle).
+        Ok(RiscvTrapEntryOutcome::EnterKernelIdle { reason }) => {
+            // INVARIANT (not the control-flow discriminator): the typed idle outcome already
+            // decided we idle; `current == None|Some(0)` must hold. A live current here is a bug —
+            // treat it as a fatal invariant violation, NEVER as idle-into-a-live-task.
+            let cur = shared.current_tid_authoritative(cpu).unwrap_or(0);
+            if cur != 0 {
+                early_marker!(
+                    "RISCV_TYPED_IDLE_INVARIANT_VIOLATION reason={:?} current={}",
+                    reason,
+                    cur
+                );
+                riscv_trap_halt("typed_idle_invariant_violation");
+            }
+            let reason_str = match reason {
+                RiscvIdleReason::FutexWaitNoIncoming => "FutexWaitNoIncoming",
+                RiscvIdleReason::BlockedRecvNoRunnable => "BlockedRecvNoRunnable",
+            };
+            crate::yarm_log!("RISCV_TYPED_IDLE_OUTCOME result=ok reason={}", reason_str);
             crate::yarm_log!(
                 "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
             );
-            // Safe point per the timer/PLIC bring-up contract: real S-mode
-            // trap vector + kernel-state pointer are installed; service
-            // chain has reached stable idle. Both init paths default to
-            // deferred and never enable STIE / external-IRQ delivery
-            // until explicitly audited.
+            // Safe point per the timer/PLIC bring-up contract: real S-mode trap vector +
+            // kernel-state pointer are installed; the service chain has reached stable idle. Both
+            // init paths default to deferred and never enable STIE / external-IRQ delivery until
+            // explicitly audited. No frame is restored and no `sret` is armed for idle.
             let _ = crate::arch::riscv64::timer::init_timer_after_idle_safe_point();
             let _ = crate::arch::riscv64::plic::init_plic_after_idle_safe_point();
             riscv_trap_halt("kernel_idle_awaiting_io");
         }
-        early_marker!(
-            "RISCV_TRAP_HANDLE_FAILED reason=handle_trap_entry_err err={:?}",
-            err
-        );
-        riscv_trap_halt("handle_trap_entry_err");
+        // Genuine internal trap-handling failure — NEVER idle, regardless of `current`.
+        Err(err) => {
+            early_marker!(
+                "RISCV_TRAP_HANDLE_FAILED reason=handle_trap_entry_err err={:?}",
+                err
+            );
+            riscv_trap_halt("handle_trap_entry_err");
+        }
     }
 
     if first_trap && scause == EXC_USER_ECALL {
@@ -1515,6 +1539,30 @@ pub fn bootstrap_first_user_task(
         // Stage 163A: communicate E1's buffered capacity (slot 14, service_extra_cap_1)
         // so init fills E1 to exactly full with non-blocking sends and never blocks.
         init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
+    }
+    // Stage 198A (SECOND-COHORT PLAIN PARITY): sub-knob-gated (`yarm.ipc_send_plain_oracle=1`)
+    // coordination endpoint recv cap in slot 14 (service_extra_cap_1), with slot 13 LEFT EMPTY.
+    // That presence pattern (slot 13 empty + slot 14 set) tells init to run the IpcSend-plain
+    // blocked-receiver live oracle. Mutually exclusive with the sender-wake block above (which
+    // sets BOTH 13 + 14 and, when its knob is off, leaves both zero). Mirrors the x86_64 target
+    // exactly (arch/x86_64/boot.rs). The RISC-V plain IpcSend uses the canonical in-lock publish
+    // + post-lock boundary drain; the caller stays current (RiscvTrapEntryOutcome::ReturnToCurrent),
+    // so NO pre-lock gate entry is needed. NO capability transfer is provisioned in this stage.
+    else if let Some(coord_recv_cap) =
+        crate::kernel::boot::provision_init_ipc_send_plain_oracle_coord(
+            kernel,
+            RING3_INIT_SERVER_TID,
+        )
+    {
+        init_args[14] = coord_recv_cap as u64;
+    }
+    // Stage 198A: sub-knob-gated (`yarm.ipc_send_enqueue_oracle=1`) PLAIN no-waiter enqueue
+    // oracle. It needs NO coordination cap (no fork, no blocked receiver — a plain send to the
+    // loopback E1 simply enqueues), so it is signalled by slot 17 ALONE (slots 13 + 14 empty).
+    // init runs it against E1 (slots 6/7, provisioned under the base proof knob).
+    else if crate::kernel::boot::ipc_send_enqueue_oracle_active() {
+        init_args[17] = 1; // enqueue-oracle discriminator (init otherwise leaves slot 17 zero)
+        crate::yarm_log!("IPC_SEND_ENQUEUE_ORACLE_PROVISION_OK slot17=1");
     }
     // Stage 196C/196D/196E/196F: default-off RISC-V oracle WORKLOADS reuse init slot 5
     // (supervisor_control_recv_ep, unused by init on RISC-V) as a sentinel: 1 = FutexWake live

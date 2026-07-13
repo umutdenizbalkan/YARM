@@ -82,7 +82,7 @@ drain; **restore** = arch activation hook.
 | reverify | `futex_wait_reverify_blocked` (still Blocked) | same | same |
 | dequeue | `futex_wait_dispatch_step_mut` | same | same |
 | restore | CR3/ASID via `d2_recv_switch_incoming_asid` + `post_switch_restore_arch_thread_state` → `iretq`/`sysret` | TTBR0_EL1/ASID + EL0 frame → `eret` | `cr3_for_asid`+`map_kernel_shared_into_asid`+`write_satp` (real `sfence.vma`) + frame → `sret` |
-| idle (no-incoming) | drain `else`: clear deferral, `incoming=idle`, NO frame restored, x86 scheduler HLT idle terminal | `enter_post_lock_idle` (dedicated) | drain returns `Err(Internal)` w/ `current==None` → bridge `RISCV_KERNEL_IDLE_WAITING_FOR_IO` |
+| idle (no-incoming) | drain `else`: clear deferral, `incoming=idle`, NO frame restored, x86 scheduler HLT idle terminal | `enter_post_lock_idle` (dedicated) | **Stage 197B:** drain returns the typed `EnterKernelIdle { reason: FutexWaitNoIncoming }` (a SUCCESS) → bridge emits `RISCV_TYPED_IDLE_OUTCOME result=ok` + `RISCV_KERNEL_IDLE_WAITING_FOR_IO` (no `Err(Internal)` sentinel) |
 | idle proof | source-audited (see §4) | `AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok` | `RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1 outgoing_blocked=1` |
 | switch proof | FutexWait switch oracle | switch oracle SMP=2 | switch oracle (`RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok wake_count=1`) |
 | marker | `class=FutexWait` (arch=x86_64) | `arch=aarch64` | `arch=riscv64` |
@@ -137,7 +137,7 @@ design difference, not an implementation identity claim:
 | `current` None/idle | yes (`step_mut`→None, current stays cleared) | yes | yes (`current_none=1`) |
 | outgoing stays `Blocked(Futex)` | yes (reverify_ok gate) | yes | yes (`outgoing_blocked=1`) |
 | no userspace frame restored | yes (`incoming=idle` branch skips restore) | yes | yes |
-| terminal | x86 scheduler HLT idle (drain clears deferral + emits `incoming=idle`) | `enter_post_lock_idle` (dedicated fn) | bridge `Err(Internal)` w/ `current==None` → `RISCV_KERNEL_IDLE_WAITING_FOR_IO` |
+| terminal | x86 scheduler HLT idle (drain clears deferral + emits `incoming=idle`) | `enter_post_lock_idle` (dedicated fn) | **Stage 197B:** typed `EnterKernelIdle` outcome → bridge `RISCV_TYPED_IDLE_OUTCOME result=ok` + `RISCV_KERNEL_IDLE_WAITING_FOR_IO` (typed success, not an `Err` sentinel) |
 | live idle oracle | not separately wired (source-audited; equivalent guarantees) | `aarch64_futex_wait_idle_oracle` | `riscv64_futex_wait_idle_oracle` |
 
 **The seal is defined in terms of equivalent safety guarantees, not identical
@@ -180,19 +180,31 @@ No architecture uses another architecture's restore logic (hosted guards assert 
 RISC-V drain never references `arch::x86_64::page_table` / `arch::aarch64::page_table`
 / `write_cr3(` / `set_ttbr0`).
 
-## 7. Known debts (kept open)
+## 7. Known debts
 
-- **NR 27 (InitramfsReadChunk):** obsolete fallback/test ABI. Remove after all PM and
-  crash-restart paths use the ZC-grant loader. **NOT part of the permanent cohort.**
+### 7.1 Resolved
+
+- **NR 27 (InitramfsReadChunk): REMOVED (Stage 197A).** The byte-copy bridge and every
+  fallback are gone; the MemoryObject zero-copy grant is the sole, mandatory ELF-load path.
+- **RISC-V idle sentinel: RESOLVED (Stage 197B).** The former `Err(Internal)`-shaped bridge
+  exit was replaced with an explicit typed RISC-V trap outcome
+  (`RiscvTrapEntryOutcome::{ReturnToCurrent, ReturnToIncoming, EnterKernelIdle { reason }}`).
+  Intentional post-lock idle is now a first-class **success** outcome
+  (`EnterKernelIdle { reason: FutexWaitNoIncoming }` → `RISCV_TYPED_IDLE_OUTCOME result=ok`),
+  while a genuine internal error stays on the `Err` channel and always takes the fatal
+  `RISCV_TRAP_HANDLE_FAILED` path — it can never be read as idle. `current == None` is only an
+  **invariant check** inside the idle arm, never the control-flow discriminator. FutexWait is
+  currently the only retired class producing typed idle; **Yield has no idle outcome**. A
+  default-off negative oracle (`yarm.riscv_typed_outcome_internal_error_oracle=1`) proves a
+  genuine `Internal` error fatals with zero idle markers.
+
+### 7.2 Kept open
+
 - **RISC-V trap stack:** 2 MiB is an emergency correctness size. Measure maximum
   trap/syscall stack depth and remove oversized frames before RISC-V SMP scaling. Not
   reduced here.
-- **RISC-V idle sentinel:** the FutexWait idle handoff uses an `Err(Internal)`-shaped
-  bridge exit. A hosted regression guard (Stage 197) proves the FutexWait idle SUCCESS
-  attestation (`RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE`) is emitted **only** from the
-  attested FutexWait idle branch (gated on the idle-oracle knob) and can never be
-  produced by an unrelated `Internal` error. The sentinel convention is **not** used
-  by Yield or any other class. A future typed idle outcome remains recommended.
+- **Second-cohort IpcSend parity; D2 recv/send parity; AArch64 + RISC-V AP user dispatch:**
+  out of scope for the first cohort — future retirement cohorts.
 
 ## 8. Normal-boot vs oracle distinction
 

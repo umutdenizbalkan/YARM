@@ -364,6 +364,16 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_force_init_zc_load_fail(enabled);
         crate::yarm_log!("YARM_FORCE_INIT_ZC_LOAD_FAIL_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.riscv_typed_outcome_internal_error_oracle {
+        // Stage 197B: default-off NEGATIVE oracle knob. Forces a genuine internal trap-handling
+        // error on the first RISC-V syscall from a live task, proving the bridge fatals (never
+        // enters FutexWait typed idle) on the error channel.
+        crate::kernel::boot::set_riscv_typed_outcome_internal_error_oracle_enabled(enabled);
+        crate::yarm_log!(
+            "YARM_RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_SET enabled={}",
+            enabled
+        );
+    }
     if let Some(enabled) = parsed.riscv64_queue_switch_foundation_oracle {
         // Stage 196D: default-off RISC-V queue-advancing context-switch FOUNDATION oracle knob.
         // Arms the one-shot post-lock switch (publish/re-enqueue outgoing, defer, drain to
@@ -641,6 +651,10 @@ pub struct YarmBootOptions<'a> {
     /// required init ELF load to fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path is
     /// exercisable under QEMU. NEVER set on a normal boot.
     pub force_init_zc_load_fail: Option<bool>,
+    /// Stage 197B: `yarm.riscv_typed_outcome_internal_error_oracle=1` DEFAULT-OFF negative oracle.
+    /// Forces a genuine internal RISC-V trap-handling error on the first syscall from a live task,
+    /// proving the bridge fatals (`RISCV_TRAP_HANDLE_FAILED`) and never enters FutexWait typed idle.
+    pub riscv_typed_outcome_internal_error_oracle: Option<bool>,
     /// Stage 196D: `yarm.riscv64_queue_switch_foundation_oracle=1` DEFAULT-OFF knob. Provisions
     /// init startup slot 5 (=2) so init runs the two-task queue-advancing context-switch
     /// FOUNDATION proof (task A yields → post-lock switch to task B with a real SATP/sfence.vma +
@@ -823,6 +837,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.force_init_zc_load_fail" {
             options.force_init_zc_load_fail = parse_bool_knob(value);
+        }
+        if key == b"yarm.riscv_typed_outcome_internal_error_oracle" {
+            options.riscv_typed_outcome_internal_error_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.riscv64_queue_switch_foundation_oracle" {
             options.riscv64_queue_switch_foundation_oracle = parse_bool_knob(value);

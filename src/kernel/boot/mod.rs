@@ -1414,6 +1414,43 @@ pub(crate) fn ipc_send_boundary_origin_take(cpu_idx: usize) -> bool {
         && IPC_SEND_BOUNDARY_ORIGIN[cpu_idx].swap(false, core::sync::atomic::Ordering::AcqRel)
 }
 
+// ── Stage 198A1: authoritative blocking-syscall idle provenance ──────────────────────────
+//
+// The RISC-V trap wrapper must NOT infer intentional idle from scheduler state alone
+// (`Ok` result + `current == None` + zero runnable). Instead, the canonical blocking path
+// (`handle_trap_event`'s `blocking_syscall && caller_blocked` branch — IpcRecv / IpcCall /
+// IpcSend) publishes an AUTHORITATIVE per-CPU token recording the tid it just blocked and
+// dispatched away from. The wrapper CONSUMES that token: token present + terminal scheduler
+// state → typed `EnterKernelIdle { BlockedRecvNoRunnable }`; terminal state WITHOUT the token
+// is a bug and takes a defensive error path, never silent idle. x86_64 / AArch64 set the token
+// too (arch-neutral seam) but never read it — they own their own idle bridges.
+
+/// Stage 198A1: per-CPU "a canonical blocking syscall blocked+dispatched-away this trap" token.
+/// Stores `tid + 1` (0 = unset); consumed once by the RISC-V trap-entry wrapper.
+pub(crate) static BLOCKED_SYSCALL_IDLE_PROVENANCE: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 198A1: publish authoritative idle provenance — a canonical blocking syscall blocked
+/// `tid` and dispatched away from it on `cpu`. Called from the arch-neutral blocking seam.
+pub(crate) fn blocked_syscall_idle_provenance_set(cpu_idx: usize, tid: u64) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        BLOCKED_SYSCALL_IDLE_PROVENANCE[cpu_idx]
+            .store(tid.wrapping_add(1), core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Stage 198A1: consume the blocking-syscall idle provenance for `cpu` (clear + return the tid,
+/// or `None` if no canonical blocking syscall published provenance this trap).
+pub(crate) fn blocked_syscall_idle_provenance_take(cpu_idx: usize) -> Option<u64> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let raw =
+        BLOCKED_SYSCALL_IDLE_PROVENANCE[cpu_idx].swap(0, core::sync::atomic::Ordering::AcqRel);
+    (raw != 0).then(|| raw - 1)
+}
+
 /// Stage 193A: one-shot latch for the IpcSendPlain boundary retirement markers.
 static IPC_SEND_PLAIN_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -1430,8 +1467,31 @@ pub(crate) fn maybe_log_ipc_send_plain_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendPlain");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok");
+        // Stage 198A (SECOND-COHORT PLAIN PARITY): all architectures emit the canonical
+        // arch-tagged retirement marker `arch=<arch> class=IpcSendPlain`. The drain executor
+        // (`execute_dispatch_post_work` in runtime.rs) is arch-neutral and reached from all
+        // three trap-entry drains, so the arch string is selected here by `cfg`.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendPlain");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendPlain result=ok"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendPlain");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendPlain result=ok"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendPlain");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendPlain result=ok"
+            );
+        }
     }
 }
 
@@ -1582,8 +1642,37 @@ pub(crate) fn maybe_log_ipc_send_plain_enqueue_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendPlainEnqueue");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok");
+        // Stage 198A (SECOND-COHORT PLAIN PARITY): all architectures emit the canonical
+        // arch-tagged retirement marker `arch=<arch> class=IpcSendPlainEnqueue`. This helper
+        // is called from the arch-neutral in-lock enqueue seam (ipc_state.rs), so the arch
+        // string is selected here by `cfg`.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendPlainEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendPlainEnqueue result=ok"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendPlainEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendPlainEnqueue result=ok"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendPlainEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendPlainEnqueue result=ok"
+            );
+        }
     }
 }
 
@@ -2586,6 +2675,22 @@ pub(crate) fn set_force_init_zc_load_fail(enabled: bool) {
 
 pub fn force_init_zc_load_fail() -> bool {
     FORCE_INIT_ZC_LOAD_FAIL.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 197B default-off NEGATIVE oracle knob (`yarm.riscv_typed_outcome_internal_error_oracle=1`):
+/// forces the RISC-V trap wrapper to return a GENUINE internal trap-handling error on the first
+/// syscall from a LIVE current task, proving the bridge takes the fatal `RISCV_TRAP_HANDLE_FAILED`
+/// path and NEVER the FutexWait typed-idle-success path. NEVER set on a normal boot.
+pub(crate) static RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_ENABLED:
+    core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_typed_outcome_internal_error_oracle_enabled(enabled: bool) {
+    RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_ENABLED
+        .store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn riscv_typed_outcome_internal_error_oracle_enabled() -> bool {
+    RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Maximum accepted init ELF size (16 MiB) — shared across architectures.

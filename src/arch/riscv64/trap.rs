@@ -24,6 +24,38 @@ pub struct Riscv64TrapContext {
     pub stval: usize,
 }
 
+/// Stage 197B: why the RISC-V trap wrapper decided to enter the kernel idle terminal. Idle is a
+/// FIRST-CLASS SUCCESS outcome (not an error and not an `Err(Internal)` sentinel), tagged with an
+/// explicit provenance so a genuine internal failure can never be mistaken for intentional idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiscvIdleReason {
+    /// The default-on FutexWait queue-advancing drain found no runnable incoming task while the
+    /// outgoing caller stays `Blocked(Futex)` — the retired-class post-lock idle outcome.
+    FutexWaitNoIncoming,
+    /// Stage 198A1: a canonical BLOCKING syscall (IpcRecv / IpcCall / IpcSend) blocked the caller
+    /// and dispatched away leaving no runnable task. The provenance is AUTHORITATIVE — published
+    /// by the arch-neutral blocking seam (`BLOCKED_SYSCALL_IDLE_PROVENANCE`) and consumed here — so
+    /// idle is a POSITIVE outcome of a real blocking operation, never inferred from `current == None`
+    /// + zero-runnable scheduler state alone.
+    BlockedRecvNoRunnable,
+}
+
+/// Stage 197B: the explicit, typed result of the RISC-V shared trap-entry wrapper. It replaces the
+/// former `Err(Internal)`-shaped idle sentinel: intentional idle is `EnterKernelIdle` (a success),
+/// while a genuine internal failure stays on the `Err` channel of
+/// `Result<RiscvTrapEntryOutcome, TrapHandleError>` and can never be read as idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RiscvTrapEntryOutcome {
+    /// Same-task syscall return (DebugLog / FutexWake split, a normal handled syscall, or a
+    /// FutexWait/Yield that did not switch): the trap `sret`s back to the caller.
+    ReturnToCurrent,
+    /// A post-lock switch drain (FutexWait switch / Yield switch) armed an incoming task's frame +
+    /// SATP; the trap `sret`s into the incoming task.
+    ReturnToIncoming,
+    /// Intentional kernel idle — enter the WFI idle terminal with a typed provenance.
+    EnterKernelIdle { reason: RiscvIdleReason },
+}
+
 static LAST_RESTORED_TLS_BASE: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
 
 pub fn last_restored_tls_base(cpu: CpuId) -> Option<usize> {
@@ -252,6 +284,10 @@ static RISCV_DEBUGLOG_SPLIT_MARKERS_LOGGED: core::sync::atomic::AtomicBool =
 static RISCV_FUTEXWAKE_SPLIT_MARKERS_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+// Stage 197B: one-shot latch for the default-off NEGATIVE oracle (forced genuine internal error).
+static RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_FIRED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 // Stage 196A post-lock-drain FOUNDATION oracle state (default-off; armed by
 // `yarm.riscv64_post_lock_foundation_oracle=1`).
 //   - DONE_FLAG: one-shot guard so the oracle publishes/consumes exactly once.
@@ -293,7 +329,7 @@ pub fn handle_riscv_trap_entry_shared(
     cpu: CpuId,
     context: Riscv64TrapContext,
     frame: &mut TrapFrame,
-) -> Result<(), TrapHandleError> {
+) -> Result<RiscvTrapEntryOutcome, TrapHandleError> {
     use core::sync::atomic::Ordering;
     let cpu_idx = cpu.0 as usize;
     let is_syscall = matches!(decode_trap_context(context), TrapEvent::Syscall);
@@ -345,7 +381,7 @@ pub fn handle_riscv_trap_entry_shared(
                         );
                         crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr={} result=ok", nr);
                     }
-                    return Ok(());
+                    return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                 }
                 Err(TrapHandleError::Syscall(e)) => {
                     // A normal syscall error produced on the split path is encoded
@@ -361,7 +397,7 @@ pub fn handle_riscv_trap_entry_shared(
                         );
                         crate::yarm_log!("RISCV_SPLIT_FINALIZE_OK nr={} result=handled_err", nr);
                     }
-                    return Ok(());
+                    return Ok(RiscvTrapEntryOutcome::ReturnToCurrent);
                 }
                 // A genuine kernel-side failure (e.g. MissingTrapFrame) — propagate.
                 Err(other) => return Err(other),
@@ -370,6 +406,28 @@ pub fn handle_riscv_trap_entry_shared(
         // The helper declined (None: unavailable requester, or a FutexWake
         // validation miss that the global-lock path must encode canonically) —
         // fall through to the unchanged broad-lock handler exactly once.
+    }
+
+    // ── Stage 197B NEGATIVE oracle (default-off) ──
+    // Force a GENUINE internal trap-handling error on the FIRST syscall from a LIVE current task.
+    // The current task is provably live here (a user syscall trap; `current != 0`), so this is
+    // NOT an idle condition. The bridge must take the fatal `RISCV_TRAP_HANDLE_FAILED` path — it
+    // must NEVER read this `Err` as a FutexWait typed-idle success. This proves the error/idle
+    // separation directly.
+    if is_syscall && crate::kernel::boot::riscv_typed_outcome_internal_error_oracle_enabled() {
+        let cur = shared.current_tid_authoritative(cpu).unwrap_or(0);
+        if cur != 0
+            && !RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_FIRED.swap(true, Ordering::Relaxed)
+        {
+            crate::yarm_log!(
+                "RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_BEGIN cpu={} current={}",
+                cpu.0,
+                cur
+            );
+            return Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            ));
+        }
     }
 
     // One-shot latch for the structural markers. Consumed HERE (after the DebugLog
@@ -439,7 +497,18 @@ pub fn handle_riscv_trap_entry_shared(
         crate::yarm_log!("RISCV_GLOBAL_LOCK_DROP_ACTIVE_CLEAR cpu={}", cpu.0);
     }
 
-    let inner_result = inner_result?;
+    // Stage 197B / 198A1: a GENUINE internal failure ALWAYS stays on the `Err` channel — it can
+    // never be read as idle. Stage 198A1 removes the former state-inferred terminal-idle
+    // reclassification on this Err path (it inferred intentional idle from `current == None` + zero
+    // runnable, which is now forbidden): intentional idle is produced ONLY from explicit typed
+    // provenance (FutexWaitNoIncoming on the FutexWait drain, BlockedRecvNoRunnable on the Ok tail).
+    // An Err here takes the fatal `RISCV_TRAP_HANDLE_FAILED` bridge path regardless of `current`.
+    inner_result?;
+
+    // `switched` becomes true iff a post-lock switch drain (FutexWait switch / Yield switch) armed
+    // an incoming task; it selects `ReturnToIncoming` vs `ReturnToCurrent` at the single tail
+    // return below. It NEVER selects idle — idle is produced only by the explicit typed branches.
+    let mut switched = false;
 
     // ── Phase 3: post-lock drain (broad guard released) ──
     if log_structural {
@@ -656,6 +725,9 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!(
                     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=FutexWait result=ok"
                 );
+                // Stage 197B: an incoming task was dispatched + its frame/SATP armed → the tail
+                // return is the typed ReturnToIncoming (NOT idle, NOT an error).
+                switched = true;
             } else {
                 // Stage 196F POST-LOCK IDLE OUTCOME: no runnable incoming task. This is a
                 // SUCCESSFUL idle (not a failure): the outgoing caller stays `Blocked(Futex)`
@@ -691,15 +763,15 @@ pub fn handle_riscv_trap_entry_shared(
                     );
                 }
                 crate::yarm_log!("RISCV_FUTEX_WAIT_POST_LOCK_IDLE_ENTERED cpu={}", cpu.0);
-                // Hand off to the bridge's EXISTING proven RISC-V BSP idle policy: returning Err
-                // with `current == None` makes the bridge emit RISCV_KERNEL_IDLE_WAITING_FOR_IO,
-                // run the timer/PLIC idle-safe-point init, and enter `riscv_trap_halt` (wfi). No
-                // stale frame is restored and no `sret` is attempted; the active flag was already
-                // cleared before this drain. This reuses the SAME idle terminal as the natural
-                // "all services blocked on recv" boot idle (no second idle implementation).
-                return Err(TrapHandleError::Syscall(
-                    crate::kernel::syscall::SyscallError::Internal,
-                ));
+                // Stage 197B: return the EXPLICIT typed idle outcome (a SUCCESS), NOT an
+                // `Err(Internal)` sentinel. The bridge matches `EnterKernelIdle`, asserts the
+                // `current == None|Some(0)` invariant, emits RISCV_TYPED_IDLE_OUTCOME +
+                // RISCV_KERNEL_IDLE_WAITING_FOR_IO, runs the timer/PLIC idle-safe-point init, and
+                // enters `riscv_trap_halt` (wfi) — the SAME idle terminal, now typed. No stale
+                // frame is restored and no `sret` is armed; the active flag was already cleared.
+                return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                    reason: RiscvIdleReason::FutexWaitNoIncoming,
+                });
             }
         } else {
             // A split FutexWake flipped the outgoing waiter to Runnable before the drain ran —
@@ -783,6 +855,9 @@ pub fn handle_riscv_trap_entry_shared(
                 crate::yarm_log!(
                     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=Yield result=ok"
                 );
+                // Stage 197B: Yield always dispatched an incoming (the re-enqueued caller or
+                // another task) → typed ReturnToIncoming. Yield NEVER produces an idle outcome.
+                switched = true;
             } else {
                 // A published Yield deferral MUST have an incoming (the re-enqueued caller is
                 // always a candidate). No incoming is a genuine invariant FAILURE — NOT idle, NOT a
@@ -811,9 +886,61 @@ pub fn handle_riscv_trap_entry_shared(
         crate::yarm_log!("RISCV_SHARED_TRAP_ENTRY_DONE cpu={}", cpu.0);
     }
 
-    // `inner_result` is the canonical handler's `Result<(), TrapHandleError>`
-    // (the outer `with_cpu` KernelError was already propagated by the `?` above).
-    inner_result
+    // Stage 198A1: blocking-syscall TERMINAL-IDLE on the Ok path, from AUTHORITATIVE PROVENANCE —
+    // NOT from scheduler state alone. A canonical blocking syscall (IpcRecv / IpcCall / IpcSend)
+    // that blocks the last runnable task succeeds (`Ok`) while clearing `current`; the arch-neutral
+    // blocking seam published `BLOCKED_SYSCALL_IDLE_PROVENANCE` for the tid it blocked. We CONSUME
+    // that token here (always, so it never leaks to the next trap) and combine it with the terminal
+    // scheduler state:
+    //   * provenance present + terminal (current None|Some(0) AND zero runnable) → typed
+    //     `EnterKernelIdle { BlockedRecvNoRunnable }`. Without this the bridge would `sret` a stale
+    //     frame as tid 0 and hot-spin re-entering the blocked recv (an `IPC_RECV_ENTER tid=0` loop).
+    //   * terminal state WITHOUT provenance → a BUG (spurious `current == None`): emit a defensive
+    //     marker and take the canonical `Err` path (RISCV_TRAP_HANDLE_FAILED). NEVER silent idle.
+    //   * not terminal → the provenance (if any) is simply consumed; fall through to the same-task /
+    //     incoming tail return. A plain IpcSend SENDER keeps `current` non-zero → ReturnToCurrent.
+    // FutexWait no-incoming produced its own typed idle earlier and never reaches here; Yield either
+    // switches (`switched=true`) or keeps `current` and never idles.
+    if !switched {
+        let provenance = crate::kernel::boot::blocked_syscall_idle_provenance_take(cpu_idx);
+        let terminal_idle = shared
+            .with_cpu(cpu, |kernel| {
+                matches!(kernel.current_tid(), None | Some(0))
+                    && kernel.runnable_count_on_cpu(cpu) == 0
+            })
+            .unwrap_or(false);
+        match (provenance, terminal_idle) {
+            (Some(blocked_tid), true) => {
+                crate::yarm_log!("RISCV_BLOCKED_RECV_IDLE_PROVENANCE_OK tid={}", blocked_tid);
+                return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                    reason: RiscvIdleReason::BlockedRecvNoRunnable,
+                });
+            }
+            (None, true) => {
+                // DEFENSIVE: terminal-idle scheduler state with NO authoritative blocking-syscall
+                // provenance must NEVER be read as intentional idle — it is a bug (a non-blocking
+                // syscall left `current == None`). Take the canonical error path.
+                crate::yarm_log!(
+                    "RISCV_BLOCKED_IDLE_NO_PROVENANCE cpu={} current_none=1 runnable=0 result=defensive_err",
+                    cpu.0
+                );
+                return Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::Internal,
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // Stage 197B: the sole non-idle tail return. The broad-lock handler succeeded (`Ok` above);
+    // a switch drain either armed an incoming task (`switched` → ReturnToIncoming) or the caller
+    // returns same-task (ReturnToCurrent). This is NEVER an idle outcome — idle is produced only
+    // by the explicit typed idle branches (FutexWait no-incoming / terminal all-blocked).
+    Ok(if switched {
+        RiscvTrapEntryOutcome::ReturnToIncoming
+    } else {
+        RiscvTrapEntryOutcome::ReturnToCurrent
+    })
 }
 
 /// Stage 196A (Part 5): RISC-V post-switch architecture-restore FOUNDATION.

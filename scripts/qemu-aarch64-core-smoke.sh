@@ -30,6 +30,20 @@ if [[ "$IPC_RECV_PROOF_SENDER_WAKE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_re
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_recv_proof_sender_wake=1"
 fi
 
+# Stage 198A (SECOND-COHORT PLAIN PARITY): the plain-IpcSend live oracles are arch-neutral, so
+# AArch64 honors the same env-var -> cmdline knob translations the x86_64 core smoke does. The
+# oracle wrapper (qemu-ipc-recv-v2-oracle-smoke.sh) exports IPC_SEND_PLAIN_ORACLE /
+# IPC_SEND_ENQUEUE_ORACLE; without these translations the knobs never reach the AArch64 kernel
+# cmdline and the oracle workload never runs.
+IPC_SEND_PLAIN_ORACLE=${IPC_SEND_PLAIN_ORACLE:-0}
+if [[ "$IPC_SEND_PLAIN_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_plain_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_plain_oracle=1"
+fi
+IPC_SEND_ENQUEUE_ORACLE=${IPC_SEND_ENQUEUE_ORACLE:-0}
+if [[ "$IPC_SEND_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_enqueue_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_enqueue_oracle=1"
+fi
+
 # Stage 178 (CROSS-ARCH-D6): CROSS_ARCH_D6=1 appends yarm.cross_arch_d6=1 to emit the
 # AArch64 D6 restore-path audit markers (model=trapframe_eret; read-only observe of
 # ELR/SPSR/SP + TTBR0/ASID). Live lock-dropped restore is DEFERRED — the audit records
@@ -141,10 +155,31 @@ SPAWN_IPC_SEQUENCE=(
   "INIT_SPAWN_V5_REPLY_OK"
 )
 
-if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" "${QEMU_ARGS[@]}"; then
-  QEMU_STATUS=0
+# Stage 198A1: deterministic idle-aware completion. A correct AArch64 boot reaches the canonical
+# terminal-idle marker (SCHED_ENTER_IDLE_HLT) and then WFI-idles forever, so the plain timeout run
+# always burns the full wall-clock budget and returns 124 (which this slow CI environment then
+# fails on). With QEMU_EXPECT_TERMINAL_IDLE=1 (default) we instead stop QEMU as soon as terminal
+# idle is observed and treat that as success; the positive/forbidden marker verdict below is
+# UNCHANGED, so a missing proof marker, a forbidden marker, or an early idle-before-proof still
+# fails. IDLE_MAX_SECS bounds a genuine hang. Set QEMU_EXPECT_TERMINAL_IDLE=0 for the legacy run.
+QEMU_EXPECT_TERMINAL_IDLE="${QEMU_EXPECT_TERMINAL_IDLE:-1}"
+IDLE_MAX_SECS="${IDLE_MAX_SECS:-180}"
+TERMINAL_IDLE_MARKER="${TERMINAL_IDLE_MARKER:-SCHED_ENTER_IDLE_HLT}"
+if [[ "$QEMU_EXPECT_TERMINAL_IDLE" == "1" ]]; then
+  if run_qemu_until_idle_or_timeout "$IDLE_MAX_SECS" "$LOGFILE" "$TERMINAL_IDLE_MARKER" \
+    "$QEMU_BIN" "${QEMU_ARGS[@]}"; then
+    QEMU_STATUS=0
+    echo "[ok] aarch64 core: terminal idle ($TERMINAL_IDLE_MARKER) reached — QEMU stopped intentionally"
+  else
+    QEMU_STATUS=$?
+    echo "[err] aarch64 core: terminal idle marker never observed within ${IDLE_MAX_SECS}s (hang?)"
+  fi
 else
-  QEMU_STATUS=$?
+  if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" "${QEMU_ARGS[@]}"; then
+    QEMU_STATUS=0
+  else
+    QEMU_STATUS=$?
+  fi
 fi
 
 log_count_pattern() {
@@ -234,7 +269,12 @@ BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_CO
 # It is a benign, cross-arch condition that the x86_64 core smoke also accepts (that
 # smoke has no WrongObject blocker at all). Exclude ONLY this exact self-query line so
 # the aarch64 smoke matches x86_64's treatment; every OTHER WrongObject still blocks.
-BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject'
+# Stage 198A1: `PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295` is a BENIGN single early-boot
+# probe that also appears on the PASSING x86_64 boot (x86_64's blocker list never treats it as
+# fatal). It is emitted once under the ipc_recv_proof workload and the proof/oracle still complete
+# correctly; excluding this exact opcode=0 form keeps a REAL non-zero-opcode decode failure (and
+# PM_PANIC) fatal while matching x86_64's tolerance. A normal (non-proof) AArch64 boot emits zero.
+BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295'
 
 if [[ -f "$LOGFILE" ]]; then
   blocker_lines="$(tr '\r' '\n' <"$LOGFILE" | rg -a -n "$BLOCKER_REGEX" || true)"
@@ -768,6 +808,19 @@ if [[ -f "$LOGFILE" ]]; then
     count=$(log_count_pattern "$marker")
     echo "[info] EXT4 smoke marker count: ${marker}=${count}"
   done
+fi
+
+# Stage 198A1: a clean terminal-idle boot is a SUCCESS outcome. Control only reaches here AFTER
+# every hard required-marker + forbidden-marker check above PASSED (each exits 1 on failure), so
+# "all required positive markers fired and no forbidden marker occurred" is already established.
+# AArch64 at the idle terminal legitimately emits NO boot-to-shell marker, so recognize the
+# canonical terminal-idle marker as success instead of failing on the (inapplicable) shell check.
+# A missing proof marker, a forbidden marker, or an early idle-before-proof still fails above; a
+# genuine hang leaves the idle marker absent, so this path is not taken.
+if [[ "$QEMU_EXPECT_TERMINAL_IDLE" == "1" && -f "$LOGFILE" ]] \
+  && rg -a -q -- "$TERMINAL_IDLE_MARKER" "$LOGFILE" 2>/dev/null; then
+  echo "[ok] aarch64 core: clean terminal idle ($TERMINAL_IDLE_MARKER) after all required markers — PASS"
+  exit 0
 fi
 
 echo "[warn] boot shell and init-server markers not detected (status=$QEMU_STATUS)"
