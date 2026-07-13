@@ -51,10 +51,12 @@ first allocator lock; the global-allocator bring-up now emits per-step markers
 (`RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_OK`,
 `…_PT_ZERO_DONE`, `…_PT_INIT_DONE`, `…_PROBE_ALLOC_OK`,
 `…_PROBE_SENTINEL_OK`). BOOT-5A now records a source-audited KernelState/CPU0/scheduler prerequisite
-ladder (`RPI5_BOOT5_KERNELSTATE_AUDIT_*`) and validates the HH5 handoff bridge
-through `RPI5_BOOT5_HANDOFF_BRIDGE_OK` before the same precise deferral
-(`RPI5_HH5_DEFERRED reason=kernel_state_requires_scheduler_init`, or
-`reason=initrd_missing` when no initrd is present). This still needs a hardware
+ladder (`RPI5_BOOT5_KERNELSTATE_AUDIT_*`), validates the HH5 handoff bridge
+through `RPI5_BOOT5_HANDOFF_BRIDGE_OK`, and now runs the generic CPU0-only
+`SmpScheduler` probe through `RPI5_KERNEL_PERCPU_BOOTSTRAP_OK` and
+`RPI5_KERNEL_SCHED_BOOTSTRAP_OK`. It then defers at the precise current-source
+KernelState constructor blocker (`RPI5_HH5_DEFERRED reason=kernel_state_constructor_large_stack`,
+or `reason=initrd_missing` when no initrd is present). This still needs a hardware
 run to confirm. See `doc/RPI5_BRINGUP.md` and
 [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
@@ -62,10 +64,11 @@ run to confirm. See `doc/RPI5_BRINGUP.md` and
 
 Normal kernel bootstrap, `ENTER_USER`, and `/sbin/initramfs_srv` are **not yet
 reached on RPi5**. BOOT-4 has retired the low-physical allocator blocker with the
-gated high physmap; BOOT-5A now stops at the concrete normal-bootstrap blocker:
-CPU0/per-CPU plus scheduler initialization for the canonical `KernelState` /
-`SharedKernel` path. CPIO and `/init` are mandatory, the synthetic init fallback
-and NR27 loader are gone, and ZC ELF loading remains mandatory.
+gated high physmap; BOOT-5A1 now proves the CPU0/scheduler probe but stops at the
+remaining canonical `KernelState` / `SharedKernel` constructor issue: the current
+helper still uses a large by-value frame allocator and by-value `KernelState` move.
+CPIO and `/init` are mandatory, the synthetic init fallback and NR27 loader are
+gone, and ZC ELF loading remains mandatory.
 
 ## `services-core.manifest`
 

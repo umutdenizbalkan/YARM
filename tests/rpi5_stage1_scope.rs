@@ -1022,7 +1022,7 @@ fn rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret() {
     assert!(!hh5.contains("normal_kernel_entry_requires_low_allocator"));
     assert!(!hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
     assert!(!hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
-    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(hh5.contains("kernel_state_constructor_large_stack"));
     assert!(hh5.contains("initrd_missing"));
 
     // Build + fixture validators require the new HH5 markers.
@@ -1261,7 +1261,7 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
     assert!(hh5.contains("0x8000_0000"));
 
     // Precise deferral; still no userspace, no subsystem starts, no ERET.
-    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(hh5.contains("kernel_state_constructor_large_stack"));
     assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
     assert!(!hh5.contains("core::arch::asm!(\"eret\""));
     assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
@@ -1334,7 +1334,7 @@ fn rpi5_boot4_builds_high_half_heap_and_vm_then_defers_precisely() {
     // Task D: KernelState is NOT constructed; deferral is precise and there is no
     // userspace entry, no user TTBR0 install, no EL0 ERET, no big stack array, no
     // by-value allocator, and no premature subsystem start.
-    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(hh5.contains("kernel_state_constructor_large_stack"));
     assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
     assert!(!hh5.contains("core::arch::asm!(\"eret\""));
     assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
@@ -1445,10 +1445,38 @@ fn rpi5_boot5a_audit_and_handoff_bridge_markers_are_guarded() {
     let bridge_ok = hh5
         .find("RPI5_BOOT5_HANDOFF_BRIDGE_OK_MARKER")
         .expect("BOOT-5 handoff marker");
+    let percpu_begin = hh5
+        .find("RPI5_KERNEL_PERCPU_BOOTSTRAP_BEGIN_MARKER")
+        .expect("BOOT-5A1 per-cpu marker");
+    let percpu_ok = hh5
+        .find("RPI5_KERNEL_PERCPU_BOOTSTRAP_OK_MARKER")
+        .expect("BOOT-5A1 per-cpu ok marker");
+    let sched_begin = hh5
+        .find("RPI5_KERNEL_SCHED_BOOTSTRAP_BEGIN_MARKER")
+        .expect("BOOT-5A1 scheduler begin marker");
+    let sched_ok = hh5
+        .find("RPI5_KERNEL_SCHED_BOOTSTRAP_OK_MARKER")
+        .expect("BOOT-5A1 scheduler ok marker");
+    let state_begin = hh5
+        .find("RPI5_KERNEL_STATE_BEGIN_MARKER")
+        .expect("BOOT-5A1 state begin marker");
+    let storage_ok = hh5
+        .find("RPI5_KERNEL_STATE_STORAGE_OK_MARKER")
+        .expect("BOOT-5A1 state storage ok marker");
     let defer = hh5
-        .find("kernel_state_requires_scheduler_init")
-        .expect("precise BOOT-5A deferral");
-    assert!(highmap_ok < audit_begin && audit_begin < bridge_ok && bridge_ok < defer);
+        .find("kernel_state_constructor_large_stack")
+        .expect("precise BOOT-5A1 deferral");
+    assert!(
+        highmap_ok < audit_begin
+            && audit_begin < bridge_ok
+            && bridge_ok < percpu_begin
+            && percpu_begin < percpu_ok
+            && percpu_ok < sched_begin
+            && sched_begin < sched_ok
+            && sched_ok < state_begin
+            && state_begin < storage_ok
+            && storage_ok < defer
+    );
 
     for marker in [
         "RPI5_BOOT5_KERNELSTATE_AUDIT_BEGIN",
@@ -1468,6 +1496,30 @@ fn rpi5_boot5a_audit_and_handoff_bridge_markers_are_guarded() {
         "RPI5_BOOT5_HANDOFF_HEAP_OK",
         "RPI5_BOOT5_HANDOFF_PHYSMAP_OK",
         "RPI5_BOOT5_HANDOFF_BRIDGE_OK",
+        "RPI5_KERNEL_PERCPU_BOOTSTRAP_BEGIN",
+        "RPI5_KERNEL_PERCPU_STORAGE_OK",
+        "RPI5_KERNEL_PERCPU_CPU0_OK",
+        "RPI5_KERNEL_PERCPU_REGISTER_OK",
+        "RPI5_KERNEL_PERCPU_STACK_OK",
+        "RPI5_KERNEL_PERCPU_TOPOLOGY_OK",
+        "RPI5_KERNEL_PERCPU_BOOTSTRAP_OK",
+        "RPI5_KERNEL_PERCPU_FAILED reason=",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_BEGIN",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_CPU0_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_RUNQUEUE_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_CURRENT_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_TOPOLOGY_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_IDLE_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_FAILED reason=",
+        "RPI5_KERNEL_STATE_BEGIN",
+        "RPI5_KERNEL_STATE_STORAGE_BEGIN",
+        "RPI5_KERNEL_STATE_STORAGE_ADDRESS virt=0x",
+        "RPI5_KERNEL_STATE_STORAGE_HIGHMAP_OK",
+        "RPI5_KERNEL_STATE_STORAGE_OK",
+        "RPI5_KERNEL_STATE_FAILED reason=",
+        "RPI5_BOOT5_FAULT_BOUNDARY stage=",
+        "kernel_state_constructor_large_stack",
         "RPI5_BOOT5_HANDOFF_FAILED reason=",
     ] {
         assert!(boot.contains(marker), "boot omits BOOT-5 marker {marker}");
@@ -1478,8 +1530,25 @@ fn rpi5_boot5a_audit_and_handoff_bridge_markers_are_guarded() {
         );
     }
 
-    // BOOT-5A is an audited bridge only: it must not fake KernelState, a
-    // scheduler, user TTBR0, NR27, synthetic init, or an ERET marker.
+    let bootstrap = include_str!("../src/kernel/boot/bootstrap_state.rs");
+    assert!(
+        bootstrap.contains("pub fn boot5a1_validate_single_cpu_scheduler("),
+        "RPi5 BOOT-5A1 must share a generic Bootstrap helper"
+    );
+    assert!(
+        hh5.contains("Bootstrap::boot5a1_validate_single_cpu_scheduler("),
+        "HH5 must call the generic Bootstrap scheduler helper"
+    );
+    assert!(
+        hh5.contains("Bootstrap::static_kernel_state_storage_addr()"),
+        "HH5 must use the canonical static KernelState storage"
+    );
+    assert!(!hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(!hh5.contains("RPI5_INIT_LOOKUP_BEGIN path=/init"));
+    assert!(!hh5.contains("RPI5_HH5_TTBR0_USER_INSTALL"));
+
+    // BOOT-5A1 stops before userspace: it must not fake KernelState success,
+    // user TTBR0, NR27, synthetic init, or an ERET marker.
     for forbidden in [
         "SYSCALL_INITRAMFS_READ_CHUNK_NR",
         "InitramfsReadChunk",
@@ -1491,6 +1560,10 @@ fn rpi5_boot5a_audit_and_handoff_bridge_markers_are_guarded() {
         "psci_cpu_on",
         "init_gic",
         "timer_irq_enable",
+        "Box::new(state)",
+        "let state = KernelState::new",
+        "Rpi5KernelState",
+        "Rpi5Scheduler",
     ] {
         assert!(!hh5.contains(forbidden), "BOOT-5A bridge added {forbidden}");
     }

@@ -660,7 +660,7 @@ The accepted RPi5 boot ladder is now:
 | BOOT-2 | DTB/platform/initrd discovery | live diagnostic |
 | BOOT-3 | high-half execution and TTBR0 removal | live diagnostic |
 | BOOT-4 | high physmap, frame allocator, global allocator | live diagnostic |
-| BOOT-5A | CPU0/scheduler/KernelState audit and HH5 bridge | in progress; currently audited/deferred |
+| BOOT-5A | CPU0/scheduler/KernelState audit and HH5 bridge | in progress; CPU0/scheduler probe now runs, KernelState construction deferred at constructor stack/copy invariant |
 | BOOT-5B | real `/init` and first EL0 | future |
 | BOOT-5C | complete userspace server chain | future |
 | future | GIC/timer, RP1/PCIe, physical drivers, SMP | not part of BOOT-5 |
@@ -683,10 +683,17 @@ physical driver initialization is permitted in BOOT-5.
 The HH5 handoff bridge now validates the DTB high alias, mandatory initrd high
 alias, usable memory window alignment, reserved-range exclusion for kernel/DTB
 /initrd, high-half heap alias, and RPi5-gated physmap offset, then emits
-`RPI5_BOOT5_HANDOFF_BRIDGE_OK`. It still defers precisely at
-`RPI5_HH5_DEFERRED reason=kernel_state_requires_scheduler_init`; it does not emit
-`RPI5_ENTER_USER_ERET`, install a user TTBR0, create a synthetic init, use NR27,
-or start a byte-copy ELF fallback.
+`RPI5_BOOT5_HANDOFF_BRIDGE_OK`. BOOT-5A1 additionally calls the generic
+`Bootstrap::boot5a1_validate_single_cpu_scheduler` helper, which stages a CPU0-only
+present bitmap and exercises the current `SmpScheduler` path with the canonical
+TID-0 idle/bootstrap current, empty run queue, online=1, dispatching=1, and
+wake_only=0. KernelState construction remains deferred at the precise current
+source blocker: `Bootstrap::init_static_with_boot_memory_map` still constructs a
+large by-value frame allocator and `init_shared_static_with_boot_memory_map` still
+moves a by-value `KernelState` into `SharedKernel::new`. The hardware path now
+reports `RPI5_HH5_DEFERRED reason=kernel_state_constructor_large_stack`; it does
+not emit `RPI5_ENTER_USER_ERET`, install a user TTBR0, create a synthetic init,
+use NR27, or start a byte-copy ELF fallback.
 
 BOOT-5 policy updates:
 
@@ -712,13 +719,15 @@ BOOT-5 policy updates:
 | BOOT-2 DTB/platform/initrd discovery | LIVE diagnostic |
 | BOOT-3 high-half execution + TTBR0 removal | LIVE diagnostic |
 | BOOT-4 high physmap + allocators | LIVE diagnostic |
-| BOOT-5A KernelState/CPU0/scheduler | AUDITED bridge; deferred at scheduler bootstrap |
+| BOOT-5A KernelState/CPU0/scheduler | CPU0/scheduler probe live; deferred at KernelState constructor stack/copy invariant |
 | BOOT-5B `/init` + first EL0 | not reached |
 | BOOT-5C full userspace chain | not reached |
 
-**Next target:** invoke the current generic AArch64 CPU0/per-CPU and scheduler
-bootstrap from the validated HH5 handoff without enabling interrupts, GIC, timer,
-SMP, RP1/PCIe, physical drivers, NR27, or synthetic-init fallbacks.
+**Next target:** remove the remaining large by-value constructor/move from the
+canonical `KernelState`/`SharedKernel` bootstrap so the validated CPU0/scheduler
+probe can proceed to real in-place KernelState construction without enabling
+interrupts, GIC, timer, SMP, RP1/PCIe, physical drivers, NR27, or synthetic-init
+fallbacks.
 
 ### 13.1 Hardware artifact build
 

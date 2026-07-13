@@ -39,6 +39,15 @@ static BOOT_EXTRA_RESERVED_ENDS: [core::sync::atomic::AtomicU64; MAX_BOOT_EXTRA_
 static BOOT_INITRD_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static BOOT_INITRD_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Boot5A1SchedulerProbe {
+    pub present_bitmap: u64,
+    pub online_bitmap: u64,
+    pub wake_only_bitmap: u64,
+    pub current_tid: Option<u64>,
+    pub runnable_count: usize,
+}
+
 impl Bootstrap {
     #[inline(never)]
     fn default_boot_memory_map() -> ([MemoryRegion; MAX_BOOT_MEMORY_REGIONS], usize) {
@@ -389,6 +398,55 @@ impl Bootstrap {
 
     pub const fn default_capacity_profile() -> KernelCapacityProfile {
         KernelCapacityProfile::HostedDefault
+    }
+
+    pub fn static_kernel_state_storage_addr() -> usize {
+        core::ptr::addr_of!(BOOTSTRAP_KERNEL_STATE) as *const _ as usize
+    }
+
+    pub fn static_kernel_state_storage_size() -> usize {
+        core::mem::size_of::<KernelState>()
+    }
+
+    pub fn boot5a1_validate_single_cpu_scheduler(
+        cpu: crate::kernel::scheduler::CpuId,
+    ) -> Result<Boot5A1SchedulerProbe, KernelError> {
+        let cpu_bit = 1u64
+            .checked_shl(cpu.0 as u32)
+            .ok_or(KernelError::TaskMissing)?;
+        crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(cpu_bit)
+            .then_some(())
+            .ok_or(KernelError::TaskMissing)?;
+
+        let mut scheduler = SmpScheduler::default();
+        scheduler.set_present_cpu_bitmap(cpu_bit);
+        scheduler
+            .validate_online_cpu(cpu)
+            .map_err(map_scheduler_error)?;
+        scheduler
+            .enqueue_on(cpu, crate::kernel::ipc::ThreadId(0))
+            .map_err(map_scheduler_error)?;
+        let current = scheduler.dispatch_next_on(cpu).map(|tid| tid.0);
+        if current != Some(0) {
+            return Err(KernelError::TaskMissing);
+        }
+        if scheduler.runnable_count_on(cpu) != 0 {
+            return Err(KernelError::TaskMissing);
+        }
+        if scheduler.online_cpu_bitmap() != cpu_bit
+            || scheduler.present_cpu_bitmap() != cpu_bit
+            || scheduler.wake_only_bitmap() != 0
+        {
+            return Err(KernelError::TaskMissing);
+        }
+
+        Ok(Boot5A1SchedulerProbe {
+            present_bitmap: scheduler.present_cpu_bitmap(),
+            online_bitmap: scheduler.online_cpu_bitmap(),
+            wake_only_bitmap: scheduler.wake_only_bitmap(),
+            current_tid: current,
+            runnable_count: scheduler.runnable_count_on(cpu),
+        })
     }
 
     pub fn init() -> Result<KernelState, KernelError> {
