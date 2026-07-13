@@ -1540,6 +1540,30 @@ pub fn bootstrap_first_user_task(
         // so init fills E1 to exactly full with non-blocking sends and never blocks.
         init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
     }
+    // Stage 198A (SECOND-COHORT PLAIN PARITY): sub-knob-gated (`yarm.ipc_send_plain_oracle=1`)
+    // coordination endpoint recv cap in slot 14 (service_extra_cap_1), with slot 13 LEFT EMPTY.
+    // That presence pattern (slot 13 empty + slot 14 set) tells init to run the IpcSend-plain
+    // blocked-receiver live oracle. Mutually exclusive with the sender-wake block above (which
+    // sets BOTH 13 + 14 and, when its knob is off, leaves both zero). Mirrors the x86_64 target
+    // exactly (arch/x86_64/boot.rs). The RISC-V plain IpcSend uses the canonical in-lock publish
+    // + post-lock boundary drain; the caller stays current (RiscvTrapEntryOutcome::ReturnToCurrent),
+    // so NO pre-lock gate entry is needed. NO capability transfer is provisioned in this stage.
+    else if let Some(coord_recv_cap) =
+        crate::kernel::boot::provision_init_ipc_send_plain_oracle_coord(
+            kernel,
+            RING3_INIT_SERVER_TID,
+        )
+    {
+        init_args[14] = coord_recv_cap as u64;
+    }
+    // Stage 198A: sub-knob-gated (`yarm.ipc_send_enqueue_oracle=1`) PLAIN no-waiter enqueue
+    // oracle. It needs NO coordination cap (no fork, no blocked receiver — a plain send to the
+    // loopback E1 simply enqueues), so it is signalled by slot 17 ALONE (slots 13 + 14 empty).
+    // init runs it against E1 (slots 6/7, provisioned under the base proof knob).
+    else if crate::kernel::boot::ipc_send_enqueue_oracle_active() {
+        init_args[17] = 1; // enqueue-oracle discriminator (init otherwise leaves slot 17 zero)
+        crate::yarm_log!("IPC_SEND_ENQUEUE_ORACLE_PROVISION_OK slot17=1");
+    }
     // Stage 196C/196D/196E/196F: default-off RISC-V oracle WORKLOADS reuse init slot 5
     // (supervisor_control_recv_ep, unused by init on RISC-V) as a sentinel: 1 = FutexWake live
     // oracle (196C); 2 = queue-switch context-switch FOUNDATION oracle (196D); 3 = FutexWait

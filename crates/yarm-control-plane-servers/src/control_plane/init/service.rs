@@ -2807,6 +2807,19 @@ fn run_ipc_send_plain_oracle(e1_send: u32, e1_recv: u32, coord_recv: u32, init_t
                     got.len(),
                     received.sender_tid
                 );
+                // Stage 198A (SECOND-COHORT PLAIN PARITY): the recv-v2-blocked child
+                // resuming with a byte-identical plain payload and NO transferred cap IS
+                // the "plain send to an already-blocked receiver" live cell. Emit the
+                // canonical per-arch attestation only on a fully clean delivery so the
+                // three-arch seal can key on it. `payload_len` reports the delivered plain
+                // payload byte count (identical across arches), not the framed length.
+                if payload_match && !has_cap {
+                    yarm_user_rt::user_log!(
+                        "IPCSEND_PLAIN_BLOCKED_RECEIVER_ORACLE_DONE arch={} result=ok payload_len={} receiver_resumes=1",
+                        fr.arch,
+                        IPC_SEND_PLAIN_ORACLE_PAYLOAD.len()
+                    );
+                }
             }
             Ok(None) => {
                 yarm_user_rt::user_log!("IPC_SEND_PLAIN_ORACLE_CHILD_RECV_RET code=wouldblock");
@@ -3435,6 +3448,25 @@ fn run_ipc_send_enqueue_oracle(e1_send: u32, e1_recv: u32, init_tid: u64) {
             );
             if payload_match {
                 yarm_user_rt::user_log!("IPC_SEND_ENQUEUE_LIVE_ORACLE_DONE result=ok");
+                // Stage 198A (SECOND-COHORT PLAIN PARITY): exactly one plain message was
+                // enqueued with no blocked receiver and later dequeued byte-identical —
+                // the "plain no-waiter enqueue" live cell. Emit the canonical per-arch
+                // attestation. This oracle never forks, so derive the arch string from
+                // compile-time cfg; `payload_len` is the plain payload byte count.
+                let arch = if cfg!(target_arch = "x86_64") {
+                    "x86_64"
+                } else if cfg!(target_arch = "aarch64") {
+                    "aarch64"
+                } else if cfg!(target_arch = "riscv64") {
+                    "riscv64"
+                } else {
+                    "unknown"
+                };
+                yarm_user_rt::user_log!(
+                    "IPCSEND_PLAIN_ENQUEUE_ORACLE_DONE arch={} result=ok payload_len={} dequeue_count=1",
+                    arch,
+                    IPC_SEND_ENQUEUE_ORACLE_PAYLOAD.len()
+                );
             }
         }
         Ok(None) => {

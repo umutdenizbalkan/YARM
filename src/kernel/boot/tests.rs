@@ -60562,10 +60562,17 @@ mod stage193a_ipc_send_boundary_plain {
                 && RUNTIME_SRC.contains("crate::kernel::boot::ipc_send_boundary_origin_take("),
             "the drain must emit the IpcSend copy/wake/done markers gated on the send origin"
         );
-        assert!(
-            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok"),
-            "the IpcSendPlain retirement marker must exist"
-        );
+        // Stage 198A: the IpcSendPlain retirement marker is arch-tagged on all three arches.
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendPlain result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendPlain result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendPlain result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(m),
+                "the arch-tagged IpcSendPlain retirement marker must exist: {m}"
+            );
+        }
         // ReapFaultedTask stays global-lock-only.
         assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
     }
@@ -60955,7 +60962,17 @@ mod stage193b_ipc_send_plain_oracle {
         assert!(runtime.contains("IPC_SEND_BOUNDARY_USER_COPY_OK"));
         assert!(runtime.contains("IPC_SEND_BOUNDARY_WAKE_OK"));
         assert!(runtime.contains("IPC_SEND_BOUNDARY_SPLIT_DONE result=ok"));
-        assert!(MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok"));
+        // Stage 198A: arch-tagged on all three arches.
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendPlain result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendPlain result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendPlain result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(m),
+                "arch-tagged IpcSendPlain retire marker: {m}"
+            );
+        }
         // The init oracle DONE marker.
         assert!(
             INIT_SRC.contains("IPC_SEND_PLAIN_LIVE_ORACLE_DONE result=ok"),
@@ -61533,10 +61550,20 @@ mod stage193e_ipc_send_plain_enqueue {
             IPC_STATE_SRC.contains("sender_blocked=0"),
             "the SENDER_STATE marker must record that the sender did not block (legacy parity)"
         );
+        // Stage 198A: arch-tagged on all three arches.
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendPlainEnqueue result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendPlainEnqueue result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendPlainEnqueue result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(m),
+                "the arch-tagged IpcSendPlainEnqueue retirement marker must exist: {m}"
+            );
+        }
         assert!(
-            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok")
-                && MOD_SRC.contains("fn maybe_log_ipc_send_plain_enqueue_retired()"),
-            "the IpcSendPlainEnqueue retirement marker + latch must exist"
+            MOD_SRC.contains("fn maybe_log_ipc_send_plain_enqueue_retired()"),
+            "the IpcSendPlainEnqueue retirement latch must exist"
         );
         assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
     }
@@ -65186,9 +65213,15 @@ mod stage197_first_cohort_seal {
             "the remaining Internal must be the default-off negative (genuine error) oracle"
         );
         // The Yield drain never idles (its no-incoming is a FAIL marker) and never returns Internal.
+        // Bound to the Yield drain section only (ends at the structural `RISCV_POST_LOCK_DRAIN_DONE`
+        // marker) so the Stage 198A tail recv-block terminal-idle branch — which runs AFTER every
+        // drain and is skipped after a Yield — is not swept into this slice.
         let yld = RISCV_TRAP_SRC
             .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
             .nth(1)
+            .unwrap()
+            .split("RISCV_POST_LOCK_DRAIN_DONE")
+            .next()
             .unwrap();
         assert!(
             !yld.contains("SyscallError::Internal") && !yld.contains("EnterKernelIdle"),
@@ -65664,6 +65697,13 @@ mod stage197b_riscv_typed_idle_outcome {
         let yld = RISCV_TRAP_SRC
             .split("Stage 196G: queue-advancing YIELD RETIREMENT drain")
             .nth(1)
+            .unwrap()
+            // Bound to the Yield drain section only — it ends at the structural
+            // `RISCV_POST_LOCK_DRAIN_DONE` marker, so the Stage 198A tail terminal-idle branch
+            // (which runs AFTER every drain and is skipped after a Yield: Yield either switches
+            // → switched=true, or keeps `current` non-zero) is not swept into this slice.
+            .split("RISCV_POST_LOCK_DRAIN_DONE")
+            .next()
             .unwrap();
         assert!(
             !yld.contains("EnterKernelIdle") && !yld.contains("SyscallError::Internal"),
@@ -65800,6 +65840,298 @@ mod stage197b_riscv_typed_idle_outcome {
         assert!(
             !RISCV_TRAP_SRC.contains("Mutex::new") && !RISCV_TRAP_SRC.contains("RwLock::new"),
             "the typed cleanup must introduce no new kernel lock"
+        );
+    }
+}
+
+// ── Stage 198A: SECOND-COHORT PLAIN IpcSend CROSS-ARCHITECTURE PARITY ──────────────────────
+//
+// Exactly two plain-payload IpcSend success classes go live on all three arches:
+//   IpcSendPlain        — plain send to an already recv-v2-blocked receiver (boundary drain wake)
+//   IpcSendPlainEnqueue — plain no-waiter enqueue + later recv-v2 dequeue
+//
+// The retirement mechanism (in-lock publish + arch-neutral post-lock drain) already existed and
+// was x86-live; Stage 198A (a) arch-tags the two retirement markers, (b) replicates the x86-only
+// oracle SLOT PROVISIONING into AArch64 + RISC-V boot.rs, and (c) makes the arch-neutral oracle
+// workloads emit canonical per-arch attestations. NO capability transfer is exercised. These are
+// source-scan guards (the arch boot/trap modules are `#[cfg(target_arch)]`-gated and not built on
+// the hosted target); the LIVE proof is the QEMU seal (qemu-second-cohort-plain-seal.sh).
+mod stage198a_second_cohort_plain_parity {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const SEAL_SRC: &str = include_str!("../../../scripts/qemu-second-cohort-plain-seal.sh");
+    const FIRST_COHORT_SEAL_SRC: &str =
+        include_str!("../../../scripts/qemu-first-cohort-retirement-seal.sh");
+    const ORACLE_SMOKE: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+
+    // (1) Both retirement markers are arch-tagged for ALL THREE arches (canonical contract).
+    // Literal needles (this module's scope lacks the std `format!` macro; assert! interpolation is
+    // core `format_args!` and stays available).
+    #[test]
+    fn both_retirement_markers_arch_tagged_all_three_arches() {
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendPlain",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendPlain result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendPlain",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendPlain result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendPlain",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendPlain result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendPlainEnqueue",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendPlainEnqueue result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendPlainEnqueue",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendPlainEnqueue result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendPlainEnqueue",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendPlainEnqueue result=ok",
+        ] {
+            assert!(MOD_SRC.contains(m), "missing arch-tagged marker: {m}");
+        }
+    }
+
+    // (2) The untagged legacy forms are GONE — no `RETIRE_CLASS_DONE class=IpcSendPlain` without an
+    // `arch=` in between (would silently regress the seal's arch keying).
+    #[test]
+    fn no_untagged_plain_retirement_marker_remains() {
+        assert!(
+            !MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok"),
+            "the untagged IpcSendPlain DONE marker must be replaced by the arch-tagged form"
+        );
+        assert!(
+            !MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok"),
+            "the untagged IpcSendPlainEnqueue DONE marker must be replaced by the arch-tagged form"
+        );
+    }
+
+    // (3) The drain executor + in-lock enqueue seam remain the single arch-neutral emitters — the
+    // markers are still driven from runtime.rs (drain) and gated behind the send-origin take.
+    #[test]
+    fn retirement_markers_stay_arch_neutral_drain_driven() {
+        assert!(
+            RUNTIME_SRC.contains("maybe_log_ipc_send_plain_retired()")
+                && RUNTIME_SRC.contains("ipc_send_boundary_origin_take("),
+            "the plain blocked-waiter retirement must fire from the arch-neutral drain, origin-gated"
+        );
+        assert!(
+            MOD_SRC.contains("fn maybe_log_ipc_send_plain_retired()")
+                && MOD_SRC.contains("fn maybe_log_ipc_send_plain_enqueue_retired()"),
+            "both one-shot retirement latch helpers must exist"
+        );
+    }
+
+    // (4) Oracle slot PROVISIONING is replicated on all three arches: plain = slot 14 coord cap via
+    // provision_init_ipc_send_plain_oracle_coord; enqueue = slot 17 = 1 via ipc_send_enqueue_oracle_active.
+    #[test]
+    fn oracle_slot_provisioning_replicated_all_three_arches() {
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains("provision_init_ipc_send_plain_oracle_coord(")
+                    && src.contains("init_args[14] = coord_recv_cap as u64;"),
+                "{arch} boot.rs must provision the plain-oracle coord cap into slot 14"
+            );
+            assert!(
+                src.contains("ipc_send_enqueue_oracle_active()")
+                    && src.contains("IPC_SEND_ENQUEUE_ORACLE_PROVISION_OK slot17=1"),
+                "{arch} boot.rs must provision the enqueue-oracle discriminator into slot 17"
+            );
+        }
+    }
+
+    // (5) NO capability-transfer provisioning is added to AArch64 / RISC-V — the cap (193C),
+    // reply-cap (193D), and cap-enqueue (193F) oracles remain x86_64-only live targets.
+    #[test]
+    fn no_capability_transfer_oracle_on_non_x86_arches() {
+        for (arch, src) in [("aarch64", AARCH64_BOOT_SRC), ("riscv64", RISCV_BOOT_SRC)] {
+            for forbidden in [
+                "provision_init_ipc_send_cap_oracle_coord(",
+                "provision_init_ipc_send_reply_cap_oracle(",
+                "ipc_send_cap_enqueue_oracle_active()",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "{arch} boot.rs must NOT provision the capability-transfer oracle `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    // (6) The oracle workloads emit the canonical per-arch attestations, gated on a fully clean
+    // plain delivery (byte-match AND no transferred cap).
+    #[test]
+    fn oracle_workloads_emit_per_arch_attestations() {
+        assert!(
+            INIT_SRC.contains(
+                "IPCSEND_PLAIN_BLOCKED_RECEIVER_ORACLE_DONE arch={} result=ok payload_len={} receiver_resumes=1"
+            ),
+            "the blocked-receiver oracle must emit the per-arch attestation"
+        );
+        assert!(
+            INIT_SRC.contains(
+                "IPCSEND_PLAIN_ENQUEUE_ORACLE_DONE arch={} result=ok payload_len={} dequeue_count=1"
+            ),
+            "the enqueue oracle must emit the per-arch attestation"
+        );
+        // The blocked-receiver attestation is gated on a plain, cap-free delivery.
+        assert!(
+            INIT_SRC.contains("if payload_match && !has_cap {"),
+            "the blocked-receiver attestation must require byte-match AND no transferred cap"
+        );
+    }
+
+    // (7) RISC-V plain IpcSend stays on the canonical in-lock-publish + post-lock-drain path and
+    // returns ReturnToCurrent: the drain does not set `switched`, and the tail return selects
+    // ReturnToCurrent when no switch drain armed an incoming task. IpcSend is NOT in the pre-lock
+    // selective gate (that is DebugLog/FutexWake/FutexWait/Yield only).
+    #[test]
+    fn riscv_plain_ipcsend_returns_to_current_not_gated() {
+        assert!(
+            RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu)?;"),
+            "the RISC-V wrapper must run the arch-neutral post-lock delivery drain"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToCurrent"),
+            "the RISC-V wrapper must be able to return ReturnToCurrent (plain send stays current)"
+        );
+        // The pre-lock selective split gate must not name IpcSend (plain send uses the canonical
+        // handler, never the pre-lock gate).
+        assert!(
+            !RISCV_TRAP_SRC.contains("Syscall::IpcSend") && !RISCV_TRAP_SRC.contains("NR_IPC_SEND"),
+            "RISC-V plain IpcSend must NOT be added to the selective pre-lock gate"
+        );
+    }
+
+    // (7b) The RISC-V wrapper reaches WFI idle when a syscall BLOCKS the last runnable task (a
+    // recv-v2 with no incoming): a terminal-idle branch on the Ok path, gated on `!switched` AND
+    // the SAME positive scheduler-state predicate the Err terminal-idle path uses (current None|0
+    // AND zero runnable). Without it the bridge would sret a stale frame as tid 0 and hot-spin
+    // re-entering the blocked recv. This does NOT change the plain IpcSend sender (keeps current
+    // non-zero → ReturnToCurrent).
+    #[test]
+    fn riscv_recv_block_reaches_terminal_idle_not_spin() {
+        // The Ok-path terminal-idle branch is present and gated on `!switched`.
+        assert!(
+            RISCV_TRAP_SRC.contains("if !switched {")
+                && RISCV_TRAP_SRC.contains("recv-block TERMINAL-IDLE"),
+            "the wrapper must have the Ok-path recv-block terminal-idle branch, gated on !switched"
+        );
+        // It reuses the ExistingTerminalIdle reason + the current-None|0 + zero-runnable predicate.
+        assert!(
+            RISCV_TRAP_SRC.contains("RiscvIdleReason::ExistingTerminalIdle")
+                && RISCV_TRAP_SRC.contains("runnable_count_on_cpu(cpu) == 0"),
+            "the Ok-path idle branch must reuse the ExistingTerminalIdle reason + quiescence predicate"
+        );
+        // The same current-None|0 quiescence predicate appears on BOTH the Err terminal-idle path
+        // and the new Ok recv-block path (>= 2 sites; a third pre-existing use also exists).
+        assert!(
+            RISCV_TRAP_SRC
+                .matches("matches!(kernel.current_tid(), None | Some(0))")
+                .count()
+                >= 2,
+            "terminal-idle predicate must appear on BOTH the Err and the Ok recv-block paths"
+        );
+    }
+
+    // (8) The second-cohort seal script exists and requires all 6 cells + the canonical seal.
+    #[test]
+    fn second_cohort_seal_script_requires_six_cells() {
+        assert!(
+            SEAL_SRC.contains("SECOND_COHORT_PLAIN_SEAL arches=3 classes=2 live_cells=6 result=ok"),
+            "the seal script must emit the canonical 6-cell seal on success"
+        );
+        assert!(
+            SEAL_SRC
+                .contains("SECOND_COHORT_PLAIN_MATRIX arches=3 classes=2 live_cells=6 result=ok"),
+            "the seal script must emit the 6-cell live matrix on success"
+        );
+        // Both plain classes are keyed by BOTH the retirement marker and the attestation.
+        assert!(
+            SEAL_SRC.contains("class=IpcSendPlain result=ok")
+                && SEAL_SRC.contains("IPCSEND_PLAIN_BLOCKED_RECEIVER_ORACLE_DONE")
+                && SEAL_SRC.contains("class=IpcSendPlainEnqueue result=ok")
+                && SEAL_SRC.contains("IPCSEND_PLAIN_ENQUEUE_ORACLE_DONE"),
+            "the seal must require retirement marker + attestation for each cell"
+        );
+        // A transferred cap on a plain cell is a forbidden marker (parity break).
+        assert!(
+            SEAL_SRC.contains("transferred_cap=1"),
+            "the seal must reject transferred_cap=1 on plain cells"
+        );
+    }
+
+    // (9) The arch-parameterised oracle smoke acceptance uses the arch-tagged retirement marker and
+    // the per-arch attestation (so it now runs on all three arches, not just x86_64).
+    #[test]
+    fn oracle_smoke_acceptance_is_arch_parameterised() {
+        assert!(
+            ORACLE_SMOKE
+                .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendPlain result=ok"),
+            "the plain oracle smoke must require the arch-tagged retirement marker"
+        );
+        assert!(
+            ORACLE_SMOKE.contains(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendPlainEnqueue result=ok"
+            ),
+            "the enqueue oracle smoke must require the arch-tagged retirement marker"
+        );
+        assert!(
+            ORACLE_SMOKE.contains(
+                "IPCSEND_PLAIN_BLOCKED_RECEIVER_ORACLE_DONE arch=$ARCH result=ok payload_len=8 receiver_resumes=1"
+            ) && ORACLE_SMOKE.contains(
+                "IPCSEND_PLAIN_ENQUEUE_ORACLE_DONE arch=$ARCH result=ok payload_len=8 dequeue_count=1"
+            ),
+            "the oracle smoke must require both per-arch attestations"
+        );
+    }
+
+    // (10) EXCLUSIONS: no NEW retirement class is minted — the only IpcSend plain classes remain
+    // IpcSendPlain + IpcSendPlainEnqueue, and no shared-region / reply-cap-enqueue class appears.
+    #[test]
+    fn no_new_retirement_class_minted() {
+        assert!(
+            !MOD_SRC.contains("IpcSendReplyCapEnqueue") && !MOD_SRC.contains("IpcSendSharedRegion"),
+            "Stage 198A must not mint a reply-cap-enqueue or shared-region retirement class"
+        );
+        // The first-cohort seal (12/12 cross-arch) is preserved unchanged by this stage.
+        assert!(
+            FIRST_COHORT_SEAL_SRC
+                .contains("FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok")
+                && FIRST_COHORT_SEAL_SRC
+                    .contains("FIRST_COHORT_CROSS_ARCH_SEAL arches=3 classes=4 result=ok"),
+            "the first-cohort 12/12 seal must remain intact"
+        );
+    }
+
+    // (11) No new kernel lock and no user copy under a broad lock: the arch-tagging is pure log
+    // emission (cfg-selected yarm_log! calls); the drain still copies via copy_to_user_split OUT of
+    // any lock (unchanged mechanism).
+    #[test]
+    fn no_new_lock_no_user_copy_under_lock() {
+        // The arch-tagging edit adds only cfg-gated yarm_log! calls — no Mutex/RwLock in the helpers.
+        let plain_fn = MOD_SRC
+            .split("pub(crate) fn maybe_log_ipc_send_plain_retired()")
+            .nth(1)
+            .unwrap_or("");
+        let plain_body = &plain_fn[..plain_fn
+            .find("\n}")
+            .map(|i| i + 2)
+            .unwrap_or(plain_fn.len())];
+        assert!(
+            !plain_body.contains("Mutex") && !plain_body.contains("RwLock"),
+            "the arch-tagged retirement helper must introduce no new lock"
+        );
+        // The user copy is still performed by the drain via the split copy helper, not under a lock.
+        assert!(
+            RUNTIME_SRC.contains("copy_to_user_split"),
+            "the drain must still copy the payload out of any lock via copy_to_user_split"
         );
     }
 }

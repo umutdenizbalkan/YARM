@@ -13873,3 +13873,36 @@ negative oracle. The broad `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag is still cle
 before the post-lock drain (never true across the idle handoff or WFI), and the
 switch/idle branches keep the existing rank-1 scheduler / rank-2 task seam ordering.
 No ABI change (`SYSCALL_COUNT = 32`, `VARIANT_COUNT = 22`); no new retirement class.
+
+## Stage 198A — Second-cohort plain `IpcSend` cross-architecture parity
+
+Brings exactly the two **plain-payload** `IpcSend` success classes to live parity on
+x86_64, AArch64 and RISC-V — `IpcSendPlain` (send to an already `recv-v2`-blocked
+receiver) and `IpcSendPlainEnqueue` (no-waiter enqueue + later dequeue). **No
+capability transfer** is exercised. The full record, the 3×2 implementation matrix,
+the RISC-V `ReturnToCurrent` return-outcome audit, the error/rollback matrix, and the
+seal contract live in `doc/SECOND_COHORT_PLAIN_SEAL.md`.
+
+**Locking-relevant facts.** The retirement *mechanism* is unchanged and already
+lock-correct: the in-lock producer only snapshots + publishes (no user copy, no wake
+under the broad borrow), and the arch-neutral post-lock drain
+(`runtime.rs::execute_dispatch_post_work`) copies the payload via `copy_to_user_split`
+**out of every lock** before waking the receiver. Stage 198A only (a) arch-tags the
+two retirement markers via `cfg(target_arch)` in `maybe_log_ipc_send_plain_retired` /
+`maybe_log_ipc_send_plain_enqueue_retired`, and (b) replicates the previously
+x86-only oracle **startup-slot provisioning** (slot 14 plain coord cap; slot 17
+enqueue discriminator) into AArch64 and RISC-V `boot.rs`. RISC-V plain `IpcSend`
+stays on the canonical handler and returns `RiscvTrapEntryOutcome::ReturnToCurrent`
+(the drain wakes the receiver but never sets `switched`), so it is **not** added to
+the RISC-V selective pre-lock gate. No ABI change (`SYSCALL_COUNT = 32`,
+`VARIANT_COUNT = 23`); no new kernel lock; no new retirement class.
+
+Bringing the oracle live on RISC-V also required fixing a **pre-existing** idle-path
+gap (the `ipc_recv_proof` scaffolding had never booted cleanly on RISC-V): a
+`recv-v2` that blocks the last runnable task succeeds (`Ok`) and clears `current`
+with nothing runnable, but Stage 197B only wired `ExistingTerminalIdle` on the `Err`
+path, so the bridge `sret`'d a stale frame as tid 0 and hot-spun. The wrapper now
+also enters the typed terminal idle on the `Ok` path when `!switched` AND the same
+`current None|0` + zero-runnable quiescence predicate holds. This never affects the
+plain IpcSend sender (keeps `current` → `ReturnToCurrent`) and preserves the
+first-cohort retirements. Full record in `doc/SECOND_COHORT_PLAIN_SEAL.md`.

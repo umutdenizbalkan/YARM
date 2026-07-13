@@ -1430,8 +1430,31 @@ pub(crate) fn maybe_log_ipc_send_plain_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendPlain");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok");
+        // Stage 198A (SECOND-COHORT PLAIN PARITY): all architectures emit the canonical
+        // arch-tagged retirement marker `arch=<arch> class=IpcSendPlain`. The drain executor
+        // (`execute_dispatch_post_work` in runtime.rs) is arch-neutral and reached from all
+        // three trap-entry drains, so the arch string is selected here by `cfg`.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendPlain");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendPlain result=ok"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendPlain");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendPlain result=ok"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendPlain");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendPlain result=ok"
+            );
+        }
     }
 }
 
@@ -1582,8 +1605,37 @@ pub(crate) fn maybe_log_ipc_send_plain_enqueue_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendPlainEnqueue");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok");
+        // Stage 198A (SECOND-COHORT PLAIN PARITY): all architectures emit the canonical
+        // arch-tagged retirement marker `arch=<arch> class=IpcSendPlainEnqueue`. This helper
+        // is called from the arch-neutral in-lock enqueue seam (ipc_state.rs), so the arch
+        // string is selected here by `cfg`.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendPlainEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendPlainEnqueue result=ok"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendPlainEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendPlainEnqueue result=ok"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendPlainEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendPlainEnqueue result=ok"
+            );
+        }
     }
 }
 

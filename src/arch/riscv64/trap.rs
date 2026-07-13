@@ -897,10 +897,34 @@ pub fn handle_riscv_trap_entry_shared(
         crate::yarm_log!("RISCV_SHARED_TRAP_ENTRY_DONE cpu={}", cpu.0);
     }
 
+    // Stage 198A: recv-block TERMINAL-IDLE on the Ok path. Stage 197B wired `ExistingTerminalIdle`
+    // only on the Err channel, but a syscall that BLOCKS the last runnable task — a recv-v2 with no
+    // incoming message — succeeds (`Ok`) while clearing `current`, leaving nothing to run. Without
+    // this branch the bridge would `sret` a stale frame as tid 0 and hot-spin re-entering the
+    // blocked recv syscall instead of reaching WFI idle (observed as an `IPC_RECV_ENTER tid=0`
+    // busy loop). When NO switch drain armed an incoming task AND the scheduler is genuinely
+    // quiescent (current is `None|Some(0)` AND zero runnable tasks on this CPU — the SAME positive
+    // scheduler-state predicate the Err terminal-idle path uses), enter the typed terminal idle.
+    // This NEVER fires while any task stays current: a plain IpcSend sender, DebugLog, FutexWake,
+    // etc. keep `current` non-zero and return same-task `ReturnToCurrent` unchanged.
+    if !switched {
+        let terminal_idle = shared
+            .with_cpu(cpu, |kernel| {
+                matches!(kernel.current_tid(), None | Some(0))
+                    && kernel.runnable_count_on_cpu(cpu) == 0
+            })
+            .unwrap_or(false);
+        if terminal_idle {
+            return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                reason: RiscvIdleReason::ExistingTerminalIdle,
+            });
+        }
+    }
+
     // Stage 197B: the sole non-idle tail return. The broad-lock handler succeeded (`Ok` above);
     // a switch drain either armed an incoming task (`switched` → ReturnToIncoming) or the caller
     // returns same-task (ReturnToCurrent). This is NEVER an idle outcome — idle is produced only
-    // by the two explicit typed idle branches (FutexWait no-incoming / terminal all-blocked).
+    // by the explicit typed idle branches (FutexWait no-incoming / terminal all-blocked).
     Ok(if switched {
         RiscvTrapEntryOutcome::ReturnToIncoming
     } else {

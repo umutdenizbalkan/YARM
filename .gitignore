@@ -6,7 +6,7 @@
 /build-rpi5/
 /build-x86_64/
 /build-x86_64-crash-restart/
-/ipc-oracle-markers-x86_64.txt
+/ipc-oracle-markers-*.txt
 /rustc-ice-*.txt
 *.log
 *.log.stdout

@@ -568,6 +568,9 @@ if [[ "$YARM_IPC_SEND_PLAIN_ORACLE" == "1" ]]; then
     exit 1
   fi
   echo "[ok]   ipc-oracle: send-plain oracle sub-knob reached the kernel"
+  # Stage 198A (SECOND-COHORT PLAIN PARITY): the retirement marker is now arch-tagged
+  # and the oracle emits the canonical per-arch blocked-receiver attestation. Both are
+  # required LIVE on every arch ($ARCH selects x86_64 / aarch64 / riscv64).
   SEND_PLAIN_REQUIRED=(
     "IPC_SEND_PLAIN_ORACLE_WAITER_OBSERVED"
     "IPC_SEND_BOUNDARY_SPLIT_BEGIN"
@@ -575,7 +578,8 @@ if [[ "$YARM_IPC_SEND_PLAIN_ORACLE" == "1" ]]; then
     "IPC_SEND_BOUNDARY_USER_COPY_OK"
     "IPC_SEND_BOUNDARY_WAKE_OK"
     "IPC_SEND_BOUNDARY_SPLIT_DONE result=ok"
-    "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlain result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendPlain result=ok"
+    "IPCSEND_PLAIN_BLOCKED_RECEIVER_ORACLE_DONE arch=$ARCH result=ok payload_len=8 receiver_resumes=1"
     "IPC_SEND_PLAIN_LIVE_ORACLE_DONE result=ok"
   )
   for m in "${SEND_PLAIN_REQUIRED[@]}"; do
@@ -730,6 +734,9 @@ if [[ "$YARM_IPC_SEND_ENQUEUE_ORACLE" == "1" ]]; then
     exit 1
   fi
   echo "[ok]   ipc-oracle: send-enqueue oracle sub-knob reached the kernel"
+  # Stage 198A (SECOND-COHORT PLAIN PARITY): the retirement marker is now arch-tagged
+  # and the oracle emits the canonical per-arch enqueue attestation. Both required LIVE
+  # on every arch ($ARCH selects x86_64 / aarch64 / riscv64).
   SEND_ENQUEUE_REQUIRED=(
     "IPC_SEND_ENQUEUE_ORACLE_SEND_OK"
     "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_BEGIN"
@@ -737,7 +744,8 @@ if [[ "$YARM_IPC_SEND_ENQUEUE_ORACLE" == "1" ]]; then
     "IPC_SEND_ENQUEUE_BOUNDARY_ENQUEUE_OK"
     "IPC_SEND_ENQUEUE_BOUNDARY_SENDER_STATE_OK"
     "IPC_SEND_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok"
-    "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendPlainEnqueue result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendPlainEnqueue result=ok"
+    "IPCSEND_PLAIN_ENQUEUE_ORACLE_DONE arch=$ARCH result=ok payload_len=8 dequeue_count=1"
     "IPC_SEND_ENQUEUE_LIVE_ORACLE_DONE result=ok"
   )
   for m in "${SEND_ENQUEUE_REQUIRED[@]}"; do

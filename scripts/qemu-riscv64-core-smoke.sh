@@ -120,6 +120,24 @@ if [[ "$TYPED_INTERNAL_ERROR_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.riscv
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.riscv_typed_outcome_internal_error_oracle=1"
 fi
 
+# Stage 198A (SECOND-COHORT PLAIN PARITY): the plain-IpcSend live oracles are arch-neutral, so
+# RISC-V honors the same env-var -> cmdline knob translations the x86_64 core smoke does. The
+# oracle wrapper (qemu-ipc-recv-v2-oracle-smoke.sh) exports IPC_RECV_PROOF / IPC_SEND_PLAIN_ORACLE
+# / IPC_SEND_ENQUEUE_ORACLE; without these translations the knobs never reach the RISC-V kernel
+# cmdline and the oracle workload never runs.
+IPC_RECV_PROOF=${IPC_RECV_PROOF:-0}
+if [[ "$IPC_RECV_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_recv_proof="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_recv_proof=1"
+fi
+IPC_SEND_PLAIN_ORACLE=${IPC_SEND_PLAIN_ORACLE:-0}
+if [[ "$IPC_SEND_PLAIN_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_plain_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_plain_oracle=1"
+fi
+IPC_SEND_ENQUEUE_ORACLE=${IPC_SEND_ENQUEUE_ORACLE:-0}
+if [[ "$IPC_SEND_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_enqueue_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_enqueue_oracle=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 

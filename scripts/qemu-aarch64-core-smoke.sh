@@ -30,6 +30,20 @@ if [[ "$IPC_RECV_PROOF_SENDER_WAKE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_re
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_recv_proof_sender_wake=1"
 fi
 
+# Stage 198A (SECOND-COHORT PLAIN PARITY): the plain-IpcSend live oracles are arch-neutral, so
+# AArch64 honors the same env-var -> cmdline knob translations the x86_64 core smoke does. The
+# oracle wrapper (qemu-ipc-recv-v2-oracle-smoke.sh) exports IPC_SEND_PLAIN_ORACLE /
+# IPC_SEND_ENQUEUE_ORACLE; without these translations the knobs never reach the AArch64 kernel
+# cmdline and the oracle workload never runs.
+IPC_SEND_PLAIN_ORACLE=${IPC_SEND_PLAIN_ORACLE:-0}
+if [[ "$IPC_SEND_PLAIN_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_plain_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_plain_oracle=1"
+fi
+IPC_SEND_ENQUEUE_ORACLE=${IPC_SEND_ENQUEUE_ORACLE:-0}
+if [[ "$IPC_SEND_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_enqueue_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_enqueue_oracle=1"
+fi
+
 # Stage 178 (CROSS-ARCH-D6): CROSS_ARCH_D6=1 appends yarm.cross_arch_d6=1 to emit the
 # AArch64 D6 restore-path audit markers (model=trapframe_eret; read-only observe of
 # ELR/SPSR/SP + TTBR0/ASID). Live lock-dropped restore is DEFERRED — the audit records
