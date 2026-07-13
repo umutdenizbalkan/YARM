@@ -669,10 +669,13 @@ Current BOOT-5A source audit records the normal bootstrap prerequisites with
 `RPI5_BOOT5_KERNELSTATE_AUDIT_*` markers after
 `RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK`. The audit found that canonical storage
 is `BOOTSTRAP_KERNEL_STATE` plus `BOOTSTRAP_SHARED_KERNEL` in
-`src/kernel/boot/bootstrap_state.rs`; `init_shared_static_with_boot_memory_map`
-initializes `KernelState` in static `MaybeUninit`, then performs a `ptr::read`
-into `SharedKernel::new`. That means BOOT-5 must remove the remaining large
-move/constructor risk before constructing it on hardware. The fields requiring
+`src/kernel/boot/bootstrap_state.rs`. BOOT-5A2 replaces the old static-bootstrap
+`ptr::read` / by-value `SharedKernel::new(KernelState)` handoff with
+`SharedKernel::init_in_place`, which initializes the embedded compatibility
+`SpinLock` and its `KernelState` payload directly in final static storage. The
+non-hosted frame allocator field is zeroed in place and initialized through
+`init_from_memory_map` at its final address, so the RPi5 path no longer constructs
+a large by-value `PhysicalFrameAllocator` before publication. The fields requiring
 allocation include address-space managers, IPC, task tables, capability state,
 memory, driver, telemetry, boot-config, fault, and restart subsystems. CPU0,
 per-CPU state, the scheduler run queue, idle/bootstrap representation, current
@@ -687,13 +690,12 @@ alias, usable memory window alignment, reserved-range exclusion for kernel/DTB
 `Bootstrap::boot5a1_validate_single_cpu_scheduler` helper, which stages a CPU0-only
 present bitmap and exercises the current `SmpScheduler` path with the canonical
 TID-0 idle/bootstrap current, empty run queue, online=1, dispatching=1, and
-wake_only=0. KernelState construction remains deferred at the precise current
-source blocker: `Bootstrap::init_static_with_boot_memory_map` still constructs a
-large by-value frame allocator and `init_shared_static_with_boot_memory_map` still
-moves a by-value `KernelState` into `SharedKernel::new`. The hardware path now
-reports `RPI5_HH5_DEFERRED reason=kernel_state_constructor_large_stack`; it does
-not emit `RPI5_ENTER_USER_ERET`, install a user TTBR0, create a synthetic init,
-use NR27, or start a byte-copy ELF fallback.
+wake_only=0. BOOT-5A2 then invokes the same generic in-place SharedKernel /
+KernelState constructor, validates authoritative scheduler values from the real
+constructed object, emits `RPI5_KERNEL_STATE_INIT_OK`, `RPI5_KERNEL_STATE_OK`,
+`RPI5_BOOT5A2_DONE status=kernel_state_ready`, and stops at the checkpoint halt.
+It does not emit `RPI5_ENTER_USER_ERET`, install a user TTBR0, create a synthetic
+init, use NR27, or start a byte-copy ELF fallback.
 
 BOOT-5 policy updates:
 

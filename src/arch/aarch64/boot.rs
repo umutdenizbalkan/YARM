@@ -2381,6 +2381,123 @@ rpi5_hh_retained_marker!(
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(
+    RPI5_KERNEL_STATE_INIT_BEGIN_MARKER,
+    b"RPI5_KERNEL_STATE_INIT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_STATE_FRAME_ALLOCATOR_OK_MARKER,
+    b"RPI5_KERNEL_STATE_FRAME_ALLOCATOR_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_STATE_SCHEDULER_OK_MARKER,
+    b"RPI5_KERNEL_STATE_SCHEDULER_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_STATE_TASKS_OK_MARKER,
+    b"RPI5_KERNEL_STATE_TASKS_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_STATE_IPC_OK_MARKER, b"RPI5_KERNEL_STATE_IPC_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_STATE_CAPABILITIES_OK_MARKER,
+    b"RPI5_KERNEL_STATE_CAPABILITIES_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_STATE_VM_OK_MARKER, b"RPI5_KERNEL_STATE_VM_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_STATE_BOOTINFO_OK_MARKER,
+    b"RPI5_KERNEL_STATE_BOOTINFO_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_STATE_CPU0_OK_MARKER,
+    b"RPI5_KERNEL_STATE_CPU0_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_STATE_LOCK_OK_MARKER,
+    b"RPI5_KERNEL_STATE_LOCK_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_STATE_INIT_OK_MARKER,
+    b"RPI5_KERNEL_STATE_INIT_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_STATE_OK_MARKER, b"RPI5_KERNEL_STATE_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5A2_DONE_MARKER,
+    b"RPI5_BOOT5A2_DONE status=kernel_state_ready"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT5A2_HALT_MARKER,
+    b"RPI5_BOOT5A2_HALT reason=checkpoint_complete"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
     RPI5_KERNEL_STATE_FAILED_MARKER,
     b"RPI5_KERNEL_STATE_FAILED reason="
 );
@@ -4547,43 +4664,86 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
         rpi5_hh_halt();
     }
 
-    // BOOT-5A1 Part 5/6 — validate canonical KernelState static storage, then
-    // stop at the current-source blocker: `init_shared_static_with_boot_memory_map`
-    // still funnels through a by-value `KernelState` move into `SharedKernel::new`
-    // and `init_static_with_boot_memory_map` still creates a by-value
-    // `PhysicalFrameAllocator` by-value uninit construction before writing final storage. That
-    // violates the BOOT-5A1 no-large-stack/no-large-copy invariant on RPi5, so we
-    // do not call it on hardware yet.
+    // BOOT-5A2 Part 5/6 — validate canonical SharedKernel static storage,
+    // then construct the production SharedKernel/KernelState in place.  The
+    // generic helper initializes the embedded SpinLock and its KernelState value
+    // directly in BOOTSTRAP_SHARED_KERNEL; it does not ptr::read a live
+    // KernelState and does not pass KernelState by value to SharedKernel::new.
     if !rpi5_hh_write_line(&RPI5_KERNEL_STATE_BEGIN_MARKER)
         || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_STORAGE_BEGIN_MARKER)
     {
         rpi5_hh_halt();
     }
+    let storage_addr = crate::kernel::boot::Bootstrap::static_shared_kernel_storage_addr() as u64;
+    let storage_size = crate::kernel::boot::Bootstrap::static_shared_kernel_storage_size() as u64;
     hh5_emit_marker!(RPI5_KERNEL_STATE_STORAGE_ADDRESS_MARKER);
     hh5_emit_hex!(storage_addr);
     hh5_emit_marker!(RPI5_KERNEL_STATE_STORAGE_SIZE_SEP_MARKER);
     hh5_emit_hex!(storage_size);
     hh5_crlf!();
     if storage_addr < RPI5_HH_VA_OFFSET
-        || (storage_addr & ((core::mem::align_of::<crate::kernel::boot::KernelState>() as u64) - 1))
+        || (storage_addr & ((core::mem::align_of::<crate::runtime::SharedKernel>() as u64) - 1))
             != 0
     {
         let _ = rpi5_hh_write_bytes(&RPI5_KERNEL_STATE_FAILED_MARKER);
         let _ = rpi5_hh_write_line(b"storage_low_va");
         let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_FAULT_BOUNDARY_MARKER);
-        let _ = rpi5_hh_write_line(b"kernel_state reason=storage_low_va");
+        let _ = rpi5_hh_write_line(b"kernel_state phase=storage");
         hh5_defer!(b"kernel_state_storage_low_va");
     }
     if !rpi5_hh_write_line(&RPI5_KERNEL_STATE_STORAGE_HIGHMAP_OK_MARKER)
         || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_STORAGE_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_INIT_BEGIN_MARKER)
     {
         rpi5_hh_halt();
     }
-    let _ = rpi5_hh_write_bytes(&RPI5_KERNEL_STATE_FAILED_MARKER);
-    let _ = rpi5_hh_write_line(b"constructor_large_stack");
-    let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_FAULT_BOUNDARY_MARKER);
-    let _ = rpi5_hh_write_line(b"kernel_state reason=constructor_large_stack");
-    hh5_defer!(b"kernel_state_constructor_large_stack");
+
+    let shared = match crate::kernel::boot::Bootstrap::init_shared_static_with_capacity_profile(
+        crate::kernel::boot::Bootstrap::default_capacity_profile(),
+    ) {
+        Ok(shared) => shared,
+        Err(_) => {
+            let _ = rpi5_hh_write_bytes(&RPI5_KERNEL_STATE_FAILED_MARKER);
+            let _ = rpi5_hh_write_line(b"init");
+            let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_FAULT_BOUNDARY_MARKER);
+            let _ = rpi5_hh_write_line(b"kernel_state phase=init");
+            hh5_defer!(b"kernel_state_init_failed");
+        }
+    };
+
+    let state_ok = shared.with(|state| {
+        state.present_cpu_bitmap() == 1
+            && state.online_cpu_bitmap() == 1
+            && state.wake_only_cpu_bitmap() == 0
+            && state.current_cpu().0 == 0
+            && state.current_tid() == Some(0)
+            && state.runnable_count_on_cpu(crate::kernel::scheduler::CpuId(0)) == 0
+    });
+    if !state_ok {
+        let _ = rpi5_hh_write_bytes(&RPI5_KERNEL_STATE_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"scheduler");
+        let _ = rpi5_hh_write_bytes(&RPI5_BOOT5_FAULT_BOUNDARY_MARKER);
+        let _ = rpi5_hh_write_line(b"kernel_state phase=scheduler");
+        hh5_defer!(b"kernel_state_scheduler_invalid");
+    }
+
+    if !rpi5_hh_write_line(&RPI5_KERNEL_STATE_FRAME_ALLOCATOR_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_SCHEDULER_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_TASKS_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_IPC_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_CAPABILITIES_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_VM_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_BOOTINFO_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_CPU0_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_LOCK_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_INIT_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_STATE_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5A2_DONE_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT5A2_HALT_MARKER)
+    {
+        rpi5_hh_halt();
+    }
+    rpi5_hh_halt();
 }
 
 #[cfg(all(

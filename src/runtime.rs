@@ -248,6 +248,28 @@ impl SharedKernel {
         }
     }
 
+    /// Initialize `SharedKernel` in final storage without moving an already-live
+    /// `KernelState`.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must point to aligned, writable storage for an uninitialized
+    /// `SharedKernel`. The supplied closure must initialize the embedded
+    /// `KernelState` exactly once at the provided address. The caller must not
+    /// publish `destination` until this function returns `Ok(())`; on `Err`, boot
+    /// code must treat the destination as partially initialized leaked storage and
+    /// must not run destructors for it.
+    pub unsafe fn init_in_place<E>(
+        destination: *mut Self,
+        initialize_state: impl FnOnce(*mut KernelState) -> Result<(), E>,
+    ) -> Result<(), E> {
+        unsafe {
+            let lock_ptr = core::ptr::addr_of_mut!((*destination).state);
+            SpinLock::init_in_place(lock_ptr, initialize_state)?;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn lock(&self) -> SpinLockGuard<'_, KernelState> {
         self.state.lock()

@@ -408,6 +408,14 @@ impl Bootstrap {
         core::mem::size_of::<KernelState>()
     }
 
+    pub fn static_shared_kernel_storage_addr() -> usize {
+        core::ptr::addr_of!(BOOTSTRAP_SHARED_KERNEL) as *const _ as usize
+    }
+
+    pub fn static_shared_kernel_storage_size() -> usize {
+        core::mem::size_of::<crate::runtime::SharedKernel>()
+    }
+
     pub fn boot5a1_validate_single_cpu_scheduler(
         cpu: crate::kernel::scheduler::CpuId,
     ) -> Result<Boot5A1SchedulerProbe, KernelError> {
@@ -505,6 +513,33 @@ impl Bootstrap {
         boot_regions: &[MemoryRegion],
         reserved_ranges: &[(u64, u64)],
     ) -> Result<&'static mut KernelState, KernelError> {
+        let state_ptr = core::ptr::addr_of_mut!(BOOTSTRAP_KERNEL_STATE).cast::<KernelState>();
+        unsafe {
+            Self::init_kernel_state_in_place(
+                state_ptr,
+                capacity_profile,
+                boot_regions,
+                reserved_ranges,
+            )?;
+            Ok(&mut *state_ptr)
+        }
+    }
+
+    /// Initialize `KernelState` directly at `state_ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `state_ptr` must be aligned, writable storage for an uninitialized
+    /// `KernelState`. No reference to the destination may be published until this
+    /// function returns `Ok(())`. On `Err`, the caller must treat the destination
+    /// as partially initialized boot storage and must not run `Drop` for it.
+    #[inline(never)]
+    pub unsafe fn init_kernel_state_in_place(
+        state_ptr: *mut KernelState,
+        capacity_profile: KernelCapacityProfile,
+        boot_regions: &[MemoryRegion],
+        reserved_ranges: &[(u64, u64)],
+    ) -> Result<(), KernelError> {
         crate::arch::boot_entry::bootstrap_step("enter");
         // Register all reserved ranges in the global frame allocator guard and emit
         // PMEM_RESERVE_* diagnostics so boot logs show the full reserved map.
@@ -518,7 +553,6 @@ impl Bootstrap {
             crate::yarm_log!("PMEM_RESERVE_RANGE start=0x{:x} end=0x{:x}", start, end);
         }
 
-        let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
         let (sanitized, sanitized_len) = Self::apply_reserved_ranges(boot_regions, reserved_ranges);
         let sanitized = &sanitized[..sanitized_len];
 
@@ -571,10 +605,6 @@ impl Bootstrap {
 
         crate::arch::boot_entry::bootstrap_step("pt_frame_allocator");
         init_pt_frame_allocator(pt_slice).map_err(|_| KernelError::MemoryObjectFull)?;
-        crate::arch::boot_entry::bootstrap_step("frame_allocator");
-        frame_allocator
-            .init_from_memory_map(main_slice)
-            .map_err(|_| KernelError::MemoryObjectFull)?;
         crate::arch::boot_entry::bootstrap_step("page_table_reset_state");
         crate::arch::selected_isa::page_table::reset_state();
 
@@ -609,7 +639,6 @@ impl Bootstrap {
 
         crate::arch::boot_entry::bootstrap_step("kernel_state_write");
         unsafe {
-            let state_ptr = core::ptr::addr_of_mut!(BOOTSTRAP_KERNEL_STATE).cast::<KernelState>();
             core::ptr::addr_of_mut!((*state_ptr).kernel_aspace).write(kernel_aspace);
             core::ptr::addr_of_mut!((*state_ptr).hal)
                 .write(crate::arch::hal::SelectedIsaHal::default());
@@ -678,19 +707,49 @@ impl Bootstrap {
                 .write(store_kernel_value([None; MAX_TASKS]));
             core::ptr::addr_of_mut!((*state_ptr).robust_futex)
                 .write(store_kernel_value([None; MAX_TASKS]));
-            core::ptr::addr_of_mut!((*state_ptr).memory).write(store_kernel_value(
-                MemorySubsystem {
-                    #[cfg(feature = "hosted-dev")]
-                    user_memory: store_kernel_value(UserMemoryStore::default()),
-                    memory_objects: [None; MAX_MEMORY_OBJECTS],
-                    brk_regions: [None; MAX_TASKS],
-                    cow_pages: alloc::collections::BTreeMap::new(),
-                    #[cfg(test)]
-                    cow_page_capacity_limit: None,
-                    next_memory_object_id: 1,
-                    frame_allocator: store_kernel_value(frame_allocator),
-                },
-            ));
+            #[cfg(feature = "hosted-dev")]
+            {
+                let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
+                crate::arch::boot_entry::bootstrap_step("frame_allocator");
+                frame_allocator
+                    .init_from_memory_map(main_slice)
+                    .map_err(|_| KernelError::MemoryObjectFull)?;
+                core::ptr::addr_of_mut!((*state_ptr).memory).write(store_kernel_value(
+                    MemorySubsystem {
+                        user_memory: store_kernel_value(UserMemoryStore::default()),
+                        memory_objects: [None; MAX_MEMORY_OBJECTS],
+                        brk_regions: [None; MAX_TASKS],
+                        cow_pages: alloc::collections::BTreeMap::new(),
+                        #[cfg(test)]
+                        cow_page_capacity_limit: None,
+                        next_memory_object_id: 1,
+                        frame_allocator: store_kernel_value(frame_allocator),
+                    },
+                ));
+            }
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let memory_ptr = core::ptr::addr_of_mut!((*state_ptr).memory);
+                core::ptr::addr_of_mut!((*memory_ptr).memory_objects)
+                    .write([None; MAX_MEMORY_OBJECTS]);
+                core::ptr::addr_of_mut!((*memory_ptr).brk_regions).write([None; MAX_TASKS]);
+                core::ptr::addr_of_mut!((*memory_ptr).cow_pages)
+                    .write(alloc::collections::BTreeMap::new());
+                #[cfg(test)]
+                core::ptr::addr_of_mut!((*memory_ptr).cow_page_capacity_limit).write(None);
+                core::ptr::addr_of_mut!((*memory_ptr).next_memory_object_id).write(1);
+                let frame_allocator_ptr = core::ptr::addr_of_mut!((*memory_ptr).frame_allocator)
+                    as *mut PhysicalFrameAllocator;
+                core::ptr::write_bytes(
+                    frame_allocator_ptr.cast::<u8>(),
+                    0,
+                    core::mem::size_of::<PhysicalFrameAllocator>(),
+                );
+                crate::arch::boot_entry::bootstrap_step("frame_allocator");
+                (*frame_allocator_ptr)
+                    .init_from_memory_map(main_slice)
+                    .map_err(|_| KernelError::MemoryObjectFull)?;
+            }
             core::ptr::addr_of_mut!((*state_ptr).drivers).write(store_kernel_value(
                 DriverSubsystem {
                     driver_records: [const { None }; MAX_DRIVERS],
@@ -739,7 +798,8 @@ impl Bootstrap {
             crate::arch::boot_entry::bootstrap_step("dispatch_next_task");
             state.dispatch_next_task()?;
             crate::arch::boot_entry::bootstrap_step("done");
-            Ok(state)
+            let _ = state;
+            Ok(())
         }
     }
 
@@ -749,13 +809,12 @@ impl Bootstrap {
     // installing any trap state pointer.  Trap migration happens in a later
     // phase.  The ownership contract is:
     //
-    //   1. init_static_with_boot_memory_map writes BOOTSTRAP_KERNEL_STATE and
-    //      returns a &'static mut KernelState aliasing that storage.
-    //   2. We immediately ptr::read the bytes out, consuming the alias.
-    //      After the read, the caller must not use the &'static mut ref again.
-    //   3. The owned KernelState is moved into SharedKernel::new, which stores
-    //      it inside a SpinLock inside BOOTSTRAP_SHARED_KERNEL.
-    //   4. BOOTSTRAP_SHARED_KERNEL is written exactly once; READY flag is set.
+    //   1. BOOTSTRAP_SHARED_KERNEL storage is claimed by READY 0 -> 1.
+    //   2. SharedKernel::init_in_place initializes the embedded SpinLock and
+    //      initializes KernelState directly inside that lock's value storage.
+    //   3. No ptr::read/assume_init_read or by-value KernelState move occurs in
+    //      the static SharedKernel bootstrap path.
+    //   4. READY is set to 2 only after all fields are initialized.
     //   5. Neither install_trap_kernel_state nor install_trap_shared_kernel is
     //      called here.  Stage 2N remains fallback-active.
 
@@ -798,33 +857,18 @@ impl Bootstrap {
             panic!("init_shared_static called more than once");
         }
 
-        // Step 1: initialize KernelState into BOOTSTRAP_KERNEL_STATE.
-        let state_ref = Self::init_static_with_boot_memory_map(
-            capacity_profile,
-            boot_regions,
-            reserved_ranges,
-        )?;
-
-        // Step 2: move the KernelState bytes out of BOOTSTRAP_KERNEL_STATE.
-        // After this ptr::read the &'static mut ref must not be used again;
-        // BOOTSTRAP_KERNEL_STATE holds logically-moved-from bytes.
-        //
-        // SAFETY: init_static_with_boot_memory_map fully initializes the
-        // MaybeUninit storage and returns a valid &'static mut KernelState.
-        // ptr::read produces an owned copy; we drop the reference immediately.
-        let owned: KernelState = unsafe { core::ptr::read(state_ref as *const KernelState) };
-
-        // Step 3: wrap in SharedKernel and write into BOOTSTRAP_SHARED_KERNEL.
-        let shared = crate::runtime::SharedKernel::new(owned);
-        // SAFETY: single-writer guaranteed by the compare_exchange guard above;
-        // READY is still 1 (initializing), so no concurrent reader in
-        // shared_static_ref can yet observe the write target (it gates on == 2).
-        // We use addr_of_mut! + ptr::write to match the BOOTSTRAP_KERNEL_STATE
-        // pattern and avoid the static_mut_refs lint.
+        // Initialize SharedKernel and its embedded KernelState in final storage.
         unsafe {
             let ptr = core::ptr::addr_of_mut!(BOOTSTRAP_SHARED_KERNEL)
                 .cast::<crate::runtime::SharedKernel>();
-            core::ptr::write(ptr, shared);
+            crate::runtime::SharedKernel::init_in_place(ptr, |state_ptr| {
+                Self::init_kernel_state_in_place(
+                    state_ptr,
+                    capacity_profile,
+                    boot_regions,
+                    reserved_ranges,
+                )
+            })?;
         }
 
         // Publish: transition 1 (initializing) → 2 (ready).  The Release store

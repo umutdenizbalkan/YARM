@@ -1022,7 +1022,7 @@ fn rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret() {
     assert!(!hh5.contains("normal_kernel_entry_requires_low_allocator"));
     assert!(!hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
     assert!(!hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
-    assert!(hh5.contains("kernel_state_constructor_large_stack"));
+    assert!(hh5.contains("RPI5_BOOT5A2_DONE_MARKER"));
     assert!(hh5.contains("initrd_missing"));
 
     // Build + fixture validators require the new HH5 markers.
@@ -1261,7 +1261,7 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
     assert!(hh5.contains("0x8000_0000"));
 
     // Precise deferral; still no userspace, no subsystem starts, no ERET.
-    assert!(hh5.contains("kernel_state_constructor_large_stack"));
+    assert!(hh5.contains("RPI5_BOOT5A2_DONE_MARKER"));
     assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
     assert!(!hh5.contains("core::arch::asm!(\"eret\""));
     assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
@@ -1334,7 +1334,7 @@ fn rpi5_boot4_builds_high_half_heap_and_vm_then_defers_precisely() {
     // Task D: KernelState is NOT constructed; deferral is precise and there is no
     // userspace entry, no user TTBR0 install, no EL0 ERET, no big stack array, no
     // by-value allocator, and no premature subsystem start.
-    assert!(hh5.contains("kernel_state_constructor_large_stack"));
+    assert!(hh5.contains("RPI5_BOOT5A2_DONE_MARKER"));
     assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
     assert!(!hh5.contains("core::arch::asm!(\"eret\""));
     assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
@@ -1464,8 +1464,8 @@ fn rpi5_boot5a_audit_and_handoff_bridge_markers_are_guarded() {
         .find("RPI5_KERNEL_STATE_STORAGE_OK_MARKER")
         .expect("BOOT-5A1 state storage ok marker");
     let defer = hh5
-        .find("kernel_state_constructor_large_stack")
-        .expect("precise BOOT-5A1 deferral");
+        .find("RPI5_BOOT5A2_DONE_MARKER")
+        .expect("BOOT-5A2 checkpoint completion");
     assert!(
         highmap_ok < audit_begin
             && audit_begin < bridge_ok
@@ -1517,9 +1517,22 @@ fn rpi5_boot5a_audit_and_handoff_bridge_markers_are_guarded() {
         "RPI5_KERNEL_STATE_STORAGE_ADDRESS virt=0x",
         "RPI5_KERNEL_STATE_STORAGE_HIGHMAP_OK",
         "RPI5_KERNEL_STATE_STORAGE_OK",
+        "RPI5_KERNEL_STATE_INIT_BEGIN",
+        "RPI5_KERNEL_STATE_FRAME_ALLOCATOR_OK",
+        "RPI5_KERNEL_STATE_SCHEDULER_OK",
+        "RPI5_KERNEL_STATE_TASKS_OK",
+        "RPI5_KERNEL_STATE_IPC_OK",
+        "RPI5_KERNEL_STATE_CAPABILITIES_OK",
+        "RPI5_KERNEL_STATE_VM_OK",
+        "RPI5_KERNEL_STATE_BOOTINFO_OK",
+        "RPI5_KERNEL_STATE_CPU0_OK",
+        "RPI5_KERNEL_STATE_LOCK_OK",
+        "RPI5_KERNEL_STATE_INIT_OK",
+        "RPI5_KERNEL_STATE_OK",
         "RPI5_KERNEL_STATE_FAILED reason=",
         "RPI5_BOOT5_FAULT_BOUNDARY stage=",
-        "kernel_state_constructor_large_stack",
+        "RPI5_BOOT5A2_DONE status=kernel_state_ready",
+        "RPI5_BOOT5A2_HALT reason=checkpoint_complete",
         "RPI5_BOOT5_HANDOFF_FAILED reason=",
     ] {
         assert!(boot.contains(marker), "boot omits BOOT-5 marker {marker}");
@@ -1547,7 +1560,7 @@ fn rpi5_boot5a_audit_and_handoff_bridge_markers_are_guarded() {
     assert!(!hh5.contains("RPI5_INIT_LOOKUP_BEGIN path=/init"));
     assert!(!hh5.contains("RPI5_HH5_TTBR0_USER_INSTALL"));
 
-    // BOOT-5A1 stops before userspace: it must not fake KernelState success,
+    // BOOT-5A2 stops before userspace: it may construct KernelState, but must not add
     // user TTBR0, NR27, synthetic init, or an ERET marker.
     for forbidden in [
         "SYSCALL_INITRAMFS_READ_CHUNK_NR",
