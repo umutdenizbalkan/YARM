@@ -1540,6 +1540,21 @@ pub fn bootstrap_first_user_task(
         // so init fills E1 to exactly full with non-blocking sends and never blocks.
         init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
     }
+    // Stage 198C2 (REPLY-CAP DIRECT PARITY): sub-knob-gated (`yarm.ipc_send_reply_cap_oracle=1`)
+    // coordination endpoint recv cap in slot 13 + a kernel-provisioned transferable reply cap in
+    // slot 14 + a discriminator in slot 17 (init never uses slot 17). The (13 + 14 + 17) pattern
+    // tells init to run the IpcSend reply-cap DIRECT live oracle, distinct from sender-wake
+    // (13 + 14, no slot 17) and the ordinary-cap oracle (13 only). Mirrors the x86_64 target. The
+    // RISC-V reply-cap IpcSend uses the canonical in-lock publish + post-lock boundary drain; the
+    // SENDING caller stays current (RiscvTrapEntryOutcome::ReturnToCurrent). Oracle-only
+    // provisioning: NO reply-cap ENQUEUE slot, no shared region, normal-boot semantics unchanged.
+    else if let Some((coord_recv_cap, reply_cap)) =
+        crate::kernel::boot::provision_init_ipc_send_reply_cap_oracle(kernel, RING3_INIT_SERVER_TID)
+    {
+        init_args[13] = coord_recv_cap as u64;
+        init_args[14] = reply_cap as u64;
+        init_args[17] = 1; // reply-cap oracle discriminator (init otherwise leaves slot 17 zero)
+    }
     // Stage 198B (ORDINARY-CAP PARITY): sub-knob-gated (`yarm.ipc_send_cap_oracle=1`) coordination
     // endpoint recv cap in slot 13 (service_extra_cap_0), with slot 14 LEFT EMPTY. That presence
     // pattern (slot 13 set + slot 14 empty) tells init to run the IpcSend ORDINARY cap-transfer

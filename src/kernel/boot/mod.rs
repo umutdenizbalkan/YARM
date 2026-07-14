@@ -1693,8 +1693,33 @@ pub(crate) fn maybe_log_ipc_send_reply_cap_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendReplyCap");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendReplyCap result=ok");
+        // Stage 198C2 (REPLY-CAP DIRECT PARITY): arch-tagged on all three arches, matching the
+        // IpcSendPlain / IpcSendOrdinaryCap vocabulary. The drain executor
+        // (`execute_dispatch_post_work` in runtime.rs) is arch-neutral and reached from all three
+        // trap-entry drains, so the arch string is selected here by `cfg`. Emitted ONLY from the
+        // real reply-cap direct-delivery boundary drain (gated by the boundary-origin flag), never
+        // from ordinary-cap / plain / enqueue / test-only paths.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendReplyCap");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendReplyCap result=ok"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendReplyCap");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendReplyCap result=ok"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendReplyCap");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendReplyCap result=ok"
+            );
+        }
     }
 }
 
