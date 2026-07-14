@@ -35,13 +35,22 @@ ARCH="${1:-${ARCH:-x86_64}}"
 QEMU_SMOKE_STRICT="${QEMU_SMOKE_STRICT:-0}"
 
 case "$ARCH" in
-  x86_64)  CORE_SMOKE="$HERE/qemu-x86_64-core-smoke.sh";  CORE_LOG="qemu-x86_64-core.log";  QEMU_BIN="qemu-system-x86_64" ;;
-  aarch64) CORE_SMOKE="$HERE/qemu-aarch64-core-smoke.sh"; CORE_LOG="qemu-aarch64-core.log"; QEMU_BIN="qemu-system-aarch64" ;;
-  riscv64) CORE_SMOKE="$HERE/qemu-riscv64-core-smoke.sh"; CORE_LOG="qemu-riscv64-core.log"; QEMU_BIN="qemu-system-riscv64" ;;
+  x86_64)  CORE_SMOKE="$HERE/qemu-x86_64-core-smoke.sh";  QEMU_BIN="qemu-system-x86_64" ;;
+  aarch64) CORE_SMOKE="$HERE/qemu-aarch64-core-smoke.sh"; QEMU_BIN="qemu-system-aarch64" ;;
+  riscv64) CORE_SMOKE="$HERE/qemu-riscv64-core-smoke.sh"; QEMU_BIN="qemu-system-riscv64" ;;
   *) echo "[err] unknown ARCH: $ARCH (expected x86_64|aarch64|riscv64)"; exit 1 ;;
 esac
 
-ORACLE_SNAPSHOT="${ORACLE_SNAPSHOT:-ipc-oracle-markers-$ARCH.txt}"
+# Stage 198B1 Part B: per-invocation scratch dir so concurrent same-arch oracle
+# runs (e.g. the plain and ordinary-cap seals both booting x86_64) never share or
+# overwrite the CWD serial/analysis logs. Keyed by ORACLE_RUN_ID (default: PID),
+# so every invocation is isolated. The seal runners read this wrapper's STDOUT,
+# not these files, so relocating them is transparent to callers.
+ORACLE_RUN_ID="${ORACLE_RUN_ID:-$$}"
+ORACLE_SCRATCH_DIR="${ORACLE_SCRATCH_DIR:-${TMPDIR:-/tmp}/yarm-oracle-${ARCH}-${ORACLE_RUN_ID}}"
+mkdir -p "$ORACLE_SCRATCH_DIR"
+CORE_LOG="$ORACLE_SCRATCH_DIR/qemu-${ARCH}-core.log"
+ORACLE_SNAPSHOT="${ORACLE_SNAPSHOT:-$ORACLE_SCRATCH_DIR/ipc-oracle-markers-$ARCH.txt}"
 
 # Oracle coverage mode (Stage 157):
 #   basic    (default) — prove >=1 recv-v2 meta delivery (Stage 156 contract,
@@ -227,8 +236,10 @@ require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 # raw serial $CORE_LOG, so the raw markers are present no matter which path carries
 # them). Every marker check below reads ONLY $ANALYSIS_LOG via one helper.
 export LOGFILE="$CORE_LOG"
-CORE_RUN_LOG="ipc-oracle-core-stdout-$ARCH.log"
-ANALYSIS_LOG="ipc-oracle-run-$ARCH.log"
+# Stage 198B1 Part B: keep the analysis/run logs in the per-invocation scratch
+# dir (isolated across concurrent same-arch runs).
+CORE_RUN_LOG="$ORACLE_SCRATCH_DIR/ipc-oracle-core-stdout-$ARCH.log"
+ANALYSIS_LOG="$ORACLE_SCRATCH_DIR/ipc-oracle-run-$ARCH.log"
 rm -f "$CORE_RUN_LOG" "$ANALYSIS_LOG"
 echo "[info] ipc-oracle: booting $ARCH via $CORE_SMOKE (serial log: $CORE_LOG, run log: $CORE_RUN_LOG)"
 set +e

@@ -3024,6 +3024,21 @@ fn probe_ordinary_cap_object_identity(cprime: u32, recv_cap: u32) -> bool {
 /// received cap id is fresh (NOT the sender-local handle) — proving a sender-local
 /// CapId is never receiver authority.
 #[cfg(not(test))]
+/// Stage 198B1 Part C: compile-time arch tag for the ordinary-cap rights attestation.
+#[cfg(not(test))]
+fn ordinary_cap_arch_str() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "riscv64") {
+        "riscv64"
+    } else {
+        "unknown"
+    }
+}
+
+#[cfg(not(test))]
 fn run_ipc_send_cap_oracle(e1_send: u32, e1_recv: u32, coord_recv: u32, init_tid: u64) {
     use yarm_user_rt::ipc::Message;
 
@@ -3216,6 +3231,24 @@ fn run_ipc_send_cap_oracle(e1_send: u32, e1_recv: u32, coord_recv: u32, init_tid
         Ok(()) => {
             yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_SEND_OK");
             yarm_user_rt::user_log!("IPC_SEND_CAP_LIVE_ORACLE_DONE result=ok");
+            // Stage 198B1 Part C: ordinary-cap transfer is COPY/DELEGATION, NOT move — the
+            // SOURCE cap (e1_send) MUST remain valid for the sender after the transfer.
+            // Re-exercise it with a plain (non-cap, no FLAG_REPLY_CAP) probe send: success
+            // proves the sender retained authority. `destination_rights_ok=1` and
+            // `reply_metadata=0` are the kernel-authoritative facts (IPC_ORDINARY_CAP_RIGHTS
+            // rights_ok=1, reply_object=0), which the seal cross-checks against this line.
+            let source_still_valid =
+                match Message::with_header(0, IPC_SEND_CAP_ORACLE_OPCODE, 0, None, b"RIGHTSCK") {
+                    Ok(probe) => {
+                        unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &probe) }.is_ok()
+                    }
+                    Err(_) => false,
+                };
+            yarm_user_rt::user_log!(
+                "IPCSEND_ORDINARY_CAP_RIGHTS_OK arch={} class=IpcSendOrdinaryCap source_semantics=copy destination_rights_ok=1 source_still_valid={} reply_metadata=0",
+                ordinary_cap_arch_str(),
+                source_still_valid as u8
+            );
         }
         Err(e) => {
             yarm_user_rt::user_log!("IPC_SEND_CAP_ORACLE_SEND_FAILED code={}", e as usize);
@@ -3715,6 +3748,28 @@ fn run_ipc_send_cap_enqueue_oracle(e1_send: u32, e1_recv: u32, init_tid: u64) {
                         "IPCSEND_ORDINARY_CAP_ENQUEUE_ORACLE_DONE arch={} result=ok payload_len={} dequeue_count=1 fresh_cap=1 object_identity_ok=1",
                         arch,
                         IPC_SEND_CAP_ENQUEUE_ORACLE_PAYLOAD.len()
+                    );
+                    // Stage 198B1 Part C: ordinary-cap ENQUEUE transfer is COPY/DELEGATION — after
+                    // the enqueue + later dequeue, init's SOURCE cap (e1_send) MUST still be valid.
+                    // Re-exercise it with a plain probe send; success proves the sender retained
+                    // authority. Rights/metadata facts are kernel-authoritative
+                    // (IPC_ORDINARY_CAP_RIGHTS rights_ok=1 reply_object=0).
+                    let source_still_valid = match Message::with_header(
+                        0,
+                        IPC_SEND_CAP_ENQUEUE_ORACLE_OPCODE,
+                        0,
+                        None,
+                        b"RIGHTSCK",
+                    ) {
+                        Ok(probe) => {
+                            unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &probe) }.is_ok()
+                        }
+                        Err(_) => false,
+                    };
+                    yarm_user_rt::user_log!(
+                        "IPCSEND_ORDINARY_CAP_RIGHTS_OK arch={} class=IpcSendOrdinaryCapEnqueue source_semantics=copy destination_rights_ok=1 source_still_valid={} reply_metadata=0",
+                        arch,
+                        source_still_valid as u8
                     );
                 } else {
                     yarm_user_rt::user_log!(
