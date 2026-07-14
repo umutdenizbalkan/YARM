@@ -650,6 +650,10 @@ if [[ "$YARM_IPC_SEND_CAP_ORACLE" == "1" ]]; then
     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendOrdinaryCap result=ok"
     "IPCSEND_ORDINARY_CAP_BLOCKED_RECEIVER_ORACLE_DONE arch=$ARCH result=ok payload_len=8 receiver_resumes=1 fresh_cap=1 object_identity_ok=1"
     "IPC_SEND_CAP_LIVE_ORACLE_DONE result=ok"
+    # Stage 198B1 Part C: capability-rights attestation. Echoed here so it is a
+    # required marker on EVERY arch (the raw serial otherwise reaches only the
+    # analysis log, not this stdout the seals grep).
+    "IPCSEND_ORDINARY_CAP_RIGHTS_OK arch=$ARCH class=IpcSendOrdinaryCap source_semantics=copy destination_rights_ok=1 source_still_valid=1 reply_metadata=0"
   )
   for m in "${SEND_CAP_REQUIRED[@]}"; do
     if marker_present "$m"; then
@@ -659,6 +663,14 @@ if [[ "$YARM_IPC_SEND_CAP_ORACLE" == "1" ]]; then
       rc=1
     fi
   done
+  # Stage 198B1 Part C: the kernel-authoritative rights attestation (dst rights ==
+  # canonical transfer result, reply metadata absent) must also be present.
+  if rg -q -a -e 'IPC_ORDINARY_CAP_RIGHTS .*rights_ok=1 .*reply_object=0' "$ANALYSIS_LOG"; then
+    echo "[ok]   send-cap oracle: kernel rights attestation rights_ok=1 reply_object=0"
+  else
+    echo "[err] ipc-oracle: send-cap oracle: kernel rights attestation absent"
+    rc=1
+  fi
   # The woken child must have received a FRESH receiver-local cap (not the sender-local
   # handle) AND the byte-identical payload.
   if rg -q -a -e 'IPC_SEND_CAP_ORACLE_CHILD_RECV_OK payload_match=1 transferred_cap=1 cap_is_fresh=1' "$ANALYSIS_LOG"; then
@@ -827,6 +839,8 @@ if [[ "$YARM_IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" ]]; then
     "IPCSEND_ORDINARY_CAP_ENQUEUE_ORACLE_DONE arch=$ARCH result=ok payload_len=8 dequeue_count=1 fresh_cap=1 object_identity_ok=1"
     "IPC_TRANSFER_CAP_MATERIALIZE_OK"
     "IPC_SEND_CAP_ENQUEUE_LIVE_ORACLE_DONE result=ok"
+    # Stage 198B1 Part C: capability-rights attestation for the queued class.
+    "IPCSEND_ORDINARY_CAP_RIGHTS_OK arch=$ARCH class=IpcSendOrdinaryCapEnqueue source_semantics=copy destination_rights_ok=1 source_still_valid=1 reply_metadata=0"
   )
   for m in "${SEND_CAP_ENQUEUE_REQUIRED[@]}"; do
     if marker_present "$m"; then
@@ -836,6 +850,13 @@ if [[ "$YARM_IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" ]]; then
       rc=1
     fi
   done
+  # Stage 198B1 Part C: kernel-authoritative rights attestation for the queued class.
+  if rg -q -a -e 'IPC_ORDINARY_CAP_RIGHTS .*rights_ok=1 .*reply_object=0' "$ANALYSIS_LOG"; then
+    echo "[ok]   send-cap-enqueue oracle: kernel rights attestation rights_ok=1 reply_object=0"
+  else
+    echo "[err] ipc-oracle: send-cap-enqueue oracle: kernel rights attestation absent"
+    rc=1
+  fi
   # The receiver-later dequeue must materialize a FRESH receiver-local cap + byte-identical.
   if rg -q -a -e 'IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_OK payload_match=1 cap_is_fresh=1' "$ANALYSIS_LOG"; then
     echo "[ok]   send-cap-enqueue oracle: receiver-later dequeue materialized a fresh receiver-local cap"
