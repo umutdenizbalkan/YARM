@@ -49,9 +49,9 @@ D2 work, NO new syscall, and does not change the ordinary-cap ABI. `SYSCALL_COUN
    (`resolved_capability_split(receiver_cnode, cap)`) and compares the full `CapObject` for
    identity, then attests destination rights against the canonical transfer result.
 
-6. **Part C — direct + queued attestation markers (DONE, live-verified x86_64).** For both direct
-   (`class=IpcSendOrdinaryCap`) and queued (`class=IpcSendOrdinaryCapEnqueue`) delivery the boot
-   emits `IPC_ORDINARY_CAP_RIGHTS receiver_tid=<t> dst_rights=Some(<r>) expected_rights=<r>
+6. **Part C — direct + queued attestation markers (DONE, live-verified on all 3 arches).** For both
+   direct (`class=IpcSendOrdinaryCap`) and queued (`class=IpcSendOrdinaryCapEnqueue`) delivery the
+   boot emits `IPC_ORDINARY_CAP_RIGHTS receiver_tid=<t> dst_rights=Some(<r>) expected_rights=<r>
    rights_ok=1 object_endpoint=1 reply_object=0 generation=<g>` and
    `IPCSEND_ORDINARY_CAP_RIGHTS_OK arch=x86_64 class=<class> source_semantics=copy
    destination_rights_ok=1 source_still_valid=1 reply_metadata=0`. `source_still_valid=1` is proven
@@ -59,10 +59,15 @@ D2 work, NO new syscall, and does not change the ordinary-cap ABI. `SYSCALL_COUN
    semantics); `reply_metadata=0`/`reply_object=0` proves no reply-cap misclassification; a fresh
    receiver-local CapId (≠ sender handle, ≠ source cap) is minted (`fresh_cap=1`).
 
-7. **Part C — wired into the ordinary-cap seal (DONE).** `qemu-second-cohort-ordinary-cap-seal.sh`
+7. **Part C — wired into the ordinary-cap seal (DONE, 6/6).** `qemu-second-cohort-ordinary-cap-seal.sh`
    now requires the per-cell `IPCSEND_ORDINARY_CAP_RIGHTS_OK … destination_rights_ok=1
-   source_still_valid=1 reply_metadata=0` marker in addition to the retirement + oracle-done
-   markers before a cell counts as live (`proof=live rights=attested`).
+   source_still_valid=1 reply_metadata=0` marker in addition to the retirement + oracle-done markers
+   before a cell counts as live (`proof=live rights=attested`). The oracle smoke echoes the rights
+   marker on every arch (the raw serial otherwise reaches only the per-run analysis log, not the
+   stdout the seal greps) and additionally asserts the kernel `IPC_ORDINARY_CAP_RIGHTS … rights_ok=1
+   reply_object=0`. Confirmed against the fresh 3-arch artifacts: `SECOND_COHORT_ORDINARY_CAP_MATRIX
+   arches=3 classes=2 live_cells=6 result=ok` / `SECOND_COHORT_ORDINARY_CAP_SEAL arches=3 classes=2
+   live_cells=6 result=ok`, every cell `rights=attested`.
 
 8. **Part D — ordinary-cap negative + rollback seal (DONE, hosted).**
    `scripts/qemu-ordinary-cap-negative-seal.sh` drives the ACTUAL production transaction /
@@ -133,8 +138,12 @@ D2 work, NO new syscall, and does not change the ordinary-cap ABI. `SYSCALL_COUN
     result=ok` (12/12), `SECOND_COHORT_PLAIN_SEAL arches=3 classes=2 live_cells=6 result=ok` (6/6),
     and `SECOND_COHORT_ORDINARY_CAP_SEAL arches=3 classes=2 live_cells=6 result=ok` (6/6) are
     re-proven by the serialized combined runner (`COMBINED_RETIREMENT_SEAL first=12 plain=6
-    ordinary_cap=6 result=ok`). **Status: confirmation is part of the in-progress 3× isolation run
-    (§4); this line will be updated with the observed per-cohort results.** <!-- SEAL_RESULT -->
+    ordinary_cap=6 result=ok`). All three cohorts have been observed green against the fresh 3-arch
+    artifacts: first-cohort 12/12 and plain 6/6 (serialized combined run) and ordinary-cap 6/6
+    (standalone re-run after the Part C rights-marker capture fix). **Status: the aggregate
+    `COMBINED_RETIREMENT_SEAL` / `RETIREMENT_SEAL_ISOLATION` lines are being re-confirmed by the
+    in-progress 3× isolation run (§4); this line will carry the final aggregate result.**
+    <!-- SEAL_RESULT -->
 
 16. **Part G — exclusions honored.** No `IpcSendReplyCap` / `ReplyCapEnqueue` / shared-region / D2
     retirement is exercised or claimed (the ordinary-cap seal's `FORBIDDEN` pattern actively rejects
@@ -153,7 +162,7 @@ D2 work, NO new syscall, and does not change the ordinary-cap ABI. `SYSCALL_COUN
     non-fatal by design.)
 
 19. **Validation — hosted suite.** `cargo test --features hosted-dev --lib -- --test-threads=1`:
-    2864 passed, 0 failed, 2 ignored. Two source-scan guards that matched literals introduced by the
+    2862 passed, 0 failed, 2 ignored. Two source-scan guards that matched literals introduced by the
     Part B/C edits (`FLAG_REPLY_CAP` in a Part-C comment; the pre-Part-B `ANALYSIS_LOG` path) were
     updated to the current, still-correct code — neither is a behavior regression.
 
