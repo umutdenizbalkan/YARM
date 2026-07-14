@@ -348,11 +348,12 @@ fn try_split_debug_log_into_frame(
     cpu: CpuId,
     frame: &mut TrapFrame,
 ) -> Option<Result<(), TrapHandleError>> {
-    use crate::kernel::ipc::Message;
     // DebugLog ABI: arg0 = user ptr, arg1 = len (no cap slot).
     let user_ptr = frame.arg(0);
     let raw_len = frame.arg(1) as u64;
-    let len = (raw_len as usize).min(Message::MAX_PAYLOAD);
+    // Stage 198B: cap at DEBUG_LOG_MAX_BYTES (192, wider than IPC Message::MAX_PAYLOAD) so the
+    // canonical ordinary-cap attestations (~138 bytes) log untruncated on the split path.
+    let len = (raw_len as usize).min(crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES);
 
     // Authoritative requester TID (binds current_cpu; same task the global handler
     // sees). Unavailable → fall back to the global-lock path.

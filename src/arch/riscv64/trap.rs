@@ -32,12 +32,14 @@ pub enum RiscvIdleReason {
     /// The default-on FutexWait queue-advancing drain found no runnable incoming task while the
     /// outgoing caller stays `Blocked(Futex)` — the retired-class post-lock idle outcome.
     FutexWaitNoIncoming,
-    /// Stage 198A1: a canonical BLOCKING syscall (IpcRecv / IpcCall / IpcSend) blocked the caller
-    /// and dispatched away leaving no runnable task. The provenance is AUTHORITATIVE — published
-    /// by the arch-neutral blocking seam (`BLOCKED_SYSCALL_IDLE_PROVENANCE`) and consumed here — so
-    /// idle is a POSITIVE outcome of a real blocking operation, never inferred from `current == None`
-    /// + zero-runnable scheduler state alone.
-    BlockedRecvNoRunnable,
+    /// Stage 198A1/198B: a canonical BLOCKING IPC syscall (IpcRecv / IpcCall / IpcSend) blocked the
+    /// caller and dispatched away leaving no runnable task. The provenance is AUTHORITATIVE —
+    /// published by the arch-neutral blocking seam (`BLOCKED_SYSCALL_IDLE_PROVENANCE`, with the
+    /// exact blocking class recorded separately) and consumed here — so idle is a POSITIVE outcome
+    /// of a real blocking operation, never inferred from `current == None` + zero-runnable state
+    /// alone. (Generalized from the recv-only `BlockedRecvNoRunnable`, since the producer covers all
+    /// three blocking IPC syscalls, not recv alone.)
+    BlockedIpcNoRunnable,
 }
 
 /// Stage 197B: the explicit, typed result of the RISC-V shared trap-entry wrapper. It replaces the
@@ -501,7 +503,7 @@ pub fn handle_riscv_trap_entry_shared(
     // never be read as idle. Stage 198A1 removes the former state-inferred terminal-idle
     // reclassification on this Err path (it inferred intentional idle from `current == None` + zero
     // runnable, which is now forbidden): intentional idle is produced ONLY from explicit typed
-    // provenance (FutexWaitNoIncoming on the FutexWait drain, BlockedRecvNoRunnable on the Ok tail).
+    // provenance (FutexWaitNoIncoming on the FutexWait drain, BlockedIpcNoRunnable on the Ok tail).
     // An Err here takes the fatal `RISCV_TRAP_HANDLE_FAILED` bridge path regardless of `current`.
     inner_result?;
 
@@ -893,7 +895,7 @@ pub fn handle_riscv_trap_entry_shared(
     // that token here (always, so it never leaks to the next trap) and combine it with the terminal
     // scheduler state:
     //   * provenance present + terminal (current None|Some(0) AND zero runnable) → typed
-    //     `EnterKernelIdle { BlockedRecvNoRunnable }`. Without this the bridge would `sret` a stale
+    //     `EnterKernelIdle { BlockedIpcNoRunnable }`. Without this the bridge would `sret` a stale
     //     frame as tid 0 and hot-spin re-entering the blocked recv (an `IPC_RECV_ENTER tid=0` loop).
     //   * terminal state WITHOUT provenance → a BUG (spurious `current == None`): emit a defensive
     //     marker and take the canonical `Err` path (RISCV_TRAP_HANDLE_FAILED). NEVER silent idle.
@@ -910,10 +912,14 @@ pub fn handle_riscv_trap_entry_shared(
             })
             .unwrap_or(false);
         match (provenance, terminal_idle) {
-            (Some(blocked_tid), true) => {
-                crate::yarm_log!("RISCV_BLOCKED_RECV_IDLE_PROVENANCE_OK tid={}", blocked_tid);
+            (Some((blocked_tid, class)), true) => {
+                crate::yarm_log!(
+                    "RISCV_BLOCKED_IPC_IDLE_PROVENANCE_OK tid={} class={}",
+                    blocked_tid,
+                    class.as_str()
+                );
                 return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
-                    reason: RiscvIdleReason::BlockedRecvNoRunnable,
+                    reason: RiscvIdleReason::BlockedIpcNoRunnable,
                 });
             }
             (None, true) => {

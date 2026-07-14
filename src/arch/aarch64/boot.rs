@@ -7719,6 +7719,16 @@ pub fn bootstrap_first_user_task(
         // so init fills E1 to exactly full with non-blocking sends and never blocks.
         init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
     }
+    // Stage 198B (ORDINARY-CAP PARITY): sub-knob-gated (`yarm.ipc_send_cap_oracle=1`) coordination
+    // endpoint recv cap in slot 13 (service_extra_cap_0), with slot 14 LEFT EMPTY. That presence
+    // pattern (slot 13 set + slot 14 empty) tells init to run the IpcSend ORDINARY cap-transfer
+    // blocked-receiver live oracle. Mutually exclusive with sender-wake (13 + 14) and the plain
+    // oracle (14 only). Mirrors the x86_64 target; NO reply-cap / shared-region provisioning added.
+    else if let Some(coord_recv_cap) =
+        crate::kernel::boot::provision_init_ipc_send_cap_oracle_coord(kernel, RING3_INIT_SERVER_TID)
+    {
+        init_args[13] = coord_recv_cap as u64;
+    }
     // Stage 198A (SECOND-COHORT PLAIN PARITY): sub-knob-gated (`yarm.ipc_send_plain_oracle=1`)
     // coordination endpoint recv cap in slot 14 (service_extra_cap_1), with slot 13 LEFT EMPTY.
     // That presence pattern (slot 13 empty + slot 14 set) tells init to run the IpcSend-plain
@@ -7740,6 +7750,13 @@ pub fn bootstrap_first_user_task(
     else if crate::kernel::boot::ipc_send_enqueue_oracle_active() {
         init_args[17] = 1; // enqueue-oracle discriminator (init otherwise leaves slot 17 zero)
         crate::yarm_log!("IPC_SEND_ENQUEUE_ORACLE_PROVISION_OK slot17=1");
+    }
+    // Stage 198B: sub-knob-gated (`yarm.ipc_send_cap_enqueue_oracle=1`) ORDINARY-cap no-waiter
+    // enqueue oracle. Shares the slot-17 discriminator with the plain enqueue (198A) but uses
+    // value 2 (slots 13 + 14 empty). Like the plain enqueue it needs no cap beyond E1.
+    else if crate::kernel::boot::ipc_send_cap_enqueue_oracle_active() {
+        init_args[17] = 2; // cap-enqueue-oracle discriminator (init otherwise leaves slot 17 zero)
+        crate::yarm_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_PROVISION_OK slot17=2");
     }
     // Stage 195C: default-off AArch64 FutexWake live oracle. Slot 5
     // (supervisor_control_recv_ep) is unused by init, so under

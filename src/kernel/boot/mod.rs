@@ -1414,16 +1414,53 @@ pub(crate) fn ipc_send_boundary_origin_take(cpu_idx: usize) -> bool {
         && IPC_SEND_BOUNDARY_ORIGIN[cpu_idx].swap(false, core::sync::atomic::Ordering::AcqRel)
 }
 
-// ── Stage 198A1: authoritative blocking-syscall idle provenance ──────────────────────────
+// ── Stage 198A1 / 198B: authoritative blocking-syscall idle provenance ────────────────────
 //
 // The RISC-V trap wrapper must NOT infer intentional idle from scheduler state alone
 // (`Ok` result + `current == None` + zero runnable). Instead, the canonical blocking path
 // (`handle_trap_event`'s `blocking_syscall && caller_blocked` branch — IpcRecv / IpcCall /
 // IpcSend) publishes an AUTHORITATIVE per-CPU token recording the tid it just blocked and
-// dispatched away from. The wrapper CONSUMES that token: token present + terminal scheduler
-// state → typed `EnterKernelIdle { BlockedRecvNoRunnable }`; terminal state WITHOUT the token
-// is a bug and takes a defensive error path, never silent idle. x86_64 / AArch64 set the token
-// too (arch-neutral seam) but never read it — they own their own idle bridges.
+// dispatched away from, plus the exact blocking syscall CLASS. The wrapper CONSUMES that token:
+// token present + terminal scheduler state → typed `EnterKernelIdle { BlockedIpcNoRunnable }`;
+// terminal state WITHOUT the token is a bug and takes a defensive error path, never silent idle.
+// x86_64 / AArch64 set the token too (arch-neutral seam) but never read it — they own their own
+// idle bridges. (Stage 198B generalized the reason name from the recv-only `BlockedRecvNoRunnable`
+// to `BlockedIpcNoRunnable` + a separately recorded blocking class, since the producer covers
+// IpcRecv / IpcCall / IpcSend, not recv alone.)
+
+/// Stage 198B: the authoritative blocking syscall class that produced idle provenance. Recorded
+/// separately from the reason so `RiscvIdleReason` stays a plain (non-payload) enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockingSyscallClass {
+    IpcRecv,
+    IpcCall,
+    IpcSend,
+}
+
+impl BlockingSyscallClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockingSyscallClass::IpcRecv => "IpcRecv",
+            BlockingSyscallClass::IpcCall => "IpcCall",
+            BlockingSyscallClass::IpcSend => "IpcSend",
+        }
+    }
+    fn to_code(self) -> u8 {
+        match self {
+            BlockingSyscallClass::IpcRecv => 1,
+            BlockingSyscallClass::IpcCall => 2,
+            BlockingSyscallClass::IpcSend => 3,
+        }
+    }
+    fn from_code(code: u8) -> Option<BlockingSyscallClass> {
+        match code {
+            1 => Some(BlockingSyscallClass::IpcRecv),
+            2 => Some(BlockingSyscallClass::IpcCall),
+            3 => Some(BlockingSyscallClass::IpcSend),
+            _ => None,
+        }
+    }
+}
 
 /// Stage 198A1: per-CPU "a canonical blocking syscall blocked+dispatched-away this trap" token.
 /// Stores `tid + 1` (0 = unset); consumed once by the RISC-V trap-entry wrapper.
@@ -1431,24 +1468,44 @@ pub(crate) static BLOCKED_SYSCALL_IDLE_PROVENANCE: [core::sync::atomic::AtomicU6
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
 
-/// Stage 198A1: publish authoritative idle provenance — a canonical blocking syscall blocked
-/// `tid` and dispatched away from it on `cpu`. Called from the arch-neutral blocking seam.
-pub(crate) fn blocked_syscall_idle_provenance_set(cpu_idx: usize, tid: u64) {
+/// Stage 198B: per-CPU blocking-syscall class code paired with the provenance token above (only
+/// meaningful while the token is set; single-CPU IRQ-off trap path, so the pair is consistent).
+static BLOCKED_SYSCALL_IDLE_CLASS: [core::sync::atomic::AtomicU8;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 198A1/198B: publish authoritative idle provenance — a canonical blocking syscall of
+/// `class` blocked `tid` and dispatched away from it on `cpu`. Called from the arch-neutral seam.
+pub(crate) fn blocked_syscall_idle_provenance_set(
+    cpu_idx: usize,
+    tid: u64,
+    class: BlockingSyscallClass,
+) {
     if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        BLOCKED_SYSCALL_IDLE_CLASS[cpu_idx]
+            .store(class.to_code(), core::sync::atomic::Ordering::Release);
         BLOCKED_SYSCALL_IDLE_PROVENANCE[cpu_idx]
             .store(tid.wrapping_add(1), core::sync::atomic::Ordering::Release);
     }
 }
 
-/// Stage 198A1: consume the blocking-syscall idle provenance for `cpu` (clear + return the tid,
-/// or `None` if no canonical blocking syscall published provenance this trap).
-pub(crate) fn blocked_syscall_idle_provenance_take(cpu_idx: usize) -> Option<u64> {
+/// Stage 198A1/198B: consume the blocking-syscall idle provenance for `cpu` (clear + return the
+/// `(tid, class)`, or `None` if no canonical blocking syscall published provenance this trap).
+pub(crate) fn blocked_syscall_idle_provenance_take(
+    cpu_idx: usize,
+) -> Option<(u64, BlockingSyscallClass)> {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return None;
     }
     let raw =
         BLOCKED_SYSCALL_IDLE_PROVENANCE[cpu_idx].swap(0, core::sync::atomic::Ordering::AcqRel);
-    (raw != 0).then(|| raw - 1)
+    if raw == 0 {
+        return None;
+    }
+    let code = BLOCKED_SYSCALL_IDLE_CLASS[cpu_idx].swap(0, core::sync::atomic::Ordering::AcqRel);
+    // A set token always co-recorded a valid class; default to IpcRecv only if somehow absent.
+    let class = BlockingSyscallClass::from_code(code).unwrap_or(BlockingSyscallClass::IpcRecv);
+    Some((raw - 1, class))
 }
 
 /// Stage 193A: one-shot latch for the IpcSendPlain boundary retirement markers.
@@ -1549,8 +1606,34 @@ pub(crate) fn maybe_log_ipc_send_ordinary_cap_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendOrdinaryCap");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok");
+        // Stage 198B (ORDINARY-CAP PARITY): arch-tagged on all three arches. The drain executor
+        // (`execute_dispatch_post_work` in runtime.rs) is arch-neutral and reached from all three
+        // trap-entry drains, so the arch string is selected here by `cfg`.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendOrdinaryCap"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendOrdinaryCap result=ok"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendOrdinaryCap");
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendOrdinaryCap result=ok"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendOrdinaryCap"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendOrdinaryCap result=ok"
+            );
+        }
     }
 }
 
@@ -1704,8 +1787,35 @@ pub(crate) fn maybe_log_ipc_send_ordinary_cap_enqueue_retired() {
         )
         .is_ok()
     {
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN class=IpcSendOrdinaryCapEnqueue");
-        crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCapEnqueue result=ok");
+        // Stage 198B (ORDINARY-CAP PARITY): arch-tagged on all three arches. Emitted from the
+        // arch-neutral in-lock enqueue seam (ipc_state.rs), so `cfg` selects the arch string.
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendOrdinaryCapEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendOrdinaryCapEnqueue result=ok"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendOrdinaryCapEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendOrdinaryCapEnqueue result=ok"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendOrdinaryCapEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendOrdinaryCapEnqueue result=ok"
+            );
+        }
     }
 }
 

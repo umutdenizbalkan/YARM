@@ -43,6 +43,18 @@ IPC_SEND_ENQUEUE_ORACLE=${IPC_SEND_ENQUEUE_ORACLE:-0}
 if [[ "$IPC_SEND_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_enqueue_oracle="* ]]; then
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_enqueue_oracle=1"
 fi
+# Stage 198B (ORDINARY-CAP PARITY): AArch64 honors the same env-var -> cmdline knob translations
+# the x86_64 core smoke does for the ordinary-cap IpcSend live oracles. The oracle wrapper exports
+# IPC_SEND_CAP_ORACLE / IPC_SEND_CAP_ENQUEUE_ORACLE; without these the knobs never reach the AArch64
+# kernel cmdline and the ordinary-cap oracle workload never runs.
+IPC_SEND_CAP_ORACLE=${IPC_SEND_CAP_ORACLE:-0}
+if [[ "$IPC_SEND_CAP_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_cap_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_cap_oracle=1"
+fi
+IPC_SEND_CAP_ENQUEUE_ORACLE=${IPC_SEND_CAP_ENQUEUE_ORACLE:-0}
+if [[ "$IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_cap_enqueue_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_cap_enqueue_oracle=1"
+fi
 
 # Stage 178 (CROSS-ARCH-D6): CROSS_ARCH_D6=1 appends yarm.cross_arch_d6=1 to emit the
 # AArch64 D6 restore-path audit markers (model=trapframe_eret; read-only observe of

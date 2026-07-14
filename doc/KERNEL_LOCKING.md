@@ -13926,3 +13926,45 @@ core-smoke and oracle wrappers also gain deterministic idle-aware completion (ki
 QEMU + exit 0 once the required proof markers + `SCHED_ENTER_IDLE_HLT` are observed
 with no forbidden marker), so a clean terminal-idle boot no longer fails on the
 wall-clock timeout. Full record in `doc/SECOND_COHORT_PLAIN_SEAL.md`.
+
+## Stage 198B — SECOND-COHORT ORDINARY-CAP IpcSend cross-architecture parity
+
+Two **ordinary-capability** `IpcSend` success classes go live on all three arches:
+`IpcSendOrdinaryCap` (an ordinary endpoint cap transferred to an already
+`recv-v2`-blocked receiver) and `IpcSendOrdinaryCapEnqueue` (an ordinary-cap
+no-waiter enqueue + later `recv-v2` dequeue). Same **canonical in-lock publish +
+arch-neutral post-lock boundary drain** model as the plain cohort — the drain
+materializes the receiver-local cap through the single live seam
+`materialize_received_cap_snapshot_with_delegation_split`
+(`src/kernel/boot/cap_transfer_delegation_split.rs`), used by BOTH the
+blocked-waiter delivery (`execute_blocked_waiter_ordinary_cap_delivery`) and the
+enqueue's recv-boundary delivery (`complete_recv_boundary_ordinary_cap`).
+
+Stage 198B (a) **arch-tags** the two ordinary-cap retirement markers
+(`maybe_log_ipc_send_ordinary_cap_retired` / `…_enqueue_retired`, `cfg`-selected
+per arch, origin-gated by `ipc_send_cap_boundary_origin_take`), (b) **replicates**
+the x86-only ordinary-cap oracle slot provisioning (blocked = slot 13
+`provision_init_ipc_send_cap_oracle_coord`; enqueue = slot 17 = 2
+`ipc_send_cap_enqueue_oracle_active`) into AArch64 + RISC-V `boot.rs`, and (c) adds
+a kernel-side **authoritative object-identity proof** at the materialize chokepoint:
+after the mint it re-resolves the minted cap OUT of the receiver's cspace and
+compares the FULL `CapObject` to the source object, emitting
+`IPC_ORDINARY_CAP_OBJECT_IDENTITY … match=1` (a real cnode resolve, not a
+`CapId != 0` check). Reply caps are classified by the authoritative
+`source_object == CapObject::Reply` (never a user flag) and deferred, so the
+ordinary-cap seam only ever mints ordinary caps.
+
+The RISC-V ordinary-cap **sender** stays on the canonical handler and returns
+`ReturnToCurrent` (not added to the pre-lock gate). The blocking-idle provenance
+reason is the widened `RiscvIdleReason::BlockedIpcNoRunnable` and records the
+concrete `BlockingSyscallClass` (`IpcRecv`/`IpcCall`/`IpcSend`). The canonical
+ordinary-cap attestations (~138 bytes with the `arch=` tag) exceed an IPC
+`Message::MAX_PAYLOAD` (128), so the DebugLog copy seam ONLY is widened to
+`DEBUG_LOG_MAX_BYTES = 192` in lockstep across userspace + both kernel copy paths
+(IPC framing unchanged; `syscall::debug` made `pub(crate)` for the shared cap
+constant). No ABI change (`SYSCALL_COUNT = 32`, `VARIANT_COUNT = 22`); no new
+kernel lock; no CNode capacity increase; NR 27 absent; reply-cap / shared-region /
+`D2` stay unretired. Live 6-cell seal
+(`scripts/qemu-second-cohort-ordinary-cap-seal.sh`):
+`SECOND_COHORT_ORDINARY_CAP_SEAL arches=3 classes=2 live_cells=6 result=ok`.
+Full record in `doc/SECOND_COHORT_ORDINARY_CAP_SEAL.md`.
