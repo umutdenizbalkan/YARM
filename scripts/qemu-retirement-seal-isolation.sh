@@ -58,9 +58,10 @@ for i in $(seq 1 "$RUNS"); do
   fi
 done
 
+successful_runs=$((RUNS - failed_runs))
 if [[ "$failed_runs" -eq 0 && "$contaminated_runs" -eq 0 && "$timeout_runs" -eq 0 ]]; then
-  echo "RETIREMENT_SEAL_ISOLATION repeated_runs=${RUNS} contaminated_runs=0 timeout_runs=0 result=ok"
+  echo "RETIREMENT_SEAL_ISOLATION serialized=1 repeated_runs=${RUNS} successful_runs=${successful_runs} contaminated_runs=0 timeout_runs=0 result=ok"
   exit 0
 fi
-echo "RETIREMENT_SEAL_ISOLATION repeated_runs=${RUNS} contaminated_runs=${contaminated_runs} timeout_runs=${timeout_runs} failed_runs=${failed_runs} result=fail"
+echo "RETIREMENT_SEAL_ISOLATION serialized=1 repeated_runs=${RUNS} successful_runs=${successful_runs} contaminated_runs=${contaminated_runs} timeout_runs=${timeout_runs} failed_runs=${failed_runs} result=fail"
 exit 1
