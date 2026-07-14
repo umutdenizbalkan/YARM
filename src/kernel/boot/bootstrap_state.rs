@@ -70,6 +70,23 @@ impl Bootstrap {
         }
     }
 
+    /// Initialize an array of `Option<T>` elements directly in final storage.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must point at aligned, writable, uninitialized storage for
+    /// `[Option<T>; N]`. No reference to the array may be published until all
+    /// elements have been written.
+    #[cfg(not(feature = "hosted-dev"))]
+    unsafe fn init_option_array_none<T, const N: usize>(destination: *mut [Option<T>; N]) {
+        unsafe {
+            let elem = destination.cast::<Option<T>>();
+            for idx in 0..N {
+                elem.add(idx).write(None);
+            }
+        }
+    }
+
     #[inline(never)]
     fn default_boot_memory_map() -> ([MemoryRegion; MAX_BOOT_MEMORY_REGIONS], usize) {
         let mut staged = [MemoryRegion {
@@ -646,32 +663,65 @@ impl Bootstrap {
             })?;
 
         crate::arch::boot_entry::bootstrap_step("scheduler_new");
-        let mut scheduler = SmpScheduler::default();
         let present_cpu_bitmap =
             crate::arch::boot_entry::take_staged_present_cpu_bitmap_for_bootstrap()
                 .unwrap_or_else(topology::default_present_cpu_bitmap);
-        scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
-        scheduler
-            .enqueue_on(
-                CpuId(platform_constants::BOOTSTRAP_CPU_ID),
-                crate::kernel::ipc::ThreadId(0),
-            )
-            .map_err(map_scheduler_error)?;
 
         crate::arch::boot_entry::bootstrap_step("kernel_state_write");
         unsafe {
             core::ptr::addr_of_mut!((*state_ptr).kernel_aspace).write(kernel_aspace);
             core::ptr::addr_of_mut!((*state_ptr).hal)
                 .write(crate::arch::hal::SelectedIsaHal::default());
-            core::ptr::addr_of_mut!((*state_ptr).user_spaces)
-                .write(store_kernel_value(AddressSpaceManager::default()));
-            core::ptr::addr_of_mut!((*state_ptr).scheduler_state).write(SpinLockIrq::new(
-                SchedulerState {
-                    scheduler: store_kernel_value(scheduler),
-                    timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS),
-                    current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
-                },
-            ));
+            #[cfg(feature = "hosted-dev")]
+            {
+                core::ptr::addr_of_mut!((*state_ptr).user_spaces)
+                    .write(store_kernel_value(AddressSpaceManager::default()));
+                let mut scheduler = SmpScheduler::default();
+                scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
+                scheduler
+                    .enqueue_on(
+                        CpuId(platform_constants::BOOTSTRAP_CPU_ID),
+                        crate::kernel::ipc::ThreadId(0),
+                    )
+                    .map_err(map_scheduler_error)?;
+                core::ptr::addr_of_mut!((*state_ptr).scheduler_state).write(SpinLockIrq::new(
+                    SchedulerState {
+                        scheduler: store_kernel_value(scheduler),
+                        timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS),
+                        current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
+                    },
+                ));
+            }
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                AddressSpaceManager::init_in_place_default(core::ptr::addr_of_mut!(
+                    (*state_ptr).user_spaces
+                )
+                    as *mut AddressSpaceManager);
+                crate::kernel::lock::SpinLockIrq::init_in_place(
+                    core::ptr::addr_of_mut!((*state_ptr).scheduler_state),
+                    |scheduler_state_ptr| {
+                        let scheduler_ptr =
+                            core::ptr::addr_of_mut!((*scheduler_state_ptr).scheduler)
+                                as *mut SmpScheduler;
+                        SmpScheduler::init_in_place_default(scheduler_ptr);
+                        let scheduler = &mut *scheduler_ptr;
+                        scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
+                        scheduler
+                            .enqueue_on(
+                                CpuId(platform_constants::BOOTSTRAP_CPU_ID),
+                                crate::kernel::ipc::ThreadId(0),
+                            )
+                            .map_err(map_scheduler_error)?;
+                        core::ptr::addr_of_mut!((*scheduler_state_ptr).timer).write(Timer::new(
+                            platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+                        ));
+                        core::ptr::addr_of_mut!((*scheduler_state_ptr).current_cpu)
+                            .write(CpuId(platform_constants::BOOTSTRAP_CPU_ID));
+                        Ok(())
+                    },
+                )?;
+            }
             core::ptr::addr_of_mut!((*state_ptr).ipc_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).driver_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).fault_state_lock).write(SpinLockIrq::new(()));
@@ -683,34 +733,116 @@ impl Bootstrap {
             core::ptr::addr_of_mut!((*state_ptr).vm_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).task_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).memory_state_lock).write(SpinLockIrq::new(()));
-            core::ptr::addr_of_mut!((*state_ptr).ipc).write(store_kernel_value(IpcSubsystem {
-                cross_cpu_work: SmpMailbox::default(),
-                live_tlb_shootdown: LiveTlbShootdownState {
-                    next_sequence: 1,
-                    active: None,
-                },
-                endpoints: [const { None }; MAX_ENDPOINTS],
-                endpoint_waiters: [None; MAX_ENDPOINTS],
-                endpoint_sender_waiters: [[None; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
-                endpoint_generations: [0; MAX_ENDPOINTS],
-                notifications: [const { None }; MAX_NOTIFICATIONS],
-                notification_waiters: [None; MAX_NOTIFICATIONS],
-                notification_generations: [0; MAX_NOTIFICATIONS],
-                irq_routes: [None; MAX_IRQ_LINES],
-                transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
-                transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
-                active_transfer_mappings: [const { None }; MAX_TRANSFER_ENVELOPES],
-                reply_caps: [const { None }; MAX_REPLY_CAPS],
-                reply_cap_generations: [0; MAX_REPLY_CAPS],
-                telemetry: IpcPathTelemetry::default(),
-            }));
-            core::ptr::addr_of_mut!((*state_ptr).capability).write(CapabilitySubsystem {
-                cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
-                process_cnodes: store_kernel_value([const { None }; MAX_TASKS]),
-                delegated_capability_links: store_kernel_value(
-                    [const { None }; MAX_DELEGATED_CAPABILITY_LINKS],
-                ),
-            });
+            #[cfg(feature = "hosted-dev")]
+            {
+                core::ptr::addr_of_mut!((*state_ptr).ipc).write(store_kernel_value(IpcSubsystem {
+                    cross_cpu_work: SmpMailbox::default(),
+                    live_tlb_shootdown: LiveTlbShootdownState {
+                        next_sequence: 1,
+                        active: None,
+                    },
+                    endpoints: [const { None }; MAX_ENDPOINTS],
+                    endpoint_waiters: [None; MAX_ENDPOINTS],
+                    endpoint_sender_waiters: [[None; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
+                    endpoint_generations: [0; MAX_ENDPOINTS],
+                    notifications: [const { None }; MAX_NOTIFICATIONS],
+                    notification_waiters: [None; MAX_NOTIFICATIONS],
+                    notification_generations: [0; MAX_NOTIFICATIONS],
+                    irq_routes: [None; MAX_IRQ_LINES],
+                    transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
+                    transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
+                    active_transfer_mappings: [const { None }; MAX_TRANSFER_ENVELOPES],
+                    reply_caps: [const { None }; MAX_REPLY_CAPS],
+                    reply_cap_generations: [0; MAX_REPLY_CAPS],
+                    telemetry: IpcPathTelemetry::default(),
+                }));
+                core::ptr::addr_of_mut!((*state_ptr).capability).write(CapabilitySubsystem {
+                    cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
+                    process_cnodes: store_kernel_value([const { None }; MAX_TASKS]),
+                    delegated_capability_links: store_kernel_value(
+                        [const { None }; MAX_DELEGATED_CAPABILITY_LINKS],
+                    ),
+                });
+                core::ptr::addr_of_mut!((*state_ptr).tcbs)
+                    .write(store_kernel_value([const { None }; MAX_TASKS]));
+                core::ptr::addr_of_mut!((*state_ptr).task_classes)
+                    .write(store_kernel_value([None; MAX_TASKS]));
+                core::ptr::addr_of_mut!((*state_ptr).tls_restore_pending)
+                    .write(store_kernel_value([None; MAX_TASKS]));
+                core::ptr::addr_of_mut!((*state_ptr).robust_futex)
+                    .write(store_kernel_value([None; MAX_TASKS]));
+            }
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let ipc_ptr = core::ptr::addr_of_mut!((*state_ptr).ipc) as *mut IpcSubsystem;
+                core::ptr::addr_of_mut!((*ipc_ptr).cross_cpu_work).write(SmpMailbox::default());
+                core::ptr::addr_of_mut!((*ipc_ptr).live_tlb_shootdown).write(
+                    LiveTlbShootdownState {
+                        next_sequence: 1,
+                        active: None,
+                    },
+                );
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).endpoints));
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).endpoint_waiters));
+                let sender_waiters = core::ptr::addr_of_mut!((*ipc_ptr).endpoint_sender_waiters)
+                    .cast::<Option<SenderWaiter>>();
+                for idx in 0..(MAX_ENDPOINTS * MAX_ENDPOINT_SENDER_WAITERS) {
+                    sender_waiters.add(idx).write(None);
+                }
+                core::ptr::write_bytes(
+                    core::ptr::addr_of_mut!((*ipc_ptr).endpoint_generations).cast::<u8>(),
+                    0,
+                    core::mem::size_of::<[u64; MAX_ENDPOINTS]>(),
+                );
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).notifications));
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*ipc_ptr).notification_waiters
+                ));
+                core::ptr::write_bytes(
+                    core::ptr::addr_of_mut!((*ipc_ptr).notification_generations).cast::<u8>(),
+                    0,
+                    core::mem::size_of::<[u64; MAX_NOTIFICATIONS]>(),
+                );
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).irq_routes));
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*ipc_ptr).transfer_envelopes
+                ));
+                core::ptr::write_bytes(
+                    core::ptr::addr_of_mut!((*ipc_ptr).transfer_envelope_generations).cast::<u8>(),
+                    0,
+                    core::mem::size_of::<[u64; MAX_TRANSFER_ENVELOPES]>(),
+                );
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*ipc_ptr).active_transfer_mappings
+                ));
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).reply_caps));
+                core::ptr::write_bytes(
+                    core::ptr::addr_of_mut!((*ipc_ptr).reply_cap_generations).cast::<u8>(),
+                    0,
+                    core::mem::size_of::<[u64; MAX_REPLY_CAPS]>(),
+                );
+                core::ptr::addr_of_mut!((*ipc_ptr).telemetry).write(IpcPathTelemetry::default());
+
+                let cap_ptr = core::ptr::addr_of_mut!((*state_ptr).capability);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*cap_ptr).cnode_spaces)
+                    as *mut [Option<CNodeSpace>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*cap_ptr).process_cnodes)
+                    as *mut [Option<ProcessCNodeRecord>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*cap_ptr).delegated_capability_links
+                )
+                    as *mut [Option<DelegatedCapabilityLink>; MAX_DELEGATED_CAPABILITY_LINKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*state_ptr).tcbs)
+                    as *mut [Option<ThreadControlBlock>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*state_ptr).task_classes)
+                    as *mut [Option<TaskClass>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*state_ptr).tls_restore_pending
+                )
+                    as *mut [Option<ThreadId>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*state_ptr).robust_futex)
+                    as *mut [Option<RobustFutexRecord>; MAX_TASKS]);
+            }
             core::ptr::addr_of_mut!((*state_ptr).tid_allocation_policy).write(
                 TidAllocationPolicy::new(STATIC_TID_UPPER_BOUND, INITIAL_DYNAMIC_TID),
             );
@@ -720,14 +852,6 @@ impl Bootstrap {
                     INITIAL_DYNAMIC_TID,
                 )),
             );
-            core::ptr::addr_of_mut!((*state_ptr).tcbs)
-                .write(store_kernel_value([const { None }; MAX_TASKS]));
-            core::ptr::addr_of_mut!((*state_ptr).task_classes)
-                .write(store_kernel_value([None; MAX_TASKS]));
-            core::ptr::addr_of_mut!((*state_ptr).tls_restore_pending)
-                .write(store_kernel_value([None; MAX_TASKS]));
-            core::ptr::addr_of_mut!((*state_ptr).robust_futex)
-                .write(store_kernel_value([None; MAX_TASKS]));
             #[cfg(feature = "hosted-dev")]
             {
                 let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
@@ -751,9 +875,8 @@ impl Bootstrap {
             #[cfg(not(feature = "hosted-dev"))]
             {
                 let memory_ptr = core::ptr::addr_of_mut!((*state_ptr).memory);
-                core::ptr::addr_of_mut!((*memory_ptr).memory_objects)
-                    .write([None; MAX_MEMORY_OBJECTS]);
-                core::ptr::addr_of_mut!((*memory_ptr).brk_regions).write([None; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*memory_ptr).memory_objects));
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*memory_ptr).brk_regions));
                 core::ptr::addr_of_mut!((*memory_ptr).cow_pages)
                     .write(alloc::collections::BTreeMap::new());
                 #[cfg(test)]
