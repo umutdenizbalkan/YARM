@@ -76,23 +76,29 @@ seal_cap_direct() { # <arch> <logfile>
   local arch="$1" log="$2"
   local retire="GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcSendOrdinaryCap result=ok"
   local attest="IPCSEND_ORDINARY_CAP_BLOCKED_RECEIVER_ORACLE_DONE arch=${arch} result=ok payload_len=8 receiver_resumes=1 fresh_cap=1 object_identity_ok=1"
-  if rg -a -N "$retire" "$log" >/dev/null 2>&1 && rg -a -N "$attest" "$log" >/dev/null 2>&1; then
-    echo "SECOND_COHORT_ORDINARY_CAP_SEAL arch=${arch} class=IpcSendOrdinaryCap result=ok proof=live"
+  # Stage 198B1 Part C: capability-rights attestation. The destination rights must
+  # match the canonical copy/delegation result, the source cap must survive the
+  # transfer (copy semantics), and NO reply-cap metadata may appear.
+  local rights="IPCSEND_ORDINARY_CAP_RIGHTS_OK arch=${arch} class=IpcSendOrdinaryCap source_semantics=copy destination_rights_ok=1 source_still_valid=1 reply_metadata=0"
+  if rg -a -N "$retire" "$log" >/dev/null 2>&1 && rg -a -N "$attest" "$log" >/dev/null 2>&1 && rg -a -N "$rights" "$log" >/dev/null 2>&1; then
+    echo "SECOND_COHORT_ORDINARY_CAP_SEAL arch=${arch} class=IpcSendOrdinaryCap result=ok proof=live rights=attested"
     live_cells=$((live_cells+1)); return 0
   fi
   echo "SECOND_COHORT_ORDINARY_CAP_SEAL arch=${arch} class=IpcSendOrdinaryCap result=MISSING"
-  die "no live proof for arch=${arch} class=IpcSendOrdinaryCap"; return 1
+  die "no live proof (retire+attest+rights) for arch=${arch} class=IpcSendOrdinaryCap"; return 1
 }
 seal_cap_enqueue() { # <arch> <logfile>
   local arch="$1" log="$2"
   local retire="GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcSendOrdinaryCapEnqueue result=ok"
   local attest="IPCSEND_ORDINARY_CAP_ENQUEUE_ORACLE_DONE arch=${arch} result=ok payload_len=8 dequeue_count=1 fresh_cap=1 object_identity_ok=1"
-  if rg -a -N "$retire" "$log" >/dev/null 2>&1 && rg -a -N "$attest" "$log" >/dev/null 2>&1; then
-    echo "SECOND_COHORT_ORDINARY_CAP_SEAL arch=${arch} class=IpcSendOrdinaryCapEnqueue result=ok proof=live"
+  # Stage 198B1 Part C: same rights attestation for the queued-delivery class.
+  local rights="IPCSEND_ORDINARY_CAP_RIGHTS_OK arch=${arch} class=IpcSendOrdinaryCapEnqueue source_semantics=copy destination_rights_ok=1 source_still_valid=1 reply_metadata=0"
+  if rg -a -N "$retire" "$log" >/dev/null 2>&1 && rg -a -N "$attest" "$log" >/dev/null 2>&1 && rg -a -N "$rights" "$log" >/dev/null 2>&1; then
+    echo "SECOND_COHORT_ORDINARY_CAP_SEAL arch=${arch} class=IpcSendOrdinaryCapEnqueue result=ok proof=live rights=attested"
     live_cells=$((live_cells+1)); return 0
   fi
   echo "SECOND_COHORT_ORDINARY_CAP_SEAL arch=${arch} class=IpcSendOrdinaryCapEnqueue result=MISSING"
-  die "no live proof for arch=${arch} class=IpcSendOrdinaryCapEnqueue"; return 1
+  die "no live proof (retire+attest+rights) for arch=${arch} class=IpcSendOrdinaryCapEnqueue"; return 1
 }
 
 echo "── second-cohort ordinary-cap seal matrix ──"
