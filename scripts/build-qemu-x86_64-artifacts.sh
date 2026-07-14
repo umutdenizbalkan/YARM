@@ -60,6 +60,8 @@ BUILD_LOG=${BUILD_LOG:-$OUT_DIR/x86_64-build.log}
 
 mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
+# Stage 198B1 Part A: record build-start + delete stale outputs (fail closed).
+common_build_integrity_init
 
 CARGO_Z_ARGS=()
 if cargo -V 2>/dev/null | grep -qi nightly; then
@@ -72,7 +74,9 @@ else
 fi
 
 echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} for ${KERNEL_RUST_TARGET}"
-set +e
+# Stage 198B1 Part A: NO `set +e` — `set -euo pipefail` (with the `| tee` under
+# pipefail) makes every cargo build fatal; a compile/link failure aborts here
+# and NO artifact is published (the stale output was already deleted).
 cargo build \
   --target "$KERNEL_RUST_TARGET" \
   --profile "$SERVER_BUILD_PROFILE" \
@@ -172,24 +176,16 @@ if common_supervisor_restart_test_enabled; then
 else
   CRASH_TEST_SERVER_BUILD_STATUS=0
 fi
-set -e
+# Stage 198B1 Part A: every cargo build above ran fail-closed under
+# `set -euo pipefail`; reaching here means all of them succeeded.
 
-if [[ "$KERNEL_BUILD_STATUS" -ne 0 || \
-      "$SERVER_BUILD_STATUS" -ne 0 || \
-      "$PM_BUILD_STATUS" -ne 0 || \
-      "$SUPERVISOR_BUILD_STATUS" -ne 0 || \
-      "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 || \
-      "$DEVFS_SERVER_BUILD_STATUS" -ne 0 || \
-      "$VFS_SERVER_BUILD_STATUS" -ne 0 || \
-      "$DRIVER_MANAGER_BUILD_STATUS" -ne 0 || \
-      "$BLKCACHE_SERVER_BUILD_STATUS" -ne 0 || \
-      "$VIRTIO_BLK_SERVER_BUILD_STATUS" -ne 0 || \
-      "$RAMFS_SERVER_BUILD_STATUS" -ne 0 || \
-      "$FAT_SERVER_BUILD_STATUS" -ne 0 || \
-      "$EXT4_SERVER_BUILD_STATUS" -ne 0 || "$CRASH_TEST_SERVER_BUILD_STATUS" -ne 0 ]]; then
-  common_exit_if_strict_mode
-fi
-
+# Staging: a MISSING ELF fails closed (the helpers call common_exit_if_strict_mode,
+# which now always `exit`s — uncatchable by `|| true`). `|| true` is retained ONLY
+# so the pre-existing advisory ELF-hygiene checks (RWE / W^X page-overlap) stay
+# advisory exactly as before — those are NOT build/compile/copy failures and are
+# out of scope for Stage 198B1. The fatal freshness+existence gate below
+# (common_verify_initramfs_stage_paths) is what actually rejects a missing/stale
+# staged artifact, so a failed server compile still fails the build closed.
 common_stage_server_init_elf || true
 common_stage_aux_server_elf || true
 common_stage_supervisor_elf || true
@@ -203,24 +199,32 @@ common_stage_ramfs_server_elf || true
 common_stage_fat_server_elf || true
 common_stage_ext4_server_elf || true
 common_stage_crash_test_server_elf || true
-common_verify_initramfs_stage_paths || true
+# FATAL gate: every required initramfs path must exist AND be fresh (mtime newer
+# than build-start) — a missing/stale staged ELF aborts here.
+common_verify_initramfs_stage_paths
 # Phase 3B: use 4096-byte-aligned packer so late-service ELFs can be zero-copy loaded.
 common_create_initramfs_aligned
 
-if [[ -f "$KERNEL_ELF" ]]; then
-  cp "$KERNEL_ELF" "$KERNEL_IMAGE"
-  cp "$KERNEL_ELF" "$KERNEL_DEBUG_ELF"
+# Stage 198B1 Part A: publish the kernel image atomically (stage to a temp
+# sibling, then mv). `set -e` guarantees a failed cp aborts.
+if [[ ! -f "$KERNEL_ELF" ]]; then
+  echo "[error][integrity] kernel ELF not produced by the build: $KERNEL_ELF"
+  exit 1
 fi
+cp "$KERNEL_ELF" "${KERNEL_IMAGE}.staging.$$"
+mv -f "${KERNEL_IMAGE}.staging.$$" "$KERNEL_IMAGE"
+cp "$KERNEL_ELF" "${KERNEL_DEBUG_ELF}.staging.$$"
+mv -f "${KERNEL_DEBUG_ELF}.staging.$$" "$KERNEL_DEBUG_ELF"
+
+# Freshness + marker + manifest gates (fail closed on any violation).
+common_verify_artifact_fresh "$KERNEL_IMAGE" "kernel image"
+common_verify_artifact_fresh "$INITRAMFS_IMAGE_ABS" "initramfs image"
+common_verify_kernel_markers "$KERNEL_IMAGE" "x86_64"
+common_write_manifest "x86_64" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE_ABS"
+common_emit_build_integrity_line "x86_64"
 
 echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"
-
-if [[ -f "$KERNEL_IMAGE" ]]; then
-  echo "[ok] kernel image: $KERNEL_IMAGE"
-else
-  echo "[warn] kernel image missing: $KERNEL_IMAGE"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
-fi
-
+echo "[ok] kernel image: $KERNEL_IMAGE"
 [[ -f "$KERNEL_DEBUG_ELF" ]] && echo "[ok] kernel debug elf: $KERNEL_DEBUG_ELF"
 
 echo "[ok] x86_64 qemu artifacts completed"

@@ -848,6 +848,19 @@ impl crate::runtime::SharedKernel {
         receiver_cnode: CNodeId,
         cap: CapId,
     ) -> Option<CapObject> {
+        self.resolved_capability_split(receiver_cnode, cap)
+            .map(|c| c.object)
+    }
+
+    /// Stage 198B1 Part C: like `resolved_cap_object_split`, but returns the FULL
+    /// `Capability` (object + rights) so the ordinary-cap delivery layer can
+    /// authoritatively attest the destination rights AND the object identity of
+    /// the freshly minted receiver-local cap. Rank-4 capability seam only.
+    pub(crate) fn resolved_capability_split(
+        &self,
+        receiver_cnode: CNodeId,
+        cap: CapId,
+    ) -> Option<Capability> {
         self.with_capability_state_split_mut(|capability| {
             capability
                 .cnode_spaces
@@ -855,7 +868,6 @@ impl crate::runtime::SharedKernel {
                 .flatten()
                 .find(|space| space.id == receiver_cnode)
                 .and_then(|space| kernel_ref(&space.cspace).get(cap))
-                .map(|c| c.object)
         })
     }
 }

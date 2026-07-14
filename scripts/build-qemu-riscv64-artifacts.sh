@@ -52,6 +52,8 @@ BUILD_LOG=${BUILD_LOG:-$OUT_DIR/riscv64-build.log}
 
 mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
+# Stage 198B1 Part A: record build-start + delete stale outputs (fail closed).
+common_build_integrity_init
 
 CARGO_Z_ARGS=()
 if cargo -V 2>/dev/null | rg -q "nightly"; then
@@ -60,7 +62,7 @@ if cargo -V 2>/dev/null | rg -q "nightly"; then
 fi
 
 echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} for ${KERNEL_RUST_TARGET} and ${SERVER_PACKAGE}/${SERVER_BIN} for ${SERVER_RUST_TARGET}"
-set +e
+# Stage 198B1 Part A: NO `set +e` — every cargo build is fatal under `set -euo pipefail`.
 cargo build --target "$KERNEL_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$KERNEL_PACKAGE" --bin "$KERNEL_BIN" "${CARGO_Z_ARGS[@]}"
 KERNEL_BUILD_STATUS=$?
 cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$SERVER_BIN" "${CARGO_Z_ARGS[@]}"
@@ -105,9 +107,12 @@ if common_supervisor_restart_test_enabled; then
 else
   CRASH_TEST_SERVER_BUILD_STATUS=0
 fi
-set -e
-[[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 || "$PM_BUILD_STATUS" -ne 0 || "$SUPERVISOR_BUILD_STATUS" -ne 0 || "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 || "$DEVFS_SERVER_BUILD_STATUS" -ne 0 || "$VFS_SERVER_BUILD_STATUS" -ne 0 || "$BLKCACHE_SERVER_BUILD_STATUS" -ne 0 || "$VIRTIO_BLK_SERVER_BUILD_STATUS" -ne 0 || "$DRIVER_MANAGER_BUILD_STATUS" -ne 0 || "$RAMFS_SERVER_BUILD_STATUS" -ne 0 || "$FAT_SERVER_BUILD_STATUS" -ne 0 || "$EXT4_SERVER_BUILD_STATUS" -ne 0 || "$CRASH_TEST_SERVER_BUILD_STATUS" -ne 0 ]] && common_exit_if_strict_mode
+# Stage 198B1 Part A: every cargo build above ran fail-closed; reaching here
+# means all succeeded.
 
+# Staging: `|| true` keeps the pre-existing advisory ELF-hygiene checks advisory;
+# a MISSING ELF still fails closed (helpers `exit`), and the fatal freshness gate
+# below rejects a missing/stale staged artifact.
 common_stage_server_init_elf || true
 common_stage_aux_server_elf || true
 common_stage_supervisor_elf || true
@@ -121,39 +126,34 @@ common_stage_ramfs_server_elf || true
 common_stage_fat_server_elf || true
 common_stage_ext4_server_elf || true
 common_stage_crash_test_server_elf || true
-common_verify_initramfs_stage_paths || true
+common_verify_initramfs_stage_paths
 common_create_initramfs_aligned
 
-if [[ -f "$KERNEL_ELF" ]]; then
-  if command -v llvm-objcopy >/dev/null 2>&1; then
-    llvm-objcopy -O binary "$KERNEL_ELF" "$KERNEL_IMAGE" || true
-  elif command -v rust-objcopy >/dev/null 2>&1; then
-    rust-objcopy -O binary "$KERNEL_ELF" "$KERNEL_IMAGE" || true
-  fi
+# Stage 198B1 Part A: objcopy the kernel to the booted raw binary atomically; a
+# failed objcopy aborts (no `|| true`).
+if [[ ! -f "$KERNEL_ELF" ]]; then
+  echo "[error][integrity] kernel ELF not produced by the build: $KERNEL_ELF"
+  exit 1
 fi
-
-artifact_report() {
-  local label="$1"
-  local path="$2"
-  if [[ -f "$path" ]]; then
-    local sz
-    sz=$(stat -c '%s' "$path" 2>/dev/null || wc -c <"$path")
-    echo "[ok] ${label}: ${path} (size=${sz} bytes)"
-    return 0
-  fi
-  echo "[fail] ${label} missing: ${path}"
-  return 1
-}
-
-missing=0
-artifact_report "initramfs image" "$INITRAMFS_IMAGE_ABS" || missing=$((missing + 1))
-artifact_report "kernel image" "$KERNEL_IMAGE" || missing=$((missing + 1))
-
-if (( missing > 0 )); then
-  echo "[fail] build-qemu-riscv64-artifacts: ${missing} required artifact(s) missing"
-  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
-  exit 0
+if command -v llvm-objcopy >/dev/null 2>&1; then
+  llvm-objcopy -O binary "$KERNEL_ELF" "${KERNEL_IMAGE}.staging.$$"
+elif command -v rust-objcopy >/dev/null 2>&1; then
+  rust-objcopy -O binary "$KERNEL_ELF" "${KERNEL_IMAGE}.staging.$$"
+else
+  echo "[error][integrity] no objcopy available to produce raw kernel binary: $KERNEL_IMAGE"
+  exit 1
 fi
+mv -f "${KERNEL_IMAGE}.staging.$$" "$KERNEL_IMAGE"
 
+# Freshness + marker + manifest gates (fail closed). $KERNEL_IMAGE IS the booted
+# raw binary on riscv64.
+common_verify_artifact_fresh "$KERNEL_IMAGE" "kernel image"
+common_verify_artifact_fresh "$INITRAMFS_IMAGE_ABS" "initramfs image"
+common_verify_kernel_markers "$KERNEL_IMAGE" "riscv64"
+common_write_manifest "riscv64" "$KERNEL_IMAGE" "$INITRAMFS_IMAGE_ABS"
+common_emit_build_integrity_line "riscv64"
+
+echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"
+echo "[ok] kernel image: $KERNEL_IMAGE"
 echo "[ok] riscv64 qemu artifacts completed"
 echo "[next] run smoke boot: scripts/qemu-riscv64-core-smoke.sh"

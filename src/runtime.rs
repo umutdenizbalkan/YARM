@@ -1396,11 +1396,14 @@ impl SharedKernel {
         receiver_tid: u64,
         receiver_cnode: crate::kernel::capabilities::CNodeId,
         source_object: crate::kernel::capabilities::CapObject,
+        expected_rights: crate::kernel::capabilities::CapRights,
         cap: crate::kernel::capabilities::CapId,
     ) {
         use crate::kernel::capabilities::CapObject;
-        let installed = self.resolved_cap_object_split(receiver_cnode, cap);
-        let identity_match = installed == Some(source_object);
+        // Resolve the FULL freshly-minted capability (object + rights) out of the receiver cspace.
+        let installed = self.resolved_capability_split(receiver_cnode, cap);
+        let installed_object = installed.map(|c| c.object);
+        let identity_match = installed_object == Some(source_object);
         let endpoint_index = |obj: &CapObject| match obj {
             CapObject::Endpoint { index, .. } => Some(*index),
             _ => None,
@@ -1409,8 +1412,32 @@ impl SharedKernel {
             "IPC_ORDINARY_CAP_OBJECT_IDENTITY receiver_tid={} src_endpoint={:?} dst_endpoint={:?} match={}",
             receiver_tid,
             endpoint_index(&source_object),
-            installed.as_ref().and_then(endpoint_index),
+            installed_object.as_ref().and_then(endpoint_index),
             identity_match as u8
+        );
+        // Stage 198B1 Part C: AUTHORITATIVE capability-entry (rights + metadata) attestation.
+        //  * destination rights MUST equal the canonical transfer/delegation result (the snapshot
+        //    `expected_rights`, taken from `source_capability.rights()` — ordinary-cap transfer does
+        //    NOT attenuate), so `rights_ok=1`.
+        //  * the minted object MUST be an Endpoint, NOT a Reply — reply-cap metadata is absent
+        //    (`reply_object=0`), so a reply cap can never be misclassified as ordinary here.
+        //  * the endpoint generation is carried for validity (nonzero on a live object).
+        let dst_rights_bits = installed.map(|c| c.rights_bits());
+        let rights_ok = dst_rights_bits == Some(expected_rights.bits());
+        let (is_endpoint, generation) = match installed_object {
+            Some(CapObject::Endpoint { generation, .. }) => (true, generation),
+            _ => (false, 0),
+        };
+        let reply_object = matches!(installed_object, Some(CapObject::Reply { .. })) as u8;
+        crate::yarm_log!(
+            "IPC_ORDINARY_CAP_RIGHTS receiver_tid={} dst_rights={:?} expected_rights={} rights_ok={} object_endpoint={} reply_object={} generation={}",
+            receiver_tid,
+            dst_rights_bits,
+            expected_rights.bits(),
+            rights_ok as u8,
+            is_endpoint as u8,
+            reply_object,
+            generation
         );
     }
 
@@ -1478,11 +1505,12 @@ impl SharedKernel {
                     cap.0
                 );
                 crate::yarm_log!("CAP_TRANSFER_BOUNDARY_SEAM_DELEGATION_OK kind=ordinary");
-                // Stage 198B: authoritative object-identity proof of the freshly minted cap.
+                // Stage 198B / 198B1: authoritative object-identity + rights proof of the cap.
                 self.log_ordinary_cap_object_identity(
                     pending.receiver_tid,
                     pending.receiver_cnode,
                     pending.object,
+                    pending.rights,
                     cap,
                 );
                 cap.0
@@ -1969,11 +1997,12 @@ impl SharedKernel {
                     snap.waiter_tid,
                     cap.0
                 );
-                // Stage 198B: authoritative object-identity proof of the freshly minted cap.
+                // Stage 198B / 198B1: authoritative object-identity + rights proof of the cap.
                 self.log_ordinary_cap_object_identity(
                     snap.waiter_tid,
                     snap.receiver_cnode,
                     snap.object,
+                    snap.rights,
                     cap,
                 );
                 // Stage 193C: IpcSend-origin ordinary-cap deliveries emit the boundary

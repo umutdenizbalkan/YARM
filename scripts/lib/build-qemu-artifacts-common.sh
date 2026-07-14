@@ -3,10 +3,110 @@
 
 set -euo pipefail
 
+# Stage 198B1 Part A: fail closed. Historically this exited only when
+# ARTIFACTS_STRICT=1, so a compile/stage failure under the default (non-strict)
+# build was swallowed and a STALE kernel remained at the output path and booted
+# (the exact defect that made 128-byte DebugLog behavior look current in Stage
+# 198B). It now ALWAYS exits nonzero — a failed compile, link, objcopy,
+# initramfs build, or copy aborts the whole build. `ARTIFACTS_STRICT` is retained
+# only as an explicit override for callers that still want to force the legacy
+# soft-skip (set ARTIFACTS_SOFT_FAIL=1), which nothing in the seal path does.
 common_exit_if_strict_mode() {
-  if [[ "${ARTIFACTS_STRICT:-0}" == "1" ]]; then
-    exit 1
+  if [[ "${ARTIFACTS_SOFT_FAIL:-0}" == "1" ]]; then
+    echo "[warn] ARTIFACTS_SOFT_FAIL=1: continuing past a build/stage failure (NOT for seals)"
+    return 0
   fi
+  echo "[error] build/stage step failed — failing closed (no stale artifact will be published)"
+  exit 1
+}
+
+# ── Stage 198B1 Part A: fail-closed artifact build integrity ──────────────────
+#
+# Record a build-start stamp and DELETE the output artifacts up front, so a
+# failed build leaves NO artifact at the expected output path (never accept an
+# artifact merely because a file already exists). Published artifacts are later
+# required to be strictly newer than this stamp.
+common_build_integrity_init() {
+  BUILD_START_EPOCH="$(date +%s)"
+  BUILD_START_HUMAN="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  BUILD_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+  ARTIFACT_MANIFEST="${ARTIFACT_MANIFEST:-$OUT_DIR/artifact-manifest.txt}"
+  export BUILD_START_EPOCH BUILD_START_HUMAN BUILD_COMMIT ARTIFACT_MANIFEST
+  rm -f "$KERNEL_IMAGE" "$INITRAMFS_IMAGE" "$INITRAMFS_IMAGE_ABS" "$ARTIFACT_MANIFEST" 2>/dev/null || true
+  [[ -n "${KERNEL_DEBUG_ELF:-}" ]] && rm -f "$KERNEL_DEBUG_ELF" 2>/dev/null || true
+  echo "[integrity] build-start=$BUILD_START_HUMAN epoch=$BUILD_START_EPOCH commit=$BUILD_COMMIT out_dir=$OUT_DIR"
+}
+
+# Assert a just-published artifact exists AND is strictly newer than build-start
+# (a stale artifact from a prior build has an older mtime and is rejected).
+common_verify_artifact_fresh() {
+  local path="$1" label="$2"
+  if [[ ! -f "$path" ]]; then
+    echo "[error][integrity] $label missing after build (fail closed): $path"
+    return 1
+  fi
+  local m
+  m="$(stat -c '%Y' "$path")"
+  if [[ "$m" -lt "${BUILD_START_EPOCH:?build-integrity not initialized}" ]]; then
+    echo "[error][integrity] $label is STALE (mtime $m < build-start $BUILD_START_EPOCH): $path"
+    return 1
+  fi
+  echo "[integrity] fresh: $label mtime=$m > build-start=$BUILD_START_EPOCH ($path)"
+}
+
+# Verify the freshly produced kernel binary CONTAINS every required marker and
+# NONE of the forbidden/obsolete ones. The untagged ordinary-cap retirement
+# marker is the exact stale-kernel fingerprint (pre-198B kernels carry it).
+common_verify_kernel_markers() {
+  local kernel="$1" arch="$2" rc=0 m
+  local required=(
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcSendOrdinaryCap result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcSendOrdinaryCapEnqueue result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcSendPlain result=ok"
+    "IPC_ORDINARY_CAP_OBJECT_IDENTITY"
+  )
+  local forbidden=(
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok"
+    "class=IpcSendReplyCapEnqueue"
+    "class=IpcSendSharedRegion"
+    "InitramfsReadChunk"
+  )
+  for m in "${required[@]}"; do
+    if ! grep -qa -F -- "$m" "$kernel"; then
+      echo "[error][integrity] required marker ABSENT from kernel ($arch): '$m'"
+      rc=1
+    fi
+  done
+  for m in "${forbidden[@]}"; do
+    if grep -qa -F -- "$m" "$kernel"; then
+      echo "[error][integrity] FORBIDDEN/obsolete marker PRESENT in kernel ($arch): '$m' (stale binary?)"
+      rc=1
+    fi
+  done
+  [[ "$rc" -eq 0 ]] && echo "[integrity] kernel marker contract satisfied ($arch): required present, forbidden absent"
+  return "$rc"
+}
+
+# Record commit + per-artifact hash/size/mtime to the manifest.
+common_write_manifest() {
+  local arch="$1"; shift
+  {
+    echo "commit=$BUILD_COMMIT"
+    echo "arch=$arch"
+    echo "build_start=$BUILD_START_HUMAN epoch=$BUILD_START_EPOCH"
+    local f
+    for f in "$@"; do
+      [[ -f "$f" ]] || continue
+      printf 'artifact %s sha256=%s size=%s mtime=%s\n' \
+        "$f" "$(sha256sum "$f" | cut -d' ' -f1)" "$(stat -c '%s' "$f")" "$(stat -c '%Y' "$f")"
+    done
+  } | tee "$ARTIFACT_MANIFEST"
+}
+
+# Emit the per-arch build-integrity line (aggregated by the seal runner).
+common_emit_build_integrity_line() {
+  local arch="$1"
+  echo "ARTIFACT_BUILD_INTEGRITY arch=${arch} stale_artifact_acceptance=0 failed_build_rejected=1 result=ok"
 }
 
 common_prepare_rootfs_dirs() {
@@ -456,18 +556,31 @@ common_verify_initramfs_stage_paths() {
   if common_supervisor_restart_test_enabled; then
     required_paths+=("sbin/crash_test_srv")
   fi
+  local stale=0
   for path in "${required_paths[@]}"; do
     if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
       echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
       missing=1
+      continue
+    fi
+    # Stage 198B1 Part A: reject a STALE staged artifact (a server compile that
+    # failed under `|| true` would leave the previous build's ELF here). Every
+    # staged path must have been (re)written this build, i.e. mtime >= build-start.
+    if [[ -n "${BUILD_START_EPOCH:-}" ]]; then
+      local m
+      m="$(stat -c '%Y' "$ROOTFS_DIR/$path")"
+      if [[ "$m" -lt "$BUILD_START_EPOCH" ]]; then
+        echo "[error][integrity] STALE staged artifact (mtime $m < build-start $BUILD_START_EPOCH): $ROOTFS_DIR/$path"
+        stale=1
+      fi
     fi
   done
-  if [[ "$missing" -ne 0 ]]; then
-    echo "[error] initramfs staging incomplete"
+  if [[ "$missing" -ne 0 || "$stale" -ne 0 ]]; then
+    echo "[error] initramfs staging incomplete or stale"
     common_exit_if_strict_mode
     return 1
   fi
-  echo "[ok] all required initramfs stage paths present"
+  echo "[ok] all required initramfs stage paths present and fresh"
 }
 
 common_create_initramfs_newc() {

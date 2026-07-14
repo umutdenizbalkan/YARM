@@ -53,6 +53,8 @@ BUILD_LOG=${BUILD_LOG:-$OUT_DIR/aarch64-build.log}
 
 mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
+# Stage 198B1 Part A: record build-start + delete stale outputs (fail closed).
+common_build_integrity_init
 
 CARGO_Z_ARGS=()
 USE_NIGHTLY=0
@@ -70,7 +72,8 @@ if [[ "$KERNEL_RUST_TARGET" != *.json && -f "targets/${KERNEL_RUST_TARGET}.json"
 fi
 
 echo "[info] building ${KERNEL_PACKAGE}/${KERNEL_BIN} for ${KERNEL_RUST_TARGET}"
-set +e
+# Stage 198B1 Part A: NO `set +e` — every cargo build is fatal under
+# `set -euo pipefail` (pipefail carries cargo's status through `| tee`).
 cargo build --target "$KERNEL_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$KERNEL_PACKAGE" --bin "$KERNEL_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee "$BUILD_LOG"
 KERNEL_BUILD_STATUS=$?
 echo "[info] building ${SERVER_PACKAGE}/${SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
@@ -116,12 +119,12 @@ if common_supervisor_restart_test_enabled; then
 else
   CRASH_TEST_SERVER_BUILD_STATUS=0
 fi
-set -e
+# Stage 198B1 Part A: every cargo build above ran fail-closed; reaching here
+# means all succeeded.
 
-if [[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 || "$PM_BUILD_STATUS" -ne 0 || "$SUPERVISOR_BUILD_STATUS" -ne 0 || "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 || "$DEVFS_SERVER_BUILD_STATUS" -ne 0 || "$VFS_SERVER_BUILD_STATUS" -ne 0 || "$BLKCACHE_SERVER_BUILD_STATUS" -ne 0 || "$VIRTIO_BLK_SERVER_BUILD_STATUS" -ne 0 || "$DRIVER_MANAGER_BUILD_STATUS" -ne 0 || "$RAMFS_SERVER_BUILD_STATUS" -ne 0 || "$FAT_SERVER_BUILD_STATUS" -ne 0 || "$EXT4_SERVER_BUILD_STATUS" -ne 0 || "$CRASH_TEST_SERVER_BUILD_STATUS" -ne 0 ]]; then
-  common_exit_if_strict_mode
-fi
-
+# Staging: `|| true` keeps the pre-existing advisory ELF-hygiene (RWE/W^X) checks
+# advisory; a MISSING ELF still fails closed (helpers `exit`), and the fatal
+# freshness+existence gate below rejects a missing/stale staged artifact.
 common_stage_server_init_elf || true
 common_stage_aux_server_elf || true
 common_stage_supervisor_elf || true
@@ -135,19 +138,36 @@ common_stage_ramfs_server_elf || true
 common_stage_fat_server_elf || true
 common_stage_ext4_server_elf || true
 common_stage_crash_test_server_elf || true
-common_verify_initramfs_stage_paths || true
+common_verify_initramfs_stage_paths
 # Phase 3B: use 4096-byte-aligned packer so late-service ELFs can be zero-copy loaded.
 common_create_initramfs_aligned
 
-[[ -f "$KERNEL_ELF" ]] && cp "$KERNEL_ELF" "$KERNEL_IMAGE"
-if [[ -f "$KERNEL_ELF" ]]; then
-  if command -v llvm-objcopy >/dev/null 2>&1; then
-    llvm-objcopy -O binary "$KERNEL_ELF" "$KERNEL_BIN_IMAGE" || true
-  elif command -v rust-objcopy >/dev/null 2>&1; then
-    rust-objcopy -O binary "$KERNEL_ELF" "$KERNEL_BIN_IMAGE" || true
-  fi
+# Stage 198B1 Part A: publish kernel ELF + objcopy'd binary atomically; a failed
+# objcopy/cp aborts (no `|| true`). The .bin is the booted artifact.
+if [[ ! -f "$KERNEL_ELF" ]]; then
+  echo "[error][integrity] kernel ELF not produced by the build: $KERNEL_ELF"
+  exit 1
 fi
+cp "$KERNEL_ELF" "${KERNEL_IMAGE}.staging.$$"
+mv -f "${KERNEL_IMAGE}.staging.$$" "$KERNEL_IMAGE"
+if command -v llvm-objcopy >/dev/null 2>&1; then
+  llvm-objcopy -O binary "$KERNEL_ELF" "${KERNEL_BIN_IMAGE}.staging.$$"
+elif command -v rust-objcopy >/dev/null 2>&1; then
+  rust-objcopy -O binary "$KERNEL_ELF" "${KERNEL_BIN_IMAGE}.staging.$$"
+else
+  echo "[error][integrity] no objcopy available to produce raw kernel binary: $KERNEL_BIN_IMAGE"
+  exit 1
+fi
+mv -f "${KERNEL_BIN_IMAGE}.staging.$$" "$KERNEL_BIN_IMAGE"
+
+# Freshness + marker + manifest gates (fail closed). Markers verified on the
+# BOOTED raw binary ($KERNEL_BIN_IMAGE).
+common_verify_artifact_fresh "$KERNEL_BIN_IMAGE" "kernel binary image"
+common_verify_artifact_fresh "$INITRAMFS_IMAGE_ABS" "initramfs image"
+common_verify_kernel_markers "$KERNEL_BIN_IMAGE" "aarch64"
+common_write_manifest "aarch64" "$KERNEL_BIN_IMAGE" "$INITRAMFS_IMAGE_ABS"
+common_emit_build_integrity_line "aarch64"
 
 echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"
 echo "[ok] kernel image: $KERNEL_IMAGE"
-[[ -f "$KERNEL_BIN_IMAGE" ]] && echo "[ok] kernel binary image: $KERNEL_BIN_IMAGE" || echo "[warn] raw kernel binary missing: $KERNEL_BIN_IMAGE"
+echo "[ok] kernel binary image: $KERNEL_BIN_IMAGE"

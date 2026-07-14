@@ -43896,8 +43896,11 @@ mod stage163_sender_wake_proven {
     //     captured explicitly and proof_require no longer reads a separate file.
     #[test]
     fn stage163b_oracle_single_log_one_helper() {
+        // Stage 198B1 Part B routed the oracle's per-run logs into a unique
+        // per-invocation scratch dir (isolation), so the analysis log is now
+        // ORACLE_SCRATCH_DIR-prefixed — still exactly ONE analysis log + ONE helper.
         assert!(
-            ORACLE_SCRIPT.contains("ANALYSIS_LOG=\"ipc-oracle-run-$ARCH.log\"")
+            ORACLE_SCRIPT.contains("ANALYSIS_LOG=\"$ORACLE_SCRATCH_DIR/ipc-oracle-run-$ARCH.log\"")
                 && ORACLE_SCRIPT.contains("marker_present()"),
             "the oracle must build one analysis log and one marker_present helper"
         );
@@ -49673,6 +49676,131 @@ mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
         assert_eq!(
             refcount_after, refcount_before,
             "materialize rollback must restore the source object cap_refcount (no leak)"
+        );
+    }
+
+    // Stage 198B1 Part D: an invalid receiver PAYLOAD destination (unmapped user
+    // VA) is rejected at the producer's pre-copy validation (Phase A.2, before the
+    // transfer envelope is consumed). No work is stashed (=> no receiver wake, no
+    // partial payload/metadata ever becomes visible), nothing is minted (source
+    // object cap_refcount unchanged => no receiver-cap leak), and the transfer
+    // envelope is untouched so delivery stays retryable.
+    #[test]
+    fn stage188c_invalid_receiver_payload_dest_rejected_no_stash() {
+        let (mut state, endpoint_idx, handle, _tc, _asid, mem_id) =
+            blocked_waiter_with_ordinary_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let mo_slot = state.memory_object_slot_by_id(mem_id).expect("obj slot");
+        let refcount_before = state.memory.memory_objects[mo_slot]
+            .expect("obj")
+            .cap_refcount;
+
+        // Capture the receiver recv-cap BEFORE the producer consumes the waiter
+        // state, so the envelope-retryability check below can re-resolve the
+        // endpoint the envelope is bound to.
+        let recv_cap_for_endpoint = state
+            .with_tcb_mut(1, |t| t.blocked_recv_state.map(|s| s.recv_cap))
+            .flatten()
+            .expect("waiter recv cap");
+
+        // Point the payload buffer at an UNMAPPED user VA (the fixture maps only the
+        // page at 0x4000). Leave meta at its valid 0x4400 so the failure is isolated
+        // to the payload destination.
+        state.with_tcb_mut(1, |tcb| {
+            if let Some(s) = tcb.blocked_recv_state.as_mut() {
+                s.payload_user_ptr = 0x40000;
+            }
+        });
+
+        let msg = ordinary_cap_msg(handle);
+        let r = crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "an unmapped receiver payload destination must be a synchronous producer error"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed on a payload-destination fault (no wake, no partial visible)"
+        );
+        let refcount_after = state.memory.memory_objects[mo_slot]
+            .expect("obj")
+            .cap_refcount;
+        assert_eq!(
+            refcount_after, refcount_before,
+            "a payload-destination fault must not mint anything (no source cap_refcount bump)"
+        );
+        // The envelope was NOT consumed here (payload validation in Phase A.2
+        // precedes the Phase A.3 envelope take), so the transfer stays retryable:
+        // take_transfer_envelope still succeeds against the same (handle, endpoint,
+        // receiver) tuple, proving the transferable was not leaked or dropped.
+        let recv_endpoint = state
+            .resolve_capability_for_task(1, recv_cap_for_endpoint)
+            .expect("recv cap resolvable")
+            .object;
+        assert!(
+            state
+                .take_transfer_envelope(handle, recv_endpoint, ThreadId(1))
+                .is_some(),
+            "the transfer envelope must survive a payload-destination fault (retryable)"
+        );
+    }
+
+    // Stage 198B1 Part D: an invalid receiver METADATA destination (unmapped user
+    // VA) is rejected at the producer's meta pre-validation (Phase A.4). By that
+    // point the envelope is consumed (matching the legacy meta-copy-fault path),
+    // but NOTHING is minted, so there is no receiver-cap leak (source object
+    // cap_refcount unchanged) and no post-work is stashed (no wake, no partial
+    // metadata visible).
+    #[test]
+    fn stage188c_invalid_receiver_meta_dest_rejected_no_stash_no_mint() {
+        let (mut state, endpoint_idx, handle, _tc, _asid, mem_id) =
+            blocked_waiter_with_ordinary_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let mo_slot = state.memory_object_slot_by_id(mem_id).expect("obj slot");
+        let refcount_before = state.memory.memory_objects[mo_slot]
+            .expect("obj")
+            .cap_refcount;
+
+        // Keep payload valid (0x4000) but point meta at an UNMAPPED VA so the
+        // failure lands in Phase A.4 (after the payload check and envelope consume).
+        state.with_tcb_mut(1, |tcb| {
+            if let Some(s) = tcb.blocked_recv_state.as_mut() {
+                s.meta_user_ptr = 0x40000;
+            }
+        });
+
+        let msg = ordinary_cap_msg(handle);
+        let r = crate::kernel::syscall::produce_blocked_waiter_ordinary_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &msg,
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "an unmapped receiver metadata destination must be a synchronous producer error"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed on a metadata-destination fault"
+        );
+        let refcount_after = state.memory.memory_objects[mo_slot]
+            .expect("obj")
+            .cap_refcount;
+        assert_eq!(
+            refcount_after, refcount_before,
+            "a metadata-destination fault must not leave a minted receiver cap (refcount unchanged)"
         );
     }
 
@@ -66191,6 +66319,7 @@ mod stage198b_second_cohort_ordinary_cap_parity {
     const DEBUG_SRC: &str = include_str!("../syscall/debug.rs");
     const SYSCALL_SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const TRAPFRAME_SRC: &str = include_str!("../trapframe.rs");
     const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
     const SEAL_SRC: &str = include_str!("../../../scripts/qemu-second-cohort-ordinary-cap-seal.sh");
     const PLAIN_SEAL_SRC: &str = include_str!("../../../scripts/qemu-second-cohort-plain-seal.sh");
@@ -66322,12 +66451,24 @@ mod stage198b_second_cohort_ordinary_cap_parity {
                 && RUNTIME_SRC.contains("IPC_ORDINARY_CAP_OBJECT_IDENTITY receiver_tid="),
             "the delivery layer must emit the object-identity marker"
         );
-        // Meaningful comparison: resolve the minted cap's object out of the receiver cspace and
-        // compare the FULL CapObject (not a nonzero-CapId check).
+        // Meaningful comparison: resolve the minted cap's FULL capability (object + rights) out of
+        // the receiver cspace and compare the FULL CapObject (not a nonzero-CapId check). Stage
+        // 198B1 Part C widened the resolve from object-only to the full capability so the same
+        // helper backs both the object-identity proof AND the destination-rights attestation.
         assert!(
-            RUNTIME_SRC.contains("self.resolved_cap_object_split(receiver_cnode, cap)")
-                && RUNTIME_SRC.contains("let identity_match = installed == Some(source_object);"),
+            RUNTIME_SRC.contains("self.resolved_capability_split(receiver_cnode, cap)")
+                && RUNTIME_SRC.contains("let installed_object = installed.map(|c| c.object);")
+                && RUNTIME_SRC
+                    .contains("let identity_match = installed_object == Some(source_object);"),
             "the identity proof must resolve the minted cap and compare the full object identity"
+        );
+        // Part C: the same resolve also drives the rights attestation (dst rights == expected,
+        // reply metadata absent) emitted as IPC_ORDINARY_CAP_RIGHTS.
+        assert!(
+            RUNTIME_SRC.contains("IPC_ORDINARY_CAP_RIGHTS receiver_tid=")
+                && RUNTIME_SRC
+                    .contains("let rights_ok = dst_rights_bits == Some(expected_rights.bits());"),
+            "the delivery layer must attest destination rights against the canonical transfer result"
         );
         // The cnode-resolve helper lives in the capability-lifecycle module (legitimate cspace
         // access; NOT one of the files the Stage 186A helper-only guard covers), not in the
@@ -66505,5 +66646,102 @@ mod stage198b_second_cohort_ordinary_cap_parity {
             USER_RT_SRC.contains("const MAX_LOG_LEN: usize = 192;"),
             "the userspace DebugLog emitter must match the 192-byte cap"
         );
+    }
+
+    // Stage 198B1 Part F: the DebugLog 192-byte widening must stay BOUNDED. Beyond
+    // the four limits being equal (proven above), this pins the >192 over-length
+    // policy, the global/split behavioral identity, and the absence of a risky
+    // trap-frame stack expansion — the three ways a future edit could silently
+    // unbalance the copy seam.
+    #[test]
+    fn debuglog_192_bound_is_capped_identical_and_trapframe_safe() {
+        // (1) Exactly one canonical definition each — the shared cap plus the
+        // userspace mirror. No divergent third value (e.g. a stray = 256/224 cap).
+        assert_eq!(
+            DEBUG_SRC
+                .matches("pub(crate) const DEBUG_LOG_MAX_BYTES: usize = 192;")
+                .count(),
+            1,
+            "DEBUG_LOG_MAX_BYTES must be defined exactly once at 192"
+        );
+        assert_eq!(
+            USER_RT_SRC
+                .matches("const MAX_LOG_LEN: usize = 192;")
+                .count(),
+            1,
+            "userspace MAX_LOG_LEN must be defined exactly once at 192"
+        );
+        // Guard against a wider cap slipping in via a raw literal on any DebugLog
+        // copy path (all three sites must route through the shared const, never a
+        // larger hardcoded length).
+        for (label, src) in [
+            ("global handler", DEBUG_SRC),
+            ("split handler", SYSCALL_SPLIT_SRC),
+            ("split copy helper", RUNTIME_SRC),
+        ] {
+            for wider in [
+                "DEBUG_LOG_MAX_BYTES: usize = 224",
+                "DEBUG_LOG_MAX_BYTES: usize = 256",
+                "DEBUG_LOG_MAX_BYTES: usize = 320",
+                "DEBUG_LOG_MAX_BYTES: usize = 512",
+            ] {
+                assert!(
+                    !src.contains(wider),
+                    "{label} must not redefine the DebugLog cap wider than 192"
+                );
+            }
+        }
+
+        // (2) Over-length policy: BOTH kernel handlers clamp (truncate) the
+        // requested length to the shared cap with `.min(...DEBUG_LOG_MAX_BYTES)`,
+        // so a >192 request logs the first 192 bytes rather than being rejected —
+        // and both do it identically.
+        assert!(
+            DEBUG_SRC.contains(".min(DEBUG_LOG_MAX_BYTES)"),
+            "the global DebugLog handler must clamp raw_len to the 192 cap"
+        );
+        assert!(
+            SYSCALL_SPLIT_SRC.contains(".min(crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES)"),
+            "the split DebugLog handler must clamp raw_len to the same 192 cap"
+        );
+        // The split copy helper defensively refuses anything over the cap; because
+        // the split handler already truncated, this never fires in practice but
+        // pins the helper's ceiling to the shared const (no silent wider copy).
+        assert!(
+            RUNTIME_SRC
+                .contains("const MAX: usize = crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES;")
+                && RUNTIME_SRC.contains("len > MAX"),
+            "copy_from_user_asid_split_read must cap its copy at the shared 192-byte const"
+        );
+
+        // (3) No risky trap-frame stack expansion: the 192-byte scratch buffer is a
+        // handler local, never a field of the TrapFrame struct, so widening the log
+        // cap did NOT grow the per-trap saved state.
+        assert!(
+            !TRAPFRAME_SRC.contains("DEBUG_LOG_MAX_BYTES") && !TRAPFRAME_SRC.contains("[u8; 192]"),
+            "the DebugLog buffer must not be embedded in the TrapFrame (no trap-frame widening)"
+        );
+        assert!(
+            DEBUG_SRC.contains("let mut payload = [0u8; DEBUG_LOG_MAX_BYTES];"),
+            "the global handler's 192-byte buffer must be a handler-local scratch array"
+        );
+
+        // (4) Cross-arch identity: the cap is a plain arch-independent const, not
+        // gated behind any `#[cfg(target_arch = ...)]`, so all three arches share
+        // one value by construction.
+        let def_idx = DEBUG_SRC
+            .find("pub(crate) const DEBUG_LOG_MAX_BYTES")
+            .expect("cap definition present");
+        let preceding = &DEBUG_SRC[..def_idx];
+        let last_cfg = preceding.rfind("#[cfg(");
+        if let Some(cfg_at) = last_cfg {
+            // Any cfg attribute immediately preceding the const would sit within a
+            // few lines; assert none targets an arch gate right before the const.
+            let between = &DEBUG_SRC[cfg_at..def_idx];
+            assert!(
+                between.contains(';') || between.contains('}') || !between.contains("target_arch"),
+                "the DebugLog cap const must not be arch-gated"
+            );
+        }
     }
 }

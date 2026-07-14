@@ -35,13 +35,22 @@ ARCH="${1:-${ARCH:-x86_64}}"
 QEMU_SMOKE_STRICT="${QEMU_SMOKE_STRICT:-0}"
 
 case "$ARCH" in
-  x86_64)  CORE_SMOKE="$HERE/qemu-x86_64-core-smoke.sh";  CORE_LOG="qemu-x86_64-core.log";  QEMU_BIN="qemu-system-x86_64" ;;
-  aarch64) CORE_SMOKE="$HERE/qemu-aarch64-core-smoke.sh"; CORE_LOG="qemu-aarch64-core.log"; QEMU_BIN="qemu-system-aarch64" ;;
-  riscv64) CORE_SMOKE="$HERE/qemu-riscv64-core-smoke.sh"; CORE_LOG="qemu-riscv64-core.log"; QEMU_BIN="qemu-system-riscv64" ;;
+  x86_64)  CORE_SMOKE="$HERE/qemu-x86_64-core-smoke.sh";  QEMU_BIN="qemu-system-x86_64" ;;
+  aarch64) CORE_SMOKE="$HERE/qemu-aarch64-core-smoke.sh"; QEMU_BIN="qemu-system-aarch64" ;;
+  riscv64) CORE_SMOKE="$HERE/qemu-riscv64-core-smoke.sh"; QEMU_BIN="qemu-system-riscv64" ;;
   *) echo "[err] unknown ARCH: $ARCH (expected x86_64|aarch64|riscv64)"; exit 1 ;;
 esac
 
-ORACLE_SNAPSHOT="${ORACLE_SNAPSHOT:-ipc-oracle-markers-$ARCH.txt}"
+# Stage 198B1 Part B: per-invocation scratch dir so concurrent same-arch oracle
+# runs (e.g. the plain and ordinary-cap seals both booting x86_64) never share or
+# overwrite the CWD serial/analysis logs. Keyed by ORACLE_RUN_ID (default: PID),
+# so every invocation is isolated. The seal runners read this wrapper's STDOUT,
+# not these files, so relocating them is transparent to callers.
+ORACLE_RUN_ID="${ORACLE_RUN_ID:-$$}"
+ORACLE_SCRATCH_DIR="${ORACLE_SCRATCH_DIR:-${TMPDIR:-/tmp}/yarm-oracle-${ARCH}-${ORACLE_RUN_ID}}"
+mkdir -p "$ORACLE_SCRATCH_DIR"
+CORE_LOG="$ORACLE_SCRATCH_DIR/qemu-${ARCH}-core.log"
+ORACLE_SNAPSHOT="${ORACLE_SNAPSHOT:-$ORACLE_SCRATCH_DIR/ipc-oracle-markers-$ARCH.txt}"
 
 # Oracle coverage mode (Stage 157):
 #   basic    (default) — prove >=1 recv-v2 meta delivery (Stage 156 contract,
@@ -227,8 +236,10 @@ require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 # raw serial $CORE_LOG, so the raw markers are present no matter which path carries
 # them). Every marker check below reads ONLY $ANALYSIS_LOG via one helper.
 export LOGFILE="$CORE_LOG"
-CORE_RUN_LOG="ipc-oracle-core-stdout-$ARCH.log"
-ANALYSIS_LOG="ipc-oracle-run-$ARCH.log"
+# Stage 198B1 Part B: keep the analysis/run logs in the per-invocation scratch
+# dir (isolated across concurrent same-arch runs).
+CORE_RUN_LOG="$ORACLE_SCRATCH_DIR/ipc-oracle-core-stdout-$ARCH.log"
+ANALYSIS_LOG="$ORACLE_SCRATCH_DIR/ipc-oracle-run-$ARCH.log"
 rm -f "$CORE_RUN_LOG" "$ANALYSIS_LOG"
 echo "[info] ipc-oracle: booting $ARCH via $CORE_SMOKE (serial log: $CORE_LOG, run log: $CORE_RUN_LOG)"
 set +e
@@ -639,6 +650,10 @@ if [[ "$YARM_IPC_SEND_CAP_ORACLE" == "1" ]]; then
     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendOrdinaryCap result=ok"
     "IPCSEND_ORDINARY_CAP_BLOCKED_RECEIVER_ORACLE_DONE arch=$ARCH result=ok payload_len=8 receiver_resumes=1 fresh_cap=1 object_identity_ok=1"
     "IPC_SEND_CAP_LIVE_ORACLE_DONE result=ok"
+    # Stage 198B1 Part C: capability-rights attestation. Echoed here so it is a
+    # required marker on EVERY arch (the raw serial otherwise reaches only the
+    # analysis log, not this stdout the seals grep).
+    "IPCSEND_ORDINARY_CAP_RIGHTS_OK arch=$ARCH class=IpcSendOrdinaryCap source_semantics=copy destination_rights_ok=1 source_still_valid=1 reply_metadata=0"
   )
   for m in "${SEND_CAP_REQUIRED[@]}"; do
     if marker_present "$m"; then
@@ -648,6 +663,14 @@ if [[ "$YARM_IPC_SEND_CAP_ORACLE" == "1" ]]; then
       rc=1
     fi
   done
+  # Stage 198B1 Part C: the kernel-authoritative rights attestation (dst rights ==
+  # canonical transfer result, reply metadata absent) must also be present.
+  if rg -q -a -e 'IPC_ORDINARY_CAP_RIGHTS .*rights_ok=1 .*reply_object=0' "$ANALYSIS_LOG"; then
+    echo "[ok]   send-cap oracle: kernel rights attestation rights_ok=1 reply_object=0"
+  else
+    echo "[err] ipc-oracle: send-cap oracle: kernel rights attestation absent"
+    rc=1
+  fi
   # The woken child must have received a FRESH receiver-local cap (not the sender-local
   # handle) AND the byte-identical payload.
   if rg -q -a -e 'IPC_SEND_CAP_ORACLE_CHILD_RECV_OK payload_match=1 transferred_cap=1 cap_is_fresh=1' "$ANALYSIS_LOG"; then
@@ -816,6 +839,8 @@ if [[ "$YARM_IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" ]]; then
     "IPCSEND_ORDINARY_CAP_ENQUEUE_ORACLE_DONE arch=$ARCH result=ok payload_len=8 dequeue_count=1 fresh_cap=1 object_identity_ok=1"
     "IPC_TRANSFER_CAP_MATERIALIZE_OK"
     "IPC_SEND_CAP_ENQUEUE_LIVE_ORACLE_DONE result=ok"
+    # Stage 198B1 Part C: capability-rights attestation for the queued class.
+    "IPCSEND_ORDINARY_CAP_RIGHTS_OK arch=$ARCH class=IpcSendOrdinaryCapEnqueue source_semantics=copy destination_rights_ok=1 source_still_valid=1 reply_metadata=0"
   )
   for m in "${SEND_CAP_ENQUEUE_REQUIRED[@]}"; do
     if marker_present "$m"; then
@@ -825,6 +850,13 @@ if [[ "$YARM_IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" ]]; then
       rc=1
     fi
   done
+  # Stage 198B1 Part C: kernel-authoritative rights attestation for the queued class.
+  if rg -q -a -e 'IPC_ORDINARY_CAP_RIGHTS .*rights_ok=1 .*reply_object=0' "$ANALYSIS_LOG"; then
+    echo "[ok]   send-cap-enqueue oracle: kernel rights attestation rights_ok=1 reply_object=0"
+  else
+    echo "[err] ipc-oracle: send-cap-enqueue oracle: kernel rights attestation absent"
+    rc=1
+  fi
   # The receiver-later dequeue must materialize a FRESH receiver-local cap + byte-identical.
   if rg -q -a -e 'IPC_SEND_CAP_ENQUEUE_ORACLE_RECV_OK payload_match=1 cap_is_fresh=1' "$ANALYSIS_LOG"; then
     echo "[ok]   send-cap-enqueue oracle: receiver-later dequeue materialized a fresh receiver-local cap"
