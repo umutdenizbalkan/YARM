@@ -240,7 +240,10 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 // NOTE: these `mod` declarations must stay AFTER the `syscall_trace!` macro
 // definition above (textual macro scoping).
 mod cap;
-mod debug;
+// Stage 198B: `pub(crate)` so the split DebugLog copy seam (`runtime.rs`,
+// `syscall_split.rs`) can reference `debug::DEBUG_LOG_MAX_BYTES` (the widened
+// 192-byte DebugLog copy cap). The module's items remain otherwise crate-internal.
+pub(crate) mod debug;
 mod helpers;
 mod initramfs;
 mod ipc;
@@ -1749,16 +1752,22 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
             if kernel.current_tid() == caller_tid {
                 let _ = kernel.dispatch_next_task().map_err(SyscallError::from)?;
             }
-            // Stage 198A1: publish AUTHORITATIVE idle provenance. A canonical blocking syscall
+            // Stage 198A1/198B: publish AUTHORITATIVE idle provenance. A canonical blocking syscall
             // (IpcRecv / IpcCall / IpcSend) just blocked `caller_tid` and dispatched away from it
             // (`current` is now the next runnable task, or None if none). The RISC-V trap wrapper
-            // consumes this token to decide typed `EnterKernelIdle { BlockedRecvNoRunnable }` from a
-            // POSITIVE signal — never from scheduler state alone. Arch-neutral: x86_64 / AArch64
-            // set it but never read it (they own their own idle bridges).
+            // consumes this token to decide typed `EnterKernelIdle { BlockedIpcNoRunnable }` from a
+            // POSITIVE signal — never from scheduler state alone — with the exact blocking class
+            // recorded. Arch-neutral: x86_64 / AArch64 set it but never read it.
             if let Some(blocked_tid) = caller_tid {
+                let class = match syscall {
+                    Syscall::IpcCall => crate::kernel::boot::BlockingSyscallClass::IpcCall,
+                    Syscall::IpcSend => crate::kernel::boot::BlockingSyscallClass::IpcSend,
+                    _ => crate::kernel::boot::BlockingSyscallClass::IpcRecv,
+                };
                 crate::kernel::boot::blocked_syscall_idle_provenance_set(
                     kernel.current_cpu().0 as usize,
                     blocked_tid,
+                    class,
                 );
             }
             syscall_trace!(

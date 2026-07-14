@@ -833,3 +833,29 @@ impl KernelState {
         Some((cnode, cap_id))
     }
 }
+
+impl crate::runtime::SharedKernel {
+    /// Stage 198B — split-read resolve of the `CapObject` a receiver-local `cap` references, read
+    /// OUT of the receiver's cspace under the rank-4 capability seam only (no broad
+    /// `&mut KernelState`, no IPC/task/scheduler lock). Returns `None` if the cnode space or the
+    /// cap slot is absent. Used by the ordinary-cap delivery executors (`runtime.rs`) to prove the
+    /// freshly materialized cap references the SAME object the sender transferred — a real cnode
+    /// lookup, not a `CapId != 0` check. (Placed here, not in `capability_state.rs`, so the Stage
+    /// 186A "capability seam is helper-only in those files" guard stays intact; this file already
+    /// resolves caps out of the cspace.)
+    pub(crate) fn resolved_cap_object_split(
+        &self,
+        receiver_cnode: CNodeId,
+        cap: CapId,
+    ) -> Option<CapObject> {
+        self.with_capability_state_split_mut(|capability| {
+            capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == receiver_cnode)
+                .and_then(|space| kernel_ref(&space.cspace).get(cap))
+                .map(|c| c.object)
+        })
+    }
+}

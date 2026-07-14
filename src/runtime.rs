@@ -1384,6 +1384,36 @@ impl SharedKernel {
         }
     }
 
+    /// Stage 198B — emit the AUTHORITATIVE ordinary-cap object-identity proof for a freshly
+    /// materialized receiver-local cap. Re-resolves the cap OUT of the receiver's cspace (rank-4
+    /// capability seam, `resolved_cap_object_split`) and compares the FULL `CapObject` to the source
+    /// object the sender transferred, emitting `IPC_ORDINARY_CAP_OBJECT_IDENTITY … match={0|1}`.
+    /// `match=1` proves object identity is preserved (SAME object, fresh CapId); a genuine mismatch
+    /// or a missing install yields `match=0`. This is a real cnode lookup, not a `CapId != 0` check.
+    /// Both ordinary-cap delivery executors (blocked-waiter + recv-boundary) call it on materialize.
+    fn log_ordinary_cap_object_identity(
+        &self,
+        receiver_tid: u64,
+        receiver_cnode: crate::kernel::capabilities::CNodeId,
+        source_object: crate::kernel::capabilities::CapObject,
+        cap: crate::kernel::capabilities::CapId,
+    ) {
+        use crate::kernel::capabilities::CapObject;
+        let installed = self.resolved_cap_object_split(receiver_cnode, cap);
+        let identity_match = installed == Some(source_object);
+        let endpoint_index = |obj: &CapObject| match obj {
+            CapObject::Endpoint { index, .. } => Some(*index),
+            _ => None,
+        };
+        crate::yarm_log!(
+            "IPC_ORDINARY_CAP_OBJECT_IDENTITY receiver_tid={} src_endpoint={:?} dst_endpoint={:?} match={}",
+            receiver_tid,
+            endpoint_index(&source_object),
+            installed.as_ref().and_then(endpoint_index),
+            identity_match as u8
+        );
+    }
+
     /// Stage 187B — Phase B/C for an ordinary (non-reply, non-shared-region)
     /// cap transfer to a user receiver on the queued-split recv boundary.
     ///
@@ -1448,6 +1478,13 @@ impl SharedKernel {
                     cap.0
                 );
                 crate::yarm_log!("CAP_TRANSFER_BOUNDARY_SEAM_DELEGATION_OK kind=ordinary");
+                // Stage 198B: authoritative object-identity proof of the freshly minted cap.
+                self.log_ordinary_cap_object_identity(
+                    pending.receiver_tid,
+                    pending.receiver_cnode,
+                    pending.object,
+                    cap,
+                );
                 cap.0
             }
             Ok(CapTransferMaterializeOutcome::DeferredReplyCap) => {
@@ -1932,6 +1969,13 @@ impl SharedKernel {
                     snap.waiter_tid,
                     cap.0
                 );
+                // Stage 198B: authoritative object-identity proof of the freshly minted cap.
+                self.log_ordinary_cap_object_identity(
+                    snap.waiter_tid,
+                    snap.receiver_cnode,
+                    snap.object,
+                    cap,
+                );
                 // Stage 193C: IpcSend-origin ordinary-cap deliveries emit the boundary
                 // materialize marker here (peek — the flag is consumed after the wake
                 // below). Reply-origin deliveries leave the flag unset (silent).
@@ -2325,13 +2369,18 @@ impl SharedKernel {
         asid_raw: u64,
         user_ptr: usize,
         len: usize,
-    ) -> Option<[u8; crate::kernel::ipc::Message::MAX_PAYLOAD]> {
+    ) -> Option<[u8; crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES]> {
         use crate::kernel::vm::{Asid, PAGE_SIZE, VirtAddr};
-        if asid_raw == 0 || len == 0 || len > crate::kernel::ipc::Message::MAX_PAYLOAD {
+        // Stage 198B: the buffer widened to DEBUG_LOG_MAX_BYTES (192, from Message::MAX_PAYLOAD=128)
+        // so the split DebugLog path can log the ~138-byte ordinary-cap attestations untruncated.
+        // The only other callers copy 4 bytes (futex value reads) and read `[..4]`, so the wider
+        // buffer is inert for them. This changes NO IPC message framing.
+        const MAX: usize = crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES;
+        if asid_raw == 0 || len == 0 || len > MAX {
             return None;
         }
         let asid = Asid(u16::try_from(asid_raw).ok()?);
-        let mut out = [0u8; crate::kernel::ipc::Message::MAX_PAYLOAD];
+        let mut out = [0u8; MAX];
         let mut done = 0usize;
         while done < len {
             let va = user_ptr.checked_add(done)?;

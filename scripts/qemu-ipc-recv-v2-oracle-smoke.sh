@@ -625,6 +625,9 @@ if [[ "$YARM_IPC_SEND_CAP_ORACLE" == "1" ]]; then
     exit 1
   fi
   echo "[ok]   ipc-oracle: send-cap oracle sub-knob reached the kernel"
+  # Stage 198B (ORDINARY-CAP PARITY): the retirement marker is now arch-tagged and the oracle
+  # emits the canonical per-arch blocked-receiver attestation (fresh cap + authoritative object
+  # identity). Both required LIVE on every arch ($ARCH selects x86_64 / aarch64 / riscv64).
   SEND_CAP_REQUIRED=(
     "IPC_SEND_CAP_ORACLE_WAITER_OBSERVED"
     "IPC_SEND_CAP_BOUNDARY_SPLIT_BEGIN"
@@ -633,7 +636,8 @@ if [[ "$YARM_IPC_SEND_CAP_ORACLE" == "1" ]]; then
     "IPC_SEND_CAP_BOUNDARY_USER_COPY_OK"
     "IPC_SEND_CAP_BOUNDARY_WAKE_OK"
     "IPC_SEND_CAP_BOUNDARY_SPLIT_DONE result=ok"
-    "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendOrdinaryCap result=ok"
+    "IPCSEND_ORDINARY_CAP_BLOCKED_RECEIVER_ORACLE_DONE arch=$ARCH result=ok payload_len=8 receiver_resumes=1 fresh_cap=1 object_identity_ok=1"
     "IPC_SEND_CAP_LIVE_ORACLE_DONE result=ok"
   )
   for m in "${SEND_CAP_REQUIRED[@]}"; do
@@ -650,6 +654,14 @@ if [[ "$YARM_IPC_SEND_CAP_ORACLE" == "1" ]]; then
     echo "[ok]   send-cap oracle: child received a fresh receiver-local cap + byte-identical payload"
   else
     echo "[err] ipc-oracle: send-cap oracle: child did NOT observe a fresh cap + byte-identical payload"
+    rc=1
+  fi
+  # Stage 198B: the kernel's AUTHORITATIVE object-identity comparison must confirm the materialized
+  # receiver-local cap references the SAME endpoint object the sender transferred (match=1).
+  if rg -q -a -e 'IPC_ORDINARY_CAP_OBJECT_IDENTITY .*match=1' "$ANALYSIS_LOG"; then
+    echo "[ok]   send-cap oracle: kernel authoritative object-identity match=1 (same object preserved)"
+  else
+    echo "[err] ipc-oracle: send-cap oracle: kernel object-identity match=1 marker absent"
     rc=1
   fi
   for f in "IPC_SEND_CAP_BOUNDARY_SPLIT_FAIL" "IPC_SEND_CAP_ORACLE_SEND_FAILED" \
@@ -790,6 +802,8 @@ if [[ "$YARM_IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" ]]; then
     exit 1
   fi
   echo "[ok]   ipc-oracle: send-cap-enqueue oracle sub-knob reached the kernel"
+  # Stage 198B (ORDINARY-CAP PARITY): arch-tagged retirement + the canonical per-arch enqueue
+  # attestation (fresh cap + authoritative object identity). Both required LIVE on every arch.
   SEND_CAP_ENQUEUE_REQUIRED=(
     "IPC_SEND_CAP_ENQUEUE_ORACLE_SEND_OK"
     "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_BEGIN"
@@ -798,7 +812,8 @@ if [[ "$YARM_IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" ]]; then
     "IPC_SEND_CAP_ENQUEUE_BOUNDARY_TRANSFER_STATE_OK"
     "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SENDER_STATE_OK"
     "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_DONE result=ok"
-    "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCapEnqueue result=ok"
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendOrdinaryCapEnqueue result=ok"
+    "IPCSEND_ORDINARY_CAP_ENQUEUE_ORACLE_DONE arch=$ARCH result=ok payload_len=8 dequeue_count=1 fresh_cap=1 object_identity_ok=1"
     "IPC_TRANSFER_CAP_MATERIALIZE_OK"
     "IPC_SEND_CAP_ENQUEUE_LIVE_ORACLE_DONE result=ok"
   )
@@ -815,6 +830,13 @@ if [[ "$YARM_IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" ]]; then
     echo "[ok]   send-cap-enqueue oracle: receiver-later dequeue materialized a fresh receiver-local cap"
   else
     echo "[err] ipc-oracle: send-cap-enqueue oracle: receiver-later dequeue did NOT materialize a fresh cap"
+    rc=1
+  fi
+  # Stage 198B: kernel AUTHORITATIVE object-identity comparison (same endpoint object preserved).
+  if rg -q -a -e 'IPC_ORDINARY_CAP_OBJECT_IDENTITY .*match=1' "$ANALYSIS_LOG"; then
+    echo "[ok]   send-cap-enqueue oracle: kernel authoritative object-identity match=1"
+  else
+    echo "[err] ipc-oracle: send-cap-enqueue oracle: kernel object-identity match=1 marker absent"
     rc=1
   fi
   for f in "IPC_SEND_CAP_ENQUEUE_BOUNDARY_SPLIT_FAIL" "IPC_SEND_CAP_ENQUEUE_ORACLE_SEND_FAILED" \

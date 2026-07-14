@@ -175,7 +175,11 @@ pub mod syscall {
         #[cfg(target_os = "none")]
         {
             const SYSCALL_DEBUG_LOG_NR: usize = 15;
-            const MAX_LOG_LEN: usize = 128;
+            // Stage 198B: 192 (was 128) so the canonical ordinary-cap attestations
+            // (`IPCSEND_ORDINARY_CAP_*_ORACLE_DONE arch=<arch> result=ok payload_len=<n> ...
+            // fresh_cap=1 object_identity_ok=1`, ~138 bytes with `arch=riscv64`/`aarch64`) fit
+            // untruncated. A per-emit stack buffer; the wider size is inert for shorter messages.
+            const MAX_LOG_LEN: usize = 192;
             struct LogBuf {
                 buf: [u8; MAX_LOG_LEN],
                 len: usize,

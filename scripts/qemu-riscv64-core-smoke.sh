@@ -137,6 +137,18 @@ IPC_SEND_ENQUEUE_ORACLE=${IPC_SEND_ENQUEUE_ORACLE:-0}
 if [[ "$IPC_SEND_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_enqueue_oracle="* ]]; then
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_enqueue_oracle=1"
 fi
+# Stage 198B (ORDINARY-CAP PARITY): the ordinary-cap IpcSend live oracles are arch-neutral; RISC-V
+# honors the same env-var -> cmdline knob translations the x86_64 core smoke does. The oracle
+# wrapper exports IPC_SEND_CAP_ORACLE / IPC_SEND_CAP_ENQUEUE_ORACLE; without these the knobs never
+# reach the RISC-V kernel cmdline and the ordinary-cap oracle workload never runs.
+IPC_SEND_CAP_ORACLE=${IPC_SEND_CAP_ORACLE:-0}
+if [[ "$IPC_SEND_CAP_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_cap_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_cap_oracle=1"
+fi
+IPC_SEND_CAP_ENQUEUE_ORACLE=${IPC_SEND_CAP_ENQUEUE_ORACLE:-0}
+if [[ "$IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_cap_enqueue_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_cap_enqueue_oracle=1"
+fi
 
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"

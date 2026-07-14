@@ -10,8 +10,13 @@
 
 use super::{AARCH64_SYSCALL_TRACE, SyscallError};
 use crate::kernel::boot::KernelState;
-use crate::kernel::ipc::Message;
 use crate::kernel::trapframe::TrapFrame;
+
+/// Stage 198B: maximum DebugLog message length (bytes). Wider than an IPC `Message::MAX_PAYLOAD`
+/// (128) so the canonical ordinary-cap live attestations (~138 bytes) log untruncated. This bounds
+/// ONLY the DebugLog copy seam; IPC message framing is unchanged. Kept in sync with the split
+/// DebugLog handler (`syscall_split.rs`) and the userspace `MAX_LOG_LEN` (`yarm-user-rt`).
+pub(crate) const DEBUG_LOG_MAX_BYTES: usize = 192;
 
 pub(super) fn handle_debug_log(
     kernel: &mut KernelState,
@@ -31,7 +36,12 @@ pub(super) fn handle_debug_log(
     );
     let user_ptr = a0;
     let raw_len = a1;
-    let len = raw_len.min(Message::MAX_PAYLOAD);
+    // Stage 198B: DebugLog messages may be up to DEBUG_LOG_MAX_BYTES (192) — wider than an IPC
+    // `Message::MAX_PAYLOAD` (128) — so the canonical ordinary-cap attestations (~138 bytes with
+    // `arch=riscv64`/`aarch64`) log UNTRUNCATED. This is a copy-length cap on the DebugLog seam
+    // ONLY (a dedicated stack buffer + the slice copy); it does NOT change IPC message framing or
+    // the DebugLog split-dispatch / retirement mechanism.
+    let len = raw_len.min(DEBUG_LOG_MAX_BYTES);
     syscall_trace!(
         "DEBUG_LOG_ENTER tid={} ptr=0x{:x} len={}",
         tid,
@@ -42,14 +52,12 @@ pub(super) fn handle_debug_log(
         frame.set_ok(0, 0, 0);
         return Ok(());
     }
-    let payload = match kernel.copy_from_current_user(user_ptr, len) {
-        Ok(data) => data,
-        Err(e) => {
-            syscall_trace!("DEBUG_LOG_COPY_FAIL tid={} err={:?}", tid, e);
-            frame.set_ok(0, 0, 0);
-            return Ok(());
-        }
-    };
+    let mut payload = [0u8; DEBUG_LOG_MAX_BYTES];
+    if let Err(e) = kernel.copy_from_current_user_into_slice(user_ptr, len, &mut payload) {
+        syscall_trace!("DEBUG_LOG_COPY_FAIL tid={} err={:?}", tid, e);
+        frame.set_ok(0, 0, 0);
+        return Ok(());
+    }
     syscall_trace!("DEBUG_LOG_COPY_OK tid={} len={}", tid, len);
     let msg_str = core::str::from_utf8(&payload[..len]).unwrap_or("<utf8_err>");
     crate::yarm_log!("USER_LOG tid={} msg={}", tid, msg_str);

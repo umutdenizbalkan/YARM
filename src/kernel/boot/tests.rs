@@ -61079,8 +61079,10 @@ mod stage193c_ipc_send_ordinary_cap {
             "the executor must emit the cap materialize/copy/wake/done markers gated on origin"
         );
         assert!(
-            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok"),
-            "the IpcSendOrdinaryCap retirement marker must exist"
+            MOD_SRC.contains(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendOrdinaryCap result=ok"
+            ),
+            "the IpcSendOrdinaryCap retirement marker must exist (arch-tagged as of Stage 198B)"
         );
         assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
     }
@@ -61771,9 +61773,9 @@ mod stage193f_ipc_send_cap_enqueue {
         );
         assert!(
             MOD_SRC.contains(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCapEnqueue result=ok"
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendOrdinaryCapEnqueue result=ok"
             ) && MOD_SRC.contains("fn maybe_log_ipc_send_ordinary_cap_enqueue_retired()"),
-            "the IpcSendOrdinaryCapEnqueue retirement marker + latch must exist"
+            "the IpcSendOrdinaryCapEnqueue retirement marker (arch-tagged, Stage 198B) + latch must exist"
         );
         assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
     }
@@ -65635,7 +65637,7 @@ mod stage197b_riscv_typed_idle_outcome {
         assert!(
             RISCV_TRAP_SRC.contains("pub enum RiscvIdleReason {")
                 && RISCV_TRAP_SRC.contains("FutexWaitNoIncoming,")
-                && RISCV_TRAP_SRC.contains("BlockedRecvNoRunnable,"),
+                && RISCV_TRAP_SRC.contains("BlockedIpcNoRunnable,"),
             "the idle reason enum must enumerate both typed provenances"
         );
         // The outcome enum has exactly three variants (ReturnToCurrent / ReturnToIncoming /
@@ -65669,7 +65671,7 @@ mod stage197b_riscv_typed_idle_outcome {
         // The reason match in the bridge names both idle provenances (no catch-all `_`).
         assert!(
             RISCV_BOOT_SRC.contains("RiscvIdleReason::FutexWaitNoIncoming =>")
-                && RISCV_BOOT_SRC.contains("RiscvIdleReason::BlockedRecvNoRunnable =>"),
+                && RISCV_BOOT_SRC.contains("RiscvIdleReason::BlockedIpcNoRunnable =>"),
             "the bridge must name both typed idle reasons"
         );
     }
@@ -65958,21 +65960,19 @@ mod stage198a_second_cohort_plain_parity {
         }
     }
 
-    // (5) NO capability-transfer provisioning is added to AArch64 / RISC-V — the cap (193C),
-    // reply-cap (193D), and cap-enqueue (193F) oracles remain x86_64-only live targets.
+    // (5) The REPLY-cap (193D) oracle remains an x86_64-only live target — it is NOT provisioned on
+    // AArch64 / RISC-V. NB: Stage 198B *does* replicate the two ORDINARY-cap oracles
+    // (`provision_init_ipc_send_cap_oracle_coord` = 193C blocked receiver,
+    // `ipc_send_cap_enqueue_oracle_active` = 193F enqueue) onto all three arches, so those two are no
+    // longer forbidden here (asserted present by the Stage 198B parity module). Only the reply-cap
+    // path stays excluded on non-x86.
     #[test]
-    fn no_capability_transfer_oracle_on_non_x86_arches() {
+    fn no_reply_cap_oracle_on_non_x86_arches() {
         for (arch, src) in [("aarch64", AARCH64_BOOT_SRC), ("riscv64", RISCV_BOOT_SRC)] {
-            for forbidden in [
-                "provision_init_ipc_send_cap_oracle_coord(",
-                "provision_init_ipc_send_reply_cap_oracle(",
-                "ipc_send_cap_enqueue_oracle_active()",
-            ] {
-                assert!(
-                    !src.contains(forbidden),
-                    "{arch} boot.rs must NOT provision the capability-transfer oracle `{forbidden}`"
-                );
-            }
+            assert!(
+                !src.contains("provision_init_ipc_send_reply_cap_oracle("),
+                "{arch} boot.rs must NOT provision the reply-cap oracle (x86_64-only live target)"
+            );
         }
     }
 
@@ -66024,7 +66024,7 @@ mod stage198a_second_cohort_plain_parity {
     // (7b) Stage 198A1: the RISC-V wrapper reaches WFI idle when a canonical blocking syscall blocks
     // the last runnable task — from AUTHORITATIVE PROVENANCE, not scheduler state alone. The Ok-path
     // idle branch is gated on `!switched`, CONSUMES the blocking-syscall provenance token, and only
-    // idles with typed `BlockedRecvNoRunnable` when provenance is present AND the state is terminal.
+    // idles with typed `BlockedIpcNoRunnable` when provenance is present AND the state is terminal.
     #[test]
     fn riscv_blocked_recv_idle_requires_typed_provenance() {
         // The Ok-path idle branch is present, gated on `!switched`, and consumes the provenance.
@@ -66033,12 +66033,12 @@ mod stage198a_second_cohort_plain_parity {
                 && RISCV_TRAP_SRC.contains("blocked_syscall_idle_provenance_take(cpu_idx)"),
             "the Ok-path idle branch must consume the authoritative blocking-syscall provenance"
         );
-        // Typed idle uses the BlockedRecvNoRunnable provenance + the terminal quiescence predicate.
+        // Typed idle uses the BlockedIpcNoRunnable provenance + the terminal quiescence predicate.
         assert!(
-            RISCV_TRAP_SRC.contains("RiscvIdleReason::BlockedRecvNoRunnable")
-                && RISCV_TRAP_SRC.contains("RISCV_BLOCKED_RECV_IDLE_PROVENANCE_OK tid=")
+            RISCV_TRAP_SRC.contains("RiscvIdleReason::BlockedIpcNoRunnable")
+                && RISCV_TRAP_SRC.contains("RISCV_BLOCKED_IPC_IDLE_PROVENANCE_OK tid=")
                 && RISCV_TRAP_SRC.contains("runnable_count_on_cpu(cpu) == 0"),
-            "typed idle must combine BlockedRecvNoRunnable provenance with the quiescence predicate"
+            "typed idle must combine BlockedIpcNoRunnable provenance with the quiescence predicate"
         );
         // Terminal state WITHOUT provenance takes the defensive canonical error path, NEVER idle.
         // Scope to the no-provenance match arm so the defensive marker + Err are co-located.
@@ -66168,6 +66168,342 @@ mod stage198a_second_cohort_plain_parity {
         assert!(
             RUNTIME_SRC.contains("copy_to_user_split"),
             "the drain must still copy the payload out of any lock via copy_to_user_split"
+        );
+    }
+}
+
+/// Stage 198B — SECOND-COHORT ORDINARY-CAP IpcSend cross-architecture parity (source-scan guards).
+/// Mirrors the Stage 198A plain module for the two ordinary-cap classes: `IpcSendOrdinaryCap`
+/// (ordinary cap → already recv-v2-blocked receiver) and `IpcSendOrdinaryCapEnqueue` (ordinary-cap
+/// no-waiter enqueue + later recv-v2 dequeue).
+mod stage198b_second_cohort_ordinary_cap_parity {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const DELEG_SPLIT_SRC: &str = include_str!("cap_transfer_delegation_split.rs");
+    const CAP_LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+    const DEBUG_SRC: &str = include_str!("../syscall/debug.rs");
+    const SYSCALL_SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const SEAL_SRC: &str = include_str!("../../../scripts/qemu-second-cohort-ordinary-cap-seal.sh");
+    const PLAIN_SEAL_SRC: &str = include_str!("../../../scripts/qemu-second-cohort-plain-seal.sh");
+    const FIRST_COHORT_SEAL_SRC: &str =
+        include_str!("../../../scripts/qemu-first-cohort-retirement-seal.sh");
+    const ORACLE_SMOKE: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+
+    // (1) Both ordinary-cap retirement markers are arch-tagged for ALL THREE arches.
+    #[test]
+    fn both_ordinary_cap_retirement_markers_arch_tagged_all_three_arches() {
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendOrdinaryCap",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendOrdinaryCap result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendOrdinaryCap",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendOrdinaryCap result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendOrdinaryCap",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendOrdinaryCap result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendOrdinaryCapEnqueue",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendOrdinaryCapEnqueue result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendOrdinaryCapEnqueue",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendOrdinaryCapEnqueue result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendOrdinaryCapEnqueue",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendOrdinaryCapEnqueue result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(m),
+                "missing arch-tagged ordinary-cap marker: {m}"
+            );
+        }
+    }
+
+    // (2) No untagged legacy DONE form remains for either ordinary-cap class.
+    #[test]
+    fn no_untagged_ordinary_cap_retirement_marker_remains() {
+        assert!(
+            !MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok"),
+            "the untagged IpcSendOrdinaryCap DONE marker must be replaced by the arch-tagged form"
+        );
+        assert!(
+            !MOD_SRC.contains(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCapEnqueue result=ok"
+            ),
+            "the untagged IpcSendOrdinaryCapEnqueue DONE marker must be arch-tagged"
+        );
+    }
+
+    // (3) The ordinary-cap retirement fires from the arch-neutral drain, origin-gated by the
+    // IpcSend-cap boundary take. Both one-shot latch helpers exist.
+    #[test]
+    fn ordinary_cap_retirement_arch_neutral_drain_driven() {
+        assert!(
+            RUNTIME_SRC.contains("maybe_log_ipc_send_ordinary_cap_retired()")
+                && RUNTIME_SRC.contains("ipc_send_cap_boundary_origin_take("),
+            "the ordinary-cap blocked-waiter retirement must fire from the arch-neutral drain, gated"
+        );
+        assert!(
+            MOD_SRC.contains("fn maybe_log_ipc_send_ordinary_cap_retired()")
+                && MOD_SRC.contains("fn maybe_log_ipc_send_ordinary_cap_enqueue_retired()"),
+            "both one-shot ordinary-cap retirement latch helpers must exist"
+        );
+    }
+
+    // (4) The ORDINARY-cap oracle slot provisioning is replicated on all three arches: blocked =
+    // slot 13 coord cap via provision_init_ipc_send_cap_oracle_coord; enqueue = slot 17 = 2 via
+    // ipc_send_cap_enqueue_oracle_active.
+    #[test]
+    fn ordinary_cap_oracle_slot_provisioning_replicated_all_three_arches() {
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains("provision_init_ipc_send_cap_oracle_coord("),
+                "{arch} boot.rs must provision the ordinary-cap blocked oracle coord cap (slot 13)"
+            );
+            assert!(
+                src.contains("ipc_send_cap_enqueue_oracle_active()")
+                    && src.contains("IPC_SEND_CAP_ENQUEUE_ORACLE_PROVISION_OK slot17=2"),
+                "{arch} boot.rs must provision the ordinary-cap enqueue discriminator (slot 17 = 2)"
+            );
+        }
+    }
+
+    // (5) The REPLY-cap (193D) oracle remains x86_64-only — NOT provisioned on AArch64 / RISC-V.
+    #[test]
+    fn no_reply_cap_oracle_on_non_x86_arches() {
+        for (arch, src) in [("aarch64", AARCH64_BOOT_SRC), ("riscv64", RISCV_BOOT_SRC)] {
+            assert!(
+                !src.contains("provision_init_ipc_send_reply_cap_oracle("),
+                "{arch} boot.rs must NOT provision the reply-cap oracle (x86_64-only live target)"
+            );
+        }
+    }
+
+    // (6) The oracle workloads emit the canonical per-arch ordinary-cap attestations carrying
+    // fresh_cap=1 object_identity_ok=1, gated on a clean delivery (byte-match + fresh cap present).
+    #[test]
+    fn ordinary_cap_oracle_workloads_emit_per_arch_attestations() {
+        assert!(
+            INIT_SRC.contains(
+                "IPCSEND_ORDINARY_CAP_BLOCKED_RECEIVER_ORACLE_DONE arch={} result=ok payload_len={} receiver_resumes=1 fresh_cap=1 object_identity_ok=1"
+            ),
+            "the blocked-receiver ordinary-cap oracle must emit the per-arch attestation"
+        );
+        assert!(
+            INIT_SRC.contains(
+                "IPCSEND_ORDINARY_CAP_ENQUEUE_ORACLE_DONE arch={} result=ok payload_len={} dequeue_count=1 fresh_cap=1 object_identity_ok=1"
+            ),
+            "the enqueue ordinary-cap oracle must emit the per-arch attestation"
+        );
+        // The blocked attestation is gated on a byte-match AND a fresh transferred cap.
+        assert!(
+            INIT_SRC.contains("if payload_match && has_cap && cap_is_fresh {"),
+            "the blocked attestation must require byte-match AND a fresh transferred cap"
+        );
+    }
+
+    // (7) The AUTHORITATIVE kernel-side object-identity proof lives in the DELIVERY layer
+    // (`runtime.rs::log_ordinary_cap_object_identity`), fed by a real cnode resolve of the minted
+    // cap out of the receiver's cspace (`resolved_cap_object_split`, capability-state module) — a
+    // full-CapObject comparison, NOT a `CapId != 0` check. Both ordinary-cap delivery executors call
+    // it on materialize. (The delegation-split materialize module stays a pure link-recorder — it
+    // must NOT touch cspace itself, guarded by `stage186d3_uses_atomic_mint_and_records_links_only`.)
+    #[test]
+    fn authoritative_object_identity_in_delivery_layer() {
+        assert!(
+            RUNTIME_SRC.contains("fn log_ordinary_cap_object_identity(")
+                && RUNTIME_SRC.contains("IPC_ORDINARY_CAP_OBJECT_IDENTITY receiver_tid="),
+            "the delivery layer must emit the object-identity marker"
+        );
+        // Meaningful comparison: resolve the minted cap's object out of the receiver cspace and
+        // compare the FULL CapObject (not a nonzero-CapId check).
+        assert!(
+            RUNTIME_SRC.contains("self.resolved_cap_object_split(receiver_cnode, cap)")
+                && RUNTIME_SRC.contains("let identity_match = installed == Some(source_object);"),
+            "the identity proof must resolve the minted cap and compare the full object identity"
+        );
+        // The cnode-resolve helper lives in the capability-lifecycle module (legitimate cspace
+        // access; NOT one of the files the Stage 186A helper-only guard covers), not in the
+        // delegation-split link recorder.
+        assert!(
+            CAP_LIFECYCLE_SRC.contains("fn resolved_cap_object_split(")
+                && CAP_LIFECYCLE_SRC.contains("kernel_ref(&space.cspace).get(cap)"),
+            "the split cnode-resolve helper must live in the capability-lifecycle module"
+        );
+        // Both live delivery executors emit the proof on materialize.
+        assert!(
+            RUNTIME_SRC
+                .matches("self.log_ordinary_cap_object_identity(")
+                .count()
+                >= 2,
+            "both the blocked-waiter and recv-boundary deliveries must emit the identity proof"
+        );
+    }
+
+    // (8) RISC-V ordinary-cap IpcSend (the SENDER) stays on the canonical handler and returns
+    // ReturnToCurrent — it is NOT added to the pre-lock selective gate.
+    #[test]
+    fn riscv_ordinary_cap_ipcsend_returns_to_current_not_gated() {
+        assert!(
+            RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu)?;")
+                && RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToCurrent"),
+            "the RISC-V wrapper must run the drain and be able to return ReturnToCurrent"
+        );
+        assert!(
+            !RISCV_TRAP_SRC.contains("Syscall::IpcSend") && !RISCV_TRAP_SRC.contains("NR_IPC_SEND"),
+            "RISC-V ordinary-cap IpcSend must NOT be added to the selective pre-lock gate"
+        );
+    }
+
+    // (9) Reply-cap classification is object-derived (envelope source_object == Reply), NEVER solely
+    // from the user-controlled FLAG_REPLY_CAP flag — so no user flag can smuggle a reply cap into
+    // the ordinary-cap seam. The delegation-split seam defers Reply objects up front.
+    #[test]
+    fn reply_cap_classification_is_object_derived() {
+        assert!(
+            DELEG_SPLIT_SRC.contains("matches!(snapshot.object, CapObject::Reply { .. })"),
+            "the delegation-split materialize must classify reply caps by the authoritative object kind"
+        );
+    }
+
+    // (10) Blocking-idle provenance: the reason variant is the WIDENED BlockedIpcNoRunnable (not the
+    // too-narrow BlockedRecvNoRunnable), and the concrete BlockingSyscallClass is recorded.
+    #[test]
+    fn blocking_idle_provenance_widened_and_class_recorded() {
+        assert!(
+            RISCV_TRAP_SRC.contains("RiscvIdleReason::BlockedIpcNoRunnable")
+                && !RISCV_TRAP_SRC.contains("RiscvIdleReason::BlockedRecvNoRunnable"),
+            "the RISC-V idle reason must be the widened BlockedIpcNoRunnable (no live use of the \
+             too-narrow BlockedRecvNoRunnable variant; a prose mention of the rename is fine)"
+        );
+        assert!(
+            MOD_SRC.contains("BLOCKED_SYSCALL_IDLE_CLASS")
+                && MOD_SRC.contains("enum BlockingSyscallClass")
+                && MOD_SRC.contains("IpcSend"),
+            "the concrete blocking-syscall class (incl. IpcSend) must be recorded alongside the tid"
+        );
+    }
+
+    // (11) The ordinary-cap seal requires all 6 cells (retirement + attestation with
+    // fresh_cap=1 object_identity_ok=1) and forbids reply-cap / shared-region / identity-fail.
+    #[test]
+    fn ordinary_cap_seal_requires_six_cells_and_forbids_reply_shared() {
+        assert!(
+            SEAL_SRC.contains(
+                "SECOND_COHORT_ORDINARY_CAP_SEAL arches=3 classes=2 live_cells=6 result=ok"
+            ) && SEAL_SRC.contains(
+                "SECOND_COHORT_ORDINARY_CAP_MATRIX arches=3 classes=2 live_cells=6 result=ok"
+            ),
+            "the seal script must emit the canonical 6-cell matrix + seal on success"
+        );
+        assert!(
+            SEAL_SRC.contains("class=IpcSendOrdinaryCap result=ok")
+                && SEAL_SRC.contains("IPCSEND_ORDINARY_CAP_BLOCKED_RECEIVER_ORACLE_DONE")
+                && SEAL_SRC.contains("class=IpcSendOrdinaryCapEnqueue result=ok")
+                && SEAL_SRC.contains("IPCSEND_ORDINARY_CAP_ENQUEUE_ORACLE_DONE"),
+            "the seal must key each cell on both the retirement marker and the attestation"
+        );
+        for forbidden in [
+            "ORACLE_IDENTITY_FAIL",
+            "class=IpcSendReplyCap",
+            "class=IpcSendSharedRegion",
+        ] {
+            assert!(
+                SEAL_SRC.contains(forbidden),
+                "the seal must list `{forbidden}` as a forbidden marker"
+            );
+        }
+    }
+
+    // (12) The arch-parameterised oracle smoke acceptance keys on the arch-tagged retirement + the
+    // per-arch ordinary-cap attestations (so it runs on all three arches).
+    #[test]
+    fn ordinary_cap_oracle_smoke_is_arch_parameterised() {
+        assert!(
+            ORACLE_SMOKE.contains(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendOrdinaryCap result=ok"
+            ) && ORACLE_SMOKE.contains(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendOrdinaryCapEnqueue result=ok"
+            ),
+            "the ordinary-cap oracle smoke must require the arch-tagged retirement markers"
+        );
+        assert!(
+            ORACLE_SMOKE.contains(
+                "IPCSEND_ORDINARY_CAP_BLOCKED_RECEIVER_ORACLE_DONE arch=$ARCH result=ok payload_len=8 receiver_resumes=1 fresh_cap=1 object_identity_ok=1"
+            ) && ORACLE_SMOKE.contains(
+                "IPCSEND_ORDINARY_CAP_ENQUEUE_ORACLE_DONE arch=$ARCH result=ok payload_len=8 dequeue_count=1 fresh_cap=1 object_identity_ok=1"
+            ),
+            "the oracle smoke must require both per-arch ordinary-cap attestations"
+        );
+    }
+
+    // (13) EXCLUSIONS: no NEW retirement class minted (no reply-cap-enqueue / shared-region), and
+    // the earlier cohorts are preserved (plain 6/6, first cohort 12/12).
+    #[test]
+    fn no_new_class_and_earlier_cohorts_preserved() {
+        assert!(
+            !MOD_SRC.contains("IpcSendReplyCapEnqueue") && !MOD_SRC.contains("IpcSendSharedRegion"),
+            "Stage 198B must not mint a reply-cap-enqueue or shared-region retirement class"
+        );
+        assert!(
+            PLAIN_SEAL_SRC
+                .contains("SECOND_COHORT_PLAIN_SEAL arches=3 classes=2 live_cells=6 result=ok"),
+            "the second-cohort plain 6/6 seal must remain intact"
+        );
+        assert!(
+            FIRST_COHORT_SEAL_SRC
+                .contains("FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok"),
+            "the first-cohort 12/12 seal must remain intact"
+        );
+    }
+
+    // (14) No new lock in the identity proof / retirement helpers, and no CNode capacity increase
+    // was made to force the oracle to pass.
+    #[test]
+    fn no_new_lock_no_cnode_capacity_increase() {
+        let ord_fn = MOD_SRC
+            .split("pub(crate) fn maybe_log_ipc_send_ordinary_cap_retired()")
+            .nth(1)
+            .unwrap_or("");
+        let ord_body = &ord_fn[..ord_fn.find("\n}").map(|i| i + 2).unwrap_or(ord_fn.len())];
+        assert!(
+            !ord_body.contains("Mutex") && !ord_body.contains("RwLock"),
+            "the ordinary-cap retirement helper must introduce no new lock"
+        );
+        // The identity proof reuses the existing capability split seam, not a new lock.
+        assert!(
+            DELEG_SPLIT_SRC.contains("with_capability_state_split_mut("),
+            "the identity proof must reuse the existing capability split seam"
+        );
+    }
+
+    // (15) DebugLog copy is widened to 192 in lockstep across userspace + BOTH kernel copy paths so
+    // the ~138-byte attestations log untruncated; `syscall::debug` is pub(crate) for the shared cap.
+    #[test]
+    fn debuglog_copy_widened_to_192_in_lockstep() {
+        assert!(
+            DEBUG_SRC.contains("pub(crate) const DEBUG_LOG_MAX_BYTES: usize = 192;"),
+            "the DebugLog copy cap must be 192 bytes"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) mod debug;"),
+            "the debug module must be pub(crate) so the split copy seam can share the cap constant"
+        );
+        assert!(
+            SYSCALL_SPLIT_SRC.contains("crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES")
+                && RUNTIME_SRC.contains("crate::kernel::syscall::debug::DEBUG_LOG_MAX_BYTES"),
+            "both the split handler and its copy helper must use the shared 192-byte cap"
+        );
+        assert!(
+            USER_RT_SRC.contains("const MAX_LOG_LEN: usize = 192;"),
+            "the userspace DebugLog emitter must match the 192-byte cap"
         );
     }
 }
