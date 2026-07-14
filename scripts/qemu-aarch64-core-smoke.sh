@@ -55,6 +55,13 @@ IPC_SEND_CAP_ENQUEUE_ORACLE=${IPC_SEND_CAP_ENQUEUE_ORACLE:-0}
 if [[ "$IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_cap_enqueue_oracle="* ]]; then
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_cap_enqueue_oracle=1"
 fi
+# Stage 198C2: propagate the reply-cap DIRECT oracle knob to the AArch64 cmdline (mirrors
+# the ordinary-cap knob above); without it yarm.ipc_send_reply_cap_oracle=1 never reaches
+# the kernel and the reply-cap direct oracle workload / boot provisioning never runs.
+IPC_SEND_REPLY_CAP_ORACLE=${IPC_SEND_REPLY_CAP_ORACLE:-0}
+if [[ "$IPC_SEND_REPLY_CAP_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_reply_cap_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_reply_cap_oracle=1"
+fi
 
 # Stage 178 (CROSS-ARCH-D6): CROSS_ARCH_D6=1 appends yarm.cross_arch_d6=1 to emit the
 # AArch64 D6 restore-path audit markers (model=trapframe_eret; read-only observe of

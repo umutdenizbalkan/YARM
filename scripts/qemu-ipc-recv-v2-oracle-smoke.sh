@@ -723,7 +723,8 @@ if [[ "$YARM_IPC_SEND_REPLY_CAP_ORACLE" == "1" ]]; then
     "IPC_SEND_REPLY_CAP_BOUNDARY_USER_COPY_OK"
     "IPC_SEND_REPLY_CAP_BOUNDARY_WAKE_OK"
     "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_DONE result=ok"
-    "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendReplyCap result=ok"
+    # Stage 198C2: arch-tagged retirement marker (was untagged in 193D).
+    "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendReplyCap result=ok"
     "IPC_SEND_REPLY_CAP_LIVE_ORACLE_DONE result=ok"
   )
   for m in "${SEND_REPLY_CAP_REQUIRED[@]}"; do

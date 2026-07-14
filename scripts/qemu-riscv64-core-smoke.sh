@@ -149,6 +149,13 @@ IPC_SEND_CAP_ENQUEUE_ORACLE=${IPC_SEND_CAP_ENQUEUE_ORACLE:-0}
 if [[ "$IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_cap_enqueue_oracle="* ]]; then
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_cap_enqueue_oracle=1"
 fi
+# Stage 198C2: propagate the reply-cap DIRECT oracle knob to the RISC-V cmdline (mirrors the
+# ordinary-cap knob above); without it yarm.ipc_send_reply_cap_oracle=1 never reaches the
+# kernel and the reply-cap direct oracle workload / boot provisioning never runs.
+IPC_SEND_REPLY_CAP_ORACLE=${IPC_SEND_REPLY_CAP_ORACLE:-0}
+if [[ "$IPC_SEND_REPLY_CAP_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_reply_cap_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_reply_cap_oracle=1"
+fi
 
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
