@@ -3233,10 +3233,11 @@ fn run_ipc_send_cap_oracle(e1_send: u32, e1_recv: u32, coord_recv: u32, init_tid
             yarm_user_rt::user_log!("IPC_SEND_CAP_LIVE_ORACLE_DONE result=ok");
             // Stage 198B1 Part C: ordinary-cap transfer is COPY/DELEGATION, NOT move — the
             // SOURCE cap (e1_send) MUST remain valid for the sender after the transfer.
-            // Re-exercise it with a plain (non-cap, no FLAG_REPLY_CAP) probe send: success
-            // proves the sender retained authority. `destination_rights_ok=1` and
-            // `reply_metadata=0` are the kernel-authoritative facts (IPC_ORDINARY_CAP_RIGHTS
-            // rights_ok=1, reply_object=0), which the seal cross-checks against this line.
+            // Re-exercise it with a plain non-cap probe send (no reply flag, no shared
+            // region): success proves the sender retained authority. destination-rights-ok
+            // and reply-metadata-absent are the kernel-authoritative facts
+            // (IPC_ORDINARY_CAP_RIGHTS rights_ok=1, reply_object=0), which the seal
+            // cross-checks against this line.
             let source_still_valid =
                 match Message::with_header(0, IPC_SEND_CAP_ORACLE_OPCODE, 0, None, b"RIGHTSCK") {
                     Ok(probe) => {

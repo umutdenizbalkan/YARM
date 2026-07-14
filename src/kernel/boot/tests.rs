@@ -43896,8 +43896,11 @@ mod stage163_sender_wake_proven {
     //     captured explicitly and proof_require no longer reads a separate file.
     #[test]
     fn stage163b_oracle_single_log_one_helper() {
+        // Stage 198B1 Part B routed the oracle's per-run logs into a unique
+        // per-invocation scratch dir (isolation), so the analysis log is now
+        // ORACLE_SCRATCH_DIR-prefixed — still exactly ONE analysis log + ONE helper.
         assert!(
-            ORACLE_SCRIPT.contains("ANALYSIS_LOG=\"ipc-oracle-run-$ARCH.log\"")
+            ORACLE_SCRIPT.contains("ANALYSIS_LOG=\"$ORACLE_SCRATCH_DIR/ipc-oracle-run-$ARCH.log\"")
                 && ORACLE_SCRIPT.contains("marker_present()"),
             "the oracle must build one analysis log and one marker_present helper"
         );
