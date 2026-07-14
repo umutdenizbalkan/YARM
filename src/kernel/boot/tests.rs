@@ -50581,6 +50581,422 @@ mod stage188d_reply_cap_rank_inversion_seam {
             );
         }
     }
+
+    // ── Stage 198C1 — reply-cap direct-delivery classifier + semantics hardening ──
+    //
+    // These lock in the audit (doc/STAGE_198C_REPLY_CAP_AUDIT.md) findings in hosted
+    // code with NO architecture wiring and NO new lock/ABI/marker: reply-cap
+    // classification is authoritative from the resolved `CapObject::Reply` (never a
+    // user flag), and the source-cap disposition is delegation with a one-shot
+    // *record* arbiter (not move/consume).
+
+    // Helper: resolve the recv endpoint object the fixture's waiter is blocked on.
+    fn fixture_recv_endpoint(state: &mut KernelState) -> CapObject {
+        let recv_cap = state
+            .with_tcb_mut(1, |t| t.blocked_recv_state.map(|s| s.recv_cap))
+            .flatten()
+            .expect("waiter recv cap");
+        state
+            .resolve_capability_for_task(1, recv_cap)
+            .expect("resolve recv cap")
+            .object
+    }
+
+    // (1) OBJECT-AUTHORITY, positive direction: a transferred `Reply` object is
+    // routed to the reply-cap boundary split even when the message carries NO
+    // FLAG_REPLY_CAP (the real userspace IpcSend ABI only ever sets
+    // FLAG_CAP_TRANSFER). A user therefore cannot suppress reply classification by
+    // clearing the flag — the split peeks the source OBJECT.
+    #[test]
+    fn stage198c1_reply_object_routed_by_object_not_flag() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, asid1) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // NON-reply flag (ordinary FLAG_CAP_TRANSFER), pointing at the Reply envelope.
+        let msg = Message::with_header(
+            0,
+            0,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"\x00\x00rep",
+        )
+        .expect("ordinary-flagged msg on a reply envelope");
+        let produced = state
+            .try_ipc_send_boundary_split_reply_cap_pub(1, endpoint_idx, &msg)
+            .expect("reply boundary split");
+        assert!(
+            produced,
+            "a transferred Reply object must route to the reply-cap split by OBJECT, not by flag"
+        );
+
+        let shared = SharedKernel::new(state);
+        assert!(shared.drain_dispatch_post_work(CPU0).is_ok(), "drain");
+        // Delivered as a REPLY cap (reply meta flag), not an ordinary transferred cap.
+        let meta = shared
+            .with(|k| k.copy_from_user(asid1, VirtAddr(0x4400), 40))
+            .expect("read meta");
+        let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().unwrap());
+        assert_ne!(
+            recv_meta_flags & crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64,
+            0,
+            "object-routed reply delivery must set the REPLY_CAP meta flag"
+        );
+        let recorded = shared.with(|k| {
+            k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id))
+        });
+        assert!(
+            recorded.is_some(),
+            "the reply record must carry the materialized receiver-local cap"
+        );
+        // Restore the global drainer flag so a following test's fixture yield
+        // takes the immediate-switch path (test-isolation hygiene).
+        set_trap_drainer(false);
+    }
+
+    // (2) OBJECT-AUTHORITY, negative direction: an ordinary (non-Reply) object does
+    // NOT get grabbed by the reply-cap boundary even when the message DOES carry
+    // FLAG_REPLY_CAP. The split peeks WITHOUT consuming, so it declines (Ok(false))
+    // and leaves the waiter state and the envelope intact for the ordinary slice.
+    #[test]
+    fn stage198c1_ordinary_object_declines_reply_boundary_no_consume() {
+        let (mut state, endpoint_idx, _reply_handle, _ri, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let recv_endpoint = fixture_recv_endpoint(&mut state);
+        let (_mem_id, ord_cap) = state
+            .create_memory_object(PhysAddr(0xCB000))
+            .expect("ordinary memory object");
+        let ord_handle = state
+            .stash_transfer_envelope(ThreadId(0), ord_cap, recv_endpoint, Some(ThreadId(1)), None)
+            .expect("stash ordinary envelope");
+
+        // Force the reply flag on an ordinary object — must still decline.
+        let msg = reply_cap_msg(ord_handle);
+        let produced = state
+            .try_ipc_send_boundary_split_reply_cap_pub(1, endpoint_idx, &msg)
+            .expect("reply boundary split");
+        set_trap_drainer(false);
+        assert!(
+            !produced,
+            "an ordinary object must NOT be routed to the reply split even with FLAG_REPLY_CAP"
+        );
+        // Peek did not consume the ordinary envelope; the waiter is untouched.
+        assert!(
+            state
+                .peek_transfer_envelope_source_object(ord_handle)
+                .is_some(),
+            "the reply split must peek WITHOUT consuming a non-Reply envelope"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |t| t.blocked_recv_state)
+                .flatten()
+                .is_some(),
+            "a declined reply split must not consume the waiter's blocked_recv_state"
+        );
+    }
+
+    // (3) A non-Reply source cannot be forced into the reply PRODUCER: even with
+    // FLAG_REPLY_CAP set, Phase A rejects a non-Reply object with WrongObject and
+    // stashes nothing (no wake, no partial delivery).
+    #[test]
+    fn stage198c1_non_reply_source_rejected_by_reply_producer_no_stash() {
+        let (mut state, endpoint_idx, _reply_handle, _ri, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let recv_endpoint = fixture_recv_endpoint(&mut state);
+        let (_mem_id, ord_cap) = state
+            .create_memory_object(PhysAddr(0xCC000))
+            .expect("ordinary memory object");
+        let ord_handle = state
+            .stash_transfer_envelope(ThreadId(0), ord_cap, recv_endpoint, Some(ThreadId(1)), None)
+            .expect("stash ordinary envelope");
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(ord_handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "a non-Reply source must be a synchronous WrongObject at the reply producer"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed when the source object is not a Reply"
+        );
+    }
+
+    // (4) A stale/cancelled source generation is rejected at Phase A: the reply
+    // object's liveness check keys on `reply_cap_generations[index]`, so a bumped
+    // generation (the signal a slot was cancelled and reused) fails with
+    // InvalidCapability — nothing stashed, waiter not woken. (The complementary
+    // "slot emptied, same generation" cancellation is caught later at the Phase-B'
+    // record set and is covered by `stage188d_stale_record_rolls_back_no_wake`.)
+    #[test]
+    fn stage198c1_stale_source_generation_rejected_no_stash() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // Simulate the slot being cancelled + reused: bump the generation so the
+        // captured reply object's generation is now stale.
+        state.with_ipc_state_mut(|ipc| {
+            ipc.reply_cap_generations[reply_index] =
+                ipc.reply_cap_generations[reply_index].wrapping_add(1);
+        });
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "a stale source generation must be rejected at Phase A (dead object)"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed for a dead reply object"
+        );
+        assert!(
+            !matches!(
+                state.task_status(1),
+                Some(TaskStatus::Runnable | TaskStatus::Running)
+            ) || state.current_tid() == Some(1),
+            "the waiter must not be woken by a rejected delivery"
+        );
+    }
+
+    // (5) An invalid source handle (no such envelope) is rejected at Phase A with
+    // no stash.
+    #[test]
+    fn stage198c1_invalid_source_handle_rejected_no_stash() {
+        let (mut state, endpoint_idx, _handle, _ri, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(0x0DEA_D000_BEEF_0000),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "an invalid source handle must be a Phase-A error"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed for an invalid source handle"
+        );
+    }
+
+    // (6) An invalid receiver payload destination is rejected at the producer's
+    // pre-copy validation BEFORE the reply envelope is consumed: no stash, nothing
+    // minted (reply record has no waiter cap), envelope retained (retryable).
+    #[test]
+    fn stage198c1_invalid_receiver_payload_dest_rejected_no_stash() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        state.with_tcb_mut(1, |tcb| {
+            if let Some(s) = tcb.blocked_recv_state.as_mut() {
+                s.payload_user_ptr = 0x40000; // unmapped
+            }
+        });
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "an unmapped receiver payload dest must be rejected"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed on a payload-destination fault"
+        );
+        let recorded =
+            state.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id));
+        assert_eq!(
+            recorded, None,
+            "nothing may be minted/recorded on a payload fault"
+        );
+        // Payload validation precedes the envelope take, so it stays retryable.
+        assert!(
+            state.peek_transfer_envelope_source_object(handle).is_some(),
+            "the reply envelope must survive a payload-destination fault (retryable)"
+        );
+    }
+
+    // (7) DELEGATION + one-shot RECORD arbiter (the core audit finding): after a
+    // successful reply-cap transfer the SENDER/caller's reply cap is still present
+    // (delegation, NOT move), and the receiver holds a distinct cap to the SAME
+    // Reply object. Invocability is decided by the one-shot record, not by cap
+    // presence: emptying the record makes the object non-live even though BOTH caps
+    // still physically resolve in their cnodes.
+    #[test]
+    fn stage198c1_delegation_sender_cap_present_record_is_one_shot_arbiter() {
+        let (mut state, endpoint_idx, handle, reply_index, reply_generation, asid1) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // The caller/sender's reply cap (task 0) recorded at creation.
+        let caller_cap = state
+            .with_ipc_state(|ipc| ipc.reply_caps[reply_index].map(|r| r.caller_cap_id))
+            .expect("caller cap id");
+
+        let produced = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        )
+        .expect("producer");
+        assert!(produced);
+        let shared = SharedKernel::new(state);
+        assert!(shared.drain_dispatch_post_work(CPU0).is_ok(), "drain");
+
+        let reply_object = CapObject::Reply {
+            index: reply_index,
+            generation: reply_generation,
+        };
+        // Receiver-local cap from the delivered meta.
+        let meta = shared
+            .with(|k| k.copy_from_user(asid1, VirtAddr(0x4400), 40))
+            .expect("meta");
+        let receiver_cap = CapId(u64::from_le_bytes(meta[16..24].try_into().unwrap()));
+
+        shared.with(|k| {
+            // Delegation: the sender/caller cap is NOT consumed by the transfer.
+            let caller = k
+                .resolve_capability_for_task(0, caller_cap)
+                .expect("caller reply cap still resolves after transfer (delegation, not move)");
+            assert_eq!(
+                caller.object, reply_object,
+                "caller cap references the Reply object"
+            );
+            // The receiver holds a DISTINCT cap to the SAME object.
+            let recv = k
+                .resolve_capability_for_task(1, receiver_cap)
+                .expect("receiver reply cap resolves");
+            assert_eq!(
+                recv.object, reply_object,
+                "receiver cap references the same Reply object"
+            );
+            assert_ne!(
+                receiver_cap.0, caller_cap.0,
+                "receiver cap is a fresh, distinct CapId"
+            );
+            // The record is the arbiter and now points at the receiver-local cap.
+            let recorded =
+                k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id));
+            assert_eq!(
+                recorded,
+                Some(receiver_cap),
+                "record binds the receiver-local cap"
+            );
+            // Object is currently live/invocable.
+            assert!(k.capability_object_live(reply_object).is_some());
+        });
+
+        // One-shot: emptying the record (exactly what `ipc_reply` does at consume)
+        // is the single arbiter — a re-prime of the SAME (index, generation) now
+        // fails (slot empty), even though BOTH caps still physically resolve in
+        // their cnodes. Invocability is decided by the record, not cap presence.
+        shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| ipc.reply_caps[reply_index] = None);
+            assert!(
+                k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].is_none()),
+                "the consumed record slot must be empty (one-shot consume point)"
+            );
+            let reprime = k.try_set_reply_cap_waiter_cap(reply_index, reply_generation, receiver_cap);
+            assert!(
+                !matches!(reprime, crate::kernel::boot::ReplyRecordSetOutcome::Set),
+                "re-priming a consumed record must fail — the record is the one-shot arbiter"
+            );
+            assert!(
+                k.resolve_capability_for_task(0, caller_cap).is_ok()
+                    && k.resolve_capability_for_task(1, receiver_cap).is_ok(),
+                "both caps still physically resolve — invocability is decided by the record, not cap presence"
+            );
+        });
+        set_trap_drainer(false);
+    }
+
+    // (8) Provisional receiver-cap rollback after an executor user-copy fault: the
+    // producer pre-validates, but the payload page is unmapped before the drain, so
+    // the executor mints, then faults on copy, and must roll the provisional cap
+    // and its recorded waiter-cap all the way back — real Err, no waiter cap left,
+    // waiter not woken.
+    #[test]
+    fn stage198c1_provisional_cap_rolled_back_on_executor_copy_fault() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, asid1) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let produced = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        )
+        .expect("producer");
+        assert!(produced);
+
+        // Unmap the payload/meta page AFTER the producer validated it, so the
+        // executor's post-mint copy faults.
+        state
+            .unmap_user_page_in_asid(asid1, VirtAddr(0x4000))
+            .expect("unmap payload page");
+
+        let shared = SharedKernel::new(state);
+        let drain = shared.drain_dispatch_post_work(CPU0);
+        set_trap_drainer(false);
+        assert!(
+            drain.is_err(),
+            "an executor copy fault must surface as a real Err"
+        );
+        let recorded = shared.with(|k| {
+            k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id))
+        });
+        assert_eq!(
+            recorded, None,
+            "the provisional receiver-cap + recorded waiter-cap must be fully rolled back"
+        );
+        // The receiver-local reply cap must not survive the rollback (no cap leak).
+        let receiver_leak = shared.with(|k| {
+            k.with_ipc_state(|ipc| ipc.reply_caps[reply_index])
+                .and_then(|r| r.waiter_cap_id)
+                .is_some()
+        });
+        assert!(
+            !receiver_leak,
+            "no receiver-local reply cap may be left recorded after rollback"
+        );
+    }
 }
 
 // ===========================================================================
