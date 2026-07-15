@@ -725,6 +725,10 @@ if [[ "$YARM_IPC_SEND_REPLY_CAP_ORACLE" == "1" ]]; then
     "IPC_SEND_REPLY_CAP_BOUNDARY_SPLIT_DONE result=ok"
     # Stage 198C2: arch-tagged retirement marker (was untagged in 193D).
     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$ARCH class=IpcSendReplyCap result=ok"
+    # Stage 198C2B: echo the fresh-receiver-cap marker in the required list so it is
+    # captured on EVERY arch's stdout (the delegated core-smoke summary otherwise omits
+    # the raw line, which the seal greps).
+    "IPC_SEND_REPLY_CAP_ORACLE_CHILD_RECV_OK payload_match=1 reply_cap=1 reply_is_fresh=1"
     # Stage 198C2B: live object-identity, delegation-rights, and one-shot proofs.
     "IPCSEND_REPLY_CAP_OBJECT_IDENTITY_OK arch=$ARCH object_match=1 target_match=1 reply_metadata=1"
     "IPCSEND_REPLY_CAP_RIGHTS_OK arch=$ARCH delegation=1 destination_rights_ok=1 source_cap_present=1"
