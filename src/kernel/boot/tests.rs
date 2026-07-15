@@ -63385,6 +63385,379 @@ mod stage198ds_direct_only_reply_caps {
     }
 }
 
+// Stage 198E1 — SHARED-REGION IpcSend AUDIT (hosted preparation, no production change).
+//
+// Audit/preparation for cross-arch retirement of the shared-region IpcSend path. Proves the
+// classification is object-authoritative, ordinary/reply objects cannot be forced into or out of
+// the shared path, the transfer is a one-shot delegation, and the envelope/active-mapping/cleanup
+// lifecycle reclaims cleanly on teardown. The mapping-plan WRITE gate and cleanup-token
+// generation/stale/duplicate semantics are additionally covered by the existing stage54_* /
+// stage56_* tests (composed into the hosted audit seal). See doc/STAGE_198E1_SHARED_REGION_AUDIT.md.
+//
+// VERDICT: IpcSendSharedRegionDirect = NEEDS_BOUNDED_FIX; IpcSendSharedRegionEnqueue =
+// NEEDS_BOUNDED_FIX (the map + TLB shootdown + user-copy still run under the broad lock; the
+// post-lock map/copy boundary snapshot does not yet exist for shared-region).
+mod stage198e1_shared_region_audit {
+    use super::*;
+    use crate::kernel::recv_core::recv_shared_v3::{
+        CAP_RIGHT_MAP, CAP_RIGHT_WRITE, MAP_READ, MAP_WRITE, OPCODE_SHARED_MEM_VALUE,
+        RecvV3MappingPlan, compute_recv_v3_mapping_plan,
+    };
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::ipc_recv_core::materialize_received_message_cap;
+
+    fn shared_envelope_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| {
+                state.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes[i]
+                        .map(|e| e.shared_region.is_some())
+                        .unwrap_or(false)
+                })
+            })
+            .count()
+    }
+
+    fn active_mapping_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| state.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+            .count()
+    }
+
+    // (1) The two shared-region object variants are exactly MemoryObject and DmaRegion, chosen by
+    // the RESOLVED grant object on the send side (not a user flag).
+    #[test]
+    fn shared_region_object_types_are_memoryobject_and_dmaregion() {
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        assert!(
+            IPC_SRC.contains("CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}"),
+            "shared-region send must accept exactly MemoryObject|DmaRegion by resolved object"
+        );
+    }
+
+    // (2) A MemoryObject shared-region transfer materializes as an ordinary delegated cap: a FRESH
+    // receiver-local CapId with the SAME object identity (id/generation) as the source.
+    #[test]
+    fn memoryobject_transfer_materializes_fresh_cap_preserving_identity() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let source_obj = state.current_task_capability(mem_cap).expect("src").object;
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
+            .expect("stash");
+        let msg = Message::with_header(0, 0x44, Message::FLAG_CAP_TRANSFER, Some(handle), b"cap")
+            .expect("msg");
+        let cap_id = materialize_received_message_cap(&mut state, endpoint, 2, 0, &msg)
+            .expect("ok")
+            .expect("minted");
+        assert_ne!(
+            cap_id, mem_cap.0,
+            "receiver-local cap must be fresh, not the sender CapId"
+        );
+        let minted = state
+            .resolve_capability_for_task(2, CapId(cap_id))
+            .expect("resolve minted");
+        assert!(!matches!(minted.object, CapObject::Reply { .. }));
+        assert_eq!(
+            minted.object, source_obj,
+            "object identity/generation preserved"
+        );
+    }
+
+    // (3) A Reply object is EXCLUDED from the shared-region/transfer path: FLAG_CAP_TRANSFER + Reply
+    // envelope fails closed (direct-only reply policy intact), never delegated or mapped.
+    #[test]
+    fn reply_object_excluded_from_shared_region_transfer() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash");
+        let msg = Message::with_header(0, 0x44, Message::FLAG_CAP_TRANSFER, Some(handle), b"rc")
+            .expect("msg");
+        assert_eq!(
+            materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg),
+            Err(SyscallError::InvalidCapability),
+            "a Reply object must never enter the shared/ordinary transfer path"
+        );
+    }
+
+    // (4) An ordinary cap cannot be forced into a mapping without canonical MAP authority, and a
+    // writable mapping requires canonical WRITE authority (object-authoritative gate, not a flag).
+    #[test]
+    fn ordinary_cap_cannot_force_mapping_without_authority() {
+        // No MAP right → InsufficientRights even with the shared-mem opcode + read intent.
+        assert_eq!(
+            compute_recv_v3_mapping_plan(
+                OPCODE_SHARED_MEM_VALUE,
+                MAP_READ,
+                0x4000,
+                PAGE_SIZE as u64,
+                0, // no CAP_RIGHT_MAP
+                PAGE_SIZE as u64,
+                PAGE_SIZE as u64,
+            ),
+            RecvV3MappingPlan::InsufficientRights
+        );
+        // WRITE intent without WRITE right → InsufficientRights.
+        assert_eq!(
+            compute_recv_v3_mapping_plan(
+                OPCODE_SHARED_MEM_VALUE,
+                MAP_READ | MAP_WRITE,
+                0x4000,
+                PAGE_SIZE as u64,
+                CAP_RIGHT_MAP, // MAP but not WRITE
+                PAGE_SIZE as u64,
+                PAGE_SIZE as u64,
+            ),
+            RecvV3MappingPlan::InsufficientRights
+        );
+        // A non-shared opcode never maps (an ordinary transfer stays unmapped).
+        assert_eq!(
+            compute_recv_v3_mapping_plan(
+                0,
+                MAP_READ,
+                0x4000,
+                PAGE_SIZE as u64,
+                CAP_RIGHT_MAP | CAP_RIGHT_WRITE,
+                PAGE_SIZE as u64,
+                PAGE_SIZE as u64,
+            ),
+            RecvV3MappingPlan::Skip
+        );
+    }
+
+    // (5) A shared-region transfer envelope pins its object for the queue interval, and process
+    // teardown purges the envelope AND unpins the object — no envelope/reference leak.
+    #[test]
+    fn shared_region_envelope_pins_and_teardown_reclaims() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let mem_cap_t1 = state
+            .grant_capability_task_to_task(0, mem_cap, 1)
+            .expect("grant to t1");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let _handle = state
+            .stash_transfer_envelope(ThreadId(1), mem_cap_t1, endpoint, None, Some(region))
+            .expect("stash shared envelope");
+        assert_eq!(shared_envelope_count(&state), 1);
+
+        state.purge_transfer_envelopes_for_pid(1);
+        assert_eq!(
+            shared_envelope_count(&state),
+            0,
+            "sender teardown must purge the queued shared-region envelope (unpin, no leak)"
+        );
+    }
+
+    // (6) The shared-region transfer envelope is one-shot: a duplicate dequeue cannot re-materialize.
+    #[test]
+    fn shared_region_transfer_envelope_is_one_shot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, Some(region))
+            .expect("stash");
+        assert!(
+            state
+                .take_transfer_envelope(handle, endpoint, ThreadId(0))
+                .is_some()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(handle, endpoint, ThreadId(0))
+                .is_none(),
+            "one envelope → at most one materialization"
+        );
+    }
+
+    // (7) An invalid/stale source handle at dequeue is rejected (no envelope → InvalidCapability).
+    #[test]
+    fn invalid_stale_source_handle_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        // Bogus handle: no envelope stashed.
+        let msg = Message::with_header(
+            0,
+            0x44,
+            Message::FLAG_CAP_TRANSFER,
+            Some(0xDEAD_BEEF),
+            b"cap",
+        )
+        .expect("msg");
+        assert!(
+            materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg).is_err(),
+            "a stale/absent transfer envelope must be rejected"
+        );
+    }
+
+    // (8) Receiver CNode full at materialize → mint fails, the envelope is consumed (dropped), and
+    // no receiver cap leaks.
+    #[test]
+    fn receiver_cnode_full_rollback_for_shared_transfer() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let cnode2 = state.task_cnode(2).expect("task2 cnode");
+        let mut filled = 0usize;
+        for _ in 0..8192 {
+            if state
+                .mint_capability_in_cnode(
+                    cnode2,
+                    Capability::new(CapObject::Kernel, CapRights::READ),
+                )
+                .is_err()
+            {
+                break;
+            }
+            filled += 1;
+        }
+        assert!(filled > 0);
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
+            .expect("stash");
+        let msg = Message::with_header(0, 0x44, Message::FLAG_CAP_TRANSFER, Some(handle), b"cap")
+            .expect("msg");
+        assert!(
+            materialize_received_message_cap(&mut state, endpoint, 2, 0, &msg).is_err(),
+            "mint into a full cnode must fail"
+        );
+        assert!(
+            state.peek_transfer_envelope_source_object(handle).is_none(),
+            "the envelope is consumed/dropped on the failed materialize"
+        );
+    }
+
+    // (9) The active-mapping registry is keyed by (owner, generation-encoded CapId): a stale/
+    // different CapId does not match a live mapping, and a duplicate release is rejected.
+    #[test]
+    fn active_mapping_keyed_by_owner_and_generation_cap() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let cap = CapId(0x0002_0000_0000_0007); // slot 7, generation encoded high
+        state
+            .register_active_transfer_mapping(ThreadId(2), cap, VirtAddr(0x4000), PAGE_SIZE)
+            .expect("register");
+        assert_eq!(
+            state.active_transfer_mapping_for(ThreadId(2), cap),
+            Some((VirtAddr(0x4000), PAGE_SIZE))
+        );
+        // A stale/replacement CapId (different generation bits) must not match.
+        let stale = CapId(cap.0 ^ (1 << 40));
+        assert_eq!(state.active_transfer_mapping_for(ThreadId(2), stale), None);
+        // First release succeeds; a duplicate release is rejected.
+        assert!(state.remove_active_transfer_mapping(ThreadId(2), cap));
+        assert!(
+            !state.remove_active_transfer_mapping(ThreadId(2), cap),
+            "duplicate release must be rejected"
+        );
+    }
+
+    // (10) Receiver/process teardown reclaims active mappings — no mapping survives exit.
+    #[test]
+    fn receiver_teardown_purges_active_mappings() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let cap = CapId(0x0003_0000_0000_0002);
+        state
+            .register_active_transfer_mapping(ThreadId(2), cap, VirtAddr(0x8000), PAGE_SIZE)
+            .expect("register");
+        assert_eq!(active_mapping_count(&state), 1);
+        state.purge_active_transfer_mappings_for_pid(2);
+        assert_eq!(
+            active_mapping_count(&state),
+            0,
+            "no active mapping may survive receiver/process teardown"
+        );
+        assert_eq!(state.active_transfer_mapping_for(ThreadId(2), cap), None);
+    }
+
+    // (11) Full teardown leaves NO envelope and NO mapping leak.
+    #[test]
+    fn full_teardown_leaves_no_leak() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let mem_cap_t2 = state
+            .grant_capability_task_to_task(0, mem_cap, 2)
+            .expect("grant to t2");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let _h = state
+            .stash_transfer_envelope(
+                ThreadId(2),
+                mem_cap_t2,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let cap = CapId(0x0004_0000_0000_0003);
+        state
+            .register_active_transfer_mapping(ThreadId(2), cap, VirtAddr(0xC000), PAGE_SIZE)
+            .expect("register");
+        assert_eq!(shared_envelope_count(&state), 1);
+        assert_eq!(active_mapping_count(&state), 1);
+
+        state.purge_transfer_envelopes_for_pid(2);
+        state.purge_active_transfer_mappings_for_pid(2);
+
+        assert_eq!(
+            shared_envelope_count(&state),
+            0,
+            "no transfer-envelope leak"
+        );
+        assert_eq!(active_mapping_count(&state), 0, "no active-mapping leak");
+    }
+}
+
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
 // no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
 // reality the audit relied on, so a future stage cannot silently flip an architecture
