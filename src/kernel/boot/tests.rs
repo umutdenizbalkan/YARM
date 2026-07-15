@@ -61543,6 +61543,214 @@ mod stage193b_ipc_send_plain_oracle {
     }
 }
 
+// Stage 198C2B — reply-cap DIRECT one-shot live wiring. Source-level guards over the
+// new oracle topology (real wakeable caller = init, responder removed only for the
+// gated oracle), the kernel object-identity/rights attestations, the arch-tagged
+// marker origin, the seal contract, and the RISC-V typed-return preservation.
+mod stage198c2b_reply_cap_one_shot_wiring {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SEAL_SRC: &str =
+        include_str!("../../../scripts/qemu-second-cohort-reply-cap-direct-seal.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // (1) Provisioning topology: the reply record is bound to a real wakeable caller
+    // (init) with responder=None, and init is granted the reply-endpoint RECV cap
+    // returned as a third value.
+    #[test]
+    fn provisioning_wakeable_caller_responder_none() {
+        let body = MOD_SRC
+            .split("fn provision_init_ipc_send_reply_cap_oracle(")
+            .nth(1)
+            .and_then(|r| r.split("\n}").next())
+            .expect("provision fn body");
+        assert!(
+            body.contains("-> Option<(u32, u32, u32)>")
+                || MOD_SRC.contains(
+                    "fn provision_init_ipc_send_reply_cap_oracle(\n    kernel: &mut KernelState,\n    init_tid: u64,\n) -> Option<(u32, u32, u32)>"
+                ),
+            "the reply-cap oracle provisioning must return the three-tuple (coord, reply_cap, reply_recv)"
+        );
+        assert!(
+            body.contains("reply_recv_init")
+                && body.contains("grant_capability_task_to_task_with_rights"),
+            "init must be granted the reply-endpoint RECV cap (the wakeable caller)"
+        );
+        assert!(
+            body.contains(
+                "crate::kernel::ipc::ThreadId(init_tid),\n        reply_recv_init,\n        None,"
+            ),
+            "the Reply record must be created with caller=init and responder=None (child may invoke)"
+        );
+    }
+
+    // (2) The responder=None relaxation lives ONLY inside this knob-gated provisioning
+    // (guarded by ipc_send_reply_cap_oracle_active), never in the general reply path.
+    #[test]
+    fn responder_none_only_in_gated_oracle() {
+        let body = MOD_SRC
+            .split("fn provision_init_ipc_send_reply_cap_oracle(")
+            .nth(1)
+            .and_then(|r| r.split("\n}").next())
+            .expect("provision fn body");
+        assert!(
+            body.contains("if !ipc_send_reply_cap_oracle_active() {"),
+            "the provisioning (incl. responder=None) must be gated by the reply-cap oracle knob"
+        );
+    }
+
+    // (3) All three arch boots destructure the three-tuple and carry the reply-endpoint
+    // RECV cap in slot 17 (no longer the literal `= 1`).
+    #[test]
+    fn boot_slot17_reply_recv_all_arches() {
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains("Some((coord_recv_cap, reply_cap, reply_recv_cap)) =")
+                    && src
+                        .contains("crate::kernel::boot::provision_init_ipc_send_reply_cap_oracle("),
+                "{arch} boot must destructure the reply-cap oracle three-tuple"
+            );
+            assert!(
+                src.contains("init_args[17] = reply_recv_cap as u64;"),
+                "{arch} boot must carry the reply-endpoint RECV cap in slot 17"
+            );
+        }
+    }
+
+    // (4) Reply-cap ENQUEUE remains disabled: this stage adds no enqueue provisioning,
+    // and the reply-cap direct branch sets no enqueue discriminator.
+    #[test]
+    fn reply_enqueue_provisioning_absent() {
+        for src in [X86_BOOT_SRC, AARCH64_BOOT_SRC, RISCV_BOOT_SRC] {
+            assert!(
+                !src.contains("provision_init_ipc_send_reply_cap_enqueue")
+                    && !src.contains("IpcSendReplyCapEnqueue"),
+                "no reply-cap ENQUEUE provisioning may be present"
+            );
+        }
+        assert!(
+            !MOD_SRC.contains("provision_init_ipc_send_reply_cap_enqueue"),
+            "boot/mod.rs must not add reply-cap enqueue provisioning"
+        );
+    }
+
+    // (5) Kernel attestation: the object-identity + rights markers are emitted ONLY for
+    // the live IpcSend reply-cap boundary delivery (boundary-origin gated) and compare
+    // the FULL resolved object + rights, not a CapId!=0 / freshness proxy.
+    #[test]
+    fn kernel_attestation_boundary_origin_gated() {
+        let body = RUNTIME_SRC
+            .split("fn execute_blocked_waiter_reply_cap_delivery(")
+            .nth(1)
+            .and_then(|r| r.split("\n    fn ").next().or(Some(r)))
+            .expect("executor body");
+        // Both attestation markers gated by the reply-cap boundary origin.
+        let ident_at = body
+            .find("IPCSEND_REPLY_CAP_OBJECT_IDENTITY_OK")
+            .expect("object-identity marker present");
+        let rights_at = body
+            .find("IPCSEND_REPLY_CAP_RIGHTS_OK")
+            .expect("rights marker present");
+        let gate_at = body
+            .find("ipc_send_reply_cap_boundary_origin_is_set")
+            .expect("boundary-origin gate present");
+        // The gate that wraps the attestation appears before both markers in the Set arm.
+        let attest_gate = body.rfind("ipc_send_reply_cap_boundary_origin_is_set(cpu.0 as usize) {\n                    let arch");
+        assert!(
+            attest_gate.is_some()
+                && attest_gate.unwrap() < ident_at
+                && attest_gate.unwrap() < rights_at,
+            "both attestations must be emitted under the boundary-origin gate"
+        );
+        let _ = gate_at;
+        assert!(
+            body.contains("resolved_capability_split(")
+                && body.contains("installed_object == Some(reply_object)"),
+            "object_match must compare the FULL resolved receiver cap object to the source Reply"
+        );
+        assert!(
+            body.contains("== Some(CapRights::SEND)"),
+            "destination_rights_ok must compare against the canonical reply-cap rights (SEND)"
+        );
+    }
+
+    // (6) Oracle one-shot: the receiver child invokes the transferred reply cap TWICE
+    // and the caller (init) blocks canonically and emits the one-shot marker.
+    #[test]
+    fn oracle_double_invoke_and_one_shot_marker() {
+        let body = INIT_SRC
+            .split("fn run_ipc_send_reply_cap_oracle(")
+            .nth(1)
+            .and_then(|r| r.split("\nfn ").next())
+            .expect("oracle body");
+        assert_eq!(
+            body.matches("yarm_user_rt::syscall::ipc_reply(").count(),
+            2,
+            "the receiver child must invoke the reply cap exactly twice (first + second)"
+        );
+        assert!(
+            body.contains("IPC_SEND_REPLY_CAP_ORACLE_CHILD_FIRST_REPLY")
+                && body.contains("IPC_SEND_REPLY_CAP_ORACLE_CHILD_SECOND_REPLY"),
+            "the child must log both invocation outcomes"
+        );
+        assert!(
+            body.contains("yarm_user_rt::syscall::ipc_recv(reply_recv)"),
+            "the caller must enter the canonical BLOCKED waiting-for-reply state"
+        );
+        assert!(
+            body.contains(
+                "IPCSEND_REPLY_CAP_ONE_SHOT_OK arch={} first_reply=ok second_reply=rejected caller_wakes=1 duplicate_reply=0"
+            ),
+            "the caller must emit the aggregate one-shot attestation on success"
+        );
+    }
+
+    // (7) Seal contract: the seal requires all five live proofs per arch and emits the
+    // 3/3 cross-arch seal.
+    #[test]
+    fn seal_parser_contract() {
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcSendReplyCap result=ok",
+            "IPCSEND_REPLY_CAP_OBJECT_IDENTITY_OK arch=${arch} object_match=1 target_match=1 reply_metadata=1",
+            "IPCSEND_REPLY_CAP_RIGHTS_OK arch=${arch} delegation=1 destination_rights_ok=1 source_cap_present=1",
+            "IPCSEND_REPLY_CAP_ONE_SHOT_OK arch=${arch} first_reply=ok second_reply=rejected caller_wakes=1 duplicate_reply=0",
+            "SECOND_COHORT_REPLY_CAP_DIRECT_SEAL arches=3 classes=1 live_cells=3 result=ok",
+        ] {
+            assert!(SEAL_SRC.contains(m), "seal must require/emit `{m}`");
+        }
+        assert!(
+            SEAL_SRC.contains("class=IpcSendReplyCapEnqueue|class=IpcSendSharedRegion"),
+            "the seal must reject reply-cap-enqueue and shared-region markers"
+        );
+    }
+
+    // (8) RISC-V typed-return preservation: the reply-cap IpcSend sender is NOT added to
+    // the RISC-V pre-lock selective gate; the wrapper stays able to ReturnToCurrent.
+    #[test]
+    fn riscv_return_to_current_preserved() {
+        assert!(
+            RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToCurrent")
+                && RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu)"),
+            "the RISC-V wrapper must run the drain and be able to ReturnToCurrent"
+        );
+        assert!(
+            !RISCV_BOOT_SRC.contains("IpcSendReplyCap gate")
+                && RISCV_BOOT_SRC.contains("ReturnToCurrent"),
+            "RISC-V reply-cap sender must stay on the canonical ReturnToCurrent path"
+        );
+    }
+}
+
 // Stage 193C — IPCSEND ORDINARY-CAP BOUNDARY SPLIT. Extends the IpcSend boundary
 // decomposition to ordinary cap-transfer sends to an already-recv-v2-blocked
 // receiver, reusing the SAME 188C ordinary-cap producer + executor `ipc_reply` uses
