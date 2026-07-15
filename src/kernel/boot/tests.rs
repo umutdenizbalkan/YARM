@@ -50997,6 +50997,100 @@ mod stage188d_reply_cap_rank_inversion_seam {
             "no receiver-local reply cap may be left recorded after rollback"
         );
     }
+
+    // Stage 198C3: an invalid receiver METADATA destination is rejected at the
+    // producer's meta pre-validation (Phase A.4). The reply envelope is consumed by
+    // then, but NOTHING is minted (no receiver reply-cap leak, no waiter cap recorded)
+    // and no post-work is stashed (no receiver/caller wake, no partial metadata).
+    #[test]
+    fn stage198c3_invalid_receiver_meta_dest_rejected_no_stash() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        state.with_tcb_mut(1, |tcb| {
+            if let Some(s) = tcb.blocked_recv_state.as_mut() {
+                s.meta_user_ptr = 0x40000; // unmapped
+            }
+        });
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "an unmapped receiver metadata dest must be rejected"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed on a metadata-destination fault"
+        );
+        let recorded =
+            state.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id));
+        assert_eq!(
+            recorded, None,
+            "nothing may be minted/recorded on a metadata fault"
+        );
+    }
+
+    // Stage 198C3: a DUPLICATE transfer attempt of the same reply envelope is rejected
+    // — the transfer envelope is one-shot. Simulating a first transfer by consuming the
+    // envelope, the producer's Phase-A take of the same handle then fails, and nothing
+    // is stashed (no double mint, no duplicate Reply authority materialized, waiter
+    // state preserved).
+    #[test]
+    fn stage198c3_duplicate_transfer_envelope_rejected_no_double_mint() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // Resolve the endpoint the envelope is bound to, then consume it once (the
+        // "first" transfer). A second take of a one-shot envelope must be impossible.
+        let recv_cap = state
+            .with_tcb_mut(1, |t| t.blocked_recv_state.map(|s| s.recv_cap))
+            .flatten()
+            .expect("waiter recv cap");
+        let recv_endpoint = state
+            .resolve_capability_for_task(1, recv_cap)
+            .expect("resolve recv cap")
+            .object;
+        assert!(
+            state
+                .take_transfer_envelope(handle, recv_endpoint, ThreadId(1))
+                .is_some(),
+            "the first transfer consumes the one-shot envelope"
+        );
+
+        // The producer's Phase-A take of the same (now-consumed) handle must fail.
+        let r2 = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r2.is_err(),
+            "a duplicate transfer of the consumed one-shot envelope must be a Phase-A error"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed for a duplicate transfer attempt"
+        );
+        // No receiver cap was materialized for the duplicate attempt.
+        let recorded =
+            state.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id));
+        assert_eq!(
+            recorded, None,
+            "no receiver reply-cap may be minted for a duplicate transfer"
+        );
+    }
 }
 
 // ===========================================================================
@@ -61554,6 +61648,8 @@ mod stage198c2b_reply_cap_one_shot_wiring {
     const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
     const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
     const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const AARCH64_CORE_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
     const SEAL_SRC: &str =
         include_str!("../../../scripts/qemu-second-cohort-reply-cap-direct-seal.sh");
     const INIT_SRC: &str = include_str!(
@@ -61748,6 +61844,45 @@ mod stage198c2b_reply_cap_one_shot_wiring {
                 && RISCV_BOOT_SRC.contains("ReturnToCurrent"),
             "RISC-V reply-cap sender must stay on the canonical ReturnToCurrent path"
         );
+    }
+
+    // (9) Stage 198C3: the AArch64 InvalidCapability exemption for the reply-cap
+    // one-shot second invocation is NARROW: it matches exactly the expected
+    // `IPC_REPLY_FAIL tid=<n> reply_cap=<n> err=InvalidCapability` form (the
+    // second_reply=rejected proof), NOT a bare InvalidCapability — so every OTHER
+    // InvalidCapability (materialize/lookup/etc.) still blocks the boot.
+    #[test]
+    fn aarch64_invalidcapability_exemption_is_narrow() {
+        // The blocker regex still treats generic InvalidCapability as fatal.
+        assert!(
+            AARCH64_CORE_SMOKE_SRC.contains("BLOCKER_REGEX=")
+                && AARCH64_CORE_SMOKE_SRC.contains("InvalidCapability"),
+            "the aarch64 blocker regex must still list InvalidCapability"
+        );
+        // The exemption is the exact reply-cap one-shot form, not a broad wildcard.
+        assert!(
+            AARCH64_CORE_SMOKE_SRC
+                .contains("IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability"),
+            "the exemption must be scoped to the exact reply-cap second-invoke IPC_REPLY_FAIL form"
+        );
+        // It must NOT blanket-exclude InvalidCapability, IPC_RECV_CAP_MATERIALIZE_FAILED,
+        // CAP_LOOKUP, or WrongObject/StaleCapability generally.
+        let exclude = AARCH64_CORE_SMOKE_SRC
+            .split("BLOCKER_EXCLUDE_REGEX='")
+            .nth(1)
+            .and_then(|r| r.split('\'').next())
+            .expect("exclude regex literal");
+        for forbidden in [
+            "|InvalidCapability|",
+            "IPC_RECV_CAP_MATERIALIZE_FAILED",
+            "CAP_LOOKUP",
+            "IPC_CALL_FAIL",
+        ] {
+            assert!(
+                !exclude.contains(forbidden),
+                "the exemption must not broadly suppress `{forbidden}`"
+            );
+        }
     }
 }
 
@@ -62063,10 +62198,19 @@ mod stage193d_ipc_send_reply_cap {
                 && RUNTIME_SRC.contains("ipc_send_reply_cap_boundary_origin_take("),
             "the executor must emit the reply-cap materialize/copy/wake/done markers gated on origin"
         );
-        assert!(
-            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendReplyCap result=ok"),
-            "the IpcSendReplyCap retirement marker must exist"
-        );
+        // Stage 198C2: the retirement marker is arch-tagged and emitted for all
+        // three arches (the reply-cap class is retired cross-arch, sealed 3/3 in
+        // 198C2B), so the un-tagged form no longer exists.
+        for needle in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendReplyCap result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendReplyCap result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendReplyCap result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(needle),
+                "the arch-tagged IpcSendReplyCap retirement marker must exist: {needle}"
+            );
+        }
         assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
     }
 
@@ -62160,9 +62304,12 @@ mod stage193d_ipc_send_reply_cap {
                 && X86_BOOT_SRC.contains("init_args[17] = 1;"),
             "x86_64 boot must provision coord(13) + reply cap(14) + discriminator(17)"
         );
+        // Stage 198C2B: the slot-17 discriminator binds the reply-endpoint RECV
+        // cap (the wakeable caller), so the dispatch predicate is now an
+        // `if let Some(..) = ctx.pm_request_recv_cap` guard rather than `.is_some()`.
         assert!(
             INIT_SRC.contains("run_ipc_send_reply_cap_oracle(")
-                && INIT_SRC.contains("ctx.pm_request_recv_cap.is_some()"),
+                && INIT_SRC.contains("if let Some(reply_recv_cap) = ctx.pm_request_recv_cap"),
             "init must dispatch the reply-cap oracle on the slot-17 discriminator"
         );
     }
@@ -66712,18 +66859,16 @@ mod stage198a_second_cohort_plain_parity {
         }
     }
 
-    // (5) The REPLY-cap (193D) oracle remains an x86_64-only live target — it is NOT provisioned on
-    // AArch64 / RISC-V. NB: Stage 198B *does* replicate the two ORDINARY-cap oracles
-    // (`provision_init_ipc_send_cap_oracle_coord` = 193C blocked receiver,
-    // `ipc_send_cap_enqueue_oracle_active` = 193F enqueue) onto all three arches, so those two are no
-    // longer forbidden here (asserted present by the Stage 198B parity module). Only the reply-cap
-    // path stays excluded on non-x86.
+    // (5) Stage 198C2/198C2B: the REPLY-cap oracle is now a CROSS-ARCH live target —
+    // `provision_init_ipc_send_reply_cap_oracle` is wired on all three arches and the
+    // reply-cap one-shot delivery was sealed 3/3 (SECOND_COHORT_REPLY_CAP_DIRECT_SEAL).
+    // It is no longer x86-only, so AArch64 and RISC-V boot.rs MUST provision it.
     #[test]
-    fn no_reply_cap_oracle_on_non_x86_arches() {
+    fn reply_cap_oracle_provisioned_on_all_arches() {
         for (arch, src) in [("aarch64", AARCH64_BOOT_SRC), ("riscv64", RISCV_BOOT_SRC)] {
             assert!(
-                !src.contains("provision_init_ipc_send_reply_cap_oracle("),
-                "{arch} boot.rs must NOT provision the reply-cap oracle (x86_64-only live target)"
+                src.contains("provision_init_ipc_send_reply_cap_oracle("),
+                "{arch} boot.rs must provision the reply-cap oracle (cross-arch live target, 198C2B)"
             );
         }
     }
@@ -67028,13 +67173,15 @@ mod stage198b_second_cohort_ordinary_cap_parity {
         }
     }
 
-    // (5) The REPLY-cap (193D) oracle remains x86_64-only — NOT provisioned on AArch64 / RISC-V.
+    // (5) Stage 198C2/198C2B: the REPLY-cap oracle is now CROSS-ARCH — provisioned on
+    // all three arches and sealed 3/3 (SECOND_COHORT_REPLY_CAP_DIRECT_SEAL). AArch64 and
+    // RISC-V boot.rs MUST provision it.
     #[test]
-    fn no_reply_cap_oracle_on_non_x86_arches() {
+    fn reply_cap_oracle_provisioned_on_all_arches() {
         for (arch, src) in [("aarch64", AARCH64_BOOT_SRC), ("riscv64", RISCV_BOOT_SRC)] {
             assert!(
-                !src.contains("provision_init_ipc_send_reply_cap_oracle("),
-                "{arch} boot.rs must NOT provision the reply-cap oracle (x86_64-only live target)"
+                src.contains("provision_init_ipc_send_reply_cap_oracle("),
+                "{arch} boot.rs must provision the reply-cap oracle (cross-arch live target, 198C2B)"
             );
         }
     }

@@ -150,3 +150,49 @@ satisfied by the object-level one-shot record, NOT by cap-count uniqueness. Any 
 must preserve `reply_caps[slot] = None` as the single consume point and must keep Phase-B' stale
 rollback intact, or duplicate-reply becomes possible. The transient two-CSpace coexistence is
 SAFE under the current model but means the oracle must prove one-shot at the **object** layer.
+
+## 8. Stage 198C3 — Reply-Cap Direct Negative Seal & Final Acceptance
+
+The positive reply-cap direct-delivery topology and the one-shot oracle (198C2/198C2B, sealed
+`SECOND_COHORT_REPLY_CAP_DIRECT_SEAL arches=3 classes=1 live_cells=3 result=ok`) are **unchanged**
+— no delivery/topology change was made because no real defect was found. 198C3 adds the negative
+half and reconciles stale guards.
+
+### Negative / rollback seal
+`scripts/qemu-reply-cap-direct-negative-seal.sh` drives 18 hosted production-path cases through the
+real producer/executor + reply-cap lifecycle helpers, each asserting its own rollback invariant:
+invalid source cap; stale source generation; non-Reply source; invalid receiver payload/metadata
+dest; provisional-cap rollback on executor copy fault; Phase-B' stale-record rollback; duplicate
+transfer attempt (no double mint); one-shot record arbiter / duplicate invoke; caller exit/reap
+revoke; caller generation replacement + reused-TID stale reply; rollback clears slot + waiter cap;
+record slot cleared on revoke; receiver-cnode teardown; server exit holding delegated cap;
+unbound-responder rejection. Emits:
+`SECOND_COHORT_REPLY_CAP_DIRECT_NEGATIVE_SEAL cases=18 leaked_reply_caps=0 leaked_reply_objects=0
+duplicate_wakes=0 duplicate_replies=0 result=ok` — the zeros are by construction (the seal fails
+unless every case passes, and every case asserts no leak / no wake / no duplicate).
+
+### AArch64 InvalidCapability exemption scope
+`aarch64_invalidcapability_exemption_is_narrow` proves the core-smoke's blocker exemption is
+restricted to the exact gated one-shot second-invoke line
+(`IPC_REPLY_FAIL tid=<n> reply_cap=<n> err=InvalidCapability`): `InvalidCapability` remains in
+`BLOCKER_REGEX`, and the exclusion does NOT hide `IPC_RECV_CAP_MATERIALIZE_FAILED`, `CAP_LOOKUP`,
+or `IPC_CALL_FAIL`. The exemption cannot suppress any other reply-cap failure.
+
+### Reconciled stale guards
+The 198C2/198C2B cross-arch wiring left four hosted guards asserting the *old* x86-only reply-cap
+oracle (they were not caught because the full suite was not re-run then). They are reconciled to the
+accepted reality (topology unchanged): the retirement marker is now arch-tagged for all three arches;
+init dispatches on the `if let Some(reply_recv_cap) = ctx.pm_request_recv_cap` slot-17 discriminator;
+and `reply_cap_oracle_provisioned_on_all_arches` replaces the two `no_reply_cap_oracle_on_non_x86`
+guards.
+
+### Combined preservation
+The reply-cap-direct cohort and the supervisor crash-restart baseline are added to
+`scripts/qemu-combined-retirement-seal.sh`, which now proves, strictly serialized:
+first-cohort 12/12, plain 6/6, ordinary-cap 6/6, reply-cap-direct 3/3, crash-restart result=ok, and
+emits `SECOND_COHORT_PROGRESS first=12 plain=6 ordinary_cap=6 reply_cap_direct=3 result=ok`.
+
+### Preserved invariants (unchanged in 198C3)
+SYSCALL_COUNT=32, VARIANT_COUNT=22, NR27/InitramfsReadChunk absent, DEBUG_LOG_MAX_BYTES=192, no new
+global lock, no ABI/capacity change, reply-cap **enqueue** path still not provisioned
+(`provision_init_ipc_send_reply_cap_enqueue` absent), shared-region and D2 still unretired.

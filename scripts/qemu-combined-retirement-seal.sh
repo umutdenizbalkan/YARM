@@ -3,9 +3,10 @@
 #
 # Stage 198B1 Part B — COMBINED RETIREMENT SEAL (Model 1: serialized master).
 #
-# Runs the three functional cohort seals STRICTLY SEQUENTIALLY — first-cohort
+# Runs the functional cohort seals STRICTLY SEQUENTIALLY — first-cohort
 # (12 cells), second-cohort plain (6 cells), second-cohort ordinary-cap (6
-# cells) — never concurrently. Serialization is the isolation model: only ONE
+# cells), second-cohort reply-cap-direct (3 cells), and the supervisor
+# crash-restart baseline — never concurrently. Serialization is the isolation model: only ONE
 # QEMU runs at a time, so there is no CPU/memory starvation (the root cause of
 # the Stage 198B AArch64-enqueue 5/6 partial and the first-cohort exit-124
 # timeout) and no shared log/artifact/socket contention. Each seal gets a
@@ -54,9 +55,14 @@ run_seal plain          scripts/qemu-second-cohort-plain-seal.sh \
   "SECOND_COHORT_PLAIN_SEAL arches=3 classes=2 live_cells=6 result=ok"
 run_seal ordinary_cap   scripts/qemu-second-cohort-ordinary-cap-seal.sh \
   "SECOND_COHORT_ORDINARY_CAP_SEAL arches=3 classes=2 live_cells=6 result=ok"
+run_seal reply_cap_direct scripts/qemu-second-cohort-reply-cap-direct-seal.sh \
+  "SECOND_COHORT_REPLY_CAP_DIRECT_SEAL arches=3 classes=1 live_cells=3 result=ok"
+run_seal crash_restart  scripts/qemu-supervisor-crash-restart-smoke.sh \
+  "SUPERVISOR_CRASH_RESTART_BASELINE .*result=ok"
 
 if [[ "$overall" -eq 0 ]]; then
-  echo "COMBINED_RETIREMENT_SEAL first=12 plain=6 ordinary_cap=6 result=ok"
+  echo "COMBINED_RETIREMENT_SEAL first=12 plain=6 ordinary_cap=6 reply_cap_direct=3 crash_restart=ok result=ok"
+  echo "SECOND_COHORT_PROGRESS first=12 plain=6 ordinary_cap=6 reply_cap_direct=3 result=ok"
   exit 0
 fi
 echo "COMBINED_RETIREMENT_SEAL result=fail"
