@@ -62908,6 +62908,201 @@ mod stage193g_remaining_shapes_audit {
     }
 }
 
+// Stage 198D1 — QUEUED REPLY-CAP LIFETIME MODEL (design clarification, no production change).
+//
+// These tests do NOT enable or retire the queued reply-cap class. They pin the lifetime facts
+// that the chosen redesign (design A — typed queued envelope carrying kernel-derived object
+// identity) depends on, using existing kernel primitives only. See
+// doc/STAGE_198D1_QUEUED_REPLY_CAP_AUDIT.md.
+mod stage198d1_queued_reply_cap_lifetime {
+    use super::*;
+
+    // Helper: create an endpoint and mint a Reply cap whose RECORD is owned by
+    // `record_caller` (its exit/death revokes the record). The reply cap itself is
+    // minted into the ACTIVE cnode (task 0, the sender that stashes the queued
+    // envelope), matching how create_reply_cap_for_caller mints (dest = active cnode;
+    // caller_tid only sets the record's owner). Returns
+    // (endpoint object, reply cap id, reply object, reply index, reply generation).
+    fn reply_envelope_fixture(
+        state: &mut KernelState,
+        record_caller: ThreadId,
+    ) -> (CapObject, CapId, CapObject, usize, u64) {
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+        // create_reply_cap_for_caller resolves the reply-recv cap in the RECORD
+        // caller's cnode; grant it there when the caller is not the active task.
+        let recv_cap = if record_caller.0 == state.current_tid().unwrap_or(u64::MAX) {
+            recv_cap_global
+        } else {
+            state
+                .grant_capability_task_to_task(0, recv_cap_global, record_caller.0)
+                .expect("dup recv cap into caller cnode")
+        };
+        let reply_cap = state
+            .create_reply_cap_for_caller(record_caller, recv_cap, None)
+            .expect("create reply cap");
+        // Minted into the active (task-0) cnode — resolve it there.
+        let reply_obj = state
+            .current_task_capability(reply_cap)
+            .expect("resolve reply cap")
+            .object;
+        let (index, generation) = match reply_obj {
+            CapObject::Reply { index, generation } => (index, generation),
+            other => panic!("expected Reply object, got {other:?}"),
+        };
+        (endpoint, reply_cap, reply_obj, index, generation)
+    }
+
+    // (1) The queued class discriminator is the kernel-resolved object stored in the
+    // envelope at stash time — available WITHOUT consulting any message flag. This is
+    // the authoritative identity design A routes on (never FLAG_REPLY_CAP).
+    #[test]
+    fn queued_reply_envelope_classification_is_object_authoritative() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, reply_cap, reply_obj, _idx, _gen) =
+            reply_envelope_fixture(&mut state, ThreadId(0));
+        assert!(matches!(reply_obj, CapObject::Reply { .. }));
+
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash reply envelope");
+        // The recv-side classifier can recover the authoritative Reply object with a
+        // pure, non-consuming peek — no flag needed.
+        assert_eq!(
+            state.peek_transfer_envelope_source_object(handle),
+            Some(reply_obj)
+        );
+        assert!(matches!(
+            state.peek_transfer_envelope_source_object(handle),
+            Some(CapObject::Reply { .. })
+        ));
+    }
+
+    // (2) One queue entry yields at most one receiver cap: take_transfer_envelope
+    // hands back the Reply source object exactly once, then None.
+    #[test]
+    fn queued_reply_envelope_take_is_one_shot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, reply_cap, _reply_obj, _idx, _gen) =
+            reply_envelope_fixture(&mut state, ThreadId(0));
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash reply envelope");
+
+        let taken = state
+            .take_transfer_envelope(handle, endpoint, ThreadId(0))
+            .expect("take once");
+        assert!(matches!(taken.source_object, CapObject::Reply { .. }));
+        // A duplicate dequeue / retry cannot re-materialize: the slot is consumed.
+        assert!(
+            state
+                .take_transfer_envelope(handle, endpoint, ThreadId(0))
+                .is_none()
+        );
+    }
+
+    // (3) THE queued-specific refinement: after a caller EXIT the reply record slot is
+    // cleared but the slot generation is NOT bumped, so capability_object_live (which
+    // only compares the generation) still returns Some. Only the record-present check
+    // catches the exit. This is exactly why the queued finalize must revalidate the
+    // full record (resolve_reply_index), not merely capability_object_live like the
+    // synchronous direct path.
+    #[test]
+    fn caller_exit_requires_record_present_check_not_just_generation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        // Record owned by task 1; the queued source cap lives in the active (task-0) cnode.
+        let (endpoint, reply_cap, reply_obj, index, _gen) =
+            reply_envelope_fixture(&mut state, ThreadId(1));
+        let _handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash reply envelope");
+
+        // Live before the caller dies: both checks pass.
+        assert!(state.capability_object_live(reply_obj).is_some());
+        assert!(state.reply_cap_record_present(index));
+
+        state.mark_task_dead(1).expect("mark caller dead");
+
+        // Generation-only liveness is INSUFFICIENT — it still passes.
+        assert!(
+            state.capability_object_live(reply_obj).is_some(),
+            "generation is not bumped on caller exit, so capability_object_live stays Some"
+        );
+        // The record-present check is what rejects the exited caller.
+        assert!(
+            !state.reply_cap_record_present(index),
+            "the reply record slot must be cleared on caller exit"
+        );
+    }
+
+    // (4) No envelope leak: purge_transfer_envelopes_for_pid reclaims a still-queued
+    // reply envelope when a participating process (here the bound receiver) is torn
+    // down. The purge matches source OR receiver pid; this exercises the receiver
+    // branch, and the source branch shares the identical clear path.
+    #[test]
+    fn queued_reply_envelope_reclaimed_on_process_teardown() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (endpoint, reply_cap, _reply_obj, _idx, _gen) =
+            reply_envelope_fixture(&mut state, ThreadId(0));
+        // Bind the queued envelope to receiver task 1; source cap lives in task 0.
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, Some(ThreadId(1)), None)
+            .expect("stash reply envelope");
+        assert!(state.peek_transfer_envelope_source_object(handle).is_some());
+
+        state.purge_transfer_envelopes_for_pid(1);
+
+        assert!(
+            state.peek_transfer_envelope_source_object(handle).is_none(),
+            "the queued reply envelope must be reclaimed on process teardown (no leak)"
+        );
+    }
+
+    // (5) Provisional-mint rollback leaves the canonical drop state: the receiver-local
+    // reply cap and the global waiter_cap_id are cleared, but the Reply RECORD stays
+    // present (re-deliverable) — no cap/waiter/record leak on a copy/CNode fault.
+    #[test]
+    fn provisional_reply_mint_rollback_leaves_record_live() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_endpoint, _reply_cap, reply_obj, index, generation) =
+            reply_envelope_fixture(&mut state, ThreadId(0));
+        let cnode = state.task_cnode(0).expect("task0 cnode");
+
+        // Simulate the provisional receiver-local mint + record priming.
+        let minted = state
+            .mint_capability_in_cnode(cnode, Capability::new(reply_obj, CapRights::SEND))
+            .expect("provisional receiver mint");
+        state.set_reply_cap_waiter_cap(index, generation, minted);
+        assert_eq!(state.reply_cap_record_waiter_cap(index), Some(minted));
+
+        // A subsequent copy/CNode failure rolls the provisional mint back.
+        assert!(
+            state.rollback_materialized_recv_cap(0, minted, true),
+            "reply-cap rollback must clear the provisional receiver slot"
+        );
+
+        // Receiver-local cap gone, waiter_cap cleared, but the record stays present.
+        assert!(
+            state.current_task_capability(minted).is_none(),
+            "the provisional receiver reply cap must be revoked"
+        );
+        assert_eq!(
+            state.reply_cap_record_waiter_cap(index),
+            None,
+            "the stale waiter_cap_id must be cleared"
+        );
+        assert!(
+            state.reply_cap_record_present(index),
+            "the Reply record itself must remain live/re-deliverable after rollback"
+        );
+    }
+}
+
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
 // no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
 // reality the audit relied on, so a future stage cannot silently flip an architecture
