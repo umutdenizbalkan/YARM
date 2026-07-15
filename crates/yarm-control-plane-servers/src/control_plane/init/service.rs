@@ -2014,14 +2014,16 @@ pub fn run() {
             //   slots 13 + 14      → sender-wake proof (Stage 163)
             //   slot 13 only       → Stage 193C IpcSend ordinary cap-transfer live oracle
             if let Some(slot14) = ctx.service_extra_cap_1 {
-                if ctx.pm_request_recv_cap.is_some() {
-                    // Slot 17 discriminator set → reply-cap oracle: slot 13 = coord,
-                    // slot 14 = the kernel-provisioned transferable reply cap.
+                if let Some(reply_recv_cap) = ctx.pm_request_recv_cap {
+                    // Slot 17 set → reply-cap DIRECT oracle: slot 13 = coord, slot 14 =
+                    // the kernel-provisioned transferable reply cap, slot 17 = init's
+                    // reply-endpoint RECV cap (the wakeable caller, Stage 198C2B).
                     run_ipc_send_reply_cap_oracle(
                         proof_send,
                         proof_recv,
                         e2_recv,
                         slot14,
+                        reply_recv_cap,
                         ctx.task_id,
                     );
                 } else {
@@ -3268,6 +3270,14 @@ const IPC_SEND_REPLY_CAP_ORACLE_OPCODE: u16 = 0x0FA2;
 #[cfg(not(test))]
 const IPC_SEND_REPLY_CAP_ORACLE_PAYLOAD: [u8; 8] = *b"REPLY93D";
 
+/// Stage 198C2B: opcode + payload the receiver child sends back through the
+/// transferred reply cap (`ipc_reply`) to wake the caller (init). Distinct from the
+/// forward payload so the caller can confirm it woke with the EXPECTED reply.
+#[cfg(not(test))]
+const IPC_SEND_REPLY_CAP_ORACLE_REPLY_OPCODE: u16 = 0x0FA3;
+#[cfg(not(test))]
+const IPC_SEND_REPLY_CAP_ORACLE_REPLY_PAYLOAD: [u8; 8] = *b"ONESHOT!";
+
 /// Stage 193D: deterministic IpcSend reply-cap transfer LIVE oracle.
 ///
 /// Runs ONLY under BOTH `yarm.ipc_recv_proof=1` and `yarm.ipc_send_reply_cap_oracle=1`
@@ -3291,6 +3301,7 @@ fn run_ipc_send_reply_cap_oracle(
     e1_recv: u32,
     coord_recv: u32,
     reply_cap: u32,
+    reply_recv: u32,
     init_tid: u64,
 ) {
     use yarm_user_rt::ipc::Message;
@@ -3352,6 +3363,7 @@ fn run_ipc_send_reply_cap_oracle(
         yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_ENTRY");
         yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_RECV_BEGIN");
         // SAFETY: e1_recv is a kernel-provisioned RECV cap to the proof loopback.
+        let mut child_recv_reply: Option<u32> = None;
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(e1_recv) } {
             Ok(Some(received)) => {
                 // A reply-cap delivery strips the 2-byte inline opcode prefix (strip
@@ -3369,6 +3381,7 @@ fn run_ipc_send_reply_cap_oracle(
                 let recv_reply = received.reply_cap;
                 let has_reply_cap = recv_reply.is_some();
                 let reply_is_fresh = matches!(recv_reply, Some(c) if c != reply_cap);
+                child_recv_reply = recv_reply;
                 yarm_user_rt::user_log!(
                     "IPC_SEND_REPLY_CAP_ORACLE_CHILD_RECV_OK payload_match={} reply_cap={} reply_is_fresh={} recv_reply_cap={} sender_local_cap={} payload_len={} sender_tid={}",
                     payload_match as u8,
@@ -3389,6 +3402,38 @@ fn run_ipc_send_reply_cap_oracle(
                     e as usize
                 );
             }
+        }
+        // Stage 198C2B ONE-SHOT: the receiver invokes the transferred reply cap. The
+        // FIRST invocation must succeed (waking the caller, init); the SECOND must be
+        // rejected because the Reply RECORD is now consumed, even though the cap entry
+        // may still resolve. This is the object-layer one-shot proof.
+        if let Some(rc) = child_recv_reply {
+            if let Ok(reply_msg) = Message::with_header(
+                0,
+                IPC_SEND_REPLY_CAP_ORACLE_REPLY_OPCODE,
+                0,
+                None,
+                &IPC_SEND_REPLY_CAP_ORACLE_REPLY_PAYLOAD,
+            ) {
+                // SAFETY: rc is the fresh receiver-local reply cap the kernel materialized.
+                let first = unsafe { yarm_user_rt::syscall::ipc_reply(rc, &reply_msg) };
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_REPLY_CAP_ORACLE_CHILD_FIRST_REPLY ok={} code={}",
+                    first.is_ok() as u8,
+                    first.err().map(|e| e as usize).unwrap_or(0)
+                );
+                // SAFETY: same cap; the record is now consumed so this must fail.
+                let second = unsafe { yarm_user_rt::syscall::ipc_reply(rc, &reply_msg) };
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_REPLY_CAP_ORACLE_CHILD_SECOND_REPLY rejected={} code={}",
+                    second.is_err() as u8,
+                    second.err().map(|e| e as usize).unwrap_or(0)
+                );
+            } else {
+                yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_REPLY_MSG_FAIL");
+            }
+        } else {
+            yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_NO_REPLY_CAP");
         }
         yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_CHILD_DONE");
         yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_PARK_BEGIN role=child");
@@ -3478,15 +3523,70 @@ fn run_ipc_send_reply_cap_oracle(
     match send {
         Ok(()) => {
             yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_SEND_OK");
-            yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_LIVE_ORACLE_DONE result=ok");
+            // Stage 198C2B ONE-SHOT: init is the wakeable CALLER. Enter the canonical
+            // waiting-for-reply state on the reply endpoint; the woken receiver child
+            // invokes the transferred reply cap, which wakes init EXACTLY once with the
+            // expected reply. A non-blocking re-probe then proves NO second reply was
+            // delivered (duplicate_reply=0), which — with the child's rejected second
+            // invocation — is the object-layer one-shot proof.
+            let mut caller_wakes = 0u8;
+            let mut reply_payload_ok = 0u8;
+            // Canonical blocked-waiting-for-reply state: init BLOCKS on its reply
+            // endpoint. The woken receiver child invokes the transferred reply cap,
+            // which wakes init here exactly once.
+            // SAFETY: reply_recv is init's RECV cap to its own reply endpoint.
+            match unsafe { yarm_user_rt::syscall::ipc_recv(reply_recv) } {
+                Ok(Some(r)) => {
+                    caller_wakes = 1;
+                    let got = r.as_slice();
+                    let opcode_le = IPC_SEND_REPLY_CAP_ORACLE_REPLY_OPCODE.to_le_bytes();
+                    let stripped = got == &IPC_SEND_REPLY_CAP_ORACLE_REPLY_PAYLOAD[..];
+                    let framed = got.len() == 2 + IPC_SEND_REPLY_CAP_ORACLE_REPLY_PAYLOAD.len()
+                        && got[0..2] == opcode_le
+                        && got[2..] == IPC_SEND_REPLY_CAP_ORACLE_REPLY_PAYLOAD[..];
+                    reply_payload_ok = (stripped || framed) as u8;
+                }
+                _ => {}
+            }
+            // Re-probe: there must be NO second reply queued (the child's second
+            // invocation was rejected at the consumed record → no duplicate delivery).
+            let dup = matches!(
+                unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv, 0) },
+                Ok(Some(_))
+            );
+            let duplicate_reply = dup as u8;
+            yarm_user_rt::user_log!(
+                "IPC_SEND_REPLY_CAP_ORACLE_CALLER_WOKE caller_wakes={} reply_payload_ok={} duplicate_reply={}",
+                caller_wakes,
+                reply_payload_ok,
+                duplicate_reply
+            );
+            // Aggregate one-shot attestation. first_reply=ok is proven by the caller
+            // having woken with the correct reply payload; second_reply=rejected is
+            // proven by the absence of any duplicate reply (a successful second
+            // invocation would have delivered a second reply).
+            let first_reply_ok = caller_wakes == 1 && reply_payload_ok == 1;
+            let second_reply_rejected = duplicate_reply == 0;
+            if first_reply_ok && second_reply_rejected {
+                yarm_user_rt::user_log!(
+                    "IPCSEND_REPLY_CAP_ONE_SHOT_OK arch={} first_reply=ok second_reply=rejected caller_wakes=1 duplicate_reply=0",
+                    ordinary_cap_arch_str()
+                );
+                yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_LIVE_ORACLE_DONE result=ok");
+            } else {
+                yarm_user_rt::user_log!(
+                    "IPC_SEND_REPLY_CAP_ORACLE_ONE_SHOT_FAIL first_reply_ok={} second_reply_rejected={}",
+                    first_reply_ok as u8,
+                    second_reply_rejected as u8
+                );
+            }
         }
         Err(e) => {
             yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_SEND_FAILED code={}", e as usize);
         }
     }
     yarm_user_rt::user_log!("IPC_SEND_REPLY_CAP_ORACLE_PARENT_DONE");
-    // init returns to its post-proof flow (blocks on the alert endpoint), handing the
-    // CPU to the woken child so it can log its CHILD_RECV_OK.
+    // init returns to its post-proof flow (blocks on the alert endpoint).
 }
 
 /// Stage 193E: application opcode for the enqueue oracle message.

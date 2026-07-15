@@ -1548,12 +1548,15 @@ pub fn bootstrap_first_user_task(
     // RISC-V reply-cap IpcSend uses the canonical in-lock publish + post-lock boundary drain; the
     // SENDING caller stays current (RiscvTrapEntryOutcome::ReturnToCurrent). Oracle-only
     // provisioning: NO reply-cap ENQUEUE slot, no shared region, normal-boot semantics unchanged.
-    else if let Some((coord_recv_cap, reply_cap)) =
+    else if let Some((coord_recv_cap, reply_cap, reply_recv_cap)) =
         crate::kernel::boot::provision_init_ipc_send_reply_cap_oracle(kernel, RING3_INIT_SERVER_TID)
     {
         init_args[13] = coord_recv_cap as u64;
         init_args[14] = reply_cap as u64;
-        init_args[17] = 1; // reply-cap oracle discriminator (init otherwise leaves slot 17 zero)
+        // Stage 198C2B: slot 17 carries init's reply-endpoint RECV cap (the wakeable
+        // caller) AND doubles as the reply-cap-oracle discriminator (a real non-zero cap
+        // is `Some`); init otherwise leaves slot 17 zero.
+        init_args[17] = reply_recv_cap as u64;
     }
     // Stage 198B (ORDINARY-CAP PARITY): sub-knob-gated (`yarm.ipc_send_cap_oracle=1`) coordination
     // endpoint recv cap in slot 13 (service_extra_cap_0), with slot 14 LEFT EMPTY. That presence

@@ -3019,7 +3019,7 @@ pub fn provision_init_ipc_send_cap_oracle_coord(
 pub fn provision_init_ipc_send_reply_cap_oracle(
     kernel: &mut KernelState,
     init_tid: u64,
-) -> Option<(u32, u32)> {
+) -> Option<(u32, u32, u32)> {
     if !ipc_send_reply_cap_oracle_active() {
         return None;
     }
@@ -3051,8 +3051,17 @@ pub fn provision_init_ipc_send_reply_cap_oracle(
     };
     IPC_RECV_PROOF_SENDER_WAKE_E2_IDX.store(e2_idx, core::sync::atomic::Ordering::Release);
 
-    // (b) Reply endpoint (task 0 keeps the RECV cap — the synthetic caller) + a
-    // transferable Reply cap minted DIRECTLY into init's cnode via the existing seam.
+    // (b) Reply endpoint + a transferable Reply cap minted DIRECTLY into init's cnode.
+    //
+    // Stage 198C2B (ONE-SHOT LIVE): init is the REAL wakeable caller (not a synthetic
+    // task-0 caller). init is granted the reply endpoint RECV cap (returned as the third
+    // value → slot 17, which also serves as the reply-cap-oracle discriminator: a real
+    // non-zero cap is `Some`), so after transferring the reply cap init blocks on this
+    // endpoint in the canonical waiting-for-reply state and the receiving child's
+    // `ipc_reply` wakes it exactly once. `responder = None` so the child (a distinct TID)
+    // is permitted to invoke the transferred reply cap — the record is bound to the
+    // caller, NOT to a responder identity that would reject the child. Caller = init so
+    // the reply is delivered back to init's reply endpoint on invocation.
     let (_reply_eidx, _reply_send, reply_recv_root) = match kernel.create_endpoint(2) {
         Ok(t) => t,
         Err(e) => {
@@ -3070,12 +3079,29 @@ pub fn provision_init_ipc_send_reply_cap_oracle(
             return None;
         }
     };
-    // caller = task 0 (holds the reply endpoint RECV cap); responder = init; mint the
-    // Reply cap into init's cnode so init can transfer it.
-    let reply_cap = match kernel.create_reply_cap_for_caller_in_cnode(
-        crate::kernel::ipc::ThreadId(0),
+    // Grant init the reply endpoint RECV cap so init can be the wakeable caller.
+    let reply_recv_init = match kernel.grant_capability_task_to_task_with_rights(
+        0,
         reply_recv_root,
-        Some(crate::kernel::ipc::ThreadId(init_tid)),
+        init_tid,
+        crate::kernel::capabilities::CapRights::RECEIVE,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPC_SEND_REPLY_CAP_ORACLE_FAIL step=grant_reply_recv err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    // caller = init (holds the reply endpoint RECV cap, the wakeable caller); responder =
+    // None (the receiving child may invoke); mint the one-shot Reply cap into init's cnode
+    // so init can transfer it.
+    let reply_cap = match kernel.create_reply_cap_for_caller_in_cnode(
+        crate::kernel::ipc::ThreadId(init_tid),
+        reply_recv_init,
+        None,
         Some(init_cnode),
     ) {
         Ok(c) => c,
@@ -3088,14 +3114,19 @@ pub fn provision_init_ipc_send_reply_cap_oracle(
         }
     };
     crate::yarm_log!(
-        "IPC_SEND_REPLY_CAP_ORACLE_PROVISION_OK init_tid={} e1_idx={} e2_idx={} coord_recv={} reply_cap={}",
+        "IPC_SEND_REPLY_CAP_ORACLE_PROVISION_OK init_tid={} e1_idx={} e2_idx={} coord_recv={} reply_cap={} reply_recv={} responder=none",
         init_tid,
         IPC_RECV_PROOF_SENDER_WAKE_E1_IDX.load(core::sync::atomic::Ordering::Acquire),
         e2_idx,
         coord_recv.0,
-        reply_cap.0
+        reply_cap.0,
+        reply_recv_init.0
     );
-    Some((coord_recv.0 as u32, reply_cap.0 as u32))
+    Some((
+        coord_recv.0 as u32,
+        reply_cap.0 as u32,
+        reply_recv_init.0 as u32,
+    ))
 }
 
 /// Stage 193B: push the deterministic "receiver blocked on E1" coordination
