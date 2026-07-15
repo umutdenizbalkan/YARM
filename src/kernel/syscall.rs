@@ -1404,6 +1404,15 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                 && delivery.msg.opcode != OPCODE_SHARED_MEM
                 && let Some(plan) = delivery.cap_transfer
                 && !plan.is_reply_cap
+                // Stage 198D2A: object precedence — an IpcSend reply cap is tagged
+                // FLAG_CAP_TRANSFER (plan.is_reply_cap is flag-derived and false), so
+                // exclude it from the ordinary snapshot by its authoritative envelope
+                // object; it falls through to materialize_received_message_cap_routed,
+                // which routes the Reply object to the canonical reply direct-mint.
+                && !matches!(
+                    kernel.peek_transfer_envelope_source_object(plan.raw_handle),
+                    Some(CapObject::Reply { .. })
+                )
             {
                 match phase_a_snapshot_ordinary_transfer(
                     kernel,

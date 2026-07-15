@@ -197,12 +197,29 @@ pub(crate) fn materialize_received_message_cap(
     msg: &Message,
 ) -> Result<Option<u64>, SyscallError> {
     let raw = msg.transferred_cap().map(|c| c.0);
-    let (kind, value) = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
-        ("reply", raw)
-    } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0 {
-        ("transfer", raw)
-    } else {
-        ("none", None)
+    // Stage 198D2A: object-authoritative classification. The queued transfer
+    // envelope's kernel-resolved `source_object` is the authoritative class
+    // discriminator — NOT the user-visible message flag. An IpcSend reply cap is
+    // tagged FLAG_CAP_TRANSFER (the ABI has no reply flag), so a Reply object MUST
+    // route to the reply direct-mint branch regardless of the flag, and a non-Reply
+    // object must never be forced into the reply branch by a spoofed flag. The flag
+    // is consulted ONLY when no transfer envelope applies (the canonical IPC-call /
+    // plain-reply path, where identity lives in the flag, not an envelope).
+    let envelope_object = raw.and_then(|h| kernel.peek_transfer_envelope_source_object(h));
+    let (kind, value) = match envelope_object {
+        Some(CapObject::Reply { .. }) => ("reply", raw),
+        Some(_) => ("transfer", raw),
+        None => {
+            if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+                ("reply", raw)
+            } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN))
+                != 0
+            {
+                ("transfer", raw)
+            } else {
+                ("none", None)
+            }
+        }
     };
     let Some(raw_value) = value else {
         return Ok(None);
@@ -268,6 +285,19 @@ pub(crate) fn materialize_received_message_cap(
         if kernel.capability_object_live(reply_object).is_none() {
             crate::yarm_log!(
                 "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=reply_object_not_live",
+                raw_value
+            );
+            return Err(SyscallError::InvalidCapability);
+        }
+        // Stage 198D2A: record-present is MANDATORY immediately before the mint.
+        // A caller exit / reap clears the global ReplyCapRecord slot WITHOUT bumping
+        // the object generation, so `capability_object_live` (generation-only) still
+        // passes across the queue interval. Requiring the slot to be present rejects a
+        // queued reply cap whose caller exited between enqueue and dequeue — no stale
+        // authority survives, and the ReplyCapRecord is not consumed on this reject.
+        if !kernel.reply_cap_record_present(reply_index) {
+            crate::yarm_log!(
+                "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=reply_record_absent",
                 raw_value
             );
             return Err(SyscallError::InvalidCapability);
@@ -433,6 +463,23 @@ pub(crate) fn materialize_received_message_cap_routed(
         CapTransferSplitResult, materialize_split_reply_cap_equivalent,
         materialize_split_transfer_cap_equivalent,
     };
+    // Stage 198D2A: object precedence at the split router. The D1 transfer arm and
+    // D5 reply arm both classify by MESSAGE FLAG (`CapTransferRecvClass::classify`).
+    // An IpcSend reply cap is tagged FLAG_CAP_TRANSFER, so without this guard the
+    // transfer arm would materialize a one-shot Reply object as an ordinary
+    // delegatable cap (the Stage 193G misroute). When the flag is NOT FLAG_REPLY_CAP
+    // but the queued envelope's authoritative object IS a Reply, route to the
+    // object-authoritative canonical materialize (reply direct-mint). A genuine
+    // FLAG_REPLY_CAP reply cap keeps its existing D5 split reply arm below unchanged.
+    if (msg.flags & Message::FLAG_REPLY_CAP) == 0
+        && let Some(handle) = msg.transferred_cap().map(|c| c.0)
+        && matches!(
+            kernel.peek_transfer_envelope_source_object(handle),
+            Some(CapObject::Reply { .. })
+        )
+    {
+        return materialize_received_message_cap(kernel, endpoint, receiver_tid, sender_tid, msg);
+    }
     // D1 supported scope (Pass 1 / Stage 104): non-shared-region only.
     // Shared-region transfers carry receiver-side mapping obligations outside
     // the materialize step; they keep the canonical path per the Stage 103

@@ -171,7 +171,15 @@ impl KernelState {
         else {
             return false;
         };
-        if is_reply_cap {
+        // Stage 198D2A: the rollback FLAVOR is object-authoritative, derived from the
+        // resolved receiver-local cap object, not the caller's flag-derived
+        // `is_reply_cap`. A queued IpcSend reply cap is minted (via the object-routed
+        // reply path) from a FLAG_CAP_TRANSFER message, so its caller passes
+        // `is_reply_cap == false`; using that here would wrongly run the transfer
+        // rollback on a Reply cap. The `is_reply_cap` parameter is retained for the
+        // diagnostic markers below but no longer selects the reclamation path.
+        let _ = is_reply_cap;
+        if matches!(cap_object, CapObject::Reply { .. }) {
             let cleared =
                 self.fast_revoke_reply_cap_in_cnode(receiver_cnode, materialized_cap, cap_object);
             if let CapObject::Reply { index, generation } = cap_object {
