@@ -1,6 +1,18 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Stage 198D1 — Queued Reply-Cap Semantic Audit & Redesign
 
+> **STATUS — REJECTED BY POLICY: DIRECT-ONLY REPLY AUTHORITY (Stage 198D-S).**
+> This document is retained as **design history**. Its queued reply-cap implementation path
+> (design A / Stage 198D2) is **not adopted**: queued reply-cap transfer is not part of YARM's
+> supported capability model. Reply capabilities are **direct-delivery only, one-shot, and are
+> never stored in an endpoint message queue**. Stage 198D-S enforces this in production
+> (`REPLY_CAP_QUEUEING_SUPPORTED = false`): IpcSend refuses to enqueue a Reply-object transfer
+> when no compatible receiver is blocked, and the recv-side materialize fails closed if a Reply
+> object ever reaches dequeue via an internal invariant violation. **Stage 198D2B (the live queued
+> class) is cancelled.** The object-derived rollback, ReplyCapRecord-present validation, and
+> generation/caller checks introduced while exploring the queued path are retained as hardening.
+> The audit below remains accurate as an analysis of *why* queued reply-cap delivery is hazardous.
+
 Audit/design only, traced against branch head `b6df618`, x86_64 reference path. This increment
 does **not** enable or retire the queued reply-cap class. It fixes the architecture-neutral design
 that Stage 198D2 will implement. It builds on the accepted **direct** reply-cap delivery (198C2B/198C3)

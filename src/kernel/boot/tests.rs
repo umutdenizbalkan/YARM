@@ -63103,352 +63103,142 @@ mod stage198d1_queued_reply_cap_lifetime {
     }
 }
 
-// Stage 198D2A — QUEUED REPLY-CAP RECEIVE ROUTING (production path, hosted proof).
+// Stage 198D-S — DIRECT-ONLY REPLY CAPABILITIES (production policy, hosted proof).
 //
-// Proves the object-authoritative dequeue routing added in 198D2A: at recv-v2
-// materialization the stashed TransferEnvelope.source_object is the class
-// discriminator, the user message flag can neither force nor suppress the Reply
-// classification, the record-present check is load-bearing across the queue
-// interval, and every failure path drops the envelope / rolls back the mint
-// WITHOUT consuming the ReplyCapRecord. See doc/STAGE_198D1_QUEUED_REPLY_CAP_AUDIT.md.
-mod stage198d2a_queued_reply_cap_routing {
+// Policy: reply caps are direct-delivery only, one-shot, and are NEVER stored in an
+// endpoint message queue. IpcSend refuses to enqueue a Reply-object transfer when no
+// compatible receiver is blocked (send-side, before any TransferEnvelope is stashed),
+// and the recv-side materialize fails CLOSED if a Reply object without FLAG_REPLY_CAP
+// ever reaches dequeue through an internal invariant violation. Ordinary caps and
+// plain messages are unaffected. The accepted Stage 198C direct path and the
+// canonical FLAG_REPLY_CAP ipc-call reply path are unchanged. Supersedes 198D2A and
+// cancels the queued reply-cap live class (Stage 198D2B).
+mod stage198ds_direct_only_reply_caps {
     use super::*;
     use crate::kernel::syscall::SyscallError;
     use crate::kernel::syscall::ipc_recv_core::materialize_received_message_cap;
 
-    // Stash a Reply envelope (record owned by `record_caller`; source cap in the
-    // active task-0 cnode) and build a queued message carrying `flags` + the handle.
-    // Returns (endpoint, handle, reply_obj, index, generation, msg).
-    fn reply_msg_fixture(
-        state: &mut KernelState,
-        record_caller: ThreadId,
-        flags: u16,
-    ) -> (CapObject, u64, CapObject, usize, u64, Message) {
-        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
-        let endpoint = state
-            .current_task_capability(send_cap)
-            .expect("send cap")
-            .object;
-        let recv_cap = if record_caller.0 == state.current_tid().unwrap_or(u64::MAX) {
-            recv_cap_global
-        } else {
-            state
-                .grant_capability_task_to_task(0, recv_cap_global, record_caller.0)
-                .expect("dup recv cap")
-        };
+    // Count queued transfer envelopes whose authoritative source object is a Reply.
+    fn count_reply_envelopes(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| {
+                state.with_ipc_state(|ipc| {
+                    matches!(
+                        ipc.transfer_envelopes[i].map(|e| e.source_object),
+                        Some(CapObject::Reply { .. })
+                    )
+                })
+            })
+            .count()
+    }
+
+    fn endpoint_queue_depth(state: &KernelState, endpoint_idx: usize) -> usize {
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued())
+    }
+
+    // (1) Reply cap + NO receiver → refused (canonical WouldBlock), and NOTHING is
+    // queued: no endpoint message, no Reply TransferEnvelope. (Requirement 1/2,
+    // proof 4/5/6.)
+    #[test]
+    fn reply_cap_send_no_receiver_refused_and_not_queued() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
         let reply_cap = state
-            .create_reply_cap_for_caller(record_caller, recv_cap, None)
-            .expect("create reply cap");
-        let reply_obj = state
-            .current_task_capability(reply_cap)
-            .expect("resolve reply cap")
-            .object;
-        let (index, generation) = match reply_obj {
-            CapObject::Reply { index, generation } => (index, generation),
-            other => panic!("expected Reply, got {other:?}"),
-        };
-        let handle = state
-            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
-            .expect("stash reply envelope");
-        let msg = Message::with_header(0, 0x44, flags, Some(handle), b"rc").expect("msg");
-        (endpoint, handle, reply_obj, index, generation, msg)
-    }
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply cap");
 
-    // (1) A queued reply cap tagged ONLY FLAG_CAP_TRANSFER (the IpcSend shape, no
-    // reply flag) materializes as a one-shot Reply: SEND-only, recorded as waiter.
-    #[test]
-    fn queued_reply_flag_cap_transfer_routes_as_reply() {
-        let mut state = Bootstrap::init().expect("init");
-        let (endpoint, _h, _obj, index, _gen, msg) =
-            reply_msg_fixture(&mut state, ThreadId(0), Message::FLAG_CAP_TRANSFER);
-        let cap_id = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg)
-            .expect("materialize ok")
-            .expect("minted a cap");
-        let cap = state
-            .current_task_capability(CapId(cap_id))
-            .expect("resolve minted");
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                inline_payload_word(b"rcap"),
+                0,
+                reply_cap.0 as usize,
+            ],
+        );
+        let res = state.handle_trap(Trap::Syscall, Some(&mut frame));
         assert!(
-            matches!(cap.object, CapObject::Reply { .. }),
-            "must be Reply"
+            res.is_err() || frame.error_code().is_some(),
+            "reply-cap send with no blocked receiver must be refused"
         );
-        assert_eq!(cap.rights(), CapRights::SEND, "reply cap is SEND-only");
         assert_eq!(
-            state.reply_cap_record_waiter_cap(index),
-            Some(CapId(cap_id)),
-            "waiter-cap tracking installed"
+            endpoint_queue_depth(&state, endpoint_idx),
+            0,
+            "no message may be queued for a refused reply-cap send"
+        );
+        assert_eq!(
+            count_reply_envelopes(&state),
+            0,
+            "no Reply TransferEnvelope may remain after refusal"
         );
     }
 
-    // (2) An ordinary queued cap-transfer (non-Reply object) still materializes as
-    // an ordinary delegated cap — the routing change does not disturb it.
+    // (2) Ordinary cap + no receiver → existing enqueue still succeeds (unchanged).
     #[test]
-    fn ordinary_queued_cap_remains_ordinary() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(2).expect("task2");
-        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
-        let endpoint = state
-            .current_task_capability(send_cap)
-            .expect("send")
-            .object;
+    fn ordinary_cap_send_no_receiver_still_enqueues() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        let (endpoint_idx, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
         let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
-        let handle = state
-            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
-            .expect("stash ordinary envelope");
-        let msg = Message::with_header(0, 0x44, Message::FLAG_CAP_TRANSFER, Some(handle), b"cap")
-            .expect("msg");
-        let cap_id = materialize_received_message_cap(&mut state, endpoint, 2, 0, &msg)
-            .expect("materialize ok")
-            .expect("minted a cap");
-        let cap = state
-            .resolve_capability_for_task(2, CapId(cap_id))
-            .expect("resolve minted");
-        assert!(
-            !matches!(cap.object, CapObject::Reply { .. }),
-            "ordinary object must NOT become a Reply"
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                inline_payload_word(b"ocap"),
+                0,
+                mem_cap.0 as usize,
+            ],
         );
-    }
-
-    // (3) A spoofed FLAG_REPLY_CAP cannot force a NON-Reply envelope into the reply
-    // path — the object is authoritative, so it materializes as ordinary.
-    #[test]
-    fn user_flag_cannot_force_ordinary_into_reply() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(2).expect("task2");
-        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
-        let endpoint = state
-            .current_task_capability(send_cap)
-            .expect("send")
-            .object;
-        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
-        let handle = state
-            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
-            .expect("stash ordinary envelope");
-        let msg = Message::with_header(0, 0x44, Message::FLAG_REPLY_CAP, Some(handle), b"cap")
-            .expect("msg");
-        let cap_id = materialize_received_message_cap(&mut state, endpoint, 2, 0, &msg)
-            .expect("materialize ok")
-            .expect("minted a cap");
-        let cap = state
-            .resolve_capability_for_task(2, CapId(cap_id))
-            .expect("resolve minted");
-        assert!(
-            !matches!(cap.object, CapObject::Reply { .. }),
-            "FLAG_REPLY_CAP must NOT force an ordinary object into the reply path"
-        );
-    }
-
-    // (4) A flag that omits the reply bit cannot SUPPRESS a genuine Reply envelope:
-    // FLAG_CAP_TRANSFER_PLAIN + Reply object still routes reply.
-    #[test]
-    fn user_flag_cannot_suppress_reply_envelope_classification() {
-        let mut state = Bootstrap::init().expect("init");
-        let (endpoint, _h, _obj, index, _gen, msg) =
-            reply_msg_fixture(&mut state, ThreadId(0), Message::FLAG_CAP_TRANSFER_PLAIN);
-        let cap_id = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg)
-            .expect("materialize ok")
-            .expect("minted a cap");
-        let cap = state
-            .current_task_capability(CapId(cap_id))
-            .expect("resolve");
-        assert!(matches!(cap.object, CapObject::Reply { .. }));
+        state
+            .handle_trap(Trap::Syscall, Some(&mut frame))
+            .expect("ordinary-cap send");
+        assert_eq!(frame.error_code(), None);
         assert_eq!(
-            state.reply_cap_record_waiter_cap(index),
-            Some(CapId(cap_id))
+            endpoint_queue_depth(&state, endpoint_idx),
+            1,
+            "ordinary cap-transfer must still enqueue with no receiver"
         );
     }
 
-    // (5) The canonical IPC-call reply path (FLAG_REPLY_CAP + Reply envelope) is
-    // unchanged: flag and object agree and it routes reply.
+    // (3) Plain message + no receiver → existing enqueue unchanged.
     #[test]
-    fn canonical_ipc_call_reply_flag_path_still_routes_reply() {
-        let mut state = Bootstrap::init().expect("init");
-        let (endpoint, _h, _obj, index, _gen, msg) =
-            reply_msg_fixture(&mut state, ThreadId(0), Message::FLAG_REPLY_CAP);
-        let cap_id = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg)
-            .expect("materialize ok")
-            .expect("minted a cap");
-        let cap = state
-            .current_task_capability(CapId(cap_id))
-            .expect("resolve");
-        assert!(matches!(cap.object, CapObject::Reply { .. }));
-        assert_eq!(
-            state.reply_cap_record_waiter_cap(index),
-            Some(CapId(cap_id))
+    fn plain_message_send_no_receiver_still_enqueues() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        let (endpoint_idx, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                inline_payload_word(b"plan"),
+                0,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
         );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut frame))
+            .expect("plain send");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(endpoint_queue_depth(&state, endpoint_idx), 1);
     }
 
-    // (6) Caller exits between enqueue and dequeue: the record slot is cleared but
-    // the object generation is NOT bumped, so capability_object_live still passes —
-    // the record-present check is what rejects it. The envelope is consumed
-    // (dropped) and the ReplyCapRecord is not resurrected/consumed.
+    // (4) Defense-in-depth (Requirement 5): if a Reply object WITHOUT FLAG_REPLY_CAP
+    // reaches dequeue via an invariant violation, materialize FAILS CLOSED — mints no
+    // cap, reclaims the envelope, installs no waiter, and does NOT consume the record.
     #[test]
-    fn caller_exit_before_dequeue_rejected_via_record_present() {
+    fn reply_object_without_flag_fails_closed_at_dequeue() {
         let mut state = Bootstrap::init().expect("init");
-        state.register_task(1).expect("task1");
-        let (endpoint, handle, reply_obj, index, _gen, msg) =
-            reply_msg_fixture(&mut state, ThreadId(1), Message::FLAG_CAP_TRANSFER);
-
-        state.mark_task_dead(1).expect("kill caller");
-        // Generation-only liveness is insufficient here:
-        assert!(state.capability_object_live(reply_obj).is_some());
-        assert!(!state.reply_cap_record_present(index));
-
-        let res = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg);
-        assert_eq!(res, Err(SyscallError::InvalidCapability));
-        // Envelope consumed (dropped); no receiver cap minted.
-        assert!(state.peek_transfer_envelope_source_object(handle).is_none());
-    }
-
-    // (7) Caller reap + slot reuse (generation replacement): a NEW reply cap reuses
-    // the slot and bumps the generation, so the OLD queued envelope names a dead
-    // generation and is rejected by capability_object_live; the new record is intact.
-    #[test]
-    fn generation_replacement_rejects_old_queued_envelope() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(1).expect("task1");
-        let (endpoint, handle, _old_obj, index, old_gen, msg) =
-            reply_msg_fixture(&mut state, ThreadId(1), Message::FLAG_CAP_TRANSFER);
-
-        state.mark_task_dead(1).expect("kill caller");
-        // Re-mint a reply cap: reuses slot `index`, bumps the generation.
-        let (_eid2, _s2, recv2) = state.create_endpoint(4).expect("endpoint2");
-        let new_reply = state
-            .create_reply_cap_for_caller(ThreadId(0), recv2, None)
-            .expect("re-mint reply cap");
-        let new_gen = match state
-            .current_task_capability(new_reply)
-            .expect("resolve")
-            .object
-        {
-            CapObject::Reply {
-                index: i,
-                generation,
-            } if i == index => generation,
-            other => panic!("expected reused slot Reply, got {other:?}"),
-        };
-        assert_ne!(new_gen, old_gen, "slot reuse must bump the generation");
-
-        // The OLD envelope (old generation) must be rejected, new record untouched.
-        let res = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg);
-        assert_eq!(res, Err(SyscallError::InvalidCapability));
-        assert!(state.peek_transfer_envelope_source_object(handle).is_none());
-        assert!(
-            state.reply_cap_record_present(index),
-            "new record must survive"
-        );
-    }
-
-    // (8) A duplicate dequeue / retry cannot mint a second receiver cap: the
-    // one-shot envelope is consumed by the first take.
-    #[test]
-    fn duplicate_dequeue_mints_at_most_one() {
-        let mut state = Bootstrap::init().expect("init");
-        let (endpoint, _h, _obj, _index, _gen, msg) =
-            reply_msg_fixture(&mut state, ThreadId(0), Message::FLAG_CAP_TRANSFER);
-        assert!(
-            materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg)
-                .expect("first ok")
-                .is_some()
-        );
-        // Second attempt: envelope already consumed.
-        assert_eq!(
-            materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg),
-            Err(SyscallError::InvalidCapability)
-        );
-    }
-
-    // (9) Receiver CNode full at mint time: the mint fails, the envelope is consumed
-    // (dropped), and the ReplyCapRecord is NOT consumed (waiter never set).
-    #[test]
-    fn receiver_cnode_full_rejects_without_record_consume() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(2).expect("task2");
-        let cnode2 = state.task_cnode(2).expect("task2 cnode");
-        // Fill the receiver cnode.
-        let mut filled = 0usize;
-        for _ in 0..8192 {
-            if state
-                .mint_capability_in_cnode(
-                    cnode2,
-                    Capability::new(CapObject::Kernel, CapRights::READ),
-                )
-                .is_err()
-            {
-                break;
-            }
-            filled += 1;
-        }
-        assert!(filled > 0, "cnode must accept then reject");
-
-        let (endpoint, handle, _obj, index, _gen, msg) =
-            reply_msg_fixture(&mut state, ThreadId(0), Message::FLAG_CAP_TRANSFER);
-        let res = materialize_received_message_cap(&mut state, endpoint, 2, 0, &msg);
-        assert!(res.is_err(), "mint into a full cnode must fail");
-        assert!(state.peek_transfer_envelope_source_object(handle).is_none());
-        assert_eq!(
-            state.reply_cap_record_waiter_cap(index),
-            None,
-            "record must not be consumed on mint failure"
-        );
-        assert!(
-            state.reply_cap_record_present(index),
-            "record still present"
-        );
-    }
-
-    // (10) Provisional-mint rollback (payload/metadata copy fault after mint) is
-    // OBJECT-flavored: even when called with the flag-derived is_reply_cap=false
-    // (the IpcSend shape), it revokes the receiver reply cap + clears waiter-cap and
-    // leaves the ReplyCapRecord live (canonical drop; no leaked cap/waiter).
-    #[test]
-    fn provisional_mint_rollback_is_object_flavored() {
-        let mut state = Bootstrap::init().expect("init");
-        let (endpoint, _h, _obj, index, _gen, msg) =
-            reply_msg_fixture(&mut state, ThreadId(0), Message::FLAG_CAP_TRANSFER);
-        let cap_id = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg)
-            .expect("ok")
-            .expect("minted");
-        assert_eq!(
-            state.reply_cap_record_waiter_cap(index),
-            Some(CapId(cap_id))
-        );
-
-        // Post-mint writeback fault path passes the flag-derived is_reply_cap=false;
-        // the rollback flavor must still be reply (object-authoritative).
-        assert!(state.rollback_materialized_recv_cap(0, CapId(cap_id), false));
-        assert!(
-            state.current_task_capability(CapId(cap_id)).is_none(),
-            "receiver reply cap revoked"
-        );
-        assert_eq!(
-            state.reply_cap_record_waiter_cap(index),
-            None,
-            "waiter-cap cleared"
-        );
-        assert!(
-            state.reply_cap_record_present(index),
-            "ReplyCapRecord not consumed on failed delivery (re-deliverable)"
-        );
-    }
-
-    // (11) Receiver/source teardown before finalization purges the queued envelope,
-    // so a later materialize finds no envelope and rejects — no envelope leak, and
-    // the record is not consumed.
-    #[test]
-    fn teardown_before_finalization_purges_envelope() {
-        let mut state = Bootstrap::init().expect("init");
-        state.register_task(2).expect("task2");
-        let (endpoint, send_cap, recv_cap_global) = {
-            let (e, s, r) = state.create_endpoint(4).expect("endpoint");
-            (e, s, r)
-        };
-        let _ = (endpoint, recv_cap_global);
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
         let endpoint = state
             .current_task_capability(send_cap)
             .expect("send")
             .object;
         let reply_cap = state
-            .create_reply_cap_for_caller(ThreadId(0), recv_cap_global, None)
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
             .expect("reply cap");
         let index = match state
             .current_task_capability(reply_cap)
@@ -63459,21 +63249,139 @@ mod stage198d2a_queued_reply_cap_routing {
             other => panic!("expected Reply, got {other:?}"),
         };
         let handle = state
-            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, Some(ThreadId(2)), None)
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
             .expect("stash");
+        // FLAG_CAP_TRANSFER (no reply flag) — the forbidden queued reply-cap shape.
         let msg = Message::with_header(0, 0x44, Message::FLAG_CAP_TRANSFER, Some(handle), b"rc")
             .expect("msg");
 
-        // Receiver process torn down before finalization.
-        state.purge_transfer_envelopes_for_pid(2);
-        assert!(state.peek_transfer_envelope_source_object(handle).is_none());
-
-        let res = materialize_received_message_cap(&mut state, endpoint, 2, 0, &msg);
-        assert!(res.is_err(), "no envelope → reject");
+        let res = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg);
+        assert_eq!(
+            res,
+            Err(SyscallError::InvalidCapability),
+            "must fail closed"
+        );
+        assert!(
+            state.peek_transfer_envelope_source_object(handle).is_none(),
+            "envelope reclaimed (no leak)"
+        );
+        assert_eq!(
+            state.reply_cap_record_waiter_cap(index),
+            None,
+            "no waiter-cap installed (no leak)"
+        );
         assert!(
             state.reply_cap_record_present(index),
-            "record not consumed by a purged-envelope reject"
+            "ReplyCapRecord not consumed on the fail-closed reject"
         );
+    }
+
+    // (5) The accepted canonical FLAG_REPLY_CAP ipc-call reply path is UNCHANGED:
+    // flag and object agree and it materializes the one-shot reply cap.
+    #[test]
+    fn canonical_flag_reply_cap_still_materializes() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+        let index = match state
+            .current_task_capability(reply_cap)
+            .expect("obj")
+            .object
+        {
+            CapObject::Reply { index, .. } => index,
+            other => panic!("expected Reply, got {other:?}"),
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash");
+        let msg = Message::with_header(0, 0x44, Message::FLAG_REPLY_CAP, Some(handle), b"rc")
+            .expect("msg");
+        let cap_id = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg)
+            .expect("ok")
+            .expect("minted");
+        let cap = state
+            .current_task_capability(CapId(cap_id))
+            .expect("resolve");
+        assert!(matches!(cap.object, CapObject::Reply { .. }));
+        assert_eq!(cap.rights(), CapRights::SEND);
+        assert_eq!(
+            state.reply_cap_record_waiter_cap(index),
+            Some(CapId(cap_id))
+        );
+    }
+
+    // (6) The Stage 198C direct one-shot semantics are retained: a live reply cap
+    // replies exactly once, and a second invocation is rejected.
+    #[test]
+    fn direct_reply_one_shot_first_succeeds_second_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+        let first = Message::new(9, b"ok").expect("reply");
+        state.ipc_reply(reply_cap, first).expect("first reply");
+        let second = Message::new(9, b"no").expect("replay");
+        assert_eq!(
+            state.ipc_reply(reply_cap, second),
+            Err(KernelError::InvalidCapability),
+            "second invocation of a one-shot reply cap must be rejected"
+        );
+    }
+
+    // (7) Authoritative direct-only policy guard: queueing unsupported, no reply-cap
+    // enqueue retirement marker, no reply-cap enqueue provisioning, and both
+    // enforcement points present in production source.
+    #[test]
+    fn direct_only_reply_policy_guard() {
+        // The authoritative compile-time switch is false.
+        assert!(
+            !crate::kernel::syscall::REPLY_CAP_QUEUEING_SUPPORTED,
+            "reply_cap_queueing_supported must be false (direct-only policy)"
+        );
+
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        const RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+        const MOD_SRC: &str = include_str!("mod.rs");
+        const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+        const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+        const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+
+        assert!(
+            IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"),
+            "the authoritative policy constant must be defined false"
+        );
+        // Send-side refusal + recv-side fail-closed enforcement points exist.
+        assert!(
+            IPC_SRC.contains("IPC_SEND_REPLY_CAP_DIRECT_ONLY"),
+            "IpcSend must refuse a no-receiver reply-cap transfer"
+        );
+        assert!(
+            RECV_CORE_SRC.contains("IPC_RECV_REPLY_CAP_QUEUE_REFUSED"),
+            "recv-side must fail closed on a queued reply-cap shape"
+        );
+        // No reply-cap ENQUEUE retirement class / marker.
+        assert!(
+            !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
+            "no reply-cap enqueue retirement class may exist"
+        );
+        // No reply-cap enqueue provisioning on any arch.
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                !src.contains("provision_init_ipc_send_reply_cap_enqueue"),
+                "{arch} boot.rs must not provision reply-cap enqueue"
+            );
+        }
     }
 }
 

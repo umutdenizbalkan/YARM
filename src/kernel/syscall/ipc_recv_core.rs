@@ -197,29 +197,42 @@ pub(crate) fn materialize_received_message_cap(
     msg: &Message,
 ) -> Result<Option<u64>, SyscallError> {
     let raw = msg.transferred_cap().map(|c| c.0);
-    // Stage 198D2A: object-authoritative classification. The queued transfer
-    // envelope's kernel-resolved `source_object` is the authoritative class
-    // discriminator — NOT the user-visible message flag. An IpcSend reply cap is
-    // tagged FLAG_CAP_TRANSFER (the ABI has no reply flag), so a Reply object MUST
-    // route to the reply direct-mint branch regardless of the flag, and a non-Reply
-    // object must never be forced into the reply branch by a spoofed flag. The flag
-    // is consulted ONLY when no transfer envelope applies (the canonical IPC-call /
-    // plain-reply path, where identity lives in the flag, not an envelope).
-    let envelope_object = raw.and_then(|h| kernel.peek_transfer_envelope_source_object(h));
-    let (kind, value) = match envelope_object {
-        Some(CapObject::Reply { .. }) => ("reply", raw),
-        Some(_) => ("transfer", raw),
-        None => {
-            if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
-                ("reply", raw)
-            } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN))
-                != 0
-            {
-                ("transfer", raw)
-            } else {
-                ("none", None)
-            }
+    // Stage 198D-S — DIRECT-ONLY REPLY CAPS. Reply capabilities are special: they are
+    // direct-delivery only, one-shot, and are NEVER stored in an endpoint message
+    // queue (enforced up front at IpcSend, which refuses to enqueue a Reply-object
+    // transfer). A transfer envelope whose kernel-resolved source_object is a Reply
+    // BUT which arrives WITHOUT the canonical FLAG_REPLY_CAP (the ipc-call reply
+    // channel) is the forbidden *queued reply-cap transfer* shape — reachable here
+    // only through an internal invariant violation. Fail CLOSED: reclaim the envelope
+    // once (no leak), mint no receiver cap, and wake no one. It is NOT treated as a
+    // supported queued delivery. (The accepted FLAG_REPLY_CAP ipc-call reply path,
+    // where flag and object agree, continues below via the object-authoritative reply
+    // branch, which still revalidates the record.)
+    if matches!(
+        raw.and_then(|h| kernel.peek_transfer_envelope_source_object(h)),
+        Some(CapObject::Reply { .. })
+    ) && (msg.flags & Message::FLAG_REPLY_CAP) == 0
+    {
+        if let Some(handle) = raw {
+            let _ = kernel.take_transfer_envelope(
+                handle,
+                endpoint,
+                crate::kernel::ipc::ThreadId(receiver_tid),
+            );
         }
+        crate::yarm_log!(
+            "IPC_RECV_REPLY_CAP_QUEUE_REFUSED raw={} receiver_tid={} reason=direct_only",
+            raw.unwrap_or(0),
+            receiver_tid
+        );
+        return Err(SyscallError::InvalidCapability);
+    }
+    let (kind, value) = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
+        ("reply", raw)
+    } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0 {
+        ("transfer", raw)
+    } else {
+        ("none", None)
     };
     let Some(raw_value) = value else {
         return Ok(None);
@@ -463,14 +476,14 @@ pub(crate) fn materialize_received_message_cap_routed(
         CapTransferSplitResult, materialize_split_reply_cap_equivalent,
         materialize_split_transfer_cap_equivalent,
     };
-    // Stage 198D2A: object precedence at the split router. The D1 transfer arm and
-    // D5 reply arm both classify by MESSAGE FLAG (`CapTransferRecvClass::classify`).
-    // An IpcSend reply cap is tagged FLAG_CAP_TRANSFER, so without this guard the
-    // transfer arm would materialize a one-shot Reply object as an ordinary
-    // delegatable cap (the Stage 193G misroute). When the flag is NOT FLAG_REPLY_CAP
-    // but the queued envelope's authoritative object IS a Reply, route to the
-    // object-authoritative canonical materialize (reply direct-mint). A genuine
-    // FLAG_REPLY_CAP reply cap keeps its existing D5 split reply arm below unchanged.
+    // Stage 198D-S — DIRECT-ONLY REPLY CAPS. The D1 transfer arm and D5 reply arm both
+    // classify by MESSAGE FLAG (`CapTransferRecvClass::classify`), so without this
+    // guard a Reply object tagged FLAG_CAP_TRANSFER (the forbidden queued reply-cap
+    // transfer shape) would fall into the D1 transfer arm and be materialized as an
+    // ordinary delegatable cap. Route any non-FLAG_REPLY_CAP message whose envelope
+    // object is a Reply to the canonical materialize, which FAILS CLOSED for it
+    // (reclaims the envelope, mints nothing). A genuine FLAG_REPLY_CAP reply cap keeps
+    // its existing D5 split reply arm below unchanged.
     if (msg.flags & Message::FLAG_REPLY_CAP) == 0
         && let Some(handle) = msg.transferred_cap().map(|c| c.0)
         && matches!(
