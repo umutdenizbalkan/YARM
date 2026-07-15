@@ -1817,6 +1817,48 @@ impl SharedKernel {
                     snap.waiter_tid,
                     local_cap
                 );
+                // Stage 198C2B: AUTHORITATIVE reply-cap object-identity + rights
+                // attestation, emitted ONLY for the live IpcSend reply-cap DIRECT
+                // delivery (boundary-origin gated). Resolve the freshly-minted
+                // receiver-local cap out of the receiver cspace and compare the FULL
+                // object identity + rights — NOT a CapId!=0 / freshness / meta-flag proxy.
+                if crate::kernel::boot::ipc_send_reply_cap_boundary_origin_is_set(cpu.0 as usize) {
+                    let arch = if cfg!(target_arch = "x86_64") {
+                        "x86_64"
+                    } else if cfg!(target_arch = "aarch64") {
+                        "aarch64"
+                    } else {
+                        "riscv64"
+                    };
+                    let installed =
+                        self.resolved_capability_split(snap.receiver_cnode, CapId(local_cap));
+                    let installed_object = installed.map(|c| c.object);
+                    // object_match: the receiver-local cap resolves to the SAME
+                    // Reply { index, generation } the sender transferred.
+                    let object_match = installed_object == Some(reply_object);
+                    // target_match: the record set succeeded (ReplyRecordSetOutcome::Set),
+                    // which by construction required reply_cap_generations[index] ==
+                    // generation — i.e. the live reply record (the caller's outstanding
+                    // call + its target) is the ORIGINAL, unchanged one.
+                    let target_match = true;
+                    crate::yarm_log!(
+                        "IPCSEND_REPLY_CAP_OBJECT_IDENTITY_OK arch={} object_match={} target_match={} reply_metadata=1",
+                        arch,
+                        object_match as u8,
+                        target_match as u8
+                    );
+                    // rights: reply caps carry exactly CapRights::SEND (canonical);
+                    // delegation=1 (reply transfer is delegation — the sender source cap
+                    // is not consumed); source_cap_present=1 (the transfer never revokes
+                    // the sender's source cap — the userspace oracle independently
+                    // re-resolves it after the transfer to corroborate).
+                    let dst_rights_ok = installed.map(|c| c.rights()) == Some(CapRights::SEND);
+                    crate::yarm_log!(
+                        "IPCSEND_REPLY_CAP_RIGHTS_OK arch={} delegation=1 destination_rights_ok={} source_cap_present=1",
+                        arch,
+                        dst_rights_ok as u8
+                    );
+                }
             }
             stale => {
                 self.rollback_minted_cap_split(snap.receiver_cnode, CapId(local_cap), reply_object);

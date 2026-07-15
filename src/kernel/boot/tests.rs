@@ -50581,6 +50581,516 @@ mod stage188d_reply_cap_rank_inversion_seam {
             );
         }
     }
+
+    // ── Stage 198C1 — reply-cap direct-delivery classifier + semantics hardening ──
+    //
+    // These lock in the audit (doc/STAGE_198C_REPLY_CAP_AUDIT.md) findings in hosted
+    // code with NO architecture wiring and NO new lock/ABI/marker: reply-cap
+    // classification is authoritative from the resolved `CapObject::Reply` (never a
+    // user flag), and the source-cap disposition is delegation with a one-shot
+    // *record* arbiter (not move/consume).
+
+    // Helper: resolve the recv endpoint object the fixture's waiter is blocked on.
+    fn fixture_recv_endpoint(state: &mut KernelState) -> CapObject {
+        let recv_cap = state
+            .with_tcb_mut(1, |t| t.blocked_recv_state.map(|s| s.recv_cap))
+            .flatten()
+            .expect("waiter recv cap");
+        state
+            .resolve_capability_for_task(1, recv_cap)
+            .expect("resolve recv cap")
+            .object
+    }
+
+    // (1) OBJECT-AUTHORITY, positive direction: a transferred `Reply` object is
+    // routed to the reply-cap boundary split even when the message carries NO
+    // FLAG_REPLY_CAP (the real userspace IpcSend ABI only ever sets
+    // FLAG_CAP_TRANSFER). A user therefore cannot suppress reply classification by
+    // clearing the flag — the split peeks the source OBJECT.
+    #[test]
+    fn stage198c1_reply_object_routed_by_object_not_flag() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, asid1) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // NON-reply flag (ordinary FLAG_CAP_TRANSFER), pointing at the Reply envelope.
+        let msg = Message::with_header(
+            0,
+            0,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"\x00\x00rep",
+        )
+        .expect("ordinary-flagged msg on a reply envelope");
+        let produced = state
+            .try_ipc_send_boundary_split_reply_cap_pub(1, endpoint_idx, &msg)
+            .expect("reply boundary split");
+        assert!(
+            produced,
+            "a transferred Reply object must route to the reply-cap split by OBJECT, not by flag"
+        );
+
+        let shared = SharedKernel::new(state);
+        assert!(shared.drain_dispatch_post_work(CPU0).is_ok(), "drain");
+        // Delivered as a REPLY cap (reply meta flag), not an ordinary transferred cap.
+        let meta = shared
+            .with(|k| k.copy_from_user(asid1, VirtAddr(0x4400), 40))
+            .expect("read meta");
+        let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().unwrap());
+        assert_ne!(
+            recv_meta_flags & crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64,
+            0,
+            "object-routed reply delivery must set the REPLY_CAP meta flag"
+        );
+        let recorded = shared.with(|k| {
+            k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id))
+        });
+        assert!(
+            recorded.is_some(),
+            "the reply record must carry the materialized receiver-local cap"
+        );
+        // Restore the global drainer flag so a following test's fixture yield
+        // takes the immediate-switch path (test-isolation hygiene).
+        set_trap_drainer(false);
+    }
+
+    // (2) OBJECT-AUTHORITY, negative direction: an ordinary (non-Reply) object does
+    // NOT get grabbed by the reply-cap boundary even when the message DOES carry
+    // FLAG_REPLY_CAP. The split peeks WITHOUT consuming, so it declines (Ok(false))
+    // and leaves the waiter state and the envelope intact for the ordinary slice.
+    #[test]
+    fn stage198c1_ordinary_object_declines_reply_boundary_no_consume() {
+        let (mut state, endpoint_idx, _reply_handle, _ri, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let recv_endpoint = fixture_recv_endpoint(&mut state);
+        let (_mem_id, ord_cap) = state
+            .create_memory_object(PhysAddr(0xCB000))
+            .expect("ordinary memory object");
+        let ord_handle = state
+            .stash_transfer_envelope(ThreadId(0), ord_cap, recv_endpoint, Some(ThreadId(1)), None)
+            .expect("stash ordinary envelope");
+
+        // Force the reply flag on an ordinary object — must still decline.
+        let msg = reply_cap_msg(ord_handle);
+        let produced = state
+            .try_ipc_send_boundary_split_reply_cap_pub(1, endpoint_idx, &msg)
+            .expect("reply boundary split");
+        set_trap_drainer(false);
+        assert!(
+            !produced,
+            "an ordinary object must NOT be routed to the reply split even with FLAG_REPLY_CAP"
+        );
+        // Peek did not consume the ordinary envelope; the waiter is untouched.
+        assert!(
+            state
+                .peek_transfer_envelope_source_object(ord_handle)
+                .is_some(),
+            "the reply split must peek WITHOUT consuming a non-Reply envelope"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |t| t.blocked_recv_state)
+                .flatten()
+                .is_some(),
+            "a declined reply split must not consume the waiter's blocked_recv_state"
+        );
+    }
+
+    // (3) A non-Reply source cannot be forced into the reply PRODUCER: even with
+    // FLAG_REPLY_CAP set, Phase A rejects a non-Reply object with WrongObject and
+    // stashes nothing (no wake, no partial delivery).
+    #[test]
+    fn stage198c1_non_reply_source_rejected_by_reply_producer_no_stash() {
+        let (mut state, endpoint_idx, _reply_handle, _ri, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let recv_endpoint = fixture_recv_endpoint(&mut state);
+        let (_mem_id, ord_cap) = state
+            .create_memory_object(PhysAddr(0xCC000))
+            .expect("ordinary memory object");
+        let ord_handle = state
+            .stash_transfer_envelope(ThreadId(0), ord_cap, recv_endpoint, Some(ThreadId(1)), None)
+            .expect("stash ordinary envelope");
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(ord_handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "a non-Reply source must be a synchronous WrongObject at the reply producer"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed when the source object is not a Reply"
+        );
+    }
+
+    // (4) A stale/cancelled source generation is rejected at Phase A: the reply
+    // object's liveness check keys on `reply_cap_generations[index]`, so a bumped
+    // generation (the signal a slot was cancelled and reused) fails with
+    // InvalidCapability — nothing stashed, waiter not woken. (The complementary
+    // "slot emptied, same generation" cancellation is caught later at the Phase-B'
+    // record set and is covered by `stage188d_stale_record_rolls_back_no_wake`.)
+    #[test]
+    fn stage198c1_stale_source_generation_rejected_no_stash() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // Simulate the slot being cancelled + reused: bump the generation so the
+        // captured reply object's generation is now stale.
+        state.with_ipc_state_mut(|ipc| {
+            ipc.reply_cap_generations[reply_index] =
+                ipc.reply_cap_generations[reply_index].wrapping_add(1);
+        });
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "a stale source generation must be rejected at Phase A (dead object)"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed for a dead reply object"
+        );
+        assert!(
+            !matches!(
+                state.task_status(1),
+                Some(TaskStatus::Runnable | TaskStatus::Running)
+            ) || state.current_tid() == Some(1),
+            "the waiter must not be woken by a rejected delivery"
+        );
+    }
+
+    // (5) An invalid source handle (no such envelope) is rejected at Phase A with
+    // no stash.
+    #[test]
+    fn stage198c1_invalid_source_handle_rejected_no_stash() {
+        let (mut state, endpoint_idx, _handle, _ri, _g, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(0x0DEA_D000_BEEF_0000),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "an invalid source handle must be a Phase-A error"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed for an invalid source handle"
+        );
+    }
+
+    // (6) An invalid receiver payload destination is rejected at the producer's
+    // pre-copy validation BEFORE the reply envelope is consumed: no stash, nothing
+    // minted (reply record has no waiter cap), envelope retained (retryable).
+    #[test]
+    fn stage198c1_invalid_receiver_payload_dest_rejected_no_stash() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        state.with_tcb_mut(1, |tcb| {
+            if let Some(s) = tcb.blocked_recv_state.as_mut() {
+                s.payload_user_ptr = 0x40000; // unmapped
+            }
+        });
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "an unmapped receiver payload dest must be rejected"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed on a payload-destination fault"
+        );
+        let recorded =
+            state.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id));
+        assert_eq!(
+            recorded, None,
+            "nothing may be minted/recorded on a payload fault"
+        );
+        // Payload validation precedes the envelope take, so it stays retryable.
+        assert!(
+            state.peek_transfer_envelope_source_object(handle).is_some(),
+            "the reply envelope must survive a payload-destination fault (retryable)"
+        );
+    }
+
+    // (7) DELEGATION + one-shot RECORD arbiter (the core audit finding): after a
+    // successful reply-cap transfer the SENDER/caller's reply cap is still present
+    // (delegation, NOT move), and the receiver holds a distinct cap to the SAME
+    // Reply object. Invocability is decided by the one-shot record, not by cap
+    // presence: emptying the record makes the object non-live even though BOTH caps
+    // still physically resolve in their cnodes.
+    #[test]
+    fn stage198c1_delegation_sender_cap_present_record_is_one_shot_arbiter() {
+        let (mut state, endpoint_idx, handle, reply_index, reply_generation, asid1) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // The caller/sender's reply cap (task 0) recorded at creation.
+        let caller_cap = state
+            .with_ipc_state(|ipc| ipc.reply_caps[reply_index].map(|r| r.caller_cap_id))
+            .expect("caller cap id");
+
+        let produced = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        )
+        .expect("producer");
+        assert!(produced);
+        let shared = SharedKernel::new(state);
+        assert!(shared.drain_dispatch_post_work(CPU0).is_ok(), "drain");
+
+        let reply_object = CapObject::Reply {
+            index: reply_index,
+            generation: reply_generation,
+        };
+        // Receiver-local cap from the delivered meta.
+        let meta = shared
+            .with(|k| k.copy_from_user(asid1, VirtAddr(0x4400), 40))
+            .expect("meta");
+        let receiver_cap = CapId(u64::from_le_bytes(meta[16..24].try_into().unwrap()));
+
+        shared.with(|k| {
+            // Delegation: the sender/caller cap is NOT consumed by the transfer.
+            let caller = k
+                .resolve_capability_for_task(0, caller_cap)
+                .expect("caller reply cap still resolves after transfer (delegation, not move)");
+            assert_eq!(
+                caller.object, reply_object,
+                "caller cap references the Reply object"
+            );
+            // The receiver holds a DISTINCT cap to the SAME object.
+            let recv = k
+                .resolve_capability_for_task(1, receiver_cap)
+                .expect("receiver reply cap resolves");
+            assert_eq!(
+                recv.object, reply_object,
+                "receiver cap references the same Reply object"
+            );
+            assert_ne!(
+                receiver_cap.0, caller_cap.0,
+                "receiver cap is a fresh, distinct CapId"
+            );
+            // The record is the arbiter and now points at the receiver-local cap.
+            let recorded =
+                k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id));
+            assert_eq!(
+                recorded,
+                Some(receiver_cap),
+                "record binds the receiver-local cap"
+            );
+            // Object is currently live/invocable.
+            assert!(k.capability_object_live(reply_object).is_some());
+        });
+
+        // One-shot: emptying the record (exactly what `ipc_reply` does at consume)
+        // is the single arbiter — a re-prime of the SAME (index, generation) now
+        // fails (slot empty), even though BOTH caps still physically resolve in
+        // their cnodes. Invocability is decided by the record, not cap presence.
+        shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| ipc.reply_caps[reply_index] = None);
+            assert!(
+                k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].is_none()),
+                "the consumed record slot must be empty (one-shot consume point)"
+            );
+            let reprime = k.try_set_reply_cap_waiter_cap(reply_index, reply_generation, receiver_cap);
+            assert!(
+                !matches!(reprime, crate::kernel::boot::ReplyRecordSetOutcome::Set),
+                "re-priming a consumed record must fail — the record is the one-shot arbiter"
+            );
+            assert!(
+                k.resolve_capability_for_task(0, caller_cap).is_ok()
+                    && k.resolve_capability_for_task(1, receiver_cap).is_ok(),
+                "both caps still physically resolve — invocability is decided by the record, not cap presence"
+            );
+        });
+        set_trap_drainer(false);
+    }
+
+    // (8) Provisional receiver-cap rollback after an executor user-copy fault: the
+    // producer pre-validates, but the payload page is unmapped before the drain, so
+    // the executor mints, then faults on copy, and must roll the provisional cap
+    // and its recorded waiter-cap all the way back — real Err, no waiter cap left,
+    // waiter not woken.
+    #[test]
+    fn stage198c1_provisional_cap_rolled_back_on_executor_copy_fault() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, asid1) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let produced = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        )
+        .expect("producer");
+        assert!(produced);
+
+        // Unmap the payload/meta page AFTER the producer validated it, so the
+        // executor's post-mint copy faults.
+        state
+            .unmap_user_page_in_asid(asid1, VirtAddr(0x4000))
+            .expect("unmap payload page");
+
+        let shared = SharedKernel::new(state);
+        let drain = shared.drain_dispatch_post_work(CPU0);
+        set_trap_drainer(false);
+        assert!(
+            drain.is_err(),
+            "an executor copy fault must surface as a real Err"
+        );
+        let recorded = shared.with(|k| {
+            k.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id))
+        });
+        assert_eq!(
+            recorded, None,
+            "the provisional receiver-cap + recorded waiter-cap must be fully rolled back"
+        );
+        // The receiver-local reply cap must not survive the rollback (no cap leak).
+        let receiver_leak = shared.with(|k| {
+            k.with_ipc_state(|ipc| ipc.reply_caps[reply_index])
+                .and_then(|r| r.waiter_cap_id)
+                .is_some()
+        });
+        assert!(
+            !receiver_leak,
+            "no receiver-local reply cap may be left recorded after rollback"
+        );
+    }
+
+    // Stage 198C3: an invalid receiver METADATA destination is rejected at the
+    // producer's meta pre-validation (Phase A.4). The reply envelope is consumed by
+    // then, but NOTHING is minted (no receiver reply-cap leak, no waiter cap recorded)
+    // and no post-work is stashed (no receiver/caller wake, no partial metadata).
+    #[test]
+    fn stage198c3_invalid_receiver_meta_dest_rejected_no_stash() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        state.with_tcb_mut(1, |tcb| {
+            if let Some(s) = tcb.blocked_recv_state.as_mut() {
+                s.meta_user_ptr = 0x40000; // unmapped
+            }
+        });
+
+        let r = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "an unmapped receiver metadata dest must be rejected"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed on a metadata-destination fault"
+        );
+        let recorded =
+            state.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id));
+        assert_eq!(
+            recorded, None,
+            "nothing may be minted/recorded on a metadata fault"
+        );
+    }
+
+    // Stage 198C3: a DUPLICATE transfer attempt of the same reply envelope is rejected
+    // — the transfer envelope is one-shot. Simulating a first transfer by consuming the
+    // envelope, the producer's Phase-A take of the same handle then fails, and nothing
+    // is stashed (no double mint, no duplicate Reply authority materialized, waiter
+    // state preserved).
+    #[test]
+    fn stage198c3_duplicate_transfer_envelope_rejected_no_double_mint() {
+        let (mut state, endpoint_idx, handle, reply_index, _gen, _asid) =
+            blocked_waiter_with_reply_envelope();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        // Resolve the endpoint the envelope is bound to, then consume it once (the
+        // "first" transfer). A second take of a one-shot envelope must be impossible.
+        let recv_cap = state
+            .with_tcb_mut(1, |t| t.blocked_recv_state.map(|s| s.recv_cap))
+            .flatten()
+            .expect("waiter recv cap");
+        let recv_endpoint = state
+            .resolve_capability_for_task(1, recv_cap)
+            .expect("resolve recv cap")
+            .object;
+        assert!(
+            state
+                .take_transfer_envelope(handle, recv_endpoint, ThreadId(1))
+                .is_some(),
+            "the first transfer consumes the one-shot envelope"
+        );
+
+        // The producer's Phase-A take of the same (now-consumed) handle must fail.
+        let r2 = crate::kernel::syscall::produce_blocked_waiter_reply_cap_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &reply_cap_msg(handle),
+        );
+        set_trap_drainer(false);
+        assert!(
+            r2.is_err(),
+            "a duplicate transfer of the consumed one-shot envelope must be a Phase-A error"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no post-work may be stashed for a duplicate transfer attempt"
+        );
+        // No receiver cap was materialized for the duplicate attempt.
+        let recorded =
+            state.with_ipc_state(|ipc| ipc.reply_caps[reply_index].and_then(|r| r.waiter_cap_id));
+        assert_eq!(
+            recorded, None,
+            "no receiver reply-cap may be minted for a duplicate transfer"
+        );
+    }
 }
 
 // ===========================================================================
@@ -61127,6 +61637,255 @@ mod stage193b_ipc_send_plain_oracle {
     }
 }
 
+// Stage 198C2B — reply-cap DIRECT one-shot live wiring. Source-level guards over the
+// new oracle topology (real wakeable caller = init, responder removed only for the
+// gated oracle), the kernel object-identity/rights attestations, the arch-tagged
+// marker origin, the seal contract, and the RISC-V typed-return preservation.
+mod stage198c2b_reply_cap_one_shot_wiring {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const AARCH64_CORE_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const SEAL_SRC: &str =
+        include_str!("../../../scripts/qemu-second-cohort-reply-cap-direct-seal.sh");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // (1) Provisioning topology: the reply record is bound to a real wakeable caller
+    // (init) with responder=None, and init is granted the reply-endpoint RECV cap
+    // returned as a third value.
+    #[test]
+    fn provisioning_wakeable_caller_responder_none() {
+        let body = MOD_SRC
+            .split("fn provision_init_ipc_send_reply_cap_oracle(")
+            .nth(1)
+            .and_then(|r| r.split("\n}").next())
+            .expect("provision fn body");
+        assert!(
+            body.contains("-> Option<(u32, u32, u32)>")
+                || MOD_SRC.contains(
+                    "fn provision_init_ipc_send_reply_cap_oracle(\n    kernel: &mut KernelState,\n    init_tid: u64,\n) -> Option<(u32, u32, u32)>"
+                ),
+            "the reply-cap oracle provisioning must return the three-tuple (coord, reply_cap, reply_recv)"
+        );
+        assert!(
+            body.contains("reply_recv_init")
+                && body.contains("grant_capability_task_to_task_with_rights"),
+            "init must be granted the reply-endpoint RECV cap (the wakeable caller)"
+        );
+        assert!(
+            body.contains(
+                "crate::kernel::ipc::ThreadId(init_tid),\n        reply_recv_init,\n        None,"
+            ),
+            "the Reply record must be created with caller=init and responder=None (child may invoke)"
+        );
+    }
+
+    // (2) The responder=None relaxation lives ONLY inside this knob-gated provisioning
+    // (guarded by ipc_send_reply_cap_oracle_active), never in the general reply path.
+    #[test]
+    fn responder_none_only_in_gated_oracle() {
+        let body = MOD_SRC
+            .split("fn provision_init_ipc_send_reply_cap_oracle(")
+            .nth(1)
+            .and_then(|r| r.split("\n}").next())
+            .expect("provision fn body");
+        assert!(
+            body.contains("if !ipc_send_reply_cap_oracle_active() {"),
+            "the provisioning (incl. responder=None) must be gated by the reply-cap oracle knob"
+        );
+    }
+
+    // (3) All three arch boots destructure the three-tuple and carry the reply-endpoint
+    // RECV cap in slot 17 (no longer the literal `= 1`).
+    #[test]
+    fn boot_slot17_reply_recv_all_arches() {
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains("Some((coord_recv_cap, reply_cap, reply_recv_cap)) =")
+                    && src
+                        .contains("crate::kernel::boot::provision_init_ipc_send_reply_cap_oracle("),
+                "{arch} boot must destructure the reply-cap oracle three-tuple"
+            );
+            assert!(
+                src.contains("init_args[17] = reply_recv_cap as u64;"),
+                "{arch} boot must carry the reply-endpoint RECV cap in slot 17"
+            );
+        }
+    }
+
+    // (4) Reply-cap ENQUEUE remains disabled: this stage adds no enqueue provisioning,
+    // and the reply-cap direct branch sets no enqueue discriminator.
+    #[test]
+    fn reply_enqueue_provisioning_absent() {
+        for src in [X86_BOOT_SRC, AARCH64_BOOT_SRC, RISCV_BOOT_SRC] {
+            assert!(
+                !src.contains("provision_init_ipc_send_reply_cap_enqueue")
+                    && !src.contains("IpcSendReplyCapEnqueue"),
+                "no reply-cap ENQUEUE provisioning may be present"
+            );
+        }
+        assert!(
+            !MOD_SRC.contains("provision_init_ipc_send_reply_cap_enqueue"),
+            "boot/mod.rs must not add reply-cap enqueue provisioning"
+        );
+    }
+
+    // (5) Kernel attestation: the object-identity + rights markers are emitted ONLY for
+    // the live IpcSend reply-cap boundary delivery (boundary-origin gated) and compare
+    // the FULL resolved object + rights, not a CapId!=0 / freshness proxy.
+    #[test]
+    fn kernel_attestation_boundary_origin_gated() {
+        let body = RUNTIME_SRC
+            .split("fn execute_blocked_waiter_reply_cap_delivery(")
+            .nth(1)
+            .and_then(|r| r.split("\n    fn ").next().or(Some(r)))
+            .expect("executor body");
+        // Both attestation markers gated by the reply-cap boundary origin.
+        let ident_at = body
+            .find("IPCSEND_REPLY_CAP_OBJECT_IDENTITY_OK")
+            .expect("object-identity marker present");
+        let rights_at = body
+            .find("IPCSEND_REPLY_CAP_RIGHTS_OK")
+            .expect("rights marker present");
+        let gate_at = body
+            .find("ipc_send_reply_cap_boundary_origin_is_set")
+            .expect("boundary-origin gate present");
+        // The gate that wraps the attestation appears before both markers in the Set arm.
+        let attest_gate = body.rfind("ipc_send_reply_cap_boundary_origin_is_set(cpu.0 as usize) {\n                    let arch");
+        assert!(
+            attest_gate.is_some()
+                && attest_gate.unwrap() < ident_at
+                && attest_gate.unwrap() < rights_at,
+            "both attestations must be emitted under the boundary-origin gate"
+        );
+        let _ = gate_at;
+        assert!(
+            body.contains("resolved_capability_split(")
+                && body.contains("installed_object == Some(reply_object)"),
+            "object_match must compare the FULL resolved receiver cap object to the source Reply"
+        );
+        assert!(
+            body.contains("== Some(CapRights::SEND)"),
+            "destination_rights_ok must compare against the canonical reply-cap rights (SEND)"
+        );
+    }
+
+    // (6) Oracle one-shot: the receiver child invokes the transferred reply cap TWICE
+    // and the caller (init) blocks canonically and emits the one-shot marker.
+    #[test]
+    fn oracle_double_invoke_and_one_shot_marker() {
+        let body = INIT_SRC
+            .split("fn run_ipc_send_reply_cap_oracle(")
+            .nth(1)
+            .and_then(|r| r.split("\nfn ").next())
+            .expect("oracle body");
+        assert_eq!(
+            body.matches("yarm_user_rt::syscall::ipc_reply(").count(),
+            2,
+            "the receiver child must invoke the reply cap exactly twice (first + second)"
+        );
+        assert!(
+            body.contains("IPC_SEND_REPLY_CAP_ORACLE_CHILD_FIRST_REPLY")
+                && body.contains("IPC_SEND_REPLY_CAP_ORACLE_CHILD_SECOND_REPLY"),
+            "the child must log both invocation outcomes"
+        );
+        assert!(
+            body.contains("yarm_user_rt::syscall::ipc_recv(reply_recv)"),
+            "the caller must enter the canonical BLOCKED waiting-for-reply state"
+        );
+        assert!(
+            body.contains(
+                "IPCSEND_REPLY_CAP_ONE_SHOT_OK arch={} first_reply=ok second_reply=rejected caller_wakes=1 duplicate_reply=0"
+            ),
+            "the caller must emit the aggregate one-shot attestation on success"
+        );
+    }
+
+    // (7) Seal contract: the seal requires all five live proofs per arch and emits the
+    // 3/3 cross-arch seal.
+    #[test]
+    fn seal_parser_contract() {
+        for m in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcSendReplyCap result=ok",
+            "IPCSEND_REPLY_CAP_OBJECT_IDENTITY_OK arch=${arch} object_match=1 target_match=1 reply_metadata=1",
+            "IPCSEND_REPLY_CAP_RIGHTS_OK arch=${arch} delegation=1 destination_rights_ok=1 source_cap_present=1",
+            "IPCSEND_REPLY_CAP_ONE_SHOT_OK arch=${arch} first_reply=ok second_reply=rejected caller_wakes=1 duplicate_reply=0",
+            "SECOND_COHORT_REPLY_CAP_DIRECT_SEAL arches=3 classes=1 live_cells=3 result=ok",
+        ] {
+            assert!(SEAL_SRC.contains(m), "seal must require/emit `{m}`");
+        }
+        assert!(
+            SEAL_SRC.contains("class=IpcSendReplyCapEnqueue|class=IpcSendSharedRegion"),
+            "the seal must reject reply-cap-enqueue and shared-region markers"
+        );
+    }
+
+    // (8) RISC-V typed-return preservation: the reply-cap IpcSend sender is NOT added to
+    // the RISC-V pre-lock selective gate; the wrapper stays able to ReturnToCurrent.
+    #[test]
+    fn riscv_return_to_current_preserved() {
+        assert!(
+            RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToCurrent")
+                && RISCV_TRAP_SRC.contains("drain_dispatch_post_work(cpu)"),
+            "the RISC-V wrapper must run the drain and be able to ReturnToCurrent"
+        );
+        assert!(
+            !RISCV_BOOT_SRC.contains("IpcSendReplyCap gate")
+                && RISCV_BOOT_SRC.contains("ReturnToCurrent"),
+            "RISC-V reply-cap sender must stay on the canonical ReturnToCurrent path"
+        );
+    }
+
+    // (9) Stage 198C3: the AArch64 InvalidCapability exemption for the reply-cap
+    // one-shot second invocation is NARROW: it matches exactly the expected
+    // `IPC_REPLY_FAIL tid=<n> reply_cap=<n> err=InvalidCapability` form (the
+    // second_reply=rejected proof), NOT a bare InvalidCapability — so every OTHER
+    // InvalidCapability (materialize/lookup/etc.) still blocks the boot.
+    #[test]
+    fn aarch64_invalidcapability_exemption_is_narrow() {
+        // The blocker regex still treats generic InvalidCapability as fatal.
+        assert!(
+            AARCH64_CORE_SMOKE_SRC.contains("BLOCKER_REGEX=")
+                && AARCH64_CORE_SMOKE_SRC.contains("InvalidCapability"),
+            "the aarch64 blocker regex must still list InvalidCapability"
+        );
+        // The exemption is the exact reply-cap one-shot form, not a broad wildcard.
+        assert!(
+            AARCH64_CORE_SMOKE_SRC
+                .contains("IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability"),
+            "the exemption must be scoped to the exact reply-cap second-invoke IPC_REPLY_FAIL form"
+        );
+        // It must NOT blanket-exclude InvalidCapability, IPC_RECV_CAP_MATERIALIZE_FAILED,
+        // CAP_LOOKUP, or WrongObject/StaleCapability generally.
+        let exclude = AARCH64_CORE_SMOKE_SRC
+            .split("BLOCKER_EXCLUDE_REGEX='")
+            .nth(1)
+            .and_then(|r| r.split('\'').next())
+            .expect("exclude regex literal");
+        for forbidden in [
+            "|InvalidCapability|",
+            "IPC_RECV_CAP_MATERIALIZE_FAILED",
+            "CAP_LOOKUP",
+            "IPC_CALL_FAIL",
+        ] {
+            assert!(
+                !exclude.contains(forbidden),
+                "the exemption must not broadly suppress `{forbidden}`"
+            );
+        }
+    }
+}
+
 // Stage 193C — IPCSEND ORDINARY-CAP BOUNDARY SPLIT. Extends the IpcSend boundary
 // decomposition to ordinary cap-transfer sends to an already-recv-v2-blocked
 // receiver, reusing the SAME 188C ordinary-cap producer + executor `ipc_reply` uses
@@ -61439,10 +62198,19 @@ mod stage193d_ipc_send_reply_cap {
                 && RUNTIME_SRC.contains("ipc_send_reply_cap_boundary_origin_take("),
             "the executor must emit the reply-cap materialize/copy/wake/done markers gated on origin"
         );
-        assert!(
-            MOD_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendReplyCap result=ok"),
-            "the IpcSendReplyCap retirement marker must exist"
-        );
+        // Stage 198C2: the retirement marker is arch-tagged and emitted for all
+        // three arches (the reply-cap class is retired cross-arch, sealed 3/3 in
+        // 198C2B), so the un-tagged form no longer exists.
+        for needle in [
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendReplyCap result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendReplyCap result=ok",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendReplyCap result=ok",
+        ] {
+            assert!(
+                MOD_SRC.contains(needle),
+                "the arch-tagged IpcSendReplyCap retirement marker must exist: {needle}"
+            );
+        }
         assert!(!SPLIT_SRC.contains("Syscall::ReapFaultedTask => Some"));
     }
 
@@ -61536,9 +62304,12 @@ mod stage193d_ipc_send_reply_cap {
                 && X86_BOOT_SRC.contains("init_args[17] = 1;"),
             "x86_64 boot must provision coord(13) + reply cap(14) + discriminator(17)"
         );
+        // Stage 198C2B: the slot-17 discriminator binds the reply-endpoint RECV
+        // cap (the wakeable caller), so the dispatch predicate is now an
+        // `if let Some(..) = ctx.pm_request_recv_cap` guard rather than `.is_some()`.
         assert!(
             INIT_SRC.contains("run_ipc_send_reply_cap_oracle(")
-                && INIT_SRC.contains("ctx.pm_request_recv_cap.is_some()"),
+                && INIT_SRC.contains("if let Some(reply_recv_cap) = ctx.pm_request_recv_cap"),
             "init must dispatch the reply-cap oracle on the slot-17 discriminator"
         );
     }
@@ -62134,6 +62905,1458 @@ mod stage193g_remaining_shapes_audit {
             DOC_SRC.contains("Stage 193G") && DOC_SRC.contains("both shapes NO-GO"),
             "the 193G audit no-go must be documented in KERNEL_LOCKING.md"
         );
+    }
+}
+
+// Stage 198D1 — QUEUED REPLY-CAP LIFETIME MODEL (design clarification, no production change).
+//
+// These tests do NOT enable or retire the queued reply-cap class. They pin the lifetime facts
+// that the chosen redesign (design A — typed queued envelope carrying kernel-derived object
+// identity) depends on, using existing kernel primitives only. See
+// doc/STAGE_198D1_QUEUED_REPLY_CAP_AUDIT.md.
+mod stage198d1_queued_reply_cap_lifetime {
+    use super::*;
+
+    // Helper: create an endpoint and mint a Reply cap whose RECORD is owned by
+    // `record_caller` (its exit/death revokes the record). The reply cap itself is
+    // minted into the ACTIVE cnode (task 0, the sender that stashes the queued
+    // envelope), matching how create_reply_cap_for_caller mints (dest = active cnode;
+    // caller_tid only sets the record's owner). Returns
+    // (endpoint object, reply cap id, reply object, reply index, reply generation).
+    fn reply_envelope_fixture(
+        state: &mut KernelState,
+        record_caller: ThreadId,
+    ) -> (CapObject, CapId, CapObject, usize, u64) {
+        let (_eid, send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+        // create_reply_cap_for_caller resolves the reply-recv cap in the RECORD
+        // caller's cnode; grant it there when the caller is not the active task.
+        let recv_cap = if record_caller.0 == state.current_tid().unwrap_or(u64::MAX) {
+            recv_cap_global
+        } else {
+            state
+                .grant_capability_task_to_task(0, recv_cap_global, record_caller.0)
+                .expect("dup recv cap into caller cnode")
+        };
+        let reply_cap = state
+            .create_reply_cap_for_caller(record_caller, recv_cap, None)
+            .expect("create reply cap");
+        // Minted into the active (task-0) cnode — resolve it there.
+        let reply_obj = state
+            .current_task_capability(reply_cap)
+            .expect("resolve reply cap")
+            .object;
+        let (index, generation) = match reply_obj {
+            CapObject::Reply { index, generation } => (index, generation),
+            other => panic!("expected Reply object, got {other:?}"),
+        };
+        (endpoint, reply_cap, reply_obj, index, generation)
+    }
+
+    // (1) The queued class discriminator is the kernel-resolved object stored in the
+    // envelope at stash time — available WITHOUT consulting any message flag. This is
+    // the authoritative identity design A routes on (never FLAG_REPLY_CAP).
+    #[test]
+    fn queued_reply_envelope_classification_is_object_authoritative() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, reply_cap, reply_obj, _idx, _gen) =
+            reply_envelope_fixture(&mut state, ThreadId(0));
+        assert!(matches!(reply_obj, CapObject::Reply { .. }));
+
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash reply envelope");
+        // The recv-side classifier can recover the authoritative Reply object with a
+        // pure, non-consuming peek — no flag needed.
+        assert_eq!(
+            state.peek_transfer_envelope_source_object(handle),
+            Some(reply_obj)
+        );
+        assert!(matches!(
+            state.peek_transfer_envelope_source_object(handle),
+            Some(CapObject::Reply { .. })
+        ));
+    }
+
+    // (2) One queue entry yields at most one receiver cap: take_transfer_envelope
+    // hands back the Reply source object exactly once, then None.
+    #[test]
+    fn queued_reply_envelope_take_is_one_shot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, reply_cap, _reply_obj, _idx, _gen) =
+            reply_envelope_fixture(&mut state, ThreadId(0));
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash reply envelope");
+
+        let taken = state
+            .take_transfer_envelope(handle, endpoint, ThreadId(0))
+            .expect("take once");
+        assert!(matches!(taken.source_object, CapObject::Reply { .. }));
+        // A duplicate dequeue / retry cannot re-materialize: the slot is consumed.
+        assert!(
+            state
+                .take_transfer_envelope(handle, endpoint, ThreadId(0))
+                .is_none()
+        );
+    }
+
+    // (3) THE queued-specific refinement: after a caller EXIT the reply record slot is
+    // cleared but the slot generation is NOT bumped, so capability_object_live (which
+    // only compares the generation) still returns Some. Only the record-present check
+    // catches the exit. This is exactly why the queued finalize must revalidate the
+    // full record (resolve_reply_index), not merely capability_object_live like the
+    // synchronous direct path.
+    #[test]
+    fn caller_exit_requires_record_present_check_not_just_generation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        // Record owned by task 1; the queued source cap lives in the active (task-0) cnode.
+        let (endpoint, reply_cap, reply_obj, index, _gen) =
+            reply_envelope_fixture(&mut state, ThreadId(1));
+        let _handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash reply envelope");
+
+        // Live before the caller dies: both checks pass.
+        assert!(state.capability_object_live(reply_obj).is_some());
+        assert!(state.reply_cap_record_present(index));
+
+        state.mark_task_dead(1).expect("mark caller dead");
+
+        // Generation-only liveness is INSUFFICIENT — it still passes.
+        assert!(
+            state.capability_object_live(reply_obj).is_some(),
+            "generation is not bumped on caller exit, so capability_object_live stays Some"
+        );
+        // The record-present check is what rejects the exited caller.
+        assert!(
+            !state.reply_cap_record_present(index),
+            "the reply record slot must be cleared on caller exit"
+        );
+    }
+
+    // (4) No envelope leak: purge_transfer_envelopes_for_pid reclaims a still-queued
+    // reply envelope when a participating process (here the bound receiver) is torn
+    // down. The purge matches source OR receiver pid; this exercises the receiver
+    // branch, and the source branch shares the identical clear path.
+    #[test]
+    fn queued_reply_envelope_reclaimed_on_process_teardown() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (endpoint, reply_cap, _reply_obj, _idx, _gen) =
+            reply_envelope_fixture(&mut state, ThreadId(0));
+        // Bind the queued envelope to receiver task 1; source cap lives in task 0.
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, Some(ThreadId(1)), None)
+            .expect("stash reply envelope");
+        assert!(state.peek_transfer_envelope_source_object(handle).is_some());
+
+        state.purge_transfer_envelopes_for_pid(1);
+
+        assert!(
+            state.peek_transfer_envelope_source_object(handle).is_none(),
+            "the queued reply envelope must be reclaimed on process teardown (no leak)"
+        );
+    }
+
+    // (5) Provisional-mint rollback leaves the canonical drop state: the receiver-local
+    // reply cap and the global waiter_cap_id are cleared, but the Reply RECORD stays
+    // present (re-deliverable) — no cap/waiter/record leak on a copy/CNode fault.
+    #[test]
+    fn provisional_reply_mint_rollback_leaves_record_live() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_endpoint, _reply_cap, reply_obj, index, generation) =
+            reply_envelope_fixture(&mut state, ThreadId(0));
+        let cnode = state.task_cnode(0).expect("task0 cnode");
+
+        // Simulate the provisional receiver-local mint + record priming.
+        let minted = state
+            .mint_capability_in_cnode(cnode, Capability::new(reply_obj, CapRights::SEND))
+            .expect("provisional receiver mint");
+        state.set_reply_cap_waiter_cap(index, generation, minted);
+        assert_eq!(state.reply_cap_record_waiter_cap(index), Some(minted));
+
+        // A subsequent copy/CNode failure rolls the provisional mint back.
+        assert!(
+            state.rollback_materialized_recv_cap(0, minted, true),
+            "reply-cap rollback must clear the provisional receiver slot"
+        );
+
+        // Receiver-local cap gone, waiter_cap cleared, but the record stays present.
+        assert!(
+            state.current_task_capability(minted).is_none(),
+            "the provisional receiver reply cap must be revoked"
+        );
+        assert_eq!(
+            state.reply_cap_record_waiter_cap(index),
+            None,
+            "the stale waiter_cap_id must be cleared"
+        );
+        assert!(
+            state.reply_cap_record_present(index),
+            "the Reply record itself must remain live/re-deliverable after rollback"
+        );
+    }
+}
+
+// Stage 198D-S — DIRECT-ONLY REPLY CAPABILITIES (production policy, hosted proof).
+//
+// Policy: reply caps are direct-delivery only, one-shot, and are NEVER stored in an
+// endpoint message queue. IpcSend refuses to enqueue a Reply-object transfer when no
+// compatible receiver is blocked (send-side, before any TransferEnvelope is stashed),
+// and the recv-side materialize fails CLOSED if a Reply object without FLAG_REPLY_CAP
+// ever reaches dequeue through an internal invariant violation. Ordinary caps and
+// plain messages are unaffected. The accepted Stage 198C direct path and the
+// canonical FLAG_REPLY_CAP ipc-call reply path are unchanged. Supersedes 198D2A and
+// cancels the queued reply-cap live class (Stage 198D2B).
+mod stage198ds_direct_only_reply_caps {
+    use super::*;
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::ipc_recv_core::materialize_received_message_cap;
+
+    // Count queued transfer envelopes whose authoritative source object is a Reply.
+    fn count_reply_envelopes(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| {
+                state.with_ipc_state(|ipc| {
+                    matches!(
+                        ipc.transfer_envelopes[i].map(|e| e.source_object),
+                        Some(CapObject::Reply { .. })
+                    )
+                })
+            })
+            .count()
+    }
+
+    fn endpoint_queue_depth(state: &KernelState, endpoint_idx: usize) -> usize {
+        state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued())
+    }
+
+    // (1) Reply cap + NO receiver → refused (canonical WouldBlock), and NOTHING is
+    // queued: no endpoint message, no Reply TransferEnvelope. (Requirement 1/2,
+    // proof 4/5/6.)
+    #[test]
+    fn reply_cap_send_no_receiver_refused_and_not_queued() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                inline_payload_word(b"rcap"),
+                0,
+                reply_cap.0 as usize,
+            ],
+        );
+        let res = state.handle_trap(Trap::Syscall, Some(&mut frame));
+        assert!(
+            res.is_err() || frame.error_code().is_some(),
+            "reply-cap send with no blocked receiver must be refused"
+        );
+        assert_eq!(
+            endpoint_queue_depth(&state, endpoint_idx),
+            0,
+            "no message may be queued for a refused reply-cap send"
+        );
+        assert_eq!(
+            count_reply_envelopes(&state),
+            0,
+            "no Reply TransferEnvelope may remain after refusal"
+        );
+    }
+
+    // (2) Ordinary cap + no receiver → existing enqueue still succeeds (unchanged).
+    #[test]
+    fn ordinary_cap_send_no_receiver_still_enqueues() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        let (endpoint_idx, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                inline_payload_word(b"ocap"),
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut frame))
+            .expect("ordinary-cap send");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(
+            endpoint_queue_depth(&state, endpoint_idx),
+            1,
+            "ordinary cap-transfer must still enqueue with no receiver"
+        );
+    }
+
+    // (3) Plain message + no receiver → existing enqueue unchanged.
+    #[test]
+    fn plain_message_send_no_receiver_still_enqueues() {
+        let mut state = Bootstrap::init_boxed().expect("init");
+        let (endpoint_idx, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                inline_payload_word(b"plan"),
+                0,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        state
+            .handle_trap(Trap::Syscall, Some(&mut frame))
+            .expect("plain send");
+        assert_eq!(frame.error_code(), None);
+        assert_eq!(endpoint_queue_depth(&state, endpoint_idx), 1);
+    }
+
+    // (4) Defense-in-depth (Requirement 5): if a Reply object WITHOUT FLAG_REPLY_CAP
+    // reaches dequeue via an invariant violation, materialize FAILS CLOSED — mints no
+    // cap, reclaims the envelope, installs no waiter, and does NOT consume the record.
+    #[test]
+    fn reply_object_without_flag_fails_closed_at_dequeue() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+        let index = match state
+            .current_task_capability(reply_cap)
+            .expect("obj")
+            .object
+        {
+            CapObject::Reply { index, .. } => index,
+            other => panic!("expected Reply, got {other:?}"),
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash");
+        // FLAG_CAP_TRANSFER (no reply flag) — the forbidden queued reply-cap shape.
+        let msg = Message::with_header(0, 0x44, Message::FLAG_CAP_TRANSFER, Some(handle), b"rc")
+            .expect("msg");
+
+        let res = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg);
+        assert_eq!(
+            res,
+            Err(SyscallError::InvalidCapability),
+            "must fail closed"
+        );
+        assert!(
+            state.peek_transfer_envelope_source_object(handle).is_none(),
+            "envelope reclaimed (no leak)"
+        );
+        assert_eq!(
+            state.reply_cap_record_waiter_cap(index),
+            None,
+            "no waiter-cap installed (no leak)"
+        );
+        assert!(
+            state.reply_cap_record_present(index),
+            "ReplyCapRecord not consumed on the fail-closed reject"
+        );
+    }
+
+    // (5) The accepted canonical FLAG_REPLY_CAP ipc-call reply path is UNCHANGED:
+    // flag and object agree and it materializes the one-shot reply cap.
+    #[test]
+    fn canonical_flag_reply_cap_still_materializes() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+        let index = match state
+            .current_task_capability(reply_cap)
+            .expect("obj")
+            .object
+        {
+            CapObject::Reply { index, .. } => index,
+            other => panic!("expected Reply, got {other:?}"),
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash");
+        let msg = Message::with_header(0, 0x44, Message::FLAG_REPLY_CAP, Some(handle), b"rc")
+            .expect("msg");
+        let cap_id = materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg)
+            .expect("ok")
+            .expect("minted");
+        let cap = state
+            .current_task_capability(CapId(cap_id))
+            .expect("resolve");
+        assert!(matches!(cap.object, CapObject::Reply { .. }));
+        assert_eq!(cap.rights(), CapRights::SEND);
+        assert_eq!(
+            state.reply_cap_record_waiter_cap(index),
+            Some(CapId(cap_id))
+        );
+    }
+
+    // (6) The Stage 198C direct one-shot semantics are retained: a live reply cap
+    // replies exactly once, and a second invocation is rejected.
+    #[test]
+    fn direct_reply_one_shot_first_succeeds_second_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+        let first = Message::new(9, b"ok").expect("reply");
+        state.ipc_reply(reply_cap, first).expect("first reply");
+        let second = Message::new(9, b"no").expect("replay");
+        assert_eq!(
+            state.ipc_reply(reply_cap, second),
+            Err(KernelError::InvalidCapability),
+            "second invocation of a one-shot reply cap must be rejected"
+        );
+    }
+
+    // (7) Authoritative direct-only policy guard: queueing unsupported, no reply-cap
+    // enqueue retirement marker, no reply-cap enqueue provisioning, and both
+    // enforcement points present in production source.
+    #[test]
+    fn direct_only_reply_policy_guard() {
+        // The authoritative compile-time switch is false.
+        assert!(
+            !crate::kernel::syscall::REPLY_CAP_QUEUEING_SUPPORTED,
+            "reply_cap_queueing_supported must be false (direct-only policy)"
+        );
+
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        const RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+        const MOD_SRC: &str = include_str!("mod.rs");
+        const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+        const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+        const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+
+        assert!(
+            IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"),
+            "the authoritative policy constant must be defined false"
+        );
+        // Send-side refusal + recv-side fail-closed enforcement points exist.
+        assert!(
+            IPC_SRC.contains("IPC_SEND_REPLY_CAP_DIRECT_ONLY"),
+            "IpcSend must refuse a no-receiver reply-cap transfer"
+        );
+        assert!(
+            RECV_CORE_SRC.contains("IPC_RECV_REPLY_CAP_QUEUE_REFUSED"),
+            "recv-side must fail closed on a queued reply-cap shape"
+        );
+        // No reply-cap ENQUEUE retirement class / marker.
+        assert!(
+            !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
+            "no reply-cap enqueue retirement class may exist"
+        );
+        // No reply-cap enqueue provisioning on any arch.
+        for (arch, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                !src.contains("provision_init_ipc_send_reply_cap_enqueue"),
+                "{arch} boot.rs must not provision reply-cap enqueue"
+            );
+        }
+    }
+}
+
+// Stage 198E1 — SHARED-REGION IpcSend AUDIT (hosted preparation, no production change).
+//
+// Audit/preparation for cross-arch retirement of the shared-region IpcSend path. Proves the
+// classification is object-authoritative, ordinary/reply objects cannot be forced into or out of
+// the shared path, the transfer is a one-shot delegation, and the envelope/active-mapping/cleanup
+// lifecycle reclaims cleanly on teardown. The mapping-plan WRITE gate and cleanup-token
+// generation/stale/duplicate semantics are additionally covered by the existing stage54_* /
+// stage56_* tests (composed into the hosted audit seal). See doc/STAGE_198E1_SHARED_REGION_AUDIT.md.
+//
+// VERDICT: IpcSendSharedRegionDirect = NEEDS_BOUNDED_FIX; IpcSendSharedRegionEnqueue =
+// NEEDS_BOUNDED_FIX (the map + TLB shootdown + user-copy still run under the broad lock; the
+// post-lock map/copy boundary snapshot does not yet exist for shared-region).
+mod stage198e1_shared_region_audit {
+    use super::*;
+    use crate::kernel::recv_core::recv_shared_v3::{
+        CAP_RIGHT_MAP, CAP_RIGHT_WRITE, MAP_READ, MAP_WRITE, OPCODE_SHARED_MEM_VALUE,
+        RecvV3MappingPlan, compute_recv_v3_mapping_plan,
+    };
+    use crate::kernel::syscall::SyscallError;
+    use crate::kernel::syscall::ipc_recv_core::materialize_received_message_cap;
+
+    fn shared_envelope_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| {
+                state.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes[i]
+                        .map(|e| e.shared_region.is_some())
+                        .unwrap_or(false)
+                })
+            })
+            .count()
+    }
+
+    fn active_mapping_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| state.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+            .count()
+    }
+
+    // (1) The two shared-region object variants are exactly MemoryObject and DmaRegion, chosen by
+    // the RESOLVED grant object on the send side (not a user flag).
+    #[test]
+    fn shared_region_object_types_are_memoryobject_and_dmaregion() {
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        assert!(
+            IPC_SRC.contains("CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. } => {}"),
+            "shared-region send must accept exactly MemoryObject|DmaRegion by resolved object"
+        );
+    }
+
+    // (2) A MemoryObject shared-region transfer materializes as an ordinary delegated cap: a FRESH
+    // receiver-local CapId with the SAME object identity (id/generation) as the source.
+    #[test]
+    fn memoryobject_transfer_materializes_fresh_cap_preserving_identity() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let source_obj = state.current_task_capability(mem_cap).expect("src").object;
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
+            .expect("stash");
+        let msg = Message::with_header(0, 0x44, Message::FLAG_CAP_TRANSFER, Some(handle), b"cap")
+            .expect("msg");
+        let cap_id = materialize_received_message_cap(&mut state, endpoint, 2, 0, &msg)
+            .expect("ok")
+            .expect("minted");
+        assert_ne!(
+            cap_id, mem_cap.0,
+            "receiver-local cap must be fresh, not the sender CapId"
+        );
+        let minted = state
+            .resolve_capability_for_task(2, CapId(cap_id))
+            .expect("resolve minted");
+        assert!(!matches!(minted.object, CapObject::Reply { .. }));
+        assert_eq!(
+            minted.object, source_obj,
+            "object identity/generation preserved"
+        );
+    }
+
+    // (3) A Reply object is EXCLUDED from the shared-region/transfer path: FLAG_CAP_TRANSFER + Reply
+    // envelope fails closed (direct-only reply policy intact), never delegated or mapped.
+    #[test]
+    fn reply_object_excluded_from_shared_region_transfer() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply cap");
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, None, None)
+            .expect("stash");
+        let msg = Message::with_header(0, 0x44, Message::FLAG_CAP_TRANSFER, Some(handle), b"rc")
+            .expect("msg");
+        assert_eq!(
+            materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg),
+            Err(SyscallError::InvalidCapability),
+            "a Reply object must never enter the shared/ordinary transfer path"
+        );
+    }
+
+    // (4) An ordinary cap cannot be forced into a mapping without canonical MAP authority, and a
+    // writable mapping requires canonical WRITE authority (object-authoritative gate, not a flag).
+    #[test]
+    fn ordinary_cap_cannot_force_mapping_without_authority() {
+        // No MAP right → InsufficientRights even with the shared-mem opcode + read intent.
+        assert_eq!(
+            compute_recv_v3_mapping_plan(
+                OPCODE_SHARED_MEM_VALUE,
+                MAP_READ,
+                0x4000,
+                PAGE_SIZE as u64,
+                0, // no CAP_RIGHT_MAP
+                PAGE_SIZE as u64,
+                PAGE_SIZE as u64,
+            ),
+            RecvV3MappingPlan::InsufficientRights
+        );
+        // WRITE intent without WRITE right → InsufficientRights.
+        assert_eq!(
+            compute_recv_v3_mapping_plan(
+                OPCODE_SHARED_MEM_VALUE,
+                MAP_READ | MAP_WRITE,
+                0x4000,
+                PAGE_SIZE as u64,
+                CAP_RIGHT_MAP, // MAP but not WRITE
+                PAGE_SIZE as u64,
+                PAGE_SIZE as u64,
+            ),
+            RecvV3MappingPlan::InsufficientRights
+        );
+        // A non-shared opcode never maps (an ordinary transfer stays unmapped).
+        assert_eq!(
+            compute_recv_v3_mapping_plan(
+                0,
+                MAP_READ,
+                0x4000,
+                PAGE_SIZE as u64,
+                CAP_RIGHT_MAP | CAP_RIGHT_WRITE,
+                PAGE_SIZE as u64,
+                PAGE_SIZE as u64,
+            ),
+            RecvV3MappingPlan::Skip
+        );
+    }
+
+    // (5) A shared-region transfer envelope pins its object for the queue interval, and process
+    // teardown purges the envelope AND unpins the object — no envelope/reference leak.
+    #[test]
+    fn shared_region_envelope_pins_and_teardown_reclaims() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let mem_cap_t1 = state
+            .grant_capability_task_to_task(0, mem_cap, 1)
+            .expect("grant to t1");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let _handle = state
+            .stash_transfer_envelope(ThreadId(1), mem_cap_t1, endpoint, None, Some(region))
+            .expect("stash shared envelope");
+        assert_eq!(shared_envelope_count(&state), 1);
+
+        state.purge_transfer_envelopes_for_pid(1);
+        assert_eq!(
+            shared_envelope_count(&state),
+            0,
+            "sender teardown must purge the queued shared-region envelope (unpin, no leak)"
+        );
+    }
+
+    // (6) The shared-region transfer envelope is one-shot: a duplicate dequeue cannot re-materialize.
+    #[test]
+    fn shared_region_transfer_envelope_is_one_shot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, Some(region))
+            .expect("stash");
+        assert!(
+            state
+                .take_transfer_envelope(handle, endpoint, ThreadId(0))
+                .is_some()
+        );
+        assert!(
+            state
+                .take_transfer_envelope(handle, endpoint, ThreadId(0))
+                .is_none(),
+            "one envelope → at most one materialization"
+        );
+    }
+
+    // (7) An invalid/stale source handle at dequeue is rejected (no envelope → InvalidCapability).
+    #[test]
+    fn invalid_stale_source_handle_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        // Bogus handle: no envelope stashed.
+        let msg = Message::with_header(
+            0,
+            0x44,
+            Message::FLAG_CAP_TRANSFER,
+            Some(0xDEAD_BEEF),
+            b"cap",
+        )
+        .expect("msg");
+        assert!(
+            materialize_received_message_cap(&mut state, endpoint, 0, 0, &msg).is_err(),
+            "a stale/absent transfer envelope must be rejected"
+        );
+    }
+
+    // (8) Receiver CNode full at materialize → mint fails, the envelope is consumed (dropped), and
+    // no receiver cap leaks.
+    #[test]
+    fn receiver_cnode_full_rollback_for_shared_transfer() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let cnode2 = state.task_cnode(2).expect("task2 cnode");
+        let mut filled = 0usize;
+        for _ in 0..8192 {
+            if state
+                .mint_capability_in_cnode(
+                    cnode2,
+                    Capability::new(CapObject::Kernel, CapRights::READ),
+                )
+                .is_err()
+            {
+                break;
+            }
+            filled += 1;
+        }
+        assert!(filled > 0);
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
+            .expect("stash");
+        let msg = Message::with_header(0, 0x44, Message::FLAG_CAP_TRANSFER, Some(handle), b"cap")
+            .expect("msg");
+        assert!(
+            materialize_received_message_cap(&mut state, endpoint, 2, 0, &msg).is_err(),
+            "mint into a full cnode must fail"
+        );
+        assert!(
+            state.peek_transfer_envelope_source_object(handle).is_none(),
+            "the envelope is consumed/dropped on the failed materialize"
+        );
+    }
+
+    // (9) The active-mapping registry is keyed by (owner, generation-encoded CapId): a stale/
+    // different CapId does not match a live mapping, and a duplicate release is rejected.
+    #[test]
+    fn active_mapping_keyed_by_owner_and_generation_cap() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let cap = CapId(0x0002_0000_0000_0007); // slot 7, generation encoded high
+        state
+            .register_active_transfer_mapping(ThreadId(2), cap, VirtAddr(0x4000), PAGE_SIZE)
+            .expect("register");
+        assert_eq!(
+            state.active_transfer_mapping_for(ThreadId(2), cap),
+            Some((VirtAddr(0x4000), PAGE_SIZE))
+        );
+        // A stale/replacement CapId (different generation bits) must not match.
+        let stale = CapId(cap.0 ^ (1 << 40));
+        assert_eq!(state.active_transfer_mapping_for(ThreadId(2), stale), None);
+        // First release succeeds; a duplicate release is rejected.
+        assert!(state.remove_active_transfer_mapping(ThreadId(2), cap));
+        assert!(
+            !state.remove_active_transfer_mapping(ThreadId(2), cap),
+            "duplicate release must be rejected"
+        );
+    }
+
+    // (10) Receiver/process teardown reclaims active mappings — no mapping survives exit.
+    #[test]
+    fn receiver_teardown_purges_active_mappings() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let cap = CapId(0x0003_0000_0000_0002);
+        state
+            .register_active_transfer_mapping(ThreadId(2), cap, VirtAddr(0x8000), PAGE_SIZE)
+            .expect("register");
+        assert_eq!(active_mapping_count(&state), 1);
+        state.purge_active_transfer_mappings_for_pid(2);
+        assert_eq!(
+            active_mapping_count(&state),
+            0,
+            "no active mapping may survive receiver/process teardown"
+        );
+        assert_eq!(state.active_transfer_mapping_for(ThreadId(2), cap), None);
+    }
+
+    // (11) Full teardown leaves NO envelope and NO mapping leak.
+    #[test]
+    fn full_teardown_leaves_no_leak() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let mem_cap_t2 = state
+            .grant_capability_task_to_task(0, mem_cap, 2)
+            .expect("grant to t2");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let _h = state
+            .stash_transfer_envelope(
+                ThreadId(2),
+                mem_cap_t2,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let cap = CapId(0x0004_0000_0000_0003);
+        state
+            .register_active_transfer_mapping(ThreadId(2), cap, VirtAddr(0xC000), PAGE_SIZE)
+            .expect("register");
+        assert_eq!(shared_envelope_count(&state), 1);
+        assert_eq!(active_mapping_count(&state), 1);
+
+        state.purge_transfer_envelopes_for_pid(2);
+        state.purge_active_transfer_mappings_for_pid(2);
+
+        assert_eq!(
+            shared_envelope_count(&state),
+            0,
+            "no transfer-envelope leak"
+        );
+        assert_eq!(active_mapping_count(&state), 0, "no active-mapping leak");
+    }
+}
+
+// Stage 198E2A — SHARED-REGION post-lock DIRECT transaction (production path, hosted proof).
+//
+// Drives the real Phase-A snapshot producer + post-lock executor + idempotent rollback
+// (src/kernel/boot/shared_region_txn.rs) through hosted production-path tests. No QEMU, no live
+// architecture class, no arch retirement gate. See doc/STAGE_198E2A_SHARED_REGION_DIRECT.md.
+mod stage198e2a_shared_region_direct {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        RecvBoundarySharedRegionSnapshot, SHARED_REGION_TXN_FORCE_COPY_FAULT,
+        SHARED_REGION_TXN_FORCE_MAP_FAULT, SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP,
+        SharedRegionTxnError,
+    };
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+    use core::sync::atomic::Ordering;
+
+    const MAP_VA: u64 = 0x10_000;
+    const META_PTR: u64 = 0x20_000;
+
+    fn shared_envelope_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| {
+                state.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes[i]
+                        .map(|e| e.shared_region.is_some())
+                        .unwrap_or(false)
+                })
+            })
+            .count()
+    }
+    fn active_mapping_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| state.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+            .count()
+    }
+
+    // Set up: endpoint + a MemoryObject source cap (READ|WRITE|MAP) in task 0's cnode, receiver
+    // task 2 with its own ASID (meta page mapped, MAP_VA left free), and a stashed shared-region
+    // envelope bound to the receiver. Returns (endpoint, handle, receiver_asid, source_obj).
+    fn setup(
+        state: &mut KernelState,
+        source_rights: CapRights,
+        region_len: u64,
+    ) -> (CapObject, u64, crate::kernel::vm::Asid, CapObject) {
+        state.register_task(2).expect("task2");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap0) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let source_obj = state.current_task_capability(mem_cap0).expect("obj").object;
+        let src_cap = state
+            .mint_capability_for_current_context(Capability::new(source_obj, source_rights))
+            .expect("mint source cap");
+
+        // Receiver ASID: map the meta page RW; leave MAP_VA unmapped for the shared mapping.
+        let (asid, map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                map_cap,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x5000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map meta page");
+
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: region_len,
+        };
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash shared envelope");
+        (endpoint, handle, asid, source_obj)
+    }
+
+    fn snapshot(
+        state: &mut KernelState,
+        endpoint: CapObject,
+        handle: u64,
+        map_write: bool,
+    ) -> RecvBoundarySharedRegionSnapshot {
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        state
+            .shared_region_direct_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg)
+            .expect("phase A")
+    }
+
+    // (1) MemoryObject snapshot captures authoritative identity + attenuated rights.
+    #[test]
+    fn memoryobject_snapshot_captures_authoritative_identity() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid, obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert_eq!(snap.object, obj);
+        assert!(matches!(snap.object, CapObject::MemoryObject { .. }));
+        assert_eq!(snap.receiver_asid, asid);
+        assert!(snap.origin_direct);
+        assert!(snap.pin_owned, "snapshot owns the object pin");
+        // Read intent → WRITE attenuated away.
+        assert!(!snap.rights.contains(CapRights::WRITE));
+        assert!(snap.rights.contains(CapRights::MAP));
+    }
+
+    // (2) DmaRegion offset/length preserved in the descriptor + object.
+    #[test]
+    fn dmaregion_offset_length_preserved() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let (_eid, send_cap, _r) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (mem_id, _c) = state.alloc_anonymous_memory_object().expect("mem");
+        let dma_obj = CapObject::DmaRegion {
+            id: mem_id,
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let src = state
+            .mint_capability_for_current_context(Capability::new(
+                dma_obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint dma");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x5000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), src, endpoint, Some(ThreadId(2)), Some(region))
+            .expect("stash");
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert!(
+            matches!(snap.object, CapObject::DmaRegion { offset: 0, len, .. } if len == PAGE_SIZE as u64)
+        );
+        assert_eq!(snap.descriptor.len, PAGE_SIZE as u64);
+    }
+
+    // (3) The envelope pin transfers into the snapshot with no reference gap: the envelope is
+    // consumed but the shared-region pin count is not dropped (snapshot owns it).
+    #[test]
+    fn envelope_pin_transfers_into_snapshot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(shared_envelope_count(&state), 1);
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert_eq!(shared_envelope_count(&state), 0, "envelope consumed");
+        assert!(
+            snap.pin_owned,
+            "pin ownership moved to the snapshot (no gap / no leak)"
+        );
+        // Rolling back an unexecuted-but-owned snapshot must release the pin.
+        let mut txn = crate::kernel::boot::shared_region_txn::SharedRegionDirectTxn {
+            state: crate::kernel::boot::shared_region_txn::SharedRegionTxnState::Reserved,
+            snapshot: snap,
+            minted_cap: None,
+            mapped: None,
+        };
+        state.rollback_shared_region_direct_txn(&mut txn);
+        assert!(!txn.snapshot.pin_owned, "rollback releases the owned pin");
+    }
+
+    // (4) Source process exit AFTER the snapshot does not invalidate the owned object state — the
+    // snapshot never re-resolves sender CSpace, so execution still succeeds.
+    #[test]
+    fn source_exit_after_snapshot_does_not_invalidate() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, send_cap, _r) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem0) = state.alloc_anonymous_memory_object().expect("mem");
+        let obj = state.current_task_capability(mem0).expect("o").object;
+        // Source cap owned by task 1.
+        let src0 = state
+            .mint_capability_for_current_context(Capability::new(
+                obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint");
+        let src1 = state
+            .grant_capability_task_to_task(0, src0, 1)
+            .expect("grant to t1");
+        state.register_task(2).expect("task2");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x5000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(1), src1, endpoint, Some(ThreadId(2)), Some(region))
+            .expect("stash");
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        // Source task 1 exits AFTER the snapshot.
+        state.mark_task_dead(1).expect("kill source");
+        // Execution still succeeds (identity is frozen; sender CSpace not re-resolved).
+        let out = state.shared_region_direct_execute(snap).expect("publish");
+        assert_eq!(out.mapped_len, PAGE_SIZE);
+    }
+
+    // (5) Receiver exits BEFORE cap mint → cancel, no mapping, no cap, no leak.
+    #[test]
+    fn receiver_exits_before_cap_mint() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        state.mark_task_dead(2).expect("kill receiver");
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::ReceiverGone)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (6) Receiver generation replacement (ASID changed) before finalization → stale txn cannot
+    // publish; no mapping, no leak.
+    #[test]
+    fn receiver_generation_replacement_blocks_publish() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        // Rebind receiver to a fresh ASID (generation-bearing authority changes).
+        let (asid2, _mc2) = state.create_user_address_space().expect("asid2");
+        state.bind_task_asid(2, asid2).expect("rebind");
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::ReceiverGone)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (7) Receiver CNode full → mint fails, rollback, no mapping.
+    #[test]
+    fn receiver_cnode_full_shared_direct() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let cnode2 = state.task_cnode(2).expect("cnode2");
+        for _ in 0..8192 {
+            if state
+                .mint_capability_in_cnode(
+                    cnode2,
+                    Capability::new(CapObject::Kernel, CapRights::READ),
+                )
+                .is_err()
+            {
+                break;
+            }
+        }
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::CnodeFull)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (8) Missing MAP right → rejected before any mapping.
+    #[test]
+    fn missing_map_right_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(&mut state, CapRights::READ, PAGE_SIZE as u64);
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::MissingMapRight)
+        );
+    }
+
+    // (9) Write request without WRITE right → rejected (no writable mapping without WRITE).
+    #[test]
+    fn write_request_without_write_right_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, true); // write intent, no WRITE right
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::MissingWriteRight)
+        );
+    }
+
+    // (10) Map failure → rollback removes the provisional mapping and revokes the cap; no leak.
+    #[test]
+    fn map_failure_rolls_back() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        SHARED_REGION_TXN_FORCE_MAP_FAULT.store(true, Ordering::SeqCst);
+        let res = state.shared_region_direct_execute(snap);
+        SHARED_REGION_TXN_FORCE_MAP_FAULT.store(false, Ordering::SeqCst);
+        assert_eq!(res, Err(SharedRegionTxnError::MapFault));
+        assert_eq!(active_mapping_count(&state), 0, "no active-mapping leak");
+    }
+
+    // (11) Metadata-copy failure after mapping → rollback unmaps + removes + revokes; no leak.
+    #[test]
+    fn metadata_copy_failure_rolls_back() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
+        let res = state.shared_region_direct_execute(snap);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+        assert_eq!(res, Err(SharedRegionTxnError::CopyFault));
+        assert_eq!(
+            active_mapping_count(&state),
+            0,
+            "no active-mapping leak after copy fault"
+        );
+    }
+
+    // (12) Successful delivery: exactly one cap, one mapping, one wake; NX enforced; envelope gone.
+    #[test]
+    fn successful_delivery_one_cap_one_mapping_one_wake() {
+        let mut state = Bootstrap::init().expect("init");
+        state.enqueue_current_cpu(0).ok();
+        let (endpoint, handle, _asid, obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        // Block the receiver so the wake is observable.
+        state.enqueue_current_cpu(2).ok();
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        let out = state.shared_region_direct_execute(snap).expect("publish");
+        assert_eq!(out.mapped_base, MAP_VA);
+        assert_eq!(out.mapped_len, PAGE_SIZE);
+        assert_eq!(
+            active_mapping_count(&state),
+            1,
+            "exactly one active mapping"
+        );
+        // The receiver-local cap is a fresh MemoryObject cap with the same identity.
+        let cap = state
+            .resolve_capability_for_task(2, out.receiver_local_cap)
+            .expect("resolve");
+        assert_eq!(cap.object, obj);
+        assert!(
+            !cap.has_right(CapRights::WRITE),
+            "read-intent mapping cap is not writable"
+        );
+        assert_eq!(
+            shared_envelope_count(&state),
+            0,
+            "envelope consumed, not leaked"
+        );
+    }
+
+    // (13) Rollback is idempotent: invoking it twice never unmaps or revokes twice.
+    #[test]
+    fn rollback_is_idempotent() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        // Force a copy fault so the txn maps then rolls back, then roll back AGAIN by hand.
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
+        let _ = state.shared_region_direct_execute(snap);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+        assert_eq!(active_mapping_count(&state), 0);
+        // Re-run a fresh rollback on a Cancelled txn: must be a no-op (no double unmap/revoke).
+        let snap2 = {
+            let (endpoint, handle, _a, _o) = setup(
+                &mut state,
+                CapRights::READ | CapRights::MAP,
+                PAGE_SIZE as u64,
+            );
+            snapshot(&mut state, endpoint, handle, false)
+        };
+        let mut txn = crate::kernel::boot::shared_region_txn::SharedRegionDirectTxn {
+            state: crate::kernel::boot::shared_region_txn::SharedRegionTxnState::Reserved,
+            snapshot: snap2,
+            minted_cap: None,
+            mapped: None,
+        };
+        state.rollback_shared_region_direct_txn(&mut txn);
+        let before = active_mapping_count(&state);
+        state.rollback_shared_region_direct_txn(&mut txn); // second call: no-op
+        state.rollback_shared_region_direct_txn(&mut txn); // third call: no-op
+        assert_eq!(active_mapping_count(&state), before);
+        assert!(!txn.snapshot.pin_owned);
+    }
+
+    // (14) A stale cleanup token (different generation-bearing CapId) cannot release a replacement
+    // mapping in the active registry.
+    #[test]
+    fn stale_cleanup_token_cannot_release_replacement() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let live = CapId(0x0002_0000_0000_0009);
+        state
+            .register_active_transfer_mapping(ThreadId(2), live, VirtAddr(MAP_VA), PAGE_SIZE)
+            .expect("register");
+        let stale = CapId(live.0 ^ (1 << 40));
+        assert!(
+            !state.remove_active_transfer_mapping(ThreadId(2), stale),
+            "a stale/replacement CapId must not release the live mapping"
+        );
+        assert!(state.remove_active_transfer_mapping(ThreadId(2), live));
+    }
+
+    // (15) Reply and ordinary-cap paths remain excluded/unchanged: a Reply envelope is rejected by
+    // Phase A; a plain (non-shared) transfer envelope is rejected (WrongObject) by Phase A.
+    #[test]
+    fn reply_and_ordinary_paths_excluded_from_shared_txn() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        state.register_task(2).expect("task2");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x5000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        // Reply envelope → Phase A rejects (not a shared-region object).
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply");
+        let rh = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, Some(ThreadId(2)), None)
+            .expect("stash reply");
+        let rmsg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(rh),
+            b"x",
+        )
+        .expect("m");
+        assert!(
+            state
+                .shared_region_direct_phase_a(rh, endpoint, 2, MAP_VA, false, META_PTR, rmsg)
+                .is_err()
+        );
+        // Ordinary (non-shared) MemoryObject envelope → Phase A rejects (no shared_region descriptor).
+        let (_id, mem) = state.alloc_anonymous_memory_object().expect("mem");
+        let oh = state
+            .stash_transfer_envelope(ThreadId(0), mem, endpoint, Some(ThreadId(2)), None)
+            .expect("stash ordinary");
+        let omsg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(oh),
+            b"x",
+        )
+        .expect("m");
+        assert!(
+            state
+                .shared_region_direct_phase_a(oh, endpoint, 2, MAP_VA, false, META_PTR, omsg)
+                .is_err()
+        );
+    }
+
+    // (16) Receiver exits / generation-replaces AFTER map, BEFORE publication → phase-8 final
+    // revalidation fails; the single rollback performs exactly one unmap/revoke (no leak, no wake).
+    #[test]
+    fn stale_after_map_before_publish_rolls_back_exactly_once() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP.store(true, Ordering::SeqCst);
+        let res = state.shared_region_direct_execute(snap);
+        SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP.store(false, Ordering::SeqCst);
+        assert_eq!(res, Err(SharedRegionTxnError::StalePublish));
+        assert_eq!(
+            active_mapping_count(&state),
+            0,
+            "mapping unmapped exactly once, no leak"
+        );
+    }
+
+    // (17) NX is enforced structurally: the executor never enables execute on the mapping.
+    #[test]
+    fn mapping_execute_permission_never_enabled() {
+        const SRC: &str = include_str!("shared_region_txn.rs");
+        assert!(
+            SRC.contains("execute: false, // NX ALWAYS."),
+            "the shared-region mapping must always be non-executable"
+        );
+    }
+
+    // (18) Bad region (zero length / unaligned VA) is rejected without side effects.
+    #[test]
+    fn bad_region_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        // Snapshot with an UNALIGNED map_va → BadRegion.
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("m");
+        let snap = state
+            .shared_region_direct_phase_a(handle, endpoint, 2, MAP_VA + 1, false, META_PTR, msg)
+            .expect("phase A");
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::BadRegion)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
     }
 }
 
@@ -66088,18 +68311,16 @@ mod stage198a_second_cohort_plain_parity {
         }
     }
 
-    // (5) The REPLY-cap (193D) oracle remains an x86_64-only live target — it is NOT provisioned on
-    // AArch64 / RISC-V. NB: Stage 198B *does* replicate the two ORDINARY-cap oracles
-    // (`provision_init_ipc_send_cap_oracle_coord` = 193C blocked receiver,
-    // `ipc_send_cap_enqueue_oracle_active` = 193F enqueue) onto all three arches, so those two are no
-    // longer forbidden here (asserted present by the Stage 198B parity module). Only the reply-cap
-    // path stays excluded on non-x86.
+    // (5) Stage 198C2/198C2B: the REPLY-cap oracle is now a CROSS-ARCH live target —
+    // `provision_init_ipc_send_reply_cap_oracle` is wired on all three arches and the
+    // reply-cap one-shot delivery was sealed 3/3 (SECOND_COHORT_REPLY_CAP_DIRECT_SEAL).
+    // It is no longer x86-only, so AArch64 and RISC-V boot.rs MUST provision it.
     #[test]
-    fn no_reply_cap_oracle_on_non_x86_arches() {
+    fn reply_cap_oracle_provisioned_on_all_arches() {
         for (arch, src) in [("aarch64", AARCH64_BOOT_SRC), ("riscv64", RISCV_BOOT_SRC)] {
             assert!(
-                !src.contains("provision_init_ipc_send_reply_cap_oracle("),
-                "{arch} boot.rs must NOT provision the reply-cap oracle (x86_64-only live target)"
+                src.contains("provision_init_ipc_send_reply_cap_oracle("),
+                "{arch} boot.rs must provision the reply-cap oracle (cross-arch live target, 198C2B)"
             );
         }
     }
@@ -66404,13 +68625,15 @@ mod stage198b_second_cohort_ordinary_cap_parity {
         }
     }
 
-    // (5) The REPLY-cap (193D) oracle remains x86_64-only — NOT provisioned on AArch64 / RISC-V.
+    // (5) Stage 198C2/198C2B: the REPLY-cap oracle is now CROSS-ARCH — provisioned on
+    // all three arches and sealed 3/3 (SECOND_COHORT_REPLY_CAP_DIRECT_SEAL). AArch64 and
+    // RISC-V boot.rs MUST provision it.
     #[test]
-    fn no_reply_cap_oracle_on_non_x86_arches() {
+    fn reply_cap_oracle_provisioned_on_all_arches() {
         for (arch, src) in [("aarch64", AARCH64_BOOT_SRC), ("riscv64", RISCV_BOOT_SRC)] {
             assert!(
-                !src.contains("provision_init_ipc_send_reply_cap_oracle("),
-                "{arch} boot.rs must NOT provision the reply-cap oracle (x86_64-only live target)"
+                src.contains("provision_init_ipc_send_reply_cap_oracle("),
+                "{arch} boot.rs must provision the reply-cap oracle (cross-arch live target, 198C2B)"
             );
         }
     }

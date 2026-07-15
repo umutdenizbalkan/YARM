@@ -99,6 +99,50 @@ impl KernelState {
         Some(envelope)
     }
 
+    /// Stage 198E2A: consume a transfer envelope WITHOUT releasing its shared-region object pin.
+    ///
+    /// Identical validation + one-shot consume to [`take_transfer_envelope`], but the `+1`
+    /// MemoryObject pin (normally dropped for a shared-region envelope) is LEFT in place so the
+    /// post-lock shared-region transaction snapshot can take over its lifetime ownership with no
+    /// reference gap (the pin never transiently reaches zero). Non-shared envelopes carry no pin,
+    /// so this is byte-identical to the plain consume for them.
+    pub(crate) fn take_transfer_envelope_keep_pin(
+        &mut self,
+        handle: u64,
+        endpoint: CapObject,
+        receiver_tid: ThreadId,
+    ) -> Option<TransferEnvelope> {
+        let idx = usize::try_from(handle & 0xFFFF).ok()?;
+        if idx >= MAX_TRANSFER_ENVELOPES {
+            return None;
+        }
+        let generation = handle >> 16;
+        if generation == 0
+            || self.with_ipc_state(|ipc| ipc.transfer_envelope_generations[idx]) != generation
+        {
+            return None;
+        }
+        let mut envelope = self.with_ipc_state(|ipc| ipc.transfer_envelopes[idx])?;
+        if envelope.endpoint != endpoint {
+            return None;
+        }
+        if let Some(bound_receiver) = envelope.receiver_tid {
+            if bound_receiver != receiver_tid {
+                return None;
+            }
+        }
+        envelope = envelope.transition(TransferState::Released)?;
+        // NB: no `adjust_memory_object_pin_refcount(-1)` here — the caller keeps the pin.
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.transfer_records_materialized = ipc
+                .telemetry
+                .transfer_records_materialized
+                .saturating_add(1);
+            ipc.transfer_envelopes[idx] = None;
+        });
+        Some(envelope)
+    }
+
     /// Stage 193D: non-consuming peek at a transfer envelope's source object type.
     ///
     /// Returns the `source_object` of the envelope named by `handle` (idx +
@@ -171,7 +215,15 @@ impl KernelState {
         else {
             return false;
         };
-        if is_reply_cap {
+        // Stage 198D2A: the rollback FLAVOR is object-authoritative, derived from the
+        // resolved receiver-local cap object, not the caller's flag-derived
+        // `is_reply_cap`. A queued IpcSend reply cap is minted (via the object-routed
+        // reply path) from a FLAG_CAP_TRANSFER message, so its caller passes
+        // `is_reply_cap == false`; using that here would wrongly run the transfer
+        // rollback on a Reply cap. The `is_reply_cap` parameter is retained for the
+        // diagnostic markers below but no longer selects the reclamation path.
+        let _ = is_reply_cap;
+        if matches!(cap_object, CapObject::Reply { .. }) {
             let cleared =
                 self.fast_revoke_reply_cap_in_cnode(receiver_cnode, materialized_cap, cap_object);
             if let CapObject::Reply { index, generation } = cap_object {

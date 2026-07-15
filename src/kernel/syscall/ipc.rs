@@ -45,6 +45,17 @@ use crate::kernel::trap::FaultAccess;
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::{PAGE_SIZE, PageFlags, VirtAddr};
 
+/// Stage 198D-S — DIRECT-ONLY REPLY CAPS (authoritative policy).
+///
+/// Reply capabilities are special: direct-delivery only, one-shot, and NEVER stored
+/// in an endpoint message queue. Queued reply-cap transfer is not part of YARM's
+/// supported capability model (the Stage 198D2B live queued class is cancelled). This
+/// constant is the single authoritative switch: it is `false`, and both the IpcSend
+/// send-side refusal (`handle_ipc_send`) and the recv-side fail-closed guard depend on
+/// reply caps having no queued path. Flipping it would re-enable queueing — which is a
+/// deliberate policy reversal, not an incidental change.
+pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;
+
 fn transfer_flag_bits(transfer_cap: Option<CapId>) -> u16 {
     if transfer_cap.is_some() {
         Message::FLAG_CAP_TRANSFER
@@ -261,6 +272,38 @@ pub(super) fn handle_ipc_send(
         validate_transfer_cap(kernel, c)?;
     }
     let sender_tid = current_tid(kernel)?;
+
+    // Stage 198D-S — DIRECT-ONLY REPLY CAPS. Reply capabilities are special: they are
+    // direct-delivery only, one-shot, and are NEVER stored in an endpoint message
+    // queue. If the source object is a Reply and there is NO compatible (recv-v2
+    // blocked) receiver ready to take the accepted Stage 198C direct hand-off, refuse
+    // the send up front — BEFORE any TransferEnvelope is stashed or any Message is
+    // built — so no queued reply-cap state can ever be created. Ordinary caps and
+    // plain messages are unaffected; a Reply hand-off to an already-blocked receiver
+    // keeps the accepted Stage 198C direct path below. The canonical WouldBlock error
+    // is returned (no new ABI/error code): the operation cannot complete without a
+    // ready receiver, and reply caps have no queued fallback.
+    if !REPLY_CAP_QUEUEING_SUPPORTED
+        && let Some(tc) = transfer_cap
+        && matches!(
+            kernel
+                .capability_service()
+                .resolve_current_task_capability(tc)
+                .map(|c| c.object),
+            Some(CapObject::Reply { .. })
+        )
+    {
+        let direct_receiver = kernel
+            .endpoint_waiter_tid(endpoint)
+            .filter(|rt| kernel.is_task_recv_v2_blocked(rt.0));
+        if direct_receiver.is_none() {
+            crate::yarm_log!(
+                "IPC_SEND_REPLY_CAP_DIRECT_ONLY tid={} reason=no_blocked_receiver",
+                sender_tid
+            );
+            return Err(SyscallError::WouldBlock);
+        }
+    }
 
     let sender_has_user_asid = current_task_has_user_asid(kernel)?;
     let send_timeout_ticks = if sender_has_user_asid || len == 0 {

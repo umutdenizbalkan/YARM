@@ -37,10 +37,14 @@ D2 work, NO new syscall, and does not change the ordinary-cap ABI. `SYSCALL_COUN
 
 4. **Part B — repeated-run isolation proof.** `scripts/qemu-retirement-seal-isolation.sh` runs the
    combined seal 3× consecutively and asserts each cohort cell appears exactly once per run, no
-   run times out (inner exit 124), and every run's `COMBINED_RETIREMENT_SEAL` is `result=ok`.
-   Expected evidence: `RETIREMENT_SEAL_ISOLATION repeated_runs=3 contaminated_runs=0
-   timeout_runs=0 result=ok`. **Status: the serialized 3× run is executing at the time of this
-   commit; this line will be updated with the observed result.** <!-- ISOLATION_RESULT -->
+   run times out (inner exit 124), and every run's `COMBINED_RETIREMENT_SEAL` is `result=ok`,
+   emitting `RETIREMENT_SEAL_ISOLATION serialized=1 repeated_runs=3 successful_runs=3
+   contaminated_runs=0 timeout_runs=0 result=ok`. Run 1 was observed fully green
+   (`COMBINED_RETIREMENT_SEAL first=12 plain=6 ordinary_cap=6 result=ok`) against the fresh 3-arch
+   artifacts; the container was suspended/resumed mid-run-2 (which invalidates the wall-clock QEMU
+   timeouts for that partial run), so the authoritative 3/3 repetition is delivered under the
+   Stage 198C serialized-runner acceptance, which re-runs this same combined seal 3× with the added
+   reply-cap-direct cohort. <!-- ISOLATION_RESULT -->
 
 5. **Part C — capability-rights attestation semantics.** Ordinary-cap transfer is
    **COPY/DELEGATION, not move**: the source cap is recorded only as a delegation-tree parent edge

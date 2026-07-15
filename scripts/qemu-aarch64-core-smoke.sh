@@ -55,6 +55,13 @@ IPC_SEND_CAP_ENQUEUE_ORACLE=${IPC_SEND_CAP_ENQUEUE_ORACLE:-0}
 if [[ "$IPC_SEND_CAP_ENQUEUE_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_cap_enqueue_oracle="* ]]; then
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_cap_enqueue_oracle=1"
 fi
+# Stage 198C2: propagate the reply-cap DIRECT oracle knob to the AArch64 cmdline (mirrors
+# the ordinary-cap knob above); without it yarm.ipc_send_reply_cap_oracle=1 never reaches
+# the kernel and the reply-cap direct oracle workload / boot provisioning never runs.
+IPC_SEND_REPLY_CAP_ORACLE=${IPC_SEND_REPLY_CAP_ORACLE:-0}
+if [[ "$IPC_SEND_REPLY_CAP_ORACLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_send_reply_cap_oracle="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_send_reply_cap_oracle=1"
+fi
 
 # Stage 178 (CROSS-ARCH-D6): CROSS_ARCH_D6=1 appends yarm.cross_arch_d6=1 to emit the
 # AArch64 D6 restore-path audit markers (model=trapframe_eret; read-only observe of
@@ -286,7 +293,13 @@ BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_CO
 # fatal). It is emitted once under the ipc_recv_proof workload and the proof/oracle still complete
 # correctly; excluding this exact opcode=0 form keeps a REAL non-zero-opcode decode failure (and
 # PM_PANIC) fatal while matching x86_64's tolerance. A normal (non-proof) AArch64 boot emits zero.
-BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295'
+# Stage 198C2B: the reply-cap DIRECT one-shot oracle's SECOND invocation of the
+# transferred reply cap is REQUIRED to fail (the Reply record is already consumed) —
+# the kernel logs `IPC_REPLY_FAIL tid=<child> reply_cap=<c> err=InvalidCapability`.
+# This is the canonical one-shot rejection (the proof `second_reply=rejected`), NOT a
+# boot blocker; the x86_64 and riscv64 core smokes never flag it. Exclude ONLY this
+# exact IPC_REPLY_FAIL form; every other InvalidCapability still blocks.
+BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected|IPC_REPLY_FAIL tid=[0-9]+ reply_cap=[0-9]+ err=InvalidCapability|SUPERVISOR_LIFECYCLE_QUERY_ERR tid=[0-9]+ err=WrongObject|PM_RECV_DECODE_FAIL opcode=0 reply_cap=4294967295'
 
 if [[ -f "$LOGFILE" ]]; then
   blocker_lines="$(tr '\r' '\n' <"$LOGFILE" | rg -a -n "$BLOCKER_REGEX" || true)"

@@ -247,6 +247,9 @@ pub(crate) mod debug;
 mod helpers;
 mod initramfs;
 mod ipc;
+// Stage 198D-S: re-export the authoritative direct-only reply-cap policy switch so
+// the policy guard test can assert it as a compile-time constant.
+pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;
 mod ipc_abi;
 // Stage 154: D1/D5 cap-boundary landing zone. Holds the pure recv-v2 meta
 // codec today; the stateful cap/materialization seams stay in syscall.rs until
@@ -1404,6 +1407,15 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                 && delivery.msg.opcode != OPCODE_SHARED_MEM
                 && let Some(plan) = delivery.cap_transfer
                 && !plan.is_reply_cap
+                // Stage 198D-S — DIRECT-ONLY REPLY CAPS. An IpcSend reply cap is tagged
+                // FLAG_CAP_TRANSFER (plan.is_reply_cap is flag-derived and false), so
+                // exclude any Reply-object envelope from the ordinary snapshot; it falls
+                // through to materialize_received_message_cap_routed, which fails CLOSED
+                // for the forbidden queued reply-cap transfer shape (mints nothing).
+                && !matches!(
+                    kernel.peek_transfer_envelope_source_object(plan.raw_handle),
+                    Some(CapObject::Reply { .. })
+                )
             {
                 match phase_a_snapshot_ordinary_transfer(
                     kernel,

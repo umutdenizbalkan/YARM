@@ -263,7 +263,12 @@ impl KernelState {
     }
 
     /// Return whether the global `ReplyCapRecord` at `reply_index` is present.
-    #[cfg(test)]
+    ///
+    /// Stage 198D2A: used in production by the queued reply-cap materialize as the
+    /// record-present half of the finalization revalidation (paired with the
+    /// generation check in `capability_object_live`). Caller exit clears the record
+    /// slot WITHOUT bumping the object generation, so this presence check is
+    /// load-bearing across the queue interval.
     pub(crate) fn reply_cap_record_present(&self, reply_index: usize) -> bool {
         self.with_ipc_state(|ipc| {
             ipc.reply_caps
