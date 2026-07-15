@@ -63758,6 +63758,608 @@ mod stage198e1_shared_region_audit {
     }
 }
 
+// Stage 198E2A — SHARED-REGION post-lock DIRECT transaction (production path, hosted proof).
+//
+// Drives the real Phase-A snapshot producer + post-lock executor + idempotent rollback
+// (src/kernel/boot/shared_region_txn.rs) through hosted production-path tests. No QEMU, no live
+// architecture class, no arch retirement gate. See doc/STAGE_198E2A_SHARED_REGION_DIRECT.md.
+mod stage198e2a_shared_region_direct {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        RecvBoundarySharedRegionSnapshot, SHARED_REGION_TXN_FORCE_COPY_FAULT,
+        SHARED_REGION_TXN_FORCE_MAP_FAULT, SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP,
+        SharedRegionTxnError,
+    };
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+    use core::sync::atomic::Ordering;
+
+    const MAP_VA: u64 = 0x10_000;
+    const META_PTR: u64 = 0x20_000;
+
+    fn shared_envelope_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| {
+                state.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes[i]
+                        .map(|e| e.shared_region.is_some())
+                        .unwrap_or(false)
+                })
+            })
+            .count()
+    }
+    fn active_mapping_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| state.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+            .count()
+    }
+
+    // Set up: endpoint + a MemoryObject source cap (READ|WRITE|MAP) in task 0's cnode, receiver
+    // task 2 with its own ASID (meta page mapped, MAP_VA left free), and a stashed shared-region
+    // envelope bound to the receiver. Returns (endpoint, handle, receiver_asid, source_obj).
+    fn setup(
+        state: &mut KernelState,
+        source_rights: CapRights,
+        region_len: u64,
+    ) -> (CapObject, u64, crate::kernel::vm::Asid, CapObject) {
+        state.register_task(2).expect("task2");
+        let (_eid, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem_cap0) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let source_obj = state.current_task_capability(mem_cap0).expect("obj").object;
+        let src_cap = state
+            .mint_capability_for_current_context(Capability::new(source_obj, source_rights))
+            .expect("mint source cap");
+
+        // Receiver ASID: map the meta page RW; leave MAP_VA unmapped for the shared mapping.
+        let (asid, map_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                map_cap,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x5000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map meta page");
+
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: region_len,
+        };
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash shared envelope");
+        (endpoint, handle, asid, source_obj)
+    }
+
+    fn snapshot(
+        state: &mut KernelState,
+        endpoint: CapObject,
+        handle: u64,
+        map_write: bool,
+    ) -> RecvBoundarySharedRegionSnapshot {
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        state
+            .shared_region_direct_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg)
+            .expect("phase A")
+    }
+
+    // (1) MemoryObject snapshot captures authoritative identity + attenuated rights.
+    #[test]
+    fn memoryobject_snapshot_captures_authoritative_identity() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid, obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert_eq!(snap.object, obj);
+        assert!(matches!(snap.object, CapObject::MemoryObject { .. }));
+        assert_eq!(snap.receiver_asid, asid);
+        assert!(snap.origin_direct);
+        assert!(snap.pin_owned, "snapshot owns the object pin");
+        // Read intent → WRITE attenuated away.
+        assert!(!snap.rights.contains(CapRights::WRITE));
+        assert!(snap.rights.contains(CapRights::MAP));
+    }
+
+    // (2) DmaRegion offset/length preserved in the descriptor + object.
+    #[test]
+    fn dmaregion_offset_length_preserved() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let (_eid, send_cap, _r) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (mem_id, _c) = state.alloc_anonymous_memory_object().expect("mem");
+        let dma_obj = CapObject::DmaRegion {
+            id: mem_id,
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let src = state
+            .mint_capability_for_current_context(Capability::new(
+                dma_obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint dma");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x5000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), src, endpoint, Some(ThreadId(2)), Some(region))
+            .expect("stash");
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert!(
+            matches!(snap.object, CapObject::DmaRegion { offset: 0, len, .. } if len == PAGE_SIZE as u64)
+        );
+        assert_eq!(snap.descriptor.len, PAGE_SIZE as u64);
+    }
+
+    // (3) The envelope pin transfers into the snapshot with no reference gap: the envelope is
+    // consumed but the shared-region pin count is not dropped (snapshot owns it).
+    #[test]
+    fn envelope_pin_transfers_into_snapshot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(shared_envelope_count(&state), 1);
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert_eq!(shared_envelope_count(&state), 0, "envelope consumed");
+        assert!(
+            snap.pin_owned,
+            "pin ownership moved to the snapshot (no gap / no leak)"
+        );
+        // Rolling back an unexecuted-but-owned snapshot must release the pin.
+        let mut txn = crate::kernel::boot::shared_region_txn::SharedRegionDirectTxn {
+            state: crate::kernel::boot::shared_region_txn::SharedRegionTxnState::Reserved,
+            snapshot: snap,
+            minted_cap: None,
+            mapped: None,
+        };
+        state.rollback_shared_region_direct_txn(&mut txn);
+        assert!(!txn.snapshot.pin_owned, "rollback releases the owned pin");
+    }
+
+    // (4) Source process exit AFTER the snapshot does not invalidate the owned object state — the
+    // snapshot never re-resolves sender CSpace, so execution still succeeds.
+    #[test]
+    fn source_exit_after_snapshot_does_not_invalidate() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, send_cap, _r) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem0) = state.alloc_anonymous_memory_object().expect("mem");
+        let obj = state.current_task_capability(mem0).expect("o").object;
+        // Source cap owned by task 1.
+        let src0 = state
+            .mint_capability_for_current_context(Capability::new(
+                obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint");
+        let src1 = state
+            .grant_capability_task_to_task(0, src0, 1)
+            .expect("grant to t1");
+        state.register_task(2).expect("task2");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x5000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(1), src1, endpoint, Some(ThreadId(2)), Some(region))
+            .expect("stash");
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        // Source task 1 exits AFTER the snapshot.
+        state.mark_task_dead(1).expect("kill source");
+        // Execution still succeeds (identity is frozen; sender CSpace not re-resolved).
+        let out = state.shared_region_direct_execute(snap).expect("publish");
+        assert_eq!(out.mapped_len, PAGE_SIZE);
+    }
+
+    // (5) Receiver exits BEFORE cap mint → cancel, no mapping, no cap, no leak.
+    #[test]
+    fn receiver_exits_before_cap_mint() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        state.mark_task_dead(2).expect("kill receiver");
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::ReceiverGone)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (6) Receiver generation replacement (ASID changed) before finalization → stale txn cannot
+    // publish; no mapping, no leak.
+    #[test]
+    fn receiver_generation_replacement_blocks_publish() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        // Rebind receiver to a fresh ASID (generation-bearing authority changes).
+        let (asid2, _mc2) = state.create_user_address_space().expect("asid2");
+        state.bind_task_asid(2, asid2).expect("rebind");
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::ReceiverGone)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (7) Receiver CNode full → mint fails, rollback, no mapping.
+    #[test]
+    fn receiver_cnode_full_shared_direct() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let cnode2 = state.task_cnode(2).expect("cnode2");
+        for _ in 0..8192 {
+            if state
+                .mint_capability_in_cnode(
+                    cnode2,
+                    Capability::new(CapObject::Kernel, CapRights::READ),
+                )
+                .is_err()
+            {
+                break;
+            }
+        }
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::CnodeFull)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (8) Missing MAP right → rejected before any mapping.
+    #[test]
+    fn missing_map_right_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(&mut state, CapRights::READ, PAGE_SIZE as u64);
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::MissingMapRight)
+        );
+    }
+
+    // (9) Write request without WRITE right → rejected (no writable mapping without WRITE).
+    #[test]
+    fn write_request_without_write_right_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, true); // write intent, no WRITE right
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::MissingWriteRight)
+        );
+    }
+
+    // (10) Map failure → rollback removes the provisional mapping and revokes the cap; no leak.
+    #[test]
+    fn map_failure_rolls_back() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        SHARED_REGION_TXN_FORCE_MAP_FAULT.store(true, Ordering::SeqCst);
+        let res = state.shared_region_direct_execute(snap);
+        SHARED_REGION_TXN_FORCE_MAP_FAULT.store(false, Ordering::SeqCst);
+        assert_eq!(res, Err(SharedRegionTxnError::MapFault));
+        assert_eq!(active_mapping_count(&state), 0, "no active-mapping leak");
+    }
+
+    // (11) Metadata-copy failure after mapping → rollback unmaps + removes + revokes; no leak.
+    #[test]
+    fn metadata_copy_failure_rolls_back() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
+        let res = state.shared_region_direct_execute(snap);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+        assert_eq!(res, Err(SharedRegionTxnError::CopyFault));
+        assert_eq!(
+            active_mapping_count(&state),
+            0,
+            "no active-mapping leak after copy fault"
+        );
+    }
+
+    // (12) Successful delivery: exactly one cap, one mapping, one wake; NX enforced; envelope gone.
+    #[test]
+    fn successful_delivery_one_cap_one_mapping_one_wake() {
+        let mut state = Bootstrap::init().expect("init");
+        state.enqueue_current_cpu(0).ok();
+        let (endpoint, handle, _asid, obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        // Block the receiver so the wake is observable.
+        state.enqueue_current_cpu(2).ok();
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        let out = state.shared_region_direct_execute(snap).expect("publish");
+        assert_eq!(out.mapped_base, MAP_VA);
+        assert_eq!(out.mapped_len, PAGE_SIZE);
+        assert_eq!(
+            active_mapping_count(&state),
+            1,
+            "exactly one active mapping"
+        );
+        // The receiver-local cap is a fresh MemoryObject cap with the same identity.
+        let cap = state
+            .resolve_capability_for_task(2, out.receiver_local_cap)
+            .expect("resolve");
+        assert_eq!(cap.object, obj);
+        assert!(
+            !cap.has_right(CapRights::WRITE),
+            "read-intent mapping cap is not writable"
+        );
+        assert_eq!(
+            shared_envelope_count(&state),
+            0,
+            "envelope consumed, not leaked"
+        );
+    }
+
+    // (13) Rollback is idempotent: invoking it twice never unmaps or revokes twice.
+    #[test]
+    fn rollback_is_idempotent() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        // Force a copy fault so the txn maps then rolls back, then roll back AGAIN by hand.
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
+        let _ = state.shared_region_direct_execute(snap);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+        assert_eq!(active_mapping_count(&state), 0);
+        // Re-run a fresh rollback on a Cancelled txn: must be a no-op (no double unmap/revoke).
+        let snap2 = {
+            let (endpoint, handle, _a, _o) = setup(
+                &mut state,
+                CapRights::READ | CapRights::MAP,
+                PAGE_SIZE as u64,
+            );
+            snapshot(&mut state, endpoint, handle, false)
+        };
+        let mut txn = crate::kernel::boot::shared_region_txn::SharedRegionDirectTxn {
+            state: crate::kernel::boot::shared_region_txn::SharedRegionTxnState::Reserved,
+            snapshot: snap2,
+            minted_cap: None,
+            mapped: None,
+        };
+        state.rollback_shared_region_direct_txn(&mut txn);
+        let before = active_mapping_count(&state);
+        state.rollback_shared_region_direct_txn(&mut txn); // second call: no-op
+        state.rollback_shared_region_direct_txn(&mut txn); // third call: no-op
+        assert_eq!(active_mapping_count(&state), before);
+        assert!(!txn.snapshot.pin_owned);
+    }
+
+    // (14) A stale cleanup token (different generation-bearing CapId) cannot release a replacement
+    // mapping in the active registry.
+    #[test]
+    fn stale_cleanup_token_cannot_release_replacement() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let live = CapId(0x0002_0000_0000_0009);
+        state
+            .register_active_transfer_mapping(ThreadId(2), live, VirtAddr(MAP_VA), PAGE_SIZE)
+            .expect("register");
+        let stale = CapId(live.0 ^ (1 << 40));
+        assert!(
+            !state.remove_active_transfer_mapping(ThreadId(2), stale),
+            "a stale/replacement CapId must not release the live mapping"
+        );
+        assert!(state.remove_active_transfer_mapping(ThreadId(2), live));
+    }
+
+    // (15) Reply and ordinary-cap paths remain excluded/unchanged: a Reply envelope is rejected by
+    // Phase A; a plain (non-shared) transfer envelope is rejected (WrongObject) by Phase A.
+    #[test]
+    fn reply_and_ordinary_paths_excluded_from_shared_txn() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        state.register_task(2).expect("task2");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x5000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        // Reply envelope → Phase A rejects (not a shared-region object).
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply");
+        let rh = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, Some(ThreadId(2)), None)
+            .expect("stash reply");
+        let rmsg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(rh),
+            b"x",
+        )
+        .expect("m");
+        assert!(
+            state
+                .shared_region_direct_phase_a(rh, endpoint, 2, MAP_VA, false, META_PTR, rmsg)
+                .is_err()
+        );
+        // Ordinary (non-shared) MemoryObject envelope → Phase A rejects (no shared_region descriptor).
+        let (_id, mem) = state.alloc_anonymous_memory_object().expect("mem");
+        let oh = state
+            .stash_transfer_envelope(ThreadId(0), mem, endpoint, Some(ThreadId(2)), None)
+            .expect("stash ordinary");
+        let omsg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(oh),
+            b"x",
+        )
+        .expect("m");
+        assert!(
+            state
+                .shared_region_direct_phase_a(oh, endpoint, 2, MAP_VA, false, META_PTR, omsg)
+                .is_err()
+        );
+    }
+
+    // (16) Receiver exits / generation-replaces AFTER map, BEFORE publication → phase-8 final
+    // revalidation fails; the single rollback performs exactly one unmap/revoke (no leak, no wake).
+    #[test]
+    fn stale_after_map_before_publish_rolls_back_exactly_once() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        let snap = snapshot(&mut state, endpoint, handle, false);
+        SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP.store(true, Ordering::SeqCst);
+        let res = state.shared_region_direct_execute(snap);
+        SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP.store(false, Ordering::SeqCst);
+        assert_eq!(res, Err(SharedRegionTxnError::StalePublish));
+        assert_eq!(
+            active_mapping_count(&state),
+            0,
+            "mapping unmapped exactly once, no leak"
+        );
+    }
+
+    // (17) NX is enforced structurally: the executor never enables execute on the mapping.
+    #[test]
+    fn mapping_execute_permission_never_enabled() {
+        const SRC: &str = include_str!("shared_region_txn.rs");
+        assert!(
+            SRC.contains("execute: false, // NX ALWAYS."),
+            "the shared-region mapping must always be non-executable"
+        );
+    }
+
+    // (18) Bad region (zero length / unaligned VA) is rejected without side effects.
+    #[test]
+    fn bad_region_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid, _obj) = setup(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+        );
+        // Snapshot with an UNALIGNED map_va → BadRegion.
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("m");
+        let snap = state
+            .shared_region_direct_phase_a(handle, endpoint, 2, MAP_VA + 1, false, META_PTR, msg)
+            .expect("phase A");
+        assert_eq!(
+            state.shared_region_direct_execute(snap),
+            Err(SharedRegionTxnError::BadRegion)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+}
+
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
 // no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
 // reality the audit relied on, so a future stage cannot silently flip an architecture

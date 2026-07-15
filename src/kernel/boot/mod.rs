@@ -23,6 +23,7 @@ mod orchestrator_state;
 mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
+mod shared_region_txn;
 mod task_core_state;
 mod task_policy_state;
 mod thread_state;
