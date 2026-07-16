@@ -416,6 +416,51 @@ impl KernelState {
         })
     }
 
+    /// Stage 198E3B2A: `&mut IpcSubsystem` sibling of [`Self::register_active_transfer_mapping`] for
+    /// use inside `SharedKernel::with_ipc_split_mut` (rank 3 only). Byte-identical slot logic.
+    pub(crate) fn register_active_transfer_mapping_locked(
+        ipc: &mut super::IpcSubsystem,
+        owner_tid: ThreadId,
+        transfer_cap: CapId,
+        base: VirtAddr,
+        len: usize,
+    ) -> bool {
+        if let Some(slot) = ipc
+            .active_transfer_mappings
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        {
+            *slot = Some(ActiveTransferMapping {
+                owner_tid,
+                transfer_cap,
+                base,
+                len,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stage 198E3B2A: `&mut IpcSubsystem` sibling of [`Self::remove_active_transfer_mapping`]
+    /// (rank 3 only). Byte-identical guarded remove.
+    pub(crate) fn remove_active_transfer_mapping_locked(
+        ipc: &mut super::IpcSubsystem,
+        owner_tid: ThreadId,
+        transfer_cap: CapId,
+    ) -> bool {
+        for slot in ipc.active_transfer_mappings.iter_mut() {
+            let Some(mapping) = *slot else {
+                continue;
+            };
+            if mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap {
+                *slot = None;
+                return true;
+            }
+        }
+        false
+    }
+
     pub(crate) fn active_transfer_mapping_for(
         &self,
         owner_tid: ThreadId,

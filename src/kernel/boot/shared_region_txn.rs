@@ -310,6 +310,25 @@ impl KernelState {
         self.with_ipc_state(|ipc| ipc.shared_region_cancel_overflow)
     }
 
+    /// Stage 198E3B2A: `&mut IpcSubsystem` sibling of [`Self::shared_region_consume_cancel`] for use
+    /// inside `SharedKernel::with_ipc_split_mut` (rank 3 only). Byte-identical one-shot consume; does
+    /// NOT clear the permanent fail-closed overflow fuse (same rationale as the broad-borrow version).
+    pub(crate) fn shared_region_consume_cancel_locked(
+        ipc: &mut super::IpcSubsystem,
+        receiver_tid: u64,
+        receiver_asid: crate::kernel::vm::Asid,
+    ) -> bool {
+        for slot in ipc.shared_region_cancel_requests.iter_mut() {
+            if let Some(req) = *slot {
+                if req.tid == receiver_tid && req.asid == receiver_asid {
+                    *slot = None;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Phase A (UNDER the broad lock): consume the shared-region transfer envelope, TAKE OVER its
     /// object pin, resolve + attenuate the destination rights, and capture the receiver's
     /// generation-bearing authority. Fails closed (envelope reclaimed by the caller path) on any

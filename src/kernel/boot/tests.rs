@@ -66186,6 +66186,236 @@ mod stage198e3_shared_region_live {
     }
 }
 
+// Stage 198E3B2A — SHARED-REGION OFF-LOCK SEAM FOUNDATION (substrate equivalence, hosted proof).
+//
+// Proves the narrowly scoped `&mut <Subsystem>` `_locked` seam helpers behave IDENTICALLY to their
+// broad-borrow reference siblings, and that they take a single-domain subsystem reference (never a
+// whole `&mut KernelState`). These helpers are the rank-3/5/6 substrate that the pending
+// `SharedRegionOffLockCtx` (Stage 198E3B2A part 2) composes into the off-lock context.
+mod stage198e3b2a_shared_region_seams {
+    use super::*;
+
+    fn mem_object(state: &mut KernelState, phys: u64) -> CapObject {
+        let (_id, cap) = state.create_memory_object(PhysAddr(phys)).expect("mem obj");
+        state.current_task_capability(cap).expect("obj").object
+    }
+
+    // (1) pin-refcount `_locked` == broad path (memory rank 6).
+    #[test]
+    fn pin_refcount_locked_equivalent() {
+        let mut s = Bootstrap::init().expect("init");
+        let obj = mem_object(&mut s, 0xCA000);
+        let base = s.memory_object_refcounts(PhysAddr(0xCA000)).expect("rc").2;
+        s.adjust_memory_object_pin_refcount(obj, 1);
+        let after_broad = s.memory_object_refcounts(PhysAddr(0xCA000)).expect("rc").2;
+        s.adjust_memory_object_pin_refcount(obj, -1); // undo
+        s.with_memory_state_mut(|m| {
+            KernelState::adjust_memory_object_pin_refcount_locked(m, obj, 1)
+        });
+        let after_locked = s.memory_object_refcounts(PhysAddr(0xCA000)).expect("rc").2;
+        assert_eq!(after_broad, after_locked);
+        assert_eq!(after_broad, base + 1);
+    }
+
+    // (2) map-refcount insert/remove `_locked` == broad path (memory rank 6).
+    #[test]
+    fn map_refcount_locked_equivalent() {
+        let mut s = Bootstrap::init().expect("init");
+        let _obj = mem_object(&mut s, 0xCB000);
+        let base = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        s.note_mapping_inserted(PhysAddr(0xCB000));
+        let broad_ins = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        s.note_mapping_removed(PhysAddr(0xCB000)); // undo
+        s.with_memory_state_mut(|m| {
+            KernelState::note_mapping_inserted_locked(m, PhysAddr(0xCB000))
+        });
+        let locked_ins = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        assert_eq!(broad_ins, locked_ins);
+        assert_eq!(broad_ins, base + 1);
+        // removal sibling matches too.
+        s.note_mapping_removed(PhysAddr(0xCB000));
+        let broad_rem = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        s.with_memory_state_mut(|m| {
+            KernelState::note_mapping_inserted_locked(m, PhysAddr(0xCB000))
+        });
+        s.with_memory_state_mut(|m| KernelState::note_mapping_removed_locked(m, PhysAddr(0xCB000)));
+        let locked_rem = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        assert_eq!(broad_rem, locked_rem);
+    }
+
+    // (3) phys-base `_locked` returns the frozen shared object's physical base (memory rank 6).
+    #[test]
+    fn phys_base_locked_correct() {
+        let mut s = Bootstrap::init().expect("init");
+        let obj = mem_object(&mut s, 0xCC000);
+        let got = s.with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, obj));
+        assert_eq!(got, Some(PhysAddr(0xCC000)));
+        // DmaRegion offset is honored.
+        let CapObject::MemoryObject { id } = obj else {
+            panic!("memory object")
+        };
+        let dma = CapObject::DmaRegion {
+            id,
+            offset: 0x1000,
+            len: 0x1000,
+        };
+        let dma_base = s.with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, dma));
+        assert_eq!(dma_base, Some(PhysAddr(0xCC000 + 0x1000)));
+    }
+
+    // (4) active-mapping register/remove `_locked` == broad path (IPC rank 3).
+    #[test]
+    fn active_mapping_locked_equivalent() {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("task2");
+        let cap = CapId(0x0002_0000_0000_0007);
+        // Broad register, then read back.
+        s.register_active_transfer_mapping(ThreadId(2), cap, VirtAddr(0x9000), PAGE_SIZE)
+            .expect("register");
+        let broad = s.active_transfer_mapping_for(ThreadId(2), cap);
+        assert!(s.remove_active_transfer_mapping(ThreadId(2), cap)); // undo
+        // Locked register, then read back — identical.
+        let ok = s.with_ipc_state_mut(|ipc| {
+            KernelState::register_active_transfer_mapping_locked(
+                ipc,
+                ThreadId(2),
+                cap,
+                VirtAddr(0x9000),
+                PAGE_SIZE,
+            )
+        });
+        assert!(ok);
+        let locked = s.active_transfer_mapping_for(ThreadId(2), cap);
+        assert_eq!(broad, locked);
+        assert_eq!(locked, Some((VirtAddr(0x9000), PAGE_SIZE)));
+        // Locked remove clears exactly that entry.
+        let removed = s.with_ipc_state_mut(|ipc| {
+            KernelState::remove_active_transfer_mapping_locked(ipc, ThreadId(2), cap)
+        });
+        assert!(removed);
+        assert_eq!(s.active_transfer_mapping_for(ThreadId(2), cap), None);
+    }
+
+    // (5) cancellation-consume `_locked` consumes ONLY the matching (tid, asid) request (IPC rank 3).
+    #[test]
+    fn consume_cancel_locked_mutates_only_intended() {
+        let mut s = Bootstrap::init().expect("init");
+        let a_asid = {
+            s.register_task(10).expect("t10");
+            let (asid, _mc) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(10, asid).expect("bind");
+            asid
+        };
+        let b_asid = {
+            s.register_task(11).expect("t11");
+            let (asid, _mc) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(11, asid).expect("bind");
+            asid
+        };
+        assert!(s.shared_region_request_cancel(10, a_asid));
+        assert!(s.shared_region_request_cancel(11, b_asid));
+        // Consume only (10, a_asid).
+        let consumed = s.with_ipc_state_mut(|ipc| {
+            KernelState::shared_region_consume_cancel_locked(ipc, 10, a_asid)
+        });
+        assert!(consumed);
+        // (10) gone, (11) remains — only intended state changed.
+        let present = |tid: u64, asid: crate::kernel::vm::Asid, s: &KernelState| {
+            s.with_ipc_state(|ipc| {
+                ipc.shared_region_cancel_requests
+                    .iter()
+                    .flatten()
+                    .any(|r| r.tid == tid && r.asid == asid)
+            })
+        };
+        assert!(!present(10, a_asid, &s), "consumed request gone");
+        assert!(present(11, b_asid, &s), "unrelated request untouched");
+        // A second consume of the same key is a no-op (one-shot).
+        assert!(
+            !s.with_ipc_state_mut(|ipc| KernelState::shared_region_consume_cancel_locked(
+                ipc, 10, a_asid
+            ))
+        );
+    }
+
+    // (6b) receiver-alive raw read (task rank 2): live (tid, captured_asid) accepted; a dead/exited
+    // task, a missing tid, and a replacement ASID (reused numeric TID) are all rejected.
+    #[test]
+    fn receiver_alive_raw_read_generation_bearing() {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (asid, _mc) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(2, asid).expect("bind");
+        let (other_asid, _mc2) = s.create_user_address_space().expect("asid2");
+        assert_ne!(asid, other_asid);
+        let alive = |tid: u64, a: crate::kernel::vm::Asid, s: &KernelState| unsafe {
+            KernelState::shared_region_receiver_alive_from_raw(s as *const KernelState, tid, a)
+        };
+        assert!(alive(2, asid, &s), "live (tid, captured asid) accepted");
+        assert!(
+            !alive(2, other_asid, &s),
+            "replacement/wrong ASID rejected (generation-bearing)"
+        );
+        assert!(!alive(99, asid, &s), "missing tid rejected");
+        s.mark_task_dead(2).expect("kill");
+        assert!(!alive(2, asid, &s), "dead task rejected");
+    }
+
+    // (6) SAFETY / SOURCE CONTRACT: every `_locked` seam helper takes a single `&mut <Subsystem>` (or
+    // `&<Subsystem>`) — NEVER a whole `&mut KernelState`; and the off-lock receiver read projects the
+    // task lock via the addr_of! raw-pointer pattern, never a whole-KernelState reference.
+    #[test]
+    fn locked_seam_helpers_take_subsystem_not_kernelstate() {
+        const TXN_SRC: &str = include_str!("shared_region_txn.rs");
+        const XFER_SRC: &str = include_str!("transfer_state.rs");
+        const MEMLC_SRC: &str = include_str!("memory_lifecycle_state.rs");
+        const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+        for (src, needle) in [
+            (
+                TXN_SRC,
+                "fn shared_region_consume_cancel_locked(\n        ipc: &mut super::IpcSubsystem,",
+            ),
+            (
+                XFER_SRC,
+                "fn register_active_transfer_mapping_locked(\n        ipc: &mut super::IpcSubsystem,",
+            ),
+            (
+                XFER_SRC,
+                "fn remove_active_transfer_mapping_locked(\n        ipc: &mut super::IpcSubsystem,",
+            ),
+            (
+                MEMLC_SRC,
+                "fn note_mapping_inserted_locked(memory: &mut MemorySubsystem,",
+            ),
+            (
+                MEMLC_SRC,
+                "fn adjust_memory_object_pin_refcount_locked(\n        memory: &mut MemorySubsystem,",
+            ),
+            (
+                MEMLC_SRC,
+                "fn shared_region_phys_base_locked(\n        memory: &MemorySubsystem,",
+            ),
+        ] {
+            assert!(
+                src.contains(needle),
+                "seam helper signature contract missing: {needle}"
+            );
+        }
+        // The off-lock receiver read acquires ONLY the task lock via addr_of! projection and never
+        // forms a whole-KernelState reference.
+        assert!(
+            ORCH_SRC.contains("fn shared_region_receiver_alive_from_raw(")
+                && ORCH_SRC.contains("addr_of!((*state).task_state_lock)")
+                && ORCH_SRC.contains("addr_of!((*state).tcbs)"),
+            "receiver-alive raw read must project the task lock via addr_of! (no &mut KernelState)"
+        );
+        assert!(
+            !ORCH_SRC.contains("&mut *(state as *mut KernelState)"),
+            "the raw receiver read must never reconstruct a whole &mut KernelState"
+        );
+    }
+}
+
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
 // no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
 // reality the audit relied on, so a future stage cannot silently flip an architecture
