@@ -1757,33 +1757,35 @@ impl SharedKernel {
             _ => "direct",
         };
         let waiter_tid = snap.snapshot.receiver_tid;
-        let endpoint_idx = snap.endpoint_idx;
+        let arch = crate::kernel::boot::current_arch_tag();
         crate::yarm_log!(
             "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_shared_region waiter_tid={}",
             waiter_tid
         );
         crate::yarm_log!("DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocked_waiter_shared_region");
 
-        // Object attestation (frozen CapObject classification + fresh-cap intent + pin transfer).
-        let object_match = u8::from(matches!(
-            snap.snapshot.object,
-            crate::kernel::capabilities::CapObject::MemoryObject { .. }
-                | crate::kernel::capabilities::CapObject::DmaRegion { .. }
-        ));
-        let arch = crate::kernel::boot::current_arch_tag();
-        crate::yarm_log!(
-            "IPCSEND_SHARED_REGION_OBJECT_OK arch={} class={} object_match={} fresh_cap=1 pin_transfer={}",
-            arch,
-            class,
-            object_match,
-            u8::from(snap.snapshot.pin_owned)
-        );
-
-        // Run the accepted post-lock transaction. (Foundation: via a brief with_cpu re-entry; the
-        // live oracle requires the seam decomposition noted above.)
-        let result = self.with_cpu(cpu, |kernel| kernel.shared_region_execute(snap.snapshot));
+        // Run the accepted post-lock transaction FULLY OFF-LOCK through `SharedRegionOffLockCtx` —
+        // no broad-borrow re-entry and no whole-KernelState borrow. The finalize step inside the
+        // runner clears the blocked-return state + the exact endpoint waiter slot and then enqueues
+        // the receiver exactly once; the user copy + any TLB completion run with no lock held.
+        let mut ctx = SharedRegionOffLockCtx(self);
+        let result =
+            crate::kernel::boot::shared_region_txn::run_shared_region_txn(&mut ctx, snap.snapshot);
         match result {
-            Ok(Ok(publish)) => {
+            Ok(publish) => {
+                // Origin-gated shared-region attestations + retirement — emitted ONLY here, after the
+                // transaction finalized, the waiter state cleared, and the receiver enqueued once.
+                let object_match = u8::from(matches!(
+                    snap.snapshot.object,
+                    crate::kernel::capabilities::CapObject::MemoryObject { .. }
+                        | crate::kernel::capabilities::CapObject::DmaRegion { .. }
+                ));
+                crate::yarm_log!(
+                    "IPCSEND_SHARED_REGION_OBJECT_OK arch={} class={} object_match={} fresh_cap=1 pin_transfer=1",
+                    arch,
+                    class,
+                    object_match
+                );
                 let map_right = u8::from(
                     snap.snapshot
                         .rights
@@ -1803,16 +1805,6 @@ impl SharedKernel {
                     map_right,
                     write_ok
                 );
-                // Phase C — complete the blocked recv-v2 waiter: clear its return regs and the
-                // endpoint receiver-waiter slot. The single wake was already applied inside
-                // `shared_region_execute` (no second wake here).
-                let _ = self.with_cpu(cpu, |kernel| {
-                    kernel.clear_blocked_recv_return_regs(waiter_tid);
-                    kernel.ipc_clear_plain_receiver_waiter_only(
-                        endpoint_idx,
-                        crate::kernel::ipc::ThreadId(waiter_tid),
-                    );
-                });
                 crate::yarm_log!(
                     "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch={} class={} transaction_published=1 receiver_wakes={} leaked_state=0",
                     arch,
@@ -1833,16 +1825,16 @@ impl SharedKernel {
                 );
                 Ok(())
             }
-            Ok(Err(e)) => {
-                // The transaction already rolled back to a clean state (single idempotent
-                // rollback): mapped prefix unmapped, provisional cap revoked, pin released, no wake.
+            Err(e) => {
+                // The transaction already rolled back to a clean state (single idempotent rollback):
+                // no wake, mapped prefix unmapped, provisional cap revoked, pin released. NO
+                // shared-region attestation or retirement marker is emitted from a rolled-back txn.
                 crate::yarm_log!(
                     "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_shared_region reason=txn err={:?}",
                     e
                 );
                 Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))
             }
-            Err(_) => Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)),
         }
     }
 
@@ -2932,6 +2924,49 @@ impl SharedKernel {
         true
     }
 
+    /// Origin-neutral finalize + wake for a shared-region delivery, entirely off-lock. For a blocked
+    /// endpoint waiter (`snap.blocked_endpoint_waiter`) it validates the exact endpoint waiter slot
+    /// (rank 3), clears the blocked-return register state (rank 2) and that slot (rank 3), THEN wakes
+    /// (rank 2 set-Runnable → rank 1 enqueue). All fallible work (waiter validation) precedes the
+    /// enqueue; a missing / replacement waiter returns `false` with NO wake. Locks are non-nested and
+    /// no IPC/cap/VM/memory lock is held during the wake. Mirrors the broad `ctx_finalize_and_wake`.
+    pub(crate) fn sr_finalize_blocked_receiver_and_wake_split(
+        &self,
+        snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    ) -> Option<bool> {
+        use crate::kernel::ipc::ThreadId;
+        if snap.blocked_endpoint_waiter {
+            let CapObject::Endpoint {
+                index: eidx,
+                generation: egen,
+            } = snap.endpoint
+            else {
+                return None;
+            };
+            // rank 3: the exact endpoint (index + generation) must still hold THIS receiver.
+            let ours = self.with_ipc_split_mut(|ipc| {
+                eidx < ipc.endpoint_waiters.len()
+                    && ipc.endpoint_generations[eidx] == egen
+                    && ipc.endpoint_waiters[eidx] == Some(ThreadId(snap.receiver_tid))
+            });
+            if !ours {
+                return None;
+            }
+            // rank 2: clear blocked-return register state.
+            self.with_task_tcbs_split_mut(|tcbs| {
+                KernelState::clear_blocked_recv_return_regs_locked(tcbs, snap.receiver_tid)
+            });
+            // rank 3: clear the exact waiter slot (still ours) — BEFORE the receiver becomes runnable.
+            self.with_ipc_split_mut(|ipc| {
+                if ipc.endpoint_waiters[eidx] == Some(ThreadId(snap.receiver_tid)) {
+                    ipc.endpoint_waiters[eidx] = None;
+                }
+            });
+        }
+        // rank 2 (set Runnable) → rank 1 (enqueue): the single wake, the last visible action.
+        Some(self.sr_wake_receiver_split(snap.receiver_tid))
+    }
+
     /// Off-global-lock, all-or-nothing user-copy primitive (introduced Stage 191C; its
     /// original NR 27 InitramfsReadChunk caller was removed in Stage 197A, but this remains a
     /// generic split-path write seam with dedicated no-partial-write unit tests): copy the
@@ -3459,8 +3494,11 @@ impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegio
     ) -> bool {
         self.0.copy_to_user_split(asid, va, bytes).is_ok()
     }
-    fn ctx_wake(&mut self, tid: u64) -> bool {
-        self.0.sr_wake_receiver_split(tid)
+    fn ctx_finalize_and_wake(
+        &mut self,
+        snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    ) -> Option<bool> {
+        self.0.sr_finalize_blocked_receiver_and_wake_split(snap)
     }
     fn ctx_release_pin(&mut self, object: CapObject) {
         self.0.sr_release_pin_split(object)

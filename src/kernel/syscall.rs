@@ -961,7 +961,7 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
     // object-authoritative classification + attenuated rights + receiver generation authority).
     // The receiver's recv buffers provide the map VA and the recv-v2 meta target. Read-only for
     // the primary live seal (existing hosted tests cover the canonical writable-right gate).
-    let snapshot = kernel
+    let mut snapshot = kernel
         .shared_region_phase_a(
             handle,
             recv_endpoint,
@@ -973,6 +973,10 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
             true,
         )
         .map_err(SyscallError::from)?;
+    // The receiver was consumed as a BLOCKED ENDPOINT WAITER: finalization must clear its
+    // blocked-return state + the endpoint waiter slot before waking (structural, not the origin
+    // marker).
+    snapshot.blocked_endpoint_waiter = true;
     stash_shared_region_delivery(
         cpu_idx,
         snapshot,

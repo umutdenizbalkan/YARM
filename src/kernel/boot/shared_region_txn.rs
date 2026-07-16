@@ -83,6 +83,12 @@ pub(crate) struct RecvBoundarySharedRegionSnapshot {
     pub(crate) pin_owned: bool,
     /// Direct-delivery origin marker (vs a future queued reuse).
     pub(crate) origin_direct: bool,
+    /// STRUCTURAL (not the origin marker): the receiver was consumed as a blocked ENDPOINT WAITER,
+    /// so finalization must clear its blocked-return register state and the exact endpoint
+    /// receiver-waiter slot BEFORE waking, and treat a missing/replacement waiter as stale. When
+    /// false (the transaction proofs and the queued dequeue, where the receiver is not a blocked
+    /// endpoint waiter) finalization is a plain wake. Set independently of `origin_direct`.
+    pub(crate) blocked_endpoint_waiter: bool,
     /// The dequeued message (recv-v2 metadata source).
     pub(crate) msg: Message,
 }
@@ -402,6 +408,10 @@ impl KernelState {
             map_write,
             pin_owned: true,
             origin_direct,
+            // Default: NOT a blocked endpoint waiter. The direct blocked-receiver producer sets this
+            // true after Phase A (it consumed the receiver's blocked_recv_state); the transaction
+            // proofs and the queued dequeue leave it false (plain wake).
+            blocked_endpoint_waiter: false,
             msg,
         })
     }
@@ -528,8 +538,16 @@ pub(crate) trait SharedRegionExecCtx {
     ) -> bool;
     /// OFF-LOCK: copy the recv-v2 meta to user memory with NO kernel lock held.
     fn ctx_copy_meta(&mut self, asid: crate::kernel::vm::Asid, va: VirtAddr, bytes: &[u8]) -> bool;
-    /// rank 1: publish exactly one receiver wake through the scheduler.
-    fn ctx_wake(&mut self, tid: u64) -> bool;
+    /// Origin-neutral final delivery. `None` = STALE finalization (a blocked endpoint waiter that is
+    /// now missing or replaced by a different task) — nothing is enqueued and the runner rolls back
+    /// without waking. `Some(woke)` = publish; `woke` records whether the receiver was actually
+    /// enqueued. For a blocked endpoint waiter (`snap.blocked_endpoint_waiter`) it validates the exact
+    /// endpoint waiter slot, clears the blocked-return register state (rank 2) and that slot (rank 3),
+    /// THEN transitions the receiver Runnable (rank 2) and enqueues it exactly once (rank 1) —
+    /// non-nested, no IPC/cap/VM/memory lock held during the wake, the enqueue the LAST visible
+    /// action. When `blocked_endpoint_waiter` is false it is a plain best-effort wake (always
+    /// `Some`), preserving the accepted transaction-executor semantics.
+    fn ctx_finalize_and_wake(&mut self, snap: &RecvBoundarySharedRegionSnapshot) -> Option<bool>;
     /// rank 6: release the transferred object pin (once).
     fn ctx_release_pin(&mut self, object: CapObject);
     /// rank 5 + TLB: unmap the mapped prefix via the two-phase shootdown-before-reclaim contract.
@@ -747,9 +765,21 @@ pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
         return Err(SharedRegionTxnError::StalePublish);
     }
 
-    // Phase 9/10: publish + wake receiver exactly once, then release the transfer pin (the
-    // receiver-local cap now owns the object reference).
-    let woke = ctx.ctx_wake(txn.snapshot.receiver_tid);
+    // Phase 9: FINALIZE + wake. This is the ONLY step past which no failure is allowed — all fallible
+    // work (blocked-return clear, endpoint-waiter validation) happens INSIDE it BEFORE the rank-1
+    // enqueue. If the waiter is stale (missing / replaced by a different task) it returns false
+    // WITHOUT enqueuing, and the transaction rolls back with NO wake (StalePublish). On success the
+    // receiver was enqueued exactly once, AFTER its blocked-return + endpoint-waiter state cleared.
+    let woke = match ctx.ctx_finalize_and_wake(&txn.snapshot) {
+        Some(woke) => woke,
+        None => {
+            // Stale finalization (missing / replacement endpoint waiter): no enqueue happened.
+            rollback_shared_region_txn(ctx, &mut txn);
+            return Err(SharedRegionTxnError::StalePublish);
+        }
+    };
+    // Phase 10: release the transfer pin (infallible; the receiver-local cap now owns the object
+    // reference). Purely internal refcount work — never externally visible, never after a failure.
     if txn.snapshot.pin_owned {
         ctx.ctx_release_pin(txn.snapshot.object);
         txn.snapshot.pin_owned = false;
@@ -856,8 +886,35 @@ impl SharedRegionExecCtx for KernelState {
     fn ctx_copy_meta(&mut self, asid: crate::kernel::vm::Asid, va: VirtAddr, bytes: &[u8]) -> bool {
         self.copy_to_user(asid, va, bytes).is_ok()
     }
-    fn ctx_wake(&mut self, tid: u64) -> bool {
-        self.apply_split_receiver_wake_plan(ThreadId(tid)).is_ok()
+    fn ctx_finalize_and_wake(&mut self, snap: &RecvBoundarySharedRegionSnapshot) -> Option<bool> {
+        if snap.blocked_endpoint_waiter {
+            let CapObject::Endpoint {
+                index: eidx,
+                generation: egen,
+            } = snap.endpoint
+            else {
+                return None;
+            };
+            // Waiter identity (rank 3 read): the exact endpoint (index + generation) must still hold
+            // THIS receiver as its waiter. A missing / replaced (different-tid) waiter is stale.
+            let ours = self.with_ipc_state(|ipc| {
+                eidx < ipc.endpoint_waiters.len()
+                    && ipc.endpoint_generations[eidx] == egen
+                    && ipc.endpoint_waiters[eidx] == Some(ThreadId(snap.receiver_tid))
+            });
+            if !ours {
+                return None;
+            }
+            // rank 2: clear blocked-return register state; rank 3: clear the exact waiter slot —
+            // BOTH before the receiver becomes runnable.
+            self.clear_blocked_recv_return_regs(snap.receiver_tid);
+            self.ipc_clear_plain_receiver_waiter_only(eidx, ThreadId(snap.receiver_tid));
+        }
+        // rank 2 (set Runnable) → rank 1 (enqueue): the single wake, the last visible action.
+        Some(
+            self.apply_split_receiver_wake_plan(ThreadId(snap.receiver_tid))
+                .is_ok(),
+        )
     }
     fn ctx_release_pin(&mut self, object: CapObject) {
         self.adjust_memory_object_pin_refcount(object, -1);

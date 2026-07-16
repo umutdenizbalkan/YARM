@@ -66716,12 +66716,454 @@ mod stage198e3b2a_offlock_ctx {
             !unmap.contains("with_vm_user_spaces_split_mut(|spaces| {\n                self.with_memory_split_mut"),
             "unmap must not nest the memory lock inside the VM lock"
         );
-        // Production drain unchanged: still the broad-context executor (with_cpu + shared_region_execute).
+        // Stage 198E3B2B switched the production drain to the OFF-LOCK context: it now runs
+        // `run_shared_region_txn(&mut SharedRegionOffLockCtx(self), ...)` with no broad re-entry.
+        // Bound the drain body between its own definition and the next executor definition.
+        let drain = RT
+            .split_once("fn execute_blocked_waiter_shared_region_delivery")
+            .map(|(_, r)| {
+                // Bound at the NEXT executor's doc comment (its prose mentions `with_cpu`, so the
+                // fn keyword is too late a boundary).
+                r.split_once("/// Stage 188D").map(|(b, _)| b).unwrap_or(r)
+            })
+            .expect("drain present");
         assert!(
-            RT.contains("kernel.shared_region_execute(snap.snapshot)")
-                && RT.contains("fn execute_blocked_waiter_shared_region_delivery"),
-            "the production post-work drain must remain on the broad context (not switched)"
+            drain.contains("SharedRegionOffLockCtx(self)")
+                && drain.contains("run_shared_region_txn(&mut ctx"),
+            "the drain must execute through SharedRegionOffLockCtx"
         );
+        for forbidden in ["with_cpu(", ".with(", "shared_region_execute"] {
+            assert!(
+                !drain.contains(forbidden),
+                "the switched drain must not contain `{forbidden}`"
+            );
+        }
+        // The broad-context executor call is gone entirely.
+        assert!(
+            !RT.contains("kernel.shared_region_execute("),
+            "no broad KernelState shared-region executor call may remain"
+        );
+    }
+}
+
+// Stage 198E3B2B — SHARED-REGION DRAIN SWITCHED TO OFF-LOCK EXECUTION (hosted proof).
+//
+// Drives the REAL post-work drain (`drain_dispatch_post_work` → the switched
+// `execute_blocked_waiter_shared_region_delivery`) end-to-end through `SharedRegionOffLockCtx`, and
+// proves the finalization order (blocked-return + endpoint-waiter cleared BEFORE the single wake),
+// the stale/replacement-waiter rollback (zero wake), the failure rollbacks (receiver stays blocked),
+// exactly-one enqueue, no duplicate wake, post-work-slot clearing, and origin-gated markers. Live
+// producers remain gated/dormant.
+mod stage198e3b2b_drain_switch {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        SHARED_REGION_TXN_FORCE_COPY_FAULT, SHARED_REGION_TXN_MAP_FAULT_AT_PAGE,
+    };
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+    use crate::kernel::task::{RecvAbiVariant, TaskStatus, WaitReason};
+    use crate::runtime::SharedKernel;
+    use core::sync::atomic::Ordering;
+
+    const CPU0: CpuId = CpuId(0);
+    const MAP_VA: u64 = 0x30_000;
+    const META_PTR: u64 = 0x60_000;
+
+    fn reset_globals() {
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(false);
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(false, Ordering::Relaxed);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let _ = crate::kernel::boot::shared_region_live_origin_take(0);
+    }
+
+    struct Drn {
+        shared: SharedKernel,
+        eidx: usize,
+        phys0: u64,
+        asid: crate::kernel::vm::Asid,
+    }
+
+    // Build a BLOCKED recv-v2 waiter (task 2), an endpoint whose waiter slot names task 2, a
+    // `pages`-page MemoryObject source cap + a stashed shared-region envelope, then run the DIRECT
+    // producer (which snapshots blocked_endpoint_waiter=true + origin Direct + stashes the post-work).
+    // Wrap in SharedKernel for the real drain. `waiter_slot=None` leaves the endpoint slot empty.
+    fn build_blocked(pages: usize, waiter_slot: Option<u64>) -> Drn {
+        reset_globals();
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("task2");
+        // A genuinely blocked receiver is NOT in the run queue; the finalize wake is
+        // the sole enqueue, so runnable_count starts at 0 and the wake makes it 1.
+        let (eidx, _send_cap, recv_cap) = s.create_endpoint(4).expect("endpoint");
+        let recv_cap_t2 = s
+            .grant_capability_task_to_task(0, recv_cap, 2)
+            .expect("grant recv");
+        let (_id, mem_cap0) = s
+            .alloc_anonymous_memory_object_with_len(pages * PAGE_SIZE)
+            .expect("mem");
+        let source_obj = s.current_task_capability(mem_cap0).expect("obj").object;
+        let phys0 = s
+            .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, source_obj))
+            .expect("phys")
+            .0;
+        let src_cap = s
+            .mint_capability_for_current_context(Capability::new(
+                source_obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint");
+        let (asid, aspace) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(2, asid).expect("bind");
+        s.map_user_page(
+            aspace,
+            VirtAddr(META_PTR),
+            Mapping {
+                phys: PhysAddr(0x7000_0000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("meta");
+        // Block the receiver on recv-v2 (map VA at MAP_VA, meta at META_PTR) + endpoint waiter slot.
+        s.with_tcb_mut(2, |tcb| {
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_t2));
+            tcb.user_context.user_gprs[0] = 0xDEAD; // sentinel: finalize must clear it to 0
+            tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                recv_cap: recv_cap_t2,
+                payload_user_ptr: MAP_VA as usize,
+                payload_user_len: crate::kernel::ipc::Message::MAX_PAYLOAD,
+                meta_user_ptr: META_PTR as usize,
+                meta_user_len: 40,
+                recv_abi: RecvAbiVariant::RecvV2,
+            });
+        });
+        let endpoint = s
+            .resolve_capability_for_task(2, recv_cap_t2)
+            .expect("resolve")
+            .object;
+        s.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_waiters[eidx] = waiter_slot.map(ThreadId);
+        });
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: (pages * PAGE_SIZE) as u64,
+        };
+        let handle = s
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        let produced = crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut s, 2, eidx, &msg,
+        )
+        .expect("producer");
+        assert!(produced, "direct producer must publish post-work");
+        Drn {
+            shared: SharedKernel::new(s),
+            eidx,
+            phys0,
+            asid,
+        }
+    }
+
+    fn drain(d: &Drn) -> Result<(), crate::kernel::boot::TrapHandleError> {
+        d.shared.drain_dispatch_post_work(CPU0)
+    }
+    fn status(d: &Drn) -> Option<TaskStatus> {
+        d.shared.with(|k| k.task_status(2))
+    }
+    fn waiter(d: &Drn) -> Option<ThreadId> {
+        d.shared
+            .with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiters[d.eidx]))
+    }
+    fn ret_reg(d: &Drn) -> usize {
+        d.shared
+            .with(|k| k.with_tcb_mut(2, |tcb| tcb.user_context.user_gprs[0]))
+            .unwrap_or(0)
+    }
+    fn active_mappings(d: &Drn) -> usize {
+        d.shared.with(|k| {
+            (0..MAX_TRANSFER_ENVELOPES)
+                .filter(|&i| k.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+                .count()
+        })
+    }
+    fn pin(d: &Drn) -> u32 {
+        d.shared
+            .with(|k| k.memory_object_refcounts(PhysAddr(d.phys0)).map(|t| t.2))
+            .unwrap_or(99)
+    }
+    fn stash_empty(d: &Drn) -> bool {
+        unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none()
+    }
+
+    // (3/5/6/12/14) Direct-origin success: finalize clears the blocked-return regs + the exact
+    // endpoint waiter slot, THEN enqueues the receiver once (Runnable); mapping + cap + meta land.
+    #[test]
+    fn direct_success_clears_then_wakes() {
+        let d = build_blocked(2, Some(2));
+        let runnable_before = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert!(drain(&d).is_ok(), "drain succeeds");
+        assert_eq!(waiter(&d), None, "endpoint waiter slot cleared");
+        assert_eq!(
+            ret_reg(&d),
+            0,
+            "blocked-return register cleared (was 0xDEAD)"
+        );
+        assert_eq!(
+            status(&d),
+            Some(TaskStatus::Runnable),
+            "receiver woken to Runnable"
+        );
+        assert_eq!(active_mappings(&d), 1, "one active mapping published");
+        let runnable_after = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert_eq!(
+            runnable_after,
+            runnable_before + 1,
+            "exactly one scheduler enqueue"
+        );
+        assert!(stash_empty(&d), "post-work slot cleared on success");
+        reset_globals();
+    }
+
+    // (7) A REPLACEMENT waiter (slot names a different task) → stale finalization: rollback, zero
+    // wake, receiver stays blocked, nothing mapped, the other task's slot untouched.
+    #[test]
+    fn replacement_waiter_rolls_back_zero_wake() {
+        let d = build_blocked(1, Some(2));
+        // A different task 3 replaced the waiter slot after the producer ran.
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = Some(ThreadId(3))));
+        assert!(drain(&d).is_err(), "stale finalization fails the drain");
+        assert!(
+            matches!(status(&d), Some(TaskStatus::Blocked(_))),
+            "receiver stays blocked (zero wake)"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(3)),
+            "replacement waiter untouched"
+        );
+        assert_eq!(active_mappings(&d), 0, "nothing published");
+        assert_eq!(pin(&d), 0, "pin released on rollback");
+        assert!(stash_empty(&d), "post-work slot cleared on failure");
+        reset_globals();
+    }
+
+    // (8) A MISSING waiter (slot cleared after the producer ran) → stale finalization rollback.
+    #[test]
+    fn missing_waiter_rolls_back_zero_wake() {
+        let d = build_blocked(1, Some(2));
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = None));
+        assert!(drain(&d).is_err());
+        assert!(
+            matches!(status(&d), Some(TaskStatus::Blocked(_))),
+            "receiver stays blocked (zero wake)"
+        );
+        assert_eq!(active_mappings(&d), 0);
+        assert_eq!(pin(&d), 0);
+        reset_globals();
+    }
+
+    // (10/11) Copy failure and map failure BEFORE finalize: receiver stays blocked + not enqueued,
+    // waiter slot intact, nothing mapped, pin released.
+    #[test]
+    fn copy_and_map_failure_leave_receiver_blocked() {
+        // copy fault
+        let d = build_blocked(1, Some(2));
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
+        assert!(drain(&d).is_err());
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+        assert!(matches!(status(&d), Some(TaskStatus::Blocked(_))));
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(2)),
+            "waiter slot untouched on pre-finalize failure"
+        );
+        assert_eq!(active_mappings(&d), 0);
+        assert_eq!(pin(&d), 0);
+        assert!(stash_empty(&d));
+        reset_globals();
+        // map fault (2 pages, fault on page 1)
+        let d = build_blocked(2, Some(2));
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(1, Ordering::SeqCst);
+        assert!(drain(&d).is_err());
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+        assert!(matches!(status(&d), Some(TaskStatus::Blocked(_))));
+        assert_eq!(waiter(&d), Some(ThreadId(2)));
+        assert_eq!(active_mappings(&d), 0);
+        assert_eq!(pin(&d), 0);
+        reset_globals();
+    }
+
+    // (9) Receiver ASID replacement before finalization → ReceiverGone rollback.
+    #[test]
+    fn receiver_asid_replacement_rolls_back() {
+        let d = build_blocked(1, Some(2));
+        d.shared.with(|k| {
+            let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
+            k.bind_task_asid(2, new_asid).expect("rebind");
+        });
+        assert!(drain(&d).is_err());
+        assert_eq!(active_mappings(&d), 0);
+        assert_eq!(pin(&d), 0);
+        reset_globals();
+    }
+
+    // (13) No duplicate wake on a repeated drain: the second drain finds an empty stash → no-op.
+    #[test]
+    fn repeated_drain_no_duplicate_wake() {
+        let d = build_blocked(1, Some(2));
+        let before = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert!(drain(&d).is_ok());
+        let after1 = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert_eq!(after1, before + 1);
+        assert!(drain(&d).is_ok(), "second drain is a no-op");
+        let after2 = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert_eq!(after2, after1, "no duplicate enqueue");
+        reset_globals();
+    }
+
+    // (4) Enqueue-origin post-work also finalizes + wakes through the same off-lock context.
+    #[test]
+    fn enqueue_origin_succeeds_through_offlock() {
+        reset_globals();
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("task2");
+        s.enqueue_current_cpu(2).ok();
+        let (eidx, send_cap, _r) = s.create_endpoint(4).expect("endpoint");
+        let endpoint = s.current_task_capability(send_cap).expect("send").object;
+        let (_id, mem_cap0) = s
+            .alloc_anonymous_memory_object_with_len(PAGE_SIZE)
+            .expect("mem");
+        let source_obj = s.current_task_capability(mem_cap0).expect("obj").object;
+        let src_cap = s
+            .mint_capability_for_current_context(Capability::new(
+                source_obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint");
+        let (asid, aspace) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(2, asid).expect("bind");
+        s.map_user_page(
+            aspace,
+            VirtAddr(META_PTR),
+            Mapping {
+                phys: PhysAddr(0x7100_0000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = s
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        // Queued origin: receiver is NOT a blocked endpoint waiter (blocked_endpoint_waiter=false).
+        let produced = crate::kernel::syscall::produce_queued_shared_region_delivery(
+            &mut s, 2, eidx, endpoint, MAP_VA, META_PTR, false, &msg,
+        )
+        .expect("producer");
+        assert!(produced);
+        let d = Drn {
+            shared: SharedKernel::new(s),
+            eidx,
+            phys0: 0,
+            asid,
+        };
+        assert!(drain(&d).is_ok(), "enqueue-origin drain succeeds off-lock");
+        assert_eq!(active_mappings(&d), 1);
+        assert_eq!(status(&d), Some(TaskStatus::Runnable));
+        let _ = d.asid;
+        reset_globals();
+    }
+
+    // (16) Retirement markers are emitted ONLY in the success arm, AFTER the finalize; (17) producers
+    // are dormant off the knob. Source/behavior contracts.
+    #[test]
+    fn markers_success_only_and_producers_dormant() {
+        const RT: &str = include_str!("../../runtime.rs");
+        let drain_fn = RT
+            .split_once("fn execute_blocked_waiter_shared_region_delivery")
+            .map(|(_, r)| r.split_once("/// Stage 188D").map(|(b, _)| b).unwrap_or(r))
+            .expect("drain");
+        // The retirement + attestation markers live AFTER the run's Ok(...) and BEFORE the Err arm.
+        let ok_arm = drain_fn
+            .split_once("Ok(publish) => {")
+            .map(|(_, r)| r.split_once("Err(e) => {").map(|(b, _)| b).unwrap_or(r))
+            .expect("ok arm");
+        for m in [
+            "IPCSEND_SHARED_REGION_LIFECYCLE_OK",
+            "maybe_log_ipc_send_shared_region_direct_retired",
+            "maybe_log_ipc_send_shared_region_enqueue_retired",
+        ] {
+            assert!(
+                ok_arm.contains(m),
+                "success-only marker `{m}` must be in the Ok arm"
+            );
+        }
+        let err_arm = drain_fn
+            .split_once("Err(e) => {")
+            .map(|(_, r)| r)
+            .expect("err arm");
+        assert!(
+            !err_arm.contains("IPCSEND_SHARED_REGION")
+                && !err_arm.contains("maybe_log_ipc_send_shared_region"),
+            "no shared-region attestation/retirement marker from the rolled-back (Err) arm"
+        );
+        // Producers dormant: off the knob the direct producer declines (legacy path).
+        reset_globals();
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(1),
+            b"x",
+        )
+        .expect("m");
+        assert!(
+            !crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+                &mut s, 2, 0, &msg
+            )
+            .unwrap_or(false),
+            "off the oracle knob the producer must stay dormant"
+        );
+        reset_globals();
     }
 }
 
