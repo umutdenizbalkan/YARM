@@ -3,13 +3,15 @@
 
 use super::{
     IpcEndpointRecvResult, IpcEndpointSendResult, IpcEndpointSplitRejectReason, IpcFastpathResult,
-    KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, NotificationObject,
-    ReplyCapRecord, ReplyRecordSetOutcome, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
+    IpcSubsystem, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
+    NotificationObject, ReceiverWaiterIdentity, ReplyCapRecord, ReplyRecordSetOutcome,
+    SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
 use crate::kernel::syscall::complete_blocked_recv_for_waiter;
 use crate::kernel::task::{RecvAbiVariant, TaskStatus, WaitReason};
+use crate::kernel::vm::Asid;
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
 };
@@ -24,6 +26,80 @@ struct RecvBlockPhasePlan {
     blocked_tid: ThreadId,
     endpoint_idx: usize,
     recv_cap: CapId,
+    /// Stage 198E3B2B2: the blocking receiver's captured ASID, threaded from the task phase (rank 2)
+    /// so the ipc phase (rank 3) can publish the COMPLETE generation-bearing waiter identity.
+    receiver_asid: Asid,
+}
+
+impl IpcSubsystem {
+    /// Stage 198E3B2B2 — endpoint RECEIVE-waiter slot accessors. The slot stores a complete
+    /// [`ReceiverWaiterIdentity`]; every authority operation (claim / clear / cleanup / restore) goes
+    /// through these, so numeric TID alone can never authorize a waiter mutation.
+
+    /// The present receiver waiter's TID (for waking / telemetry only — never an authority check).
+    pub(crate) fn endpoint_waiter_tid(&self, idx: usize) -> Option<ThreadId> {
+        self.endpoint_waiters
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(|w| w.tid)
+    }
+
+    /// The present receiver waiter's COMPLETE identity, or `None`.
+    pub(crate) fn endpoint_waiter_identity(&self, idx: usize) -> Option<ReceiverWaiterIdentity> {
+        self.endpoint_waiters.get(idx).copied().flatten()
+    }
+
+    /// Whether a receiver waiter is present at `idx` (no identity comparison).
+    pub(crate) fn endpoint_waiter_present(&self, idx: usize) -> bool {
+        self.endpoint_waiters.get(idx).map(Option::is_some) == Some(true)
+    }
+
+    /// Publish (overwrite) the complete identity at `idx`. Returns the displaced identity, if any.
+    pub(crate) fn set_endpoint_waiter(
+        &mut self,
+        idx: usize,
+        identity: ReceiverWaiterIdentity,
+    ) -> Option<ReceiverWaiterIdentity> {
+        let displaced = self.endpoint_waiters.get(idx).copied().flatten();
+        self.endpoint_waiters[idx] = Some(identity);
+        displaced
+    }
+
+    /// Unconditionally take (remove + return) the waiter at `idx`.
+    pub(crate) fn take_endpoint_waiter(&mut self, idx: usize) -> Option<ReceiverWaiterIdentity> {
+        self.endpoint_waiters.get_mut(idx).and_then(Option::take)
+    }
+
+    /// Clear the slot at `idx` iff it EXACTLY matches `identity` (full generation-bearing compare).
+    /// Returns true iff a waiter was cleared. Never removes a replacement task's waiter.
+    pub(crate) fn clear_endpoint_waiter_if_identity(
+        &mut self,
+        idx: usize,
+        identity: ReceiverWaiterIdentity,
+    ) -> bool {
+        if self.endpoint_waiters.get(idx).copied().flatten() == Some(identity) {
+            self.endpoint_waiters[idx] = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear EVERY endpoint receive-waiter slot whose complete identity matches `identity`
+    /// (task-teardown / timeout cleanup — identity-keyed, so a replacement waiter is never removed).
+    pub(crate) fn clear_endpoint_waiters_for_identity(&mut self, identity: ReceiverWaiterIdentity) {
+        for waiter in self.endpoint_waiters.iter_mut() {
+            if *waiter == Some(identity) {
+                *waiter = None;
+            }
+        }
+    }
+
+    /// Whether any endpoint receive-waiter slot still holds the complete `identity`.
+    pub(crate) fn any_endpoint_waiter_is(&self, identity: ReceiverWaiterIdentity) -> bool {
+        self.endpoint_waiters.iter().any(|w| *w == Some(identity))
+    }
 }
 
 impl KernelState {
@@ -228,22 +304,25 @@ impl KernelState {
     /// path (`process_ipc_timeout_deadlines`) performs the same clearance for
     /// timed-out tasks; this helper applies the same logic unconditionally.
     pub(crate) fn clear_ipc_waiters_for_tid(&mut self, tid: u64) {
-        let tid = crate::kernel::ipc::ThreadId(tid);
+        let tid_id = crate::kernel::ipc::ThreadId(tid);
+        // Stage 198E3B2B2: the endpoint RECEIVE-waiter is cleared by the exiting task's COMPLETE
+        // identity (tid + its captured ASID), so a sweep can never remove a replacement task's
+        // waiter (a reused numeric TID always carries a different ASID). Task exit runs synchronously
+        // under the global lock while this is still the task at `tid`, so its current ASID IS the one
+        // it published with. Sender/notification waiter structures keep their numeric-TID sweep — they
+        // are not endpoint receive-waiters and are out of this stage's scope.
+        let identity = ReceiverWaiterIdentity::new(tid_id, self.task_asid(tid).unwrap_or(Asid(0)));
         self.with_ipc_state_mut(|ipc| {
-            for waiter in ipc.endpoint_waiters.iter_mut() {
-                if *waiter == Some(tid) {
-                    *waiter = None;
-                }
-            }
+            ipc.clear_endpoint_waiters_for_identity(identity);
             for queue in ipc.endpoint_sender_waiters.iter_mut() {
                 for slot in queue.iter_mut() {
-                    if slot.as_ref().is_some_and(|w| w.tid == tid) {
+                    if slot.as_ref().is_some_and(|w| w.tid == tid_id) {
                         *slot = None;
                     }
                 }
             }
             for waiter in ipc.notification_waiters.iter_mut() {
-                if *waiter == Some(tid) {
+                if *waiter == Some(tid_id) {
                     *waiter = None;
                 }
             }
@@ -282,12 +361,7 @@ impl KernelState {
     #[cfg(test)]
     pub(crate) fn endpoint_waiter_count(&self, endpoint_idx: usize) -> usize {
         self.with_ipc_state(|ipc| {
-            if ipc
-                .endpoint_waiters
-                .get(endpoint_idx)
-                .and_then(|w| *w)
-                .is_some()
-            {
+            if ipc.endpoint_waiter_present(endpoint_idx) {
                 1
             } else {
                 0
@@ -489,10 +563,16 @@ impl KernelState {
         );
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         crate::yarm_log!("SCHED_BLOCK tid={}", blocked_tid);
+        // Stage 198E3B2B2: capture the receiver's ASID now (task rank 2, no lock held) so the ipc
+        // publish (rank 3) stores the COMPLETE generation-bearing waiter identity. An address-space-
+        // less task (kernel/test context) falls back to Asid(0) — such tasks are not the numeric-TID
+        // reuse surface (real user receivers always carry a distinct ASID).
+        let receiver_asid = self.task_asid(blocked_tid).unwrap_or(Asid(0));
         Ok(RecvBlockPhasePlan {
             blocked_tid: ThreadId(blocked_tid),
             endpoint_idx,
             recv_cap,
+            receiver_asid,
         })
     }
 
@@ -533,8 +613,11 @@ impl KernelState {
         &mut self,
         plan: RecvBlockPhasePlan,
     ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
-        let outcome =
-            self.publish_recv_waiter_live(plan.endpoint_idx, plan.blocked_tid, plan.recv_cap);
+        let outcome = self.publish_recv_waiter_live(
+            plan.endpoint_idx,
+            ReceiverWaiterIdentity::new(plan.blocked_tid, plan.receiver_asid),
+            plan.recv_cap,
+        );
         if matches!(
             outcome,
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
@@ -803,10 +886,10 @@ impl KernelState {
         &mut self,
         endpoint_idx: usize,
     ) -> Result<(), KernelError> {
-        let waiter_tid = self.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[endpoint_idx].take());
-        if let Some(waiter_tid) = waiter_tid {
-            crate::yarm_log!("SCHED_WAKE tid={}", waiter_tid.0);
-            self.wake_tid_to_runnable(waiter_tid)?;
+        let waiter = self.with_ipc_state_mut(|ipc| ipc.take_endpoint_waiter(endpoint_idx));
+        if let Some(waiter) = waiter {
+            crate::yarm_log!("SCHED_WAKE tid={}", waiter.tid.0);
+            self.wake_tid_to_runnable(waiter.tid)?;
         }
         Ok(())
     }
@@ -865,8 +948,10 @@ impl KernelState {
         let mut total = 0usize;
         let mut scan_announced = false;
         loop {
-            // `(tid, is_send)` — `is_send` classifies the SCHED_TIMEOUT_EXPIRED kind.
-            let mut expired: [Option<(ThreadId, bool)>; TIMEOUT_SCAN_CHUNK] =
+            // `(tid, is_send, asid)` — `is_send` classifies the SCHED_TIMEOUT_EXPIRED kind; `asid` is
+            // the timed-out task's captured ASID (Stage 198E3B2B2), so the endpoint receive-waiter is
+            // cleared by COMPLETE identity, never numeric TID alone.
+            let mut expired: [Option<(ThreadId, bool, Asid)>; TIMEOUT_SCAN_CHUNK] =
                 [None; TIMEOUT_SCAN_CHUNK];
             let mut n = 0usize;
             // Phase 1 (task rank 2): mark up to CHUNK expired tasks Runnable.
@@ -887,7 +972,7 @@ impl KernelState {
                         tcb.status = TaskStatus::Runnable;
                         tcb.ipc_timeout_deadline = None;
                         tcb.ipc_timeout_fired = true;
-                        expired[n] = Some((tcb.tid, is_send));
+                        expired[n] = Some((tcb.tid, is_send, tcb.asid.unwrap_or(Asid(0))));
                         n += 1;
                     }
                 }
@@ -916,11 +1001,9 @@ impl KernelState {
             self.with_ipc_state_mut(|ipc| {
                 for entry in expired.iter().take(n).flatten() {
                     let tid = entry.0;
-                    for waiter in ipc.endpoint_waiters.iter_mut() {
-                        if *waiter == Some(tid) {
-                            *waiter = None;
-                        }
-                    }
+                    let identity = ReceiverWaiterIdentity::new(tid, entry.2);
+                    // Endpoint receive-waiter: cleared by COMPLETE identity (never numeric TID alone).
+                    ipc.clear_endpoint_waiters_for_identity(identity);
                     for queue in ipc.endpoint_sender_waiters.iter_mut() {
                         for slot in queue.iter_mut() {
                             if slot.as_ref().is_some_and(|w| w.tid == tid) {
@@ -939,7 +1022,8 @@ impl KernelState {
                 // unless the clear loop has a bug.
                 for entry in expired.iter().take(n).flatten() {
                     let tid = entry.0;
-                    let remains = ipc.endpoint_waiters.iter().any(|w| *w == Some(tid))
+                    let identity = ReceiverWaiterIdentity::new(tid, entry.2);
+                    let remains = ipc.any_endpoint_waiter_is(identity)
                         || ipc
                             .endpoint_sender_waiters
                             .iter()
@@ -1056,7 +1140,7 @@ impl KernelState {
                     IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
                 );
             }
-            if ipc.endpoint_waiters[endpoint_idx].is_some() {
+            if ipc.endpoint_waiter_present(endpoint_idx) {
                 return IpcEndpointRecvResult::Ineligible(
                     IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
                 );
@@ -1180,7 +1264,7 @@ impl KernelState {
                     IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
                 );
             }
-            if ipc.endpoint_waiters[endpoint_idx].is_some() {
+            if ipc.endpoint_waiter_present(endpoint_idx) {
                 return IpcEndpointRecvResult::Ineligible(
                     IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
                 );
@@ -1287,7 +1371,7 @@ impl KernelState {
                     IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
                 );
             }
-            let receiver_waiter = ipc.endpoint_waiters[endpoint_idx];
+            let receiver_waiter = ipc.endpoint_waiter_identity(endpoint_idx);
             let has_sender_waiters = ipc.endpoint_sender_waiters[endpoint_idx]
                 .iter()
                 .any(Option::is_some);
@@ -1300,12 +1384,12 @@ impl KernelState {
                         IpcEndpointSplitRejectReason::SenderWaiterPresent,
                     );
                 }
-                (Some(receiver_tid), false) => {
+                (Some(receiver), false) => {
                     // Receiver waiter present, no sender waiters.
                     // TID comes from a locked ipc_state_lock read — no unlocked access needed.
                     // Caller must check is_task_recv_v2_blocked (task_state_lock rank 3) before
                     // calling ipc_try_send_to_plain_receiver_endpoint_only (ipc_state_lock rank 4).
-                    return IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid);
+                    return IpcEndpointSendResult::ReceiverWaiterFound(receiver);
                 }
                 (None, true) => {
                     return IpcEndpointSendResult::Ineligible(
@@ -1584,7 +1668,7 @@ impl KernelState {
     pub(crate) fn ipc_try_send_to_plain_receiver_endpoint_only(
         &mut self,
         endpoint_idx: usize,
-        expected_receiver_tid: ThreadId,
+        expected_receiver: ReceiverWaiterIdentity,
         msg: Message,
     ) -> IpcEndpointSendResult {
         self.with_ipc_state_mut(|ipc| {
@@ -1593,8 +1677,10 @@ impl KernelState {
                     IpcEndpointSplitRejectReason::EndpointIndexOutOfRange,
                 );
             }
-            // Re-verify receiver slot: timeout may have cleared it between pre-check and lock.
-            if ipc.endpoint_waiters[endpoint_idx] != Some(expected_receiver_tid) {
+            // Re-verify receiver slot by COMPLETE identity (Stage 198E3B2B2): a timeout may have
+            // cleared it, or a replacement task may have reused the numeric TID with a different ASID,
+            // between the pre-check and this lock — numeric TID alone must not authorize the clear.
+            if ipc.endpoint_waiter_identity(endpoint_idx) != Some(expected_receiver) {
                 return IpcEndpointSendResult::Ineligible(
                     IpcEndpointSplitRejectReason::ReceiverWaiterPresent,
                 );
@@ -1634,13 +1720,13 @@ impl KernelState {
                     IpcEndpointSplitRejectReason::EndpointQueueFull,
                 );
             }
-            // Clear receiver from waiters; wake is applied outside lock.
-            ipc.endpoint_waiters[endpoint_idx] = None;
+            // Clear receiver from waiters by the EXACT identity re-verified above; wake outside lock.
+            ipc.clear_endpoint_waiter_if_identity(endpoint_idx, expected_receiver);
             crate::yarm_log!(
                 "IPC_SEND_SPLIT_ENQUEUED_WAKE_RECEIVER receiver_tid={}",
-                expected_receiver_tid.0
+                expected_receiver.tid.0
             );
-            IpcEndpointSendResult::EnqueuedWakeReceiver(expected_receiver_tid)
+            IpcEndpointSendResult::EnqueuedWakeReceiver(expected_receiver.tid)
         })
     }
 
@@ -2348,7 +2434,7 @@ impl KernelState {
         // Stage 4K/4L Phase 1–5 discipline.  The lock is released before Phase 2–5
         // so it is never held across user-memory copy, cap ops, or scheduler mutation.
         let opt_waiter_tid: Option<ThreadId> =
-            self.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]);
+            self.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx));
         if let Some(waiter_tid) = opt_waiter_tid {
             crate::yarm_log!(
                 "IPC_REPLY_DELIVER_TO_WAITER tid={} endpoint={} len={}",
@@ -2420,9 +2506,8 @@ impl KernelState {
                 .send(msg)
                 .map_err(|_| KernelError::EndpointQueueFull)?;
             Ok::<_, KernelError>(
-                ipc.endpoint_waiters[endpoint_idx]
-                    .take()
-                    .map(super::SchedulerWakePlan::Wake)
+                ipc.take_endpoint_waiter(endpoint_idx)
+                    .map(|w| super::SchedulerWakePlan::Wake(w.tid))
                     .unwrap_or(super::SchedulerWakePlan::None),
             )
         })?;
@@ -2826,7 +2911,7 @@ impl KernelState {
             // Phase 1: snapshot waiter TID under ipc_state_lock.  Lock released before
             // Phase 2 (task_state_lock, rank 3) to preserve lock-rank ordering.
             let opt_waiter_tid: Option<ThreadId> =
-                self.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]);
+                self.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx));
             if let Some(waiter_tid) = opt_waiter_tid {
                 crate::yarm_log!(
                     "IPC_SEND_SYNC_WAITER endpoint={} waiter_tid={}",
@@ -2914,7 +2999,7 @@ impl KernelState {
             return Err(KernelError::WouldBlock);
         }
 
-        if let Some(waiter_tid) = self.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]) {
+        if let Some(waiter_tid) = self.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)) {
             crate::yarm_log!(
                 "IPC_RECV_DELIVER_TO_WAITER tid={} endpoint={} len={} reply_cap={}",
                 waiter_tid.0,
@@ -3007,11 +3092,14 @@ impl KernelState {
         endpoint_idx: usize,
         expected_receiver_tid: ThreadId,
     ) {
+        // Stage 198E3B2B2: clear by the receiver's COMPLETE identity (tid + its current ASID) — a
+        // stale slot bearing a different ASID (numeric TID reuse) is left untouched.
+        let expected = ReceiverWaiterIdentity::new(
+            expected_receiver_tid,
+            self.task_asid(expected_receiver_tid.0).unwrap_or(Asid(0)),
+        );
         self.with_ipc_state_mut(|ipc| {
-            if ipc.endpoint_waiters.get(endpoint_idx).copied().flatten()
-                == Some(expected_receiver_tid)
-            {
-                ipc.endpoint_waiters[endpoint_idx] = None;
+            if ipc.clear_endpoint_waiter_if_identity(endpoint_idx, expected) {
                 crate::yarm_log!(
                     "IPC_SEND_SPLIT_RECV_V2_CLEAR_WAITER receiver_tid={}",
                     expected_receiver_tid.0
@@ -3043,11 +3131,14 @@ impl KernelState {
         msg: Message,
         recv_v2_completed: bool,
     ) -> Result<super::SchedulerWakePlan, KernelError> {
+        // Stage 198E3B2B2: re-verify + clear by the receiver's COMPLETE identity (tid + current ASID).
+        let expected = ReceiverWaiterIdentity::new(
+            expected_receiver_tid,
+            self.task_asid(expected_receiver_tid.0).unwrap_or(Asid(0)),
+        );
         self.with_ipc_state_mut(|ipc| {
-            // Re-verify waiter slot: defence-in-depth under the global kernel lock.
-            if ipc.endpoint_waiters.get(endpoint_idx).copied().flatten()
-                != Some(expected_receiver_tid)
-            {
+            // Re-verify waiter slot by full identity: defence-in-depth under the global kernel lock.
+            if ipc.endpoint_waiter_identity(endpoint_idx) != Some(expected) {
                 return Err(KernelError::WrongObject);
             }
             if !recv_v2_completed {
@@ -3070,7 +3161,7 @@ impl KernelState {
                     .send(msg)
                     .map_err(|_| KernelError::EndpointQueueFull)?;
             }
-            ipc.endpoint_waiters[endpoint_idx] = None;
+            ipc.clear_endpoint_waiter_if_identity(endpoint_idx, expected);
             ipc.telemetry.rendezvous_handoffs = ipc.telemetry.rendezvous_handoffs.saturating_add(1);
             crate::yarm_log!(
                 "IPC_SEND_SYNC_CLEAR_WAITER receiver_tid={}",
@@ -3180,7 +3271,7 @@ impl KernelState {
     pub(crate) fn try_publish_recv_waiter_audit_only(
         &mut self,
         endpoint_idx: usize,
-        receiver_tid: ThreadId,
+        receiver: ReceiverWaiterIdentity,
         recv_cap: CapId,
     ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
         use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
@@ -3195,14 +3286,16 @@ impl KernelState {
             if endpoint.queued() > 0 {
                 return PublishWaiterOutcome::QueueNonEmpty;
             }
-            if ipc.endpoint_waiters[endpoint_idx].is_some() {
+            if ipc.endpoint_waiter_present(endpoint_idx) {
                 return PublishWaiterOutcome::ReceiverAlreadyWaiting;
             }
-            ipc.endpoint_waiters[endpoint_idx] = Some(receiver_tid);
+            // Stage 198E3B2B2: store the COMPLETE generation-bearing identity.
+            ipc.set_endpoint_waiter(endpoint_idx, receiver);
             crate::yarm_log!(
-                "D2_RECV_WAITER_PUBLISH_AUDIT endpoint={} tid={} recv_cap={}",
+                "D2_RECV_WAITER_PUBLISH_AUDIT endpoint={} tid={} asid={} recv_cap={}",
                 endpoint_idx,
-                receiver_tid.0,
+                receiver.tid.0,
+                receiver.asid.0,
                 recv_cap.0
             );
             PublishWaiterOutcome::Published
@@ -3234,10 +3327,11 @@ impl KernelState {
     pub(crate) fn publish_recv_waiter_live(
         &mut self,
         endpoint_idx: usize,
-        receiver_tid: ThreadId,
+        receiver: ReceiverWaiterIdentity,
         recv_cap: CapId,
     ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
         use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
+        let receiver_tid = receiver.tid;
         let outcome = self.with_ipc_state_mut(|ipc| {
             if endpoint_idx >= ipc.endpoints.len() {
                 return PublishWaiterOutcome::InvalidEndpoint;
@@ -3249,20 +3343,21 @@ impl KernelState {
             if endpoint.queued() > 0 {
                 return PublishWaiterOutcome::QueueNonEmpty;
             }
-            if let Some(displaced) = ipc.endpoint_waiters[endpoint_idx] {
-                // Canonical overwrite semantics preserved (additive marker).
+            // Stage 198E3B2B2: store the COMPLETE generation-bearing identity (canonical overwrite
+            // semantics preserved — a displaced waiter is logged, last receiver wins).
+            if let Some(displaced) = ipc.set_endpoint_waiter(endpoint_idx, receiver) {
                 crate::yarm_log!(
                     "D2_RECV_WAITER_DISPLACED endpoint={} old_tid={} new_tid={}",
                     endpoint_idx,
-                    displaced.0,
+                    displaced.tid.0,
                     receiver_tid.0
                 );
             }
-            ipc.endpoint_waiters[endpoint_idx] = Some(receiver_tid);
             crate::yarm_log!(
-                "D2_RECV_WAITER_PUBLISH endpoint={} tid={} recv_cap={}",
+                "D2_RECV_WAITER_PUBLISH endpoint={} tid={} asid={} recv_cap={}",
                 endpoint_idx,
                 receiver_tid.0,
+                receiver.asid.0,
                 recv_cap.0
             );
             // Stage 193B: if this is the send-plain oracle loopback E1, push a
@@ -3389,7 +3484,7 @@ impl KernelState {
                 .get(endpoint_idx)
                 .and_then(Option::as_ref)
                 .map(|e| e.mode());
-            let waiter = ipc.endpoint_waiters[endpoint_idx];
+            let waiter = ipc.endpoint_waiter_tid(endpoint_idx);
             (mode, waiter)
         });
         let endpoint_mode = endpoint_mode.ok_or(KernelError::WrongObject)?;
@@ -3443,7 +3538,7 @@ impl KernelState {
         }
         let endpoint_idx = self.resolve_endpoint_index(send_capability.object)?;
         let waiter_tid = self
-            .with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx])
+            .with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx))
             .ok_or(KernelError::WouldBlock)?;
         let transfer_handle = self
             .stash_transfer_envelope(

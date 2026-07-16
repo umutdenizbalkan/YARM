@@ -2816,7 +2816,12 @@ fn run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
             receiver_waiter_idx,
             Message::new(0, b"waiter").expect("msg"),
         ),
-        IpcEndpointSendResult::ReceiverWaiterFound(ThreadId(1))
+        IpcEndpointSendResult::ReceiverWaiterFound(
+            crate::kernel::boot::ReceiverWaiterIdentity::new(
+                ThreadId(1),
+                crate::kernel::vm::Asid(0)
+            )
+        )
     );
 
     // Co-presence guard: inject sender waiter + keep receiver waiter → Ineligible(SenderWaiterPresent).
@@ -3333,7 +3338,11 @@ fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_pl
 
     // Directly inject receiver waiter state: task 1 blocked on recv.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+        ipc.endpoint_waiters[endpoint_idx] =
+            Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                ThreadId(1),
+                crate::kernel::vm::Asid(0),
+            ));
     });
     state.with_tcbs_mut(|tcbs| {
         if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 1) {
@@ -3342,7 +3351,11 @@ fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_pl
     });
 
     let msg = Message::new(7, b"hello").expect("msg");
-    let result = state.ipc_try_send_to_plain_receiver_endpoint_only(endpoint_idx, ThreadId(1), msg);
+    let result = state.ipc_try_send_to_plain_receiver_endpoint_only(
+        endpoint_idx,
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), crate::kernel::vm::Asid(0)),
+        msg,
+    );
 
     let recv_tid = match result {
         IpcEndpointSendResult::EnqueuedWakeReceiver(tid) => tid,
@@ -3358,7 +3371,7 @@ fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_pl
     );
     // Receiver waiter slot must be cleared under lock.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "receiver waiter slot must be cleared after Stage 4F enqueue"
     );
     // Receiver must still be Blocked (wake not yet applied).
@@ -3418,7 +3431,7 @@ fn run_ipc_send_syscall_split_delivers_to_waiting_plain_receiver() {
         )))
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "receiver must be registered as endpoint waiter"
     );
@@ -3455,7 +3468,7 @@ fn run_ipc_send_syscall_split_delivers_to_waiting_plain_receiver() {
     );
     // Waiter slot must have been cleared.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4F"
     );
     // Message must be readable by the receiver.
@@ -3505,7 +3518,7 @@ fn run_ipc_send_syscall_nonzero_timeout_to_waiting_receiver_uses_split_path() {
     assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
     assert_eq!(state.current_tid(), Some(0));
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "receiver must be registered as endpoint waiter"
     );
@@ -3533,7 +3546,7 @@ fn run_ipc_send_syscall_nonzero_timeout_to_waiting_receiver_uses_split_path() {
         "receiver must be Runnable after Stage 4H wake"
     );
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4H"
     );
     assert_eq!(
@@ -14367,7 +14380,7 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
         "task 1 must be blocked on recv"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "task 1 must be registered as endpoint waiter"
     );
@@ -14407,7 +14420,7 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     );
     // Waiter slot must be cleared.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4K"
     );
     // Message must NOT be in the endpoint queue (delivered directly to user buffer).
@@ -14522,7 +14535,7 @@ fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiv
         "task 1 must be blocked on recv"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "task 1 must be registered as endpoint waiter"
     );
@@ -14559,7 +14572,7 @@ fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiv
     );
     // Waiter slot must be cleared (Phase 4).
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4O"
     );
     // Message must NOT be in the endpoint queue (delivered directly to user buffers).
@@ -14695,7 +14708,7 @@ fn run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
         "task 1 must be blocked on recv"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "task 1 must be registered as endpoint waiter"
     );
@@ -14733,7 +14746,7 @@ fn run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     );
     // Waiter slot must be cleared.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4L"
     );
     // Message must NOT be in the endpoint queue (delivered directly to recv-v2 buffer).
@@ -14931,7 +14944,7 @@ fn run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
     // Waiter slot must be cleared (Phase 4: ipc_clear_plain_receiver_waiter_only
     // under ipc_state_lock; Phase 5: wake_tid_to_runnable outside locks).
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx).is_none()),
         "reply endpoint waiter slot must be cleared after delivery"
     );
     // Telemetry must record the split delivery.
@@ -15121,7 +15134,7 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
         "task 1 must be blocked recv-v2 on reply endpoint"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx)),
         Some(ThreadId(1)),
         "reply endpoint waiter slot must hold task 1"
     );
@@ -15160,7 +15173,7 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
     );
     // Phase 4: reply endpoint waiter slot must be cleared.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx).is_none()),
         "Phase 4 must clear reply endpoint waiter slot"
     );
     // Direct delivery — reply endpoint queue must be empty.
@@ -15398,7 +15411,7 @@ fn run_ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake() {
     );
     // Phase 1 precondition: waiter slot is populated.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_some()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx).is_some()),
         "endpoint_waiters slot must be Some before ipc_reply"
     );
 
@@ -15413,7 +15426,7 @@ fn run_ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake() {
 
     // Phase 4 postcondition: ipc_clear_plain_receiver_waiter_only cleared the slot.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx).is_none()),
         "Phase 4 must clear endpoint_waiters slot after recv-v2 delivery"
     );
     // Phase 5 postcondition: wake_tid_to_runnable made task 1 Runnable.
@@ -15471,7 +15484,7 @@ fn sync_endpoint_phase4_helper_delivers_legacy_message_under_ipc_state_lock() {
         .handle_trap(Trap::Syscall, Some(&mut recv_tf))
         .expect("recv trap");
     // Receiver is now blocked in the endpoint waiter slot.
-    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid));
     assert_eq!(
         waiter_tid,
         Some(ThreadId(80)),
@@ -15484,7 +15497,7 @@ fn sync_endpoint_phase4_helper_delivers_legacy_message_under_ipc_state_lock() {
         .ipc_try_send_sync_endpoint_only(eid, ThreadId(80), msg, false)
         .expect("phase4 ok");
     // Waiter slot must have been cleared.
-    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid));
     assert_eq!(after, None, "waiter slot must be cleared after Phase 4");
     // Message must be in the endpoint queue.
     let queued = state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued());
@@ -15520,7 +15533,7 @@ fn sync_endpoint_phase4_helper_skips_enqueue_when_recv_v2_completed() {
     state
         .handle_trap(Trap::Syscall, Some(&mut recv_tf))
         .expect("recv trap");
-    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid));
     assert_eq!(waiter_tid, Some(ThreadId(81)));
 
     let msg = Message::new(1, b"v2done").expect("msg");
@@ -15528,7 +15541,7 @@ fn sync_endpoint_phase4_helper_skips_enqueue_when_recv_v2_completed() {
         .ipc_try_send_sync_endpoint_only(eid, ThreadId(81), msg, true)
         .expect("phase4 recv_v2 ok");
     // Waiter slot cleared.
-    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid));
     assert_eq!(after, None, "waiter slot must be cleared");
     // Message must NOT be in endpoint queue (recv-v2 path delivers directly to TrapFrame).
     let queued = state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued());
@@ -16013,7 +16026,7 @@ fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
         .handle_trap(Trap::Syscall, Some(&mut tf))
         .expect("recv trap");
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid)),
         Some(ThreadId(1)),
         "receiver waiter must be registered"
     );
@@ -16029,9 +16042,8 @@ fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
     let wake_plan = state.with_ipc_state_mut(|ipc| {
         let ep = ipc.endpoints[eid].as_mut().expect("endpoint must exist");
         kernel_mut(ep).send(reply_msg).expect("enqueue reply ok");
-        ipc.endpoint_waiters[eid]
-            .take()
-            .map(super::SchedulerWakePlan::Wake)
+        ipc.take_endpoint_waiter(eid)
+            .map(|w| super::SchedulerWakePlan::Wake(w.tid))
             .unwrap_or(super::SchedulerWakePlan::None)
     });
     state
@@ -16040,7 +16052,7 @@ fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
 
     // Receiver waiter slot must be cleared inside the closure (atomic with enqueue).
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid)),
         None,
         "waiter slot must be cleared atomically with enqueue"
     );
@@ -16800,7 +16812,7 @@ fn kernel_fault_report_completes_blocked_supervisor_recv_v2_without_stranding_qu
         .expect("supervisor recv blocks");
     assert_eq!(state.current_tid(), Some(0));
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "supervisor must be the fault endpoint waiter"
     );
@@ -16813,7 +16825,7 @@ fn kernel_fault_report_completes_blocked_supervisor_recv_v2_without_stranding_qu
 
     let (waiter, queued) = state.with_ipc_state(|ipc| {
         (
-            ipc.endpoint_waiters[endpoint_idx],
+            ipc.endpoint_waiter_tid(endpoint_idx),
             ipc.endpoints[endpoint_idx]
                 .as_ref()
                 .map(|ep| super::kernel_ref(ep).queued())
@@ -17448,8 +17460,12 @@ fn exit_task_clears_endpoint_receiver_waiter_slot() {
 
     // Directly inject a waiter into the global endpoint_waiters slot and set
     // the task's WaitReason to EndpointReceive (mirrors what ipc_recv does).
+    let asid200 = state.task_asid(200).unwrap_or(crate::kernel::vm::Asid(0));
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(200));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(200),
+            asid200,
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -17522,7 +17538,10 @@ fn mark_task_dead_clears_endpoint_waiter_slot() {
     let (ep_idx, _ep_recv_cap, _ep_send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(202));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(202),
+            crate::kernel::vm::Asid(0),
+        ));
     });
 
     assert_eq!(state.endpoint_waiter_count(ep_idx), 1, "before");
@@ -18036,7 +18055,10 @@ fn recv_timeout_process_clears_endpoint_waiter_and_deadline() {
 
     // Inject receiver waiter and deadline directly (mirrors ipc_recv_with_deadline internals).
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(280));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(280),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18138,7 +18160,10 @@ fn exit_before_ipc_recv_timeout_clears_waiter_and_deadline() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(282));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(282),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18259,7 +18284,10 @@ fn repeated_recv_timeout_cycles_no_stale_receiver_waiter() {
         let deadline = 10 + i;
 
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(tid));
+            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                crate::kernel::ipc::ThreadId(tid),
+                crate::kernel::vm::Asid(0),
+            ));
         });
         state
             .with_tcbs_mut(|tcbs| {
@@ -18375,7 +18403,10 @@ fn wake_endpoint_waiter_dead_task_does_not_resurrect_task() {
 
     // Simulate a stale entry: Dead task's TID still in waiter slot.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(292));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(292),
+            crate::kernel::vm::Asid(0),
+        ));
     });
 
     // wake_waiter_for_endpoint should either return WouldBlock or Ok without
@@ -18401,7 +18432,10 @@ fn wake_endpoint_waiter_exited_task_does_not_resurrect_task() {
 
     // exit_task cleared the waiter slot; re-inject to simulate stale pointer.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(293));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(293),
+            crate::kernel::vm::Asid(0),
+        ));
     });
 
     let _ = state.wake_waiter_for_endpoint(ep_idx);
@@ -18423,7 +18457,10 @@ fn exit_then_mark_dead_waiter_cleanup_is_idempotent() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(300));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(300),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18463,7 +18500,10 @@ fn clear_ipc_waiters_is_idempotent_for_all_waiter_types() {
 
     // Inject in all three waiter types.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(301));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(301),
+            crate::kernel::vm::Asid(0),
+        ));
         ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
             tid: crate::kernel::ipc::ThreadId(301),
             msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
@@ -18492,7 +18532,10 @@ fn timeout_fires_then_exit_no_double_disruption() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(302));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(302),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18640,7 +18683,10 @@ fn repeated_mixed_waiter_block_exit_no_stale_state() {
     // TID 315: endpoint receiver waiter
     state.register_task(315).expect("task 315");
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(315));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(315),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18703,7 +18749,10 @@ fn ipc_deadline_cleared_after_delivery_before_timeout() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(318));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(318),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18757,7 +18806,10 @@ fn repeated_recv_block_timeout_delivery_no_stale_timeout() {
         let deadline = 100 + i;
 
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(tid));
+            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                crate::kernel::ipc::ThreadId(tid),
+                crate::kernel::vm::Asid(0),
+            ));
         });
         state
             .with_tcbs_mut(|tcbs| {
@@ -20504,7 +20556,11 @@ fn stage24_cnode_teardown_with_endpoint_cap_does_not_leave_receiver_waiter() {
 
             // Inject task 1 as the endpoint receiver waiter.
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+                ipc.endpoint_waiters[endpoint_idx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(1),
+                        crate::kernel::vm::Asid(0),
+                    ));
             });
             assert_eq!(
                 state.endpoint_waiter_count(endpoint_idx),
@@ -22058,7 +22114,10 @@ fn stage25d_task_exit_clears_endpoint_receiver_waiter() {
             state.register_task(1).expect("task1");
             let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[ep] = Some(ThreadId(1));
+                ipc.endpoint_waiters[ep] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
             });
             assert_eq!(
                 state.endpoint_waiter_count(ep),
@@ -22128,7 +22187,10 @@ fn stage25d_repeated_waiter_cleanup_idempotent() {
             state.register_task(1).expect("task1");
             let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[ep] = Some(ThreadId(1));
+                ipc.endpoint_waiters[ep] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
             });
 
             state.clear_ipc_waiters_for_tid(1);
@@ -49478,7 +49540,11 @@ mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
         });
         // Register task 1 as the endpoint waiter (Phase C clears this slot).
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+            ipc.endpoint_waiters[endpoint_idx] =
+                Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
         });
 
         // Stash the transfer envelope bound to (recv_endpoint, task 1).
@@ -50173,7 +50239,11 @@ mod stage188d_reply_cap_rank_inversion_seam {
             });
         });
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+            ipc.endpoint_waiters[endpoint_idx] =
+                Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
         });
 
         let recv_endpoint = state
@@ -61363,7 +61433,7 @@ mod stage193a_ipc_send_boundary_plain {
                 "the drain must wake the receiver"
             );
             assert!(
-                k.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+                k.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
                 "the endpoint waiter slot must be cleared by the drain"
             );
             // Byte-identical payload delivered to the receiver's user buffer.
@@ -65900,7 +65970,11 @@ mod stage198e3_shared_region_live {
             });
         });
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+            ipc.endpoint_waiters[endpoint_idx] =
+                Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
         });
         let endpoint = state
             .resolve_capability_for_task(1, recv_cap_task1)
@@ -66842,8 +66916,11 @@ mod stage198e3b2b_drain_switch {
             .resolve_capability_for_task(2, recv_cap_t2)
             .expect("resolve")
             .object;
+        // Stage 198E3B2B2: park the waiter as a COMPLETE identity (tid + task 2's bound ASID), so it
+        // matches the identity the production finalizer resolves from the snapshot.
         s.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[eidx] = waiter_slot.map(ThreadId);
+            ipc.endpoint_waiters[eidx] = waiter_slot
+                .map(|t| crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(t), asid));
         });
         let region = TransferSharedRegion {
             offset: 0,
@@ -66887,7 +66964,7 @@ mod stage198e3b2b_drain_switch {
     }
     fn waiter(d: &Drn) -> Option<ThreadId> {
         d.shared
-            .with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiters[d.eidx]))
+            .with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(d.eidx)))
     }
     fn ret_reg(d: &Drn) -> usize {
         d.shared
@@ -66945,8 +67022,15 @@ mod stage198e3b2b_drain_switch {
     fn replacement_waiter_rolls_back_zero_wake() {
         let d = build_blocked(1, Some(2));
         // A different task 3 replaced the waiter slot after the producer ran.
-        d.shared
-            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = Some(ThreadId(3))));
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(3),
+                        crate::kernel::vm::Asid(0),
+                    ))
+            })
+        });
         assert!(drain(&d).is_err(), "stale finalization fails the drain");
         assert!(
             matches!(status(&d), Some(TaskStatus::Blocked(_))),
@@ -67210,7 +67294,11 @@ mod stage198e3b2b_drain_switch {
             .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_generations[d.eidx] += 1));
         assert!(
             d.shared
-                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
                 .is_none(),
             "a stale endpoint generation cannot be claimed"
         );
@@ -67227,12 +67315,20 @@ mod stage198e3b2b_drain_switch {
         d.shared.with(|k| {
             k.with_ipc_state_mut(|ipc| {
                 ipc.endpoint_generations[d.eidx] = egen + 1;
-                ipc.endpoint_waiters[d.eidx] = Some(ThreadId(2)); // a fresh incarnation's waiter
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(2),
+                        crate::kernel::vm::Asid(0),
+                    )); // a fresh incarnation's waiter
             })
         });
         assert!(
             d.shared
-                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
                 .is_none(),
             "generation is part of the claim authority — a recreated endpoint is not our endpoint"
         );
@@ -67244,11 +67340,22 @@ mod stage198e3b2b_drain_switch {
     fn waiter_replaced_by_other_tid_rejects_claim() {
         let d = build_blocked(1, Some(2));
         let egen = endpoint_gen(&d);
-        d.shared
-            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = Some(ThreadId(9))));
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(9),
+                        crate::kernel::vm::Asid(0),
+                    ))
+            })
+        });
         assert!(
             d.shared
-                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
                 .is_none(),
             "a different waiter TID cannot be claimed"
         );
@@ -67260,39 +67367,37 @@ mod stage198e3b2b_drain_switch {
         reset_globals();
     }
 
-    // (4) Waiter is the SAME numeric TID but a different receiver ASID/generation. Prevalidation with
-    // the captured ASID rejects it BEFORE any claim; and even a forced numeric claim commits as
-    // Replaced (numeric TID alone is never the authority — the ASID recheck is).
+    // (4) Waiter slot holds a REPLACEMENT identity: the SAME numeric TID but a different ASID. A stale
+    // finalizer bearing the ORIGINAL identity cannot claim it (numeric TID alone is never the
+    // authority — the full {tid, ASID} identity is), so the replacement waiter is never cleared.
     #[test]
     fn same_numeric_tid_different_asid_is_not_authority() {
         let d = build_blocked(1, Some(2));
         let orig_asid = d.asid;
-        d.shared.with(|k| {
+        // A replacement incarnation (same numeric TID, different ASID) now owns the waiter slot.
+        let replacement = d.shared.with(|k| {
             let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
-            k.bind_task_asid(2, new_asid).expect("rebind");
+            crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), new_asid)
         });
-        assert!(
-            !d.shared.sr_prevalidate_blocked_receiver_split(2, orig_asid),
-            "same numeric TID with a different ASID is not our receiver"
-        );
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.set_endpoint_waiter(d.eidx, replacement)));
         let egen = endpoint_gen(&d);
-        let claim = d
-            .shared
-            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
-            .expect("numeric+generation claim succeeds — proving TID is not enough on its own");
-        assert_eq!(
-            d.shared.sr_commit_blocked_receiver_split(2, orig_asid),
-            ReceiverCommit::Replaced,
-            "the ASID recheck at commit rejects the replaced incarnation"
-        );
+        // The stale finalizer's identity (original ASID) does NOT match the replacement slot → no claim.
         assert!(
-            d.shared.sr_restore_endpoint_waiter_split(&claim),
-            "the live replacement task's exact waiter is restored"
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), orig_asid)
+                )
+                .is_none(),
+            "a same-numeric-TID / different-ASID replacement cannot be claimed by the original identity"
         );
         assert_eq!(
-            waiter(&d),
-            Some(ThreadId(2)),
-            "no live task left without a waiter"
+            d.shared
+                .with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(d.eidx))),
+            Some(replacement),
+            "the replacement waiter is never cleared"
         );
         reset_globals();
     }
@@ -67306,7 +67411,11 @@ mod stage198e3b2b_drain_switch {
             .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = None));
         assert!(
             d.shared
-                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
                 .is_none(),
             "a missing waiter cannot be claimed"
         );
@@ -67322,7 +67431,11 @@ mod stage198e3b2b_drain_switch {
         let before = regs(&d);
         assert!(
             d.shared
-                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(7))
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(7), d.asid)
+                )
                 .is_none(),
             "wrong receiver → claim fails"
         );
@@ -67336,7 +67449,11 @@ mod stage198e3b2b_drain_switch {
         let d = build_blocked(1, Some(2));
         assert!(
             d.shared
-                .sr_claim_endpoint_waiter_split(d.eidx, endpoint_gen(&d) + 5, ThreadId(2))
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    endpoint_gen(&d) + 5,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
                 .is_none(),
             "stale generation → no claim"
         );
@@ -67355,12 +67472,20 @@ mod stage198e3b2b_drain_switch {
         let egen = endpoint_gen(&d);
         let _claim = d
             .shared
-            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+            .sr_claim_endpoint_waiter_split(
+                d.eidx,
+                egen,
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+            )
             .expect("claim");
         assert_eq!(waiter(&d), None, "the claimed waiter is removed");
         assert!(
             d.shared
-                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
                 .is_none(),
             "the waiter cannot be claimed twice"
         );
@@ -67375,7 +67500,11 @@ mod stage198e3b2b_drain_switch {
         let egen = endpoint_gen(&d);
         let _claim = d
             .shared
-            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+            .sr_claim_endpoint_waiter_split(
+                d.eidx,
+                egen,
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+            )
             .expect("claim");
         d.shared.with(|k| {
             k.with_tcb_mut(2, |tcb| tcb.status = TaskStatus::Exited(0));
@@ -67403,16 +67532,23 @@ mod stage198e3b2b_drain_switch {
         reset_globals();
     }
 
-    // (10) Receiver ASID changes after the claim → Replaced: registers untouched, the exact claimed
-    // waiter is restored for the live task.
+    // (10) Receiver ASID changes AFTER the identity claim → Replaced: registers untouched, and the
+    // claimed waiter is NOT restored (Stage 198E3B2B2 removed the numeric-TID Replaced→restore — the
+    // claimed waiter belonged to the vanished original incarnation, so restoring it would target a
+    // task that no longer exists; the generation-bearing restore itself refuses because the task is
+    // no longer blocked with the claimed identity).
     #[test]
-    fn receiver_asid_change_after_claim_restores_waiter() {
+    fn receiver_asid_change_after_claim_no_restore() {
         let d = build_blocked(1, Some(2));
         let egen = endpoint_gen(&d);
         let orig_asid = d.asid;
         let claim = d
             .shared
-            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+            .sr_claim_endpoint_waiter_split(
+                d.eidx,
+                egen,
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+            )
             .expect("claim");
         assert_eq!(waiter(&d), None, "claimed");
         d.shared.with(|k| {
@@ -67425,13 +67561,13 @@ mod stage198e3b2b_drain_switch {
         );
         assert_eq!(ret_reg(&d), 0xDEAD, "no register cleared on Replaced");
         assert!(
-            d.shared.sr_restore_endpoint_waiter_split(&claim),
-            "restore the live task's EXACT waiter"
+            !d.shared.sr_restore_endpoint_waiter_split(&claim),
+            "restore refuses: the task is no longer blocked with the claimed identity"
         );
         assert_eq!(
             waiter(&d),
-            Some(ThreadId(2)),
-            "live blocked task keeps its waiter"
+            None,
+            "no waiter fabricated for the vanished incarnation"
         );
         reset_globals();
     }
@@ -67444,14 +67580,25 @@ mod stage198e3b2b_drain_switch {
         let egen = endpoint_gen(&d);
         let claim = d
             .shared
-            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+            .sr_claim_endpoint_waiter_split(
+                d.eidx,
+                egen,
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+            )
             .expect("claim");
         // Case A: slot free → restore re-installs the claimed waiter (no live task stranded).
         assert!(d.shared.sr_restore_endpoint_waiter_split(&claim));
         assert_eq!(waiter(&d), Some(ThreadId(2)));
         // Case B: a NEWER waiter already holds the slot → restore refuses (never clobbers).
-        d.shared
-            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = Some(ThreadId(5))));
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(5),
+                        crate::kernel::vm::Asid(0),
+                    ))
+            })
+        });
         assert!(!d.shared.sr_restore_endpoint_waiter_split(&claim));
         assert_eq!(waiter(&d), Some(ThreadId(5)), "newer waiter not clobbered");
         // Case C: endpoint generation advanced → restore refuses (stale token can't target a new
@@ -67474,8 +67621,15 @@ mod stage198e3b2b_drain_switch {
     #[test]
     fn failed_finalization_preserves_registers_end_to_end() {
         let d = build_blocked(1, Some(2));
-        d.shared
-            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = Some(ThreadId(3))));
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(3),
+                        crate::kernel::vm::Asid(0),
+                    ))
+            })
+        });
         assert!(drain(&d).is_err(), "stale waiter fails the drain");
         assert_eq!(
             ret_reg(&d),
@@ -67527,7 +67681,11 @@ mod stage198e3b2b_drain_switch {
         let egen = endpoint_gen(&d);
         assert!(
             d.shared
-                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
                 .is_none(),
             "the emptied waiter slot cannot be re-claimed"
         );
@@ -67576,6 +67734,226 @@ mod stage198e3b2b_drain_switch {
             "off the oracle knob the producer must stay dormant"
         );
         reset_globals();
+    }
+}
+
+// Stage 198E3B2B2 — GENERATION-BEARING ENDPOINT WAITER IDENTITY (hosted proof).
+//
+// The endpoint receive-waiter slot stores a COMPLETE `ReceiverWaiterIdentity { tid, asid }`, and all
+// waiter authority (publish / claim / clear / cleanup / restore) compares the full identity — numeric
+// TID reuse can never let a stale actor claim, clear, or restore a replacement task's waiter. These
+// focused cases cover the required matrix: publication stores tid+asid; same tid+asid claims; same tid
+// / different asid cannot be claimed; generation mismatch cannot be claimed; a replacement publishes
+// its own waiter without collision; a stale finalizer cannot remove or restore a replacement's waiter;
+// an exited task's waiter is removed and not restored; restoration is exact-identity-only; timeout /
+// exit cleanup remove only the matching identity; and no numeric-TID-only comparison remains in
+// production. (Direct/ordinary/reply single-wake + D2 no-lost-wakeup are covered by the existing IPC
+// suites, which remain green.)
+mod stage198e3b2b2_waiter_identity {
+    use super::*;
+    use crate::kernel::boot::ReceiverWaiterIdentity;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    fn ident(tid: u64, asid: u16) -> ReceiverWaiterIdentity {
+        ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+
+    // (1) Publication stores the full identity (tid + asid), not a bare TID.
+    #[test]
+    fn publication_stores_full_identity() {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let outcome = s.publish_recv_waiter_live(eidx, ident(2, 7), recv);
+        assert!(matches!(
+            outcome,
+            crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
+        ));
+        assert_eq!(
+            s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx)),
+            Some(ident(2, 7)),
+            "the slot holds the complete generation-bearing identity"
+        );
+    }
+
+    // (2) Same tid AND same asid → claim succeeds. (3) Same tid / different asid → claim fails, slot
+    // untouched. (4) Endpoint generation mismatch → claim fails.
+    #[test]
+    fn claim_requires_full_identity_and_generation() {
+        let shared = SharedKernel::new({
+            let mut s = Bootstrap::init().expect("init");
+            s.register_task(2).expect("t2");
+            let (eidx, _snd, recv) = s.create_endpoint(4).expect("ep");
+            s.publish_recv_waiter_live(eidx, ident(2, 7), recv);
+            s
+        });
+        let eidx = shared.with(|k| {
+            (0..MAX_ENDPOINTS)
+                .find(|&i| k.with_ipc_state(|ipc| ipc.endpoint_waiter_present(i)))
+                .expect("waiter present")
+        });
+        let egen = shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]));
+        // (3) same tid, different asid → no claim, slot untouched.
+        assert!(
+            shared
+                .sr_claim_endpoint_waiter_split(eidx, egen, ident(2, 99))
+                .is_none(),
+            "same numeric TID with a different ASID cannot be claimed"
+        );
+        assert_eq!(
+            shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx))),
+            Some(ident(2, 7)),
+            "the original waiter is untouched"
+        );
+        // (4) generation mismatch → no claim.
+        assert!(
+            shared
+                .sr_claim_endpoint_waiter_split(eidx, egen + 1, ident(2, 7))
+                .is_none(),
+            "a stale endpoint generation cannot be claimed"
+        );
+        // (2) exact identity + generation → claim succeeds (remove once).
+        let claim = shared
+            .sr_claim_endpoint_waiter_split(eidx, egen, ident(2, 7))
+            .expect("exact identity claims");
+        assert_eq!(claim.receiver, ident(2, 7));
+        assert!(
+            !shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_present(eidx))),
+            "claimed exactly once"
+        );
+    }
+
+    // (5) A replacement task (same numeric TID, new ASID) publishes its OWN waiter with no collision;
+    // (6) a stale finalizer bearing the ORIGINAL identity can neither claim nor clear it.
+    #[test]
+    fn replacement_publishes_and_is_not_removable_by_stale_identity() {
+        let shared = SharedKernel::new({
+            let mut s = Bootstrap::init().expect("init");
+            s.register_task(2).expect("t2");
+            let (eidx, _snd, recv) = s.create_endpoint(4).expect("ep");
+            // Original incarnation publishes, then a replacement (new asid) overwrites (last wins).
+            s.publish_recv_waiter_live(eidx, ident(2, 7), recv);
+            s.publish_recv_waiter_live(eidx, ident(2, 8), recv);
+            s
+        });
+        let eidx = shared.with(|k| {
+            (0..MAX_ENDPOINTS)
+                .find(|&i| k.with_ipc_state(|ipc| ipc.endpoint_waiter_present(i)))
+                .expect("waiter")
+        });
+        assert_eq!(
+            shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx))),
+            Some(ident(2, 8)),
+            "the replacement's own identity owns the slot"
+        );
+        let egen = shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]));
+        // Stale finalizer with the ORIGINAL identity: cannot claim/clear the replacement.
+        assert!(
+            shared
+                .sr_claim_endpoint_waiter_split(eidx, egen, ident(2, 7))
+                .is_none(),
+            "the stale original identity cannot claim the replacement waiter"
+        );
+        shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                assert!(
+                    !ipc.clear_endpoint_waiter_if_identity(eidx, ident(2, 7)),
+                    "identity-keyed clear refuses the mismatched identity"
+                );
+                ipc.clear_endpoint_waiters_for_identity(ident(2, 7));
+            })
+        });
+        assert_eq!(
+            shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx))),
+            Some(ident(2, 8)),
+            "the replacement waiter is never removed by a stale identity sweep"
+        );
+    }
+
+    // (11) Timeout cleanup removes ONLY the matching identity: a same-index slot bearing a different
+    // identity, and a different endpoint's waiter, are both untouched.
+    #[test]
+    fn identity_keyed_cleanup_removes_only_matching() {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (e1, _s1, r1) = s.create_endpoint(4).expect("e1");
+        let (e2, _s2, r2) = s.create_endpoint(4).expect("e2");
+        s.publish_recv_waiter_live(e1, ident(2, 7), r1);
+        s.publish_recv_waiter_live(e2, ident(3, 9), r2);
+        s.with_ipc_state_mut(|ipc| {
+            // Sweep for {2, 7}: only e1 is cleared; e2's {3, 9} is untouched.
+            ipc.clear_endpoint_waiters_for_identity(ident(2, 7));
+            assert!(
+                !ipc.endpoint_waiter_present(e1),
+                "matching identity cleared"
+            );
+            assert_eq!(
+                ipc.endpoint_waiter_identity(e2),
+                Some(ident(3, 9)),
+                "a different identity is never swept"
+            );
+            // A sweep for a stale {2, 7} after a replacement {2, 8} took e1 must not remove it.
+            ipc.set_endpoint_waiter(e1, ident(2, 8));
+            ipc.clear_endpoint_waiters_for_identity(ident(2, 7));
+            assert_eq!(
+                ipc.endpoint_waiter_identity(e1),
+                Some(ident(2, 8)),
+                "task-exit / timeout cleanup cannot remove a replacement waiter"
+            );
+        });
+    }
+
+    // (18) Source guard: no numeric-TID-only endpoint-waiter comparison remains in production — every
+    // authority comparison routes through the identity helpers.
+    #[test]
+    fn no_numeric_tid_only_waiter_comparison_in_production() {
+        const IPC_SRC: &str = include_str!("ipc_state.rs");
+        const RT_SRC: &str = include_str!("../../runtime.rs");
+        const SR_SRC: &str = include_str!("shared_region_txn.rs");
+        // The exact numeric-TID comparison/claim/restore patterns removed by Stage 198E3B2B2.
+        for (src, name, forbidden) in [
+            (
+                IPC_SRC,
+                "ipc_state.rs",
+                "endpoint_waiters[endpoint_idx] != Some(expected_receiver_tid)",
+            ),
+            (
+                IPC_SRC,
+                "ipc_state.rs",
+                "endpoint_waiters[endpoint_idx] == Some(expected_receiver_tid)",
+            ),
+            (
+                RT_SRC,
+                "runtime.rs",
+                "endpoint_waiters[eidx] == Some(receiver)",
+            ),
+            (
+                RT_SRC,
+                "runtime.rs",
+                "endpoint_waiters[claim.eidx] = Some(claim.receiver)",
+            ),
+            (
+                SR_SRC,
+                "shared_region_txn.rs",
+                "endpoint_waiters[eidx] == Some(receiver)",
+            ),
+        ] {
+            assert!(
+                !src.contains(forbidden),
+                "{name} must not contain the numeric-TID-only pattern `{forbidden}`"
+            );
+        }
+        // The authority comparisons now go through the identity helpers.
+        assert!(
+            RT_SRC.contains("endpoint_waiter_identity(eidx) == Some(receiver)"),
+            "the shared-region claim must compare the full identity"
+        );
+        assert!(
+            IPC_SRC.contains("endpoint_waiter_identity(endpoint_idx) != Some(expected_receiver)"),
+            "the plain-send re-verify must compare the full identity"
+        );
     }
 }
 

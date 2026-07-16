@@ -341,7 +341,7 @@ impl KernelState {
         if self.with_ipc_state(|ipc| ipc.endpoint_generations[index]) != generation {
             return None;
         }
-        self.with_ipc_state(|ipc| ipc.endpoint_waiters[index])
+        self.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(index))
     }
 
     pub(crate) fn note_transfer_record_revoked(&mut self) {

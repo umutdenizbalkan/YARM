@@ -115,10 +115,12 @@ pub(crate) enum IpcEndpointSendResult {
     /// Message enqueued and receiver slot cleared under ipc_state_lock.
     /// Caller must apply WakeReceiver outside the lock via apply_split_receiver_wake_plan.
     EnqueuedWakeReceiver(ThreadId),
-    /// Stage 4F pre-screen: found a plain receiver waiter with this TID and no sender waiters.
-    /// TID came from a locked ipc_state_lock read in ipc_try_send_queued_plain_endpoint_only.
-    /// Caller should check is_task_recv_v2_blocked then call ipc_try_send_to_plain_receiver_endpoint_only.
-    ReceiverWaiterFound(ThreadId),
+    /// Stage 4F pre-screen: found a plain receiver waiter with this COMPLETE identity (tid + ASID,
+    /// Stage 198E3B2B2) and no sender waiters. The identity came from a locked ipc_state_lock read in
+    /// ipc_try_send_queued_plain_endpoint_only. Caller checks is_task_recv_v2_blocked then calls
+    /// ipc_try_send_to_plain_receiver_endpoint_only, which re-verifies the FULL identity (never
+    /// numeric TID alone) before clearing the waiter slot.
+    ReceiverWaiterFound(ReceiverWaiterIdentity),
     Ineligible(IpcEndpointSplitRejectReason),
 }
 

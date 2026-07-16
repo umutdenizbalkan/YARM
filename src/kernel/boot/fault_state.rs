@@ -106,7 +106,7 @@ impl SupervisorFaultReportWire {
 
 impl KernelState {
     fn endpoint_fault_report_waiter(&self, endpoint_idx: usize) -> Option<ThreadId> {
-        self.with_ipc_state(|ipc| ipc.endpoint_waiters.get(endpoint_idx).copied().flatten())
+        self.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx))
     }
 
     fn endpoint_fault_report_stats(&self, endpoint_idx: usize) -> Option<(u64, usize, usize)> {
@@ -117,13 +117,7 @@ impl KernelState {
                 .get(endpoint_idx)?
                 .as_ref()
                 .map(|endpoint| kernel_ref(endpoint).queued())?;
-            let waiters = usize::from(
-                ipc.endpoint_waiters
-                    .get(endpoint_idx)
-                    .copied()
-                    .flatten()
-                    .is_some(),
-            );
+            let waiters = usize::from(ipc.endpoint_waiter_present(endpoint_idx));
             Some((generation, waiters, queued))
         })
     }

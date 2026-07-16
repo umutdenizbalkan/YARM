@@ -128,6 +128,25 @@ pub(crate) struct CowPageRecord {
     pub(crate) virt: VirtAddr,
 }
 
+/// Stage 198E3B2B2 — GENERATION-BEARING endpoint receive-waiter identity. The endpoint waiter slot
+/// stores this complete identity (never a bare numeric `ThreadId`) so numeric TID reuse cannot let a
+/// stale finalizer/cleanup claim, clear, or restore a REPLACEMENT task's waiter. The `asid` is the
+/// receiver's captured address-space (its task incarnation discriminator): a replacement task that
+/// reuses the numeric TID always carries a different ASID, so an exact `==` on this struct
+/// distinguishes incarnations. All endpoint-receive-waiter authority (publish / claim / clear /
+/// cleanup / restore) compares the FULL identity — numeric TID alone is never sufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceiverWaiterIdentity {
+    pub(crate) tid: ThreadId,
+    pub(crate) asid: Asid,
+}
+
+impl ReceiverWaiterIdentity {
+    pub(crate) fn new(tid: ThreadId, asid: Asid) -> Self {
+        Self { tid, asid }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RobustFutexRecord {
     pub(crate) tid: ThreadId,
@@ -240,7 +259,7 @@ pub(crate) struct IpcSubsystem {
     pub(crate) cross_cpu_work: SmpMailbox,
     pub(crate) live_tlb_shootdown: LiveTlbShootdownState,
     pub(crate) endpoints: [Option<KernelStorage<Endpoint>>; MAX_ENDPOINTS],
-    pub(crate) endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
+    pub(crate) endpoint_waiters: [Option<ReceiverWaiterIdentity>; MAX_ENDPOINTS],
     pub(crate) endpoint_sender_waiters:
         [[Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
     pub(crate) endpoint_generations: [u64; MAX_ENDPOINTS],

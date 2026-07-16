@@ -902,7 +902,9 @@ impl SharedRegionExecCtx for KernelState {
         else {
             return None;
         };
-        let receiver = ThreadId(snap.receiver_tid);
+        // Stage 198E3B2B2: claim by the COMPLETE identity captured at production (tid + ASID).
+        let receiver =
+            super::ReceiverWaiterIdentity::new(ThreadId(snap.receiver_tid), snap.receiver_asid);
         // Stage 198E3B2B1 CLAIM-THEN-COMMIT (reference mirror of the off-lock seam ordering).
         // Phase 1 (rank 2): prevalidate — NO mutation. Dead/replaced/not-blocked → stale BEFORE claim.
         // (`blocked_recv_state` was consumed at production; the live signal is Blocked(EndpointReceive)
@@ -922,14 +924,15 @@ impl SharedRegionExecCtx for KernelState {
         if !prevalid {
             return None;
         }
-        // Phase 2 (rank 3): exact, generation-bearing waiter claim (remove once). A missing / replaced
-        // waiter or a changed endpoint generation → no claim, slot untouched, stale.
+        // Phase 2 (rank 3): exact, generation-bearing IDENTITY claim (remove once). A missing /
+        // different-identity waiter (including a replacement task reusing the numeric TID with a new
+        // ASID) or a changed endpoint generation → no claim, slot untouched, stale.
         let claimed = self.with_ipc_state_mut(|ipc| {
             if eidx < ipc.endpoint_waiters.len()
                 && ipc.endpoint_generations[eidx] == egen
-                && ipc.endpoint_waiters[eidx] == Some(receiver)
+                && ipc.endpoint_waiter_identity(eidx) == Some(receiver)
             {
-                ipc.endpoint_waiters[eidx] = None;
+                ipc.take_endpoint_waiter(eidx);
                 true
             } else {
                 false
@@ -960,23 +963,13 @@ impl SharedRegionExecCtx for KernelState {
             2 => {
                 // rank 2: clear blocked-return registers, THEN rank 2→1 wake (set Runnable + enqueue).
                 self.clear_blocked_recv_return_regs(snap.receiver_tid);
-                Some(self.apply_split_receiver_wake_plan(receiver).is_ok())
+                Some(self.apply_split_receiver_wake_plan(receiver.tid).is_ok())
             }
-            1 => {
-                // Live task at the TID but replaced incarnation: restore its EXACT (generation-bearing)
-                // waiter so no live blocked task is stranded, then treat as stale (zero wake).
-                self.with_ipc_state_mut(|ipc| {
-                    if eidx < ipc.endpoint_waiters.len()
-                        && ipc.endpoint_generations[eidx] == egen
-                        && ipc.endpoint_waiters[eidx].is_none()
-                    {
-                        ipc.endpoint_waiters[eidx] = Some(receiver);
-                    }
-                });
-                None
-            }
-            // Dead/removed receiver after the claim: the claimed waiter is correctly stale — never
-            // restore (no live task to strand). Zero wake.
+            // Dead/removed OR replaced (ASID changed) receiver after the IDENTITY claim: the claimed
+            // waiter belonged to our exact receiver incarnation, which no longer exists — it is
+            // correctly stale and MUST NOT be restored (Stage 198E3B2B2 removed the numeric-TID
+            // Replaced→restore; a restore could only target the vanished incarnation, never a live
+            // replacement task). Zero wake.
             _ => None,
         }
     }

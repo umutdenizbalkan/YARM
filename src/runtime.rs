@@ -2963,14 +2963,16 @@ impl SharedKernel {
         &self,
         eidx: usize,
         egen: u64,
-        receiver: crate::kernel::ipc::ThreadId,
+        receiver: crate::kernel::boot::ReceiverWaiterIdentity,
     ) -> Option<WaiterClaim> {
         self.with_ipc_split_mut(|ipc| {
+            // Stage 198E3B2B2: the slot must hold the COMPLETE identity (tid + ASID) — numeric TID
+            // reuse with a different ASID is not our receiver and is never claimed/cleared.
             if eidx < ipc.endpoint_waiters.len()
                 && ipc.endpoint_generations[eidx] == egen
-                && ipc.endpoint_waiters[eidx] == Some(receiver)
+                && ipc.endpoint_waiter_identity(eidx) == Some(receiver)
             {
-                ipc.endpoint_waiters[eidx] = None;
+                ipc.take_endpoint_waiter(eidx);
                 Some(WaiterClaim {
                     eidx,
                     generation: egen,
@@ -2982,17 +2984,26 @@ impl SharedKernel {
         })
     }
 
-    /// rank 3 (ipc lock) — restore the EXACT claimed waiter using its generation-bearing token, but
-    /// only if the endpoint still exists at that generation AND its slot is currently free (never
-    /// clobbering a newer waiter). Used solely on a post-claim recoverable abort where a LIVE task
-    /// must keep its waiter — so no live blocked task is ever left without one.
+    /// rank 2 → rank 3 — restore the EXACT claimed waiter using its generation-bearing identity token.
+    /// Stage 198E3B2B2: restoration is permitted ONLY when the COMPLETE identity still matches — the
+    /// endpoint still exists at the claimed generation, the slot is currently free (never clobbering a
+    /// newer waiter), AND the task is STILL blocked on that endpoint with the same tid + ASID. It can
+    /// therefore never fabricate or overwrite a waiter for a replacement task. (The numeric-TID
+    /// Replaced→restore of Stage 198E3B2B1 is removed; the shared-region finalizer no longer restores,
+    /// so this is a guarded primitive whose exact-identity contract is proven by the focused tests.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn sr_restore_endpoint_waiter_split(&self, claim: &WaiterClaim) -> bool {
+        // rank 2: the task must still be blocked on recv with the EXACT claimed identity.
+        if !self.sr_prevalidate_blocked_receiver_split(claim.receiver.tid.0, claim.receiver.asid) {
+            return false;
+        }
+        // rank 3: slot free + endpoint generation matches → re-install the EXACT identity.
         self.with_ipc_split_mut(|ipc| {
             if claim.eidx < ipc.endpoint_waiters.len()
                 && ipc.endpoint_generations[claim.eidx] == claim.generation
-                && ipc.endpoint_waiters[claim.eidx].is_none()
+                && !ipc.endpoint_waiter_present(claim.eidx)
             {
-                ipc.endpoint_waiters[claim.eidx] = Some(claim.receiver);
+                ipc.set_endpoint_waiter(claim.eidx, claim.receiver);
                 true
             } else {
                 false
@@ -3080,7 +3091,6 @@ impl SharedKernel {
         &self,
         snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
     ) -> Option<bool> {
-        use crate::kernel::ipc::ThreadId;
         if !snap.blocked_endpoint_waiter {
             // Plain wake path: no endpoint-waiter identity to claim (queued dequeue / txn proofs).
             return Some(self.sr_wake_receiver_split(snap.receiver_tid));
@@ -3092,14 +3102,20 @@ impl SharedKernel {
         else {
             return None;
         };
-        let receiver = ThreadId(snap.receiver_tid);
+        // Stage 198E3B2B2: the claim is by the COMPLETE identity captured at production (tid + ASID).
+        let receiver = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(snap.receiver_tid),
+            snap.receiver_asid,
+        );
         // Phase 1 (rank 2): prevalidate — NO mutation. A dead/replaced receiver is stale BEFORE claim,
         // so a replacement waiter slot is never removed on the common path.
         if !self.sr_prevalidate_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
             return None;
         }
-        // Phase 2 (rank 3): the exact, generation-bearing waiter claim (remove once).
-        let claim = self.sr_claim_endpoint_waiter_split(eidx, egen, receiver)?;
+        // Phase 2 (rank 3): the exact, generation-bearing IDENTITY claim (remove once). Because the
+        // claim requires the full {tid, ASID} identity, a replacement task (reused numeric TID, new
+        // ASID) can never be claimed or cleared here.
+        let _claim = self.sr_claim_endpoint_waiter_split(eidx, egen, receiver)?;
         // Phase 3 (rank 2): commit — registers cleared ONLY here, strictly after the claim.
         match self.sr_commit_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
             ReceiverCommit::Committed(affinity) => {
@@ -3107,17 +3123,12 @@ impl SharedKernel {
                 self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity);
                 Some(true)
             }
-            ReceiverCommit::GoneDead => {
-                // Receiver exited/removed after the claim: the claimed waiter is correctly stale. Do
-                // NOT restore (no live task to strand). Zero wake; the transaction rolls back.
-                None
-            }
-            ReceiverCommit::Replaced => {
-                // A live task occupies the TID but is no longer our receiver: restore its EXACT
-                // (generation-bearing) waiter so no live blocked task is stranded, then roll back.
-                let _ = self.sr_restore_endpoint_waiter_split(&claim);
-                None
-            }
+            // Receiver exited OR was replaced (ASID changed) after the identity claim: the claimed
+            // waiter belonged to our exact receiver incarnation, which no longer exists — it is
+            // correctly stale and MUST NOT be restored (the old numeric-TID Replaced→restore is
+            // removed; a restore could only ever target the vanished incarnation, never a live
+            // replacement task). Zero wake; the transaction rolls back.
+            ReceiverCommit::GoneDead | ReceiverCommit::Replaced => None,
         }
     }
 
@@ -3593,11 +3604,17 @@ pub(crate) struct SharedRegionMapFollowup {
 /// waiter slot (Stage 198E3B2B1). It carries the endpoint GENERATION it was claimed under so a later
 /// restore can only ever re-target the same endpoint incarnation — never a destroyed/recreated one.
 /// The claim is the sole authority for having removed the waiter; a numeric TID alone is never it.
+// Stage 198E3B2B2: with an identity-exact claim the production finalizer never restores (a claimed
+// waiter always belonged to the exact vanished incarnation), so the claim's fields are read only by
+// the guarded restore primitive and its focused tests.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WaiterClaim {
     pub(crate) eidx: usize,
     pub(crate) generation: u64,
-    pub(crate) receiver: crate::kernel::ipc::ThreadId,
+    /// Stage 198E3B2B2: the COMPLETE generation-bearing receiver identity (tid + ASID) that was
+    /// removed — a restore can only ever re-install this exact identity, never a replacement task.
+    pub(crate) receiver: crate::kernel::boot::ReceiverWaiterIdentity,
 }
 
 /// Outcome of the Phase-3 task commit, run only AFTER a successful waiter claim (Stage 198E3B2B1).
