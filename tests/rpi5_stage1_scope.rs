@@ -1022,7 +1022,7 @@ fn rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret() {
     assert!(!hh5.contains("normal_kernel_entry_requires_low_allocator"));
     assert!(!hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
     assert!(!hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
-    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(hh5.contains("RPI5_BOOT5A2_DONE_MARKER"));
     assert!(hh5.contains("initrd_missing"));
 
     // Build + fixture validators require the new HH5 markers.
@@ -1261,7 +1261,7 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
     assert!(hh5.contains("0x8000_0000"));
 
     // Precise deferral; still no userspace, no subsystem starts, no ERET.
-    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(hh5.contains("RPI5_BOOT5A2_DONE_MARKER"));
     assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
     assert!(!hh5.contains("core::arch::asm!(\"eret\""));
     assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
@@ -1334,7 +1334,7 @@ fn rpi5_boot4_builds_high_half_heap_and_vm_then_defers_precisely() {
     // Task D: KernelState is NOT constructed; deferral is precise and there is no
     // userspace entry, no user TTBR0 install, no EL0 ERET, no big stack array, no
     // by-value allocator, and no premature subsystem start.
-    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(hh5.contains("RPI5_BOOT5A2_DONE_MARKER"));
     assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
     assert!(!hh5.contains("core::arch::asm!(\"eret\""));
     assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
@@ -1418,6 +1418,167 @@ fn rpi5_boot4_physmap_bridge_is_gated_and_preserves_default_identity() {
             build.contains(marker),
             "build omits physmap marker {marker}"
         );
+    }
+}
+
+#[test]
+fn rpi5_boot5a_audit_and_handoff_bridge_markers_are_guarded() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+    let fixture = include_str!("../scripts/test-create-rpi5-stage1-boot-dir.sh");
+
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    let highmap_ok = hh5
+        .find("RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK_MARKER")
+        .expect("BOOT-4 highmap marker");
+    let audit_begin = hh5
+        .find("RPI5_BOOT5_KERNELSTATE_AUDIT_BEGIN_MARKER")
+        .expect("BOOT-5 audit marker");
+    let bridge_ok = hh5
+        .find("RPI5_BOOT5_HANDOFF_BRIDGE_OK_MARKER")
+        .expect("BOOT-5 handoff marker");
+    let percpu_begin = hh5
+        .find("RPI5_KERNEL_PERCPU_BOOTSTRAP_BEGIN_MARKER")
+        .expect("BOOT-5A1 per-cpu marker");
+    let percpu_ok = hh5
+        .find("RPI5_KERNEL_PERCPU_BOOTSTRAP_OK_MARKER")
+        .expect("BOOT-5A1 per-cpu ok marker");
+    let sched_begin = hh5
+        .find("RPI5_KERNEL_SCHED_BOOTSTRAP_BEGIN_MARKER")
+        .expect("BOOT-5A1 scheduler begin marker");
+    let sched_ok = hh5
+        .find("RPI5_KERNEL_SCHED_BOOTSTRAP_OK_MARKER")
+        .expect("BOOT-5A1 scheduler ok marker");
+    let state_begin = hh5
+        .find("RPI5_KERNEL_STATE_BEGIN_MARKER")
+        .expect("BOOT-5A1 state begin marker");
+    let storage_ok = hh5
+        .find("RPI5_KERNEL_STATE_STORAGE_OK_MARKER")
+        .expect("BOOT-5A1 state storage ok marker");
+    let defer = hh5
+        .find("RPI5_BOOT5A2_DONE_MARKER")
+        .expect("BOOT-5A2 checkpoint completion");
+    assert!(
+        highmap_ok < audit_begin
+            && audit_begin < bridge_ok
+            && bridge_ok < percpu_begin
+            && percpu_begin < percpu_ok
+            && percpu_ok < sched_begin
+            && sched_begin < sched_ok
+            && sched_ok < state_begin
+            && state_begin < storage_ok
+            && storage_ok < defer
+    );
+
+    for marker in [
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_BEGIN",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_STORAGE",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_CPU0",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_SCHEDULER",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_TASK",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_IPC",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_CAP",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_VM",
+        "RPI5_BOOT5_KERNELSTATE_AUDIT_DONE",
+        "RPI5_BOOT5_HANDOFF_BRIDGE_BEGIN",
+        "RPI5_BOOT5_HANDOFF_DTB_OK",
+        "RPI5_BOOT5_HANDOFF_INITRD_OK",
+        "RPI5_BOOT5_HANDOFF_MEMORY_OK",
+        "RPI5_BOOT5_HANDOFF_RESERVED_OK",
+        "RPI5_BOOT5_HANDOFF_HEAP_OK",
+        "RPI5_BOOT5_HANDOFF_PHYSMAP_OK",
+        "RPI5_BOOT5_HANDOFF_BRIDGE_OK",
+        "RPI5_KERNEL_PERCPU_BOOTSTRAP_BEGIN",
+        "RPI5_KERNEL_PERCPU_STORAGE_OK",
+        "RPI5_KERNEL_PERCPU_CPU0_OK",
+        "RPI5_KERNEL_PERCPU_REGISTER_OK",
+        "RPI5_KERNEL_PERCPU_STACK_OK",
+        "RPI5_KERNEL_PERCPU_TOPOLOGY_OK",
+        "RPI5_KERNEL_PERCPU_BOOTSTRAP_OK",
+        "RPI5_KERNEL_PERCPU_FAILED reason=",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_BEGIN",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_CPU0_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_RUNQUEUE_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_CURRENT_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_TOPOLOGY_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_IDLE_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_OK",
+        "RPI5_KERNEL_SCHED_BOOTSTRAP_FAILED reason=",
+        "RPI5_KERNEL_STATE_BEGIN",
+        "RPI5_KERNEL_STATE_STORAGE_BEGIN",
+        "RPI5_KERNEL_STATE_STORAGE_ADDRESS virt=0x",
+        "RPI5_KERNEL_STATE_STORAGE_HIGHMAP_OK",
+        "RPI5_KERNEL_STATE_STORAGE_OK",
+        "RPI5_KERNEL_STATE_INIT_BEGIN",
+        "RPI5_KERNEL_STATE_FRAME_ALLOCATOR_OK",
+        "RPI5_KERNEL_STATE_SCHEDULER_OK",
+        "RPI5_KERNEL_STATE_TASKS_OK",
+        "RPI5_KERNEL_STATE_IPC_OK",
+        "RPI5_KERNEL_STATE_CAPABILITIES_OK",
+        "RPI5_KERNEL_STATE_VM_OK",
+        "RPI5_KERNEL_STATE_BOOTINFO_OK",
+        "RPI5_KERNEL_STATE_CPU0_OK",
+        "RPI5_KERNEL_STATE_LOCK_OK",
+        "RPI5_KERNEL_STATE_INIT_OK",
+        "RPI5_KERNEL_STATE_OK",
+        "RPI5_KERNEL_STATE_FAILED reason=",
+        "RPI5_BOOT5_FAULT_BOUNDARY stage=",
+        "RPI5_BOOT5A2_DONE status=kernel_state_ready",
+        "RPI5_BOOT5A2_HALT reason=checkpoint_complete",
+        "RPI5_BOOT5_HANDOFF_FAILED reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits BOOT-5 marker {marker}");
+        assert!(build.contains(marker), "build omits BOOT-5 marker {marker}");
+        assert!(
+            fixture.contains(marker),
+            "fixture omits BOOT-5 marker {marker}"
+        );
+    }
+
+    let bootstrap = include_str!("../src/kernel/boot/bootstrap_state.rs");
+    assert!(
+        bootstrap.contains("pub fn boot5a1_validate_single_cpu_scheduler("),
+        "RPi5 BOOT-5A1 must share a generic Bootstrap helper"
+    );
+    assert!(
+        hh5.contains("Bootstrap::boot5a1_validate_single_cpu_scheduler("),
+        "HH5 must call the generic Bootstrap scheduler helper"
+    );
+    assert!(
+        hh5.contains("Bootstrap::static_kernel_state_storage_addr()"),
+        "HH5 must use the canonical static KernelState storage"
+    );
+    assert!(!hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(!hh5.contains("RPI5_INIT_LOOKUP_BEGIN path=/init"));
+    assert!(!hh5.contains("RPI5_HH5_TTBR0_USER_INSTALL"));
+
+    // BOOT-5A2 stops before userspace: it may construct KernelState, but must not add
+    // user TTBR0, NR27, synthetic init, or an ERET marker.
+    for forbidden in [
+        "SYSCALL_INITRAMFS_READ_CHUNK_NR",
+        "InitramfsReadChunk",
+        "PM_NR27_SELF_PROBE",
+        "RPI5_ENTER_USER_ERET",
+        "synthetic init",
+        "core::arch::asm!(\"eret\"",
+        "start_secondary_cpus",
+        "psci_cpu_on",
+        "init_gic",
+        "timer_irq_enable",
+        "Box::new(state)",
+        "let state = KernelState::new",
+        "Rpi5KernelState",
+        "Rpi5Scheduler",
+    ] {
+        assert!(!hh5.contains(forbidden), "BOOT-5A bridge added {forbidden}");
     }
 }
 
@@ -1537,4 +1698,58 @@ fn rpi5_boot4_global_allocator_pt_init_is_markered_and_bss_is_zeroed() {
             "HH5 bridge must not contain {forbidden}"
         );
     }
+}
+
+#[test]
+fn rpi5_highhalf_exports_generic_kernel_range_and_reserves_physical_extent() {
+    let ld = include_str!("../targets/aarch64-rpi5-stage2-highhalf-none.ld");
+    let bootstrap = include_str!("../src/kernel/boot/bootstrap_state.rs");
+
+    assert!(
+        ld.contains("__kernel_start = __kernel_virt_start;"),
+        "RPi5 high-half linker script must alias generic start to high-half kernel VA start"
+    );
+    assert!(
+        ld.contains(
+            ". = ALIGN(4096);\n    __kernel_virt_end = .;\n    __kernel_end = __kernel_virt_end;"
+        ),
+        "generic kernel end must be page-aligned and alias the high-half kernel VA end"
+    );
+    assert!(
+        ld.contains("__kernel_phys_end = __kernel_virt_end - __kernel_va_offset;"),
+        "physical kernel end must remain derived from the high VA end and VA offset"
+    );
+    assert!(
+        ld.contains("ASSERT(__kernel_start == __kernel_virt_start"),
+        "linker script should assert the generic start alias cannot diverge"
+    );
+    assert!(
+        ld.contains("ASSERT(__kernel_end == __kernel_virt_end"),
+        "linker script should assert the generic end alias cannot diverge"
+    );
+
+    assert!(
+        bootstrap.contains("const RPI5_HIGH_HALF_LINK_BASE: u64 = 0xffff_ff80_0000_0000;"),
+        "RPi5 high-half bootstrap must define the VA->PA link offset used for reservations"
+    );
+    assert!(
+        bootstrap.contains("fn kernel_link_base_for_reserved_range() -> u64"),
+        "bootstrap reservation code must centralize target-specific linker VA translation"
+    );
+    assert!(
+        bootstrap.contains("feature = \"rpi5-highhalf\"")
+            && bootstrap.contains("RPI5_HIGH_HALF_LINK_BASE")
+            && bootstrap.contains("platform_constants::KERNEL_LINK_VIRT_BASE"),
+        "RPi5 high-half must override the generic AArch64 zero link base without changing other targets"
+    );
+    assert!(
+        bootstrap.contains("let link_base = Self::kernel_link_base_for_reserved_range();"),
+        "default_reserved_ranges must translate linker-symbol VAs through the target-specific helper"
+    );
+    assert!(
+        bootstrap.contains("let kernel_start_phys = kernel_start_virt.saturating_sub(link_base);")
+            && bootstrap
+                .contains("let kernel_end_phys = kernel_end_virt.saturating_sub(link_base);"),
+        "kernel reservation must subtract the link base before publishing physical ranges"
+    );
 }

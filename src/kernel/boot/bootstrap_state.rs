@@ -39,7 +39,54 @@ static BOOT_EXTRA_RESERVED_ENDS: [core::sync::atomic::AtomicU64; MAX_BOOT_EXTRA_
 static BOOT_INITRD_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static BOOT_INITRD_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(all(target_arch = "aarch64", feature = "rpi5-highhalf"))]
+const RPI5_HIGH_HALF_LINK_BASE: u64 = 0xffff_ff80_0000_0000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Boot5A1SchedulerProbe {
+    pub present_bitmap: u64,
+    pub online_bitmap: u64,
+    pub wake_only_bitmap: u64,
+    pub current_tid: Option<u64>,
+    pub runnable_count: usize,
+}
+
 impl Bootstrap {
+    #[cfg(not(feature = "hosted-dev"))]
+    fn kernel_link_base_for_reserved_range() -> u64 {
+        #[cfg(all(target_arch = "aarch64", feature = "rpi5-highhalf"))]
+        {
+            // The RPi5 high-half stage2 linker script exports generic kernel
+            // symbols at their high virtual addresses, while the frame
+            // allocator reserves physical ranges.  The generic AArch64
+            // platform layout keeps KERNEL_LINK_VIRT_BASE at zero for QEMU
+            // and the low stage1 image, so the high-half diagnostic profile
+            // supplies the VA->PA offset explicitly here.
+            RPI5_HIGH_HALF_LINK_BASE
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "rpi5-highhalf")))]
+        {
+            platform_constants::KERNEL_LINK_VIRT_BASE
+        }
+    }
+
+    /// Initialize an array of `Option<T>` elements directly in final storage.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must point at aligned, writable, uninitialized storage for
+    /// `[Option<T>; N]`. No reference to the array may be published until all
+    /// elements have been written.
+    #[cfg(not(feature = "hosted-dev"))]
+    unsafe fn init_option_array_none<T, const N: usize>(destination: *mut [Option<T>; N]) {
+        unsafe {
+            let elem = destination.cast::<Option<T>>();
+            for idx in 0..N {
+                elem.add(idx).write(None);
+            }
+        }
+    }
+
     #[inline(never)]
     fn default_boot_memory_map() -> ([MemoryRegion; MAX_BOOT_MEMORY_REGIONS], usize) {
         let mut staged = [MemoryRegion {
@@ -76,7 +123,7 @@ impl Bootstrap {
             // reserved. On targets that link the kernel at PA = VMA
             // (aarch64, riscv64) KERNEL_LINK_VIRT_BASE is 0 and this
             // becomes a no-op subtraction.
-            let link_base = platform_constants::KERNEL_LINK_VIRT_BASE;
+            let link_base = Self::kernel_link_base_for_reserved_range();
             let kernel_start_virt = core::ptr::addr_of!(__kernel_start) as u64;
             let kernel_end_virt = core::ptr::addr_of!(__kernel_end) as u64;
             let kernel_start_phys = kernel_start_virt.saturating_sub(link_base);
@@ -391,6 +438,63 @@ impl Bootstrap {
         KernelCapacityProfile::HostedDefault
     }
 
+    pub fn static_kernel_state_storage_addr() -> usize {
+        core::ptr::addr_of!(BOOTSTRAP_KERNEL_STATE) as *const _ as usize
+    }
+
+    pub fn static_kernel_state_storage_size() -> usize {
+        core::mem::size_of::<KernelState>()
+    }
+
+    pub fn static_shared_kernel_storage_addr() -> usize {
+        core::ptr::addr_of!(BOOTSTRAP_SHARED_KERNEL) as *const _ as usize
+    }
+
+    pub fn static_shared_kernel_storage_size() -> usize {
+        core::mem::size_of::<crate::runtime::SharedKernel>()
+    }
+
+    pub fn boot5a1_validate_single_cpu_scheduler(
+        cpu: crate::kernel::scheduler::CpuId,
+    ) -> Result<Boot5A1SchedulerProbe, KernelError> {
+        let cpu_bit = 1u64
+            .checked_shl(cpu.0 as u32)
+            .ok_or(KernelError::TaskMissing)?;
+        crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(cpu_bit)
+            .then_some(())
+            .ok_or(KernelError::TaskMissing)?;
+
+        let mut scheduler = SmpScheduler::default();
+        scheduler.set_present_cpu_bitmap(cpu_bit);
+        scheduler
+            .validate_online_cpu(cpu)
+            .map_err(map_scheduler_error)?;
+        scheduler
+            .enqueue_on(cpu, crate::kernel::ipc::ThreadId(0))
+            .map_err(map_scheduler_error)?;
+        let current = scheduler.dispatch_next_on(cpu).map(|tid| tid.0);
+        if current != Some(0) {
+            return Err(KernelError::TaskMissing);
+        }
+        if scheduler.runnable_count_on(cpu) != 0 {
+            return Err(KernelError::TaskMissing);
+        }
+        if scheduler.online_cpu_bitmap() != cpu_bit
+            || scheduler.present_cpu_bitmap() != cpu_bit
+            || scheduler.wake_only_bitmap() != 0
+        {
+            return Err(KernelError::TaskMissing);
+        }
+
+        Ok(Boot5A1SchedulerProbe {
+            present_bitmap: scheduler.present_cpu_bitmap(),
+            online_bitmap: scheduler.online_cpu_bitmap(),
+            wake_only_bitmap: scheduler.wake_only_bitmap(),
+            current_tid: current,
+            runnable_count: scheduler.runnable_count_on(cpu),
+        })
+    }
+
     pub fn init() -> Result<KernelState, KernelError> {
         Self::init_with_capacity_profile(Self::default_capacity_profile())
     }
@@ -447,6 +551,33 @@ impl Bootstrap {
         boot_regions: &[MemoryRegion],
         reserved_ranges: &[(u64, u64)],
     ) -> Result<&'static mut KernelState, KernelError> {
+        let state_ptr = core::ptr::addr_of_mut!(BOOTSTRAP_KERNEL_STATE).cast::<KernelState>();
+        unsafe {
+            Self::init_kernel_state_in_place(
+                state_ptr,
+                capacity_profile,
+                boot_regions,
+                reserved_ranges,
+            )?;
+            Ok(&mut *state_ptr)
+        }
+    }
+
+    /// Initialize `KernelState` directly at `state_ptr`.
+    ///
+    /// # Safety
+    ///
+    /// `state_ptr` must be aligned, writable storage for an uninitialized
+    /// `KernelState`. No reference to the destination may be published until this
+    /// function returns `Ok(())`. On `Err`, the caller must treat the destination
+    /// as partially initialized boot storage and must not run `Drop` for it.
+    #[inline(never)]
+    pub unsafe fn init_kernel_state_in_place(
+        state_ptr: *mut KernelState,
+        capacity_profile: KernelCapacityProfile,
+        boot_regions: &[MemoryRegion],
+        reserved_ranges: &[(u64, u64)],
+    ) -> Result<(), KernelError> {
         crate::arch::boot_entry::bootstrap_step("enter");
         // Register all reserved ranges in the global frame allocator guard and emit
         // PMEM_RESERVE_* diagnostics so boot logs show the full reserved map.
@@ -460,7 +591,6 @@ impl Bootstrap {
             crate::yarm_log!("PMEM_RESERVE_RANGE start=0x{:x} end=0x{:x}", start, end);
         }
 
-        let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
         let (sanitized, sanitized_len) = Self::apply_reserved_ranges(boot_regions, reserved_ranges);
         let sanitized = &sanitized[..sanitized_len];
 
@@ -513,10 +643,6 @@ impl Bootstrap {
 
         crate::arch::boot_entry::bootstrap_step("pt_frame_allocator");
         init_pt_frame_allocator(pt_slice).map_err(|_| KernelError::MemoryObjectFull)?;
-        crate::arch::boot_entry::bootstrap_step("frame_allocator");
-        frame_allocator
-            .init_from_memory_map(main_slice)
-            .map_err(|_| KernelError::MemoryObjectFull)?;
         crate::arch::boot_entry::bootstrap_step("page_table_reset_state");
         crate::arch::selected_isa::page_table::reset_state();
 
@@ -537,33 +663,65 @@ impl Bootstrap {
             })?;
 
         crate::arch::boot_entry::bootstrap_step("scheduler_new");
-        let mut scheduler = SmpScheduler::default();
         let present_cpu_bitmap =
             crate::arch::boot_entry::take_staged_present_cpu_bitmap_for_bootstrap()
                 .unwrap_or_else(topology::default_present_cpu_bitmap);
-        scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
-        scheduler
-            .enqueue_on(
-                CpuId(platform_constants::BOOTSTRAP_CPU_ID),
-                crate::kernel::ipc::ThreadId(0),
-            )
-            .map_err(map_scheduler_error)?;
 
         crate::arch::boot_entry::bootstrap_step("kernel_state_write");
         unsafe {
-            let state_ptr = core::ptr::addr_of_mut!(BOOTSTRAP_KERNEL_STATE).cast::<KernelState>();
             core::ptr::addr_of_mut!((*state_ptr).kernel_aspace).write(kernel_aspace);
             core::ptr::addr_of_mut!((*state_ptr).hal)
                 .write(crate::arch::hal::SelectedIsaHal::default());
-            core::ptr::addr_of_mut!((*state_ptr).user_spaces)
-                .write(store_kernel_value(AddressSpaceManager::default()));
-            core::ptr::addr_of_mut!((*state_ptr).scheduler_state).write(SpinLockIrq::new(
-                SchedulerState {
-                    scheduler: store_kernel_value(scheduler),
-                    timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS),
-                    current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
-                },
-            ));
+            #[cfg(feature = "hosted-dev")]
+            {
+                core::ptr::addr_of_mut!((*state_ptr).user_spaces)
+                    .write(store_kernel_value(AddressSpaceManager::default()));
+                let mut scheduler = SmpScheduler::default();
+                scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
+                scheduler
+                    .enqueue_on(
+                        CpuId(platform_constants::BOOTSTRAP_CPU_ID),
+                        crate::kernel::ipc::ThreadId(0),
+                    )
+                    .map_err(map_scheduler_error)?;
+                core::ptr::addr_of_mut!((*state_ptr).scheduler_state).write(SpinLockIrq::new(
+                    SchedulerState {
+                        scheduler: store_kernel_value(scheduler),
+                        timer: Timer::new(platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS),
+                        current_cpu: CpuId(platform_constants::BOOTSTRAP_CPU_ID),
+                    },
+                ));
+            }
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                AddressSpaceManager::init_in_place_default(core::ptr::addr_of_mut!(
+                    (*state_ptr).user_spaces
+                )
+                    as *mut AddressSpaceManager);
+                crate::kernel::lock::SpinLockIrq::init_in_place(
+                    core::ptr::addr_of_mut!((*state_ptr).scheduler_state),
+                    |scheduler_state_ptr| {
+                        let scheduler_ptr =
+                            core::ptr::addr_of_mut!((*scheduler_state_ptr).scheduler)
+                                as *mut SmpScheduler;
+                        SmpScheduler::init_in_place_default(scheduler_ptr);
+                        let scheduler = &mut *scheduler_ptr;
+                        scheduler.set_present_cpu_bitmap(present_cpu_bitmap);
+                        scheduler
+                            .enqueue_on(
+                                CpuId(platform_constants::BOOTSTRAP_CPU_ID),
+                                crate::kernel::ipc::ThreadId(0),
+                            )
+                            .map_err(map_scheduler_error)?;
+                        core::ptr::addr_of_mut!((*scheduler_state_ptr).timer).write(Timer::new(
+                            platform_constants::BOOTSTRAP_TIMER_DEADLINE_TICKS,
+                        ));
+                        core::ptr::addr_of_mut!((*scheduler_state_ptr).current_cpu)
+                            .write(CpuId(platform_constants::BOOTSTRAP_CPU_ID));
+                        Ok(())
+                    },
+                )?;
+            }
             core::ptr::addr_of_mut!((*state_ptr).ipc_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).driver_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).fault_state_lock).write(SpinLockIrq::new(()));
@@ -575,34 +733,116 @@ impl Bootstrap {
             core::ptr::addr_of_mut!((*state_ptr).vm_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).task_state_lock).write(SpinLockIrq::new(()));
             core::ptr::addr_of_mut!((*state_ptr).memory_state_lock).write(SpinLockIrq::new(()));
-            core::ptr::addr_of_mut!((*state_ptr).ipc).write(store_kernel_value(IpcSubsystem {
-                cross_cpu_work: SmpMailbox::default(),
-                live_tlb_shootdown: LiveTlbShootdownState {
-                    next_sequence: 1,
-                    active: None,
-                },
-                endpoints: [const { None }; MAX_ENDPOINTS],
-                endpoint_waiters: [None; MAX_ENDPOINTS],
-                endpoint_sender_waiters: [[None; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
-                endpoint_generations: [0; MAX_ENDPOINTS],
-                notifications: [const { None }; MAX_NOTIFICATIONS],
-                notification_waiters: [None; MAX_NOTIFICATIONS],
-                notification_generations: [0; MAX_NOTIFICATIONS],
-                irq_routes: [None; MAX_IRQ_LINES],
-                transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
-                transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
-                active_transfer_mappings: [const { None }; MAX_TRANSFER_ENVELOPES],
-                reply_caps: [const { None }; MAX_REPLY_CAPS],
-                reply_cap_generations: [0; MAX_REPLY_CAPS],
-                telemetry: IpcPathTelemetry::default(),
-            }));
-            core::ptr::addr_of_mut!((*state_ptr).capability).write(CapabilitySubsystem {
-                cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
-                process_cnodes: store_kernel_value([const { None }; MAX_TASKS]),
-                delegated_capability_links: store_kernel_value(
-                    [const { None }; MAX_DELEGATED_CAPABILITY_LINKS],
-                ),
-            });
+            #[cfg(feature = "hosted-dev")]
+            {
+                core::ptr::addr_of_mut!((*state_ptr).ipc).write(store_kernel_value(IpcSubsystem {
+                    cross_cpu_work: SmpMailbox::default(),
+                    live_tlb_shootdown: LiveTlbShootdownState {
+                        next_sequence: 1,
+                        active: None,
+                    },
+                    endpoints: [const { None }; MAX_ENDPOINTS],
+                    endpoint_waiters: [None; MAX_ENDPOINTS],
+                    endpoint_sender_waiters: [[None; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
+                    endpoint_generations: [0; MAX_ENDPOINTS],
+                    notifications: [const { None }; MAX_NOTIFICATIONS],
+                    notification_waiters: [None; MAX_NOTIFICATIONS],
+                    notification_generations: [0; MAX_NOTIFICATIONS],
+                    irq_routes: [None; MAX_IRQ_LINES],
+                    transfer_envelopes: [const { None }; MAX_TRANSFER_ENVELOPES],
+                    transfer_envelope_generations: [0; MAX_TRANSFER_ENVELOPES],
+                    active_transfer_mappings: [const { None }; MAX_TRANSFER_ENVELOPES],
+                    reply_caps: [const { None }; MAX_REPLY_CAPS],
+                    reply_cap_generations: [0; MAX_REPLY_CAPS],
+                    telemetry: IpcPathTelemetry::default(),
+                }));
+                core::ptr::addr_of_mut!((*state_ptr).capability).write(CapabilitySubsystem {
+                    cnode_spaces: store_kernel_value([const { None }; MAX_TASKS]),
+                    process_cnodes: store_kernel_value([const { None }; MAX_TASKS]),
+                    delegated_capability_links: store_kernel_value(
+                        [const { None }; MAX_DELEGATED_CAPABILITY_LINKS],
+                    ),
+                });
+                core::ptr::addr_of_mut!((*state_ptr).tcbs)
+                    .write(store_kernel_value([const { None }; MAX_TASKS]));
+                core::ptr::addr_of_mut!((*state_ptr).task_classes)
+                    .write(store_kernel_value([None; MAX_TASKS]));
+                core::ptr::addr_of_mut!((*state_ptr).tls_restore_pending)
+                    .write(store_kernel_value([None; MAX_TASKS]));
+                core::ptr::addr_of_mut!((*state_ptr).robust_futex)
+                    .write(store_kernel_value([None; MAX_TASKS]));
+            }
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let ipc_ptr = core::ptr::addr_of_mut!((*state_ptr).ipc) as *mut IpcSubsystem;
+                core::ptr::addr_of_mut!((*ipc_ptr).cross_cpu_work).write(SmpMailbox::default());
+                core::ptr::addr_of_mut!((*ipc_ptr).live_tlb_shootdown).write(
+                    LiveTlbShootdownState {
+                        next_sequence: 1,
+                        active: None,
+                    },
+                );
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).endpoints));
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).endpoint_waiters));
+                let sender_waiters = core::ptr::addr_of_mut!((*ipc_ptr).endpoint_sender_waiters)
+                    .cast::<Option<SenderWaiter>>();
+                for idx in 0..(MAX_ENDPOINTS * MAX_ENDPOINT_SENDER_WAITERS) {
+                    sender_waiters.add(idx).write(None);
+                }
+                core::ptr::write_bytes(
+                    core::ptr::addr_of_mut!((*ipc_ptr).endpoint_generations).cast::<u8>(),
+                    0,
+                    core::mem::size_of::<[u64; MAX_ENDPOINTS]>(),
+                );
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).notifications));
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*ipc_ptr).notification_waiters
+                ));
+                core::ptr::write_bytes(
+                    core::ptr::addr_of_mut!((*ipc_ptr).notification_generations).cast::<u8>(),
+                    0,
+                    core::mem::size_of::<[u64; MAX_NOTIFICATIONS]>(),
+                );
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).irq_routes));
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*ipc_ptr).transfer_envelopes
+                ));
+                core::ptr::write_bytes(
+                    core::ptr::addr_of_mut!((*ipc_ptr).transfer_envelope_generations).cast::<u8>(),
+                    0,
+                    core::mem::size_of::<[u64; MAX_TRANSFER_ENVELOPES]>(),
+                );
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*ipc_ptr).active_transfer_mappings
+                ));
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*ipc_ptr).reply_caps));
+                core::ptr::write_bytes(
+                    core::ptr::addr_of_mut!((*ipc_ptr).reply_cap_generations).cast::<u8>(),
+                    0,
+                    core::mem::size_of::<[u64; MAX_REPLY_CAPS]>(),
+                );
+                core::ptr::addr_of_mut!((*ipc_ptr).telemetry).write(IpcPathTelemetry::default());
+
+                let cap_ptr = core::ptr::addr_of_mut!((*state_ptr).capability);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*cap_ptr).cnode_spaces)
+                    as *mut [Option<CNodeSpace>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*cap_ptr).process_cnodes)
+                    as *mut [Option<ProcessCNodeRecord>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*cap_ptr).delegated_capability_links
+                )
+                    as *mut [Option<DelegatedCapabilityLink>; MAX_DELEGATED_CAPABILITY_LINKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*state_ptr).tcbs)
+                    as *mut [Option<ThreadControlBlock>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*state_ptr).task_classes)
+                    as *mut [Option<TaskClass>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!(
+                    (*state_ptr).tls_restore_pending
+                )
+                    as *mut [Option<ThreadId>; MAX_TASKS]);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*state_ptr).robust_futex)
+                    as *mut [Option<RobustFutexRecord>; MAX_TASKS]);
+            }
             core::ptr::addr_of_mut!((*state_ptr).tid_allocation_policy).write(
                 TidAllocationPolicy::new(STATIC_TID_UPPER_BOUND, INITIAL_DYNAMIC_TID),
             );
@@ -612,27 +852,48 @@ impl Bootstrap {
                     INITIAL_DYNAMIC_TID,
                 )),
             );
-            core::ptr::addr_of_mut!((*state_ptr).tcbs)
-                .write(store_kernel_value([const { None }; MAX_TASKS]));
-            core::ptr::addr_of_mut!((*state_ptr).task_classes)
-                .write(store_kernel_value([None; MAX_TASKS]));
-            core::ptr::addr_of_mut!((*state_ptr).tls_restore_pending)
-                .write(store_kernel_value([None; MAX_TASKS]));
-            core::ptr::addr_of_mut!((*state_ptr).robust_futex)
-                .write(store_kernel_value([None; MAX_TASKS]));
-            core::ptr::addr_of_mut!((*state_ptr).memory).write(store_kernel_value(
-                MemorySubsystem {
-                    #[cfg(feature = "hosted-dev")]
-                    user_memory: store_kernel_value(UserMemoryStore::default()),
-                    memory_objects: [None; MAX_MEMORY_OBJECTS],
-                    brk_regions: [None; MAX_TASKS],
-                    cow_pages: alloc::collections::BTreeMap::new(),
-                    #[cfg(test)]
-                    cow_page_capacity_limit: None,
-                    next_memory_object_id: 1,
-                    frame_allocator: store_kernel_value(frame_allocator),
-                },
-            ));
+            #[cfg(feature = "hosted-dev")]
+            {
+                let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
+                crate::arch::boot_entry::bootstrap_step("frame_allocator");
+                frame_allocator
+                    .init_from_memory_map(main_slice)
+                    .map_err(|_| KernelError::MemoryObjectFull)?;
+                core::ptr::addr_of_mut!((*state_ptr).memory).write(store_kernel_value(
+                    MemorySubsystem {
+                        user_memory: store_kernel_value(UserMemoryStore::default()),
+                        memory_objects: [None; MAX_MEMORY_OBJECTS],
+                        brk_regions: [None; MAX_TASKS],
+                        cow_pages: alloc::collections::BTreeMap::new(),
+                        #[cfg(test)]
+                        cow_page_capacity_limit: None,
+                        next_memory_object_id: 1,
+                        frame_allocator: store_kernel_value(frame_allocator),
+                    },
+                ));
+            }
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let memory_ptr = core::ptr::addr_of_mut!((*state_ptr).memory);
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*memory_ptr).memory_objects));
+                Self::init_option_array_none(core::ptr::addr_of_mut!((*memory_ptr).brk_regions));
+                core::ptr::addr_of_mut!((*memory_ptr).cow_pages)
+                    .write(alloc::collections::BTreeMap::new());
+                #[cfg(test)]
+                core::ptr::addr_of_mut!((*memory_ptr).cow_page_capacity_limit).write(None);
+                core::ptr::addr_of_mut!((*memory_ptr).next_memory_object_id).write(1);
+                let frame_allocator_ptr = core::ptr::addr_of_mut!((*memory_ptr).frame_allocator)
+                    as *mut PhysicalFrameAllocator;
+                core::ptr::write_bytes(
+                    frame_allocator_ptr.cast::<u8>(),
+                    0,
+                    core::mem::size_of::<PhysicalFrameAllocator>(),
+                );
+                crate::arch::boot_entry::bootstrap_step("frame_allocator");
+                (*frame_allocator_ptr)
+                    .init_from_memory_map(main_slice)
+                    .map_err(|_| KernelError::MemoryObjectFull)?;
+            }
             core::ptr::addr_of_mut!((*state_ptr).drivers).write(store_kernel_value(
                 DriverSubsystem {
                     driver_records: [const { None }; MAX_DRIVERS],
@@ -681,7 +942,8 @@ impl Bootstrap {
             crate::arch::boot_entry::bootstrap_step("dispatch_next_task");
             state.dispatch_next_task()?;
             crate::arch::boot_entry::bootstrap_step("done");
-            Ok(state)
+            let _ = state;
+            Ok(())
         }
     }
 
@@ -691,13 +953,12 @@ impl Bootstrap {
     // installing any trap state pointer.  Trap migration happens in a later
     // phase.  The ownership contract is:
     //
-    //   1. init_static_with_boot_memory_map writes BOOTSTRAP_KERNEL_STATE and
-    //      returns a &'static mut KernelState aliasing that storage.
-    //   2. We immediately ptr::read the bytes out, consuming the alias.
-    //      After the read, the caller must not use the &'static mut ref again.
-    //   3. The owned KernelState is moved into SharedKernel::new, which stores
-    //      it inside a SpinLock inside BOOTSTRAP_SHARED_KERNEL.
-    //   4. BOOTSTRAP_SHARED_KERNEL is written exactly once; READY flag is set.
+    //   1. BOOTSTRAP_SHARED_KERNEL storage is claimed by READY 0 -> 1.
+    //   2. SharedKernel::init_in_place initializes the embedded SpinLock and
+    //      initializes KernelState directly inside that lock's value storage.
+    //   3. No ptr::read/assume_init_read or by-value KernelState move occurs in
+    //      the static SharedKernel bootstrap path.
+    //   4. READY is set to 2 only after all fields are initialized.
     //   5. Neither install_trap_kernel_state nor install_trap_shared_kernel is
     //      called here.  Stage 2N remains fallback-active.
 
@@ -740,33 +1001,18 @@ impl Bootstrap {
             panic!("init_shared_static called more than once");
         }
 
-        // Step 1: initialize KernelState into BOOTSTRAP_KERNEL_STATE.
-        let state_ref = Self::init_static_with_boot_memory_map(
-            capacity_profile,
-            boot_regions,
-            reserved_ranges,
-        )?;
-
-        // Step 2: move the KernelState bytes out of BOOTSTRAP_KERNEL_STATE.
-        // After this ptr::read the &'static mut ref must not be used again;
-        // BOOTSTRAP_KERNEL_STATE holds logically-moved-from bytes.
-        //
-        // SAFETY: init_static_with_boot_memory_map fully initializes the
-        // MaybeUninit storage and returns a valid &'static mut KernelState.
-        // ptr::read produces an owned copy; we drop the reference immediately.
-        let owned: KernelState = unsafe { core::ptr::read(state_ref as *const KernelState) };
-
-        // Step 3: wrap in SharedKernel and write into BOOTSTRAP_SHARED_KERNEL.
-        let shared = crate::runtime::SharedKernel::new(owned);
-        // SAFETY: single-writer guaranteed by the compare_exchange guard above;
-        // READY is still 1 (initializing), so no concurrent reader in
-        // shared_static_ref can yet observe the write target (it gates on == 2).
-        // We use addr_of_mut! + ptr::write to match the BOOTSTRAP_KERNEL_STATE
-        // pattern and avoid the static_mut_refs lint.
+        // Initialize SharedKernel and its embedded KernelState in final storage.
         unsafe {
             let ptr = core::ptr::addr_of_mut!(BOOTSTRAP_SHARED_KERNEL)
                 .cast::<crate::runtime::SharedKernel>();
-            core::ptr::write(ptr, shared);
+            crate::runtime::SharedKernel::init_in_place(ptr, |state_ptr| {
+                Self::init_kernel_state_in_place(
+                    state_ptr,
+                    capacity_profile,
+                    boot_regions,
+                    reserved_ranges,
+                )
+            })?;
         }
 
         // Publish: transition 1 (initializing) → 2 (ready).  The Release store

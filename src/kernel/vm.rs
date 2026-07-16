@@ -960,6 +960,30 @@ impl Default for AddressSpaceManager {
 }
 
 impl AddressSpaceManager {
+    /// Initialize `AddressSpaceManager` directly in final boot storage without
+    /// returning the fixed arrays by value.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must be aligned, writable, unique storage for an
+    /// uninitialized `AddressSpaceManager`. The caller must not publish the
+    /// manager until all fields have been written.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) unsafe fn init_in_place_default(destination: *mut Self) {
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).next_asid).write(1);
+            let entries = core::ptr::addr_of_mut!((*destination).entries).cast::<Option<AsEntry>>();
+            for idx in 0..MAX_ADDRESS_SPACES {
+                entries.add(idx).write(None);
+            }
+            let retired =
+                core::ptr::addr_of_mut!((*destination).retired).cast::<Option<RetiredAsid>>();
+            for idx in 0..MAX_ADDRESS_SPACES {
+                retired.add(idx).write(None);
+            }
+        }
+    }
+
     fn asid_in_use(&self, asid: Asid) -> bool {
         self.entries
             .iter()

@@ -435,6 +435,30 @@ impl Default for SmpScheduler {
 }
 
 impl SmpScheduler {
+    /// Initialize `SmpScheduler` directly in final boot storage without forming
+    /// a complete by-value scheduler temporary.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must be aligned, writable, unique storage for an
+    /// uninitialized `SmpScheduler`. The caller must not publish the scheduler
+    /// until this function returns. Each field is written exactly once here.
+    #[cfg(not(feature = "hosted-dev"))]
+    pub(crate) unsafe fn init_in_place_default(destination: *mut Self) {
+        unsafe {
+            let schedulers_ptr =
+                core::ptr::addr_of_mut!((*destination).schedulers).cast::<PriorityScheduler>();
+            for idx in 0..MAX_CPUS {
+                schedulers_ptr.add(idx).write(PriorityScheduler::default());
+            }
+            core::ptr::addr_of_mut!((*destination).topology).write(
+                CpuTopology::from_present_bitmap(topology::default_present_cpu_bitmap()),
+            );
+            core::ptr::addr_of_mut!((*destination).next_balance_cpu).write(0);
+            core::ptr::addr_of_mut!((*destination).wake_only).write(0);
+        }
+    }
+
     fn check_cpu(cpu: CpuId) -> Result<usize, SchedulerError> {
         let idx = cpu.0 as usize;
         if idx >= MAX_CPUS {

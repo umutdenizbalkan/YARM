@@ -52,6 +52,30 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// Initialize a `SpinLock<T>` directly in its final storage.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must be non-null, properly aligned, writable storage for a
+    /// `SpinLock<T>` that does not currently contain a live value. The caller must
+    /// not publish `destination` until `initialize_value` returns `Ok(())`. The
+    /// closure receives the address of the lock-protected `T` storage and must
+    /// initialize that `T` exactly once without reading it first. On error, the
+    /// partially initialized storage must be treated as leaked boot storage; no
+    /// destructor may be run for uninitialized fields.
+    pub unsafe fn init_in_place<E>(
+        destination: *mut Self,
+        initialize_value: impl FnOnce(*mut T) -> Result<(), E>,
+    ) -> Result<(), E> {
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).held)
+                .write(CachePaddedFlag(AtomicBool::new(false)));
+            let value_ptr = core::ptr::addr_of_mut!((*destination).value).cast::<T>();
+            initialize_value(value_ptr)?;
+        }
+        Ok(())
+    }
+
     #[must_use = "if unused, the lock is immediately released when the guard is dropped"]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         // Use compare_exchange_weak in the retry loop: weak CAS may spuriously
@@ -106,6 +130,30 @@ impl<T> SpinLockIrq<T> {
             held: CachePaddedFlag(AtomicBool::new(false)),
             value: UnsafeCell::new(value),
         }
+    }
+
+    /// Initialize a `SpinLockIrq<T>` directly in its final storage.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must be non-null, properly aligned, writable storage for a
+    /// `SpinLockIrq<T>` that does not currently contain a live value. The caller
+    /// must not publish `destination` until `initialize_value` returns `Ok(())`.
+    /// The closure receives the address of the IRQ-lock-protected `T` storage
+    /// and must initialize that `T` exactly once without reading it first. On
+    /// error, the partially initialized storage must be treated as leaked boot
+    /// storage; no destructor may be run for uninitialized fields.
+    pub unsafe fn init_in_place<E>(
+        destination: *mut Self,
+        initialize_value: impl FnOnce(*mut T) -> Result<(), E>,
+    ) -> Result<(), E> {
+        unsafe {
+            core::ptr::addr_of_mut!((*destination).held)
+                .write(CachePaddedFlag(AtomicBool::new(false)));
+            let value_ptr = core::ptr::addr_of_mut!((*destination).value).cast::<T>();
+            initialize_value(value_ptr)?;
+        }
+        Ok(())
     }
 
     #[must_use = "if unused, the lock is immediately released when the guard is dropped"]
