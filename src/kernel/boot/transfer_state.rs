@@ -442,6 +442,27 @@ impl KernelState {
         }
     }
 
+    /// Stage 198E3B2A: update the provisional active-mapping entry's authorized length to the
+    /// current mapped prefix (rank 3 only) — the domain-side "update mapped-prefix progress" seam.
+    /// Returns true iff the entry existed. (The accepted authoritative progress is the txn-local
+    /// `mapped_prefix_len`; this keeps the registry entry consistent for prefix-tracked cleanup.)
+    pub(crate) fn update_active_transfer_mapping_len_locked(
+        ipc: &mut super::IpcSubsystem,
+        owner_tid: ThreadId,
+        transfer_cap: CapId,
+        new_len: usize,
+    ) -> bool {
+        for slot in ipc.active_transfer_mappings.iter_mut() {
+            if let Some(mapping) = slot.as_mut() {
+                if mapping.owner_tid == owner_tid && mapping.transfer_cap == transfer_cap {
+                    mapping.len = new_len;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Stage 198E3B2A: `&mut IpcSubsystem` sibling of [`Self::remove_active_transfer_mapping`]
     /// (rank 3 only). Byte-identical guarded remove.
     pub(crate) fn remove_active_transfer_mapping_locked(

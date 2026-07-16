@@ -66416,6 +66416,315 @@ mod stage198e3b2a_shared_region_seams {
     }
 }
 
+// Stage 198E3B2A part 2 — SharedRegionOffLockCtx end-to-end equivalence + safety (hosted proof).
+//
+// Drives the accepted `run_shared_region_txn` through the OFF-LOCK `SharedRegionOffLockCtx` (all
+// bounded SharedKernel split seams, no broad borrow) and proves it produces the SAME publish /
+// rollback outcomes as the broad-borrow reference path, plus the lock-discipline source contracts.
+// The production post-work drain is NOT switched (still the broad context) and no producer is live.
+mod stage198e3b2a_offlock_ctx {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        RecvBoundarySharedRegionSnapshot, SHARED_REGION_TXN_FORCE_COPY_FAULT,
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE, SharedRegionTxnError, run_shared_region_txn,
+    };
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+    use crate::runtime::{SharedKernel, SharedRegionOffLockCtx};
+    use core::sync::atomic::Ordering;
+
+    const MAP_VA: u64 = 0x20_000;
+    const META_PTR: u64 = 0x40_000;
+
+    fn reset_hooks() {
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+    }
+
+    struct Fx {
+        shared: SharedKernel,
+        snap: RecvBoundarySharedRegionSnapshot,
+        phys0: u64,
+        asid: crate::kernel::vm::Asid,
+    }
+
+    // Build a receiver (task 2, own ASID, meta page mapped, MAP_VA..+pages free) + a `pages`-page
+    // MemoryObject source cap + a stashed shared-region envelope, take the Phase-A snapshot, and wrap
+    // the KernelState in a SharedKernel for off-lock execution.
+    fn build(pages: usize, rights: CapRights, map_write: bool) -> Fx {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("task2");
+        s.enqueue_current_cpu(2).expect("enqueue");
+        let (_eidx, send_cap, _r) = s.create_endpoint(4).expect("endpoint");
+        let endpoint = s.current_task_capability(send_cap).expect("send").object;
+        let (_id, mem_cap0) = s
+            .alloc_anonymous_memory_object_with_len(pages * PAGE_SIZE)
+            .expect("mem");
+        let source_obj = s.current_task_capability(mem_cap0).expect("obj").object;
+        let phys0 = s
+            .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, source_obj))
+            .expect("phys")
+            .0;
+        let src_cap = s
+            .mint_capability_for_current_context(Capability::new(source_obj, rights))
+            .expect("mint src");
+        let (asid, aspace) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(2, asid).expect("bind");
+        s.map_user_page(
+            aspace,
+            VirtAddr(META_PTR),
+            Mapping {
+                phys: PhysAddr(0x5000_0000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: (pages * PAGE_SIZE) as u64,
+        };
+        let handle = s
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        let snap = s
+            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg, true)
+            .expect("phase A");
+        Fx {
+            shared: SharedKernel::new(s),
+            snap,
+            phys0,
+            asid,
+        }
+    }
+
+    fn run_offlock(
+        fx: &Fx,
+    ) -> Result<
+        crate::kernel::boot::shared_region_txn::SharedRegionDirectPublish,
+        SharedRegionTxnError,
+    > {
+        let mut ctx = SharedRegionOffLockCtx(&fx.shared);
+        run_shared_region_txn(&mut ctx, fx.snap)
+    }
+    fn active_mappings(fx: &Fx) -> usize {
+        fx.shared.with(|k| {
+            (0..MAX_TRANSFER_ENVELOPES)
+                .filter(|&i| k.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+                .count()
+        })
+    }
+    fn mapped_pages(fx: &Fx, pages: usize) -> usize {
+        (0..pages)
+            .filter(|&i| {
+                crate::arch::selected_isa::page_table::resolve_page(
+                    fx.asid,
+                    VirtAddr(MAP_VA + (i * PAGE_SIZE) as u64),
+                )
+                .is_some()
+            })
+            .count()
+    }
+    fn cnode_occupied(fx: &Fx) -> usize {
+        fx.shared.with(|k| {
+            k.cnode_occupied_slots(k.task_cnode(2).expect("cn"))
+                .unwrap_or(0)
+        })
+    }
+    fn pin_refcount(fx: &Fx) -> u32 {
+        fx.shared
+            .with(|k| k.memory_object_refcounts(PhysAddr(fx.phys0)).map(|t| t.2))
+            .unwrap_or(0)
+    }
+
+    // (4/5) one-page + multi-page success: off-lock publish maps every page, mints exactly one cap,
+    // writes the recv-v2 meta (transferred-cap), and wakes the receiver once — same as the reference.
+    #[test]
+    fn offlock_success_single_and_multi_page() {
+        for pages in [1usize, 3usize] {
+            reset_hooks();
+            let fx = build(pages, CapRights::READ | CapRights::MAP, false);
+            let occ_before = cnode_occupied(&fx);
+            let out = run_offlock(&fx).expect("publish");
+            assert_eq!(out.mapped_len, pages * PAGE_SIZE);
+            assert!(out.woke_receiver, "one wake on success");
+            assert_eq!(active_mappings(&fx), 1, "exactly one active mapping");
+            assert_eq!(mapped_pages(&fx, pages), pages, "every page mapped");
+            assert_eq!(
+                cnode_occupied(&fx),
+                occ_before + 1,
+                "exactly one cap minted"
+            );
+            // recv-v2 meta written to the receiver's meta page (transferred-cap flag + fresh cap).
+            let meta = fx
+                .shared
+                .with(|k| k.copy_from_user(fx.asid, VirtAddr(META_PTR), 40))
+                .expect("meta");
+            let flags = u64::from_le_bytes(meta[24..32].try_into().unwrap());
+            assert_ne!(
+                flags & crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
+                0,
+                "meta sets TRANSFERRED_CAP"
+            );
+            let cap_id = u64::from_le_bytes(meta[16..24].try_into().unwrap());
+            assert_eq!(cap_id, out.receiver_local_cap.0);
+        }
+    }
+
+    // (6) page-N map fault: rollback unmaps EXACTLY the mapped prefix, revokes the provisional cap,
+    // releases the pin — the exact-prefix ownership is honored off-lock.
+    #[test]
+    fn offlock_map_fault_rolls_back_exact_prefix() {
+        reset_hooks();
+        let fx = build(2, CapRights::READ | CapRights::MAP, false);
+        let occ_before = cnode_occupied(&fx);
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(1, Ordering::SeqCst); // fault on the 2nd page
+        let res = run_offlock(&fx);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::MapFault));
+        assert_eq!(active_mappings(&fx), 0, "provisional mapping removed");
+        assert_eq!(mapped_pages(&fx, 2), 0, "mapped prefix fully unmapped");
+        assert_eq!(cnode_occupied(&fx), occ_before, "provisional cap revoked");
+        assert_eq!(pin_refcount(&fx), 0, "pin released");
+    }
+
+    // (7 partial) copy fault after complete mapping: rollback unmaps all, revokes, releases pin.
+    #[test]
+    fn offlock_copy_fault_rolls_back() {
+        reset_hooks();
+        let fx = build(2, CapRights::READ | CapRights::MAP, false);
+        let occ_before = cnode_occupied(&fx);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
+        let res = run_offlock(&fx);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::CopyFault));
+        assert_eq!(active_mappings(&fx), 0);
+        assert_eq!(mapped_pages(&fx, 2), 0);
+        assert_eq!(cnode_occupied(&fx), occ_before);
+        assert_eq!(pin_refcount(&fx), 0);
+    }
+
+    // (13) receiver ASID replacement before publication → ReceiverGone; nothing published/woken.
+    #[test]
+    fn offlock_receiver_asid_replacement_rejected() {
+        reset_hooks();
+        let fx = build(1, CapRights::READ | CapRights::MAP, false);
+        // Reused numeric TID 2 gets a NEW ASID → the captured-ASID snapshot is stale.
+        fx.shared.with(|k| {
+            let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
+            assert_ne!(new_asid, fx.snap.receiver_asid);
+            k.bind_task_asid(2, new_asid).expect("rebind");
+        });
+        let res = run_offlock(&fx);
+        assert_eq!(res, Err(SharedRegionTxnError::ReceiverGone));
+        assert_eq!(active_mappings(&fx), 0);
+    }
+
+    // (16/17) exactly one wake on success, zero wake on failure: on a mint failure the receiver is
+    // never enqueued. (cnode filled so the mint fails.)
+    #[test]
+    fn offlock_cap_mint_failure_zero_wake() {
+        reset_hooks();
+        let fx = build(1, CapRights::READ | CapRights::MAP, false);
+        // Fill the receiver cnode so the mint returns CnodeFull.
+        fx.shared.with(|k| {
+            let cn = k.task_cnode(2).expect("cn");
+            let cap = k.current_task_capability(fx.snap.source_cap);
+            let obj = cap.map(|c| c.object).unwrap_or(fx.snap.object);
+            // Mint until full.
+            for _ in 0..4096 {
+                if k.mint_capability_in_cnode(cn, Capability::new(obj, CapRights::READ))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let res = run_offlock(&fx);
+        assert_eq!(res, Err(SharedRegionTxnError::CnodeFull));
+        assert_eq!(active_mappings(&fx), 0, "no provisional mapping");
+        assert_eq!(mapped_pages(&fx, 1), 0, "nothing mapped");
+        assert_eq!(pin_refcount(&fx), 0, "pin released on rollback");
+    }
+
+    // (14) cancellation overflow fuse: while latched, the off-lock executor cancels (no publish).
+    #[test]
+    fn offlock_cancel_overflow_fuse_authoritative() {
+        reset_hooks();
+        let fx = build(1, CapRights::READ | CapRights::MAP, false);
+        // Latch the fuse directly in IpcState (equivalent to a saturating unrecordable cancellation).
+        fx.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.shared_region_cancel_overflow = true));
+        let res = run_offlock(&fx);
+        assert_eq!(res, Err(SharedRegionTxnError::Cancelled));
+        assert_eq!(active_mappings(&fx), 0);
+        assert_eq!(pin_refcount(&fx), 0);
+    }
+
+    // (18/19/20) SOURCE CONTRACTS: the OffLockCtx impl holds no broad borrow; the seams re-derive
+    // their domain pointer per call (no cached pointer) and never nest VM+memory or cap+memory locks;
+    // the production drain still uses the broad context (unchanged, dormant).
+    #[test]
+    fn offlock_ctx_source_contracts() {
+        const RT: &str = include_str!("../../runtime.rs");
+        let ctx_impl = RT
+            .split_once("impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegionOffLockCtx")
+            .map(|(_, r)| r.split_once("\n}\n").map(|(b, _)| b).unwrap_or(r))
+            .expect("OffLockCtx impl present");
+        for forbidden in ["with_cpu(", ".with(", "&mut KernelState"] {
+            assert!(
+                !ctx_impl.contains(forbidden),
+                "SharedRegionOffLockCtx impl must not contain `{forbidden}`"
+            );
+        }
+        // Every seam re-derives from data_ptr()/split seams (no cached projected pointer field).
+        assert!(
+            RT.contains(
+                "pub(crate) struct SharedRegionOffLockCtx<'a>(pub(crate) &'a SharedKernel);"
+            ),
+            "OffLockCtx wraps only &SharedKernel (no cached domain pointer)"
+        );
+        // The unmap seam releases the VM lock (rank 5) BEFORE the memory reclaim (rank 6) — separate
+        // `with_*_split_mut` calls, never nested; the map seam applies memory accounting after VM.
+        let unmap = RT
+            .split_once("pub(crate) fn unmap_range_two_phase_split(")
+            .map(|(_, r)| r.split_once("\n    }\n").map(|(b, _)| b).unwrap_or(r))
+            .expect("unmap seam present");
+        let vm_pos = unmap
+            .find("with_vm_user_spaces_split_mut")
+            .expect("vm phase");
+        let reclaim_pos = unmap
+            .find("reclaim_memory_object_for_phys_locked")
+            .expect("reclaim phase");
+        assert!(
+            vm_pos < reclaim_pos,
+            "VM PTE removal must precede (and its lock release) the rank-6 reclaim"
+        );
+        assert!(
+            !unmap.contains("with_vm_user_spaces_split_mut(|spaces| {\n                self.with_memory_split_mut"),
+            "unmap must not nest the memory lock inside the VM lock"
+        );
+        // Production drain unchanged: still the broad-context executor (with_cpu + shared_region_execute).
+        assert!(
+            RT.contains("kernel.shared_region_execute(snap.snapshot)")
+                && RT.contains("fn execute_blocked_waiter_shared_region_delivery"),
+            "the production post-work drain must remain on the broad context (not switched)"
+        );
+    }
+}
+
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
 // no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
 // reality the audit relied on, so a future stage cannot silently flip an architecture

@@ -536,8 +536,15 @@ pub(crate) trait SharedRegionExecCtx {
     fn ctx_unmap_prefix(&mut self, asid: crate::kernel::vm::Asid, base: usize, len: usize);
     /// rank 3: remove the provisional active-mapping entry (guarded).
     fn ctx_remove_active_mapping(&mut self, tid: u64, cap: CapId) -> bool;
-    /// rank 4 (+6): revoke the provisional receiver-local cap (guarded).
-    fn ctx_revoke_cap(&mut self, cnode: crate::kernel::capabilities::CNodeId, cap: CapId);
+    /// rank 4 (+6): revoke the provisional receiver-local cap (guarded). `object` lets the off-lock
+    /// context call the exact inverse of its mint (`rollback_minted_cap_split`); the broad context
+    /// ignores it (its `revoke_capability_in_cnode` resolves the object from the cnode slot).
+    fn ctx_revoke_cap(
+        &mut self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: CapId,
+        object: CapObject,
+    );
 }
 
 /// Cancellation-authoritative fold (single definition): overflow fuse → test hook → one-shot
@@ -800,7 +807,7 @@ pub(crate) fn rollback_shared_region_txn<C: SharedRegionExecCtx>(
     }
     // (4) Revoke the provisional receiver cap (once — guarded by take()).
     if let Some(cap) = txn.minted_cap.take() {
-        ctx.ctx_revoke_cap(txn.snapshot.receiver_cnode, cap);
+        ctx.ctx_revoke_cap(txn.snapshot.receiver_cnode, cap, txn.snapshot.object);
     }
     // (5) Release the transferred object pin (once — guarded by pin_owned). NEVER before the unmap
     // + required shootdown above complete.
@@ -861,7 +868,12 @@ impl SharedRegionExecCtx for KernelState {
     fn ctx_remove_active_mapping(&mut self, tid: u64, cap: CapId) -> bool {
         self.remove_active_transfer_mapping(ThreadId(tid), cap)
     }
-    fn ctx_revoke_cap(&mut self, cnode: crate::kernel::capabilities::CNodeId, cap: CapId) {
+    fn ctx_revoke_cap(
+        &mut self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: CapId,
+        _object: CapObject,
+    ) {
         let _ = self.revoke_capability_in_cnode(cnode, cap);
     }
 }
