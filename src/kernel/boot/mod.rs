@@ -2979,6 +2979,29 @@ pub fn x86_futex_wake_oracle_enabled() -> bool {
     X86_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 198E3C1: default-off x86_64 DIRECT shared-region live-oracle WORKLOAD selector
+/// (`yarm.x86_64_shared_region_direct_oracle=1`). Provisions init startup slot 5 (=2) so init runs
+/// the parent/child shared-region (`IpcSendSharedRegionDirect`) delivery proof — a receiver blocks
+/// first in recv-v2, the parent transfers a multi-page shared `MemoryObject`, and the accepted
+/// off-lock post-lock drain maps it + wakes the receiver exactly once. Selecting this workload also
+/// arms the shared IPC/oracle-proof knob so the direct producer becomes live (INERT on a normal
+/// boot, which never sets this). Does NOT enable the queued shared-region class or any non-x86 arch.
+pub(crate) static X86_SHARED_REGION_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_shared_region_direct_oracle_enabled(enabled: bool) {
+    X86_SHARED_REGION_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        // Selecting the workload arms the shared IPC/oracle-proof knob so the DIRECT shared-region
+        // producer is live for this run (the queued class stays disabled).
+        set_ipc_recv_oracle_proof_enabled(true);
+    }
+}
+
+pub fn x86_shared_region_direct_oracle_enabled() -> bool {
+    X86_SHARED_REGION_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 // ─── Stage 197A-C: mandatory init ELF loading (no synthetic fallback) ──────────────────
 //
 // Why an init load can be fatal. There is NO synthetic/placeholder init ELF fallback anymore

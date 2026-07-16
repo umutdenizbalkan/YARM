@@ -358,6 +358,17 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_x86_futex_wake_oracle_enabled(enabled);
         crate::yarm_log!("YARM_X86_64_FUTEX_WAKE_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.x86_64_shared_region_direct_oracle {
+        // Stage 198E3C1: default-off x86_64 DIRECT shared-region (`IpcSendSharedRegionDirect`)
+        // live-oracle knob. Provisions init startup slot 5 (=2) so init runs the parent/child
+        // shared-region delivery proof AND arms the shared IPC/oracle-proof knob so the direct
+        // producer is live. Does NOT enable the queued class or any non-x86 architecture.
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(enabled);
+        crate::yarm_log!(
+            "YARM_X86_64_SHARED_REGION_DIRECT_ORACLE_SET enabled={}",
+            enabled
+        );
+    }
     if let Some(enabled) = parsed.force_init_zc_load_fail {
         // Stage 197A: default-off fault-injection knob. Forces the required init ELF load to
         // fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path is exercisable under QEMU.
@@ -647,6 +658,12 @@ pub struct YarmBootOptions<'a> {
     /// then 0, waiter resumes once). Selects the proof workload only; the FutexWake retirement
     /// MECHANISM is already live by default. Closes the first-cohort matrix at 12/12 LIVE.
     pub x86_64_futex_wake_oracle: Option<bool>,
+    /// Stage 198E3C1: `yarm.x86_64_shared_region_direct_oracle=1` DEFAULT-OFF knob. Provisions init
+    /// startup slot 5 (=2) so init runs the parent/child DIRECT shared-region
+    /// (`IpcSendSharedRegionDirect`) delivery proof, and arms the shared IPC/oracle-proof knob so the
+    /// direct producer is live for the run. Selects the workload + enables exactly one x86_64
+    /// shared-region class; the queued class and all non-x86 architectures stay disabled.
+    pub x86_64_shared_region_direct_oracle: Option<bool>,
     /// Stage 197A: `yarm.force_init_zc_load_fail=1` DEFAULT-OFF fault-injection knob. Forces the
     /// required init ELF load to fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path is
     /// exercisable under QEMU. NEVER set on a normal boot.
@@ -834,6 +851,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.x86_64_futex_wake_oracle" {
             options.x86_64_futex_wake_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.x86_64_shared_region_direct_oracle" {
+            options.x86_64_shared_region_direct_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.force_init_zc_load_fail" {
             options.force_init_zc_load_fail = parse_bool_knob(value);
@@ -1368,6 +1388,30 @@ mod tests {
         );
         // Independent of the RISC-V FutexWake knob (no cross-arch aliasing).
         let x = parse_yarm_boot_options(b"yarm.x86_64_futex_wake_oracle=1");
+        assert_eq!(x.riscv64_futex_wake_oracle, None);
+    }
+
+    // Stage 198E3C1: the x86_64 DIRECT shared-region live-oracle knob parses independently and
+    // defaults off, and does not alias the FutexWake knob or any non-x86 arch knob.
+    #[test]
+    fn x86_64_shared_region_direct_oracle_knob_parses_and_defaults_off() {
+        assert_eq!(
+            parse_yarm_boot_options(b"").x86_64_shared_region_direct_oracle,
+            None
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.x86_64_shared_region_direct_oracle=1")
+                .x86_64_shared_region_direct_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.x86_64_shared_region_direct_oracle=0")
+                .x86_64_shared_region_direct_oracle,
+            Some(false)
+        );
+        // Independent of the FutexWake knob and never aliases a non-x86 arch.
+        let x = parse_yarm_boot_options(b"yarm.x86_64_shared_region_direct_oracle=1");
+        assert_eq!(x.x86_64_futex_wake_oracle, None);
         assert_eq!(x.riscv64_futex_wake_oracle, None);
     }
 
