@@ -887,34 +887,98 @@ impl SharedRegionExecCtx for KernelState {
         self.copy_to_user(asid, va, bytes).is_ok()
     }
     fn ctx_finalize_and_wake(&mut self, snap: &RecvBoundarySharedRegionSnapshot) -> Option<bool> {
-        if snap.blocked_endpoint_waiter {
-            let CapObject::Endpoint {
-                index: eidx,
-                generation: egen,
-            } = snap.endpoint
-            else {
-                return None;
-            };
-            // Waiter identity (rank 3 read): the exact endpoint (index + generation) must still hold
-            // THIS receiver as its waiter. A missing / replaced (different-tid) waiter is stale.
-            let ours = self.with_ipc_state(|ipc| {
-                eidx < ipc.endpoint_waiters.len()
-                    && ipc.endpoint_generations[eidx] == egen
-                    && ipc.endpoint_waiters[eidx] == Some(ThreadId(snap.receiver_tid))
-            });
-            if !ours {
-                return None;
-            }
-            // rank 2: clear blocked-return register state; rank 3: clear the exact waiter slot —
-            // BOTH before the receiver becomes runnable.
-            self.clear_blocked_recv_return_regs(snap.receiver_tid);
-            self.ipc_clear_plain_receiver_waiter_only(eidx, ThreadId(snap.receiver_tid));
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        if !snap.blocked_endpoint_waiter {
+            // Plain wake path (queued dequeue / txn proofs): no endpoint-waiter identity to claim.
+            return Some(
+                self.apply_split_receiver_wake_plan(ThreadId(snap.receiver_tid))
+                    .is_ok(),
+            );
         }
-        // rank 2 (set Runnable) → rank 1 (enqueue): the single wake, the last visible action.
-        Some(
-            self.apply_split_receiver_wake_plan(ThreadId(snap.receiver_tid))
-                .is_ok(),
-        )
+        let CapObject::Endpoint {
+            index: eidx,
+            generation: egen,
+        } = snap.endpoint
+        else {
+            return None;
+        };
+        let receiver = ThreadId(snap.receiver_tid);
+        // Stage 198E3B2B1 CLAIM-THEN-COMMIT (reference mirror of the off-lock seam ordering).
+        // Phase 1 (rank 2): prevalidate — NO mutation. Dead/replaced/not-blocked → stale BEFORE claim.
+        // (`blocked_recv_state` was consumed at production; the live signal is Blocked(EndpointReceive)
+        // + captured ASID, with the exact endpoint identity/generation verified in the Phase-2 claim.)
+        let prevalid = self.with_tcbs(|tcbs| {
+            match tcbs.iter().flatten().find(|t| t.tid.0 == snap.receiver_tid) {
+                Some(tcb) => {
+                    tcb.asid == Some(snap.receiver_asid)
+                        && matches!(
+                            tcb.status,
+                            TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                        )
+                }
+                None => false,
+            }
+        });
+        if !prevalid {
+            return None;
+        }
+        // Phase 2 (rank 3): exact, generation-bearing waiter claim (remove once). A missing / replaced
+        // waiter or a changed endpoint generation → no claim, slot untouched, stale.
+        let claimed = self.with_ipc_state_mut(|ipc| {
+            if eidx < ipc.endpoint_waiters.len()
+                && ipc.endpoint_generations[eidx] == egen
+                && ipc.endpoint_waiters[eidx] == Some(receiver)
+            {
+                ipc.endpoint_waiters[eidx] = None;
+                true
+            } else {
+                false
+            }
+        });
+        if !claimed {
+            return None;
+        }
+        // Phase 3 (rank 2): commit — registers cleared ONLY here, strictly AFTER the claim. Classify
+        // first so no register is touched unless the receiver is a still-live match.
+        let class = self.with_tcbs(|tcbs| {
+            match tcbs.iter().flatten().find(|t| t.tid.0 == snap.receiver_tid) {
+                None => 0u8, // dead
+                Some(tcb) if matches!(tcb.status, TaskStatus::Exited(_) | TaskStatus::Dead) => 0,
+                Some(tcb)
+                    if tcb.asid == Some(snap.receiver_asid)
+                        && matches!(
+                            tcb.status,
+                            TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                        ) =>
+                {
+                    2 // commit
+                }
+                Some(_) => 1, // replaced (live, different incarnation)
+            }
+        });
+        match class {
+            2 => {
+                // rank 2: clear blocked-return registers, THEN rank 2→1 wake (set Runnable + enqueue).
+                self.clear_blocked_recv_return_regs(snap.receiver_tid);
+                Some(self.apply_split_receiver_wake_plan(receiver).is_ok())
+            }
+            1 => {
+                // Live task at the TID but replaced incarnation: restore its EXACT (generation-bearing)
+                // waiter so no live blocked task is stranded, then treat as stale (zero wake).
+                self.with_ipc_state_mut(|ipc| {
+                    if eidx < ipc.endpoint_waiters.len()
+                        && ipc.endpoint_generations[eidx] == egen
+                        && ipc.endpoint_waiters[eidx].is_none()
+                    {
+                        ipc.endpoint_waiters[eidx] = Some(receiver);
+                    }
+                });
+                None
+            }
+            // Dead/removed receiver after the claim: the claimed waiter is correctly stale — never
+            // restore (no live task to strand). Zero wake.
+            _ => None,
+        }
     }
     fn ctx_release_pin(&mut self, object: CapObject) {
         self.adjust_memory_object_pin_refcount(object, -1);

@@ -2924,47 +2924,201 @@ impl SharedKernel {
         true
     }
 
+    /// rank 2 (task lock) — Stage 198E3B2B1 Phase 1: blocked-receiver PREVALIDATION. Makes NO
+    /// mutation. Requires the expected receiver TID to still exist, its captured ASID to still match,
+    /// and it to still be blocked in the expected recv-v2 operation. A dead / replaced / not-blocked
+    /// receiver returns `false` (stale) BEFORE any waiter is touched, so the common (no-concurrent-
+    /// mutator) replacement never removes a replacement task's waiter slot.
+    pub(crate) fn sr_prevalidate_blocked_receiver_split(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> bool {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        // NOTE: the recv-v2 payload state (`blocked_recv_state`) was CONSUMED into the snapshot at
+        // production (`blocked_recv_state.take()`), so the live check for "still blocked in the
+        // expected recv-v2 operation" is the surviving `Blocked(EndpointReceive)` status + the
+        // captured ASID; the exact endpoint identity + generation is verified in the Phase-2 claim.
+        self.with_task_tcbs_split_mut(
+            |tcbs| match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
+                Some(tcb) => {
+                    tcb.asid == Some(asid)
+                        && matches!(
+                            tcb.status,
+                            TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                        )
+                }
+                None => false,
+            },
+        )
+    }
+
+    /// rank 3 (ipc lock) — Stage 198E3B2B1 Phase 2: the exact, atomic waiter CLAIM. Under a single
+    /// rank-3 critical section it revalidates the endpoint index AND GENERATION, requires the exact
+    /// expected receiver as the slot's waiter, then removes that waiter EXACTLY ONCE and returns an
+    /// owned generation-bearing `WaiterClaim`. An endpoint destroyed/recreated (generation changed),
+    /// a different or absent waiter → no claim (`None`), slot untouched. The endpoint generation is
+    /// part of the claim authority: a same-index-but-newer endpoint can never be claimed.
+    pub(crate) fn sr_claim_endpoint_waiter_split(
+        &self,
+        eidx: usize,
+        egen: u64,
+        receiver: crate::kernel::ipc::ThreadId,
+    ) -> Option<WaiterClaim> {
+        self.with_ipc_split_mut(|ipc| {
+            if eidx < ipc.endpoint_waiters.len()
+                && ipc.endpoint_generations[eidx] == egen
+                && ipc.endpoint_waiters[eidx] == Some(receiver)
+            {
+                ipc.endpoint_waiters[eidx] = None;
+                Some(WaiterClaim {
+                    eidx,
+                    generation: egen,
+                    receiver,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    /// rank 3 (ipc lock) — restore the EXACT claimed waiter using its generation-bearing token, but
+    /// only if the endpoint still exists at that generation AND its slot is currently free (never
+    /// clobbering a newer waiter). Used solely on a post-claim recoverable abort where a LIVE task
+    /// must keep its waiter — so no live blocked task is ever left without one.
+    pub(crate) fn sr_restore_endpoint_waiter_split(&self, claim: &WaiterClaim) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            if claim.eidx < ipc.endpoint_waiters.len()
+                && ipc.endpoint_generations[claim.eidx] == claim.generation
+                && ipc.endpoint_waiters[claim.eidx].is_none()
+            {
+                ipc.endpoint_waiters[claim.eidx] = Some(claim.receiver);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// rank 2 (task lock) — Stage 198E3B2B1 Phase 3: task COMMIT, run ONLY after a successful waiter
+    /// claim. Revalidates TID + ASID + blocked recv-v2 state AGAIN; for a still-live matching blocked
+    /// receiver this is infallible — it clears the blocked-return register state, transitions the
+    /// receiver Runnable, and captures its affinity (`Committed`). A receiver that EXITED / was
+    /// removed → `GoneDead` (never restore). A live task whose ASID no longer matches (replaced at the
+    /// same TID) → `Replaced` (caller restores its waiter). NO register is mutated on `GoneDead` /
+    /// `Replaced`, so a failed commit leaves the blocked-return registers byte-identical.
+    pub(crate) fn sr_commit_blocked_receiver_split(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> ReceiverCommit {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        self.with_task_tcbs_split_mut(|tcbs| {
+            // Classify FIRST (immutable), so no register is touched unless we commit. `blocked_recv_state`
+            // was consumed at production, so the live-match signal is `Blocked(EndpointReceive)` + ASID.
+            let class = match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
+                None => ReceiverCommit::GoneDead,
+                Some(tcb) if matches!(tcb.status, TaskStatus::Exited(_) | TaskStatus::Dead) => {
+                    ReceiverCommit::GoneDead
+                }
+                Some(tcb)
+                    if tcb.asid == Some(asid)
+                        && matches!(
+                            tcb.status,
+                            TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                        ) =>
+                {
+                    ReceiverCommit::Committed(None)
+                }
+                Some(_) => ReceiverCommit::Replaced,
+            };
+            if !matches!(class, ReceiverCommit::Committed(_)) {
+                return class;
+            }
+            // Infallible commit for a still-live matching blocked receiver: clear the blocked-return
+            // register state (single-sourced arch-gated helper), then set Runnable + capture affinity.
+            KernelState::clear_blocked_recv_return_regs_locked(tcbs, tid);
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .expect("prevalidated present");
+            tcb.status = TaskStatus::Runnable;
+            ReceiverCommit::Committed(tcb.cpu_affinity)
+        })
+    }
+
+    /// rank 1 (scheduler lock) — Stage 198E3B2B1 Phase 4: the single ENQUEUE. The receiver is already
+    /// Runnable (committed under the task lock); this only enqueues it exactly once on its captured
+    /// affinity (else the current CPU). This is the final externally visible action and is NON-fallible
+    /// — no fallible work runs after it. Priority is class-derived (SystemServer=High else Normal).
+    pub(crate) fn sr_enqueue_committed_receiver_split(&self, tid: u64, affinity: Option<CpuId>) {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::TaskClass;
+        let priority = match self.task_class_split_read(tid) {
+            Some(TaskClass::SystemServer) => TaskPriority::High,
+            _ => TaskPriority::Normal,
+        };
+        self.with_scheduler_split_mut(|sched| {
+            let cpu = affinity.unwrap_or(sched.current_cpu);
+            let sm = kernel_mut(&mut sched.scheduler);
+            let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
+        });
+    }
+
     /// Origin-neutral finalize + wake for a shared-region delivery, entirely off-lock. For a blocked
-    /// endpoint waiter (`snap.blocked_endpoint_waiter`) it validates the exact endpoint waiter slot
-    /// (rank 3), clears the blocked-return register state (rank 2) and that slot (rank 3), THEN wakes
-    /// (rank 2 set-Runnable → rank 1 enqueue). All fallible work (waiter validation) precedes the
-    /// enqueue; a missing / replacement waiter returns `false` with NO wake. Locks are non-nested and
-    /// no IPC/cap/VM/memory lock is held during the wake. Mirrors the broad `ctx_finalize_and_wake`.
+    /// endpoint waiter (`snap.blocked_endpoint_waiter`) it runs the Stage 198E3B2B1 CLAIM-THEN-COMMIT
+    /// protocol: Phase 1 prevalidate (rank 2, no mutation) → Phase 2 exact generation-bearing waiter
+    /// claim (rank 3, remove once) → Phase 3 commit (rank 2, clear registers + Runnable + affinity for
+    /// a live match; NO register mutation before the claim, none on a failed commit) → Phase 4 enqueue
+    /// (rank 1, once, non-fallible, last visible action). A dead receiver after the claim is stale with
+    /// the claimed waiter left removed; a replaced receiver has its exact waiter restored so no live
+    /// task is stranded — both roll back with ZERO wake. When `!blocked_endpoint_waiter` (queued
+    /// dequeue / proofs) it is a plain best-effort wake, preserving the prior executor semantics.
     pub(crate) fn sr_finalize_blocked_receiver_and_wake_split(
         &self,
         snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
     ) -> Option<bool> {
         use crate::kernel::ipc::ThreadId;
-        if snap.blocked_endpoint_waiter {
-            let CapObject::Endpoint {
-                index: eidx,
-                generation: egen,
-            } = snap.endpoint
-            else {
-                return None;
-            };
-            // rank 3: the exact endpoint (index + generation) must still hold THIS receiver.
-            let ours = self.with_ipc_split_mut(|ipc| {
-                eidx < ipc.endpoint_waiters.len()
-                    && ipc.endpoint_generations[eidx] == egen
-                    && ipc.endpoint_waiters[eidx] == Some(ThreadId(snap.receiver_tid))
-            });
-            if !ours {
-                return None;
-            }
-            // rank 2: clear blocked-return register state.
-            self.with_task_tcbs_split_mut(|tcbs| {
-                KernelState::clear_blocked_recv_return_regs_locked(tcbs, snap.receiver_tid)
-            });
-            // rank 3: clear the exact waiter slot (still ours) — BEFORE the receiver becomes runnable.
-            self.with_ipc_split_mut(|ipc| {
-                if ipc.endpoint_waiters[eidx] == Some(ThreadId(snap.receiver_tid)) {
-                    ipc.endpoint_waiters[eidx] = None;
-                }
-            });
+        if !snap.blocked_endpoint_waiter {
+            // Plain wake path: no endpoint-waiter identity to claim (queued dequeue / txn proofs).
+            return Some(self.sr_wake_receiver_split(snap.receiver_tid));
         }
-        // rank 2 (set Runnable) → rank 1 (enqueue): the single wake, the last visible action.
-        Some(self.sr_wake_receiver_split(snap.receiver_tid))
+        let CapObject::Endpoint {
+            index: eidx,
+            generation: egen,
+        } = snap.endpoint
+        else {
+            return None;
+        };
+        let receiver = ThreadId(snap.receiver_tid);
+        // Phase 1 (rank 2): prevalidate — NO mutation. A dead/replaced receiver is stale BEFORE claim,
+        // so a replacement waiter slot is never removed on the common path.
+        if !self.sr_prevalidate_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
+            return None;
+        }
+        // Phase 2 (rank 3): the exact, generation-bearing waiter claim (remove once).
+        let claim = self.sr_claim_endpoint_waiter_split(eidx, egen, receiver)?;
+        // Phase 3 (rank 2): commit — registers cleared ONLY here, strictly after the claim.
+        match self.sr_commit_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
+            ReceiverCommit::Committed(affinity) => {
+                // Phase 4 (rank 1): the single, non-fallible enqueue — the last externally visible act.
+                self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity);
+                Some(true)
+            }
+            ReceiverCommit::GoneDead => {
+                // Receiver exited/removed after the claim: the claimed waiter is correctly stale. Do
+                // NOT restore (no live task to strand). Zero wake; the transaction rolls back.
+                None
+            }
+            ReceiverCommit::Replaced => {
+                // A live task occupies the TID but is no longer our receiver: restore its EXACT
+                // (generation-bearing) waiter so no live blocked task is stranded, then roll back.
+                let _ = self.sr_restore_endpoint_waiter_split(&claim);
+                None
+            }
+        }
     }
 
     /// Off-global-lock, all-or-nothing user-copy primitive (introduced Stage 191C; its
@@ -3433,6 +3587,31 @@ impl SharedKernel {
 pub(crate) struct SharedRegionMapFollowup {
     pub(crate) inserted_phys: crate::kernel::vm::PhysAddr,
     pub(crate) replaced: Option<crate::kernel::vm::Mapping>,
+}
+
+/// Owned proof that THIS blocked-receiver finalization removed EXACTLY its receiver's endpoint
+/// waiter slot (Stage 198E3B2B1). It carries the endpoint GENERATION it was claimed under so a later
+/// restore can only ever re-target the same endpoint incarnation — never a destroyed/recreated one.
+/// The claim is the sole authority for having removed the waiter; a numeric TID alone is never it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WaiterClaim {
+    pub(crate) eidx: usize,
+    pub(crate) generation: u64,
+    pub(crate) receiver: crate::kernel::ipc::ThreadId,
+}
+
+/// Outcome of the Phase-3 task commit, run only AFTER a successful waiter claim (Stage 198E3B2B1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverCommit {
+    /// Still-live matching blocked receiver: its blocked-return register state was cleared and it was
+    /// transitioned Runnable; the captured affinity is carried for the single Phase-4 enqueue.
+    Committed(Option<CpuId>),
+    /// The receiver exited / was removed after the claim: the claimed waiter is correctly stale and
+    /// MUST NOT be restored (there is no live task to strand). No register was mutated.
+    GoneDead,
+    /// A live task still occupies the TID but is no longer our receiver (ASID replaced): the caller
+    /// restores its EXACT claimed waiter so no live blocked task is stranded. No register was mutated.
+    Replaced,
 }
 
 /// Stage 198E3B2A: the OFF-LOCK shared-region execution context. Implements the single

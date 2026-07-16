@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Stage 198E3B2B — SHARED-REGION DRAIN SWITCHED TO OFF-LOCK EXECUTION SEAL.
+# Stage 198E3B2B / 198E3B2B1 — SHARED-REGION OFF-LOCK DRAIN + ATOMIC FINALIZATION SEAL.
 #
 # Proves the REAL post-work drain (`drain_dispatch_post_work` → the switched
 # `execute_blocked_waiter_shared_region_delivery`) runs the shared-region transaction end-to-end
 # through `SharedRegionOffLockCtx` — no broad `&mut KernelState`, no `with(...)`/`with_cpu(...)`
-# re-entry, no `shared_region_execute`. Each case asserts its own invariant so the seal's zero-counts
-# hold by construction:
-#   - the finalize order (blocked-return regs + endpoint waiter slot cleared BEFORE the single wake),
-#   - stale/replacement/missing-waiter → rollback with ZERO wake (receiver stays Blocked),
-#   - copy/map/ASID-replacement failures → rollback (receiver stays Blocked, nothing leaked),
-#   - exactly ONE scheduler enqueue on success and NO duplicate wake on a repeated drain,
-#   - the post-work stash slot cleared on success,
-#   - retirement/attestation markers emitted ONLY in the success arm (never from the rolled-back arm),
-#   - producers dormant off the oracle knob.
+# re-entry — AND that blocked-receiver finalization is the Stage 198E3B2B1 CLAIM-THEN-COMMIT protocol:
+#   Phase 1 prevalidate (rank 2, NO mutation)
+#   Phase 2 exact GENERATION-BEARING waiter claim (rank 3, remove once)
+#   Phase 3 commit (rank 2, clear registers + Runnable ONLY for a still-live match; restore the exact
+#           claimed waiter for a live replaced task; leave a dead receiver's slot cleared)
+#   Phase 4 enqueue (rank 1, once, non-fallible, last visible action)
+# Each case asserts its own invariant, so the seal's counters hold by construction (it fails unless
+# every case passes):
+#   - registers are NEVER cleared before an exact waiter claim (register_clear_before_claim=0),
+#   - the endpoint GENERATION is checked during the claim, and a same-numeric-TID/different-ASID or a
+#     destroyed/recreated endpoint is rejected (waiter_claim_generation_safe=1),
+#   - a replacement waiter is never cleared, and no live blocked task is ever left without a waiter
+#     (live_task_without_waiter=0),
+#   - the user copy + TLB shootdown stay off every lock (user_copy_under_lock=0, tlb_wait_under_lock=0),
+#   - exactly one enqueue on success, none on any failure (duplicate_wakes=0).
 # Hosted-only, no QEMU.
 #
 # Emits on success:
-#   SECOND_COHORT_SHARED_REGION_OFFLOCK_SEAL broad_kernel_borrows=0 user_copy_under_lock=0 \
-#       tlb_wait_under_lock=0 waiter_clear_after_wake=0 leaked_caps=0 leaked_mappings=0 \
-#       leaked_transactions=0 duplicate_wakes=0 result=ok
+#   SECOND_COHORT_SHARED_REGION_OFFLOCK_SEAL broad_kernel_borrows=0 waiter_claim_generation_safe=1 \
+#       register_clear_before_claim=0 live_task_without_waiter=0 user_copy_under_lock=0 \
+#       tlb_wait_under_lock=0 duplicate_wakes=0 result=ok
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -38,11 +44,28 @@ CASES=(
   markers_success_only_and_producers_dormant
   # source contract: the drain executes through the off-lock context (no broad borrow)
   offlock_ctx_source_contracts
+  # Stage 198E3B2B1 — atomic claim-then-commit finalization interleavings
+  generation_change_between_prevalidate_and_claim
+  endpoint_recreated_at_same_index_rejects_claim
+  waiter_replaced_by_other_tid_rejects_claim
+  same_numeric_tid_different_asid_is_not_authority
+  missing_waiter_rejects_claim
+  failed_claim_leaves_registers_byte_identical
+  failed_claim_leaves_valid_waiter_untouched
+  successful_claim_removes_exactly_one_waiter
+  receiver_exit_after_claim_is_gone_dead_no_restore
+  receiver_asid_change_after_claim_restores_waiter
+  replaced_restore_never_strands_never_clobbers
+  failed_finalization_preserves_registers_end_to_end
+  success_clears_regs_runnable_one_enqueue
+  repeated_finalization_cannot_enqueue_twice
+  markers_stay_success_only_no_publish_on_stale
+  producers_remain_dormant_off_knob
 )
 expected="${#CASES[@]}"
 
 log="${TMPDIR:-/tmp}/shared-region-offlock-seal.$$.log"
-note "running ${expected} off-lock drain cases (hosted, no QEMU)"
+note "running ${expected} off-lock drain + atomic-finalization cases (hosted, no QEMU)"
 if ! cargo test --features hosted-dev --lib -- --test-threads=1 "${CASES[@]}" >"$log" 2>&1; then
   echo "[shared-region-offlock-seal][fail] cases did not all pass:"
   grep -E "FAILED|error\[|panicked|test result" "$log" | head
@@ -57,5 +80,5 @@ if [[ "${passed:-0}" -ne "$expected" ]]; then
   echo "SECOND_COHORT_SHARED_REGION_OFFLOCK_SEAL cases=${expected} passed=${passed:-0} result=fail"
   exit 1
 fi
-note "${passed}/${expected} off-lock drain cases passed"
-echo "SECOND_COHORT_SHARED_REGION_OFFLOCK_SEAL broad_kernel_borrows=0 user_copy_under_lock=0 tlb_wait_under_lock=0 waiter_clear_after_wake=0 leaked_caps=0 leaked_mappings=0 leaked_transactions=0 duplicate_wakes=0 result=ok"
+note "${passed}/${expected} off-lock drain + atomic-finalization cases passed"
+echo "SECOND_COHORT_SHARED_REGION_OFFLOCK_SEAL broad_kernel_borrows=0 waiter_claim_generation_safe=1 register_clear_before_claim=0 live_task_without_waiter=0 user_copy_under_lock=0 tlb_wait_under_lock=0 duplicate_wakes=0 result=ok"

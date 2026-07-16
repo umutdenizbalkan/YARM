@@ -66761,7 +66761,7 @@ mod stage198e3b2b_drain_switch {
     };
     use crate::kernel::syscall::OPCODE_SHARED_MEM;
     use crate::kernel::task::{RecvAbiVariant, TaskStatus, WaitReason};
-    use crate::runtime::SharedKernel;
+    use crate::runtime::{ReceiverCommit, SharedKernel};
     use core::sync::atomic::Ordering;
 
     const CPU0: CpuId = CpuId(0);
@@ -67144,6 +67144,418 @@ mod stage198e3b2b_drain_switch {
             "no shared-region attestation/retirement marker from the rolled-back (Err) arm"
         );
         // Producers dormant: off the knob the direct producer declines (legacy path).
+        reset_globals();
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(1),
+            b"x",
+        )
+        .expect("m");
+        assert!(
+            !crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+                &mut s, 2, 0, &msg
+            )
+            .unwrap_or(false),
+            "off the oracle knob the producer must stay dormant"
+        );
+        reset_globals();
+    }
+
+    // ── Stage 198E3B2B1 — ATOMIC (claim-then-commit) blocked-receiver finalization ──────────────
+    // The finalize protocol is: Phase 1 prevalidate (rank 2, no mutation) → Phase 2 exact
+    // generation-bearing waiter CLAIM (rank 3, remove once) → Phase 3 commit (rank 2, clear registers
+    // + Runnable ONLY for a still-live match; restore/leave stale otherwise) → Phase 4 enqueue
+    // (rank 1, once, non-fallible). These focused interleaving cases drive the individual phase seams
+    // (so a mutation can be injected BETWEEN phases) plus the composed drain end-to-end.
+
+    fn endpoint_gen(d: &Drn) -> u64 {
+        d.shared
+            .with(|k| k.with_ipc_state(|ipc| ipc.endpoint_generations[d.eidx]))
+    }
+    // All blocked-return registers the commit clears (arg0 + the arch return GPRs) as one tuple, so a
+    // failed finalization can be proven byte-identical.
+    fn regs(d: &Drn) -> (usize, usize, usize, usize, usize) {
+        d.shared
+            .with(|k| {
+                k.with_tcb_mut(2, |tcb| {
+                    (
+                        tcb.user_context.arg0,
+                        tcb.user_context.user_gprs[0],
+                        tcb.user_context.user_gprs[2],
+                        tcb.user_context.user_gprs[3],
+                        tcb.user_context.user_gprs[7],
+                    )
+                })
+            })
+            .unwrap_or((0, 0, 0, 0, 0))
+    }
+
+    // (1) Endpoint generation changes between task prevalidation and the waiter claim → claim fails,
+    // slot + registers untouched.
+    #[test]
+    fn generation_change_between_prevalidate_and_claim() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        assert!(
+            d.shared.sr_prevalidate_blocked_receiver_split(2, d.asid),
+            "prevalidate passes for the live matching receiver"
+        );
+        // Endpoint destroyed/recreated after prevalidation: its generation advances.
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_generations[d.eidx] += 1));
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .is_none(),
+            "a stale endpoint generation cannot be claimed"
+        );
+        assert_eq!(waiter(&d), Some(ThreadId(2)), "waiter slot untouched");
+        assert_eq!(ret_reg(&d), 0xDEAD, "no register mutation on failed claim");
+        reset_globals();
+    }
+
+    // (2) Endpoint destroyed and recreated at the SAME index (generation advanced) → claim rejected.
+    #[test]
+    fn endpoint_recreated_at_same_index_rejects_claim() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_generations[d.eidx] = egen + 1;
+                ipc.endpoint_waiters[d.eidx] = Some(ThreadId(2)); // a fresh incarnation's waiter
+            })
+        });
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .is_none(),
+            "generation is part of the claim authority — a recreated endpoint is not our endpoint"
+        );
+        reset_globals();
+    }
+
+    // (3) Waiter replaced by a DIFFERENT TID → claim fails, the replacement waiter is never cleared.
+    #[test]
+    fn waiter_replaced_by_other_tid_rejects_claim() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = Some(ThreadId(9))));
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .is_none(),
+            "a different waiter TID cannot be claimed"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(9)),
+            "the replacement waiter is never cleared"
+        );
+        reset_globals();
+    }
+
+    // (4) Waiter is the SAME numeric TID but a different receiver ASID/generation. Prevalidation with
+    // the captured ASID rejects it BEFORE any claim; and even a forced numeric claim commits as
+    // Replaced (numeric TID alone is never the authority — the ASID recheck is).
+    #[test]
+    fn same_numeric_tid_different_asid_is_not_authority() {
+        let d = build_blocked(1, Some(2));
+        let orig_asid = d.asid;
+        d.shared.with(|k| {
+            let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
+            k.bind_task_asid(2, new_asid).expect("rebind");
+        });
+        assert!(
+            !d.shared.sr_prevalidate_blocked_receiver_split(2, orig_asid),
+            "same numeric TID with a different ASID is not our receiver"
+        );
+        let egen = endpoint_gen(&d);
+        let claim = d
+            .shared
+            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+            .expect("numeric+generation claim succeeds — proving TID is not enough on its own");
+        assert_eq!(
+            d.shared.sr_commit_blocked_receiver_split(2, orig_asid),
+            ReceiverCommit::Replaced,
+            "the ASID recheck at commit rejects the replaced incarnation"
+        );
+        assert!(
+            d.shared.sr_restore_endpoint_waiter_split(&claim),
+            "the live replacement task's exact waiter is restored"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(2)),
+            "no live task left without a waiter"
+        );
+        reset_globals();
+    }
+
+    // (5) Missing waiter (slot already cleared) → claim fails.
+    #[test]
+    fn missing_waiter_rejects_claim() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = None));
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .is_none(),
+            "a missing waiter cannot be claimed"
+        );
+        reset_globals();
+    }
+
+    // (6) A failed claim leaves the blocked-return registers byte-identical (registers are NEVER
+    // touched before/without a successful claim).
+    #[test]
+    fn failed_claim_leaves_registers_byte_identical() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let before = regs(&d);
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(7))
+                .is_none(),
+            "wrong receiver → claim fails"
+        );
+        assert_eq!(regs(&d), before, "no register changed on a failed claim");
+        reset_globals();
+    }
+
+    // (7) A failed claim (stale generation) leaves the original VALID waiter untouched.
+    #[test]
+    fn failed_claim_leaves_valid_waiter_untouched() {
+        let d = build_blocked(1, Some(2));
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(d.eidx, endpoint_gen(&d) + 5, ThreadId(2))
+                .is_none(),
+            "stale generation → no claim"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(2)),
+            "the valid waiter is untouched"
+        );
+        reset_globals();
+    }
+
+    // (8) A successful claim removes EXACTLY one waiter (a second claim finds nothing).
+    #[test]
+    fn successful_claim_removes_exactly_one_waiter() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let _claim = d
+            .shared
+            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+            .expect("claim");
+        assert_eq!(waiter(&d), None, "the claimed waiter is removed");
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .is_none(),
+            "the waiter cannot be claimed twice"
+        );
+        reset_globals();
+    }
+
+    // (9) Receiver EXITS after the claim but before the task commit → GoneDead: registers untouched,
+    // the claimed waiter stays cleared (correctly stale, never restored), zero wake.
+    #[test]
+    fn receiver_exit_after_claim_is_gone_dead_no_restore() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let _claim = d
+            .shared
+            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+            .expect("claim");
+        d.shared.with(|k| {
+            k.with_tcb_mut(2, |tcb| tcb.status = TaskStatus::Exited(0));
+        });
+        assert_eq!(
+            d.shared.sr_commit_blocked_receiver_split(2, d.asid),
+            ReceiverCommit::GoneDead,
+            "an exited receiver commits as GoneDead"
+        );
+        assert_eq!(
+            ret_reg(&d),
+            0xDEAD,
+            "no register cleared for a dead receiver"
+        );
+        assert_eq!(
+            waiter(&d),
+            None,
+            "the dead receiver's claimed waiter stays cleared"
+        );
+        assert_eq!(
+            d.shared.with(|k| k.runnable_count_on_for_test(CPU0)),
+            0,
+            "zero wake"
+        );
+        reset_globals();
+    }
+
+    // (10) Receiver ASID changes after the claim → Replaced: registers untouched, the exact claimed
+    // waiter is restored for the live task.
+    #[test]
+    fn receiver_asid_change_after_claim_restores_waiter() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let orig_asid = d.asid;
+        let claim = d
+            .shared
+            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+            .expect("claim");
+        assert_eq!(waiter(&d), None, "claimed");
+        d.shared.with(|k| {
+            let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
+            k.bind_task_asid(2, new_asid).expect("rebind");
+        });
+        assert_eq!(
+            d.shared.sr_commit_blocked_receiver_split(2, orig_asid),
+            ReceiverCommit::Replaced
+        );
+        assert_eq!(ret_reg(&d), 0xDEAD, "no register cleared on Replaced");
+        assert!(
+            d.shared.sr_restore_endpoint_waiter_split(&claim),
+            "restore the live task's EXACT waiter"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(2)),
+            "live blocked task keeps its waiter"
+        );
+        reset_globals();
+    }
+
+    // (11) The generation-bearing restore never strands a live task and never clobbers a newer waiter
+    // or restores into a recreated endpoint.
+    #[test]
+    fn replaced_restore_never_strands_never_clobbers() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let claim = d
+            .shared
+            .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+            .expect("claim");
+        // Case A: slot free → restore re-installs the claimed waiter (no live task stranded).
+        assert!(d.shared.sr_restore_endpoint_waiter_split(&claim));
+        assert_eq!(waiter(&d), Some(ThreadId(2)));
+        // Case B: a NEWER waiter already holds the slot → restore refuses (never clobbers).
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = Some(ThreadId(5))));
+        assert!(!d.shared.sr_restore_endpoint_waiter_split(&claim));
+        assert_eq!(waiter(&d), Some(ThreadId(5)), "newer waiter not clobbered");
+        // Case C: endpoint generation advanced → restore refuses (stale token can't target a new
+        // endpoint incarnation).
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] = None;
+                ipc.endpoint_generations[d.eidx] = egen + 1;
+            })
+        });
+        assert!(
+            !d.shared.sr_restore_endpoint_waiter_split(&claim),
+            "the generation-bearing token cannot restore into a recreated endpoint"
+        );
+        reset_globals();
+    }
+
+    // (12) A failed finalization end-to-end (stale replacement waiter) leaves the live blocked task's
+    // return registers byte-identical and the receiver still blocked.
+    #[test]
+    fn failed_finalization_preserves_registers_end_to_end() {
+        let d = build_blocked(1, Some(2));
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = Some(ThreadId(3))));
+        assert!(drain(&d).is_err(), "stale waiter fails the drain");
+        assert_eq!(
+            ret_reg(&d),
+            0xDEAD,
+            "return registers untouched on failed finalization"
+        );
+        assert!(
+            matches!(status(&d), Some(TaskStatus::Blocked(_))),
+            "receiver stays blocked"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(3)),
+            "replacement waiter untouched"
+        );
+        reset_globals();
+    }
+
+    // (13) Success clears the registers, marks the receiver Runnable, and enqueues EXACTLY once.
+    #[test]
+    fn success_clears_regs_runnable_one_enqueue() {
+        let d = build_blocked(1, Some(2));
+        let before = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert!(drain(&d).is_ok());
+        assert_eq!(ret_reg(&d), 0, "registers cleared on success");
+        assert_eq!(status(&d), Some(TaskStatus::Runnable));
+        assert_eq!(waiter(&d), None, "exactly one waiter cleared");
+        assert_eq!(
+            d.shared.with(|k| k.runnable_count_on_for_test(CPU0)),
+            before + 1,
+            "exactly one enqueue"
+        );
+        reset_globals();
+    }
+
+    // (14) Repeated finalization cannot enqueue twice: after the wake the receiver is Runnable (not a
+    // blocked waiter) and its waiter slot is empty, so neither a prevalidate nor a claim can re-fire.
+    #[test]
+    fn repeated_finalization_cannot_enqueue_twice() {
+        let d = build_blocked(1, Some(2));
+        let before = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert!(drain(&d).is_ok());
+        let after1 = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert_eq!(after1, before + 1);
+        assert!(
+            !d.shared.sr_prevalidate_blocked_receiver_split(2, d.asid),
+            "a woken receiver is no longer a blocked waiter"
+        );
+        let egen = endpoint_gen(&d);
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(d.eidx, egen, ThreadId(2))
+                .is_none(),
+            "the emptied waiter slot cannot be re-claimed"
+        );
+        assert_eq!(
+            d.shared.with(|k| k.runnable_count_on_for_test(CPU0)),
+            after1,
+            "no second enqueue"
+        );
+        reset_globals();
+    }
+
+    // (15) Markers remain success-only: a stale finalization does not publish (Err arm → the
+    // retirement/attestation markers, which live only in the Ok arm, are never emitted).
+    #[test]
+    fn markers_stay_success_only_no_publish_on_stale() {
+        let d = build_blocked(1, Some(2));
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = None));
+        assert!(
+            drain(&d).is_err(),
+            "a stale finalization rolls back and does not publish"
+        );
+        reset_globals();
+    }
+
+    // (16) Production shared-region producers remain dormant off the oracle knob.
+    #[test]
+    fn producers_remain_dormant_off_knob() {
         reset_globals();
         let mut s = Bootstrap::init().expect("init");
         s.register_task(2).expect("t2");
