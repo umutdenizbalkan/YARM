@@ -112,7 +112,7 @@ pub(crate) struct SharedRegionDirectPublish {
     pub(crate) woke_receiver: bool,
 }
 
-/// Typed failure from `shared_region_direct_execute`. The transaction has ALREADY been rolled back
+/// Typed failure from `shared_region_execute`. The transaction has ALREADY been rolled back
 /// to `Cancelled` (idempotent) by the time this is returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SharedRegionTxnError {
@@ -210,17 +210,39 @@ impl KernelState {
     }
 
     /// Teardown API (protocol A): mark a generation-bearing cancellation request for an in-flight
-    /// shared-region direct transaction. The executor observes it at its next checkpoint and
-    /// performs ALL cleanup itself (executor is the single cleanup owner). Matched on BOTH the
+    /// shared-region transaction (direct OR queued). The executor observes it at its next checkpoint
+    /// and performs ALL cleanup itself (executor is the single cleanup owner). Matched on BOTH the
     /// numeric receiver TID and the captured ASID, so a delayed action for an old TID cannot cancel
-    /// a replacement process's transaction. Returns `true` if the request was recorded.
+    /// a replacement process's transaction.
+    ///
+    /// FAIL-CLOSED (Stage 198E2B): returns `true` when the request is recorded (or an identical one
+    /// already exists). When the table is full it first evicts a STALE entry — one whose `(tid,asid)`
+    /// no longer names a live receiver (so it can never be consumed by any transaction) — and
+    /// records into the freed slot. If (and only if) every occupant is still live, it sets the
+    /// `shared_region_cancel_overflow` latch (a permanent per-instance fail-closed fuse) and returns
+    /// `false`; while that latch is set EVERY executor checkpoint treats cancellation as authoritative,
+    /// so no transaction can proceed past a cancellation that could not be recorded. Silent
+    /// cancellation loss is therefore impossible.
     pub(crate) fn shared_region_request_cancel(
         &mut self,
         receiver_tid: u64,
         receiver_asid: crate::kernel::vm::Asid,
     ) -> bool {
+        // A cancel-request occupant is STALE if its (tid, asid) can no longer belong to any live
+        // transaction (the task is gone / exited / has a different ASID now).
+        let occupant_is_stale = |ipc_tid: u64, ipc_asid: crate::kernel::vm::Asid| -> bool {
+            match self.task_status(ipc_tid) {
+                None | Some(TaskStatus::Exited(_)) | Some(TaskStatus::Dead) => true,
+                _ => self.task_asid(ipc_tid) != Some(ipc_asid),
+            }
+        };
+        // Precompute staleness (needs &self) before the &mut borrow.
+        let stale_flags: [bool; MAX_SHARED_REGION_CANCEL_REQUESTS] = core::array::from_fn(|i| {
+            self.with_ipc_state(|ipc| ipc.shared_region_cancel_requests[i])
+                .map(|r| occupant_is_stale(r.tid, r.asid))
+                .unwrap_or(true)
+        });
         self.with_ipc_state_mut(|ipc| {
-            // Idempotent: if an identical request already exists, treat it as recorded.
             if ipc
                 .shared_region_cancel_requests
                 .iter()
@@ -229,17 +251,21 @@ impl KernelState {
             {
                 return true;
             }
-            if let Some(slot) = ipc
+            // Prefer a free slot, otherwise a stale one.
+            let target = ipc
                 .shared_region_cancel_requests
-                .iter_mut()
-                .find(|s| s.is_none())
-            {
-                *slot = Some(SharedRegionCancelReq {
+                .iter()
+                .position(|s| s.is_none())
+                .or_else(|| stale_flags.iter().position(|&stale| stale));
+            if let Some(idx) = target {
+                ipc.shared_region_cancel_requests[idx] = Some(SharedRegionCancelReq {
                     tid: receiver_tid,
                     asid: receiver_asid,
                 });
                 true
             } else {
+                // Cannot record → FAIL CLOSED: no transaction may publish past this cancellation.
+                ipc.shared_region_cancel_overflow = true;
                 false
             }
         })
@@ -247,6 +273,12 @@ impl KernelState {
 
     /// Consume (one-shot) a matching cancellation request for `(receiver_tid, receiver_asid)`.
     /// Generation-bearing: BOTH the TID and the ASID must match.
+    ///
+    /// This does NOT clear the fail-closed overflow latch: `shared_region_cancel_now` checks the
+    /// latch BEFORE calling consume, so a set latch already cancels every transaction unconditionally.
+    /// Clearing it here on an unrelated consume would be unsafe — the specific cancellation that
+    /// overflowed was never recorded, so once the latch cleared that receiver could publish (silent
+    /// cancellation loss). The latch is therefore a permanent per-kernel-instance safety fuse.
     fn shared_region_consume_cancel(
         &mut self,
         receiver_tid: u64,
@@ -265,14 +297,22 @@ impl KernelState {
         })
     }
 
+    fn shared_region_cancel_overflowed(&self) -> bool {
+        self.with_ipc_state(|ipc| ipc.shared_region_cancel_overflow)
+    }
+
     /// Executor checkpoint: is cancellation authoritative for this transaction right now? A `true`
-    /// result means teardown marked `CancelRequested`, a test simulated it at this checkpoint, or
-    /// the receiver died / generation-replaced. Consumes the pending request so it is one-shot.
+    /// result means the fail-closed overflow latch is set, teardown marked a matching request, a
+    /// test simulated it at this checkpoint, or the receiver died / generation-replaced. Consumes
+    /// the pending request so it is one-shot.
     fn shared_region_cancel_now(
         &mut self,
         snap: &RecvBoundarySharedRegionSnapshot,
         checkpoint: usize,
     ) -> bool {
+        if self.shared_region_cancel_overflowed() {
+            return true;
+        }
         if self.shared_region_txn_cancel_hook_at(checkpoint) {
             return true;
         }
@@ -287,7 +327,13 @@ impl KernelState {
     /// object pin, resolve + attenuate the destination rights, and capture the receiver's
     /// generation-bearing authority. Fails closed (envelope reclaimed by the caller path) on any
     /// mismatch. Sender CSpace is resolved exactly ONCE here, never again.
-    pub(crate) fn shared_region_direct_phase_a(
+    ///
+    /// Origin-neutral (Stage 198E2B): `origin_direct` records whether this snapshot came from the
+    /// direct (no-waiter, sender-side) or the queued (receiver-side dequeue) delivery path. It sets
+    /// ONLY the `origin_direct` proof marker on the snapshot — it never influences classification,
+    /// rights attenuation, mapping, rollback, lifecycle, or wake. Both origins converge on the SAME
+    /// `shared_region_execute` executor with identical security/mapping semantics.
+    pub(crate) fn shared_region_phase_a(
         &mut self,
         handle: u64,
         endpoint: CapObject,
@@ -296,6 +342,7 @@ impl KernelState {
         map_write: bool,
         meta_ptr: u64,
         msg: Message,
+        origin_direct: bool,
     ) -> Result<RecvBoundarySharedRegionSnapshot, KernelError> {
         // Consume the envelope KEEPING the pin (no reference gap): the snapshot owns it now.
         let envelope = self
@@ -348,14 +395,20 @@ impl KernelState {
             meta_ptr,
             map_write,
             pin_owned: true,
-            origin_direct: true,
+            origin_direct,
             msg,
         })
     }
 
     /// Post-lock executor: phases 2..10. Every failure converges on the single idempotent rollback
     /// and returns the typed error AFTER the transaction is `Cancelled`.
-    pub(crate) fn shared_region_direct_execute(
+    ///
+    /// Origin-neutral (Stage 198E2B): the SAME executor serves both the direct (no-waiter) and the
+    /// queued (receiver-side dequeue) delivery paths. `snapshot.origin_direct` is a proof marker
+    /// only — every security, classification, mapping-permission, rollback, lifecycle, and wake
+    /// decision below is identical regardless of origin. There is exactly one shared-region
+    /// transfer mechanism.
+    pub(crate) fn shared_region_execute(
         &mut self,
         snapshot: RecvBoundarySharedRegionSnapshot,
     ) -> Result<SharedRegionDirectPublish, SharedRegionTxnError> {

@@ -254,10 +254,18 @@ pub(crate) struct IpcSubsystem {
     pub(crate) reply_caps: [Option<ReplyCapRecord>; MAX_REPLY_CAPS],
     pub(crate) reply_cap_generations: [u64; MAX_REPLY_CAPS],
     /// Stage 198E2A1: bounded generation-bearing cancellation requests for in-flight shared-region
-    /// direct transactions (executor-owned cleanup protocol). Not a queue/CNode/ABI capacity — an
-    /// internal signal table matched by (receiver TID **and** ASID).
+    /// transactions (executor-owned cleanup protocol). Not a queue/CNode/ABI capacity — an internal
+    /// signal table matched by (receiver TID **and** ASID).
     pub(crate) shared_region_cancel_requests:
         [Option<SharedRegionCancelReq>; MAX_SHARED_REGION_CANCEL_REQUESTS],
+    /// Stage 198E2B: FAIL-CLOSED latch. Set when a cancellation request cannot be recorded (the
+    /// table is full and no stale entry can be evicted). While set, every executor checkpoint treats
+    /// cancellation as authoritative, so NO transaction can map further, write back, publish, or wake
+    /// after an unrecordable cancellation — silent cancellation loss is impossible. It is a PERMANENT
+    /// per-kernel-instance safety fuse: it never auto-clears, because the cancellation that overflowed
+    /// was never recorded, so clearing the latch could let that receiver publish (silent loss). Reset
+    /// only with the whole IpcState at kernel init.
+    pub(crate) shared_region_cancel_overflow: bool,
     pub(crate) telemetry: IpcPathTelemetry,
 }
 

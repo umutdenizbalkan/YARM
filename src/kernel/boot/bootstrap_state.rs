@@ -595,6 +595,7 @@ impl Bootstrap {
                 reply_caps: [const { None }; MAX_REPLY_CAPS],
                 reply_cap_generations: [0; MAX_REPLY_CAPS],
                 shared_region_cancel_requests: [const { None }; MAX_SHARED_REGION_CANCEL_REQUESTS],
+                shared_region_cancel_overflow: false,
                 telemetry: IpcPathTelemetry::default(),
             }));
             core::ptr::addr_of_mut!((*state_ptr).capability).write(CapabilitySubsystem {
