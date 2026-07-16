@@ -159,56 +159,58 @@ pub(crate) static SHARED_REGION_TXN_MAP_FAULT_AT_PAGE: core::sync::atomic::Atomi
 pub(crate) static SHARED_REGION_TXN_CANCEL_AT_PAGE: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(usize::MAX);
 
-impl KernelState {
-    #[cfg(test)]
-    fn shared_region_txn_force_map_fault(&self) -> bool {
-        SHARED_REGION_TXN_FORCE_MAP_FAULT.load(core::sync::atomic::Ordering::SeqCst)
-    }
-    #[cfg(not(test))]
-    fn shared_region_txn_force_map_fault(&self) -> bool {
-        false
-    }
-    #[cfg(test)]
-    fn shared_region_txn_force_copy_fault(&self) -> bool {
-        SHARED_REGION_TXN_FORCE_COPY_FAULT.load(core::sync::atomic::Ordering::SeqCst)
-    }
-    #[cfg(not(test))]
-    fn shared_region_txn_force_copy_fault(&self) -> bool {
-        false
-    }
-    #[cfg(test)]
-    fn shared_region_txn_force_stale_after_map(&self) -> bool {
-        SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP.load(core::sync::atomic::Ordering::SeqCst)
-    }
-    #[cfg(not(test))]
-    fn shared_region_txn_force_stale_after_map(&self) -> bool {
-        false
-    }
-    #[cfg(test)]
-    fn shared_region_txn_cancel_hook_at(&self, checkpoint: usize) -> bool {
-        SHARED_REGION_TXN_CANCEL_AT.load(core::sync::atomic::Ordering::SeqCst) == checkpoint
-    }
-    #[cfg(not(test))]
-    fn shared_region_txn_cancel_hook_at(&self, _checkpoint: usize) -> bool {
-        false
-    }
-    #[cfg(test)]
-    fn shared_region_txn_map_fault_at_page(&self, page: usize) -> bool {
-        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.load(core::sync::atomic::Ordering::SeqCst) == page
-    }
-    #[cfg(not(test))]
-    fn shared_region_txn_map_fault_at_page(&self, _page: usize) -> bool {
-        false
-    }
-    #[cfg(test)]
-    fn shared_region_txn_cancel_at_page(&self, page: usize) -> bool {
-        SHARED_REGION_TXN_CANCEL_AT_PAGE.load(core::sync::atomic::Ordering::SeqCst) == page
-    }
-    #[cfg(not(test))]
-    fn shared_region_txn_cancel_at_page(&self, _page: usize) -> bool {
-        false
-    }
+// ── Deterministic test-fault hooks (read as module free functions by the generic transaction
+// runner, so BOTH the broad-borrow and off-lock contexts observe the same injected faults). ──
+#[cfg(test)]
+fn hook_force_map_fault() -> bool {
+    SHARED_REGION_TXN_FORCE_MAP_FAULT.load(core::sync::atomic::Ordering::SeqCst)
+}
+#[cfg(not(test))]
+fn hook_force_map_fault() -> bool {
+    false
+}
+#[cfg(test)]
+fn hook_force_copy_fault() -> bool {
+    SHARED_REGION_TXN_FORCE_COPY_FAULT.load(core::sync::atomic::Ordering::SeqCst)
+}
+#[cfg(not(test))]
+fn hook_force_copy_fault() -> bool {
+    false
+}
+#[cfg(test)]
+fn hook_force_stale_after_map() -> bool {
+    SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP.load(core::sync::atomic::Ordering::SeqCst)
+}
+#[cfg(not(test))]
+fn hook_force_stale_after_map() -> bool {
+    false
+}
+#[cfg(test)]
+fn hook_cancel_at(checkpoint: usize) -> bool {
+    SHARED_REGION_TXN_CANCEL_AT.load(core::sync::atomic::Ordering::SeqCst) == checkpoint
+}
+#[cfg(not(test))]
+fn hook_cancel_at(_checkpoint: usize) -> bool {
+    false
+}
+#[cfg(test)]
+fn hook_map_fault_at_page(page: usize) -> bool {
+    SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.load(core::sync::atomic::Ordering::SeqCst) == page
+}
+#[cfg(not(test))]
+fn hook_map_fault_at_page(_page: usize) -> bool {
+    false
+}
+#[cfg(test)]
+fn hook_cancel_at_page(page: usize) -> bool {
+    SHARED_REGION_TXN_CANCEL_AT_PAGE.load(core::sync::atomic::Ordering::SeqCst) == page
+}
+#[cfg(not(test))]
+fn hook_cancel_at_page(_page: usize) -> bool {
+    false
+}
 
+impl KernelState {
     /// Teardown API (protocol A): mark a generation-bearing cancellation request for an in-flight
     /// shared-region transaction (direct OR queued). The executor observes it at its next checkpoint
     /// and performs ALL cleanup itself (executor is the single cleanup owner). Matched on BOTH the
@@ -308,28 +310,6 @@ impl KernelState {
         self.with_ipc_state(|ipc| ipc.shared_region_cancel_overflow)
     }
 
-    /// Executor checkpoint: is cancellation authoritative for this transaction right now? A `true`
-    /// result means the fail-closed overflow latch is set, teardown marked a matching request, a
-    /// test simulated it at this checkpoint, or the receiver died / generation-replaced. Consumes
-    /// the pending request so it is one-shot.
-    fn shared_region_cancel_now(
-        &mut self,
-        snap: &RecvBoundarySharedRegionSnapshot,
-        checkpoint: usize,
-    ) -> bool {
-        if self.shared_region_cancel_overflowed() {
-            return true;
-        }
-        if self.shared_region_txn_cancel_hook_at(checkpoint) {
-            return true;
-        }
-        if self.shared_region_consume_cancel(snap.receiver_tid, snap.receiver_asid) {
-            return true;
-        }
-        // A dead / generation-replaced receiver is also authoritative cancellation.
-        !self.shared_region_receiver_alive(snap)
-    }
-
     /// Phase A (UNDER the broad lock): consume the shared-region transfer envelope, TAKE OVER its
     /// object pin, resolve + attenuate the destination rights, and capture the receiver's
     /// generation-bearing authority. Fails closed (envelope reclaimed by the caller path) on any
@@ -419,219 +399,11 @@ impl KernelState {
         &mut self,
         snapshot: RecvBoundarySharedRegionSnapshot,
     ) -> Result<SharedRegionDirectPublish, SharedRegionTxnError> {
-        let mut txn = SharedRegionDirectTxn {
-            state: SharedRegionTxnState::Reserved,
-            snapshot,
-            minted_cap: None,
-            mapped: None,
-            mapped_prefix_len: 0,
-        };
-
-        // Phase 1: revalidate receiver generation-authority BEFORE reserving anything.
-        if !self.shared_region_receiver_alive(&txn.snapshot) {
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::ReceiverGone);
-        }
-        // Phase 1b: object generation still live.
-        if self.capability_object_live(txn.snapshot.object).is_none() {
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::GenerationReplaced);
-        }
-        // Checkpoint 1 — before cap mint.
-        if self.shared_region_cancel_now(&txn.snapshot, 1) {
-            txn.state = SharedRegionTxnState::CancelRequested;
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::Cancelled);
-        }
-
-        // Bounds check (DmaRegion / region len) up front.
-        let region_len = match usize::try_from(txn.snapshot.descriptor.len) {
-            Ok(v) if v > 0 => v,
-            _ => {
-                self.rollback_shared_region_direct_txn(&mut txn);
-                return Err(SharedRegionTxnError::BadRegion);
-            }
-        };
-        if txn.snapshot.map_va == 0 || !txn.snapshot.map_va.is_multiple_of(PAGE_SIZE as u64) {
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::BadRegion);
-        }
-        // Rights gates (object-authoritative): MAP required; WRITE only with canonical WRITE.
-        if !txn.snapshot.rights.contains(CapRights::MAP) {
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::MissingMapRight);
-        }
-        if txn.snapshot.map_write && !txn.snapshot.rights.contains(CapRights::WRITE) {
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::MissingWriteRight);
-        }
-
-        // Phase 3: mint ONE fresh receiver-local cap with the attenuated rights.
-        let minted = match self.mint_capability_in_cnode(
-            txn.snapshot.receiver_cnode,
-            Capability::new(txn.snapshot.object, txn.snapshot.rights),
-        ) {
-            Ok(cap) => cap,
-            Err(_) => {
-                self.rollback_shared_region_direct_txn(&mut txn);
-                return Err(SharedRegionTxnError::CnodeFull);
-            }
-        };
-        txn.minted_cap = Some(minted);
-        txn.state = SharedRegionTxnState::CapMinted;
-
-        // Phase 4: map ONLY the authorized region. Register the provisional active mapping BEFORE
-        // the first page maps, so process-exit cleanup owns any partial mapping (no untracked
-        // window). NX enforced (execute=false); writable only with canonical WRITE.
-        let mapped_len = page_round_up(region_len);
-        if self
-            .register_active_transfer_mapping(
-                ThreadId(txn.snapshot.receiver_tid),
-                minted,
-                VirtAddr(txn.snapshot.map_va),
-                mapped_len,
-            )
-            .is_err()
-        {
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::Internal);
-        }
-        // From here a (future) mapping is owned by the active-mapping registry AND the txn.
-        txn.mapped = Some((txn.snapshot.map_va, mapped_len));
-        txn.state = SharedRegionTxnState::Mapping;
-
-        let phys_start = match self.shared_region_phys_base(txn.snapshot.object) {
-            Some(p) => p,
-            None => {
-                self.rollback_shared_region_direct_txn(&mut txn);
-                return Err(SharedRegionTxnError::BadRegion);
-            }
-        };
-        let map_flags = PageFlags {
-            read: true,
-            write: txn.snapshot.map_write,
-            execute: false, // NX ALWAYS.
-            user: true,
-            cache_policy: CachePolicy::WriteBack,
-        };
-        let num_pages = mapped_len / PAGE_SIZE;
-
-        // Checkpoint 2 — before the FIRST map.
-        if self.shared_region_cancel_now(&txn.snapshot, 2) {
-            txn.state = SharedRegionTxnState::CancelRequested;
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::Cancelled);
-        }
-
-        for i in 0..num_pages {
-            // Checkpoint 3 — BETWEEN page mappings (before mapping page `i`). Once cancellation is
-            // authoritative, NO further page is mapped: rollback unmaps exactly the prefix so far.
-            if i > 0
-                && (self.shared_region_txn_cancel_at_page(i)
-                    || self.shared_region_cancel_now(&txn.snapshot, 3))
-            {
-                txn.state = SharedRegionTxnState::CancelRequested;
-                self.rollback_shared_region_direct_txn(&mut txn);
-                return Err(SharedRegionTxnError::Cancelled);
-            }
-            let virt = VirtAddr(txn.snapshot.map_va + (i * PAGE_SIZE) as u64);
-            let phys = PhysAddr(phys_start.0 + (i * PAGE_SIZE) as u64);
-            let fault = self.shared_region_txn_force_map_fault()
-                || self.shared_region_txn_map_fault_at_page(i);
-            if fault
-                || self
-                    .map_user_page_in_asid_raw(
-                        txn.snapshot.receiver_asid,
-                        virt,
-                        Mapping {
-                            phys,
-                            flags: map_flags,
-                        },
-                    )
-                    .is_err()
-            {
-                // Page `i` failed after pages 0..i succeeded: rollback unmaps exactly that prefix.
-                self.rollback_shared_region_direct_txn(&mut txn);
-                return Err(SharedRegionTxnError::MapFault);
-            }
-            // AUTHORITATIVE progress update AFTER each successful page, BEFORE the next.
-            txn.mapped_prefix_len = (i + 1) * PAGE_SIZE;
-        }
-        // Phase 5/6: mapping complete (fresh maps need no TLB shootdown; only rollback unmaps do).
-        txn.state = SharedRegionTxnState::Mapped;
-
-        // Checkpoint 4 — after mapping, before writeback.
-        if self.shared_region_cancel_now(&txn.snapshot, 4) {
-            txn.state = SharedRegionTxnState::CancelRequested;
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::Cancelled);
-        }
-
-        // Checkpoint 5 — before the user writeback. After cancellation no writeback may occur.
-        if self.shared_region_cancel_now(&txn.snapshot, 5) {
-            txn.state = SharedRegionTxnState::CancelRequested;
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::Cancelled);
-        }
-
-        // Phase 7: user metadata copy OUTSIDE all locks (recv-v2 meta).
-        let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
-            txn.snapshot.msg.sender_tid.0,
-            txn.snapshot.msg.opcode,
-            txn.snapshot.msg.flags,
-            txn.snapshot.msg.as_slice().len() as u32,
-            minted.0,
-            crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
-            txn.snapshot.msg.sender_tid.0,
-        );
-        let copy_ok = !self.shared_region_txn_force_copy_fault()
-            && self
-                .copy_to_user(
-                    txn.snapshot.receiver_asid,
-                    VirtAddr(txn.snapshot.meta_ptr),
-                    &meta,
-                )
-                .is_ok();
-        if !copy_ok {
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::CopyFault);
-        }
-
-        // Phase 8 / checkpoint 6 — IMMEDIATELY before publication and wake: revalidate receiver
-        // generation + transaction ownership + any pending cancellation. Nothing is published if
-        // cancellation is authoritative here.
-        if self.shared_region_txn_force_stale_after_map()
-            || self.capability_object_live(txn.snapshot.object).is_none()
-            || self.shared_region_cancel_now(&txn.snapshot, 6)
-        {
-            self.rollback_shared_region_direct_txn(&mut txn);
-            return Err(SharedRegionTxnError::StalePublish);
-        }
-
-        // Phase 9/10: publish + wake receiver exactly once, then release the transfer pin (the
-        // receiver-local cap now owns the object reference), and clear the post-work state.
-        let woke = self
-            .apply_split_receiver_wake_plan(ThreadId(txn.snapshot.receiver_tid))
-            .is_ok();
-        if txn.snapshot.pin_owned {
-            self.adjust_memory_object_pin_refcount(txn.snapshot.object, -1);
-            txn.snapshot.pin_owned = false;
-        }
-        txn.state = SharedRegionTxnState::Published;
-        crate::yarm_log!(
-            "SHARED_REGION_DIRECT_PUBLISH receiver_tid={} cap={} base=0x{:x} len={} wake={}",
-            txn.snapshot.receiver_tid,
-            minted.0,
-            txn.snapshot.map_va,
-            mapped_len,
-            woke
-        );
-        Ok(SharedRegionDirectPublish {
-            receiver_local_cap: minted,
-            mapped_base: txn.snapshot.map_va,
-            mapped_len,
-            woke_receiver: woke,
-        })
+        // The transaction logic lives ONCE in `run_shared_region_txn`, parameterised over a
+        // `SharedRegionExecCtx`. This broad-borrow (`&mut KernelState`) context is used by the
+        // hosted transaction/cancellation/rollback proofs; the production drain uses the off-lock
+        // `SharedKernel` context (Stage 198E3B) — SAME logic, SAME single rollback.
+        run_shared_region_txn(self, snapshot)
     }
 
     /// The SINGLE idempotent rollback executor. Safe to call from EVERY state; each undo step is
@@ -639,48 +411,10 @@ impl KernelState {
     /// prevent-wake → unmap → TLB shootdown → remove active mapping → revoke cap → release pin →
     /// clear state.
     pub(crate) fn rollback_shared_region_direct_txn(&mut self, txn: &mut SharedRegionDirectTxn) {
-        // One-shot ownership: a Published txn is NEVER rolled back; a Cancelled txn is already
-        // fully unwound (all resource handles were taken), so a second/third call is a no-op —
-        // nothing can be unmapped, revoked, or pin-released twice.
-        if txn.state == SharedRegionTxnState::Published
-            || txn.state == SharedRegionTxnState::Cancelled
-        {
-            return;
-        }
-        // Claim cleanup ownership (protocol A: the executor is the single cleanup owner).
-        txn.state = SharedRegionTxnState::CleanupOwned;
-
-        // Reverse order. (1) Publication/wake is simply never performed on this path.
-        // (2) Unmap EXACTLY the successfully-mapped page prefix (two-phase; the shootdown completes
-        // before frames are freed). This does not depend on reaching the terminal `Mapped` state.
-        let base = txn.mapped.map(|(b, _)| b);
-        if let Some(base) = base {
-            if txn.mapped_prefix_len > 0 {
-                self.unmap_range_two_phase(
-                    txn.snapshot.receiver_asid,
-                    base as usize,
-                    txn.mapped_prefix_len,
-                );
-            }
-            txn.mapped_prefix_len = 0;
-            txn.mapped = None;
-        }
-        // (3) Remove the provisional/active mapping registry entry (guarded: remove returns false
-        // if already gone; the CapId key is generation-bearing so a reused slot cannot be hit).
-        if let Some(cap) = txn.minted_cap {
-            let _ = self.remove_active_transfer_mapping(ThreadId(txn.snapshot.receiver_tid), cap);
-        }
-        // (4) Revoke the provisional receiver cap (once — guarded by take()).
-        if let Some(cap) = txn.minted_cap.take() {
-            let _ = self.revoke_capability_in_cnode(txn.snapshot.receiver_cnode, cap);
-        }
-        // (5) Release the transferred object pin (once — guarded by pin_owned). NEVER before the
-        // unmap + required shootdown above complete.
-        if txn.snapshot.pin_owned {
-            self.adjust_memory_object_pin_refcount(txn.snapshot.object, -1);
-            txn.snapshot.pin_owned = false;
-        }
-        txn.state = SharedRegionTxnState::Cancelled;
+        // The single idempotent rollback logic lives ONCE in `rollback_shared_region_txn`,
+        // parameterised over a `SharedRegionExecCtx`. This broad-borrow context delegates to the
+        // KernelState methods; the off-lock production context (Stage 198E3B) delegates to seams.
+        rollback_shared_region_txn(self, txn);
     }
 
     /// Receiver liveness + generation-bearing authority: the task must exist, not be Exited, and
@@ -725,5 +459,390 @@ fn capobject_generation(object: CapObject) -> u64 {
         | CapObject::Notification { generation, .. }
         | CapObject::Reply { generation, .. } => generation,
         _ => 0,
+    }
+}
+
+// ── Stage 198E3B: single transaction implementation over a bounded execution context ──────────
+//
+// The shared-region post-lock transaction logic is written EXACTLY ONCE (`run_shared_region_txn`)
+// plus ONE idempotent rollback (`rollback_shared_region_txn`), both parameterised over the
+// `SharedRegionExecCtx` trait — there is no second transaction representation or rollback.
+//
+// Two contexts implement the trait:
+//  - `KernelState` (broad borrow): used by the hosted transaction / cancellation / partial-map /
+//    rollback proofs. The primitives delegate to the existing KernelState methods.
+//  - the off-lock production context (Stage 198E3B, `SharedKernel`): each primitive acquires ONE
+//    ranked domain lock (scheduler 1 / task 2 / IPC 3 / capability 4 / VM 5 / memory 6) and releases
+//    it before the next phase, so the user copy and TLB completion run with NO lock held.
+//
+// The runner NEVER holds a broad borrow itself: it only calls context primitives + reads the
+// deterministic test-fault statics (module free functions above).
+
+/// Bounded execution primitives for the shared-region transaction. Each primitive is a single
+/// ranked-lock operation (or an off-lock user copy); the runner sequences them with no lock held
+/// across primitives. No primitive returns or retains a `&mut KernelState` / field reference.
+pub(crate) trait SharedRegionExecCtx {
+    /// rank 2: receiver TID live (not Dead/Exited) AND its ASID still equals the captured ASID.
+    fn ctx_receiver_alive(&self, snap: &RecvBoundarySharedRegionSnapshot) -> bool;
+    /// rank 4/6: the frozen source object is still live.
+    fn ctx_object_live(&self, object: CapObject) -> bool;
+    /// rank 3: the fail-closed cancellation overflow fuse is set.
+    fn ctx_cancel_overflowed(&self) -> bool;
+    /// rank 3: one-shot consume a matching (tid, asid) cancellation request.
+    fn ctx_consume_cancel(&mut self, tid: u64, asid: crate::kernel::vm::Asid) -> bool;
+    /// rank 4 (+6): mint one attenuated receiver-local cap. `Err(())` = cnode full / stale object.
+    fn ctx_mint(
+        &mut self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: Capability,
+    ) -> Result<CapId, ()>;
+    /// rank 3: register the provisional active-mapping entry BEFORE the first page maps.
+    fn ctx_register_active_mapping(&mut self, tid: u64, cap: CapId, va: u64, len: usize) -> bool;
+    /// rank 6: physical base of the shared region.
+    fn ctx_phys_base(&self, object: CapObject) -> Option<PhysAddr>;
+    /// rank 5 (+6): map exactly ONE user page (NX enforced by the caller's flags).
+    fn ctx_map_page(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        virt: VirtAddr,
+        mapping: Mapping,
+    ) -> bool;
+    /// OFF-LOCK: copy the recv-v2 meta to user memory with NO kernel lock held.
+    fn ctx_copy_meta(&mut self, asid: crate::kernel::vm::Asid, va: VirtAddr, bytes: &[u8]) -> bool;
+    /// rank 1: publish exactly one receiver wake through the scheduler.
+    fn ctx_wake(&mut self, tid: u64) -> bool;
+    /// rank 6: release the transferred object pin (once).
+    fn ctx_release_pin(&mut self, object: CapObject);
+    /// rank 5 + TLB: unmap the mapped prefix via the two-phase shootdown-before-reclaim contract.
+    fn ctx_unmap_prefix(&mut self, asid: crate::kernel::vm::Asid, base: usize, len: usize);
+    /// rank 3: remove the provisional active-mapping entry (guarded).
+    fn ctx_remove_active_mapping(&mut self, tid: u64, cap: CapId) -> bool;
+    /// rank 4 (+6): revoke the provisional receiver-local cap (guarded).
+    fn ctx_revoke_cap(&mut self, cnode: crate::kernel::capabilities::CNodeId, cap: CapId);
+}
+
+/// Cancellation-authoritative fold (single definition): overflow fuse → test hook → one-shot
+/// consume → dead/generation-replaced receiver. Consumes any pending matching request.
+fn cancel_now<C: SharedRegionExecCtx>(
+    ctx: &mut C,
+    snap: &RecvBoundarySharedRegionSnapshot,
+    checkpoint: usize,
+) -> bool {
+    if ctx.ctx_cancel_overflowed() {
+        return true;
+    }
+    if hook_cancel_at(checkpoint) {
+        return true;
+    }
+    if ctx.ctx_consume_cancel(snap.receiver_tid, snap.receiver_asid) {
+        return true;
+    }
+    !ctx.ctx_receiver_alive(snap)
+}
+
+/// The SINGLE post-lock transaction runner (phases 1..10). Every failure converges on the single
+/// idempotent rollback and returns the typed error AFTER the transaction is `Cancelled`.
+pub(crate) fn run_shared_region_txn<C: SharedRegionExecCtx>(
+    ctx: &mut C,
+    snapshot: RecvBoundarySharedRegionSnapshot,
+) -> Result<SharedRegionDirectPublish, SharedRegionTxnError> {
+    let mut txn = SharedRegionDirectTxn {
+        state: SharedRegionTxnState::Reserved,
+        snapshot,
+        minted_cap: None,
+        mapped: None,
+        mapped_prefix_len: 0,
+    };
+
+    // Phase 1: revalidate receiver generation-authority BEFORE reserving anything.
+    if !ctx.ctx_receiver_alive(&txn.snapshot) {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::ReceiverGone);
+    }
+    // Phase 1b: object generation still live.
+    if !ctx.ctx_object_live(txn.snapshot.object) {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::GenerationReplaced);
+    }
+    // Checkpoint 1 — before cap mint.
+    if cancel_now(ctx, &txn.snapshot, 1) {
+        txn.state = SharedRegionTxnState::CancelRequested;
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::Cancelled);
+    }
+
+    // Bounds check (DmaRegion / region len) up front.
+    let region_len = match usize::try_from(txn.snapshot.descriptor.len) {
+        Ok(v) if v > 0 => v,
+        _ => {
+            rollback_shared_region_txn(ctx, &mut txn);
+            return Err(SharedRegionTxnError::BadRegion);
+        }
+    };
+    if txn.snapshot.map_va == 0 || !txn.snapshot.map_va.is_multiple_of(PAGE_SIZE as u64) {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::BadRegion);
+    }
+    // Rights gates (object-authoritative): MAP required; WRITE only with canonical WRITE.
+    if !txn.snapshot.rights.contains(CapRights::MAP) {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::MissingMapRight);
+    }
+    if txn.snapshot.map_write && !txn.snapshot.rights.contains(CapRights::WRITE) {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::MissingWriteRight);
+    }
+
+    // Phase 3: mint ONE fresh receiver-local cap with the attenuated rights.
+    let minted = match ctx.ctx_mint(
+        txn.snapshot.receiver_cnode,
+        Capability::new(txn.snapshot.object, txn.snapshot.rights),
+    ) {
+        Ok(cap) => cap,
+        Err(()) => {
+            rollback_shared_region_txn(ctx, &mut txn);
+            return Err(SharedRegionTxnError::CnodeFull);
+        }
+    };
+    txn.minted_cap = Some(minted);
+    txn.state = SharedRegionTxnState::CapMinted;
+
+    // Phase 4: register the provisional active mapping BEFORE the first page maps, so process-exit
+    // cleanup owns any partial mapping (no untracked window). NX enforced; writable only with WRITE.
+    let mapped_len = page_round_up(region_len);
+    if !ctx.ctx_register_active_mapping(
+        txn.snapshot.receiver_tid,
+        minted,
+        txn.snapshot.map_va,
+        mapped_len,
+    ) {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::Internal);
+    }
+    txn.mapped = Some((txn.snapshot.map_va, mapped_len));
+    txn.state = SharedRegionTxnState::Mapping;
+
+    let phys_start = match ctx.ctx_phys_base(txn.snapshot.object) {
+        Some(p) => p,
+        None => {
+            rollback_shared_region_txn(ctx, &mut txn);
+            return Err(SharedRegionTxnError::BadRegion);
+        }
+    };
+    let map_flags = PageFlags {
+        read: true,
+        write: txn.snapshot.map_write,
+        execute: false, // NX ALWAYS.
+        user: true,
+        cache_policy: CachePolicy::WriteBack,
+    };
+    let num_pages = mapped_len / PAGE_SIZE;
+
+    // Checkpoint 2 — before the FIRST map.
+    if cancel_now(ctx, &txn.snapshot, 2) {
+        txn.state = SharedRegionTxnState::CancelRequested;
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::Cancelled);
+    }
+
+    for i in 0..num_pages {
+        // Checkpoint 3 — BETWEEN page mappings (before mapping page `i`). Once cancellation is
+        // authoritative, NO further page is mapped: rollback unmaps exactly the prefix so far.
+        if i > 0 && (hook_cancel_at_page(i) || cancel_now(ctx, &txn.snapshot, 3)) {
+            txn.state = SharedRegionTxnState::CancelRequested;
+            rollback_shared_region_txn(ctx, &mut txn);
+            return Err(SharedRegionTxnError::Cancelled);
+        }
+        let virt = VirtAddr(txn.snapshot.map_va + (i * PAGE_SIZE) as u64);
+        let phys = PhysAddr(phys_start.0 + (i * PAGE_SIZE) as u64);
+        let fault = hook_force_map_fault() || hook_map_fault_at_page(i);
+        if fault
+            || !ctx.ctx_map_page(
+                txn.snapshot.receiver_asid,
+                virt,
+                Mapping {
+                    phys,
+                    flags: map_flags,
+                },
+            )
+        {
+            // Page `i` failed after pages 0..i succeeded: rollback unmaps exactly that prefix.
+            rollback_shared_region_txn(ctx, &mut txn);
+            return Err(SharedRegionTxnError::MapFault);
+        }
+        // AUTHORITATIVE progress update AFTER each successful page, BEFORE the next.
+        txn.mapped_prefix_len = (i + 1) * PAGE_SIZE;
+    }
+    // Phase 5/6: mapping complete (fresh maps need no TLB shootdown; only rollback unmaps do).
+    txn.state = SharedRegionTxnState::Mapped;
+
+    // Checkpoint 4 — after mapping, before writeback.
+    if cancel_now(ctx, &txn.snapshot, 4) {
+        txn.state = SharedRegionTxnState::CancelRequested;
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::Cancelled);
+    }
+    // Checkpoint 5 — before the user writeback. After cancellation no writeback may occur.
+    if cancel_now(ctx, &txn.snapshot, 5) {
+        txn.state = SharedRegionTxnState::CancelRequested;
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::Cancelled);
+    }
+
+    // Phase 7: user metadata copy OUTSIDE all locks (recv-v2 meta).
+    let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
+        txn.snapshot.msg.sender_tid.0,
+        txn.snapshot.msg.opcode,
+        txn.snapshot.msg.flags,
+        txn.snapshot.msg.as_slice().len() as u32,
+        minted.0,
+        crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
+        txn.snapshot.msg.sender_tid.0,
+    );
+    let copy_ok = !hook_force_copy_fault()
+        && ctx.ctx_copy_meta(
+            txn.snapshot.receiver_asid,
+            VirtAddr(txn.snapshot.meta_ptr),
+            &meta,
+        );
+    if !copy_ok {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::CopyFault);
+    }
+
+    // Phase 8 / checkpoint 6 — IMMEDIATELY before publication and wake: revalidate receiver
+    // generation + transaction ownership + any pending cancellation. Nothing is published if
+    // cancellation is authoritative here.
+    if hook_force_stale_after_map()
+        || !ctx.ctx_object_live(txn.snapshot.object)
+        || cancel_now(ctx, &txn.snapshot, 6)
+    {
+        rollback_shared_region_txn(ctx, &mut txn);
+        return Err(SharedRegionTxnError::StalePublish);
+    }
+
+    // Phase 9/10: publish + wake receiver exactly once, then release the transfer pin (the
+    // receiver-local cap now owns the object reference).
+    let woke = ctx.ctx_wake(txn.snapshot.receiver_tid);
+    if txn.snapshot.pin_owned {
+        ctx.ctx_release_pin(txn.snapshot.object);
+        txn.snapshot.pin_owned = false;
+    }
+    txn.state = SharedRegionTxnState::Published;
+    crate::yarm_log!(
+        "SHARED_REGION_DIRECT_PUBLISH receiver_tid={} cap={} base=0x{:x} len={} wake={}",
+        txn.snapshot.receiver_tid,
+        minted.0,
+        txn.snapshot.map_va,
+        mapped_len,
+        woke
+    );
+    Ok(SharedRegionDirectPublish {
+        receiver_local_cap: minted,
+        mapped_base: txn.snapshot.map_va,
+        mapped_len,
+        woke_receiver: woke,
+    })
+}
+
+/// The SINGLE idempotent rollback. Safe from EVERY state; each undo step is guarded so nothing is
+/// unmapped, revoked, or pin-released twice. Reverse order: prevent-wake → unmap prefix (two-phase
+/// shootdown-before-reclaim) → remove active mapping → revoke cap → release pin → clear state.
+pub(crate) fn rollback_shared_region_txn<C: SharedRegionExecCtx>(
+    ctx: &mut C,
+    txn: &mut SharedRegionDirectTxn,
+) {
+    // One-shot ownership: a Published txn is NEVER rolled back; a Cancelled txn is already fully
+    // unwound, so a second/third call is a no-op.
+    if txn.state == SharedRegionTxnState::Published || txn.state == SharedRegionTxnState::Cancelled
+    {
+        return;
+    }
+    // Claim cleanup ownership (protocol A: the executor is the single cleanup owner).
+    txn.state = SharedRegionTxnState::CleanupOwned;
+
+    // (1) Publication/wake is simply never performed on this path.
+    // (2) Unmap EXACTLY the successfully-mapped page prefix (two-phase; the shootdown completes
+    // before frames are freed). Does not depend on reaching the terminal `Mapped` state.
+    if let Some((base, _)) = txn.mapped {
+        if txn.mapped_prefix_len > 0 {
+            ctx.ctx_unmap_prefix(
+                txn.snapshot.receiver_asid,
+                base as usize,
+                txn.mapped_prefix_len,
+            );
+        }
+        txn.mapped_prefix_len = 0;
+        txn.mapped = None;
+    }
+    // (3) Remove the provisional/active mapping registry entry (guarded).
+    if let Some(cap) = txn.minted_cap {
+        let _ = ctx.ctx_remove_active_mapping(txn.snapshot.receiver_tid, cap);
+    }
+    // (4) Revoke the provisional receiver cap (once — guarded by take()).
+    if let Some(cap) = txn.minted_cap.take() {
+        ctx.ctx_revoke_cap(txn.snapshot.receiver_cnode, cap);
+    }
+    // (5) Release the transferred object pin (once — guarded by pin_owned). NEVER before the unmap
+    // + required shootdown above complete.
+    if txn.snapshot.pin_owned {
+        ctx.ctx_release_pin(txn.snapshot.object);
+        txn.snapshot.pin_owned = false;
+    }
+    txn.state = SharedRegionTxnState::Cancelled;
+}
+
+impl SharedRegionExecCtx for KernelState {
+    fn ctx_receiver_alive(&self, snap: &RecvBoundarySharedRegionSnapshot) -> bool {
+        self.shared_region_receiver_alive(snap)
+    }
+    fn ctx_object_live(&self, object: CapObject) -> bool {
+        self.capability_object_live(object).is_some()
+    }
+    fn ctx_cancel_overflowed(&self) -> bool {
+        self.shared_region_cancel_overflowed()
+    }
+    fn ctx_consume_cancel(&mut self, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
+        self.shared_region_consume_cancel(tid, asid)
+    }
+    fn ctx_mint(
+        &mut self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: Capability,
+    ) -> Result<CapId, ()> {
+        self.mint_capability_in_cnode(cnode, cap).map_err(|_| ())
+    }
+    fn ctx_register_active_mapping(&mut self, tid: u64, cap: CapId, va: u64, len: usize) -> bool {
+        self.register_active_transfer_mapping(ThreadId(tid), cap, VirtAddr(va), len)
+            .is_ok()
+    }
+    fn ctx_phys_base(&self, object: CapObject) -> Option<PhysAddr> {
+        self.shared_region_phys_base(object)
+    }
+    fn ctx_map_page(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        virt: VirtAddr,
+        mapping: Mapping,
+    ) -> bool {
+        self.map_user_page_in_asid_raw(asid, virt, mapping).is_ok()
+    }
+    fn ctx_copy_meta(&mut self, asid: crate::kernel::vm::Asid, va: VirtAddr, bytes: &[u8]) -> bool {
+        self.copy_to_user(asid, va, bytes).is_ok()
+    }
+    fn ctx_wake(&mut self, tid: u64) -> bool {
+        self.apply_split_receiver_wake_plan(ThreadId(tid)).is_ok()
+    }
+    fn ctx_release_pin(&mut self, object: CapObject) {
+        self.adjust_memory_object_pin_refcount(object, -1);
+    }
+    fn ctx_unmap_prefix(&mut self, asid: crate::kernel::vm::Asid, base: usize, len: usize) {
+        self.unmap_range_two_phase(asid, base, len);
+    }
+    fn ctx_remove_active_mapping(&mut self, tid: u64, cap: CapId) -> bool {
+        self.remove_active_transfer_mapping(ThreadId(tid), cap)
+    }
+    fn ctx_revoke_cap(&mut self, cnode: crate::kernel::capabilities::CNodeId, cap: CapId) {
+        let _ = self.revoke_capability_in_cnode(cnode, cap);
     }
 }
