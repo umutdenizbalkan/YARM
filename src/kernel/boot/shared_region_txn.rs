@@ -242,14 +242,16 @@ impl KernelState {
                 .map(|r| occupant_is_stale(r.tid, r.asid))
                 .unwrap_or(true)
         });
-        self.with_ipc_state_mut(|ipc| {
+        // Returns (recorded, fuse_newly_set): fuse_newly_set is true ONLY on the clear → set
+        // overflow transition, so the diagnostic (emitted below, outside the IPC borrow) fires once.
+        let (recorded, fuse_newly_set) = self.with_ipc_state_mut(|ipc| {
             if ipc
                 .shared_region_cancel_requests
                 .iter()
                 .flatten()
                 .any(|r| r.tid == receiver_tid && r.asid == receiver_asid)
             {
-                return true;
+                return (true, false);
             }
             // Prefer a free slot, otherwise a stale one.
             let target = ipc
@@ -262,13 +264,18 @@ impl KernelState {
                     tid: receiver_tid,
                     asid: receiver_asid,
                 });
-                true
+                (true, false)
             } else {
                 // Cannot record → FAIL CLOSED: no transaction may publish past this cancellation.
+                let newly_set = !ipc.shared_region_cancel_overflow;
                 ipc.shared_region_cancel_overflow = true;
-                false
+                (false, newly_set)
             }
-        })
+        });
+        if fuse_newly_set {
+            crate::kernel::boot::maybe_log_shared_region_cancel_fuse_set();
+        }
+        recorded
     }
 
     /// Consume (one-shot) a matching cancellation request for `(receiver_tid, receiver_asid)`.

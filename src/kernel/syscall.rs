@@ -873,6 +873,164 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
     Ok(true)
 }
 
+/// Stage 198E3 — shared internal helper: tag the origin and stash a shared-region delivery.
+///
+/// SAFETY: local-CPU trap path, interrupts disabled, no concurrent access — identical discipline
+/// to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` store.
+fn stash_shared_region_delivery(
+    cpu_idx: usize,
+    snapshot: crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    endpoint_idx: usize,
+    origin: crate::kernel::boot::SharedRegionLiveOrigin,
+) {
+    use crate::kernel::dispatch_post_work::{
+        BlockedWaiterSharedRegionDeliverySnapshot, DispatchPostWork,
+    };
+    crate::kernel::boot::shared_region_live_origin_set(cpu_idx, origin);
+    unsafe {
+        crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].store(
+            DispatchPostWork::BlockedWaiterSharedRegionDelivery(
+                BlockedWaiterSharedRegionDeliverySnapshot {
+                    snapshot,
+                    endpoint_idx,
+                },
+            ),
+        );
+    }
+}
+
+/// Stage 198E3 — is the shared-region live path eligible for this send? (gated + drainer-active)
+fn shared_region_live_eligible(kernel: &KernelState, msg: &Message) -> Option<usize> {
+    let is_transfer =
+        (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0;
+    let shared_region =
+        is_transfer && msg.opcode == OPCODE_SHARED_MEM && msg.transferred_cap().is_some();
+    if !shared_region {
+        return None;
+    }
+    // Stage 198E3 foundation: LIVE only under the oracle-proof knob (INERT on a normal boot — the
+    // legacy shared-region delivery path runs and no live-class markers are emitted).
+    if !crate::kernel::boot::ipc_recv_oracle_proof_enabled() {
+        return None;
+    }
+    // Only produce when a trap-entry drainer will run (mirrors the Stage 117 / 188C stash
+    // discipline). Direct/kernel-internal callers (no drainer) fall back to the legacy path.
+    let cpu_idx = kernel.current_cpu().0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    Some(cpu_idx)
+}
+
+/// Stage 198E3 — Phase A producer for a shared-region (MemoryObject / DmaRegion) DIRECT delivery
+/// to an already recv-v2-blocked receiver, wired into the Stage 188A dispatch-return channel.
+///
+/// The shared-region sibling of [`produce_blocked_waiter_ordinary_cap_delivery`]. It consumes the
+/// waiter's blocked state, resolves the endpoint the envelope is bound to, and builds the accepted
+/// origin-neutral post-lock snapshot via `shared_region_phase_a(origin_direct=true)` — which
+/// consumes the transfer envelope ONCE and moves its object pin into the snapshot with no reference
+/// gap. NO mint / map / user copy under the broad borrow: the drain executor runs
+/// `shared_region_execute` after the broad borrow drops.
+///
+/// Returns `Ok(true)` (produced; executor completes the delivery + slot-clear), `Ok(false)` (not a
+/// shared-region send, oracle knob off, or no drainer — caller uses the legacy path), or `Err(e)`
+/// (a real Phase-A fault) with the SAME envelope disposition the legacy path produces.
+pub(crate) fn produce_blocked_waiter_shared_region_delivery(
+    kernel: &mut KernelState,
+    waiter_tid: u64,
+    endpoint_idx: usize,
+    msg: &Message,
+) -> Result<bool, SyscallError> {
+    let Some(cpu_idx) = shared_region_live_eligible(kernel, msg) else {
+        return Ok(false);
+    };
+    // Phase A.1 — consume blocked state and resolve the endpoint the envelope is bound to.
+    let blocked_state = kernel
+        .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
+        .flatten()
+        .ok_or(SyscallError::InvalidArgs)?;
+    let recv_endpoint = kernel
+        .resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
+        .map_err(SyscallError::from)?
+        .object;
+    let handle = msg.transferred_cap().unwrap().0;
+    // Phase A.2 — build the accepted post-lock snapshot (envelope consume + pin transfer +
+    // object-authoritative classification + attenuated rights + receiver generation authority).
+    // The receiver's recv buffers provide the map VA and the recv-v2 meta target. Read-only for
+    // the primary live seal (existing hosted tests cover the canonical writable-right gate).
+    let snapshot = kernel
+        .shared_region_phase_a(
+            handle,
+            recv_endpoint,
+            waiter_tid,
+            blocked_state.payload_user_ptr as u64,
+            false,
+            blocked_state.meta_user_ptr as u64,
+            *msg,
+            true,
+        )
+        .map_err(SyscallError::from)?;
+    stash_shared_region_delivery(
+        cpu_idx,
+        snapshot,
+        endpoint_idx,
+        crate::kernel::boot::SharedRegionLiveOrigin::Direct,
+    );
+    crate::yarm_log!(
+        "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_shared_region waiter_tid={}",
+        waiter_tid
+    );
+    Ok(true)
+}
+
+/// Stage 198E3 — Phase A producer for a QUEUED shared-region delivery at the receiver-side dequeue
+/// (no-waiter enqueue followed by a later recv). The receiver is the CURRENT dequeuing task; its
+/// recv request supplies the map VA and meta target. Builds the accepted snapshot via
+/// `shared_region_phase_a(origin_direct=false)` (same envelope-consume + pin-transfer + executor).
+///
+/// Returns `Ok(true)` (produced), `Ok(false)` (ineligible / knob off / no drainer), or `Err(e)`.
+pub(crate) fn produce_queued_shared_region_delivery(
+    kernel: &mut KernelState,
+    receiver_tid: u64,
+    endpoint_idx: usize,
+    endpoint: crate::kernel::capabilities::CapObject,
+    map_va: u64,
+    meta_ptr: u64,
+    map_write: bool,
+    msg: &Message,
+) -> Result<bool, SyscallError> {
+    let Some(cpu_idx) = shared_region_live_eligible(kernel, msg) else {
+        return Ok(false);
+    };
+    let handle = msg.transferred_cap().unwrap().0;
+    let snapshot = kernel
+        .shared_region_phase_a(
+            handle,
+            endpoint,
+            receiver_tid,
+            map_va,
+            map_write,
+            meta_ptr,
+            *msg,
+            false,
+        )
+        .map_err(SyscallError::from)?;
+    stash_shared_region_delivery(
+        cpu_idx,
+        snapshot,
+        endpoint_idx,
+        crate::kernel::boot::SharedRegionLiveOrigin::Enqueue,
+    );
+    crate::yarm_log!(
+        "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_shared_region waiter_tid={}",
+        receiver_tid
+    );
+    Ok(true)
+}
+
 /// Stage 188D — Phase A producer for a REPLY-CAP blocked recv-v2 waiter
 /// delivery, wired into the Stage 188A dispatch-return channel.
 ///

@@ -62867,11 +62867,15 @@ mod stage193g_remaining_shapes_audit {
     fn no_retirement_class_for_either_remaining_shape() {
         assert!(
             !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
-            "193G must NOT add an IpcSendReplyCapEnqueue retirement class"
+            "reply-cap enqueue must stay direct-only (never a retirement class)"
         );
+        // Stage 198E3 introduced the two shared-region LIVE classes (direct + enqueue). The 193G
+        // no-go invariant is superseded for shared region: what endures is that reply-cap enqueue
+        // never becomes a class, and the accepted classes below remain.
         assert!(
-            !MOD_SRC.contains("IpcSendSharedRegion"),
-            "193G must NOT add an IpcSendSharedRegion retirement class"
+            MOD_SRC.contains("IpcSendSharedRegionDirect")
+                && MOD_SRC.contains("IpcSendSharedRegionEnqueue"),
+            "Stage 198E3 introduces the two shared-region live retirement classes"
         );
         for class in [
             "class=IpcSendPlain result=ok",
@@ -65807,6 +65811,381 @@ mod stage198e2b_shared_region_enqueue {
     }
 }
 
+// Stage 198E3 — SHARED-REGION IpcSend LIVE wiring (foundation, hosted proof).
+//
+// Proves the kernel-side production wiring for the two live shared-region classes: the direct
+// (blocked-receiver) and queued (dequeue) producers publish exactly ONE origin-tagged post-lock
+// work item that reuses the accepted `shared_region_execute`; the class-tagged attestation +
+// retirement markers are origin-gated; the fail-closed cancellation fuse diagnostic fires exactly
+// once; and the RISC-V sender/receiver typed-outcome contract is preserved. The live 6-cell QEMU
+// seal (userspace oracle) is proven by scripts/qemu-shared-region-live-seal.sh (live-wiring
+// continuation). See doc/STAGE_198E3_SHARED_REGION_LIVE.md.
+mod stage198e3_shared_region_live {
+    use super::*;
+    use crate::kernel::boot::{SharedRegionLiveOrigin, shared_region_live_origin_take};
+    use crate::kernel::dispatch_post_work::DispatchPostWork;
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+
+    const CPU0: CpuId = CpuId(0);
+    const MAP_VA: u64 = 0x8000;
+    const META_PTR: u64 = 0x8800;
+
+    fn set_trap_drainer(active: bool) {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+            .store(active, core::sync::atomic::Ordering::Relaxed);
+    }
+    fn clear_stash() {
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let _ = shared_region_live_origin_take(0);
+    }
+    // Restore process-global state to its default so these tests never contaminate others (the
+    // oracle-proof knob defaults OFF and only these tests set it on).
+    fn restore_globals() {
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(false);
+        set_trap_drainer(false);
+        clear_stash();
+    }
+    fn take_stash() -> DispatchPostWork {
+        unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }
+            .unwrap_or(DispatchPostWork::None)
+    }
+    fn shared_msg(handle: u64) -> Message {
+        Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("shared msg")
+    }
+
+    // task 1 blocked recv-v2 (map VA @ MAP_VA, meta @ META_PTR), a MemoryObject source cap owned by
+    // task 0, and a SHARED-REGION transfer envelope bound to (recv_endpoint, task 1). The oracle
+    // knob + trap drainer are enabled. Returns (state, endpoint_idx, endpoint, handle).
+    fn blocked_shared_region_fixture() -> (KernelState, usize, CapObject, u64) {
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
+        set_trap_drainer(true);
+        clear_stash();
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap_task1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("grant recv cap");
+        let (_mem_id, src_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind");
+        state
+            .map_user_page(
+                aspace1,
+                VirtAddr(META_PTR & !(PAGE_SIZE as u64 - 1)),
+                Mapping {
+                    phys: PhysAddr(0x9000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map meta page");
+        // The producer targets waiter_tid=1 explicitly (resolving its cnode/asid + blocked state);
+        // it does not require task 1 to be the current task, so no scheduler switch is needed.
+        state.with_tcb_mut(1, |tcb| {
+            tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                recv_cap: recv_cap_task1,
+                payload_user_ptr: MAP_VA as usize,
+                payload_user_len: crate::kernel::ipc::Message::MAX_PAYLOAD,
+                meta_user_ptr: META_PTR as usize,
+                meta_user_len: 40,
+                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            });
+        });
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+        });
+        let endpoint = state
+            .resolve_capability_for_task(1, recv_cap_task1)
+            .expect("resolve recv cap")
+            .object;
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(1)),
+                Some(region),
+            )
+            .expect("stash shared envelope");
+        (state, endpoint_idx, endpoint, handle)
+    }
+
+    // (1) The DIRECT producer publishes exactly one post-work item tagged origin_direct=true and
+    // sets the per-CPU live origin to Direct.
+    #[test]
+    fn direct_live_work_publication_origin() {
+        let (mut state, endpoint_idx, _endpoint, handle) = blocked_shared_region_fixture();
+        let produced = crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert!(
+            produced,
+            "a shared-region direct send must publish post-work"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_none(),
+            "producer consumed the waiter's blocked_recv_state"
+        );
+        match take_stash() {
+            DispatchPostWork::BlockedWaiterSharedRegionDelivery(snap) => {
+                assert!(snap.snapshot.origin_direct, "direct origin marker");
+                assert_eq!(snap.endpoint_idx, endpoint_idx);
+                assert!(snap.snapshot.pin_owned, "pin transferred into the snapshot");
+                assert!(matches!(
+                    snap.snapshot.object,
+                    CapObject::MemoryObject { .. }
+                ));
+            }
+            other => panic!("expected shared-region delivery, got {other:?}"),
+        }
+        restore_globals();
+    }
+
+    // (2) The QUEUED producer publishes exactly one post-work item tagged origin_direct=false and
+    // sets the per-CPU live origin to Enqueue.
+    #[test]
+    fn enqueue_live_work_publication_origin() {
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
+        set_trap_drainer(true);
+        clear_stash();
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let (endpoint_idx, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_mem_id, src_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR & !(PAGE_SIZE as u64 - 1)),
+                Mapping {
+                    phys: PhysAddr(0xA000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let produced = crate::kernel::syscall::produce_queued_shared_region_delivery(
+            &mut state,
+            2,
+            endpoint_idx,
+            endpoint,
+            MAP_VA,
+            META_PTR,
+            false,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert!(
+            produced,
+            "a queued shared-region dequeue must publish post-work"
+        );
+        match take_stash() {
+            DispatchPostWork::BlockedWaiterSharedRegionDelivery(snap) => {
+                assert!(!snap.snapshot.origin_direct, "enqueue origin marker");
+                assert_eq!(snap.snapshot.receiver_tid, 2);
+            }
+            other => panic!("expected shared-region delivery, got {other:?}"),
+        }
+        restore_globals();
+    }
+
+    // (3) Marker origin gating: the live origin is unset until a producer sets it, is class-correct
+    // after, and is one-shot consumed — so ordinary/reply/plain/hosted paths (which never set it)
+    // can never emit the shared-region live markers.
+    #[test]
+    fn marker_origin_gating() {
+        clear_stash();
+        assert_eq!(
+            shared_region_live_origin_take(0),
+            None,
+            "no origin set → drain emits no shared-region markers"
+        );
+        let (mut state, endpoint_idx, _endpoint, handle) = blocked_shared_region_fixture();
+        crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert_eq!(
+            shared_region_live_origin_take(0),
+            Some(SharedRegionLiveOrigin::Direct),
+            "direct producer tags the origin"
+        );
+        assert_eq!(
+            shared_region_live_origin_take(0),
+            None,
+            "origin is one-shot (consumed exactly once)"
+        );
+        restore_globals();
+    }
+
+    // (4) Exactly one post-work item per transaction: the stash holds a single item.
+    #[test]
+    fn one_post_work_item_per_transaction() {
+        let (mut state, endpoint_idx, _endpoint, handle) = blocked_shared_region_fixture();
+        crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert!(matches!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() },
+            Some(DispatchPostWork::BlockedWaiterSharedRegionDelivery(_))
+        ));
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "exactly one work item is published per transaction"
+        );
+        restore_globals();
+    }
+
+    // (5) Off the oracle knob the producer is INERT (legacy path runs, no live class): the sender's
+    // shared-region send stays on the ReturnToCurrent (continue) path and the RISC-V receiver idle
+    // contract uses EnterKernelIdle{BlockedIpcNoRunnable}, never Err(Internal) as idle control flow.
+    #[test]
+    fn riscv_return_to_current_and_inert_without_knob() {
+        // Build the fixture (knob on), then turn the knob OFF: the producer must decline so the
+        // legacy path (sender continues, ReturnToCurrent) runs unchanged.
+        let (mut state, endpoint_idx, _endpoint, handle) = blocked_shared_region_fixture();
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(false);
+        let produced = crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert!(
+            !produced,
+            "off the knob the producer must decline (legacy path)"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_some(),
+            "declining leaves the waiter's blocked state untouched"
+        );
+        // RISC-V typed-outcome contract (sender continues / receiver idle) preserved: the receiver
+        // idle path uses the authoritative EnterKernelIdle{BlockedIpcNoRunnable, IpcRecv}, and no
+        // Err(Internal) is used as successful idle control flow.
+        const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        assert!(
+            RISCV_TRAP_SRC.contains("BlockedIpcNoRunnable"),
+            "RISC-V receiver idle must use the typed BlockedIpcNoRunnable outcome"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("ReturnToCurrent"),
+            "RISC-V sender-continues must use the typed ReturnToCurrent outcome"
+        );
+        restore_globals();
+    }
+
+    // (6) Seal parser / contract: the live seal script requires all attestations + retirement
+    // markers for BOTH classes on ALL THREE arches, forbids a fuse trip, and emits the six-cell
+    // seal line.
+    #[test]
+    fn seal_parser_contract() {
+        const SEAL: &str = include_str!("../../../scripts/qemu-shared-region-live-seal.sh");
+        for needle in [
+            "IPCSEND_SHARED_REGION_OBJECT_OK arch=$arch class=$class object_match=1 fresh_cap=1 pin_transfer=1",
+            "IPCSEND_SHARED_REGION_MAP_OK arch=$arch class=$class map_right=1 write_right_ok=1 nx=1 cleanup_token=1",
+            "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch=$arch class=$class transaction_published=1 receiver_wakes=1 leaked_state=0",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$arch class=$rclass result=ok",
+            "IpcSendSharedRegionDirect",
+            "IpcSendSharedRegionEnqueue",
+            "SHARED_REGION_CANCEL_FUSE_SET", // forbidden-marker guard
+            "live_cells=6 fuse_trips=0 result=ok",
+        ] {
+            assert!(SEAL.contains(needle), "seal contract missing: {needle}");
+        }
+    }
+
+    // (7) The fail-closed cancellation-fuse diagnostic is emitted EXACTLY ONCE, and a real overflow
+    // (all cancel slots occupied by live receivers) trips it.
+    #[test]
+    fn fuse_diagnostic_emitted_once() {
+        crate::kernel::boot::reset_shared_region_cancel_fuse_log();
+        assert!(
+            crate::kernel::boot::maybe_log_shared_region_cancel_fuse_set(),
+            "first fuse diagnostic emits"
+        );
+        assert!(
+            !crate::kernel::boot::maybe_log_shared_region_cancel_fuse_set(),
+            "second call is a no-op (emitted exactly once)"
+        );
+        // A real overflow trips the fuse via request_cancel.
+        crate::kernel::boot::reset_shared_region_cancel_fuse_log();
+        let mut state = Bootstrap::init().expect("init");
+        let mut tids = [0u64; MAX_SHARED_REGION_CANCEL_REQUESTS];
+        for (i, slot) in tids.iter_mut().enumerate() {
+            let tid = 90 + i as u64;
+            *slot = tid;
+            state.register_task(tid).expect("task");
+            let (asid, _mc) = state.create_user_address_space().expect("asid");
+            state.bind_task_asid(tid, asid).expect("bind");
+            assert!(state.shared_region_request_cancel(tid, asid));
+        }
+        // Fifth live request overflows → fuse trips (and the diagnostic emits once).
+        state.register_task(99).expect("task99");
+        let (asid99, _mc) = state.create_user_address_space().expect("asid99");
+        state.bind_task_asid(99, asid99).expect("bind99");
+        assert!(
+            !state.shared_region_request_cancel(99, asid99),
+            "overflow fails closed"
+        );
+        assert!(
+            state.with_ipc_state(|ipc| ipc.shared_region_cancel_overflow),
+            "fuse latched in IpcState"
+        );
+        // The global diagnostic latch was won by the request_cancel overflow above.
+        assert!(
+            !crate::kernel::boot::maybe_log_shared_region_cancel_fuse_set(),
+            "the overflow already emitted the one-shot diagnostic"
+        );
+    }
+}
+
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
 // no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
 // reality the audit relied on, so a future stage cannot silently flip an architecture
@@ -65947,12 +66326,13 @@ mod stage194_cross_arch_portability_audit {
         );
     }
 
-    // 194 adds NO new retirement class (audit only).
+    // 194 adds NO new retirement class (audit only). The shared-region classes were later
+    // introduced by Stage 198E3, so they are no longer in this forbidden set; the enduring
+    // exclusions (reply-cap enqueue + per-arch DebugLog) remain.
     #[test]
     fn no_new_retirement_class_added() {
         for forbidden in [
             "class=IpcSendReplyCapEnqueue",
-            "class=IpcSendSharedRegion",
             "class=DebugLogAarch64",
             "class=DebugLogRiscv",
         ] {
@@ -69929,9 +70309,12 @@ mod stage198a_second_cohort_plain_parity {
     #[test]
     fn no_new_retirement_class_minted() {
         assert!(
-            !MOD_SRC.contains("IpcSendReplyCapEnqueue") && !MOD_SRC.contains("IpcSendSharedRegion"),
-            "Stage 198A must not mint a reply-cap-enqueue or shared-region retirement class"
+            !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
+            "Stage 198A must not mint a reply-cap-enqueue retirement class (reply caps direct-only)"
         );
+        // Stage 198A itself minted no shared-region class; Stage 198E3 later introduced the two
+        // shared-region live classes, so the enduring 198A invariant is only the reply-cap-enqueue
+        // exclusion above.
         // The first-cohort seal (12/12 cross-arch) is preserved unchanged by this stage.
         assert!(
             FIRST_COHORT_SEAL_SRC
@@ -70260,9 +70643,11 @@ mod stage198b_second_cohort_ordinary_cap_parity {
     #[test]
     fn no_new_class_and_earlier_cohorts_preserved() {
         assert!(
-            !MOD_SRC.contains("IpcSendReplyCapEnqueue") && !MOD_SRC.contains("IpcSendSharedRegion"),
-            "Stage 198B must not mint a reply-cap-enqueue or shared-region retirement class"
+            !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
+            "Stage 198B must not mint a reply-cap-enqueue retirement class (reply caps direct-only)"
         );
+        // Stage 198B itself minted no shared-region class; Stage 198E3 later introduced the two
+        // shared-region live classes, so the enduring exclusion is only reply-cap-enqueue.
         assert!(
             PLAIN_SEAL_SRC
                 .contains("SECOND_COHORT_PLAIN_SEAL arches=3 classes=2 live_cells=6 result=ok"),

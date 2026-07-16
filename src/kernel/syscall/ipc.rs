@@ -504,6 +504,30 @@ pub(super) fn handle_ipc_send(
                                 IpcSchedulerPlan::None,
                             ),
                             Ok(false) => {
+                                // Stage 198E3: shared-region DIRECT live path — gated behind the
+                                // oracle-proof knob. Under the knob (and a drainer), the producer
+                                // snapshots the accepted post-lock transaction (envelope consume +
+                                // pin transfer) by value; the trap-entry drain runs
+                                // `shared_region_execute` after the broad borrow drops (map, meta
+                                // copy, revalidate, single wake) — NO map/copy under the broad
+                                // borrow. Off the knob → Ok(false) → the legacy path below runs
+                                // (unchanged normal boot). Err → a real Phase-A fault.
+                                match crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+                                    kernel,
+                                    receiver_tid.0,
+                                    endpoint_idx,
+                                    &msg,
+                                ) {
+                                    // Producer stashed the post-work (drain completes delivery +
+                                    // slot-clear + single wake) — no in-lock wake plan here.
+                                    Ok(true) => (Some(Ok(())), IpcSchedulerPlan::None),
+                                    // A real Phase-A fault — the outer error path releases any
+                                    // still-stashed envelope (same disposition as the legacy arm).
+                                    Err(_e) => (
+                                        Some(Err(KernelError::UserMemoryFault)),
+                                        IpcSchedulerPlan::None,
+                                    ),
+                                    Ok(false) => {
                                 // Stage 4K/4O legacy: recv-v2 blocked receiver — deliver
                                 // directly outside ipc_state_lock (still under the broad
                                 // borrow). Handles the shared-region variant all boundary
@@ -526,6 +550,8 @@ pub(super) fn handle_ipc_send(
                                         Some(Err(KernelError::UserMemoryFault)),
                                         IpcSchedulerPlan::None,
                                     ),
+                                }
+                                    }
                                 }
                             }
                         }

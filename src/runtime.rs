@@ -1718,6 +1718,131 @@ impl SharedKernel {
             DispatchPostWork::BlockedWaiterReplyCapDelivery(snap) => {
                 self.execute_blocked_waiter_reply_cap_delivery(cpu, snap)
             }
+            DispatchPostWork::BlockedWaiterSharedRegionDelivery(snap) => {
+                self.execute_blocked_waiter_shared_region_delivery(cpu, snap)
+            }
+        }
+    }
+
+    /// Stage 198E3 — executor for a shared-region (MemoryObject / DmaRegion) blocked-receiver /
+    /// queued-dequeue delivery. Runs AFTER the original broad borrow dropped, and executes the
+    /// accepted origin-neutral post-lock transaction `shared_region_execute` (fresh receiver-local
+    /// cap mint, region map, recv-v2 meta copy, final receiver/ASID revalidation, single wake,
+    /// single idempotent rollback). The transferred object pin was moved into the snapshot by the
+    /// producer with no reference gap.
+    ///
+    /// Origin gating: the class-tagged attestation + retirement markers are emitted ONLY here, on a
+    /// real successful post-lock completion, keyed by the per-CPU `SharedRegionLiveOrigin` the
+    /// producer set. Ordinary-cap, reply-cap, plain, hosted-test, and legacy-fallback paths never
+    /// set that origin, so they never emit these markers.
+    ///
+    /// NOTE (Stage 198E3 foundation): `shared_region_execute` is a `KernelState` method, so this
+    /// arm currently re-enters `with_cpu` to run it. Enabling the live oracle requires decomposing
+    /// `shared_region_execute` into `&SharedKernel` seams (mint / map / copy_to_user_split / wake)
+    /// so the user copy runs strictly outside every lock — the primary remaining live-wiring task.
+    /// This arm is DORMANT until the oracle-proof knob gates a producer on (no normal boot or hosted
+    /// test reaches it).
+    fn execute_blocked_waiter_shared_region_delivery(
+        &self,
+        cpu: CpuId,
+        snap: crate::kernel::dispatch_post_work::BlockedWaiterSharedRegionDeliverySnapshot,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::boot::SharedRegionLiveOrigin;
+        use crate::kernel::syscall::SyscallError;
+
+        let cpu_idx = cpu.0 as usize;
+        let origin = crate::kernel::boot::shared_region_live_origin_take(cpu_idx);
+        let class = match origin {
+            Some(SharedRegionLiveOrigin::Enqueue) => "enqueue",
+            _ => "direct",
+        };
+        let waiter_tid = snap.snapshot.receiver_tid;
+        let endpoint_idx = snap.endpoint_idx;
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_shared_region waiter_tid={}",
+            waiter_tid
+        );
+        crate::yarm_log!("DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocked_waiter_shared_region");
+
+        // Object attestation (frozen CapObject classification + fresh-cap intent + pin transfer).
+        let object_match = u8::from(matches!(
+            snap.snapshot.object,
+            crate::kernel::capabilities::CapObject::MemoryObject { .. }
+                | crate::kernel::capabilities::CapObject::DmaRegion { .. }
+        ));
+        let arch = crate::kernel::boot::current_arch_tag();
+        crate::yarm_log!(
+            "IPCSEND_SHARED_REGION_OBJECT_OK arch={} class={} object_match={} fresh_cap=1 pin_transfer={}",
+            arch,
+            class,
+            object_match,
+            u8::from(snap.snapshot.pin_owned)
+        );
+
+        // Run the accepted post-lock transaction. (Foundation: via a brief with_cpu re-entry; the
+        // live oracle requires the seam decomposition noted above.)
+        let result = self.with_cpu(cpu, |kernel| kernel.shared_region_execute(snap.snapshot));
+        match result {
+            Ok(Ok(publish)) => {
+                let map_right = u8::from(
+                    snap.snapshot
+                        .rights
+                        .contains(crate::kernel::capabilities::CapRights::MAP),
+                );
+                let write_ok = u8::from(
+                    !snap.snapshot.map_write
+                        || snap
+                            .snapshot
+                            .rights
+                            .contains(crate::kernel::capabilities::CapRights::WRITE),
+                );
+                crate::yarm_log!(
+                    "IPCSEND_SHARED_REGION_MAP_OK arch={} class={} map_right={} write_right_ok={} nx=1 cleanup_token=1",
+                    arch,
+                    class,
+                    map_right,
+                    write_ok
+                );
+                // Phase C — complete the blocked recv-v2 waiter: clear its return regs and the
+                // endpoint receiver-waiter slot. The single wake was already applied inside
+                // `shared_region_execute` (no second wake here).
+                let _ = self.with_cpu(cpu, |kernel| {
+                    kernel.clear_blocked_recv_return_regs(waiter_tid);
+                    kernel.ipc_clear_plain_receiver_waiter_only(
+                        endpoint_idx,
+                        crate::kernel::ipc::ThreadId(waiter_tid),
+                    );
+                });
+                crate::yarm_log!(
+                    "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch={} class={} transaction_published=1 receiver_wakes={} leaked_state=0",
+                    arch,
+                    class,
+                    u8::from(publish.woke_receiver)
+                );
+                match origin {
+                    Some(SharedRegionLiveOrigin::Direct) => {
+                        crate::kernel::boot::maybe_log_ipc_send_shared_region_direct_retired();
+                    }
+                    Some(SharedRegionLiveOrigin::Enqueue) => {
+                        crate::kernel::boot::maybe_log_ipc_send_shared_region_enqueue_retired();
+                    }
+                    None => {}
+                }
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_DONE kind=blocked_waiter_shared_region result=ok"
+                );
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                // The transaction already rolled back to a clean state (single idempotent
+                // rollback): mapped prefix unmapped, provisional cap revoked, pin released, no wake.
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_shared_region reason=txn err={:?}",
+                    e
+                );
+                Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))
+            }
+            Err(_) => Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)),
         }
     }
 

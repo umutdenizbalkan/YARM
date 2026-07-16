@@ -23,7 +23,7 @@ mod orchestrator_state;
 mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
-mod shared_region_txn;
+pub(crate) mod shared_region_txn;
 mod task_core_state;
 mod task_policy_state;
 mod thread_state;
@@ -1507,6 +1507,202 @@ pub(crate) fn blocked_syscall_idle_provenance_take(
     // A set token always co-recorded a valid class; default to IpcRecv only if somehow absent.
     let class = BlockingSyscallClass::from_code(code).unwrap_or(BlockingSyscallClass::IpcRecv);
     Some((raw - 1, class))
+}
+
+// ── Stage 198E3 (SHARED-REGION LIVE) ──────────────────────────────────────────────────────
+//
+// The accepted post-lock shared-region transaction (`shared_region_execute`) is wired LIVE into
+// the direct (blocked-receiver) and queued (dequeue) receive boundaries, gated behind the
+// oracle-proof knob (`ipc_recv_oracle_proof_enabled`) so it is INERT on a normal boot (the legacy
+// path runs and no shared-region live class markers are emitted). A per-CPU origin tag records the
+// pending shared-region post-work's CLASS (direct vs enqueue) so the drain executor emits the
+// class-correct attestations + retirement markers ONLY from a real post-lock completion — never
+// from ordinary-cap, reply-cap, plain, hosted-test, or fallback paths.
+
+/// Stage 198E3: the running architecture tag for runtime markers (arch-neutral drain executor).
+pub(crate) const fn current_arch_tag() -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    {
+        "aarch64"
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x86_64"
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        "riscv64"
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )))]
+    {
+        "host"
+    }
+}
+
+/// Stage 198E3: per-CPU shared-region live post-work origin (0 = none, 1 = direct, 2 = enqueue).
+pub(crate) static SHARED_REGION_LIVE_ORIGIN: [core::sync::atomic::AtomicU8;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Origin class for a pending shared-region live delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedRegionLiveOrigin {
+    Direct,
+    Enqueue,
+}
+
+/// Stage 198E3: tag the just-stashed shared-region delivery on `cpu` with its class origin.
+pub(crate) fn shared_region_live_origin_set(cpu_idx: usize, origin: SharedRegionLiveOrigin) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        let code = match origin {
+            SharedRegionLiveOrigin::Direct => 1,
+            SharedRegionLiveOrigin::Enqueue => 2,
+        };
+        SHARED_REGION_LIVE_ORIGIN[cpu_idx].store(code, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Stage 198E3: consume the shared-region live origin for `cpu` (clear + return prior class).
+pub(crate) fn shared_region_live_origin_take(cpu_idx: usize) -> Option<SharedRegionLiveOrigin> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    match SHARED_REGION_LIVE_ORIGIN[cpu_idx].swap(0, core::sync::atomic::Ordering::AcqRel) {
+        1 => Some(SharedRegionLiveOrigin::Direct),
+        2 => Some(SharedRegionLiveOrigin::Enqueue),
+        _ => None,
+    }
+}
+
+/// Stage 198E3: one-shot latch for the fail-closed cancellation-fuse diagnostic.
+static SHARED_REGION_CANCEL_FUSE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 198E3: emit the fail-closed cancellation-fuse diagnostic EXACTLY ONCE, when the fuse
+/// transitions clear → set (a cancellation request that could not be recorded). The fuse is never
+/// auto-cleared; a normal live oracle run must show `count=0` of this marker. Returns `true` iff
+/// this call actually emitted (won the one-shot latch).
+pub(crate) fn maybe_log_shared_region_cancel_fuse_set() -> bool {
+    if SHARED_REGION_CANCEL_FUSE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!(
+            "SHARED_REGION_CANCEL_FUSE_SET reason=capacity_exhausted result=fail_closed"
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// Test-only: reset the one-shot fuse-diagnostic latch so the "emitted exactly once" contract can
+/// be exercised deterministically without cross-test contamination from the shared static.
+#[cfg(test)]
+pub(crate) fn reset_shared_region_cancel_fuse_log() {
+    SHARED_REGION_CANCEL_FUSE_LOGGED.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Stage 198E3: one-shot latch for the IpcSendSharedRegionDirect retirement markers.
+static IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 198E3: emit the IpcSendSharedRegionDirect retirement markers exactly once (first direct
+/// shared-region delivery completed through the out-of-broad-lock post-lock transaction). Arch is
+/// selected here by `cfg` (the drain executor is arch-neutral, reached from all three drains).
+pub(crate) fn maybe_log_ipc_send_shared_region_direct_retired() {
+    if IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendSharedRegionDirect"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendSharedRegionDirect result=ok"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendSharedRegionDirect"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendSharedRegionDirect result=ok"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendSharedRegionDirect"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendSharedRegionDirect result=ok"
+            );
+        }
+    }
+}
+
+/// Stage 198E3: one-shot latch for the IpcSendSharedRegionEnqueue retirement markers.
+static IPC_SEND_SHARED_REGION_ENQUEUE_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 198E3: emit the IpcSendSharedRegionEnqueue retirement markers exactly once (first queued
+/// shared-region delivery completed through the out-of-broad-lock post-lock transaction).
+pub(crate) fn maybe_log_ipc_send_shared_region_enqueue_retired() {
+    if IPC_SEND_SHARED_REGION_ENQUEUE_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendSharedRegionEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendSharedRegionEnqueue result=ok"
+            );
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendSharedRegionEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendSharedRegionEnqueue result=ok"
+            );
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendSharedRegionEnqueue"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendSharedRegionEnqueue result=ok"
+            );
+        }
+    }
 }
 
 /// Stage 193A: one-shot latch for the IpcSendPlain boundary retirement markers.
