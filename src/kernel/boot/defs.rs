@@ -253,8 +253,24 @@ pub(crate) struct IpcSubsystem {
     pub(crate) active_transfer_mappings: [Option<ActiveTransferMapping>; MAX_TRANSFER_ENVELOPES],
     pub(crate) reply_caps: [Option<ReplyCapRecord>; MAX_REPLY_CAPS],
     pub(crate) reply_cap_generations: [u64; MAX_REPLY_CAPS],
+    /// Stage 198E2A1: bounded generation-bearing cancellation requests for in-flight shared-region
+    /// direct transactions (executor-owned cleanup protocol). Not a queue/CNode/ABI capacity — an
+    /// internal signal table matched by (receiver TID **and** ASID).
+    pub(crate) shared_region_cancel_requests:
+        [Option<SharedRegionCancelReq>; MAX_SHARED_REGION_CANCEL_REQUESTS],
     pub(crate) telemetry: IpcPathTelemetry,
 }
+
+/// Stage 198E2A1: a generation-bearing cancellation request for a shared-region direct transaction.
+/// Matched on BOTH the numeric receiver TID and the captured ASID, so a delayed lifecycle action
+/// for an old TID cannot cancel a replacement process's transaction (different ASID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SharedRegionCancelReq {
+    pub(crate) tid: u64,
+    pub(crate) asid: crate::kernel::vm::Asid,
+}
+
+pub(crate) const MAX_SHARED_REGION_CANCEL_REQUESTS: usize = 4;
 
 #[cfg(feature = "hosted-dev")]
 pub(crate) type UserMemoryStore = BTreeMap<(u16, u64), u8>;
