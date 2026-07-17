@@ -357,6 +357,13 @@ impl KernelState {
         })
     }
 
+    /// Stage 198E3C1B rollback accessor: the number of live (allocated) endpoint slots. A leak-free
+    /// provisioning rollback must leave this UNCHANGED versus the pre-attempt count.
+    #[cfg(test)]
+    pub(crate) fn live_endpoint_count_for_test(&self) -> usize {
+        self.with_ipc_state(|ipc| ipc.endpoints.iter().flatten().count())
+    }
+
     /// Count non-None endpoint_waiters slots for test assertions.
     #[cfg(test)]
     pub(crate) fn endpoint_waiter_count(&self, endpoint_idx: usize) -> usize {

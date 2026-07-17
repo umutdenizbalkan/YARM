@@ -48,10 +48,13 @@ parent IpcSend(OPCODE_SHARED_MEM, FLAG_CAP_TRANSFER, transferred_cap=mem_cap)
   transferred_cap = the init-local `mem_cap`, a small inline payload), then `ipc_send(send_ep, &msg)`.
   The source cap is preserved (the kernel duplicates through the envelope). Returns the exact
   `SyscallError`.
-- `recv_shared_region_v2`: recv on the endpoint with `payload_ptr = ORACLE_MAP_VA` (dedicated
-  unmapped 2-page window), `payload_len = 2*PAGE_SIZE`, a separate valid `IpcRecvMetaV2` buffer, and
-  `map_intent = SYSCALL_RECV_MAP_INTENT_READ`. On return, decode `meta.cap_id` (receiver-local cap)
-  when `recv_meta_flags & TRANSFERRED_CAP`; the two mapped pages are readable at `ORACLE_MAP_VA`.
+- `recv_shared_region_v2`: recv on the endpoint with `payload_ptr = SHARED_REGION_ORACLE_VA`
+  (dedicated unmapped 2-page window), `payload_len = 2*PAGE_SIZE`, and a separate valid
+  `IpcRecvMetaV2` buffer. It passes **NO map-intent argument**: the DIRECT blocked-waiter delivery
+  hardcodes read-only (`shared_region_phase_a(..., map_write=false, ...)`), so
+  `recv_shared_mem_map_intent_flags` (the immediate-inline path's arg4 reader) is NOT on this path.
+  On return, decode `meta.cap_id` (receiver-local cap) when `recv_meta_flags & TRANSFERRED_CAP`; the
+  two mapped pages are readable at `SHARED_REGION_ORACLE_VA`.
 - `release_shared_region_mapping`: `TransferRelease(cap, 0, 0)`; first → Ok(len), duplicate →
   `InvalidArgs`.
 

@@ -262,4 +262,11 @@ impl KernelState {
     pub(crate) fn memory_object_exists_for_phys(&self, phys: PhysAddr) -> bool {
         self.memory_object_refcounts(phys).is_some()
     }
+
+    /// Stage 198E3C1B rollback accessor: the number of live (non-reclaimed) MemoryObject slots.
+    /// A leak-free provisioning rollback must leave this UNCHANGED versus the pre-attempt count.
+    #[cfg(test)]
+    pub(crate) fn live_memory_object_count_for_test(&self) -> usize {
+        self.with_memory_state(|memory| memory.memory_objects.iter().flatten().count())
+    }
 }

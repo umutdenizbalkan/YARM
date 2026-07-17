@@ -3224,6 +3224,13 @@ pub fn provision_init_ipc_send_cap_oracle_coord(
 /// exercises multi-page mapping progress).
 pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
 
+/// Stage 198E3C1B: the init startup-slot-5 selector value that names the DIRECT shared-region
+/// oracle (mirrors `yarm_user_rt::syscall::SHARED_REGION_ORACLE_SELECTOR`). Slot 5 is a mutually
+/// exclusive selector: 1 = x86_64 FutexWake oracle, 2 = shared-region direct oracle. Only ONE may
+/// be armed per boot (the boot caller fails closed if both knobs are set).
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
+
 /// Stage 198E3C1: the deterministic known byte the oracle writes at object offset `off`. It varies
 /// with `off`, so the pattern SPANS BOTH pages (page 0 and page 1 hold different bytes), and it is a
 /// pure formula the userspace child recomputes to validate the mapped contents. No secret, no ABI.
@@ -3235,21 +3242,134 @@ pub(crate) const fn shared_region_oracle_pattern_byte(off: usize) -> u8 {
         .wrapping_add(0x5A)
 }
 
-/// Stage 198E3C1: provision the DIRECT shared-region live oracle's source object. Under BOTH the
-/// compile-time feature and the runtime selector, allocate ONE fresh two-page `MemoryObject`, fill
-/// both backing pages with the deterministic pattern (kernel direct map — NO userspace WRITE cap is
-/// minted for initialization), then mint a source cap into init's CNode with canonical
-/// capability-transfer authority and read-only receiver rights (`READ | MAP`, no `WRITE`, no
-/// execute). Returns the init-local source `CapId` for the startup-arg slot. Fail-closed: on any
-/// step failure it emits a precise provisioning-failure marker and returns `None` (the caller then
-/// leaves the oracle un-armed) — it never partially arms.
+/// Stage 198E3C1B: the two init-local caps a fully-provisioned shared-region oracle hands to init.
+///
+/// The report's original three-slot plan (`mem_cap` / `send_cap` / `recv_cap` in startup slots
+/// 13/14/15) does NOT fit: startup slot 15 is `STARTUP_SLOT_INITRD_PTR` (already occupied by the
+/// boot initrd pointer), leaving only the two free service-extra slots 13/14. So the send and recv
+/// authorities collapse into ONE endpoint cap carrying `SEND | RECEIVE`: the parent sends on it and
+/// the forked child receives on the SAME cap through init's shared CSpace. Two caps, two slots.
 #[cfg(feature = "x86-shared-region-direct-oracle")]
-pub fn provision_init_shared_region_oracle(kernel: &mut KernelState, init_tid: u64) -> Option<u32> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedRegionOracleCaps {
+    /// init-local `MemoryObject` source cap (`READ | MAP`, no `WRITE`/execute) → startup slot 13.
+    pub mem_cap: u32,
+    /// init-local endpoint cap carrying `SEND | RECEIVE` for the oracle rendezvous → startup slot 14.
+    pub endpoint_cap: u32,
+    /// The endpoint's slot index (for the drain/waiter bookkeeping and hosted assertions).
+    pub endpoint_idx: usize,
+}
+
+/// Stage 198E3C1B: TEST-ONLY fault-injection selector for the provisioning transaction. Names the
+/// step at which provisioning is forced to fail, so hosted tests can assert the rollback leaves NO
+/// leaked cap, NO leaked object, and NO occupied startup slot at EVERY failure point. Defaults to 0
+/// (no injection) so a real build's provisioning is byte-identical.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub(crate) static SHARED_REGION_ORACLE_FAULT_INJECT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Fault-injection step codes (0 = none). Each names the step FORCED to fail; rollback must then
+/// reclaim everything created by the strictly-earlier steps.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub(crate) mod shared_region_fault {
+    pub const NONE: u32 = 0;
+    pub const ALLOC: u32 = 1;
+    pub const RESOLVE: u32 = 2;
+    pub const GRANT_MEM: u32 = 3;
+    pub const CREATE_EP: u32 = 4;
+    pub const RESOLVE_EP: u32 = 5;
+    pub const MINT_EP: u32 = 6;
+    /// Highest injectable step (inclusive) — hosted tests sweep `1..=LAST`.
+    pub const LAST: u32 = MINT_EP;
+}
+
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub(crate) fn set_shared_region_oracle_fault_inject(step: u32) {
+    SHARED_REGION_ORACLE_FAULT_INJECT.store(step, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+fn shared_region_oracle_fault_inject() -> u32 {
+    SHARED_REGION_ORACLE_FAULT_INJECT.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Rollback scratch: every reclaimable resource the transaction has created so far, in creation
+/// order. Rollback undoes them in REVERSE order.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[derive(Default, Clone, Copy)]
+struct SharedRegionProvisionScratch {
+    /// Source `MemoryObject` cap in task 0's CNode — revoking it cascades to init's delegated mem
+    /// cap and reclaims the object (refcount → 0).
+    obj_src_cap: Option<crate::kernel::capabilities::CapId>,
+    /// Endpoint SEND/RECEIVE root caps in task 0's CNode (from `create_endpoint`).
+    ep_send_root: Option<crate::kernel::capabilities::CapId>,
+    ep_recv_root: Option<crate::kernel::capabilities::CapId>,
+    /// The endpoint object slot.
+    endpoint_idx: Option<usize>,
+    /// The `SEND | RECEIVE` cap minted into init's CNode.
+    init_ep_cap: Option<crate::kernel::capabilities::CapId>,
+}
+
+/// Undo a partial provisioning transaction. Idempotent and total: every present resource is
+/// reclaimed (best-effort `let _`), leaving NO leaked cap, NO leaked object, and NO startup slot
+/// written (the caller only writes slots on a `Some` return).
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+fn rollback_shared_region_provision(
+    kernel: &mut KernelState,
+    init_tid: u64,
+    scratch: &SharedRegionProvisionScratch,
+) {
+    // 1. init-local endpoint cap.
+    if let (Some(cap), Some(cnode)) = (scratch.init_ep_cap, kernel.task_cnode(init_tid)) {
+        let _ = kernel.revoke_capability_in_cnode(cnode, cap);
+    }
+    // 2. endpoint root caps in task 0's CNode.
+    if let Some(cnode) = kernel.task_cnode(0) {
+        for root in [scratch.ep_send_root, scratch.ep_recv_root]
+            .into_iter()
+            .flatten()
+        {
+            let _ = kernel.revoke_capability_in_cnode(cnode, root);
+        }
+    }
+    // 3. endpoint object.
+    if let Some(eidx) = scratch.endpoint_idx {
+        let _ = kernel.destroy_endpoint(eidx);
+    }
+    // 4. source MemoryObject cap (cascades to init's delegated mem cap + reclaims the object).
+    if let (Some(cap), Some(cnode)) = (scratch.obj_src_cap, kernel.task_cnode(0)) {
+        let _ = kernel.revoke_capability_in_cnode(cnode, cap);
+    }
+}
+
+/// Stage 198E3C1B: provision the DIRECT shared-region live oracle TRANSACTIONALLY. Under BOTH the
+/// compile-time feature and the runtime selector, it (1) allocates ONE fresh two-page
+/// `MemoryObject`, fills both backing pages with the deterministic pattern (kernel direct map — NO
+/// userspace WRITE cap is minted for init), (2) grants init a `READ | MAP` (no `WRITE`/execute)
+/// source cap with canonical transfer authority, (3) creates the rendezvous endpoint, and (4) mints
+/// a `SEND | RECEIVE` endpoint cap into init's CNode. Returns `SharedRegionOracleCaps` for the
+/// startup slots. Fail-closed AND leak-free: on ANY step failure it emits a precise failure marker,
+/// rolls back every resource created so far (no leaked cap / object / occupied slot), and returns
+/// `None` (the caller then leaves the oracle un-armed) — it never partially arms.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub fn provision_init_shared_region_oracle(
+    kernel: &mut KernelState,
+    init_tid: u64,
+) -> Option<SharedRegionOracleCaps> {
     if !x86_shared_region_direct_oracle_enabled() {
         return None;
     }
-    use crate::kernel::capabilities::CapRights;
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    let inject = shared_region_oracle_fault_inject();
     let len = SHARED_REGION_ORACLE_PAGES * crate::kernel::vm::PAGE_SIZE;
+    let mut scratch = SharedRegionProvisionScratch::default();
+
+    // Step 1: allocate the source object.
+    if inject == shared_region_fault::ALLOC {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=alloc err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
     let (obj_id, src_cap0) = match kernel.alloc_anonymous_memory_object_with_len(len) {
         Ok(t) => t,
         Err(e) => {
@@ -3257,13 +3377,22 @@ pub fn provision_init_shared_region_oracle(kernel: &mut KernelState, init_tid: u
             return None;
         }
     };
-    let object = match kernel.current_task_capability(src_cap0) {
+    scratch.obj_src_cap = Some(src_cap0);
+
+    // Step 2: resolve the object handle.
+    if inject == shared_region_fault::RESOLVE {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=resolve err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let _object = match kernel.current_task_capability(src_cap0) {
         Some(c) => c.object,
         None => {
             crate::yarm_log!(
                 "SHARED_REGION_ORACLE_PROVISION_FAIL step=resolve obj_id={}",
                 obj_id
             );
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
             return None;
         }
     };
@@ -3272,7 +3401,7 @@ pub fn provision_init_shared_region_oracle(kernel: &mut KernelState, init_tid: u
     #[cfg(not(feature = "hosted-dev"))]
     {
         let phys = match kernel
-            .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, object))
+            .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, _object))
         {
             Some(p) => p.0,
             None => {
@@ -3280,6 +3409,7 @@ pub fn provision_init_shared_region_oracle(kernel: &mut KernelState, init_tid: u
                     "SHARED_REGION_ORACLE_PROVISION_FAIL step=phys obj_id={}",
                     obj_id
                 );
+                rollback_shared_region_provision(kernel, init_tid, &scratch);
                 return None;
             }
         };
@@ -3290,13 +3420,20 @@ pub fn provision_init_shared_region_oracle(kernel: &mut KernelState, init_tid: u
                 },
                 None => {
                     crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=fill off={}", off);
+                    rollback_shared_region_provision(kernel, init_tid, &scratch);
                     return None;
                 }
             }
         }
     }
-    // Read-only receiver rights + canonical transfer authority: READ | MAP (no WRITE, no execute).
-    let init_cap = match kernel.grant_capability_task_to_task_with_rights(
+
+    // Step 3: grant init the read-only source cap (READ | MAP; canonical transfer authority).
+    if inject == shared_region_fault::GRANT_MEM {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=grant err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let init_mem_cap = match kernel.grant_capability_task_to_task_with_rights(
         0,
         src_cap0,
         init_tid,
@@ -3305,17 +3442,95 @@ pub fn provision_init_shared_region_oracle(kernel: &mut KernelState, init_tid: u
         Ok(c) => c,
         Err(e) => {
             crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=grant err={:?}", e);
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
             return None;
         }
     };
+
+    // Step 4: create the rendezvous endpoint.
+    if inject == shared_region_fault::CREATE_EP {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=create_ep err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let (endpoint_idx, ep_send_root, ep_recv_root) = match kernel.create_endpoint(8) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_PROVISION_FAIL step=create_ep err={:?}",
+                e
+            );
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    scratch.ep_send_root = Some(ep_send_root);
+    scratch.ep_recv_root = Some(ep_recv_root);
+    scratch.endpoint_idx = Some(endpoint_idx);
+
+    // Step 5: resolve the endpoint object (for its generation) so the combined cap is well-formed.
+    if inject == shared_region_fault::RESOLVE_EP {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=resolve_ep err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let ep_object = match kernel.current_task_capability(ep_recv_root) {
+        Some(c) => c.object,
+        None => {
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_PROVISION_FAIL step=resolve_ep eidx={}",
+                endpoint_idx
+            );
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    debug_assert!(matches!(ep_object, CapObject::Endpoint { .. }));
+
+    // Step 6: mint the SEND | RECEIVE endpoint cap into init's CNode.
+    if inject == shared_region_fault::MINT_EP {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=mint_ep err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let init_cnode = match kernel.task_cnode(init_tid) {
+        Some(c) => c,
+        None => {
+            crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=init_cnode");
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    let init_ep_cap = match kernel.mint_capability_in_cnode(
+        init_cnode,
+        Capability::new(ep_object, CapRights::SEND | CapRights::RECEIVE),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_PROVISION_FAIL step=mint_ep err={:?}",
+                e
+            );
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    scratch.init_ep_cap = Some(init_ep_cap);
+
     crate::yarm_log!(
-        "SHARED_REGION_ORACLE_PROVISION_OK init_tid={} obj_id={} pages={} src_cap={}",
+        "SHARED_REGION_ORACLE_PROVISION_OK init_tid={} obj_id={} pages={} mem_cap={} endpoint_cap={} eidx={}",
         init_tid,
         obj_id,
         SHARED_REGION_ORACLE_PAGES,
-        init_cap.0
+        init_mem_cap.0,
+        init_ep_cap.0,
+        endpoint_idx
     );
-    Some(init_cap.0 as u32)
+    Some(SharedRegionOracleCaps {
+        mem_cap: init_mem_cap.0 as u32,
+        endpoint_cap: init_ep_cap.0 as u32,
+        endpoint_idx,
+    })
 }
 
 /// Stage 193D: provision the reply-cap live oracle. Under BOTH the base proof knob and

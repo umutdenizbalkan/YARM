@@ -948,6 +948,204 @@ fn run_x86_futex_wake_oracle(init_tid: u64) {
     }
 }
 
+// ─── Stage 198E3C1B: x86_64 DIRECT shared-region live oracle (COMPILE-ONLY scaffold) ─────
+// Parent/child DIRECT blocked-receiver shared-region proof topology. Child B recv-v2-blocks on the
+// oracle endpoint (the ORDINARY recv path, NOT RecvSharedV3); parent A then issues exactly ONE
+// `IpcSend(OPCODE_SHARED_MEM | FLAG_CAP_TRANSFER, mem_cap)` (the DIRECT boundary path, NOT the
+// shared-region ENQUEUE path), whose blocked-waiter delivery maps the two source pages READ-ONLY at
+// the dedicated unmapped window `SHARED_REGION_ORACLE_VA`. B resumes out of its recv frame, validates
+// BOTH pages against the deterministic pattern, releases the mapping through the receiver-local
+// cleanup cap (`TransferRelease(cap,0,0)` → Ok(len); a duplicate → InvalidArgs), and parks.
+//
+// Coordination is AUTHORITATIVE (single-CPU handshake), never timing: B wakes A on the handshake
+// futex and then immediately enters the blocking recv, which yields the CPU to A only after B is a
+// registered recv-v2 waiter — so when A's `futex_wait(handshake)` returns, B is provably blocked on
+// the endpoint. Default-off: slot-5 selector = 2 (mutually exclusive with the FutexWake selector 1)
+// AND the `x86-shared-region-direct-oracle` cargo feature. This scaffold is COMPILE-ONLY in this
+// stage — it emits NO live retirement seal and is never exercised under QEMU here.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+mod x86_shared_region_direct_oracle {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
+    pub(super) static HANDSHAKE: AtomicU32 = AtomicU32::new(0x00E0);
+    pub(super) static PARK: AtomicU32 = AtomicU32::new(0x00E1);
+    pub(super) static CHILD_TID: AtomicU64 = AtomicU64::new(0);
+    // Caps the parent hands the child through the shared address space (both share init's CSpace).
+    pub(super) static ENDPOINT_CAP: AtomicU32 = AtomicU32::new(0);
+    // Child-published outcome: 0 = unrun, 1 = both pages validated + release contract satisfied,
+    // 0xFFFF-family = a specific failure. Read by the parent after it yields to the child.
+    pub(super) static CHILD_RESULT: AtomicU32 = AtomicU32::new(0);
+    pub(super) static PAGES_OK: AtomicU32 = AtomicU32::new(0);
+    pub(super) static RELEASE_OK: AtomicU32 = AtomicU32::new(0);
+
+    #[allow(unused)]
+    pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
+    #[allow(unused)]
+    pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
+
+    /// Validate the two mapped pages against the deterministic oracle pattern. Detects corruption
+    /// (any mismatched byte), a page swap (page 0 and page 1 hold DISTINCT bytes at the same in-page
+    /// offset, so a swapped mapping mismatches), and short/second-page coverage (every byte across
+    /// BOTH pages is checked). Returns `true` iff every byte matches.
+    ///
+    /// # Safety
+    /// `base..base+len` must be the readable two-page mapping returned by the recv.
+    pub(super) unsafe fn validate_two_pages(base: usize, len: usize) -> bool {
+        if len != yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN {
+            return false;
+        }
+        let mut off = 0usize;
+        while off < len {
+            // SAFETY: caller guarantees the whole window is mapped readable.
+            let got = unsafe { core::ptr::read_volatile((base + off) as *const u8) };
+            if got != yarm_user_rt::syscall::shared_region_oracle_pattern_byte(off) {
+                return false;
+            }
+            off += 1;
+        }
+        true
+    }
+
+    /// Naked child entry trampoline (see the FutexWake oracle for the RSP-alignment rationale).
+    #[unsafe(naked)]
+    pub(super) extern "C" fn child_entry() -> ! {
+        core::arch::naked_asm!(
+            "call {body}",
+            "ud2",
+            body = sym child_body,
+        )
+    }
+
+    /// Child B: wake the parent (handshake), recv-v2-block on the oracle endpoint (ordinary recv —
+    /// the DIRECT blocked-waiter path maps read-only, so no map-intent arg), validate both mapped
+    /// pages, exercise the release contract (first → Ok(len); duplicate → InvalidArgs), publish the
+    /// outcome, and park. Never returns.
+    pub(super) extern "C" fn child_body() -> ! {
+        yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_CHILD_WAKE_PARENT");
+        // Authoritative single-CPU handshake: wake A, then block on recv so A resumes only once B is
+        // a registered recv-v2 waiter.
+        let handshake = HANDSHAKE.as_ptr();
+        let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+        let endpoint_cap = ENDPOINT_CAP.load(Relaxed);
+        let va = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
+        let len = yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN;
+        // SAFETY: `va..va+len` is the dedicated unmapped two-page window (compile-time VA contract).
+        let recv = unsafe { yarm_user_rt::syscall::recv_shared_region_v2(endpoint_cap, va, len) };
+        match recv {
+            Ok(Some(r)) => {
+                // SAFETY: the DIRECT delivery mapped the two pages readable at `r.mapped_base`.
+                let pages_ok = unsafe { validate_two_pages(r.mapped_base, r.mapped_len) };
+                PAGES_OK.store(u32::from(pages_ok), Relaxed);
+                yarm_user_rt::user_log!(
+                    "SHARED_REGION_DIRECT_ORACLE_CHILD_MAPPED base=0x{:x} len={} cap={} pages_ok={}",
+                    r.mapped_base,
+                    r.mapped_len,
+                    r.receiver_cap,
+                    pages_ok as u32
+                );
+                // Release contract: first release returns Ok(len); a duplicate returns InvalidArgs.
+                // SAFETY: `r.receiver_cap` is the receiver-local cleanup cap from the recv.
+                let first =
+                    unsafe { yarm_user_rt::syscall::release_shared_region_mapping(r.receiver_cap) };
+                // SAFETY: intentional duplicate release to observe the canonical stale rejection.
+                let dup =
+                    unsafe { yarm_user_rt::syscall::release_shared_region_mapping(r.receiver_cap) };
+                let release_ok = matches!(first, Ok(l) if l == r.mapped_len)
+                    && matches!(dup, Err(yarm_user_rt::syscall::SyscallError::InvalidArgs));
+                RELEASE_OK.store(u32::from(release_ok), Relaxed);
+                CHILD_RESULT.store(if pages_ok && release_ok { 1 } else { 0xF1 }, Relaxed);
+            }
+            Ok(None) => {
+                CHILD_RESULT.store(0xF2, Relaxed);
+                yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_CHILD_WOULDBLOCK");
+            }
+            Err(e) => {
+                CHILD_RESULT.store(0xF3, Relaxed);
+                yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_CHILD_RECV_FAIL err={:?}", e);
+            }
+        }
+        let btid = CHILD_TID.load(Relaxed);
+        yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_CHILD_DONE tid={}", btid);
+        let park = PARK.as_ptr();
+        loop {
+            let pv = PARK.load(Relaxed);
+            let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+        }
+    }
+}
+
+/// Parent A (COMPILE-ONLY scaffold): read the provisioned caps from the startup slots, spawn child
+/// B, block on the handshake (B is provably recv-v2-blocked when this returns), send the region
+/// through the DIRECT path exactly once, YIELD so B resumes and validates, then emit the topology +
+/// child-validation markers. Emits NO live retirement seal.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn run_x86_shared_region_direct_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use x86_shared_region_direct_oracle as oracle;
+    yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_BEGIN init_tid={}", init_tid);
+    let mem_cap = yarm_user_rt::runtime::startup_arg_slot(
+        yarm_user_rt::syscall::STARTUP_SLOT_SHARED_REGION_MEM_CAP,
+    )
+    .unwrap_or(0) as u32;
+    let endpoint_cap = yarm_user_rt::runtime::startup_arg_slot(
+        yarm_user_rt::syscall::STARTUP_SLOT_SHARED_REGION_ENDPOINT_CAP,
+    )
+    .unwrap_or(0) as u32;
+    if mem_cap == 0 || endpoint_cap == 0 {
+        yarm_user_rt::user_log!(
+            "SHARED_REGION_DIRECT_ORACLE_MISSING_CAPS mem_cap={} endpoint_cap={}",
+            mem_cap,
+            endpoint_cap
+        );
+        return;
+    }
+    oracle::ENDPOINT_CAP.store(endpoint_cap, Relaxed);
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(oracle::CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = oracle::child_entry as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(oracle::CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    oracle::CHILD_TID.store(child_tid, Relaxed);
+    yarm_user_rt::user_log!(
+        "SHARED_REGION_DIRECT_ORACLE_CHILD_SPAWNED child_tid={}",
+        child_tid
+    );
+    // Authoritative handshake: when this returns, B is provably a recv-v2 waiter on the endpoint.
+    let handshake = oracle::HANDSHAKE.as_ptr();
+    let hv = oracle::HANDSHAKE.load(Relaxed);
+    let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
+    yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_PARENT_RESUMED");
+    // Exactly ONE DIRECT send to the blocked receiver (IpcSend, NOT the shared-region enqueue path).
+    let payload = [0x5Au8, 0x3C];
+    // SAFETY: `endpoint_cap` is the SEND|RECEIVE oracle cap; `mem_cap` the read-only source cap.
+    let sent =
+        unsafe { yarm_user_rt::syscall::send_shared_region(endpoint_cap, mem_cap, &payload) };
+    // Hand the CPU to the now-Runnable B so it resumes out of its recv frame and validates.
+    let _ = yarm_user_rt::syscall::yield_now();
+    let child_result = oracle::CHILD_RESULT.load(Relaxed);
+    let pages_ok = oracle::PAGES_OK.load(Relaxed);
+    let release_ok = oracle::RELEASE_OK.load(Relaxed);
+    yarm_user_rt::user_log!(
+        "SHARED_REGION_DIRECT_ORACLE_TOPOLOGY_OK init_tid={} child_tid={} send_ok={} pages_ok={} release_ok={} child_result={}",
+        init_tid,
+        child_tid,
+        sent.is_ok() as u32,
+        pages_ok,
+        release_ok,
+        child_result
+    );
+}
+
 // ─── Stage 196C: RISC-V FutexWake live oracle ────────────────────────────────────────
 // The RISC-V port of the 195C parent/child FutexWake (NR 10) proof. The child blocks through
 // the LEGACY global-lock FutexWait (NR 9, still global-lock-only on RISC-V); the parent (init)
@@ -1926,6 +2124,15 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     if ctx.supervisor_control_recv_ep == Some(1) {
         run_x86_futex_wake_oracle(ctx.task_id);
+    }
+
+    // Stage 198E3C1B: default-off + feature-gated x86_64 DIRECT shared-region live oracle. Slot-5
+    // selector 2 (mutually exclusive with the FutexWake selector 1) tells init to run the
+    // parent/child DIRECT blocked-receiver shared-region topology. COMPILE-ONLY in this stage — the
+    // scaffold is wired but emits no live seal and is not exercised under QEMU here.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    if ctx.supervisor_control_recv_ep == Some(2) {
+        run_x86_shared_region_direct_oracle(ctx.task_id);
     }
 
     // Stage 195C: default-off AArch64 FutexWake live oracle. The kernel reuses init

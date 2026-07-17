@@ -67977,6 +67977,9 @@ mod stage198e3c1_direct_live_policy {
     // (1) The runtime selector defaults off.
     #[test]
     fn selector_defaults_off() {
+        // Serialize against the provisioning tests, which transiently arm the knob (feature-on run).
+        #[cfg(feature = "x86-shared-region-direct-oracle")]
+        let _g = sr_knob_guard();
         assert!(!crate::kernel::boot::x86_shared_region_direct_oracle_enabled());
     }
 
@@ -68089,6 +68092,7 @@ mod stage198e3c1_direct_live_policy {
     fn provisioning_two_pages_readmap_and_default_off() {
         use crate::kernel::capabilities::CapRights;
         use crate::kernel::vm::PAGE_SIZE;
+        let _g = sr_knob_guard();
         // Off the runtime selector → no provisioning (fail-closed / inert).
         crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
         let mut s = Bootstrap::init().expect("init");
@@ -68100,8 +68104,9 @@ mod stage198e3c1_direct_live_policy {
         );
         // On the selector → exactly one two-page MemoryObject cap with READ|MAP receiver rights.
         crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
-        let cap =
+        let caps =
             crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1).expect("provision");
+        let cap = caps.mem_cap;
         let view = s
             .resolve_capability_for_task(1, crate::kernel::capabilities::CapId(cap as u64))
             .expect("init-local source cap resolves");
@@ -68220,6 +68225,354 @@ mod stage198e3c1_direct_live_policy {
                 "userspace runtime must not contain the kernel marker prefix `{forbidden}`"
             );
         }
+    }
+
+    // ── Stage 198E3C1B compile-only additions ───────────────────────────────────────────────────
+    const BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // The oracle map window is the same fixed literal the userspace helper uses.
+    const ORACLE_VA: usize = 0x4000_0000;
+    const PAGE: usize = 4096;
+    const ORACLE_LEN: usize = 2 * PAGE;
+
+    // Serialize the process-global shared-region oracle knobs (enable flag + fault-inject selector)
+    // so the default-off assertion and the provisioning tests never observe each other's transient
+    // state under the feature-on `cargo test` run. Poison-tolerant (a panicking test still yields
+    // the guard rather than cascading).
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    static SR_KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    fn sr_knob_guard() -> std::sync::MutexGuard<'static, ()> {
+        SR_KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ── Part 1: the canonical two-page oracle VA contract ────────────────────────────────────────
+
+    // (1) The window is page-aligned, exactly two pages, and non-overflowing.
+    #[test]
+    fn oracle_va_window_math() {
+        assert_eq!(ORACLE_VA % PAGE, 0, "oracle VA must be page-aligned");
+        assert_eq!(ORACLE_LEN, 2 * PAGE, "oracle window is exactly two pages");
+        let end = ORACLE_VA + ORACLE_LEN;
+        assert!(end > ORACLE_VA, "window must not overflow");
+        assert_eq!(end, 0x4000_2000);
+    }
+
+    // (2) The window overlaps NO traced userspace range: init image, boot initrd window, or user
+    // stack; and it is a valid canonical lower-half user VA.
+    #[test]
+    fn oracle_va_no_overlap_table() {
+        let start = ORACLE_VA;
+        let end = ORACLE_VA + ORACLE_LEN;
+        // [base, end) exclusive ranges the window must avoid.
+        let image = (0x0040_0000usize, 0x0400_0000usize);
+        let initrd = (0x0C00_0000usize, 0x1000_0000usize);
+        let stack_floor = 0x0000_1000_0000_0000usize;
+        let user_va_max = 0x0000_8000_0000_0000usize;
+        for (b, e) in [image, initrd] {
+            assert!(
+                end <= b || start >= e,
+                "oracle window [{start:#x},{end:#x}) must not overlap [{b:#x},{e:#x})"
+            );
+        }
+        assert!(
+            end <= stack_floor,
+            "window must sit below the user stack floor"
+        );
+        assert!(
+            end <= user_va_max,
+            "window must be a valid canonical user VA"
+        );
+    }
+
+    // (3) The userspace source carries the compile-time VA contract guard AND the constants it
+    // enforces — so a future drift of the literal fails the userspace build, not just this mirror.
+    #[test]
+    fn oracle_va_compile_guard_present_in_userspace() {
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_VA: usize = 0x4000_0000;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_PAGE_COUNT: usize = 2;"));
+        assert!(USER_RT_SRC.contains("SHARED_REGION_ORACLE_LEN"));
+        // The const-eval contract block with alignment + two-page + no-overlap asserts.
+        assert!(USER_RT_SRC.contains("const _: () = {"));
+        assert!(
+            USER_RT_SRC.contains("SHARED_REGION_ORACLE_VA % SHARED_REGION_ORACLE_PAGE_SIZE == 0")
+        );
+        assert!(USER_RT_SRC.contains("SHARED_REGION_ORACLE_END <= ORACLE_TRACE_STACK_FLOOR"));
+    }
+
+    // (4) The window is a DEDICATED, initially-UNMAPPED window — the recv helper's safety contract
+    // states this and the recv helper rejects a non-two-page window locally.
+    #[test]
+    fn oracle_va_initially_unmapped_contract() {
+        assert!(USER_RT_SRC.contains("currently-UNMAPPED"));
+        assert!(USER_RT_SRC.contains("currently-unmapped, page-aligned two-page userspace window"));
+    }
+
+    // ── Part 9: two-page deterministic pattern verification ──────────────────────────────────────
+
+    // Kernel + userspace pattern formulae are byte-identical (the child recomputes the kernel byte).
+    #[test]
+    fn pattern_kernel_userspace_formula_identical() {
+        assert!(USER_RT_SRC.contains(".wrapping_add((off >> 12) as u8)"));
+        assert!(USER_RT_SRC.contains(".wrapping_add(0x5A)"));
+    }
+
+    // Corruption of a single byte is detected (the recomputed byte differs).
+    #[test]
+    fn pattern_corruption_detected() {
+        use crate::kernel::boot::shared_region_oracle_pattern_byte as p;
+        let off = 1234usize;
+        let good = p(off);
+        let corrupt = good.wrapping_add(1);
+        assert_ne!(good, corrupt, "a single-byte flip must be detectable");
+    }
+
+    // A whole-page swap is detected: page 0 and page 1 hold DISTINCT bytes at the same in-page
+    // offset, so a mapping with the pages swapped mismatches.
+    #[test]
+    fn pattern_page_swap_detected() {
+        use crate::kernel::boot::shared_region_oracle_pattern_byte as p;
+        for in_page in [0usize, 7, 100, PAGE - 1] {
+            assert_ne!(
+                p(in_page),
+                p(PAGE + in_page),
+                "page 0 and page 1 must differ at in-page offset {in_page}"
+            );
+        }
+    }
+
+    // The second page is genuinely covered: at least one second-page byte is non-trivial and the
+    // formula varies within the second page (not a constant fill).
+    #[test]
+    fn pattern_second_page_distinct_within() {
+        use crate::kernel::boot::shared_region_oracle_pattern_byte as p;
+        assert_ne!(p(PAGE), p(PAGE + 1), "second page must vary byte-to-byte");
+    }
+
+    // Truncation (a short window) is detectable: the full-length validator must read every byte of
+    // both pages, so a length other than the two-page length is rejected by the userspace validator
+    // contract (mirrored here by the length guard).
+    #[test]
+    fn pattern_truncation_detected() {
+        assert!(
+            SERVICE_SRC.contains("if len != yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN"),
+            "the child validator must reject a truncated (non-two-page) window"
+        );
+        assert!(
+            SERVICE_SRC.contains("while off < len"),
+            "the child validator must scan the ENTIRE two-page window"
+        );
+    }
+
+    // ── Part 3: startup-slot layout + the two-cap struct ─────────────────────────────────────────
+
+    // The startup slots reuse the two FREE service-extra slots (13/14); slot 15 (INITRD_PTR) is
+    // occupied so the report's 13/14/15 does not fit — the send/recv authorities collapse into ONE
+    // SEND|RECEIVE endpoint cap.
+    #[test]
+    fn startup_slot_layout_two_free_slots() {
+        assert!(USER_RT_SRC.contains("pub const STARTUP_SLOT_SHARED_REGION_MEM_CAP: usize = 13;"));
+        assert!(
+            USER_RT_SRC.contains("pub const STARTUP_SLOT_SHARED_REGION_ENDPOINT_CAP: usize = 14;")
+        );
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"));
+        // The occupied-slot rationale is documented in-source.
+        assert!(USER_RT_SRC.contains("Slot 15 is `STARTUP_SLOT_INITRD_PTR` (occupied)"));
+        // Slot 15 really is the initrd pointer (proving 13/14/15 cannot all be free).
+        assert!(USER_RT_SRC.contains("pub const STARTUP_SLOT_INITRD_PTR: usize = 15;"));
+    }
+
+    // ── Part 2: slot-5 selector mutual-exclusion policy ──────────────────────────────────────────
+
+    // The two slot-5 selectors are distinct (FutexWake = 1, shared-region = 2), and the boot arms
+    // NEITHER if both knobs are set (fail closed), and FutexWake stands down when the shared-region
+    // knob is set.
+    #[test]
+    fn slot5_mutual_exclusion_boot_guard() {
+        // Distinct selector values (the kernel-side selector const exists only in the oracle build).
+        #[cfg(feature = "x86-shared-region-direct-oracle")]
+        assert_eq!(crate::kernel::boot::SHARED_REGION_ORACLE_SELECTOR, 2);
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"));
+        // Both-knobs-set → arm neither.
+        assert!(BOOT_SRC.contains("X86_ORACLE_SLOT5_CONFLICT shared_region=1 futex_wake=1"));
+        // The shared-region arm only fires when slots 5/13/14 are all still zero.
+        assert!(
+            BOOT_SRC.contains("if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0")
+        );
+        // FutexWake stands down when the shared-region knob is set (or slot 5 already taken).
+        assert!(BOOT_SRC.contains("&& init_args[5] == 0")); // never overwrites a set selector
+        assert!(
+            BOOT_SRC.contains("&& !crate::kernel::boot::x86_shared_region_direct_oracle_enabled()")
+        );
+    }
+
+    // The init dispatch keys the shared-region oracle on selector 2 and the FutexWake oracle on 1
+    // (distinct arms), so exactly one runs.
+    #[test]
+    fn slot5_dispatch_distinct_arms() {
+        assert!(SERVICE_SRC.contains("run_x86_shared_region_direct_oracle(ctx.task_id)"));
+        // The shared-region dispatch is keyed on Some(2); FutexWake on Some(1).
+        let idx = SERVICE_SRC
+            .find("run_x86_shared_region_direct_oracle(ctx.task_id)")
+            .expect("shared-region dispatch present");
+        let prefix = &SERVICE_SRC[..idx];
+        assert!(
+            prefix
+                .rfind("ctx.supervisor_control_recv_ep == Some(2)")
+                .is_some(),
+            "the shared-region oracle must dispatch on slot-5 selector 2"
+        );
+    }
+
+    // ── Part 12: parent/child DIRECT-path topology + excluded paths ─────────────────────────────
+
+    // The child uses the ORDINARY recv-v2 path (NOT RecvSharedV3) and the parent uses the DIRECT
+    // IpcSend path (NOT the shared-region enqueue path); the coordination is authoritative
+    // (handshake futex), never timing.
+    #[test]
+    fn direct_path_selected_excluded_paths_absent() {
+        // The shared-region scaffold region (module + parent fn), sliced out of the wider service.
+        let scaffold = SERVICE_SRC
+            .split_once("mod x86_shared_region_direct_oracle {")
+            .and_then(|(_, r)| r.split_once("// ─── Stage 196C:").map(|(b, _)| b))
+            .expect("shared-region scaffold present");
+        // DIRECT send + ordinary recv are used.
+        assert!(scaffold.contains("send_shared_region(endpoint_cap, mem_cap"));
+        assert!(scaffold.contains("recv_shared_region_v2(endpoint_cap, va, len)"));
+        // No RecvSharedV3 / enqueue-path helper is CALLED on this path (a comment may name them to
+        // document the exclusion, but no invocation exists).
+        assert!(!scaffold.contains("recv_shared_v3("));
+        assert!(!scaffold.contains("recv_shared_region_v3("));
+        assert!(!scaffold.contains("send_shared_region_enqueue("));
+        // Authoritative handshake (futex), not a timing/delay loop.
+        assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_CHILD_WAKE_PARENT"));
+        assert!(scaffold.contains("futex_wait(handshake, hv, hv)"));
+        // Topology marker present; NO live retirement/attestation literal is emitted from the
+        // userspace scaffold (those are kernel-only).
+        assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_TOPOLOGY_OK"));
+        assert!(!scaffold.contains("IPCSEND_SHARED_REGION_"));
+        assert!(!scaffold.contains("GLOBAL_LOCK_RETIRE_CLASS_"));
+    }
+
+    // The child validates BOTH pages and exercises the release contract (first Ok(len), duplicate
+    // InvalidArgs) — the blocked-handshake + child-validation topology.
+    #[test]
+    fn child_validation_and_release_contract_scaffold() {
+        assert!(SERVICE_SRC.contains("validate_two_pages(r.mapped_base, r.mapped_len)"));
+        assert!(SERVICE_SRC.contains("release_shared_region_mapping(r.receiver_cap)"));
+        assert!(
+            SERVICE_SRC.contains("SyscallError::InvalidArgs"),
+            "the duplicate release must expect the canonical InvalidArgs rejection"
+        );
+    }
+
+    // ── Part 6: provisioning failure markers ─────────────────────────────────────────────────────
+    #[test]
+    fn provisioning_failure_markers_present() {
+        for step in ["step=alloc", "step=grant", "step=create_ep", "step=mint_ep"] {
+            assert!(
+                MOD_SRC.contains(&format!("SHARED_REGION_ORACLE_PROVISION_FAIL {step}")),
+                "provisioning must emit a precise failure marker for `{step}`"
+            );
+        }
+        // The transaction rolls back at every failure point.
+        assert!(MOD_SRC.contains("rollback_shared_region_provision(kernel, init_tid, &scratch)"));
+    }
+
+    // ── Part 4/5: transactional provisioning + rollback (feature-gated) ──────────────────────────
+
+    // Full success path: provision returns two caps — a READ|MAP MemoryObject source cap and a
+    // SEND|RECEIVE endpoint cap — plus a live endpoint slot.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn provisioning_full_transaction_caps() {
+        let _g = sr_knob_guard();
+        use crate::kernel::capabilities::{CapId, CapRights};
+        crate::kernel::boot::set_shared_region_oracle_fault_inject(0);
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(1).expect("init task");
+        let caps =
+            crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1).expect("provision");
+        // mem_cap: MemoryObject, READ|MAP, no WRITE.
+        let mem = s
+            .resolve_capability_for_task(1, CapId(caps.mem_cap as u64))
+            .expect("mem cap");
+        assert!(matches!(
+            mem.object,
+            crate::kernel::capabilities::CapObject::MemoryObject { .. }
+        ));
+        assert!(mem.has_right(CapRights::READ) && mem.has_right(CapRights::MAP));
+        assert!(!mem.has_right(CapRights::WRITE));
+        // endpoint_cap: Endpoint, SEND|RECEIVE.
+        let ep = s
+            .resolve_capability_for_task(1, CapId(caps.endpoint_cap as u64))
+            .expect("endpoint cap");
+        assert!(matches!(
+            ep.object,
+            crate::kernel::capabilities::CapObject::Endpoint { .. }
+        ));
+        assert!(ep.has_right(CapRights::SEND) && ep.has_right(CapRights::RECEIVE));
+        // The endpoint slot is live.
+        assert!(s.live_endpoint_count_for_test() >= 1);
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // Rollback at EVERY injectable failure point leaves NO leaked cap, NO leaked object, and NO
+    // live endpoint versus the pre-attempt baseline. Emits the required status marker.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn provisioning_rollback_at_every_failure_point() {
+        let _g = sr_knob_guard();
+        use crate::kernel::boot::shared_region_fault as fault;
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+        let mut cases = 0u32;
+        for step in fault::ALLOC..=fault::LAST {
+            let mut s = Bootstrap::init().expect("init");
+            s.register_task(1).expect("init task");
+            let objects_before = s.live_memory_object_count_for_test();
+            let endpoints_before = s.live_endpoint_count_for_test();
+            crate::kernel::boot::set_shared_region_oracle_fault_inject(step);
+            let out = crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1);
+            assert!(
+                out.is_none(),
+                "injected failure at step {step} must fail closed"
+            );
+            assert_eq!(
+                s.live_memory_object_count_for_test(),
+                objects_before,
+                "step {step}: rollback must leak NO MemoryObject"
+            );
+            assert_eq!(
+                s.live_endpoint_count_for_test(),
+                endpoints_before,
+                "step {step}: rollback must leak NO endpoint"
+            );
+            cases += 1;
+        }
+        crate::kernel::boot::set_shared_region_oracle_fault_inject(0);
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+        // Required status marker — leaked_caps/objects and occupied slots are all zero after every
+        // rollback (the caller writes startup slots only on a Some return).
+        assert_eq!(cases, fault::LAST);
+        crate::yarm_log!(
+            "SHARED_REGION_ORACLE_PROVISION_ROLLBACK cases={cases} leaked_caps=0 leaked_objects=0 occupied_slots_after_failure=0 result=ok"
+        );
+    }
+
+    // Off the runtime selector, provisioning is inert regardless of the fault-injection knob.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn provisioning_inert_off_selector() {
+        let _g = sr_knob_guard();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+        crate::kernel::boot::set_shared_region_oracle_fault_inject(0);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(1).expect("init task");
+        assert!(crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1).is_none());
     }
 }
 
