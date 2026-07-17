@@ -68131,6 +68131,96 @@ mod stage198e3c1_direct_live_policy {
         );
         crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
     }
+
+    // ── Stage 198E3C1B: userspace send/recv/release helper ABI contract ─────────────────────────
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+
+    // The userspace helpers reuse the EXISTING syscalls + cap-transfer Message — no new ABI. The
+    // ABI constants they hardcode must match the kernel's authoritative values.
+    #[test]
+    fn userspace_helper_abi_constants_match_kernel() {
+        assert_eq!(crate::kernel::syscall::OPCODE_SHARED_MEM, 1);
+        assert_eq!(crate::kernel::syscall::SYSCALL_TRANSFER_RELEASE_NR, 4);
+        assert_eq!(crate::kernel::syscall::SYSCALL_IPC_RECV_NR, 2);
+        // The userspace helper module encodes exactly these values.
+        assert!(USER_RT_SRC.contains("pub const OPCODE_SHARED_MEM: u16 = 1;"));
+        assert!(USER_RT_SRC.contains("const SYSCALL_TRANSFER_RELEASE_NR: usize = 4;"));
+    }
+
+    // send_shared_region encodes OPCODE_SHARED_MEM + the canonical cap-transfer flag + one ipc_send,
+    // carrying exactly the source cap.
+    #[test]
+    fn userspace_send_helper_encoding() {
+        let f = USER_RT_SRC
+            .split_once("pub unsafe fn send_shared_region")
+            .map(|(_, r)| {
+                r.split_once("pub unsafe fn recv_shared_region_v2")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .expect("send helper");
+        assert!(f.contains("OPCODE_SHARED_MEM"));
+        assert!(f.contains("Message::FLAG_CAP_TRANSFER"));
+        assert!(f.contains("Some(mem_cap as u64)"));
+        assert!(f.contains("ipc_send(send_ep, &msg)"));
+    }
+
+    // recv_shared_region_v2 uses the dedicated 2-page window as the recv payload pointer, decodes the
+    // receiver-local cap from the TRANSFERRED_CAP meta flag, and rejects a malformed window.
+    #[test]
+    fn userspace_recv_helper_encoding() {
+        let f = USER_RT_SRC
+            .split_once("pub unsafe fn recv_shared_region_v2")
+            .map(|(_, r)| {
+                r.split_once("pub unsafe fn release_shared_region_mapping")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .expect("recv helper");
+        assert!(
+            f.contains("map_len != 2 * PAGE"),
+            "must require a two-page window"
+        );
+        assert!(
+            f.contains("map_va,\n            map_len,"),
+            "payload ptr/len = the map window"
+        );
+        assert!(
+            f.contains("SYSCALL_RECV_META_TRANSFERRED_CAP"),
+            "decode receiver-local cap"
+        );
+        assert!(f.contains("receiver_cap: meta.cap_id as u32"));
+    }
+
+    // release_shared_region_mapping issues TransferRelease(cap,0,0) and surfaces the canonical error.
+    #[test]
+    fn userspace_release_helper_encoding() {
+        let f = USER_RT_SRC
+            .split_once("pub unsafe fn release_shared_region_mapping")
+            .map(|(_, r)| r)
+            .expect("release helper");
+        assert!(f.contains("SYSCALL_TRANSFER_RELEASE_NR"));
+        assert!(
+            f.contains("[cleanup_cap as usize, 0, 0, 0, 0, 0]"),
+            "TransferRelease(cap, 0, 0)"
+        );
+        assert!(
+            f.contains("decode_syscall_error"),
+            "surfaces the canonical kernel error"
+        );
+    }
+
+    // Userspace must never emit strings the kernel-attestation parser keys on: the helpers/oracle
+    // source contains no kernel attestation/retirement literal.
+    #[test]
+    fn userspace_cannot_satisfy_kernel_attestation_parser() {
+        for forbidden in ["IPCSEND_SHARED_REGION_", "GLOBAL_LOCK_RETIRE_CLASS_"] {
+            assert!(
+                !USER_RT_SRC.contains(forbidden),
+                "userspace runtime must not contain the kernel marker prefix `{forbidden}`"
+            );
+        }
+    }
 }
 
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
