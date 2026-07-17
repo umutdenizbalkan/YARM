@@ -3220,6 +3220,104 @@ pub fn provision_init_ipc_send_cap_oracle_coord(
     Some(recv_cap.0 as u32)
 }
 
+/// Stage 198E3C1: the DIRECT shared-region oracle's fixed region size (two pages, so the live path
+/// exercises multi-page mapping progress).
+pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
+
+/// Stage 198E3C1: the deterministic known byte the oracle writes at object offset `off`. It varies
+/// with `off`, so the pattern SPANS BOTH pages (page 0 and page 1 hold different bytes), and it is a
+/// pure formula the userspace child recomputes to validate the mapped contents. No secret, no ABI.
+pub(crate) const fn shared_region_oracle_pattern_byte(off: usize) -> u8 {
+    // Vary with BOTH the in-page offset and the page index (`off >> 12`) so consecutive pages hold
+    // distinct bytes at the same in-page offset — the pattern genuinely spans both pages.
+    (off as u8)
+        .wrapping_add((off >> 12) as u8)
+        .wrapping_add(0x5A)
+}
+
+/// Stage 198E3C1: provision the DIRECT shared-region live oracle's source object. Under BOTH the
+/// compile-time feature and the runtime selector, allocate ONE fresh two-page `MemoryObject`, fill
+/// both backing pages with the deterministic pattern (kernel direct map — NO userspace WRITE cap is
+/// minted for initialization), then mint a source cap into init's CNode with canonical
+/// capability-transfer authority and read-only receiver rights (`READ | MAP`, no `WRITE`, no
+/// execute). Returns the init-local source `CapId` for the startup-arg slot. Fail-closed: on any
+/// step failure it emits a precise provisioning-failure marker and returns `None` (the caller then
+/// leaves the oracle un-armed) — it never partially arms.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub fn provision_init_shared_region_oracle(kernel: &mut KernelState, init_tid: u64) -> Option<u32> {
+    if !x86_shared_region_direct_oracle_enabled() {
+        return None;
+    }
+    use crate::kernel::capabilities::CapRights;
+    let len = SHARED_REGION_ORACLE_PAGES * crate::kernel::vm::PAGE_SIZE;
+    let (obj_id, src_cap0) = match kernel.alloc_anonymous_memory_object_with_len(len) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=alloc err={:?}", e);
+            return None;
+        }
+    };
+    let object = match kernel.current_task_capability(src_cap0) {
+        Some(c) => c.object,
+        None => {
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_PROVISION_FAIL step=resolve obj_id={}",
+                obj_id
+            );
+            return None;
+        }
+    };
+    // Initialize both pages with the deterministic pattern through the kernel direct map (bare-metal
+    // only; a normal boot never reaches this, and no userspace WRITE authority is created).
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        let phys = match kernel
+            .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, object))
+        {
+            Some(p) => p.0,
+            None => {
+                crate::yarm_log!(
+                    "SHARED_REGION_ORACLE_PROVISION_FAIL step=phys obj_id={}",
+                    obj_id
+                );
+                return None;
+            }
+        };
+        for off in 0..len {
+            match KernelState::phys_to_direct_map_ptr(phys + off as u64) {
+                Some(ptr) => unsafe {
+                    core::ptr::write_volatile(ptr, shared_region_oracle_pattern_byte(off));
+                },
+                None => {
+                    crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=fill off={}", off);
+                    return None;
+                }
+            }
+        }
+    }
+    // Read-only receiver rights + canonical transfer authority: READ | MAP (no WRITE, no execute).
+    let init_cap = match kernel.grant_capability_task_to_task_with_rights(
+        0,
+        src_cap0,
+        init_tid,
+        CapRights::READ | CapRights::MAP,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=grant err={:?}", e);
+            return None;
+        }
+    };
+    crate::yarm_log!(
+        "SHARED_REGION_ORACLE_PROVISION_OK init_tid={} obj_id={} pages={} src_cap={}",
+        init_tid,
+        obj_id,
+        SHARED_REGION_ORACLE_PAGES,
+        init_cap.0
+    );
+    Some(init_cap.0 as u32)
+}
+
 /// Stage 193D: provision the reply-cap live oracle. Under BOTH the base proof knob and
 /// the send-reply-cap sub-knob, this (a) creates the coordination endpoint + grants init
 /// a RECV cap (slot 13), and (b) mints a transferable one-shot Reply cap directly into

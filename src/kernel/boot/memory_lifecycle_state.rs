@@ -243,6 +243,20 @@ impl KernelState {
         })
     }
 
+    /// Stage 198E3C1 test accessor: the byte length of the MemoryObject backing `phys` (used to
+    /// prove the shared-region oracle provisions exactly a two-page object).
+    #[cfg(test)]
+    pub(crate) fn memory_object_len_for_test(&self, phys: PhysAddr) -> Option<usize> {
+        self.with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|obj| obj.phys == phys)
+                .map(|obj| obj.len)
+        })
+    }
+
     /// Return true if a MemoryObject slot exists for `phys` (i.e., not reclaimed).
     #[cfg(test)]
     pub(crate) fn memory_object_exists_for_phys(&self, phys: PhysAddr) -> bool {

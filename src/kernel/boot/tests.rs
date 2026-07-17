@@ -68065,6 +68065,72 @@ mod stage198e3c1_direct_live_policy {
             "no shared-region ENQUEUE retirement literal may be compiled"
         );
     }
+
+    // (10) The deterministic pattern spans both pages: the byte at a page-0 offset differs from the
+    // byte at the same in-page offset in page 1 (so it is not a per-page-constant fill).
+    #[test]
+    fn oracle_pattern_spans_both_pages() {
+        use crate::kernel::vm::PAGE_SIZE;
+        let p0 = crate::kernel::boot::shared_region_oracle_pattern_byte(8);
+        let p1 = crate::kernel::boot::shared_region_oracle_pattern_byte(PAGE_SIZE + 8);
+        assert_ne!(
+            p0, p1,
+            "the pattern must vary across the page boundary (spans both pages)"
+        );
+        // Two pages is the fixed oracle region size.
+        assert_eq!(crate::kernel::boot::SHARED_REGION_ORACLE_PAGES, 2);
+    }
+
+    // (9/11/12/13) Provisioning creates exactly two pages, mints a READ|MAP (no WRITE/execute)
+    // transferable source cap into init's CNode, and is fail-closed off the runtime selector.
+    // (Feature-gated: the provisioning fn only compiles for the armed oracle build.)
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn provisioning_two_pages_readmap_and_default_off() {
+        use crate::kernel::capabilities::CapRights;
+        use crate::kernel::vm::PAGE_SIZE;
+        // Off the runtime selector → no provisioning (fail-closed / inert).
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(1).expect("init task");
+        assert_eq!(
+            crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1),
+            None,
+            "off the runtime selector the oracle must not provision"
+        );
+        // On the selector → exactly one two-page MemoryObject cap with READ|MAP receiver rights.
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+        let cap =
+            crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1).expect("provision");
+        let view = s
+            .resolve_capability_for_task(1, crate::kernel::capabilities::CapId(cap as u64))
+            .expect("init-local source cap resolves");
+        assert!(
+            matches!(
+                view.object,
+                crate::kernel::capabilities::CapObject::MemoryObject { .. }
+            ),
+            "the source cap is a MemoryObject"
+        );
+        // Exactly two pages of backing.
+        let base = s
+            .with_memory_state(|m| {
+                crate::kernel::boot::KernelState::shared_region_phys_base_locked(m, view.object)
+            })
+            .expect("phys base");
+        assert_eq!(
+            s.memory_object_len_for_test(base),
+            Some(2 * PAGE_SIZE),
+            "the provisioned object spans exactly two pages"
+        );
+        // Receiver rights are read-only READ|MAP — no WRITE, no execute.
+        assert!(view.has_right(CapRights::READ) && view.has_right(CapRights::MAP));
+        assert!(
+            !view.has_right(CapRights::WRITE),
+            "no receiver WRITE authority may be granted"
+        );
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
 }
 
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
