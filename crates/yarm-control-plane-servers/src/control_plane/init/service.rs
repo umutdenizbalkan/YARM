@@ -957,17 +957,29 @@ fn run_x86_futex_wake_oracle(init_tid: u64) {
 // BOTH pages against the deterministic pattern, releases the mapping through the receiver-local
 // cleanup cap (`TransferRelease(cap,0,0)` → Ok(len); a duplicate → InvalidArgs), and parks.
 //
-// Coordination is AUTHORITATIVE (single-CPU handshake), never timing: B wakes A on the handshake
-// futex and then immediately enters the blocking recv, which yields the CPU to A only after B is a
-// registered recv-v2 waiter — so when A's `futex_wait(handshake)` returns, B is provably blocked on
-// the endpoint. Default-off: slot-5 selector = 2 (mutually exclusive with the FutexWake selector 1)
-// AND the `x86-shared-region-direct-oracle` cargo feature. This scaffold is COMPILE-ONLY in this
-// stage — it emits NO live retirement seal and is never exercised under QEMU here.
+// Stage 198E3C1B-H — AUTHORITATIVE blocked-recv handshake (replaces the invalid pre-recv futex
+// signal). The child's `CHILD_STARTED` futex bump is a LIVENESS signal ONLY — it is raised BEFORE the
+// child enters recv, so it is NOT proof that the child is a committed recv-v2 waiter (a valid
+// interleaving — a timer preemption, or SMP — could let A run and send while B is still runnable,
+// hitting the immediate/no-waiter path). The AUTHORITATIVE proof lives in the KERNEL: the receiver's
+// own recv path publishes `SHARED_REGION_BLOCKED_RECV_ACK` only AFTER the blocked-recv record is
+// fully committed (endpoint waiter linked + task Blocked + `BlockedRecvState` payload/meta stored),
+// and the DIRECT delivery producer (`produce_blocked_waiter_shared_region_delivery`) consumes that
+// ack exactly once for the exact receiver + endpoint + oracle VA. So A's send can only REACH the
+// direct blocked path once B is authoritatively a committed recv-v2 waiter at `SHARED_REGION_ORACLE_VA`;
+// a too-early send finds no ack → the kernel declines the direct path → a detectable non-direct
+// outcome, never a silently-wrong immediate delivery. There is no timing/yield-count dependency in
+// the correctness gate. Default-off: slot-5 selector = 2 (mutually exclusive with the FutexWake
+// selector 1). This scaffold is COMPILE-ONLY in this stage — it emits NO live retirement seal and is
+// never exercised under QEMU here.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 mod x86_shared_region_direct_oracle {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
-    pub(super) static HANDSHAKE: AtomicU32 = AtomicU32::new(0x00E0);
+    // LIVENESS signal only (child reached its recv preamble) — NOT proof the child is blocked. The
+    // authoritative blocked proof is the KERNEL's `SHARED_REGION_BLOCKED_RECV_ACK` (published after
+    // full waiter commit) which the direct-delivery producer consumes; see the module header.
+    pub(super) static CHILD_STARTED: AtomicU32 = AtomicU32::new(0x00E0);
     pub(super) static PARK: AtomicU32 = AtomicU32::new(0x00E1);
     pub(super) static CHILD_TID: AtomicU64 = AtomicU64::new(0);
     // Caps the parent hands the child through the shared address space (both share init's CSpace).
@@ -1016,16 +1028,19 @@ mod x86_shared_region_direct_oracle {
         )
     }
 
-    /// Child B: wake the parent (handshake), recv-v2-block on the oracle endpoint (ordinary recv —
-    /// the DIRECT blocked-waiter path maps read-only, so no map-intent arg), validate both mapped
-    /// pages, exercise the release contract (first → Ok(len); duplicate → InvalidArgs), publish the
-    /// outcome, and park. Never returns.
+    /// Child B: raise the `CHILD_STARTED` LIVENESS signal (NOT a blocked-proof — see the module
+    /// header), recv-v2-block on the oracle endpoint (ordinary recv — the DIRECT blocked-waiter path
+    /// maps read-only, so no map-intent arg), validate both mapped pages, exercise the release
+    /// contract (first → Ok(len); duplicate → InvalidArgs), publish the outcome, and park. Never
+    /// returns. Correctness does NOT depend on this signal's timing: the kernel's authoritative
+    /// blocked-recv ack (published only after B's waiter is fully committed) is what gates A's direct
+    /// delivery.
     pub(super) extern "C" fn child_body() -> ! {
-        yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_CHILD_WAKE_PARENT");
-        // Authoritative single-CPU handshake: wake A, then block on recv so A resumes only once B is
-        // a registered recv-v2 waiter.
-        let handshake = HANDSHAKE.as_ptr();
-        let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+        yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_CHILD_STARTED");
+        // Liveness only: signal that B reached its recv preamble. This does NOT prove B is blocked —
+        // the KERNEL's post-commit ack is the authoritative proof.
+        let started = CHILD_STARTED.as_ptr();
+        let _ = yarm_user_rt::syscall::futex_wake(started, 1);
         let endpoint_cap = ENDPOINT_CAP.load(Relaxed);
         let va = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
         let len = yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN;
@@ -1075,9 +1090,13 @@ mod x86_shared_region_direct_oracle {
 }
 
 /// Parent A (COMPILE-ONLY scaffold): read the provisioned caps from the startup slots, spawn child
-/// B, block on the handshake (B is provably recv-v2-blocked when this returns), send the region
-/// through the DIRECT path exactly once, YIELD so B resumes and validates, then emit the topology +
-/// child-validation markers. Emits NO live retirement seal.
+/// B, wait on the `CHILD_STARTED` LIVENESS signal (NOT a blocked proof), send the region through the
+/// DIRECT path exactly once, YIELD so B resumes and validates, then emit the topology +
+/// child-validation markers. The send's CORRECTNESS is enforced by the KERNEL: the direct blocked
+/// delivery consumes the authoritative `SHARED_REGION_BLOCKED_RECV_ACK` (published only after B's
+/// recv-v2 waiter is fully committed at the oracle VA), so a too-early send cannot reach the direct
+/// path — it declines to a detectable non-direct outcome, never a silent immediate delivery. Emits
+/// NO live retirement seal.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn run_x86_shared_region_direct_oracle(init_tid: u64) {
     use core::sync::atomic::Ordering::Relaxed;
@@ -1120,12 +1139,17 @@ fn run_x86_shared_region_direct_oracle(init_tid: u64) {
         "SHARED_REGION_DIRECT_ORACLE_CHILD_SPAWNED child_tid={}",
         child_tid
     );
-    // Authoritative handshake: when this returns, B is provably a recv-v2 waiter on the endpoint.
-    let handshake = oracle::HANDSHAKE.as_ptr();
-    let hv = oracle::HANDSHAKE.load(Relaxed);
-    let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
+    // LIVENESS wait on CHILD_STARTED (NOT a blocked proof). Even if A resumes before B is a committed
+    // waiter, correctness holds: the kernel's authoritative ack (published only after B's waiter is
+    // fully committed at the oracle VA) is what gates A's DIRECT delivery below — a too-early send
+    // finds no ack and declines the direct path (detectable), never a silent immediate delivery.
+    let started = oracle::CHILD_STARTED.as_ptr();
+    let sv = oracle::CHILD_STARTED.load(Relaxed);
+    let _ = yarm_user_rt::syscall::futex_wait(started, sv, sv);
     yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_PARENT_RESUMED");
     // Exactly ONE DIRECT send to the blocked receiver (IpcSend, NOT the shared-region enqueue path).
+    // The kernel's ack gate (produce_blocked_waiter_shared_region_delivery → consume_for_delivery)
+    // dominates this send: it reaches the direct path only if B is an authoritative committed waiter.
     let payload = [0x5Au8, 0x3C];
     // SAFETY: `endpoint_cap` is the SEND|RECEIVE oracle cap; `mem_cap` the read-only source cap.
     let sent =

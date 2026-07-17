@@ -947,6 +947,27 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
     let Some(cpu_idx) = shared_region_live_eligible(kernel, msg) else {
         return Ok(false);
     };
+    // Stage 198E3C1B-H: AUTHORITATIVE blocked-recv ack gate. The DIRECT delivery to this waiter is
+    // structurally dominated by the acknowledgement the RECEIVER's own recv path published AFTER its
+    // blocked-recv record was fully committed (endpoint waiter linked + task Blocked + BlockedRecvState
+    // payload/meta stored). Consume it exactly once for THIS receiver + endpoint: an absent, stale,
+    // wrong-receiver/endpoint/VA, or already-consumed (duplicate send) ack declines the direct path
+    // (falls back to the legacy delivery). Oracle-only (feature + knob gated); a strict no-op
+    // otherwise, so production shared-region delivery is byte-identical.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    if crate::kernel::boot::x86_shared_region_direct_oracle_enabled()
+        && !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(
+            waiter_tid,
+            endpoint_idx,
+        )
+    {
+        crate::yarm_log!(
+            "SHARED_REGION_DIRECT_DECLINE_NO_ACK tid={} endpoint={}",
+            waiter_tid,
+            endpoint_idx
+        );
+        return Ok(false);
+    }
     // Phase A.1 — consume blocked state and resolve the endpoint the envelope is bound to.
     let blocked_state = kernel
         .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())

@@ -3224,12 +3224,260 @@ pub fn provision_init_ipc_send_cap_oracle_coord(
 /// exercises multi-page mapping progress).
 pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
 
+/// Stage 198E3C1B-H: the dedicated unmapped two-page oracle receive window VA, mirroring
+/// `yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA`. The authoritative blocked-recv acknowledgement
+/// requires the receiver's `payload_user_ptr` to equal this exact VA (a wrong-VA recv is rejected).
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x4000_0000;
+
 /// Stage 198E3C1B: the init startup-slot-5 selector value that names the DIRECT shared-region
 /// oracle (mirrors `yarm_user_rt::syscall::SHARED_REGION_ORACLE_SELECTOR`). Slot 5 is a mutually
 /// exclusive selector: 1 = x86_64 FutexWake oracle, 2 = shared-region direct oracle. Only ONE may
 /// be armed per boot (the boot caller fails closed if both knobs are set).
 #[cfg(feature = "x86-shared-region-direct-oracle")]
 pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
+
+// ── Stage 198E3C1B-H: authoritative blocked-recv acknowledgement ─────────────────────────────────
+// The pre-recv futex signal (child wakes parent BEFORE entering recv) is NOT proof that the child is
+// a committed recv-v2 waiter: the wake precedes waiter registration, so a valid interleaving lets the
+// parent send while the child is still runnable, taking the immediate/no-waiter path. The
+// authoritative acknowledgement below is published by the RECEIVER's own recv path ONLY after the
+// blocked-recv record is fully committed (endpoint waiter linked + task Blocked + BlockedRecvState
+// payload/meta stored), and it records the exact committed identity so the send side (and hosted
+// tests) can prove the direct blocked path is reachable ONLY for the expected receiver/endpoint/VA.
+//
+// It is oracle-only (feature-gated), reads authoritative committed state, and does NOT wake, mint a
+// capability, copy user memory, add a kernel lock, or emit any retirement success.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub mod shared_region_blocked_recv {
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+    /// Complete authoritative snapshot of a fully-committed shared-region blocked recv-v2 waiter.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SharedRegionBlockedRecvAck {
+        pub receiver_tid: u64,
+        /// ASID = the receiver's incarnation/generation discriminator.
+        pub receiver_generation: u32,
+        pub endpoint_idx: usize,
+        pub endpoint_generation: u64,
+        pub payload_va: usize,
+        pub meta_ptr: usize,
+        pub map_len: usize,
+        pub recv_v2: bool,
+        /// Monotonic commit sequence — a fresh publish always advances it, so a stale reader that
+        /// cached an earlier ack can detect it changed. Duplicate consumption is rejected separately.
+        pub commit_seq: u64,
+    }
+
+    static VALID: AtomicBool = AtomicBool::new(false);
+    static CONSUMED: AtomicBool = AtomicBool::new(false);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static RECEIVER_TID: AtomicU64 = AtomicU64::new(0);
+    static RECEIVER_GEN: AtomicU32 = AtomicU32::new(0);
+    static ENDPOINT_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static ENDPOINT_GEN: AtomicU64 = AtomicU64::new(0);
+    static PAYLOAD_VA: AtomicUsize = AtomicUsize::new(0);
+    static META_PTR: AtomicUsize = AtomicUsize::new(0);
+    static MAP_LEN: AtomicUsize = AtomicUsize::new(0);
+    static RECV_V2: AtomicBool = AtomicBool::new(false);
+
+    /// Reset the ack (test setup + between boots). Clears everything to the unpublished state.
+    pub fn reset() {
+        VALID.store(false, Ordering::Release);
+        CONSUMED.store(false, Ordering::Release);
+    }
+
+    /// Publish the authoritative ack. Fields are stored first, then `VALID` is released last, so a
+    /// reader that observes `VALID` via `snapshot()` sees a complete record (no torn read). The
+    /// caller is the receiver's own recv path AFTER full commit; it must have already validated the
+    /// oracle contract. Advances the commit sequence and clears the consumed flag (a fresh commit is
+    /// independently consumable exactly once).
+    pub(crate) fn publish(ack: SharedRegionBlockedRecvAck) {
+        RECEIVER_TID.store(ack.receiver_tid, Ordering::Relaxed);
+        RECEIVER_GEN.store(ack.receiver_generation, Ordering::Relaxed);
+        ENDPOINT_IDX.store(ack.endpoint_idx, Ordering::Relaxed);
+        ENDPOINT_GEN.store(ack.endpoint_generation, Ordering::Relaxed);
+        PAYLOAD_VA.store(ack.payload_va, Ordering::Relaxed);
+        META_PTR.store(ack.meta_ptr, Ordering::Relaxed);
+        MAP_LEN.store(ack.map_len, Ordering::Relaxed);
+        RECV_V2.store(ack.recv_v2, Ordering::Relaxed);
+        SEQ.store(ack.commit_seq, Ordering::Relaxed);
+        CONSUMED.store(false, Ordering::Relaxed);
+        VALID.store(true, Ordering::Release);
+    }
+
+    /// Monotonic next commit sequence (for the publisher).
+    pub(crate) fn next_commit_seq() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Authoritative snapshot, or `None` if no ack has been committed since the last reset.
+    pub fn snapshot() -> Option<SharedRegionBlockedRecvAck> {
+        if !VALID.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(SharedRegionBlockedRecvAck {
+            receiver_tid: RECEIVER_TID.load(Ordering::Relaxed),
+            receiver_generation: RECEIVER_GEN.load(Ordering::Relaxed),
+            endpoint_idx: ENDPOINT_IDX.load(Ordering::Relaxed),
+            endpoint_generation: ENDPOINT_GEN.load(Ordering::Relaxed),
+            payload_va: PAYLOAD_VA.load(Ordering::Relaxed),
+            meta_ptr: META_PTR.load(Ordering::Relaxed),
+            map_len: MAP_LEN.load(Ordering::Relaxed),
+            recv_v2: RECV_V2.load(Ordering::Relaxed),
+            commit_seq: SEQ.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Authoritative gate for the parent's DIRECT send: returns `true` ONLY if a committed,
+    /// unconsumed ack matches the EXACT expected receiver identity, generation, endpoint identity,
+    /// recv-v2 contract, payload VA, metadata pointer, and two-page map length. Rejects a wrong
+    /// receiver / stale generation / wrong endpoint / wrong VA / wrong meta ptr / plain (non-v2)
+    /// waiter / absent ack. Does NOT consume — see `consume_if_matches`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matches(
+        receiver_tid: u64,
+        receiver_generation: u32,
+        endpoint_idx: usize,
+        endpoint_generation: u64,
+        payload_va: usize,
+        meta_ptr: usize,
+        map_len: usize,
+    ) -> bool {
+        matches!(
+            snapshot(),
+            Some(a) if !CONSUMED.load(Ordering::Acquire)
+                && a.recv_v2
+                && a.receiver_tid == receiver_tid
+                && a.receiver_generation == receiver_generation
+                && a.endpoint_idx == endpoint_idx
+                && a.endpoint_generation == endpoint_generation
+                && a.payload_va == payload_va
+                && a.meta_ptr == meta_ptr
+                && a.map_len == map_len
+        )
+    }
+
+    /// Consume the ack exactly once if it matches — a DUPLICATE consume (already consumed) returns
+    /// `false`, so a duplicate parent send cannot re-satisfy the gate on a stale ack.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_if_matches(
+        receiver_tid: u64,
+        receiver_generation: u32,
+        endpoint_idx: usize,
+        endpoint_generation: u64,
+        payload_va: usize,
+        meta_ptr: usize,
+        map_len: usize,
+    ) -> bool {
+        if !matches(
+            receiver_tid,
+            receiver_generation,
+            endpoint_idx,
+            endpoint_generation,
+            payload_va,
+            meta_ptr,
+            map_len,
+        ) {
+            return false;
+        }
+        // Claim exactly once.
+        CONSUMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Send-side authoritative gate for the DIRECT blocked-recv delivery: consume the ack exactly
+    /// once iff a committed, unconsumed, recv-v2, oracle-VA ack exists for THIS receiver + endpoint.
+    /// A wrong receiver, wrong endpoint, non-oracle VA, plain (non-v2) waiter, absent ack, or an
+    /// already-consumed (duplicate) ack all return `false`, so the direct path declines and no
+    /// duplicate send can re-satisfy the gate.
+    pub(crate) fn consume_for_delivery(receiver_tid: u64, endpoint_idx: usize) -> bool {
+        let matches_now = matches!(
+            snapshot(),
+            Some(a) if !CONSUMED.load(Ordering::Acquire)
+                && a.recv_v2
+                && a.receiver_tid == receiver_tid
+                && a.endpoint_idx == endpoint_idx
+                && a.payload_va == super::SHARED_REGION_ORACLE_USER_VA
+        );
+        if !matches_now {
+            return false;
+        }
+        CONSUMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+/// Stage 198E3C1B-H: publish the authoritative blocked-recv acknowledgement from the RECEIVER's own
+/// recv path, called ONLY after the blocked-recv record is fully committed (endpoint waiter linked,
+/// task Blocked, `BlockedRecvState` payload/meta stored). Feature + runtime-knob gated; a strict
+/// no-op otherwise. It re-reads authoritative committed state (the endpoint waiter identity must
+/// equal this receiver) and validates the oracle contract (recv-v2, payload VA = the oracle window,
+/// two-page length, non-null metadata pointer) before recording the ack. It does NOT wake, mint,
+/// copy user memory, add a lock, or emit any retirement marker.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub(crate) fn maybe_publish_shared_region_blocked_recv_ack(
+    kernel: &KernelState,
+    receiver_tid: u64,
+    endpoint: crate::kernel::capabilities::CapObject,
+    state: &crate::kernel::task::BlockedRecvState,
+) {
+    use crate::kernel::capabilities::CapObject;
+    if !x86_shared_region_direct_oracle_enabled() {
+        return;
+    }
+    // Oracle contract: recv-v2, the dedicated two-page oracle window, a real metadata buffer.
+    let two_pages = SHARED_REGION_ORACLE_PAGES * crate::kernel::vm::PAGE_SIZE;
+    let recv_v2 = state.recv_abi == crate::kernel::task::RecvAbiVariant::RecvV2;
+    let CapObject::Endpoint { index, generation } = endpoint else {
+        return;
+    };
+    if !recv_v2
+        || state.payload_user_ptr != SHARED_REGION_ORACLE_USER_VA
+        || state.payload_user_len < two_pages
+        || state.meta_user_ptr == 0
+    {
+        return;
+    }
+    // Authoritative commit check: the endpoint waiter slot must already hold THIS receiver (the
+    // Phase-C publish committed it before BlockedRecvState was stored). If it does not, the record is
+    // not fully committed for this endpoint — do not acknowledge.
+    let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
+    let receiver_generation = kernel
+        .task_asid(receiver_tid)
+        .map(|a| a.0 as u32)
+        .unwrap_or(0);
+    match waiter {
+        Some(w) if w.tid.0 == receiver_tid && w.asid.0 as u32 == receiver_generation => {}
+        _ => return,
+    }
+    let ack = shared_region_blocked_recv::SharedRegionBlockedRecvAck {
+        receiver_tid,
+        receiver_generation,
+        endpoint_idx: index,
+        endpoint_generation: generation,
+        payload_va: state.payload_user_ptr,
+        meta_ptr: state.meta_user_ptr,
+        map_len: two_pages,
+        recv_v2: true,
+        commit_seq: shared_region_blocked_recv::next_commit_seq(),
+    };
+    shared_region_blocked_recv::publish(ack);
+    crate::yarm_log!(
+        "SHARED_REGION_BLOCKED_RECV_ACK tid={} gen={} endpoint={} ep_gen={} payload_va=0x{:x} meta_ptr=0x{:x} map_len={} recv_v2=1 seq={}",
+        ack.receiver_tid,
+        ack.receiver_generation,
+        ack.endpoint_idx,
+        ack.endpoint_generation,
+        ack.payload_va,
+        ack.meta_ptr,
+        ack.map_len,
+        ack.commit_seq
+    );
+}
 
 /// Stage 198E3C1: the deterministic known byte the oracle writes at object offset `off`. It varies
 /// with `off`, so the pattern SPANS BOTH pages (page 0 and page 1 hold different bytes), and it is a

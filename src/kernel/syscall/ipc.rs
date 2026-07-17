@@ -717,6 +717,16 @@ pub(super) fn handle_ipc_recv(
                 state.meta_user_ptr,
                 state.meta_user_len
             );
+            // Stage 198E3C1B-H: publish the AUTHORITATIVE blocked-recv acknowledgement now that the
+            // blocked-recv record is FULLY committed — the endpoint waiter was linked + the task
+            // marked Blocked inside `ipc_recv` (Phases B/C), and `BlockedRecvState` (payload/meta)
+            // was just stored above. This is the earliest point the complete committed identity
+            // exists; it is oracle-only (feature+knob gated), reads authoritative committed state,
+            // and does not wake / mint / copy / lock / retire. A strict no-op off the oracle.
+            #[cfg(feature = "x86-shared-region-direct-oracle")]
+            crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+                kernel, recv_tid, endpoint, &state,
+            );
         }
         return Err(SyscallError::WouldBlock);
     }

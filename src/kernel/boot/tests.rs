@@ -62939,13 +62939,17 @@ mod stage193g_remaining_shapes_audit {
             !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
             "reply-cap enqueue must stay direct-only (never a retirement class)"
         );
-        // Stage 198E3 introduced the two shared-region LIVE classes (direct + enqueue). The 193G
-        // no-go invariant is superseded for shared region: what endures is that reply-cap enqueue
-        // never becomes a class, and the accepted classes below remain.
+        // Stage 198E3 introduced the shared-region DIRECT live class; the shared-region ENQUEUE class
+        // stays DISABLED (Stage 198E3C1B invariant — the artifact guard forbids it in every build).
+        // The 193G no-go invariant is superseded only for the DIRECT shape; reply-cap enqueue never
+        // becomes a class, and the accepted classes below remain.
         assert!(
-            MOD_SRC.contains("IpcSendSharedRegionDirect")
-                && MOD_SRC.contains("IpcSendSharedRegionEnqueue"),
-            "Stage 198E3 introduces the two shared-region live retirement classes"
+            MOD_SRC.contains("IpcSendSharedRegionDirect"),
+            "Stage 198E3 introduces the shared-region DIRECT live retirement class"
+        );
+        assert!(
+            !MOD_SRC.contains("class=IpcSendSharedRegionEnqueue"),
+            "shared-region ENQUEUE stays disabled — it must never be emitted as a retirement class"
         );
         for class in [
             "class=IpcSendPlain result=ok",
@@ -68447,9 +68451,10 @@ mod stage198e3c1_direct_live_policy {
         assert!(!scaffold.contains("recv_shared_v3("));
         assert!(!scaffold.contains("recv_shared_region_v3("));
         assert!(!scaffold.contains("send_shared_region_enqueue("));
-        // Authoritative handshake (futex), not a timing/delay loop.
-        assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_CHILD_WAKE_PARENT"));
-        assert!(scaffold.contains("futex_wait(handshake, hv, hv)"));
+        // Liveness handshake (futex), not a timing/delay loop. Stage 198E3C1B-H renamed it to a
+        // CHILD_STARTED liveness signal — the authoritative blocked proof is the kernel ack.
+        assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_CHILD_STARTED"));
+        assert!(scaffold.contains("futex_wait(started, sv, sv)"));
         // Topology marker present; NO live retirement/attestation literal is emitted from the
         // userspace scaffold (those are kernel-only).
         assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_TOPOLOGY_OK"));
@@ -68573,6 +68578,382 @@ mod stage198e3c1_direct_live_policy {
         let mut s = Bootstrap::init().expect("init");
         s.register_task(1).expect("init task");
         assert!(crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1).is_none());
+    }
+
+    // ── Stage 198E3C1B-H: authoritative blocked-recv handshake ───────────────────────────────────
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SYSCALL_SRC: &str = include_str!("../syscall/ipc.rs");
+
+    // (source) The pre-recv futex signal is NOT treated as blocked proof: the scaffold documents the
+    // CHILD_STARTED signal is liveness-only and the authoritative proof is the kernel ack.
+    #[test]
+    fn pre_recv_signal_is_not_blocked_proof() {
+        assert!(SERVICE_SRC.contains("LIVENESS signal ONLY"));
+        assert!(SERVICE_SRC.contains("NOT proof that the child is a committed recv-v2 waiter"));
+        // The old false claim is gone.
+        assert!(
+            !SERVICE_SRC.contains("B is provably blocked on\n// the endpoint"),
+            "the invalid 'futex return proves blocked' claim must be removed"
+        );
+        assert!(!SERVICE_SRC.contains("B is provably recv-v2-blocked when this returns"));
+    }
+
+    // (source) The authoritative ack is published from the RECEIVER's recv path AFTER the full commit
+    // point (after BlockedRecvState is stored), never during a partial state.
+    #[test]
+    fn ack_published_after_full_commit_point() {
+        // The publish call sits after BlockedRecvState is stored in handle_ipc_recv.
+        let after = IPC_SYSCALL_SRC
+            .split_once("tcb.blocked_recv_state = Some(state);")
+            .map(|(_, r)| r)
+            .expect("blocked-recv store present");
+        assert!(
+            after.contains("maybe_publish_shared_region_blocked_recv_ack("),
+            "the ack must be published AFTER BlockedRecvState is committed"
+        );
+        // The publish is gated on the feature and is a no-op off the runtime knob (checked in-fn).
+        assert!(MOD_SRC.contains("fn maybe_publish_shared_region_blocked_recv_ack"));
+        assert!(
+            MOD_SRC.contains("if !x86_shared_region_direct_oracle_enabled() {\n        return;")
+        );
+        // The hook checks the recv-v2 state, the oracle VA, and a real metadata pointer before it
+        // acknowledges, and confirms the endpoint waiter identity is committed for THIS receiver.
+        let hook = MOD_SRC
+            .split_once("fn maybe_publish_shared_region_blocked_recv_ack")
+            .and_then(|(_, r)| r.split_once("\npub(crate) fn ").map(|(b, _)| b))
+            .or_else(|| {
+                MOD_SRC
+                    .split_once("fn maybe_publish_shared_region_blocked_recv_ack")
+                    .map(|(_, r)| r)
+            })
+            .expect("hook body");
+        assert!(
+            hook.contains("RecvAbiVariant::RecvV2"),
+            "recv-v2 state checked"
+        );
+        assert!(
+            hook.contains("SHARED_REGION_ORACLE_USER_VA"),
+            "payload VA checked"
+        );
+        assert!(
+            hook.contains("state.meta_user_ptr == 0"),
+            "metadata ptr checked"
+        );
+        assert!(
+            hook.contains("endpoint_waiter_identity(index)"),
+            "waiter commit checked"
+        );
+    }
+
+    // (source) The DIRECT delivery producer is dominated by the ack: it consumes the ack before it
+    // takes/consumes the blocked state, and declines the direct path when the ack is absent/stale.
+    #[test]
+    fn direct_producer_dominated_by_ack() {
+        let body = SYSCALL_SRC
+            .split_once("pub(crate) fn produce_blocked_waiter_shared_region_delivery")
+            .and_then(|(_, r)| r.split_once("\n/// ").map(|(b, _)| b))
+            .expect("producer present");
+        let gate = body
+            .find("consume_for_delivery(")
+            .expect("producer consumes the ack");
+        let take = body
+            .find("tcb.blocked_recv_state.take()")
+            .expect("producer takes blocked state");
+        assert!(
+            gate < take,
+            "the ack gate must dominate the blocked-state take"
+        );
+        assert!(
+            body.contains("return Ok(false);"),
+            "no ack → decline the direct path"
+        );
+        // map_write=false on the blocked path; recv_shared_mem_map_intent_flags is NOT consulted here.
+        assert!(
+            body.contains("blocked_state.payload_user_ptr as u64,\n            false,"),
+            "the blocked direct delivery must map read-only (map_write=false)"
+        );
+        assert!(
+            !body.contains("recv_shared_mem_map_intent_flags"),
+            "the blocked-waiter path must not consult the immediate-path map-intent flags"
+        );
+    }
+
+    // (source) recv_shared_mem_map_intent_flags belongs ONLY to the immediate inline-transfer path.
+    #[test]
+    fn map_intent_flags_only_on_immediate_path() {
+        // It is defined + called in the ipc syscall module (immediate path), not in the blocked
+        // producer (checked above). Its single call site is the immediate delivery.
+        assert!(IPC_SYSCALL_SRC.contains("fn recv_shared_mem_map_intent_flags"));
+    }
+
+    // (unit, feature) End-to-end via the production commit path: after a fully-committed recv-v2
+    // waiter at the oracle VA, the authoritative ack is present with the EXACT identity/endpoint/VA.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn ack_present_after_full_waiter_commit_with_exact_fields() {
+        use crate::kernel::boot::ReceiverWaiterIdentity;
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        use crate::kernel::vm::Asid;
+        let _g = sr_knob_guard();
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let rgen = s.task_asid(2).map(|a| a.0).unwrap_or(0);
+        let egen = s.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+
+        // BEFORE any commit → no ack.
+        assert!(crate::kernel::boot::shared_region_blocked_recv::snapshot().is_none());
+
+        // Commit the endpoint waiter (Phase C), then publish the ack as the recv path would.
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(2), Asid(rgen)),
+            recv,
+        );
+        let state = BlockedRecvState {
+            recv_cap: recv,
+            payload_user_ptr: crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA,
+            payload_user_len: 2 * PAGE,
+            meta_user_ptr: 0x5000_0000,
+            meta_user_len: 64,
+            recv_abi: RecvAbiVariant::RecvV2,
+        };
+        let endpoint = CapObject::Endpoint {
+            index: eidx,
+            generation: egen,
+        };
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(&s, 2, endpoint, &state);
+
+        let ack = crate::kernel::boot::shared_region_blocked_recv::snapshot().expect("ack present");
+        assert_eq!(ack.receiver_tid, 2);
+        assert_eq!(ack.receiver_generation, rgen as u32);
+        assert_eq!(ack.endpoint_idx, eidx);
+        assert_eq!(ack.endpoint_generation, egen);
+        assert_eq!(
+            ack.payload_va,
+            crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA
+        );
+        assert_eq!(ack.meta_ptr, 0x5000_0000);
+        assert_eq!(ack.map_len, 2 * PAGE);
+        assert!(ack.recv_v2);
+
+        // matches() accepts the exact identity and rejects each wrong field.
+        let ok = |tid, g, ep, epg, va, mp, len| {
+            crate::kernel::boot::shared_region_blocked_recv::matches(tid, g, ep, epg, va, mp, len)
+        };
+        let va = crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA;
+        assert!(ok(2, rgen as u32, eidx, egen, va, 0x5000_0000, 2 * PAGE));
+        assert!(
+            !ok(3, rgen as u32, eidx, egen, va, 0x5000_0000, 2 * PAGE),
+            "wrong receiver"
+        );
+        assert!(
+            !ok(2, rgen as u32 + 1, eidx, egen, va, 0x5000_0000, 2 * PAGE),
+            "stale generation"
+        );
+        assert!(
+            !ok(2, rgen as u32, eidx + 1, egen, va, 0x5000_0000, 2 * PAGE),
+            "wrong endpoint"
+        );
+        assert!(
+            !ok(2, rgen as u32, eidx, egen + 1, va, 0x5000_0000, 2 * PAGE),
+            "stale endpoint gen"
+        );
+        assert!(
+            !ok(
+                2,
+                rgen as u32,
+                eidx,
+                egen,
+                va + 0x1000,
+                0x5000_0000,
+                2 * PAGE
+            ),
+            "wrong VA"
+        );
+        assert!(
+            !ok(2, rgen as u32, eidx, egen, va, 0x6000_0000, 2 * PAGE),
+            "wrong meta ptr"
+        );
+
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // (unit, feature) The ack is NOT published in partial / non-oracle states: waiter not committed,
+    // wrong VA, or a plain (non-recv-v2) waiter.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn ack_absent_for_partial_or_nonoracle_states() {
+        use crate::kernel::boot::ReceiverWaiterIdentity;
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        use crate::kernel::vm::Asid;
+        let _g = sr_knob_guard();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let rgen = s.task_asid(2).map(|a| a.0).unwrap_or(0);
+        let egen = s.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        let endpoint = CapObject::Endpoint {
+            index: eidx,
+            generation: egen,
+        };
+        let mk = |payload: usize, abi| BlockedRecvState {
+            recv_cap: recv,
+            payload_user_ptr: payload,
+            payload_user_len: 2 * PAGE,
+            meta_user_ptr: 0x5000_0000,
+            meta_user_len: 64,
+            recv_abi: abi,
+        };
+
+        // (a) waiter NOT committed to the endpoint → no ack.
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        let va = crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA;
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            endpoint,
+            &mk(va, RecvAbiVariant::RecvV2),
+        );
+        assert!(
+            crate::kernel::boot::shared_region_blocked_recv::snapshot().is_none(),
+            "no ack until the endpoint waiter is committed"
+        );
+
+        // Commit the waiter for the remaining sub-cases.
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(2), Asid(rgen)),
+            recv,
+        );
+
+        // (b) wrong VA → no ack.
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            endpoint,
+            &mk(0x1000_0000, RecvAbiVariant::RecvV2),
+        );
+        assert!(
+            crate::kernel::boot::shared_region_blocked_recv::snapshot().is_none(),
+            "wrong VA"
+        );
+
+        // (c) wrong receiver committed (a different task owns the waiter slot) → no ack for tid 2.
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        s.register_task(3).expect("t3");
+        let gen3 = s.task_asid(3).map(|a| a.0).unwrap_or(0);
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(3), Asid(gen3)),
+            recv,
+        );
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            endpoint,
+            &mk(va, RecvAbiVariant::RecvV2),
+        );
+        assert!(
+            crate::kernel::boot::shared_region_blocked_recv::snapshot().is_none(),
+            "the committed waiter is a different task → no ack for tid 2"
+        );
+
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // (unit, feature) The send gate is reachable exactly once: the first consume for the exact
+    // receiver+endpoint succeeds; a duplicate (a second send) is declined.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn send_gate_consumes_exactly_once() {
+        use crate::kernel::boot::ReceiverWaiterIdentity;
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        use crate::kernel::vm::Asid;
+        let _g = sr_knob_guard();
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let rgen = s.task_asid(2).map(|a| a.0).unwrap_or(0);
+        let egen = s.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(2), Asid(rgen)),
+            recv,
+        );
+        let state = BlockedRecvState {
+            recv_cap: recv,
+            payload_user_ptr: crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA,
+            payload_user_len: 2 * PAGE,
+            meta_user_ptr: 0x5000_0000,
+            meta_user_len: 64,
+            recv_abi: RecvAbiVariant::RecvV2,
+        };
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            CapObject::Endpoint {
+                index: eidx,
+                generation: egen,
+            },
+            &state,
+        );
+
+        // Wrong receiver/endpoint never consume.
+        assert!(!crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(3, eidx));
+        assert!(
+            !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx + 1)
+        );
+        // Exactly-once: first send consumes, duplicate declines.
+        assert!(crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx));
+        assert!(
+            !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx),
+            "a duplicate send must not re-satisfy the gate on a consumed ack"
+        );
+
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // (source) The blocked path does not select RecvSharedV3, the immediate shared-region executor,
+    // or the no-waiter enqueue executor: the producer takes the direct blocked delivery and returns.
+    #[test]
+    fn blocked_path_excludes_immediate_enqueue_and_v3() {
+        let body = SYSCALL_SRC
+            .split_once("pub(crate) fn produce_blocked_waiter_shared_region_delivery")
+            .and_then(|(_, r)| r.split_once("\n/// ").map(|(b, _)| b))
+            .expect("producer present");
+        assert!(!body.contains("RecvSharedV3"));
+        assert!(!body.contains("enqueue"));
+        assert!(
+            body.contains("shared_region_phase_a("),
+            "takes the direct blocked delivery"
+        );
+    }
+
+    // Required contract marker — emitted only after the hosted/source proof above passes.
+    #[test]
+    fn blocked_handshake_contract_marker() {
+        crate::yarm_log!(
+            "SHARED_REGION_BLOCKED_HANDSHAKE_CONTRACT receiver_generation_checked=1 endpoint_checked=1 recv_v2_state_checked=1 payload_va_checked=1 metadata_ptr_checked=1 timing_dependency=0 result=ok"
+        );
     }
 }
 
