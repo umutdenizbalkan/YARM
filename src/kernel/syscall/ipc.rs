@@ -523,6 +523,15 @@ pub(super) fn handle_ipc_send(
                                     // Producer stashed the post-work (drain completes delivery +
                                     // slot-clear + single wake) — no in-lock wake plan here.
                                     Ok(true) => (Some(Ok(())), IpcSchedulerPlan::None),
+                                    // Stage 198E3C1C: the oracle-armed pre-ack FAIL-CLOSED decline
+                                    // returns the canonical retryable WouldBlock (NOT a fault, NOT
+                                    // legacy delivery): no blocked state was taken, nothing mapped/
+                                    // minted/queued/woken; the outer path releases the transfer
+                                    // envelope so the source cap is preserved and the parent retries.
+                                    Err(SyscallError::WouldBlock) => (
+                                        Some(Err(KernelError::WouldBlock)),
+                                        IpcSchedulerPlan::None,
+                                    ),
                                     // A real Phase-A fault — the outer error path releases any
                                     // still-stashed envelope (same disposition as the legacy arm).
                                     Err(_e) => (

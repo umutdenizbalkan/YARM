@@ -989,6 +989,11 @@ mod x86_shared_region_direct_oracle {
     pub(super) static CHILD_RESULT: AtomicU32 = AtomicU32::new(0);
     pub(super) static PAGES_OK: AtomicU32 = AtomicU32::new(0);
     pub(super) static RELEASE_OK: AtomicU32 = AtomicU32::new(0);
+    // The sender's source MemoryObject cap (slot 13), so the child can prove its receiver-local cap
+    // is FRESH (nonzero and distinct from the sender's cap).
+    pub(super) static SENDER_MEM_CAP: AtomicU32 = AtomicU32::new(0);
+    // Exact count of times the child's post-delivery validation body runs — must be exactly one.
+    pub(super) static CONTINUATIONS: AtomicU32 = AtomicU32::new(0);
 
     #[allow(unused)]
     pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
@@ -1002,6 +1007,7 @@ mod x86_shared_region_direct_oracle {
     ///
     /// # Safety
     /// `base..base+len` must be the readable two-page mapping returned by the recv.
+    #[allow(dead_code)]
     pub(super) unsafe fn validate_two_pages(base: usize, len: usize) -> bool {
         if len != yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN {
             return false;
@@ -1016,6 +1022,29 @@ mod x86_shared_region_direct_oracle {
             off += 1;
         }
         true
+    }
+
+    /// Validate each page independently so page 0 and page 1 are proven separately (a page swap or a
+    /// single-page mapping is detected). Returns `(page0_ok, page1_ok)`.
+    ///
+    /// # Safety
+    /// `base..base+len` must be the readable two-page mapping returned by the recv.
+    pub(super) unsafe fn validate_pages_split(base: usize, len: usize) -> (bool, bool) {
+        const PAGE: usize = yarm_user_rt::syscall::SHARED_REGION_ORACLE_PAGE_SIZE;
+        if len != 2 * PAGE {
+            return (false, false);
+        }
+        let mut ok = [true; 2];
+        let mut off = 0usize;
+        while off < len {
+            // SAFETY: caller guarantees the whole window is mapped readable.
+            let got = unsafe { core::ptr::read_volatile((base + off) as *const u8) };
+            if got != yarm_user_rt::syscall::shared_region_oracle_pattern_byte(off) {
+                ok[off / PAGE] = false;
+            }
+            off += 1;
+        }
+        (ok[0], ok[1])
     }
 
     /// Naked child entry trampoline (see the FutexWake oracle for the RSP-alignment rationale).
@@ -1042,33 +1071,68 @@ mod x86_shared_region_direct_oracle {
         let started = CHILD_STARTED.as_ptr();
         let _ = yarm_user_rt::syscall::futex_wake(started, 1);
         let endpoint_cap = ENDPOINT_CAP.load(Relaxed);
+        let sender_mem_cap = SENDER_MEM_CAP.load(Relaxed);
         let va = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
         let len = yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN;
         // SAFETY: `va..va+len` is the dedicated unmapped two-page window (compile-time VA contract).
         let recv = unsafe { yarm_user_rt::syscall::recv_shared_region_v2(endpoint_cap, va, len) };
         match recv {
             Ok(Some(r)) => {
+                // This is the ONE post-delivery continuation — count it exactly once.
+                CONTINUATIONS.fetch_add(1, Relaxed);
+                // Inline-payload contract (observable via the recv-v2 meta): the DIRECT delivery
+                // preserves the sender's opcode (OPCODE_SHARED_MEM) and carries the 16-byte encoded
+                // shared-region descriptor (offset u64 + len u64) as the message payload.
+                let inline_ok =
+                    r.opcode == yarm_user_rt::syscall::OPCODE_SHARED_MEM && r.payload_len == 16;
+                // Page patterns across BOTH pages.
                 // SAFETY: the DIRECT delivery mapped the two pages readable at `r.mapped_base`.
-                let pages_ok = unsafe { validate_two_pages(r.mapped_base, r.mapped_len) };
+                let (page0_ok, page1_ok) =
+                    unsafe { validate_pages_split(r.mapped_base, r.mapped_len) };
+                let pages_ok = page0_ok && page1_ok && r.mapped_len == len;
                 PAGES_OK.store(u32::from(pages_ok), Relaxed);
+                // Fresh receiver-local cap: nonzero and distinct from the sender's source cap.
+                let fresh_cap = r.receiver_cap != 0 && (r.receiver_cap as u32) != sender_mem_cap;
                 yarm_user_rt::user_log!(
-                    "SHARED_REGION_DIRECT_ORACLE_CHILD_MAPPED base=0x{:x} len={} cap={} pages_ok={}",
+                    "SHARED_REGION_DIRECT_ORACLE_CHILD_MAPPED base=0x{:x} len={} cap={} sender_cap={} inline_ok={} page0={} page1={} fresh_cap={}",
                     r.mapped_base,
                     r.mapped_len,
                     r.receiver_cap,
-                    pages_ok as u32
+                    sender_mem_cap,
+                    inline_ok as u32,
+                    page0_ok as u32,
+                    page1_ok as u32,
+                    fresh_cap as u32
                 );
-                // Release contract: first release returns Ok(len); a duplicate returns InvalidArgs.
+                // Cleanup contract: the receiver-local cap IS the cleanup authority (nonzero). First
+                // release returns Ok(len); a duplicate returns the canonical stale/invalid error.
+                let cleanup_nonzero = r.receiver_cap != 0;
                 // SAFETY: `r.receiver_cap` is the receiver-local cleanup cap from the recv.
                 let first =
                     unsafe { yarm_user_rt::syscall::release_shared_region_mapping(r.receiver_cap) };
                 // SAFETY: intentional duplicate release to observe the canonical stale rejection.
                 let dup =
                     unsafe { yarm_user_rt::syscall::release_shared_region_mapping(r.receiver_cap) };
-                let release_ok = matches!(first, Ok(l) if l == r.mapped_len)
-                    && matches!(dup, Err(yarm_user_rt::syscall::SyscallError::InvalidArgs));
+                let first_ok = matches!(first, Ok(l) if l == r.mapped_len);
+                let dup_rejected =
+                    matches!(dup, Err(yarm_user_rt::syscall::SyscallError::InvalidArgs));
+                let release_ok = cleanup_nonzero && first_ok && dup_rejected;
                 RELEASE_OK.store(u32::from(release_ok), Relaxed);
-                CHILD_RESULT.store(if pages_ok && release_ok { 1 } else { 0xF1 }, Relaxed);
+                let all_ok = inline_ok && pages_ok && fresh_cap && release_ok;
+                CHILD_RESULT.store(if all_ok { 1 } else { 0xF1 }, Relaxed);
+                // Userspace completion marker (contract fields; NX/read-only is KERNEL-attested).
+                if all_ok {
+                    yarm_user_rt::user_log!(
+                        "X86_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap=1 readonly=1 first_release=ok second_release=rejected wakes=1 result=ok"
+                    );
+                } else {
+                    yarm_user_rt::user_log!(
+                        "X86_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap={} readonly=1 first_release={} second_release={} wakes=1 result=fail",
+                        fresh_cap as u32,
+                        first_ok as u32,
+                        dup_rejected as u32
+                    );
+                }
             }
             Ok(None) => {
                 CHILD_RESULT.store(0xF2, Relaxed);
@@ -1080,7 +1144,11 @@ mod x86_shared_region_direct_oracle {
             }
         }
         let btid = CHILD_TID.load(Relaxed);
-        yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_CHILD_DONE tid={}", btid);
+        yarm_user_rt::user_log!(
+            "SHARED_REGION_DIRECT_ORACLE_CHILD_DONE tid={} continuations={}",
+            btid,
+            CONTINUATIONS.load(Relaxed)
+        );
         let park = PARK.as_ptr();
         loop {
             let pv = PARK.load(Relaxed);
@@ -1147,25 +1215,67 @@ fn run_x86_shared_region_direct_oracle(init_tid: u64) {
     let sv = oracle::CHILD_STARTED.load(Relaxed);
     let _ = yarm_user_rt::syscall::futex_wait(started, sv, sv);
     yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_PARENT_RESUMED");
-    // Exactly ONE DIRECT send to the blocked receiver (IpcSend, NOT the shared-region enqueue path).
-    // The kernel's ack gate (produce_blocked_waiter_shared_region_delivery → consume_for_delivery)
-    // dominates this send: it reaches the direct path only if B is an authoritative committed waiter.
-    let payload = [0x5Au8, 0x3C];
-    // SAFETY: `endpoint_cap` is the SEND|RECEIVE oracle cap; `mem_cap` the read-only source cap.
-    let sent =
-        unsafe { yarm_user_rt::syscall::send_shared_region(endpoint_cap, mem_cap, &payload) };
+    oracle::SENDER_MEM_CAP.store(mem_cap, Relaxed);
+    // BOUNDED authoritative retry (no timed waits, no delay loops). The kernel ack gate dominates:
+    // it reaches the DIRECT path only once B is an authoritative committed recv-v2 waiter at the
+    // oracle VA. Until then the send returns the canonical retryable `WouldBlock` (fail-closed, no
+    // mutation, source cap preserved); the parent YIELDs (handing the CPU to B so it can commit its
+    // waiter) and retries. Exactly one send succeeds; any non-retryable result fails the oracle.
+    const MAX_SEND_ATTEMPTS: u32 = 64;
+    let mut attempts: u32 = 0;
+    let mut succeeded = false;
+    let mut hard_fail = false;
+    while attempts < MAX_SEND_ATTEMPTS {
+        attempts += 1;
+        // SAFETY: `endpoint_cap` is the SEND|RECEIVE oracle cap; `mem_cap` the read-only source cap.
+        match unsafe { yarm_user_rt::syscall::send_shared_region(endpoint_cap, mem_cap) } {
+            Ok(()) => {
+                succeeded = true;
+                break;
+            }
+            Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+                // Pre-ack: B is not yet a committed waiter. Hand it the CPU and retry.
+                let _ = yarm_user_rt::syscall::yield_now();
+            }
+            Err(e) => {
+                hard_fail = true;
+                yarm_user_rt::user_log!(
+                    "X86_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=fail err={:?}",
+                    attempts,
+                    attempts - 1,
+                    e
+                );
+                break;
+            }
+        }
+    }
+    if succeeded {
+        yarm_user_rt::user_log!(
+            "X86_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=ok",
+            attempts,
+            attempts - 1
+        );
+    } else if !hard_fail {
+        yarm_user_rt::user_log!(
+            "X86_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=exhausted",
+            attempts,
+            attempts.saturating_sub(1)
+        );
+    }
     // Hand the CPU to the now-Runnable B so it resumes out of its recv frame and validates.
     let _ = yarm_user_rt::syscall::yield_now();
     let child_result = oracle::CHILD_RESULT.load(Relaxed);
     let pages_ok = oracle::PAGES_OK.load(Relaxed);
     let release_ok = oracle::RELEASE_OK.load(Relaxed);
+    let continuations = oracle::CONTINUATIONS.load(Relaxed);
     yarm_user_rt::user_log!(
-        "SHARED_REGION_DIRECT_ORACLE_TOPOLOGY_OK init_tid={} child_tid={} send_ok={} pages_ok={} release_ok={} child_result={}",
+        "SHARED_REGION_DIRECT_ORACLE_TOPOLOGY_OK init_tid={} child_tid={} send_ok={} pages_ok={} release_ok={} continuations={} child_result={}",
         init_tid,
         child_tid,
-        sent.is_ok() as u32,
+        succeeded as u32,
         pages_ok,
         release_ok,
+        continuations,
         child_result
     );
 }

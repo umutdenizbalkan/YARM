@@ -3388,21 +3388,28 @@ pub mod shared_region_blocked_recv {
             .is_ok()
     }
 
-    /// Send-side authoritative gate for the DIRECT blocked-recv delivery: consume the ack exactly
-    /// once iff a committed, unconsumed, recv-v2, oracle-VA ack exists for THIS receiver + endpoint.
-    /// A wrong receiver, wrong endpoint, non-oracle VA, plain (non-v2) waiter, absent ack, or an
-    /// already-consumed (duplicate) ack all return `false`, so the direct path declines and no
-    /// duplicate send can re-satisfy the gate.
-    pub(crate) fn consume_for_delivery(receiver_tid: u64, endpoint_idx: usize) -> bool {
-        let matches_now = matches!(
+    /// Non-consuming send-side match: a committed, unconsumed, recv-v2, oracle-VA ack exists for THIS
+    /// receiver + endpoint. Used to DECIDE the direct path (and, on no-match, fail closed) WITHOUT
+    /// consuming the ack — so a pre-publication failure leaves the ack available for a retry.
+    pub(crate) fn matches_for_delivery(receiver_tid: u64, endpoint_idx: usize) -> bool {
+        matches!(
             snapshot(),
             Some(a) if !CONSUMED.load(Ordering::Acquire)
                 && a.recv_v2
                 && a.receiver_tid == receiver_tid
                 && a.endpoint_idx == endpoint_idx
                 && a.payload_va == super::SHARED_REGION_ORACLE_USER_VA
-        );
-        if !matches_now {
+        )
+    }
+
+    /// Send-side authoritative gate for the DIRECT blocked-recv delivery: consume the ack exactly
+    /// once iff a committed, unconsumed, recv-v2, oracle-VA ack exists for THIS receiver + endpoint.
+    /// A wrong receiver, wrong endpoint, non-oracle VA, plain (non-v2) waiter, absent ack, or an
+    /// already-consumed (duplicate) ack all return `false`, so the direct path declines and no
+    /// duplicate send can re-satisfy the gate. Called ONLY after the post-work item is published, so
+    /// the consume is the atomic commit of a successful delivery (never a pre-publication loss).
+    pub(crate) fn consume_for_delivery(receiver_tid: u64, endpoint_idx: usize) -> bool {
+        if !matches_for_delivery(receiver_tid, endpoint_idx) {
             return false;
         }
         CONSUMED

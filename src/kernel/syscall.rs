@@ -947,26 +947,30 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
     let Some(cpu_idx) = shared_region_live_eligible(kernel, msg) else {
         return Ok(false);
     };
-    // Stage 198E3C1B-H: AUTHORITATIVE blocked-recv ack gate. The DIRECT delivery to this waiter is
-    // structurally dominated by the acknowledgement the RECEIVER's own recv path published AFTER its
-    // blocked-recv record was fully committed (endpoint waiter linked + task Blocked + BlockedRecvState
-    // payload/meta stored). Consume it exactly once for THIS receiver + endpoint: an absent, stale,
-    // wrong-receiver/endpoint/VA, or already-consumed (duplicate send) ack declines the direct path
-    // (falls back to the legacy delivery). Oracle-only (feature + knob gated); a strict no-op
-    // otherwise, so production shared-region delivery is byte-identical.
+    // Stage 198E3C1C: AUTHORITATIVE blocked-recv ack gate — FAIL CLOSED before any mutation. The
+    // DIRECT delivery is dominated by the acknowledgement the RECEIVER's recv path published AFTER
+    // its blocked-recv record was fully committed. When the oracle is armed and NO matching,
+    // unconsumed ack exists for THIS receiver + endpoint (a too-early send, wrong identity, or a
+    // duplicate whose ack was already consumed), return the canonical retryable `WouldBlock`: the
+    // caller does NOT run the legacy delivery, takes NO blocked state, mints/maps/pins nothing,
+    // queues no message, wakes no one, and the source cap + transfer envelope are preserved (the
+    // outer send path releases the envelope on WouldBlock; the parent re-stashes it on retry). The
+    // ack is checked NON-destructively here and only CONSUMED after the post-work is published
+    // below, so a pre-publication failure never permanently consumes it. Oracle-only (feature + knob
+    // gated); off the oracle this is a strict no-op and production delivery is byte-identical.
     #[cfg(feature = "x86-shared-region-direct-oracle")]
     if crate::kernel::boot::x86_shared_region_direct_oracle_enabled()
-        && !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(
+        && !crate::kernel::boot::shared_region_blocked_recv::matches_for_delivery(
             waiter_tid,
             endpoint_idx,
         )
     {
         crate::yarm_log!(
-            "SHARED_REGION_DIRECT_DECLINE_NO_ACK tid={} endpoint={}",
+            "SHARED_REGION_DIRECT_DECLINE_NO_ACK tid={} endpoint={} result=retry",
             waiter_tid,
             endpoint_idx
         );
-        return Ok(false);
+        return Err(SyscallError::WouldBlock);
     }
     // Phase A.1 — consume blocked state and resolve the endpoint the envelope is bound to.
     let blocked_state = kernel
@@ -1004,6 +1008,24 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
         endpoint_idx,
         crate::kernel::boot::SharedRegionLiveOrigin::Direct,
     );
+    // Stage 198E3C1C: the post-work item is now published (the delivery is committed to the drain).
+    // CONSUME the authoritative ack exactly once — this is the atomic commit point, so a duplicate
+    // send (a second attempt after success) finds the ack consumed and fails closed above, and no
+    // pre-publication failure could have consumed it. The oracle waiter is unique per boot, so the
+    // consume always succeeds here; a false result would indicate a stale/raced ack (logged).
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    if crate::kernel::boot::x86_shared_region_direct_oracle_enabled()
+        && !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(
+            waiter_tid,
+            endpoint_idx,
+        )
+    {
+        crate::yarm_log!(
+            "SHARED_REGION_DIRECT_ACK_CONSUME_RACE tid={} endpoint={}",
+            waiter_tid,
+            endpoint_idx
+        );
+    }
     crate::yarm_log!(
         "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_shared_region waiter_tid={}",
         waiter_tid

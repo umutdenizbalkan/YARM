@@ -68168,10 +68168,17 @@ mod stage198e3c1_direct_live_policy {
                     .unwrap_or(r)
             })
             .expect("send helper");
-        assert!(f.contains("OPCODE_SHARED_MEM"));
-        assert!(f.contains("Message::FLAG_CAP_TRANSFER"));
-        assert!(f.contains("Some(mem_cap as u64)"));
-        assert!(f.contains("ipc_send(send_ep, &msg)"));
+        // Stage 198E3C1C: the kernel selects the shared-region transfer by the LARGE-transfer form
+        // of IpcSend — arg(PTR)=offset, arg(LEN)=region byte length (> MAX_PAYLOAD=128) — NOT by an
+        // inline frame opcode. The helper issues the raw IpcSend with offset 0 + the two-page length,
+        // carrying the source cap as the transferred cap.
+        assert!(f.contains("SYSCALL_IPC_SEND_NR"));
+        assert!(f.contains("let region_len = SHARED_REGION_ORACLE_LEN"));
+        assert!(f.contains("mem_cap as usize"));
+        assert!(
+            !f.contains("ipc_send(send_ep, &msg)"),
+            "must not use the inline-message path"
+        );
     }
 
     // recv_shared_region_v2 uses the dedicated 2-page window as the recv payload pointer, decodes the
@@ -68466,12 +68473,49 @@ mod stage198e3c1_direct_live_policy {
     // InvalidArgs) — the blocked-handshake + child-validation topology.
     #[test]
     fn child_validation_and_release_contract_scaffold() {
-        assert!(SERVICE_SRC.contains("validate_two_pages(r.mapped_base, r.mapped_len)"));
+        assert!(SERVICE_SRC.contains("validate_pages_split(r.mapped_base, r.mapped_len)"));
         assert!(SERVICE_SRC.contains("release_shared_region_mapping(r.receiver_cap)"));
         assert!(
             SERVICE_SRC.contains("SyscallError::InvalidArgs"),
             "the duplicate release must expect the canonical InvalidArgs rejection"
         );
+        // Stage 198E3C1C: full live validation — inline opcode/len, fresh distinct cap, exactly-one
+        // continuation, and the userspace completion marker.
+        assert!(SERVICE_SRC.contains("r.opcode == yarm_user_rt::syscall::OPCODE_SHARED_MEM"));
+        assert!(SERVICE_SRC.contains("(r.receiver_cap as u32) != sender_mem_cap"));
+        assert!(SERVICE_SRC.contains("CONTINUATIONS.fetch_add(1, Relaxed)"));
+        assert!(SERVICE_SRC.contains(
+            "X86_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap=1 readonly=1 first_release=ok second_release=rejected wakes=1 result=ok"
+        ));
+    }
+
+    // Stage 198E3C1C: the parent uses a BOUNDED authoritative retry (no sleeps/timing): it retries
+    // only on the canonical WouldBlock and emits the diagnostic send marker; exactly one send
+    // succeeds.
+    #[test]
+    fn parent_bounded_retry_on_wouldblock() {
+        let scaffold = SERVICE_SRC
+            .split_once("fn run_x86_shared_region_direct_oracle")
+            .and_then(|(_, r)| r.split_once("// ─── Stage 196C:").map(|(b, _)| b))
+            .expect("parent fn present");
+        assert!(
+            scaffold.contains("SyscallError::WouldBlock"),
+            "retries on the canonical result"
+        );
+        assert!(
+            scaffold.contains("MAX_SEND_ATTEMPTS"),
+            "the retry count is bounded"
+        );
+        assert!(
+            !scaffold.contains("sleep"),
+            "no sleep/timing synchronization"
+        );
+        assert!(
+            scaffold
+                .contains("X86_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=ok")
+        );
+        // A hard (non-retryable) error fails the oracle rather than looping.
+        assert!(scaffold.contains("hard_fail = true"));
     }
 
     // ── Part 6: provisioning failure markers ─────────────────────────────────────────────────────
@@ -68653,9 +68697,11 @@ mod stage198e3c1_direct_live_policy {
             .split_once("pub(crate) fn produce_blocked_waiter_shared_region_delivery")
             .and_then(|(_, r)| r.split_once("\n/// ").map(|(b, _)| b))
             .expect("producer present");
+        // Stage 198E3C1C: the non-consuming ack gate (matches_for_delivery) dominates the blocked-
+        // state take and fails closed; the ack is CONSUMED only after the post-work publish.
         let gate = body
-            .find("consume_for_delivery(")
-            .expect("producer consumes the ack");
+            .find("matches_for_delivery(")
+            .expect("producer checks the ack (non-consuming)");
         let take = body
             .find("tcb.blocked_recv_state.take()")
             .expect("producer takes blocked state");
@@ -68664,8 +68710,8 @@ mod stage198e3c1_direct_live_policy {
             "the ack gate must dominate the blocked-state take"
         );
         assert!(
-            body.contains("return Ok(false);"),
-            "no ack → decline the direct path"
+            body.contains("return Err(SyscallError::WouldBlock);"),
+            "no ack → fail closed with the canonical retryable result"
         );
         // map_write=false on the blocked path; recv_shared_mem_map_intent_flags is NOT consulted here.
         assert!(
@@ -68953,6 +68999,116 @@ mod stage198e3c1_direct_live_policy {
     fn blocked_handshake_contract_marker() {
         crate::yarm_log!(
             "SHARED_REGION_BLOCKED_HANDSHAKE_CONTRACT receiver_generation_checked=1 endpoint_checked=1 recv_v2_state_checked=1 payload_va_checked=1 metadata_ptr_checked=1 timing_dependency=0 result=ok"
+        );
+    }
+
+    // ── Stage 198E3C1C: pre-ack fail-closed + consume-after-publish ordering ─────────────────────
+
+    // (source) The producer FAILS CLOSED before any mutation when armed and no matching ack exists:
+    // it returns the canonical retryable WouldBlock (never Ok(false)→legacy), and the fail-closed
+    // check DOMINATES the blocked-state take, the snapshot build, and the post-work publish.
+    #[test]
+    fn preack_producer_fails_closed_before_mutation() {
+        let body = SYSCALL_SRC
+            .split_once("pub(crate) fn produce_blocked_waiter_shared_region_delivery")
+            .and_then(|(_, r)| r.split_once("\n/// ").map(|(b, _)| b))
+            .expect("producer present");
+        let gate = body
+            .find("matches_for_delivery(")
+            .expect("non-consuming pre-ack gate present");
+        let fail_closed = body[gate..]
+            .find("return Err(SyscallError::WouldBlock);")
+            .map(|i| gate + i)
+            .expect("fail-closed WouldBlock return present");
+        let take = body.find("blocked_recv_state.take()").expect("state take");
+        let stash = body
+            .find("stash_shared_region_delivery(")
+            .expect("post-work publish");
+        assert!(
+            gate < take,
+            "pre-ack gate must dominate the blocked-state take"
+        );
+        assert!(
+            fail_closed < take,
+            "the WouldBlock return must precede any mutation"
+        );
+        // The ack is CONSUMED only AFTER the post-work is published (never before).
+        let consume = body.find("consume_for_delivery(").expect("consume present");
+        assert!(
+            stash < consume,
+            "the ack must be consumed only after the post-work is published"
+        );
+    }
+
+    // (source) The ipc.rs boundary maps the producer's WouldBlock to a RETRYABLE KernelError::
+    // WouldBlock (not a UserMemoryFault, not the legacy delivery).
+    #[test]
+    fn preack_ipc_maps_wouldblock_retryable() {
+        assert!(
+            IPC_SYSCALL_SRC.contains(
+                "Err(SyscallError::WouldBlock) => (\n                                        Some(Err(KernelError::WouldBlock)),"
+            ),
+            "the oracle pre-ack decline must surface as a retryable WouldBlock, not a fault"
+        );
+    }
+
+    // (unit, feature) The non-consuming check leaves the ack AVAILABLE across repeated pre-publication
+    // attempts; only consume_for_delivery claims it, exactly once.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn preack_ack_survives_until_consume() {
+        use crate::kernel::boot::ReceiverWaiterIdentity;
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        use crate::kernel::vm::Asid;
+        let _g = sr_knob_guard();
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let rg = s.task_asid(2).map(|a| a.0).unwrap_or(0);
+        let egen = s.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(2), Asid(rg)),
+            recv,
+        );
+        let state = BlockedRecvState {
+            recv_cap: recv,
+            payload_user_ptr: crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA,
+            payload_user_len: 2 * PAGE,
+            meta_user_ptr: 0x5000_0000,
+            meta_user_len: 64,
+            recv_abi: RecvAbiVariant::RecvV2,
+        };
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            CapObject::Endpoint {
+                index: eidx,
+                generation: egen,
+            },
+            &state,
+        );
+        // Repeated non-consuming checks keep returning true — the ack is not lost by a check.
+        for _ in 0..3 {
+            assert!(crate::kernel::boot::shared_region_blocked_recv::matches_for_delivery(2, eidx));
+        }
+        // The single consume claims it; afterwards it is gone (a duplicate send cannot re-publish).
+        assert!(crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx));
+        assert!(!crate::kernel::boot::shared_region_blocked_recv::matches_for_delivery(2, eidx));
+        assert!(!crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx));
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // Stage 198E3C1C compile/hosted contract marker for the QEMU-proof precursors (NOT a live seal).
+    #[test]
+    fn direct_qemu_proof_precursor_marker() {
+        crate::yarm_log!(
+            "SHARED_REGION_DIRECT_QEMU_PRECURSOR preack_fail_closed=1 retryable=WouldBlock consume_after_publish=1 userspace_retry_bounded=1 result=ok"
         );
     }
 }

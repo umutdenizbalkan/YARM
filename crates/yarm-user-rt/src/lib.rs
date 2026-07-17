@@ -497,21 +497,32 @@ pub mod syscall {
     pub unsafe fn send_shared_region(
         send_ep: u32,
         mem_cap: u32,
-        payload: &[u8],
     ) -> core::result::Result<(), SyscallError> {
         if mem_cap == 0 {
             return Err(SyscallError::InvalidArgs);
         }
-        let msg = Message::with_header(
-            0,
-            OPCODE_SHARED_MEM,
-            Message::FLAG_CAP_TRANSFER,
-            Some(mem_cap as u64),
-            payload,
-        )
-        .map_err(|_| SyscallError::InvalidArgs)?;
-        // Exactly one transfer; ipc_send surfaces the canonical kernel error unchanged.
-        unsafe { ipc_send(send_ep, &msg) }
+        // The kernel selects the shared-region transfer (`OPCODE_SHARED_MEM`, region descriptor
+        // payload) by the LARGE-transfer form of `IpcSend`: `arg(PTR)` is the OFFSET into the source
+        // object and `arg(LEN)` is the region byte length (which must exceed `Message::MAX_PAYLOAD`
+        // = 128, so it is not mistaken for an ordinary inline cap transfer). It is NOT selected by an
+        // inline frame opcode. We transfer the whole two-page oracle region at offset 0. The kernel
+        // stashes the transfer envelope, builds the `OPCODE_SHARED_MEM` message, and (for a blocked
+        // recv-v2 waiter) delivers it directly. The source cap is preserved. Surfaces the canonical
+        // `SyscallError` unchanged (`WouldBlock` on the pre-ack retry path).
+        let offset = 0usize;
+        let region_len = SHARED_REGION_ORACLE_LEN; // 2 * PAGE_SIZE = 8192 > 128
+        let args = [send_ep as usize, offset, region_len, 0, 0, mem_cap as usize];
+        // SAFETY: architecture syscall ABI entry; the transferred cap authorizes the region.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_SEND_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
     }
 
     /// Stage 198E3C1: recv-v2 shared-region receive with a DEDICATED page-aligned two-page destination
