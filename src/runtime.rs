@@ -1757,7 +1757,6 @@ impl SharedKernel {
             _ => "direct",
         };
         let waiter_tid = snap.snapshot.receiver_tid;
-        let arch = crate::kernel::boot::current_arch_tag();
         crate::yarm_log!(
             "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_shared_region waiter_tid={}",
             waiter_tid
@@ -1775,51 +1774,16 @@ impl SharedKernel {
             Ok(publish) => {
                 // Origin-gated shared-region attestations + retirement — emitted ONLY here, after the
                 // transaction finalized, the waiter state cleared, and the receiver enqueued once.
-                let object_match = u8::from(matches!(
-                    snap.snapshot.object,
-                    crate::kernel::capabilities::CapObject::MemoryObject { .. }
-                        | crate::kernel::capabilities::CapObject::DmaRegion { .. }
-                ));
-                crate::yarm_log!(
-                    "IPCSEND_SHARED_REGION_OBJECT_OK arch={} class={} object_match={} fresh_cap=1 pin_transfer=1",
-                    arch,
+                // The marker LITERALS live entirely inside the cfg-gated helper, so a NORMAL build
+                // (feature off) contains none of the `IPCSEND_SHARED_REGION_*` / `class=IpcSend
+                // SharedRegionDirect` strings. `class` is consumed by the helper (arch is fixed
+                // x86_64 there, the only architecture the feature compiles for).
+                crate::kernel::boot::maybe_emit_shared_region_direct_live_markers(
                     class,
-                    object_match
+                    &snap.snapshot,
+                    publish.woke_receiver,
+                    origin,
                 );
-                let map_right = u8::from(
-                    snap.snapshot
-                        .rights
-                        .contains(crate::kernel::capabilities::CapRights::MAP),
-                );
-                let write_ok = u8::from(
-                    !snap.snapshot.map_write
-                        || snap
-                            .snapshot
-                            .rights
-                            .contains(crate::kernel::capabilities::CapRights::WRITE),
-                );
-                crate::yarm_log!(
-                    "IPCSEND_SHARED_REGION_MAP_OK arch={} class={} map_right={} write_right_ok={} nx=1 cleanup_token=1",
-                    arch,
-                    class,
-                    map_right,
-                    write_ok
-                );
-                crate::yarm_log!(
-                    "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch={} class={} transaction_published=1 receiver_wakes={} leaked_state=0",
-                    arch,
-                    class,
-                    u8::from(publish.woke_receiver)
-                );
-                match origin {
-                    Some(SharedRegionLiveOrigin::Direct) => {
-                        crate::kernel::boot::maybe_log_ipc_send_shared_region_direct_retired();
-                    }
-                    Some(SharedRegionLiveOrigin::Enqueue) => {
-                        crate::kernel::boot::maybe_log_ipc_send_shared_region_enqueue_retired();
-                    }
-                    None => {}
-                }
                 crate::yarm_log!(
                     "DISPATCH_POST_WORK_DONE kind=blocked_waiter_shared_region result=ok"
                 );

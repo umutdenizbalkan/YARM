@@ -67203,28 +67203,29 @@ mod stage198e3b2b_drain_switch {
             .split_once("fn execute_blocked_waiter_shared_region_delivery")
             .map(|(_, r)| r.split_once("/// Stage 188D").map(|(b, _)| b).unwrap_or(r))
             .expect("drain");
-        // The retirement + attestation markers live AFTER the run's Ok(...) and BEFORE the Err arm.
+        // Stage 198E3C1: the attestation + retirement marker LITERALS moved into the cfg-gated
+        // `maybe_emit_shared_region_direct_live_markers` helper (so a normal build stays marker-clean);
+        // the drain's success arm calls it exactly once, AFTER the run's Ok(...) and BEFORE the Err arm.
         let ok_arm = drain_fn
             .split_once("Ok(publish) => {")
             .map(|(_, r)| r.split_once("Err(e) => {").map(|(b, _)| b).unwrap_or(r))
             .expect("ok arm");
-        for m in [
-            "IPCSEND_SHARED_REGION_LIFECYCLE_OK",
-            "maybe_log_ipc_send_shared_region_direct_retired",
-            "maybe_log_ipc_send_shared_region_enqueue_retired",
-        ] {
-            assert!(
-                ok_arm.contains(m),
-                "success-only marker `{m}` must be in the Ok arm"
-            );
-        }
+        assert!(
+            ok_arm.contains("maybe_emit_shared_region_direct_live_markers"),
+            "the success arm must emit the origin-gated live markers through the cfg-gated helper"
+        );
+        // The raw marker literals must NOT be inline in the drain (they live in the gated helper).
+        assert!(
+            !ok_arm.contains("IPCSEND_SHARED_REGION_OBJECT_OK"),
+            "attestation literals must not be inline in the drain (moved to the cfg-gated helper)"
+        );
         let err_arm = drain_fn
             .split_once("Err(e) => {")
             .map(|(_, r)| r)
             .expect("err arm");
         assert!(
             !err_arm.contains("IPCSEND_SHARED_REGION")
-                && !err_arm.contains("maybe_log_ipc_send_shared_region"),
+                && !err_arm.contains("maybe_emit_shared_region"),
             "no shared-region attestation/retirement marker from the rolled-back (Err) arm"
         );
         // Producers dormant: off the knob the direct producer declines (legacy path).
@@ -67953,6 +67954,115 @@ mod stage198e3b2b2_waiter_identity {
         assert!(
             IPC_SRC.contains("endpoint_waiter_identity(endpoint_idx) != Some(expected_receiver)"),
             "the plain-send re-verify must compare the full identity"
+        );
+    }
+}
+
+// Stage 198E3C1 — x86_64 DIRECT shared-region live-oracle build/marker POLICY (hosted contract).
+//
+// The direct shared-region live markers (attestations + `IpcSendSharedRegionDirect` retirement) are
+// compiled ONLY for the explicitly-armed x86_64 oracle build (`feature = "x86-shared-region-direct-
+// oracle"`), and even then the runtime selector `yarm.x86_64_shared_region_direct_oracle=1` is still
+// required to execute the oracle. So a normal artifact — and every non-x86 artifact — is
+// marker-clean, the queued class stays forbidden, and the compile-time feature alone activates no
+// runtime behavior. These source/build-contract tests lock that policy in.
+mod stage198e3c1_direct_live_policy {
+    use super::*;
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RT_SRC: &str = include_str!("../../runtime.rs");
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+
+    // (1) The runtime selector defaults off.
+    #[test]
+    fn selector_defaults_off() {
+        assert!(!crate::kernel::boot::x86_shared_region_direct_oracle_enabled());
+    }
+
+    // (2) The selector parses x86-specifically (the cmdline key is `yarm.x86_64_...`) and (3) the
+    // feature alone does not runtime-arm: the mod.rs setter arms the shared oracle-proof knob, but the
+    // marker path stays behind BOTH the cfg feature and the runtime knob.
+    #[test]
+    fn selector_x86_specific_and_feature_alone_does_not_arm() {
+        assert!(CMDLINE_SRC.contains("yarm.x86_64_shared_region_direct_oracle"));
+        assert!(
+            CMDLINE_SRC.contains("options.x86_64_shared_region_direct_oracle = parse_bool_knob")
+        );
+        // The Cargo feature exists and is NOT in the default set (default = ["hosted-dev"]).
+        assert!(CARGO_SRC.contains("x86-shared-region-direct-oracle = []"));
+        assert!(CARGO_SRC.contains("default = [\"hosted-dev\"]"));
+        // The runtime setter arms the shared proof knob (so the already-wired producer goes live),
+        // proving the runtime selector — not the compile-time feature — is what activates behavior.
+        assert!(
+            MOD_SRC.contains("fn set_x86_shared_region_direct_oracle_enabled")
+                && MOD_SRC.contains("set_ipc_recv_oracle_proof_enabled(true)"),
+            "the runtime selector setter must arm the shared oracle-proof knob"
+        );
+    }
+
+    // (4/5) Normal build is marker-clean: every shared-region marker literal in mod.rs lives inside a
+    // `#[cfg(all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\"))]` block, and
+    // the drain in runtime.rs holds NO inline marker literal (they moved to the gated helper).
+    #[test]
+    fn normal_build_is_marker_clean() {
+        // The gated marker helper carries the attestation literals.
+        let gated = MOD_SRC
+            .split_once("fn maybe_emit_shared_region_direct_live_markers")
+            .map(|(_, r)| r)
+            .expect("gated helper present");
+        assert!(gated.contains("IPCSEND_SHARED_REGION_OBJECT_OK"));
+        // Every attestation/retirement literal in mod.rs is preceded by the feature+x86 cfg.
+        assert!(
+            MOD_SRC.contains(
+                "#[cfg(all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\"))]"
+            ),
+            "the direct marker paths must be gated on the armed x86_64 oracle feature"
+        );
+        // The drain's success arm delegates to the gated helper and holds no inline literal.
+        assert!(RT_SRC.contains("maybe_emit_shared_region_direct_live_markers("));
+        assert!(
+            !RT_SRC.contains("IPCSEND_SHARED_REGION_OBJECT_OK"),
+            "runtime drain must not inline shared-region marker literals"
+        );
+    }
+
+    // (6) The artifact guard permits the DIRECT class only under the armed x86 build env flag, and
+    // (7) the ENQUEUE class is forbidden in EVERY build.
+    #[test]
+    fn artifact_guard_direct_only_enqueue_forbidden() {
+        assert!(
+            GUARD_SRC.contains("class=IpcSendSharedRegionEnqueue"),
+            "the guard must forbid the shared-region ENQUEUE class in every build"
+        );
+        assert!(
+            GUARD_SRC.contains("YARM_SHARED_REGION_DIRECT_ORACLE_BUILD")
+                && GUARD_SRC.contains("forbidden+=(\"class=IpcSendSharedRegion\")"),
+            "the guard must forbid the bare shared-region class except in the armed x86 oracle build"
+        );
+    }
+
+    // (8) The non-x86 marker path is absent: no shared-region marker literal is compiled for AArch64
+    // or RISC-V (the gate requires target_arch = x86_64), and mod.rs no longer emits per-arch direct
+    // literals for aarch64/riscv64.
+    #[test]
+    fn non_x86_marker_path_absent() {
+        assert!(
+            !MOD_SRC.contains("class=IpcSendSharedRegionDirect result=ok\"\n            );\n        }\n        #[cfg(target_arch = \"riscv64\")]"),
+            "no per-arch riscv64 direct retirement literal may remain"
+        );
+        assert!(
+            !MOD_SRC.contains("arch=aarch64 class=IpcSendSharedRegionDirect"),
+            "no AArch64 direct shared-region retirement literal may be compiled"
+        );
+        assert!(
+            !MOD_SRC.contains("arch=riscv64 class=IpcSendSharedRegionDirect"),
+            "no RISC-V direct shared-region retirement literal may be compiled"
+        );
+        // And the enqueue class literal is gone entirely (never compiled anywhere).
+        assert!(
+            !MOD_SRC.contains("class=IpcSendSharedRegionEnqueue"),
+            "no shared-region ENQUEUE retirement literal may be compiled"
         );
     }
 }

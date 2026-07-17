@@ -1614,13 +1614,18 @@ pub(crate) fn reset_shared_region_cancel_fuse_log() {
     SHARED_REGION_CANCEL_FUSE_LOGGED.store(false, core::sync::atomic::Ordering::Release);
 }
 
-/// Stage 198E3: one-shot latch for the IpcSendSharedRegionDirect retirement markers.
+/// Stage 198E3C1: one-shot latch for the `IpcSendSharedRegionDirect` retirement markers. Compiled
+/// ONLY for the explicitly-armed x86_64 live-oracle build (`feature = "x86-shared-region-direct-
+/// oracle"`); a normal artifact and every non-x86 artifact contain none of these literals.
+#[cfg(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"))]
 static IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Stage 198E3: emit the IpcSendSharedRegionDirect retirement markers exactly once (first direct
-/// shared-region delivery completed through the out-of-broad-lock post-lock transaction). Arch is
-/// selected here by `cfg` (the drain executor is arch-neutral, reached from all three drains).
+/// Stage 198E3C1: emit the `IpcSendSharedRegionDirect` retirement markers exactly once — only from
+/// the x86_64 armed-oracle build, only after a real off-lock direct completion (called solely by the
+/// gated live-marker helper). The queued class and all non-x86 architectures never compile a
+/// shared-region retirement literal.
+#[cfg(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"))]
 pub(crate) fn maybe_log_ipc_send_shared_region_direct_retired() {
     if IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED
         .compare_exchange(
@@ -1631,80 +1636,66 @@ pub(crate) fn maybe_log_ipc_send_shared_region_direct_retired() {
         )
         .is_ok()
     {
-        #[cfg(target_arch = "aarch64")]
-        {
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendSharedRegionDirect"
-            );
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendSharedRegionDirect result=ok"
-            );
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendSharedRegionDirect"
-            );
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendSharedRegionDirect result=ok"
-            );
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendSharedRegionDirect"
-            );
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendSharedRegionDirect result=ok"
-            );
-        }
+        crate::yarm_log!(
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendSharedRegionDirect"
+        );
+        crate::yarm_log!(
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendSharedRegionDirect result=ok"
+        );
     }
 }
 
-/// Stage 198E3: one-shot latch for the IpcSendSharedRegionEnqueue retirement markers.
-static IPC_SEND_SHARED_REGION_ENQUEUE_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-/// Stage 198E3: emit the IpcSendSharedRegionEnqueue retirement markers exactly once (first queued
-/// shared-region delivery completed through the out-of-broad-lock post-lock transaction).
-pub(crate) fn maybe_log_ipc_send_shared_region_enqueue_retired() {
-    if IPC_SEND_SHARED_REGION_ENQUEUE_RETIRE_LOGGED
-        .compare_exchange(
-            false,
-            true,
-            core::sync::atomic::Ordering::AcqRel,
-            core::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
-    {
-        #[cfg(target_arch = "aarch64")]
-        {
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendSharedRegionEnqueue"
-            );
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendSharedRegionEnqueue result=ok"
-            );
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendSharedRegionEnqueue"
-            );
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendSharedRegionEnqueue result=ok"
-            );
-        }
-        #[cfg(target_arch = "riscv64")]
-        {
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendSharedRegionEnqueue"
-            );
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendSharedRegionEnqueue result=ok"
-            );
-        }
+/// Stage 198E3C1: origin-gated shared-region LIVE markers (attestations + retirement), emitted ONLY
+/// from the drain's success arm AFTER the transaction finalized, the waiter was cleared, and the
+/// receiver enqueued exactly once. Every marker LITERAL is confined here and gated on the x86_64
+/// armed-oracle build, so a NORMAL artifact — and every non-x86 artifact — is marker-clean. Only the
+/// DIRECT class emits (the queued class is forbidden this stage); a non-Direct origin is a no-op.
+#[cfg(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"))]
+pub(crate) fn maybe_emit_shared_region_direct_live_markers(
+    class: &str,
+    snapshot: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    woke_receiver: bool,
+    origin: Option<SharedRegionLiveOrigin>,
+) {
+    use crate::kernel::capabilities::{CapObject, CapRights};
+    if !matches!(origin, Some(SharedRegionLiveOrigin::Direct)) {
+        return;
     }
+    let object_match = u8::from(matches!(
+        snapshot.object,
+        CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. }
+    ));
+    crate::yarm_log!(
+        "IPCSEND_SHARED_REGION_OBJECT_OK arch=x86_64 class={} object_match={} fresh_cap=1 pin_transfer=1",
+        class,
+        object_match
+    );
+    let map_right = u8::from(snapshot.rights.contains(CapRights::MAP));
+    let write_ok = u8::from(!snapshot.map_write || snapshot.rights.contains(CapRights::WRITE));
+    crate::yarm_log!(
+        "IPCSEND_SHARED_REGION_MAP_OK arch=x86_64 class={} map_right={} write_right_ok={} nx=1 cleanup_token=1",
+        class,
+        map_right,
+        write_ok
+    );
+    crate::yarm_log!(
+        "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch=x86_64 class={} transaction_published=1 receiver_wakes={} leaked_state=0",
+        class,
+        u8::from(woke_receiver)
+    );
+    maybe_log_ipc_send_shared_region_direct_retired();
+}
+
+/// Stage 198E3C1: marker-clean stub for every NON-armed build (all normal artifacts + all non-x86
+/// architectures). It contains no marker literal, so a normal artifact stays clean and no
+/// shared-region retirement/attestation literal is ever compiled into an AArch64/RISC-V binary.
+#[cfg(not(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64")))]
+pub(crate) fn maybe_emit_shared_region_direct_live_markers(
+    _class: &str,
+    _snapshot: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    _woke_receiver: bool,
+    _origin: Option<SharedRegionLiveOrigin>,
+) {
 }
 
 /// Stage 193A: one-shot latch for the IpcSendPlain boundary retirement markers.

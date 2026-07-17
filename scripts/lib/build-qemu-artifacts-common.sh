@@ -68,9 +68,25 @@ common_verify_kernel_markers() {
   local forbidden=(
     "GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok"
     "class=IpcSendReplyCapEnqueue"
-    "class=IpcSendSharedRegion"
+    # The shared-region ENQUEUE class is forbidden in EVERY build (never enabled).
+    "class=IpcSendSharedRegionEnqueue"
     "InitramfsReadChunk"
   )
+  # Stage 198E3C1: the shared-region DIRECT retirement literal is permitted ONLY in the explicitly
+  # armed x86_64 live-oracle build (the smoke runner sets YARM_SHARED_REGION_DIRECT_ORACLE_BUILD=1
+  # and builds with `--features x86-shared-region-direct-oracle` on x86_64). In EVERY other build —
+  # all normal artifacts and every AArch64/RISC-V artifact — `class=IpcSendSharedRegion` (which also
+  # catches the Direct suffix) stays forbidden, so a normal/non-x86 artifact is marker-clean.
+  if [[ "${YARM_SHARED_REGION_DIRECT_ORACLE_BUILD:-0}" == "1" && "$arch" == "x86_64" ]]; then
+    # Armed x86 oracle build: still forbid a BARE Direct retirement without the arch tag (a stale/
+    # cross-arch fingerprint) and any non-x86 shared-region marker, but allow the arch-tagged Direct.
+    forbidden+=(
+      "arch=aarch64 class=IpcSendSharedRegion"
+      "arch=riscv64 class=IpcSendSharedRegion"
+    )
+  else
+    forbidden+=("class=IpcSendSharedRegion")
+  fi
   for m in "${required[@]}"; do
     if ! grep -qa -F -- "$m" "$kernel"; then
       echo "[error][integrity] required marker ABSENT from kernel ($arch): '$m'"
