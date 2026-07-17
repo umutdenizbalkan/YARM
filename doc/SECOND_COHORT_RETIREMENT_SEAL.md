@@ -147,3 +147,55 @@ Excluded (would wrongly make 21): `IpcSendSharedRegionEnqueue` (3 cells) — uns
 The supported-cell count is therefore **18, not 21**. Stage 198F's combined seal aggregates
 these 18 second-cohort cells (alongside the 12 first-cohort cells) and must never count the
 shared-region enqueue class.
+
+## 12. Stage 198F — complete 30-cell cross-architecture retirement seal
+
+1. **Exact commit tested:** the Stage 198F seal commit (this document's head). The combined runner
+   (`scripts/qemu-combined-retirement-seal.sh`) refuses to seal on a dirty tree, records
+   `git rev-parse HEAD`, builds every artifact fresh from that HEAD, and rejects any artifact that
+   predates the run or any subordinate seal not present in the current-run log dir.
+
+2. **First cohort — 12 cells** (4 classes × 3 arches): `DebugLog`, `FutexWake`, `FutexWait`, `Yield`
+   on x86_64 + aarch64 + riscv64 (`FIRST_COHORT_CROSS_ARCH_SEAL arches=3 classes=4 result=ok`).
+
+3. **Supported IpcSend cohort — 18 cells** (6 classes × 3 arches): the §11 table
+   (`IpcSendPlain`, `IpcSendPlainEnqueue`, `IpcSendOrdinaryCap`, `IpcSendOrdinaryCapEnqueue`,
+   `IpcSendReplyCap`, `IpcSendSharedRegionDirect`).
+
+4. **30-cell total:** `first_cohort_cells=12` + `ipc_send_cells=18` = `total_live_cells=30`
+   (`total_classes=10`). The runner computes this from an EXPLICIT per-cohort class manifest, never a
+   broad substring count, and emits the seal only when every current-run cohort passed, the total is
+   exactly 30, `fuse_trips=0`, `duplicate_wakes=0`, and the tree stayed clean at the seal commit.
+
+5. **Exact supported class list (10):** `DebugLog`, `FutexWake`, `FutexWait`, `Yield`,
+   `IpcSendPlain`, `IpcSendPlainEnqueue`, `IpcSendOrdinaryCap`, `IpcSendOrdinaryCapEnqueue`,
+   `IpcSendReplyCap`, `IpcSendSharedRegionDirect`.
+
+6. **`IpcSendReplyCapEnqueue` — UNSUPPORTED:** the queued reply-cap path is not a production
+   retirement class. It has no live oracle/producer and the artifact guard forbids
+   `class=IpcSendReplyCapEnqueue` in every build. It is a policy exclusion (not a missing cell) and is
+   never counted; counting it would wrongly make the total 33.
+
+7. **`IpcSendSharedRegionEnqueue` — UNSUPPORTED:** as in §10 — no feature/build marker, no live
+   oracle, no runtime producer; forbidden in every build; never counted (would also make 33).
+
+8. **Direct shared-region 3/3:** the shared-region DIRECT matrix cohort
+   (`SECOND_COHORT_SHARED_REGION_DIRECT_MATRIX_SEAL arches=3 classes=1 live_cells=3 fuse_trips=0
+   duplicate_wakes=0 result=ok`) contributes the final 3 IpcSend cells; x86_64/aarch64/riscv64 all pass.
+
+9. **Artifact/run manifest:** `"$LOGROOT/stage198f-manifest.txt"` under the per-run
+   `LOGROOT=/tmp/combined-retirement-seal/<RUN_ID>/` — one row per (arch, cohort) with artifact path,
+   SHA-256, size, mtime, log path, and individual seal result, plus the seal commit + run id + totals.
+
+10. **Top-level seal** (host-side only — NEVER a kernel DebugLog marker literal):
+
+```
+STAGE_198F_COMPLETE_RETIREMENT_SEAL_HEADER commit=<sha> run_id=<id> manifest=<path> result=ok
+STAGE_198F_COMPLETE_RETIREMENT_SEAL arches=3 first_cohort_classes=4 first_cohort_cells=12 ipc_send_classes=6 ipc_send_cells=18 total_classes=10 total_live_cells=30 reply_cap_enqueue=unsupported shared_region_enqueue=unsupported fuse_trips=0 duplicate_wakes=0 result=ok
+```
+
+11. **Next stage — Stage 199 (blocking IPC / D2):** the blocking-IPC / reply / timeout / notification
+    seal (`IpcCall` retirement, reply-record lifecycle, send/recv timeouts, notifications). Stage 198F
+    does NOT begin any of it, nor shared-region/reply-cap enqueue enablement, D3, or D6. The hosted
+    enqueue transaction tests remain mechanism/reference coverage only and are never described as
+    production-retired.

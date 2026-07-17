@@ -70077,6 +70077,247 @@ mod stage198e3ds_matrix_seal {
     }
 }
 
+// Stage 198F — COMPLETE 30-CELL CROSS-ARCH RETIREMENT SEAL POLICY. Source/parser guards over the
+// extended combined runner, the explicit 10-class / 30-cell accounting, and the reply-cap-enqueue +
+// shared-region-enqueue UNSUPPORTED policy. No new mechanism; acceptance policy + documentation only.
+mod stage198f_complete_seal {
+    use super::*;
+    use std::{format, string::String, vec::Vec};
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const COMBINED_SRC: &str = include_str!("../../../scripts/qemu-combined-retirement-seal.sh");
+    const MATRIX_SRC: &str =
+        include_str!("../../../scripts/qemu-shared-region-direct-matrix-seal.sh");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+    const TESTS_SRC: &str = include_str!("tests.rs");
+
+    // The four supported FIRST-cohort classes (× 3 arches = 12 cells).
+    const FIRST_COHORT_CLASSES: [&str; 4] = ["DebugLog", "FutexWake", "FutexWait", "Yield"];
+    // The six supported second-cohort IpcSend classes (× 3 arches = 18 cells).
+    const IPC_SEND_CLASSES: [&str; 6] = [
+        "IpcSendPlain",
+        "IpcSendPlainEnqueue",
+        "IpcSendOrdinaryCap",
+        "IpcSendOrdinaryCapEnqueue",
+        "IpcSendReplyCap",
+        "IpcSendSharedRegionDirect",
+    ];
+    // Policy-excluded (UNSUPPORTED for production retirement); never counted.
+    const UNSUPPORTED_CLASSES: [&str; 2] = ["IpcSendReplyCapEnqueue", "IpcSendSharedRegionEnqueue"];
+
+    // Pure mirror of the Stage 198F 30-cell accounting: sum only SUPPORTED classes, each requiring
+    // three DISTINCT architecture cells from the current run. `cells` is a list of (class, arch);
+    // returns (first_cohort_cells, ipc_send_cells, total) or None on any policy violation.
+    fn stage198f_total(cells: &[(&str, &str)]) -> Option<(u32, u32, u32)> {
+        // Any unsupported enqueue class present at all rejects the run.
+        for (class, _) in cells {
+            if UNSUPPORTED_CLASSES.contains(class) {
+                return None;
+            }
+        }
+        let arches = ["x86_64", "aarch64", "riscv64"];
+        let count_class = |class: &str| -> Option<u32> {
+            let mut seen: Vec<&str> = Vec::new();
+            for (c, a) in cells {
+                if *c == class {
+                    if !arches.contains(a) || seen.contains(a) {
+                        return None; // wrong-arch attribution OR duplicate arch cell
+                    }
+                    seen.push(a);
+                }
+            }
+            if seen.len() == 3 { Some(3) } else { None } // must be all three distinct arches
+        };
+        let mut first = 0u32;
+        for c in FIRST_COHORT_CLASSES {
+            first += count_class(c)?;
+        }
+        let mut ipc = 0u32;
+        for c in IPC_SEND_CLASSES {
+            ipc += count_class(c)?;
+        }
+        Some((first, ipc, first + ipc))
+    }
+
+    fn full_matrix() -> Vec<(&'static str, &'static str)> {
+        let mut v = Vec::new();
+        for c in FIRST_COHORT_CLASSES.iter().chain(IPC_SEND_CLASSES.iter()) {
+            for a in ["x86_64", "aarch64", "riscv64"] {
+                v.push((*c, a));
+            }
+        }
+        v
+    }
+
+    // (counts) Supported first-cohort classes = 4, supported IpcSend classes = 6, total classes = 10,
+    // supported live cells = 30.
+    #[test]
+    fn supported_class_and_cell_counts() {
+        assert_eq!(FIRST_COHORT_CLASSES.len(), 4);
+        assert_eq!(IPC_SEND_CLASSES.len(), 6);
+        assert_eq!(FIRST_COHORT_CLASSES.len() + IPC_SEND_CLASSES.len(), 10);
+        let m = full_matrix();
+        let (first, ipc, total) = stage198f_total(&m).expect("full matrix passes");
+        assert_eq!(first, 12);
+        assert_eq!(ipc, 18);
+        assert_eq!(total, 30);
+    }
+
+    // (parser) The 33-cell total is rejected: adding EITHER unsupported enqueue class (×3) that would
+    // push the naive total to 33 rejects the run.
+    #[test]
+    fn thirty_three_cell_total_rejected() {
+        // Sanity: a naive count of all-supported + one enqueue class would be 33.
+        assert_eq!(30 + 3, 33);
+        for bad in UNSUPPORTED_CLASSES {
+            let mut m = full_matrix();
+            for a in ["x86_64", "aarch64", "riscv64"] {
+                m.push((bad, a));
+            }
+            assert_eq!(
+                stage198f_total(&m),
+                None,
+                "including {bad} (→ 33) must be rejected"
+            );
+        }
+    }
+
+    // (parser) A supported class with only TWO cells, or a DUPLICATE cell from one arch (masking a
+    // missing arch), or a THIRD cell from the wrong arch, fails the run.
+    #[test]
+    fn each_supported_class_requires_three_distinct_arches() {
+        // Two cells for IpcSendPlain (missing riscv64) → reject.
+        let mut two = full_matrix();
+        two.retain(|(c, a)| !(*c == "IpcSendPlain" && *a == "riscv64"));
+        assert_eq!(stage198f_total(&two), None);
+        // Duplicate x86_64 cell for IpcSendPlain (still only 2 distinct arches) → reject.
+        let mut dup = full_matrix();
+        dup.retain(|(c, a)| !(*c == "IpcSendPlain" && *a == "riscv64"));
+        dup.push(("IpcSendPlain", "x86_64"));
+        assert_eq!(stage198f_total(&dup), None);
+        // Wrong-architecture attribution for a Yield cell → reject.
+        let mut wrong = full_matrix();
+        wrong.retain(|(c, a)| !(*c == "Yield" && *a == "riscv64"));
+        wrong.push(("Yield", "powerpc64"));
+        assert_eq!(stage198f_total(&wrong), None);
+    }
+
+    // (policy) reply-cap enqueue AND shared-region enqueue are excluded: the artifact guard forbids
+    // both retirement class literals in EVERY build, neither is in the supported list, and neither has
+    // a production retirement DONE marker in the kernel.
+    #[test]
+    fn reply_cap_and_shared_region_enqueue_excluded() {
+        assert!(GUARD_SRC.contains("\"class=IpcSendReplyCapEnqueue\""));
+        assert!(GUARD_SRC.contains("\"class=IpcSendSharedRegionEnqueue\""));
+        for bad in UNSUPPORTED_CLASSES {
+            assert!(!IPC_SEND_CLASSES.contains(&bad));
+            assert!(
+                !MOD_SRC.contains(&format!("class={bad} result=ok")),
+                "unsupported class must have NO production retirement DONE marker: {bad}"
+            );
+        }
+    }
+
+    // (policy) The hosted enqueue transaction/mechanism tests exist as reference coverage but do NOT
+    // imply LIVE production support: there is no live shared-region enqueue oracle wrapper/producer,
+    // and the artifact guard keeps the class forbidden in every build.
+    #[test]
+    fn hosted_enqueue_tests_do_not_imply_live_support() {
+        // Reference/mechanism coverage may exist in-tree (kept, not deleted)…
+        let has_hosted_enqueue_refs = TESTS_SRC.contains("SharedRegionEnqueue")
+            || TESTS_SRC.contains("shared_region_enqueue");
+        // …but there is NO live shared-region ENQUEUE oracle wrapper on any arch.
+        const SERVICE_SRC: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(!SERVICE_SRC.contains("run_x86_shared_region_enqueue_oracle"));
+        assert!(!SERVICE_SRC.contains("run_aarch64_shared_region_enqueue_oracle"));
+        assert!(!SERVICE_SRC.contains("run_riscv_shared_region_enqueue_oracle"));
+        // …and the artifact guard forbids the class regardless of any hosted coverage.
+        assert!(GUARD_SRC.contains("\"class=IpcSendSharedRegionEnqueue\""));
+        // The existence of reference coverage does not change the policy verdict.
+        let _ = has_hosted_enqueue_refs;
+    }
+
+    // (runner) The combined runner encodes Stage 198F provenance: clean-tree gate, fresh-from-HEAD
+    // artifact build, a current-run manifest, the shared-region matrix cohort, an explicit
+    // 12/18/30 total, and the top-level seal emitted ONLY on all-pass + fuse=0 + dupwake=0.
+    #[test]
+    fn combined_runner_encodes_198f_provenance_and_seal() {
+        // Clean-tree provenance + exact seal commit.
+        assert!(COMBINED_SRC.contains("SEAL_COMMIT=\"$(git rev-parse HEAD)\""));
+        assert!(
+            COMBINED_SRC.contains("git status --porcelain") && COMBINED_SRC.contains("dirty_tree")
+        );
+        // Fresh-from-HEAD artifact build + stale-artifact (predates-run) rejection.
+        assert!(COMBINED_SRC.contains("build-qemu-${arch}-artifacts.sh"));
+        assert!(
+            COMBINED_SRC.contains("STALE artifact") && COMBINED_SRC.contains("BUILD_START_EPOCH")
+        );
+        // A current-run manifest is written.
+        assert!(
+            COMBINED_SRC.contains("stage198f-manifest.txt")
+                && COMBINED_SRC.contains("manifest_row")
+        );
+        // The shared-region matrix cohort is invoked and its aggregate marker required.
+        assert!(COMBINED_SRC.contains("scripts/qemu-shared-region-direct-matrix-seal.sh"));
+        assert!(COMBINED_SRC.contains(
+            "SECOND_COHORT_SHARED_REGION_DIRECT_MATRIX_SEAL arches=3 classes=1 live_cells=3 fuse_trips=0 duplicate_wakes=0 result=ok"
+        ));
+        // Explicit 12/18/30 accounting (not broad substring counts) gates the top-level seal.
+        assert!(COMBINED_SRC.contains("first_cohort_cells\" -eq 12"));
+        assert!(COMBINED_SRC.contains("ipc_send_cells\" -eq 18"));
+        assert!(COMBINED_SRC.contains("total_cells\" -eq 30"));
+        assert!(
+            COMBINED_SRC.contains("fuse_total\" -eq 0")
+                && COMBINED_SRC.contains("dupwake_total\" -eq 0")
+        );
+        // The final seal line carries the exact required fields.
+        assert!(COMBINED_SRC.contains(
+            "STAGE_198F_COMPLETE_RETIREMENT_SEAL arches=3 first_cohort_classes=4 first_cohort_cells=12 ipc_send_classes=6 ipc_send_cells=18 total_classes=10 total_live_cells=30 reply_cap_enqueue=unsupported shared_region_enqueue=unsupported fuse_trips=0 duplicate_wakes=0 result=ok"
+        ));
+    }
+
+    // (stale logs) The aggregate cannot consume a stale individual log: each subordinate seal is
+    // verified from THIS run's captured stdout under the per-run LOGROOT, and the HEAD/tree are
+    // required unchanged across the run.
+    #[test]
+    fn aggregate_cannot_consume_stale_logs() {
+        // run_seal captures each seal's stdout to "$LOGROOT/${name}.log" and greps THAT.
+        assert!(COMBINED_SRC.contains("local log=\"$LOGROOT/${name}.log\""));
+        assert!(COMBINED_SRC.contains("grep -qa -- \"$expect\" \"$log\""));
+        // The tree must be unchanged (same HEAD, still clean) across the whole run.
+        assert!(COMBINED_SRC.contains("END_COMMIT=\"$(git rev-parse HEAD)\""));
+        assert!(COMBINED_SRC.contains("HEAD changed during run"));
+        assert!(COMBINED_SRC.contains("tree became dirty during run"));
+        // The matrix runner ALSO forbids stale per-arch seals (accepts only THIS run's captured logs).
+        assert!(
+            MATRIX_SRC.contains("a stale individual seal cannot satisfy the combined run")
+                || MATRIX_SRC.contains("never a pre-existing log")
+        );
+    }
+
+    // (doc) The seal doc reflects the 30-cell policy: 12 + 18 = 30, the exact class lists, both
+    // enqueue exclusions, and the top-level seal string.
+    #[test]
+    fn doc_matches_30_cell_policy() {
+        assert!(SEAL_DOC.contains("6 classes × 3 arches = 18"));
+        assert!(SEAL_DOC.contains("18, not 21"));
+        for c in FIRST_COHORT_CLASSES {
+            assert!(SEAL_DOC.contains(c), "doc must list first-cohort class {c}");
+        }
+        for c in IPC_SEND_CLASSES {
+            assert!(SEAL_DOC.contains(c), "doc must list IpcSend class {c}");
+        }
+        assert!(
+            SEAL_DOC.contains("IpcSendReplyCapEnqueue")
+                && SEAL_DOC.contains("IpcSendSharedRegionEnqueue")
+        );
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SEAL_DOC.contains("STAGE_198F_COMPLETE_RETIREMENT_SEAL"));
+    }
+}
+
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
 // no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
 // reality the audit relied on, so a future stage cannot silently flip an architecture
