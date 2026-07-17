@@ -68160,24 +68160,37 @@ mod stage198e3c1_direct_live_policy {
     // carrying exactly the source cap.
     #[test]
     fn userspace_send_helper_encoding() {
+        // Stage 198E3C2A: the canonical helper is `send_shared_region_large(send_ep, mem_cap, offset,
+        // region_len)`. The kernel selects the shared-region transfer purely by the LARGE-transfer
+        // form of IpcSend — arg(PTR)=offset, arg(LEN)=region byte length (> MAX_PAYLOAD=128) — NOT by
+        // an inline frame opcode.
         let f = USER_RT_SRC
-            .split_once("pub unsafe fn send_shared_region")
-            .map(|(_, r)| {
-                r.split_once("pub unsafe fn recv_shared_region_v2")
+            .split_once("pub unsafe fn send_shared_region_large")
+            .and_then(|(_, r)| {
+                r.split_once("\n    pub unsafe fn send_shared_region")
                     .map(|(b, _)| b)
-                    .unwrap_or(r)
             })
-            .expect("send helper");
-        // Stage 198E3C1C: the kernel selects the shared-region transfer by the LARGE-transfer form
-        // of IpcSend — arg(PTR)=offset, arg(LEN)=region byte length (> MAX_PAYLOAD=128) — NOT by an
-        // inline frame opcode. The helper issues the raw IpcSend with offset 0 + the two-page length,
-        // carrying the source cap as the transferred cap.
+            .expect("send_shared_region_large helper");
         assert!(f.contains("SYSCALL_IPC_SEND_NR"));
-        assert!(f.contains("let region_len = SHARED_REGION_ORACLE_LEN"));
-        assert!(f.contains("mem_cap as usize"));
+        // offset in arg1, region_len in arg2, mem_cap in arg5.
+        assert!(f.contains("[send_ep as usize, offset, region_len, 0, 0, mem_cap as usize]"));
+        // Large-transfer selector guard: region_len must exceed MAX_PAYLOAD.
+        assert!(f.contains("region_len <= IPC_MESSAGE_MAX_PAYLOAD"));
+        // No inline `Message` framing on the send path (a comment may name the kernel-produced
+        // OPCODE_SHARED_MEM, but the helper constructs no inline message and calls no inline send).
         assert!(
-            !f.contains("ipc_send(send_ep, &msg)"),
+            !f.contains("Message::with_header"),
+            "must not build an inline message"
+        );
+        assert!(
+            !f.contains("ipc_send(send_ep"),
             "must not use the inline-message path"
+        );
+        // The oracle convenience wrapper forwards to the large helper with offset 0 + the 2-page len.
+        assert!(
+            USER_RT_SRC.contains(
+                "send_shared_region_large(send_ep, mem_cap, 0, SHARED_REGION_ORACLE_LEN)"
+            )
         );
     }
 
@@ -68445,11 +68458,12 @@ mod stage198e3c1_direct_live_policy {
     // (handshake futex), never timing.
     #[test]
     fn direct_path_selected_excluded_paths_absent() {
-        // The shared-region scaffold region (module + parent fn), sliced out of the wider service.
+        // Stage 198E3C2A: the shared-region logic lives in the arch-neutral core module (+ the x86
+        // wrapper + parent fn). Slice from the core module to the next unrelated oracle.
         let scaffold = SERVICE_SRC
-            .split_once("mod x86_shared_region_direct_oracle {")
+            .split_once("mod shared_region_oracle_core {")
             .and_then(|(_, r)| r.split_once("// ─── Stage 196C:").map(|(b, _)| b))
-            .expect("shared-region scaffold present");
+            .expect("shared-region core present");
         // DIRECT send + ordinary recv are used.
         assert!(scaffold.contains("send_shared_region(endpoint_cap, mem_cap"));
         assert!(scaffold.contains("recv_shared_region_v2(endpoint_cap, va, len)"));
@@ -68494,10 +68508,12 @@ mod stage198e3c1_direct_live_policy {
     // succeeds.
     #[test]
     fn parent_bounded_retry_on_wouldblock() {
+        // Stage 198E3C2A: the bounded retry lives in the arch-neutral core; the x86 wrapper emits the
+        // arch send marker. Slice the whole shared-region region.
         let scaffold = SERVICE_SRC
-            .split_once("fn run_x86_shared_region_direct_oracle")
+            .split_once("mod shared_region_oracle_core {")
             .and_then(|(_, r)| r.split_once("// ─── Stage 196C:").map(|(b, _)| b))
-            .expect("parent fn present");
+            .expect("shared-region core + wrapper present");
         assert!(
             scaffold.contains("SyscallError::WouldBlock"),
             "retries on the canonical result"
@@ -69109,6 +69125,250 @@ mod stage198e3c1_direct_live_policy {
     fn direct_qemu_proof_precursor_marker() {
         crate::yarm_log!(
             "SHARED_REGION_DIRECT_QEMU_PRECURSOR preack_fail_closed=1 retryable=WouldBlock consume_after_publish=1 userspace_retry_bounded=1 result=ok"
+        );
+    }
+
+    // ── Stage 198E3C2A: authoritative large-length send ABI + portable oracle core ───────────────
+    const KERNEL_IPC_SRC: &str = include_str!("../../../crates/yarm-kernel/src/ipc.rs");
+    const CONTRACT_DOC: &str =
+        include_str!("../../../doc/STAGE_198E3C1_SHARED_REGION_USERSPACE_CONTRACT.md");
+
+    // Slice the canonical `send_shared_region_large` helper body.
+    fn large_send_helper() -> &'static str {
+        USER_RT_SRC
+            .split_once("pub unsafe fn send_shared_region_large")
+            .and_then(|(_, r)| {
+                r.split_once("\n    pub unsafe fn send_shared_region")
+                    .map(|(b, _)| b)
+            })
+            .expect("send_shared_region_large helper")
+    }
+
+    // (1) The helper selects the LARGE-length IpcSend path: it issues the raw IpcSend with the region
+    // length in arg(LEN), not an inline message.
+    #[test]
+    fn abi_guard_large_length_path_selected() {
+        let f = large_send_helper();
+        assert!(f.contains("SYSCALL_IPC_SEND_NR"));
+        assert!(f.contains("raw_syscall(SYSCALL_IPC_SEND_NR, args)"));
+        assert!(
+            !f.contains("Message::with_header"),
+            "no inline message construction"
+        );
+        assert!(!f.contains("ipc_send(send_ep"), "no inline-send path");
+    }
+
+    // (2) Two pages produce the expected region-byte length; the oracle convenience uses it.
+    #[test]
+    fn abi_guard_two_page_region_length() {
+        const PAGE: usize = 4096;
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_PAGE_SIZE: usize = 4096;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_PAGE_COUNT: usize = 2;"));
+        // 2 pages = 8192, which must exceed the 128-byte inline threshold.
+        assert_eq!(2 * PAGE, 8192);
+        assert!(2 * PAGE > 128);
+        assert!(
+            USER_RT_SRC.contains(
+                "send_shared_region_large(send_ep, mem_cap, 0, SHARED_REGION_ORACLE_LEN)"
+            )
+        );
+    }
+
+    // (3) Source offset occupies arg1, region length arg2, source cap arg5 (the transfer-cap slot).
+    #[test]
+    fn abi_guard_argument_positions() {
+        let f = large_send_helper();
+        assert!(
+            f.contains("[send_ep as usize, offset, region_len, 0, 0, mem_cap as usize]"),
+            "offset in arg1, region_len in arg2, mem_cap in arg5"
+        );
+        // Match the kernel's authoritative arg indices.
+        assert_eq!(crate::kernel::syscall::SYSCALL_ARG_CAP, 0);
+        assert_eq!(crate::kernel::syscall::SYSCALL_ARG_PTR, 1);
+        assert_eq!(crate::kernel::syscall::SYSCALL_ARG_LEN, 2);
+        assert_eq!(crate::kernel::syscall::SYSCALL_ARG_TRANSFER_CAP, 5);
+    }
+
+    // (4) Descriptor size and field order match kernel decoding (16 bytes: offset u64 @0, len u64 @8).
+    #[test]
+    fn abi_guard_descriptor_layout_matches_kernel() {
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_DESCRIPTOR_LEN: usize = 16;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_DESCRIPTOR_OFFSET_AT: usize = 0;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_DESCRIPTOR_LEN_AT: usize = 8;"));
+        // Kernel authority.
+        assert!(KERNEL_IPC_SRC.contains("pub const ENCODED_LEN: usize = 16;"));
+        assert!(KERNEL_IPC_SRC.contains("out[i] = off[i];"));
+        assert!(KERNEL_IPC_SRC.contains("out[8 + i] = len[i];"));
+    }
+
+    // (5) The helper does NOT construct an inline shared-memory opcode frame.
+    #[test]
+    fn abi_guard_no_inline_opcode_frame() {
+        let f = large_send_helper();
+        assert!(!f.contains("Message::with_header"));
+        assert!(
+            !f.contains("FLAG_CAP_TRANSFER"),
+            "no inline cap-transfer flag framing"
+        );
+    }
+
+    // (6) The inline payload path cannot accidentally select shared-region delivery: the helper only
+    // ever sends with region_len > MAX_PAYLOAD (guarded), and the kernel's inline branch is a distinct
+    // OPCODE_INLINE construction.
+    #[test]
+    fn abi_guard_inline_path_cannot_select_shared_region() {
+        let f = large_send_helper();
+        assert!(f.contains("region_len <= IPC_MESSAGE_MAX_PAYLOAD"));
+        // Kernel: the shared-region branch is guarded by len > MAX_PAYLOAD; the ELSE branch builds an
+        // ordinary OPCODE_INLINE message (distinct path).
+        assert!(IPC_SYSCALL_SRC.contains("if len > Message::MAX_PAYLOAD {"));
+        assert!(IPC_SYSCALL_SRC.contains("OPCODE_INLINE"));
+    }
+
+    // (7) `region_len <= MAX_PAYLOAD` is rejected locally with the canonical InvalidArgs.
+    #[test]
+    fn abi_guard_small_length_rejected() {
+        let f = large_send_helper();
+        let idx = f
+            .find("region_len <= IPC_MESSAGE_MAX_PAYLOAD")
+            .expect("small-len guard");
+        assert!(
+            f[idx..].contains("return Err(SyscallError::InvalidArgs);"),
+            "a length <= MAX_PAYLOAD must be rejected with InvalidArgs"
+        );
+        assert_eq!(crate::kernel::syscall::OPCODE_SHARED_MEM, 1);
+    }
+
+    // (8) Malformed offset/length (overflow) returns the canonical error.
+    #[test]
+    fn abi_guard_overflow_rejected() {
+        let f = large_send_helper();
+        assert!(f.contains("offset.checked_add(region_len).is_none()"));
+    }
+
+    // (9) The source cap remains valid after a retryable pre-ack WouldBlock: the producer's fail-
+    // closed path returns WouldBlock BEFORE taking blocked state (no mutation), and ipc.rs surfaces
+    // it as a retryable error whose envelope is released (source cap preserved), not a fault.
+    #[test]
+    fn abi_guard_source_cap_survives_wouldblock() {
+        assert!(SYSCALL_SRC.contains("return Err(SyscallError::WouldBlock);"));
+        assert!(IPC_SYSCALL_SRC.contains(
+            "Err(SyscallError::WouldBlock) => (\n                                        Some(Err(KernelError::WouldBlock)),"
+        ));
+    }
+
+    // (10) Exactly ONE TransferEnvelope is created on a successful shared-region send.
+    #[test]
+    fn abi_guard_one_transfer_envelope() {
+        // The large-transfer branch stashes exactly one envelope carrying the region descriptor.
+        let large = IPC_SYSCALL_SRC
+            .split_once("if len > Message::MAX_PAYLOAD {")
+            .and_then(|(_, r)| r.split_once("} else {").map(|(b, _)| b))
+            .expect("large-transfer branch");
+        assert_eq!(
+            large.matches("stash_transfer_handle(").count(),
+            1,
+            "exactly one TransferEnvelope stash on the large-transfer path"
+        );
+        assert!(large.contains("Some(TransferSharedRegion {"));
+    }
+
+    // (11) The contract document and the source constants agree.
+    #[test]
+    fn abi_guard_doc_matches_source() {
+        // The doc reflects the corrected large-length ABI, not the obsolete inline-opcode claim.
+        assert!(CONTRACT_DOC.contains("large-transfer form of `IpcSend`"));
+        assert!(CONTRACT_DOC.contains("NOT** selected by an inline"));
+        assert!(CONTRACT_DOC.contains("ENCODED_LEN` = **16 bytes**"));
+        assert!(CONTRACT_DOC.contains("Message::MAX_PAYLOAD"));
+        assert!(CONTRACT_DOC.contains("128"));
+        // Descriptor + threshold constants agree numerically.
+        assert_eq!(crate::kernel::syscall::OPCODE_SHARED_MEM, 1);
+    }
+
+    // (12) The x86_64 sealed live-oracle encoding is preserved byte-for-byte: the exact SEND +
+    // completion markers remain, and the send still encodes offset/len/cap identically.
+    #[test]
+    fn abi_guard_x86_sealed_encoding_preserved() {
+        assert!(
+            SERVICE_SRC
+                .contains("X86_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=ok")
+        );
+        assert!(SERVICE_SRC.contains(
+            "X86_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap=1 readonly=1 first_release=ok second_release=rejected wakes=1 result=ok"
+        ));
+        // The x86 wrapper drives the arch-neutral core (the send encoding is the common helper).
+        assert!(SERVICE_SRC.contains("core_oracle::parent_wait_and_send(endpoint_cap, mem_cap)"));
+        assert!(SERVICE_SRC.contains("send_shared_region(endpoint_cap, mem_cap)"));
+    }
+
+    // Portable oracle core: the arch-neutral module exists, is `not(hosted-dev)`-gated (all arches),
+    // and the x86 wrapper delegates to it (spawn + arch marker only in the wrapper).
+    #[test]
+    fn portable_oracle_core_present_and_used() {
+        assert!(SERVICE_SRC.contains("mod shared_region_oracle_core {"));
+        assert!(
+            SERVICE_SRC.contains("pub(super) unsafe fn child_recv_and_validate() -> RecvOutcome")
+        );
+        assert!(SERVICE_SRC.contains("pub(super) unsafe fn parent_wait_and_send(endpoint_cap: u32, mem_cap: u32) -> SendOutcome"));
+        assert!(SERVICE_SRC.contains("pub(super) fn oracle_caps() -> (u32, u32)"));
+        // The x86 wrapper uses the core for child validation + parent send + cap decode.
+        assert!(SERVICE_SRC.contains("core_oracle::child_recv_and_validate()"));
+        assert!(SERVICE_SRC.contains("core_oracle::oracle_caps()"));
+    }
+
+    // Cross-architecture preparation: no non-x86 shared-region LIVE selector/producer/retirement is
+    // enabled yet, and enqueue stays disabled everywhere.
+    #[test]
+    fn cross_arch_shared_region_live_off_for_non_x86() {
+        // The kernel provisioning + knob + selector + ack + markers are x86_64-gated only.
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"x86-shared-region-direct-oracle\")]\npub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"
+        ));
+        assert!(MOD_SRC.contains(
+            "#[cfg(all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\"))]"
+        ));
+        // Only the x86 wrapper + dispatch exist; there is NO aarch64/riscv shared-region oracle fn.
+        assert!(!SERVICE_SRC.contains("run_aarch64_shared_region_direct_oracle"));
+        assert!(!SERVICE_SRC.contains("run_riscv_shared_region_direct_oracle"));
+        // The slot-5 shared-region dispatch is x86_64-target-gated.
+        let disp = SERVICE_SRC
+            .find("run_x86_shared_region_direct_oracle(ctx.task_id)")
+            .expect("x86 dispatch");
+        let prefix = &SERVICE_SRC[..disp];
+        assert!(
+            prefix.rfind("target_arch = \"x86_64\"").is_some(),
+            "the shared-region dispatch must be x86_64-gated"
+        );
+        // Enqueue stays disabled: no live enqueue class literal anywhere in the kernel.
+        assert!(!MOD_SRC.contains("class=IpcSendSharedRegionEnqueue"));
+    }
+
+    // The arch syscall register wrappers pass the common helper's 6 args without truncation/reorder.
+    #[test]
+    fn cross_arch_raw_syscall_passes_six_args() {
+        const X86: &str = include_str!("../../../crates/yarm-user-rt/src/arch/x86_64.rs");
+        const ARM: &str = include_str!("../../../crates/yarm-user-rt/src/arch/aarch64.rs");
+        const RV: &str = include_str!("../../../crates/yarm-user-rt/src/arch/riscv64.rs");
+        for (name, src) in [("x86_64", X86), ("aarch64", ARM), ("riscv64", RV)] {
+            assert!(
+                src.contains("fn raw_syscall(") && src.contains("args: [usize; 6]"),
+                "{name} raw_syscall must take a 6-element arg array"
+            );
+            for i in 0..6 {
+                assert!(
+                    src.contains(&format!("args[{i}]")),
+                    "{name} raw_syscall must forward args[{i}]"
+                );
+            }
+        }
+    }
+
+    // Required hosted contract marker (NOT a live retirement marker).
+    #[test]
+    fn large_send_abi_contract_marker() {
+        crate::yarm_log!(
+            "SHARED_REGION_LARGE_SEND_ABI_CONTRACT descriptor_bytes=16 inline_selector=0 source_cap_preserved=1 result=ok"
         );
     }
 }

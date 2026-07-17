@@ -487,30 +487,51 @@ pub mod syscall {
         pub payload_len: usize,
     }
 
-    /// Stage 198E3C1: issue exactly ONE read-only shared-region cap transfer. Builds a `Message` with
-    /// `OPCODE_SHARED_MEM` + the canonical `FLAG_CAP_TRANSFER`, carrying exactly the provisioned
-    /// `mem_cap`. The source cap is PRESERVED (the kernel duplicates it through the transfer
-    /// envelope). Returns the exact kernel `SyscallError` — never translated into success.
+    /// Kernel `Message::MAX_PAYLOAD` (mirror). An `IpcSend` whose `arg(LEN)` EXCEEDS this selects the
+    /// large shared-region transfer branch; `arg(LEN) <= this` is an ordinary inline cap transfer.
+    pub const IPC_MESSAGE_MAX_PAYLOAD: usize = 128;
+    /// Kernel `SharedMemoryRegion::ENCODED_LEN` (mirror): the region descriptor the kernel builds.
+    pub const SHARED_REGION_DESCRIPTOR_LEN: usize = 16;
+    /// Descriptor field byte offsets (mirror of `SharedMemoryRegion::encode`): offset `u64` then len
+    /// `u64`, little-endian.
+    pub const SHARED_REGION_DESCRIPTOR_OFFSET_AT: usize = 0;
+    pub const SHARED_REGION_DESCRIPTOR_LEN_AT: usize = 8;
+
+    /// Stage 198E3C2A: the CANONICAL, architecture-neutral shared-region send. The kernel selects the
+    /// shared-region transfer purely by the LARGE-transfer form of `IpcSend` — `arg(SYSCALL_ARG_PTR)`
+    /// carries the byte OFFSET into the source object and `arg(SYSCALL_ARG_LEN)` carries the region
+    /// byte length, which MUST exceed `IPC_MESSAGE_MAX_PAYLOAD` (128) or the send is decoded as an
+    /// ordinary inline cap transfer. The transferred source cap rides in `arg(SYSCALL_ARG_TRANSFER_
+    /// CAP)`. This helper builds NO inline `Message` and depends on NO `OPCODE_SHARED_MEM` framing —
+    /// the kernel produces the opcode + the 16-byte `SharedMemoryRegion` descriptor. The source cap
+    /// is PRESERVED (delegated through the transfer envelope, not moved). Rejects `region_len <=
+    /// IPC_MESSAGE_MAX_PAYLOAD` and an overflowing `offset + region_len` locally with `InvalidArgs`.
+    /// Returns the canonical kernel `SyscallError` unchanged (`WouldBlock` on the pre-ack retry path).
     ///
     /// # Safety
-    /// `send_ep` must be a valid send cap and `mem_cap` a valid transferable MemoryObject/DmaRegion.
-    pub unsafe fn send_shared_region(
+    /// `send_ep` must be a valid SEND cap and `mem_cap` a valid transferable MemoryObject/DmaRegion.
+    pub unsafe fn send_shared_region_large(
         send_ep: u32,
         mem_cap: u32,
+        offset: usize,
+        region_len: usize,
     ) -> core::result::Result<(), SyscallError> {
         if mem_cap == 0 {
             return Err(SyscallError::InvalidArgs);
         }
-        // The kernel selects the shared-region transfer (`OPCODE_SHARED_MEM`, region descriptor
-        // payload) by the LARGE-transfer form of `IpcSend`: `arg(PTR)` is the OFFSET into the source
-        // object and `arg(LEN)` is the region byte length (which must exceed `Message::MAX_PAYLOAD`
-        // = 128, so it is not mistaken for an ordinary inline cap transfer). It is NOT selected by an
-        // inline frame opcode. We transfer the whole two-page oracle region at offset 0. The kernel
-        // stashes the transfer envelope, builds the `OPCODE_SHARED_MEM` message, and (for a blocked
-        // recv-v2 waiter) delivers it directly. The source cap is preserved. Surfaces the canonical
-        // `SyscallError` unchanged (`WouldBlock` on the pre-ack retry path).
-        let offset = 0usize;
-        let region_len = SHARED_REGION_ORACLE_LEN; // 2 * PAGE_SIZE = 8192 > 128
+        // Local guards mirroring the kernel: the large-transfer branch requires len > MAX_PAYLOAD,
+        // and `offset + region_len` must not overflow (the kernel's validate_user_region rejects an
+        // overflow / out-of-range region).
+        if region_len <= IPC_MESSAGE_MAX_PAYLOAD {
+            return Err(SyscallError::InvalidArgs);
+        }
+        if offset.checked_add(region_len).is_none() {
+            return Err(SyscallError::InvalidArgs);
+        }
+        // args: [ep_cap(ARG_CAP=0), offset(ARG_PTR=1), region_len(ARG_LEN=2), _, _, mem_cap(
+        // ARG_TRANSFER_CAP=5)]. The kernel stashes exactly one transfer envelope, builds the
+        // OPCODE_SHARED_MEM message with the encoded descriptor, and (for a blocked recv-v2 waiter)
+        // delivers it directly.
         let args = [send_ep as usize, offset, region_len, 0, 0, mem_cap as usize];
         // SAFETY: architecture syscall ABI entry; the transferred cap authorizes the region.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_SEND_NR, args) };
@@ -523,6 +544,20 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
+    }
+
+    /// Oracle convenience over [`send_shared_region_large`]: transfer the WHOLE two-page oracle
+    /// region at offset 0 (`SHARED_REGION_ORACLE_LEN = 8192 > 128`). Identical encoding to the
+    /// sealed x86_64 live oracle.
+    ///
+    /// # Safety
+    /// Same contract as [`send_shared_region_large`].
+    pub unsafe fn send_shared_region(
+        send_ep: u32,
+        mem_cap: u32,
+    ) -> core::result::Result<(), SyscallError> {
+        // SAFETY: forwards to the canonical helper with the oracle's offset 0 + two-page length.
+        unsafe { send_shared_region_large(send_ep, mem_cap, 0, SHARED_REGION_ORACLE_LEN) }
     }
 
     /// Stage 198E3C1: recv-v2 shared-region receive with a DEDICATED page-aligned two-page destination
