@@ -1776,8 +1776,9 @@ impl SharedKernel {
                 // transaction finalized, the waiter state cleared, and the receiver enqueued once.
                 // The marker LITERALS live entirely inside the cfg-gated helper, so a NORMAL build
                 // (feature off) contains none of the `IPCSEND_SHARED_REGION_*` / `class=IpcSend
-                // SharedRegionDirect` strings. `class` is consumed by the helper (arch is fixed
-                // x86_64 there, the only architecture the feature compiles for).
+                // SharedRegionDirect` strings. `class` is consumed by the helper (the `arch=<a>` tag
+                // is fixed by the helper's compiled `target_arch` — x86_64 or aarch64 — the only
+                // architectures whose per-arch feature compiles the marker paths).
                 crate::kernel::boot::maybe_emit_shared_region_direct_live_markers(
                     class,
                     &snap.snapshot,

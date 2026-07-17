@@ -958,8 +958,8 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
     // ack is checked NON-destructively here and only CONSUMED after the post-work is published
     // below, so a pre-publication failure never permanently consumes it. Oracle-only (feature + knob
     // gated); off the oracle this is a strict no-op and production delivery is byte-identical.
-    #[cfg(feature = "x86-shared-region-direct-oracle")]
-    if crate::kernel::boot::x86_shared_region_direct_oracle_enabled()
+    #[cfg(feature = "shared-region-direct-oracle")]
+    if crate::kernel::boot::shared_region_direct_oracle_enabled()
         && !crate::kernel::boot::shared_region_blocked_recv::matches_for_delivery(
             waiter_tid,
             endpoint_idx,
@@ -1013,8 +1013,8 @@ pub(crate) fn produce_blocked_waiter_shared_region_delivery(
     // send (a second attempt after success) finds the ack consumed and fails closed above, and no
     // pre-publication failure could have consumed it. The oracle waiter is unique per boot, so the
     // consume always succeeds here; a false result would indicate a stale/raced ack (logged).
-    #[cfg(feature = "x86-shared-region-direct-oracle")]
-    if crate::kernel::boot::x86_shared_region_direct_oracle_enabled()
+    #[cfg(feature = "shared-region-direct-oracle")]
+    if crate::kernel::boot::shared_region_direct_oracle_enabled()
         && !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(
             waiter_tid,
             endpoint_idx,

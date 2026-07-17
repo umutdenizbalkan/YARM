@@ -662,12 +662,20 @@ pub mod syscall {
             }
             Ok(ret.ret0 as usize)
         }
+        // AArch64/RISC-V return-lane ABI (mirrors the frozen `decode_release` for NR 4): there is NO
+        // separate error register — the kernel's `set_ok(map_len, 0, 0)` exports X0 = the released
+        // length on success, while an error exports X0 = the small `SyscallError` code. Because a
+        // released length is ALWAYS a nonzero page-multiple (>= PAGE) and every error code is a small
+        // value below PAGE, the page-alignment test is the authoritative success/error discriminator
+        // (X0 = value on OK vs X0 = error otherwise — the earlier `ret1` read was wrong: the kernel
+        // leaves ret1 = 0 on this syscall). The duplicate release therefore surfaces `InvalidArgs`.
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         {
-            if ret.ret0 != 0 {
+            const PAGE: usize = 4096;
+            if ret.ret0 < PAGE || !ret.ret0.is_multiple_of(PAGE) {
                 return Err(decode_syscall_error(ret.ret0));
             }
-            Ok(ret.ret1 as usize)
+            Ok(ret.ret0)
         }
     }
 
@@ -682,14 +690,22 @@ pub mod syscall {
     pub const SHARED_REGION_ORACLE_PAGE_COUNT: usize = 2;
     pub const SHARED_REGION_ORACLE_LEN: usize =
         SHARED_REGION_ORACLE_PAGE_COUNT * SHARED_REGION_ORACLE_PAGE_SIZE;
-    /// The base VA of the two-page window: 1 GiB. Above the init image (loaded at 0x0040_0000, a few
-    /// MB) and the boot initrd window (~0x0C00_1000, 192 MB); far below the user stack (~0x7ffx_...,
-    /// multi-TB). All oracle `.bss` scratch buffers live inside the init image, well below 1 GiB.
+    /// The base VA of the two-page window. It MUST land in the target's user address space, in the gap
+    /// between the init image + initrd window (below) and the user stack (above). x86_64 (and RISC-V,
+    /// unused) use 1 GiB — above the init image (0x0040_0000, a few MB) and the boot initrd window
+    /// (~0x0C00_1000), far below the user stack. AArch64's user address space is only the low
+    /// `TTBR0_EL1` half below `KERNEL_SPACE_BASE = 0x4000_0000` (1 GiB), so 1 GiB is NOT a user VA
+    /// there (a map at it faults `PrivilegeViolation`); the AArch64 window sits at 512 MiB, still above
+    /// the image/initrd and below the AArch64 user stack (observed just under 1 GiB). All oracle `.bss`
+    /// scratch buffers live inside the init image, well below either window.
+    #[cfg(target_arch = "aarch64")]
+    pub const SHARED_REGION_ORACLE_VA: usize = 0x2000_0000;
+    #[cfg(not(target_arch = "aarch64"))]
     pub const SHARED_REGION_ORACLE_VA: usize = 0x4000_0000;
     pub const SHARED_REGION_ORACLE_END: usize = SHARED_REGION_ORACLE_VA + SHARED_REGION_ORACLE_LEN;
 
-    // ── Traced x86_64 userspace ranges the window must NOT overlap (for the compile-time guards) ──
-    /// init image load base (`USER_LOAD_BASE`, targets/x86_64-yarm-user-none.ld).
+    // ── Traced userspace ranges the window must NOT overlap (for the compile-time guards) ──
+    /// init image load base (`USER_LOAD_BASE`, the per-arch user linker script).
     const ORACLE_TRACE_IMAGE_BASE: usize = 0x0040_0000;
     /// Generous upper bound on the init image (image is a few MB; 64 MB covers text+rodata+data+bss
     /// including every oracle scratch buffer).
@@ -697,9 +713,17 @@ pub mod syscall {
     /// Boot initrd pointer window (`STARTUP_SLOT_INITRD_PTR` example value 0x0C00_1000) + a margin.
     const ORACLE_TRACE_INITRD_BASE: usize = 0x0C00_0000;
     const ORACLE_TRACE_INITRD_END: usize = 0x1000_0000;
-    /// Conservative lower bound of the user stack region (observed stacks live at ~0x7ffx_xxxx_xxxx).
+    /// Conservative lower bound of the user stack region. On x86_64 stacks live at ~0x7ffx_xxxx_xxxx;
+    /// on AArch64 the user stack sits just below the 1 GiB `KERNEL_SPACE_BASE` (observed ~0x3fbc_0000),
+    /// so a 768 MiB floor stays strictly below it while the 512 MiB oracle window stays below the floor.
+    #[cfg(target_arch = "aarch64")]
+    const ORACLE_TRACE_STACK_FLOOR: usize = 0x3000_0000;
+    #[cfg(not(target_arch = "aarch64"))]
     const ORACLE_TRACE_STACK_FLOOR: usize = 0x0000_1000_0000_0000;
-    /// x86_64 canonical lower-half user VA ceiling.
+    /// User VA ceiling: x86_64 canonical lower-half; AArch64 `TTBR0` user half = `KERNEL_SPACE_BASE`.
+    #[cfg(target_arch = "aarch64")]
+    const ORACLE_TRACE_USER_VA_MAX: usize = 0x4000_0000;
+    #[cfg(not(target_arch = "aarch64"))]
     const ORACLE_TRACE_USER_VA_MAX: usize = 0x0000_8000_0000_0000;
 
     // Compile-time VA contract: alignment, exactly two pages, no overflow, valid user VA, and no
@@ -743,6 +767,11 @@ pub mod syscall {
     pub const STARTUP_SLOT_SHARED_REGION_ENDPOINT_CAP: usize = 14; // == SERVICE_EXTRA_CAP_1
     /// The slot-5 selector value that names this oracle (1 = FutexWake oracle; 2 = shared-region).
     pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
+    /// The AArch64 slot-5 selector for the SAME direct shared-region oracle. Slots 1-5 name the
+    /// AArch64 FutexWake / FutexWait-switch / FutexWait-idle / Yield / Yield-lone oracles, so the
+    /// AArch64 shared-region oracle takes selector 6. The workload body is identical (it reuses the
+    /// arch-neutral oracle core); only the boot-side selector differs from x86's `2`.
+    pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;
 
     /// Stage 159BC/D proof-only recv-v2 with a deliberately undersized payload
     /// buffer.

@@ -7775,14 +7775,52 @@ pub fn bootstrap_first_user_task(
         init_args[17] = 2; // cap-enqueue-oracle discriminator (init otherwise leaves slot 17 zero)
         crate::yarm_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_PROVISION_OK slot17=2");
     }
+    // Stage 198E3C2B: default-off + feature-gated AArch64 DIRECT shared-region live oracle. Mirrors
+    // the x86_64 target (arch/x86_64/boot.rs) EXACTLY except for the slot-5 selector (=6, since the
+    // AArch64 selectors 1-5 already name the FutexWake / FutexWait-switch / FutexWait-idle / Yield /
+    // Yield-lone oracles). It reuses init startup slot 5 (supervisor_control_recv_ep, unused by init)
+    // as the SELECTOR and the two free service-extra slots 13/14 for the source MemoryObject cap and
+    // the combined SEND|RECEIVE endpoint cap, calling the SAME arch-neutral provisioning helper. It is
+    // mutually exclusive with EVERY slot-13/14 oracle above (only fires when both are still zero) AND
+    // with the five slot-5 Yield/FutexWait/FutexWake oracles below (they share slot 5): if the
+    // shared-region knob AND any other slot-5 knob are both set the boot arms NEITHER (fail closed).
+    // Transactional + leak-free — a provisioning failure rolls back and leaves the oracle un-armed.
+    #[cfg(feature = "aarch64-shared-region-direct-oracle")]
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
+        let slot5_conflict = crate::kernel::boot::aarch64_yield_lone_oracle_enabled()
+            || crate::kernel::boot::aarch64_yield_oracle_enabled()
+            || crate::kernel::boot::aarch64_futex_wait_idle_oracle_enabled()
+            || crate::kernel::boot::aarch64_futex_wait_retire_enabled()
+            || crate::kernel::boot::aarch64_futex_wake_oracle_enabled();
+        if crate::kernel::boot::aarch64_shared_region_direct_oracle_enabled() && slot5_conflict {
+            crate::yarm_log!(
+                "AARCH64_ORACLE_SLOT5_CONFLICT shared_region=1 other_slot5=1 result=arm_neither"
+            );
+        } else if let Some(caps) =
+            crate::kernel::boot::provision_init_shared_region_oracle(kernel, RING3_INIT_SERVER_TID)
+        {
+            init_args[5] = crate::kernel::boot::AARCH64_SHARED_REGION_ORACLE_SELECTOR;
+            init_args[13] = caps.mem_cap as u64;
+            init_args[14] = caps.endpoint_cap as u64;
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_SLOTS slot5={} slot13={} slot14={} eidx={}",
+                init_args[5],
+                init_args[13],
+                init_args[14],
+                caps.endpoint_idx
+            );
+        }
+    }
     // Stage 195C: default-off AArch64 FutexWake live oracle. Slot 5
     // (supervisor_control_recv_ep) is unused by init, so under
     // `yarm.aarch64_futex_wake_oracle=1` we reuse it as a sentinel (=1) that tells init to
     // run the parent/child FutexWake oracle. A normal boot leaves it 0 and init skips it.
-    // Slot-5 oracle sentinel: 5 = Stage 195G lone-task Yield oracle; 4 = Stage 195G two-task
-    // Yield oracle; 3 = Stage 195F FutexWait NO-INCOMING idle oracle; 2 = Stage 195E FutexWait
-    // switch oracle (retire flag = its discriminator); 1 = Stage 195C FutexWake oracle.
-    if crate::kernel::boot::aarch64_yield_lone_oracle_enabled() {
+    // Slot-5 oracle sentinel: 6 = Stage 198E3C2B DIRECT shared-region oracle; 5 = Stage 195G
+    // lone-task Yield oracle; 4 = Stage 195G two-task Yield oracle; 3 = Stage 195F FutexWait
+    // NO-INCOMING idle oracle; 2 = Stage 195E FutexWait switch oracle (retire flag = its
+    // discriminator); 1 = Stage 195C FutexWake oracle. It never overwrites a selector the
+    // shared-region oracle already set (guarded by `init_args[5] == 0`).
+    if init_args[5] == 0 && crate::kernel::boot::aarch64_yield_lone_oracle_enabled() {
         init_args[5] = 5;
         crate::yarm_log!("AARCH64_YIELD_LONE_ORACLE_PROVISION_OK slot5=5");
     } else if crate::kernel::boot::aarch64_yield_oracle_enabled() {

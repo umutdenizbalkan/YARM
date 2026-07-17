@@ -89,3 +89,27 @@ userspace: raw IpcSend(NR=1, [ep_cap, offset=0, len=REGION_BYTES>128, 0, 0, mem_
 | descriptor offset field | bytes `0..8` (`SHARED_REGION_DESCRIPTOR_OFFSET_AT = 0`) | `encode()` writes `offset` at `0..8` |
 | descriptor length field | bytes `8..16` (`SHARED_REGION_DESCRIPTOR_LEN_AT = 8`) | `encode()` writes `len` at `8..16` |
 | IpcSend NR | `SYSCALL_IPC_SEND_NR = 1` | `Syscall::IpcSend` = 1 |
+
+## Stage 198E3C2B — AArch64 direct live cell (second armed arch)
+
+The sealed x86_64 cell was ported to **AArch64** reusing the SAME arch-neutral kernel transaction
+(`shared_region_txn`), authoritative blocked-recv ack, off-lock producer gate, waiter identity,
+finalization, AND the arch-neutral userspace `shared_region_oracle_core` — no kernel logic or oracle
+core was duplicated. Activation requires BOTH the build feature `aarch64-shared-region-direct-oracle`
+AND the runtime selector `yarm.aarch64_shared_region_direct_oracle=1`; init startup slot-5 selector is
+**6** (x86 uses 2; AArch64 selectors 1–5 already name the FutexWake/FutexWait/Yield oracles). A clean
+`-smp 1` boot earned the genuine seal
+`SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=aarch64 classes=1 live_cells=1 fuse_trips=0 result=ok`.
+
+Two arch-specific facts surfaced (and were fixed) porting the sealed x86 flow — both are ABI/address
+constants, NOT changes to the sealed large-send ABI or the kernel transaction:
+
+| Concern | x86_64 (sealed) | AArch64 | Why it differs |
+| --- | --- | --- | --- |
+| oracle receive-window VA | `0x4000_0000` (1 GiB) | `0x2000_0000` (512 MiB) | AArch64's user (TTBR0) half ends at `KERNEL_SPACE_BASE = 0x4000_0000`, so 1 GiB is **not** a user VA there (a map at it fails `PrivilegeViolation`). Parametrized per-`target_arch` in BOTH `yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA` and kernel `SHARED_REGION_ORACLE_USER_VA` (they MUST stay equal); the 512 MiB window sits above the image/initrd and below the AArch64 user stack (observed just under 1 GiB). |
+| `TransferRelease` (NR 4) return-lane decode | separate error register (`RCX`); value in `RAX`/`ret0` | no error register — X0 = released length on success, X0 = small `SyscallError` code on error | `release_shared_region_mapping`'s AArch64 branch now mirrors the frozen `decode_release` convention: the released length is always a nonzero page-multiple (≥ PAGE) while every error code is below PAGE, so the page-alignment test is the authoritative success/error discriminator. (The earlier `ret1` read was wrong: `handle_transfer_release` leaves `ret1 = 0`.) The x86 branch is unchanged. |
+
+Marker literals stay arch-parametrized through `SHARED_REGION_ORACLE_ARCH` (one emitter serves both
+arches); the artifact guard admits the DIRECT retirement literal only for an explicitly-armed
+x86_64 **or** aarch64 oracle build and still forbids it (plus the ENQUEUE class) everywhere else.
+RISC-V remains un-wired; enqueue stays disabled on every arch.

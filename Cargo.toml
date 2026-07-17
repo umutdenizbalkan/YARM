@@ -48,7 +48,14 @@ riscv64-timer-irq = []
 # feature only COMPILES the marker paths; the runtime selector
 # (`yarm.x86_64_shared_region_direct_oracle=1`) is still required to execute the oracle — the feature
 # alone activates no runtime behavior. x86_64-only; never enables the queued class or any non-x86 arch.
-x86-shared-region-direct-oracle = []
+#
+# Stage 198E3C2B: `shared-region-direct-oracle` is the ARCH-NEUTRAL umbrella that compiles the shared
+# kernel logic (provisioning, authoritative ack, direct producer gate). Each per-arch feature enables
+# it AND gates that arch's marker literals + boot caller. Marker literals are additionally
+# `target_arch`-gated so the AArch64 feature never activates x86 markers (and vice versa).
+shared-region-direct-oracle = []
+x86-shared-region-direct-oracle = ["shared-region-direct-oracle"]
+aarch64-shared-region-direct-oracle = ["shared-region-direct-oracle"]
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }

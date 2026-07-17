@@ -732,7 +732,7 @@ pub(super) fn handle_ipc_recv(
             // was just stored above. This is the earliest point the complete committed identity
             // exists; it is oracle-only (feature+knob gated), reads authoritative committed state,
             // and does not wake / mint / copy / lock / retire. A strict no-op off the oracle.
-            #[cfg(feature = "x86-shared-region-direct-oracle")]
+            #[cfg(feature = "shared-region-direct-oracle")]
             crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
                 kernel, recv_tid, endpoint, &state,
             );

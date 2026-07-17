@@ -67996,8 +67996,13 @@ mod stage198e3c1_direct_live_policy {
         assert!(
             CMDLINE_SRC.contains("options.x86_64_shared_region_direct_oracle = parse_bool_knob")
         );
-        // The Cargo feature exists and is NOT in the default set (default = ["hosted-dev"]).
-        assert!(CARGO_SRC.contains("x86-shared-region-direct-oracle = []"));
+        // The per-arch feature exists, forwards to the arch-neutral umbrella, and neither the umbrella
+        // nor the per-arch feature is in the default set (default = ["hosted-dev"]).
+        assert!(CARGO_SRC.contains("shared-region-direct-oracle = []"));
+        assert!(
+            CARGO_SRC
+                .contains("x86-shared-region-direct-oracle = [\"shared-region-direct-oracle\"]")
+        );
         assert!(CARGO_SRC.contains("default = [\"hosted-dev\"]"));
         // The runtime setter arms the shared proof knob (so the already-wired producer goes live),
         // proving the runtime selector — not the compile-time feature — is what activates behavior.
@@ -68019,12 +68024,19 @@ mod stage198e3c1_direct_live_policy {
             .map(|(_, r)| r)
             .expect("gated helper present");
         assert!(gated.contains("IPCSEND_SHARED_REGION_OBJECT_OK"));
-        // Every attestation/retirement literal in mod.rs is preceded by the feature+x86 cfg.
+        // Every attestation/retirement literal in mod.rs is preceded by the per-arch armed cfg: the
+        // gate admits the x86 feature ONLY on x86_64 and the aarch64 feature ONLY on aarch64, so a
+        // NORMAL build (neither feature) — and each arch under the OTHER arch's feature — is clean.
         assert!(
             MOD_SRC.contains(
-                "#[cfg(all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\"))]"
+                "all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\")"
             ),
-            "the direct marker paths must be gated on the armed x86_64 oracle feature"
+            "the direct marker paths must admit the x86 feature only on x86_64"
+        );
+        assert!(
+            MOD_SRC.contains("feature = \"aarch64-shared-region-direct-oracle\"")
+                && MOD_SRC.contains("target_arch = \"aarch64\""),
+            "the direct marker paths must admit the aarch64 feature only on aarch64"
         );
         // The drain's success arm delegates to the gated helper and holds no inline literal.
         assert!(RT_SRC.contains("maybe_emit_shared_region_direct_live_markers("));
@@ -68673,9 +68685,7 @@ mod stage198e3c1_direct_live_policy {
         );
         // The publish is gated on the feature and is a no-op off the runtime knob (checked in-fn).
         assert!(MOD_SRC.contains("fn maybe_publish_shared_region_blocked_recv_ack"));
-        assert!(
-            MOD_SRC.contains("if !x86_shared_region_direct_oracle_enabled() {\n        return;")
-        );
+        assert!(MOD_SRC.contains("if !shared_region_direct_oracle_enabled() {\n        return;"));
         // The hook checks the recv-v2 state, the oracle VA, and a real metadata pointer before it
         // acknowledges, and confirms the endpoint waiter identity is committed for THIS receiver.
         let hook = MOD_SRC
@@ -69317,29 +69327,42 @@ mod stage198e3c1_direct_live_policy {
         assert!(SERVICE_SRC.contains("core_oracle::oracle_caps()"));
     }
 
-    // Cross-architecture preparation: no non-x86 shared-region LIVE selector/producer/retirement is
-    // enabled yet, and enqueue stays disabled everywhere.
+    // Cross-architecture state (Stage 198E3C2B): the DIRECT shared-region cell is now LIVE on x86_64
+    // AND AArch64, but RISC-V remains completely un-wired, and enqueue stays disabled everywhere.
     #[test]
-    fn cross_arch_shared_region_live_off_for_non_x86() {
-        // The kernel provisioning + knob + selector + ack + markers are x86_64-gated only.
+    fn cross_arch_shared_region_live_riscv_off_aarch64_wired() {
+        // The x86 selector const is still x86-feature-gated (=2); AArch64 has its own selector (=6).
         assert!(MOD_SRC.contains(
             "#[cfg(feature = \"x86-shared-region-direct-oracle\")]\npub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"
         ));
         assert!(MOD_SRC.contains(
-            "#[cfg(all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\"))]"
+            "#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]\npub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;"
         ));
-        // Only the x86 wrapper + dispatch exist; there is NO aarch64/riscv shared-region oracle fn.
-        assert!(!SERVICE_SRC.contains("run_aarch64_shared_region_direct_oracle"));
+        // Both arch wrappers exist; there is STILL NO riscv shared-region oracle fn.
+        assert!(SERVICE_SRC.contains("run_x86_shared_region_direct_oracle"));
+        assert!(SERVICE_SRC.contains("run_aarch64_shared_region_direct_oracle"));
         assert!(!SERVICE_SRC.contains("run_riscv_shared_region_direct_oracle"));
-        // The slot-5 shared-region dispatch is x86_64-target-gated.
-        let disp = SERVICE_SRC
-            .find("run_x86_shared_region_direct_oracle(ctx.task_id)")
-            .expect("x86 dispatch");
-        let prefix = &SERVICE_SRC[..disp];
-        assert!(
-            prefix.rfind("target_arch = \"x86_64\"").is_some(),
-            "the shared-region dispatch must be x86_64-gated"
-        );
+        // The slot-5 shared-region dispatch is target-gated per arch (never RISC-V).
+        for (name, disp) in [
+            ("x86_64", "run_x86_shared_region_direct_oracle(ctx.task_id)"),
+            (
+                "aarch64",
+                "run_aarch64_shared_region_direct_oracle(ctx.task_id)",
+            ),
+        ] {
+            let at = SERVICE_SRC
+                .find(disp)
+                .unwrap_or_else(|| panic!("{name} dispatch"));
+            let prefix = &SERVICE_SRC[..at];
+            let cfg = prefix.rfind("#[cfg(").expect("dispatch cfg");
+            assert!(
+                SERVICE_SRC[cfg..at].contains(&format!("target_arch = \"{name}\"")),
+                "the {name} shared-region dispatch must be {name}-target-gated"
+            );
+        }
+        assert!(!SERVICE_SRC.contains(
+            "target_arch = \"riscv64\"\n    if ctx.supervisor_control_recv_ep == Some(6)"
+        ));
         // Enqueue stays disabled: no live enqueue class literal anywhere in the kernel.
         assert!(!MOD_SRC.contains("class=IpcSendSharedRegionEnqueue"));
     }
@@ -69369,6 +69392,201 @@ mod stage198e3c1_direct_live_policy {
     fn large_send_abi_contract_marker() {
         crate::yarm_log!(
             "SHARED_REGION_LARGE_SEND_ABI_CONTRACT descriptor_bytes=16 inline_selector=0 source_cap_preserved=1 result=ok"
+        );
+    }
+}
+
+// Stage 198E3C2B — AARCH64 DIRECT SHARED-REGION LIVE CELL POLICY. Source-inspection guards that lock
+// in the AArch64 port's contract: it reuses the SAME arch-neutral kernel transaction/ack/marker core
+// and oracle core (no duplication), requires BOTH the per-arch feature AND the runtime selector to
+// activate, keeps enqueue disabled, keeps RISC-V un-wired, and never lets the userspace completion
+// stand in for the kernel attestations.
+mod stage198e3c2b_aarch64_direct {
+    use super::*;
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RT_SRC: &str = include_str!("../../runtime.rs");
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-shared-region-direct-aarch64-smoke.sh");
+
+    // (1) The AArch64 per-arch feature forwards to the arch-neutral umbrella and is NOT default-on.
+    #[test]
+    fn aarch64_feature_forwards_to_umbrella_and_defaults_off() {
+        assert!(CARGO_SRC.contains("shared-region-direct-oracle = []"));
+        assert!(
+            CARGO_SRC.contains(
+                "aarch64-shared-region-direct-oracle = [\"shared-region-direct-oracle\"]"
+            )
+        );
+        assert!(CARGO_SRC.contains("default = [\"hosted-dev\"]"));
+        // The umbrella (not the per-arch feature) gates the shared kernel logic.
+        assert!(MOD_SRC.contains("#[cfg(feature = \"shared-region-direct-oracle\")]"));
+    }
+
+    // (2) BOTH the feature AND the runtime selector are required: the AArch64 cmdline key parses to a
+    // default-off knob, the setter arms the shared oracle-proof knob, and the boot provisioning caller
+    // is feature-gated behind `aarch64-shared-region-direct-oracle`.
+    #[test]
+    fn aarch64_feature_and_selector_both_required() {
+        // Cmdline knob parses + defaults off.
+        assert!(CMDLINE_SRC.contains("yarm.aarch64_shared_region_direct_oracle"));
+        assert!(
+            CMDLINE_SRC.contains("options.aarch64_shared_region_direct_oracle = parse_bool_knob")
+        );
+        // The runtime setter arms the shared proof knob (runtime selector activates behavior).
+        assert!(
+            MOD_SRC.contains("fn set_aarch64_shared_region_direct_oracle_enabled")
+                && MOD_SRC.contains("set_ipc_recv_oracle_proof_enabled(true)")
+        );
+        // The shared enabled predicate ORs the two per-arch knobs (so the umbrella logic arms for
+        // EITHER arch), and the AArch64 boot provisioning is compiled ONLY under the AArch64 feature.
+        assert!(MOD_SRC.contains(
+            "x86_shared_region_direct_oracle_enabled() || aarch64_shared_region_direct_oracle_enabled()"
+        ));
+        assert!(BOOT_SRC.contains("#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]"));
+        assert!(BOOT_SRC.contains("aarch64_shared_region_direct_oracle_enabled()"));
+    }
+
+    // (3) The AArch64 boot provisioning slot contract: selector 6, source cap + endpoint cap in slots
+    // 13/14, mutually exclusive with every slot-13/14 oracle above AND with the five slot-5 oracles
+    // (fail-closed arm-neither), and it reuses the SAME arch-neutral `provision_init_shared_region_oracle`.
+    #[test]
+    fn aarch64_boot_provisioning_slot_contract() {
+        // Selector 6; reuses the arch-neutral provisioning helper (no duplicated kernel logic).
+        assert!(BOOT_SRC.contains("crate::kernel::boot::AARCH64_SHARED_REGION_ORACLE_SELECTOR"));
+        assert!(BOOT_SRC.contains(
+            "crate::kernel::boot::provision_init_shared_region_oracle(kernel, RING3_INIT_SERVER_TID)"
+        ));
+        // Only fires when slots 5/13/14 are all still zero (mutually exclusive with slot-13/14 oracles).
+        assert!(
+            BOOT_SRC.contains("if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0")
+        );
+        // Fail-closed slot-5 conflict: if the shared-region knob AND any other slot-5 oracle are both
+        // armed, arm NEITHER.
+        assert!(BOOT_SRC.contains("AARCH64_ORACLE_SLOT5_CONFLICT"));
+        assert!(BOOT_SRC.contains("result=arm_neither"));
+        // The other five slot-5 oracles never overwrite a selector the shared-region oracle set.
+        assert!(BOOT_SRC.contains(
+            "if init_args[5] == 0 && crate::kernel::boot::aarch64_yield_lone_oracle_enabled()"
+        ));
+    }
+
+    // (4) The AArch64 selector value = 6, distinct from x86's 2 and from the five AArch64 slot-5
+    // oracles (1-5); the userspace and kernel selector constants agree.
+    #[test]
+    fn aarch64_selector_is_six_distinct_from_others() {
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]\npub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;"
+        ));
+        assert!(USER_RT_SRC.contains("pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;"));
+        // x86 keeps its own value 2.
+        assert!(MOD_SRC.contains("pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"));
+    }
+
+    // (5) The AArch64 userspace wrapper delegates ENTIRELY to the arch-neutral oracle core — it
+    // duplicates NO recv/validate/release/send/retry logic (only spawn + arch-named markers).
+    #[test]
+    fn aarch64_wrapper_delegates_no_duplicated_impl() {
+        // The wrapper drives the shared core for spawn + parent send + child validation.
+        assert!(SERVICE_SRC.contains("fn run_aarch64_shared_region_direct_oracle"));
+        assert!(SERVICE_SRC.contains("core_oracle::parent_wait_and_send(endpoint_cap, mem_cap)"));
+        assert!(SERVICE_SRC.contains("aarch64_shared_region_direct_oracle_child"));
+        // Isolate the AArch64 wrapper span (its two fns) and prove it contains no re-implemented core
+        // logic: no direct recv-v2 call, no release call, no bounded-retry loop of its own.
+        let start = SERVICE_SRC
+            .find("fn aarch64_shared_region_direct_oracle_child")
+            .expect("aarch64 child fn");
+        let end = SERVICE_SRC[start..]
+            .find("// ─── Stage 196C")
+            .map(|o| start + o)
+            .expect("end of aarch64 wrapper");
+        let span = &SERVICE_SRC[start..end];
+        assert!(
+            !span.contains("recv_shared_region_v2("),
+            "the aarch64 wrapper must NOT re-implement the recv (delegates to the core)"
+        );
+        assert!(
+            !span.contains("release_shared_region_mapping("),
+            "the aarch64 wrapper must NOT re-implement the release (delegates to the core)"
+        );
+        assert!(
+            !span.contains("MAX_SEND_ATTEMPTS"),
+            "the aarch64 wrapper must NOT re-implement the bounded send retry (delegates to the core)"
+        );
+        // It DOES call the arch-neutral core for the child body + caps.
+        assert!(span.contains("core_oracle::child_recv_and_validate()"));
+        assert!(span.contains("core_oracle::oracle_caps()"));
+    }
+
+    // (6) The kernel attestations are the authoritative proof: the userspace completion marker alone
+    // cannot satisfy the smoke, which requires all FIVE kernel markers each exactly once PLUS the
+    // single off-lock post-work publication, independently of the userspace DONE line.
+    #[test]
+    fn aarch64_userspace_cannot_substitute_for_kernel_attestations() {
+        // The smoke requires the five KERNEL markers (arch=aarch64) each exactly once.
+        for m in [
+            "IPCSEND_SHARED_REGION_OBJECT_OK arch=aarch64 class=direct",
+            "IPCSEND_SHARED_REGION_MAP_OK arch=aarch64 class=direct",
+            "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch=aarch64 class=direct",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendSharedRegionDirect",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendSharedRegionDirect result=ok",
+        ] {
+            assert!(
+                SMOKE_SRC.contains(m),
+                "smoke must require kernel marker: {m}"
+            );
+        }
+        // The single off-lock publication is required exactly once (independent of userspace).
+        assert!(
+            SMOKE_SRC
+                .contains("DISPATCH_POST_WORK_DONE kind=blocked_waiter_shared_region result=ok")
+        );
+        // The userspace DONE line is ALSO required, but it is NOT the retirement proof.
+        assert!(SMOKE_SRC.contains("AARCH64_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE"));
+    }
+
+    // (7) The artifact guard exception is build-specific: it permits the DIRECT literal ONLY for the
+    // explicitly armed AArch64 oracle build, still forbids the bare/off-arch shared-region marker, and
+    // forbids the ENQUEUE class in every build.
+    #[test]
+    fn aarch64_artifact_guard_exception_is_build_specific() {
+        assert!(GUARD_SRC.contains(
+            "YARM_SHARED_REGION_DIRECT_ORACLE_BUILD:-0}\" == \"1\" && \"$arch\" == \"aarch64\""
+        ));
+        assert!(GUARD_SRC.contains("arch=x86_64 class=IpcSendSharedRegion"));
+        // The default branch still forbids the bare shared-region class (normal/off-arch builds clean).
+        assert!(GUARD_SRC.contains("forbidden+=(\"class=IpcSendSharedRegion\")"));
+        // Enqueue forbidden in every build.
+        assert!(GUARD_SRC.contains("class=IpcSendSharedRegionEnqueue"));
+    }
+
+    // (8) The AArch64 marker emitters remain arch-parametrized (no hardcoded per-arch literal): the
+    // retirement/attestation literals are emitted through `SHARED_REGION_ORACLE_ARCH`, so the SAME
+    // emitter serves x86_64 and aarch64 without duplication, and the drain holds no inline literal.
+    #[test]
+    fn aarch64_markers_reuse_parametrized_emitter() {
+        assert!(MOD_SRC.contains("arch={} class=IpcSendSharedRegionDirect"));
+        assert!(MOD_SRC.contains("SHARED_REGION_ORACLE_ARCH"));
+        // No hardcoded aarch64 shared-region literal (must be parametrized).
+        assert!(!MOD_SRC.contains("arch=aarch64 class=IpcSendSharedRegionDirect"));
+        // The drain delegates to the gated helper (no inline literal).
+        assert!(RT_SRC.contains("maybe_emit_shared_region_direct_live_markers("));
+        assert!(!RT_SRC.contains("IPCSEND_SHARED_REGION_OBJECT_OK"));
+    }
+
+    // (9) Required hosted contract marker for the AArch64 cell (NOT a live retirement marker; the live
+    // seal is earned ONLY from a clean QEMU boot log).
+    #[test]
+    fn aarch64_direct_cell_contract_marker() {
+        crate::yarm_log!(
+            "AARCH64_SHARED_REGION_DIRECT_CELL_CONTRACT selector=6 umbrella_reused=1 oracle_core_reused=1 enqueue=0 riscv=0 result=ok"
         );
     }
 }
