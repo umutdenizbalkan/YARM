@@ -1718,6 +1718,87 @@ impl SharedKernel {
             DispatchPostWork::BlockedWaiterReplyCapDelivery(snap) => {
                 self.execute_blocked_waiter_reply_cap_delivery(cpu, snap)
             }
+            DispatchPostWork::BlockedWaiterSharedRegionDelivery(snap) => {
+                self.execute_blocked_waiter_shared_region_delivery(cpu, snap)
+            }
+        }
+    }
+
+    /// Stage 198E3 — executor for a shared-region (MemoryObject / DmaRegion) blocked-receiver /
+    /// queued-dequeue delivery. Runs AFTER the original broad borrow dropped, and executes the
+    /// accepted origin-neutral post-lock transaction `shared_region_execute` (fresh receiver-local
+    /// cap mint, region map, recv-v2 meta copy, final receiver/ASID revalidation, single wake,
+    /// single idempotent rollback). The transferred object pin was moved into the snapshot by the
+    /// producer with no reference gap.
+    ///
+    /// Origin gating: the class-tagged attestation + retirement markers are emitted ONLY here, on a
+    /// real successful post-lock completion, keyed by the per-CPU `SharedRegionLiveOrigin` the
+    /// producer set. Ordinary-cap, reply-cap, plain, hosted-test, and legacy-fallback paths never
+    /// set that origin, so they never emit these markers.
+    ///
+    /// NOTE (Stage 198E3 foundation): `shared_region_execute` is a `KernelState` method, so this
+    /// arm currently re-enters `with_cpu` to run it. Enabling the live oracle requires decomposing
+    /// `shared_region_execute` into `&SharedKernel` seams (mint / map / copy_to_user_split / wake)
+    /// so the user copy runs strictly outside every lock — the primary remaining live-wiring task.
+    /// This arm is DORMANT until the oracle-proof knob gates a producer on (no normal boot or hosted
+    /// test reaches it).
+    fn execute_blocked_waiter_shared_region_delivery(
+        &self,
+        cpu: CpuId,
+        snap: crate::kernel::dispatch_post_work::BlockedWaiterSharedRegionDeliverySnapshot,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::boot::SharedRegionLiveOrigin;
+        use crate::kernel::syscall::SyscallError;
+
+        let cpu_idx = cpu.0 as usize;
+        let origin = crate::kernel::boot::shared_region_live_origin_take(cpu_idx);
+        let class = match origin {
+            Some(SharedRegionLiveOrigin::Enqueue) => "enqueue",
+            _ => "direct",
+        };
+        let waiter_tid = snap.snapshot.receiver_tid;
+        crate::yarm_log!(
+            "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_shared_region waiter_tid={}",
+            waiter_tid
+        );
+        crate::yarm_log!("DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocked_waiter_shared_region");
+
+        // Run the accepted post-lock transaction FULLY OFF-LOCK through `SharedRegionOffLockCtx` —
+        // no broad-borrow re-entry and no whole-KernelState borrow. The finalize step inside the
+        // runner clears the blocked-return state + the exact endpoint waiter slot and then enqueues
+        // the receiver exactly once; the user copy + any TLB completion run with no lock held.
+        let mut ctx = SharedRegionOffLockCtx(self);
+        let result =
+            crate::kernel::boot::shared_region_txn::run_shared_region_txn(&mut ctx, snap.snapshot);
+        match result {
+            Ok(publish) => {
+                // Origin-gated shared-region attestations + retirement — emitted ONLY here, after the
+                // transaction finalized, the waiter state cleared, and the receiver enqueued once.
+                // The marker LITERALS live entirely inside the cfg-gated helper, so a NORMAL build
+                // (feature off) contains none of the `IPCSEND_SHARED_REGION_*` / `class=IpcSend
+                // SharedRegionDirect` strings. `class` is consumed by the helper (arch is fixed
+                // x86_64 there, the only architecture the feature compiles for).
+                crate::kernel::boot::maybe_emit_shared_region_direct_live_markers(
+                    class,
+                    &snap.snapshot,
+                    publish.woke_receiver,
+                    origin,
+                );
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_DONE kind=blocked_waiter_shared_region result=ok"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // The transaction already rolled back to a clean state (single idempotent rollback):
+                // no wake, mapped prefix unmapped, provisional cap revoked, pin released. NO
+                // shared-region attestation or retirement marker is emitted from a rolled-back txn.
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_FAIL kind=blocked_waiter_shared_region reason=txn err={:?}",
+                    e
+                );
+                Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))
+            }
         }
     }
 
@@ -2560,6 +2641,461 @@ impl SharedKernel {
         count as u32
     }
 
+    // ── Stage 198E3B2A part 2: shared-region OFF-LOCK seams ─────────────────────────────────────
+    //
+    // Each seam re-derives its domain pointer from `self.state.data_ptr()` on EVERY call (no cached
+    // projected pointers), acquires ONLY its documented domain lock, and returns owned/copyable data
+    // (no domain reference escapes a guard). No seam forms a whole `&mut KernelState`.
+
+    /// rank 2: generation-bearing receiver liveness (status not Dead/Exited + captured ASID).
+    pub(crate) fn sr_receiver_alive_split(&self, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
+        unsafe {
+            KernelState::shared_region_receiver_alive_from_raw(self.state.data_ptr(), tid, asid)
+        }
+    }
+    /// rank 3: the fail-closed cancellation overflow fuse (read).
+    pub(crate) fn sr_cancel_overflowed_split(&self) -> bool {
+        self.with_ipc_split_mut(|ipc| ipc.shared_region_cancel_overflow)
+    }
+    /// rank 3: one-shot consume a matching (tid, asid) cancellation request.
+    pub(crate) fn sr_consume_cancel_split(&self, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::shared_region_consume_cancel_locked(ipc, tid, asid)
+        })
+    }
+    /// rank 3: register the provisional active mapping.
+    pub(crate) fn sr_register_active_mapping_split(
+        &self,
+        tid: u64,
+        cap: CapId,
+        va: u64,
+        len: usize,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::register_active_transfer_mapping_locked(
+                ipc,
+                crate::kernel::ipc::ThreadId(tid),
+                cap,
+                crate::kernel::vm::VirtAddr(va),
+                len,
+            )
+        })
+    }
+    /// rank 3: update the provisional active mapping's length to the current mapped prefix.
+    pub(crate) fn sr_update_mapped_prefix_split(
+        &self,
+        tid: u64,
+        cap: CapId,
+        prefix_len: usize,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::update_active_transfer_mapping_len_locked(
+                ipc,
+                crate::kernel::ipc::ThreadId(tid),
+                cap,
+                prefix_len,
+            )
+        })
+    }
+    /// rank 3: remove the provisional active mapping (guarded).
+    pub(crate) fn sr_remove_active_mapping_split(&self, tid: u64, cap: CapId) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            KernelState::remove_active_transfer_mapping_locked(
+                ipc,
+                crate::kernel::ipc::ThreadId(tid),
+                cap,
+            )
+        })
+    }
+    /// rank 6: physical base of the frozen shared object.
+    pub(crate) fn sr_phys_base_split(
+        &self,
+        object: CapObject,
+    ) -> Option<crate::kernel::vm::PhysAddr> {
+        self.with_memory_split_mut(|m| KernelState::shared_region_phys_base_locked(m, object))
+    }
+    /// rank 6: release the transferred object pin (once).
+    pub(crate) fn sr_release_pin_split(&self, object: CapObject) {
+        self.with_memory_split_mut(|m| {
+            KernelState::adjust_memory_object_pin_refcount_locked(m, object, -1)
+        })
+    }
+    /// Equivalent to `capability_object_live`: MemoryObject/DmaRegion are unconditionally live;
+    /// Endpoint/Notification/Reply are generation-checked under the IPC lock (rank 3).
+    pub(crate) fn sr_object_live_split(&self, object: CapObject) -> bool {
+        // Mirrors `capability_object_live`: generation-checked for Endpoint/Notification/Reply
+        // (rank 3 IPC read; bounds via the array length), unconditionally live otherwise
+        // (MemoryObject/DmaRegion — the only shared-region objects — take the `_ => true` arm).
+        match object {
+            CapObject::Endpoint { index, generation } => self.with_ipc_split_mut(|ipc| {
+                index < ipc.endpoint_generations.len()
+                    && ipc.endpoint_generations[index] == generation
+            }),
+            CapObject::Notification { index, generation } => self.with_ipc_split_mut(|ipc| {
+                index < ipc.notification_generations.len()
+                    && ipc.notification_generations[index] == generation
+            }),
+            CapObject::Reply { index, generation } => self.with_ipc_split_mut(|ipc| {
+                index < ipc.reply_cap_generations.len()
+                    && ipc.reply_cap_generations[index] == generation
+            }),
+            _ => true,
+        }
+    }
+    /// rank 4 (+6, ordered non-overlapping): mint the attenuated receiver-local cap. Reuses the
+    /// accepted `mint_capability_with_memory_ref_split` (rank-6 memory-ref phase, then rank-4 cnode
+    /// slot phase, with its own rollback) — NO second mint implementation, no cap+memory nesting.
+    pub(crate) fn sr_mint_split(
+        &self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: crate::kernel::capabilities::Capability,
+    ) -> Result<CapId, ()> {
+        self.mint_capability_with_memory_ref_split(cnode, cap)
+            .map_err(|_| ())
+    }
+    /// rank 4 (+6): revoke the provisional minted cap — the exact inverse of `sr_mint_split`.
+    /// Idempotent (a second call finds no slot / no refcount to drop).
+    pub(crate) fn sr_revoke_split(
+        &self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: CapId,
+        object: CapObject,
+    ) {
+        self.rollback_minted_cap_split(cnode, cap, object);
+    }
+
+    /// rank 5: map EXACTLY one user page and return the owned follow-up needed for rank-6 accounting
+    /// (and exact rollback). NX/rights/alignment are enforced by the caller (the runner); this seam
+    /// additionally asserts alignment + NX and never lets a page-table reference escape the guard.
+    pub(crate) fn map_user_page_in_asid_split(
+        &self,
+        asid: crate::kernel::vm::Asid,
+        virt: crate::kernel::vm::VirtAddr,
+        mapping: crate::kernel::vm::Mapping,
+    ) -> Result<SharedRegionMapFollowup, KernelError> {
+        use crate::kernel::vm::{PAGE_SIZE, VmError};
+        if virt.0 % (PAGE_SIZE as u64) != 0 {
+            return Err(KernelError::Vm(VmError::InvalidAddress));
+        }
+        debug_assert!(!mapping.flags.execute, "shared-region mapping must be NX");
+        let replaced = self.with_vm_user_spaces_split_mut(|spaces| {
+            spaces
+                .get_mut(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                .map_page(virt, mapping)
+                .map_err(KernelError::Vm)
+        })?;
+        Ok(SharedRegionMapFollowup {
+            inserted_phys: mapping.phys,
+            replaced,
+        })
+    }
+
+    /// rank 6: apply the map follow-up AFTER the VM lock dropped (map_refcount bookkeeping). A fresh
+    /// shared-region page has no replaced mapping; a replaced page's old frame is accounted/reclaimed
+    /// here (memory rank 6 only — never under the VM lock).
+    pub(crate) fn sr_apply_map_followup_split(&self, follow: SharedRegionMapFollowup) {
+        self.with_memory_split_mut(|m| {
+            if let Some(old) = follow.replaced {
+                KernelState::note_mapping_removed_locked(m, old.phys);
+                KernelState::reclaim_memory_object_for_phys_locked(m, old.phys);
+            }
+            KernelState::note_mapping_inserted_locked(m, follow.inserted_phys);
+        });
+    }
+
+    /// rank 5 → TLB (no lock) → rank 6: two-phase unmap of the EXACT mapped prefix. Zero-length is a
+    /// no-op. Each page: remove the PTE under the VM lock, produce the owned removed-mapping "plan",
+    /// release the VM lock, complete the required TLB shootdown with NO lock held, then reclaim under
+    /// the memory lock — never reclaiming before shootdown. Repeat calls are no-ops (pages already
+    /// gone). On hosted single-CPU the shootdown target bitmap is 0 (no cross-CPU wait); during a
+    /// shared-region rollback the object stays pinned, so the reclaim is a guarded no-op there.
+    pub(crate) fn unmap_range_two_phase_split(
+        &self,
+        asid: crate::kernel::vm::Asid,
+        base: usize,
+        len: usize,
+    ) {
+        use crate::kernel::vm::{PAGE_SIZE, VirtAddr};
+        if len == 0 {
+            return;
+        }
+        let end = base.saturating_add(len);
+        let mut va = base;
+        while va < end {
+            // Phase A (rank 5): remove exactly one PTE, produce the owned removed mapping.
+            let removed = self.with_vm_user_spaces_split_mut(|spaces| {
+                spaces
+                    .get_mut(asid)
+                    .and_then(|a| a.unmap_page(VirtAddr(va as u64)).ok().flatten())
+            });
+            if let Some(mapping) = removed {
+                // Phase A' (rank 6): map_refcount-- (mirrors `unmap_page_phase1`'s note_mapping_removed).
+                self.with_memory_split_mut(|m| {
+                    KernelState::note_mapping_removed_locked(m, mapping.phys)
+                });
+                // Phase B: TLB shootdown wait — NO domain lock held. Hosted single-CPU has an empty
+                // target bitmap, so no cross-CPU wait is needed here; the ordering (strictly after
+                // the VM lock released, strictly before the reclaim below) is preserved regardless.
+                // Phase C (rank 6): reclaim the frame — only AFTER shootdown. Guarded (a still-pinned
+                // or still-cap-referenced object is not freed), so a rollback prefix-unmap is a no-op.
+                self.with_memory_split_mut(|m| {
+                    KernelState::reclaim_memory_object_for_phys_locked(m, mapping.phys)
+                });
+            }
+            va = va.saturating_add(PAGE_SIZE);
+        }
+    }
+
+    /// rank 2 → rank 1 (non-nested): wake a blocked receiver exactly once. Phase 1 (task lock) reads
+    /// + validates status and sets it Runnable, capturing the affinity; phase 2 (scheduler lock)
+    /// enqueues. NO IPC/capability/VM/memory lock is held. Mirrors `apply_split_receiver_wake_plan`
+    /// (`wake_tid_to_runnable` → `enqueue_woken_task`) for a blocked recv-v2 receiver (whose plain
+    /// recv carries no IPC deadline, so the broad path's timeout-clear is a no-op here).
+    pub(crate) fn sr_wake_receiver_split(&self, tid: u64) -> bool {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::{TaskClass, TaskStatus};
+        // Phase 1 (rank 2): validate + set Runnable, capture affinity.
+        let plan = self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
+            let old = tcb.status;
+            if !matches!(
+                old,
+                TaskStatus::Blocked(_) | TaskStatus::Runnable | TaskStatus::Running
+            ) {
+                return None;
+            }
+            if !matches!(old, TaskStatus::Runnable) {
+                tcb.status = TaskStatus::Runnable;
+            }
+            Some(tcb.cpu_affinity)
+        });
+        let Some(affinity) = plan else {
+            return false;
+        };
+        // Phase 2 (rank 1): enqueue on the pinned CPU, else the current CPU (mirrors
+        // `enqueue_woken_task`). Priority is class-derived (SystemServer=High else Normal).
+        let priority = match self.task_class_split_read(tid) {
+            Some(TaskClass::SystemServer) => TaskPriority::High,
+            _ => TaskPriority::Normal,
+        };
+        self.with_scheduler_split_mut(|sched| {
+            let cpu = affinity.unwrap_or(sched.current_cpu);
+            let sm = kernel_mut(&mut sched.scheduler);
+            let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
+        });
+        true
+    }
+
+    /// rank 2 (task lock) — Stage 198E3B2B1 Phase 1: blocked-receiver PREVALIDATION. Makes NO
+    /// mutation. Requires the expected receiver TID to still exist, its captured ASID to still match,
+    /// and it to still be blocked in the expected recv-v2 operation. A dead / replaced / not-blocked
+    /// receiver returns `false` (stale) BEFORE any waiter is touched, so the common (no-concurrent-
+    /// mutator) replacement never removes a replacement task's waiter slot.
+    pub(crate) fn sr_prevalidate_blocked_receiver_split(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> bool {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        // NOTE: the recv-v2 payload state (`blocked_recv_state`) was CONSUMED into the snapshot at
+        // production (`blocked_recv_state.take()`), so the live check for "still blocked in the
+        // expected recv-v2 operation" is the surviving `Blocked(EndpointReceive)` status + the
+        // captured ASID; the exact endpoint identity + generation is verified in the Phase-2 claim.
+        self.with_task_tcbs_split_mut(
+            |tcbs| match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
+                Some(tcb) => {
+                    tcb.asid == Some(asid)
+                        && matches!(
+                            tcb.status,
+                            TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                        )
+                }
+                None => false,
+            },
+        )
+    }
+
+    /// rank 3 (ipc lock) — Stage 198E3B2B1 Phase 2: the exact, atomic waiter CLAIM. Under a single
+    /// rank-3 critical section it revalidates the endpoint index AND GENERATION, requires the exact
+    /// expected receiver as the slot's waiter, then removes that waiter EXACTLY ONCE and returns an
+    /// owned generation-bearing `WaiterClaim`. An endpoint destroyed/recreated (generation changed),
+    /// a different or absent waiter → no claim (`None`), slot untouched. The endpoint generation is
+    /// part of the claim authority: a same-index-but-newer endpoint can never be claimed.
+    pub(crate) fn sr_claim_endpoint_waiter_split(
+        &self,
+        eidx: usize,
+        egen: u64,
+        receiver: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> Option<WaiterClaim> {
+        self.with_ipc_split_mut(|ipc| {
+            // Stage 198E3B2B2: the slot must hold the COMPLETE identity (tid + ASID) — numeric TID
+            // reuse with a different ASID is not our receiver and is never claimed/cleared.
+            if eidx < ipc.endpoint_waiters.len()
+                && ipc.endpoint_generations[eidx] == egen
+                && ipc.endpoint_waiter_identity(eidx) == Some(receiver)
+            {
+                ipc.take_endpoint_waiter(eidx);
+                Some(WaiterClaim {
+                    eidx,
+                    generation: egen,
+                    receiver,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    /// rank 2 → rank 3 — restore the EXACT claimed waiter using its generation-bearing identity token.
+    /// Stage 198E3B2B2: restoration is permitted ONLY when the COMPLETE identity still matches — the
+    /// endpoint still exists at the claimed generation, the slot is currently free (never clobbering a
+    /// newer waiter), AND the task is STILL blocked on that endpoint with the same tid + ASID. It can
+    /// therefore never fabricate or overwrite a waiter for a replacement task. (The numeric-TID
+    /// Replaced→restore of Stage 198E3B2B1 is removed; the shared-region finalizer no longer restores,
+    /// so this is a guarded primitive whose exact-identity contract is proven by the focused tests.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn sr_restore_endpoint_waiter_split(&self, claim: &WaiterClaim) -> bool {
+        // rank 2: the task must still be blocked on recv with the EXACT claimed identity.
+        if !self.sr_prevalidate_blocked_receiver_split(claim.receiver.tid.0, claim.receiver.asid) {
+            return false;
+        }
+        // rank 3: slot free + endpoint generation matches → re-install the EXACT identity.
+        self.with_ipc_split_mut(|ipc| {
+            if claim.eidx < ipc.endpoint_waiters.len()
+                && ipc.endpoint_generations[claim.eidx] == claim.generation
+                && !ipc.endpoint_waiter_present(claim.eidx)
+            {
+                ipc.set_endpoint_waiter(claim.eidx, claim.receiver);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// rank 2 (task lock) — Stage 198E3B2B1 Phase 3: task COMMIT, run ONLY after a successful waiter
+    /// claim. Revalidates TID + ASID + blocked recv-v2 state AGAIN; for a still-live matching blocked
+    /// receiver this is infallible — it clears the blocked-return register state, transitions the
+    /// receiver Runnable, and captures its affinity (`Committed`). A receiver that EXITED / was
+    /// removed → `GoneDead` (never restore). A live task whose ASID no longer matches (replaced at the
+    /// same TID) → `Replaced` (caller restores its waiter). NO register is mutated on `GoneDead` /
+    /// `Replaced`, so a failed commit leaves the blocked-return registers byte-identical.
+    pub(crate) fn sr_commit_blocked_receiver_split(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> ReceiverCommit {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        self.with_task_tcbs_split_mut(|tcbs| {
+            // Classify FIRST (immutable), so no register is touched unless we commit. `blocked_recv_state`
+            // was consumed at production, so the live-match signal is `Blocked(EndpointReceive)` + ASID.
+            let class = match tcbs.iter().flatten().find(|t| t.tid.0 == tid) {
+                None => ReceiverCommit::GoneDead,
+                Some(tcb) if matches!(tcb.status, TaskStatus::Exited(_) | TaskStatus::Dead) => {
+                    ReceiverCommit::GoneDead
+                }
+                Some(tcb)
+                    if tcb.asid == Some(asid)
+                        && matches!(
+                            tcb.status,
+                            TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                        ) =>
+                {
+                    ReceiverCommit::Committed(None)
+                }
+                Some(_) => ReceiverCommit::Replaced,
+            };
+            if !matches!(class, ReceiverCommit::Committed(_)) {
+                return class;
+            }
+            // Infallible commit for a still-live matching blocked receiver: clear the blocked-return
+            // register state (single-sourced arch-gated helper), then set Runnable + capture affinity.
+            KernelState::clear_blocked_recv_return_regs_locked(tcbs, tid);
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .expect("prevalidated present");
+            tcb.status = TaskStatus::Runnable;
+            ReceiverCommit::Committed(tcb.cpu_affinity)
+        })
+    }
+
+    /// rank 1 (scheduler lock) — Stage 198E3B2B1 Phase 4: the single ENQUEUE. The receiver is already
+    /// Runnable (committed under the task lock); this only enqueues it exactly once on its captured
+    /// affinity (else the current CPU). This is the final externally visible action and is NON-fallible
+    /// — no fallible work runs after it. Priority is class-derived (SystemServer=High else Normal).
+    pub(crate) fn sr_enqueue_committed_receiver_split(&self, tid: u64, affinity: Option<CpuId>) {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::TaskClass;
+        let priority = match self.task_class_split_read(tid) {
+            Some(TaskClass::SystemServer) => TaskPriority::High,
+            _ => TaskPriority::Normal,
+        };
+        self.with_scheduler_split_mut(|sched| {
+            let cpu = affinity.unwrap_or(sched.current_cpu);
+            let sm = kernel_mut(&mut sched.scheduler);
+            let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
+        });
+    }
+
+    /// Origin-neutral finalize + wake for a shared-region delivery, entirely off-lock. For a blocked
+    /// endpoint waiter (`snap.blocked_endpoint_waiter`) it runs the Stage 198E3B2B1 CLAIM-THEN-COMMIT
+    /// protocol: Phase 1 prevalidate (rank 2, no mutation) → Phase 2 exact generation-bearing waiter
+    /// claim (rank 3, remove once) → Phase 3 commit (rank 2, clear registers + Runnable + affinity for
+    /// a live match; NO register mutation before the claim, none on a failed commit) → Phase 4 enqueue
+    /// (rank 1, once, non-fallible, last visible action). A dead receiver after the claim is stale with
+    /// the claimed waiter left removed; a replaced receiver has its exact waiter restored so no live
+    /// task is stranded — both roll back with ZERO wake. When `!blocked_endpoint_waiter` (queued
+    /// dequeue / proofs) it is a plain best-effort wake, preserving the prior executor semantics.
+    pub(crate) fn sr_finalize_blocked_receiver_and_wake_split(
+        &self,
+        snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    ) -> Option<bool> {
+        if !snap.blocked_endpoint_waiter {
+            // Plain wake path: no endpoint-waiter identity to claim (queued dequeue / txn proofs).
+            return Some(self.sr_wake_receiver_split(snap.receiver_tid));
+        }
+        let CapObject::Endpoint {
+            index: eidx,
+            generation: egen,
+        } = snap.endpoint
+        else {
+            return None;
+        };
+        // Stage 198E3B2B2: the claim is by the COMPLETE identity captured at production (tid + ASID).
+        let receiver = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(snap.receiver_tid),
+            snap.receiver_asid,
+        );
+        // Phase 1 (rank 2): prevalidate — NO mutation. A dead/replaced receiver is stale BEFORE claim,
+        // so a replacement waiter slot is never removed on the common path.
+        if !self.sr_prevalidate_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
+            return None;
+        }
+        // Phase 2 (rank 3): the exact, generation-bearing IDENTITY claim (remove once). Because the
+        // claim requires the full {tid, ASID} identity, a replacement task (reused numeric TID, new
+        // ASID) can never be claimed or cleared here.
+        let _claim = self.sr_claim_endpoint_waiter_split(eidx, egen, receiver)?;
+        // Phase 3 (rank 2): commit — registers cleared ONLY here, strictly after the claim.
+        match self.sr_commit_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
+            ReceiverCommit::Committed(affinity) => {
+                // Phase 4 (rank 1): the single, non-fallible enqueue — the last externally visible act.
+                self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity);
+                Some(true)
+            }
+            // Receiver exited OR was replaced (ASID changed) after the identity claim: the claimed
+            // waiter belonged to our exact receiver incarnation, which no longer exists — it is
+            // correctly stale and MUST NOT be restored (the old numeric-TID Replaced→restore is
+            // removed; a restore could only ever target the vanished incarnation, never a live
+            // replacement task). Zero wake; the transaction rolls back.
+            ReceiverCommit::GoneDead | ReceiverCommit::Replaced => None,
+        }
+    }
+
     /// Off-global-lock, all-or-nothing user-copy primitive (introduced Stage 191C; its
     /// original NR 27 InitramfsReadChunk caller was removed in Stage 197A, but this remains a
     /// generic split-path write seam with dedicated no-partial-write unit tests): copy the
@@ -3017,6 +3553,129 @@ impl SharedKernel {
         begin_boot_raw_borrow_window();
         // SAFETY: delegated to caller (see doc comment above).
         unsafe { &mut *self.state.data_ptr() }
+    }
+}
+
+/// Owned follow-up from `map_user_page_in_asid_split` (rank 5), applied under memory rank 6 AFTER
+/// the VM lock drops. Sufficient for map accounting and exact rollback of the just-mapped page.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SharedRegionMapFollowup {
+    pub(crate) inserted_phys: crate::kernel::vm::PhysAddr,
+    pub(crate) replaced: Option<crate::kernel::vm::Mapping>,
+}
+
+/// Owned proof that THIS blocked-receiver finalization removed EXACTLY its receiver's endpoint
+/// waiter slot (Stage 198E3B2B1). It carries the endpoint GENERATION it was claimed under so a later
+/// restore can only ever re-target the same endpoint incarnation — never a destroyed/recreated one.
+/// The claim is the sole authority for having removed the waiter; a numeric TID alone is never it.
+// Stage 198E3B2B2: with an identity-exact claim the production finalizer never restores (a claimed
+// waiter always belonged to the exact vanished incarnation), so the claim's fields are read only by
+// the guarded restore primitive and its focused tests.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WaiterClaim {
+    pub(crate) eidx: usize,
+    pub(crate) generation: u64,
+    /// Stage 198E3B2B2: the COMPLETE generation-bearing receiver identity (tid + ASID) that was
+    /// removed — a restore can only ever re-install this exact identity, never a replacement task.
+    pub(crate) receiver: crate::kernel::boot::ReceiverWaiterIdentity,
+}
+
+/// Outcome of the Phase-3 task commit, run only AFTER a successful waiter claim (Stage 198E3B2B1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverCommit {
+    /// Still-live matching blocked receiver: its blocked-return register state was cleared and it was
+    /// transitioned Runnable; the captured affinity is carried for the single Phase-4 enqueue.
+    Committed(Option<CpuId>),
+    /// The receiver exited / was removed after the claim: the claimed waiter is correctly stale and
+    /// MUST NOT be restored (there is no live task to strand). No register was mutated.
+    GoneDead,
+    /// A live task still occupies the TID but is no longer our receiver (ASID replaced): the caller
+    /// restores its EXACT claimed waiter so no live blocked task is stranded. No register was mutated.
+    Replaced,
+}
+
+/// Stage 198E3B2A: the OFF-LOCK shared-region execution context. Implements the single
+/// `SharedRegionExecCtx` transaction boundary ENTIRELY through the bounded `SharedKernel` split
+/// seams — it holds no broad borrow: no `with(...)`, no `with_cpu(...)`, no `&mut KernelState`, and
+/// no cached projected pointer (each seam re-derives from `data_ptr()` per call). Not yet used by
+/// the production post-work drain; tests drive it via `run_shared_region_txn(&mut ctx, snapshot)`.
+pub(crate) struct SharedRegionOffLockCtx<'a>(pub(crate) &'a SharedKernel);
+
+impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegionOffLockCtx<'_> {
+    fn ctx_receiver_alive(
+        &self,
+        snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    ) -> bool {
+        self.0
+            .sr_receiver_alive_split(snap.receiver_tid, snap.receiver_asid)
+    }
+    fn ctx_object_live(&self, object: CapObject) -> bool {
+        self.0.sr_object_live_split(object)
+    }
+    fn ctx_cancel_overflowed(&self) -> bool {
+        self.0.sr_cancel_overflowed_split()
+    }
+    fn ctx_consume_cancel(&mut self, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
+        self.0.sr_consume_cancel_split(tid, asid)
+    }
+    fn ctx_mint(
+        &mut self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: crate::kernel::capabilities::Capability,
+    ) -> Result<CapId, ()> {
+        self.0.sr_mint_split(cnode, cap)
+    }
+    fn ctx_register_active_mapping(&mut self, tid: u64, cap: CapId, va: u64, len: usize) -> bool {
+        self.0.sr_register_active_mapping_split(tid, cap, va, len)
+    }
+    fn ctx_phys_base(&self, object: CapObject) -> Option<crate::kernel::vm::PhysAddr> {
+        self.0.sr_phys_base_split(object)
+    }
+    fn ctx_map_page(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        virt: crate::kernel::vm::VirtAddr,
+        mapping: crate::kernel::vm::Mapping,
+    ) -> bool {
+        match self.0.map_user_page_in_asid_split(asid, virt, mapping) {
+            Ok(follow) => {
+                self.0.sr_apply_map_followup_split(follow);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+    fn ctx_copy_meta(
+        &mut self,
+        asid: crate::kernel::vm::Asid,
+        va: crate::kernel::vm::VirtAddr,
+        bytes: &[u8],
+    ) -> bool {
+        self.0.copy_to_user_split(asid, va, bytes).is_ok()
+    }
+    fn ctx_finalize_and_wake(
+        &mut self,
+        snap: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    ) -> Option<bool> {
+        self.0.sr_finalize_blocked_receiver_and_wake_split(snap)
+    }
+    fn ctx_release_pin(&mut self, object: CapObject) {
+        self.0.sr_release_pin_split(object)
+    }
+    fn ctx_unmap_prefix(&mut self, asid: crate::kernel::vm::Asid, base: usize, len: usize) {
+        self.0.unmap_range_two_phase_split(asid, base, len)
+    }
+    fn ctx_remove_active_mapping(&mut self, tid: u64, cap: CapId) -> bool {
+        self.0.sr_remove_active_mapping_split(tid, cap)
+    }
+    fn ctx_revoke_cap(
+        &mut self,
+        cnode: crate::kernel::capabilities::CNodeId,
+        cap: CapId,
+        object: CapObject,
+    ) {
+        self.0.sr_revoke_split(cnode, cap, object)
     }
 }
 

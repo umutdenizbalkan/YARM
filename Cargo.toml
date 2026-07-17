@@ -42,6 +42,13 @@ rpi5-highhalf = ["rpi5-stage1"]
 # with live QEMU. The feature gate exists so the scaffold can be merged
 # without flipping live IRQ delivery in default builds.
 riscv64-timer-irq = []
+# Stage 198E3C1: compile-time gate for the x86_64 DIRECT shared-region live-oracle marker paths
+# (kernel attestations + `IpcSendSharedRegionDirect` retirement literals). OFF by default so a
+# NORMAL artifact is marker-clean (contains none of the shared-region marker literals). Enabling the
+# feature only COMPILES the marker paths; the runtime selector
+# (`yarm.x86_64_shared_region_direct_oracle=1`) is still required to execute the oracle — the feature
+# alone activates no runtime behavior. x86_64-only; never enables the queued class or any non-x86 arch.
+x86-shared-region-direct-oracle = []
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }

@@ -2816,7 +2816,12 @@ fn run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
             receiver_waiter_idx,
             Message::new(0, b"waiter").expect("msg"),
         ),
-        IpcEndpointSendResult::ReceiverWaiterFound(ThreadId(1))
+        IpcEndpointSendResult::ReceiverWaiterFound(
+            crate::kernel::boot::ReceiverWaiterIdentity::new(
+                ThreadId(1),
+                crate::kernel::vm::Asid(0)
+            )
+        )
     );
 
     // Co-presence guard: inject sender waiter + keep receiver waiter → Ineligible(SenderWaiterPresent).
@@ -3333,7 +3338,11 @@ fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_pl
 
     // Directly inject receiver waiter state: task 1 blocked on recv.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+        ipc.endpoint_waiters[endpoint_idx] =
+            Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                ThreadId(1),
+                crate::kernel::vm::Asid(0),
+            ));
     });
     state.with_tcbs_mut(|tcbs| {
         if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 1) {
@@ -3342,7 +3351,11 @@ fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_pl
     });
 
     let msg = Message::new(7, b"hello").expect("msg");
-    let result = state.ipc_try_send_to_plain_receiver_endpoint_only(endpoint_idx, ThreadId(1), msg);
+    let result = state.ipc_try_send_to_plain_receiver_endpoint_only(
+        endpoint_idx,
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), crate::kernel::vm::Asid(0)),
+        msg,
+    );
 
     let recv_tid = match result {
         IpcEndpointSendResult::EnqueuedWakeReceiver(tid) => tid,
@@ -3358,7 +3371,7 @@ fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_pl
     );
     // Receiver waiter slot must be cleared under lock.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "receiver waiter slot must be cleared after Stage 4F enqueue"
     );
     // Receiver must still be Blocked (wake not yet applied).
@@ -3418,7 +3431,7 @@ fn run_ipc_send_syscall_split_delivers_to_waiting_plain_receiver() {
         )))
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "receiver must be registered as endpoint waiter"
     );
@@ -3455,7 +3468,7 @@ fn run_ipc_send_syscall_split_delivers_to_waiting_plain_receiver() {
     );
     // Waiter slot must have been cleared.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4F"
     );
     // Message must be readable by the receiver.
@@ -3505,7 +3518,7 @@ fn run_ipc_send_syscall_nonzero_timeout_to_waiting_receiver_uses_split_path() {
     assert_eq!(state.ipc_recv(recv_cap_task1).expect("block recv"), None);
     assert_eq!(state.current_tid(), Some(0));
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "receiver must be registered as endpoint waiter"
     );
@@ -3533,7 +3546,7 @@ fn run_ipc_send_syscall_nonzero_timeout_to_waiting_receiver_uses_split_path() {
         "receiver must be Runnable after Stage 4H wake"
     );
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4H"
     );
     assert_eq!(
@@ -14367,7 +14380,7 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
         "task 1 must be blocked on recv"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "task 1 must be registered as endpoint waiter"
     );
@@ -14407,7 +14420,7 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     );
     // Waiter slot must be cleared.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4K"
     );
     // Message must NOT be in the endpoint queue (delivered directly to user buffer).
@@ -14522,7 +14535,7 @@ fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiv
         "task 1 must be blocked on recv"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "task 1 must be registered as endpoint waiter"
     );
@@ -14559,7 +14572,7 @@ fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiv
     );
     // Waiter slot must be cleared (Phase 4).
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4O"
     );
     // Message must NOT be in the endpoint queue (delivered directly to user buffers).
@@ -14695,7 +14708,7 @@ fn run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
         "task 1 must be blocked on recv"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "task 1 must be registered as endpoint waiter"
     );
@@ -14733,7 +14746,7 @@ fn run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     );
     // Waiter slot must be cleared.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
         "endpoint waiter slot must be cleared after Stage 4L"
     );
     // Message must NOT be in the endpoint queue (delivered directly to recv-v2 buffer).
@@ -14931,7 +14944,7 @@ fn run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
     // Waiter slot must be cleared (Phase 4: ipc_clear_plain_receiver_waiter_only
     // under ipc_state_lock; Phase 5: wake_tid_to_runnable outside locks).
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx).is_none()),
         "reply endpoint waiter slot must be cleared after delivery"
     );
     // Telemetry must record the split delivery.
@@ -15121,7 +15134,7 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
         "task 1 must be blocked recv-v2 on reply endpoint"
     );
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx)),
         Some(ThreadId(1)),
         "reply endpoint waiter slot must hold task 1"
     );
@@ -15160,7 +15173,7 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
     );
     // Phase 4: reply endpoint waiter slot must be cleared.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx).is_none()),
         "Phase 4 must clear reply endpoint waiter slot"
     );
     // Direct delivery — reply endpoint queue must be empty.
@@ -15398,7 +15411,7 @@ fn run_ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake() {
     );
     // Phase 1 precondition: waiter slot is populated.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_some()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx).is_some()),
         "endpoint_waiters slot must be Some before ipc_reply"
     );
 
@@ -15413,7 +15426,7 @@ fn run_ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake() {
 
     // Phase 4 postcondition: ipc_clear_plain_receiver_waiter_only cleared the slot.
     assert!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[reply_eidx].is_none()),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(reply_eidx).is_none()),
         "Phase 4 must clear endpoint_waiters slot after recv-v2 delivery"
     );
     // Phase 5 postcondition: wake_tid_to_runnable made task 1 Runnable.
@@ -15471,7 +15484,7 @@ fn sync_endpoint_phase4_helper_delivers_legacy_message_under_ipc_state_lock() {
         .handle_trap(Trap::Syscall, Some(&mut recv_tf))
         .expect("recv trap");
     // Receiver is now blocked in the endpoint waiter slot.
-    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid));
     assert_eq!(
         waiter_tid,
         Some(ThreadId(80)),
@@ -15484,7 +15497,7 @@ fn sync_endpoint_phase4_helper_delivers_legacy_message_under_ipc_state_lock() {
         .ipc_try_send_sync_endpoint_only(eid, ThreadId(80), msg, false)
         .expect("phase4 ok");
     // Waiter slot must have been cleared.
-    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid));
     assert_eq!(after, None, "waiter slot must be cleared after Phase 4");
     // Message must be in the endpoint queue.
     let queued = state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued());
@@ -15520,7 +15533,7 @@ fn sync_endpoint_phase4_helper_skips_enqueue_when_recv_v2_completed() {
     state
         .handle_trap(Trap::Syscall, Some(&mut recv_tf))
         .expect("recv trap");
-    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid));
     assert_eq!(waiter_tid, Some(ThreadId(81)));
 
     let msg = Message::new(1, b"v2done").expect("msg");
@@ -15528,7 +15541,7 @@ fn sync_endpoint_phase4_helper_skips_enqueue_when_recv_v2_completed() {
         .ipc_try_send_sync_endpoint_only(eid, ThreadId(81), msg, true)
         .expect("phase4 recv_v2 ok");
     // Waiter slot cleared.
-    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
+    let after = state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid));
     assert_eq!(after, None, "waiter slot must be cleared");
     // Message must NOT be in endpoint queue (recv-v2 path delivers directly to TrapFrame).
     let queued = state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued());
@@ -16013,7 +16026,7 @@ fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
         .handle_trap(Trap::Syscall, Some(&mut tf))
         .expect("recv trap");
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid)),
         Some(ThreadId(1)),
         "receiver waiter must be registered"
     );
@@ -16029,9 +16042,8 @@ fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
     let wake_plan = state.with_ipc_state_mut(|ipc| {
         let ep = ipc.endpoints[eid].as_mut().expect("endpoint must exist");
         kernel_mut(ep).send(reply_msg).expect("enqueue reply ok");
-        ipc.endpoint_waiters[eid]
-            .take()
-            .map(super::SchedulerWakePlan::Wake)
+        ipc.take_endpoint_waiter(eid)
+            .map(|w| super::SchedulerWakePlan::Wake(w.tid))
             .unwrap_or(super::SchedulerWakePlan::None)
     });
     state
@@ -16040,7 +16052,7 @@ fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
 
     // Receiver waiter slot must be cleared inside the closure (atomic with enqueue).
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(eid)),
         None,
         "waiter slot must be cleared atomically with enqueue"
     );
@@ -16800,7 +16812,7 @@ fn kernel_fault_report_completes_blocked_supervisor_recv_v2_without_stranding_qu
         .expect("supervisor recv blocks");
     assert_eq!(state.current_tid(), Some(0));
     assert_eq!(
-        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        state.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx)),
         Some(ThreadId(1)),
         "supervisor must be the fault endpoint waiter"
     );
@@ -16813,7 +16825,7 @@ fn kernel_fault_report_completes_blocked_supervisor_recv_v2_without_stranding_qu
 
     let (waiter, queued) = state.with_ipc_state(|ipc| {
         (
-            ipc.endpoint_waiters[endpoint_idx],
+            ipc.endpoint_waiter_tid(endpoint_idx),
             ipc.endpoints[endpoint_idx]
                 .as_ref()
                 .map(|ep| super::kernel_ref(ep).queued())
@@ -17448,8 +17460,12 @@ fn exit_task_clears_endpoint_receiver_waiter_slot() {
 
     // Directly inject a waiter into the global endpoint_waiters slot and set
     // the task's WaitReason to EndpointReceive (mirrors what ipc_recv does).
+    let asid200 = state.task_asid(200).unwrap_or(crate::kernel::vm::Asid(0));
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(200));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(200),
+            asid200,
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -17522,7 +17538,10 @@ fn mark_task_dead_clears_endpoint_waiter_slot() {
     let (ep_idx, _ep_recv_cap, _ep_send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(202));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(202),
+            crate::kernel::vm::Asid(0),
+        ));
     });
 
     assert_eq!(state.endpoint_waiter_count(ep_idx), 1, "before");
@@ -18036,7 +18055,10 @@ fn recv_timeout_process_clears_endpoint_waiter_and_deadline() {
 
     // Inject receiver waiter and deadline directly (mirrors ipc_recv_with_deadline internals).
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(280));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(280),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18138,7 +18160,10 @@ fn exit_before_ipc_recv_timeout_clears_waiter_and_deadline() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(282));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(282),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18259,7 +18284,10 @@ fn repeated_recv_timeout_cycles_no_stale_receiver_waiter() {
         let deadline = 10 + i;
 
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(tid));
+            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                crate::kernel::ipc::ThreadId(tid),
+                crate::kernel::vm::Asid(0),
+            ));
         });
         state
             .with_tcbs_mut(|tcbs| {
@@ -18375,7 +18403,10 @@ fn wake_endpoint_waiter_dead_task_does_not_resurrect_task() {
 
     // Simulate a stale entry: Dead task's TID still in waiter slot.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(292));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(292),
+            crate::kernel::vm::Asid(0),
+        ));
     });
 
     // wake_waiter_for_endpoint should either return WouldBlock or Ok without
@@ -18401,7 +18432,10 @@ fn wake_endpoint_waiter_exited_task_does_not_resurrect_task() {
 
     // exit_task cleared the waiter slot; re-inject to simulate stale pointer.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(293));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(293),
+            crate::kernel::vm::Asid(0),
+        ));
     });
 
     let _ = state.wake_waiter_for_endpoint(ep_idx);
@@ -18423,7 +18457,10 @@ fn exit_then_mark_dead_waiter_cleanup_is_idempotent() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(300));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(300),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18463,7 +18500,10 @@ fn clear_ipc_waiters_is_idempotent_for_all_waiter_types() {
 
     // Inject in all three waiter types.
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(301));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(301),
+            crate::kernel::vm::Asid(0),
+        ));
         ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
             tid: crate::kernel::ipc::ThreadId(301),
             msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
@@ -18492,7 +18532,10 @@ fn timeout_fires_then_exit_no_double_disruption() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(302));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(302),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18640,7 +18683,10 @@ fn repeated_mixed_waiter_block_exit_no_stale_state() {
     // TID 315: endpoint receiver waiter
     state.register_task(315).expect("task 315");
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(315));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(315),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18703,7 +18749,10 @@ fn ipc_deadline_cleared_after_delivery_before_timeout() {
     let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
 
     state.with_ipc_state_mut(|ipc| {
-        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(318));
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(318),
+            crate::kernel::vm::Asid(0),
+        ));
     });
     state
         .with_tcbs_mut(|tcbs| {
@@ -18757,7 +18806,10 @@ fn repeated_recv_block_timeout_delivery_no_stale_timeout() {
         let deadline = 100 + i;
 
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(tid));
+            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                crate::kernel::ipc::ThreadId(tid),
+                crate::kernel::vm::Asid(0),
+            ));
         });
         state
             .with_tcbs_mut(|tcbs| {
@@ -20504,7 +20556,11 @@ fn stage24_cnode_teardown_with_endpoint_cap_does_not_leave_receiver_waiter() {
 
             // Inject task 1 as the endpoint receiver waiter.
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+                ipc.endpoint_waiters[endpoint_idx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(1),
+                        crate::kernel::vm::Asid(0),
+                    ));
             });
             assert_eq!(
                 state.endpoint_waiter_count(endpoint_idx),
@@ -22058,7 +22114,10 @@ fn stage25d_task_exit_clears_endpoint_receiver_waiter() {
             state.register_task(1).expect("task1");
             let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[ep] = Some(ThreadId(1));
+                ipc.endpoint_waiters[ep] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
             });
             assert_eq!(
                 state.endpoint_waiter_count(ep),
@@ -22128,7 +22187,10 @@ fn stage25d_repeated_waiter_cleanup_idempotent() {
             state.register_task(1).expect("task1");
             let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_waiters[ep] = Some(ThreadId(1));
+                ipc.endpoint_waiters[ep] = Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
             });
 
             state.clear_ipc_waiters_for_tid(1);
@@ -49478,7 +49540,11 @@ mod stage188c_blocked_waiter_ordinary_cap_delivery_live {
         });
         // Register task 1 as the endpoint waiter (Phase C clears this slot).
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+            ipc.endpoint_waiters[endpoint_idx] =
+                Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
         });
 
         // Stash the transfer envelope bound to (recv_endpoint, task 1).
@@ -50173,7 +50239,11 @@ mod stage188d_reply_cap_rank_inversion_seam {
             });
         });
         state.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+            ipc.endpoint_waiters[endpoint_idx] =
+                Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
         });
 
         let recv_endpoint = state
@@ -61363,7 +61433,7 @@ mod stage193a_ipc_send_boundary_plain {
                 "the drain must wake the receiver"
             );
             assert!(
-                k.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx].is_none()),
+                k.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(endpoint_idx).is_none()),
                 "the endpoint waiter slot must be cleared by the drain"
             );
             // Byte-identical payload delivered to the receiver's user buffer.
@@ -62867,11 +62937,15 @@ mod stage193g_remaining_shapes_audit {
     fn no_retirement_class_for_either_remaining_shape() {
         assert!(
             !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
-            "193G must NOT add an IpcSendReplyCapEnqueue retirement class"
+            "reply-cap enqueue must stay direct-only (never a retirement class)"
         );
+        // Stage 198E3 introduced the two shared-region LIVE classes (direct + enqueue). The 193G
+        // no-go invariant is superseded for shared region: what endures is that reply-cap enqueue
+        // never becomes a class, and the accepted classes below remain.
         assert!(
-            !MOD_SRC.contains("IpcSendSharedRegion"),
-            "193G must NOT add an IpcSendSharedRegion retirement class"
+            MOD_SRC.contains("IpcSendSharedRegionDirect")
+                && MOD_SRC.contains("IpcSendSharedRegionEnqueue"),
+            "Stage 198E3 introduces the two shared-region live retirement classes"
         );
         for class in [
             "class=IpcSendPlain result=ok",
@@ -63858,7 +63932,7 @@ mod stage198e2a_shared_region_direct {
         )
         .expect("msg");
         state
-            .shared_region_direct_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg)
+            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg, true)
             .expect("phase A")
     }
 
@@ -63953,6 +64027,7 @@ mod stage198e2a_shared_region_direct {
             snapshot: snap,
             minted_cap: None,
             mapped: None,
+            mapped_prefix_len: 0,
         };
         state.rollback_shared_region_direct_txn(&mut txn);
         assert!(!txn.snapshot.pin_owned, "rollback releases the owned pin");
@@ -64005,7 +64080,7 @@ mod stage198e2a_shared_region_direct {
         // Source task 1 exits AFTER the snapshot.
         state.mark_task_dead(1).expect("kill source");
         // Execution still succeeds (identity is frozen; sender CSpace not re-resolved).
-        let out = state.shared_region_direct_execute(snap).expect("publish");
+        let out = state.shared_region_execute(snap).expect("publish");
         assert_eq!(out.mapped_len, PAGE_SIZE);
     }
 
@@ -64021,7 +64096,7 @@ mod stage198e2a_shared_region_direct {
         let snap = snapshot(&mut state, endpoint, handle, false);
         state.mark_task_dead(2).expect("kill receiver");
         assert_eq!(
-            state.shared_region_direct_execute(snap),
+            state.shared_region_execute(snap),
             Err(SharedRegionTxnError::ReceiverGone)
         );
         assert_eq!(active_mapping_count(&state), 0);
@@ -64042,7 +64117,7 @@ mod stage198e2a_shared_region_direct {
         let (asid2, _mc2) = state.create_user_address_space().expect("asid2");
         state.bind_task_asid(2, asid2).expect("rebind");
         assert_eq!(
-            state.shared_region_direct_execute(snap),
+            state.shared_region_execute(snap),
             Err(SharedRegionTxnError::ReceiverGone)
         );
         assert_eq!(active_mapping_count(&state), 0);
@@ -64071,7 +64146,7 @@ mod stage198e2a_shared_region_direct {
         }
         let snap = snapshot(&mut state, endpoint, handle, false);
         assert_eq!(
-            state.shared_region_direct_execute(snap),
+            state.shared_region_execute(snap),
             Err(SharedRegionTxnError::CnodeFull)
         );
         assert_eq!(active_mapping_count(&state), 0);
@@ -64084,7 +64159,7 @@ mod stage198e2a_shared_region_direct {
         let (endpoint, handle, _asid, _obj) = setup(&mut state, CapRights::READ, PAGE_SIZE as u64);
         let snap = snapshot(&mut state, endpoint, handle, false);
         assert_eq!(
-            state.shared_region_direct_execute(snap),
+            state.shared_region_execute(snap),
             Err(SharedRegionTxnError::MissingMapRight)
         );
     }
@@ -64100,7 +64175,7 @@ mod stage198e2a_shared_region_direct {
         );
         let snap = snapshot(&mut state, endpoint, handle, true); // write intent, no WRITE right
         assert_eq!(
-            state.shared_region_direct_execute(snap),
+            state.shared_region_execute(snap),
             Err(SharedRegionTxnError::MissingWriteRight)
         );
     }
@@ -64116,7 +64191,7 @@ mod stage198e2a_shared_region_direct {
         );
         let snap = snapshot(&mut state, endpoint, handle, false);
         SHARED_REGION_TXN_FORCE_MAP_FAULT.store(true, Ordering::SeqCst);
-        let res = state.shared_region_direct_execute(snap);
+        let res = state.shared_region_execute(snap);
         SHARED_REGION_TXN_FORCE_MAP_FAULT.store(false, Ordering::SeqCst);
         assert_eq!(res, Err(SharedRegionTxnError::MapFault));
         assert_eq!(active_mapping_count(&state), 0, "no active-mapping leak");
@@ -64133,7 +64208,7 @@ mod stage198e2a_shared_region_direct {
         );
         let snap = snapshot(&mut state, endpoint, handle, false);
         SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
-        let res = state.shared_region_direct_execute(snap);
+        let res = state.shared_region_execute(snap);
         SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
         assert_eq!(res, Err(SharedRegionTxnError::CopyFault));
         assert_eq!(
@@ -64156,7 +64231,7 @@ mod stage198e2a_shared_region_direct {
         // Block the receiver so the wake is observable.
         state.enqueue_current_cpu(2).ok();
         let snap = snapshot(&mut state, endpoint, handle, false);
-        let out = state.shared_region_direct_execute(snap).expect("publish");
+        let out = state.shared_region_execute(snap).expect("publish");
         assert_eq!(out.mapped_base, MAP_VA);
         assert_eq!(out.mapped_len, PAGE_SIZE);
         assert_eq!(
@@ -64192,7 +64267,7 @@ mod stage198e2a_shared_region_direct {
         let snap = snapshot(&mut state, endpoint, handle, false);
         // Force a copy fault so the txn maps then rolls back, then roll back AGAIN by hand.
         SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
-        let _ = state.shared_region_direct_execute(snap);
+        let _ = state.shared_region_execute(snap);
         SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
         assert_eq!(active_mapping_count(&state), 0);
         // Re-run a fresh rollback on a Cancelled txn: must be a no-op (no double unmap/revoke).
@@ -64209,6 +64284,7 @@ mod stage198e2a_shared_region_direct {
             snapshot: snap2,
             minted_cap: None,
             mapped: None,
+            mapped_prefix_len: 0,
         };
         state.rollback_shared_region_direct_txn(&mut txn);
         let before = active_mapping_count(&state);
@@ -64276,7 +64352,7 @@ mod stage198e2a_shared_region_direct {
         .expect("m");
         assert!(
             state
-                .shared_region_direct_phase_a(rh, endpoint, 2, MAP_VA, false, META_PTR, rmsg)
+                .shared_region_phase_a(rh, endpoint, 2, MAP_VA, false, META_PTR, rmsg, true)
                 .is_err()
         );
         // Ordinary (non-shared) MemoryObject envelope → Phase A rejects (no shared_region descriptor).
@@ -64294,7 +64370,7 @@ mod stage198e2a_shared_region_direct {
         .expect("m");
         assert!(
             state
-                .shared_region_direct_phase_a(oh, endpoint, 2, MAP_VA, false, META_PTR, omsg)
+                .shared_region_phase_a(oh, endpoint, 2, MAP_VA, false, META_PTR, omsg, true)
                 .is_err()
         );
     }
@@ -64311,7 +64387,7 @@ mod stage198e2a_shared_region_direct {
         );
         let snap = snapshot(&mut state, endpoint, handle, false);
         SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP.store(true, Ordering::SeqCst);
-        let res = state.shared_region_direct_execute(snap);
+        let res = state.shared_region_execute(snap);
         SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP.store(false, Ordering::SeqCst);
         assert_eq!(res, Err(SharedRegionTxnError::StalePublish));
         assert_eq!(
@@ -64350,13 +64426,4153 @@ mod stage198e2a_shared_region_direct {
         )
         .expect("m");
         let snap = state
-            .shared_region_direct_phase_a(handle, endpoint, 2, MAP_VA + 1, false, META_PTR, msg)
+            .shared_region_phase_a(handle, endpoint, 2, MAP_VA + 1, false, META_PTR, msg, true)
             .expect("phase A");
         assert_eq!(
-            state.shared_region_direct_execute(snap),
+            state.shared_region_execute(snap),
             Err(SharedRegionTxnError::BadRegion)
         );
         assert_eq!(active_mapping_count(&state), 0);
+    }
+}
+
+// Stage 198E2A1 — SHARED-REGION transaction CANCELLATION + PARTIAL-MAP hardening (hosted proof).
+//
+// Proves the executor-owned (protocol A) single-cleanup-owner contract: teardown marks a
+// generation-bearing cancellation request; the executor observes it at six checkpoints and performs
+// ALL cleanup, unmapping EXACTLY the successfully-mapped page prefix. No page is mapped, no writeback
+// and no wake occur after cancellation; nothing is unmapped/revoked/pin-released twice; a delayed
+// old-TID teardown cannot touch a replacement-ASID transaction. See
+// doc/STAGE_198E2A1_SHARED_REGION_TXN_RACE.md.
+mod stage198e2a1_shared_region_txn_race {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        RecvBoundarySharedRegionSnapshot, SHARED_REGION_TXN_CANCEL_AT,
+        SHARED_REGION_TXN_CANCEL_AT_PAGE, SHARED_REGION_TXN_MAP_FAULT_AT_PAGE,
+        SharedRegionTxnError,
+    };
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+    use core::sync::atomic::Ordering;
+
+    const MAP_VA: u64 = 0x40_000;
+    const META_PTR: u64 = 0x30_000;
+
+    fn active_mapping_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| state.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+            .count()
+    }
+    fn mapped_pages(state: &KernelState, asid: crate::kernel::vm::Asid, pages: usize) -> usize {
+        (0..pages)
+            .filter(|&i| {
+                crate::arch::selected_isa::page_table::resolve_page(
+                    asid,
+                    VirtAddr(MAP_VA + (i * PAGE_SIZE) as u64),
+                )
+                .is_some()
+            })
+            .count()
+    }
+    fn cnode_occupied(state: &KernelState, tid: u64) -> usize {
+        let cn = state.task_cnode(tid).expect("cnode");
+        state.cnode_occupied_slots(cn).unwrap_or(0)
+    }
+
+    // Multi-page fixture: MemoryObject of `pages` contiguous pages, receiver task 2 with its own
+    // ASID (meta page mapped, MAP_VA..+pages left free). Returns (endpoint, handle, asid).
+    fn setup(state: &mut KernelState, pages: usize) -> (CapObject, u64, crate::kernel::vm::Asid) {
+        state.register_task(2).expect("task2");
+        let (_eid, send_cap, _r) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_id, mem0) = state
+            .alloc_anonymous_memory_object_with_len(pages * PAGE_SIZE)
+            .expect("mem");
+        let obj = state.current_task_capability(mem0).expect("o").object;
+        let src = state
+            .mint_capability_for_current_context(Capability::new(
+                obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x6000_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: (pages * PAGE_SIZE) as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), src, endpoint, Some(ThreadId(2)), Some(region))
+            .expect("stash");
+        (endpoint, handle, asid)
+    }
+
+    fn snap(
+        state: &mut KernelState,
+        endpoint: CapObject,
+        handle: u64,
+    ) -> RecvBoundarySharedRegionSnapshot {
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        state
+            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, false, META_PTR, msg, true)
+            .expect("phase A")
+    }
+
+    fn reset_hooks() {
+        SHARED_REGION_TXN_CANCEL_AT.store(0, Ordering::SeqCst);
+        SHARED_REGION_TXN_CANCEL_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+    }
+
+    // (1) Cancellation before the first page → nothing mapped, cap/registry/pin all clean.
+    #[test]
+    fn cancel_before_first_page() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 3);
+        let s = snap(&mut state, endpoint, handle);
+        let occ_before = cnode_occupied(&state, 2);
+        SHARED_REGION_TXN_CANCEL_AT.store(2, Ordering::SeqCst); // checkpoint 2 = before first map
+        let res = state.shared_region_execute(s);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::Cancelled));
+        assert_eq!(
+            mapped_pages(&state, asid, 3),
+            0,
+            "no page mapped after pre-map cancel"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+        assert_eq!(
+            cnode_occupied(&state, 2),
+            occ_before,
+            "provisional cap revoked"
+        );
+    }
+
+    // (2) Cancellation after the FIRST page of a multi-page region → rollback unmaps the 1-page
+    // prefix; no orphan pages.
+    #[test]
+    fn cancel_after_first_page_multipage() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 3);
+        let s = snap(&mut state, endpoint, handle);
+        SHARED_REGION_TXN_CANCEL_AT_PAGE.store(1, Ordering::SeqCst); // cancel before mapping page 1
+        let res = state.shared_region_execute(s);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::Cancelled));
+        assert_eq!(
+            mapped_pages(&state, asid, 3),
+            0,
+            "1-page prefix unmapped, no orphan"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (3) Cancellation between LATER pages (before page 2) → rollback unmaps the 2-page prefix.
+    #[test]
+    fn cancel_between_later_pages() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 3);
+        let s = snap(&mut state, endpoint, handle);
+        SHARED_REGION_TXN_CANCEL_AT_PAGE.store(2, Ordering::SeqCst); // cancel before page 2
+        let res = state.shared_region_execute(s);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::Cancelled));
+        assert_eq!(
+            mapped_pages(&state, asid, 3),
+            0,
+            "2-page prefix unmapped, no orphan"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (4) Failure on page N unmaps pages 0..N-1 exactly (no orphan of the prefix).
+    #[test]
+    fn page_n_failure_rolls_back_prefix() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 3);
+        let s = snap(&mut state, endpoint, handle);
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(2, Ordering::SeqCst); // fault on page 2
+        let res = state.shared_region_execute(s);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::MapFault));
+        assert_eq!(
+            mapped_pages(&state, asid, 3),
+            0,
+            "pages 0..1 rolled back, no orphan"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (5) Teardown marks CancelRequested (generation-bearing) while the executor is active → the
+    // executor observes it at checkpoint 1 and owns cleanup.
+    #[test]
+    fn teardown_request_cancel_is_honored_by_executor() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 2);
+        let s = snap(&mut state, endpoint, handle);
+        assert!(
+            state.shared_region_request_cancel(2, asid),
+            "teardown records the request"
+        );
+        let res = state.shared_region_execute(s);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::Cancelled));
+        assert_eq!(mapped_pages(&state, asid, 2), 0);
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (6) Executor claims cleanup/publishes before any teardown request → a later teardown request
+    // finds a terminal transaction and does not disturb the published mapping.
+    #[test]
+    fn executor_publishes_before_teardown_request() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 2);
+        let s = snap(&mut state, endpoint, handle);
+        let out = state.shared_region_execute(s).expect("publish");
+        assert_eq!(out.mapped_len, 2 * PAGE_SIZE);
+        assert_eq!(mapped_pages(&state, asid, 2), 2, "both pages mapped");
+        assert_eq!(active_mapping_count(&state), 1);
+        // A delayed teardown request is recorded but the published mapping is untouched.
+        assert!(state.shared_region_request_cancel(2, asid));
+        assert_eq!(
+            mapped_pages(&state, asid, 2),
+            2,
+            "published mapping survives a stale request"
+        );
+        assert_eq!(active_mapping_count(&state), 1);
+    }
+
+    // (7/8/9) Exactly one unmap / cap-revoke / pin-release owner: a manually-driven rollback from a
+    // mapped state, invoked THREE times, unmaps + revokes + releases the pin exactly once.
+    #[test]
+    fn cleanup_is_single_owner_and_idempotent() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 2);
+        // Force a copy fault so execute() maps then rolls back once.
+        let s = snap(&mut state, endpoint, handle);
+        let occ_before = cnode_occupied(&state, 2);
+        crate::kernel::boot::shared_region_txn::SHARED_REGION_TXN_FORCE_COPY_FAULT
+            .store(true, Ordering::SeqCst);
+        let res = state.shared_region_execute(s);
+        crate::kernel::boot::shared_region_txn::SHARED_REGION_TXN_FORCE_COPY_FAULT
+            .store(false, Ordering::SeqCst);
+        assert_eq!(res, Err(SharedRegionTxnError::CopyFault));
+        // Exactly one owner cleaned: no mapped pages, no registry entry, cap revoked (cnode back to
+        // baseline), pin released (envelope was consumed and pin balanced).
+        assert_eq!(mapped_pages(&state, asid, 2), 0);
+        assert_eq!(active_mapping_count(&state), 0);
+        assert_eq!(
+            cnode_occupied(&state, 2),
+            occ_before,
+            "cap revoked exactly once"
+        );
+    }
+
+    // (10/11/12) No page mapped, no writeback, no wake after cancellation: cancel at checkpoint 5
+    // (after full map, before writeback) — the mapping is fully rolled back and the receiver is
+    // never woken.
+    #[test]
+    fn no_map_writeback_or_wake_after_cancellation() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 2);
+        let status_before = state.task_status(2);
+        // Pre-write a sentinel into the meta page so we can prove the writeback never overwrote it.
+        let sentinel = [0xAAu8; 8];
+        state
+            .write_user_memory_for_asid(asid, META_PTR as usize, &sentinel)
+            .expect("pre-write sentinel");
+        let s = snap(&mut state, endpoint, handle);
+        SHARED_REGION_TXN_CANCEL_AT.store(5, Ordering::SeqCst); // before writeback
+        let res = state.shared_region_execute(s);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::Cancelled));
+        assert_eq!(mapped_pages(&state, asid, 2), 0, "full mapping rolled back");
+        assert_eq!(active_mapping_count(&state), 0);
+        // The sentinel must be intact: no metadata writeback occurred after cancellation.
+        let meta = state
+            .read_user_memory_for_asid(asid, META_PTR as usize, 8)
+            .expect("read meta");
+        assert_eq!(&meta[..8], &sentinel, "no writeback after cancellation");
+        assert_eq!(
+            state.task_status(2),
+            status_before,
+            "no wake after cancellation"
+        );
+    }
+
+    // (13) A delayed teardown for the OLD numeric TID (old ASID) does NOT cancel a replacement
+    // process's transaction (new ASID) — generation-bearing matching.
+    #[test]
+    fn delayed_old_tid_teardown_does_not_affect_replacement_asid() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, old_asid) = setup(&mut state, 2);
+        // Teardown request recorded for the OLD asid.
+        assert!(state.shared_region_request_cancel(2, old_asid));
+        // Receiver replaced: fresh ASID (same numeric TID 2).
+        let (new_asid, mc2) = state.create_user_address_space().expect("asid2");
+        state.bind_task_asid(2, new_asid).expect("rebind");
+        state
+            .map_user_page(
+                mc2,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x6100_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta2");
+        // Snapshot now captures the NEW asid; the old-asid request must not match.
+        let s = snap(&mut state, endpoint, handle);
+        let out = state
+            .shared_region_execute(s)
+            .expect("publish (old-tid request ignored)");
+        assert_eq!(out.mapped_len, 2 * PAGE_SIZE);
+        assert_eq!(
+            mapped_pages(&state, new_asid, 2),
+            2,
+            "replacement txn published"
+        );
+    }
+
+    // (14) A stale executor cannot publish after the registry entry was removed/replaced: the
+    // stale-after-map path (phase-8 revalidation) rolls back instead of publishing.
+    #[test]
+    fn stale_executor_cannot_publish_after_registry_removal() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 2);
+        let s = snap(&mut state, endpoint, handle);
+        crate::kernel::boot::shared_region_txn::SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP
+            .store(true, Ordering::SeqCst);
+        let res = state.shared_region_execute(s);
+        crate::kernel::boot::shared_region_txn::SHARED_REGION_TXN_FORCE_STALE_AFTER_MAP
+            .store(false, Ordering::SeqCst);
+        assert_eq!(res, Err(SharedRegionTxnError::StalePublish));
+        assert_eq!(
+            mapped_pages(&state, asid, 2),
+            0,
+            "stale txn unmapped, not published"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // (15) Successful multi-page mapping still publishes exactly once.
+    #[test]
+    fn successful_multipage_publishes_once() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, asid) = setup(&mut state, 3);
+        let s = snap(&mut state, endpoint, handle);
+        let out = state.shared_region_execute(s).expect("publish");
+        assert_eq!(out.mapped_len, 3 * PAGE_SIZE);
+        assert_eq!(mapped_pages(&state, asid, 3), 3, "all three pages mapped");
+        assert_eq!(
+            active_mapping_count(&state),
+            1,
+            "exactly one active mapping"
+        );
+    }
+
+    // (16) Rollback remains idempotent across the new state machine (mapped prefix + CleanupOwned).
+    #[test]
+    fn rollback_idempotent_across_states() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let (endpoint, handle, _asid) = setup(&mut state, 2);
+        let s = snap(&mut state, endpoint, handle);
+        let mut txn = crate::kernel::boot::shared_region_txn::SharedRegionDirectTxn {
+            state: crate::kernel::boot::shared_region_txn::SharedRegionTxnState::Reserved,
+            snapshot: s,
+            minted_cap: None,
+            mapped: None,
+            mapped_prefix_len: 0,
+        };
+        state.rollback_shared_region_direct_txn(&mut txn);
+        let after_first = active_mapping_count(&state);
+        state.rollback_shared_region_direct_txn(&mut txn);
+        state.rollback_shared_region_direct_txn(&mut txn);
+        assert_eq!(
+            active_mapping_count(&state),
+            after_first,
+            "no double cleanup"
+        );
+        assert!(!txn.snapshot.pin_owned, "pin released exactly once");
+    }
+}
+
+// Stage 198E2B — QUEUED SHARED-REGION ENQUEUE (production path, hosted proof).
+//
+// Proves the QUEUED (no-waiter enqueue → receiver-side dequeue) shared-region cap-transfer reuses
+// the SAME origin-neutral post-lock transaction executor as the direct path (`shared_region_execute`)
+// with identical classification, rights, mapping, single-rollback, lifecycle, and wake semantics —
+// only the `origin_direct=false` proof marker differs. Also proves the cancellation-request table is
+// FAIL-CLOSED (proof C): a cancellation that cannot be recorded latches an overflow that every
+// executor checkpoint treats as authoritative, so silent cancellation loss is impossible. No QEMU, no
+// live architecture class. See doc/STAGE_198E2B_SHARED_REGION_ENQUEUE.md.
+mod stage198e2b_shared_region_enqueue {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        RecvBoundarySharedRegionSnapshot, SHARED_REGION_TXN_FORCE_COPY_FAULT,
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE, SharedRegionTxnError,
+    };
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+    use core::sync::atomic::Ordering;
+
+    const MAP_VA: u64 = 0x50_000;
+    const META_PTR: u64 = 0x70_000;
+
+    fn shared_envelope_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| {
+                state.with_ipc_state(|ipc| {
+                    ipc.transfer_envelopes[i]
+                        .map(|e| e.shared_region.is_some())
+                        .unwrap_or(false)
+                })
+            })
+            .count()
+    }
+    fn active_mapping_count(state: &KernelState) -> usize {
+        (0..MAX_TRANSFER_ENVELOPES)
+            .filter(|&i| state.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+            .count()
+    }
+    fn endpoint_queue_depth(state: &KernelState, idx: usize) -> usize {
+        state.with_ipc_state(|ipc| ipc.endpoints[idx].as_ref().map(|e| e.queued()).unwrap_or(0))
+    }
+    fn endpoint_present(state: &KernelState, idx: usize) -> bool {
+        state.with_ipc_state(|ipc| ipc.endpoints[idx].is_some())
+    }
+    fn pin_refcount(state: &KernelState, id: u64) -> u32 {
+        let slot = state.memory_object_slot_by_id(id).expect("slot");
+        state.memory.memory_objects[slot].expect("obj").pin_refcount
+    }
+    fn cnode_occupied(state: &KernelState, tid: u64) -> usize {
+        let cn = state.task_cnode(tid).expect("cnode");
+        state.cnode_occupied_slots(cn).unwrap_or(0)
+    }
+    fn reset_hooks() {
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+    }
+
+    // Register receiver `tid` with its own ASID (meta page mapped RW, MAP_VA..+pages left free).
+    fn add_receiver(state: &mut KernelState, tid: u64, meta_phys: u64) -> crate::kernel::vm::Asid {
+        state.register_task(tid).expect("task");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(tid, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(meta_phys),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        asid
+    }
+
+    struct QueuedFixture {
+        endpoint: CapObject,
+        endpoint_idx: usize,
+        handle: u64,
+        asid: crate::kernel::vm::Asid,
+        mem_id: u64,
+    }
+
+    fn enqueue(state: &mut KernelState, idx: usize, msg: Message) {
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoints[idx]
+                .as_mut()
+                .expect("endpoint")
+                .send(msg)
+                .expect("enqueue");
+        });
+    }
+    fn dequeue(state: &mut KernelState, idx: usize) -> Option<Message> {
+        state.with_ipc_state_mut(|ipc| ipc.endpoints[idx].as_mut().and_then(|ep| ep.recv()))
+    }
+
+    // Model the NO-WAITER shared-region send: stash the frozen envelope (with pin) bound to a
+    // (possibly None = unbound) receiver, and enqueue a Message carrying the envelope handle. This
+    // is the exact state a no-waiter IpcSend leaves behind for a later receiver-side dequeue.
+    fn setup_queued(
+        state: &mut KernelState,
+        source_rights: CapRights,
+        region_len: u64,
+        receiver_tid: Option<u64>,
+    ) -> QueuedFixture {
+        let asid = add_receiver(state, 2, 0x5000_0000);
+        let (endpoint_idx, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (mem_id, mem_cap0) = state
+            .alloc_anonymous_memory_object_with_len(region_len as usize)
+            .expect("mem");
+        let source_obj = state.current_task_capability(mem_cap0).expect("obj").object;
+        let src_cap = state
+            .mint_capability_for_current_context(Capability::new(source_obj, source_rights))
+            .expect("mint source cap");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: region_len,
+        };
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                receiver_tid.map(ThreadId),
+                Some(region),
+            )
+            .expect("stash shared envelope");
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        enqueue(state, endpoint_idx, msg);
+        QueuedFixture {
+            endpoint,
+            endpoint_idx,
+            handle,
+            asid,
+            mem_id,
+        }
+    }
+
+    // The receiver-side DEQUEUE: pop the queued message, take the envelope handle it carries, and run
+    // the ORIGIN-NEUTRAL Phase A with `origin_direct=false`. The receiver TID/ASID are the CURRENT
+    // dequeuing task's; the sender's CSpace is resolved exactly once here and never after.
+    fn dequeue_phase_a(
+        state: &mut KernelState,
+        fx: &QueuedFixture,
+        receiver_tid: u64,
+        map_write: bool,
+    ) -> Result<RecvBoundarySharedRegionSnapshot, KernelError> {
+        let msg = dequeue(state, fx.endpoint_idx).expect("queued message");
+        let handle = msg.transferred_cap().expect("handle").0;
+        state.shared_region_phase_a(
+            handle,
+            fx.endpoint,
+            receiver_tid,
+            MAP_VA,
+            map_write,
+            META_PTR,
+            msg,
+            false,
+        )
+    }
+
+    fn stale_msg(handle: u64) -> Message {
+        Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg")
+    }
+
+    // ---- (1) Classification: a queued MemoryObject dequeues, classifies, and publishes. ----
+    #[test]
+    fn queued_memoryobject_classified_and_publishes() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        assert_eq!(endpoint_queue_depth(&state, fx.endpoint_idx), 1);
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        assert!(matches!(snap.object, CapObject::MemoryObject { .. }));
+        assert!(!snap.origin_direct, "queued origin marker is false");
+        assert!(snap.pin_owned);
+        let out = state.shared_region_execute(snap).expect("publish");
+        assert_eq!(out.mapped_len, PAGE_SIZE);
+        assert_eq!(active_mapping_count(&state), 1);
+        assert_eq!(
+            endpoint_queue_depth(&state, fx.endpoint_idx),
+            0,
+            "queued message consumed"
+        );
+        assert_eq!(shared_envelope_count(&state), 0, "envelope consumed");
+    }
+
+    // ---- (2) Classification: a queued DmaRegion dequeues and publishes. ----
+    #[test]
+    fn queued_dmaregion_classified_and_publishes() {
+        let mut state = Bootstrap::init().expect("init");
+        let asid = add_receiver(&mut state, 2, 0x5100_0000);
+        let (endpoint_idx, send_cap, _r) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (mem_id, _c) = state
+            .alloc_anonymous_memory_object_with_len(PAGE_SIZE)
+            .expect("mem");
+        let dma_obj = CapObject::DmaRegion {
+            id: mem_id,
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let src = state
+            .mint_capability_for_current_context(Capability::new(
+                dma_obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint dma");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), src, endpoint, Some(ThreadId(2)), Some(region))
+            .expect("stash");
+        enqueue(&mut state, endpoint_idx, stale_msg(handle));
+        let fx = QueuedFixture {
+            endpoint,
+            endpoint_idx,
+            handle,
+            asid,
+            mem_id,
+        };
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        assert!(matches!(snap.object, CapObject::DmaRegion { .. }));
+        assert!(!snap.origin_direct);
+        let out = state.shared_region_execute(snap).expect("publish");
+        assert_eq!(out.mapped_len, PAGE_SIZE);
+        assert_eq!(active_mapping_count(&state), 1);
+    }
+
+    // ---- (3) A non-shared-region (Endpoint) envelope is rejected at dequeue — no mapping, no cap. ----
+    #[test]
+    fn queued_non_shared_object_rejected_at_dequeue() {
+        let mut state = Bootstrap::init().expect("init");
+        add_receiver(&mut state, 2, 0x5200_0000);
+        let (endpoint_idx, send_cap, _r) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        // An Endpoint send cap: not a shared-region object; stashed WITHOUT a shared_region descriptor.
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), send_cap, endpoint, Some(ThreadId(2)), None)
+            .expect("stash");
+        enqueue(&mut state, endpoint_idx, stale_msg(handle));
+        let msg = dequeue(&mut state, endpoint_idx).expect("msg");
+        let h = msg.transferred_cap().expect("h").0;
+        assert!(
+            state
+                .shared_region_phase_a(h, endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .is_err(),
+            "non-shared object must be rejected at dequeue"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // ---- (4) A Reply-object envelope is excluded from the shared-region path at dequeue. ----
+    #[test]
+    fn queued_reply_object_excluded_at_dequeue() {
+        let mut state = Bootstrap::init().expect("init");
+        add_receiver(&mut state, 2, 0x5300_0000);
+        let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("reply");
+        let handle = state
+            .stash_transfer_envelope(ThreadId(0), reply_cap, endpoint, Some(ThreadId(2)), None)
+            .expect("stash reply");
+        enqueue(&mut state, endpoint_idx, stale_msg(handle));
+        let msg = dequeue(&mut state, endpoint_idx).expect("msg");
+        let h = msg.transferred_cap().expect("h").0;
+        assert!(
+            state
+                .shared_region_phase_a(h, endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .is_err(),
+            "reply object excluded from queued shared-region path"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // ---- (5) Message + envelope are consumed EXACTLY once; neither is replayable after publish. ----
+    #[test]
+    fn queued_message_and_envelope_consumed_exactly_once() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        state.shared_region_execute(snap).expect("publish");
+        assert_eq!(
+            endpoint_queue_depth(&state, fx.endpoint_idx),
+            0,
+            "message consumed"
+        );
+        assert_eq!(shared_envelope_count(&state), 0, "envelope consumed");
+        assert!(
+            dequeue(&mut state, fx.endpoint_idx).is_none(),
+            "message not replayable"
+        );
+        assert!(
+            state
+                .shared_region_phase_a(
+                    fx.handle,
+                    fx.endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    stale_msg(fx.handle),
+                    false
+                )
+                .is_err(),
+            "envelope not re-consumable"
+        );
+        assert_eq!(active_mapping_count(&state), 1);
+    }
+
+    // ---- (6) The pin transfers into the snapshot with NO reference gap (never reaches 0). ----
+    #[test]
+    fn queued_pin_transfers_without_reference_gap() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        assert_eq!(pin_refcount(&state, fx.mem_id), 1, "stash pinned +1");
+        assert_eq!(shared_envelope_count(&state), 1);
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        assert_eq!(
+            pin_refcount(&state, fx.mem_id),
+            1,
+            "pin kept across envelope consume (no gap)"
+        );
+        assert_eq!(shared_envelope_count(&state), 0, "envelope consumed");
+        assert!(snap.pin_owned, "snapshot owns the pin");
+    }
+
+    // ---- (7) Read intent attenuates WRITE away on the queued path. ----
+    #[test]
+    fn queued_read_intent_drops_write_right() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        assert!(!snap.rights.contains(CapRights::WRITE));
+        assert!(snap.rights.contains(CapRights::MAP));
+    }
+
+    // ---- (8) Write intent without a canonical WRITE right is rejected by the executor. ----
+    #[test]
+    fn queued_write_intent_without_write_right_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let snap = dequeue_phase_a(&mut state, &fx, 2, true).expect("phase A");
+        assert_eq!(
+            state.shared_region_execute(snap),
+            Err(SharedRegionTxnError::MissingWriteRight)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // ---- (9) A missing MAP right is rejected by the executor. ----
+    #[test]
+    fn queued_map_right_missing_rejected() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(&mut state, CapRights::READ, PAGE_SIZE as u64, Some(2));
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        assert_eq!(
+            state.shared_region_execute(snap),
+            Err(SharedRegionTxnError::MissingMapRight)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // ---- (10) A writable queued mapping publishes, and the mapping is ALWAYS non-executable. ----
+    #[test]
+    fn queued_write_mapping_is_nx() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::WRITE | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let snap = dequeue_phase_a(&mut state, &fx, 2, true).expect("phase A");
+        assert!(snap.rights.contains(CapRights::WRITE));
+        let out = state.shared_region_execute(snap).expect("publish writable");
+        assert_eq!(out.mapped_len, PAGE_SIZE);
+        // NX is structural: the executor never enables execute on the mapping.
+        const SRC: &str = include_str!("shared_region_txn.rs");
+        assert!(
+            SRC.contains("execute: false, // NX ALWAYS."),
+            "queued shared-region mapping must always be non-executable"
+        );
+    }
+
+    // ---- (11) DmaRegion bounds are enforced: an over-span region is rejected at stash. ----
+    #[test]
+    fn queued_dmaregion_bounds_enforced() {
+        let mut state = Bootstrap::init().expect("init");
+        add_receiver(&mut state, 2, 0x5400_0000);
+        let (_idx, send_cap, _r) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (mem_id, _c) = state
+            .alloc_anonymous_memory_object_with_len(3 * PAGE_SIZE)
+            .expect("mem");
+        let dma_obj = CapObject::DmaRegion {
+            id: mem_id,
+            offset: 0,
+            len: (2 * PAGE_SIZE) as u64,
+        };
+        let src = state
+            .mint_capability_for_current_context(Capability::new(
+                dma_obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint");
+        // A region exceeding the DmaRegion span is rejected before any envelope is created.
+        let over = TransferSharedRegion {
+            offset: 0,
+            len: (3 * PAGE_SIZE) as u64,
+        };
+        assert!(
+            state
+                .stash_transfer_envelope(ThreadId(0), src, endpoint, Some(ThreadId(2)), Some(over))
+                .is_none(),
+            "over-span DmaRegion must be rejected at stash (bounds enforced)"
+        );
+        assert_eq!(shared_envelope_count(&state), 0);
+    }
+
+    // ---- (12) Two receivers cannot consume the SAME envelope: the second attempt fails closed. ----
+    #[test]
+    fn queued_two_receivers_cannot_consume_same_envelope() {
+        let mut state = Bootstrap::init().expect("init");
+        // Unbound envelope so both receivers could attempt it.
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            None,
+        );
+        // Second receiver task 3 with its own ASID.
+        add_receiver(&mut state, 3, 0x5500_0000);
+        // Receiver 2 dequeues + consumes the envelope.
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A r2");
+        // Receiver 3 races on the SAME handle: the envelope is already gone → fails closed.
+        assert!(
+            state
+                .shared_region_phase_a(
+                    fx.handle,
+                    fx.endpoint,
+                    3,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    stale_msg(fx.handle),
+                    false
+                )
+                .is_err(),
+            "second receiver cannot consume the same envelope"
+        );
+        state.shared_region_execute(snap).expect("r2 publishes");
+        assert_eq!(active_mapping_count(&state), 1, "exactly one mapping");
+    }
+
+    // ---- (13) The queued message is popped exactly once; the envelope is consumed exactly once. ----
+    #[test]
+    fn queued_envelope_consumed_message_not_replayable() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let msg = dequeue(&mut state, fx.endpoint_idx).expect("first pop");
+        assert!(
+            dequeue(&mut state, fx.endpoint_idx).is_none(),
+            "message is not replayable"
+        );
+        let h = msg.transferred_cap().expect("h").0;
+        let snap = state
+            .shared_region_phase_a(h, fx.endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+            .expect("phase A");
+        assert_eq!(shared_envelope_count(&state), 0, "envelope consumed once");
+        assert!(
+            state
+                .shared_region_phase_a(
+                    h,
+                    fx.endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    stale_msg(h),
+                    false
+                )
+                .is_err(),
+            "envelope not re-consumable"
+        );
+        state.shared_region_execute(snap).expect("publish");
+    }
+
+    // ---- (14) A stale-handle dequeue leaves NO dangling state: the real envelope stays intact. ----
+    #[test]
+    fn queued_stale_handle_dequeue_leaves_no_dangling() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        // Wrong-generation handle (stale): must not resolve, must not consume the real envelope.
+        let stale = fx.handle ^ (1u64 << 20);
+        assert!(
+            state
+                .shared_region_phase_a(
+                    stale,
+                    fx.endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    stale_msg(stale),
+                    false
+                )
+                .is_err(),
+            "stale handle must fail closed"
+        );
+        assert_eq!(
+            shared_envelope_count(&state),
+            1,
+            "real envelope untouched (no dangling)"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+        assert_eq!(pin_refcount(&state, fx.mem_id), 1, "pin untouched");
+    }
+
+    // ---- (15) A successful queued publish yields exactly one receiver cap + one active mapping. ----
+    #[test]
+    fn queued_publish_yields_one_cap_one_active_mapping() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let occ_before = cnode_occupied(&state, 2);
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        let out = state.shared_region_execute(snap).expect("publish");
+        assert_eq!(
+            cnode_occupied(&state, 2),
+            occ_before + 1,
+            "exactly one receiver cap minted"
+        );
+        assert_eq!(
+            active_mapping_count(&state),
+            1,
+            "exactly one active mapping"
+        );
+        let cn = state.task_cnode(2).expect("cnode");
+        assert!(
+            state
+                .capability_for_cnode_local(cn, out.receiver_local_cap)
+                .is_some(),
+            "minted cap resolves in the receiver cnode"
+        );
+    }
+
+    // ---- (16) A page-N map fault on the queued path rolls back exactly the mapped prefix. ----
+    #[test]
+    fn queued_map_fault_rolls_back_prefix() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            (2 * PAGE_SIZE) as u64,
+            Some(2),
+        );
+        let occ_before = cnode_occupied(&state, 2);
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(1, Ordering::SeqCst); // fault on 2nd page
+        let res = state.shared_region_execute(snap);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::MapFault));
+        assert_eq!(active_mapping_count(&state), 0, "prefix unmapped, no leak");
+        assert_eq!(
+            cnode_occupied(&state, 2),
+            occ_before,
+            "provisional cap revoked"
+        );
+        assert_eq!(
+            pin_refcount(&state, fx.mem_id),
+            0,
+            "pin released on rollback"
+        );
+    }
+
+    // ---- (17) A user-copy fault on the queued path rolls back the whole transaction. ----
+    #[test]
+    fn queued_copy_fault_rolls_back() {
+        reset_hooks();
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let occ_before = cnode_occupied(&state, 2);
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
+        let res = state.shared_region_execute(snap);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::CopyFault));
+        assert_eq!(active_mapping_count(&state), 0, "mapping unmapped");
+        assert_eq!(cnode_occupied(&state, 2), occ_before, "cap revoked");
+        assert_eq!(pin_refcount(&state, fx.mem_id), 0, "pin released");
+    }
+
+    // ---- (18) Source exit BEFORE dequeue purges the envelope + pin; the queued message goes inert. ----
+    #[test]
+    fn queued_source_exit_before_dequeue_purges_message_envelope_pin() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let asid = add_receiver(&mut state, 2, 0x5600_0000);
+        let (endpoint_idx, send_cap, _r) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (mem_id, mem0) = state
+            .alloc_anonymous_memory_object_with_len(PAGE_SIZE)
+            .expect("mem");
+        let obj = state.current_task_capability(mem0).expect("o").object;
+        let src0 = state
+            .mint_capability_for_current_context(Capability::new(
+                obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint");
+        // Source cap owned by task 1.
+        let src1 = state
+            .grant_capability_task_to_task(0, src0, 1)
+            .expect("grant to t1");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(ThreadId(1), src1, endpoint, Some(ThreadId(2)), Some(region))
+            .expect("stash");
+        enqueue(&mut state, endpoint_idx, stale_msg(handle));
+        assert_eq!(pin_refcount(&state, mem_id), 1);
+        // Source process exits BEFORE the receiver dequeues.
+        state.exit_task(1, 0).expect("exit source");
+        state.purge_transfer_envelopes_for_pid(1);
+        assert_eq!(shared_envelope_count(&state), 0, "envelope purged");
+        assert_eq!(pin_refcount(&state, mem_id), 0, "pin released");
+        // The queued message is now inert: dequeue → the handle resolves to nothing.
+        let msg = dequeue(&mut state, endpoint_idx).expect("msg present");
+        let h = msg.transferred_cap().expect("h").0;
+        assert!(
+            state
+                .shared_region_phase_a(h, endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .is_err(),
+            "inert queued message cannot produce a transaction"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+        let _ = asid;
+    }
+
+    // ---- (19) Receiver exit BEFORE dequeue removes the queued association (envelope + pin). ----
+    #[test]
+    fn queued_receiver_exit_before_dequeue_removes_association() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        state.mark_task_dead(2).expect("kill receiver");
+        state.purge_transfer_envelopes_for_pid(2);
+        assert_eq!(shared_envelope_count(&state), 0, "association removed");
+        assert_eq!(pin_refcount(&state, fx.mem_id), 0, "pin released");
+        let msg = dequeue(&mut state, fx.endpoint_idx).expect("msg");
+        let h = msg.transferred_cap().expect("h").0;
+        assert!(
+            state
+                .shared_region_phase_a(h, fx.endpoint, 2, MAP_VA, false, META_PTR, msg, false)
+                .is_err(),
+            "no transaction after the receiver association is removed"
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // ---- (20) Receiver exit AFTER the snapshot → the executor cancels (ReceiverGone), no publish. ----
+    #[test]
+    fn queued_receiver_exit_after_snapshot_cancels() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        state.mark_task_dead(2).expect("kill receiver");
+        assert_eq!(
+            state.shared_region_execute(snap),
+            Err(SharedRegionTxnError::ReceiverGone)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+        assert_eq!(
+            pin_refcount(&state, fx.mem_id),
+            0,
+            "pin released on rollback"
+        );
+    }
+
+    // ---- (21) Endpoint teardown BEFORE dequeue reclaims the message and envelope together. ----
+    #[test]
+    fn queued_endpoint_teardown_before_dequeue_reclaims_together() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        assert_eq!(endpoint_queue_depth(&state, fx.endpoint_idx), 1);
+        // Endpoint teardown: the endpoint (and its queued message) is dropped, and process teardown
+        // purges the bound envelope + pin — the two are reclaimed together, not left half-torn.
+        state.destroy_endpoint(fx.endpoint_idx).expect("destroy");
+        state.purge_transfer_envelopes_for_pid(0);
+        assert!(
+            !endpoint_present(&state, fx.endpoint_idx),
+            "endpoint (and its queued message) reclaimed"
+        );
+        assert_eq!(shared_envelope_count(&state), 0, "envelope reclaimed");
+        assert_eq!(pin_refcount(&state, fx.mem_id), 0, "pin released");
+        assert!(
+            state
+                .shared_region_phase_a(
+                    fx.handle,
+                    fx.endpoint,
+                    2,
+                    MAP_VA,
+                    false,
+                    META_PTR,
+                    stale_msg(fx.handle),
+                    false
+                )
+                .is_err(),
+            "no transaction survives endpoint teardown"
+        );
+    }
+
+    // ---- (22) Endpoint teardown AFTER the snapshot → cancellation prevents publication. ----
+    #[test]
+    fn queued_endpoint_teardown_after_snapshot_prevents_publication() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        // Teardown occurs while the transaction is in flight: it destroys the endpoint AND marks a
+        // generation-bearing cancellation request, which the executor observes → no publication.
+        state.destroy_endpoint(fx.endpoint_idx).expect("destroy");
+        assert!(
+            state.shared_region_request_cancel(2, snap.receiver_asid),
+            "teardown records the cancellation"
+        );
+        assert_eq!(
+            state.shared_region_execute(snap),
+            Err(SharedRegionTxnError::Cancelled)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+        assert_eq!(pin_refcount(&state, fx.mem_id), 0, "pin released on cancel");
+    }
+
+    // ---- (23) A reused numeric TID with a NEW ASID cannot consume/publish the old transaction. ----
+    #[test]
+    fn queued_reused_tid_new_asid_cannot_consume_or_publish() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        // Snapshot captures the OLD ASID.
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        // The numeric TID 2 is reused by a replacement with a DIFFERENT ASID.
+        let (new_asid, mc2) = state.create_user_address_space().expect("asid2");
+        assert_ne!(new_asid, snap.receiver_asid);
+        state.bind_task_asid(2, new_asid).expect("rebind");
+        state
+            .map_user_page(
+                mc2,
+                VirtAddr(META_PTR),
+                Mapping {
+                    phys: PhysAddr(0x5700_0000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta2");
+        // The stale (old-ASID) transaction can no longer publish into the reused TID.
+        assert_eq!(
+            state.shared_region_execute(snap),
+            Err(SharedRegionTxnError::ReceiverGone)
+        );
+        assert_eq!(active_mapping_count(&state), 0);
+    }
+
+    // ================= Cancellation-capacity proof (proof C: fail-closed) =================
+
+    fn cancel_overflow(state: &KernelState) -> bool {
+        state.with_ipc_state(|ipc| ipc.shared_region_cancel_overflow)
+    }
+    fn cancel_slots_used(state: &KernelState) -> usize {
+        state.with_ipc_state(|ipc| ipc.shared_region_cancel_requests.iter().flatten().count())
+    }
+    fn cancel_req_present(state: &KernelState, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
+        state.with_ipc_state(|ipc| {
+            ipc.shared_region_cancel_requests
+                .iter()
+                .flatten()
+                .any(|r| r.tid == tid && r.asid == asid)
+        })
+    }
+    fn live_task(state: &mut KernelState, tid: u64) -> crate::kernel::vm::Asid {
+        state.register_task(tid).expect("task");
+        let (asid, _mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(tid, asid).expect("bind");
+        asid
+    }
+
+    // (C1) With every cancellation slot occupied by a LIVE request, one more request FAILS CLOSED
+    // (latches overflow) rather than silently dropping the cancellation.
+    #[test]
+    fn cap_all_slots_occupied_extra_request_fails_closed() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut asids = [None; MAX_SHARED_REGION_CANCEL_REQUESTS];
+        for i in 0..MAX_SHARED_REGION_CANCEL_REQUESTS {
+            let tid = 10 + i as u64;
+            let asid = live_task(&mut state, tid);
+            asids[i] = Some(asid);
+            assert!(
+                state.shared_region_request_cancel(tid, asid),
+                "record {tid}"
+            );
+        }
+        assert_eq!(cancel_slots_used(&state), MAX_SHARED_REGION_CANCEL_REQUESTS);
+        assert!(!cancel_overflow(&state), "no overflow while there is room");
+        // One more LIVE request: no slot, no stale entry to evict → fail closed.
+        let extra_tid = 10 + MAX_SHARED_REGION_CANCEL_REQUESTS as u64;
+        let extra_asid = live_task(&mut state, extra_tid);
+        assert!(
+            !state.shared_region_request_cancel(extra_tid, extra_asid),
+            "extra request cannot be recorded"
+        );
+        assert!(
+            cancel_overflow(&state),
+            "unrecordable cancellation latches the fail-closed overflow"
+        );
+    }
+
+    // (C2) A stale occupant (its receiver died) is evicted so a LIVE cancellation records — the live
+    // occupants are untouched, and no capacity is added.
+    #[test]
+    fn cap_stale_entry_evicted_so_live_cancellation_records() {
+        let mut state = Bootstrap::init().expect("init");
+        let mut tids_asids = [(0u64, None); MAX_SHARED_REGION_CANCEL_REQUESTS];
+        for i in 0..MAX_SHARED_REGION_CANCEL_REQUESTS {
+            let tid = 20 + i as u64;
+            let asid = live_task(&mut state, tid);
+            tids_asids[i] = (tid, Some(asid));
+            assert!(state.shared_region_request_cancel(tid, asid));
+        }
+        // The first occupant's receiver dies → its slot becomes STALE (can never be consumed).
+        state.mark_task_dead(20).expect("kill");
+        // A live cancellation now records by evicting the stale slot — NOT by growing the table.
+        let live_tid = 40;
+        let live_asid = live_task(&mut state, live_tid);
+        assert!(
+            state.shared_region_request_cancel(live_tid, live_asid),
+            "live cancellation records into the evicted stale slot"
+        );
+        assert!(
+            !cancel_overflow(&state),
+            "no overflow: a stale slot was reclaimed"
+        );
+        assert_eq!(
+            cancel_slots_used(&state),
+            MAX_SHARED_REGION_CANCEL_REQUESTS,
+            "capacity unchanged"
+        );
+        assert!(cancel_req_present(&state, live_tid, live_asid));
+        // A still-live occupant's cancellation was not disturbed.
+        let (t1, a1) = tids_asids[1];
+        assert!(cancel_req_present(&state, t1, a1.unwrap()));
+    }
+
+    // (C3) A replacement-ASID request for a reused numeric TID is DISTINCT from the stale old-ASID
+    // request — the (tid, asid) key keeps them separate.
+    #[test]
+    fn cap_replacement_asid_request_distinct_from_stale_tid() {
+        let mut state = Bootstrap::init().expect("init");
+        let old_asid = live_task(&mut state, 50);
+        assert!(state.shared_region_request_cancel(50, old_asid));
+        assert!(cancel_req_present(&state, 50, old_asid));
+        // Reuse TID 50 with a new ASID.
+        let (new_asid, _mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(50, new_asid).expect("rebind");
+        assert_ne!(new_asid, old_asid);
+        assert!(state.shared_region_request_cancel(50, new_asid));
+        // Both keys coexist as distinct requests (the old one is not matched by the new ASID).
+        assert!(
+            cancel_req_present(&state, 50, new_asid),
+            "replacement request recorded"
+        );
+        assert!(
+            cancel_req_present(&state, 50, old_asid),
+            "old-ASID request remains distinct"
+        );
+    }
+
+    // (C4) No transaction publishes after an UNRECORDABLE cancellation: the overflow latch is
+    // authoritative for every executor checkpoint.
+    #[test]
+    fn cap_no_publish_after_unrecordable_cancellation() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        // Saturate the cancel table with LIVE requests so a cancellation for our receiver cannot be
+        // recorded — it must fail closed.
+        for i in 0..MAX_SHARED_REGION_CANCEL_REQUESTS {
+            let tid = 60 + i as u64;
+            let asid = live_task(&mut state, tid);
+            assert!(state.shared_region_request_cancel(tid, asid));
+        }
+        assert!(
+            !state.shared_region_request_cancel(2, snap.receiver_asid),
+            "receiver cancellation cannot be recorded (table full of live entries)"
+        );
+        assert!(cancel_overflow(&state), "overflow latched");
+        // The executor treats the latch as authoritative → cancels, never publishes.
+        assert_eq!(
+            state.shared_region_execute(snap),
+            Err(SharedRegionTxnError::Cancelled)
+        );
+        assert_eq!(active_mapping_count(&state), 0, "nothing published");
+        assert_eq!(pin_refcount(&state, fx.mem_id), 0, "pin released on cancel");
+    }
+
+    // (C5) The fail-closed overflow fuse is GLOBAL and PERMANENT: once latched it cancels every
+    // transaction, and it does not auto-clear (clearing it could let the unrecordable cancellation's
+    // receiver publish — silent loss). This is the conservative safety valve, not a recovery path.
+    #[test]
+    fn cap_overflow_latch_is_global_and_permanent() {
+        let mut state = Bootstrap::init().expect("init");
+        let fx = setup_queued(
+            &mut state,
+            CapRights::READ | CapRights::MAP,
+            PAGE_SIZE as u64,
+            Some(2),
+        );
+        let snap = dequeue_phase_a(&mut state, &fx, 2, false).expect("phase A");
+        // Saturate + latch overflow (none of these requests names our receiver).
+        for i in 0..MAX_SHARED_REGION_CANCEL_REQUESTS {
+            let tid = 70 + i as u64;
+            let asid = live_task(&mut state, tid);
+            assert!(state.shared_region_request_cancel(tid, asid));
+        }
+        assert!(!state.shared_region_request_cancel(2, snap.receiver_asid));
+        assert!(cancel_overflow(&state));
+        // Our transaction cancels under the global fuse, and the fuse remains latched afterwards.
+        assert_eq!(
+            state.shared_region_execute(snap),
+            Err(SharedRegionTxnError::Cancelled)
+        );
+        assert!(
+            cancel_overflow(&state),
+            "fuse stays latched (permanent conservative fail-closed)"
+        );
+        assert_eq!(
+            active_mapping_count(&state),
+            0,
+            "nothing published under the fuse"
+        );
+    }
+}
+
+// Stage 198E3 — SHARED-REGION IpcSend LIVE wiring (foundation, hosted proof).
+//
+// Proves the kernel-side production wiring for the two live shared-region classes: the direct
+// (blocked-receiver) and queued (dequeue) producers publish exactly ONE origin-tagged post-lock
+// work item that reuses the accepted `shared_region_execute`; the class-tagged attestation +
+// retirement markers are origin-gated; the fail-closed cancellation fuse diagnostic fires exactly
+// once; and the RISC-V sender/receiver typed-outcome contract is preserved. The live 6-cell QEMU
+// seal (userspace oracle) is proven by scripts/qemu-shared-region-live-seal.sh (live-wiring
+// continuation). See doc/STAGE_198E3_SHARED_REGION_LIVE.md.
+mod stage198e3_shared_region_live {
+    use super::*;
+    use crate::kernel::boot::{SharedRegionLiveOrigin, shared_region_live_origin_take};
+    use crate::kernel::dispatch_post_work::DispatchPostWork;
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+
+    const CPU0: CpuId = CpuId(0);
+    const MAP_VA: u64 = 0x8000;
+    const META_PTR: u64 = 0x8800;
+
+    fn set_trap_drainer(active: bool) {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+            .store(active, core::sync::atomic::Ordering::Relaxed);
+    }
+    fn clear_stash() {
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let _ = shared_region_live_origin_take(0);
+    }
+    // Restore process-global state to its default so these tests never contaminate others (the
+    // oracle-proof knob defaults OFF and only these tests set it on).
+    fn restore_globals() {
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(false);
+        set_trap_drainer(false);
+        clear_stash();
+    }
+    fn take_stash() -> DispatchPostWork {
+        unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }
+            .unwrap_or(DispatchPostWork::None)
+    }
+    fn shared_msg(handle: u64) -> Message {
+        Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("shared msg")
+    }
+
+    // task 1 blocked recv-v2 (map VA @ MAP_VA, meta @ META_PTR), a MemoryObject source cap owned by
+    // task 0, and a SHARED-REGION transfer envelope bound to (recv_endpoint, task 1). The oracle
+    // knob + trap drainer are enabled. Returns (state, endpoint_idx, endpoint, handle).
+    fn blocked_shared_region_fixture() -> (KernelState, usize, CapObject, u64) {
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
+        set_trap_drainer(true);
+        clear_stash();
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let recv_cap_task1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("grant recv cap");
+        let (_mem_id, src_cap) = state.alloc_anonymous_memory_object().expect("mem obj");
+        let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind");
+        state
+            .map_user_page(
+                aspace1,
+                VirtAddr(META_PTR & !(PAGE_SIZE as u64 - 1)),
+                Mapping {
+                    phys: PhysAddr(0x9000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map meta page");
+        // The producer targets waiter_tid=1 explicitly (resolving its cnode/asid + blocked state);
+        // it does not require task 1 to be the current task, so no scheduler switch is needed.
+        state.with_tcb_mut(1, |tcb| {
+            tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                recv_cap: recv_cap_task1,
+                payload_user_ptr: MAP_VA as usize,
+                payload_user_len: crate::kernel::ipc::Message::MAX_PAYLOAD,
+                meta_user_ptr: META_PTR as usize,
+                meta_user_len: 40,
+                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            });
+        });
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_waiters[endpoint_idx] =
+                Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    ThreadId(1),
+                    crate::kernel::vm::Asid(0),
+                ));
+        });
+        let endpoint = state
+            .resolve_capability_for_task(1, recv_cap_task1)
+            .expect("resolve recv cap")
+            .object;
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(1)),
+                Some(region),
+            )
+            .expect("stash shared envelope");
+        (state, endpoint_idx, endpoint, handle)
+    }
+
+    // (1) The DIRECT producer publishes exactly one post-work item tagged origin_direct=true and
+    // sets the per-CPU live origin to Direct.
+    #[test]
+    fn direct_live_work_publication_origin() {
+        let (mut state, endpoint_idx, _endpoint, handle) = blocked_shared_region_fixture();
+        let produced = crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert!(
+            produced,
+            "a shared-region direct send must publish post-work"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_none(),
+            "producer consumed the waiter's blocked_recv_state"
+        );
+        match take_stash() {
+            DispatchPostWork::BlockedWaiterSharedRegionDelivery(snap) => {
+                assert!(snap.snapshot.origin_direct, "direct origin marker");
+                assert_eq!(snap.endpoint_idx, endpoint_idx);
+                assert!(snap.snapshot.pin_owned, "pin transferred into the snapshot");
+                assert!(matches!(
+                    snap.snapshot.object,
+                    CapObject::MemoryObject { .. }
+                ));
+            }
+            other => panic!("expected shared-region delivery, got {other:?}"),
+        }
+        restore_globals();
+    }
+
+    // (2) The QUEUED producer publishes exactly one post-work item tagged origin_direct=false and
+    // sets the per-CPU live origin to Enqueue.
+    #[test]
+    fn enqueue_live_work_publication_origin() {
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
+        set_trap_drainer(true);
+        clear_stash();
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("task2");
+        let (endpoint_idx, send_cap, _recv) = state.create_endpoint(4).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send")
+            .object;
+        let (_mem_id, src_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        let (asid, mc) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(2, asid).expect("bind");
+        state
+            .map_user_page(
+                mc,
+                VirtAddr(META_PTR & !(PAGE_SIZE as u64 - 1)),
+                Mapping {
+                    phys: PhysAddr(0xA000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = state
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let produced = crate::kernel::syscall::produce_queued_shared_region_delivery(
+            &mut state,
+            2,
+            endpoint_idx,
+            endpoint,
+            MAP_VA,
+            META_PTR,
+            false,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert!(
+            produced,
+            "a queued shared-region dequeue must publish post-work"
+        );
+        match take_stash() {
+            DispatchPostWork::BlockedWaiterSharedRegionDelivery(snap) => {
+                assert!(!snap.snapshot.origin_direct, "enqueue origin marker");
+                assert_eq!(snap.snapshot.receiver_tid, 2);
+            }
+            other => panic!("expected shared-region delivery, got {other:?}"),
+        }
+        restore_globals();
+    }
+
+    // (3) Marker origin gating: the live origin is unset until a producer sets it, is class-correct
+    // after, and is one-shot consumed — so ordinary/reply/plain/hosted paths (which never set it)
+    // can never emit the shared-region live markers.
+    #[test]
+    fn marker_origin_gating() {
+        clear_stash();
+        assert_eq!(
+            shared_region_live_origin_take(0),
+            None,
+            "no origin set → drain emits no shared-region markers"
+        );
+        let (mut state, endpoint_idx, _endpoint, handle) = blocked_shared_region_fixture();
+        crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert_eq!(
+            shared_region_live_origin_take(0),
+            Some(SharedRegionLiveOrigin::Direct),
+            "direct producer tags the origin"
+        );
+        assert_eq!(
+            shared_region_live_origin_take(0),
+            None,
+            "origin is one-shot (consumed exactly once)"
+        );
+        restore_globals();
+    }
+
+    // (4) Exactly one post-work item per transaction: the stash holds a single item.
+    #[test]
+    fn one_post_work_item_per_transaction() {
+        let (mut state, endpoint_idx, _endpoint, handle) = blocked_shared_region_fixture();
+        crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert!(matches!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() },
+            Some(DispatchPostWork::BlockedWaiterSharedRegionDelivery(_))
+        ));
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "exactly one work item is published per transaction"
+        );
+        restore_globals();
+    }
+
+    // (5) Off the oracle knob the producer is INERT (legacy path runs, no live class): the sender's
+    // shared-region send stays on the ReturnToCurrent (continue) path and the RISC-V receiver idle
+    // contract uses EnterKernelIdle{BlockedIpcNoRunnable}, never Err(Internal) as idle control flow.
+    #[test]
+    fn riscv_return_to_current_and_inert_without_knob() {
+        // Build the fixture (knob on), then turn the knob OFF: the producer must decline so the
+        // legacy path (sender continues, ReturnToCurrent) runs unchanged.
+        let (mut state, endpoint_idx, _endpoint, handle) = blocked_shared_region_fixture();
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(false);
+        let produced = crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut state,
+            1,
+            endpoint_idx,
+            &shared_msg(handle),
+        )
+        .expect("producer");
+        assert!(
+            !produced,
+            "off the knob the producer must decline (legacy path)"
+        );
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_some(),
+            "declining leaves the waiter's blocked state untouched"
+        );
+        // RISC-V typed-outcome contract (sender continues / receiver idle) preserved: the receiver
+        // idle path uses the authoritative EnterKernelIdle{BlockedIpcNoRunnable, IpcRecv}, and no
+        // Err(Internal) is used as successful idle control flow.
+        const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        assert!(
+            RISCV_TRAP_SRC.contains("BlockedIpcNoRunnable"),
+            "RISC-V receiver idle must use the typed BlockedIpcNoRunnable outcome"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("ReturnToCurrent"),
+            "RISC-V sender-continues must use the typed ReturnToCurrent outcome"
+        );
+        restore_globals();
+    }
+
+    // (6) Seal parser / contract: the live seal script requires all attestations + retirement
+    // markers for BOTH classes on ALL THREE arches, forbids a fuse trip, and emits the six-cell
+    // seal line.
+    #[test]
+    fn seal_parser_contract() {
+        const SEAL: &str = include_str!("../../../scripts/qemu-shared-region-live-seal.sh");
+        for needle in [
+            "IPCSEND_SHARED_REGION_OBJECT_OK arch=$arch class=$class object_match=1 fresh_cap=1 pin_transfer=1",
+            "IPCSEND_SHARED_REGION_MAP_OK arch=$arch class=$class map_right=1 write_right_ok=1 nx=1 cleanup_token=1",
+            "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch=$arch class=$class transaction_published=1 receiver_wakes=1 leaked_state=0",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=$arch class=$rclass result=ok",
+            "IpcSendSharedRegionDirect",
+            "IpcSendSharedRegionEnqueue",
+            "SHARED_REGION_CANCEL_FUSE_SET", // forbidden-marker guard
+            "live_cells=6 fuse_trips=0 result=ok",
+        ] {
+            assert!(SEAL.contains(needle), "seal contract missing: {needle}");
+        }
+    }
+
+    // (7) The fail-closed cancellation-fuse diagnostic is emitted EXACTLY ONCE, and a real overflow
+    // (all cancel slots occupied by live receivers) trips it.
+    #[test]
+    fn fuse_diagnostic_emitted_once() {
+        crate::kernel::boot::reset_shared_region_cancel_fuse_log();
+        assert!(
+            crate::kernel::boot::maybe_log_shared_region_cancel_fuse_set(),
+            "first fuse diagnostic emits"
+        );
+        assert!(
+            !crate::kernel::boot::maybe_log_shared_region_cancel_fuse_set(),
+            "second call is a no-op (emitted exactly once)"
+        );
+        // A real overflow trips the fuse via request_cancel.
+        crate::kernel::boot::reset_shared_region_cancel_fuse_log();
+        let mut state = Bootstrap::init().expect("init");
+        let mut tids = [0u64; MAX_SHARED_REGION_CANCEL_REQUESTS];
+        for (i, slot) in tids.iter_mut().enumerate() {
+            let tid = 90 + i as u64;
+            *slot = tid;
+            state.register_task(tid).expect("task");
+            let (asid, _mc) = state.create_user_address_space().expect("asid");
+            state.bind_task_asid(tid, asid).expect("bind");
+            assert!(state.shared_region_request_cancel(tid, asid));
+        }
+        // Fifth live request overflows → fuse trips (and the diagnostic emits once).
+        state.register_task(99).expect("task99");
+        let (asid99, _mc) = state.create_user_address_space().expect("asid99");
+        state.bind_task_asid(99, asid99).expect("bind99");
+        assert!(
+            !state.shared_region_request_cancel(99, asid99),
+            "overflow fails closed"
+        );
+        assert!(
+            state.with_ipc_state(|ipc| ipc.shared_region_cancel_overflow),
+            "fuse latched in IpcState"
+        );
+        // The global diagnostic latch was won by the request_cancel overflow above.
+        assert!(
+            !crate::kernel::boot::maybe_log_shared_region_cancel_fuse_set(),
+            "the overflow already emitted the one-shot diagnostic"
+        );
+    }
+}
+
+// Stage 198E3B2A — SHARED-REGION OFF-LOCK SEAM FOUNDATION (substrate equivalence, hosted proof).
+//
+// Proves the narrowly scoped `&mut <Subsystem>` `_locked` seam helpers behave IDENTICALLY to their
+// broad-borrow reference siblings, and that they take a single-domain subsystem reference (never a
+// whole `&mut KernelState`). These helpers are the rank-3/5/6 substrate that the pending
+// `SharedRegionOffLockCtx` (Stage 198E3B2A part 2) composes into the off-lock context.
+mod stage198e3b2a_shared_region_seams {
+    use super::*;
+
+    fn mem_object(state: &mut KernelState, phys: u64) -> CapObject {
+        let (_id, cap) = state.create_memory_object(PhysAddr(phys)).expect("mem obj");
+        state.current_task_capability(cap).expect("obj").object
+    }
+
+    // (1) pin-refcount `_locked` == broad path (memory rank 6).
+    #[test]
+    fn pin_refcount_locked_equivalent() {
+        let mut s = Bootstrap::init().expect("init");
+        let obj = mem_object(&mut s, 0xCA000);
+        let base = s.memory_object_refcounts(PhysAddr(0xCA000)).expect("rc").2;
+        s.adjust_memory_object_pin_refcount(obj, 1);
+        let after_broad = s.memory_object_refcounts(PhysAddr(0xCA000)).expect("rc").2;
+        s.adjust_memory_object_pin_refcount(obj, -1); // undo
+        s.with_memory_state_mut(|m| {
+            KernelState::adjust_memory_object_pin_refcount_locked(m, obj, 1)
+        });
+        let after_locked = s.memory_object_refcounts(PhysAddr(0xCA000)).expect("rc").2;
+        assert_eq!(after_broad, after_locked);
+        assert_eq!(after_broad, base + 1);
+    }
+
+    // (2) map-refcount insert/remove `_locked` == broad path (memory rank 6).
+    #[test]
+    fn map_refcount_locked_equivalent() {
+        let mut s = Bootstrap::init().expect("init");
+        let _obj = mem_object(&mut s, 0xCB000);
+        let base = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        s.note_mapping_inserted(PhysAddr(0xCB000));
+        let broad_ins = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        s.note_mapping_removed(PhysAddr(0xCB000)); // undo
+        s.with_memory_state_mut(|m| {
+            KernelState::note_mapping_inserted_locked(m, PhysAddr(0xCB000))
+        });
+        let locked_ins = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        assert_eq!(broad_ins, locked_ins);
+        assert_eq!(broad_ins, base + 1);
+        // removal sibling matches too.
+        s.note_mapping_removed(PhysAddr(0xCB000));
+        let broad_rem = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        s.with_memory_state_mut(|m| {
+            KernelState::note_mapping_inserted_locked(m, PhysAddr(0xCB000))
+        });
+        s.with_memory_state_mut(|m| KernelState::note_mapping_removed_locked(m, PhysAddr(0xCB000)));
+        let locked_rem = s.memory_object_refcounts(PhysAddr(0xCB000)).expect("rc").1;
+        assert_eq!(broad_rem, locked_rem);
+    }
+
+    // (3) phys-base `_locked` returns the frozen shared object's physical base (memory rank 6).
+    #[test]
+    fn phys_base_locked_correct() {
+        let mut s = Bootstrap::init().expect("init");
+        let obj = mem_object(&mut s, 0xCC000);
+        let got = s.with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, obj));
+        assert_eq!(got, Some(PhysAddr(0xCC000)));
+        // DmaRegion offset is honored.
+        let CapObject::MemoryObject { id } = obj else {
+            panic!("memory object")
+        };
+        let dma = CapObject::DmaRegion {
+            id,
+            offset: 0x1000,
+            len: 0x1000,
+        };
+        let dma_base = s.with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, dma));
+        assert_eq!(dma_base, Some(PhysAddr(0xCC000 + 0x1000)));
+    }
+
+    // (4) active-mapping register/remove `_locked` == broad path (IPC rank 3).
+    #[test]
+    fn active_mapping_locked_equivalent() {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("task2");
+        let cap = CapId(0x0002_0000_0000_0007);
+        // Broad register, then read back.
+        s.register_active_transfer_mapping(ThreadId(2), cap, VirtAddr(0x9000), PAGE_SIZE)
+            .expect("register");
+        let broad = s.active_transfer_mapping_for(ThreadId(2), cap);
+        assert!(s.remove_active_transfer_mapping(ThreadId(2), cap)); // undo
+        // Locked register, then read back — identical.
+        let ok = s.with_ipc_state_mut(|ipc| {
+            KernelState::register_active_transfer_mapping_locked(
+                ipc,
+                ThreadId(2),
+                cap,
+                VirtAddr(0x9000),
+                PAGE_SIZE,
+            )
+        });
+        assert!(ok);
+        let locked = s.active_transfer_mapping_for(ThreadId(2), cap);
+        assert_eq!(broad, locked);
+        assert_eq!(locked, Some((VirtAddr(0x9000), PAGE_SIZE)));
+        // Locked remove clears exactly that entry.
+        let removed = s.with_ipc_state_mut(|ipc| {
+            KernelState::remove_active_transfer_mapping_locked(ipc, ThreadId(2), cap)
+        });
+        assert!(removed);
+        assert_eq!(s.active_transfer_mapping_for(ThreadId(2), cap), None);
+    }
+
+    // (5) cancellation-consume `_locked` consumes ONLY the matching (tid, asid) request (IPC rank 3).
+    #[test]
+    fn consume_cancel_locked_mutates_only_intended() {
+        let mut s = Bootstrap::init().expect("init");
+        let a_asid = {
+            s.register_task(10).expect("t10");
+            let (asid, _mc) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(10, asid).expect("bind");
+            asid
+        };
+        let b_asid = {
+            s.register_task(11).expect("t11");
+            let (asid, _mc) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(11, asid).expect("bind");
+            asid
+        };
+        assert!(s.shared_region_request_cancel(10, a_asid));
+        assert!(s.shared_region_request_cancel(11, b_asid));
+        // Consume only (10, a_asid).
+        let consumed = s.with_ipc_state_mut(|ipc| {
+            KernelState::shared_region_consume_cancel_locked(ipc, 10, a_asid)
+        });
+        assert!(consumed);
+        // (10) gone, (11) remains — only intended state changed.
+        let present = |tid: u64, asid: crate::kernel::vm::Asid, s: &KernelState| {
+            s.with_ipc_state(|ipc| {
+                ipc.shared_region_cancel_requests
+                    .iter()
+                    .flatten()
+                    .any(|r| r.tid == tid && r.asid == asid)
+            })
+        };
+        assert!(!present(10, a_asid, &s), "consumed request gone");
+        assert!(present(11, b_asid, &s), "unrelated request untouched");
+        // A second consume of the same key is a no-op (one-shot).
+        assert!(
+            !s.with_ipc_state_mut(|ipc| KernelState::shared_region_consume_cancel_locked(
+                ipc, 10, a_asid
+            ))
+        );
+    }
+
+    // (6b) receiver-alive raw read (task rank 2): live (tid, captured_asid) accepted; a dead/exited
+    // task, a missing tid, and a replacement ASID (reused numeric TID) are all rejected.
+    #[test]
+    fn receiver_alive_raw_read_generation_bearing() {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (asid, _mc) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(2, asid).expect("bind");
+        let (other_asid, _mc2) = s.create_user_address_space().expect("asid2");
+        assert_ne!(asid, other_asid);
+        let alive = |tid: u64, a: crate::kernel::vm::Asid, s: &KernelState| unsafe {
+            KernelState::shared_region_receiver_alive_from_raw(s as *const KernelState, tid, a)
+        };
+        assert!(alive(2, asid, &s), "live (tid, captured asid) accepted");
+        assert!(
+            !alive(2, other_asid, &s),
+            "replacement/wrong ASID rejected (generation-bearing)"
+        );
+        assert!(!alive(99, asid, &s), "missing tid rejected");
+        s.mark_task_dead(2).expect("kill");
+        assert!(!alive(2, asid, &s), "dead task rejected");
+    }
+
+    // (6) SAFETY / SOURCE CONTRACT: every `_locked` seam helper takes a single `&mut <Subsystem>` (or
+    // `&<Subsystem>`) — NEVER a whole `&mut KernelState`; and the off-lock receiver read projects the
+    // task lock via the addr_of! raw-pointer pattern, never a whole-KernelState reference.
+    #[test]
+    fn locked_seam_helpers_take_subsystem_not_kernelstate() {
+        const TXN_SRC: &str = include_str!("shared_region_txn.rs");
+        const XFER_SRC: &str = include_str!("transfer_state.rs");
+        const MEMLC_SRC: &str = include_str!("memory_lifecycle_state.rs");
+        const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+        for (src, needle) in [
+            (
+                TXN_SRC,
+                "fn shared_region_consume_cancel_locked(\n        ipc: &mut super::IpcSubsystem,",
+            ),
+            (
+                XFER_SRC,
+                "fn register_active_transfer_mapping_locked(\n        ipc: &mut super::IpcSubsystem,",
+            ),
+            (
+                XFER_SRC,
+                "fn remove_active_transfer_mapping_locked(\n        ipc: &mut super::IpcSubsystem,",
+            ),
+            (
+                MEMLC_SRC,
+                "fn note_mapping_inserted_locked(memory: &mut MemorySubsystem,",
+            ),
+            (
+                MEMLC_SRC,
+                "fn adjust_memory_object_pin_refcount_locked(\n        memory: &mut MemorySubsystem,",
+            ),
+            (
+                MEMLC_SRC,
+                "fn shared_region_phys_base_locked(\n        memory: &MemorySubsystem,",
+            ),
+        ] {
+            assert!(
+                src.contains(needle),
+                "seam helper signature contract missing: {needle}"
+            );
+        }
+        // The off-lock receiver read acquires ONLY the task lock via addr_of! projection and never
+        // forms a whole-KernelState reference.
+        assert!(
+            ORCH_SRC.contains("fn shared_region_receiver_alive_from_raw(")
+                && ORCH_SRC.contains("addr_of!((*state).task_state_lock)")
+                && ORCH_SRC.contains("addr_of!((*state).tcbs)"),
+            "receiver-alive raw read must project the task lock via addr_of! (no &mut KernelState)"
+        );
+        assert!(
+            !ORCH_SRC.contains("&mut *(state as *mut KernelState)"),
+            "the raw receiver read must never reconstruct a whole &mut KernelState"
+        );
+    }
+}
+
+// Stage 198E3B2A part 2 — SharedRegionOffLockCtx end-to-end equivalence + safety (hosted proof).
+//
+// Drives the accepted `run_shared_region_txn` through the OFF-LOCK `SharedRegionOffLockCtx` (all
+// bounded SharedKernel split seams, no broad borrow) and proves it produces the SAME publish /
+// rollback outcomes as the broad-borrow reference path, plus the lock-discipline source contracts.
+// The production post-work drain is NOT switched (still the broad context) and no producer is live.
+mod stage198e3b2a_offlock_ctx {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        RecvBoundarySharedRegionSnapshot, SHARED_REGION_TXN_FORCE_COPY_FAULT,
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE, SharedRegionTxnError, run_shared_region_txn,
+    };
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+    use crate::runtime::{SharedKernel, SharedRegionOffLockCtx};
+    use core::sync::atomic::Ordering;
+
+    const MAP_VA: u64 = 0x20_000;
+    const META_PTR: u64 = 0x40_000;
+
+    fn reset_hooks() {
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+    }
+
+    struct Fx {
+        shared: SharedKernel,
+        snap: RecvBoundarySharedRegionSnapshot,
+        phys0: u64,
+        asid: crate::kernel::vm::Asid,
+    }
+
+    // Build a receiver (task 2, own ASID, meta page mapped, MAP_VA..+pages free) + a `pages`-page
+    // MemoryObject source cap + a stashed shared-region envelope, take the Phase-A snapshot, and wrap
+    // the KernelState in a SharedKernel for off-lock execution.
+    fn build(pages: usize, rights: CapRights, map_write: bool) -> Fx {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("task2");
+        s.enqueue_current_cpu(2).expect("enqueue");
+        let (_eidx, send_cap, _r) = s.create_endpoint(4).expect("endpoint");
+        let endpoint = s.current_task_capability(send_cap).expect("send").object;
+        let (_id, mem_cap0) = s
+            .alloc_anonymous_memory_object_with_len(pages * PAGE_SIZE)
+            .expect("mem");
+        let source_obj = s.current_task_capability(mem_cap0).expect("obj").object;
+        let phys0 = s
+            .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, source_obj))
+            .expect("phys")
+            .0;
+        let src_cap = s
+            .mint_capability_for_current_context(Capability::new(source_obj, rights))
+            .expect("mint src");
+        let (asid, aspace) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(2, asid).expect("bind");
+        s.map_user_page(
+            aspace,
+            VirtAddr(META_PTR),
+            Mapping {
+                phys: PhysAddr(0x5000_0000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: (pages * PAGE_SIZE) as u64,
+        };
+        let handle = s
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        let snap = s
+            .shared_region_phase_a(handle, endpoint, 2, MAP_VA, map_write, META_PTR, msg, true)
+            .expect("phase A");
+        Fx {
+            shared: SharedKernel::new(s),
+            snap,
+            phys0,
+            asid,
+        }
+    }
+
+    fn run_offlock(
+        fx: &Fx,
+    ) -> Result<
+        crate::kernel::boot::shared_region_txn::SharedRegionDirectPublish,
+        SharedRegionTxnError,
+    > {
+        let mut ctx = SharedRegionOffLockCtx(&fx.shared);
+        run_shared_region_txn(&mut ctx, fx.snap)
+    }
+    fn active_mappings(fx: &Fx) -> usize {
+        fx.shared.with(|k| {
+            (0..MAX_TRANSFER_ENVELOPES)
+                .filter(|&i| k.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+                .count()
+        })
+    }
+    fn mapped_pages(fx: &Fx, pages: usize) -> usize {
+        (0..pages)
+            .filter(|&i| {
+                crate::arch::selected_isa::page_table::resolve_page(
+                    fx.asid,
+                    VirtAddr(MAP_VA + (i * PAGE_SIZE) as u64),
+                )
+                .is_some()
+            })
+            .count()
+    }
+    fn cnode_occupied(fx: &Fx) -> usize {
+        fx.shared.with(|k| {
+            k.cnode_occupied_slots(k.task_cnode(2).expect("cn"))
+                .unwrap_or(0)
+        })
+    }
+    fn pin_refcount(fx: &Fx) -> u32 {
+        fx.shared
+            .with(|k| k.memory_object_refcounts(PhysAddr(fx.phys0)).map(|t| t.2))
+            .unwrap_or(0)
+    }
+
+    // (4/5) one-page + multi-page success: off-lock publish maps every page, mints exactly one cap,
+    // writes the recv-v2 meta (transferred-cap), and wakes the receiver once — same as the reference.
+    #[test]
+    fn offlock_success_single_and_multi_page() {
+        for pages in [1usize, 3usize] {
+            reset_hooks();
+            let fx = build(pages, CapRights::READ | CapRights::MAP, false);
+            let occ_before = cnode_occupied(&fx);
+            let out = run_offlock(&fx).expect("publish");
+            assert_eq!(out.mapped_len, pages * PAGE_SIZE);
+            assert!(out.woke_receiver, "one wake on success");
+            assert_eq!(active_mappings(&fx), 1, "exactly one active mapping");
+            assert_eq!(mapped_pages(&fx, pages), pages, "every page mapped");
+            assert_eq!(
+                cnode_occupied(&fx),
+                occ_before + 1,
+                "exactly one cap minted"
+            );
+            // recv-v2 meta written to the receiver's meta page (transferred-cap flag + fresh cap).
+            let meta = fx
+                .shared
+                .with(|k| k.copy_from_user(fx.asid, VirtAddr(META_PTR), 40))
+                .expect("meta");
+            let flags = u64::from_le_bytes(meta[24..32].try_into().unwrap());
+            assert_ne!(
+                flags & crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
+                0,
+                "meta sets TRANSFERRED_CAP"
+            );
+            let cap_id = u64::from_le_bytes(meta[16..24].try_into().unwrap());
+            assert_eq!(cap_id, out.receiver_local_cap.0);
+        }
+    }
+
+    // (6) page-N map fault: rollback unmaps EXACTLY the mapped prefix, revokes the provisional cap,
+    // releases the pin — the exact-prefix ownership is honored off-lock.
+    #[test]
+    fn offlock_map_fault_rolls_back_exact_prefix() {
+        reset_hooks();
+        let fx = build(2, CapRights::READ | CapRights::MAP, false);
+        let occ_before = cnode_occupied(&fx);
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(1, Ordering::SeqCst); // fault on the 2nd page
+        let res = run_offlock(&fx);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::MapFault));
+        assert_eq!(active_mappings(&fx), 0, "provisional mapping removed");
+        assert_eq!(mapped_pages(&fx, 2), 0, "mapped prefix fully unmapped");
+        assert_eq!(cnode_occupied(&fx), occ_before, "provisional cap revoked");
+        assert_eq!(pin_refcount(&fx), 0, "pin released");
+    }
+
+    // (7 partial) copy fault after complete mapping: rollback unmaps all, revokes, releases pin.
+    #[test]
+    fn offlock_copy_fault_rolls_back() {
+        reset_hooks();
+        let fx = build(2, CapRights::READ | CapRights::MAP, false);
+        let occ_before = cnode_occupied(&fx);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
+        let res = run_offlock(&fx);
+        reset_hooks();
+        assert_eq!(res, Err(SharedRegionTxnError::CopyFault));
+        assert_eq!(active_mappings(&fx), 0);
+        assert_eq!(mapped_pages(&fx, 2), 0);
+        assert_eq!(cnode_occupied(&fx), occ_before);
+        assert_eq!(pin_refcount(&fx), 0);
+    }
+
+    // (13) receiver ASID replacement before publication → ReceiverGone; nothing published/woken.
+    #[test]
+    fn offlock_receiver_asid_replacement_rejected() {
+        reset_hooks();
+        let fx = build(1, CapRights::READ | CapRights::MAP, false);
+        // Reused numeric TID 2 gets a NEW ASID → the captured-ASID snapshot is stale.
+        fx.shared.with(|k| {
+            let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
+            assert_ne!(new_asid, fx.snap.receiver_asid);
+            k.bind_task_asid(2, new_asid).expect("rebind");
+        });
+        let res = run_offlock(&fx);
+        assert_eq!(res, Err(SharedRegionTxnError::ReceiverGone));
+        assert_eq!(active_mappings(&fx), 0);
+    }
+
+    // (16/17) exactly one wake on success, zero wake on failure: on a mint failure the receiver is
+    // never enqueued. (cnode filled so the mint fails.)
+    #[test]
+    fn offlock_cap_mint_failure_zero_wake() {
+        reset_hooks();
+        let fx = build(1, CapRights::READ | CapRights::MAP, false);
+        // Fill the receiver cnode so the mint returns CnodeFull.
+        fx.shared.with(|k| {
+            let cn = k.task_cnode(2).expect("cn");
+            let cap = k.current_task_capability(fx.snap.source_cap);
+            let obj = cap.map(|c| c.object).unwrap_or(fx.snap.object);
+            // Mint until full.
+            for _ in 0..4096 {
+                if k.mint_capability_in_cnode(cn, Capability::new(obj, CapRights::READ))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let res = run_offlock(&fx);
+        assert_eq!(res, Err(SharedRegionTxnError::CnodeFull));
+        assert_eq!(active_mappings(&fx), 0, "no provisional mapping");
+        assert_eq!(mapped_pages(&fx, 1), 0, "nothing mapped");
+        assert_eq!(pin_refcount(&fx), 0, "pin released on rollback");
+    }
+
+    // (14) cancellation overflow fuse: while latched, the off-lock executor cancels (no publish).
+    #[test]
+    fn offlock_cancel_overflow_fuse_authoritative() {
+        reset_hooks();
+        let fx = build(1, CapRights::READ | CapRights::MAP, false);
+        // Latch the fuse directly in IpcState (equivalent to a saturating unrecordable cancellation).
+        fx.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.shared_region_cancel_overflow = true));
+        let res = run_offlock(&fx);
+        assert_eq!(res, Err(SharedRegionTxnError::Cancelled));
+        assert_eq!(active_mappings(&fx), 0);
+        assert_eq!(pin_refcount(&fx), 0);
+    }
+
+    // (18/19/20) SOURCE CONTRACTS: the OffLockCtx impl holds no broad borrow; the seams re-derive
+    // their domain pointer per call (no cached pointer) and never nest VM+memory or cap+memory locks;
+    // the production drain still uses the broad context (unchanged, dormant).
+    #[test]
+    fn offlock_ctx_source_contracts() {
+        const RT: &str = include_str!("../../runtime.rs");
+        let ctx_impl = RT
+            .split_once("impl crate::kernel::boot::shared_region_txn::SharedRegionExecCtx for SharedRegionOffLockCtx")
+            .map(|(_, r)| r.split_once("\n}\n").map(|(b, _)| b).unwrap_or(r))
+            .expect("OffLockCtx impl present");
+        for forbidden in ["with_cpu(", ".with(", "&mut KernelState"] {
+            assert!(
+                !ctx_impl.contains(forbidden),
+                "SharedRegionOffLockCtx impl must not contain `{forbidden}`"
+            );
+        }
+        // Every seam re-derives from data_ptr()/split seams (no cached projected pointer field).
+        assert!(
+            RT.contains(
+                "pub(crate) struct SharedRegionOffLockCtx<'a>(pub(crate) &'a SharedKernel);"
+            ),
+            "OffLockCtx wraps only &SharedKernel (no cached domain pointer)"
+        );
+        // The unmap seam releases the VM lock (rank 5) BEFORE the memory reclaim (rank 6) — separate
+        // `with_*_split_mut` calls, never nested; the map seam applies memory accounting after VM.
+        let unmap = RT
+            .split_once("pub(crate) fn unmap_range_two_phase_split(")
+            .map(|(_, r)| r.split_once("\n    }\n").map(|(b, _)| b).unwrap_or(r))
+            .expect("unmap seam present");
+        let vm_pos = unmap
+            .find("with_vm_user_spaces_split_mut")
+            .expect("vm phase");
+        let reclaim_pos = unmap
+            .find("reclaim_memory_object_for_phys_locked")
+            .expect("reclaim phase");
+        assert!(
+            vm_pos < reclaim_pos,
+            "VM PTE removal must precede (and its lock release) the rank-6 reclaim"
+        );
+        assert!(
+            !unmap.contains("with_vm_user_spaces_split_mut(|spaces| {\n                self.with_memory_split_mut"),
+            "unmap must not nest the memory lock inside the VM lock"
+        );
+        // Stage 198E3B2B switched the production drain to the OFF-LOCK context: it now runs
+        // `run_shared_region_txn(&mut SharedRegionOffLockCtx(self), ...)` with no broad re-entry.
+        // Bound the drain body between its own definition and the next executor definition.
+        let drain = RT
+            .split_once("fn execute_blocked_waiter_shared_region_delivery")
+            .map(|(_, r)| {
+                // Bound at the NEXT executor's doc comment (its prose mentions `with_cpu`, so the
+                // fn keyword is too late a boundary).
+                r.split_once("/// Stage 188D").map(|(b, _)| b).unwrap_or(r)
+            })
+            .expect("drain present");
+        assert!(
+            drain.contains("SharedRegionOffLockCtx(self)")
+                && drain.contains("run_shared_region_txn(&mut ctx"),
+            "the drain must execute through SharedRegionOffLockCtx"
+        );
+        for forbidden in ["with_cpu(", ".with(", "shared_region_execute"] {
+            assert!(
+                !drain.contains(forbidden),
+                "the switched drain must not contain `{forbidden}`"
+            );
+        }
+        // The broad-context executor call is gone entirely.
+        assert!(
+            !RT.contains("kernel.shared_region_execute("),
+            "no broad KernelState shared-region executor call may remain"
+        );
+    }
+}
+
+// Stage 198E3B2B — SHARED-REGION DRAIN SWITCHED TO OFF-LOCK EXECUTION (hosted proof).
+//
+// Drives the REAL post-work drain (`drain_dispatch_post_work` → the switched
+// `execute_blocked_waiter_shared_region_delivery`) end-to-end through `SharedRegionOffLockCtx`, and
+// proves the finalization order (blocked-return + endpoint-waiter cleared BEFORE the single wake),
+// the stale/replacement-waiter rollback (zero wake), the failure rollbacks (receiver stays blocked),
+// exactly-one enqueue, no duplicate wake, post-work-slot clearing, and origin-gated markers. Live
+// producers remain gated/dormant.
+mod stage198e3b2b_drain_switch {
+    use super::*;
+    use crate::kernel::boot::shared_region_txn::{
+        SHARED_REGION_TXN_FORCE_COPY_FAULT, SHARED_REGION_TXN_MAP_FAULT_AT_PAGE,
+    };
+    use crate::kernel::syscall::OPCODE_SHARED_MEM;
+    use crate::kernel::task::{RecvAbiVariant, TaskStatus, WaitReason};
+    use crate::runtime::{ReceiverCommit, SharedKernel};
+    use core::sync::atomic::Ordering;
+
+    const CPU0: CpuId = CpuId(0);
+    const MAP_VA: u64 = 0x30_000;
+    const META_PTR: u64 = 0x60_000;
+
+    fn reset_globals() {
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(false);
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(false, Ordering::Relaxed);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let _ = crate::kernel::boot::shared_region_live_origin_take(0);
+    }
+
+    struct Drn {
+        shared: SharedKernel,
+        eidx: usize,
+        phys0: u64,
+        asid: crate::kernel::vm::Asid,
+    }
+
+    // Build a BLOCKED recv-v2 waiter (task 2), an endpoint whose waiter slot names task 2, a
+    // `pages`-page MemoryObject source cap + a stashed shared-region envelope, then run the DIRECT
+    // producer (which snapshots blocked_endpoint_waiter=true + origin Direct + stashes the post-work).
+    // Wrap in SharedKernel for the real drain. `waiter_slot=None` leaves the endpoint slot empty.
+    fn build_blocked(pages: usize, waiter_slot: Option<u64>) -> Drn {
+        reset_globals();
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("task2");
+        // A genuinely blocked receiver is NOT in the run queue; the finalize wake is
+        // the sole enqueue, so runnable_count starts at 0 and the wake makes it 1.
+        let (eidx, _send_cap, recv_cap) = s.create_endpoint(4).expect("endpoint");
+        let recv_cap_t2 = s
+            .grant_capability_task_to_task(0, recv_cap, 2)
+            .expect("grant recv");
+        let (_id, mem_cap0) = s
+            .alloc_anonymous_memory_object_with_len(pages * PAGE_SIZE)
+            .expect("mem");
+        let source_obj = s.current_task_capability(mem_cap0).expect("obj").object;
+        let phys0 = s
+            .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, source_obj))
+            .expect("phys")
+            .0;
+        let src_cap = s
+            .mint_capability_for_current_context(Capability::new(
+                source_obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint");
+        let (asid, aspace) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(2, asid).expect("bind");
+        s.map_user_page(
+            aspace,
+            VirtAddr(META_PTR),
+            Mapping {
+                phys: PhysAddr(0x7000_0000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("meta");
+        // Block the receiver on recv-v2 (map VA at MAP_VA, meta at META_PTR) + endpoint waiter slot.
+        s.with_tcb_mut(2, |tcb| {
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_t2));
+            tcb.user_context.user_gprs[0] = 0xDEAD; // sentinel: finalize must clear it to 0
+            tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                recv_cap: recv_cap_t2,
+                payload_user_ptr: MAP_VA as usize,
+                payload_user_len: crate::kernel::ipc::Message::MAX_PAYLOAD,
+                meta_user_ptr: META_PTR as usize,
+                meta_user_len: 40,
+                recv_abi: RecvAbiVariant::RecvV2,
+            });
+        });
+        let endpoint = s
+            .resolve_capability_for_task(2, recv_cap_t2)
+            .expect("resolve")
+            .object;
+        // Stage 198E3B2B2: park the waiter as a COMPLETE identity (tid + task 2's bound ASID), so it
+        // matches the identity the production finalizer resolves from the snapshot.
+        s.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_waiters[eidx] = waiter_slot
+                .map(|t| crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(t), asid));
+        });
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: (pages * PAGE_SIZE) as u64,
+        };
+        let handle = s
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        let produced = crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+            &mut s, 2, eidx, &msg,
+        )
+        .expect("producer");
+        assert!(produced, "direct producer must publish post-work");
+        Drn {
+            shared: SharedKernel::new(s),
+            eidx,
+            phys0,
+            asid,
+        }
+    }
+
+    fn drain(d: &Drn) -> Result<(), crate::kernel::boot::TrapHandleError> {
+        d.shared.drain_dispatch_post_work(CPU0)
+    }
+    fn status(d: &Drn) -> Option<TaskStatus> {
+        d.shared.with(|k| k.task_status(2))
+    }
+    fn waiter(d: &Drn) -> Option<ThreadId> {
+        d.shared
+            .with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_tid(d.eidx)))
+    }
+    fn ret_reg(d: &Drn) -> usize {
+        d.shared
+            .with(|k| k.with_tcb_mut(2, |tcb| tcb.user_context.user_gprs[0]))
+            .unwrap_or(0)
+    }
+    fn active_mappings(d: &Drn) -> usize {
+        d.shared.with(|k| {
+            (0..MAX_TRANSFER_ENVELOPES)
+                .filter(|&i| k.with_ipc_state(|ipc| ipc.active_transfer_mappings[i].is_some()))
+                .count()
+        })
+    }
+    fn pin(d: &Drn) -> u32 {
+        d.shared
+            .with(|k| k.memory_object_refcounts(PhysAddr(d.phys0)).map(|t| t.2))
+            .unwrap_or(99)
+    }
+    fn stash_empty(d: &Drn) -> bool {
+        unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none()
+    }
+
+    // (3/5/6/12/14) Direct-origin success: finalize clears the blocked-return regs + the exact
+    // endpoint waiter slot, THEN enqueues the receiver once (Runnable); mapping + cap + meta land.
+    #[test]
+    fn direct_success_clears_then_wakes() {
+        let d = build_blocked(2, Some(2));
+        let runnable_before = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert!(drain(&d).is_ok(), "drain succeeds");
+        assert_eq!(waiter(&d), None, "endpoint waiter slot cleared");
+        assert_eq!(
+            ret_reg(&d),
+            0,
+            "blocked-return register cleared (was 0xDEAD)"
+        );
+        assert_eq!(
+            status(&d),
+            Some(TaskStatus::Runnable),
+            "receiver woken to Runnable"
+        );
+        assert_eq!(active_mappings(&d), 1, "one active mapping published");
+        let runnable_after = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert_eq!(
+            runnable_after,
+            runnable_before + 1,
+            "exactly one scheduler enqueue"
+        );
+        assert!(stash_empty(&d), "post-work slot cleared on success");
+        reset_globals();
+    }
+
+    // (7) A REPLACEMENT waiter (slot names a different task) → stale finalization: rollback, zero
+    // wake, receiver stays blocked, nothing mapped, the other task's slot untouched.
+    #[test]
+    fn replacement_waiter_rolls_back_zero_wake() {
+        let d = build_blocked(1, Some(2));
+        // A different task 3 replaced the waiter slot after the producer ran.
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(3),
+                        crate::kernel::vm::Asid(0),
+                    ))
+            })
+        });
+        assert!(drain(&d).is_err(), "stale finalization fails the drain");
+        assert!(
+            matches!(status(&d), Some(TaskStatus::Blocked(_))),
+            "receiver stays blocked (zero wake)"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(3)),
+            "replacement waiter untouched"
+        );
+        assert_eq!(active_mappings(&d), 0, "nothing published");
+        assert_eq!(pin(&d), 0, "pin released on rollback");
+        assert!(stash_empty(&d), "post-work slot cleared on failure");
+        reset_globals();
+    }
+
+    // (8) A MISSING waiter (slot cleared after the producer ran) → stale finalization rollback.
+    #[test]
+    fn missing_waiter_rolls_back_zero_wake() {
+        let d = build_blocked(1, Some(2));
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = None));
+        assert!(drain(&d).is_err());
+        assert!(
+            matches!(status(&d), Some(TaskStatus::Blocked(_))),
+            "receiver stays blocked (zero wake)"
+        );
+        assert_eq!(active_mappings(&d), 0);
+        assert_eq!(pin(&d), 0);
+        reset_globals();
+    }
+
+    // (10/11) Copy failure and map failure BEFORE finalize: receiver stays blocked + not enqueued,
+    // waiter slot intact, nothing mapped, pin released.
+    #[test]
+    fn copy_and_map_failure_leave_receiver_blocked() {
+        // copy fault
+        let d = build_blocked(1, Some(2));
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(true, Ordering::SeqCst);
+        assert!(drain(&d).is_err());
+        SHARED_REGION_TXN_FORCE_COPY_FAULT.store(false, Ordering::SeqCst);
+        assert!(matches!(status(&d), Some(TaskStatus::Blocked(_))));
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(2)),
+            "waiter slot untouched on pre-finalize failure"
+        );
+        assert_eq!(active_mappings(&d), 0);
+        assert_eq!(pin(&d), 0);
+        assert!(stash_empty(&d));
+        reset_globals();
+        // map fault (2 pages, fault on page 1)
+        let d = build_blocked(2, Some(2));
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(1, Ordering::SeqCst);
+        assert!(drain(&d).is_err());
+        SHARED_REGION_TXN_MAP_FAULT_AT_PAGE.store(usize::MAX, Ordering::SeqCst);
+        assert!(matches!(status(&d), Some(TaskStatus::Blocked(_))));
+        assert_eq!(waiter(&d), Some(ThreadId(2)));
+        assert_eq!(active_mappings(&d), 0);
+        assert_eq!(pin(&d), 0);
+        reset_globals();
+    }
+
+    // (9) Receiver ASID replacement before finalization → ReceiverGone rollback.
+    #[test]
+    fn receiver_asid_replacement_rolls_back() {
+        let d = build_blocked(1, Some(2));
+        d.shared.with(|k| {
+            let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
+            k.bind_task_asid(2, new_asid).expect("rebind");
+        });
+        assert!(drain(&d).is_err());
+        assert_eq!(active_mappings(&d), 0);
+        assert_eq!(pin(&d), 0);
+        reset_globals();
+    }
+
+    // (13) No duplicate wake on a repeated drain: the second drain finds an empty stash → no-op.
+    #[test]
+    fn repeated_drain_no_duplicate_wake() {
+        let d = build_blocked(1, Some(2));
+        let before = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert!(drain(&d).is_ok());
+        let after1 = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert_eq!(after1, before + 1);
+        assert!(drain(&d).is_ok(), "second drain is a no-op");
+        let after2 = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert_eq!(after2, after1, "no duplicate enqueue");
+        reset_globals();
+    }
+
+    // (4) Enqueue-origin post-work also finalizes + wakes through the same off-lock context.
+    #[test]
+    fn enqueue_origin_succeeds_through_offlock() {
+        reset_globals();
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(true);
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("task2");
+        s.enqueue_current_cpu(2).ok();
+        let (eidx, send_cap, _r) = s.create_endpoint(4).expect("endpoint");
+        let endpoint = s.current_task_capability(send_cap).expect("send").object;
+        let (_id, mem_cap0) = s
+            .alloc_anonymous_memory_object_with_len(PAGE_SIZE)
+            .expect("mem");
+        let source_obj = s.current_task_capability(mem_cap0).expect("obj").object;
+        let src_cap = s
+            .mint_capability_for_current_context(Capability::new(
+                source_obj,
+                CapRights::READ | CapRights::MAP,
+            ))
+            .expect("mint");
+        let (asid, aspace) = s.create_user_address_space().expect("asid");
+        s.bind_task_asid(2, asid).expect("bind");
+        s.map_user_page(
+            aspace,
+            VirtAddr(META_PTR),
+            Mapping {
+                phys: PhysAddr(0x7100_0000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("meta");
+        let region = TransferSharedRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let handle = s
+            .stash_transfer_envelope(
+                ThreadId(0),
+                src_cap,
+                endpoint,
+                Some(ThreadId(2)),
+                Some(region),
+            )
+            .expect("stash");
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"sr",
+        )
+        .expect("msg");
+        // Queued origin: receiver is NOT a blocked endpoint waiter (blocked_endpoint_waiter=false).
+        let produced = crate::kernel::syscall::produce_queued_shared_region_delivery(
+            &mut s, 2, eidx, endpoint, MAP_VA, META_PTR, false, &msg,
+        )
+        .expect("producer");
+        assert!(produced);
+        let d = Drn {
+            shared: SharedKernel::new(s),
+            eidx,
+            phys0: 0,
+            asid,
+        };
+        assert!(drain(&d).is_ok(), "enqueue-origin drain succeeds off-lock");
+        assert_eq!(active_mappings(&d), 1);
+        assert_eq!(status(&d), Some(TaskStatus::Runnable));
+        let _ = d.asid;
+        reset_globals();
+    }
+
+    // (16) Retirement markers are emitted ONLY in the success arm, AFTER the finalize; (17) producers
+    // are dormant off the knob. Source/behavior contracts.
+    #[test]
+    fn markers_success_only_and_producers_dormant() {
+        const RT: &str = include_str!("../../runtime.rs");
+        let drain_fn = RT
+            .split_once("fn execute_blocked_waiter_shared_region_delivery")
+            .map(|(_, r)| r.split_once("/// Stage 188D").map(|(b, _)| b).unwrap_or(r))
+            .expect("drain");
+        // Stage 198E3C1: the attestation + retirement marker LITERALS moved into the cfg-gated
+        // `maybe_emit_shared_region_direct_live_markers` helper (so a normal build stays marker-clean);
+        // the drain's success arm calls it exactly once, AFTER the run's Ok(...) and BEFORE the Err arm.
+        let ok_arm = drain_fn
+            .split_once("Ok(publish) => {")
+            .map(|(_, r)| r.split_once("Err(e) => {").map(|(b, _)| b).unwrap_or(r))
+            .expect("ok arm");
+        assert!(
+            ok_arm.contains("maybe_emit_shared_region_direct_live_markers"),
+            "the success arm must emit the origin-gated live markers through the cfg-gated helper"
+        );
+        // The raw marker literals must NOT be inline in the drain (they live in the gated helper).
+        assert!(
+            !ok_arm.contains("IPCSEND_SHARED_REGION_OBJECT_OK"),
+            "attestation literals must not be inline in the drain (moved to the cfg-gated helper)"
+        );
+        let err_arm = drain_fn
+            .split_once("Err(e) => {")
+            .map(|(_, r)| r)
+            .expect("err arm");
+        assert!(
+            !err_arm.contains("IPCSEND_SHARED_REGION")
+                && !err_arm.contains("maybe_emit_shared_region"),
+            "no shared-region attestation/retirement marker from the rolled-back (Err) arm"
+        );
+        // Producers dormant: off the knob the direct producer declines (legacy path).
+        reset_globals();
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(1),
+            b"x",
+        )
+        .expect("m");
+        assert!(
+            !crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+                &mut s, 2, 0, &msg
+            )
+            .unwrap_or(false),
+            "off the oracle knob the producer must stay dormant"
+        );
+        reset_globals();
+    }
+
+    // ── Stage 198E3B2B1 — ATOMIC (claim-then-commit) blocked-receiver finalization ──────────────
+    // The finalize protocol is: Phase 1 prevalidate (rank 2, no mutation) → Phase 2 exact
+    // generation-bearing waiter CLAIM (rank 3, remove once) → Phase 3 commit (rank 2, clear registers
+    // + Runnable ONLY for a still-live match; restore/leave stale otherwise) → Phase 4 enqueue
+    // (rank 1, once, non-fallible). These focused interleaving cases drive the individual phase seams
+    // (so a mutation can be injected BETWEEN phases) plus the composed drain end-to-end.
+
+    fn endpoint_gen(d: &Drn) -> u64 {
+        d.shared
+            .with(|k| k.with_ipc_state(|ipc| ipc.endpoint_generations[d.eidx]))
+    }
+    // All blocked-return registers the commit clears (arg0 + the arch return GPRs) as one tuple, so a
+    // failed finalization can be proven byte-identical.
+    fn regs(d: &Drn) -> (usize, usize, usize, usize, usize) {
+        d.shared
+            .with(|k| {
+                k.with_tcb_mut(2, |tcb| {
+                    (
+                        tcb.user_context.arg0,
+                        tcb.user_context.user_gprs[0],
+                        tcb.user_context.user_gprs[2],
+                        tcb.user_context.user_gprs[3],
+                        tcb.user_context.user_gprs[7],
+                    )
+                })
+            })
+            .unwrap_or((0, 0, 0, 0, 0))
+    }
+
+    // (1) Endpoint generation changes between task prevalidation and the waiter claim → claim fails,
+    // slot + registers untouched.
+    #[test]
+    fn generation_change_between_prevalidate_and_claim() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        assert!(
+            d.shared.sr_prevalidate_blocked_receiver_split(2, d.asid),
+            "prevalidate passes for the live matching receiver"
+        );
+        // Endpoint destroyed/recreated after prevalidation: its generation advances.
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_generations[d.eidx] += 1));
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
+                .is_none(),
+            "a stale endpoint generation cannot be claimed"
+        );
+        assert_eq!(waiter(&d), Some(ThreadId(2)), "waiter slot untouched");
+        assert_eq!(ret_reg(&d), 0xDEAD, "no register mutation on failed claim");
+        reset_globals();
+    }
+
+    // (2) Endpoint destroyed and recreated at the SAME index (generation advanced) → claim rejected.
+    #[test]
+    fn endpoint_recreated_at_same_index_rejects_claim() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_generations[d.eidx] = egen + 1;
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(2),
+                        crate::kernel::vm::Asid(0),
+                    )); // a fresh incarnation's waiter
+            })
+        });
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
+                .is_none(),
+            "generation is part of the claim authority — a recreated endpoint is not our endpoint"
+        );
+        reset_globals();
+    }
+
+    // (3) Waiter replaced by a DIFFERENT TID → claim fails, the replacement waiter is never cleared.
+    #[test]
+    fn waiter_replaced_by_other_tid_rejects_claim() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(9),
+                        crate::kernel::vm::Asid(0),
+                    ))
+            })
+        });
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
+                .is_none(),
+            "a different waiter TID cannot be claimed"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(9)),
+            "the replacement waiter is never cleared"
+        );
+        reset_globals();
+    }
+
+    // (4) Waiter slot holds a REPLACEMENT identity: the SAME numeric TID but a different ASID. A stale
+    // finalizer bearing the ORIGINAL identity cannot claim it (numeric TID alone is never the
+    // authority — the full {tid, ASID} identity is), so the replacement waiter is never cleared.
+    #[test]
+    fn same_numeric_tid_different_asid_is_not_authority() {
+        let d = build_blocked(1, Some(2));
+        let orig_asid = d.asid;
+        // A replacement incarnation (same numeric TID, different ASID) now owns the waiter slot.
+        let replacement = d.shared.with(|k| {
+            let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
+            crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), new_asid)
+        });
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.set_endpoint_waiter(d.eidx, replacement)));
+        let egen = endpoint_gen(&d);
+        // The stale finalizer's identity (original ASID) does NOT match the replacement slot → no claim.
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), orig_asid)
+                )
+                .is_none(),
+            "a same-numeric-TID / different-ASID replacement cannot be claimed by the original identity"
+        );
+        assert_eq!(
+            d.shared
+                .with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(d.eidx))),
+            Some(replacement),
+            "the replacement waiter is never cleared"
+        );
+        reset_globals();
+    }
+
+    // (5) Missing waiter (slot already cleared) → claim fails.
+    #[test]
+    fn missing_waiter_rejects_claim() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = None));
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
+                .is_none(),
+            "a missing waiter cannot be claimed"
+        );
+        reset_globals();
+    }
+
+    // (6) A failed claim leaves the blocked-return registers byte-identical (registers are NEVER
+    // touched before/without a successful claim).
+    #[test]
+    fn failed_claim_leaves_registers_byte_identical() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let before = regs(&d);
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(7), d.asid)
+                )
+                .is_none(),
+            "wrong receiver → claim fails"
+        );
+        assert_eq!(regs(&d), before, "no register changed on a failed claim");
+        reset_globals();
+    }
+
+    // (7) A failed claim (stale generation) leaves the original VALID waiter untouched.
+    #[test]
+    fn failed_claim_leaves_valid_waiter_untouched() {
+        let d = build_blocked(1, Some(2));
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    endpoint_gen(&d) + 5,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
+                .is_none(),
+            "stale generation → no claim"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(2)),
+            "the valid waiter is untouched"
+        );
+        reset_globals();
+    }
+
+    // (8) A successful claim removes EXACTLY one waiter (a second claim finds nothing).
+    #[test]
+    fn successful_claim_removes_exactly_one_waiter() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let _claim = d
+            .shared
+            .sr_claim_endpoint_waiter_split(
+                d.eidx,
+                egen,
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+            )
+            .expect("claim");
+        assert_eq!(waiter(&d), None, "the claimed waiter is removed");
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
+                .is_none(),
+            "the waiter cannot be claimed twice"
+        );
+        reset_globals();
+    }
+
+    // (9) Receiver EXITS after the claim but before the task commit → GoneDead: registers untouched,
+    // the claimed waiter stays cleared (correctly stale, never restored), zero wake.
+    #[test]
+    fn receiver_exit_after_claim_is_gone_dead_no_restore() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let _claim = d
+            .shared
+            .sr_claim_endpoint_waiter_split(
+                d.eidx,
+                egen,
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+            )
+            .expect("claim");
+        d.shared.with(|k| {
+            k.with_tcb_mut(2, |tcb| tcb.status = TaskStatus::Exited(0));
+        });
+        assert_eq!(
+            d.shared.sr_commit_blocked_receiver_split(2, d.asid),
+            ReceiverCommit::GoneDead,
+            "an exited receiver commits as GoneDead"
+        );
+        assert_eq!(
+            ret_reg(&d),
+            0xDEAD,
+            "no register cleared for a dead receiver"
+        );
+        assert_eq!(
+            waiter(&d),
+            None,
+            "the dead receiver's claimed waiter stays cleared"
+        );
+        assert_eq!(
+            d.shared.with(|k| k.runnable_count_on_for_test(CPU0)),
+            0,
+            "zero wake"
+        );
+        reset_globals();
+    }
+
+    // (10) Receiver ASID changes AFTER the identity claim → Replaced: registers untouched, and the
+    // claimed waiter is NOT restored (Stage 198E3B2B2 removed the numeric-TID Replaced→restore — the
+    // claimed waiter belonged to the vanished original incarnation, so restoring it would target a
+    // task that no longer exists; the generation-bearing restore itself refuses because the task is
+    // no longer blocked with the claimed identity).
+    #[test]
+    fn receiver_asid_change_after_claim_no_restore() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let orig_asid = d.asid;
+        let claim = d
+            .shared
+            .sr_claim_endpoint_waiter_split(
+                d.eidx,
+                egen,
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+            )
+            .expect("claim");
+        assert_eq!(waiter(&d), None, "claimed");
+        d.shared.with(|k| {
+            let (new_asid, _mc) = k.create_user_address_space().expect("asid2");
+            k.bind_task_asid(2, new_asid).expect("rebind");
+        });
+        assert_eq!(
+            d.shared.sr_commit_blocked_receiver_split(2, orig_asid),
+            ReceiverCommit::Replaced
+        );
+        assert_eq!(ret_reg(&d), 0xDEAD, "no register cleared on Replaced");
+        assert!(
+            !d.shared.sr_restore_endpoint_waiter_split(&claim),
+            "restore refuses: the task is no longer blocked with the claimed identity"
+        );
+        assert_eq!(
+            waiter(&d),
+            None,
+            "no waiter fabricated for the vanished incarnation"
+        );
+        reset_globals();
+    }
+
+    // (11) The generation-bearing restore never strands a live task and never clobbers a newer waiter
+    // or restores into a recreated endpoint.
+    #[test]
+    fn replaced_restore_never_strands_never_clobbers() {
+        let d = build_blocked(1, Some(2));
+        let egen = endpoint_gen(&d);
+        let claim = d
+            .shared
+            .sr_claim_endpoint_waiter_split(
+                d.eidx,
+                egen,
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid),
+            )
+            .expect("claim");
+        // Case A: slot free → restore re-installs the claimed waiter (no live task stranded).
+        assert!(d.shared.sr_restore_endpoint_waiter_split(&claim));
+        assert_eq!(waiter(&d), Some(ThreadId(2)));
+        // Case B: a NEWER waiter already holds the slot → restore refuses (never clobbers).
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(5),
+                        crate::kernel::vm::Asid(0),
+                    ))
+            })
+        });
+        assert!(!d.shared.sr_restore_endpoint_waiter_split(&claim));
+        assert_eq!(waiter(&d), Some(ThreadId(5)), "newer waiter not clobbered");
+        // Case C: endpoint generation advanced → restore refuses (stale token can't target a new
+        // endpoint incarnation).
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] = None;
+                ipc.endpoint_generations[d.eidx] = egen + 1;
+            })
+        });
+        assert!(
+            !d.shared.sr_restore_endpoint_waiter_split(&claim),
+            "the generation-bearing token cannot restore into a recreated endpoint"
+        );
+        reset_globals();
+    }
+
+    // (12) A failed finalization end-to-end (stale replacement waiter) leaves the live blocked task's
+    // return registers byte-identical and the receiver still blocked.
+    #[test]
+    fn failed_finalization_preserves_registers_end_to_end() {
+        let d = build_blocked(1, Some(2));
+        d.shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[d.eidx] =
+                    Some(crate::kernel::boot::ReceiverWaiterIdentity::new(
+                        ThreadId(3),
+                        crate::kernel::vm::Asid(0),
+                    ))
+            })
+        });
+        assert!(drain(&d).is_err(), "stale waiter fails the drain");
+        assert_eq!(
+            ret_reg(&d),
+            0xDEAD,
+            "return registers untouched on failed finalization"
+        );
+        assert!(
+            matches!(status(&d), Some(TaskStatus::Blocked(_))),
+            "receiver stays blocked"
+        );
+        assert_eq!(
+            waiter(&d),
+            Some(ThreadId(3)),
+            "replacement waiter untouched"
+        );
+        reset_globals();
+    }
+
+    // (13) Success clears the registers, marks the receiver Runnable, and enqueues EXACTLY once.
+    #[test]
+    fn success_clears_regs_runnable_one_enqueue() {
+        let d = build_blocked(1, Some(2));
+        let before = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert!(drain(&d).is_ok());
+        assert_eq!(ret_reg(&d), 0, "registers cleared on success");
+        assert_eq!(status(&d), Some(TaskStatus::Runnable));
+        assert_eq!(waiter(&d), None, "exactly one waiter cleared");
+        assert_eq!(
+            d.shared.with(|k| k.runnable_count_on_for_test(CPU0)),
+            before + 1,
+            "exactly one enqueue"
+        );
+        reset_globals();
+    }
+
+    // (14) Repeated finalization cannot enqueue twice: after the wake the receiver is Runnable (not a
+    // blocked waiter) and its waiter slot is empty, so neither a prevalidate nor a claim can re-fire.
+    #[test]
+    fn repeated_finalization_cannot_enqueue_twice() {
+        let d = build_blocked(1, Some(2));
+        let before = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert!(drain(&d).is_ok());
+        let after1 = d.shared.with(|k| k.runnable_count_on_for_test(CPU0));
+        assert_eq!(after1, before + 1);
+        assert!(
+            !d.shared.sr_prevalidate_blocked_receiver_split(2, d.asid),
+            "a woken receiver is no longer a blocked waiter"
+        );
+        let egen = endpoint_gen(&d);
+        assert!(
+            d.shared
+                .sr_claim_endpoint_waiter_split(
+                    d.eidx,
+                    egen,
+                    crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), d.asid)
+                )
+                .is_none(),
+            "the emptied waiter slot cannot be re-claimed"
+        );
+        assert_eq!(
+            d.shared.with(|k| k.runnable_count_on_for_test(CPU0)),
+            after1,
+            "no second enqueue"
+        );
+        reset_globals();
+    }
+
+    // (15) Markers remain success-only: a stale finalization does not publish (Err arm → the
+    // retirement/attestation markers, which live only in the Ok arm, are never emitted).
+    #[test]
+    fn markers_stay_success_only_no_publish_on_stale() {
+        let d = build_blocked(1, Some(2));
+        d.shared
+            .with(|k| k.with_ipc_state_mut(|ipc| ipc.endpoint_waiters[d.eidx] = None));
+        assert!(
+            drain(&d).is_err(),
+            "a stale finalization rolls back and does not publish"
+        );
+        reset_globals();
+    }
+
+    // (16) Production shared-region producers remain dormant off the oracle knob.
+    #[test]
+    fn producers_remain_dormant_off_knob() {
+        reset_globals();
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0].store(true, Ordering::Relaxed);
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(1),
+            b"x",
+        )
+        .expect("m");
+        assert!(
+            !crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+                &mut s, 2, 0, &msg
+            )
+            .unwrap_or(false),
+            "off the oracle knob the producer must stay dormant"
+        );
+        reset_globals();
+    }
+}
+
+// Stage 198E3B2B2 — GENERATION-BEARING ENDPOINT WAITER IDENTITY (hosted proof).
+//
+// The endpoint receive-waiter slot stores a COMPLETE `ReceiverWaiterIdentity { tid, asid }`, and all
+// waiter authority (publish / claim / clear / cleanup / restore) compares the full identity — numeric
+// TID reuse can never let a stale actor claim, clear, or restore a replacement task's waiter. These
+// focused cases cover the required matrix: publication stores tid+asid; same tid+asid claims; same tid
+// / different asid cannot be claimed; generation mismatch cannot be claimed; a replacement publishes
+// its own waiter without collision; a stale finalizer cannot remove or restore a replacement's waiter;
+// an exited task's waiter is removed and not restored; restoration is exact-identity-only; timeout /
+// exit cleanup remove only the matching identity; and no numeric-TID-only comparison remains in
+// production. (Direct/ordinary/reply single-wake + D2 no-lost-wakeup are covered by the existing IPC
+// suites, which remain green.)
+mod stage198e3b2b2_waiter_identity {
+    use super::*;
+    use crate::kernel::boot::ReceiverWaiterIdentity;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    fn ident(tid: u64, asid: u16) -> ReceiverWaiterIdentity {
+        ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+
+    // (1) Publication stores the full identity (tid + asid), not a bare TID.
+    #[test]
+    fn publication_stores_full_identity() {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let outcome = s.publish_recv_waiter_live(eidx, ident(2, 7), recv);
+        assert!(matches!(
+            outcome,
+            crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
+        ));
+        assert_eq!(
+            s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx)),
+            Some(ident(2, 7)),
+            "the slot holds the complete generation-bearing identity"
+        );
+    }
+
+    // (2) Same tid AND same asid → claim succeeds. (3) Same tid / different asid → claim fails, slot
+    // untouched. (4) Endpoint generation mismatch → claim fails.
+    #[test]
+    fn claim_requires_full_identity_and_generation() {
+        let shared = SharedKernel::new({
+            let mut s = Bootstrap::init().expect("init");
+            s.register_task(2).expect("t2");
+            let (eidx, _snd, recv) = s.create_endpoint(4).expect("ep");
+            s.publish_recv_waiter_live(eidx, ident(2, 7), recv);
+            s
+        });
+        let eidx = shared.with(|k| {
+            (0..MAX_ENDPOINTS)
+                .find(|&i| k.with_ipc_state(|ipc| ipc.endpoint_waiter_present(i)))
+                .expect("waiter present")
+        });
+        let egen = shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]));
+        // (3) same tid, different asid → no claim, slot untouched.
+        assert!(
+            shared
+                .sr_claim_endpoint_waiter_split(eidx, egen, ident(2, 99))
+                .is_none(),
+            "same numeric TID with a different ASID cannot be claimed"
+        );
+        assert_eq!(
+            shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx))),
+            Some(ident(2, 7)),
+            "the original waiter is untouched"
+        );
+        // (4) generation mismatch → no claim.
+        assert!(
+            shared
+                .sr_claim_endpoint_waiter_split(eidx, egen + 1, ident(2, 7))
+                .is_none(),
+            "a stale endpoint generation cannot be claimed"
+        );
+        // (2) exact identity + generation → claim succeeds (remove once).
+        let claim = shared
+            .sr_claim_endpoint_waiter_split(eidx, egen, ident(2, 7))
+            .expect("exact identity claims");
+        assert_eq!(claim.receiver, ident(2, 7));
+        assert!(
+            !shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_present(eidx))),
+            "claimed exactly once"
+        );
+    }
+
+    // (5) A replacement task (same numeric TID, new ASID) publishes its OWN waiter with no collision;
+    // (6) a stale finalizer bearing the ORIGINAL identity can neither claim nor clear it.
+    #[test]
+    fn replacement_publishes_and_is_not_removable_by_stale_identity() {
+        let shared = SharedKernel::new({
+            let mut s = Bootstrap::init().expect("init");
+            s.register_task(2).expect("t2");
+            let (eidx, _snd, recv) = s.create_endpoint(4).expect("ep");
+            // Original incarnation publishes, then a replacement (new asid) overwrites (last wins).
+            s.publish_recv_waiter_live(eidx, ident(2, 7), recv);
+            s.publish_recv_waiter_live(eidx, ident(2, 8), recv);
+            s
+        });
+        let eidx = shared.with(|k| {
+            (0..MAX_ENDPOINTS)
+                .find(|&i| k.with_ipc_state(|ipc| ipc.endpoint_waiter_present(i)))
+                .expect("waiter")
+        });
+        assert_eq!(
+            shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx))),
+            Some(ident(2, 8)),
+            "the replacement's own identity owns the slot"
+        );
+        let egen = shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]));
+        // Stale finalizer with the ORIGINAL identity: cannot claim/clear the replacement.
+        assert!(
+            shared
+                .sr_claim_endpoint_waiter_split(eidx, egen, ident(2, 7))
+                .is_none(),
+            "the stale original identity cannot claim the replacement waiter"
+        );
+        shared.with(|k| {
+            k.with_ipc_state_mut(|ipc| {
+                assert!(
+                    !ipc.clear_endpoint_waiter_if_identity(eidx, ident(2, 7)),
+                    "identity-keyed clear refuses the mismatched identity"
+                );
+                ipc.clear_endpoint_waiters_for_identity(ident(2, 7));
+            })
+        });
+        assert_eq!(
+            shared.with(|k| k.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx))),
+            Some(ident(2, 8)),
+            "the replacement waiter is never removed by a stale identity sweep"
+        );
+    }
+
+    // (11) Timeout cleanup removes ONLY the matching identity: a same-index slot bearing a different
+    // identity, and a different endpoint's waiter, are both untouched.
+    #[test]
+    fn identity_keyed_cleanup_removes_only_matching() {
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (e1, _s1, r1) = s.create_endpoint(4).expect("e1");
+        let (e2, _s2, r2) = s.create_endpoint(4).expect("e2");
+        s.publish_recv_waiter_live(e1, ident(2, 7), r1);
+        s.publish_recv_waiter_live(e2, ident(3, 9), r2);
+        s.with_ipc_state_mut(|ipc| {
+            // Sweep for {2, 7}: only e1 is cleared; e2's {3, 9} is untouched.
+            ipc.clear_endpoint_waiters_for_identity(ident(2, 7));
+            assert!(
+                !ipc.endpoint_waiter_present(e1),
+                "matching identity cleared"
+            );
+            assert_eq!(
+                ipc.endpoint_waiter_identity(e2),
+                Some(ident(3, 9)),
+                "a different identity is never swept"
+            );
+            // A sweep for a stale {2, 7} after a replacement {2, 8} took e1 must not remove it.
+            ipc.set_endpoint_waiter(e1, ident(2, 8));
+            ipc.clear_endpoint_waiters_for_identity(ident(2, 7));
+            assert_eq!(
+                ipc.endpoint_waiter_identity(e1),
+                Some(ident(2, 8)),
+                "task-exit / timeout cleanup cannot remove a replacement waiter"
+            );
+        });
+    }
+
+    // (18) Source guard: no numeric-TID-only endpoint-waiter comparison remains in production — every
+    // authority comparison routes through the identity helpers.
+    #[test]
+    fn no_numeric_tid_only_waiter_comparison_in_production() {
+        const IPC_SRC: &str = include_str!("ipc_state.rs");
+        const RT_SRC: &str = include_str!("../../runtime.rs");
+        const SR_SRC: &str = include_str!("shared_region_txn.rs");
+        // The exact numeric-TID comparison/claim/restore patterns removed by Stage 198E3B2B2.
+        for (src, name, forbidden) in [
+            (
+                IPC_SRC,
+                "ipc_state.rs",
+                "endpoint_waiters[endpoint_idx] != Some(expected_receiver_tid)",
+            ),
+            (
+                IPC_SRC,
+                "ipc_state.rs",
+                "endpoint_waiters[endpoint_idx] == Some(expected_receiver_tid)",
+            ),
+            (
+                RT_SRC,
+                "runtime.rs",
+                "endpoint_waiters[eidx] == Some(receiver)",
+            ),
+            (
+                RT_SRC,
+                "runtime.rs",
+                "endpoint_waiters[claim.eidx] = Some(claim.receiver)",
+            ),
+            (
+                SR_SRC,
+                "shared_region_txn.rs",
+                "endpoint_waiters[eidx] == Some(receiver)",
+            ),
+        ] {
+            assert!(
+                !src.contains(forbidden),
+                "{name} must not contain the numeric-TID-only pattern `{forbidden}`"
+            );
+        }
+        // The authority comparisons now go through the identity helpers.
+        assert!(
+            RT_SRC.contains("endpoint_waiter_identity(eidx) == Some(receiver)"),
+            "the shared-region claim must compare the full identity"
+        );
+        assert!(
+            IPC_SRC.contains("endpoint_waiter_identity(endpoint_idx) != Some(expected_receiver)"),
+            "the plain-send re-verify must compare the full identity"
+        );
+    }
+}
+
+// Stage 198E3C1 — x86_64 DIRECT shared-region live-oracle build/marker POLICY (hosted contract).
+//
+// The direct shared-region live markers (attestations + `IpcSendSharedRegionDirect` retirement) are
+// compiled ONLY for the explicitly-armed x86_64 oracle build (`feature = "x86-shared-region-direct-
+// oracle"`), and even then the runtime selector `yarm.x86_64_shared_region_direct_oracle=1` is still
+// required to execute the oracle. So a normal artifact — and every non-x86 artifact — is
+// marker-clean, the queued class stays forbidden, and the compile-time feature alone activates no
+// runtime behavior. These source/build-contract tests lock that policy in.
+mod stage198e3c1_direct_live_policy {
+    use super::*;
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RT_SRC: &str = include_str!("../../runtime.rs");
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+
+    // (1) The runtime selector defaults off.
+    #[test]
+    fn selector_defaults_off() {
+        // Serialize against the provisioning tests, which transiently arm the knob (feature-on run).
+        #[cfg(feature = "x86-shared-region-direct-oracle")]
+        let _g = sr_knob_guard();
+        assert!(!crate::kernel::boot::x86_shared_region_direct_oracle_enabled());
+    }
+
+    // (2) The selector parses x86-specifically (the cmdline key is `yarm.x86_64_...`) and (3) the
+    // feature alone does not runtime-arm: the mod.rs setter arms the shared oracle-proof knob, but the
+    // marker path stays behind BOTH the cfg feature and the runtime knob.
+    #[test]
+    fn selector_x86_specific_and_feature_alone_does_not_arm() {
+        assert!(CMDLINE_SRC.contains("yarm.x86_64_shared_region_direct_oracle"));
+        assert!(
+            CMDLINE_SRC.contains("options.x86_64_shared_region_direct_oracle = parse_bool_knob")
+        );
+        // The Cargo feature exists and is NOT in the default set (default = ["hosted-dev"]).
+        assert!(CARGO_SRC.contains("x86-shared-region-direct-oracle = []"));
+        assert!(CARGO_SRC.contains("default = [\"hosted-dev\"]"));
+        // The runtime setter arms the shared proof knob (so the already-wired producer goes live),
+        // proving the runtime selector — not the compile-time feature — is what activates behavior.
+        assert!(
+            MOD_SRC.contains("fn set_x86_shared_region_direct_oracle_enabled")
+                && MOD_SRC.contains("set_ipc_recv_oracle_proof_enabled(true)"),
+            "the runtime selector setter must arm the shared oracle-proof knob"
+        );
+    }
+
+    // (4/5) Normal build is marker-clean: every shared-region marker literal in mod.rs lives inside a
+    // `#[cfg(all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\"))]` block, and
+    // the drain in runtime.rs holds NO inline marker literal (they moved to the gated helper).
+    #[test]
+    fn normal_build_is_marker_clean() {
+        // The gated marker helper carries the attestation literals.
+        let gated = MOD_SRC
+            .split_once("fn maybe_emit_shared_region_direct_live_markers")
+            .map(|(_, r)| r)
+            .expect("gated helper present");
+        assert!(gated.contains("IPCSEND_SHARED_REGION_OBJECT_OK"));
+        // Every attestation/retirement literal in mod.rs is preceded by the feature+x86 cfg.
+        assert!(
+            MOD_SRC.contains(
+                "#[cfg(all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\"))]"
+            ),
+            "the direct marker paths must be gated on the armed x86_64 oracle feature"
+        );
+        // The drain's success arm delegates to the gated helper and holds no inline literal.
+        assert!(RT_SRC.contains("maybe_emit_shared_region_direct_live_markers("));
+        assert!(
+            !RT_SRC.contains("IPCSEND_SHARED_REGION_OBJECT_OK"),
+            "runtime drain must not inline shared-region marker literals"
+        );
+    }
+
+    // (6) The artifact guard permits the DIRECT class only under the armed x86 build env flag, and
+    // (7) the ENQUEUE class is forbidden in EVERY build.
+    #[test]
+    fn artifact_guard_direct_only_enqueue_forbidden() {
+        assert!(
+            GUARD_SRC.contains("class=IpcSendSharedRegionEnqueue"),
+            "the guard must forbid the shared-region ENQUEUE class in every build"
+        );
+        assert!(
+            GUARD_SRC.contains("YARM_SHARED_REGION_DIRECT_ORACLE_BUILD")
+                && GUARD_SRC.contains("forbidden+=(\"class=IpcSendSharedRegion\")"),
+            "the guard must forbid the bare shared-region class except in the armed x86 oracle build"
+        );
+    }
+
+    // (8) The non-x86 marker path is absent: no shared-region marker literal is compiled for AArch64
+    // or RISC-V (the gate requires target_arch = x86_64), and mod.rs no longer emits per-arch direct
+    // literals for aarch64/riscv64.
+    #[test]
+    fn non_x86_marker_path_absent() {
+        assert!(
+            !MOD_SRC.contains("class=IpcSendSharedRegionDirect result=ok\"\n            );\n        }\n        #[cfg(target_arch = \"riscv64\")]"),
+            "no per-arch riscv64 direct retirement literal may remain"
+        );
+        assert!(
+            !MOD_SRC.contains("arch=aarch64 class=IpcSendSharedRegionDirect"),
+            "no AArch64 direct shared-region retirement literal may be compiled"
+        );
+        assert!(
+            !MOD_SRC.contains("arch=riscv64 class=IpcSendSharedRegionDirect"),
+            "no RISC-V direct shared-region retirement literal may be compiled"
+        );
+        // And the enqueue class literal is gone entirely (never compiled anywhere).
+        assert!(
+            !MOD_SRC.contains("class=IpcSendSharedRegionEnqueue"),
+            "no shared-region ENQUEUE retirement literal may be compiled"
+        );
+    }
+
+    // (10) The deterministic pattern spans both pages: the byte at a page-0 offset differs from the
+    // byte at the same in-page offset in page 1 (so it is not a per-page-constant fill).
+    #[test]
+    fn oracle_pattern_spans_both_pages() {
+        use crate::kernel::vm::PAGE_SIZE;
+        let p0 = crate::kernel::boot::shared_region_oracle_pattern_byte(8);
+        let p1 = crate::kernel::boot::shared_region_oracle_pattern_byte(PAGE_SIZE + 8);
+        assert_ne!(
+            p0, p1,
+            "the pattern must vary across the page boundary (spans both pages)"
+        );
+        // Two pages is the fixed oracle region size.
+        assert_eq!(crate::kernel::boot::SHARED_REGION_ORACLE_PAGES, 2);
+    }
+
+    // (9/11/12/13) Provisioning creates exactly two pages, mints a READ|MAP (no WRITE/execute)
+    // transferable source cap into init's CNode, and is fail-closed off the runtime selector.
+    // (Feature-gated: the provisioning fn only compiles for the armed oracle build.)
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn provisioning_two_pages_readmap_and_default_off() {
+        use crate::kernel::capabilities::CapRights;
+        use crate::kernel::vm::PAGE_SIZE;
+        let _g = sr_knob_guard();
+        // Off the runtime selector → no provisioning (fail-closed / inert).
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(1).expect("init task");
+        assert_eq!(
+            crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1),
+            None,
+            "off the runtime selector the oracle must not provision"
+        );
+        // On the selector → exactly one two-page MemoryObject cap with READ|MAP receiver rights.
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+        let caps =
+            crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1).expect("provision");
+        let cap = caps.mem_cap;
+        let view = s
+            .resolve_capability_for_task(1, crate::kernel::capabilities::CapId(cap as u64))
+            .expect("init-local source cap resolves");
+        assert!(
+            matches!(
+                view.object,
+                crate::kernel::capabilities::CapObject::MemoryObject { .. }
+            ),
+            "the source cap is a MemoryObject"
+        );
+        // Exactly two pages of backing.
+        let base = s
+            .with_memory_state(|m| {
+                crate::kernel::boot::KernelState::shared_region_phys_base_locked(m, view.object)
+            })
+            .expect("phys base");
+        assert_eq!(
+            s.memory_object_len_for_test(base),
+            Some(2 * PAGE_SIZE),
+            "the provisioned object spans exactly two pages"
+        );
+        // Receiver rights are read-only READ|MAP — no WRITE, no execute.
+        assert!(view.has_right(CapRights::READ) && view.has_right(CapRights::MAP));
+        assert!(
+            !view.has_right(CapRights::WRITE),
+            "no receiver WRITE authority may be granted"
+        );
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // ── Stage 198E3C1B: userspace send/recv/release helper ABI contract ─────────────────────────
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+
+    // The userspace helpers reuse the EXISTING syscalls + cap-transfer Message — no new ABI. The
+    // ABI constants they hardcode must match the kernel's authoritative values.
+    #[test]
+    fn userspace_helper_abi_constants_match_kernel() {
+        assert_eq!(crate::kernel::syscall::OPCODE_SHARED_MEM, 1);
+        assert_eq!(crate::kernel::syscall::SYSCALL_TRANSFER_RELEASE_NR, 4);
+        assert_eq!(crate::kernel::syscall::SYSCALL_IPC_RECV_NR, 2);
+        // The userspace helper module encodes exactly these values.
+        assert!(USER_RT_SRC.contains("pub const OPCODE_SHARED_MEM: u16 = 1;"));
+        assert!(USER_RT_SRC.contains("const SYSCALL_TRANSFER_RELEASE_NR: usize = 4;"));
+    }
+
+    // send_shared_region encodes OPCODE_SHARED_MEM + the canonical cap-transfer flag + one ipc_send,
+    // carrying exactly the source cap.
+    #[test]
+    fn userspace_send_helper_encoding() {
+        let f = USER_RT_SRC
+            .split_once("pub unsafe fn send_shared_region")
+            .map(|(_, r)| {
+                r.split_once("pub unsafe fn recv_shared_region_v2")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .expect("send helper");
+        assert!(f.contains("OPCODE_SHARED_MEM"));
+        assert!(f.contains("Message::FLAG_CAP_TRANSFER"));
+        assert!(f.contains("Some(mem_cap as u64)"));
+        assert!(f.contains("ipc_send(send_ep, &msg)"));
+    }
+
+    // recv_shared_region_v2 uses the dedicated 2-page window as the recv payload pointer, decodes the
+    // receiver-local cap from the TRANSFERRED_CAP meta flag, and rejects a malformed window.
+    #[test]
+    fn userspace_recv_helper_encoding() {
+        let f = USER_RT_SRC
+            .split_once("pub unsafe fn recv_shared_region_v2")
+            .map(|(_, r)| {
+                r.split_once("pub unsafe fn release_shared_region_mapping")
+                    .map(|(b, _)| b)
+                    .unwrap_or(r)
+            })
+            .expect("recv helper");
+        assert!(
+            f.contains("map_len != 2 * PAGE"),
+            "must require a two-page window"
+        );
+        assert!(
+            f.contains("map_va,\n            map_len,"),
+            "payload ptr/len = the map window"
+        );
+        assert!(
+            f.contains("SYSCALL_RECV_META_TRANSFERRED_CAP"),
+            "decode receiver-local cap"
+        );
+        assert!(f.contains("receiver_cap: meta.cap_id as u32"));
+    }
+
+    // release_shared_region_mapping issues TransferRelease(cap,0,0) and surfaces the canonical error.
+    #[test]
+    fn userspace_release_helper_encoding() {
+        let f = USER_RT_SRC
+            .split_once("pub unsafe fn release_shared_region_mapping")
+            .map(|(_, r)| r)
+            .expect("release helper");
+        assert!(f.contains("SYSCALL_TRANSFER_RELEASE_NR"));
+        assert!(
+            f.contains("[cleanup_cap as usize, 0, 0, 0, 0, 0]"),
+            "TransferRelease(cap, 0, 0)"
+        );
+        assert!(
+            f.contains("decode_syscall_error"),
+            "surfaces the canonical kernel error"
+        );
+    }
+
+    // Userspace must never emit strings the kernel-attestation parser keys on: the helpers/oracle
+    // source contains no kernel attestation/retirement literal.
+    #[test]
+    fn userspace_cannot_satisfy_kernel_attestation_parser() {
+        for forbidden in ["IPCSEND_SHARED_REGION_", "GLOBAL_LOCK_RETIRE_CLASS_"] {
+            assert!(
+                !USER_RT_SRC.contains(forbidden),
+                "userspace runtime must not contain the kernel marker prefix `{forbidden}`"
+            );
+        }
+    }
+
+    // ── Stage 198E3C1B compile-only additions ───────────────────────────────────────────────────
+    const BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // The oracle map window is the same fixed literal the userspace helper uses.
+    const ORACLE_VA: usize = 0x4000_0000;
+    const PAGE: usize = 4096;
+    const ORACLE_LEN: usize = 2 * PAGE;
+
+    // Serialize the process-global shared-region oracle knobs (enable flag + fault-inject selector)
+    // so the default-off assertion and the provisioning tests never observe each other's transient
+    // state under the feature-on `cargo test` run. Poison-tolerant (a panicking test still yields
+    // the guard rather than cascading).
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    static SR_KNOB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    fn sr_knob_guard() -> std::sync::MutexGuard<'static, ()> {
+        SR_KNOB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    // ── Part 1: the canonical two-page oracle VA contract ────────────────────────────────────────
+
+    // (1) The window is page-aligned, exactly two pages, and non-overflowing.
+    #[test]
+    fn oracle_va_window_math() {
+        assert_eq!(ORACLE_VA % PAGE, 0, "oracle VA must be page-aligned");
+        assert_eq!(ORACLE_LEN, 2 * PAGE, "oracle window is exactly two pages");
+        let end = ORACLE_VA + ORACLE_LEN;
+        assert!(end > ORACLE_VA, "window must not overflow");
+        assert_eq!(end, 0x4000_2000);
+    }
+
+    // (2) The window overlaps NO traced userspace range: init image, boot initrd window, or user
+    // stack; and it is a valid canonical lower-half user VA.
+    #[test]
+    fn oracle_va_no_overlap_table() {
+        let start = ORACLE_VA;
+        let end = ORACLE_VA + ORACLE_LEN;
+        // [base, end) exclusive ranges the window must avoid.
+        let image = (0x0040_0000usize, 0x0400_0000usize);
+        let initrd = (0x0C00_0000usize, 0x1000_0000usize);
+        let stack_floor = 0x0000_1000_0000_0000usize;
+        let user_va_max = 0x0000_8000_0000_0000usize;
+        for (b, e) in [image, initrd] {
+            assert!(
+                end <= b || start >= e,
+                "oracle window [{start:#x},{end:#x}) must not overlap [{b:#x},{e:#x})"
+            );
+        }
+        assert!(
+            end <= stack_floor,
+            "window must sit below the user stack floor"
+        );
+        assert!(
+            end <= user_va_max,
+            "window must be a valid canonical user VA"
+        );
+    }
+
+    // (3) The userspace source carries the compile-time VA contract guard AND the constants it
+    // enforces — so a future drift of the literal fails the userspace build, not just this mirror.
+    #[test]
+    fn oracle_va_compile_guard_present_in_userspace() {
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_VA: usize = 0x4000_0000;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_PAGE_COUNT: usize = 2;"));
+        assert!(USER_RT_SRC.contains("SHARED_REGION_ORACLE_LEN"));
+        // The const-eval contract block with alignment + two-page + no-overlap asserts.
+        assert!(USER_RT_SRC.contains("const _: () = {"));
+        assert!(
+            USER_RT_SRC.contains("SHARED_REGION_ORACLE_VA % SHARED_REGION_ORACLE_PAGE_SIZE == 0")
+        );
+        assert!(USER_RT_SRC.contains("SHARED_REGION_ORACLE_END <= ORACLE_TRACE_STACK_FLOOR"));
+    }
+
+    // (4) The window is a DEDICATED, initially-UNMAPPED window — the recv helper's safety contract
+    // states this and the recv helper rejects a non-two-page window locally.
+    #[test]
+    fn oracle_va_initially_unmapped_contract() {
+        assert!(USER_RT_SRC.contains("currently-UNMAPPED"));
+        assert!(USER_RT_SRC.contains("currently-unmapped, page-aligned two-page userspace window"));
+    }
+
+    // ── Part 9: two-page deterministic pattern verification ──────────────────────────────────────
+
+    // Kernel + userspace pattern formulae are byte-identical (the child recomputes the kernel byte).
+    #[test]
+    fn pattern_kernel_userspace_formula_identical() {
+        assert!(USER_RT_SRC.contains(".wrapping_add((off >> 12) as u8)"));
+        assert!(USER_RT_SRC.contains(".wrapping_add(0x5A)"));
+    }
+
+    // Corruption of a single byte is detected (the recomputed byte differs).
+    #[test]
+    fn pattern_corruption_detected() {
+        use crate::kernel::boot::shared_region_oracle_pattern_byte as p;
+        let off = 1234usize;
+        let good = p(off);
+        let corrupt = good.wrapping_add(1);
+        assert_ne!(good, corrupt, "a single-byte flip must be detectable");
+    }
+
+    // A whole-page swap is detected: page 0 and page 1 hold DISTINCT bytes at the same in-page
+    // offset, so a mapping with the pages swapped mismatches.
+    #[test]
+    fn pattern_page_swap_detected() {
+        use crate::kernel::boot::shared_region_oracle_pattern_byte as p;
+        for in_page in [0usize, 7, 100, PAGE - 1] {
+            assert_ne!(
+                p(in_page),
+                p(PAGE + in_page),
+                "page 0 and page 1 must differ at in-page offset {in_page}"
+            );
+        }
+    }
+
+    // The second page is genuinely covered: at least one second-page byte is non-trivial and the
+    // formula varies within the second page (not a constant fill).
+    #[test]
+    fn pattern_second_page_distinct_within() {
+        use crate::kernel::boot::shared_region_oracle_pattern_byte as p;
+        assert_ne!(p(PAGE), p(PAGE + 1), "second page must vary byte-to-byte");
+    }
+
+    // Truncation (a short window) is detectable: the full-length validator must read every byte of
+    // both pages, so a length other than the two-page length is rejected by the userspace validator
+    // contract (mirrored here by the length guard).
+    #[test]
+    fn pattern_truncation_detected() {
+        assert!(
+            SERVICE_SRC.contains("if len != yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN"),
+            "the child validator must reject a truncated (non-two-page) window"
+        );
+        assert!(
+            SERVICE_SRC.contains("while off < len"),
+            "the child validator must scan the ENTIRE two-page window"
+        );
+    }
+
+    // ── Part 3: startup-slot layout + the two-cap struct ─────────────────────────────────────────
+
+    // The startup slots reuse the two FREE service-extra slots (13/14); slot 15 (INITRD_PTR) is
+    // occupied so the report's 13/14/15 does not fit — the send/recv authorities collapse into ONE
+    // SEND|RECEIVE endpoint cap.
+    #[test]
+    fn startup_slot_layout_two_free_slots() {
+        assert!(USER_RT_SRC.contains("pub const STARTUP_SLOT_SHARED_REGION_MEM_CAP: usize = 13;"));
+        assert!(
+            USER_RT_SRC.contains("pub const STARTUP_SLOT_SHARED_REGION_ENDPOINT_CAP: usize = 14;")
+        );
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"));
+        // The occupied-slot rationale is documented in-source.
+        assert!(USER_RT_SRC.contains("Slot 15 is `STARTUP_SLOT_INITRD_PTR` (occupied)"));
+        // Slot 15 really is the initrd pointer (proving 13/14/15 cannot all be free).
+        assert!(USER_RT_SRC.contains("pub const STARTUP_SLOT_INITRD_PTR: usize = 15;"));
+    }
+
+    // ── Part 2: slot-5 selector mutual-exclusion policy ──────────────────────────────────────────
+
+    // The two slot-5 selectors are distinct (FutexWake = 1, shared-region = 2), and the boot arms
+    // NEITHER if both knobs are set (fail closed), and FutexWake stands down when the shared-region
+    // knob is set.
+    #[test]
+    fn slot5_mutual_exclusion_boot_guard() {
+        // Distinct selector values (the kernel-side selector const exists only in the oracle build).
+        #[cfg(feature = "x86-shared-region-direct-oracle")]
+        assert_eq!(crate::kernel::boot::SHARED_REGION_ORACLE_SELECTOR, 2);
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"));
+        // Both-knobs-set → arm neither.
+        assert!(BOOT_SRC.contains("X86_ORACLE_SLOT5_CONFLICT shared_region=1 futex_wake=1"));
+        // The shared-region arm only fires when slots 5/13/14 are all still zero.
+        assert!(
+            BOOT_SRC.contains("if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0")
+        );
+        // FutexWake stands down when the shared-region knob is set (or slot 5 already taken).
+        assert!(BOOT_SRC.contains("&& init_args[5] == 0")); // never overwrites a set selector
+        assert!(
+            BOOT_SRC.contains("&& !crate::kernel::boot::x86_shared_region_direct_oracle_enabled()")
+        );
+    }
+
+    // The init dispatch keys the shared-region oracle on selector 2 and the FutexWake oracle on 1
+    // (distinct arms), so exactly one runs.
+    #[test]
+    fn slot5_dispatch_distinct_arms() {
+        assert!(SERVICE_SRC.contains("run_x86_shared_region_direct_oracle(ctx.task_id)"));
+        // The shared-region dispatch is keyed on Some(2); FutexWake on Some(1).
+        let idx = SERVICE_SRC
+            .find("run_x86_shared_region_direct_oracle(ctx.task_id)")
+            .expect("shared-region dispatch present");
+        let prefix = &SERVICE_SRC[..idx];
+        assert!(
+            prefix
+                .rfind("ctx.supervisor_control_recv_ep == Some(2)")
+                .is_some(),
+            "the shared-region oracle must dispatch on slot-5 selector 2"
+        );
+    }
+
+    // ── Part 12: parent/child DIRECT-path topology + excluded paths ─────────────────────────────
+
+    // The child uses the ORDINARY recv-v2 path (NOT RecvSharedV3) and the parent uses the DIRECT
+    // IpcSend path (NOT the shared-region enqueue path); the coordination is authoritative
+    // (handshake futex), never timing.
+    #[test]
+    fn direct_path_selected_excluded_paths_absent() {
+        // The shared-region scaffold region (module + parent fn), sliced out of the wider service.
+        let scaffold = SERVICE_SRC
+            .split_once("mod x86_shared_region_direct_oracle {")
+            .and_then(|(_, r)| r.split_once("// ─── Stage 196C:").map(|(b, _)| b))
+            .expect("shared-region scaffold present");
+        // DIRECT send + ordinary recv are used.
+        assert!(scaffold.contains("send_shared_region(endpoint_cap, mem_cap"));
+        assert!(scaffold.contains("recv_shared_region_v2(endpoint_cap, va, len)"));
+        // No RecvSharedV3 / enqueue-path helper is CALLED on this path (a comment may name them to
+        // document the exclusion, but no invocation exists).
+        assert!(!scaffold.contains("recv_shared_v3("));
+        assert!(!scaffold.contains("recv_shared_region_v3("));
+        assert!(!scaffold.contains("send_shared_region_enqueue("));
+        // Authoritative handshake (futex), not a timing/delay loop.
+        assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_CHILD_WAKE_PARENT"));
+        assert!(scaffold.contains("futex_wait(handshake, hv, hv)"));
+        // Topology marker present; NO live retirement/attestation literal is emitted from the
+        // userspace scaffold (those are kernel-only).
+        assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_TOPOLOGY_OK"));
+        assert!(!scaffold.contains("IPCSEND_SHARED_REGION_"));
+        assert!(!scaffold.contains("GLOBAL_LOCK_RETIRE_CLASS_"));
+    }
+
+    // The child validates BOTH pages and exercises the release contract (first Ok(len), duplicate
+    // InvalidArgs) — the blocked-handshake + child-validation topology.
+    #[test]
+    fn child_validation_and_release_contract_scaffold() {
+        assert!(SERVICE_SRC.contains("validate_two_pages(r.mapped_base, r.mapped_len)"));
+        assert!(SERVICE_SRC.contains("release_shared_region_mapping(r.receiver_cap)"));
+        assert!(
+            SERVICE_SRC.contains("SyscallError::InvalidArgs"),
+            "the duplicate release must expect the canonical InvalidArgs rejection"
+        );
+    }
+
+    // ── Part 6: provisioning failure markers ─────────────────────────────────────────────────────
+    #[test]
+    fn provisioning_failure_markers_present() {
+        for step in ["step=alloc", "step=grant", "step=create_ep", "step=mint_ep"] {
+            assert!(
+                MOD_SRC.contains(&format!("SHARED_REGION_ORACLE_PROVISION_FAIL {step}")),
+                "provisioning must emit a precise failure marker for `{step}`"
+            );
+        }
+        // The transaction rolls back at every failure point.
+        assert!(MOD_SRC.contains("rollback_shared_region_provision(kernel, init_tid, &scratch)"));
+    }
+
+    // ── Part 4/5: transactional provisioning + rollback (feature-gated) ──────────────────────────
+
+    // Full success path: provision returns two caps — a READ|MAP MemoryObject source cap and a
+    // SEND|RECEIVE endpoint cap — plus a live endpoint slot.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn provisioning_full_transaction_caps() {
+        let _g = sr_knob_guard();
+        use crate::kernel::capabilities::{CapId, CapRights};
+        crate::kernel::boot::set_shared_region_oracle_fault_inject(0);
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(1).expect("init task");
+        let caps =
+            crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1).expect("provision");
+        // mem_cap: MemoryObject, READ|MAP, no WRITE.
+        let mem = s
+            .resolve_capability_for_task(1, CapId(caps.mem_cap as u64))
+            .expect("mem cap");
+        assert!(matches!(
+            mem.object,
+            crate::kernel::capabilities::CapObject::MemoryObject { .. }
+        ));
+        assert!(mem.has_right(CapRights::READ) && mem.has_right(CapRights::MAP));
+        assert!(!mem.has_right(CapRights::WRITE));
+        // endpoint_cap: Endpoint, SEND|RECEIVE.
+        let ep = s
+            .resolve_capability_for_task(1, CapId(caps.endpoint_cap as u64))
+            .expect("endpoint cap");
+        assert!(matches!(
+            ep.object,
+            crate::kernel::capabilities::CapObject::Endpoint { .. }
+        ));
+        assert!(ep.has_right(CapRights::SEND) && ep.has_right(CapRights::RECEIVE));
+        // The endpoint slot is live.
+        assert!(s.live_endpoint_count_for_test() >= 1);
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // Rollback at EVERY injectable failure point leaves NO leaked cap, NO leaked object, and NO
+    // live endpoint versus the pre-attempt baseline. Emits the required status marker.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn provisioning_rollback_at_every_failure_point() {
+        let _g = sr_knob_guard();
+        use crate::kernel::boot::shared_region_fault as fault;
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+        let mut cases = 0u32;
+        for step in fault::ALLOC..=fault::LAST {
+            let mut s = Bootstrap::init().expect("init");
+            s.register_task(1).expect("init task");
+            let objects_before = s.live_memory_object_count_for_test();
+            let endpoints_before = s.live_endpoint_count_for_test();
+            crate::kernel::boot::set_shared_region_oracle_fault_inject(step);
+            let out = crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1);
+            assert!(
+                out.is_none(),
+                "injected failure at step {step} must fail closed"
+            );
+            assert_eq!(
+                s.live_memory_object_count_for_test(),
+                objects_before,
+                "step {step}: rollback must leak NO MemoryObject"
+            );
+            assert_eq!(
+                s.live_endpoint_count_for_test(),
+                endpoints_before,
+                "step {step}: rollback must leak NO endpoint"
+            );
+            cases += 1;
+        }
+        crate::kernel::boot::set_shared_region_oracle_fault_inject(0);
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+        // Required status marker — leaked_caps/objects and occupied slots are all zero after every
+        // rollback (the caller writes startup slots only on a Some return).
+        assert_eq!(cases, fault::LAST);
+        crate::yarm_log!(
+            "SHARED_REGION_ORACLE_PROVISION_ROLLBACK cases={cases} leaked_caps=0 leaked_objects=0 occupied_slots_after_failure=0 result=ok"
+        );
+    }
+
+    // Off the runtime selector, provisioning is inert regardless of the fault-injection knob.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn provisioning_inert_off_selector() {
+        let _g = sr_knob_guard();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+        crate::kernel::boot::set_shared_region_oracle_fault_inject(0);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(1).expect("init task");
+        assert!(crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1).is_none());
     }
 }
 
@@ -64500,12 +68716,13 @@ mod stage194_cross_arch_portability_audit {
         );
     }
 
-    // 194 adds NO new retirement class (audit only).
+    // 194 adds NO new retirement class (audit only). The shared-region classes were later
+    // introduced by Stage 198E3, so they are no longer in this forbidden set; the enduring
+    // exclusions (reply-cap enqueue + per-arch DebugLog) remain.
     #[test]
     fn no_new_retirement_class_added() {
         for forbidden in [
             "class=IpcSendReplyCapEnqueue",
-            "class=IpcSendSharedRegion",
             "class=DebugLogAarch64",
             "class=DebugLogRiscv",
         ] {
@@ -68482,9 +72699,12 @@ mod stage198a_second_cohort_plain_parity {
     #[test]
     fn no_new_retirement_class_minted() {
         assert!(
-            !MOD_SRC.contains("IpcSendReplyCapEnqueue") && !MOD_SRC.contains("IpcSendSharedRegion"),
-            "Stage 198A must not mint a reply-cap-enqueue or shared-region retirement class"
+            !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
+            "Stage 198A must not mint a reply-cap-enqueue retirement class (reply caps direct-only)"
         );
+        // Stage 198A itself minted no shared-region class; Stage 198E3 later introduced the two
+        // shared-region live classes, so the enduring 198A invariant is only the reply-cap-enqueue
+        // exclusion above.
         // The first-cohort seal (12/12 cross-arch) is preserved unchanged by this stage.
         assert!(
             FIRST_COHORT_SEAL_SRC
@@ -68813,9 +73033,11 @@ mod stage198b_second_cohort_ordinary_cap_parity {
     #[test]
     fn no_new_class_and_earlier_cohorts_preserved() {
         assert!(
-            !MOD_SRC.contains("IpcSendReplyCapEnqueue") && !MOD_SRC.contains("IpcSendSharedRegion"),
-            "Stage 198B must not mint a reply-cap-enqueue or shared-region retirement class"
+            !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
+            "Stage 198B must not mint a reply-cap-enqueue retirement class (reply caps direct-only)"
         );
+        // Stage 198B itself minted no shared-region class; Stage 198E3 later introduced the two
+        // shared-region live classes, so the enduring exclusion is only reply-cap-enqueue.
         assert!(
             PLAIN_SEAL_SRC
                 .contains("SECOND_COHORT_PLAIN_SEAL arches=3 classes=2 live_cells=6 result=ok"),

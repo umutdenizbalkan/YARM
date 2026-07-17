@@ -23,7 +23,7 @@ mod orchestrator_state;
 mod reply_cap_rank_split;
 mod restart_state;
 mod scheduler_state;
-mod shared_region_txn;
+pub(crate) mod shared_region_txn;
 mod task_core_state;
 mod task_policy_state;
 mod thread_state;
@@ -115,10 +115,12 @@ pub(crate) enum IpcEndpointSendResult {
     /// Message enqueued and receiver slot cleared under ipc_state_lock.
     /// Caller must apply WakeReceiver outside the lock via apply_split_receiver_wake_plan.
     EnqueuedWakeReceiver(ThreadId),
-    /// Stage 4F pre-screen: found a plain receiver waiter with this TID and no sender waiters.
-    /// TID came from a locked ipc_state_lock read in ipc_try_send_queued_plain_endpoint_only.
-    /// Caller should check is_task_recv_v2_blocked then call ipc_try_send_to_plain_receiver_endpoint_only.
-    ReceiverWaiterFound(ThreadId),
+    /// Stage 4F pre-screen: found a plain receiver waiter with this COMPLETE identity (tid + ASID,
+    /// Stage 198E3B2B2) and no sender waiters. The identity came from a locked ipc_state_lock read in
+    /// ipc_try_send_queued_plain_endpoint_only. Caller checks is_task_recv_v2_blocked then calls
+    /// ipc_try_send_to_plain_receiver_endpoint_only, which re-verifies the FULL identity (never
+    /// numeric TID alone) before clearing the waiter slot.
+    ReceiverWaiterFound(ReceiverWaiterIdentity),
     Ineligible(IpcEndpointSplitRejectReason),
 }
 
@@ -1509,6 +1511,193 @@ pub(crate) fn blocked_syscall_idle_provenance_take(
     Some((raw - 1, class))
 }
 
+// ── Stage 198E3 (SHARED-REGION LIVE) ──────────────────────────────────────────────────────
+//
+// The accepted post-lock shared-region transaction (`shared_region_execute`) is wired LIVE into
+// the direct (blocked-receiver) and queued (dequeue) receive boundaries, gated behind the
+// oracle-proof knob (`ipc_recv_oracle_proof_enabled`) so it is INERT on a normal boot (the legacy
+// path runs and no shared-region live class markers are emitted). A per-CPU origin tag records the
+// pending shared-region post-work's CLASS (direct vs enqueue) so the drain executor emits the
+// class-correct attestations + retirement markers ONLY from a real post-lock completion — never
+// from ordinary-cap, reply-cap, plain, hosted-test, or fallback paths.
+
+/// Stage 198E3: the running architecture tag for runtime markers (arch-neutral drain executor).
+pub(crate) const fn current_arch_tag() -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    {
+        "aarch64"
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x86_64"
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        "riscv64"
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        target_arch = "riscv64"
+    )))]
+    {
+        "host"
+    }
+}
+
+/// Stage 198E3: per-CPU shared-region live post-work origin (0 = none, 1 = direct, 2 = enqueue).
+pub(crate) static SHARED_REGION_LIVE_ORIGIN: [core::sync::atomic::AtomicU8;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Origin class for a pending shared-region live delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SharedRegionLiveOrigin {
+    Direct,
+    Enqueue,
+}
+
+/// Stage 198E3: tag the just-stashed shared-region delivery on `cpu` with its class origin.
+pub(crate) fn shared_region_live_origin_set(cpu_idx: usize, origin: SharedRegionLiveOrigin) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        let code = match origin {
+            SharedRegionLiveOrigin::Direct => 1,
+            SharedRegionLiveOrigin::Enqueue => 2,
+        };
+        SHARED_REGION_LIVE_ORIGIN[cpu_idx].store(code, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Stage 198E3: consume the shared-region live origin for `cpu` (clear + return prior class).
+pub(crate) fn shared_region_live_origin_take(cpu_idx: usize) -> Option<SharedRegionLiveOrigin> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    match SHARED_REGION_LIVE_ORIGIN[cpu_idx].swap(0, core::sync::atomic::Ordering::AcqRel) {
+        1 => Some(SharedRegionLiveOrigin::Direct),
+        2 => Some(SharedRegionLiveOrigin::Enqueue),
+        _ => None,
+    }
+}
+
+/// Stage 198E3: one-shot latch for the fail-closed cancellation-fuse diagnostic.
+static SHARED_REGION_CANCEL_FUSE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 198E3: emit the fail-closed cancellation-fuse diagnostic EXACTLY ONCE, when the fuse
+/// transitions clear → set (a cancellation request that could not be recorded). The fuse is never
+/// auto-cleared; a normal live oracle run must show `count=0` of this marker. Returns `true` iff
+/// this call actually emitted (won the one-shot latch).
+pub(crate) fn maybe_log_shared_region_cancel_fuse_set() -> bool {
+    if SHARED_REGION_CANCEL_FUSE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!(
+            "SHARED_REGION_CANCEL_FUSE_SET reason=capacity_exhausted result=fail_closed"
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// Test-only: reset the one-shot fuse-diagnostic latch so the "emitted exactly once" contract can
+/// be exercised deterministically without cross-test contamination from the shared static.
+#[cfg(test)]
+pub(crate) fn reset_shared_region_cancel_fuse_log() {
+    SHARED_REGION_CANCEL_FUSE_LOGGED.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Stage 198E3C1: one-shot latch for the `IpcSendSharedRegionDirect` retirement markers. Compiled
+/// ONLY for the explicitly-armed x86_64 live-oracle build (`feature = "x86-shared-region-direct-
+/// oracle"`); a normal artifact and every non-x86 artifact contain none of these literals.
+#[cfg(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"))]
+static IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 198E3C1: emit the `IpcSendSharedRegionDirect` retirement markers exactly once — only from
+/// the x86_64 armed-oracle build, only after a real off-lock direct completion (called solely by the
+/// gated live-marker helper). The queued class and all non-x86 architectures never compile a
+/// shared-region retirement literal.
+#[cfg(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"))]
+pub(crate) fn maybe_log_ipc_send_shared_region_direct_retired() {
+    if IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!(
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendSharedRegionDirect"
+        );
+        crate::yarm_log!(
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendSharedRegionDirect result=ok"
+        );
+    }
+}
+
+/// Stage 198E3C1: origin-gated shared-region LIVE markers (attestations + retirement), emitted ONLY
+/// from the drain's success arm AFTER the transaction finalized, the waiter was cleared, and the
+/// receiver enqueued exactly once. Every marker LITERAL is confined here and gated on the x86_64
+/// armed-oracle build, so a NORMAL artifact — and every non-x86 artifact — is marker-clean. Only the
+/// DIRECT class emits (the queued class is forbidden this stage); a non-Direct origin is a no-op.
+#[cfg(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"))]
+pub(crate) fn maybe_emit_shared_region_direct_live_markers(
+    class: &str,
+    snapshot: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    woke_receiver: bool,
+    origin: Option<SharedRegionLiveOrigin>,
+) {
+    use crate::kernel::capabilities::{CapObject, CapRights};
+    if !matches!(origin, Some(SharedRegionLiveOrigin::Direct)) {
+        return;
+    }
+    let object_match = u8::from(matches!(
+        snapshot.object,
+        CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. }
+    ));
+    crate::yarm_log!(
+        "IPCSEND_SHARED_REGION_OBJECT_OK arch=x86_64 class={} object_match={} fresh_cap=1 pin_transfer=1",
+        class,
+        object_match
+    );
+    let map_right = u8::from(snapshot.rights.contains(CapRights::MAP));
+    let write_ok = u8::from(!snapshot.map_write || snapshot.rights.contains(CapRights::WRITE));
+    crate::yarm_log!(
+        "IPCSEND_SHARED_REGION_MAP_OK arch=x86_64 class={} map_right={} write_right_ok={} nx=1 cleanup_token=1",
+        class,
+        map_right,
+        write_ok
+    );
+    crate::yarm_log!(
+        "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch=x86_64 class={} transaction_published=1 receiver_wakes={} leaked_state=0",
+        class,
+        u8::from(woke_receiver)
+    );
+    maybe_log_ipc_send_shared_region_direct_retired();
+}
+
+/// Stage 198E3C1: marker-clean stub for every NON-armed build (all normal artifacts + all non-x86
+/// architectures). It contains no marker literal, so a normal artifact stays clean and no
+/// shared-region retirement/attestation literal is ever compiled into an AArch64/RISC-V binary.
+#[cfg(not(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64")))]
+pub(crate) fn maybe_emit_shared_region_direct_live_markers(
+    _class: &str,
+    _snapshot: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    _woke_receiver: bool,
+    _origin: Option<SharedRegionLiveOrigin>,
+) {
+}
+
 /// Stage 193A: one-shot latch for the IpcSendPlain boundary retirement markers.
 static IPC_SEND_PLAIN_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -2781,6 +2970,29 @@ pub fn x86_futex_wake_oracle_enabled() -> bool {
     X86_FUTEX_WAKE_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 198E3C1: default-off x86_64 DIRECT shared-region live-oracle WORKLOAD selector
+/// (`yarm.x86_64_shared_region_direct_oracle=1`). Provisions init startup slot 5 (=2) so init runs
+/// the parent/child shared-region (`IpcSendSharedRegionDirect`) delivery proof — a receiver blocks
+/// first in recv-v2, the parent transfers a multi-page shared `MemoryObject`, and the accepted
+/// off-lock post-lock drain maps it + wakes the receiver exactly once. Selecting this workload also
+/// arms the shared IPC/oracle-proof knob so the direct producer becomes live (INERT on a normal
+/// boot, which never sets this). Does NOT enable the queued shared-region class or any non-x86 arch.
+pub(crate) static X86_SHARED_REGION_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_shared_region_direct_oracle_enabled(enabled: bool) {
+    X86_SHARED_REGION_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        // Selecting the workload arms the shared IPC/oracle-proof knob so the DIRECT shared-region
+        // producer is live for this run (the queued class stays disabled).
+        set_ipc_recv_oracle_proof_enabled(true);
+    }
+}
+
+pub fn x86_shared_region_direct_oracle_enabled() -> bool {
+    X86_SHARED_REGION_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 // ─── Stage 197A-C: mandatory init ELF loading (no synthetic fallback) ──────────────────
 //
 // Why an init load can be fatal. There is NO synthetic/placeholder init ELF fallback anymore
@@ -3006,6 +3218,319 @@ pub fn provision_init_ipc_send_cap_oracle_coord(
         recv_cap.0
     );
     Some(recv_cap.0 as u32)
+}
+
+/// Stage 198E3C1: the DIRECT shared-region oracle's fixed region size (two pages, so the live path
+/// exercises multi-page mapping progress).
+pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
+
+/// Stage 198E3C1B: the init startup-slot-5 selector value that names the DIRECT shared-region
+/// oracle (mirrors `yarm_user_rt::syscall::SHARED_REGION_ORACLE_SELECTOR`). Slot 5 is a mutually
+/// exclusive selector: 1 = x86_64 FutexWake oracle, 2 = shared-region direct oracle. Only ONE may
+/// be armed per boot (the boot caller fails closed if both knobs are set).
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
+
+/// Stage 198E3C1: the deterministic known byte the oracle writes at object offset `off`. It varies
+/// with `off`, so the pattern SPANS BOTH pages (page 0 and page 1 hold different bytes), and it is a
+/// pure formula the userspace child recomputes to validate the mapped contents. No secret, no ABI.
+pub(crate) const fn shared_region_oracle_pattern_byte(off: usize) -> u8 {
+    // Vary with BOTH the in-page offset and the page index (`off >> 12`) so consecutive pages hold
+    // distinct bytes at the same in-page offset — the pattern genuinely spans both pages.
+    (off as u8)
+        .wrapping_add((off >> 12) as u8)
+        .wrapping_add(0x5A)
+}
+
+/// Stage 198E3C1B: the two init-local caps a fully-provisioned shared-region oracle hands to init.
+///
+/// The report's original three-slot plan (`mem_cap` / `send_cap` / `recv_cap` in startup slots
+/// 13/14/15) does NOT fit: startup slot 15 is `STARTUP_SLOT_INITRD_PTR` (already occupied by the
+/// boot initrd pointer), leaving only the two free service-extra slots 13/14. So the send and recv
+/// authorities collapse into ONE endpoint cap carrying `SEND | RECEIVE`: the parent sends on it and
+/// the forked child receives on the SAME cap through init's shared CSpace. Two caps, two slots.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedRegionOracleCaps {
+    /// init-local `MemoryObject` source cap (`READ | MAP`, no `WRITE`/execute) → startup slot 13.
+    pub mem_cap: u32,
+    /// init-local endpoint cap carrying `SEND | RECEIVE` for the oracle rendezvous → startup slot 14.
+    pub endpoint_cap: u32,
+    /// The endpoint's slot index (for the drain/waiter bookkeeping and hosted assertions).
+    pub endpoint_idx: usize,
+}
+
+/// Stage 198E3C1B: TEST-ONLY fault-injection selector for the provisioning transaction. Names the
+/// step at which provisioning is forced to fail, so hosted tests can assert the rollback leaves NO
+/// leaked cap, NO leaked object, and NO occupied startup slot at EVERY failure point. Defaults to 0
+/// (no injection) so a real build's provisioning is byte-identical.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub(crate) static SHARED_REGION_ORACLE_FAULT_INJECT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Fault-injection step codes (0 = none). Each names the step FORCED to fail; rollback must then
+/// reclaim everything created by the strictly-earlier steps.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub(crate) mod shared_region_fault {
+    pub const NONE: u32 = 0;
+    pub const ALLOC: u32 = 1;
+    pub const RESOLVE: u32 = 2;
+    pub const GRANT_MEM: u32 = 3;
+    pub const CREATE_EP: u32 = 4;
+    pub const RESOLVE_EP: u32 = 5;
+    pub const MINT_EP: u32 = 6;
+    /// Highest injectable step (inclusive) — hosted tests sweep `1..=LAST`.
+    pub const LAST: u32 = MINT_EP;
+}
+
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub(crate) fn set_shared_region_oracle_fault_inject(step: u32) {
+    SHARED_REGION_ORACLE_FAULT_INJECT.store(step, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+fn shared_region_oracle_fault_inject() -> u32 {
+    SHARED_REGION_ORACLE_FAULT_INJECT.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Rollback scratch: every reclaimable resource the transaction has created so far, in creation
+/// order. Rollback undoes them in REVERSE order.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[derive(Default, Clone, Copy)]
+struct SharedRegionProvisionScratch {
+    /// Source `MemoryObject` cap in task 0's CNode — revoking it cascades to init's delegated mem
+    /// cap and reclaims the object (refcount → 0).
+    obj_src_cap: Option<crate::kernel::capabilities::CapId>,
+    /// Endpoint SEND/RECEIVE root caps in task 0's CNode (from `create_endpoint`).
+    ep_send_root: Option<crate::kernel::capabilities::CapId>,
+    ep_recv_root: Option<crate::kernel::capabilities::CapId>,
+    /// The endpoint object slot.
+    endpoint_idx: Option<usize>,
+    /// The `SEND | RECEIVE` cap minted into init's CNode.
+    init_ep_cap: Option<crate::kernel::capabilities::CapId>,
+}
+
+/// Undo a partial provisioning transaction. Idempotent and total: every present resource is
+/// reclaimed (best-effort `let _`), leaving NO leaked cap, NO leaked object, and NO startup slot
+/// written (the caller only writes slots on a `Some` return).
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+fn rollback_shared_region_provision(
+    kernel: &mut KernelState,
+    init_tid: u64,
+    scratch: &SharedRegionProvisionScratch,
+) {
+    // 1. init-local endpoint cap.
+    if let (Some(cap), Some(cnode)) = (scratch.init_ep_cap, kernel.task_cnode(init_tid)) {
+        let _ = kernel.revoke_capability_in_cnode(cnode, cap);
+    }
+    // 2. endpoint root caps in task 0's CNode.
+    if let Some(cnode) = kernel.task_cnode(0) {
+        for root in [scratch.ep_send_root, scratch.ep_recv_root]
+            .into_iter()
+            .flatten()
+        {
+            let _ = kernel.revoke_capability_in_cnode(cnode, root);
+        }
+    }
+    // 3. endpoint object.
+    if let Some(eidx) = scratch.endpoint_idx {
+        let _ = kernel.destroy_endpoint(eidx);
+    }
+    // 4. source MemoryObject cap (cascades to init's delegated mem cap + reclaims the object).
+    if let (Some(cap), Some(cnode)) = (scratch.obj_src_cap, kernel.task_cnode(0)) {
+        let _ = kernel.revoke_capability_in_cnode(cnode, cap);
+    }
+}
+
+/// Stage 198E3C1B: provision the DIRECT shared-region live oracle TRANSACTIONALLY. Under BOTH the
+/// compile-time feature and the runtime selector, it (1) allocates ONE fresh two-page
+/// `MemoryObject`, fills both backing pages with the deterministic pattern (kernel direct map — NO
+/// userspace WRITE cap is minted for init), (2) grants init a `READ | MAP` (no `WRITE`/execute)
+/// source cap with canonical transfer authority, (3) creates the rendezvous endpoint, and (4) mints
+/// a `SEND | RECEIVE` endpoint cap into init's CNode. Returns `SharedRegionOracleCaps` for the
+/// startup slots. Fail-closed AND leak-free: on ANY step failure it emits a precise failure marker,
+/// rolls back every resource created so far (no leaked cap / object / occupied slot), and returns
+/// `None` (the caller then leaves the oracle un-armed) — it never partially arms.
+#[cfg(feature = "x86-shared-region-direct-oracle")]
+pub fn provision_init_shared_region_oracle(
+    kernel: &mut KernelState,
+    init_tid: u64,
+) -> Option<SharedRegionOracleCaps> {
+    if !x86_shared_region_direct_oracle_enabled() {
+        return None;
+    }
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    let inject = shared_region_oracle_fault_inject();
+    let len = SHARED_REGION_ORACLE_PAGES * crate::kernel::vm::PAGE_SIZE;
+    let mut scratch = SharedRegionProvisionScratch::default();
+
+    // Step 1: allocate the source object.
+    if inject == shared_region_fault::ALLOC {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=alloc err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let (obj_id, src_cap0) = match kernel.alloc_anonymous_memory_object_with_len(len) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=alloc err={:?}", e);
+            return None;
+        }
+    };
+    scratch.obj_src_cap = Some(src_cap0);
+
+    // Step 2: resolve the object handle.
+    if inject == shared_region_fault::RESOLVE {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=resolve err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let _object = match kernel.current_task_capability(src_cap0) {
+        Some(c) => c.object,
+        None => {
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_PROVISION_FAIL step=resolve obj_id={}",
+                obj_id
+            );
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    // Initialize both pages with the deterministic pattern through the kernel direct map (bare-metal
+    // only; a normal boot never reaches this, and no userspace WRITE authority is created).
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        let phys = match kernel
+            .with_memory_state(|m| KernelState::shared_region_phys_base_locked(m, _object))
+        {
+            Some(p) => p.0,
+            None => {
+                crate::yarm_log!(
+                    "SHARED_REGION_ORACLE_PROVISION_FAIL step=phys obj_id={}",
+                    obj_id
+                );
+                rollback_shared_region_provision(kernel, init_tid, &scratch);
+                return None;
+            }
+        };
+        for off in 0..len {
+            match KernelState::phys_to_direct_map_ptr(phys + off as u64) {
+                Some(ptr) => unsafe {
+                    core::ptr::write_volatile(ptr, shared_region_oracle_pattern_byte(off));
+                },
+                None => {
+                    crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=fill off={}", off);
+                    rollback_shared_region_provision(kernel, init_tid, &scratch);
+                    return None;
+                }
+            }
+        }
+    }
+
+    // Step 3: grant init the read-only source cap (READ | MAP; canonical transfer authority).
+    if inject == shared_region_fault::GRANT_MEM {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=grant err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let init_mem_cap = match kernel.grant_capability_task_to_task_with_rights(
+        0,
+        src_cap0,
+        init_tid,
+        CapRights::READ | CapRights::MAP,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=grant err={:?}", e);
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+
+    // Step 4: create the rendezvous endpoint.
+    if inject == shared_region_fault::CREATE_EP {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=create_ep err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let (endpoint_idx, ep_send_root, ep_recv_root) = match kernel.create_endpoint(8) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_PROVISION_FAIL step=create_ep err={:?}",
+                e
+            );
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    scratch.ep_send_root = Some(ep_send_root);
+    scratch.ep_recv_root = Some(ep_recv_root);
+    scratch.endpoint_idx = Some(endpoint_idx);
+
+    // Step 5: resolve the endpoint object (for its generation) so the combined cap is well-formed.
+    if inject == shared_region_fault::RESOLVE_EP {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=resolve_ep err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let ep_object = match kernel.current_task_capability(ep_recv_root) {
+        Some(c) => c.object,
+        None => {
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_PROVISION_FAIL step=resolve_ep eidx={}",
+                endpoint_idx
+            );
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    debug_assert!(matches!(ep_object, CapObject::Endpoint { .. }));
+
+    // Step 6: mint the SEND | RECEIVE endpoint cap into init's CNode.
+    if inject == shared_region_fault::MINT_EP {
+        crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=mint_ep err=Injected");
+        rollback_shared_region_provision(kernel, init_tid, &scratch);
+        return None;
+    }
+    let init_cnode = match kernel.task_cnode(init_tid) {
+        Some(c) => c,
+        None => {
+            crate::yarm_log!("SHARED_REGION_ORACLE_PROVISION_FAIL step=init_cnode");
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    let init_ep_cap = match kernel.mint_capability_in_cnode(
+        init_cnode,
+        Capability::new(ep_object, CapRights::SEND | CapRights::RECEIVE),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_PROVISION_FAIL step=mint_ep err={:?}",
+                e
+            );
+            rollback_shared_region_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    scratch.init_ep_cap = Some(init_ep_cap);
+
+    crate::yarm_log!(
+        "SHARED_REGION_ORACLE_PROVISION_OK init_tid={} obj_id={} pages={} mem_cap={} endpoint_cap={} eidx={}",
+        init_tid,
+        obj_id,
+        SHARED_REGION_ORACLE_PAGES,
+        init_mem_cap.0,
+        init_ep_cap.0,
+        endpoint_idx
+    );
+    Some(SharedRegionOracleCaps {
+        mem_cap: init_mem_cap.0 as u32,
+        endpoint_cap: init_ep_cap.0 as u32,
+        endpoint_idx,
+    })
 }
 
 /// Stage 193D: provision the reply-cap live oracle. Under BOTH the base proof knob and

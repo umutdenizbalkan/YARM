@@ -459,20 +459,22 @@ pub(super) fn handle_ipc_send(
                 IpcEndpointSendResult::EnqueuedWakeReceiver(_) => {
                     unreachable!("Stage 4E never returns EnqueuedWakeReceiver")
                 }
-                IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
+                IpcEndpointSendResult::ReceiverWaiterFound(receiver) => {
                     // Stage 4F: ipc_try_send_queued_plain_endpoint_only found a plain
-                    // receiver waiter with no sender waiters. TID came from ipc_state_lock
-                    // read — no unlocked waiter array access needed.
+                    // receiver waiter with no sender waiters. The COMPLETE identity (tid + ASID)
+                    // came from an ipc_state_lock read — no unlocked waiter array access needed.
                     // Check recv-v2 under task_state_lock (rank 3) BEFORE
                     // ipc_state_lock (rank 4) — required by lock ordering.
+                    let receiver_tid = receiver.tid;
                     let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
                     if !is_recv_v2 {
                         // Stage 4F: non-recv-v2 receiver. Cap-transfer messages return
                         // Ineligible here (split_unsafe_flags check in
-                        // ipc_try_send_to_plain_receiver_endpoint_only).
+                        // ipc_try_send_to_plain_receiver_endpoint_only). The plain-send re-verifies
+                        // the FULL identity before clearing the waiter (never numeric TID alone).
                         match kernel.ipc_try_send_to_plain_receiver_endpoint_only(
                             endpoint_idx,
-                            receiver_tid,
+                            receiver,
                             msg,
                         ) {
                             IpcEndpointSendResult::EnqueuedWakeReceiver(recv_tid) => {
@@ -504,6 +506,30 @@ pub(super) fn handle_ipc_send(
                                 IpcSchedulerPlan::None,
                             ),
                             Ok(false) => {
+                                // Stage 198E3: shared-region DIRECT live path — gated behind the
+                                // oracle-proof knob. Under the knob (and a drainer), the producer
+                                // snapshots the accepted post-lock transaction (envelope consume +
+                                // pin transfer) by value; the trap-entry drain runs
+                                // `shared_region_execute` after the broad borrow drops (map, meta
+                                // copy, revalidate, single wake) — NO map/copy under the broad
+                                // borrow. Off the knob → Ok(false) → the legacy path below runs
+                                // (unchanged normal boot). Err → a real Phase-A fault.
+                                match crate::kernel::syscall::produce_blocked_waiter_shared_region_delivery(
+                                    kernel,
+                                    receiver_tid.0,
+                                    endpoint_idx,
+                                    &msg,
+                                ) {
+                                    // Producer stashed the post-work (drain completes delivery +
+                                    // slot-clear + single wake) — no in-lock wake plan here.
+                                    Ok(true) => (Some(Ok(())), IpcSchedulerPlan::None),
+                                    // A real Phase-A fault — the outer error path releases any
+                                    // still-stashed envelope (same disposition as the legacy arm).
+                                    Err(_e) => (
+                                        Some(Err(KernelError::UserMemoryFault)),
+                                        IpcSchedulerPlan::None,
+                                    ),
+                                    Ok(false) => {
                                 // Stage 4K/4O legacy: recv-v2 blocked receiver — deliver
                                 // directly outside ipc_state_lock (still under the broad
                                 // borrow). Handles the shared-region variant all boundary
@@ -526,6 +552,8 @@ pub(super) fn handle_ipc_send(
                                         Some(Err(KernelError::UserMemoryFault)),
                                         IpcSchedulerPlan::None,
                                     ),
+                                }
+                                    }
                                 }
                             }
                         }
@@ -988,7 +1016,8 @@ pub(super) fn handle_ipc_call(
     // receiver_tid to take_transfer_envelope — passing sender_tid would cause
     // the bound-receiver check to fail and the envelope to leak.
     let call_split_wake = match kernel.ipc_try_send_queued_plain_endpoint_only(endpoint_idx, msg) {
-        IpcEndpointSendResult::ReceiverWaiterFound(receiver_tid) => {
+        IpcEndpointSendResult::ReceiverWaiterFound(receiver) => {
+            let receiver_tid = receiver.tid;
             let is_recv_v2 = kernel.is_task_recv_v2_blocked(receiver_tid.0);
             if is_recv_v2 {
                 // Stage 188E: wire the reply-cap producer (188D rank-inversion

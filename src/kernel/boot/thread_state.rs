@@ -383,6 +383,24 @@ impl KernelState {
         });
     }
 
+    /// Stage 198E3B2B: `&mut [Option<TCB>]` sibling of [`Self::clear_blocked_recv_return_regs`] for
+    /// use inside `SharedKernel::with_task_tcbs_split_mut` (task rank 2 only). Byte-identical.
+    pub(crate) fn clear_blocked_recv_return_regs_locked(
+        tcbs: &mut [Option<crate::kernel::task::ThreadControlBlock>],
+        waiter_tid: u64,
+    ) {
+        if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == waiter_tid) {
+            tcb.user_context.arg0 = 0;
+            tcb.user_context.user_gprs[0] = 0; // RAX / x0  = ret0  = 0 (success)
+            #[cfg(target_arch = "x86_64")]
+            {
+                tcb.user_context.user_gprs[2] = 0; // RCX = error = 0 (success)
+                tcb.user_context.user_gprs[3] = 0; // RDX = ret2  = 0
+                tcb.user_context.user_gprs[7] = 0; // R8  = ret1  = 0
+            }
+        }
+    }
+
     pub fn thread_kernel_context(&self, tid: u64) -> Option<KernelExecutionContext> {
         self.with_tcbs(|tcbs| {
             tcbs.iter()

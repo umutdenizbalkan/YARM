@@ -947,10 +947,45 @@ pub fn bootstrap_first_user_task(
         init_args[17] = 2; // cap-enqueue-oracle discriminator
         crate::yarm_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_PROVISION_OK slot17=2");
     }
+    // Stage 198E3C1B: default-off + feature-gated x86_64 DIRECT shared-region live oracle. It
+    // reuses init startup slot 5 (supervisor_control_recv_ep, unused by init) as a SELECTOR (=2)
+    // and the two free service-extra slots 13/14 for the source MemoryObject cap and the combined
+    // SEND|RECEIVE endpoint cap. It is mutually exclusive with EVERY slot-13/14 oracle above (only
+    // fires when both are still zero) AND with the FutexWake oracle below (they share slot 5): if
+    // both slot-5 knobs are set the boot arms NEITHER (fail closed). Transactional + leak-free — a
+    // provisioning failure rolls back and leaves the oracle un-armed.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
+        if crate::kernel::boot::x86_shared_region_direct_oracle_enabled()
+            && crate::kernel::boot::x86_futex_wake_oracle_enabled()
+        {
+            crate::yarm_log!(
+                "X86_ORACLE_SLOT5_CONFLICT shared_region=1 futex_wake=1 result=arm_neither"
+            );
+        } else if let Some(caps) =
+            crate::kernel::boot::provision_init_shared_region_oracle(kernel, RING3_INIT_SERVER_TID)
+        {
+            init_args[5] = crate::kernel::boot::SHARED_REGION_ORACLE_SELECTOR;
+            init_args[13] = caps.mem_cap as u64;
+            init_args[14] = caps.endpoint_cap as u64;
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_SLOTS slot5={} slot13={} slot14={} eidx={}",
+                init_args[5],
+                init_args[13],
+                init_args[14],
+                caps.endpoint_idx
+            );
+        }
+    }
     // Stage 197A: default-off x86_64 FutexWake live oracle. init startup slot 5
     // (supervisor_control_recv_ep, unused by init) is reused as a sentinel (=1) ONLY under
-    // `yarm.x86_64_futex_wake_oracle=1`. A normal boot leaves it 0 and init skips this.
-    if crate::kernel::boot::x86_futex_wake_oracle_enabled() {
+    // `yarm.x86_64_futex_wake_oracle=1`. A normal boot leaves it 0 and init skips this. Slot-5
+    // mutual exclusion (Stage 198E3C1B): it never overwrites a selector the shared-region oracle
+    // already set, and it stands down entirely if the shared-region knob is set (fail closed).
+    if crate::kernel::boot::x86_futex_wake_oracle_enabled()
+        && init_args[5] == 0
+        && !crate::kernel::boot::x86_shared_region_direct_oracle_enabled()
+    {
         init_args[5] = 1;
         crate::yarm_log!("X86_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1");
     }

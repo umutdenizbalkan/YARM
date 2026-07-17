@@ -464,6 +464,240 @@ pub mod syscall {
         }))
     }
 
+    // ── Stage 198E3C1: narrow userspace shared-region (IpcSendSharedRegionDirect) helpers ─────────
+    // These reuse the EXISTING IpcSend / IpcRecv / TransferRelease syscalls + the existing cap-transfer
+    // Message representation — no new syscall, ABI field, or second shared-region representation.
+
+    /// Message opcode selecting a shared-region cap transfer (IPC message ABI; mirrors the kernel's
+    /// `OPCODE_SHARED_MEM`). Not a new syscall/ABI variant — just the header opcode value.
+    pub const OPCODE_SHARED_MEM: u16 = 1;
+    /// `Syscall::TransferRelease` number (mirrors `SYSCALL_TRANSFER_RELEASE_NR`).
+    const SYSCALL_TRANSFER_RELEASE_NR: usize = 4;
+
+    /// Outcome of a successful shared-region receive.
+    pub struct SharedRegionRecv {
+        /// Receiver-local transferred cap — ALSO the cleanup token. Nonzero; differs from the sender's
+        /// source cap.
+        pub receiver_cap: u32,
+        /// VA the two-page region is mapped at (the caller-provided window).
+        pub mapped_base: usize,
+        pub mapped_len: usize,
+        pub sender_tid: u64,
+        pub opcode: u16,
+        pub payload_len: usize,
+    }
+
+    /// Stage 198E3C1: issue exactly ONE read-only shared-region cap transfer. Builds a `Message` with
+    /// `OPCODE_SHARED_MEM` + the canonical `FLAG_CAP_TRANSFER`, carrying exactly the provisioned
+    /// `mem_cap`. The source cap is PRESERVED (the kernel duplicates it through the transfer
+    /// envelope). Returns the exact kernel `SyscallError` — never translated into success.
+    ///
+    /// # Safety
+    /// `send_ep` must be a valid send cap and `mem_cap` a valid transferable MemoryObject/DmaRegion.
+    pub unsafe fn send_shared_region(
+        send_ep: u32,
+        mem_cap: u32,
+        payload: &[u8],
+    ) -> core::result::Result<(), SyscallError> {
+        if mem_cap == 0 {
+            return Err(SyscallError::InvalidArgs);
+        }
+        let msg = Message::with_header(
+            0,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(mem_cap as u64),
+            payload,
+        )
+        .map_err(|_| SyscallError::InvalidArgs)?;
+        // Exactly one transfer; ipc_send surfaces the canonical kernel error unchanged.
+        unsafe { ipc_send(send_ep, &msg) }
+    }
+
+    /// Stage 198E3C1: recv-v2 shared-region receive with a DEDICATED page-aligned two-page destination
+    /// window. The blocked-waiter DIRECT delivery maps the region READ-ONLY at `map_va` (the producer
+    /// hardcodes `map_write=false`), so no map-intent argument is needed — the child only supplies the
+    /// destination window + a valid metadata buffer. On success the receiver-local cap is decoded from
+    /// `IpcRecvMetaV2.cap_id` (present iff the `TRANSFERRED_CAP` meta flag is set); the two mapped
+    /// pages are then readable at `map_va`. Rejects a malformed (non-aligned / non-two-page) window and
+    /// missing transferred-cap metadata locally.
+    ///
+    /// # Safety
+    /// `map_va..map_va+map_len` must be a currently-unmapped, page-aligned two-page userspace window.
+    pub unsafe fn recv_shared_region_v2(
+        recv_ep: u32,
+        map_va: usize,
+        map_len: usize,
+    ) -> core::result::Result<Option<SharedRegionRecv>, SyscallError> {
+        const PAGE: usize = 4096;
+        if map_va == 0
+            || map_va % PAGE != 0
+            || map_len == 0
+            || map_len % PAGE != 0
+            || map_len != 2 * PAGE
+        {
+            return Err(SyscallError::InvalidArgs);
+        }
+        let mut meta = IpcRecvMetaV2 {
+            status: u64::MAX,
+            opcode: 0,
+            flags: 0,
+            payload_len: 0,
+            cap_id: SYSCALL_NO_TRANSFER_CAP,
+            recv_meta_flags: 0,
+            sender_tid: 0,
+        };
+        // args: [recv_ep, payload_ptr = map_va, payload_len = map_len, meta_ptr, meta_len, unused].
+        let args = [
+            recv_ep as usize,
+            map_va,
+            map_len,
+            (&mut meta as *mut IpcRecvMetaV2) as usize,
+            core::mem::size_of::<IpcRecvMetaV2>(),
+            0,
+        ];
+        // SAFETY: architecture syscall ABI entry; buffers outlive the call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            let err = decode_syscall_error(ret.error);
+            return if matches!(err, SyscallError::WouldBlock) {
+                Ok(None)
+            } else {
+                Err(err)
+            };
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 && meta.status == u64::MAX {
+            let err = decode_syscall_error(ret.ret0);
+            return if matches!(err, SyscallError::WouldBlock) {
+                Ok(None)
+            } else {
+                Err(err)
+            };
+        }
+        let has_cap = (meta.recv_meta_flags as usize & SYSCALL_RECV_META_TRANSFERRED_CAP) != 0
+            && meta.cap_id != SYSCALL_NO_TRANSFER_CAP;
+        if !has_cap {
+            // A shared-region delivery MUST carry the receiver-local cap; malformed metadata otherwise.
+            return Err(SyscallError::InvalidArgs);
+        }
+        Ok(Some(SharedRegionRecv {
+            receiver_cap: meta.cap_id as u32,
+            mapped_base: map_va,
+            mapped_len: map_len,
+            sender_tid: meta.sender_tid,
+            opcode: meta.opcode as u16,
+            payload_len: meta.payload_len as usize,
+        }))
+    }
+
+    /// Stage 198E3C1: release the shared-region mapping via its cleanup token (the receiver-local
+    /// cap). `TransferRelease(cap, base=0, len=0)` lets the kernel resolve the active mapping, unmap
+    /// it (two-phase shootdown), revoke the cap, and remove the mapping. The FIRST release returns
+    /// `Ok(map_len)`; a DUPLICATE release returns `SyscallError::InvalidArgs` (the cap + mapping are
+    /// gone) — the canonical stale/invalid rejection, surfaced verbatim.
+    ///
+    /// # Safety
+    /// `cleanup_cap` must be the receiver-local cap returned by `recv_shared_region_v2`.
+    pub unsafe fn release_shared_region_mapping(
+        cleanup_cap: u32,
+    ) -> core::result::Result<usize, SyscallError> {
+        if cleanup_cap == 0 {
+            return Err(SyscallError::InvalidArgs);
+        }
+        let args = [cleanup_cap as usize, 0, 0, 0, 0, 0];
+        // SAFETY: architecture syscall ABI entry.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_TRANSFER_RELEASE_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        {
+            if ret.error != 0 {
+                return Err(decode_syscall_error(ret.error));
+            }
+            Ok(ret.ret0 as usize)
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        {
+            if ret.ret0 != 0 {
+                return Err(decode_syscall_error(ret.ret0));
+            }
+            Ok(ret.ret1 as usize)
+        }
+    }
+
+    // ── Stage 198E3C1B: canonical two-page oracle map window + startup-slot layout ───────────────
+    // The child's recv-v2 payload pointer is this dedicated, currently-UNMAPPED, page-aligned
+    // two-page window. It sits in the gap between the x86_64 init image and the user stack, clear of
+    // every traced userspace range (image / initrd / stack / oracle .bss buffers).
+
+    /// x86_64 user page size (matches the kernel `PAGE_SIZE`).
+    pub const SHARED_REGION_ORACLE_PAGE_SIZE: usize = 4096;
+    /// The oracle region is exactly two pages (so the live path exercises multi-page mapping).
+    pub const SHARED_REGION_ORACLE_PAGE_COUNT: usize = 2;
+    pub const SHARED_REGION_ORACLE_LEN: usize =
+        SHARED_REGION_ORACLE_PAGE_COUNT * SHARED_REGION_ORACLE_PAGE_SIZE;
+    /// The base VA of the two-page window: 1 GiB. Above the init image (loaded at 0x0040_0000, a few
+    /// MB) and the boot initrd window (~0x0C00_1000, 192 MB); far below the user stack (~0x7ffx_...,
+    /// multi-TB). All oracle `.bss` scratch buffers live inside the init image, well below 1 GiB.
+    pub const SHARED_REGION_ORACLE_VA: usize = 0x4000_0000;
+    pub const SHARED_REGION_ORACLE_END: usize = SHARED_REGION_ORACLE_VA + SHARED_REGION_ORACLE_LEN;
+
+    // ── Traced x86_64 userspace ranges the window must NOT overlap (for the compile-time guards) ──
+    /// init image load base (`USER_LOAD_BASE`, targets/x86_64-yarm-user-none.ld).
+    const ORACLE_TRACE_IMAGE_BASE: usize = 0x0040_0000;
+    /// Generous upper bound on the init image (image is a few MB; 64 MB covers text+rodata+data+bss
+    /// including every oracle scratch buffer).
+    const ORACLE_TRACE_IMAGE_END: usize = 0x0400_0000;
+    /// Boot initrd pointer window (`STARTUP_SLOT_INITRD_PTR` example value 0x0C00_1000) + a margin.
+    const ORACLE_TRACE_INITRD_BASE: usize = 0x0C00_0000;
+    const ORACLE_TRACE_INITRD_END: usize = 0x1000_0000;
+    /// Conservative lower bound of the user stack region (observed stacks live at ~0x7ffx_xxxx_xxxx).
+    const ORACLE_TRACE_STACK_FLOOR: usize = 0x0000_1000_0000_0000;
+    /// x86_64 canonical lower-half user VA ceiling.
+    const ORACLE_TRACE_USER_VA_MAX: usize = 0x0000_8000_0000_0000;
+
+    // Compile-time VA contract: alignment, exactly two pages, no overflow, valid user VA, and no
+    // overlap with any traced range. A violation fails the build.
+    const _: () = {
+        assert!(SHARED_REGION_ORACLE_VA % SHARED_REGION_ORACLE_PAGE_SIZE == 0);
+        assert!(SHARED_REGION_ORACLE_LEN == 2 * SHARED_REGION_ORACLE_PAGE_SIZE);
+        assert!(SHARED_REGION_ORACLE_END > SHARED_REGION_ORACLE_VA); // no overflow
+        assert!(SHARED_REGION_ORACLE_END <= ORACLE_TRACE_USER_VA_MAX); // valid user VA
+        // No overlap with the init image.
+        assert!(
+            SHARED_REGION_ORACLE_VA >= ORACLE_TRACE_IMAGE_END
+                || SHARED_REGION_ORACLE_END <= ORACLE_TRACE_IMAGE_BASE
+        );
+        // No overlap with the initrd window.
+        assert!(
+            SHARED_REGION_ORACLE_VA >= ORACLE_TRACE_INITRD_END
+                || SHARED_REGION_ORACLE_END <= ORACLE_TRACE_INITRD_BASE
+        );
+        // Strictly below the user stack floor.
+        assert!(SHARED_REGION_ORACLE_END <= ORACLE_TRACE_STACK_FLOOR);
+    };
+
+    /// The deterministic byte the oracle source region holds at object offset `off`. Varies with BOTH
+    /// the in-page offset and the page index (`off >> 12`), so page 0 and page 1 hold distinct bytes
+    /// at the same in-page offset — the pattern genuinely spans both pages. Mirrors the kernel's
+    /// `shared_region_oracle_pattern_byte`; the child recomputes it to validate the mapping.
+    pub const fn shared_region_oracle_pattern_byte(off: usize) -> u8 {
+        (off as u8)
+            .wrapping_add((off >> 12) as u8)
+            .wrapping_add(0x5A)
+    }
+
+    // ── Startup-slot layout for the shared-region oracle (reuses the two FREE service-extra slots) ─
+    // Slot 15 is `STARTUP_SLOT_INITRD_PTR` (occupied), so the report's 13/14/15 does NOT fit; only
+    // slots 13 and 14 are free. The oracle therefore uses ONE endpoint cap carrying `SEND | RECEIVE`
+    // (parent sends, forked child receives — they share init's CSpace), needing just two cap slots.
+    /// Shared MemoryObject source cap (init-local, `READ | MAP`).
+    pub const STARTUP_SLOT_SHARED_REGION_MEM_CAP: usize = 13; // == SERVICE_EXTRA_CAP_0
+    /// Endpoint cap carrying `SEND | RECEIVE` for the oracle rendezvous.
+    pub const STARTUP_SLOT_SHARED_REGION_ENDPOINT_CAP: usize = 14; // == SERVICE_EXTRA_CAP_1
+    /// The slot-5 selector value that names this oracle (1 = FutexWake oracle; 2 = shared-region).
+    pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
+
     /// Stage 159BC/D proof-only recv-v2 with a deliberately undersized payload
     /// buffer.
     ///

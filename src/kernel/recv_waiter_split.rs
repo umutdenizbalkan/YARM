@@ -148,7 +148,14 @@ pub fn try_publish_recv_waiter(
     kernel: &mut KernelState,
     plan: PublishWaiterPlan,
 ) -> PublishWaiterOutcome {
-    kernel.try_publish_recv_waiter_audit_only(plan.endpoint_idx, plan.receiver_tid, plan.recv_cap)
+    // Stage 198E3B2B2: publish the COMPLETE generation-bearing identity (tid + captured ASID).
+    let receiver = crate::kernel::boot::ReceiverWaiterIdentity::new(
+        plan.receiver_tid,
+        kernel
+            .task_asid(plan.receiver_tid.0)
+            .unwrap_or(crate::kernel::vm::Asid(0)),
+    );
+    kernel.try_publish_recv_waiter_audit_only(plan.endpoint_idx, receiver, plan.recv_cap)
 }
 
 #[cfg(test)]
@@ -275,10 +282,11 @@ mod tests {
             "live primitive must exist in ipc_state.rs"
         );
         assert!(
-            ipc_src.contains(
-                "self.publish_recv_waiter_live(plan.endpoint_idx, plan.blocked_tid, plan.recv_cap)"
-            ),
-            "recv_block_phase_c_ipc_publish must route the publish through the live primitive"
+            ipc_src.contains("self.publish_recv_waiter_live(")
+                && ipc_src
+                    .contains("ReceiverWaiterIdentity::new(plan.blocked_tid, plan.receiver_asid)"),
+            "recv_block_phase_c_ipc_publish must route the publish through the live primitive with the \
+             complete generation-bearing identity"
         );
         assert!(
             ipc_src.contains("D2_PUBLISH_RACE_UNWIND"),
@@ -591,7 +599,14 @@ mod tests {
         assert_eq!(state.endpoint_waiter_tid(endpoint_obj), None);
 
         // Step 3 (receiver, rank 3): publish observes the non-empty queue.
-        let outcome = state.publish_recv_waiter_live(idx, ThreadId(0), recv_cap);
+        let outcome = state.publish_recv_waiter_live(
+            idx,
+            crate::kernel::boot::ReceiverWaiterIdentity::new(
+                ThreadId(0),
+                crate::kernel::vm::Asid(0),
+            ),
+            recv_cap,
+        );
         assert_eq!(
             outcome,
             PublishWaiterOutcome::QueueNonEmpty,

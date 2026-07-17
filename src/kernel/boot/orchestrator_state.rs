@@ -1514,6 +1514,33 @@ impl KernelState {
             .unwrap_or(0)
     }
 
+    /// Stage 198E3B2A: generation-bearing receiver liveness read under the task lock (rank 2) ONLY.
+    /// Mirrors `KernelState::shared_region_receiver_alive` exactly: the TID must name a TCB that is
+    /// not Exited/Dead AND still holds the captured ASID (a replacement task reusing the numeric TID
+    /// gets a different ASID → rejected). One task-lock acquisition covers both status + ASID; no TCB
+    /// reference escapes the guard.
+    ///
+    /// # Safety
+    /// `state` must be the live `KernelState` storage owned by the calling `SharedKernel`.
+    pub(crate) unsafe fn shared_region_receiver_alive_from_raw(
+        state: *const KernelState,
+        tid: u64,
+        captured_asid: crate::kernel::vm::Asid,
+    ) -> bool {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+        let _guard = lock_ref.lock();
+        let tcbs = kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+        match tcbs.iter().flatten().find(|tcb| tcb.tid.0 == tid) {
+            None => false,
+            Some(tcb) => {
+                if matches!(tcb.status, TaskStatus::Exited(_) | TaskStatus::Dead) {
+                    return false;
+                }
+                tcb.asid == Some(captured_asid)
+            }
+        }
+    }
+
     pub(crate) fn with_scheduler_state<R>(&self, f: impl FnOnce(&SchedulerState) -> R) -> R {
         // Lock-order domain: scheduler
         Self::debug_lock_order_note("scheduler");

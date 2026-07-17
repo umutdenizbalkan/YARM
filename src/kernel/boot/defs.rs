@@ -128,6 +128,25 @@ pub(crate) struct CowPageRecord {
     pub(crate) virt: VirtAddr,
 }
 
+/// Stage 198E3B2B2 — GENERATION-BEARING endpoint receive-waiter identity. The endpoint waiter slot
+/// stores this complete identity (never a bare numeric `ThreadId`) so numeric TID reuse cannot let a
+/// stale finalizer/cleanup claim, clear, or restore a REPLACEMENT task's waiter. The `asid` is the
+/// receiver's captured address-space (its task incarnation discriminator): a replacement task that
+/// reuses the numeric TID always carries a different ASID, so an exact `==` on this struct
+/// distinguishes incarnations. All endpoint-receive-waiter authority (publish / claim / clear /
+/// cleanup / restore) compares the FULL identity — numeric TID alone is never sufficient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceiverWaiterIdentity {
+    pub(crate) tid: ThreadId,
+    pub(crate) asid: Asid,
+}
+
+impl ReceiverWaiterIdentity {
+    pub(crate) fn new(tid: ThreadId, asid: Asid) -> Self {
+        Self { tid, asid }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RobustFutexRecord {
     pub(crate) tid: ThreadId,
@@ -240,7 +259,7 @@ pub(crate) struct IpcSubsystem {
     pub(crate) cross_cpu_work: SmpMailbox,
     pub(crate) live_tlb_shootdown: LiveTlbShootdownState,
     pub(crate) endpoints: [Option<KernelStorage<Endpoint>>; MAX_ENDPOINTS],
-    pub(crate) endpoint_waiters: [Option<ThreadId>; MAX_ENDPOINTS],
+    pub(crate) endpoint_waiters: [Option<ReceiverWaiterIdentity>; MAX_ENDPOINTS],
     pub(crate) endpoint_sender_waiters:
         [[Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
     pub(crate) endpoint_generations: [u64; MAX_ENDPOINTS],
@@ -253,8 +272,32 @@ pub(crate) struct IpcSubsystem {
     pub(crate) active_transfer_mappings: [Option<ActiveTransferMapping>; MAX_TRANSFER_ENVELOPES],
     pub(crate) reply_caps: [Option<ReplyCapRecord>; MAX_REPLY_CAPS],
     pub(crate) reply_cap_generations: [u64; MAX_REPLY_CAPS],
+    /// Stage 198E2A1: bounded generation-bearing cancellation requests for in-flight shared-region
+    /// transactions (executor-owned cleanup protocol). Not a queue/CNode/ABI capacity — an internal
+    /// signal table matched by (receiver TID **and** ASID).
+    pub(crate) shared_region_cancel_requests:
+        [Option<SharedRegionCancelReq>; MAX_SHARED_REGION_CANCEL_REQUESTS],
+    /// Stage 198E2B: FAIL-CLOSED latch. Set when a cancellation request cannot be recorded (the
+    /// table is full and no stale entry can be evicted). While set, every executor checkpoint treats
+    /// cancellation as authoritative, so NO transaction can map further, write back, publish, or wake
+    /// after an unrecordable cancellation — silent cancellation loss is impossible. It is a PERMANENT
+    /// per-kernel-instance safety fuse: it never auto-clears, because the cancellation that overflowed
+    /// was never recorded, so clearing the latch could let that receiver publish (silent loss). Reset
+    /// only with the whole IpcState at kernel init.
+    pub(crate) shared_region_cancel_overflow: bool,
     pub(crate) telemetry: IpcPathTelemetry,
 }
+
+/// Stage 198E2A1: a generation-bearing cancellation request for a shared-region direct transaction.
+/// Matched on BOTH the numeric receiver TID and the captured ASID, so a delayed lifecycle action
+/// for an old TID cannot cancel a replacement process's transaction (different ASID).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SharedRegionCancelReq {
+    pub(crate) tid: u64,
+    pub(crate) asid: crate::kernel::vm::Asid,
+}
+
+pub(crate) const MAX_SHARED_REGION_CANCEL_REQUESTS: usize = 4;
 
 #[cfg(feature = "hosted-dev")]
 pub(crate) type UserMemoryStore = BTreeMap<(u16, u64), u8>;

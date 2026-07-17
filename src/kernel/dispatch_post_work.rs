@@ -85,6 +85,16 @@ pub(crate) enum DispatchPostWork {
     /// by phase separation (disjoint rank-4 then rank-3 critical sections).
     #[cfg_attr(not(test), allow(dead_code))]
     BlockedWaiterReplyCapDelivery(BlockedWaiterReplyCapDeliverySnapshot),
+    /// A shared-region (MemoryObject / DmaRegion) blocked-receiver OR queued-dequeue delivery
+    /// deferred past the broad borrow (Stage 198E3). The executor runs the accepted origin-neutral
+    /// post-lock transaction `shared_region_execute` (fresh receiver-local cap mint, region map,
+    /// user meta copy, final revalidation, single wake, single idempotent rollback). The producer
+    /// already consumed the transfer envelope ONCE and transferred its object pin into the carried
+    /// `RecvBoundarySharedRegionSnapshot` (no reference gap); `origin_direct` on that snapshot
+    /// selects the class (direct vs enqueue) for the retirement/attestation markers only — it never
+    /// changes security, classification, mapping, rollback, lifecycle, or wake semantics.
+    #[cfg_attr(not(test), allow(dead_code))]
+    BlockedWaiterSharedRegionDelivery(BlockedWaiterSharedRegionDeliverySnapshot),
 }
 
 impl DispatchPostWork {
@@ -102,8 +112,25 @@ impl DispatchPostWork {
             Self::BlockedWaiterPlainDelivery(_) => "blocked_waiter_plain",
             Self::BlockedWaiterOrdinaryCapDelivery(_) => "blocked_waiter_ordinary_cap",
             Self::BlockedWaiterReplyCapDelivery(_) => "blocked_waiter_reply_cap",
+            Self::BlockedWaiterSharedRegionDelivery(_) => "blocked_waiter_shared_region",
         }
     }
+}
+
+/// By-value snapshot of a shared-region blocked-receiver / queued-dequeue delivery (Stage 198E3).
+///
+/// Wraps the accepted owned, `Copy` post-lock transaction snapshot
+/// (`RecvBoundarySharedRegionSnapshot` — frozen object identity, attenuated rights, descriptor,
+/// receiver generation-bearing authority, mapping intent, transferred pin ownership, recv-v2 meta
+/// source message, and the `origin_direct` class marker) plus the endpoint index whose
+/// receiver-waiter slot the executor clears after a successful direct delivery. No `&mut
+/// KernelState`, no borrows, no sender-local `CapId` as authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BlockedWaiterSharedRegionDeliverySnapshot {
+    /// The accepted post-lock transaction snapshot (executed by `shared_region_execute`).
+    pub(crate) snapshot: crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
+    /// Endpoint index whose receiver-waiter slot the executor clears in Phase C (direct path).
+    pub(crate) endpoint_idx: usize,
 }
 
 /// By-value snapshot of a plain (no-cap, no-reply) blocked-waiter delivery.
