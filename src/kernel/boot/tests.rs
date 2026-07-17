@@ -69849,6 +69849,234 @@ mod stage198e3c2c_riscv_direct {
     }
 }
 
+// Stage 198E3D-S — SHARED-REGION DIRECT 3/3 COMBINED SEAL + ENQUEUE POLICY FREEZE. Source/parser
+// guards over the combined matrix seal runner, the target-specific VA/release-decoder rules (which
+// must NOT be unified), the 18-not-21 supported-cell accounting, and the shared-region enqueue
+// unsupported policy. No new mechanism; documentation + acceptance policy only.
+mod stage198e3ds_matrix_seal {
+    use super::*;
+    use std::vec::Vec;
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const MATRIX_SRC: &str =
+        include_str!("../../../scripts/qemu-shared-region-direct-matrix-seal.sh");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+
+    // A pure mirror of the aggregate-seal acceptance rule: the matrix passes iff a FRESH per-arch LIVE
+    // seal is present for EACH of exactly {x86_64, aarch64, riscv64}, there is no enqueue/fuse
+    // evidence, and no seal names a wrong architecture. Returns the aggregate `live_cells`, or None on
+    // rejection. `lines` is the captured serialized-run output (per-arch seals + evidence).
+    fn aggregate_live_cells(lines: &[&str]) -> Option<u32> {
+        // Reject any enqueue evidence or fuse trip anywhere in the run.
+        for l in lines {
+            if l.contains("IpcSendSharedRegionEnqueue")
+                || l.contains("class=enqueue")
+                || l.contains("SHARED_REGION_CANCEL_FUSE_SET")
+            {
+                return None;
+            }
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            let want = std::format!(
+                "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch={arch} classes=1 live_cells=1 fuse_trips=0 result=ok"
+            );
+            let hits = lines.iter().filter(|l| **l == want).count();
+            // Missing OR duplicate per-arch seal rejects the run.
+            if hits != 1 {
+                return None;
+            }
+            seen.push(arch);
+        }
+        // A seal naming an unexpected architecture rejects (guards against a wrong-arch marker).
+        for l in lines {
+            if l.starts_with("SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=")
+                && let Some(rest) =
+                    l.strip_prefix("SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=")
+            {
+                let a = rest.split(' ').next().unwrap_or("");
+                if !matches!(a, "x86_64" | "aarch64" | "riscv64") {
+                    return None;
+                }
+            }
+        }
+        Some(seen.len() as u32)
+    }
+
+    fn ok_line(arch: &str) -> String {
+        std::format!(
+            "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch={arch} classes=1 live_cells=1 fuse_trips=0 result=ok"
+        )
+    }
+
+    // (parser) All three current-run seals present → aggregate live_cells = 3.
+    #[test]
+    fn aggregate_requires_all_three_current_run_seals() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let r = ok_line("riscv64");
+        let lines = [x.as_str(), a.as_str(), r.as_str()];
+        assert_eq!(aggregate_live_cells(&lines), Some(3));
+    }
+
+    // (parser) A MISSING architecture seal rejects (fewer than three current-run cells).
+    #[test]
+    fn aggregate_missing_arch_seal_rejected() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let lines = [x.as_str(), a.as_str()]; // riscv64 missing
+        assert_eq!(aggregate_live_cells(&lines), None);
+    }
+
+    // (parser) A DUPLICATE architecture seal rejects (a stale + fresh, or two copies).
+    #[test]
+    fn aggregate_duplicate_arch_seal_rejected() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let r = ok_line("riscv64");
+        let lines = [x.as_str(), a.as_str(), r.as_str(), x.as_str()];
+        assert_eq!(aggregate_live_cells(&lines), None);
+    }
+
+    // (parser) ENQUEUE evidence anywhere in the run rejects the aggregate.
+    #[test]
+    fn aggregate_enqueue_evidence_rejected() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let r = ok_line("riscv64");
+        let bad =
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendSharedRegionEnqueue result=ok";
+        let lines = [x.as_str(), a.as_str(), r.as_str(), bad];
+        assert_eq!(aggregate_live_cells(&lines), None);
+    }
+
+    // (parser) A WRONG-architecture seal marker rejects.
+    #[test]
+    fn aggregate_wrong_arch_marker_rejected() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let r = ok_line("riscv64");
+        let wrong = ok_line("powerpc64");
+        let lines = [x.as_str(), a.as_str(), r.as_str(), wrong.as_str()];
+        assert_eq!(aggregate_live_cells(&lines), None);
+    }
+
+    // (runner) The bash matrix runner encodes the SAME policy: fresh per-arch invocation, requires 3
+    // current-run seals, fuse=0, duplicate_wakes=0, and emits the aggregate only then.
+    #[test]
+    fn matrix_runner_encodes_fresh_and_aggregate_policy() {
+        // It invokes each FRESH per-arch smoke (which rebuild artifacts), not a stale log.
+        assert!(MATRIX_SRC.contains("scripts/qemu-shared-region-direct-x86_64-smoke.sh"));
+        assert!(MATRIX_SRC.contains("scripts/qemu-shared-region-direct-aarch64-smoke.sh"));
+        assert!(MATRIX_SRC.contains("scripts/qemu-shared-region-direct-riscv64-smoke.sh"));
+        // The aggregate is gated on all three fresh seals + zero fuse + zero duplicate wakes.
+        assert!(
+            MATRIX_SRC.contains("seals_ok\" -ne 3") && MATRIX_SRC.contains("fuse_total\" -ne 0")
+        );
+        assert!(MATRIX_SRC.contains("dupwake_total\" -ne 0"));
+        assert!(MATRIX_SRC.contains(
+            "SECOND_COHORT_SHARED_REGION_DIRECT_MATRIX_SEAL arches=3 classes=1 live_cells=3 fuse_trips=0 duplicate_wakes=0 result=ok"
+        ));
+    }
+
+    // (source guard) The target-specific oracle VAs must NOT be unified: x86=1 GiB, aarch64/riscv=512
+    // MiB, and the kernel + userspace constants agree per arch. riscv/aarch64 never reuse the x86 VA.
+    #[test]
+    fn oracle_vas_are_target_specific_not_unified() {
+        // Userspace: aarch64/riscv share 512 MiB; x86 (the else arm) is 1 GiB.
+        assert!(USER_RT_SRC.contains(
+            "#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]\n    pub const SHARED_REGION_ORACLE_VA: usize = 0x2000_0000;"
+        ));
+        assert!(USER_RT_SRC.contains(
+            "#[cfg(not(any(target_arch = \"aarch64\", target_arch = \"riscv64\")))]\n    pub const SHARED_REGION_ORACLE_VA: usize = 0x4000_0000;"
+        ));
+        // Kernel mirrors the same split (the ack gate compares against this exact VA).
+        assert!(MOD_SRC.contains("pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x2000_0000;"));
+        assert!(MOD_SRC.contains("pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x4000_0000;"));
+        // The values are genuinely distinct (a single cross-arch rule would be wrong).
+        const X86: usize = 0x4000_0000;
+        const NONX86: usize = 0x2000_0000;
+        assert_ne!(X86, NONX86);
+        // aarch64/riscv must NOT reuse the x86 1 GiB value (kernel space / heap base respectively).
+        assert_ne!(NONX86, 0x4000_0000);
+    }
+
+    // (source guard) The release decoders must NOT be unified: x86 uses the separate error register;
+    // aarch64/riscv share the page-aligned value-or-error convention. Both branches must remain.
+    #[test]
+    fn release_decoders_are_target_specific_not_unified() {
+        let helper = USER_RT_SRC
+            .split_once("pub unsafe fn release_shared_region_mapping(")
+            .and_then(|(_, r)| r.split_once("\n    }"))
+            .map(|(b, _)| b)
+            .expect("release helper present");
+        // x86 branch: separate error register.
+        assert!(helper.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(helper.contains("ret.error != 0"));
+        // aarch64/riscv branch: page-aligned length discriminator (NOT the x86 rule).
+        assert!(
+            helper.contains("#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]")
+        );
+        assert!(helper.contains("ret.ret0 < PAGE || !ret.ret0.is_multiple_of(PAGE)"));
+    }
+
+    // (accounting) The supported second-cohort IpcSend matrix = 6 classes × 3 arches = 18 cells; the
+    // shared-region ENQUEUE class is NOT among them (counting it would wrongly make 21).
+    #[test]
+    fn supported_cell_count_is_18_not_21() {
+        // The six supported classes each have a production per-arch retirement DONE marker in mod.rs.
+        let supported = [
+            "IpcSendPlain",
+            "IpcSendPlainEnqueue",
+            "IpcSendOrdinaryCap",
+            "IpcSendOrdinaryCapEnqueue",
+            "IpcSendReplyCap",
+            "IpcSendSharedRegionDirect",
+        ];
+        for class in supported {
+            assert!(
+                MOD_SRC.contains(&std::format!("class={class} result=ok")),
+                "supported class must have a retirement DONE marker: {class}"
+            );
+        }
+        let cells = supported.len() * 3;
+        assert_eq!(cells, 18, "6 supported classes × 3 arches = 18 cells");
+        assert_ne!(cells, 21);
+        // The shared-region ENQUEUE class is NOT a supported production class: it has no retirement
+        // DONE marker and is forbidden by the artifact guard in every build.
+        assert!(!MOD_SRC.contains("class=IpcSendSharedRegionEnqueue result=ok"));
+        assert!(GUARD_SRC.contains("\"class=IpcSendSharedRegionEnqueue\""));
+    }
+
+    // (doc) The seal document's matrix + policy match the source: 18-not-21, the 6 supported classes,
+    // enqueue unsupported, and the three target-specific VAs.
+    #[test]
+    fn doc_matrix_matches_source_policy() {
+        assert!(SEAL_DOC.contains("6 classes × 3 arches = 18"));
+        assert!(SEAL_DOC.contains("18, not 21"));
+        assert!(
+            SEAL_DOC.contains("`IpcSendSharedRegionEnqueue`") && SEAL_DOC.contains("NOT supported")
+        );
+        for class in [
+            "IpcSendPlain",
+            "IpcSendPlainEnqueue",
+            "IpcSendOrdinaryCap",
+            "IpcSendOrdinaryCapEnqueue",
+            "IpcSendReplyCap",
+            "IpcSendSharedRegionDirect",
+        ] {
+            assert!(SEAL_DOC.contains(class), "doc matrix must list {class}");
+        }
+        // The three target-specific VAs are documented.
+        assert!(SEAL_DOC.contains("0x4000_0000") && SEAL_DOC.contains("0x2000_0000"));
+        // The aggregate seal string is documented verbatim.
+        assert!(SEAL_DOC.contains(
+            "SECOND_COHORT_SHARED_REGION_DIRECT_MATRIX_SEAL arches=3 classes=1 live_cells=3 fuse_trips=0 duplicate_wakes=0 result=ok"
+        ));
+    }
+}
+
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
 // no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
 // reality the audit relied on, so a future stage cannot silently flip an architecture
