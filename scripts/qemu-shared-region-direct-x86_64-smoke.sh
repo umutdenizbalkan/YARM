@@ -122,8 +122,8 @@ done
 # ── 4b. Userspace completion + exactly one successful send ──
 UDONE="X86_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap=1 readonly=1 first_release=ok second_release=rejected wakes=1 result=ok"
 [[ "$(count "$UDONE")" == "1" ]] || die "userspace completion missing/duplicate: $UDONE"
-send_ok=$(rg -a -c -F "X86_SHARED_REGION_DIRECT_SEND" "$NORM" 2>/dev/null | head -1 || echo 0)
-send_ok_result=$(rg -a -c -F "result=ok" <(rg -a -F "X86_SHARED_REGION_DIRECT_SEND" "$NORM") 2>/dev/null || echo 0)
+# Exactly one SUCCESSFUL send (early WouldBlock retries are allowed but each is result != ok).
+send_ok_result=$(grep -aF "X86_SHARED_REGION_DIRECT_SEND" "$NORM" | grep -aFc "result=ok" || true)
 [[ "$send_ok_result" == "1" ]] || die "expected exactly one successful send (got $send_ok_result)"
 # Continuation count must be exactly one (child validation body ran once).
 if ! rg -a -q "SHARED_REGION_DIRECT_ORACLE_CHILD_DONE .* continuations=1" "$NORM"; then

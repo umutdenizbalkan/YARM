@@ -989,9 +989,6 @@ mod x86_shared_region_direct_oracle {
     pub(super) static CHILD_RESULT: AtomicU32 = AtomicU32::new(0);
     pub(super) static PAGES_OK: AtomicU32 = AtomicU32::new(0);
     pub(super) static RELEASE_OK: AtomicU32 = AtomicU32::new(0);
-    // The sender's source MemoryObject cap (slot 13), so the child can prove its receiver-local cap
-    // is FRESH (nonzero and distinct from the sender's cap).
-    pub(super) static SENDER_MEM_CAP: AtomicU32 = AtomicU32::new(0);
     // Exact count of times the child's post-delivery validation body runs — must be exactly one.
     pub(super) static CONTINUATIONS: AtomicU32 = AtomicU32::new(0);
 
@@ -1071,7 +1068,13 @@ mod x86_shared_region_direct_oracle {
         let started = CHILD_STARTED.as_ptr();
         let _ = yarm_user_rt::syscall::futex_wake(started, 1);
         let endpoint_cap = ENDPOINT_CAP.load(Relaxed);
-        let sender_mem_cap = SENDER_MEM_CAP.load(Relaxed);
+        // Read the sender's source cap straight from the startup slot (shared CSpace) — independent
+        // of any parent-side store ordering — so the "receiver-local cap differs from sender cap"
+        // check compares against the real sender cap.
+        let sender_mem_cap = yarm_user_rt::runtime::startup_arg_slot(
+            yarm_user_rt::syscall::STARTUP_SLOT_SHARED_REGION_MEM_CAP,
+        )
+        .unwrap_or(0) as u32;
         let va = yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA;
         let len = yarm_user_rt::syscall::SHARED_REGION_ORACLE_LEN;
         // SAFETY: `va..va+len` is the dedicated unmapped two-page window (compile-time VA contract).
@@ -1215,7 +1218,6 @@ fn run_x86_shared_region_direct_oracle(init_tid: u64) {
     let sv = oracle::CHILD_STARTED.load(Relaxed);
     let _ = yarm_user_rt::syscall::futex_wait(started, sv, sv);
     yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_PARENT_RESUMED");
-    oracle::SENDER_MEM_CAP.store(mem_cap, Relaxed);
     // BOUNDED authoritative retry (no timed waits, no delay loops). The kernel ack gate dominates:
     // it reaches the DIRECT path only once B is an authoritative committed recv-v2 waiter at the
     // oracle VA. Until then the send returns the canonical retryable `WouldBlock` (fail-closed, no
