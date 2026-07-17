@@ -113,3 +113,30 @@ Marker literals stay arch-parametrized through `SHARED_REGION_ORACLE_ARCH` (one 
 arches); the artifact guard admits the DIRECT retirement literal only for an explicitly-armed
 x86_64 **or** aarch64 oracle build and still forbids it (plus the ENQUEUE class) everywhere else.
 RISC-V remains un-wired; enqueue stays disabled on every arch.
+
+## Stage 198E3C2C — RISC-V direct live cell (third armed arch → 3/3 direct matrix)
+
+The sealed cell was ported to **RISC-V** reusing the SAME arch-neutral kernel transaction, authoritative
+blocked-recv ack, off-lock producer gate, waiter identity, finalization, and portable oracle core — no
+kernel logic or oracle core was duplicated. Activation requires BOTH the build feature
+`riscv-shared-region-direct-oracle` AND the runtime selector `yarm.riscv_shared_region_direct_oracle=1`;
+init startup slot-5 selector is **7** (x86 uses 2, AArch64 6; RISC-V selectors 1–6 already name the
+FutexWake / queue-switch / FutexWait-switch / FutexWait-idle / Yield-two / Yield-lone oracles). A clean
+`-smp 1` QEMU-virt/OpenSBI boot earned the genuine seal
+`SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=riscv64 classes=1 live_cells=1 fuse_trips=0 result=ok`.
+
+Arch-specific facts (neither changes the sealed large-send ABI or the kernel transaction):
+
+| Concern | x86_64 (sealed) | AArch64 | RISC-V |
+| --- | --- | --- | --- |
+| oracle receive-window VA | `0x4000_0000` (1 GiB) | `0x2000_0000` (512 MiB) | `0x2000_0000` (512 MiB) |
+| why | above image/initrd, far below multi-TB stack | user (TTBR0) half ends at `KERNEL_SPACE_BASE = 0x4000_0000`, so 1 GiB is not a user VA | `USER_BRK_DEFAULT_BASE = 0x4000_0000` makes 1 GiB the **heap base**; the window sits in the image↔heap gap, below `KERNEL_SPACE_BASE = 0x8000_0000` |
+| `TransferRelease` (NR 4) decode | separate error register (`RCX`); value in `RAX`/`ret0` | shared: X0 = released length (≥ PAGE, page-aligned) on success, X0 = sub-PAGE error code on failure — page-alignment is the discriminator (mirrors the frozen `decode_release`) | shared with AArch64 — RISC-V's return ABI is identical (a0 = value/error), so the same `#[cfg(any(aarch64, riscv64))]` branch applies unchanged |
+
+The RISC-V trap/scheduling proof observed on the live boot: the sender's `IpcSend` ecall (`scause=0x8`)
+returns to its own userspace continuation (`RISCV_TRAP_RETURN_SRET`, `sepc` advanced exactly once by 4,
+`sstatus` preserved); the blocked receiver switches to another runnable task
+(`RISCV_FUTEX_WAIT_DISPATCH_SRET_ARMED`); and the no-runnable point types
+`RISCV_TYPED_IDLE_OUTCOME reason=BlockedIpcNoRunnable` + `RISCV_BLOCKED_IPC_IDLE_PROVENANCE_OK class=IpcRecv`
+— never `Err(Internal)`. The DIRECT shared-region cell is now LIVE on all three architectures; the queued
+(enqueue) class stays disabled everywhere.

@@ -93,6 +93,14 @@ common_verify_kernel_markers() {
       "arch=x86_64 class=IpcSendSharedRegion"
       "arch=riscv64 class=IpcSendSharedRegion"
     )
+  elif [[ "${YARM_SHARED_REGION_DIRECT_ORACLE_BUILD:-0}" == "1" && "$arch" == "riscv64" ]]; then
+    # Stage 198E3C2C: armed RISC-V oracle build: allow ONLY the arch-tagged riscv64 Direct literal;
+    # still forbid a BARE Direct retirement and any x86/AArch64 shared-region marker (a stale/
+    # cross-arch fingerprint).
+    forbidden+=(
+      "arch=x86_64 class=IpcSendSharedRegion"
+      "arch=aarch64 class=IpcSendSharedRegion"
+    )
   else
     forbidden+=("class=IpcSendSharedRegion")
   fi

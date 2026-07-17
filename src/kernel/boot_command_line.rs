@@ -380,6 +380,18 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             enabled
         );
     }
+    if let Some(enabled) = parsed.riscv_shared_region_direct_oracle {
+        // Stage 198E3C2C: default-off RISC-V DIRECT shared-region (`IpcSendSharedRegionDirect`)
+        // live-oracle knob. Provisions init startup slot 5 (=7) so init runs the SAME arch-neutral
+        // parent/child shared-region delivery proof AND arms the shared IPC/oracle-proof knob so the
+        // direct producer is live. Does NOT enable the queued class, the x86 oracle, or the AArch64
+        // oracle.
+        crate::kernel::boot::set_riscv_shared_region_direct_oracle_enabled(enabled);
+        crate::yarm_log!(
+            "YARM_RISCV_SHARED_REGION_DIRECT_ORACLE_SET enabled={}",
+            enabled
+        );
+    }
     if let Some(enabled) = parsed.force_init_zc_load_fail {
         // Stage 197A: default-off fault-injection knob. Forces the required init ELF load to
         // fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path is exercisable under QEMU.
@@ -680,6 +692,11 @@ pub struct YarmBootOptions<'a> {
     /// AArch64, and arms the shared IPC/oracle-proof knob. Selects the workload + enables exactly one
     /// AArch64 shared-region class; the queued class, x86_64 oracle, and RISC-V stay disabled.
     pub aarch64_shared_region_direct_oracle: Option<bool>,
+    /// Stage 198E3C2C: `yarm.riscv_shared_region_direct_oracle=1` DEFAULT-OFF knob. Provisions init
+    /// startup slot 5 (=7) so init runs the SAME arch-neutral DIRECT shared-region delivery proof on
+    /// RISC-V, and arms the shared IPC/oracle-proof knob. Selects the workload + enables exactly one
+    /// RISC-V shared-region class; the queued class, x86_64 oracle, and AArch64 oracle stay disabled.
+    pub riscv_shared_region_direct_oracle: Option<bool>,
     /// Stage 197A: `yarm.force_init_zc_load_fail=1` DEFAULT-OFF fault-injection knob. Forces the
     /// required init ELF load to fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path is
     /// exercisable under QEMU. NEVER set on a normal boot.
@@ -873,6 +890,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.aarch64_shared_region_direct_oracle" {
             options.aarch64_shared_region_direct_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.riscv_shared_region_direct_oracle" {
+            options.riscv_shared_region_direct_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.force_init_zc_load_fail" {
             options.force_init_zc_load_fail = parse_bool_knob(value);
@@ -1458,6 +1478,33 @@ mod tests {
         let a = parse_yarm_boot_options(b"yarm.aarch64_shared_region_direct_oracle=1");
         assert_eq!(a.x86_64_shared_region_direct_oracle, None);
         assert_eq!(a.riscv64_futex_wake_oracle, None);
+        // Selecting the AArch64 knob never arms the RISC-V shared-region knob.
+        assert_eq!(a.riscv_shared_region_direct_oracle, None);
+    }
+
+    // Stage 198E3C2C: the RISC-V DIRECT shared-region live-oracle knob parses independently and
+    // defaults off, and does not alias the x86_64/AArch64 shared-region knobs or any other arch knob.
+    #[test]
+    fn riscv_shared_region_direct_oracle_knob_parses_and_defaults_off() {
+        assert_eq!(
+            parse_yarm_boot_options(b"").riscv_shared_region_direct_oracle,
+            None
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.riscv_shared_region_direct_oracle=1")
+                .riscv_shared_region_direct_oracle,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.riscv_shared_region_direct_oracle=0")
+                .riscv_shared_region_direct_oracle,
+            Some(false)
+        );
+        // Independent of the x86/AArch64 shared-region knobs and never aliases another arch knob.
+        let r = parse_yarm_boot_options(b"yarm.riscv_shared_region_direct_oracle=1");
+        assert_eq!(r.x86_64_shared_region_direct_oracle, None);
+        assert_eq!(r.aarch64_shared_region_direct_oracle, None);
+        assert_eq!(r.riscv64_futex_wake_oracle, None);
     }
 
     // Stage 196C: the RISC-V FutexWake live-oracle knob parses independently and defaults off.

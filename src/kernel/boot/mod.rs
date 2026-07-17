@@ -1622,7 +1622,8 @@ pub(crate) fn reset_shared_region_cancel_fuse_log() {
     all(
         feature = "aarch64-shared-region-direct-oracle",
         target_arch = "aarch64"
-    )
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
 ))]
 static IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
@@ -1636,7 +1637,8 @@ static IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED: core::sync::atomic::AtomicBo
     all(
         feature = "aarch64-shared-region-direct-oracle",
         target_arch = "aarch64"
-    )
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
 ))]
 pub(crate) fn maybe_log_ipc_send_shared_region_direct_retired() {
     if IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED
@@ -1669,7 +1671,8 @@ pub(crate) fn maybe_log_ipc_send_shared_region_direct_retired() {
     all(
         feature = "aarch64-shared-region-direct-oracle",
         target_arch = "aarch64"
-    )
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
 ))]
 pub(crate) fn maybe_emit_shared_region_direct_live_markers(
     class: &str,
@@ -1717,7 +1720,8 @@ pub(crate) fn maybe_emit_shared_region_direct_live_markers(
     all(
         feature = "aarch64-shared-region-direct-oracle",
         target_arch = "aarch64"
-    )
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
 )))]
 pub(crate) fn maybe_emit_shared_region_direct_live_markers(
     _class: &str,
@@ -3042,11 +3046,33 @@ pub fn aarch64_shared_region_direct_oracle_enabled() -> bool {
     AARCH64_SHARED_REGION_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
-/// Stage 198E3C2B: the shared-region DIRECT oracle is live when EITHER arch's workload selector is
+/// Stage 198E3C2C: default-off RISC-V DIRECT shared-region live-oracle WORKLOAD selector
+/// (`yarm.riscv_shared_region_direct_oracle=1`). Mirror of the x86_64/AArch64 knobs: provisions init
+/// startup slot 5 (=7, the next free RISC-V selector after the six FutexWake/FutexWait/Yield oracles)
+/// so init runs the SAME architecture-neutral parent/child shared-region direct proof, and arms the
+/// shared IPC/oracle-proof knob so the DIRECT producer goes live. INERT on a normal boot; does NOT
+/// enable the queued class, the x86_64 oracle, or the AArch64 oracle.
+pub(crate) static RISCV_SHARED_REGION_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_shared_region_direct_oracle_enabled(enabled: bool) {
+    RISCV_SHARED_REGION_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        set_ipc_recv_oracle_proof_enabled(true);
+    }
+}
+
+pub fn riscv_shared_region_direct_oracle_enabled() -> bool {
+    RISCV_SHARED_REGION_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 198E3C2B/C: the shared-region DIRECT oracle is live when ANY arch's workload selector is
 /// armed. The provisioning, authoritative ack, and direct producer gate all key on this arch-neutral
 /// predicate; the per-arch marker literals are additionally `target_arch`-gated at their emitter.
 pub fn shared_region_direct_oracle_enabled() -> bool {
-    x86_shared_region_direct_oracle_enabled() || aarch64_shared_region_direct_oracle_enabled()
+    x86_shared_region_direct_oracle_enabled()
+        || aarch64_shared_region_direct_oracle_enabled()
+        || riscv_shared_region_direct_oracle_enabled()
 }
 
 // ─── Stage 197A-C: mandatory init ELF loading (no synthetic fallback) ──────────────────
@@ -3280,15 +3306,26 @@ pub fn provision_init_ipc_send_cap_oracle_coord(
 /// exercises multi-page mapping progress).
 pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
 
-/// Stage 198E3C1B-H: the dedicated unmapped two-page oracle receive window VA, mirroring
+/// Stage 198E3C1B-H / 198E3C2C: the dedicated unmapped two-page oracle receive window VA, mirroring
 /// `yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA` EXACTLY (same per-arch value). The authoritative
 /// blocked-recv acknowledgement requires the receiver's `payload_user_ptr` to equal this exact VA (a
-/// wrong-VA recv is rejected), and the transaction maps the two pages here. It MUST be a user VA on
-/// the target: AArch64's user half ends at `KERNEL_SPACE_BASE = 0x4000_0000`, so the AArch64 window is
-/// 512 MiB (1 GiB would fault `PrivilegeViolation`); x86_64/RISC-V use 1 GiB.
-#[cfg(all(feature = "shared-region-direct-oracle", target_arch = "aarch64"))]
+/// wrong-VA recv is rejected), and the transaction maps the two pages here. It MUST be a currently
+/// UNMAPPED user VA on the target, below its kernel boundary and clear of image/initrd/heap/stack:
+/// - AArch64 user half ends at `KERNEL_SPACE_BASE = 0x4000_0000`, so the window is 512 MiB (1 GiB
+///   faults `PrivilegeViolation`);
+/// - RISC-V places the default `brk` at `USER_BRK_DEFAULT_BASE = 0x4000_0000`, so 1 GiB is the HEAP
+///   base there — the window is 512 MiB, in the image↔heap gap and below `KERNEL_SPACE_BASE`
+///   (`0x8000_0000`);
+/// - x86_64 uses 1 GiB (well above the image/initrd, far below the multi-TB user stack).
+#[cfg(all(
+    feature = "shared-region-direct-oracle",
+    any(target_arch = "aarch64", target_arch = "riscv64")
+))]
 pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x2000_0000;
-#[cfg(all(feature = "shared-region-direct-oracle", not(target_arch = "aarch64")))]
+#[cfg(all(
+    feature = "shared-region-direct-oracle",
+    not(any(target_arch = "aarch64", target_arch = "riscv64"))
+))]
 pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x4000_0000;
 
 /// Stage 198E3C1B: the init startup-slot-5 selector value that names the DIRECT shared-region
@@ -3304,7 +3341,14 @@ pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
 #[cfg(feature = "aarch64-shared-region-direct-oracle")]
 pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;
 
-/// Stage 198E3C2B: the architecture tag baked into the shared-region DIRECT live markers. Fixed by
+/// Stage 198E3C2C: the RISC-V init startup-slot-5 selector for the DIRECT shared-region oracle. On
+/// RISC-V slot-5 values 1–6 are already claimed (FutexWake / queue-switch / FutexWait-switch /
+/// FutexWait-idle / Yield-two / Yield-lone oracles), so the shared-region oracle uses the next FREE
+/// value, 7. (x86_64 uses 2, AArch64 uses 6, each free on its own arch.)
+#[cfg(feature = "riscv-shared-region-direct-oracle")]
+pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;
+
+/// Stage 198E3C2B/C: the architecture tag baked into the shared-region DIRECT live markers. Fixed by
 /// `target_arch` (the emitter is compiled only for the armed arch), so the exact `arch=<a>` literal
 /// appears at runtime without duplicating the emitter per arch.
 #[cfg(any(
@@ -3312,10 +3356,13 @@ pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;
     all(
         feature = "aarch64-shared-region-direct-oracle",
         target_arch = "aarch64"
-    )
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
 ))]
 pub(crate) const SHARED_REGION_ORACLE_ARCH: &str = if cfg!(target_arch = "aarch64") {
     "aarch64"
+} else if cfg!(target_arch = "riscv64") {
+    "riscv64"
 } else {
     "x86_64"
 };

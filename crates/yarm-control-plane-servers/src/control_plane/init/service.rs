@@ -1470,6 +1470,122 @@ fn run_aarch64_shared_region_direct_oracle(init_tid: u64) {
     );
 }
 
+// ── Stage 198E3C2C: RISC-V arch wrapper (spawn mechanism + arch-named completion markers) ─────────
+// The ONLY RISC-V-specific pieces: the child stack/TLS statics, the plain `extern "C"` child entry
+// (RISC-V has no x86-style initial-SP call-alignment hazard, so no naked trampoline is needed —
+// matching `riscv_futex_oracle_child` / `yield_oracle_child`), thread spawn, and the two `RISCV_`-
+// prefixed completion markers. Every byte of shared-region recv/validate/release/send logic runs in
+// the SAME arch-neutral `shared_region_oracle_core` used by x86/AArch64 — this wrapper duplicates
+// NONE of it. spawn_thread forwards tls_base → tp; the six syscall args (incl. arg5 = source cap)
+// flow through the RISC-V trap ABI (a0..a5) unchanged.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static mut RISCV_SR_CHILD_STACK: [u8; 16384] = [0u8; 16384];
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static mut RISCV_SR_CHILD_TLS: [u8; 512] = [0u8; 512];
+
+/// RISC-V child body: run the arch-neutral core recv→validate→release, emit the RISC-V completion
+/// marker (the ONLY arch-named child marker), then park. Never returns.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+extern "C" fn riscv_shared_region_direct_oracle_child() -> ! {
+    use shared_region_oracle_core as core_oracle;
+    // SAFETY: freshly-spawned oracle child sharing init's CSpace/address space.
+    let o = unsafe { core_oracle::child_recv_and_validate() };
+    if o.delivered {
+        // Userspace completion marker (contract fields; NX/read-only is KERNEL-attested).
+        if o.all_ok {
+            yarm_user_rt::user_log!(
+                "RISCV_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap=1 readonly=1 first_release=ok second_release=rejected wakes=1 result=ok"
+            );
+        } else {
+            yarm_user_rt::user_log!(
+                "RISCV_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap={} readonly=1 first_release={} second_release={} wakes=1 result=fail",
+                o.fresh_cap as u32,
+                o.first_ok as u32,
+                o.dup_rejected as u32
+            );
+        }
+    }
+    core_oracle::child_park();
+}
+
+/// Parent A (RISC-V wrapper): read the provisioned caps, spawn child B (plain `extern "C"` entry),
+/// run the arch-neutral wait+bounded-send core, emit the RISC-V send marker + the topology marker.
+/// The send's CORRECTNESS is enforced by the KERNEL ack gate (see the core). Emits NO live seal.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn run_riscv_shared_region_direct_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use shared_region_oracle_core as core_oracle;
+    yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_BEGIN init_tid={}", init_tid);
+    let (mem_cap, endpoint_cap) = core_oracle::oracle_caps();
+    if mem_cap == 0 || endpoint_cap == 0 {
+        yarm_user_rt::user_log!(
+            "SHARED_REGION_DIRECT_ORACLE_MISSING_CAPS mem_cap={} endpoint_cap={}",
+            mem_cap,
+            endpoint_cap
+        );
+        return;
+    }
+    core_oracle::ENDPOINT_CAP.store(endpoint_cap, Relaxed);
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(RISCV_SR_CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = riscv_shared_region_direct_oracle_child as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(RISCV_SR_CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("SHARED_REGION_DIRECT_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    core_oracle::CHILD_TID.store(child_tid, Relaxed);
+    yarm_user_rt::user_log!(
+        "SHARED_REGION_DIRECT_ORACLE_CHILD_SPAWNED child_tid={}",
+        child_tid
+    );
+    // SAFETY: the provisioned oracle caps.
+    let send = unsafe { core_oracle::parent_wait_and_send(endpoint_cap, mem_cap) };
+    // RISC-V arch completion marker for the send (the ONLY arch-named parent marker).
+    if send.succeeded {
+        yarm_user_rt::user_log!(
+            "RISCV_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=ok",
+            send.attempts,
+            send.attempts - 1
+        );
+    } else if send.hard_fail {
+        yarm_user_rt::user_log!(
+            "RISCV_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=fail",
+            send.attempts,
+            send.attempts.saturating_sub(1)
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "RISCV_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=exhausted",
+            send.attempts,
+            send.attempts.saturating_sub(1)
+        );
+    }
+    // Hand the CPU to the now-Runnable B so it resumes out of its recv frame and validates.
+    let _ = yarm_user_rt::syscall::yield_now();
+    let child_result = core_oracle::CHILD_RESULT.load(Relaxed);
+    let pages_ok = core_oracle::PAGES_OK.load(Relaxed);
+    let release_ok = core_oracle::RELEASE_OK.load(Relaxed);
+    let continuations = core_oracle::CONTINUATIONS.load(Relaxed);
+    yarm_user_rt::user_log!(
+        "SHARED_REGION_DIRECT_ORACLE_TOPOLOGY_OK init_tid={} child_tid={} send_ok={} pages_ok={} release_ok={} continuations={} child_result={}",
+        init_tid,
+        child_tid,
+        send.succeeded as u32,
+        pages_ok,
+        release_ok,
+        continuations,
+        child_result
+    );
+}
+
 // ─── Stage 196C: RISC-V FutexWake live oracle ────────────────────────────────────────
 // The RISC-V port of the 195C parent/child FutexWake (NR 10) proof. The child blocks through
 // the LEGACY global-lock FutexWait (NR 9, still global-lock-only on RISC-V); the parent (init)
@@ -2534,6 +2650,14 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     if ctx.supervisor_control_recv_ep == Some(6) {
         run_riscv_yield_lone_task_oracle(ctx.task_id);
+    }
+    // Stage 198E3C2C: default-off + feature-gated RISC-V DIRECT shared-region live oracle. Slot-5
+    // selector 7 (mutually exclusive with the FutexWake/FutexWait/Yield selectors 1-6) tells init to
+    // run the parent/child DIRECT blocked-receiver shared-region topology on RISC-V, reusing the SAME
+    // arch-neutral oracle core as x86/AArch64. Requires both the build feature AND the runtime knob.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if ctx.supervisor_control_recv_ep == Some(7) {
+        run_riscv_shared_region_direct_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

@@ -56,6 +56,7 @@ riscv64-timer-irq = []
 shared-region-direct-oracle = []
 x86-shared-region-direct-oracle = ["shared-region-direct-oracle"]
 aarch64-shared-region-direct-oracle = ["shared-region-direct-oracle"]
+riscv-shared-region-direct-oracle = ["shared-region-direct-oracle"]
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }

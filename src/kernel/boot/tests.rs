@@ -69327,27 +69327,34 @@ mod stage198e3c1_direct_live_policy {
         assert!(SERVICE_SRC.contains("core_oracle::oracle_caps()"));
     }
 
-    // Cross-architecture state (Stage 198E3C2B): the DIRECT shared-region cell is now LIVE on x86_64
-    // AND AArch64, but RISC-V remains completely un-wired, and enqueue stays disabled everywhere.
+    // Cross-architecture state (Stage 198E3C2C): the DIRECT shared-region cell is now LIVE on ALL
+    // three arches (x86_64=selector 2, AArch64=6, RISC-V=7), and enqueue stays disabled everywhere.
     #[test]
-    fn cross_arch_shared_region_live_riscv_off_aarch64_wired() {
-        // The x86 selector const is still x86-feature-gated (=2); AArch64 has its own selector (=6).
+    fn cross_arch_shared_region_live_all_three_wired() {
+        // Each arch keeps its own feature-gated slot-5 selector const.
         assert!(MOD_SRC.contains(
             "#[cfg(feature = \"x86-shared-region-direct-oracle\")]\npub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"
         ));
         assert!(MOD_SRC.contains(
             "#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]\npub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;"
         ));
-        // Both arch wrappers exist; there is STILL NO riscv shared-region oracle fn.
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"riscv-shared-region-direct-oracle\")]\npub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"
+        ));
+        // All three arch wrappers exist.
         assert!(SERVICE_SRC.contains("run_x86_shared_region_direct_oracle"));
         assert!(SERVICE_SRC.contains("run_aarch64_shared_region_direct_oracle"));
-        assert!(!SERVICE_SRC.contains("run_riscv_shared_region_direct_oracle"));
-        // The slot-5 shared-region dispatch is target-gated per arch (never RISC-V).
+        assert!(SERVICE_SRC.contains("run_riscv_shared_region_direct_oracle"));
+        // Each slot-5 shared-region dispatch is target-gated per arch.
         for (name, disp) in [
             ("x86_64", "run_x86_shared_region_direct_oracle(ctx.task_id)"),
             (
                 "aarch64",
                 "run_aarch64_shared_region_direct_oracle(ctx.task_id)",
+            ),
+            (
+                "riscv64",
+                "run_riscv_shared_region_direct_oracle(ctx.task_id)",
             ),
         ] {
             let at = SERVICE_SRC
@@ -69360,9 +69367,6 @@ mod stage198e3c1_direct_live_policy {
                 "the {name} shared-region dispatch must be {name}-target-gated"
             );
         }
-        assert!(!SERVICE_SRC.contains(
-            "target_arch = \"riscv64\"\n    if ctx.supervisor_control_recv_ep == Some(6)"
-        ));
         // Enqueue stays disabled: no live enqueue class literal anywhere in the kernel.
         assert!(!MOD_SRC.contains("class=IpcSendSharedRegionEnqueue"));
     }
@@ -69445,11 +69449,15 @@ mod stage198e3c2b_aarch64_direct {
             MOD_SRC.contains("fn set_aarch64_shared_region_direct_oracle_enabled")
                 && MOD_SRC.contains("set_ipc_recv_oracle_proof_enabled(true)")
         );
-        // The shared enabled predicate ORs the two per-arch knobs (so the umbrella logic arms for
-        // EITHER arch), and the AArch64 boot provisioning is compiled ONLY under the AArch64 feature.
-        assert!(MOD_SRC.contains(
-            "x86_shared_region_direct_oracle_enabled() || aarch64_shared_region_direct_oracle_enabled()"
-        ));
+        // The shared enabled predicate ORs every per-arch knob (so the umbrella logic arms for ANY
+        // arch), and the AArch64 boot provisioning is compiled ONLY under the AArch64 feature.
+        let pred = MOD_SRC
+            .split_once("pub fn shared_region_direct_oracle_enabled() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("shared enabled predicate present");
+        assert!(pred.contains("x86_shared_region_direct_oracle_enabled()"));
+        assert!(pred.contains("aarch64_shared_region_direct_oracle_enabled()"));
         assert!(BOOT_SRC.contains("#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]"));
         assert!(BOOT_SRC.contains("aarch64_shared_region_direct_oracle_enabled()"));
     }
@@ -69587,6 +69595,256 @@ mod stage198e3c2b_aarch64_direct {
     fn aarch64_direct_cell_contract_marker() {
         crate::yarm_log!(
             "AARCH64_SHARED_REGION_DIRECT_CELL_CONTRACT selector=6 umbrella_reused=1 oracle_core_reused=1 enqueue=0 riscv=0 result=ok"
+        );
+    }
+}
+
+// Stage 198E3C2C — RISC-V DIRECT SHARED-REGION LIVE CELL POLICY. Source-inspection guards that lock
+// in the RISC-V port's contract: it reuses the SAME arch-neutral kernel transaction/ack/marker core
+// and oracle core (no duplication), requires BOTH the per-arch feature AND the runtime selector to
+// activate, keeps enqueue disabled, uses a target-specific user VA below the RISC-V kernel boundary
+// AND heap base, shares the AArch64 release-decode convention, and never lets the userspace
+// completion stand in for the kernel attestations. Closes the 3/3 direct-live matrix.
+mod stage198e3c2c_riscv_direct {
+    use super::*;
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const RISCV_ARCH_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/arch/riscv64.rs");
+    const SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-shared-region-direct-riscv64-smoke.sh");
+
+    // (1) The RISC-V per-arch feature forwards to the arch-neutral umbrella and is NOT default-on.
+    #[test]
+    fn riscv_feature_forwards_to_umbrella_and_defaults_off() {
+        assert!(CARGO_SRC.contains("shared-region-direct-oracle = []"));
+        assert!(
+            CARGO_SRC
+                .contains("riscv-shared-region-direct-oracle = [\"shared-region-direct-oracle\"]")
+        );
+        assert!(CARGO_SRC.contains("default = [\"hosted-dev\"]"));
+        assert!(MOD_SRC.contains("#[cfg(feature = \"shared-region-direct-oracle\")]"));
+    }
+
+    // (2) BOTH the feature AND the runtime selector are required: the RISC-V cmdline key parses to a
+    // default-off knob, the setter arms the shared oracle-proof knob, the shared enabled predicate ORs
+    // the RISC-V knob, and the boot provisioning caller is feature-gated.
+    #[test]
+    fn riscv_feature_and_selector_both_required() {
+        assert!(CMDLINE_SRC.contains("yarm.riscv_shared_region_direct_oracle"));
+        assert!(
+            CMDLINE_SRC.contains("options.riscv_shared_region_direct_oracle = parse_bool_knob")
+        );
+        assert!(
+            MOD_SRC.contains("fn set_riscv_shared_region_direct_oracle_enabled")
+                && MOD_SRC.contains("set_ipc_recv_oracle_proof_enabled(true)")
+        );
+        let pred = MOD_SRC
+            .split_once("pub fn shared_region_direct_oracle_enabled() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("shared enabled predicate present");
+        assert!(pred.contains("riscv_shared_region_direct_oracle_enabled()"));
+        assert!(BOOT_SRC.contains("#[cfg(feature = \"riscv-shared-region-direct-oracle\")]"));
+        assert!(BOOT_SRC.contains("riscv_shared_region_direct_oracle_enabled()"));
+    }
+
+    // (3) The RISC-V boot provisioning slot contract: selector 7, source cap + endpoint cap in slots
+    // 13/14, mutually exclusive with every slot-13/14 oracle above AND with the six slot-5 oracles
+    // (fail-closed arm-neither), and it reuses the SAME arch-neutral `provision_init_shared_region_oracle`.
+    #[test]
+    fn riscv_boot_provisioning_slot_contract() {
+        assert!(BOOT_SRC.contains("crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR"));
+        assert!(BOOT_SRC.contains(
+            "crate::kernel::boot::provision_init_shared_region_oracle(kernel, RING3_INIT_SERVER_TID)"
+        ));
+        assert!(
+            BOOT_SRC.contains("if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0")
+        );
+        assert!(BOOT_SRC.contains("RISCV_ORACLE_SLOT5_CONFLICT"));
+        assert!(BOOT_SRC.contains("result=arm_neither"));
+        // The six slot-5 oracles never overwrite a selector the shared-region oracle set.
+        assert!(BOOT_SRC.contains(
+            "if init_args[5] == 0 && crate::kernel::boot::riscv_yield_lone_task_oracle_enabled()"
+        ));
+    }
+
+    // (4) The RISC-V selector value = 7, distinct from x86's 2, AArch64's 6, and the six RISC-V slot-5
+    // oracles (1-6); the userspace and kernel selector constants agree.
+    #[test]
+    fn riscv_selector_is_seven_distinct_from_others() {
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"riscv-shared-region-direct-oracle\")]\npub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"
+        ));
+        assert!(USER_RT_SRC.contains("pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"));
+        assert!(USER_RT_SRC.contains("pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"));
+    }
+
+    // (5) The RISC-V userspace wrapper delegates ENTIRELY to the arch-neutral oracle core — it
+    // duplicates NO recv/validate/release/send/retry logic (only spawn + arch-named markers).
+    #[test]
+    fn riscv_wrapper_delegates_no_duplicated_impl() {
+        assert!(SERVICE_SRC.contains("fn run_riscv_shared_region_direct_oracle"));
+        assert!(SERVICE_SRC.contains("core_oracle::parent_wait_and_send(endpoint_cap, mem_cap)"));
+        assert!(SERVICE_SRC.contains("riscv_shared_region_direct_oracle_child"));
+        let start = SERVICE_SRC
+            .find("fn riscv_shared_region_direct_oracle_child")
+            .expect("riscv child fn");
+        let end = SERVICE_SRC[start..]
+            .find("// ─── Stage 196C")
+            .map(|o| start + o)
+            .expect("end of riscv wrapper");
+        let span = &SERVICE_SRC[start..end];
+        assert!(
+            !span.contains("recv_shared_region_v2("),
+            "the riscv wrapper must NOT re-implement the recv (delegates to the core)"
+        );
+        assert!(
+            !span.contains("release_shared_region_mapping("),
+            "the riscv wrapper must NOT re-implement the release (delegates to the core)"
+        );
+        assert!(
+            !span.contains("MAX_SEND_ATTEMPTS"),
+            "the riscv wrapper must NOT re-implement the bounded send retry (delegates to the core)"
+        );
+        assert!(span.contains("core_oracle::child_recv_and_validate()"));
+        assert!(span.contains("core_oracle::oracle_caps()"));
+    }
+
+    // (6) The kernel attestations are the authoritative proof: the smoke requires all FIVE kernel
+    // markers each exactly once PLUS the single off-lock post-work publication, independently of the
+    // userspace DONE line, and fails closed on the RISC-V Err(Internal) idle regression.
+    #[test]
+    fn riscv_userspace_cannot_substitute_for_kernel_attestations() {
+        for m in [
+            "IPCSEND_SHARED_REGION_OBJECT_OK arch=riscv64 class=direct",
+            "IPCSEND_SHARED_REGION_MAP_OK arch=riscv64 class=direct",
+            "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch=riscv64 class=direct",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendSharedRegionDirect",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendSharedRegionDirect result=ok",
+        ] {
+            assert!(
+                SMOKE_SRC.contains(m),
+                "smoke must require kernel marker: {m}"
+            );
+        }
+        assert!(
+            SMOKE_SRC
+                .contains("DISPATCH_POST_WORK_DONE kind=blocked_waiter_shared_region result=ok")
+        );
+        assert!(SMOKE_SRC.contains("RISCV_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE"));
+        // The smoke fails closed on the RISC-V typed-outcome regression (Err(Internal) idle path).
+        assert!(SMOKE_SRC.contains("RISCV_TRAP_HANDLE_FAILED"));
+    }
+
+    // (7) The artifact guard exception is build-specific: it permits the DIRECT literal ONLY for the
+    // explicitly armed RISC-V oracle build, still forbids the bare/off-arch shared-region marker, and
+    // forbids the ENQUEUE class in every build.
+    #[test]
+    fn riscv_artifact_guard_exception_is_build_specific() {
+        assert!(GUARD_SRC.contains(
+            "YARM_SHARED_REGION_DIRECT_ORACLE_BUILD:-0}\" == \"1\" && \"$arch\" == \"riscv64\""
+        ));
+        assert!(GUARD_SRC.contains("arch=x86_64 class=IpcSendSharedRegion"));
+        assert!(GUARD_SRC.contains("arch=aarch64 class=IpcSendSharedRegion"));
+        assert!(GUARD_SRC.contains("forbidden+=(\"class=IpcSendSharedRegion\")"));
+        assert!(GUARD_SRC.contains("class=IpcSendSharedRegionEnqueue"));
+    }
+
+    // (8) The RISC-V marker path reuses the arch-parametrized emitter (riscv64 admitted to the gate +
+    // the ARCH tag), with no hardcoded per-arch literal.
+    #[test]
+    fn riscv_markers_reuse_parametrized_emitter() {
+        assert!(MOD_SRC.contains("arch={} class=IpcSendSharedRegionDirect"));
+        // The emitter gate admits the riscv feature ONLY on riscv64.
+        assert!(MOD_SRC.contains("feature = \"riscv-shared-region-direct-oracle\""));
+        assert!(MOD_SRC.contains("cfg!(target_arch = \"riscv64\")"));
+        // No hardcoded riscv64 shared-region literal (must be parametrized).
+        assert!(!MOD_SRC.contains("arch=riscv64 class=IpcSendSharedRegionDirect"));
+    }
+
+    // (9) The RISC-V oracle VA is target-specific: 512 MiB, page-aligned, two pages, below the RISC-V
+    // kernel boundary (0x8000_0000) AND the default `brk` heap base (0x4000_0000), and the kernel +
+    // userspace constants AGREE. It is NOT the x86 1 GiB value (which is the RISC-V heap base).
+    #[test]
+    fn riscv_oracle_va_below_kernel_and_heap() {
+        // Kernel + userspace both select 0x2000_0000 on riscv64 (the `any(aarch64, riscv64)` arm).
+        assert!(MOD_SRC.contains(
+            "any(target_arch = \"aarch64\", target_arch = \"riscv64\")\n))]\npub const SHARED_REGION_ORACLE_USER_VA: usize = 0x2000_0000;"
+        ) || MOD_SRC.contains("SHARED_REGION_ORACLE_USER_VA: usize = 0x2000_0000;"));
+        assert!(USER_RT_SRC.contains(
+            "#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]\n    pub const SHARED_REGION_ORACLE_VA: usize = 0x2000_0000;"
+        ));
+        // The chosen VA + two pages must be below both the RISC-V heap base and kernel boundary.
+        const RISCV_VA: usize = 0x2000_0000;
+        const RISCV_BRK_BASE: usize = 0x4000_0000; // USER_BRK_DEFAULT_BASE
+        const RISCV_KERNEL_BASE: usize = 0x8000_0000;
+        const LEN: usize = 2 * 4096;
+        assert_eq!(RISCV_VA % 4096, 0, "page aligned");
+        assert!(
+            RISCV_VA + LEN <= RISCV_BRK_BASE,
+            "below the RISC-V heap base"
+        );
+        assert!(
+            RISCV_VA + LEN <= RISCV_KERNEL_BASE,
+            "below the RISC-V kernel boundary"
+        );
+        // It is emphatically NOT the x86 1 GiB VA (== the RISC-V heap base — would collide).
+        assert_ne!(RISCV_VA, 0x4000_0000);
+    }
+
+    // (10) The RISC-V TransferRelease decode shares the AArch64 convention (page-aligned length is the
+    // success discriminator; a sub-PAGE value is the error code) — bounded behind the common helper,
+    // NOT the x86 separate-error-register path.
+    #[test]
+    fn riscv_release_decode_shares_aarch64_convention() {
+        let helper = USER_RT_SRC
+            .split_once("pub unsafe fn release_shared_region_mapping(")
+            .and_then(|(_, r)| r.split_once("\n    }"))
+            .map(|(b, _)| b)
+            .expect("release helper present");
+        // The aarch64/riscv branch uses the page-aligned discriminator; the x86 branch uses ret.error.
+        assert!(
+            helper.contains("#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]")
+        );
+        assert!(helper.contains("ret.ret0 < PAGE || !ret.ret0.is_multiple_of(PAGE)"));
+        assert!(helper.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(helper.contains("ret.error != 0"));
+    }
+
+    // (11) The RISC-V raw_syscall forwards all SIX argument registers (a0..a5), including arg5 (the
+    // source capability), plus a7 = NR — no truncation/reorder through the trap wrapper.
+    #[test]
+    fn riscv_raw_syscall_forwards_six_args_incl_source_cap() {
+        assert!(
+            RISCV_ARCH_SRC.contains("fn raw_syscall(")
+                && RISCV_ARCH_SRC.contains("args: [usize; 6]")
+        );
+        // a0..a5 all bound from args, a7 = NR.
+        for reg in ["a0", "a1", "a2", "a3", "a4", "a5"] {
+            assert!(
+                RISCV_ARCH_SRC.contains(&format!("let {reg} = args["))
+                    || RISCV_ARCH_SRC.contains(&format!("let mut {reg} = args[")),
+                "riscv raw_syscall must forward {reg}"
+            );
+        }
+        assert!(RISCV_ARCH_SRC.contains("in(\"a5\") a5"));
+        assert!(RISCV_ARCH_SRC.contains("in(\"a7\") a7"));
+    }
+
+    // (12) Required hosted contract marker for the RISC-V cell — closes the 3/3 direct-live matrix
+    // (NOT a live retirement marker; the live seal is earned ONLY from a clean QEMU boot log).
+    #[test]
+    fn riscv_direct_cell_contract_marker() {
+        crate::yarm_log!(
+            "RISCV_SHARED_REGION_DIRECT_CELL_CONTRACT selector=7 umbrella_reused=1 oracle_core_reused=1 va=0x20000000 enqueue=0 direct_matrix=3of3 result=ok"
         );
     }
 }

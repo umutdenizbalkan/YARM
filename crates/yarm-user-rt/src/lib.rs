@@ -691,16 +691,20 @@ pub mod syscall {
     pub const SHARED_REGION_ORACLE_LEN: usize =
         SHARED_REGION_ORACLE_PAGE_COUNT * SHARED_REGION_ORACLE_PAGE_SIZE;
     /// The base VA of the two-page window. It MUST land in the target's user address space, in the gap
-    /// between the init image + initrd window (below) and the user stack (above). x86_64 (and RISC-V,
-    /// unused) use 1 GiB — above the init image (0x0040_0000, a few MB) and the boot initrd window
-    /// (~0x0C00_1000), far below the user stack. AArch64's user address space is only the low
-    /// `TTBR0_EL1` half below `KERNEL_SPACE_BASE = 0x4000_0000` (1 GiB), so 1 GiB is NOT a user VA
-    /// there (a map at it faults `PrivilegeViolation`); the AArch64 window sits at 512 MiB, still above
-    /// the image/initrd and below the AArch64 user stack (observed just under 1 GiB). All oracle `.bss`
-    /// scratch buffers live inside the init image, well below either window.
-    #[cfg(target_arch = "aarch64")]
+    /// between the init image + initrd window (below) and the user heap/stack (above):
+    /// - x86_64 uses 1 GiB — above the init image (0x0040_0000, a few MB) and the boot initrd window
+    ///   (~0x0C00_1000), far below the multi-TB user stack.
+    /// - AArch64's user address space is only the low `TTBR0_EL1` half below
+    ///   `KERNEL_SPACE_BASE = 0x4000_0000` (1 GiB), so 1 GiB is NOT a user VA there (a map at it faults
+    ///   `PrivilegeViolation`); the window sits at 512 MiB, above the image/initrd and below the user
+    ///   stack (observed just under 1 GiB).
+    /// - RISC-V places the default `brk` at `USER_BRK_DEFAULT_BASE = 0x4000_0000`, so 1 GiB is the HEAP
+    ///   base there; the window sits at 512 MiB, in the image↔heap gap and below `KERNEL_SPACE_BASE`
+    ///   (`0x8000_0000`).
+    /// All oracle `.bss` scratch buffers live inside the init image, well below any window.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     pub const SHARED_REGION_ORACLE_VA: usize = 0x2000_0000;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     pub const SHARED_REGION_ORACLE_VA: usize = 0x4000_0000;
     pub const SHARED_REGION_ORACLE_END: usize = SHARED_REGION_ORACLE_VA + SHARED_REGION_ORACLE_LEN;
 
@@ -713,17 +717,23 @@ pub mod syscall {
     /// Boot initrd pointer window (`STARTUP_SLOT_INITRD_PTR` example value 0x0C00_1000) + a margin.
     const ORACLE_TRACE_INITRD_BASE: usize = 0x0C00_0000;
     const ORACLE_TRACE_INITRD_END: usize = 0x1000_0000;
-    /// Conservative lower bound of the user stack region. On x86_64 stacks live at ~0x7ffx_xxxx_xxxx;
-    /// on AArch64 the user stack sits just below the 1 GiB `KERNEL_SPACE_BASE` (observed ~0x3fbc_0000),
-    /// so a 768 MiB floor stays strictly below it while the 512 MiB oracle window stays below the floor.
+    /// Conservative lower bound of the user heap/stack region the window stays below. x86_64 stacks
+    /// live at ~0x7ffx_xxxx_xxxx; AArch64 stacks sit just below the 1 GiB `KERNEL_SPACE_BASE` (observed
+    /// ~0x3fbc_0000, so a 768 MiB floor is strictly below); RISC-V places the default `brk` HEAP base
+    /// at 1 GiB (`0x4000_0000`), so the floor is that base — the 512 MiB window stays strictly below.
     #[cfg(target_arch = "aarch64")]
     const ORACLE_TRACE_STACK_FLOOR: usize = 0x3000_0000;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "riscv64")]
+    const ORACLE_TRACE_STACK_FLOOR: usize = 0x4000_0000;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     const ORACLE_TRACE_STACK_FLOOR: usize = 0x0000_1000_0000_0000;
-    /// User VA ceiling: x86_64 canonical lower-half; AArch64 `TTBR0` user half = `KERNEL_SPACE_BASE`.
+    /// User VA ceiling: x86_64 canonical lower-half; AArch64 `TTBR0` user half = `KERNEL_SPACE_BASE`
+    /// (0x4000_0000); RISC-V `KERNEL_SPACE_BASE` = 0x8000_0000.
     #[cfg(target_arch = "aarch64")]
     const ORACLE_TRACE_USER_VA_MAX: usize = 0x4000_0000;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "riscv64")]
+    const ORACLE_TRACE_USER_VA_MAX: usize = 0x8000_0000;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     const ORACLE_TRACE_USER_VA_MAX: usize = 0x0000_8000_0000_0000;
 
     // Compile-time VA contract: alignment, exactly two pages, no overflow, valid user VA, and no
@@ -772,6 +782,11 @@ pub mod syscall {
     /// AArch64 shared-region oracle takes selector 6. The workload body is identical (it reuses the
     /// arch-neutral oracle core); only the boot-side selector differs from x86's `2`.
     pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;
+    /// The RISC-V slot-5 selector for the SAME direct shared-region oracle. Slots 1-6 name the RISC-V
+    /// FutexWake / queue-switch / FutexWait-switch / FutexWait-idle / Yield-two / Yield-lone oracles,
+    /// so the RISC-V shared-region oracle takes selector 7. The workload body is identical (it reuses
+    /// the arch-neutral oracle core); only the boot-side selector differs from x86's `2` / AArch64's `6`.
+    pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;
 
     /// Stage 159BC/D proof-only recv-v2 with a deliberately undersized payload
     /// buffer.
