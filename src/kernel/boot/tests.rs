@@ -76266,3 +76266,381 @@ mod stage199a2b2c_offlock_seams {
         assert!(SEAL_DOC.contains("total_live_cells=30"));
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B2D — composed off-lock NR6 direct request transaction (end-to-end).
+mod stage199a2b2d_direct_request_txn {
+    use super::*;
+    use crate::kernel::ipccall_direct::{AckLease, BlockedServerAck, IpcCallDirectSnapshot};
+    use crate::kernel::ipccall_direct_txn::IpcCallDirectError;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const SERVER_PAYLOAD_VA: usize = 0x4000;
+    const SERVER_META_VA: usize = 0x4080;
+
+    fn id(tid: u64, asid: Asid) -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), asid)
+    }
+
+    /// Build a SharedKernel with task2 (server) committed-blocked on a recv-v2 of the
+    /// request endpoint, and task1 (caller) holding a request SEND cap + reply-endpoint
+    /// RECEIVE cap. Returns everything needed to drive `ipc_call_direct_request_txn`.
+    struct Fixture {
+        k: SharedKernel,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        server: crate::kernel::boot::ReceiverWaiterIdentity,
+        server_aspace_asid: Asid,
+        send_cap_t1: CapId,
+        reply_recv_cap_t1: CapId,
+        endpoint_index: usize,
+        endpoint_generation: u64,
+    }
+
+    fn blocked_server_fixture() -> Fixture {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (caller, server, send_cap_t1, reply_recv_cap_t1) = k.with(|state| {
+            state.register_task(1).expect("task1");
+            state.register_task(2).expect("task2");
+            let (asid1, _aspace1) = state.create_user_address_space().expect("asid1");
+            let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("bind1");
+            state.bind_task_asid(2, asid2).expect("bind2");
+            // Server request/meta destination page.
+            state
+                .map_user_page(
+                    aspace2,
+                    VirtAddr(SERVER_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xB000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map server buffers");
+            let (_req_eid, req_send_global, req_recv_global) =
+                state.create_endpoint(4).expect("req ep");
+            let send_cap_t1 = state
+                .grant_capability_task_to_task(0, req_send_global, 1)
+                .expect("dup req send to caller");
+            let req_recv_t2 = state
+                .grant_capability_task_to_task(0, req_recv_global, 2)
+                .expect("dup req recv to server");
+            let (_reply_eid, _reply_send, reply_recv_global) =
+                state.create_endpoint(4).expect("reply ep");
+            let reply_recv_cap_t1 = state
+                .grant_capability_task_to_task(0, reply_recv_global, 1)
+                .expect("dup reply recv to caller");
+            // Dispatch the server and block it on a recv-v2 of the request endpoint.
+            state.enqueue_current_cpu(2).expect("enqueue2");
+            state.dispatch_next_task().expect("dispatch");
+            while state.current_tid() != Some(2) {
+                state.yield_current().expect("switch to server");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    req_recv_t2.0 as usize,
+                    SERVER_PAYLOAD_VA,
+                    8,
+                    SERVER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(state.task_status(2), Some(TaskStatus::Blocked(_))),
+                "server must be blocked on recv-v2"
+            );
+            (asid1, asid2, send_cap_t1, reply_recv_cap_t1)
+        });
+        // Recover the request endpoint index+generation from the caller's SEND cap.
+        let endpoint = k
+            .resolve_endpoint_send_cap_split_read(1, send_cap_t1)
+            .expect("resolve send endpoint");
+        let (eidx, egen) = match endpoint {
+            crate::kernel::capabilities::CapObject::Endpoint { index, generation } => {
+                (index, generation)
+            }
+            _ => panic!("send cap is not an endpoint"),
+        };
+        Fixture {
+            k,
+            caller: id(1, caller),
+            server: id(2, server),
+            server_aspace_asid: server,
+            send_cap_t1,
+            reply_recv_cap_t1,
+            endpoint_index: eidx,
+            endpoint_generation: egen,
+        }
+    }
+
+    fn snapshot_for(fx: &Fixture, payload: &[u8]) -> IpcCallDirectSnapshot {
+        IpcCallDirectSnapshot::build(fx.caller, fx.send_cap_t1, fx.reply_recv_cap_t1, payload)
+            .expect("snapshot")
+    }
+
+    fn ack_for(fx: &Fixture) -> BlockedServerAck {
+        BlockedServerAck {
+            server: fx.server,
+            endpoint_index: fx.endpoint_index,
+            endpoint_generation: fx.endpoint_generation,
+            recv_v2_committed: true,
+            payload_user_ptr: SERVER_PAYLOAD_VA,
+            payload_user_len: 8,
+            meta_user_ptr: SERVER_META_VA,
+            meta_user_len: 40,
+        }
+    }
+
+    fn claimed_lease(seq: u64) -> AckLease {
+        let mut l = AckLease::new_available();
+        l.claim(seq).expect("claim");
+        l
+    }
+
+    #[test]
+    fn happy_path_delivers_once_and_wakes_server_once() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(7);
+
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 7)
+                .expect("composed transaction succeeds");
+
+        // Request payload delivered exactly once to the server's destination.
+        let delivered =
+            fx.k.with(|s| s.read_user_memory_for_asid(fx.server_aspace_asid, SERVER_PAYLOAD_VA, 8))
+                .expect("read server payload");
+        assert_eq!(&delivered[..8], b"request!");
+
+        // One server-local reply cap, resolving to the reserved reply object.
+        let resolved =
+            fx.k.with(|s| s.resolve_capability_for_task(2, out.server_reply_cap).ok());
+        assert!(
+            matches!(
+                resolved.map(|c| c.object),
+                Some(crate::kernel::capabilities::CapObject::Reply { index, generation })
+                    if index == out.record_index && generation == out.record_generation
+            ),
+            "exactly one server-local Reply cap minted"
+        );
+
+        // Record is Available (invokable) before dispatch, and the server is Runnable
+        // + enqueued (woke exactly once — it dispatches).
+        fx.k.with(|s| {
+            assert!(
+                s.direct_reply_record_is_invokable(out.record_index, out.record_generation),
+                "record Available before dispatch"
+            );
+            assert_eq!(s.task_status(2), Some(TaskStatus::Runnable));
+            s.dispatch_next_task().expect("dispatch");
+            assert_eq!(s.current_tid(), Some(2), "server woke and dispatches");
+        });
+
+        // Acknowledgement lease + reservation consumed exactly once.
+        assert!(lease.is_consumed(), "ack consumed once");
+    }
+
+    fn live_reply_records(k: &SharedKernel) -> usize {
+        k.with(|s| {
+            (0..crate::kernel::boot::MAX_REPLY_CAPS)
+                .filter(|i| s.reply_cap_record_present(*i))
+                .count()
+        })
+    }
+
+    fn assert_server_still_blocked_no_leak(k: &SharedKernel) {
+        assert!(
+            matches!(k.with(|s| s.task_status(2)), Some(TaskStatus::Blocked(_))),
+            "server remains blocked after a failed delivery"
+        );
+        assert_eq!(
+            live_reply_records(k),
+            0,
+            "a rolled-back transaction leaks no reply record"
+        );
+    }
+
+    // (no ack) A non-committed acknowledgement returns canonical WouldBlock with no
+    // mutation and no queued fallback; the lease is restored (retryable).
+    #[test]
+    fn no_ack_returns_wouldblock_no_mutation() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let mut ack = ack_for(&fx);
+        ack.recv_v2_committed = false;
+        let mut lease = claimed_lease(1);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 1),
+            Err(IpcCallDirectError::WouldBlock)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(lease.is_available(), "retryable: ack restored");
+    }
+
+    // (caller replacement) The caller's incarnation changed → CallerGone; no mutation.
+    #[test]
+    fn caller_replacement_rejected() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        // Replace task1's incarnation (new ASID) — the snapshot's caller ASID is stale.
+        fx.k.with(|s| {
+            s.unbind_task_asid(1).expect("unbind caller");
+        });
+        let mut lease = claimed_lease(2);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 2),
+            Err(IpcCallDirectError::CallerGone)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(lease.is_available());
+    }
+
+    // (server replacement) The acknowledged server incarnation no longer matches →
+    // WouldBlock (no exact committed server); no mutation.
+    #[test]
+    fn server_replacement_rejected() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        fx.k.with(|s| {
+            s.unbind_task_asid(2).expect("unbind server");
+        });
+        let mut lease = claimed_lease(3);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 3),
+            Err(IpcCallDirectError::WouldBlock)
+        );
+        assert_eq!(live_reply_records(&fx.k), 0);
+        assert!(lease.is_available());
+    }
+
+    // (endpoint generation change) A stale endpoint generation is rejected; no mutation.
+    #[test]
+    fn endpoint_generation_change_rejected() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let mut ack = ack_for(&fx);
+        ack.endpoint_generation = fx.endpoint_generation.wrapping_add(1);
+        let mut lease = claimed_lease(4);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 4),
+            Err(IpcCallDirectError::EndpointGenerationChanged)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(lease.is_available());
+    }
+
+    // (payload copy fault) An unmapped payload destination faults AFTER reservation +
+    // mint; the transaction rolls back every provisional artifact, leaves the server
+    // blocked, wakes nobody, and restores the (retryable) lease.
+    #[test]
+    fn payload_copy_fault_rolls_back() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let mut ack = ack_for(&fx);
+        ack.payload_user_ptr = 0x9_0000; // unmapped
+        let mut lease = claimed_lease(5);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 5),
+            Err(IpcCallDirectError::PayloadCopyFault)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(lease.is_available());
+    }
+
+    // (metadata copy fault) Payload copy succeeds, the metadata destination faults →
+    // rollback; server stays blocked with no usable reply authority, zero wake.
+    #[test]
+    fn metadata_copy_fault_rolls_back() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let mut ack = ack_for(&fx);
+        ack.meta_user_ptr = 0x9_0000; // unmapped, distinct page from the payload
+        let mut lease = claimed_lease(6);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 6),
+            Err(IpcCallDirectError::MetaCopyFault)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(lease.is_available());
+    }
+
+    // (duplicate drain) A second delivery attempt after success finds the server no
+    // longer blocked → WouldBlock; it cannot redeliver or double-wake.
+    #[test]
+    fn duplicate_drain_cannot_redeliver() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(8);
+        fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 8)
+            .expect("first delivery");
+        // A fresh work item retrying the same ack: the server is Runnable, not blocked.
+        let mut lease2 = claimed_lease(9);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease2, 9),
+            Err(IpcCallDirectError::WouldBlock),
+            "no redelivery once the server is no longer blocked"
+        );
+        // Exactly one live reply record (the first, committed) — no duplicate.
+        assert_eq!(live_reply_records(&fx.k), 1);
+    }
+
+    // (lease held) A work item whose lease is not ClaimedByWork cannot proceed.
+    #[test]
+    fn unclaimed_lease_cannot_proceed() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = AckLease::new_available(); // never claimed
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 1),
+            Err(IpcCallDirectError::LeaseNotClaimed)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+    }
+
+    // (dispatch requires enqueue) Immediately after a successful transaction the server
+    // is Runnable but has NOT executed (it is enqueued, not dispatched) — a server can
+    // never run merely because its task became Runnable.
+    #[test]
+    fn server_does_not_run_before_enqueue_dispatch() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(11);
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 11)
+                .expect("delivery");
+        fx.k.with(|s| {
+            // Record Available (committed) but the server has not dispatched yet.
+            assert!(s.direct_reply_record_is_invokable(out.record_index, out.record_generation));
+            assert_ne!(
+                s.current_tid(),
+                Some(2),
+                "server not yet running (enqueue != dispatch)"
+            );
+        });
+    }
+
+    // The reply authority remains a single store; ABI + Stage 198F preserved.
+    #[test]
+    fn single_authority_and_invariants_preserved() {
+        const DEFS_SRC: &str = include_str!("defs.rs");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+}

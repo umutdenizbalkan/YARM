@@ -3625,6 +3625,42 @@ impl SharedKernel {
         })
     }
 
+    /// Stage 199A2B2D: off-lock SEND-endpoint cap resolution (task rank-2 pid read →
+    /// capability rank-4 resolve), sibling of `resolve_endpoint_recv_cap_split_read`.
+    /// Returns the resolved `CapObject::Endpoint` (index+generation) the caller's
+    /// `cap` names, requiring the `SEND` right. No broad lock, no IPC lock.
+    pub(crate) fn resolve_endpoint_send_cap_split_read(
+        &self,
+        requester_tid: u64,
+        cap: CapId,
+    ) -> Result<CapObject, KernelError> {
+        let state = self.state.data_ptr();
+        let requester_pid =
+            unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
+                .ok_or(KernelError::InvalidCapability)?;
+        let (endpoint, _rights) = unsafe {
+            KernelState::resolve_endpoint_send_cap_in_pid_from_raw(
+                state as *const _,
+                requester_pid,
+                cap,
+            )
+        }?;
+        Ok(endpoint)
+    }
+
+    /// Stage 199A2B2D: off-lock resolution of the `CNodeId` for the process that owns
+    /// `tid` (task rank-2 pid read → capability rank-4 cnode lookup). Used to target
+    /// the provisional server-local reply-cap mint. `None` if the task or its cnode is
+    /// absent.
+    pub(crate) fn process_cnode_for_tid_split_read(
+        &self,
+        tid: u64,
+    ) -> Option<crate::kernel::capabilities::CNodeId> {
+        let state = self.state.data_ptr();
+        let pid = unsafe { KernelState::process_id_from_raw(state as *const _, tid) }?;
+        unsafe { KernelState::process_cnode_for_pid_from_raw(state as *const _, pid) }
+    }
+
     /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
     ///
     /// # Validation status

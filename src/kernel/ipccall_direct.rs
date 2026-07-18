@@ -312,6 +312,96 @@ impl BlockedServerAck {
     }
 }
 
+/// Outcome of an [`AckLease`] transition. Every error is a fail-closed rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckLeaseError {
+    /// `claim` attempted while not `Available` — a duplicate work item cannot claim
+    /// the same acknowledgement twice.
+    NotAvailable,
+    /// `consume`/`restore` attempted while not `ClaimedByWork`, or with the wrong
+    /// `commit_seq` (a stale/aliased holder).
+    NotClaimed,
+}
+
+/// Owned lease governing a single [`BlockedServerAck`] through one direct request
+/// transaction (Stage 199A2B2D, Part 2): `Available → ClaimedByWork → Consumed`.
+///
+/// * The recv-v2 commit point publishes the ack `Available`.
+/// * Post-work publication `claim`s it (`Available → ClaimedByWork`), tagging the
+///   monotonic `commit_seq` of the publication. A duplicate work item that tries to
+///   claim again fails `NotAvailable` — no double-claim, no double-delivery.
+/// * A successful transaction `consume`s it (`ClaimedByWork → Consumed`, one-shot).
+/// * A **retryable** pre-enqueue rollback (the exact server is still blocked)
+///   `restore`s it (`ClaimedByWork → Available`) so the caller can retry with no
+///   wake and no lost acknowledgement.
+/// * A stale/replaced/exited server `discard`s it (`→ Consumed`, terminal — never
+///   restored, since the acknowledged incarnation no longer exists).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckLease {
+    Available,
+    ClaimedByWork { commit_seq: u64 },
+    Consumed,
+}
+
+impl AckLease {
+    pub(crate) const fn new_available() -> Self {
+        Self::Available
+    }
+
+    pub(crate) const fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+    pub(crate) const fn is_claimed(&self) -> bool {
+        matches!(self, Self::ClaimedByWork { .. })
+    }
+    pub(crate) const fn is_consumed(&self) -> bool {
+        matches!(self, Self::Consumed)
+    }
+
+    /// `Available → ClaimedByWork` at post-work publication. Fails `NotAvailable` on a
+    /// duplicate/aliased claim (already `ClaimedByWork` or `Consumed`).
+    pub(crate) fn claim(&mut self, commit_seq: u64) -> Result<(), AckLeaseError> {
+        match self {
+            Self::Available => {
+                *self = Self::ClaimedByWork { commit_seq };
+                Ok(())
+            }
+            _ => Err(AckLeaseError::NotAvailable),
+        }
+    }
+
+    /// `ClaimedByWork → Consumed` on transaction success (one-shot). Requires the
+    /// exact `commit_seq` of the claim.
+    pub(crate) fn consume(&mut self, commit_seq: u64) -> Result<(), AckLeaseError> {
+        match self {
+            Self::ClaimedByWork { commit_seq: s } if *s == commit_seq => {
+                *self = Self::Consumed;
+                Ok(())
+            }
+            _ => Err(AckLeaseError::NotClaimed),
+        }
+    }
+
+    /// `ClaimedByWork → Available` on a retryable rollback (server still blocked).
+    /// The acknowledgement is not lost and no wake occurred. Requires the exact
+    /// `commit_seq`.
+    pub(crate) fn restore(&mut self, commit_seq: u64) -> Result<(), AckLeaseError> {
+        match self {
+            Self::ClaimedByWork { commit_seq: s } if *s == commit_seq => {
+                *self = Self::Available;
+                Ok(())
+            }
+            _ => Err(AckLeaseError::NotClaimed),
+        }
+    }
+
+    /// `→ Consumed` (terminal) for a stale/replaced/exited server: the acknowledged
+    /// incarnation no longer exists, so the ack is discarded, never restored.
+    pub(crate) fn discard(&mut self) {
+        *self = Self::Consumed;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +564,47 @@ mod tests {
             ..ack
         };
         assert!(!no_dest.is_committed());
+    }
+
+    // ── Acknowledgement lease ──────────────────────────────────────────────────
+
+    #[test]
+    fn ack_lease_claim_consume_one_shot() {
+        let mut l = AckLease::new_available();
+        assert!(l.is_available());
+        l.claim(5).expect("claim from Available");
+        assert!(l.is_claimed());
+        // A duplicate work item cannot claim the already-claimed lease.
+        assert_eq!(l.claim(6), Err(AckLeaseError::NotAvailable));
+        l.consume(5).expect("consume with matching seq");
+        assert!(l.is_consumed());
+        // A second consume fails (one-shot); a claim from Consumed fails.
+        assert_eq!(l.consume(5), Err(AckLeaseError::NotClaimed));
+        assert_eq!(l.claim(7), Err(AckLeaseError::NotAvailable));
+    }
+
+    #[test]
+    fn ack_lease_restore_is_retryable_and_seq_checked() {
+        let mut l = AckLease::new_available();
+        l.claim(3).expect("claim");
+        // Wrong seq cannot consume/restore.
+        assert_eq!(l.consume(4), Err(AckLeaseError::NotClaimed));
+        assert_eq!(l.restore(4), Err(AckLeaseError::NotClaimed));
+        assert!(l.is_claimed());
+        // Correct seq restores → Available (retryable, no loss).
+        l.restore(3).expect("restore");
+        assert!(l.is_available());
+    }
+
+    #[test]
+    fn ack_lease_discard_is_terminal() {
+        let mut l = AckLease::new_available();
+        l.claim(1).expect("claim");
+        l.discard();
+        assert!(
+            l.is_consumed(),
+            "a discarded (stale/exited) ack is terminal"
+        );
+        assert_eq!(l.claim(2), Err(AckLeaseError::NotAvailable));
     }
 }
