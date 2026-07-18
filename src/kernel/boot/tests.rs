@@ -76105,3 +76105,164 @@ mod stage199a2b2_request_substrate {
         assert!(SEAL_DOC.contains("total_live_cells=30"));
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B2C — off-lock reply-record reservation seams (composition step).
+//
+// LANDED: the `_split` (no broad `&mut KernelState`) reservation seams the composed
+// off-lock NR6 direct request transaction calls — reserve / bind / commit / cancel —
+// operating the SINGLE reply_caps slot via the rank-3 with_ipc_split_mut seam ONLY.
+// Proven at parity with the KernelState primitives + the invocation gate.
+//
+// NOT LANDED (remaining transaction body + STAGE_199_IPCCALL_DIRECT_REQUEST_
+// TRANSACTION_SEAL result=ok): the full composed transaction (cap-resolution
+// split-reads → require-ack → mint → off-lock copy_slice_to_user → claim/commit/
+// enqueue → commit, with the 12-case rollback), the x86 trap-entry snapshot publish,
+// and the recv-v2 ack publication point. Precise seam-level plan in
+// doc/STAGE_199A2B2C_OFFLOCK_SEAMS.md. No live NR6 split arm; behavior unchanged.
+mod stage199a2b2c_offlock_seams {
+    use super::*;
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+
+    fn ident(tid: u64, asid: u16) -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+    fn ep(index: usize, generation: u64) -> crate::kernel::capabilities::CapObject {
+        crate::kernel::capabilities::CapObject::Endpoint { index, generation }
+    }
+
+    // Off-lock reserve installs Reserved (not invokable) + binds identities; off-lock
+    // commit makes it Available (invokable) — parity with the KernelState primitives.
+    #[test]
+    fn offlock_reserve_then_commit_gates_invocation() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (idx, rgen) = k
+            .reserve_direct_reply_record_split(ident(1, 11), ident(2, 22), ep(3, 7))
+            .expect("reserve off-lock");
+        k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(idx),
+                Some(ReplyRecordReservation::Reserved)
+            );
+            assert!(
+                !s.direct_reply_record_is_invokable(idx, rgen),
+                "a Reserved record is not externally invokable"
+            );
+            let (c, r, e) = s.direct_reply_record_identities(idx).expect("present");
+            assert_eq!(c, ident(1, 11));
+            assert_eq!(r, ident(2, 22));
+            assert_eq!(e, ep(3, 7));
+        });
+        assert!(k.commit_direct_reply_record_split(idx, rgen));
+        k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(idx),
+                Some(ReplyRecordReservation::Available)
+            );
+            assert!(s.direct_reply_record_is_invokable(idx, rgen));
+        });
+    }
+
+    // Off-lock cancel reclaims the reserved slot to Vacant.
+    #[test]
+    fn offlock_cancel_reclaims_slot() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (idx, rgen) = k
+            .reserve_direct_reply_record_split(ident(1, 11), ident(2, 22), ep(3, 7))
+            .expect("reserve");
+        k.with(|s| assert!(s.reply_cap_record_present(idx)));
+        assert!(k.cancel_direct_reply_record_split(idx, rgen));
+        k.with(|s| {
+            assert!(!s.reply_cap_record_present(idx));
+            assert!(!s.direct_reply_record_is_invokable(idx, rgen));
+        });
+        // No-op false on a vacant slot.
+        assert!(!k.commit_direct_reply_record_split(idx, rgen));
+        assert!(!k.cancel_direct_reply_record_split(idx, rgen));
+    }
+
+    // Off-lock server-cap bind is accepted only into a Reserved record; after commit
+    // (Available) a re-bind fails.
+    #[test]
+    fn offlock_bind_only_into_reserved() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (idx, rgen) = k
+            .reserve_direct_reply_record_split(ident(1, 11), ident(2, 22), ep(3, 7))
+            .expect("reserve");
+        assert!(k.bind_direct_reply_record_server_cap_split(idx, rgen, CapId(99)));
+        k.with(|s| assert_eq!(s.reply_cap_record_waiter_cap(idx), Some(CapId(99))));
+        assert!(k.commit_direct_reply_record_split(idx, rgen));
+        assert!(!k.bind_direct_reply_record_server_cap_split(idx, rgen, CapId(100)));
+    }
+
+    // Off-lock commit/cancel/bind require the exact record generation.
+    #[test]
+    fn offlock_seams_require_exact_generation() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (idx, rgen) = k
+            .reserve_direct_reply_record_split(ident(1, 11), ident(2, 22), ep(3, 7))
+            .expect("reserve");
+        assert!(!k.commit_direct_reply_record_split(idx, rgen.wrapping_add(1)));
+        assert!(!k.cancel_direct_reply_record_split(idx, rgen.wrapping_add(1)));
+        assert!(!k.bind_direct_reply_record_server_cap_split(idx, rgen.wrapping_add(1), CapId(1)));
+        k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(idx),
+                Some(ReplyRecordReservation::Reserved)
+            )
+        });
+        assert!(k.commit_direct_reply_record_split(idx, rgen));
+    }
+
+    // Source: the reservation seams take no broad &mut KernelState — they operate the
+    // single reply_caps slot via with_ipc_split_mut. There is no second record store.
+    #[test]
+    fn source_seams_are_offlock_single_store() {
+        for seam in [
+            "fn reserve_direct_reply_record_split",
+            "fn commit_direct_reply_record_split",
+            "fn cancel_direct_reply_record_split",
+            "fn bind_direct_reply_record_server_cap_split",
+        ] {
+            assert!(RUNTIME_SRC.contains(seam), "missing seam: {seam}");
+        }
+        // The seam cluster uses the rank-3 split seam, not with / with_cpu.
+        let start = RUNTIME_SRC
+            .find("fn reserve_direct_reply_record_split")
+            .expect("cluster start");
+        let end = start
+            + RUNTIME_SRC[start..]
+                .find("fn sr_revoke_split")
+                .unwrap_or(RUNTIME_SRC.len() - start)
+                .min(6000);
+        let cluster = &RUNTIME_SRC[start..(start + 6000).min(RUNTIME_SRC.len())];
+        let _ = end;
+        assert!(cluster.contains("with_ipc_split_mut"));
+        assert!(
+            !cluster.contains("with_cpu(") && !cluster.contains("&mut KernelState"),
+            "off-lock reservation seams must not take the broad lock"
+        );
+    }
+
+    // No live NR6 direct split arm; ABI + reply-cap policy + Stage 198F preserved.
+    #[test]
+    fn no_live_arm_and_invariants_preserved() {
+        assert!(
+            !SPLIT_SRC.contains("IpcCallDirectRequest")
+                && !SPLIT_SRC.contains("try_split_ipc_call"),
+            "no live NR6 direct split-dispatch arm this increment"
+        );
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+}

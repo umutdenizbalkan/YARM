@@ -2765,6 +2765,115 @@ impl SharedKernel {
         self.rollback_minted_cap_split(cnode, cap, object);
     }
 
+    // ── Stage 199A2B2C: off-lock reply-record reservation seams (rank 3) ──────────
+    //
+    // These are the `_split` (no broad `&mut KernelState`) counterparts of the
+    // KernelState reservation primitives (`reserve_direct_reply_record`, …). They
+    // operate the SINGLE `reply_caps` slot via the rank-3 `with_ipc_split_mut` seam
+    // ONLY — the exact seam the composed off-lock NR6 direct request transaction uses
+    // so its record reserve / bind / commit / cancel never take the broad lock. There
+    // is no second reply-record table and no second authoritative generation.
+
+    /// rank 3 — reserve one vacant `reply_caps` slot `Reserved` (NOT invokable),
+    /// binding both `{tid,asid}` identities + the reply endpoint (index+generation in
+    /// `CapObject::Endpoint`). Returns the slot `(index, generation)` — the sole
+    /// record authority — or `CapabilityFull`.
+    pub(crate) fn reserve_direct_reply_record_split(
+        &self,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+        reply_endpoint: CapObject,
+    ) -> Result<(usize, u64), KernelError> {
+        use crate::kernel::boot::{ReplyCapRecord, ReplyRecordReservation};
+        self.with_ipc_split_mut(|ipc| {
+            for idx in 0..crate::kernel::boot::MAX_REPLY_CAPS {
+                if ipc.reply_caps[idx].is_none() {
+                    let mut generation = ipc.reply_cap_generations[idx].wrapping_add(1);
+                    if generation == 0 {
+                        generation = 1;
+                    }
+                    ipc.reply_cap_generations[idx] = generation;
+                    ipc.reply_caps[idx] = Some(ReplyCapRecord {
+                        reservation: ReplyRecordReservation::Reserved,
+                        caller_tid: caller.tid,
+                        caller_asid: caller.asid,
+                        reply_endpoint,
+                        responder_tid: Some(replier.tid),
+                        replier_asid: Some(replier.asid),
+                        caller_cap_id: CapId(0),
+                        waiter_cap_id: None,
+                    });
+                    return Ok((idx, generation));
+                }
+            }
+            Err(KernelError::CapabilityFull)
+        })
+    }
+
+    /// rank 3 — bind the provisional server-local reply CapId into a `Reserved` record
+    /// (its `waiter_cap_id`). `false` on slot/generation mismatch or non-`Reserved`.
+    pub(crate) fn bind_direct_reply_record_server_cap_split(
+        &self,
+        index: usize,
+        generation: u64,
+        server_cap: CapId,
+    ) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Reserved =>
+            {
+                record.waiter_cap_id = Some(server_cap);
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — commit a `Reserved` record → `Available` (externally invokable). This
+    /// is INFALLIBLE for an exact live reservation (it only flips the state field) and
+    /// runs strictly BEFORE the rank-1 server enqueue, so the server is never enqueued
+    /// while the record is `Reserved`. `false` only on slot/generation mismatch or a
+    /// non-`Reserved` state (never for our own exact reservation).
+    pub(crate) fn commit_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Reserved =>
+            {
+                record.reservation = ReplyRecordReservation::Available;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — cancel a `Reserved` record (rollback): `Reserved → Cancelled → Vacant`
+    /// as a single atomic ipc-state mutation, reclaiming the reserved authority so a
+    /// partially-built record can never resolve. `false` on mismatch.
+    pub(crate) fn cancel_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| {
+            let matches = matches!(
+                ipc.reply_caps.get(index),
+                Some(Some(record))
+                    if ipc.reply_cap_generations[index] == generation
+                        && record.reservation == ReplyRecordReservation::Reserved
+            );
+            if matches {
+                if let Some(Some(record)) = ipc.reply_caps.get_mut(index) {
+                    record.reservation = ReplyRecordReservation::Cancelled;
+                }
+                ipc.reply_caps[index] = None;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     /// rank 5: map EXACTLY one user page and return the owned follow-up needed for rank-6 accounting
     /// (and exact rollback). NX/rights/alignment are enforced by the caller (the runner); this seam
     /// additionally asserts alignment + NX and never lets a page-table reference escape the guard.
