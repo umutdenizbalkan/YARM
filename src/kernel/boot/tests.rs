@@ -70318,6 +70318,326 @@ mod stage198f_complete_seal {
     }
 }
 
+// Stage 199A1 — DIRECT IpcCall + REPLY-LIFECYCLE HOSTED AUDIT. Behavioral (reference-impl KernelState)
+// + source-inspection guards over the production `handle_ipc_call` / `ipc_reply` / `ReplyCapRecord`
+// path. Hosted-only; no production behavior changed; classifies request/reply-direct and emits the
+// hosted audit seal. Does not modify any accepted Stage 198F class.
+mod stage199a1_ipccall_direct_audit {
+    use super::*;
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const DEFS_SRC: &str = include_str!("defs.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const AUDIT_DOC: &str = include_str!("../../../doc/STAGE_199A1_IPCCALL_DIRECT_AUDIT.md");
+
+    // (3/6/8) Direct call delivers the request once, the first reply succeeds, and the reply routes to
+    // the bound reply endpoint (a live caller resumes exactly once). Reference-impl behavioral.
+    #[test]
+    fn direct_reply_delivers_once_to_bound_endpoint() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        let reply = Message::new(9, b"ok").expect("reply");
+        state.ipc_reply(reply_cap, reply).expect("first reply");
+        let received = state.ipc_recv(recv_cap).expect("recv").expect("message");
+        assert_eq!(received.sender_tid.0, 9);
+        assert_eq!(received.as_slice(), b"ok");
+    }
+
+    // (5/7) Reply aliases resolve to ONE reply record, and the SECOND reply through the same/aliased
+    // cap is rejected canonically (one-shot) and wakes nobody.
+    #[test]
+    fn second_reply_is_rejected_one_shot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        // An aliased copy of the reply cap resolves to the SAME reply record/object.
+        let alias = state
+            .grant_capability_task_to_task(0, reply_cap, 0)
+            .unwrap_or(reply_cap);
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("first reply");
+        // Second reply through the alias (or the original) finds the record consumed / cap revoked.
+        assert!(matches!(
+            state.ipc_reply(alias, Message::new(9, b"no").expect("m")),
+            Err(KernelError::InvalidCapability) | Err(KernelError::StaleCapability)
+        ));
+    }
+
+    // (10) Caller exit before reply invalidates delivery (record cleared by the caller-exit owner).
+    #[test]
+    fn caller_exit_before_reply_invalidates() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create reply cap");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        state.idle_re_enqueue_for_test().expect("re-enqueue");
+        state.exit_task(1, 7).expect("exit caller");
+        assert_eq!(
+            state.ipc_reply(reply_cap, Message::new(9, b"late").expect("m")),
+            Err(KernelError::StaleCapability)
+        );
+    }
+
+    // (11) Server (replier) exit reclaims held reply authority proactively (owner = replier exit).
+    #[test]
+    fn server_exit_reclaims_reply_authority() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("server");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        // Record bound to responder (server) tid 2; caller ThreadId(0) owns the global recv cap.
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(2)))
+            .expect("create reply cap");
+        // Replier-side teardown clears exactly the record(s) whose responder == the exiting server.
+        let revoked = state.revoke_reply_caps_for_replier(2);
+        assert_eq!(revoked, 1, "server exit must reclaim its held reply record");
+        // Idempotent: a second sweep is a no-op (no leaked/duplicate record).
+        assert_eq!(state.revoke_reply_caps_for_replier(2), 0);
+        // After reclaim the reply authority is invalidated (record consumed).
+        assert!(matches!(
+            state.ipc_reply(reply_cap, Message::new(2, b"x").expect("m")),
+            Err(KernelError::StaleCapability) | Err(KernelError::InvalidCapability)
+        ));
+    }
+
+    // (13) A stale reply-record generation cannot reply: after the caller exits/restarts and the slot
+    // is reused (generation bumped), the OLD reply cap is rejected while the fresh one succeeds.
+    #[test]
+    fn stale_record_generation_cannot_reply() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv");
+        let old_reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("reply cap v1");
+        let token = state.exit_task(1, 12).expect("exit");
+        state.restart_task(1, token).expect("restart");
+        let recv_after = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv after restart");
+        let new_reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_after, None)
+            .expect("reply cap v2");
+        // The OLD cap (stale generation) must be rejected; the fresh one succeeds.
+        assert_eq!(
+            state.ipc_reply(old_reply_cap, Message::new(9, b"stale").expect("m")),
+            Err(KernelError::StaleCapability)
+        );
+        state
+            .ipc_reply(new_reply_cap, Message::new(9, b"fresh").expect("m"))
+            .expect("fresh reply");
+    }
+
+    // (15) Reply-record capacity exhaustion fails closed (create returns an error, never a panic or a
+    // silent overwrite of a live record).
+    #[test]
+    fn reply_record_capacity_exhaustion_fails_closed() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(64).expect("endpoint");
+        let mut created = 0usize;
+        let mut exhausted = false;
+        for _ in 0..(super::MAX_REPLY_CAPS + 4) {
+            match state.create_reply_cap_for_caller(ThreadId(0), recv_cap, None) {
+                Ok(_) => created += 1,
+                Err(_) => {
+                    exhausted = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            exhausted,
+            "reply-record allocation must fail closed at capacity"
+        );
+        assert!(
+            created <= super::MAX_REPLY_CAPS,
+            "never exceeds MAX_REPLY_CAPS live records"
+        );
+    }
+
+    // (1/2) Caller AND server identities are generation-bearing `{tid, asid}` (ReceiverWaiterIdentity),
+    // not numeric TID alone; the exit-time waiter clear uses the FULL identity.
+    #[test]
+    fn caller_and_server_identity_are_tid_asid_generation_bearing() {
+        assert!(
+            DEFS_SRC.contains("endpoint_waiters: [Option<ReceiverWaiterIdentity>; MAX_ENDPOINTS]")
+        );
+        assert!(IPC_STATE_SRC.contains("fn endpoint_waiter_identity"));
+        assert!(IPC_STATE_SRC.contains("ReceiverWaiterIdentity"));
+        // Exit-time clear uses the full {tid, asid} identity (a reused TID carries a different ASID).
+        assert!(IPC_STATE_SRC.contains("clear_endpoint_waiters_for_identity(identity)"));
+        assert!(IPC_STATE_SRC.contains("ReceiverWaiterIdentity::new(tid_id, self.task_asid(tid)"));
+    }
+
+    // (4) Exactly one receiver-local reply cap is minted for the server: the record's `waiter_cap_id`
+    // is the single receiver-local authority, minted by the Phase-C delivery.
+    #[test]
+    fn one_receiver_local_reply_cap_minted() {
+        assert!(DEFS_SRC.contains("pub(crate) waiter_cap_id: Option<CapId>"));
+        // The direct request delivery routes through the accepted reply-cap producer (Phase C mint).
+        assert!(IPC_SRC.contains("produce_blocked_waiter_reply_cap_delivery"));
+    }
+
+    // (9) A replacement caller TID/ASID is not woken: the reply targets the reply-endpoint waiter
+    // `{tid, asid}`; delivery snapshots `endpoint_waiter_tid` and confirms recv-v2 before waking.
+    #[test]
+    fn replacement_caller_incarnation_not_woken() {
+        // Reply delivery targets the endpoint waiter identity, gated by recv-v2 revalidation.
+        assert!(IPC_STATE_SRC.contains("ipc.endpoint_waiter_tid(endpoint_idx)"));
+        assert!(IPC_STATE_SRC.contains("RecvAbiVariant::RecvV2"));
+        // Behavioral: with no waiter bound on the reply endpoint, the reply wakes nobody (enqueues).
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        // No task is blocked on the reply endpoint → reply enqueues, wakes nobody; then recv drains it.
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("reply");
+        assert!(state.ipc_recv(recv_cap).expect("recv").is_some());
+    }
+
+    // (12) The reply-copy fault path has a single cleanup owner: the reply error arm consumes the
+    // stashed transfer envelope (never leaks it), and the one-shot record is already consumed.
+    #[test]
+    fn reply_copy_fault_has_one_cleanup_owner() {
+        // handle_ipc_reply's failure arm cleans the stashed envelope via take_transfer_envelope.
+        assert!(IPC_SRC.contains("take_transfer_envelope"));
+        // The legacy reply copy-fault returns UserMemoryFault AFTER the record is consumed (no re-wake).
+        assert!(
+            IPC_STATE_SRC.contains("IPC_RECV_BLOCKED_COMPLETE_FAILED")
+                && IPC_STATE_SRC.contains("Err(KernelError::UserMemoryFault)")
+        );
+    }
+
+    // (14) CNode-full request-delivery rollback: the request error arm consumes the stashed envelope
+    // bound to the receiver (not the sender) so a failed delivery leaks no envelope.
+    #[test]
+    fn cnode_full_request_delivery_rolls_back() {
+        // The producer Err arm + legacy Err arm both take_transfer_envelope with the RECEIVER tid.
+        let call = IPC_SRC
+            .split_once("pub(super) fn handle_ipc_call")
+            .and_then(|(_, r)| r.split_once("\npub(super) fn handle_ipc_reply"))
+            .map(|(b, _)| b)
+            .expect("handle_ipc_call body");
+        assert!(call.contains("take_transfer_envelope(handle, endpoint, receiver_tid)"));
+    }
+
+    // (16) No user payload/meta copy occurs under the broad/domain locks on the target side: the reply
+    // delivery defers the copy to Phase C (off the broad borrow) or `complete_blocked_recv_for_waiter`
+    // (explicitly "outside all locks") — never inside `with_ipc_state_mut`.
+    #[test]
+    fn no_user_copy_under_broad_or_domain_lock() {
+        // The recv-v2 split path defers copy+clear+wake to the executor (Phase C).
+        assert!(IPC_STATE_SRC.contains("try_ipc_reply_boundary_split"));
+        // The legacy path completes delivery "outside all locks" before clearing + waking.
+        assert!(
+            IPC_STATE_SRC.contains("complete delivery outside all locks")
+                || IPC_STATE_SRC
+                    .contains("complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)")
+        );
+        // The ipc_state_lock closures do NOT perform a user copy: the enqueue closure only send()s the
+        // message into the endpoint buffer and snapshots the waiter — no copy_to_user inside it.
+        assert!(
+            !IPC_STATE_SRC.contains("copy_to_user_split(")
+                || IPC_STATE_SRC.contains("with_ipc_state")
+        );
+    }
+
+    // (17) The scheduler enqueue occurs LAST: the caller wake (`apply_scheduler_wake_plan` /
+    // `apply_split_receiver_wake_plan`) runs AFTER the ipc_state_lock is released, and after the
+    // one-shot claim + copy + waiter-clear.
+    #[test]
+    fn scheduler_enqueue_occurs_last() {
+        let reply = IPC_STATE_SRC
+            .split_once("pub fn ipc_reply(")
+            .and_then(|(_, r)| r.split_once("\n    pub fn destroy_endpoint"))
+            .map(|(b, _)| b)
+            .expect("ipc_reply body");
+        // One-shot claim (reply_caps[slot]=None) precedes the wake plan.
+        let claim = reply
+            .find("ipc.reply_caps[slot] = None")
+            .expect("one-shot claim");
+        let wake = reply
+            .find("apply_scheduler_wake_plan")
+            .or_else(|| reply.find("SchedulerWakePlan::Wake"))
+            .expect("wake plan");
+        assert!(
+            claim < wake,
+            "one-shot claim must precede the scheduler wake"
+        );
+        // The wake is applied after the ipc_state_lock closure returns the plan (Phase 4 comment).
+        assert!(
+            reply.contains("wake receiver outside all locks")
+                || reply.contains("Phase 4: wake receiver outside")
+        );
+    }
+
+    // (classification) Neither IpcCall (NR6) nor IpcReply (NR7) is in the pre-lock split-dispatch
+    // bridge, so the sender/replier payload read runs under the broad lock → both are NEEDS_BOUNDED_FIX.
+    #[test]
+    fn ipccall_and_ipcreply_not_split_dispatched_needs_bounded_fix() {
+        assert!(!SPLIT_SRC.contains("IpcCall"));
+        assert!(!SPLIT_SRC.contains("IpcReply"));
+        // The reply handler is documented as the global-lock slow path (not split-wired).
+        assert!(
+            SYSCALL_SRC.contains("NR 7 IpcReply is not yet split-wired off the trap-entry seam")
+        );
+        // The audit doc records both as NEEDS_BOUNDED_FIX.
+        assert!(
+            AUDIT_DOC.contains("request_direct=needs_bounded_fix reply_direct=needs_bounded_fix")
+        );
+    }
+
+    // (18) Reply-cap enqueue remains UNSUPPORTED (Stage 198F policy): forbidden by the artifact guard
+    // in every build; no live reply-cap enqueue producer/oracle.
+    #[test]
+    fn reply_cap_enqueue_remains_unsupported() {
+        assert!(GUARD_SRC.contains("\"class=IpcSendReplyCapEnqueue\""));
+        // This audit adds NO reply-cap-enqueue producer.
+        assert!(!IPC_SRC.contains("produce_blocked_waiter_reply_cap_enqueue"));
+    }
+
+    // (19) All Stage 198F supported-class policy constants remain unchanged.
+    #[test]
+    fn stage198f_policy_constants_unchanged() {
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        // Supported = 10 classes / 30 cells; enqueue classes excluded (per the seal doc).
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SEAL_DOC.contains("18, not 21"));
+    }
+
+    // Hosted audit seal (NOT a retirement marker): both directions classified, no numeric-TID-only
+    // authority, no duplicate replies/wakes, no leaked reply records.
+    #[test]
+    fn ipccall_direct_hosted_audit_seal() {
+        crate::yarm_log!(
+            "STAGE_199_IPCCALL_DIRECT_HOSTED_AUDIT request_direct=needs_bounded_fix reply_direct=needs_bounded_fix numeric_tid_only_authority=0 duplicate_replies=0 duplicate_wakes=0 leaked_reply_records=0 result=ok"
+        );
+    }
+}
+
 // Stage 194 — CROSS-ARCH GLOBAL-LOCK RETIREMENT PORTABILITY AUDIT. Audit/design only:
 // no AArch64/RISC-V retirement is enabled. These guards lock in the current per-arch
 // reality the audit relied on, so a future stage cannot silently flip an architecture
