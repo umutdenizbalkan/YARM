@@ -223,8 +223,24 @@ pub(crate) struct ActiveTransferMapping {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReplyCapRecord {
     pub(crate) caller_tid: ThreadId,
+    /// Stage 199A2A — INCARNATION discriminator for the caller (blocked requester).
+    /// Captured from `task_asid(caller_tid)` at record creation. A replacement task
+    /// that reuses the numeric caller `ThreadId` always carries a DIFFERENT ASID, so
+    /// cleanup keyed on `{caller_tid, caller_asid}` can never clear a fresh
+    /// incarnation's record on a stale numeric-TID sweep. `Asid(0)` when the caller
+    /// had no address space (kernel task) — cleanup then falls back to the numeric
+    /// TID, which is the safe (aggressive-free) direction for a one-shot record.
+    pub(crate) caller_asid: Asid,
     pub(crate) reply_endpoint: CapObject,
     pub(crate) responder_tid: Option<ThreadId>,
+    /// Stage 199A2A — INCARNATION discriminator for the bound replier (responder).
+    /// Captured from `task_asid(responder_tid)` at record creation (`None` when the
+    /// record is unbound, i.e. `responder_tid == None`, or the responder had no
+    /// address space). `ipc_reply` authorizes a reply ONLY when the CURRENT replier's
+    /// `{tid, asid}` matches this bound identity — a numeric replier TID reused by a
+    /// replacement task (different ASID) is rejected. Numeric TID alone never
+    /// authorizes a reply delivery/wake.
+    pub(crate) replier_asid: Option<Asid>,
     /// CapId of the Reply cap that `create_reply_cap_for_caller` minted into the
     /// **caller's** cnode.  Stored here so that `ipc_reply` (which runs in the
     /// **replier's** context) can also revoke it from the caller's cnode, preventing

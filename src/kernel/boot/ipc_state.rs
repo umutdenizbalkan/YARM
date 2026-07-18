@@ -249,10 +249,24 @@ impl KernelState {
     }
 
     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
+        // Stage 199A2A: resolve the CURRENT incarnation's ASID before the mutable
+        // borrow. A record is cleared only when it matches the complete
+        // `{caller_tid, caller_asid}` identity, so a numeric-TID sweep can never
+        // clear a REPLACEMENT task's record (a reused numeric TID always carries a
+        // different ASID). All production call sites (exit / restart / mark-dead /
+        // reap) run while this task's TCB is still present with its original ASID,
+        // so `asid_now` equals the stored `caller_asid` and cleanup is leak-free.
+        // If the ASID is unresolvable (`None`, e.g. a kernel task or partial
+        // teardown) we fall back to the numeric-TID match — the safe (never-leak)
+        // direction for a one-shot record.
+        let asid_now = self.task_asid(caller_tid);
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
             for slot in ipc.reply_caps.iter_mut() {
-                if slot.is_some_and(|record| record.caller_tid.0 == caller_tid) {
+                if slot.is_some_and(|record| {
+                    record.caller_tid.0 == caller_tid
+                        && asid_now.is_none_or(|a| record.caller_asid == a)
+                }) {
                     *slot = None;
                     revoked += 1;
                 }
@@ -281,6 +295,15 @@ impl KernelState {
     /// revoke is `None` and is skipped, so repeated/interleaved teardown is a
     /// no-op past the first clear.
     pub(crate) fn revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize {
+        // Stage 199A2A: resolve the CURRENT incarnation's ASID before the mutable
+        // borrow and match on the complete `{responder_tid, replier_asid}` identity.
+        // A record is SKIPPED only when we have BOTH a resolvable current ASID AND a
+        // stored `replier_asid` AND they DIFFER — i.e. the record belongs to a prior
+        // incarnation at the same numeric TID. Otherwise the record is cleared (the
+        // safe, never-leak direction). Production call sites (exit / mark-dead / reap)
+        // run while the replier's TCB is still present with its original ASID, so the
+        // stored and current ASIDs match and cleanup is leak-free.
+        let asid_now = self.task_asid(tid);
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
             for slot in ipc.reply_caps.iter_mut() {
@@ -288,6 +311,11 @@ impl KernelState {
                     record
                         .responder_tid
                         .is_some_and(|responder| responder.0 == tid)
+                        && match (record.replier_asid, asid_now) {
+                            (Some(stored), Some(now)) => stored == now,
+                            // No incarnation evidence on one side → numeric-TID match.
+                            _ => true,
+                        }
                 }) {
                     *slot = None;
                     revoked += 1;
@@ -338,6 +366,65 @@ impl KernelState {
                 .get(reply_index)
                 .and_then(|slot| slot.as_ref())
                 .and_then(|record| record.waiter_cap_id)
+        })
+    }
+
+    /// Stage 199A2A: read the caller/replier INCARNATION ASIDs captured in the
+    /// global `ReplyCapRecord` at `reply_index` (`None` if the slot is empty).
+    #[cfg(test)]
+    pub(crate) fn reply_cap_record_caller_asid(&self, reply_index: usize) -> Option<Asid> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(reply_index)
+                .and_then(|slot| slot.as_ref())
+                .map(|record| record.caller_asid)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reply_cap_record_replier_asid(&self, reply_index: usize) -> Option<Asid> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(reply_index)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|record| record.replier_asid)
+        })
+    }
+
+    /// Stage 199A2A test-only mutators: overwrite the captured incarnation ASIDs on a
+    /// live record to simulate a numeric-TID-reused REPLACEMENT task holding the same
+    /// slot under a DIFFERENT address space, so the authority/cleanup gates can be
+    /// exercised without physically recycling a TID. Returns `true` if a live record
+    /// was present at `reply_index`.
+    #[cfg(test)]
+    pub(crate) fn force_reply_cap_record_replier_asid(
+        &mut self,
+        reply_index: usize,
+        asid: Option<Asid>,
+    ) -> bool {
+        self.with_ipc_state_mut(|ipc| {
+            if let Some(Some(record)) = ipc.reply_caps.get_mut(reply_index) {
+                record.replier_asid = asid;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_reply_cap_record_caller_asid(
+        &mut self,
+        reply_index: usize,
+        asid: Asid,
+    ) -> bool {
+        self.with_ipc_state_mut(|ipc| {
+            if let Some(Some(record)) = ipc.reply_caps.get_mut(reply_index) {
+                record.caller_asid = asid;
+                true
+            } else {
+                false
+            }
         })
     }
 
@@ -1845,6 +1932,16 @@ impl KernelState {
             responder_tid.map(|t| t.0).unwrap_or(u64::MAX)
         );
 
+        // Stage 199A2A: capture the INCARNATION discriminators (ASIDs) for the caller
+        // and (if bound) the responder BEFORE the mutable ipc-state borrow. These are
+        // stored in the record so every downstream authority/cleanup decision uses the
+        // complete `{tid, asid}` identity — a numeric TID reused by a replacement task
+        // (different ASID) can never authorize a reply or clear a fresh incarnation's
+        // record. `task_asid` returns `None` for a task with no address space (kernel
+        // task); the caller then records `Asid(0)` and the responder records `None`.
+        let caller_asid = self.task_asid(caller_tid.0).unwrap_or(Asid(0));
+        let replier_asid = responder_tid.and_then(|t| self.task_asid(t.0));
+
         // Phase 1: Reserve a global reply slot with a placeholder caller_cap_id.
         // The real CapId is filled in after the mint succeeds (Phase 3).
         let (slot, generation) = self
@@ -1858,8 +1955,10 @@ impl KernelState {
                         ipc.reply_cap_generations[idx] = next_generation;
                         ipc.reply_caps[idx] = Some(ReplyCapRecord {
                             caller_tid,
+                            caller_asid,
                             reply_endpoint,
                             responder_tid,
+                            replier_asid,
                             caller_cap_id: CapId(0), // placeholder; updated in Phase 3
                             waiter_cap_id: None,     // filled in when cap is materialized
                         });
@@ -2311,11 +2410,38 @@ impl KernelState {
             Err(err) => return Err(err),
         };
         let replier_tid = ThreadId(self.current_tid().ok_or(KernelError::TaskMissing)?);
+        // Stage 199A2A: resolve the CURRENT replier's incarnation ASID before the
+        // ipc-state borrow. Authorization requires the COMPLETE `{tid, asid}` identity
+        // to match the identity captured when the record was created — a numeric
+        // replier TID reused by a replacement task (different ASID) is rejected.
+        // Numeric TID alone never authorizes a reply delivery/wake.
+        let replier_asid_now = self.task_asid(replier_tid.0);
         let allowed = self.with_ipc_state(|ipc| {
             let rec = ipc.reply_caps[slot].ok_or(KernelError::StaleCapability)?;
-            Ok::<_, KernelError>(rec.responder_tid.is_none_or(|tid| tid == replier_tid))
+            let tid_ok = rec.responder_tid.is_none_or(|tid| tid == replier_tid);
+            // Incarnation gate: when the record bound a specific responder AND both
+            // the stored and current ASIDs are known, they MUST match. A mismatch is
+            // a reused-numeric-TID replacement task and is rejected. When either ASID
+            // is unknown (kernel task / unresolved), the numeric-TID decision stands.
+            let asid_ok = match rec.responder_tid {
+                None => true,
+                Some(_) => match (rec.replier_asid, replier_asid_now) {
+                    (Some(stored), Some(now)) => stored == now,
+                    _ => true,
+                },
+            };
+            Ok::<_, KernelError>(tid_ok && asid_ok)
         })?;
         if !allowed {
+            crate::yarm_log!(
+                "IPC_REPLY_INCARNATION_REJECT replier_tid={} replier_asid={:?} record_responder={:?} record_replier_asid={:?}",
+                replier_tid.0,
+                replier_asid_now,
+                self.with_ipc_state(|ipc| ipc.reply_caps[slot]
+                    .and_then(|r| r.responder_tid)
+                    .map(|t| t.0)),
+                self.with_ipc_state(|ipc| ipc.reply_caps[slot].and_then(|r| r.replier_asid)),
+            );
             return Err(KernelError::MissingRight);
         }
         let record = self.with_ipc_state_mut(|ipc| {

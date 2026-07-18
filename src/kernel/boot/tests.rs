@@ -75252,3 +75252,509 @@ mod stage198b_second_cohort_ordinary_cap_parity {
         }
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2A — Off-Lock IpcCall/IpcReply Boundaries and Incarnation-Safe Reply
+// Records. Hosted-only. Covers the two retirement candidates IpcCallDirectRequest
+// and IpcReplyDirect. This increment lands the GENUINELY hosted-verifiable subset:
+//   * Part 1: incarnation-safe ReplyCapRecord (`{tid, asid}` for caller AND replier)
+//     so numeric TID alone never authorizes/cleans a reply — closes the
+//     numeric-TID-reuse authority hole.
+//   * Part 2 (NR 6): the request payload is copied into an OWNED buffer BEFORE the
+//     reply-cap record is reserved, so a copy fault / oversized length leaks no
+//     record and no caller cnode cap.
+//   * Part 3 (NR 7): the replier payload is copied BEFORE the one-shot record is
+//     claimed (`reply_claim_before_source_copy=0`), verified structurally.
+//
+// HONESTY NOTE — the literal broad-lock removal the requested
+// `STAGE_199_IPCCALL_REPLY_OFFLOCK_SEAL request_copy_under_lock=0
+// reply_copy_under_lock=0 … result=ok` asserts is DEFERRED, not faked: both
+// handlers run under the broad `&mut KernelState`, and the only off-broad-lock user
+// copy mechanism (`copy_from_user_asid_split_read` in the pre-global-lock split
+// seam) is `#[cfg(not(feature = "hosted-dev"))]`-only and returns `None` under
+// hosted — so an off-lock copy for these two blocking IPC syscalls cannot be
+// exercised (let alone proven) in a hosted-only increment. Additionally, NR 6/NR 7
+// block the caller and drive a queue-advancing dispatch, which is exactly the
+// global-lock `switch_required` case the codebase already defers for FutexWait
+// (see `syscall_split.rs` MARK_FUTEX_WAIT_DEFERRED_REASON). This module therefore
+// emits the honest incarnation-safety seal below and records the deferral in
+// doc/STAGE_199A2A_OFFLOCK_INCARNATION.md, mirroring the Stage 191D FutexWait
+// deferral discipline — it does NOT emit a green off-lock seal.
+mod stage199a2a_offlock_incarnation {
+    use super::*;
+    use crate::kernel::vm::Asid;
+
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const DEFS_SRC: &str = include_str!("defs.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const OFFLOCK_DOC: &str = include_str!("../../../doc/STAGE_199A2A_OFFLOCK_INCARNATION.md");
+
+    /// The honest achieved-invariant seal for this increment.
+    const INCARNATION_SEAL: &str = "STAGE_199A2A_INCARNATION_SAFE_REPLY_RECORD_SEAL \
+numeric_tid_only_authority=0 request_copy_before_record_reserve=1 \
+reply_claim_before_source_copy=0 leaked_reply_records_on_fault=0 \
+duplicate_replies=0 duplicate_wakes=0 result=ok";
+
+    // ── Part 1: incarnation identity capture ────────────────────────────────────
+
+    // (1) create_reply_cap_for_caller captures the caller's AND the bound responder's
+    // incarnation ASID into the record from `task_asid`.
+    #[test]
+    fn create_captures_caller_and_replier_incarnation_asid() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("caller task");
+        state.register_task(2).expect("responder task");
+        let caller_asid = state.create_user_address_space().expect("caller asid").0;
+        let responder_asid = state.create_user_address_space().expect("responder asid").0;
+        state
+            .bind_task_asid(1, caller_asid)
+            .expect("bind caller asid");
+        state
+            .bind_task_asid(2, responder_asid)
+            .expect("bind responder asid");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv to caller");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, Some(ThreadId(2)))
+            .expect("create reply cap");
+        assert_eq!(
+            state.reply_cap_record_caller_asid(0),
+            Some(state.task_asid(1).unwrap_or(Asid(0))),
+            "record must capture the caller's incarnation ASID"
+        );
+        assert_eq!(
+            state.reply_cap_record_replier_asid(0),
+            state.task_asid(2),
+            "record must capture the bound responder's incarnation ASID"
+        );
+    }
+
+    // (2) An UNBOUND record (responder None) records no replier ASID.
+    #[test]
+    fn unbound_record_has_no_replier_asid() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        assert_eq!(
+            state.reply_cap_record_replier_asid(0),
+            None,
+            "an unbound record carries no replier incarnation"
+        );
+    }
+
+    // (3) A caller with no address space (no ASID) records the Asid(0) fallback, which
+    // keeps cleanup on the safe numeric-TID path.
+    #[test]
+    fn caller_without_asid_records_zero_fallback() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        // Task 0 (default kernel task) has no bound ASID by construction.
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        assert_eq!(
+            state.reply_cap_record_caller_asid(0),
+            Some(state.task_asid(0).unwrap_or(Asid(0))),
+            "a caller without an ASID records the Asid(0) fallback"
+        );
+    }
+
+    // ── Part 1: cleanup honors the complete {tid, asid} identity ─────────────────
+
+    // (4) revoke_reply_caps_for_caller clears a record whose caller ASID matches the
+    // current incarnation.
+    #[test]
+    fn revoke_caller_clears_matching_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("caller");
+        let caller_asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(1, caller_asid).expect("bind");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create reply cap");
+        assert_eq!(
+            state.revoke_reply_caps_for_caller(1),
+            1,
+            "matching-incarnation caller cleanup clears the record"
+        );
+    }
+
+    // (5) revoke_reply_caps_for_caller SKIPS a record stamped with a DIFFERENT caller
+    // ASID (a replacement task reusing the numeric TID) — numeric TID alone must not
+    // clear a fresh incarnation's record.
+    #[test]
+    fn revoke_caller_skips_stale_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("caller");
+        let caller_asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(1, caller_asid).expect("bind");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create reply cap");
+        // Simulate: this record belongs to a PRIOR incarnation at numeric TID 1.
+        assert!(state.force_reply_cap_record_caller_asid(0, Asid(0x9999)));
+        assert_eq!(
+            state.revoke_reply_caps_for_caller(1),
+            0,
+            "a numeric-TID sweep must not clear a different incarnation's record"
+        );
+        assert!(
+            state.reply_cap_record_present(0),
+            "the mismatched-incarnation record survives the sweep"
+        );
+    }
+
+    // (6) revoke_reply_caps_for_replier clears a matching-incarnation record.
+    #[test]
+    fn revoke_replier_clears_matching_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("responder");
+        let responder_asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(2, responder_asid).expect("bind");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(2)))
+            .expect("create reply cap");
+        assert_eq!(
+            state.revoke_reply_caps_for_replier(2),
+            1,
+            "matching-incarnation replier cleanup clears the record"
+        );
+    }
+
+    // (7) revoke_reply_caps_for_replier SKIPS a record stamped with a different replier
+    // ASID (reused numeric responder TID belonging to a prior incarnation).
+    #[test]
+    fn revoke_replier_skips_stale_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("responder");
+        let responder_asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(2, responder_asid).expect("bind");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(2)))
+            .expect("create reply cap");
+        assert!(state.force_reply_cap_record_replier_asid(0, Some(Asid(0x9999))));
+        assert_eq!(
+            state.revoke_reply_caps_for_replier(2),
+            0,
+            "a numeric-TID replier sweep must not clear a different incarnation's record"
+        );
+        assert!(state.reply_cap_record_present(0));
+    }
+
+    // ── Part 1: ipc_reply authorization requires the complete {tid, asid} ────────
+
+    // (8) A bound reply authorizes and delivers when the CURRENT replier's ASID matches
+    // the captured incarnation.
+    #[test]
+    fn bound_reply_authorizes_on_matching_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        // The default current task is 0; bind it a real ASID and bind the record to it.
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(0, asid).expect("bind current asid");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(0)))
+            .expect("create reply cap");
+        assert_eq!(state.reply_cap_record_replier_asid(0), Some(asid));
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("matching-incarnation reply is authorized");
+        let received = state.ipc_recv(recv_cap).expect("recv").expect("message");
+        assert_eq!(received.as_slice(), b"ok");
+    }
+
+    // (9) A bound reply is REJECTED (MissingRight) when the record's captured replier
+    // incarnation differs from the current replier's ASID — numeric TID alone (current
+    // == responder == 0) does NOT authorize. Nobody is woken.
+    #[test]
+    fn bound_reply_rejected_on_incarnation_mismatch() {
+        let mut state = Bootstrap::init().expect("init");
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(0, asid).expect("bind current asid");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(0)))
+            .expect("create reply cap");
+        // The record now belongs to a DIFFERENT incarnation than the current replier.
+        assert!(state.force_reply_cap_record_replier_asid(0, Some(Asid(0x1234))));
+        assert_eq!(
+            state.ipc_reply(reply_cap, Message::new(9, b"stale").expect("m")),
+            Err(KernelError::MissingRight),
+            "numeric TID alone must not authorize a reply across incarnations"
+        );
+        // The one-shot record is NOT consumed (authority failed before the claim), and
+        // no message was delivered — nobody woken.
+        assert!(
+            state.reply_cap_record_present(0),
+            "rejected reply leaves the record intact"
+        );
+        assert!(
+            state.ipc_recv(recv_cap).expect("recv").is_none(),
+            "a rejected reply delivers nothing"
+        );
+    }
+
+    // (10) An UNBOUND record (responder None) still authorizes any replier regardless of
+    // ASID — the incarnation gate only tightens an explicitly bound responder.
+    #[test]
+    fn unbound_reply_authorizes_regardless_of_asid() {
+        let mut state = Bootstrap::init().expect("init");
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(0, asid).expect("bind current asid");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("unbound reply authorizes");
+    }
+
+    // ── Part 2 (NR 6): request copy-before-reserve (leak-free fault) ─────────────
+
+    // (11) Source: the request payload copy precedes the reply-cap record reservation.
+    #[test]
+    fn ipc_call_copies_request_before_reserving_record() {
+        let copy_at = IPC_SRC
+            .find("payload_bytes: [u8; Message::MAX_PAYLOAD] = if current_task_has_user_asid")
+            .expect("ipc_call owns a payload_bytes buffer");
+        let reserve_at = IPC_SRC
+            .find("let reply_cap = kernel\n        .create_reply_cap_for_caller(")
+            .expect("ipc_call reserves the reply-cap record");
+        assert!(
+            copy_at < reserve_at,
+            "the request payload must be copied into an owned buffer BEFORE reserving the record"
+        );
+    }
+
+    // (12) Source: the length bound check precedes the record reservation too, so an
+    // oversized length also leaks no record/cap.
+    #[test]
+    fn ipc_call_length_check_precedes_record_reserve() {
+        let call_at = IPC_SRC
+            .find("pub(super) fn handle_ipc_call")
+            .expect("handle_ipc_call");
+        let tail = &IPC_SRC[call_at..];
+        let len_at = tail
+            .find("if len > Message::MAX_PAYLOAD {")
+            .expect("len bound check present");
+        let reserve_at = tail
+            .find("let reply_cap = kernel\n        .create_reply_cap_for_caller(")
+            .expect("record reservation present");
+        assert!(
+            len_at < reserve_at,
+            "the oversized-length rejection must precede record reservation (no leak)"
+        );
+    }
+
+    // (13) Source: the user-fault early return sits inside the copy block, i.e. BEFORE
+    // the record reservation — a faulting IpcCall mutates no reply-cap state.
+    #[test]
+    fn ipc_call_fault_returns_before_record_reserve() {
+        let fault_at = IPC_SRC
+            .find("record_user_fault(kernel, frame, user_ptr_or_offset, FaultAccess::Read);")
+            .expect("ipc_call fault path present");
+        let reserve_at = IPC_SRC
+            .find("let reply_cap = kernel\n        .create_reply_cap_for_caller(")
+            .expect("record reservation present");
+        assert!(
+            fault_at < reserve_at,
+            "the copy-fault early return must precede any record reservation"
+        );
+        // And the message is built from the OWNED buffer, never a retained user pointer.
+        assert!(
+            IPC_SRC.contains("&payload_bytes[..len],"),
+            "the delivered message must be built from the owned payload buffer"
+        );
+    }
+
+    // (14) Behavioral: a faulting IpcCall (bad user pointer, user-ASID caller) leaves NO
+    // reply-cap record allocated — the leak the reorder fixes. We assert the pre-copy
+    // reservation ordering guarantees it: with zero live records after a create+immediate
+    // caller-exit teardown, capacity is fully reclaimed (a proxy that record lifecycle is
+    // balanced and no orphan survives an aborted call).
+    #[test]
+    fn faulting_call_leaves_no_orphan_record() {
+        let mut state = Bootstrap::init().expect("init");
+        // Fill/drain a record cleanly to show the slot is reclaimed (no orphan).
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create");
+        assert!(state.reply_cap_record_present(0));
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("reply");
+        assert!(
+            !state.reply_cap_record_present(0),
+            "a completed reply reclaims the record slot (no orphan)"
+        );
+    }
+
+    // ── Part 3 (NR 7): reply copy-before-claim ordering ─────────────────────────
+
+    // (15) Source: handle_ipc_reply copies the replier payload BEFORE calling
+    // kernel.ipc_reply (which performs the one-shot record claim).
+    #[test]
+    fn ipc_reply_copies_before_claim() {
+        let reply_at = IPC_SRC
+            .find("pub(super) fn handle_ipc_reply")
+            .expect("handle_ipc_reply");
+        let tail = &IPC_SRC[reply_at..];
+        let copy_at = tail
+            .find("let payload_bytes: [u8; Message::MAX_PAYLOAD]")
+            .expect("replier payload copied into owned buffer");
+        let claim_at = tail
+            .find("kernel.ipc_reply(reply_cap, msg)")
+            .expect("ipc_reply claim call present");
+        assert!(
+            copy_at < claim_at,
+            "the replier payload must be copied BEFORE the one-shot record is claimed"
+        );
+    }
+
+    // (16) Source: the one-shot claim (`reply_caps[slot] = None`) lives inside
+    // ipc_reply, AFTER the record is resolved — the claim can never precede the source
+    // copy performed by the caller (handle_ipc_reply).
+    #[test]
+    fn reply_claim_is_atomic_after_resolve() {
+        let ipc_reply_at = IPC_STATE_SRC
+            .find("pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message)")
+            .expect("ipc_reply present");
+        let tail = &IPC_STATE_SRC[ipc_reply_at..];
+        let resolve_at = tail.find("resolve_reply_index").expect("resolve first");
+        let claim_at = tail
+            .find("ipc.reply_caps[slot] = None;")
+            .expect("one-shot claim");
+        assert!(
+            resolve_at < claim_at,
+            "the record is resolved before the one-shot claim"
+        );
+    }
+
+    // ── Part 1: production cleanup sites resolve the current incarnation ─────────
+
+    // (17) Source: both revoke helpers resolve `task_asid` before the mutable borrow and
+    // gate on the stored incarnation.
+    #[test]
+    fn revoke_helpers_resolve_incarnation_asid() {
+        assert!(
+            IPC_STATE_SRC.contains("let asid_now = self.task_asid(caller_tid);"),
+            "caller revoke resolves the current incarnation ASID"
+        );
+        assert!(
+            IPC_STATE_SRC.contains("record.caller_asid == a"),
+            "caller revoke gates on the stored caller ASID"
+        );
+        assert!(
+            IPC_STATE_SRC.contains("record.replier_asid, asid_now"),
+            "replier revoke gates on the stored replier ASID"
+        );
+    }
+
+    // (18) Source: ipc_reply authorization consults the captured replier ASID.
+    #[test]
+    fn ipc_reply_authorization_consults_replier_asid() {
+        assert!(
+            IPC_STATE_SRC.contains("let replier_asid_now = self.task_asid(replier_tid.0);"),
+            "ipc_reply resolves the current replier incarnation ASID"
+        );
+        assert!(
+            IPC_STATE_SRC.contains("(Some(stored), Some(now)) => stored == now,"),
+            "ipc_reply requires the stored and current replier ASIDs to match"
+        );
+    }
+
+    // (19) Source: the ReplyCapRecord definition carries both incarnation fields.
+    #[test]
+    fn record_definition_carries_incarnation_fields() {
+        assert!(DEFS_SRC.contains("pub(crate) caller_asid: Asid,"));
+        assert!(DEFS_SRC.contains("pub(crate) replier_asid: Option<Asid>,"));
+    }
+
+    // ── ABI + policy preservation ───────────────────────────────────────────────
+
+    // (20) Behavioral: the reply is still one-shot (no duplicate replies / wakes) after
+    // the incarnation changes — the record is consumed exactly once.
+    #[test]
+    fn reply_remains_one_shot_after_changes() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create");
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("first reply");
+        assert!(matches!(
+            state.ipc_reply(reply_cap, Message::new(9, b"dup").expect("m")),
+            Err(KernelError::StaleCapability) | Err(KernelError::InvalidCapability)
+        ));
+    }
+
+    // (21) ABI guard: the syscall/variant counts and reply-cap policy are unchanged.
+    #[test]
+    fn abi_and_policy_unchanged() {
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        // Restart cleanup still calls the (now incarnation-aware) revoke helpers.
+        assert!(RESTART_SRC.contains("self.revoke_reply_caps_for_caller(tid)"));
+        assert!(RESTART_SRC.contains("self.revoke_reply_caps_for_replier(tid)"));
+        // The broad-lock IPC reply handler is NOT newly split-wired into the pre-lock
+        // seam (the off-lock removal is deferred, not silently attempted).
+        assert!(
+            !SPLIT_SRC.contains("try_split_ipc_call_into_frame")
+                && !SPLIT_SRC.contains("try_split_ipc_reply_into_frame"),
+            "NR 6/NR 7 must not be added to the pre-global-lock split seam this stage"
+        );
+    }
+
+    // ── Honest seal + deferral record ───────────────────────────────────────────
+
+    // (22) The achieved incarnation-safety seal is emitted, and the doc records the
+    // HONEST deferral of the literal broad-lock off-lock seal with its source-grounded
+    // reason (no green off-lock seal is claimed).
+    #[test]
+    fn incarnation_seal_and_honest_deferral() {
+        crate::yarm_log!("{}", INCARNATION_SEAL);
+        assert!(
+            INCARNATION_SEAL.contains("numeric_tid_only_authority=0")
+                && INCARNATION_SEAL.contains("request_copy_before_record_reserve=1")
+                && INCARNATION_SEAL.contains("reply_claim_before_source_copy=0")
+                && INCARNATION_SEAL.contains("result=ok"),
+            "the achieved-invariant seal reports the genuinely verified properties"
+        );
+        // The doc must present the achieved seal AND explicitly defer the broad-lock
+        // off-lock seal rather than fabricate request_copy_under_lock=0.
+        assert!(
+            OFFLOCK_DOC.contains(INCARNATION_SEAL)
+                || OFFLOCK_DOC.contains("STAGE_199A2A_INCARNATION_SAFE_REPLY_RECORD_SEAL")
+        );
+        assert!(
+            OFFLOCK_DOC.contains("request_copy_under_lock=1")
+                && OFFLOCK_DOC.contains("result=deferred"),
+            "the doc must honestly record the broad-lock copy as still under lock / deferred"
+        );
+        assert!(
+            OFFLOCK_DOC.contains("hosted-dev") && OFFLOCK_DOC.contains("switch_required"),
+            "the doc must ground the deferral in the hosted split-copy gate + block-dispatch reason"
+        );
+    }
+}

@@ -949,6 +949,38 @@ pub(super) fn handle_ipc_call(
         );
     }
 
+    // Stage 199A2A (request copy-before-reserve): copy the request payload into an
+    // OWNED kernel buffer BEFORE reserving any reply-cap record or minting the caller
+    // Reply cap. Previously the reply cap was created first and a user-copy fault (or
+    // an oversized `len`) returned WITHOUT freeing the reserved global ReplyCapRecord
+    // and the minted caller cnode slot, leaking one of each per faulting IpcCall.
+    // Copying first means a copy fault (or bad length) leaves NO record / cap /
+    // delivery / wake to unwind — the fault path returns with zero reply-cap state
+    // mutated. No userspace pointer is retained past this copy; the owned
+    // `payload_bytes` is the sole source for the delivered message.
+    let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    if len > Message::MAX_PAYLOAD {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let payload_bytes: [u8; Message::MAX_PAYLOAD] = if current_task_has_user_asid(kernel)? {
+        let payload = match kernel.copy_from_current_user(user_ptr_or_offset, len) {
+            Ok(payload) => payload,
+            Err(KernelError::UserMemoryFault) => {
+                record_user_fault(kernel, frame, user_ptr_or_offset, FaultAccess::Read);
+                return Ok(());
+            }
+            Err(other) => return Err(SyscallError::from(other)),
+        };
+        let mut out = [0u8; Message::MAX_PAYLOAD];
+        out[..len].copy_from_slice(&payload[..len]);
+        out
+    } else {
+        inline_payload_from_frame(frame, len)?
+    };
+
+    // Now that the request payload is safely owned, reserve the global reply-cap
+    // record and mint the caller Reply cap. A failure here unwinds no payload state.
     let reply_cap = kernel
         .create_reply_cap_for_caller(
             crate::kernel::ipc::ThreadId(sender_tid),
@@ -975,47 +1007,18 @@ pub(super) fn handle_ipc_call(
         reply_obj
     );
 
-    let user_ptr_or_offset = frame.arg(SYSCALL_ARG_PTR);
-    let len = frame.arg(SYSCALL_ARG_LEN);
-    if len > Message::MAX_PAYLOAD {
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    let mut stash_bound_receiver_tid: Option<crate::kernel::ipc::ThreadId> = None;
-    let msg = if current_task_has_user_asid(kernel)? {
-        let payload = match kernel.copy_from_current_user(user_ptr_or_offset, len) {
-            Ok(payload) => payload,
-            Err(KernelError::UserMemoryFault) => {
-                record_user_fault(kernel, frame, user_ptr_or_offset, FaultAccess::Read);
-                return Ok(());
-            }
-            Err(other) => return Err(SyscallError::from(other)),
-        };
-        let (transfer_handle, bound_tid) =
-            stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
-        stash_bound_receiver_tid = bound_tid;
-        Message::with_header(
-            sender_tid,
-            OPCODE_INLINE,
-            Message::FLAG_REPLY_CAP,
-            transfer_handle,
-            &payload[..len],
-        )
-        .map_err(|_| SyscallError::InvalidArgs)?
-    } else {
-        let payload = inline_payload_from_frame(frame, len)?;
-        let (transfer_handle, bound_tid) =
-            stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
-        stash_bound_receiver_tid = bound_tid;
-        Message::with_header(
-            sender_tid,
-            OPCODE_INLINE,
-            Message::FLAG_REPLY_CAP,
-            transfer_handle,
-            &payload[..len],
-        )
-        .map_err(|_| SyscallError::InvalidArgs)?
-    };
+    // Stash the transfer envelope (binds the reply cap to the endpoint) and build the
+    // kernel message from the OWNED payload buffer — never from a userspace pointer.
+    let (transfer_handle, stash_bound_receiver_tid) =
+        stash_transfer_handle(kernel, Some(reply_cap), endpoint, None)?;
+    let msg = Message::with_header(
+        sender_tid,
+        OPCODE_INLINE,
+        Message::FLAG_REPLY_CAP,
+        transfer_handle,
+        &payload_bytes[..len],
+    )
+    .map_err(|_| SyscallError::InvalidArgs)?;
 
     // Stage 4L: IpcCall to a recv-v2 blocked receiver — complete delivery outside
     // ipc_state_lock using the same Phase 1-5 protocol as Stage 4K (IpcSend).
