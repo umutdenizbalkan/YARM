@@ -72,6 +72,31 @@ pub(crate) enum IpcCallDirectError {
 }
 
 impl SharedKernel {
+    /// True iff the EXACT original server is still committed-blocked and its endpoint
+    /// waiter identity + generation are intact — the sole condition under which a
+    /// rolled-back acknowledgement lease may be RESTORED (retryable). Any drift
+    /// (server exited / incarnation changed / endpoint generation changed / waiter now
+    /// another identity or missing) makes it `false`, so the lease is discarded.
+    fn direct_server_exact_still_blocked(&self, ack: &BlockedServerAck) -> bool {
+        self.sr_prevalidate_blocked_receiver_split(ack.server.tid.0, ack.server.asid)
+            && self.endpoint_waiter_is_split_read(
+                ack.endpoint_index,
+                ack.endpoint_generation,
+                ack.server,
+            )
+    }
+
+    /// Settle the acknowledgement lease after a PRE-waiter-claim failure: restore it
+    /// (retryable) only when the exact original server + waiter remain intact,
+    /// otherwise discard it (a stale acknowledgement can never be resurrected).
+    fn settle_lease_pre_claim(&self, ack: &BlockedServerAck, lease: &mut AckLease, seq: u64) {
+        if self.direct_server_exact_still_blocked(ack) {
+            let _ = lease.restore(seq);
+        } else {
+            lease.discard();
+        }
+    }
+
     /// Run the composed off-lock direct NR6 request transaction. `lease` must already
     /// be `ClaimedByWork { commit_seq: lease_commit_seq }` (claimed at post-work
     /// publication). On success the lease is `Consumed` and the server is enqueued
@@ -84,23 +109,24 @@ impl SharedKernel {
         lease: &mut AckLease,
         lease_commit_seq: u64,
     ) -> Result<IpcCallDirectSuccess, IpcCallDirectError> {
+        // (0) The acknowledgement must be committed/well-formed, else non-mutating
+        // WouldBlock — never a queued fallback. Checked FIRST and touches NOTHING (the
+        // lease is not fabricated or restored): in production no lease is claimed
+        // without a committed acknowledgement.
+        if !ack.is_committed() {
+            return Err(IpcCallDirectError::WouldBlock);
+        }
+
         // The lease must be held by THIS work item — a duplicate drain cannot proceed.
         if !matches!(lease, AckLease::ClaimedByWork { commit_seq } if *commit_seq == lease_commit_seq)
         {
             return Err(IpcCallDirectError::LeaseNotClaimed);
         }
 
-        // (0) The acknowledgement must be committed/well-formed, else non-mutating
-        // WouldBlock — never a queued fallback. Retryable → restore the lease.
-        if !ack.is_committed() {
-            let _ = lease.restore(lease_commit_seq);
-            return Err(IpcCallDirectError::WouldBlock);
-        }
-
         // (1) revalidate caller {tid,asid}.
         if self.task_asid_for_tid_split_read(snapshot.caller.tid.0) != snapshot.caller.asid.0 as u64
         {
-            let _ = lease.restore(lease_commit_seq);
+            self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
             return Err(IpcCallDirectError::CallerGone);
         }
 
@@ -111,7 +137,7 @@ impl SharedKernel {
         {
             Ok(o) => o,
             Err(e) => {
-                let _ = lease.restore(lease_commit_seq);
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                 return Err(IpcCallDirectError::SendEndpoint(e));
             }
         };
@@ -119,11 +145,11 @@ impl SharedKernel {
             CapObject::Endpoint { index, generation }
                 if index == ack.endpoint_index && generation == ack.endpoint_generation => {}
             CapObject::Endpoint { index, .. } if index == ack.endpoint_index => {
-                let _ = lease.restore(lease_commit_seq);
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                 return Err(IpcCallDirectError::EndpointGenerationChanged);
             }
             _ => {
-                let _ = lease.restore(lease_commit_seq);
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                 return Err(IpcCallDirectError::WouldBlock);
             }
         }
@@ -135,7 +161,7 @@ impl SharedKernel {
         ) {
             Ok(snap) => snap.endpoint,
             Err(e) => {
-                let _ = lease.restore(lease_commit_seq);
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                 return Err(IpcCallDirectError::ReplyEndpoint(e));
             }
         };
@@ -143,7 +169,7 @@ impl SharedKernel {
         // (4) require the exact committed blocked server (still Blocked(EndpointReceive)
         // with the exact {tid,asid}). No mutation, no queued fallback on a miss.
         if !self.sr_prevalidate_blocked_receiver_split(ack.server.tid.0, ack.server.asid) {
-            let _ = lease.restore(lease_commit_seq);
+            self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
             return Err(IpcCallDirectError::WouldBlock);
         }
 
@@ -155,7 +181,7 @@ impl SharedKernel {
         ) {
             Ok(v) => v,
             Err(_) => {
-                let _ = lease.restore(lease_commit_seq);
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                 return Err(IpcCallDirectError::RecordFull);
             }
         };
@@ -165,11 +191,11 @@ impl SharedKernel {
         };
 
         // (6) mint exactly one provisional server-local Reply cap.
-        let server_cnode = match self.process_cnode_for_tid_split_read(ack.server.tid.0) {
+        let server_cnode = match self.process_cnode_for_identity_split_read(ack.server) {
             Some(c) => c,
             None => {
                 let _ = self.cancel_direct_reply_record_split(idx, rgen);
-                let _ = lease.restore(lease_commit_seq);
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                 return Err(IpcCallDirectError::ServerCnodeMissing);
             }
         };
@@ -179,7 +205,7 @@ impl SharedKernel {
             Ok(c) => c,
             Err(_) => {
                 let _ = self.cancel_direct_reply_record_split(idx, rgen);
-                let _ = lease.restore(lease_commit_seq);
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                 return Err(IpcCallDirectError::MintFailed);
             }
         };
@@ -199,7 +225,7 @@ impl SharedKernel {
         {
             self.sr_revoke_split(server_cnode, server_cap, reply_object);
             let _ = self.cancel_direct_reply_record_split(idx, rgen);
-            let _ = lease.restore(lease_commit_seq);
+            self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
             return Err(IpcCallDirectError::PayloadCopyFault);
         }
         let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
@@ -217,7 +243,7 @@ impl SharedKernel {
         {
             self.sr_revoke_split(server_cnode, server_cap, reply_object);
             let _ = self.cancel_direct_reply_record_split(idx, rgen);
-            let _ = lease.restore(lease_commit_seq);
+            self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
             return Err(IpcCallDirectError::MetaCopyFault);
         }
 
@@ -232,7 +258,7 @@ impl SharedKernel {
             None => {
                 self.sr_revoke_split(server_cnode, server_cap, reply_object);
                 let _ = self.cancel_direct_reply_record_split(idx, rgen);
-                let _ = lease.restore(lease_commit_seq);
+                self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                 return Err(IpcCallDirectError::WaiterLost);
             }
         };

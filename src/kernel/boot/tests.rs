@@ -76474,13 +76474,18 @@ mod stage199a2b2d_direct_request_txn {
         let snap = snapshot_for(&fx, b"request!");
         let mut ack = ack_for(&fx);
         ack.recv_v2_committed = false;
-        let mut lease = claimed_lease(1);
+        // The no-ack path must not fabricate or restore a lease — pass an unclaimed
+        // (Available) lease and prove it is left untouched.
+        let mut lease = AckLease::new_available();
         assert_eq!(
             fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 1),
             Err(IpcCallDirectError::WouldBlock)
         );
         assert_server_still_blocked_no_leak(&fx.k);
-        assert!(lease.is_available(), "retryable: ack restored");
+        assert!(
+            lease.is_available(),
+            "no-ack must not fabricate/claim/restore a lease"
+        );
     }
 
     // (caller replacement) The caller's incarnation changed → CallerGone; no mutation.
@@ -76518,7 +76523,10 @@ mod stage199a2b2d_direct_request_txn {
             Err(IpcCallDirectError::WouldBlock)
         );
         assert_eq!(live_reply_records(&fx.k), 0);
-        assert!(lease.is_available());
+        assert!(
+            lease.is_consumed(),
+            "server incarnation changed: ack discarded"
+        );
     }
 
     // (endpoint generation change) A stale endpoint generation is rejected; no mutation.
@@ -76534,7 +76542,10 @@ mod stage199a2b2d_direct_request_txn {
             Err(IpcCallDirectError::EndpointGenerationChanged)
         );
         assert_server_still_blocked_no_leak(&fx.k);
-        assert!(lease.is_available());
+        assert!(
+            lease.is_consumed(),
+            "stale endpoint generation: ack discarded"
+        );
     }
 
     // (payload copy fault) An unmapped payload destination faults AFTER reservation +
@@ -76642,5 +76653,135 @@ mod stage199a2b2d_direct_request_txn {
         assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
         assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+
+    // ── Part 1: generation-bearing CNode resolution ─────────────────────────────
+
+    #[test]
+    fn cnode_resolver_requires_exact_identity() {
+        let fx = blocked_server_fixture();
+        let server_asid = fx.server.asid;
+        let ok = fx.k.process_cnode_for_identity_split_read(fx.server);
+        assert!(ok.is_some(), "exact identity resolves the server CNode");
+        let replacement = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            ThreadId(2),
+            Asid(server_asid.0 ^ 0x55),
+        );
+        assert!(
+            fx.k.process_cnode_for_identity_split_read(replacement)
+                .is_none(),
+            "a replacement ASID at the same numeric TID resolves no CNode"
+        );
+    }
+
+    #[test]
+    fn no_cap_minted_into_replacement_cnode() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        fx.k.with(|s| s.unbind_task_asid(2).expect("replace server"));
+        let mut lease = claimed_lease(21);
+        assert!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 21)
+                .is_err()
+        );
+        assert_eq!(
+            live_reply_records(&fx.k),
+            0,
+            "no record/cap into replacement"
+        );
+    }
+
+    // ── Part 3: missing / changed waiter ────────────────────────────────────────
+
+    #[test]
+    fn missing_waiter_discards_and_reclaims() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                if let Some(idv) = ipc.endpoint_waiter_identity(fx.endpoint_index) {
+                    ipc.clear_endpoint_waiters_for_identity(idv);
+                }
+            })
+        });
+        let mut lease = claimed_lease(22);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 22),
+            Err(IpcCallDirectError::WaiterLost)
+        );
+        assert_eq!(live_reply_records(&fx.k), 0, "record/cap reclaimed");
+        assert!(
+            lease.is_consumed(),
+            "missing waiter: ack discarded, not restored"
+        );
+        assert_ne!(fx.k.with(|s| s.current_tid()), Some(2), "zero wake");
+    }
+
+    #[test]
+    fn changed_waiter_untouched_and_discards() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let other = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(3), Asid(0x321));
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                if let Some(idv) = ipc.endpoint_waiter_identity(fx.endpoint_index) {
+                    ipc.clear_endpoint_waiters_for_identity(idv);
+                }
+                ipc.set_endpoint_waiter(fx.endpoint_index, other);
+            })
+        });
+        let mut lease = claimed_lease(23);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 23),
+            Err(IpcCallDirectError::WaiterLost)
+        );
+        assert_eq!(
+            fx.k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(fx.endpoint_index))),
+            Some(other),
+            "replacement waiter untouched"
+        );
+        assert_eq!(live_reply_records(&fx.k), 0);
+        assert!(lease.is_consumed());
+    }
+
+    // ── Part 2: stale acknowledgements cannot be resurrected ────────────────────
+
+    #[test]
+    fn stale_ack_cannot_be_resurrected() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        fx.k.with(|s| s.unbind_task_asid(2).expect("replace server"));
+        let mut lease = claimed_lease(24);
+        assert!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 24)
+                .is_err()
+        );
+        assert!(lease.is_consumed(), "stale server ack discarded");
+        assert_eq!(
+            lease.claim(24),
+            Err(crate::kernel::ipccall_direct::AckLeaseError::NotAvailable)
+        );
+    }
+
+    // ── Defensive branches (SMP-race / provably-infallible) source-verified ─────
+    #[test]
+    fn defensive_rollback_branches_present() {
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        let sg = TXN_SRC
+            .split("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
+            .nth(1)
+            .expect("ServerGone arm present");
+        assert!(sg.contains("sr_revoke_split"));
+        assert!(sg.contains("cancel_direct_reply_record_split"));
+        assert!(sg.contains("lease.discard()"));
+        assert!(
+            !sg.contains("sr_restore_endpoint_waiter_split"),
+            "a vanished server's claimed waiter must not be restored"
+        );
+        assert!(TXN_SRC.contains("IpcCallDirectError::RecordCommitFailed"));
     }
 }

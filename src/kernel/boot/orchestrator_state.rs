@@ -2109,6 +2109,38 @@ impl KernelState {
             .map(|record| record.cnode)
     }
 
+    /// Stage 199A2B2E: GENERATION-BEARING cnode resolution. Under the task lock
+    /// (rank 2) it finds the tcb for `tid` and requires `tcb.asid == Some(asid)` — the
+    /// complete `{tid, asid}` identity — capturing the pid ONLY on an exact match;
+    /// then (task lock released) resolves that pid's cnode under `capability_state_lock`
+    /// (rank 4). A numeric TID reused by a replacement task (different ASID) yields
+    /// `None`, so no capability can be minted into a replacement process's cnode.
+    /// Numeric TID alone never authorizes cap materialization. Returns only the owned
+    /// `CNodeId`; no TCB/CNode reference escapes.
+    ///
+    /// # Safety
+    /// As `process_cnode_for_pid_from_raw` / `process_id_from_raw`.
+    pub(crate) unsafe fn process_cnode_for_identity_from_raw(
+        state: *const KernelState,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Option<CNodeId> {
+        // Task-domain read (rank 2): require the EXACT {tid, asid} incarnation and
+        // capture its pid atomically with the identity check.
+        let pid = {
+            let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+            let _guard = lock_ref.lock();
+            let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
+                kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid && tcb.asid == Some(asid))
+                .map(|tcb| tcb.thread_group_id.0)?
+        };
+        // Capability-domain read (rank 4): resolve the verified incarnation's cnode.
+        unsafe { KernelState::process_cnode_for_pid_from_raw(state, pid) }
+    }
+
     // ── Stage 27 split-mutation helper ───────────────────────────────────────
 
     /// STAGE 27: first mutating global-lock extraction. Apply a CNode-slot

@@ -3058,6 +3058,24 @@ impl SharedKernel {
         })
     }
 
+    /// Stage 199A2B2E: read-only exact endpoint-waiter check (rank 3). True iff the
+    /// endpoint at `eidx` still carries generation `egen` AND its waiter slot holds the
+    /// EXACT `{tid, asid}` identity. Used by the direct request transaction's rollback
+    /// policy to decide whether the acknowledgement lease is restorable (server + waiter
+    /// intact) or must be discarded (waiter changed/missing). No mutation.
+    pub(crate) fn endpoint_waiter_is_split_read(
+        &self,
+        eidx: usize,
+        egen: u64,
+        identity: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            eidx < ipc.endpoint_waiters.len()
+                && ipc.endpoint_generations[eidx] == egen
+                && ipc.endpoint_waiter_identity(eidx) == Some(identity)
+        })
+    }
+
     /// rank 2 → rank 3 — restore the EXACT claimed waiter using its generation-bearing identity token.
     /// Stage 198E3B2B2: restoration is permitted ONLY when the COMPLETE identity still matches — the
     /// endpoint still exists at the claimed generation, the slot is currently free (never clobbering a
@@ -3648,17 +3666,23 @@ impl SharedKernel {
         Ok(endpoint)
     }
 
-    /// Stage 199A2B2D: off-lock resolution of the `CNodeId` for the process that owns
-    /// `tid` (task rank-2 pid read → capability rank-4 cnode lookup). Used to target
-    /// the provisional server-local reply-cap mint. `None` if the task or its cnode is
-    /// absent.
-    pub(crate) fn process_cnode_for_tid_split_read(
+    /// Stage 199A2B2E: GENERATION-BEARING off-lock cnode resolution. Resolves the
+    /// `CNodeId` for the process owning the EXACT `{tid, asid}` incarnation (identity
+    /// verified under the task read, cnode resolved under the capability read). A
+    /// numeric TID reused by a replacement task (different ASID) yields `None`, so the
+    /// provisional server-local reply-cap mint can never target a replacement process.
+    pub(crate) fn process_cnode_for_identity_split_read(
         &self,
-        tid: u64,
+        identity: crate::kernel::boot::ReceiverWaiterIdentity,
     ) -> Option<crate::kernel::capabilities::CNodeId> {
         let state = self.state.data_ptr();
-        let pid = unsafe { KernelState::process_id_from_raw(state as *const _, tid) }?;
-        unsafe { KernelState::process_cnode_for_pid_from_raw(state as *const _, pid) }
+        unsafe {
+            KernelState::process_cnode_for_identity_from_raw(
+                state as *const _,
+                identity.tid.0,
+                identity.asid,
+            )
+        }
     }
 
     /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
