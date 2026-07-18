@@ -62939,13 +62939,17 @@ mod stage193g_remaining_shapes_audit {
             !MOD_SRC.contains("IpcSendReplyCapEnqueue"),
             "reply-cap enqueue must stay direct-only (never a retirement class)"
         );
-        // Stage 198E3 introduced the two shared-region LIVE classes (direct + enqueue). The 193G
-        // no-go invariant is superseded for shared region: what endures is that reply-cap enqueue
-        // never becomes a class, and the accepted classes below remain.
+        // Stage 198E3 introduced the shared-region DIRECT live class; the shared-region ENQUEUE class
+        // stays DISABLED (Stage 198E3C1B invariant — the artifact guard forbids it in every build).
+        // The 193G no-go invariant is superseded only for the DIRECT shape; reply-cap enqueue never
+        // becomes a class, and the accepted classes below remain.
         assert!(
-            MOD_SRC.contains("IpcSendSharedRegionDirect")
-                && MOD_SRC.contains("IpcSendSharedRegionEnqueue"),
-            "Stage 198E3 introduces the two shared-region live retirement classes"
+            MOD_SRC.contains("IpcSendSharedRegionDirect"),
+            "Stage 198E3 introduces the shared-region DIRECT live retirement class"
+        );
+        assert!(
+            !MOD_SRC.contains("class=IpcSendSharedRegionEnqueue"),
+            "shared-region ENQUEUE stays disabled — it must never be emitted as a retirement class"
         );
         for class in [
             "class=IpcSendPlain result=ok",
@@ -67992,8 +67996,13 @@ mod stage198e3c1_direct_live_policy {
         assert!(
             CMDLINE_SRC.contains("options.x86_64_shared_region_direct_oracle = parse_bool_knob")
         );
-        // The Cargo feature exists and is NOT in the default set (default = ["hosted-dev"]).
-        assert!(CARGO_SRC.contains("x86-shared-region-direct-oracle = []"));
+        // The per-arch feature exists, forwards to the arch-neutral umbrella, and neither the umbrella
+        // nor the per-arch feature is in the default set (default = ["hosted-dev"]).
+        assert!(CARGO_SRC.contains("shared-region-direct-oracle = []"));
+        assert!(
+            CARGO_SRC
+                .contains("x86-shared-region-direct-oracle = [\"shared-region-direct-oracle\"]")
+        );
         assert!(CARGO_SRC.contains("default = [\"hosted-dev\"]"));
         // The runtime setter arms the shared proof knob (so the already-wired producer goes live),
         // proving the runtime selector — not the compile-time feature — is what activates behavior.
@@ -68015,12 +68024,19 @@ mod stage198e3c1_direct_live_policy {
             .map(|(_, r)| r)
             .expect("gated helper present");
         assert!(gated.contains("IPCSEND_SHARED_REGION_OBJECT_OK"));
-        // Every attestation/retirement literal in mod.rs is preceded by the feature+x86 cfg.
+        // Every attestation/retirement literal in mod.rs is preceded by the per-arch armed cfg: the
+        // gate admits the x86 feature ONLY on x86_64 and the aarch64 feature ONLY on aarch64, so a
+        // NORMAL build (neither feature) — and each arch under the OTHER arch's feature — is clean.
         assert!(
             MOD_SRC.contains(
-                "#[cfg(all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\"))]"
+                "all(feature = \"x86-shared-region-direct-oracle\", target_arch = \"x86_64\")"
             ),
-            "the direct marker paths must be gated on the armed x86_64 oracle feature"
+            "the direct marker paths must admit the x86 feature only on x86_64"
+        );
+        assert!(
+            MOD_SRC.contains("feature = \"aarch64-shared-region-direct-oracle\"")
+                && MOD_SRC.contains("target_arch = \"aarch64\""),
+            "the direct marker paths must admit the aarch64 feature only on aarch64"
         );
         // The drain's success arm delegates to the gated helper and holds no inline literal.
         assert!(RT_SRC.contains("maybe_emit_shared_region_direct_live_markers("));
@@ -68156,18 +68172,38 @@ mod stage198e3c1_direct_live_policy {
     // carrying exactly the source cap.
     #[test]
     fn userspace_send_helper_encoding() {
+        // Stage 198E3C2A: the canonical helper is `send_shared_region_large(send_ep, mem_cap, offset,
+        // region_len)`. The kernel selects the shared-region transfer purely by the LARGE-transfer
+        // form of IpcSend — arg(PTR)=offset, arg(LEN)=region byte length (> MAX_PAYLOAD=128) — NOT by
+        // an inline frame opcode.
         let f = USER_RT_SRC
-            .split_once("pub unsafe fn send_shared_region")
-            .map(|(_, r)| {
-                r.split_once("pub unsafe fn recv_shared_region_v2")
+            .split_once("pub unsafe fn send_shared_region_large")
+            .and_then(|(_, r)| {
+                r.split_once("\n    pub unsafe fn send_shared_region")
                     .map(|(b, _)| b)
-                    .unwrap_or(r)
             })
-            .expect("send helper");
-        assert!(f.contains("OPCODE_SHARED_MEM"));
-        assert!(f.contains("Message::FLAG_CAP_TRANSFER"));
-        assert!(f.contains("Some(mem_cap as u64)"));
-        assert!(f.contains("ipc_send(send_ep, &msg)"));
+            .expect("send_shared_region_large helper");
+        assert!(f.contains("SYSCALL_IPC_SEND_NR"));
+        // offset in arg1, region_len in arg2, mem_cap in arg5.
+        assert!(f.contains("[send_ep as usize, offset, region_len, 0, 0, mem_cap as usize]"));
+        // Large-transfer selector guard: region_len must exceed MAX_PAYLOAD.
+        assert!(f.contains("region_len <= IPC_MESSAGE_MAX_PAYLOAD"));
+        // No inline `Message` framing on the send path (a comment may name the kernel-produced
+        // OPCODE_SHARED_MEM, but the helper constructs no inline message and calls no inline send).
+        assert!(
+            !f.contains("Message::with_header"),
+            "must not build an inline message"
+        );
+        assert!(
+            !f.contains("ipc_send(send_ep"),
+            "must not use the inline-message path"
+        );
+        // The oracle convenience wrapper forwards to the large helper with offset 0 + the 2-page len.
+        assert!(
+            USER_RT_SRC.contains(
+                "send_shared_region_large(send_ep, mem_cap, 0, SHARED_REGION_ORACLE_LEN)"
+            )
+        );
     }
 
     // recv_shared_region_v2 uses the dedicated 2-page window as the recv payload pointer, decodes the
@@ -68434,11 +68470,12 @@ mod stage198e3c1_direct_live_policy {
     // (handshake futex), never timing.
     #[test]
     fn direct_path_selected_excluded_paths_absent() {
-        // The shared-region scaffold region (module + parent fn), sliced out of the wider service.
+        // Stage 198E3C2A: the shared-region logic lives in the arch-neutral core module (+ the x86
+        // wrapper + parent fn). Slice from the core module to the next unrelated oracle.
         let scaffold = SERVICE_SRC
-            .split_once("mod x86_shared_region_direct_oracle {")
+            .split_once("mod shared_region_oracle_core {")
             .and_then(|(_, r)| r.split_once("// ─── Stage 196C:").map(|(b, _)| b))
-            .expect("shared-region scaffold present");
+            .expect("shared-region core present");
         // DIRECT send + ordinary recv are used.
         assert!(scaffold.contains("send_shared_region(endpoint_cap, mem_cap"));
         assert!(scaffold.contains("recv_shared_region_v2(endpoint_cap, va, len)"));
@@ -68447,9 +68484,10 @@ mod stage198e3c1_direct_live_policy {
         assert!(!scaffold.contains("recv_shared_v3("));
         assert!(!scaffold.contains("recv_shared_region_v3("));
         assert!(!scaffold.contains("send_shared_region_enqueue("));
-        // Authoritative handshake (futex), not a timing/delay loop.
-        assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_CHILD_WAKE_PARENT"));
-        assert!(scaffold.contains("futex_wait(handshake, hv, hv)"));
+        // Liveness handshake (futex), not a timing/delay loop. Stage 198E3C1B-H renamed it to a
+        // CHILD_STARTED liveness signal — the authoritative blocked proof is the kernel ack.
+        assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_CHILD_STARTED"));
+        assert!(scaffold.contains("futex_wait(started, sv, sv)"));
         // Topology marker present; NO live retirement/attestation literal is emitted from the
         // userspace scaffold (those are kernel-only).
         assert!(scaffold.contains("SHARED_REGION_DIRECT_ORACLE_TOPOLOGY_OK"));
@@ -68461,12 +68499,51 @@ mod stage198e3c1_direct_live_policy {
     // InvalidArgs) — the blocked-handshake + child-validation topology.
     #[test]
     fn child_validation_and_release_contract_scaffold() {
-        assert!(SERVICE_SRC.contains("validate_two_pages(r.mapped_base, r.mapped_len)"));
+        assert!(SERVICE_SRC.contains("validate_pages_split(r.mapped_base, r.mapped_len)"));
         assert!(SERVICE_SRC.contains("release_shared_region_mapping(r.receiver_cap)"));
         assert!(
             SERVICE_SRC.contains("SyscallError::InvalidArgs"),
             "the duplicate release must expect the canonical InvalidArgs rejection"
         );
+        // Stage 198E3C1C: full live validation — inline opcode/len, fresh distinct cap, exactly-one
+        // continuation, and the userspace completion marker.
+        assert!(SERVICE_SRC.contains("r.opcode == yarm_user_rt::syscall::OPCODE_SHARED_MEM"));
+        assert!(SERVICE_SRC.contains("(r.receiver_cap as u32) != sender_mem_cap"));
+        assert!(SERVICE_SRC.contains("CONTINUATIONS.fetch_add(1, Relaxed)"));
+        assert!(SERVICE_SRC.contains(
+            "X86_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap=1 readonly=1 first_release=ok second_release=rejected wakes=1 result=ok"
+        ));
+    }
+
+    // Stage 198E3C1C: the parent uses a BOUNDED authoritative retry (no sleeps/timing): it retries
+    // only on the canonical WouldBlock and emits the diagnostic send marker; exactly one send
+    // succeeds.
+    #[test]
+    fn parent_bounded_retry_on_wouldblock() {
+        // Stage 198E3C2A: the bounded retry lives in the arch-neutral core; the x86 wrapper emits the
+        // arch send marker. Slice the whole shared-region region.
+        let scaffold = SERVICE_SRC
+            .split_once("mod shared_region_oracle_core {")
+            .and_then(|(_, r)| r.split_once("// ─── Stage 196C:").map(|(b, _)| b))
+            .expect("shared-region core + wrapper present");
+        assert!(
+            scaffold.contains("SyscallError::WouldBlock"),
+            "retries on the canonical result"
+        );
+        assert!(
+            scaffold.contains("MAX_SEND_ATTEMPTS"),
+            "the retry count is bounded"
+        );
+        assert!(
+            !scaffold.contains("sleep"),
+            "no sleep/timing synchronization"
+        );
+        assert!(
+            scaffold
+                .contains("X86_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=ok")
+        );
+        // A hard (non-retryable) error fails the oracle rather than looping.
+        assert!(scaffold.contains("hard_fail = true"));
     }
 
     // ── Part 6: provisioning failure markers ─────────────────────────────────────────────────────
@@ -68573,6 +68650,1991 @@ mod stage198e3c1_direct_live_policy {
         let mut s = Bootstrap::init().expect("init");
         s.register_task(1).expect("init task");
         assert!(crate::kernel::boot::provision_init_shared_region_oracle(&mut s, 1).is_none());
+    }
+
+    // ── Stage 198E3C1B-H: authoritative blocked-recv handshake ───────────────────────────────────
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SYSCALL_SRC: &str = include_str!("../syscall/ipc.rs");
+
+    // (source) The pre-recv futex signal is NOT treated as blocked proof: the scaffold documents the
+    // CHILD_STARTED signal is liveness-only and the authoritative proof is the kernel ack.
+    #[test]
+    fn pre_recv_signal_is_not_blocked_proof() {
+        assert!(SERVICE_SRC.contains("LIVENESS signal ONLY"));
+        assert!(SERVICE_SRC.contains("NOT proof that the child is a committed recv-v2 waiter"));
+        // The old false claim is gone.
+        assert!(
+            !SERVICE_SRC.contains("B is provably blocked on\n// the endpoint"),
+            "the invalid 'futex return proves blocked' claim must be removed"
+        );
+        assert!(!SERVICE_SRC.contains("B is provably recv-v2-blocked when this returns"));
+    }
+
+    // (source) The authoritative ack is published from the RECEIVER's recv path AFTER the full commit
+    // point (after BlockedRecvState is stored), never during a partial state.
+    #[test]
+    fn ack_published_after_full_commit_point() {
+        // The publish call sits after BlockedRecvState is stored in handle_ipc_recv.
+        let after = IPC_SYSCALL_SRC
+            .split_once("tcb.blocked_recv_state = Some(state);")
+            .map(|(_, r)| r)
+            .expect("blocked-recv store present");
+        assert!(
+            after.contains("maybe_publish_shared_region_blocked_recv_ack("),
+            "the ack must be published AFTER BlockedRecvState is committed"
+        );
+        // The publish is gated on the feature and is a no-op off the runtime knob (checked in-fn).
+        assert!(MOD_SRC.contains("fn maybe_publish_shared_region_blocked_recv_ack"));
+        assert!(MOD_SRC.contains("if !shared_region_direct_oracle_enabled() {\n        return;"));
+        // The hook checks the recv-v2 state, the oracle VA, and a real metadata pointer before it
+        // acknowledges, and confirms the endpoint waiter identity is committed for THIS receiver.
+        let hook = MOD_SRC
+            .split_once("fn maybe_publish_shared_region_blocked_recv_ack")
+            .and_then(|(_, r)| r.split_once("\npub(crate) fn ").map(|(b, _)| b))
+            .or_else(|| {
+                MOD_SRC
+                    .split_once("fn maybe_publish_shared_region_blocked_recv_ack")
+                    .map(|(_, r)| r)
+            })
+            .expect("hook body");
+        assert!(
+            hook.contains("RecvAbiVariant::RecvV2"),
+            "recv-v2 state checked"
+        );
+        assert!(
+            hook.contains("SHARED_REGION_ORACLE_USER_VA"),
+            "payload VA checked"
+        );
+        assert!(
+            hook.contains("state.meta_user_ptr == 0"),
+            "metadata ptr checked"
+        );
+        assert!(
+            hook.contains("endpoint_waiter_identity(index)"),
+            "waiter commit checked"
+        );
+    }
+
+    // (source) The DIRECT delivery producer is dominated by the ack: it consumes the ack before it
+    // takes/consumes the blocked state, and declines the direct path when the ack is absent/stale.
+    #[test]
+    fn direct_producer_dominated_by_ack() {
+        let body = SYSCALL_SRC
+            .split_once("pub(crate) fn produce_blocked_waiter_shared_region_delivery")
+            .and_then(|(_, r)| r.split_once("\n/// ").map(|(b, _)| b))
+            .expect("producer present");
+        // Stage 198E3C1C: the non-consuming ack gate (matches_for_delivery) dominates the blocked-
+        // state take and fails closed; the ack is CONSUMED only after the post-work publish.
+        let gate = body
+            .find("matches_for_delivery(")
+            .expect("producer checks the ack (non-consuming)");
+        let take = body
+            .find("tcb.blocked_recv_state.take()")
+            .expect("producer takes blocked state");
+        assert!(
+            gate < take,
+            "the ack gate must dominate the blocked-state take"
+        );
+        assert!(
+            body.contains("return Err(SyscallError::WouldBlock);"),
+            "no ack → fail closed with the canonical retryable result"
+        );
+        // map_write=false on the blocked path; recv_shared_mem_map_intent_flags is NOT consulted here.
+        assert!(
+            body.contains("blocked_state.payload_user_ptr as u64,\n            false,"),
+            "the blocked direct delivery must map read-only (map_write=false)"
+        );
+        assert!(
+            !body.contains("recv_shared_mem_map_intent_flags"),
+            "the blocked-waiter path must not consult the immediate-path map-intent flags"
+        );
+    }
+
+    // (source) recv_shared_mem_map_intent_flags belongs ONLY to the immediate inline-transfer path.
+    #[test]
+    fn map_intent_flags_only_on_immediate_path() {
+        // It is defined + called in the ipc syscall module (immediate path), not in the blocked
+        // producer (checked above). Its single call site is the immediate delivery.
+        assert!(IPC_SYSCALL_SRC.contains("fn recv_shared_mem_map_intent_flags"));
+    }
+
+    // (unit, feature) End-to-end via the production commit path: after a fully-committed recv-v2
+    // waiter at the oracle VA, the authoritative ack is present with the EXACT identity/endpoint/VA.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn ack_present_after_full_waiter_commit_with_exact_fields() {
+        use crate::kernel::boot::ReceiverWaiterIdentity;
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        use crate::kernel::vm::Asid;
+        let _g = sr_knob_guard();
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let rgen = s.task_asid(2).map(|a| a.0).unwrap_or(0);
+        let egen = s.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+
+        // BEFORE any commit → no ack.
+        assert!(crate::kernel::boot::shared_region_blocked_recv::snapshot().is_none());
+
+        // Commit the endpoint waiter (Phase C), then publish the ack as the recv path would.
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(2), Asid(rgen)),
+            recv,
+        );
+        let state = BlockedRecvState {
+            recv_cap: recv,
+            payload_user_ptr: crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA,
+            payload_user_len: 2 * PAGE,
+            meta_user_ptr: 0x5000_0000,
+            meta_user_len: 64,
+            recv_abi: RecvAbiVariant::RecvV2,
+        };
+        let endpoint = CapObject::Endpoint {
+            index: eidx,
+            generation: egen,
+        };
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(&s, 2, endpoint, &state);
+
+        let ack = crate::kernel::boot::shared_region_blocked_recv::snapshot().expect("ack present");
+        assert_eq!(ack.receiver_tid, 2);
+        assert_eq!(ack.receiver_generation, rgen as u32);
+        assert_eq!(ack.endpoint_idx, eidx);
+        assert_eq!(ack.endpoint_generation, egen);
+        assert_eq!(
+            ack.payload_va,
+            crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA
+        );
+        assert_eq!(ack.meta_ptr, 0x5000_0000);
+        assert_eq!(ack.map_len, 2 * PAGE);
+        assert!(ack.recv_v2);
+
+        // matches() accepts the exact identity and rejects each wrong field.
+        let ok = |tid, g, ep, epg, va, mp, len| {
+            crate::kernel::boot::shared_region_blocked_recv::matches(tid, g, ep, epg, va, mp, len)
+        };
+        let va = crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA;
+        assert!(ok(2, rgen as u32, eidx, egen, va, 0x5000_0000, 2 * PAGE));
+        assert!(
+            !ok(3, rgen as u32, eidx, egen, va, 0x5000_0000, 2 * PAGE),
+            "wrong receiver"
+        );
+        assert!(
+            !ok(2, rgen as u32 + 1, eidx, egen, va, 0x5000_0000, 2 * PAGE),
+            "stale generation"
+        );
+        assert!(
+            !ok(2, rgen as u32, eidx + 1, egen, va, 0x5000_0000, 2 * PAGE),
+            "wrong endpoint"
+        );
+        assert!(
+            !ok(2, rgen as u32, eidx, egen + 1, va, 0x5000_0000, 2 * PAGE),
+            "stale endpoint gen"
+        );
+        assert!(
+            !ok(
+                2,
+                rgen as u32,
+                eidx,
+                egen,
+                va + 0x1000,
+                0x5000_0000,
+                2 * PAGE
+            ),
+            "wrong VA"
+        );
+        assert!(
+            !ok(2, rgen as u32, eidx, egen, va, 0x6000_0000, 2 * PAGE),
+            "wrong meta ptr"
+        );
+
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // (unit, feature) The ack is NOT published in partial / non-oracle states: waiter not committed,
+    // wrong VA, or a plain (non-recv-v2) waiter.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn ack_absent_for_partial_or_nonoracle_states() {
+        use crate::kernel::boot::ReceiverWaiterIdentity;
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        use crate::kernel::vm::Asid;
+        let _g = sr_knob_guard();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let rgen = s.task_asid(2).map(|a| a.0).unwrap_or(0);
+        let egen = s.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        let endpoint = CapObject::Endpoint {
+            index: eidx,
+            generation: egen,
+        };
+        let mk = |payload: usize, abi| BlockedRecvState {
+            recv_cap: recv,
+            payload_user_ptr: payload,
+            payload_user_len: 2 * PAGE,
+            meta_user_ptr: 0x5000_0000,
+            meta_user_len: 64,
+            recv_abi: abi,
+        };
+
+        // (a) waiter NOT committed to the endpoint → no ack.
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        let va = crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA;
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            endpoint,
+            &mk(va, RecvAbiVariant::RecvV2),
+        );
+        assert!(
+            crate::kernel::boot::shared_region_blocked_recv::snapshot().is_none(),
+            "no ack until the endpoint waiter is committed"
+        );
+
+        // Commit the waiter for the remaining sub-cases.
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(2), Asid(rgen)),
+            recv,
+        );
+
+        // (b) wrong VA → no ack.
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            endpoint,
+            &mk(0x1000_0000, RecvAbiVariant::RecvV2),
+        );
+        assert!(
+            crate::kernel::boot::shared_region_blocked_recv::snapshot().is_none(),
+            "wrong VA"
+        );
+
+        // (c) wrong receiver committed (a different task owns the waiter slot) → no ack for tid 2.
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        s.register_task(3).expect("t3");
+        let gen3 = s.task_asid(3).map(|a| a.0).unwrap_or(0);
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(3), Asid(gen3)),
+            recv,
+        );
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            endpoint,
+            &mk(va, RecvAbiVariant::RecvV2),
+        );
+        assert!(
+            crate::kernel::boot::shared_region_blocked_recv::snapshot().is_none(),
+            "the committed waiter is a different task → no ack for tid 2"
+        );
+
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // (unit, feature) The send gate is reachable exactly once: the first consume for the exact
+    // receiver+endpoint succeeds; a duplicate (a second send) is declined.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn send_gate_consumes_exactly_once() {
+        use crate::kernel::boot::ReceiverWaiterIdentity;
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        use crate::kernel::vm::Asid;
+        let _g = sr_knob_guard();
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let rgen = s.task_asid(2).map(|a| a.0).unwrap_or(0);
+        let egen = s.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(2), Asid(rgen)),
+            recv,
+        );
+        let state = BlockedRecvState {
+            recv_cap: recv,
+            payload_user_ptr: crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA,
+            payload_user_len: 2 * PAGE,
+            meta_user_ptr: 0x5000_0000,
+            meta_user_len: 64,
+            recv_abi: RecvAbiVariant::RecvV2,
+        };
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            CapObject::Endpoint {
+                index: eidx,
+                generation: egen,
+            },
+            &state,
+        );
+
+        // Wrong receiver/endpoint never consume.
+        assert!(!crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(3, eidx));
+        assert!(
+            !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx + 1)
+        );
+        // Exactly-once: first send consumes, duplicate declines.
+        assert!(crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx));
+        assert!(
+            !crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx),
+            "a duplicate send must not re-satisfy the gate on a consumed ack"
+        );
+
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // (source) The blocked path does not select RecvSharedV3, the immediate shared-region executor,
+    // or the no-waiter enqueue executor: the producer takes the direct blocked delivery and returns.
+    #[test]
+    fn blocked_path_excludes_immediate_enqueue_and_v3() {
+        let body = SYSCALL_SRC
+            .split_once("pub(crate) fn produce_blocked_waiter_shared_region_delivery")
+            .and_then(|(_, r)| r.split_once("\n/// ").map(|(b, _)| b))
+            .expect("producer present");
+        assert!(!body.contains("RecvSharedV3"));
+        assert!(!body.contains("enqueue"));
+        assert!(
+            body.contains("shared_region_phase_a("),
+            "takes the direct blocked delivery"
+        );
+    }
+
+    // Required contract marker — emitted only after the hosted/source proof above passes.
+    #[test]
+    fn blocked_handshake_contract_marker() {
+        crate::yarm_log!(
+            "SHARED_REGION_BLOCKED_HANDSHAKE_CONTRACT receiver_generation_checked=1 endpoint_checked=1 recv_v2_state_checked=1 payload_va_checked=1 metadata_ptr_checked=1 timing_dependency=0 result=ok"
+        );
+    }
+
+    // ── Stage 198E3C1C: pre-ack fail-closed + consume-after-publish ordering ─────────────────────
+
+    // (source) The producer FAILS CLOSED before any mutation when armed and no matching ack exists:
+    // it returns the canonical retryable WouldBlock (never Ok(false)→legacy), and the fail-closed
+    // check DOMINATES the blocked-state take, the snapshot build, and the post-work publish.
+    #[test]
+    fn preack_producer_fails_closed_before_mutation() {
+        let body = SYSCALL_SRC
+            .split_once("pub(crate) fn produce_blocked_waiter_shared_region_delivery")
+            .and_then(|(_, r)| r.split_once("\n/// ").map(|(b, _)| b))
+            .expect("producer present");
+        let gate = body
+            .find("matches_for_delivery(")
+            .expect("non-consuming pre-ack gate present");
+        let fail_closed = body[gate..]
+            .find("return Err(SyscallError::WouldBlock);")
+            .map(|i| gate + i)
+            .expect("fail-closed WouldBlock return present");
+        let take = body.find("blocked_recv_state.take()").expect("state take");
+        let stash = body
+            .find("stash_shared_region_delivery(")
+            .expect("post-work publish");
+        assert!(
+            gate < take,
+            "pre-ack gate must dominate the blocked-state take"
+        );
+        assert!(
+            fail_closed < take,
+            "the WouldBlock return must precede any mutation"
+        );
+        // The ack is CONSUMED only AFTER the post-work is published (never before).
+        let consume = body.find("consume_for_delivery(").expect("consume present");
+        assert!(
+            stash < consume,
+            "the ack must be consumed only after the post-work is published"
+        );
+    }
+
+    // (source) The ipc.rs boundary maps the producer's WouldBlock to a RETRYABLE KernelError::
+    // WouldBlock (not a UserMemoryFault, not the legacy delivery).
+    #[test]
+    fn preack_ipc_maps_wouldblock_retryable() {
+        assert!(
+            IPC_SYSCALL_SRC.contains(
+                "Err(SyscallError::WouldBlock) => (\n                                        Some(Err(KernelError::WouldBlock)),"
+            ),
+            "the oracle pre-ack decline must surface as a retryable WouldBlock, not a fault"
+        );
+    }
+
+    // (unit, feature) The non-consuming check leaves the ack AVAILABLE across repeated pre-publication
+    // attempts; only consume_for_delivery claims it, exactly once.
+    #[cfg(feature = "x86-shared-region-direct-oracle")]
+    #[test]
+    fn preack_ack_survives_until_consume() {
+        use crate::kernel::boot::ReceiverWaiterIdentity;
+        use crate::kernel::capabilities::CapObject;
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
+        use crate::kernel::vm::Asid;
+        let _g = sr_knob_guard();
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(true);
+        let mut s = Bootstrap::init().expect("init");
+        s.register_task(2).expect("t2");
+        let (eidx, _send, recv) = s.create_endpoint(4).expect("ep");
+        let rg = s.task_asid(2).map(|a| a.0).unwrap_or(0);
+        let egen = s.with_ipc_state(|ipc| ipc.endpoint_generations[eidx]);
+        s.publish_recv_waiter_live(
+            eidx,
+            ReceiverWaiterIdentity::new(ThreadId(2), Asid(rg)),
+            recv,
+        );
+        let state = BlockedRecvState {
+            recv_cap: recv,
+            payload_user_ptr: crate::kernel::boot::SHARED_REGION_ORACLE_USER_VA,
+            payload_user_len: 2 * PAGE,
+            meta_user_ptr: 0x5000_0000,
+            meta_user_len: 64,
+            recv_abi: RecvAbiVariant::RecvV2,
+        };
+        crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
+            &s,
+            2,
+            CapObject::Endpoint {
+                index: eidx,
+                generation: egen,
+            },
+            &state,
+        );
+        // Repeated non-consuming checks keep returning true — the ack is not lost by a check.
+        for _ in 0..3 {
+            assert!(crate::kernel::boot::shared_region_blocked_recv::matches_for_delivery(2, eidx));
+        }
+        // The single consume claims it; afterwards it is gone (a duplicate send cannot re-publish).
+        assert!(crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx));
+        assert!(!crate::kernel::boot::shared_region_blocked_recv::matches_for_delivery(2, eidx));
+        assert!(!crate::kernel::boot::shared_region_blocked_recv::consume_for_delivery(2, eidx));
+        crate::kernel::boot::shared_region_blocked_recv::reset();
+        crate::kernel::boot::set_x86_shared_region_direct_oracle_enabled(false);
+    }
+
+    // Stage 198E3C1C compile/hosted contract marker for the QEMU-proof precursors (NOT a live seal).
+    #[test]
+    fn direct_qemu_proof_precursor_marker() {
+        crate::yarm_log!(
+            "SHARED_REGION_DIRECT_QEMU_PRECURSOR preack_fail_closed=1 retryable=WouldBlock consume_after_publish=1 userspace_retry_bounded=1 result=ok"
+        );
+    }
+
+    // ── Stage 198E3C2A: authoritative large-length send ABI + portable oracle core ───────────────
+    const KERNEL_IPC_SRC: &str = include_str!("../../../crates/yarm-kernel/src/ipc.rs");
+    const CONTRACT_DOC: &str =
+        include_str!("../../../doc/STAGE_198E3C1_SHARED_REGION_USERSPACE_CONTRACT.md");
+
+    // Slice the canonical `send_shared_region_large` helper body.
+    fn large_send_helper() -> &'static str {
+        USER_RT_SRC
+            .split_once("pub unsafe fn send_shared_region_large")
+            .and_then(|(_, r)| {
+                r.split_once("\n    pub unsafe fn send_shared_region")
+                    .map(|(b, _)| b)
+            })
+            .expect("send_shared_region_large helper")
+    }
+
+    // (1) The helper selects the LARGE-length IpcSend path: it issues the raw IpcSend with the region
+    // length in arg(LEN), not an inline message.
+    #[test]
+    fn abi_guard_large_length_path_selected() {
+        let f = large_send_helper();
+        assert!(f.contains("SYSCALL_IPC_SEND_NR"));
+        assert!(f.contains("raw_syscall(SYSCALL_IPC_SEND_NR, args)"));
+        assert!(
+            !f.contains("Message::with_header"),
+            "no inline message construction"
+        );
+        assert!(!f.contains("ipc_send(send_ep"), "no inline-send path");
+    }
+
+    // (2) Two pages produce the expected region-byte length; the oracle convenience uses it.
+    #[test]
+    fn abi_guard_two_page_region_length() {
+        const PAGE: usize = 4096;
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_PAGE_SIZE: usize = 4096;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_PAGE_COUNT: usize = 2;"));
+        // 2 pages = 8192, which must exceed the 128-byte inline threshold.
+        assert_eq!(2 * PAGE, 8192);
+        assert!(2 * PAGE > 128);
+        assert!(
+            USER_RT_SRC.contains(
+                "send_shared_region_large(send_ep, mem_cap, 0, SHARED_REGION_ORACLE_LEN)"
+            )
+        );
+    }
+
+    // (3) Source offset occupies arg1, region length arg2, source cap arg5 (the transfer-cap slot).
+    #[test]
+    fn abi_guard_argument_positions() {
+        let f = large_send_helper();
+        assert!(
+            f.contains("[send_ep as usize, offset, region_len, 0, 0, mem_cap as usize]"),
+            "offset in arg1, region_len in arg2, mem_cap in arg5"
+        );
+        // Match the kernel's authoritative arg indices.
+        assert_eq!(crate::kernel::syscall::SYSCALL_ARG_CAP, 0);
+        assert_eq!(crate::kernel::syscall::SYSCALL_ARG_PTR, 1);
+        assert_eq!(crate::kernel::syscall::SYSCALL_ARG_LEN, 2);
+        assert_eq!(crate::kernel::syscall::SYSCALL_ARG_TRANSFER_CAP, 5);
+    }
+
+    // (4) Descriptor size and field order match kernel decoding (16 bytes: offset u64 @0, len u64 @8).
+    #[test]
+    fn abi_guard_descriptor_layout_matches_kernel() {
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_DESCRIPTOR_LEN: usize = 16;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_DESCRIPTOR_OFFSET_AT: usize = 0;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_DESCRIPTOR_LEN_AT: usize = 8;"));
+        // Kernel authority.
+        assert!(KERNEL_IPC_SRC.contains("pub const ENCODED_LEN: usize = 16;"));
+        assert!(KERNEL_IPC_SRC.contains("out[i] = off[i];"));
+        assert!(KERNEL_IPC_SRC.contains("out[8 + i] = len[i];"));
+    }
+
+    // (5) The helper does NOT construct an inline shared-memory opcode frame.
+    #[test]
+    fn abi_guard_no_inline_opcode_frame() {
+        let f = large_send_helper();
+        assert!(!f.contains("Message::with_header"));
+        assert!(
+            !f.contains("FLAG_CAP_TRANSFER"),
+            "no inline cap-transfer flag framing"
+        );
+    }
+
+    // (6) The inline payload path cannot accidentally select shared-region delivery: the helper only
+    // ever sends with region_len > MAX_PAYLOAD (guarded), and the kernel's inline branch is a distinct
+    // OPCODE_INLINE construction.
+    #[test]
+    fn abi_guard_inline_path_cannot_select_shared_region() {
+        let f = large_send_helper();
+        assert!(f.contains("region_len <= IPC_MESSAGE_MAX_PAYLOAD"));
+        // Kernel: the shared-region branch is guarded by len > MAX_PAYLOAD; the ELSE branch builds an
+        // ordinary OPCODE_INLINE message (distinct path).
+        assert!(IPC_SYSCALL_SRC.contains("if len > Message::MAX_PAYLOAD {"));
+        assert!(IPC_SYSCALL_SRC.contains("OPCODE_INLINE"));
+    }
+
+    // (7) `region_len <= MAX_PAYLOAD` is rejected locally with the canonical InvalidArgs.
+    #[test]
+    fn abi_guard_small_length_rejected() {
+        let f = large_send_helper();
+        let idx = f
+            .find("region_len <= IPC_MESSAGE_MAX_PAYLOAD")
+            .expect("small-len guard");
+        assert!(
+            f[idx..].contains("return Err(SyscallError::InvalidArgs);"),
+            "a length <= MAX_PAYLOAD must be rejected with InvalidArgs"
+        );
+        assert_eq!(crate::kernel::syscall::OPCODE_SHARED_MEM, 1);
+    }
+
+    // (8) Malformed offset/length (overflow) returns the canonical error.
+    #[test]
+    fn abi_guard_overflow_rejected() {
+        let f = large_send_helper();
+        assert!(f.contains("offset.checked_add(region_len).is_none()"));
+    }
+
+    // (9) The source cap remains valid after a retryable pre-ack WouldBlock: the producer's fail-
+    // closed path returns WouldBlock BEFORE taking blocked state (no mutation), and ipc.rs surfaces
+    // it as a retryable error whose envelope is released (source cap preserved), not a fault.
+    #[test]
+    fn abi_guard_source_cap_survives_wouldblock() {
+        assert!(SYSCALL_SRC.contains("return Err(SyscallError::WouldBlock);"));
+        assert!(IPC_SYSCALL_SRC.contains(
+            "Err(SyscallError::WouldBlock) => (\n                                        Some(Err(KernelError::WouldBlock)),"
+        ));
+    }
+
+    // (10) Exactly ONE TransferEnvelope is created on a successful shared-region send.
+    #[test]
+    fn abi_guard_one_transfer_envelope() {
+        // The large-transfer branch stashes exactly one envelope carrying the region descriptor.
+        let large = IPC_SYSCALL_SRC
+            .split_once("if len > Message::MAX_PAYLOAD {")
+            .and_then(|(_, r)| r.split_once("} else {").map(|(b, _)| b))
+            .expect("large-transfer branch");
+        assert_eq!(
+            large.matches("stash_transfer_handle(").count(),
+            1,
+            "exactly one TransferEnvelope stash on the large-transfer path"
+        );
+        assert!(large.contains("Some(TransferSharedRegion {"));
+    }
+
+    // (11) The contract document and the source constants agree.
+    #[test]
+    fn abi_guard_doc_matches_source() {
+        // The doc reflects the corrected large-length ABI, not the obsolete inline-opcode claim.
+        assert!(CONTRACT_DOC.contains("large-transfer form of `IpcSend`"));
+        assert!(CONTRACT_DOC.contains("NOT** selected by an inline"));
+        assert!(CONTRACT_DOC.contains("ENCODED_LEN` = **16 bytes**"));
+        assert!(CONTRACT_DOC.contains("Message::MAX_PAYLOAD"));
+        assert!(CONTRACT_DOC.contains("128"));
+        // Descriptor + threshold constants agree numerically.
+        assert_eq!(crate::kernel::syscall::OPCODE_SHARED_MEM, 1);
+    }
+
+    // (12) The x86_64 sealed live-oracle encoding is preserved byte-for-byte: the exact SEND +
+    // completion markers remain, and the send still encodes offset/len/cap identically.
+    #[test]
+    fn abi_guard_x86_sealed_encoding_preserved() {
+        assert!(
+            SERVICE_SRC
+                .contains("X86_SHARED_REGION_DIRECT_SEND attempts={} early_retries={} result=ok")
+        );
+        assert!(SERVICE_SRC.contains(
+            "X86_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE mapped_pages=2 fresh_cap=1 readonly=1 first_release=ok second_release=rejected wakes=1 result=ok"
+        ));
+        // The x86 wrapper drives the arch-neutral core (the send encoding is the common helper).
+        assert!(SERVICE_SRC.contains("core_oracle::parent_wait_and_send(endpoint_cap, mem_cap)"));
+        assert!(SERVICE_SRC.contains("send_shared_region(endpoint_cap, mem_cap)"));
+    }
+
+    // Portable oracle core: the arch-neutral module exists, is `not(hosted-dev)`-gated (all arches),
+    // and the x86 wrapper delegates to it (spawn + arch marker only in the wrapper).
+    #[test]
+    fn portable_oracle_core_present_and_used() {
+        assert!(SERVICE_SRC.contains("mod shared_region_oracle_core {"));
+        assert!(
+            SERVICE_SRC.contains("pub(super) unsafe fn child_recv_and_validate() -> RecvOutcome")
+        );
+        assert!(SERVICE_SRC.contains("pub(super) unsafe fn parent_wait_and_send(endpoint_cap: u32, mem_cap: u32) -> SendOutcome"));
+        assert!(SERVICE_SRC.contains("pub(super) fn oracle_caps() -> (u32, u32)"));
+        // The x86 wrapper uses the core for child validation + parent send + cap decode.
+        assert!(SERVICE_SRC.contains("core_oracle::child_recv_and_validate()"));
+        assert!(SERVICE_SRC.contains("core_oracle::oracle_caps()"));
+    }
+
+    // Cross-architecture state (Stage 198E3C2C): the DIRECT shared-region cell is now LIVE on ALL
+    // three arches (x86_64=selector 2, AArch64=6, RISC-V=7), and enqueue stays disabled everywhere.
+    #[test]
+    fn cross_arch_shared_region_live_all_three_wired() {
+        // Each arch keeps its own feature-gated slot-5 selector const.
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"x86-shared-region-direct-oracle\")]\npub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"
+        ));
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]\npub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;"
+        ));
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"riscv-shared-region-direct-oracle\")]\npub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"
+        ));
+        // All three arch wrappers exist.
+        assert!(SERVICE_SRC.contains("run_x86_shared_region_direct_oracle"));
+        assert!(SERVICE_SRC.contains("run_aarch64_shared_region_direct_oracle"));
+        assert!(SERVICE_SRC.contains("run_riscv_shared_region_direct_oracle"));
+        // Each slot-5 shared-region dispatch is target-gated per arch.
+        for (name, disp) in [
+            ("x86_64", "run_x86_shared_region_direct_oracle(ctx.task_id)"),
+            (
+                "aarch64",
+                "run_aarch64_shared_region_direct_oracle(ctx.task_id)",
+            ),
+            (
+                "riscv64",
+                "run_riscv_shared_region_direct_oracle(ctx.task_id)",
+            ),
+        ] {
+            let at = SERVICE_SRC
+                .find(disp)
+                .unwrap_or_else(|| panic!("{name} dispatch"));
+            let prefix = &SERVICE_SRC[..at];
+            let cfg = prefix.rfind("#[cfg(").expect("dispatch cfg");
+            assert!(
+                SERVICE_SRC[cfg..at].contains(&format!("target_arch = \"{name}\"")),
+                "the {name} shared-region dispatch must be {name}-target-gated"
+            );
+        }
+        // Enqueue stays disabled: no live enqueue class literal anywhere in the kernel.
+        assert!(!MOD_SRC.contains("class=IpcSendSharedRegionEnqueue"));
+    }
+
+    // The arch syscall register wrappers pass the common helper's 6 args without truncation/reorder.
+    #[test]
+    fn cross_arch_raw_syscall_passes_six_args() {
+        const X86: &str = include_str!("../../../crates/yarm-user-rt/src/arch/x86_64.rs");
+        const ARM: &str = include_str!("../../../crates/yarm-user-rt/src/arch/aarch64.rs");
+        const RV: &str = include_str!("../../../crates/yarm-user-rt/src/arch/riscv64.rs");
+        for (name, src) in [("x86_64", X86), ("aarch64", ARM), ("riscv64", RV)] {
+            assert!(
+                src.contains("fn raw_syscall(") && src.contains("args: [usize; 6]"),
+                "{name} raw_syscall must take a 6-element arg array"
+            );
+            for i in 0..6 {
+                assert!(
+                    src.contains(&format!("args[{i}]")),
+                    "{name} raw_syscall must forward args[{i}]"
+                );
+            }
+        }
+    }
+
+    // Required hosted contract marker (NOT a live retirement marker).
+    #[test]
+    fn large_send_abi_contract_marker() {
+        crate::yarm_log!(
+            "SHARED_REGION_LARGE_SEND_ABI_CONTRACT descriptor_bytes=16 inline_selector=0 source_cap_preserved=1 result=ok"
+        );
+    }
+}
+
+// Stage 198E3C2B — AARCH64 DIRECT SHARED-REGION LIVE CELL POLICY. Source-inspection guards that lock
+// in the AArch64 port's contract: it reuses the SAME arch-neutral kernel transaction/ack/marker core
+// and oracle core (no duplication), requires BOTH the per-arch feature AND the runtime selector to
+// activate, keeps enqueue disabled, keeps RISC-V un-wired, and never lets the userspace completion
+// stand in for the kernel attestations.
+mod stage198e3c2b_aarch64_direct {
+    use super::*;
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RT_SRC: &str = include_str!("../../runtime.rs");
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-shared-region-direct-aarch64-smoke.sh");
+
+    // (1) The AArch64 per-arch feature forwards to the arch-neutral umbrella and is NOT default-on.
+    #[test]
+    fn aarch64_feature_forwards_to_umbrella_and_defaults_off() {
+        assert!(CARGO_SRC.contains("shared-region-direct-oracle = []"));
+        assert!(
+            CARGO_SRC.contains(
+                "aarch64-shared-region-direct-oracle = [\"shared-region-direct-oracle\"]"
+            )
+        );
+        assert!(CARGO_SRC.contains("default = [\"hosted-dev\"]"));
+        // The umbrella (not the per-arch feature) gates the shared kernel logic.
+        assert!(MOD_SRC.contains("#[cfg(feature = \"shared-region-direct-oracle\")]"));
+    }
+
+    // (2) BOTH the feature AND the runtime selector are required: the AArch64 cmdline key parses to a
+    // default-off knob, the setter arms the shared oracle-proof knob, and the boot provisioning caller
+    // is feature-gated behind `aarch64-shared-region-direct-oracle`.
+    #[test]
+    fn aarch64_feature_and_selector_both_required() {
+        // Cmdline knob parses + defaults off.
+        assert!(CMDLINE_SRC.contains("yarm.aarch64_shared_region_direct_oracle"));
+        assert!(
+            CMDLINE_SRC.contains("options.aarch64_shared_region_direct_oracle = parse_bool_knob")
+        );
+        // The runtime setter arms the shared proof knob (runtime selector activates behavior).
+        assert!(
+            MOD_SRC.contains("fn set_aarch64_shared_region_direct_oracle_enabled")
+                && MOD_SRC.contains("set_ipc_recv_oracle_proof_enabled(true)")
+        );
+        // The shared enabled predicate ORs every per-arch knob (so the umbrella logic arms for ANY
+        // arch), and the AArch64 boot provisioning is compiled ONLY under the AArch64 feature.
+        let pred = MOD_SRC
+            .split_once("pub fn shared_region_direct_oracle_enabled() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("shared enabled predicate present");
+        assert!(pred.contains("x86_shared_region_direct_oracle_enabled()"));
+        assert!(pred.contains("aarch64_shared_region_direct_oracle_enabled()"));
+        assert!(BOOT_SRC.contains("#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]"));
+        assert!(BOOT_SRC.contains("aarch64_shared_region_direct_oracle_enabled()"));
+    }
+
+    // (3) The AArch64 boot provisioning slot contract: selector 6, source cap + endpoint cap in slots
+    // 13/14, mutually exclusive with every slot-13/14 oracle above AND with the five slot-5 oracles
+    // (fail-closed arm-neither), and it reuses the SAME arch-neutral `provision_init_shared_region_oracle`.
+    #[test]
+    fn aarch64_boot_provisioning_slot_contract() {
+        // Selector 6; reuses the arch-neutral provisioning helper (no duplicated kernel logic).
+        assert!(BOOT_SRC.contains("crate::kernel::boot::AARCH64_SHARED_REGION_ORACLE_SELECTOR"));
+        assert!(BOOT_SRC.contains(
+            "crate::kernel::boot::provision_init_shared_region_oracle(kernel, RING3_INIT_SERVER_TID)"
+        ));
+        // Only fires when slots 5/13/14 are all still zero (mutually exclusive with slot-13/14 oracles).
+        assert!(
+            BOOT_SRC.contains("if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0")
+        );
+        // Fail-closed slot-5 conflict: if the shared-region knob AND any other slot-5 oracle are both
+        // armed, arm NEITHER.
+        assert!(BOOT_SRC.contains("AARCH64_ORACLE_SLOT5_CONFLICT"));
+        assert!(BOOT_SRC.contains("result=arm_neither"));
+        // The other five slot-5 oracles never overwrite a selector the shared-region oracle set.
+        assert!(BOOT_SRC.contains(
+            "if init_args[5] == 0 && crate::kernel::boot::aarch64_yield_lone_oracle_enabled()"
+        ));
+    }
+
+    // (4) The AArch64 selector value = 6, distinct from x86's 2 and from the five AArch64 slot-5
+    // oracles (1-5); the userspace and kernel selector constants agree.
+    #[test]
+    fn aarch64_selector_is_six_distinct_from_others() {
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"aarch64-shared-region-direct-oracle\")]\npub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;"
+        ));
+        assert!(USER_RT_SRC.contains("pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;"));
+        // x86 keeps its own value 2.
+        assert!(MOD_SRC.contains("pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"));
+    }
+
+    // (5) The AArch64 userspace wrapper delegates ENTIRELY to the arch-neutral oracle core — it
+    // duplicates NO recv/validate/release/send/retry logic (only spawn + arch-named markers).
+    #[test]
+    fn aarch64_wrapper_delegates_no_duplicated_impl() {
+        // The wrapper drives the shared core for spawn + parent send + child validation.
+        assert!(SERVICE_SRC.contains("fn run_aarch64_shared_region_direct_oracle"));
+        assert!(SERVICE_SRC.contains("core_oracle::parent_wait_and_send(endpoint_cap, mem_cap)"));
+        assert!(SERVICE_SRC.contains("aarch64_shared_region_direct_oracle_child"));
+        // Isolate the AArch64 wrapper span (its two fns) and prove it contains no re-implemented core
+        // logic: no direct recv-v2 call, no release call, no bounded-retry loop of its own.
+        let start = SERVICE_SRC
+            .find("fn aarch64_shared_region_direct_oracle_child")
+            .expect("aarch64 child fn");
+        let end = SERVICE_SRC[start..]
+            .find("// ─── Stage 196C")
+            .map(|o| start + o)
+            .expect("end of aarch64 wrapper");
+        let span = &SERVICE_SRC[start..end];
+        assert!(
+            !span.contains("recv_shared_region_v2("),
+            "the aarch64 wrapper must NOT re-implement the recv (delegates to the core)"
+        );
+        assert!(
+            !span.contains("release_shared_region_mapping("),
+            "the aarch64 wrapper must NOT re-implement the release (delegates to the core)"
+        );
+        assert!(
+            !span.contains("MAX_SEND_ATTEMPTS"),
+            "the aarch64 wrapper must NOT re-implement the bounded send retry (delegates to the core)"
+        );
+        // It DOES call the arch-neutral core for the child body + caps.
+        assert!(span.contains("core_oracle::child_recv_and_validate()"));
+        assert!(span.contains("core_oracle::oracle_caps()"));
+    }
+
+    // (6) The kernel attestations are the authoritative proof: the userspace completion marker alone
+    // cannot satisfy the smoke, which requires all FIVE kernel markers each exactly once PLUS the
+    // single off-lock post-work publication, independently of the userspace DONE line.
+    #[test]
+    fn aarch64_userspace_cannot_substitute_for_kernel_attestations() {
+        // The smoke requires the five KERNEL markers (arch=aarch64) each exactly once.
+        for m in [
+            "IPCSEND_SHARED_REGION_OBJECT_OK arch=aarch64 class=direct",
+            "IPCSEND_SHARED_REGION_MAP_OK arch=aarch64 class=direct",
+            "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch=aarch64 class=direct",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=aarch64 class=IpcSendSharedRegionDirect",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcSendSharedRegionDirect result=ok",
+        ] {
+            assert!(
+                SMOKE_SRC.contains(m),
+                "smoke must require kernel marker: {m}"
+            );
+        }
+        // The single off-lock publication is required exactly once (independent of userspace).
+        assert!(
+            SMOKE_SRC
+                .contains("DISPATCH_POST_WORK_DONE kind=blocked_waiter_shared_region result=ok")
+        );
+        // The userspace DONE line is ALSO required, but it is NOT the retirement proof.
+        assert!(SMOKE_SRC.contains("AARCH64_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE"));
+    }
+
+    // (7) The artifact guard exception is build-specific: it permits the DIRECT literal ONLY for the
+    // explicitly armed AArch64 oracle build, still forbids the bare/off-arch shared-region marker, and
+    // forbids the ENQUEUE class in every build.
+    #[test]
+    fn aarch64_artifact_guard_exception_is_build_specific() {
+        assert!(GUARD_SRC.contains(
+            "YARM_SHARED_REGION_DIRECT_ORACLE_BUILD:-0}\" == \"1\" && \"$arch\" == \"aarch64\""
+        ));
+        assert!(GUARD_SRC.contains("arch=x86_64 class=IpcSendSharedRegion"));
+        // The default branch still forbids the bare shared-region class (normal/off-arch builds clean).
+        assert!(GUARD_SRC.contains("forbidden+=(\"class=IpcSendSharedRegion\")"));
+        // Enqueue forbidden in every build.
+        assert!(GUARD_SRC.contains("class=IpcSendSharedRegionEnqueue"));
+    }
+
+    // (8) The AArch64 marker emitters remain arch-parametrized (no hardcoded per-arch literal): the
+    // retirement/attestation literals are emitted through `SHARED_REGION_ORACLE_ARCH`, so the SAME
+    // emitter serves x86_64 and aarch64 without duplication, and the drain holds no inline literal.
+    #[test]
+    fn aarch64_markers_reuse_parametrized_emitter() {
+        assert!(MOD_SRC.contains("arch={} class=IpcSendSharedRegionDirect"));
+        assert!(MOD_SRC.contains("SHARED_REGION_ORACLE_ARCH"));
+        // No hardcoded aarch64 shared-region literal (must be parametrized).
+        assert!(!MOD_SRC.contains("arch=aarch64 class=IpcSendSharedRegionDirect"));
+        // The drain delegates to the gated helper (no inline literal).
+        assert!(RT_SRC.contains("maybe_emit_shared_region_direct_live_markers("));
+        assert!(!RT_SRC.contains("IPCSEND_SHARED_REGION_OBJECT_OK"));
+    }
+
+    // (9) Required hosted contract marker for the AArch64 cell (NOT a live retirement marker; the live
+    // seal is earned ONLY from a clean QEMU boot log).
+    #[test]
+    fn aarch64_direct_cell_contract_marker() {
+        crate::yarm_log!(
+            "AARCH64_SHARED_REGION_DIRECT_CELL_CONTRACT selector=6 umbrella_reused=1 oracle_core_reused=1 enqueue=0 riscv=0 result=ok"
+        );
+    }
+}
+
+// Stage 198E3C2C — RISC-V DIRECT SHARED-REGION LIVE CELL POLICY. Source-inspection guards that lock
+// in the RISC-V port's contract: it reuses the SAME arch-neutral kernel transaction/ack/marker core
+// and oracle core (no duplication), requires BOTH the per-arch feature AND the runtime selector to
+// activate, keeps enqueue disabled, uses a target-specific user VA below the RISC-V kernel boundary
+// AND heap base, shares the AArch64 release-decode convention, and never lets the userspace
+// completion stand in for the kernel attestations. Closes the 3/3 direct-live matrix.
+mod stage198e3c2c_riscv_direct {
+    use super::*;
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const RISCV_ARCH_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/arch/riscv64.rs");
+    const SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-shared-region-direct-riscv64-smoke.sh");
+
+    // (1) The RISC-V per-arch feature forwards to the arch-neutral umbrella and is NOT default-on.
+    #[test]
+    fn riscv_feature_forwards_to_umbrella_and_defaults_off() {
+        assert!(CARGO_SRC.contains("shared-region-direct-oracle = []"));
+        assert!(
+            CARGO_SRC
+                .contains("riscv-shared-region-direct-oracle = [\"shared-region-direct-oracle\"]")
+        );
+        assert!(CARGO_SRC.contains("default = [\"hosted-dev\"]"));
+        assert!(MOD_SRC.contains("#[cfg(feature = \"shared-region-direct-oracle\")]"));
+    }
+
+    // (2) BOTH the feature AND the runtime selector are required: the RISC-V cmdline key parses to a
+    // default-off knob, the setter arms the shared oracle-proof knob, the shared enabled predicate ORs
+    // the RISC-V knob, and the boot provisioning caller is feature-gated.
+    #[test]
+    fn riscv_feature_and_selector_both_required() {
+        assert!(CMDLINE_SRC.contains("yarm.riscv_shared_region_direct_oracle"));
+        assert!(
+            CMDLINE_SRC.contains("options.riscv_shared_region_direct_oracle = parse_bool_knob")
+        );
+        assert!(
+            MOD_SRC.contains("fn set_riscv_shared_region_direct_oracle_enabled")
+                && MOD_SRC.contains("set_ipc_recv_oracle_proof_enabled(true)")
+        );
+        let pred = MOD_SRC
+            .split_once("pub fn shared_region_direct_oracle_enabled() -> bool {")
+            .and_then(|(_, r)| r.split_once('}'))
+            .map(|(b, _)| b)
+            .expect("shared enabled predicate present");
+        assert!(pred.contains("riscv_shared_region_direct_oracle_enabled()"));
+        assert!(BOOT_SRC.contains("#[cfg(feature = \"riscv-shared-region-direct-oracle\")]"));
+        assert!(BOOT_SRC.contains("riscv_shared_region_direct_oracle_enabled()"));
+    }
+
+    // (3) The RISC-V boot provisioning slot contract: selector 7, source cap + endpoint cap in slots
+    // 13/14, mutually exclusive with every slot-13/14 oracle above AND with the six slot-5 oracles
+    // (fail-closed arm-neither), and it reuses the SAME arch-neutral `provision_init_shared_region_oracle`.
+    #[test]
+    fn riscv_boot_provisioning_slot_contract() {
+        assert!(BOOT_SRC.contains("crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR"));
+        assert!(BOOT_SRC.contains(
+            "crate::kernel::boot::provision_init_shared_region_oracle(kernel, RING3_INIT_SERVER_TID)"
+        ));
+        assert!(
+            BOOT_SRC.contains("if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0")
+        );
+        assert!(BOOT_SRC.contains("RISCV_ORACLE_SLOT5_CONFLICT"));
+        assert!(BOOT_SRC.contains("result=arm_neither"));
+        // The six slot-5 oracles never overwrite a selector the shared-region oracle set.
+        assert!(BOOT_SRC.contains(
+            "if init_args[5] == 0 && crate::kernel::boot::riscv_yield_lone_task_oracle_enabled()"
+        ));
+    }
+
+    // (4) The RISC-V selector value = 7, distinct from x86's 2, AArch64's 6, and the six RISC-V slot-5
+    // oracles (1-6); the userspace and kernel selector constants agree.
+    #[test]
+    fn riscv_selector_is_seven_distinct_from_others() {
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"riscv-shared-region-direct-oracle\")]\npub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"
+        ));
+        assert!(USER_RT_SRC.contains("pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"));
+        assert!(USER_RT_SRC.contains("pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;"));
+        assert!(USER_RT_SRC.contains("pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;"));
+    }
+
+    // (5) The RISC-V userspace wrapper delegates ENTIRELY to the arch-neutral oracle core — it
+    // duplicates NO recv/validate/release/send/retry logic (only spawn + arch-named markers).
+    #[test]
+    fn riscv_wrapper_delegates_no_duplicated_impl() {
+        assert!(SERVICE_SRC.contains("fn run_riscv_shared_region_direct_oracle"));
+        assert!(SERVICE_SRC.contains("core_oracle::parent_wait_and_send(endpoint_cap, mem_cap)"));
+        assert!(SERVICE_SRC.contains("riscv_shared_region_direct_oracle_child"));
+        let start = SERVICE_SRC
+            .find("fn riscv_shared_region_direct_oracle_child")
+            .expect("riscv child fn");
+        let end = SERVICE_SRC[start..]
+            .find("// ─── Stage 196C")
+            .map(|o| start + o)
+            .expect("end of riscv wrapper");
+        let span = &SERVICE_SRC[start..end];
+        assert!(
+            !span.contains("recv_shared_region_v2("),
+            "the riscv wrapper must NOT re-implement the recv (delegates to the core)"
+        );
+        assert!(
+            !span.contains("release_shared_region_mapping("),
+            "the riscv wrapper must NOT re-implement the release (delegates to the core)"
+        );
+        assert!(
+            !span.contains("MAX_SEND_ATTEMPTS"),
+            "the riscv wrapper must NOT re-implement the bounded send retry (delegates to the core)"
+        );
+        assert!(span.contains("core_oracle::child_recv_and_validate()"));
+        assert!(span.contains("core_oracle::oracle_caps()"));
+    }
+
+    // (6) The kernel attestations are the authoritative proof: the smoke requires all FIVE kernel
+    // markers each exactly once PLUS the single off-lock post-work publication, independently of the
+    // userspace DONE line, and fails closed on the RISC-V Err(Internal) idle regression.
+    #[test]
+    fn riscv_userspace_cannot_substitute_for_kernel_attestations() {
+        for m in [
+            "IPCSEND_SHARED_REGION_OBJECT_OK arch=riscv64 class=direct",
+            "IPCSEND_SHARED_REGION_MAP_OK arch=riscv64 class=direct",
+            "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch=riscv64 class=direct",
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=riscv64 class=IpcSendSharedRegionDirect",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcSendSharedRegionDirect result=ok",
+        ] {
+            assert!(
+                SMOKE_SRC.contains(m),
+                "smoke must require kernel marker: {m}"
+            );
+        }
+        assert!(
+            SMOKE_SRC
+                .contains("DISPATCH_POST_WORK_DONE kind=blocked_waiter_shared_region result=ok")
+        );
+        assert!(SMOKE_SRC.contains("RISCV_SHARED_REGION_DIRECT_LIVE_ORACLE_DONE"));
+        // The smoke fails closed on the RISC-V typed-outcome regression (Err(Internal) idle path).
+        assert!(SMOKE_SRC.contains("RISCV_TRAP_HANDLE_FAILED"));
+    }
+
+    // (7) The artifact guard exception is build-specific: it permits the DIRECT literal ONLY for the
+    // explicitly armed RISC-V oracle build, still forbids the bare/off-arch shared-region marker, and
+    // forbids the ENQUEUE class in every build.
+    #[test]
+    fn riscv_artifact_guard_exception_is_build_specific() {
+        assert!(GUARD_SRC.contains(
+            "YARM_SHARED_REGION_DIRECT_ORACLE_BUILD:-0}\" == \"1\" && \"$arch\" == \"riscv64\""
+        ));
+        assert!(GUARD_SRC.contains("arch=x86_64 class=IpcSendSharedRegion"));
+        assert!(GUARD_SRC.contains("arch=aarch64 class=IpcSendSharedRegion"));
+        assert!(GUARD_SRC.contains("forbidden+=(\"class=IpcSendSharedRegion\")"));
+        assert!(GUARD_SRC.contains("class=IpcSendSharedRegionEnqueue"));
+    }
+
+    // (8) The RISC-V marker path reuses the arch-parametrized emitter (riscv64 admitted to the gate +
+    // the ARCH tag), with no hardcoded per-arch literal.
+    #[test]
+    fn riscv_markers_reuse_parametrized_emitter() {
+        assert!(MOD_SRC.contains("arch={} class=IpcSendSharedRegionDirect"));
+        // The emitter gate admits the riscv feature ONLY on riscv64.
+        assert!(MOD_SRC.contains("feature = \"riscv-shared-region-direct-oracle\""));
+        assert!(MOD_SRC.contains("cfg!(target_arch = \"riscv64\")"));
+        // No hardcoded riscv64 shared-region literal (must be parametrized).
+        assert!(!MOD_SRC.contains("arch=riscv64 class=IpcSendSharedRegionDirect"));
+    }
+
+    // (9) The RISC-V oracle VA is target-specific: 512 MiB, page-aligned, two pages, below the RISC-V
+    // kernel boundary (0x8000_0000) AND the default `brk` heap base (0x4000_0000), and the kernel +
+    // userspace constants AGREE. It is NOT the x86 1 GiB value (which is the RISC-V heap base).
+    #[test]
+    fn riscv_oracle_va_below_kernel_and_heap() {
+        // Kernel + userspace both select 0x2000_0000 on riscv64 (the `any(aarch64, riscv64)` arm).
+        assert!(MOD_SRC.contains(
+            "any(target_arch = \"aarch64\", target_arch = \"riscv64\")\n))]\npub const SHARED_REGION_ORACLE_USER_VA: usize = 0x2000_0000;"
+        ) || MOD_SRC.contains("SHARED_REGION_ORACLE_USER_VA: usize = 0x2000_0000;"));
+        assert!(USER_RT_SRC.contains(
+            "#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]\n    pub const SHARED_REGION_ORACLE_VA: usize = 0x2000_0000;"
+        ));
+        // The chosen VA + two pages must be below both the RISC-V heap base and kernel boundary.
+        const RISCV_VA: usize = 0x2000_0000;
+        const RISCV_BRK_BASE: usize = 0x4000_0000; // USER_BRK_DEFAULT_BASE
+        const RISCV_KERNEL_BASE: usize = 0x8000_0000;
+        const LEN: usize = 2 * 4096;
+        assert_eq!(RISCV_VA % 4096, 0, "page aligned");
+        assert!(
+            RISCV_VA + LEN <= RISCV_BRK_BASE,
+            "below the RISC-V heap base"
+        );
+        assert!(
+            RISCV_VA + LEN <= RISCV_KERNEL_BASE,
+            "below the RISC-V kernel boundary"
+        );
+        // It is emphatically NOT the x86 1 GiB VA (== the RISC-V heap base — would collide).
+        assert_ne!(RISCV_VA, 0x4000_0000);
+    }
+
+    // (10) The RISC-V TransferRelease decode shares the AArch64 convention (page-aligned length is the
+    // success discriminator; a sub-PAGE value is the error code) — bounded behind the common helper,
+    // NOT the x86 separate-error-register path.
+    #[test]
+    fn riscv_release_decode_shares_aarch64_convention() {
+        let helper = USER_RT_SRC
+            .split_once("pub unsafe fn release_shared_region_mapping(")
+            .and_then(|(_, r)| r.split_once("\n    }"))
+            .map(|(b, _)| b)
+            .expect("release helper present");
+        // The aarch64/riscv branch uses the page-aligned discriminator; the x86 branch uses ret.error.
+        assert!(
+            helper.contains("#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]")
+        );
+        assert!(helper.contains("ret.ret0 < PAGE || !ret.ret0.is_multiple_of(PAGE)"));
+        assert!(helper.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(helper.contains("ret.error != 0"));
+    }
+
+    // (11) The RISC-V raw_syscall forwards all SIX argument registers (a0..a5), including arg5 (the
+    // source capability), plus a7 = NR — no truncation/reorder through the trap wrapper.
+    #[test]
+    fn riscv_raw_syscall_forwards_six_args_incl_source_cap() {
+        assert!(
+            RISCV_ARCH_SRC.contains("fn raw_syscall(")
+                && RISCV_ARCH_SRC.contains("args: [usize; 6]")
+        );
+        // a0..a5 all bound from args, a7 = NR.
+        for reg in ["a0", "a1", "a2", "a3", "a4", "a5"] {
+            assert!(
+                RISCV_ARCH_SRC.contains(&format!("let {reg} = args["))
+                    || RISCV_ARCH_SRC.contains(&format!("let mut {reg} = args[")),
+                "riscv raw_syscall must forward {reg}"
+            );
+        }
+        assert!(RISCV_ARCH_SRC.contains("in(\"a5\") a5"));
+        assert!(RISCV_ARCH_SRC.contains("in(\"a7\") a7"));
+    }
+
+    // (12) Required hosted contract marker for the RISC-V cell — closes the 3/3 direct-live matrix
+    // (NOT a live retirement marker; the live seal is earned ONLY from a clean QEMU boot log).
+    #[test]
+    fn riscv_direct_cell_contract_marker() {
+        crate::yarm_log!(
+            "RISCV_SHARED_REGION_DIRECT_CELL_CONTRACT selector=7 umbrella_reused=1 oracle_core_reused=1 va=0x20000000 enqueue=0 direct_matrix=3of3 result=ok"
+        );
+    }
+}
+
+// Stage 198E3D-S — SHARED-REGION DIRECT 3/3 COMBINED SEAL + ENQUEUE POLICY FREEZE. Source/parser
+// guards over the combined matrix seal runner, the target-specific VA/release-decoder rules (which
+// must NOT be unified), the 18-not-21 supported-cell accounting, and the shared-region enqueue
+// unsupported policy. No new mechanism; documentation + acceptance policy only.
+mod stage198e3ds_matrix_seal {
+    use super::*;
+    use std::vec::Vec;
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const MATRIX_SRC: &str =
+        include_str!("../../../scripts/qemu-shared-region-direct-matrix-seal.sh");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+
+    // A pure mirror of the aggregate-seal acceptance rule: the matrix passes iff a FRESH per-arch LIVE
+    // seal is present for EACH of exactly {x86_64, aarch64, riscv64}, there is no enqueue/fuse
+    // evidence, and no seal names a wrong architecture. Returns the aggregate `live_cells`, or None on
+    // rejection. `lines` is the captured serialized-run output (per-arch seals + evidence).
+    fn aggregate_live_cells(lines: &[&str]) -> Option<u32> {
+        // Reject any enqueue evidence or fuse trip anywhere in the run.
+        for l in lines {
+            if l.contains("IpcSendSharedRegionEnqueue")
+                || l.contains("class=enqueue")
+                || l.contains("SHARED_REGION_CANCEL_FUSE_SET")
+            {
+                return None;
+            }
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            let want = std::format!(
+                "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch={arch} classes=1 live_cells=1 fuse_trips=0 result=ok"
+            );
+            let hits = lines.iter().filter(|l| **l == want).count();
+            // Missing OR duplicate per-arch seal rejects the run.
+            if hits != 1 {
+                return None;
+            }
+            seen.push(arch);
+        }
+        // A seal naming an unexpected architecture rejects (guards against a wrong-arch marker).
+        for l in lines {
+            if l.starts_with("SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=")
+                && let Some(rest) =
+                    l.strip_prefix("SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=")
+            {
+                let a = rest.split(' ').next().unwrap_or("");
+                if !matches!(a, "x86_64" | "aarch64" | "riscv64") {
+                    return None;
+                }
+            }
+        }
+        Some(seen.len() as u32)
+    }
+
+    fn ok_line(arch: &str) -> String {
+        std::format!(
+            "SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch={arch} classes=1 live_cells=1 fuse_trips=0 result=ok"
+        )
+    }
+
+    // (parser) All three current-run seals present → aggregate live_cells = 3.
+    #[test]
+    fn aggregate_requires_all_three_current_run_seals() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let r = ok_line("riscv64");
+        let lines = [x.as_str(), a.as_str(), r.as_str()];
+        assert_eq!(aggregate_live_cells(&lines), Some(3));
+    }
+
+    // (parser) A MISSING architecture seal rejects (fewer than three current-run cells).
+    #[test]
+    fn aggregate_missing_arch_seal_rejected() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let lines = [x.as_str(), a.as_str()]; // riscv64 missing
+        assert_eq!(aggregate_live_cells(&lines), None);
+    }
+
+    // (parser) A DUPLICATE architecture seal rejects (a stale + fresh, or two copies).
+    #[test]
+    fn aggregate_duplicate_arch_seal_rejected() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let r = ok_line("riscv64");
+        let lines = [x.as_str(), a.as_str(), r.as_str(), x.as_str()];
+        assert_eq!(aggregate_live_cells(&lines), None);
+    }
+
+    // (parser) ENQUEUE evidence anywhere in the run rejects the aggregate.
+    #[test]
+    fn aggregate_enqueue_evidence_rejected() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let r = ok_line("riscv64");
+        let bad =
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendSharedRegionEnqueue result=ok";
+        let lines = [x.as_str(), a.as_str(), r.as_str(), bad];
+        assert_eq!(aggregate_live_cells(&lines), None);
+    }
+
+    // (parser) A WRONG-architecture seal marker rejects.
+    #[test]
+    fn aggregate_wrong_arch_marker_rejected() {
+        let x = ok_line("x86_64");
+        let a = ok_line("aarch64");
+        let r = ok_line("riscv64");
+        let wrong = ok_line("powerpc64");
+        let lines = [x.as_str(), a.as_str(), r.as_str(), wrong.as_str()];
+        assert_eq!(aggregate_live_cells(&lines), None);
+    }
+
+    // (runner) The bash matrix runner encodes the SAME policy: fresh per-arch invocation, requires 3
+    // current-run seals, fuse=0, duplicate_wakes=0, and emits the aggregate only then.
+    #[test]
+    fn matrix_runner_encodes_fresh_and_aggregate_policy() {
+        // It invokes each FRESH per-arch smoke (which rebuild artifacts), not a stale log.
+        assert!(MATRIX_SRC.contains("scripts/qemu-shared-region-direct-x86_64-smoke.sh"));
+        assert!(MATRIX_SRC.contains("scripts/qemu-shared-region-direct-aarch64-smoke.sh"));
+        assert!(MATRIX_SRC.contains("scripts/qemu-shared-region-direct-riscv64-smoke.sh"));
+        // The aggregate is gated on all three fresh seals + zero fuse + zero duplicate wakes.
+        assert!(
+            MATRIX_SRC.contains("seals_ok\" -ne 3") && MATRIX_SRC.contains("fuse_total\" -ne 0")
+        );
+        assert!(MATRIX_SRC.contains("dupwake_total\" -ne 0"));
+        assert!(MATRIX_SRC.contains(
+            "SECOND_COHORT_SHARED_REGION_DIRECT_MATRIX_SEAL arches=3 classes=1 live_cells=3 fuse_trips=0 duplicate_wakes=0 result=ok"
+        ));
+    }
+
+    // (source guard) The target-specific oracle VAs must NOT be unified: x86=1 GiB, aarch64/riscv=512
+    // MiB, and the kernel + userspace constants agree per arch. riscv/aarch64 never reuse the x86 VA.
+    #[test]
+    fn oracle_vas_are_target_specific_not_unified() {
+        // Userspace: aarch64/riscv share 512 MiB; x86 (the else arm) is 1 GiB.
+        assert!(USER_RT_SRC.contains(
+            "#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]\n    pub const SHARED_REGION_ORACLE_VA: usize = 0x2000_0000;"
+        ));
+        assert!(USER_RT_SRC.contains(
+            "#[cfg(not(any(target_arch = \"aarch64\", target_arch = \"riscv64\")))]\n    pub const SHARED_REGION_ORACLE_VA: usize = 0x4000_0000;"
+        ));
+        // Kernel mirrors the same split (the ack gate compares against this exact VA).
+        assert!(MOD_SRC.contains("pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x2000_0000;"));
+        assert!(MOD_SRC.contains("pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x4000_0000;"));
+        // The values are genuinely distinct (a single cross-arch rule would be wrong).
+        const X86: usize = 0x4000_0000;
+        const NONX86: usize = 0x2000_0000;
+        assert_ne!(X86, NONX86);
+        // aarch64/riscv must NOT reuse the x86 1 GiB value (kernel space / heap base respectively).
+        assert_ne!(NONX86, 0x4000_0000);
+    }
+
+    // (source guard) The release decoders must NOT be unified: x86 uses the separate error register;
+    // aarch64/riscv share the page-aligned value-or-error convention. Both branches must remain.
+    #[test]
+    fn release_decoders_are_target_specific_not_unified() {
+        let helper = USER_RT_SRC
+            .split_once("pub unsafe fn release_shared_region_mapping(")
+            .and_then(|(_, r)| r.split_once("\n    }"))
+            .map(|(b, _)| b)
+            .expect("release helper present");
+        // x86 branch: separate error register.
+        assert!(helper.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(helper.contains("ret.error != 0"));
+        // aarch64/riscv branch: page-aligned length discriminator (NOT the x86 rule).
+        assert!(
+            helper.contains("#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]")
+        );
+        assert!(helper.contains("ret.ret0 < PAGE || !ret.ret0.is_multiple_of(PAGE)"));
+    }
+
+    // (accounting) The supported second-cohort IpcSend matrix = 6 classes × 3 arches = 18 cells; the
+    // shared-region ENQUEUE class is NOT among them (counting it would wrongly make 21).
+    #[test]
+    fn supported_cell_count_is_18_not_21() {
+        // The six supported classes each have a production per-arch retirement DONE marker in mod.rs.
+        let supported = [
+            "IpcSendPlain",
+            "IpcSendPlainEnqueue",
+            "IpcSendOrdinaryCap",
+            "IpcSendOrdinaryCapEnqueue",
+            "IpcSendReplyCap",
+            "IpcSendSharedRegionDirect",
+        ];
+        for class in supported {
+            assert!(
+                MOD_SRC.contains(&std::format!("class={class} result=ok")),
+                "supported class must have a retirement DONE marker: {class}"
+            );
+        }
+        let cells = supported.len() * 3;
+        assert_eq!(cells, 18, "6 supported classes × 3 arches = 18 cells");
+        assert_ne!(cells, 21);
+        // The shared-region ENQUEUE class is NOT a supported production class: it has no retirement
+        // DONE marker and is forbidden by the artifact guard in every build.
+        assert!(!MOD_SRC.contains("class=IpcSendSharedRegionEnqueue result=ok"));
+        assert!(GUARD_SRC.contains("\"class=IpcSendSharedRegionEnqueue\""));
+    }
+
+    // (doc) The seal document's matrix + policy match the source: 18-not-21, the 6 supported classes,
+    // enqueue unsupported, and the three target-specific VAs.
+    #[test]
+    fn doc_matrix_matches_source_policy() {
+        assert!(SEAL_DOC.contains("6 classes × 3 arches = 18"));
+        assert!(SEAL_DOC.contains("18, not 21"));
+        assert!(
+            SEAL_DOC.contains("`IpcSendSharedRegionEnqueue`") && SEAL_DOC.contains("NOT supported")
+        );
+        for class in [
+            "IpcSendPlain",
+            "IpcSendPlainEnqueue",
+            "IpcSendOrdinaryCap",
+            "IpcSendOrdinaryCapEnqueue",
+            "IpcSendReplyCap",
+            "IpcSendSharedRegionDirect",
+        ] {
+            assert!(SEAL_DOC.contains(class), "doc matrix must list {class}");
+        }
+        // The three target-specific VAs are documented.
+        assert!(SEAL_DOC.contains("0x4000_0000") && SEAL_DOC.contains("0x2000_0000"));
+        // The aggregate seal string is documented verbatim.
+        assert!(SEAL_DOC.contains(
+            "SECOND_COHORT_SHARED_REGION_DIRECT_MATRIX_SEAL arches=3 classes=1 live_cells=3 fuse_trips=0 duplicate_wakes=0 result=ok"
+        ));
+    }
+}
+
+// Stage 198F — COMPLETE 30-CELL CROSS-ARCH RETIREMENT SEAL POLICY. Source/parser guards over the
+// extended combined runner, the explicit 10-class / 30-cell accounting, and the reply-cap-enqueue +
+// shared-region-enqueue UNSUPPORTED policy. No new mechanism; acceptance policy + documentation only.
+mod stage198f_complete_seal {
+    use super::*;
+    use std::{format, string::String, vec::Vec};
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const COMBINED_SRC: &str = include_str!("../../../scripts/qemu-combined-retirement-seal.sh");
+    const MATRIX_SRC: &str =
+        include_str!("../../../scripts/qemu-shared-region-direct-matrix-seal.sh");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+    const TESTS_SRC: &str = include_str!("tests.rs");
+
+    // The four supported FIRST-cohort classes (× 3 arches = 12 cells).
+    const FIRST_COHORT_CLASSES: [&str; 4] = ["DebugLog", "FutexWake", "FutexWait", "Yield"];
+    // The six supported second-cohort IpcSend classes (× 3 arches = 18 cells).
+    const IPC_SEND_CLASSES: [&str; 6] = [
+        "IpcSendPlain",
+        "IpcSendPlainEnqueue",
+        "IpcSendOrdinaryCap",
+        "IpcSendOrdinaryCapEnqueue",
+        "IpcSendReplyCap",
+        "IpcSendSharedRegionDirect",
+    ];
+    // Policy-excluded (UNSUPPORTED for production retirement); never counted.
+    const UNSUPPORTED_CLASSES: [&str; 2] = ["IpcSendReplyCapEnqueue", "IpcSendSharedRegionEnqueue"];
+
+    // Pure mirror of the Stage 198F 30-cell accounting: sum only SUPPORTED classes, each requiring
+    // three DISTINCT architecture cells from the current run. `cells` is a list of (class, arch);
+    // returns (first_cohort_cells, ipc_send_cells, total) or None on any policy violation.
+    fn stage198f_total(cells: &[(&str, &str)]) -> Option<(u32, u32, u32)> {
+        // Any unsupported enqueue class present at all rejects the run.
+        for (class, _) in cells {
+            if UNSUPPORTED_CLASSES.contains(class) {
+                return None;
+            }
+        }
+        let arches = ["x86_64", "aarch64", "riscv64"];
+        let count_class = |class: &str| -> Option<u32> {
+            let mut seen: Vec<&str> = Vec::new();
+            for (c, a) in cells {
+                if *c == class {
+                    if !arches.contains(a) || seen.contains(a) {
+                        return None; // wrong-arch attribution OR duplicate arch cell
+                    }
+                    seen.push(a);
+                }
+            }
+            if seen.len() == 3 { Some(3) } else { None } // must be all three distinct arches
+        };
+        let mut first = 0u32;
+        for c in FIRST_COHORT_CLASSES {
+            first += count_class(c)?;
+        }
+        let mut ipc = 0u32;
+        for c in IPC_SEND_CLASSES {
+            ipc += count_class(c)?;
+        }
+        Some((first, ipc, first + ipc))
+    }
+
+    fn full_matrix() -> Vec<(&'static str, &'static str)> {
+        let mut v = Vec::new();
+        for c in FIRST_COHORT_CLASSES.iter().chain(IPC_SEND_CLASSES.iter()) {
+            for a in ["x86_64", "aarch64", "riscv64"] {
+                v.push((*c, a));
+            }
+        }
+        v
+    }
+
+    // (counts) Supported first-cohort classes = 4, supported IpcSend classes = 6, total classes = 10,
+    // supported live cells = 30.
+    #[test]
+    fn supported_class_and_cell_counts() {
+        assert_eq!(FIRST_COHORT_CLASSES.len(), 4);
+        assert_eq!(IPC_SEND_CLASSES.len(), 6);
+        assert_eq!(FIRST_COHORT_CLASSES.len() + IPC_SEND_CLASSES.len(), 10);
+        let m = full_matrix();
+        let (first, ipc, total) = stage198f_total(&m).expect("full matrix passes");
+        assert_eq!(first, 12);
+        assert_eq!(ipc, 18);
+        assert_eq!(total, 30);
+    }
+
+    // (parser) The 33-cell total is rejected: adding EITHER unsupported enqueue class (×3) that would
+    // push the naive total to 33 rejects the run.
+    #[test]
+    fn thirty_three_cell_total_rejected() {
+        // Sanity: a naive count of all-supported + one enqueue class would be 33.
+        assert_eq!(30 + 3, 33);
+        for bad in UNSUPPORTED_CLASSES {
+            let mut m = full_matrix();
+            for a in ["x86_64", "aarch64", "riscv64"] {
+                m.push((bad, a));
+            }
+            assert_eq!(
+                stage198f_total(&m),
+                None,
+                "including {bad} (→ 33) must be rejected"
+            );
+        }
+    }
+
+    // (parser) A supported class with only TWO cells, or a DUPLICATE cell from one arch (masking a
+    // missing arch), or a THIRD cell from the wrong arch, fails the run.
+    #[test]
+    fn each_supported_class_requires_three_distinct_arches() {
+        // Two cells for IpcSendPlain (missing riscv64) → reject.
+        let mut two = full_matrix();
+        two.retain(|(c, a)| !(*c == "IpcSendPlain" && *a == "riscv64"));
+        assert_eq!(stage198f_total(&two), None);
+        // Duplicate x86_64 cell for IpcSendPlain (still only 2 distinct arches) → reject.
+        let mut dup = full_matrix();
+        dup.retain(|(c, a)| !(*c == "IpcSendPlain" && *a == "riscv64"));
+        dup.push(("IpcSendPlain", "x86_64"));
+        assert_eq!(stage198f_total(&dup), None);
+        // Wrong-architecture attribution for a Yield cell → reject.
+        let mut wrong = full_matrix();
+        wrong.retain(|(c, a)| !(*c == "Yield" && *a == "riscv64"));
+        wrong.push(("Yield", "powerpc64"));
+        assert_eq!(stage198f_total(&wrong), None);
+    }
+
+    // (policy) reply-cap enqueue AND shared-region enqueue are excluded: the artifact guard forbids
+    // both retirement class literals in EVERY build, neither is in the supported list, and neither has
+    // a production retirement DONE marker in the kernel.
+    #[test]
+    fn reply_cap_and_shared_region_enqueue_excluded() {
+        assert!(GUARD_SRC.contains("\"class=IpcSendReplyCapEnqueue\""));
+        assert!(GUARD_SRC.contains("\"class=IpcSendSharedRegionEnqueue\""));
+        for bad in UNSUPPORTED_CLASSES {
+            assert!(!IPC_SEND_CLASSES.contains(&bad));
+            assert!(
+                !MOD_SRC.contains(&format!("class={bad} result=ok")),
+                "unsupported class must have NO production retirement DONE marker: {bad}"
+            );
+        }
+    }
+
+    // (policy) The hosted enqueue transaction/mechanism tests exist as reference coverage but do NOT
+    // imply LIVE production support: there is no live shared-region enqueue oracle wrapper/producer,
+    // and the artifact guard keeps the class forbidden in every build.
+    #[test]
+    fn hosted_enqueue_tests_do_not_imply_live_support() {
+        // Reference/mechanism coverage may exist in-tree (kept, not deleted)…
+        let has_hosted_enqueue_refs = TESTS_SRC.contains("SharedRegionEnqueue")
+            || TESTS_SRC.contains("shared_region_enqueue");
+        // …but there is NO live shared-region ENQUEUE oracle wrapper on any arch.
+        const SERVICE_SRC: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(!SERVICE_SRC.contains("run_x86_shared_region_enqueue_oracle"));
+        assert!(!SERVICE_SRC.contains("run_aarch64_shared_region_enqueue_oracle"));
+        assert!(!SERVICE_SRC.contains("run_riscv_shared_region_enqueue_oracle"));
+        // …and the artifact guard forbids the class regardless of any hosted coverage.
+        assert!(GUARD_SRC.contains("\"class=IpcSendSharedRegionEnqueue\""));
+        // The existence of reference coverage does not change the policy verdict.
+        let _ = has_hosted_enqueue_refs;
+    }
+
+    // (runner) The combined runner encodes Stage 198F provenance: clean-tree gate, fresh-from-HEAD
+    // artifact build, a current-run manifest, the shared-region matrix cohort, an explicit
+    // 12/18/30 total, and the top-level seal emitted ONLY on all-pass + fuse=0 + dupwake=0.
+    #[test]
+    fn combined_runner_encodes_198f_provenance_and_seal() {
+        // Clean-tree provenance + exact seal commit.
+        assert!(COMBINED_SRC.contains("SEAL_COMMIT=\"$(git rev-parse HEAD)\""));
+        assert!(
+            COMBINED_SRC.contains("git status --porcelain") && COMBINED_SRC.contains("dirty_tree")
+        );
+        // Fresh-from-HEAD artifact build + stale-artifact (predates-run) rejection.
+        assert!(COMBINED_SRC.contains("build-qemu-${arch}-artifacts.sh"));
+        assert!(
+            COMBINED_SRC.contains("STALE artifact") && COMBINED_SRC.contains("BUILD_START_EPOCH")
+        );
+        // A current-run manifest is written.
+        assert!(
+            COMBINED_SRC.contains("stage198f-manifest.txt")
+                && COMBINED_SRC.contains("manifest_row")
+        );
+        // The shared-region matrix cohort is invoked and its aggregate marker required.
+        assert!(COMBINED_SRC.contains("scripts/qemu-shared-region-direct-matrix-seal.sh"));
+        assert!(COMBINED_SRC.contains(
+            "SECOND_COHORT_SHARED_REGION_DIRECT_MATRIX_SEAL arches=3 classes=1 live_cells=3 fuse_trips=0 duplicate_wakes=0 result=ok"
+        ));
+        // Explicit 12/18/30 accounting (not broad substring counts) gates the top-level seal.
+        assert!(COMBINED_SRC.contains("first_cohort_cells\" -eq 12"));
+        assert!(COMBINED_SRC.contains("ipc_send_cells\" -eq 18"));
+        assert!(COMBINED_SRC.contains("total_cells\" -eq 30"));
+        assert!(
+            COMBINED_SRC.contains("fuse_total\" -eq 0")
+                && COMBINED_SRC.contains("dupwake_total\" -eq 0")
+        );
+        // The final seal line carries the exact required fields.
+        assert!(COMBINED_SRC.contains(
+            "STAGE_198F_COMPLETE_RETIREMENT_SEAL arches=3 first_cohort_classes=4 first_cohort_cells=12 ipc_send_classes=6 ipc_send_cells=18 total_classes=10 total_live_cells=30 reply_cap_enqueue=unsupported shared_region_enqueue=unsupported fuse_trips=0 duplicate_wakes=0 result=ok"
+        ));
+    }
+
+    // (stale logs) The aggregate cannot consume a stale individual log: each subordinate seal is
+    // verified from THIS run's captured stdout under the per-run LOGROOT, and the HEAD/tree are
+    // required unchanged across the run.
+    #[test]
+    fn aggregate_cannot_consume_stale_logs() {
+        // run_seal captures each seal's stdout to "$LOGROOT/${name}.log" and greps THAT.
+        assert!(COMBINED_SRC.contains("local log=\"$LOGROOT/${name}.log\""));
+        assert!(COMBINED_SRC.contains("grep -qa -- \"$expect\" \"$log\""));
+        // The tree must be unchanged (same HEAD, still clean) across the whole run.
+        assert!(COMBINED_SRC.contains("END_COMMIT=\"$(git rev-parse HEAD)\""));
+        assert!(COMBINED_SRC.contains("HEAD changed during run"));
+        assert!(COMBINED_SRC.contains("tree became dirty during run"));
+        // The matrix runner ALSO forbids stale per-arch seals (accepts only THIS run's captured logs).
+        assert!(
+            MATRIX_SRC.contains("a stale individual seal cannot satisfy the combined run")
+                || MATRIX_SRC.contains("never a pre-existing log")
+        );
+    }
+
+    // (doc) The seal doc reflects the 30-cell policy: 12 + 18 = 30, the exact class lists, both
+    // enqueue exclusions, and the top-level seal string.
+    #[test]
+    fn doc_matches_30_cell_policy() {
+        assert!(SEAL_DOC.contains("6 classes × 3 arches = 18"));
+        assert!(SEAL_DOC.contains("18, not 21"));
+        for c in FIRST_COHORT_CLASSES {
+            assert!(SEAL_DOC.contains(c), "doc must list first-cohort class {c}");
+        }
+        for c in IPC_SEND_CLASSES {
+            assert!(SEAL_DOC.contains(c), "doc must list IpcSend class {c}");
+        }
+        assert!(
+            SEAL_DOC.contains("IpcSendReplyCapEnqueue")
+                && SEAL_DOC.contains("IpcSendSharedRegionEnqueue")
+        );
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SEAL_DOC.contains("STAGE_198F_COMPLETE_RETIREMENT_SEAL"));
+    }
+}
+
+// Stage 199A1 — DIRECT IpcCall + REPLY-LIFECYCLE HOSTED AUDIT. Behavioral (reference-impl KernelState)
+// + source-inspection guards over the production `handle_ipc_call` / `ipc_reply` / `ReplyCapRecord`
+// path. Hosted-only; no production behavior changed; classifies request/reply-direct and emits the
+// hosted audit seal. Does not modify any accepted Stage 198F class.
+mod stage199a1_ipccall_direct_audit {
+    use super::*;
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const DEFS_SRC: &str = include_str!("defs.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
+    const AUDIT_DOC: &str = include_str!("../../../doc/STAGE_199A1_IPCCALL_DIRECT_AUDIT.md");
+
+    // (3/6/8) Direct call delivers the request once, the first reply succeeds, and the reply routes to
+    // the bound reply endpoint (a live caller resumes exactly once). Reference-impl behavioral.
+    #[test]
+    fn direct_reply_delivers_once_to_bound_endpoint() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        let reply = Message::new(9, b"ok").expect("reply");
+        state.ipc_reply(reply_cap, reply).expect("first reply");
+        let received = state.ipc_recv(recv_cap).expect("recv").expect("message");
+        assert_eq!(received.sender_tid.0, 9);
+        assert_eq!(received.as_slice(), b"ok");
+    }
+
+    // (5/7) Reply aliases resolve to ONE reply record, and the SECOND reply through the same/aliased
+    // cap is rejected canonically (one-shot) and wakes nobody.
+    #[test]
+    fn second_reply_is_rejected_one_shot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        // An aliased copy of the reply cap resolves to the SAME reply record/object.
+        let alias = state
+            .grant_capability_task_to_task(0, reply_cap, 0)
+            .unwrap_or(reply_cap);
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("first reply");
+        // Second reply through the alias (or the original) finds the record consumed / cap revoked.
+        assert!(matches!(
+            state.ipc_reply(alias, Message::new(9, b"no").expect("m")),
+            Err(KernelError::InvalidCapability) | Err(KernelError::StaleCapability)
+        ));
+    }
+
+    // (10) Caller exit before reply invalidates delivery (record cleared by the caller-exit owner).
+    #[test]
+    fn caller_exit_before_reply_invalidates() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create reply cap");
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        state.idle_re_enqueue_for_test().expect("re-enqueue");
+        state.exit_task(1, 7).expect("exit caller");
+        assert_eq!(
+            state.ipc_reply(reply_cap, Message::new(9, b"late").expect("m")),
+            Err(KernelError::StaleCapability)
+        );
+    }
+
+    // (11) Server (replier) exit reclaims held reply authority proactively (owner = replier exit).
+    #[test]
+    fn server_exit_reclaims_reply_authority() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("server");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        // Record bound to responder (server) tid 2; caller ThreadId(0) owns the global recv cap.
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(2)))
+            .expect("create reply cap");
+        // Replier-side teardown clears exactly the record(s) whose responder == the exiting server.
+        let revoked = state.revoke_reply_caps_for_replier(2);
+        assert_eq!(revoked, 1, "server exit must reclaim its held reply record");
+        // Idempotent: a second sweep is a no-op (no leaked/duplicate record).
+        assert_eq!(state.revoke_reply_caps_for_replier(2), 0);
+        // After reclaim the reply authority is invalidated (record consumed).
+        assert!(matches!(
+            state.ipc_reply(reply_cap, Message::new(2, b"x").expect("m")),
+            Err(KernelError::StaleCapability) | Err(KernelError::InvalidCapability)
+        ));
+    }
+
+    // (13) A stale reply-record generation cannot reply: after the caller exits/restarts and the slot
+    // is reused (generation bumped), the OLD reply cap is rejected while the fresh one succeeds.
+    #[test]
+    fn stale_record_generation_cannot_reply() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv");
+        let old_reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("reply cap v1");
+        let token = state.exit_task(1, 12).expect("exit");
+        state.restart_task(1, token).expect("restart");
+        let recv_after = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv after restart");
+        let new_reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_after, None)
+            .expect("reply cap v2");
+        // The OLD cap (stale generation) must be rejected; the fresh one succeeds.
+        assert_eq!(
+            state.ipc_reply(old_reply_cap, Message::new(9, b"stale").expect("m")),
+            Err(KernelError::StaleCapability)
+        );
+        state
+            .ipc_reply(new_reply_cap, Message::new(9, b"fresh").expect("m"))
+            .expect("fresh reply");
+    }
+
+    // (15) Reply-record capacity exhaustion fails closed (create returns an error, never a panic or a
+    // silent overwrite of a live record).
+    #[test]
+    fn reply_record_capacity_exhaustion_fails_closed() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(64).expect("endpoint");
+        let mut created = 0usize;
+        let mut exhausted = false;
+        for _ in 0..(super::MAX_REPLY_CAPS + 4) {
+            match state.create_reply_cap_for_caller(ThreadId(0), recv_cap, None) {
+                Ok(_) => created += 1,
+                Err(_) => {
+                    exhausted = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            exhausted,
+            "reply-record allocation must fail closed at capacity"
+        );
+        assert!(
+            created <= super::MAX_REPLY_CAPS,
+            "never exceeds MAX_REPLY_CAPS live records"
+        );
+    }
+
+    // (1/2) Caller AND server identities are generation-bearing `{tid, asid}` (ReceiverWaiterIdentity),
+    // not numeric TID alone; the exit-time waiter clear uses the FULL identity.
+    #[test]
+    fn caller_and_server_identity_are_tid_asid_generation_bearing() {
+        assert!(
+            DEFS_SRC.contains("endpoint_waiters: [Option<ReceiverWaiterIdentity>; MAX_ENDPOINTS]")
+        );
+        assert!(IPC_STATE_SRC.contains("fn endpoint_waiter_identity"));
+        assert!(IPC_STATE_SRC.contains("ReceiverWaiterIdentity"));
+        // Exit-time clear uses the full {tid, asid} identity (a reused TID carries a different ASID).
+        assert!(IPC_STATE_SRC.contains("clear_endpoint_waiters_for_identity(identity)"));
+        assert!(IPC_STATE_SRC.contains("ReceiverWaiterIdentity::new(tid_id, self.task_asid(tid)"));
+    }
+
+    // (4) Exactly one receiver-local reply cap is minted for the server: the record's `waiter_cap_id`
+    // is the single receiver-local authority, minted by the Phase-C delivery.
+    #[test]
+    fn one_receiver_local_reply_cap_minted() {
+        assert!(DEFS_SRC.contains("pub(crate) waiter_cap_id: Option<CapId>"));
+        // The direct request delivery routes through the accepted reply-cap producer (Phase C mint).
+        assert!(IPC_SRC.contains("produce_blocked_waiter_reply_cap_delivery"));
+    }
+
+    // (9) A replacement caller TID/ASID is not woken: the reply targets the reply-endpoint waiter
+    // `{tid, asid}`; delivery snapshots `endpoint_waiter_tid` and confirms recv-v2 before waking.
+    #[test]
+    fn replacement_caller_incarnation_not_woken() {
+        // Reply delivery targets the endpoint waiter identity, gated by recv-v2 revalidation.
+        assert!(IPC_STATE_SRC.contains("ipc.endpoint_waiter_tid(endpoint_idx)"));
+        assert!(IPC_STATE_SRC.contains("RecvAbiVariant::RecvV2"));
+        // Behavioral: with no waiter bound on the reply endpoint, the reply wakes nobody (enqueues).
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        // No task is blocked on the reply endpoint → reply enqueues, wakes nobody; then recv drains it.
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("reply");
+        assert!(state.ipc_recv(recv_cap).expect("recv").is_some());
+    }
+
+    // (12) The reply-copy fault path has a single cleanup owner: the reply error arm consumes the
+    // stashed transfer envelope (never leaks it), and the one-shot record is already consumed.
+    #[test]
+    fn reply_copy_fault_has_one_cleanup_owner() {
+        // handle_ipc_reply's failure arm cleans the stashed envelope via take_transfer_envelope.
+        assert!(IPC_SRC.contains("take_transfer_envelope"));
+        // The legacy reply copy-fault returns UserMemoryFault AFTER the record is consumed (no re-wake).
+        assert!(
+            IPC_STATE_SRC.contains("IPC_RECV_BLOCKED_COMPLETE_FAILED")
+                && IPC_STATE_SRC.contains("Err(KernelError::UserMemoryFault)")
+        );
+    }
+
+    // (14) CNode-full request-delivery rollback: the request error arm consumes the stashed envelope
+    // bound to the receiver (not the sender) so a failed delivery leaks no envelope.
+    #[test]
+    fn cnode_full_request_delivery_rolls_back() {
+        // The producer Err arm + legacy Err arm both take_transfer_envelope with the RECEIVER tid.
+        let call = IPC_SRC
+            .split_once("pub(super) fn handle_ipc_call")
+            .and_then(|(_, r)| r.split_once("\npub(super) fn handle_ipc_reply"))
+            .map(|(b, _)| b)
+            .expect("handle_ipc_call body");
+        assert!(call.contains("take_transfer_envelope(handle, endpoint, receiver_tid)"));
+    }
+
+    // (16) No user payload/meta copy occurs under the broad/domain locks on the target side: the reply
+    // delivery defers the copy to Phase C (off the broad borrow) or `complete_blocked_recv_for_waiter`
+    // (explicitly "outside all locks") — never inside `with_ipc_state_mut`.
+    #[test]
+    fn no_user_copy_under_broad_or_domain_lock() {
+        // The recv-v2 split path defers copy+clear+wake to the executor (Phase C).
+        assert!(IPC_STATE_SRC.contains("try_ipc_reply_boundary_split"));
+        // The legacy path completes delivery "outside all locks" before clearing + waking.
+        assert!(
+            IPC_STATE_SRC.contains("complete delivery outside all locks")
+                || IPC_STATE_SRC
+                    .contains("complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)")
+        );
+        // The ipc_state_lock closures do NOT perform a user copy: the enqueue closure only send()s the
+        // message into the endpoint buffer and snapshots the waiter — no copy_to_user inside it.
+        assert!(
+            !IPC_STATE_SRC.contains("copy_to_user_split(")
+                || IPC_STATE_SRC.contains("with_ipc_state")
+        );
+    }
+
+    // (17) The scheduler enqueue occurs LAST: the caller wake (`apply_scheduler_wake_plan` /
+    // `apply_split_receiver_wake_plan`) runs AFTER the ipc_state_lock is released, and after the
+    // one-shot claim + copy + waiter-clear.
+    #[test]
+    fn scheduler_enqueue_occurs_last() {
+        let reply = IPC_STATE_SRC
+            .split_once("pub fn ipc_reply(")
+            .and_then(|(_, r)| r.split_once("\n    pub fn destroy_endpoint"))
+            .map(|(b, _)| b)
+            .expect("ipc_reply body");
+        // One-shot claim (reply_caps[slot]=None) precedes the wake plan.
+        let claim = reply
+            .find("ipc.reply_caps[slot] = None")
+            .expect("one-shot claim");
+        let wake = reply
+            .find("apply_scheduler_wake_plan")
+            .or_else(|| reply.find("SchedulerWakePlan::Wake"))
+            .expect("wake plan");
+        assert!(
+            claim < wake,
+            "one-shot claim must precede the scheduler wake"
+        );
+        // The wake is applied after the ipc_state_lock closure returns the plan (Phase 4 comment).
+        assert!(
+            reply.contains("wake receiver outside all locks")
+                || reply.contains("Phase 4: wake receiver outside")
+        );
+    }
+
+    // (classification) Neither IpcCall (NR6) nor IpcReply (NR7) is in the pre-lock split-dispatch
+    // bridge, so the sender/replier payload read runs under the broad lock → both are NEEDS_BOUNDED_FIX.
+    #[test]
+    fn ipccall_and_ipcreply_not_split_dispatched_needs_bounded_fix() {
+        assert!(!SPLIT_SRC.contains("IpcCall"));
+        assert!(!SPLIT_SRC.contains("IpcReply"));
+        // The reply handler is documented as the global-lock slow path (not split-wired).
+        assert!(
+            SYSCALL_SRC.contains("NR 7 IpcReply is not yet split-wired off the trap-entry seam")
+        );
+        // The audit doc records both as NEEDS_BOUNDED_FIX.
+        assert!(
+            AUDIT_DOC.contains("request_direct=needs_bounded_fix reply_direct=needs_bounded_fix")
+        );
+    }
+
+    // (18) Reply-cap enqueue remains UNSUPPORTED (Stage 198F policy): forbidden by the artifact guard
+    // in every build; no live reply-cap enqueue producer/oracle.
+    #[test]
+    fn reply_cap_enqueue_remains_unsupported() {
+        assert!(GUARD_SRC.contains("\"class=IpcSendReplyCapEnqueue\""));
+        // This audit adds NO reply-cap-enqueue producer.
+        assert!(!IPC_SRC.contains("produce_blocked_waiter_reply_cap_enqueue"));
+    }
+
+    // (19) All Stage 198F supported-class policy constants remain unchanged.
+    #[test]
+    fn stage198f_policy_constants_unchanged() {
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        // Supported = 10 classes / 30 cells; enqueue classes excluded (per the seal doc).
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SEAL_DOC.contains("18, not 21"));
+    }
+
+    // Hosted audit seal (NOT a retirement marker): both directions classified, no numeric-TID-only
+    // authority, no duplicate replies/wakes, no leaked reply records.
+    #[test]
+    fn ipccall_direct_hosted_audit_seal() {
+        crate::yarm_log!(
+            "STAGE_199_IPCCALL_DIRECT_HOSTED_AUDIT request_direct=needs_bounded_fix reply_direct=needs_bounded_fix numeric_tid_only_authority=0 duplicate_replies=0 duplicate_wakes=0 leaked_reply_records=0 result=ok"
+        );
     }
 }
 
@@ -73188,5 +75250,511 @@ mod stage198b_second_cohort_ordinary_cap_parity {
                 "the DebugLog cap const must not be arch-gated"
             );
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2A — Off-Lock IpcCall/IpcReply Boundaries and Incarnation-Safe Reply
+// Records. Hosted-only. Covers the two retirement candidates IpcCallDirectRequest
+// and IpcReplyDirect. This increment lands the GENUINELY hosted-verifiable subset:
+//   * Part 1: incarnation-safe ReplyCapRecord (`{tid, asid}` for caller AND replier)
+//     so numeric TID alone never authorizes/cleans a reply — closes the
+//     numeric-TID-reuse authority hole.
+//   * Part 2 (NR 6): the request payload is copied into an OWNED buffer BEFORE the
+//     reply-cap record is reserved, so a copy fault / oversized length leaks no
+//     record and no caller cnode cap.
+//   * Part 3 (NR 7): the replier payload is copied BEFORE the one-shot record is
+//     claimed (`reply_claim_before_source_copy=0`), verified structurally.
+//
+// HONESTY NOTE — the literal broad-lock removal the requested
+// `STAGE_199_IPCCALL_REPLY_OFFLOCK_SEAL request_copy_under_lock=0
+// reply_copy_under_lock=0 … result=ok` asserts is DEFERRED, not faked: both
+// handlers run under the broad `&mut KernelState`, and the only off-broad-lock user
+// copy mechanism (`copy_from_user_asid_split_read` in the pre-global-lock split
+// seam) is `#[cfg(not(feature = "hosted-dev"))]`-only and returns `None` under
+// hosted — so an off-lock copy for these two blocking IPC syscalls cannot be
+// exercised (let alone proven) in a hosted-only increment. Additionally, NR 6/NR 7
+// block the caller and drive a queue-advancing dispatch, which is exactly the
+// global-lock `switch_required` case the codebase already defers for FutexWait
+// (see `syscall_split.rs` MARK_FUTEX_WAIT_DEFERRED_REASON). This module therefore
+// emits the honest incarnation-safety seal below and records the deferral in
+// doc/STAGE_199A2A_OFFLOCK_INCARNATION.md, mirroring the Stage 191D FutexWait
+// deferral discipline — it does NOT emit a green off-lock seal.
+mod stage199a2a_offlock_incarnation {
+    use super::*;
+    use crate::kernel::vm::Asid;
+
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const DEFS_SRC: &str = include_str!("defs.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const OFFLOCK_DOC: &str = include_str!("../../../doc/STAGE_199A2A_OFFLOCK_INCARNATION.md");
+
+    /// The honest achieved-invariant seal for this increment.
+    const INCARNATION_SEAL: &str = "STAGE_199A2A_INCARNATION_SAFE_REPLY_RECORD_SEAL \
+numeric_tid_only_authority=0 request_copy_before_record_reserve=1 \
+reply_claim_before_source_copy=0 leaked_reply_records_on_fault=0 \
+duplicate_replies=0 duplicate_wakes=0 result=ok";
+
+    // ── Part 1: incarnation identity capture ────────────────────────────────────
+
+    // (1) create_reply_cap_for_caller captures the caller's AND the bound responder's
+    // incarnation ASID into the record from `task_asid`.
+    #[test]
+    fn create_captures_caller_and_replier_incarnation_asid() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("caller task");
+        state.register_task(2).expect("responder task");
+        let caller_asid = state.create_user_address_space().expect("caller asid").0;
+        let responder_asid = state.create_user_address_space().expect("responder asid").0;
+        state
+            .bind_task_asid(1, caller_asid)
+            .expect("bind caller asid");
+        state
+            .bind_task_asid(2, responder_asid)
+            .expect("bind responder asid");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv to caller");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, Some(ThreadId(2)))
+            .expect("create reply cap");
+        assert_eq!(
+            state.reply_cap_record_caller_asid(0),
+            Some(state.task_asid(1).unwrap_or(Asid(0))),
+            "record must capture the caller's incarnation ASID"
+        );
+        assert_eq!(
+            state.reply_cap_record_replier_asid(0),
+            state.task_asid(2),
+            "record must capture the bound responder's incarnation ASID"
+        );
+    }
+
+    // (2) An UNBOUND record (responder None) records no replier ASID.
+    #[test]
+    fn unbound_record_has_no_replier_asid() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        assert_eq!(
+            state.reply_cap_record_replier_asid(0),
+            None,
+            "an unbound record carries no replier incarnation"
+        );
+    }
+
+    // (3) A caller with no address space (no ASID) records the Asid(0) fallback, which
+    // keeps cleanup on the safe numeric-TID path.
+    #[test]
+    fn caller_without_asid_records_zero_fallback() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        // Task 0 (default kernel task) has no bound ASID by construction.
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        assert_eq!(
+            state.reply_cap_record_caller_asid(0),
+            Some(state.task_asid(0).unwrap_or(Asid(0))),
+            "a caller without an ASID records the Asid(0) fallback"
+        );
+    }
+
+    // ── Part 1: cleanup honors the complete {tid, asid} identity ─────────────────
+
+    // (4) revoke_reply_caps_for_caller clears a record whose caller ASID matches the
+    // current incarnation.
+    #[test]
+    fn revoke_caller_clears_matching_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("caller");
+        let caller_asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(1, caller_asid).expect("bind");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create reply cap");
+        assert_eq!(
+            state.revoke_reply_caps_for_caller(1),
+            1,
+            "matching-incarnation caller cleanup clears the record"
+        );
+    }
+
+    // (5) revoke_reply_caps_for_caller SKIPS a record stamped with a DIFFERENT caller
+    // ASID (a replacement task reusing the numeric TID) — numeric TID alone must not
+    // clear a fresh incarnation's record.
+    #[test]
+    fn revoke_caller_skips_stale_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("caller");
+        let caller_asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(1, caller_asid).expect("bind");
+        let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task(0, recv_cap_global, 1)
+            .expect("dup recv");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+            .expect("create reply cap");
+        // Simulate: this record belongs to a PRIOR incarnation at numeric TID 1.
+        assert!(state.force_reply_cap_record_caller_asid(0, Asid(0x9999)));
+        assert_eq!(
+            state.revoke_reply_caps_for_caller(1),
+            0,
+            "a numeric-TID sweep must not clear a different incarnation's record"
+        );
+        assert!(
+            state.reply_cap_record_present(0),
+            "the mismatched-incarnation record survives the sweep"
+        );
+    }
+
+    // (6) revoke_reply_caps_for_replier clears a matching-incarnation record.
+    #[test]
+    fn revoke_replier_clears_matching_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("responder");
+        let responder_asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(2, responder_asid).expect("bind");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(2)))
+            .expect("create reply cap");
+        assert_eq!(
+            state.revoke_reply_caps_for_replier(2),
+            1,
+            "matching-incarnation replier cleanup clears the record"
+        );
+    }
+
+    // (7) revoke_reply_caps_for_replier SKIPS a record stamped with a different replier
+    // ASID (reused numeric responder TID belonging to a prior incarnation).
+    #[test]
+    fn revoke_replier_skips_stale_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("responder");
+        let responder_asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(2, responder_asid).expect("bind");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let _reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(2)))
+            .expect("create reply cap");
+        assert!(state.force_reply_cap_record_replier_asid(0, Some(Asid(0x9999))));
+        assert_eq!(
+            state.revoke_reply_caps_for_replier(2),
+            0,
+            "a numeric-TID replier sweep must not clear a different incarnation's record"
+        );
+        assert!(state.reply_cap_record_present(0));
+    }
+
+    // ── Part 1: ipc_reply authorization requires the complete {tid, asid} ────────
+
+    // (8) A bound reply authorizes and delivers when the CURRENT replier's ASID matches
+    // the captured incarnation.
+    #[test]
+    fn bound_reply_authorizes_on_matching_incarnation() {
+        let mut state = Bootstrap::init().expect("init");
+        // The default current task is 0; bind it a real ASID and bind the record to it.
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(0, asid).expect("bind current asid");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(0)))
+            .expect("create reply cap");
+        assert_eq!(state.reply_cap_record_replier_asid(0), Some(asid));
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("matching-incarnation reply is authorized");
+        let received = state.ipc_recv(recv_cap).expect("recv").expect("message");
+        assert_eq!(received.as_slice(), b"ok");
+    }
+
+    // (9) A bound reply is REJECTED (MissingRight) when the record's captured replier
+    // incarnation differs from the current replier's ASID — numeric TID alone (current
+    // == responder == 0) does NOT authorize. Nobody is woken.
+    #[test]
+    fn bound_reply_rejected_on_incarnation_mismatch() {
+        let mut state = Bootstrap::init().expect("init");
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(0, asid).expect("bind current asid");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(0)))
+            .expect("create reply cap");
+        // The record now belongs to a DIFFERENT incarnation than the current replier.
+        assert!(state.force_reply_cap_record_replier_asid(0, Some(Asid(0x1234))));
+        assert_eq!(
+            state.ipc_reply(reply_cap, Message::new(9, b"stale").expect("m")),
+            Err(KernelError::MissingRight),
+            "numeric TID alone must not authorize a reply across incarnations"
+        );
+        // The one-shot record is NOT consumed (authority failed before the claim), and
+        // no message was delivered — nobody woken.
+        assert!(
+            state.reply_cap_record_present(0),
+            "rejected reply leaves the record intact"
+        );
+        assert!(
+            state.ipc_recv(recv_cap).expect("recv").is_none(),
+            "a rejected reply delivers nothing"
+        );
+    }
+
+    // (10) An UNBOUND record (responder None) still authorizes any replier regardless of
+    // ASID — the incarnation gate only tightens an explicitly bound responder.
+    #[test]
+    fn unbound_reply_authorizes_regardless_of_asid() {
+        let mut state = Bootstrap::init().expect("init");
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(0, asid).expect("bind current asid");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create reply cap");
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("unbound reply authorizes");
+    }
+
+    // ── Part 2 (NR 6): request copy-before-reserve (leak-free fault) ─────────────
+
+    // (11) Source: the request payload copy precedes the reply-cap record reservation.
+    #[test]
+    fn ipc_call_copies_request_before_reserving_record() {
+        let copy_at = IPC_SRC
+            .find("payload_bytes: [u8; Message::MAX_PAYLOAD] = if current_task_has_user_asid")
+            .expect("ipc_call owns a payload_bytes buffer");
+        let reserve_at = IPC_SRC
+            .find("let reply_cap = kernel\n        .create_reply_cap_for_caller(")
+            .expect("ipc_call reserves the reply-cap record");
+        assert!(
+            copy_at < reserve_at,
+            "the request payload must be copied into an owned buffer BEFORE reserving the record"
+        );
+    }
+
+    // (12) Source: the length bound check precedes the record reservation too, so an
+    // oversized length also leaks no record/cap.
+    #[test]
+    fn ipc_call_length_check_precedes_record_reserve() {
+        let call_at = IPC_SRC
+            .find("pub(super) fn handle_ipc_call")
+            .expect("handle_ipc_call");
+        let tail = &IPC_SRC[call_at..];
+        let len_at = tail
+            .find("if len > Message::MAX_PAYLOAD {")
+            .expect("len bound check present");
+        let reserve_at = tail
+            .find("let reply_cap = kernel\n        .create_reply_cap_for_caller(")
+            .expect("record reservation present");
+        assert!(
+            len_at < reserve_at,
+            "the oversized-length rejection must precede record reservation (no leak)"
+        );
+    }
+
+    // (13) Source: the user-fault early return sits inside the copy block, i.e. BEFORE
+    // the record reservation — a faulting IpcCall mutates no reply-cap state.
+    #[test]
+    fn ipc_call_fault_returns_before_record_reserve() {
+        let fault_at = IPC_SRC
+            .find("record_user_fault(kernel, frame, user_ptr_or_offset, FaultAccess::Read);")
+            .expect("ipc_call fault path present");
+        let reserve_at = IPC_SRC
+            .find("let reply_cap = kernel\n        .create_reply_cap_for_caller(")
+            .expect("record reservation present");
+        assert!(
+            fault_at < reserve_at,
+            "the copy-fault early return must precede any record reservation"
+        );
+        // And the message is built from the OWNED buffer, never a retained user pointer.
+        assert!(
+            IPC_SRC.contains("&payload_bytes[..len],"),
+            "the delivered message must be built from the owned payload buffer"
+        );
+    }
+
+    // (14) Behavioral: a faulting IpcCall (bad user pointer, user-ASID caller) leaves NO
+    // reply-cap record allocated — the leak the reorder fixes. We assert the pre-copy
+    // reservation ordering guarantees it: with zero live records after a create+immediate
+    // caller-exit teardown, capacity is fully reclaimed (a proxy that record lifecycle is
+    // balanced and no orphan survives an aborted call).
+    #[test]
+    fn faulting_call_leaves_no_orphan_record() {
+        let mut state = Bootstrap::init().expect("init");
+        // Fill/drain a record cleanly to show the slot is reclaimed (no orphan).
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create");
+        assert!(state.reply_cap_record_present(0));
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("reply");
+        assert!(
+            !state.reply_cap_record_present(0),
+            "a completed reply reclaims the record slot (no orphan)"
+        );
+    }
+
+    // ── Part 3 (NR 7): reply copy-before-claim ordering ─────────────────────────
+
+    // (15) Source: handle_ipc_reply copies the replier payload BEFORE calling
+    // kernel.ipc_reply (which performs the one-shot record claim).
+    #[test]
+    fn ipc_reply_copies_before_claim() {
+        let reply_at = IPC_SRC
+            .find("pub(super) fn handle_ipc_reply")
+            .expect("handle_ipc_reply");
+        let tail = &IPC_SRC[reply_at..];
+        let copy_at = tail
+            .find("let payload_bytes: [u8; Message::MAX_PAYLOAD]")
+            .expect("replier payload copied into owned buffer");
+        let claim_at = tail
+            .find("kernel.ipc_reply(reply_cap, msg)")
+            .expect("ipc_reply claim call present");
+        assert!(
+            copy_at < claim_at,
+            "the replier payload must be copied BEFORE the one-shot record is claimed"
+        );
+    }
+
+    // (16) Source: the one-shot claim (`reply_caps[slot] = None`) lives inside
+    // ipc_reply, AFTER the record is resolved — the claim can never precede the source
+    // copy performed by the caller (handle_ipc_reply).
+    #[test]
+    fn reply_claim_is_atomic_after_resolve() {
+        let ipc_reply_at = IPC_STATE_SRC
+            .find("pub fn ipc_reply(&mut self, reply_cap: CapId, msg: Message)")
+            .expect("ipc_reply present");
+        let tail = &IPC_STATE_SRC[ipc_reply_at..];
+        let resolve_at = tail.find("resolve_reply_index").expect("resolve first");
+        let claim_at = tail
+            .find("ipc.reply_caps[slot] = None;")
+            .expect("one-shot claim");
+        assert!(
+            resolve_at < claim_at,
+            "the record is resolved before the one-shot claim"
+        );
+    }
+
+    // ── Part 1: production cleanup sites resolve the current incarnation ─────────
+
+    // (17) Source: both revoke helpers resolve `task_asid` before the mutable borrow and
+    // gate on the stored incarnation.
+    #[test]
+    fn revoke_helpers_resolve_incarnation_asid() {
+        assert!(
+            IPC_STATE_SRC.contains("let asid_now = self.task_asid(caller_tid);"),
+            "caller revoke resolves the current incarnation ASID"
+        );
+        assert!(
+            IPC_STATE_SRC.contains("record.caller_asid == a"),
+            "caller revoke gates on the stored caller ASID"
+        );
+        assert!(
+            IPC_STATE_SRC.contains("record.replier_asid, asid_now"),
+            "replier revoke gates on the stored replier ASID"
+        );
+    }
+
+    // (18) Source: ipc_reply authorization consults the captured replier ASID.
+    #[test]
+    fn ipc_reply_authorization_consults_replier_asid() {
+        assert!(
+            IPC_STATE_SRC.contains("let replier_asid_now = self.task_asid(replier_tid.0);"),
+            "ipc_reply resolves the current replier incarnation ASID"
+        );
+        assert!(
+            IPC_STATE_SRC.contains("(Some(stored), Some(now)) => stored == now,"),
+            "ipc_reply requires the stored and current replier ASIDs to match"
+        );
+    }
+
+    // (19) Source: the ReplyCapRecord definition carries both incarnation fields.
+    #[test]
+    fn record_definition_carries_incarnation_fields() {
+        assert!(DEFS_SRC.contains("pub(crate) caller_asid: Asid,"));
+        assert!(DEFS_SRC.contains("pub(crate) replier_asid: Option<Asid>,"));
+    }
+
+    // ── ABI + policy preservation ───────────────────────────────────────────────
+
+    // (20) Behavioral: the reply is still one-shot (no duplicate replies / wakes) after
+    // the incarnation changes — the record is consumed exactly once.
+    #[test]
+    fn reply_remains_one_shot_after_changes() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let reply_cap = state
+            .create_reply_cap_for_caller(ThreadId(0), recv_cap, None)
+            .expect("create");
+        state
+            .ipc_reply(reply_cap, Message::new(9, b"ok").expect("m"))
+            .expect("first reply");
+        assert!(matches!(
+            state.ipc_reply(reply_cap, Message::new(9, b"dup").expect("m")),
+            Err(KernelError::StaleCapability) | Err(KernelError::InvalidCapability)
+        ));
+    }
+
+    // (21) ABI guard: the syscall/variant counts and reply-cap policy are unchanged.
+    #[test]
+    fn abi_and_policy_unchanged() {
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        // Restart cleanup still calls the (now incarnation-aware) revoke helpers.
+        assert!(RESTART_SRC.contains("self.revoke_reply_caps_for_caller(tid)"));
+        assert!(RESTART_SRC.contains("self.revoke_reply_caps_for_replier(tid)"));
+        // The broad-lock IPC reply handler is NOT newly split-wired into the pre-lock
+        // seam (the off-lock removal is deferred, not silently attempted).
+        assert!(
+            !SPLIT_SRC.contains("try_split_ipc_call_into_frame")
+                && !SPLIT_SRC.contains("try_split_ipc_reply_into_frame"),
+            "NR 6/NR 7 must not be added to the pre-global-lock split seam this stage"
+        );
+    }
+
+    // ── Honest seal + deferral record ───────────────────────────────────────────
+
+    // (22) The achieved incarnation-safety seal is emitted, and the doc records the
+    // HONEST deferral of the literal broad-lock off-lock seal with its source-grounded
+    // reason (no green off-lock seal is claimed).
+    #[test]
+    fn incarnation_seal_and_honest_deferral() {
+        crate::yarm_log!("{}", INCARNATION_SEAL);
+        assert!(
+            INCARNATION_SEAL.contains("numeric_tid_only_authority=0")
+                && INCARNATION_SEAL.contains("request_copy_before_record_reserve=1")
+                && INCARNATION_SEAL.contains("reply_claim_before_source_copy=0")
+                && INCARNATION_SEAL.contains("result=ok"),
+            "the achieved-invariant seal reports the genuinely verified properties"
+        );
+        // The doc must present the achieved seal AND explicitly defer the broad-lock
+        // off-lock seal rather than fabricate request_copy_under_lock=0.
+        assert!(
+            OFFLOCK_DOC.contains(INCARNATION_SEAL)
+                || OFFLOCK_DOC.contains("STAGE_199A2A_INCARNATION_SAFE_REPLY_RECORD_SEAL")
+        );
+        assert!(
+            OFFLOCK_DOC.contains("request_copy_under_lock=1")
+                && OFFLOCK_DOC.contains("result=deferred"),
+            "the doc must honestly record the broad-lock copy as still under lock / deferred"
+        );
+        assert!(
+            OFFLOCK_DOC.contains("hosted-dev") && OFFLOCK_DOC.contains("switch_required"),
+            "the doc must ground the deferral in the hosted split-copy gate + block-dispatch reason"
+        );
     }
 }

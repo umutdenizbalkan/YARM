@@ -1600,13 +1600,51 @@ pub fn bootstrap_first_user_task(
         init_args[17] = 2; // cap-enqueue-oracle discriminator (init otherwise leaves slot 17 zero)
         crate::yarm_log!("IPC_SEND_CAP_ENQUEUE_ORACLE_PROVISION_OK slot17=2");
     }
+    // Stage 198E3C2C: default-off + feature-gated RISC-V DIRECT shared-region live oracle. Mirrors
+    // the x86_64/AArch64 targets EXACTLY except for the slot-5 selector (=7, since RISC-V selectors
+    // 1–6 already name the FutexWake / queue-switch / FutexWait-switch / FutexWait-idle / Yield-two /
+    // Yield-lone oracles). It reuses init startup slot 5 (supervisor_control_recv_ep, unused by init)
+    // as the SELECTOR and the two free service-extra slots 13/14 for the source MemoryObject cap and
+    // the combined SEND|RECEIVE endpoint cap, calling the SAME arch-neutral provisioning helper. It is
+    // mutually exclusive with EVERY slot-13/14 oracle above (only fires when both are still zero) AND
+    // with the six slot-5 oracles below (they share slot 5): if the shared-region knob AND any other
+    // slot-5 knob are both set the boot arms NEITHER (fail closed). Transactional + leak-free.
+    #[cfg(feature = "riscv-shared-region-direct-oracle")]
+    if init_args[5] == 0 && init_args[13] == 0 && init_args[14] == 0 {
+        let slot5_conflict = crate::kernel::boot::riscv_yield_lone_task_oracle_enabled()
+            || crate::kernel::boot::riscv_yield_two_task_oracle_enabled()
+            || crate::kernel::boot::riscv_futex_wait_idle_oracle_enabled()
+            || crate::kernel::boot::riscv_futex_wait_oracle_enabled()
+            || crate::kernel::boot::riscv_queue_switch_foundation_oracle_enabled()
+            || crate::kernel::boot::riscv_futex_wake_oracle_enabled();
+        if crate::kernel::boot::riscv_shared_region_direct_oracle_enabled() && slot5_conflict {
+            crate::yarm_log!(
+                "RISCV_ORACLE_SLOT5_CONFLICT shared_region=1 other_slot5=1 result=arm_neither"
+            );
+        } else if let Some(caps) =
+            crate::kernel::boot::provision_init_shared_region_oracle(kernel, RING3_INIT_SERVER_TID)
+        {
+            init_args[5] = crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR;
+            init_args[13] = caps.mem_cap as u64;
+            init_args[14] = caps.endpoint_cap as u64;
+            crate::yarm_log!(
+                "SHARED_REGION_ORACLE_SLOTS slot5={} slot13={} slot14={} eidx={}",
+                init_args[5],
+                init_args[13],
+                init_args[14],
+                caps.endpoint_idx
+            );
+        }
+    }
     // Stage 196C/196D/196E/196F: default-off RISC-V oracle WORKLOADS reuse init slot 5
-    // (supervisor_control_recv_ep, unused by init on RISC-V) as a sentinel: 1 = FutexWake live
-    // oracle (196C); 2 = queue-switch context-switch FOUNDATION oracle (196D); 3 = FutexWait
-    // SWITCH oracle workload (196E/196F); 4 = FutexWait no-incoming IDLE oracle workload (196F).
-    // A normal boot leaves it 0 and init skips all four. NB: these are WORKLOAD selectors only —
-    // the FutexWait retirement mechanism itself is DEFAULT-ON (no knob) as of 196F.
-    if crate::kernel::boot::riscv_yield_lone_task_oracle_enabled() {
+    // (supervisor_control_recv_ep, unused by init on RISC-V) as a sentinel: 7 = Stage 198E3C2C DIRECT
+    // shared-region oracle; 1 = FutexWake live oracle (196C); 2 = queue-switch context-switch
+    // FOUNDATION oracle (196D); 3 = FutexWait SWITCH oracle workload (196E/196F); 4 = FutexWait
+    // no-incoming IDLE oracle workload (196F); 5/6 = Yield two/lone (196G). A normal boot leaves it 0
+    // and init skips all. NB: these are WORKLOAD selectors only — the FutexWait retirement mechanism
+    // itself is DEFAULT-ON (no knob) as of 196F. The chain never overwrites a selector the
+    // shared-region oracle already set (guarded by `init_args[5] == 0`).
+    if init_args[5] == 0 && crate::kernel::boot::riscv_yield_lone_task_oracle_enabled() {
         init_args[5] = 6;
         crate::yarm_log!("RISCV_YIELD_LONE_TASK_ORACLE_PROVISION_OK slot5=6");
     } else if crate::kernel::boot::riscv_yield_two_task_oracle_enabled() {

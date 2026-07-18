@@ -487,31 +487,77 @@ pub mod syscall {
         pub payload_len: usize,
     }
 
-    /// Stage 198E3C1: issue exactly ONE read-only shared-region cap transfer. Builds a `Message` with
-    /// `OPCODE_SHARED_MEM` + the canonical `FLAG_CAP_TRANSFER`, carrying exactly the provisioned
-    /// `mem_cap`. The source cap is PRESERVED (the kernel duplicates it through the transfer
-    /// envelope). Returns the exact kernel `SyscallError` — never translated into success.
+    /// Kernel `Message::MAX_PAYLOAD` (mirror). An `IpcSend` whose `arg(LEN)` EXCEEDS this selects the
+    /// large shared-region transfer branch; `arg(LEN) <= this` is an ordinary inline cap transfer.
+    pub const IPC_MESSAGE_MAX_PAYLOAD: usize = 128;
+    /// Kernel `SharedMemoryRegion::ENCODED_LEN` (mirror): the region descriptor the kernel builds.
+    pub const SHARED_REGION_DESCRIPTOR_LEN: usize = 16;
+    /// Descriptor field byte offsets (mirror of `SharedMemoryRegion::encode`): offset `u64` then len
+    /// `u64`, little-endian.
+    pub const SHARED_REGION_DESCRIPTOR_OFFSET_AT: usize = 0;
+    pub const SHARED_REGION_DESCRIPTOR_LEN_AT: usize = 8;
+
+    /// Stage 198E3C2A: the CANONICAL, architecture-neutral shared-region send. The kernel selects the
+    /// shared-region transfer purely by the LARGE-transfer form of `IpcSend` — `arg(SYSCALL_ARG_PTR)`
+    /// carries the byte OFFSET into the source object and `arg(SYSCALL_ARG_LEN)` carries the region
+    /// byte length, which MUST exceed `IPC_MESSAGE_MAX_PAYLOAD` (128) or the send is decoded as an
+    /// ordinary inline cap transfer. The transferred source cap rides in `arg(SYSCALL_ARG_TRANSFER_
+    /// CAP)`. This helper builds NO inline `Message` and depends on NO `OPCODE_SHARED_MEM` framing —
+    /// the kernel produces the opcode + the 16-byte `SharedMemoryRegion` descriptor. The source cap
+    /// is PRESERVED (delegated through the transfer envelope, not moved). Rejects `region_len <=
+    /// IPC_MESSAGE_MAX_PAYLOAD` and an overflowing `offset + region_len` locally with `InvalidArgs`.
+    /// Returns the canonical kernel `SyscallError` unchanged (`WouldBlock` on the pre-ack retry path).
     ///
     /// # Safety
-    /// `send_ep` must be a valid send cap and `mem_cap` a valid transferable MemoryObject/DmaRegion.
-    pub unsafe fn send_shared_region(
+    /// `send_ep` must be a valid SEND cap and `mem_cap` a valid transferable MemoryObject/DmaRegion.
+    pub unsafe fn send_shared_region_large(
         send_ep: u32,
         mem_cap: u32,
-        payload: &[u8],
+        offset: usize,
+        region_len: usize,
     ) -> core::result::Result<(), SyscallError> {
         if mem_cap == 0 {
             return Err(SyscallError::InvalidArgs);
         }
-        let msg = Message::with_header(
-            0,
-            OPCODE_SHARED_MEM,
-            Message::FLAG_CAP_TRANSFER,
-            Some(mem_cap as u64),
-            payload,
-        )
-        .map_err(|_| SyscallError::InvalidArgs)?;
-        // Exactly one transfer; ipc_send surfaces the canonical kernel error unchanged.
-        unsafe { ipc_send(send_ep, &msg) }
+        // Local guards mirroring the kernel: the large-transfer branch requires len > MAX_PAYLOAD,
+        // and `offset + region_len` must not overflow (the kernel's validate_user_region rejects an
+        // overflow / out-of-range region).
+        if region_len <= IPC_MESSAGE_MAX_PAYLOAD {
+            return Err(SyscallError::InvalidArgs);
+        }
+        if offset.checked_add(region_len).is_none() {
+            return Err(SyscallError::InvalidArgs);
+        }
+        // args: [ep_cap(ARG_CAP=0), offset(ARG_PTR=1), region_len(ARG_LEN=2), _, _, mem_cap(
+        // ARG_TRANSFER_CAP=5)]. The kernel stashes exactly one transfer envelope, builds the
+        // OPCODE_SHARED_MEM message with the encoded descriptor, and (for a blocked recv-v2 waiter)
+        // delivers it directly.
+        let args = [send_ep as usize, offset, region_len, 0, 0, mem_cap as usize];
+        // SAFETY: architecture syscall ABI entry; the transferred cap authorizes the region.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_SEND_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
+    }
+
+    /// Oracle convenience over [`send_shared_region_large`]: transfer the WHOLE two-page oracle
+    /// region at offset 0 (`SHARED_REGION_ORACLE_LEN = 8192 > 128`). Identical encoding to the
+    /// sealed x86_64 live oracle.
+    ///
+    /// # Safety
+    /// Same contract as [`send_shared_region_large`].
+    pub unsafe fn send_shared_region(
+        send_ep: u32,
+        mem_cap: u32,
+    ) -> core::result::Result<(), SyscallError> {
+        // SAFETY: forwards to the canonical helper with the oracle's offset 0 + two-page length.
+        unsafe { send_shared_region_large(send_ep, mem_cap, 0, SHARED_REGION_ORACLE_LEN) }
     }
 
     /// Stage 198E3C1: recv-v2 shared-region receive with a DEDICATED page-aligned two-page destination
@@ -616,12 +662,20 @@ pub mod syscall {
             }
             Ok(ret.ret0 as usize)
         }
+        // AArch64/RISC-V return-lane ABI (mirrors the frozen `decode_release` for NR 4): there is NO
+        // separate error register — the kernel's `set_ok(map_len, 0, 0)` exports X0 = the released
+        // length on success, while an error exports X0 = the small `SyscallError` code. Because a
+        // released length is ALWAYS a nonzero page-multiple (>= PAGE) and every error code is a small
+        // value below PAGE, the page-alignment test is the authoritative success/error discriminator
+        // (X0 = value on OK vs X0 = error otherwise — the earlier `ret1` read was wrong: the kernel
+        // leaves ret1 = 0 on this syscall). The duplicate release therefore surfaces `InvalidArgs`.
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         {
-            if ret.ret0 != 0 {
+            const PAGE: usize = 4096;
+            if ret.ret0 < PAGE || !ret.ret0.is_multiple_of(PAGE) {
                 return Err(decode_syscall_error(ret.ret0));
             }
-            Ok(ret.ret1 as usize)
+            Ok(ret.ret0)
         }
     }
 
@@ -636,14 +690,26 @@ pub mod syscall {
     pub const SHARED_REGION_ORACLE_PAGE_COUNT: usize = 2;
     pub const SHARED_REGION_ORACLE_LEN: usize =
         SHARED_REGION_ORACLE_PAGE_COUNT * SHARED_REGION_ORACLE_PAGE_SIZE;
-    /// The base VA of the two-page window: 1 GiB. Above the init image (loaded at 0x0040_0000, a few
-    /// MB) and the boot initrd window (~0x0C00_1000, 192 MB); far below the user stack (~0x7ffx_...,
-    /// multi-TB). All oracle `.bss` scratch buffers live inside the init image, well below 1 GiB.
+    /// The base VA of the two-page window. It MUST land in the target's user address space, in the gap
+    /// between the init image + initrd window (below) and the user heap/stack (above):
+    /// - x86_64 uses 1 GiB — above the init image (0x0040_0000, a few MB) and the boot initrd window
+    ///   (~0x0C00_1000), far below the multi-TB user stack.
+    /// - AArch64's user address space is only the low `TTBR0_EL1` half below
+    ///   `KERNEL_SPACE_BASE = 0x4000_0000` (1 GiB), so 1 GiB is NOT a user VA there (a map at it faults
+    ///   `PrivilegeViolation`); the window sits at 512 MiB, above the image/initrd and below the user
+    ///   stack (observed just under 1 GiB).
+    /// - RISC-V places the default `brk` at `USER_BRK_DEFAULT_BASE = 0x4000_0000`, so 1 GiB is the HEAP
+    ///   base there; the window sits at 512 MiB, in the image↔heap gap and below `KERNEL_SPACE_BASE`
+    ///   (`0x8000_0000`).
+    /// All oracle `.bss` scratch buffers live inside the init image, well below any window.
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    pub const SHARED_REGION_ORACLE_VA: usize = 0x2000_0000;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     pub const SHARED_REGION_ORACLE_VA: usize = 0x4000_0000;
     pub const SHARED_REGION_ORACLE_END: usize = SHARED_REGION_ORACLE_VA + SHARED_REGION_ORACLE_LEN;
 
-    // ── Traced x86_64 userspace ranges the window must NOT overlap (for the compile-time guards) ──
-    /// init image load base (`USER_LOAD_BASE`, targets/x86_64-yarm-user-none.ld).
+    // ── Traced userspace ranges the window must NOT overlap (for the compile-time guards) ──
+    /// init image load base (`USER_LOAD_BASE`, the per-arch user linker script).
     const ORACLE_TRACE_IMAGE_BASE: usize = 0x0040_0000;
     /// Generous upper bound on the init image (image is a few MB; 64 MB covers text+rodata+data+bss
     /// including every oracle scratch buffer).
@@ -651,9 +717,23 @@ pub mod syscall {
     /// Boot initrd pointer window (`STARTUP_SLOT_INITRD_PTR` example value 0x0C00_1000) + a margin.
     const ORACLE_TRACE_INITRD_BASE: usize = 0x0C00_0000;
     const ORACLE_TRACE_INITRD_END: usize = 0x1000_0000;
-    /// Conservative lower bound of the user stack region (observed stacks live at ~0x7ffx_xxxx_xxxx).
+    /// Conservative lower bound of the user heap/stack region the window stays below. x86_64 stacks
+    /// live at ~0x7ffx_xxxx_xxxx; AArch64 stacks sit just below the 1 GiB `KERNEL_SPACE_BASE` (observed
+    /// ~0x3fbc_0000, so a 768 MiB floor is strictly below); RISC-V places the default `brk` HEAP base
+    /// at 1 GiB (`0x4000_0000`), so the floor is that base — the 512 MiB window stays strictly below.
+    #[cfg(target_arch = "aarch64")]
+    const ORACLE_TRACE_STACK_FLOOR: usize = 0x3000_0000;
+    #[cfg(target_arch = "riscv64")]
+    const ORACLE_TRACE_STACK_FLOOR: usize = 0x4000_0000;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     const ORACLE_TRACE_STACK_FLOOR: usize = 0x0000_1000_0000_0000;
-    /// x86_64 canonical lower-half user VA ceiling.
+    /// User VA ceiling: x86_64 canonical lower-half; AArch64 `TTBR0` user half = `KERNEL_SPACE_BASE`
+    /// (0x4000_0000); RISC-V `KERNEL_SPACE_BASE` = 0x8000_0000.
+    #[cfg(target_arch = "aarch64")]
+    const ORACLE_TRACE_USER_VA_MAX: usize = 0x4000_0000;
+    #[cfg(target_arch = "riscv64")]
+    const ORACLE_TRACE_USER_VA_MAX: usize = 0x8000_0000;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
     const ORACLE_TRACE_USER_VA_MAX: usize = 0x0000_8000_0000_0000;
 
     // Compile-time VA contract: alignment, exactly two pages, no overflow, valid user VA, and no
@@ -697,6 +777,16 @@ pub mod syscall {
     pub const STARTUP_SLOT_SHARED_REGION_ENDPOINT_CAP: usize = 14; // == SERVICE_EXTRA_CAP_1
     /// The slot-5 selector value that names this oracle (1 = FutexWake oracle; 2 = shared-region).
     pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
+    /// The AArch64 slot-5 selector for the SAME direct shared-region oracle. Slots 1-5 name the
+    /// AArch64 FutexWake / FutexWait-switch / FutexWait-idle / Yield / Yield-lone oracles, so the
+    /// AArch64 shared-region oracle takes selector 6. The workload body is identical (it reuses the
+    /// arch-neutral oracle core); only the boot-side selector differs from x86's `2`.
+    pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;
+    /// The RISC-V slot-5 selector for the SAME direct shared-region oracle. Slots 1-6 name the RISC-V
+    /// FutexWake / queue-switch / FutexWait-switch / FutexWait-idle / Yield-two / Yield-lone oracles,
+    /// so the RISC-V shared-region oracle takes selector 7. The workload body is identical (it reuses
+    /// the arch-neutral oracle core); only the boot-side selector differs from x86's `2` / AArch64's `6`.
+    pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;
 
     /// Stage 159BC/D proof-only recv-v2 with a deliberately undersized payload
     /// buffer.

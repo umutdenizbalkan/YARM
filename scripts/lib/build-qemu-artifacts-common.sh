@@ -72,17 +72,34 @@ common_verify_kernel_markers() {
     "class=IpcSendSharedRegionEnqueue"
     "InitramfsReadChunk"
   )
-  # Stage 198E3C1: the shared-region DIRECT retirement literal is permitted ONLY in the explicitly
-  # armed x86_64 live-oracle build (the smoke runner sets YARM_SHARED_REGION_DIRECT_ORACLE_BUILD=1
-  # and builds with `--features x86-shared-region-direct-oracle` on x86_64). In EVERY other build —
-  # all normal artifacts and every AArch64/RISC-V artifact — `class=IpcSendSharedRegion` (which also
-  # catches the Direct suffix) stays forbidden, so a normal/non-x86 artifact is marker-clean.
+  # Stage 198E3C1/198E3C2B: the shared-region DIRECT retirement literal is permitted ONLY in an
+  # explicitly armed live-oracle build (the smoke runner sets YARM_SHARED_REGION_DIRECT_ORACLE_BUILD=1
+  # and builds with `--features <arch>-shared-region-direct-oracle` on the matching arch). The armed
+  # arch is x86_64 (198E3C1C, sealed) or aarch64 (198E3C2B). In EVERY other build — all normal
+  # artifacts, the OTHER armed arch's marker, and every RISC-V artifact — `class=IpcSendSharedRegion`
+  # (which also catches the Direct suffix) stays forbidden, so a normal/off-arch artifact is
+  # marker-clean and one armed build can never carry the other arch's shared-region literal.
   if [[ "${YARM_SHARED_REGION_DIRECT_ORACLE_BUILD:-0}" == "1" && "$arch" == "x86_64" ]]; then
     # Armed x86 oracle build: still forbid a BARE Direct retirement without the arch tag (a stale/
     # cross-arch fingerprint) and any non-x86 shared-region marker, but allow the arch-tagged Direct.
     forbidden+=(
       "arch=aarch64 class=IpcSendSharedRegion"
       "arch=riscv64 class=IpcSendSharedRegion"
+    )
+  elif [[ "${YARM_SHARED_REGION_DIRECT_ORACLE_BUILD:-0}" == "1" && "$arch" == "aarch64" ]]; then
+    # Armed AArch64 oracle build: allow ONLY the arch-tagged aarch64 Direct literal; still forbid a
+    # BARE Direct retirement and any x86/RISC-V shared-region marker (a stale/cross-arch fingerprint).
+    forbidden+=(
+      "arch=x86_64 class=IpcSendSharedRegion"
+      "arch=riscv64 class=IpcSendSharedRegion"
+    )
+  elif [[ "${YARM_SHARED_REGION_DIRECT_ORACLE_BUILD:-0}" == "1" && "$arch" == "riscv64" ]]; then
+    # Stage 198E3C2C: armed RISC-V oracle build: allow ONLY the arch-tagged riscv64 Direct literal;
+    # still forbid a BARE Direct retirement and any x86/AArch64 shared-region marker (a stale/
+    # cross-arch fingerprint).
+    forbidden+=(
+      "arch=x86_64 class=IpcSendSharedRegion"
+      "arch=aarch64 class=IpcSendSharedRegion"
     )
   else
     forbidden+=("class=IpcSendSharedRegion")

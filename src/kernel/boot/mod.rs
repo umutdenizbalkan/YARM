@@ -1617,7 +1617,14 @@ pub(crate) fn reset_shared_region_cancel_fuse_log() {
 /// Stage 198E3C1: one-shot latch for the `IpcSendSharedRegionDirect` retirement markers. Compiled
 /// ONLY for the explicitly-armed x86_64 live-oracle build (`feature = "x86-shared-region-direct-
 /// oracle"`); a normal artifact and every non-x86 artifact contain none of these literals.
-#[cfg(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"),
+    all(
+        feature = "aarch64-shared-region-direct-oracle",
+        target_arch = "aarch64"
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
+))]
 static IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -1625,7 +1632,14 @@ static IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED: core::sync::atomic::AtomicBo
 /// the x86_64 armed-oracle build, only after a real off-lock direct completion (called solely by the
 /// gated live-marker helper). The queued class and all non-x86 architectures never compile a
 /// shared-region retirement literal.
-#[cfg(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"),
+    all(
+        feature = "aarch64-shared-region-direct-oracle",
+        target_arch = "aarch64"
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
+))]
 pub(crate) fn maybe_log_ipc_send_shared_region_direct_retired() {
     if IPC_SEND_SHARED_REGION_DIRECT_RETIRE_LOGGED
         .compare_exchange(
@@ -1637,10 +1651,12 @@ pub(crate) fn maybe_log_ipc_send_shared_region_direct_retired() {
         .is_ok()
     {
         crate::yarm_log!(
-            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcSendSharedRegionDirect"
+            "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch={} class=IpcSendSharedRegionDirect",
+            SHARED_REGION_ORACLE_ARCH
         );
         crate::yarm_log!(
-            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcSendSharedRegionDirect result=ok"
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcSendSharedRegionDirect result=ok",
+            SHARED_REGION_ORACLE_ARCH
         );
     }
 }
@@ -1650,7 +1666,14 @@ pub(crate) fn maybe_log_ipc_send_shared_region_direct_retired() {
 /// receiver enqueued exactly once. Every marker LITERAL is confined here and gated on the x86_64
 /// armed-oracle build, so a NORMAL artifact — and every non-x86 artifact — is marker-clean. Only the
 /// DIRECT class emits (the queued class is forbidden this stage); a non-Direct origin is a no-op.
-#[cfg(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"))]
+#[cfg(any(
+    all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"),
+    all(
+        feature = "aarch64-shared-region-direct-oracle",
+        target_arch = "aarch64"
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
+))]
 pub(crate) fn maybe_emit_shared_region_direct_live_markers(
     class: &str,
     snapshot: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
@@ -1666,20 +1689,23 @@ pub(crate) fn maybe_emit_shared_region_direct_live_markers(
         CapObject::MemoryObject { .. } | CapObject::DmaRegion { .. }
     ));
     crate::yarm_log!(
-        "IPCSEND_SHARED_REGION_OBJECT_OK arch=x86_64 class={} object_match={} fresh_cap=1 pin_transfer=1",
+        "IPCSEND_SHARED_REGION_OBJECT_OK arch={} class={} object_match={} fresh_cap=1 pin_transfer=1",
+        SHARED_REGION_ORACLE_ARCH,
         class,
         object_match
     );
     let map_right = u8::from(snapshot.rights.contains(CapRights::MAP));
     let write_ok = u8::from(!snapshot.map_write || snapshot.rights.contains(CapRights::WRITE));
     crate::yarm_log!(
-        "IPCSEND_SHARED_REGION_MAP_OK arch=x86_64 class={} map_right={} write_right_ok={} nx=1 cleanup_token=1",
+        "IPCSEND_SHARED_REGION_MAP_OK arch={} class={} map_right={} write_right_ok={} nx=1 cleanup_token=1",
+        SHARED_REGION_ORACLE_ARCH,
         class,
         map_right,
         write_ok
     );
     crate::yarm_log!(
-        "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch=x86_64 class={} transaction_published=1 receiver_wakes={} leaked_state=0",
+        "IPCSEND_SHARED_REGION_LIFECYCLE_OK arch={} class={} transaction_published=1 receiver_wakes={} leaked_state=0",
+        SHARED_REGION_ORACLE_ARCH,
         class,
         u8::from(woke_receiver)
     );
@@ -1689,7 +1715,14 @@ pub(crate) fn maybe_emit_shared_region_direct_live_markers(
 /// Stage 198E3C1: marker-clean stub for every NON-armed build (all normal artifacts + all non-x86
 /// architectures). It contains no marker literal, so a normal artifact stays clean and no
 /// shared-region retirement/attestation literal is ever compiled into an AArch64/RISC-V binary.
-#[cfg(not(all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64")))]
+#[cfg(not(any(
+    all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"),
+    all(
+        feature = "aarch64-shared-region-direct-oracle",
+        target_arch = "aarch64"
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
+)))]
 pub(crate) fn maybe_emit_shared_region_direct_live_markers(
     _class: &str,
     _snapshot: &crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot,
@@ -2993,6 +3026,55 @@ pub fn x86_shared_region_direct_oracle_enabled() -> bool {
     X86_SHARED_REGION_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 198E3C2B: default-off AArch64 DIRECT shared-region live-oracle WORKLOAD selector
+/// (`yarm.aarch64_shared_region_direct_oracle=1`). Mirror of the x86_64 knob: provisions init startup
+/// slot 5 (=6, a free AArch64 selector) so init runs the SAME architecture-neutral parent/child
+/// shared-region direct proof, and arms the shared IPC/oracle-proof knob so the DIRECT producer goes
+/// live. INERT on a normal boot; does NOT enable the queued class, the x86 oracle, or RISC-V.
+pub(crate) static AARCH64_SHARED_REGION_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_shared_region_direct_oracle_enabled(enabled: bool) {
+    AARCH64_SHARED_REGION_DIRECT_ORACLE_ENABLED
+        .store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        set_ipc_recv_oracle_proof_enabled(true);
+    }
+}
+
+pub fn aarch64_shared_region_direct_oracle_enabled() -> bool {
+    AARCH64_SHARED_REGION_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 198E3C2C: default-off RISC-V DIRECT shared-region live-oracle WORKLOAD selector
+/// (`yarm.riscv_shared_region_direct_oracle=1`). Mirror of the x86_64/AArch64 knobs: provisions init
+/// startup slot 5 (=7, the next free RISC-V selector after the six FutexWake/FutexWait/Yield oracles)
+/// so init runs the SAME architecture-neutral parent/child shared-region direct proof, and arms the
+/// shared IPC/oracle-proof knob so the DIRECT producer goes live. INERT on a normal boot; does NOT
+/// enable the queued class, the x86_64 oracle, or the AArch64 oracle.
+pub(crate) static RISCV_SHARED_REGION_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_shared_region_direct_oracle_enabled(enabled: bool) {
+    RISCV_SHARED_REGION_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        set_ipc_recv_oracle_proof_enabled(true);
+    }
+}
+
+pub fn riscv_shared_region_direct_oracle_enabled() -> bool {
+    RISCV_SHARED_REGION_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 198E3C2B/C: the shared-region DIRECT oracle is live when ANY arch's workload selector is
+/// armed. The provisioning, authoritative ack, and direct producer gate all key on this arch-neutral
+/// predicate; the per-arch marker literals are additionally `target_arch`-gated at their emitter.
+pub fn shared_region_direct_oracle_enabled() -> bool {
+    x86_shared_region_direct_oracle_enabled()
+        || aarch64_shared_region_direct_oracle_enabled()
+        || riscv_shared_region_direct_oracle_enabled()
+}
+
 // ─── Stage 197A-C: mandatory init ELF loading (no synthetic fallback) ──────────────────
 //
 // Why an init load can be fatal. There is NO synthetic/placeholder init ELF fallback anymore
@@ -3224,12 +3306,315 @@ pub fn provision_init_ipc_send_cap_oracle_coord(
 /// exercises multi-page mapping progress).
 pub(crate) const SHARED_REGION_ORACLE_PAGES: usize = 2;
 
+/// Stage 198E3C1B-H / 198E3C2C: the dedicated unmapped two-page oracle receive window VA, mirroring
+/// `yarm_user_rt::syscall::SHARED_REGION_ORACLE_VA` EXACTLY (same per-arch value). The authoritative
+/// blocked-recv acknowledgement requires the receiver's `payload_user_ptr` to equal this exact VA (a
+/// wrong-VA recv is rejected), and the transaction maps the two pages here. It MUST be a currently
+/// UNMAPPED user VA on the target, below its kernel boundary and clear of image/initrd/heap/stack:
+/// - AArch64 user half ends at `KERNEL_SPACE_BASE = 0x4000_0000`, so the window is 512 MiB (1 GiB
+///   faults `PrivilegeViolation`);
+/// - RISC-V places the default `brk` at `USER_BRK_DEFAULT_BASE = 0x4000_0000`, so 1 GiB is the HEAP
+///   base there — the window is 512 MiB, in the image↔heap gap and below `KERNEL_SPACE_BASE`
+///   (`0x8000_0000`);
+/// - x86_64 uses 1 GiB (well above the image/initrd, far below the multi-TB user stack).
+#[cfg(all(
+    feature = "shared-region-direct-oracle",
+    any(target_arch = "aarch64", target_arch = "riscv64")
+))]
+pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x2000_0000;
+#[cfg(all(
+    feature = "shared-region-direct-oracle",
+    not(any(target_arch = "aarch64", target_arch = "riscv64"))
+))]
+pub const SHARED_REGION_ORACLE_USER_VA: usize = 0x4000_0000;
+
 /// Stage 198E3C1B: the init startup-slot-5 selector value that names the DIRECT shared-region
 /// oracle (mirrors `yarm_user_rt::syscall::SHARED_REGION_ORACLE_SELECTOR`). Slot 5 is a mutually
 /// exclusive selector: 1 = x86_64 FutexWake oracle, 2 = shared-region direct oracle. Only ONE may
 /// be armed per boot (the boot caller fails closed if both knobs are set).
 #[cfg(feature = "x86-shared-region-direct-oracle")]
 pub const SHARED_REGION_ORACLE_SELECTOR: u64 = 2;
+
+/// Stage 198E3C2B: the AArch64 init startup-slot-5 selector for the DIRECT shared-region oracle. On
+/// AArch64 slot-5 values 1–5 are already claimed (FutexWake/FutexWait-switch/idle/yield oracles), so
+/// the shared-region oracle uses the next FREE value, 6. (x86_64 uses 2, where it is free there.)
+#[cfg(feature = "aarch64-shared-region-direct-oracle")]
+pub const AARCH64_SHARED_REGION_ORACLE_SELECTOR: u64 = 6;
+
+/// Stage 198E3C2C: the RISC-V init startup-slot-5 selector for the DIRECT shared-region oracle. On
+/// RISC-V slot-5 values 1–6 are already claimed (FutexWake / queue-switch / FutexWait-switch /
+/// FutexWait-idle / Yield-two / Yield-lone oracles), so the shared-region oracle uses the next FREE
+/// value, 7. (x86_64 uses 2, AArch64 uses 6, each free on its own arch.)
+#[cfg(feature = "riscv-shared-region-direct-oracle")]
+pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;
+
+/// Stage 198E3C2B/C: the architecture tag baked into the shared-region DIRECT live markers. Fixed by
+/// `target_arch` (the emitter is compiled only for the armed arch), so the exact `arch=<a>` literal
+/// appears at runtime without duplicating the emitter per arch.
+#[cfg(any(
+    all(feature = "x86-shared-region-direct-oracle", target_arch = "x86_64"),
+    all(
+        feature = "aarch64-shared-region-direct-oracle",
+        target_arch = "aarch64"
+    ),
+    all(feature = "riscv-shared-region-direct-oracle", target_arch = "riscv64")
+))]
+pub(crate) const SHARED_REGION_ORACLE_ARCH: &str = if cfg!(target_arch = "aarch64") {
+    "aarch64"
+} else if cfg!(target_arch = "riscv64") {
+    "riscv64"
+} else {
+    "x86_64"
+};
+
+// ── Stage 198E3C1B-H: authoritative blocked-recv acknowledgement ─────────────────────────────────
+// The pre-recv futex signal (child wakes parent BEFORE entering recv) is NOT proof that the child is
+// a committed recv-v2 waiter: the wake precedes waiter registration, so a valid interleaving lets the
+// parent send while the child is still runnable, taking the immediate/no-waiter path. The
+// authoritative acknowledgement below is published by the RECEIVER's own recv path ONLY after the
+// blocked-recv record is fully committed (endpoint waiter linked + task Blocked + BlockedRecvState
+// payload/meta stored), and it records the exact committed identity so the send side (and hosted
+// tests) can prove the direct blocked path is reachable ONLY for the expected receiver/endpoint/VA.
+//
+// It is oracle-only (feature-gated), reads authoritative committed state, and does NOT wake, mint a
+// capability, copy user memory, add a kernel lock, or emit any retirement success.
+#[cfg(feature = "shared-region-direct-oracle")]
+pub mod shared_region_blocked_recv {
+    use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+    /// Complete authoritative snapshot of a fully-committed shared-region blocked recv-v2 waiter.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct SharedRegionBlockedRecvAck {
+        pub receiver_tid: u64,
+        /// ASID = the receiver's incarnation/generation discriminator.
+        pub receiver_generation: u32,
+        pub endpoint_idx: usize,
+        pub endpoint_generation: u64,
+        pub payload_va: usize,
+        pub meta_ptr: usize,
+        pub map_len: usize,
+        pub recv_v2: bool,
+        /// Monotonic commit sequence — a fresh publish always advances it, so a stale reader that
+        /// cached an earlier ack can detect it changed. Duplicate consumption is rejected separately.
+        pub commit_seq: u64,
+    }
+
+    static VALID: AtomicBool = AtomicBool::new(false);
+    static CONSUMED: AtomicBool = AtomicBool::new(false);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static RECEIVER_TID: AtomicU64 = AtomicU64::new(0);
+    static RECEIVER_GEN: AtomicU32 = AtomicU32::new(0);
+    static ENDPOINT_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static ENDPOINT_GEN: AtomicU64 = AtomicU64::new(0);
+    static PAYLOAD_VA: AtomicUsize = AtomicUsize::new(0);
+    static META_PTR: AtomicUsize = AtomicUsize::new(0);
+    static MAP_LEN: AtomicUsize = AtomicUsize::new(0);
+    static RECV_V2: AtomicBool = AtomicBool::new(false);
+
+    /// Reset the ack (test setup + between boots). Clears everything to the unpublished state.
+    pub fn reset() {
+        VALID.store(false, Ordering::Release);
+        CONSUMED.store(false, Ordering::Release);
+    }
+
+    /// Publish the authoritative ack. Fields are stored first, then `VALID` is released last, so a
+    /// reader that observes `VALID` via `snapshot()` sees a complete record (no torn read). The
+    /// caller is the receiver's own recv path AFTER full commit; it must have already validated the
+    /// oracle contract. Advances the commit sequence and clears the consumed flag (a fresh commit is
+    /// independently consumable exactly once).
+    pub(crate) fn publish(ack: SharedRegionBlockedRecvAck) {
+        RECEIVER_TID.store(ack.receiver_tid, Ordering::Relaxed);
+        RECEIVER_GEN.store(ack.receiver_generation, Ordering::Relaxed);
+        ENDPOINT_IDX.store(ack.endpoint_idx, Ordering::Relaxed);
+        ENDPOINT_GEN.store(ack.endpoint_generation, Ordering::Relaxed);
+        PAYLOAD_VA.store(ack.payload_va, Ordering::Relaxed);
+        META_PTR.store(ack.meta_ptr, Ordering::Relaxed);
+        MAP_LEN.store(ack.map_len, Ordering::Relaxed);
+        RECV_V2.store(ack.recv_v2, Ordering::Relaxed);
+        SEQ.store(ack.commit_seq, Ordering::Relaxed);
+        CONSUMED.store(false, Ordering::Relaxed);
+        VALID.store(true, Ordering::Release);
+    }
+
+    /// Monotonic next commit sequence (for the publisher).
+    pub(crate) fn next_commit_seq() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Authoritative snapshot, or `None` if no ack has been committed since the last reset.
+    pub fn snapshot() -> Option<SharedRegionBlockedRecvAck> {
+        if !VALID.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(SharedRegionBlockedRecvAck {
+            receiver_tid: RECEIVER_TID.load(Ordering::Relaxed),
+            receiver_generation: RECEIVER_GEN.load(Ordering::Relaxed),
+            endpoint_idx: ENDPOINT_IDX.load(Ordering::Relaxed),
+            endpoint_generation: ENDPOINT_GEN.load(Ordering::Relaxed),
+            payload_va: PAYLOAD_VA.load(Ordering::Relaxed),
+            meta_ptr: META_PTR.load(Ordering::Relaxed),
+            map_len: MAP_LEN.load(Ordering::Relaxed),
+            recv_v2: RECV_V2.load(Ordering::Relaxed),
+            commit_seq: SEQ.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Authoritative gate for the parent's DIRECT send: returns `true` ONLY if a committed,
+    /// unconsumed ack matches the EXACT expected receiver identity, generation, endpoint identity,
+    /// recv-v2 contract, payload VA, metadata pointer, and two-page map length. Rejects a wrong
+    /// receiver / stale generation / wrong endpoint / wrong VA / wrong meta ptr / plain (non-v2)
+    /// waiter / absent ack. Does NOT consume — see `consume_if_matches`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matches(
+        receiver_tid: u64,
+        receiver_generation: u32,
+        endpoint_idx: usize,
+        endpoint_generation: u64,
+        payload_va: usize,
+        meta_ptr: usize,
+        map_len: usize,
+    ) -> bool {
+        matches!(
+            snapshot(),
+            Some(a) if !CONSUMED.load(Ordering::Acquire)
+                && a.recv_v2
+                && a.receiver_tid == receiver_tid
+                && a.receiver_generation == receiver_generation
+                && a.endpoint_idx == endpoint_idx
+                && a.endpoint_generation == endpoint_generation
+                && a.payload_va == payload_va
+                && a.meta_ptr == meta_ptr
+                && a.map_len == map_len
+        )
+    }
+
+    /// Consume the ack exactly once if it matches — a DUPLICATE consume (already consumed) returns
+    /// `false`, so a duplicate parent send cannot re-satisfy the gate on a stale ack.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_if_matches(
+        receiver_tid: u64,
+        receiver_generation: u32,
+        endpoint_idx: usize,
+        endpoint_generation: u64,
+        payload_va: usize,
+        meta_ptr: usize,
+        map_len: usize,
+    ) -> bool {
+        if !matches(
+            receiver_tid,
+            receiver_generation,
+            endpoint_idx,
+            endpoint_generation,
+            payload_va,
+            meta_ptr,
+            map_len,
+        ) {
+            return false;
+        }
+        // Claim exactly once.
+        CONSUMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Non-consuming send-side match: a committed, unconsumed, recv-v2, oracle-VA ack exists for THIS
+    /// receiver + endpoint. Used to DECIDE the direct path (and, on no-match, fail closed) WITHOUT
+    /// consuming the ack — so a pre-publication failure leaves the ack available for a retry.
+    pub(crate) fn matches_for_delivery(receiver_tid: u64, endpoint_idx: usize) -> bool {
+        matches!(
+            snapshot(),
+            Some(a) if !CONSUMED.load(Ordering::Acquire)
+                && a.recv_v2
+                && a.receiver_tid == receiver_tid
+                && a.endpoint_idx == endpoint_idx
+                && a.payload_va == super::SHARED_REGION_ORACLE_USER_VA
+        )
+    }
+
+    /// Send-side authoritative gate for the DIRECT blocked-recv delivery: consume the ack exactly
+    /// once iff a committed, unconsumed, recv-v2, oracle-VA ack exists for THIS receiver + endpoint.
+    /// A wrong receiver, wrong endpoint, non-oracle VA, plain (non-v2) waiter, absent ack, or an
+    /// already-consumed (duplicate) ack all return `false`, so the direct path declines and no
+    /// duplicate send can re-satisfy the gate. Called ONLY after the post-work item is published, so
+    /// the consume is the atomic commit of a successful delivery (never a pre-publication loss).
+    pub(crate) fn consume_for_delivery(receiver_tid: u64, endpoint_idx: usize) -> bool {
+        if !matches_for_delivery(receiver_tid, endpoint_idx) {
+            return false;
+        }
+        CONSUMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+/// Stage 198E3C1B-H: publish the authoritative blocked-recv acknowledgement from the RECEIVER's own
+/// recv path, called ONLY after the blocked-recv record is fully committed (endpoint waiter linked,
+/// task Blocked, `BlockedRecvState` payload/meta stored). Feature + runtime-knob gated; a strict
+/// no-op otherwise. It re-reads authoritative committed state (the endpoint waiter identity must
+/// equal this receiver) and validates the oracle contract (recv-v2, payload VA = the oracle window,
+/// two-page length, non-null metadata pointer) before recording the ack. It does NOT wake, mint,
+/// copy user memory, add a lock, or emit any retirement marker.
+#[cfg(feature = "shared-region-direct-oracle")]
+pub(crate) fn maybe_publish_shared_region_blocked_recv_ack(
+    kernel: &KernelState,
+    receiver_tid: u64,
+    endpoint: crate::kernel::capabilities::CapObject,
+    state: &crate::kernel::task::BlockedRecvState,
+) {
+    use crate::kernel::capabilities::CapObject;
+    if !shared_region_direct_oracle_enabled() {
+        return;
+    }
+    // Oracle contract: recv-v2, the dedicated two-page oracle window, a real metadata buffer.
+    let two_pages = SHARED_REGION_ORACLE_PAGES * crate::kernel::vm::PAGE_SIZE;
+    let recv_v2 = state.recv_abi == crate::kernel::task::RecvAbiVariant::RecvV2;
+    let CapObject::Endpoint { index, generation } = endpoint else {
+        return;
+    };
+    if !recv_v2
+        || state.payload_user_ptr != SHARED_REGION_ORACLE_USER_VA
+        || state.payload_user_len < two_pages
+        || state.meta_user_ptr == 0
+    {
+        return;
+    }
+    // Authoritative commit check: the endpoint waiter slot must already hold THIS receiver (the
+    // Phase-C publish committed it before BlockedRecvState was stored). If it does not, the record is
+    // not fully committed for this endpoint — do not acknowledge.
+    let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
+    let receiver_generation = kernel
+        .task_asid(receiver_tid)
+        .map(|a| a.0 as u32)
+        .unwrap_or(0);
+    match waiter {
+        Some(w) if w.tid.0 == receiver_tid && w.asid.0 as u32 == receiver_generation => {}
+        _ => return,
+    }
+    let ack = shared_region_blocked_recv::SharedRegionBlockedRecvAck {
+        receiver_tid,
+        receiver_generation,
+        endpoint_idx: index,
+        endpoint_generation: generation,
+        payload_va: state.payload_user_ptr,
+        meta_ptr: state.meta_user_ptr,
+        map_len: two_pages,
+        recv_v2: true,
+        commit_seq: shared_region_blocked_recv::next_commit_seq(),
+    };
+    shared_region_blocked_recv::publish(ack);
+    crate::yarm_log!(
+        "SHARED_REGION_BLOCKED_RECV_ACK tid={} gen={} endpoint={} ep_gen={} payload_va=0x{:x} meta_ptr=0x{:x} map_len={} recv_v2=1 seq={}",
+        ack.receiver_tid,
+        ack.receiver_generation,
+        ack.endpoint_idx,
+        ack.endpoint_generation,
+        ack.payload_va,
+        ack.meta_ptr,
+        ack.map_len,
+        ack.commit_seq
+    );
+}
 
 /// Stage 198E3C1: the deterministic known byte the oracle writes at object offset `off`. It varies
 /// with `off`, so the pattern SPANS BOTH pages (page 0 and page 1 hold different bytes), and it is a
@@ -3249,7 +3634,7 @@ pub(crate) const fn shared_region_oracle_pattern_byte(off: usize) -> u8 {
 /// boot initrd pointer), leaving only the two free service-extra slots 13/14. So the send and recv
 /// authorities collapse into ONE endpoint cap carrying `SEND | RECEIVE`: the parent sends on it and
 /// the forked child receives on the SAME cap through init's shared CSpace. Two caps, two slots.
-#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[cfg(feature = "shared-region-direct-oracle")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharedRegionOracleCaps {
     /// init-local `MemoryObject` source cap (`READ | MAP`, no `WRITE`/execute) → startup slot 13.
@@ -3264,13 +3649,13 @@ pub struct SharedRegionOracleCaps {
 /// step at which provisioning is forced to fail, so hosted tests can assert the rollback leaves NO
 /// leaked cap, NO leaked object, and NO occupied startup slot at EVERY failure point. Defaults to 0
 /// (no injection) so a real build's provisioning is byte-identical.
-#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[cfg(feature = "shared-region-direct-oracle")]
 pub(crate) static SHARED_REGION_ORACLE_FAULT_INJECT: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
 /// Fault-injection step codes (0 = none). Each names the step FORCED to fail; rollback must then
 /// reclaim everything created by the strictly-earlier steps.
-#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[cfg(feature = "shared-region-direct-oracle")]
 pub(crate) mod shared_region_fault {
     pub const NONE: u32 = 0;
     pub const ALLOC: u32 = 1;
@@ -3283,19 +3668,19 @@ pub(crate) mod shared_region_fault {
     pub const LAST: u32 = MINT_EP;
 }
 
-#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[cfg(feature = "shared-region-direct-oracle")]
 pub(crate) fn set_shared_region_oracle_fault_inject(step: u32) {
     SHARED_REGION_ORACLE_FAULT_INJECT.store(step, core::sync::atomic::Ordering::Release);
 }
 
-#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[cfg(feature = "shared-region-direct-oracle")]
 fn shared_region_oracle_fault_inject() -> u32 {
     SHARED_REGION_ORACLE_FAULT_INJECT.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// Rollback scratch: every reclaimable resource the transaction has created so far, in creation
 /// order. Rollback undoes them in REVERSE order.
-#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[cfg(feature = "shared-region-direct-oracle")]
 #[derive(Default, Clone, Copy)]
 struct SharedRegionProvisionScratch {
     /// Source `MemoryObject` cap in task 0's CNode — revoking it cascades to init's delegated mem
@@ -3313,7 +3698,7 @@ struct SharedRegionProvisionScratch {
 /// Undo a partial provisioning transaction. Idempotent and total: every present resource is
 /// reclaimed (best-effort `let _`), leaving NO leaked cap, NO leaked object, and NO startup slot
 /// written (the caller only writes slots on a `Some` return).
-#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[cfg(feature = "shared-region-direct-oracle")]
 fn rollback_shared_region_provision(
     kernel: &mut KernelState,
     init_tid: u64,
@@ -3351,12 +3736,12 @@ fn rollback_shared_region_provision(
 /// startup slots. Fail-closed AND leak-free: on ANY step failure it emits a precise failure marker,
 /// rolls back every resource created so far (no leaked cap / object / occupied slot), and returns
 /// `None` (the caller then leaves the oracle un-armed) — it never partially arms.
-#[cfg(feature = "x86-shared-region-direct-oracle")]
+#[cfg(feature = "shared-region-direct-oracle")]
 pub fn provision_init_shared_region_oracle(
     kernel: &mut KernelState,
     init_tid: u64,
 ) -> Option<SharedRegionOracleCaps> {
-    if !x86_shared_region_direct_oracle_enabled() {
+    if !shared_region_direct_oracle_enabled() {
         return None;
     }
     use crate::kernel::capabilities::{CapObject, CapRights, Capability};
