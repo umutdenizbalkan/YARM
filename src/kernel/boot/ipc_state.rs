@@ -248,24 +248,23 @@ impl KernelState {
         });
     }
 
-    pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
-        // Stage 199A2A: resolve the CURRENT incarnation's ASID before the mutable
-        // borrow. A record is cleared only when it matches the complete
-        // `{caller_tid, caller_asid}` identity, so a numeric-TID sweep can never
-        // clear a REPLACEMENT task's record (a reused numeric TID always carries a
-        // different ASID). All production call sites (exit / restart / mark-dead /
-        // reap) run while this task's TCB is still present with its original ASID,
-        // so `asid_now` equals the stored `caller_asid` and cleanup is leak-free.
-        // If the ASID is unresolvable (`None`, e.g. a kernel task or partial
-        // teardown) we fall back to the numeric-TID match — the safe (never-leak)
-        // direction for a one-shot record.
-        let asid_now = self.task_asid(caller_tid);
+    /// Stage 199A2B1 — AUTHORITATIVE caller-side reply-record cleanup keyed on the
+    /// complete exiting identity supplied by the caller. The exit site captures the
+    /// exiting task's `{tid, asid}` while its TCB is still live (the authoritative
+    /// moment), and this entry point matches records on that EXACT identity — it does
+    /// NOT re-resolve an ASID from the numeric TID. A replacement task that reuses the
+    /// numeric TID always carries a different ASID, so its records are untouched.
+    /// `caller_asid == Asid(0)` is the no-address-space sentinel captured at creation
+    /// and compared verbatim (both sides use `Asid(0)` for an ASID-less task).
+    pub(crate) fn revoke_reply_caps_for_caller_identity(
+        &mut self,
+        caller: ReceiverWaiterIdentity,
+    ) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
             for slot in ipc.reply_caps.iter_mut() {
                 if slot.is_some_and(|record| {
-                    record.caller_tid.0 == caller_tid
-                        && asid_now.is_none_or(|a| record.caller_asid == a)
+                    record.caller_tid == caller.tid && record.caller_asid == caller.asid
                 }) {
                     *slot = None;
                     revoked += 1;
@@ -273,6 +272,19 @@ impl KernelState {
             }
             revoked
         })
+    }
+
+    /// Numeric-TID convenience wrapper (tests / non-authoritative callers). Resolves
+    /// the ASID once and delegates to the authoritative identity entry point. NOT used
+    /// as the production cleanup authority — the exit sites call
+    /// `revoke_reply_caps_for_caller_identity` with the identity they captured while
+    /// the exiting task was live.
+    pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
+        let asid = self.task_asid(caller_tid).unwrap_or(Asid(0));
+        self.revoke_reply_caps_for_caller_identity(ReceiverWaiterIdentity::new(
+            ThreadId(caller_tid),
+            asid,
+        ))
     }
 
     /// Clear every global `ReplyCapRecord` whose `responder_tid` (the replier) is
@@ -294,28 +306,27 @@ impl KernelState {
     /// Idempotent: a slot already cleared by a prior caller- or replier-side
     /// revoke is `None` and is skipped, so repeated/interleaved teardown is a
     /// no-op past the first clear.
-    pub(crate) fn revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize {
-        // Stage 199A2A: resolve the CURRENT incarnation's ASID before the mutable
-        // borrow and match on the complete `{responder_tid, replier_asid}` identity.
-        // A record is SKIPPED only when we have BOTH a resolvable current ASID AND a
-        // stored `replier_asid` AND they DIFFER — i.e. the record belongs to a prior
-        // incarnation at the same numeric TID. Otherwise the record is cleared (the
-        // safe, never-leak direction). Production call sites (exit / mark-dead / reap)
-        // run while the replier's TCB is still present with its original ASID, so the
-        // stored and current ASIDs match and cleanup is leak-free.
-        let asid_now = self.task_asid(tid);
+    /// Stage 199A2B1 — AUTHORITATIVE replier-side reply-record cleanup keyed on the
+    /// complete exiting identity supplied by the caller (captured while the replier's
+    /// TCB was live). Matches records on the EXACT `{responder_tid, replier_asid}`
+    /// identity — no ASID is re-resolved from the numeric TID here. A record is
+    /// SKIPPED only when it stored a concrete `replier_asid` that DIFFERS from the
+    /// supplied identity (a prior incarnation at the same numeric TID); a record with
+    /// no stored replier ASID (`None`, an ASID-less responder at creation) carries no
+    /// incarnation evidence and is matched on the numeric TID (the safe, never-leak
+    /// direction).
+    pub(crate) fn revoke_reply_caps_for_replier_identity(
+        &mut self,
+        replier: ReceiverWaiterIdentity,
+    ) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
             for slot in ipc.reply_caps.iter_mut() {
                 if slot.is_some_and(|record| {
-                    record
-                        .responder_tid
-                        .is_some_and(|responder| responder.0 == tid)
-                        && match (record.replier_asid, asid_now) {
-                            (Some(stored), Some(now)) => stored == now,
-                            // No incarnation evidence on one side → numeric-TID match.
-                            _ => true,
-                        }
+                    record.responder_tid == Some(replier.tid)
+                        && record
+                            .replier_asid
+                            .is_none_or(|stored| stored == replier.asid)
                 }) {
                     *slot = None;
                     revoked += 1;
@@ -323,6 +334,16 @@ impl KernelState {
             }
             revoked
         })
+    }
+
+    /// Numeric-TID convenience wrapper (tests / non-authoritative callers). Resolves
+    /// the ASID once and delegates to the authoritative identity entry point.
+    pub(crate) fn revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize {
+        let asid = self.task_asid(tid).unwrap_or(Asid(0));
+        self.revoke_reply_caps_for_replier_identity(ReceiverWaiterIdentity::new(
+            ThreadId(tid),
+            asid,
+        ))
     }
 
     /// Remove `tid` from all IPC waiter slots.

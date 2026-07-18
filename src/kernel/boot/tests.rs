@@ -75655,17 +75655,24 @@ duplicate_replies=0 duplicate_wakes=0 result=ok";
     // gate on the stored incarnation.
     #[test]
     fn revoke_helpers_resolve_incarnation_asid() {
+        // Stage 199A2B1: the AUTHORITATIVE cleanup entry points match the supplied
+        // identity verbatim (no ASID re-resolution inside the cleanup body).
         assert!(
-            IPC_STATE_SRC.contains("let asid_now = self.task_asid(caller_tid);"),
-            "caller revoke resolves the current incarnation ASID"
+            IPC_STATE_SRC.contains("fn revoke_reply_caps_for_caller_identity"),
+            "authoritative caller cleanup entry point exists"
         );
         assert!(
-            IPC_STATE_SRC.contains("record.caller_asid == a"),
-            "caller revoke gates on the stored caller ASID"
+            IPC_STATE_SRC
+                .contains("record.caller_tid == caller.tid && record.caller_asid == caller.asid"),
+            "caller cleanup matches the supplied {{tid,asid}} verbatim"
         );
         assert!(
-            IPC_STATE_SRC.contains("record.replier_asid, asid_now"),
-            "replier revoke gates on the stored replier ASID"
+            IPC_STATE_SRC.contains("fn revoke_reply_caps_for_replier_identity"),
+            "authoritative replier cleanup entry point exists"
+        );
+        assert!(
+            IPC_STATE_SRC.contains(".is_none_or(|stored| stored == replier.asid)"),
+            "replier cleanup matches the supplied replier identity"
         );
     }
 
@@ -75714,16 +75721,10 @@ duplicate_replies=0 duplicate_wakes=0 result=ok";
     fn abi_and_policy_unchanged() {
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
         assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
-        // Restart cleanup still calls the (now incarnation-aware) revoke helpers.
-        assert!(RESTART_SRC.contains("self.revoke_reply_caps_for_caller(tid)"));
-        assert!(RESTART_SRC.contains("self.revoke_reply_caps_for_replier(tid)"));
-        // The broad-lock IPC reply handler is NOT newly split-wired into the pre-lock
-        // seam (the off-lock removal is deferred, not silently attempted).
-        assert!(
-            !SPLIT_SRC.contains("try_split_ipc_call_into_frame")
-                && !SPLIT_SRC.contains("try_split_ipc_reply_into_frame"),
-            "NR 6/NR 7 must not be added to the pre-global-lock split seam this stage"
-        );
+        // Stage 199A2B1: restart/exit cleanup now calls the AUTHORITATIVE
+        // identity-typed entry points with the captured exiting `{tid, asid}`.
+        assert!(RESTART_SRC.contains("revoke_reply_caps_for_caller_identity"));
+        assert!(RESTART_SRC.contains("revoke_reply_caps_for_replier_identity"));
     }
 
     // ── Honest seal + deferral record ───────────────────────────────────────────
@@ -75756,5 +75757,166 @@ duplicate_replies=0 duplicate_wakes=0 result=ok";
             OFFLOCK_DOC.contains("hosted-dev") && OFFLOCK_DOC.contains("switch_required"),
             "the doc must ground the deferral in the hosted split-copy gate + block-dispatch reason"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B1 — x86_64 Off-Lock IpcCall/IpcReply foundations (this increment).
+//
+// SCOPE LANDED HERE: (Part 1) authoritative identity-typed reply-record cleanup
+// entry points wired into every task-teardown site; (Part 2) architecture-neutral
+// owned pre-lock snapshots (IpcCallDirectSnapshot / IpcReplyDirectSnapshot) and the
+// reversible one-shot reply reservation FSM (Available→Reserved→Consumed with
+// caller-copy-fault rollback) in `src/kernel/ipccall_direct.rs`, unit-tested in
+// that module.
+//
+// NOT LANDED (remaining deep work, reported as the blocker): the LIVE x86
+// split-dispatch NR6/NR7 transactions, the `x86-ipccall-direct-oracle` feature +
+// `yarm.x86_64_ipccall_direct_oracle=1` selector, boot provisioning, the userspace
+// round-trip oracle, and the genuine QEMU seal. Nothing is wired live, so the
+// direct classes are trivially default-off and the existing NR6/NR7 fallback
+// behavior is byte-for-byte unchanged.
+mod stage199a2b1_offlock_foundations {
+    use super::*;
+    use crate::kernel::vm::Asid;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const DIRECT_SRC: &str = include_str!("../ipccall_direct.rs");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+
+    fn ident(tid: u64, asid: u16) -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+
+    // (1) Caller cleanup matches the SUPPLIED {tid,asid}; a replacement task reusing
+    // the numeric TID (different ASID) is untouched.
+    #[test]
+    fn caller_cleanup_uses_supplied_identity_replacement_untouched() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("caller");
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(1, asid).expect("bind");
+        let (_eid, _s, recv_global) = state.create_endpoint(4).expect("endpoint");
+        let recv = state
+            .grant_capability_task_to_task(0, recv_global, 1)
+            .expect("dup");
+        let _rc = state
+            .create_reply_cap_for_caller(ThreadId(1), recv, None)
+            .expect("record");
+        // A replacement incarnation identity (same TID, different ASID) must NOT clear.
+        let replacement = ident(1, asid.0.wrapping_add(7));
+        assert_eq!(
+            state.revoke_reply_caps_for_caller_identity(replacement),
+            0,
+            "supplied replacement identity must not clear the live incarnation's record"
+        );
+        assert!(state.reply_cap_record_present(0));
+        // The authoritative exiting identity clears exactly its own record.
+        assert_eq!(
+            state.revoke_reply_caps_for_caller_identity(ident(1, asid.0)),
+            1
+        );
+        assert!(!state.reply_cap_record_present(0));
+    }
+
+    // (2) Replier cleanup matches the SUPPLIED {tid,asid}; a replacement replier is
+    // untouched.
+    #[test]
+    fn replier_cleanup_uses_supplied_identity_replacement_untouched() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("responder");
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(2, asid).expect("bind");
+        let (_eid, _s, recv) = state.create_endpoint(4).expect("endpoint");
+        let _rc = state
+            .create_reply_cap_for_caller(ThreadId(0), recv, Some(ThreadId(2)))
+            .expect("record");
+        let replacement = ident(2, asid.0.wrapping_add(7));
+        assert_eq!(
+            state.revoke_reply_caps_for_replier_identity(replacement),
+            0,
+            "supplied replacement replier identity must not clear the live record"
+        );
+        assert!(state.reply_cap_record_present(0));
+        assert_eq!(
+            state.revoke_reply_caps_for_replier_identity(ident(2, asid.0)),
+            1
+        );
+    }
+
+    // (3) Every task-teardown site cleans reply records through the AUTHORITATIVE
+    // identity entry points (never the numeric re-resolving path as authority).
+    #[test]
+    fn teardown_sites_use_identity_entry_points() {
+        // Two caller-identity + two replier-identity call sites at minimum
+        // (exit_task, restart_task caller; mark_dead + reap both).
+        assert!(
+            RESTART_SRC
+                .matches("revoke_reply_caps_for_caller_identity")
+                .count()
+                >= 3
+        );
+        assert!(
+            RESTART_SRC
+                .matches("revoke_reply_caps_for_replier_identity")
+                .count()
+                >= 2
+        );
+        // Each site captures the exiting task's asid while its TCB is live.
+        assert!(RESTART_SRC.contains("self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0))"));
+        // The authoritative entry points do NOT re-resolve an ASID internally.
+        assert!(IPC_STATE_SRC.contains("fn revoke_reply_caps_for_caller_identity"));
+        assert!(IPC_STATE_SRC.contains("fn revoke_reply_caps_for_replier_identity"));
+    }
+
+    // (4) The architecture-neutral foundations exist: bounded owned snapshots and the
+    // reversible one-shot reply reservation FSM.
+    #[test]
+    fn arch_neutral_foundations_present() {
+        assert!(DIRECT_SRC.contains("pub(crate) struct IpcCallDirectSnapshot"));
+        assert!(DIRECT_SRC.contains("pub(crate) struct IpcReplyDirectSnapshot"));
+        assert!(DIRECT_SRC.contains("payload: [u8; IPC_DIRECT_PAYLOAD_MAX]"));
+        assert!(DIRECT_SRC.contains("pub(crate) enum ReplyReservation"));
+        assert!(DIRECT_SRC.contains("Reserved {"));
+        assert!(DIRECT_SRC.contains("reservation_generation: u64"));
+        assert!(DIRECT_SRC.contains("Consumed"));
+        // The FSM has the reversible rollback + one-shot consume transitions.
+        assert!(DIRECT_SRC.contains("fn reserve"));
+        assert!(DIRECT_SRC.contains("fn release"));
+        assert!(DIRECT_SRC.contains("fn consume"));
+        // Bounded payload equals the kernel IPC payload bound (128).
+        assert!(DIRECT_SRC.contains("IPC_DIRECT_PAYLOAD_MAX == 128"));
+    }
+
+    // (5) Direct classes remain DEFAULT-OFF: no live NR6/NR7 split-dispatch arm was
+    // added, so the existing broad-lock fallback is unchanged this increment.
+    #[test]
+    fn direct_classes_default_off_no_live_split_arm() {
+        assert!(
+            !SPLIT_SRC.contains("try_split_ipc_call_into_frame")
+                && !SPLIT_SRC.contains("try_split_ipc_reply_into_frame")
+                && !SPLIT_SRC.contains("IpcCallDirectRequest")
+                && !SPLIT_SRC.contains("IpcReplyDirect"),
+            "no live x86 NR6/NR7 direct split-dispatch arm is wired in this increment"
+        );
+    }
+
+    // (6) Stage 198F is preserved: 10 classes / 30 live cells, unchanged.
+    #[test]
+    fn stage198f_matrix_preserved() {
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SEAL_DOC.contains("STAGE_198F_COMPLETE_RETIREMENT_SEAL"));
+    }
+
+    // (7) ABI + reply-cap policy preserved.
+    #[test]
+    fn abi_and_policy_preserved() {
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
