@@ -71,7 +71,41 @@ pub(crate) enum IpcCallDirectError {
     LeaseNotClaimed,
 }
 
+/// Bounded, owned post-work item published by the x86 trap-entry gate and drained
+/// post-lock (Stage 199A2B2F). Contains ONLY owned data — the caller identity +
+/// endpoint CapIds + payload bytes are inside `snapshot`, and the claimed
+/// acknowledgement is captured by value with its `ack_seq` claim token. No userspace
+/// payload pointer survives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectRequestPostWork {
+    pub(crate) snapshot: IpcCallDirectSnapshot,
+    pub(crate) ack: BlockedServerAck,
+    pub(crate) ack_seq: u64,
+}
+
 impl SharedKernel {
+    /// Drain one owned direct-request post-work item post-lock: run the accepted
+    /// transaction, then reconcile the GLOBAL published-acknowledgement claim with the
+    /// in-transaction lease disposition — a retryable rollback (lease returned to
+    /// `Available`) re-arms the published ack for another drain; success or a stale
+    /// discard leaves it claimed (consumed). Does not duplicate the transaction body.
+    pub(crate) fn drain_direct_request_post_work(
+        &self,
+        work: &DirectRequestPostWork,
+    ) -> Result<IpcCallDirectSuccess, IpcCallDirectError> {
+        let mut lease = AckLease::new_available();
+        // The published ack was claimed at trap-entry publication; re-establish the
+        // ClaimedByWork token for the transaction.
+        let _ = lease.claim(work.ack_seq);
+        let result =
+            self.ipc_call_direct_request_txn(&work.snapshot, &work.ack, &mut lease, work.ack_seq);
+        if lease.is_available() {
+            // Retryable pre-claim rollback: re-arm the published acknowledgement.
+            crate::kernel::boot::ipccall_direct_ack::restore(work.ack_seq);
+        }
+        result
+    }
+
     /// True iff the EXACT original server is still committed-blocked and its endpoint
     /// waiter identity + generation are intact — the sole condition under which a
     /// rolled-back acknowledgement lease may be RESTORED (retryable). Any drift

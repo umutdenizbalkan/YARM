@@ -3075,6 +3075,179 @@ pub fn shared_region_direct_oracle_enabled() -> bool {
         || riscv_shared_region_direct_oracle_enabled()
 }
 
+// ─── Stage 199A2B2F: NR6 direct-request proof gate + committed-server ack ───────────────
+/// Default-OFF internal proof gate for the x86_64 off-lock `IpcCallDirectRequest` path
+/// (trap-entry snapshot publication + production recv-v2 acknowledgement publication).
+/// Off the gate the existing NR6 path is unchanged.
+pub(crate) static IPCCALL_DIRECT_PROOF_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_ipccall_direct_proof_enabled(enabled: bool) {
+    IPCCALL_DIRECT_PROOF_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ipccall_direct_proof_enabled() -> bool {
+    IPCCALL_DIRECT_PROOF_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Authoritative committed blocked-server acknowledgement for the NR6 direct request
+/// transaction, published ONLY from the fully-committed recv-v2 path. A single-slot
+/// store with a monotonic `commit_seq` and an atomic CLAIMED guard so a duplicate
+/// trap/drain cannot claim the same acknowledgement twice; `restore` re-arms it only
+/// for a retryable rollback of the exact same publication.
+pub mod ipccall_direct_ack {
+    use crate::kernel::boot::ReceiverWaiterIdentity;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::ipccall_direct::BlockedServerAck;
+    use crate::kernel::vm::Asid;
+    use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+
+    static VALID: AtomicBool = AtomicBool::new(false);
+    static CLAIMED: AtomicBool = AtomicBool::new(false);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static SERVER_TID: AtomicU64 = AtomicU64::new(0);
+    static SERVER_ASID: AtomicU16 = AtomicU16::new(0);
+    static EP_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static EP_GEN: AtomicU64 = AtomicU64::new(0);
+    static PAYLOAD_PTR: AtomicUsize = AtomicUsize::new(0);
+    static PAYLOAD_LEN: AtomicUsize = AtomicUsize::new(0);
+    static META_PTR: AtomicUsize = AtomicUsize::new(0);
+    static META_LEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Reset (test setup / between boots).
+    pub fn reset() {
+        VALID.store(false, Ordering::Release);
+        CLAIMED.store(false, Ordering::Release);
+    }
+
+    fn next_seq() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Publish the ack (fields first, `VALID` released last). Clears the claim so a
+    /// fresh publication is independently claimable exactly once. Returns the seq.
+    pub(crate) fn publish(ack: BlockedServerAck) -> u64 {
+        let seq = next_seq();
+        SERVER_TID.store(ack.server.tid.0, Ordering::Relaxed);
+        SERVER_ASID.store(ack.server.asid.0, Ordering::Relaxed);
+        EP_IDX.store(ack.endpoint_index, Ordering::Relaxed);
+        EP_GEN.store(ack.endpoint_generation, Ordering::Relaxed);
+        PAYLOAD_PTR.store(ack.payload_user_ptr, Ordering::Relaxed);
+        PAYLOAD_LEN.store(ack.payload_user_len, Ordering::Relaxed);
+        META_PTR.store(ack.meta_user_ptr, Ordering::Relaxed);
+        META_LEN.store(ack.meta_user_len, Ordering::Relaxed);
+        SEQ.store(seq, Ordering::Relaxed);
+        CLAIMED.store(false, Ordering::Relaxed);
+        VALID.store(true, Ordering::Release);
+        seq
+    }
+
+    /// The current committed acknowledgement, or `None` if nothing is published.
+    pub fn snapshot() -> Option<BlockedServerAck> {
+        if !VALID.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(BlockedServerAck {
+            server: ReceiverWaiterIdentity::new(
+                ThreadId(SERVER_TID.load(Ordering::Relaxed)),
+                Asid(SERVER_ASID.load(Ordering::Relaxed)),
+            ),
+            endpoint_index: EP_IDX.load(Ordering::Relaxed),
+            endpoint_generation: EP_GEN.load(Ordering::Relaxed),
+            recv_v2_committed: true,
+            payload_user_ptr: PAYLOAD_PTR.load(Ordering::Relaxed),
+            payload_user_len: PAYLOAD_LEN.load(Ordering::Relaxed),
+            meta_user_ptr: META_PTR.load(Ordering::Relaxed),
+            meta_user_len: META_LEN.load(Ordering::Relaxed),
+        })
+    }
+
+    /// The published commit sequence (for the claimer).
+    pub fn commit_seq() -> u64 {
+        SEQ.load(Ordering::Relaxed)
+    }
+
+    /// Atomically CLAIM the current ack exactly once. Returns `Some((ack, seq))` on a
+    /// fresh claim; `None` if there is no ack or it is already claimed (a duplicate
+    /// trap/drain). The claim is the single ownership transfer of the acknowledgement.
+    pub fn claim() -> Option<(BlockedServerAck, u64)> {
+        let ack = snapshot()?;
+        if CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None; // already claimed — duplicate cannot claim twice
+        }
+        Some((ack, SEQ.load(Ordering::Relaxed)))
+    }
+
+    /// Re-arm (restore) a claimed ack for a retryable rollback of the SAME publication
+    /// (matching seq). Returns `true` if restored. A stale/changed publication (seq
+    /// advanced) cannot be restored — the stale ack stays claimed (discarded).
+    pub fn restore(seq: u64) -> bool {
+        if SEQ.load(Ordering::Relaxed) == seq && VALID.load(Ordering::Acquire) {
+            CLAIMED.store(false, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True iff an unclaimed committed ack is present.
+    pub fn is_claimable() -> bool {
+        VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire)
+    }
+}
+
+/// Publish the NR6 committed blocked-server acknowledgement from the recv-v2 commit
+/// point — ONLY when the proof gate is armed and the FULLY-committed recv-v2 identity
+/// exists. It does NOT wake, mint, copy user memory, mutate scheduler state, or emit a
+/// retirement marker. A strict no-op off the gate or on any partial/stale state.
+pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
+    kernel: &KernelState,
+    receiver_tid: u64,
+    endpoint: crate::kernel::capabilities::CapObject,
+    state: &crate::kernel::task::BlockedRecvState,
+) {
+    use crate::kernel::capabilities::CapObject;
+    if !ipccall_direct_proof_enabled() {
+        return;
+    }
+    let CapObject::Endpoint { index, generation } = endpoint else {
+        return;
+    };
+    // Complete-commit contract: recv-v2, valid payload dest, non-null meta dest.
+    if state.recv_abi != crate::kernel::task::RecvAbiVariant::RecvV2
+        || state.payload_user_ptr == 0
+        || state.meta_user_ptr == 0
+    {
+        return;
+    }
+    let Some(asid) = kernel.task_asid(receiver_tid) else {
+        return;
+    };
+    let server = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
+    // Re-read the endpoint waiter identity under the IPC lock immediately before
+    // publication and require an EXACT match (else the record is not fully committed
+    // for this endpoint — publish nothing).
+    let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
+    if waiter != Some(server) {
+        return;
+    }
+    let ack = crate::kernel::ipccall_direct::BlockedServerAck {
+        server,
+        endpoint_index: index,
+        endpoint_generation: generation,
+        recv_v2_committed: true,
+        payload_user_ptr: state.payload_user_ptr,
+        payload_user_len: state.payload_user_len,
+        meta_user_ptr: state.meta_user_ptr,
+        meta_user_len: state.meta_user_len,
+    };
+    let _seq = ipccall_direct_ack::publish(ack);
+}
+
 // ─── Stage 197A-C: mandatory init ELF loading (no synthetic fallback) ──────────────────
 //
 // Why an init load can be fatal. There is NO synthetic/placeholder init ELF fallback anymore

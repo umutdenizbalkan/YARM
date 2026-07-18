@@ -736,6 +736,12 @@ pub(super) fn handle_ipc_recv(
             crate::kernel::boot::maybe_publish_shared_region_blocked_recv_ack(
                 kernel, recv_tid, endpoint, &state,
             );
+            // Stage 199A2B2F: publish the NR6 committed blocked-server acknowledgement
+            // from the same fully-committed recv-v2 point (proof-gated; no wake / mint /
+            // copy / scheduler mutation / retirement marker).
+            crate::kernel::boot::maybe_publish_ipccall_direct_blocked_server_ack(
+                kernel, recv_tid, endpoint, &state,
+            );
         }
         return Err(SyscallError::WouldBlock);
     }
