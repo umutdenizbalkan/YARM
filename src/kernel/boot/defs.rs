@@ -220,8 +220,44 @@ pub(crate) struct ActiveTransferMapping {
     pub(crate) len: usize,
 }
 
+/// Stage 199A2B2 — reservation lifecycle of a single reply-record slot. This state
+/// LIVES IN the existing `reply_caps` slot (it is a field of [`ReplyCapRecord`]),
+/// so there is exactly ONE persistent reply authority store and ONE authoritative
+/// generation (`reply_cap_generations`). `Vacant` is the slot being `None`; the
+/// remaining states are carried by a present record:
+///
+/// * `Available` — externally invokable (the legacy, immediately-usable record and
+///   the committed direct record). Only `Available` records resolve for `ipc_reply`.
+/// * `Reserved` — held by an in-flight direct NR6 request transaction; NOT yet
+///   externally invokable. `resolve_reply_index` rejects it (`StaleCapability`) so a
+///   reply can never be delivered against a record whose server delivery + reply-cap
+///   materialization have not committed consistently.
+/// * `Consumed` — reserved for the NR7 one-shot reply completion (Stage 199A2B3);
+///   also not invokable.
+/// * `Cancelled` — a transient marker used during rollback immediately before the
+///   slot is cleared to `Vacant`; not invokable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyRecordReservation {
+    Available,
+    Reserved,
+    Consumed,
+    Cancelled,
+}
+
+impl ReplyRecordReservation {
+    /// Only an `Available` record is externally invokable by `ipc_reply`.
+    pub(crate) const fn is_invokable(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReplyCapRecord {
+    /// Stage 199A2B2 — the slot's reservation lifecycle (single-authority; see
+    /// [`ReplyRecordReservation`]). A record is externally invokable ONLY when this
+    /// is `Available`; a `Reserved` (in-flight direct transaction) record is never
+    /// resolvable for `ipc_reply`.
+    pub(crate) reservation: ReplyRecordReservation,
     pub(crate) caller_tid: ThreadId,
     /// Stage 199A2A — INCARNATION discriminator for the caller (blocked requester).
     /// Captured from `task_asid(caller_tid)` at record creation. A replacement task

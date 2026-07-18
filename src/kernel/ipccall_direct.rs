@@ -259,6 +259,58 @@ impl ReplyReservation {
         }
     }
 }
+/// Authoritative committed blocked-server acknowledgement for the direct NR6
+/// request transaction (Stage 199A2B2, Part 2).
+///
+/// It is a bounded, owned, by-value token representing that a request server is
+/// **committed-blocked** waiting to receive on the request endpoint. It is produced
+/// ONLY after the complete waiter slot AND the RecvV2 blocked-receive state exist,
+/// and it carries everything the off-lock transaction needs to deliver + finalize
+/// without re-reading userspace: the server's generation-bearing identity, the
+/// endpoint index + generation (the exact-waiter claim authority), a flag that the
+/// blocked receive is RecvV2-committed, and the server-side payload/metadata
+/// destinations.
+///
+/// The direct transaction REQUIRES and CONSUMES the exact acknowledgement: with no
+/// acknowledgement it returns canonical `WouldBlock` **before** reserving the reply
+/// record / minting any cap / mutating any waiter, and it never falls through to
+/// queued-call behavior. The acknowledgement is consumed only after the split-work
+/// item is installed, and restored on every pre-publication failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockedServerAck {
+    /// Generation-bearing server (blocked receiver) identity.
+    pub(crate) server: ReceiverWaiterIdentity,
+    /// Request endpoint slot index whose waiter is the server.
+    pub(crate) endpoint_index: usize,
+    /// Request endpoint generation at acknowledgement time (exact-waiter authority).
+    pub(crate) endpoint_generation: u64,
+    /// The server's blocked receive is a committed RecvV2 operation.
+    pub(crate) recv_v2_committed: bool,
+    /// Server userspace destination for the request payload.
+    pub(crate) payload_user_ptr: usize,
+    /// Server userspace payload destination length bound.
+    pub(crate) payload_user_len: usize,
+    /// Server userspace destination for the recv-v2 metadata.
+    pub(crate) meta_user_ptr: usize,
+    /// Server userspace metadata destination length bound.
+    pub(crate) meta_user_len: usize,
+}
+
+impl BlockedServerAck {
+    /// True when the acknowledgement is well-formed for a direct transaction: a
+    /// committed RecvV2 blocked receive with a payload destination. A malformed or
+    /// non-committed acknowledgement is treated as "no acknowledgement" → canonical
+    /// `WouldBlock`, never queued fallback.
+    pub(crate) const fn is_committed(&self) -> bool {
+        self.recv_v2_committed && self.payload_user_ptr != 0
+    }
+
+    /// The exact endpoint-waiter claim coordinates `(index, generation, identity)`
+    /// the transaction must present to `sr_claim_endpoint_waiter_split`.
+    pub(crate) const fn waiter_claim_key(&self) -> (usize, u64, ReceiverWaiterIdentity) {
+        (self.endpoint_index, self.endpoint_generation, self.server)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -393,5 +445,34 @@ mod tests {
         assert!(r.is_reserved());
         r.release(5).expect("correct generation releases");
         assert!(r.is_available());
+    }
+
+    // ── Committed blocked-server acknowledgement ───────────────────────────────
+
+    #[test]
+    fn blocked_server_ack_committed_predicate_and_claim_key() {
+        let ack = BlockedServerAck {
+            server: ident(5, 3),
+            endpoint_index: 2,
+            endpoint_generation: 9,
+            recv_v2_committed: true,
+            payload_user_ptr: 0x4000_0000,
+            payload_user_len: 128,
+            meta_user_ptr: 0x4000_1000,
+            meta_user_len: 40,
+        };
+        assert!(ack.is_committed());
+        assert_eq!(ack.waiter_claim_key(), (2, 9, ident(5, 3)));
+        // A non-committed or destination-less ack is treated as "no acknowledgement".
+        let not_committed = BlockedServerAck {
+            recv_v2_committed: false,
+            ..ack
+        };
+        assert!(!not_committed.is_committed());
+        let no_dest = BlockedServerAck {
+            payload_user_ptr: 0,
+            ..ack
+        };
+        assert!(!no_dest.is_committed());
     }
 }

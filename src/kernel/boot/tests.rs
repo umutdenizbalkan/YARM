@@ -75920,3 +75920,188 @@ mod stage199a2b1_offlock_foundations {
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B2 — x86_64 Off-Lock IpcCall Direct Request: reply-authority
+// representation + committed-server acknowledgement substrate (this increment).
+//
+// LANDED: (Part 4) the reply-record reservation lifecycle integrated into the
+// SINGLE existing reply_caps slot (ReplyRecordReservation on ReplyCapRecord) — a
+// Reserved record is not externally invokable until committed Available; cancel
+// reclaims the slot to Vacant; one authority store, one authoritative generation;
+// both {tid,asid} identities + the reply endpoint index+generation are bound at
+// reservation. (Part 2) the owned BlockedServerAck token type.
+//
+// NOT LANDED (remaining transaction orchestration, reported as the blocker): the
+// composed off-lock request transaction (require-exact-ack → mint one server-local
+// reply cap → off-lock request delivery → claim-then-commit-then-enqueue → commit
+// record, with full rollback), the x86 trap-entry snapshot publication, and the
+// result=ok request seal. No live split arm was added; NR6 behavior is unchanged.
+mod stage199a2b2_request_substrate {
+    use super::*;
+    use crate::kernel::vm::Asid;
+
+    const DEFS_SRC: &str = include_str!("defs.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const DIRECT_SRC: &str = include_str!("../ipccall_direct.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+
+    fn ident(tid: u64, asid: u16) -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+
+    fn endpoint_obj(index: usize, generation: u64) -> crate::kernel::capabilities::CapObject {
+        crate::kernel::capabilities::CapObject::Endpoint { index, generation }
+    }
+
+    // A reserved record is present but NOT externally invokable; committing it makes
+    // it invokable; the slot + generation are the SOLE authority (single store).
+    #[test]
+    fn reserved_record_not_invokable_until_committed() {
+        let mut state = Bootstrap::init().expect("init");
+        let (idx, rgen) = state
+            .reserve_direct_reply_record(ident(1, 11), ident(2, 22), endpoint_obj(3, 7))
+            .expect("reserve");
+        assert_eq!(
+            state.reply_cap_record_reservation(idx),
+            Some(crate::kernel::boot::ReplyRecordReservation::Reserved)
+        );
+        assert!(
+            !state.direct_reply_record_is_invokable(idx, rgen),
+            "a Reserved record must not resolve for ipc_reply"
+        );
+        assert!(
+            state.commit_direct_reply_record(idx, rgen),
+            "commit succeeds"
+        );
+        assert_eq!(
+            state.reply_cap_record_reservation(idx),
+            Some(crate::kernel::boot::ReplyRecordReservation::Available)
+        );
+        assert!(
+            state.direct_reply_record_is_invokable(idx, rgen),
+            "a committed (Available) record resolves for ipc_reply"
+        );
+    }
+
+    // Cancel reclaims the reserved slot to Vacant (rollback), reclaiming authority.
+    #[test]
+    fn cancel_reclaims_reserved_slot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (idx, rgen) = state
+            .reserve_direct_reply_record(ident(1, 11), ident(2, 22), endpoint_obj(3, 7))
+            .expect("reserve");
+        assert!(state.reply_cap_record_present(idx));
+        assert!(
+            state.cancel_direct_reply_record(idx, rgen),
+            "cancel succeeds"
+        );
+        assert!(
+            !state.reply_cap_record_present(idx),
+            "cancel clears the slot to Vacant"
+        );
+        assert!(!state.direct_reply_record_is_invokable(idx, rgen));
+        // Cancel/commit on a vacant slot is a no-op false.
+        assert!(!state.commit_direct_reply_record(idx, rgen));
+        assert!(!state.cancel_direct_reply_record(idx, rgen));
+    }
+
+    // Reservation binds BOTH {tid,asid} identities + the reply endpoint index+rgen.
+    #[test]
+    fn reservation_binds_identities_and_reply_endpoint() {
+        let mut state = Bootstrap::init().expect("init");
+        let caller = ident(1, 11);
+        let replier = ident(2, 22);
+        let ep = endpoint_obj(4, 9);
+        let (idx, _gen) = state
+            .reserve_direct_reply_record(caller, replier, ep)
+            .expect("reserve");
+        let (bound_caller, bound_replier, bound_ep) =
+            state.direct_reply_record_identities(idx).expect("present");
+        assert_eq!(bound_caller, caller, "caller identity bound");
+        assert_eq!(bound_replier, replier, "replier identity bound");
+        assert_eq!(bound_ep, ep, "reply endpoint index+generation bound");
+    }
+
+    // commit/cancel require the exact generation — a stale generation cannot mutate.
+    #[test]
+    fn commit_cancel_require_exact_generation() {
+        let mut state = Bootstrap::init().expect("init");
+        let (idx, rgen) = state
+            .reserve_direct_reply_record(ident(1, 11), ident(2, 22), endpoint_obj(3, 7))
+            .expect("reserve");
+        assert!(!state.commit_direct_reply_record(idx, rgen.wrapping_add(1)));
+        assert!(!state.cancel_direct_reply_record(idx, rgen.wrapping_add(1)));
+        // The record is untouched — still Reserved and reclaimable with the right rgen.
+        assert_eq!(
+            state.reply_cap_record_reservation(idx),
+            Some(crate::kernel::boot::ReplyRecordReservation::Reserved)
+        );
+        assert!(state.commit_direct_reply_record(idx, rgen));
+    }
+
+    // The server-local reply cap binds only into a Reserved record.
+    #[test]
+    fn server_reply_cap_binds_into_reserved_record() {
+        let mut state = Bootstrap::init().expect("init");
+        let (idx, rgen) = state
+            .reserve_direct_reply_record(ident(1, 11), ident(2, 22), endpoint_obj(3, 7))
+            .expect("reserve");
+        assert!(state.bind_direct_reply_record_server_cap(idx, rgen, CapId(77)));
+        assert_eq!(state.reply_cap_record_waiter_cap(idx), Some(CapId(77)));
+        // After commit the record is no longer Reserved, so a re-bind fails.
+        assert!(state.commit_direct_reply_record(idx, rgen));
+        assert!(!state.bind_direct_reply_record_server_cap(idx, rgen, CapId(88)));
+    }
+
+    // SINGLE authority store: the reservation lives IN the reply_caps slot; there is
+    // no parallel reply-record table and no second authoritative generation.
+    #[test]
+    fn single_reply_authority_store_no_second_table() {
+        // The reservation is a field of ReplyCapRecord (lives in the slot).
+        assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
+        // No second persistent record array was added alongside `reply_caps`.
+        assert!(
+            !IPC_STATE_SRC.contains("reply_records_2")
+                && !IPC_STATE_SRC.contains("direct_reply_records:")
+                && !IPC_STATE_SRC.contains("reservation_table"),
+            "no second persistent reply-record table exists"
+        );
+        // Only ONE reply generation array governs authority.
+        assert_eq!(
+            IPC_STATE_SRC.matches("reply_cap_generations[").count() > 0,
+            true
+        );
+        assert!(!IPC_STATE_SRC.contains("reservation_generations["));
+    }
+
+    // Committed blocked-server acknowledgement carries the required fields.
+    #[test]
+    fn blocked_server_ack_type_fields() {
+        assert!(DIRECT_SRC.contains("pub(crate) struct BlockedServerAck"));
+        assert!(DIRECT_SRC.contains("server: ReceiverWaiterIdentity"));
+        assert!(DIRECT_SRC.contains("endpoint_index: usize"));
+        assert!(DIRECT_SRC.contains("endpoint_generation: u64"));
+        assert!(DIRECT_SRC.contains("recv_v2_committed: bool"));
+        assert!(DIRECT_SRC.contains("payload_user_ptr: usize"));
+        assert!(DIRECT_SRC.contains("meta_user_ptr: usize"));
+    }
+
+    // The direct request class is still DEFAULT-OFF: no live NR6 split arm, NR7
+    // unchanged, and the reply-cap enqueue policy + ABI are preserved.
+    #[test]
+    fn direct_class_default_off_and_abi_preserved() {
+        assert!(
+            !SPLIT_SRC.contains("IpcCallDirectRequest")
+                && !SPLIT_SRC.contains("try_split_ipc_call"),
+            "no live NR6 direct split-dispatch arm this increment"
+        );
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+}
