@@ -2054,6 +2054,19 @@ const PROBE_TID_BASE: u64 = 20_189;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 const AP_WORKLOAD_TASKS: u64 = 2;
 
+/// Stage 199A2D2C1: the number of AP workload tasks to run this boot. The GENERIC scheduler-selected
+/// user-return proof (SMP oracle) runs EXACTLY ONE ordinary proof task (one fresh entry, no
+/// duplicate) — the 2-task repeated-dispatch sequence is only for the legacy `ap_user_dispatch`
+/// scaffold proof.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_workload_task_count() -> u64 {
+    if crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled() {
+        1
+    } else {
+        AP_WORKLOAD_TASKS
+    }
+}
+
 /// The per-AP workload base TID (first task on `cpu`).
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 fn ap_workload_base_tid(cpu: CpuId) -> u64 {
@@ -2274,6 +2287,16 @@ fn ap_enter_task_ring3(cpu: CpuId, tid: u64) -> ! {
         kernel_rsp0,
         cr3
     );
+    // Stage 199A2D2C1: the GENERIC scheduler-selected AP user-return proof. This task was selected
+    // from CPU 1's REAL run queue (`dispatch_next_on_cpu`), NOT a hardcoded probe TID, and enters
+    // ring 3 through the canonical `enter_user_mode_iret` (fresh-entry mode). Emit the kernel
+    // attestation with the scheduler-selected identity, once, on the first entry.
+    if count == 1 && crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled() {
+        crate::kernel::printk::printk_emit_sync(format_args!(
+            "X86_AP_GENERIC_DISPATCH_OK cpu={} mode=fresh scheduler_selected=1 tid={} result=ok",
+            cpu.0, tid
+        ));
+    }
     super::percpu::set_ap_dispatch_stage(cpu, 3);
     // Activate the task address space. Kernel higher-half stays valid (shared in every
     // ASID). All workload tasks share one ASID and run sequentially, so no concurrent
@@ -2306,7 +2329,7 @@ pub(crate) fn ap_sched_next_or_idle(shared: &crate::runtime::SharedKernel, cpu: 
     // is `None` — place the NEXT controlled workload task (if any) ONE AT A TIME so
     // exactly one task is ever runnable on this AP (no rotate-to-unrun-task).
     let n = AP_DISPATCH_COUNT[idx].load(Ordering::Acquire);
-    if (n as u64) < AP_WORKLOAD_TASKS {
+    if (n as u64) < ap_workload_task_count() {
         let next_tid = ap_workload_base_tid(cpu) + n as u64;
         // Audited placement (the wake-only guard still applies) + make it current.
         let placed = shared
@@ -2376,7 +2399,7 @@ fn live_ap_user_dispatch(kernel: &mut KernelState, cpu: CpuId) {
     // Stage 190B: build a small CONTROLLED workload of admitted tasks for this AP
     // (one shared per-AP ASID, distinct TIDs). Sequential single-AP execution.
     let base_tid = ap_workload_base_tid(cpu);
-    let (cr3, entry, ustack) = match kernel.build_ap_workload(base_tid, AP_WORKLOAD_TASKS) {
+    let (cr3, entry, ustack) = match kernel.build_ap_workload(base_tid, ap_workload_task_count()) {
         Ok(built) => built,
         Err(e) => {
             crate::yarm_log!(

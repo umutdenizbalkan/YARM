@@ -80787,7 +80787,8 @@ mod stage199a2d2b_guards {
         fn assert_owned<T: Copy + Send + Sync + 'static>() {}
         assert_owned::<crate::arch::x86_64::ap_sched::ApUserDispatchPlan>();
         assert_owned::<crate::arch::x86_64::ap_sched::ApDispatchDecision>();
-        assert_owned::<crate::arch::x86_64::ap_sched::ApReturnMode>();
+        assert_owned::<crate::arch::x86_64::ap_sched::ApUserReturnSource>();
+        assert_owned::<crate::arch::x86_64::ap_sched::SavedUserReturnFrame>();
     }
 
     // (8.18) The historical `result=blocked` diagnostic can NEVER satisfy the success seal: the

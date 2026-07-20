@@ -1497,6 +1497,27 @@ impl KernelState {
             0x0F, 0x05, // syscall
             0xEB, 0xFE, // jmp .
         ];
+        // Stage 199A2D2C1: when the x86_64 SMP cross-CPU request oracle is armed, the AP proof task
+        // runs an ORDINARY userspace stub that emits a real DebugLog userspace marker (proving it
+        // reached ring 3 and executed a real syscall on this CPU) BEFORE the yield/park. The marker
+        // string lives in a dedicated user-readable data page (PROBE_MARKER_VA).
+        const PROBE_MARKER_VA: u64 = 0x0000_0000_2002_0000;
+        const AP_GENERIC_USER_MARKER: &[u8] =
+            b"X86_AP_GENERIC_USER_ENTRY cpu=1 scheduler_selected=1 result=ok\n";
+        // len = 63 = 0x3F (asserted below).
+        const PROBE_STUB_SMP: [u8; 30] = [
+            0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax, 15   (DebugLog NR)
+            0xBF, 0x00, 0x00, 0x02, 0x20, // mov edi, 0x20020000 (marker ptr)
+            0xBE, 0x3F, 0x00, 0x00, 0x00, // mov esi, 63   (marker len)
+            0x0F, 0x05, // syscall  (DebugLog)
+            0x31, 0xC0, // xor eax, eax  (Yield)
+            0x0F, 0x05, // syscall
+            0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6  (park)
+            0x0F, 0x05, // syscall
+            0xEB, 0xFE, // jmp .
+        ];
+        const _: () = assert!(AP_GENERIC_USER_MARKER.len() == 63);
+        let smp_proof = crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled();
         let user_stack_top = PROBE_STACK_VA + (PAGE_SIZE as u64) - 16;
 
         // Idempotent: reuse an already-built per-AP workload ASID.
@@ -1521,7 +1542,22 @@ impl KernelState {
                     flags: code_flags,
                 },
             )?;
-            self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB)?;
+            if smp_proof {
+                self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB_SMP)?;
+                // Marker data page: user + read.
+                let marker_phys = self.alloc_user_data_frame()?;
+                self.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr(PROBE_MARKER_VA),
+                    Mapping {
+                        phys: PhysAddr(marker_phys),
+                        flags: PageFlags::USER_RW,
+                    },
+                )?;
+                self.copy_to_user(asid, VirtAddr(PROBE_MARKER_VA), AP_GENERIC_USER_MARKER)?;
+            } else {
+                self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB)?;
+            }
             // Stack page: user + read + write (sequential single-AP use).
             let stack_phys = self.alloc_user_data_frame()?;
             self.map_user_page_in_asid_raw(
