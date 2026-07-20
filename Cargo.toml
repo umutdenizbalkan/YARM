@@ -72,6 +72,12 @@ ipccall-direct-oracle = []
 x86-ipccall-direct-oracle = ["ipccall-direct-oracle"]
 aarch64-ipccall-direct-oracle = ["ipccall-direct-oracle"]
 riscv-ipccall-direct-oracle = ["ipccall-direct-oracle"]
+# Stage 199A2D2A: x86_64 SMP=2 cross-CPU DIRECT IpcCall (request-only) oracle. Separate from the
+# SMP=1 functional oracle above and mutually exclusive with it at runtime (distinct selector). Only
+# COMPILES the cross-CPU SMP marker paths; activation additionally requires QEMU_SMP>=2 and the
+# runtime selector `yarm.x86_64_ipccall_direct_smp_oracle=1`. Depends on the umbrella so the shared
+# direct-transaction logic + class literals compile.
+x86-ipccall-direct-smp-oracle = ["ipccall-direct-oracle"]
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }

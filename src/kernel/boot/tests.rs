@@ -80253,3 +80253,526 @@ mod stage199a2d1_smp_readiness {
         );
     }
 }
+
+/// Stage 199A2D2A — x86_64 SMP=2 cross-CPU DIRECT IpcCall (NR6 request-only) oracle.
+///
+/// Deterministic hosted proofs for the CPU-targeted remote-enqueue mechanism the cross-CPU
+/// request needs. The server is modelled on CPU 1 (blocked in recv-v2, home CPU = 1); the
+/// client runs the ACCEPTED `ipc_call_direct_request_txn` (never a fork), whose captured-affinity
+/// enqueue places the woken server on CPU 1's run queue — never the BSP. The LIVE AP
+/// dispatch-on-wake + context-restore path that would let CPU 1 actually resume the enqueued
+/// server is a separate prerequisite (see doc/STAGE_199A2D2A_SMP_REQUEST.md); this module proves
+/// the kernel mechanism that path will drive.
+#[cfg(test)]
+mod stage199a2d2a_smp_request {
+    use super::*;
+    use crate::kernel::boot::{
+        ReceiverWaiterIdentity, ReplyRecordReservation, X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR,
+        ipccall_direct_ack, ipccall_direct_smp_oracle_active, set_ipccall_direct_proof_enabled,
+        set_x86_ipccall_direct_oracle_enabled, set_x86_ipccall_direct_smp_oracle_enabled,
+        x86_ipccall_direct_oracle_enabled, x86_ipccall_direct_smp_oracle_enabled,
+    };
+    use crate::kernel::ipccall_direct::{AckLease, BlockedServerAck, IpcCallDirectSnapshot};
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+    use std::sync::{Arc, Barrier};
+
+    const SERVER_PAYLOAD_VA: usize = 0x4000;
+    const SERVER_META_VA: usize = 0x4080;
+    const CPU1: CpuId = CpuId(1);
+    const CPU0: CpuId = CpuId(0);
+
+    fn id(tid: u64, asid: Asid) -> ReceiverWaiterIdentity {
+        ReceiverWaiterIdentity::new(ThreadId(tid), asid)
+    }
+
+    struct SmpFx {
+        k: SharedKernel,
+        client: ReceiverWaiterIdentity,
+        server: ReceiverWaiterIdentity,
+        server_asid: Asid,
+        send_cap_t1: CapId,
+        reply_recv_cap_t1: CapId,
+        recv_cap_t2: CapId,
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        published_ack: BlockedServerAck,
+    }
+
+    /// task2 = server, HOME CPU 1, committed-blocked on recv-v2 of the request endpoint (modelled
+    /// on CPU 1 via `with_cpu(CPU1)`); task1 = BSP client holding the request SEND cap + reply
+    /// endpoint RECEIVE cap. Reply endpoint + server reply-cap capacity are provisioned even though
+    /// NR7 does not run this stage.
+    fn smp_server_fixture() -> SmpFx {
+        ipccall_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| s.bring_up_cpu(CPU1).expect("bring up cpu1"));
+        let (client_asid, server_asid, send_cap_t1, reply_recv_cap_t1, recv_cap_t2) =
+            k.with(|state| {
+                state.register_task(1).expect("task1 client");
+                state.register_task(2).expect("task2 server");
+                let (asid1, _aspace1) = state.create_user_address_space().expect("asid1");
+                let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+                state.bind_task_asid(1, asid1).expect("bind1");
+                state.bind_task_asid(2, asid2).expect("bind2");
+                state
+                    .map_user_page(
+                        aspace2,
+                        VirtAddr(SERVER_PAYLOAD_VA as u64),
+                        Mapping {
+                            phys: PhysAddr(0xB000),
+                            flags: PageFlags::USER_RW,
+                        },
+                    )
+                    .expect("map server buffers");
+                let (_req_eid, req_send_global, req_recv_global) =
+                    state.create_endpoint(4).expect("req ep");
+                let send_cap_t1 = state
+                    .grant_capability_task_to_task(0, req_send_global, 1)
+                    .expect("dup req send to client");
+                let recv_cap_t2 = state
+                    .grant_capability_task_to_task(0, req_recv_global, 2)
+                    .expect("dup req recv to server");
+                // Reply endpoint: client holds RECEIVE (needed by NR6 to bind the reply record).
+                let (_reply_eid, _reply_send, reply_recv_global) =
+                    state.create_endpoint(4).expect("reply ep");
+                let reply_recv_cap_t1 = state
+                    .grant_capability_task_to_task(0, reply_recv_global, 1)
+                    .expect("dup reply recv to client");
+                // Bind the server to its HOME CPU 1 BEFORE it blocks (internal placement; not a syscall).
+                state
+                    .set_task_home_cpu(2, CPU1)
+                    .expect("assign server home cpu 1");
+                (asid1, asid2, send_cap_t1, reply_recv_cap_t1, recv_cap_t2)
+            });
+
+        // Dispatch + block the server ON CPU 1 (current_cpu = 1) in recv-v2 of the request endpoint.
+        k.with_cpu(CPU1, |state| {
+            state
+                .enqueue_on_cpu(CPU1, 2)
+                .expect("enqueue server on cpu1");
+            let placed = state.dispatch_next_on_cpu(CPU1);
+            assert_eq!(placed, Some(2), "server dispatches on CPU 1");
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    recv_cap_t2.0 as usize,
+                    SERVER_PAYLOAD_VA,
+                    8,
+                    SERVER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(state.task_status(2), Some(TaskStatus::Blocked(_))),
+                "server must be blocked on recv-v2 (CPU 1)"
+            );
+        })
+        .expect("with_cpu(1)");
+
+        let endpoint = k
+            .resolve_endpoint_send_cap_split_read(1, send_cap_t1)
+            .expect("resolve send endpoint");
+        let (endpoint_index, endpoint_generation) = match endpoint {
+            crate::kernel::capabilities::CapObject::Endpoint { index, generation } => {
+                (index, generation)
+            }
+            _ => panic!("send cap is not an endpoint"),
+        };
+        let server = id(2, server_asid);
+        let published_ack = BlockedServerAck {
+            server,
+            endpoint_index,
+            endpoint_generation,
+            recv_v2_committed: true,
+            payload_user_ptr: SERVER_PAYLOAD_VA,
+            payload_user_len: 8,
+            meta_user_ptr: SERVER_META_VA,
+            meta_user_len: 40,
+        };
+        // Publish the ack to the single-slot store (models the recv-v2 commit publication).
+        let _seq = ipccall_direct_ack::publish(published_ack);
+        SmpFx {
+            k,
+            client: id(1, client_asid),
+            server,
+            server_asid,
+            send_cap_t1,
+            reply_recv_cap_t1,
+            recv_cap_t2,
+            endpoint_index,
+            endpoint_generation,
+            published_ack,
+        }
+    }
+
+    fn snapshot_for(fx: &SmpFx, payload: &[u8]) -> IpcCallDirectSnapshot {
+        IpcCallDirectSnapshot::build(fx.client, fx.send_cap_t1, fx.reply_recv_cap_t1, payload)
+            .expect("snapshot")
+    }
+
+    fn claimed_lease(seq: u64) -> AckLease {
+        let mut l = AckLease::new_available();
+        l.claim(seq).expect("claim");
+        l
+    }
+
+    fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        set_x86_ipccall_direct_smp_oracle_enabled(false);
+        set_x86_ipccall_direct_oracle_enabled(false);
+        ipccall_direct_ack::reset();
+    }
+
+    // (9.1) AP task assignment survives blocking.
+    #[test]
+    fn ap_server_home_cpu_survives_blocking() {
+        let fx = smp_server_fixture();
+        assert_eq!(
+            fx.k.with(|s| s.task_home_cpu(2)),
+            Some(CPU1),
+            "server retains home CPU 1 while blocked"
+        );
+        assert!(
+            matches!(
+                fx.k.with(|s| s.task_status(2)),
+                Some(TaskStatus::Blocked(_))
+            ),
+            "server is blocked"
+        );
+        teardown();
+    }
+
+    // (9.2) The exact CPU target is captured in the wake plan.
+    #[test]
+    fn wake_plan_captures_cpu1_target() {
+        let fx = smp_server_fixture();
+        assert_eq!(
+            fx.k.smp_request_wake_target_split_read(2),
+            Some(CPU1),
+            "wake target is CPU 1 (the server's home), not the enqueueing CPU"
+        );
+        teardown();
+    }
+
+    // (9.8) The acknowledgement contains the CPU-1 server identity.
+    #[test]
+    fn ack_carries_cpu1_server_identity() {
+        let fx = smp_server_fixture();
+        let ack = ipccall_direct_ack::snapshot().expect("ack published");
+        assert_eq!(ack.server, fx.server, "ack names the exact server tid+asid");
+        assert_eq!(ack.endpoint_index, fx.endpoint_index);
+        assert_eq!(fx.k.with(|s| s.task_home_cpu(ack.server.tid.0)), Some(CPU1));
+        teardown();
+    }
+
+    // (9.7) CPU 1 cannot dispatch the server before the enqueue publication.
+    #[test]
+    fn cpu1_cannot_dispatch_before_enqueue() {
+        let fx = smp_server_fixture();
+        // Before any request delivery, CPU 1's run queue holds no runnable server (it is Blocked).
+        assert_eq!(
+            fx.k.with(|s| s.dispatch_next_on_cpu(CPU1)),
+            None,
+            "no runnable server on CPU 1 before the remote enqueue"
+        );
+        teardown();
+    }
+
+    // (9.3 + 9.6) Remote enqueue chooses CPU 1; request bytes + record Available happen-before it.
+    #[test]
+    fn nr6_txn_remote_enqueues_server_on_cpu1_with_bytes_and_record_available() {
+        let fx = smp_server_fixture();
+        let snap = snapshot_for(&fx, b"REQ-SMP!");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(21);
+        // Run the ACCEPTED NR6 transaction (the client is on the BSP; the enqueue targets the
+        // server's home CPU via captured affinity — no fork of the transaction).
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 21)
+                .expect("cross-CPU NR6 request transaction succeeds");
+
+        // Happens-before the remote dispatch: request bytes visible in the server ASID AND the
+        // reply record is Available (not left Reserved).
+        let delivered =
+            fx.k.with(|s| s.read_user_memory_for_asid(fx.server_asid, SERVER_PAYLOAD_VA, 8))
+                .expect("server bytes");
+        assert_eq!(
+            &delivered[..8],
+            b"REQ-SMP!",
+            "request bytes visible pre-dispatch"
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(out.record_index)),
+            Some(ReplyRecordReservation::Available),
+            "reply record made Available before dispatch (never left Reserved)"
+        );
+        // One server-local reply cap minted, resolvable in the SERVER cnode.
+        let resolved =
+            fx.k.with(|s| s.resolve_capability_for_task(2, out.server_reply_cap).ok());
+        assert!(
+            matches!(
+                resolved.map(|c| c.object),
+                Some(crate::kernel::capabilities::CapObject::Reply { index, .. })
+                    if index == out.record_index
+            ),
+            "exactly one server-local Reply cap minted"
+        );
+
+        // The woken server is remotely enqueued on CPU 1 — NOT the BSP. (CPU 0's queue holds only
+        // its idle task, so its next dispatch is never the server.)
+        assert_ne!(
+            fx.k.with(|s| s.dispatch_next_on_cpu(CPU0)),
+            Some(2),
+            "server is NOT enqueued on the BSP (CPU 0)"
+        );
+        assert_eq!(
+            fx.k.with(|s| s.dispatch_next_on_cpu(CPU1)),
+            Some(2),
+            "server is remotely enqueued on CPU 1 and dispatches there"
+        );
+        assert!(lease.is_consumed(), "ack consumed once");
+        assert_eq!(
+            ipccall_direct_ack::overwrite_fuse_count(),
+            0,
+            "fuse untripped"
+        );
+        teardown();
+    }
+
+    // (9.4) Two completion attempts produce ONE remote enqueue (real threads + barrier).
+    #[test]
+    fn two_completion_attempts_one_remote_enqueue() {
+        let fx = smp_server_fixture();
+        let k = Arc::new(fx.k);
+        let client = fx.client;
+        let send_cap = fx.send_cap_t1;
+        let reply_recv = fx.reply_recv_cap_t1;
+        let ack = fx.published_ack;
+        let barrier = Arc::new(Barrier::new(2));
+        let wins = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for t in 0..2 {
+            let b = Arc::clone(&barrier);
+            let k = Arc::clone(&k);
+            let w = Arc::clone(&wins);
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        let snap =
+                            IpcCallDirectSnapshot::build(client, send_cap, reply_recv, b"REQ-SMP!")
+                                .expect("snapshot");
+                        let mut lease = AckLease::new_available();
+                        lease.claim(30 + t as u64).expect("claim lease");
+                        b.wait();
+                        // Only the ack-claim WINNER runs the transaction.
+                        if let Some((claimed_ack, seq)) = ipccall_direct_ack::claim() {
+                            let _ = seq;
+                            if k.ipc_call_direct_request_txn(
+                                &snap,
+                                &claimed_ack,
+                                &mut lease,
+                                30 + t as u64,
+                            )
+                            .is_ok()
+                            {
+                                w.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        // Exactly one delivery (the ack CAS admits one claimant) ⇒ exactly one remote enqueue.
+        assert_eq!(
+            wins.load(core::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly one delivery"
+        );
+        // The one woken server lands on CPU 1, never the BSP.
+        assert_ne!(
+            k.with(|s| s.dispatch_next_on_cpu(CPU0)),
+            Some(2),
+            "no BSP enqueue"
+        );
+        assert_eq!(
+            k.with(|s| s.dispatch_next_on_cpu(CPU1)),
+            Some(2),
+            "remote enqueue on CPU 1"
+        );
+        assert_eq!(ipccall_direct_ack::overwrite_fuse_count(), 0);
+        teardown();
+    }
+
+    // (9.5) A replacement task (same TID, different ASID) cannot inherit the AP wake.
+    #[test]
+    fn replacement_task_cannot_inherit_ap_wake() {
+        let fx = smp_server_fixture();
+        let snap = snapshot_for(&fx, b"REQ-SMP!");
+        // Forge an ack whose server ASID is a replacement (numeric-TID reuse). The txn's exact
+        // waiter claim + commit require the EXACT {tid,asid}; a replacement is rejected.
+        let mut ack = fx.published_ack;
+        ack.server = id(2, Asid(fx.server_asid.0 ^ 0x55));
+        let mut lease = claimed_lease(41);
+        let res =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 41);
+        assert!(
+            res.is_err(),
+            "replacement-identity server cannot be delivered to"
+        );
+        // No wake on either CPU: the server (tid 2) is never dispatched; it stays blocked.
+        assert_ne!(
+            fx.k.with(|s| s.dispatch_next_on_cpu(CPU1)),
+            Some(2),
+            "no wake for a replacement"
+        );
+        assert_ne!(fx.k.with(|s| s.dispatch_next_on_cpu(CPU0)), Some(2));
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(2)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        teardown();
+    }
+
+    // (9.9) Overwrite fuse remains zero for one pair.
+    #[test]
+    fn overwrite_fuse_zero_for_one_pair() {
+        let fx = smp_server_fixture();
+        assert_eq!(ipccall_direct_ack::overwrite_fuse_count(), 0);
+        teardown();
+    }
+
+    // (Part 1) SMP selector gate: activation requires smp>=2 + selector; feature-on w/o selector inert.
+    #[test]
+    fn smp_selector_gate_requires_selector_and_smp2() {
+        teardown();
+        // Selector off → inert regardless of CPU count.
+        assert!(
+            !ipccall_direct_smp_oracle_active(2),
+            "inert without the selector"
+        );
+        set_x86_ipccall_direct_smp_oracle_enabled(true);
+        assert!(x86_ipccall_direct_smp_oracle_enabled());
+        // Selector on but smp<2 → inert (same-CPU can never present as cross-CPU).
+        assert!(!ipccall_direct_smp_oracle_active(1), "inert on smp<2");
+        assert!(
+            ipccall_direct_smp_oracle_active(2),
+            "active on smp>=2 + selector"
+        );
+        teardown();
+    }
+
+    // (Part 1) Mutual exclusion: the SMP and functional selectors are never both armed.
+    #[test]
+    fn smp_and_functional_selectors_mutually_exclusive() {
+        teardown();
+        // Functional first blocks SMP.
+        set_x86_ipccall_direct_oracle_enabled(true);
+        assert!(x86_ipccall_direct_oracle_enabled());
+        set_x86_ipccall_direct_smp_oracle_enabled(true);
+        assert!(
+            !x86_ipccall_direct_smp_oracle_enabled(),
+            "SMP refused while functional armed"
+        );
+        teardown();
+        // SMP first blocks functional.
+        set_x86_ipccall_direct_smp_oracle_enabled(true);
+        assert!(x86_ipccall_direct_smp_oracle_enabled());
+        set_x86_ipccall_direct_oracle_enabled(true);
+        assert!(
+            !x86_ipccall_direct_oracle_enabled(),
+            "functional refused while SMP armed"
+        );
+        // Distinct selector values (no startup-slot collision).
+        assert_ne!(
+            X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR,
+            crate::kernel::boot::IPCCALL_DIRECT_ORACLE_SELECTOR
+        );
+        teardown();
+    }
+
+    // (Part 3) Capability/endpoint topology: SEND for the client, RECEIVE for the AP server —
+    // full {tid,asid}-authority CNodes, no shared-CNode shortcut.
+    #[test]
+    fn request_endpoint_topology_send_client_receive_server() {
+        use crate::kernel::capabilities::CapRights;
+        let fx = smp_server_fixture();
+        // Client's request cap is SEND-only (cannot RECEIVE on the request endpoint).
+        let send =
+            fx.k.with(|s| s.resolve_capability_for_task(1, fx.send_cap_t1))
+                .expect("client resolves its send cap");
+        assert!(send.has_right(CapRights::SEND), "client cap grants SEND");
+        assert!(
+            !send.has_right(CapRights::RECEIVE),
+            "BSP send cap cannot grant RECEIVE"
+        );
+        // Server's request cap is RECEIVE (it is the recv-v2 endpoint receiver).
+        let recv =
+            fx.k.with(|s| s.resolve_capability_for_task(2, fx.recv_cap_t2))
+                .expect("server resolves its recv cap");
+        assert!(
+            recv.has_right(CapRights::RECEIVE),
+            "server cap grants RECEIVE"
+        );
+        // The client CNode holds no capability at the server's recv-cap slot id that grants RECEIVE
+        // on the request endpoint (no shared-CNode shortcut; process-local receiver authority).
+        let client_at_recv_slot =
+            fx.k.with(|s| s.resolve_capability_for_task(1, fx.recv_cap_t2).ok());
+        let leaks_recv = client_at_recv_slot.is_some_and(|c| {
+            matches!(c.object, crate::kernel::capabilities::CapObject::Endpoint { index, .. } if index == fx.endpoint_index)
+                && c.has_right(CapRights::RECEIVE)
+        });
+        assert!(
+            !leaks_recv,
+            "AP receive cap cannot be resolved as a request-endpoint RECEIVE in the BSP client CNode"
+        );
+        teardown();
+    }
+
+    // (9.10) Feature-off / selector-off path is inert and unchanged.
+    #[test]
+    fn feature_off_selector_off_is_inert() {
+        teardown();
+        assert!(
+            !x86_ipccall_direct_smp_oracle_enabled(),
+            "selector off by default"
+        );
+        assert!(
+            !ipccall_direct_smp_oracle_active(2),
+            "inert when selector off"
+        );
+        assert!(!ipccall_direct_smp_oracle_active(1), "inert on smp<2");
+    }
+
+    // (9.11) No NR7 cross-CPU reply SMP marker exists in kernel source this stage.
+    #[test]
+    fn no_nr7_smp_reply_marker_in_kernel_source() {
+        let modrs = include_str!("mod.rs");
+        assert!(
+            !modrs.contains("IPCREPLY_DIRECT_SMP_REPLY_OK"),
+            "this request-only stage emits NO cross-CPU NR7 reply marker in kernel source"
+        );
+        // The request-only success + seal marker names ARE reserved for the LIVE emitter (D2A/B).
+        // Their absence-from-emission this stage is enforced by the LIVE path being blocked (see doc).
+    }
+
+    // (9.12) Stage 199 functional invariants preserved.
+    #[test]
+    fn stage199_functional_invariants_preserved() {
+        let syscall_src = include_str!("../syscall.rs");
+        assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(syscall_src.contains("pub const VARIANT_COUNT: usize = 22;"));
+        // The SMP=1 functional selector is unchanged and distinct from the SMP selector.
+        assert_eq!(crate::kernel::boot::IPCCALL_DIRECT_ORACLE_SELECTOR, 3);
+        assert_eq!(X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR, 9);
+    }
+}

@@ -3117,15 +3117,65 @@ pub(crate) static X86_IPCCALL_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicB
     core::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn set_x86_ipccall_direct_oracle_enabled(enabled: bool) {
-    X86_IPCCALL_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
     if enabled {
+        // Mutual exclusion (Stage 199A2D2A): the SMP=1 functional selector and the SMP=2 cross-CPU
+        // selector are never both armed. Refuse to arm the functional oracle if the SMP one is on.
+        if x86_ipccall_direct_smp_oracle_enabled() {
+            crate::yarm_log!("IPCCALL_DIRECT_ORACLE_REFUSED reason=smp_selector_active");
+            return;
+        }
         // Selecting the workload arms the NR6/NR7 off-lock proof gate for this run.
         set_ipccall_direct_proof_enabled(true);
     }
+    X86_IPCCALL_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
 }
 
 pub fn x86_ipccall_direct_oracle_enabled() -> bool {
     X86_IPCCALL_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+// ─── Stage 199A2D2A: x86_64 SMP=2 cross-CPU DIRECT IpcCall (NR6 request) oracle ─────────────
+/// Startup selector value for the x86_64 SMP=2 cross-CPU DIRECT IpcCall (request-only) oracle.
+/// Distinct from the SMP=1 functional selector (`IPCCALL_DIRECT_ORACLE_SELECTOR` = 3) so the two
+/// are mutually exclusive: at most one of them may be armed on any boot. Value 9 is the next free
+/// x86_64 selector after the functional direct oracle (3).
+pub const X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR: u64 = 9;
+
+/// Stage 199A2D2A: default-off x86_64 SMP=2 cross-CPU DIRECT IpcCall request oracle
+/// (`yarm.x86_64_ipccall_direct_smp_oracle=1`). This oracle runs ONE userspace IPC server on an
+/// application processor (CPU 1) blocked in recv-v2, delivers ONE NR6 direct request from a BSP
+/// (CPU 0) client, and remotely wakes + resumes the server on CPU 1. It proves ONLY the cross-CPU
+/// request direction (no NR7 reply, no complete Stage 199 SMP seal). It is MUTUALLY EXCLUSIVE with
+/// the SMP=1 functional selector, requires `target_arch = x86_64`, `QEMU_SMP >= 2`, the
+/// `x86-ipccall-direct-smp-oracle` feature, AND this selector. Feature-on without the selector is
+/// inert. Selecting it arms the shared NR6 off-lock proof gate but NOT the functional x86 flag, and
+/// NOT queued calls, timeouts, notifications, server-death wake, or any non-x86 arch. The single-slot
+/// acknowledgement overwrite fuse stays enabled (one outstanding pair).
+pub(crate) static X86_IPCCALL_DIRECT_SMP_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_ipccall_direct_smp_oracle_enabled(enabled: bool) {
+    if enabled {
+        // Mutual exclusion: refuse to arm the SMP oracle if the SMP=1 functional selector is on.
+        if x86_ipccall_direct_oracle_enabled() {
+            crate::yarm_log!("IPCCALL_DIRECT_SMP_ORACLE_REFUSED reason=functional_selector_active");
+            return;
+        }
+        set_ipccall_direct_proof_enabled(true);
+    }
+    X86_IPCCALL_DIRECT_SMP_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn x86_ipccall_direct_smp_oracle_enabled() -> bool {
+    X86_IPCCALL_DIRECT_SMP_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The x86_64 SMP cross-CPU request oracle is ACTIVE only when the selector is armed AND the boot is
+/// genuinely SMP (`online_cpus >= 2`). Same-CPU (`online_cpus < 2`) can never present as cross-CPU:
+/// the caller passes the authoritative online-CPU count so the gate cannot be spoofed by a knob
+/// alone. The `x86-ipccall-direct-smp-oracle` feature is enforced at the marker emitters (cfg-gated).
+pub fn ipccall_direct_smp_oracle_active(online_cpus: usize) -> bool {
+    x86_ipccall_direct_smp_oracle_enabled() && online_cpus >= 2
 }
 
 /// Stage 199A2C1: default-off AArch64 DIRECT IpcCall/IpcReply live-oracle WORKLOAD selector

@@ -386,6 +386,29 @@ impl KernelState {
         })
     }
 
+    /// Stage 199A2D2A: assign a task's authoritative HOME/target CPU. INTERNAL placement only — NOT
+    /// a public affinity syscall. Used by the x86_64 SMP cross-CPU request oracle to bind its server
+    /// task to CPU 1 before it blocks in recv-v2, so the accepted NR6 transaction's captured-affinity
+    /// enqueue (`sr_enqueue_committed_receiver_split`) places the woken server on CPU 1's run queue —
+    /// never migrating it to the BSP. `TaskMissing` for an unknown tid.
+    pub(crate) fn set_task_home_cpu(&mut self, tid: u64, cpu: CpuId) -> Result<(), KernelError> {
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.cpu_affinity = Some(cpu);
+            Ok(())
+        })
+    }
+
+    /// Stage 199A2D2A: read a task's assigned home CPU (the cross-CPU wake TARGET), or `None` if
+    /// unpinned. Proves the AP server retains its CPU-1 assignment across blocking.
+    pub(crate) fn task_home_cpu(&self, tid: u64) -> Option<CpuId> {
+        self.task_cpu_affinity(tid).ok().flatten()
+    }
+
     fn ensure_driver_affinity(&mut self, tid: u64) -> Result<(), KernelError> {
         if tid == 0 {
             return Ok(());

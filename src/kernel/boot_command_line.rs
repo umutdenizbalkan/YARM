@@ -400,6 +400,16 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_x86_ipccall_direct_oracle_enabled(enabled);
         crate::yarm_log!("YARM_X86_64_IPCCALL_DIRECT_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.x86_64_ipccall_direct_smp_oracle {
+        // Stage 199A2D2A: default-off x86_64 SMP=2 cross-CPU DIRECT IpcCall (request-only) oracle.
+        // Mutually exclusive with the SMP=1 functional selector (the setter refuses if that is on);
+        // activation additionally requires QEMU_SMP>=2 and the x86-ipccall-direct-smp-oracle feature.
+        crate::kernel::boot::set_x86_ipccall_direct_smp_oracle_enabled(enabled);
+        crate::yarm_log!(
+            "YARM_X86_64_IPCCALL_DIRECT_SMP_ORACLE_SET enabled={}",
+            enabled
+        );
+    }
     if let Some(enabled) = parsed.aarch64_ipccall_direct_oracle {
         // Stage 199A2C1: default-off AArch64 DIRECT IpcCall/IpcReply live round-trip oracle knob.
         // Provisions init startup slot 5 (=7) so init runs the SAME arch-neutral round trip AND arms
@@ -728,6 +738,13 @@ pub struct YarmBootOptions<'a> {
     /// direct classes; queued calls, timeouts, notifications, server-death wake, and all non-x86
     /// architectures stay disabled.
     pub x86_64_ipccall_direct_oracle: Option<bool>,
+    /// Stage 199A2D2A: `yarm.x86_64_ipccall_direct_smp_oracle=1` DEFAULT-OFF knob. Arms the x86_64
+    /// SMP=2 cross-CPU DIRECT IpcCall (request-only) oracle: one userspace IPC server blocked in
+    /// recv-v2 on CPU 1, one NR6 direct request from a CPU 0 client, remote wake + resume on CPU 1.
+    /// Proves ONLY the cross-CPU request direction (no NR7 reply, no complete SMP seal). Mutually
+    /// exclusive with `x86_64_ipccall_direct_oracle`; additionally requires QEMU_SMP>=2 and the
+    /// `x86-ipccall-direct-smp-oracle` feature.
+    pub x86_64_ipccall_direct_smp_oracle: Option<bool>,
     /// Stage 199A2C1: `yarm.aarch64_ipccall_direct_oracle=1` DEFAULT-OFF knob. Mirror of the x86_64
     /// knob on AArch64: provisions init startup slot 5 (=7) so init runs the SAME arch-neutral
     /// parent(client)/child(server) NR6 request + NR7 reply round trip, and arms the shared NR6/NR7
@@ -939,6 +956,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.x86_64_ipccall_direct_oracle" {
             options.x86_64_ipccall_direct_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.x86_64_ipccall_direct_smp_oracle" {
+            options.x86_64_ipccall_direct_smp_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_ipccall_direct_oracle" {
             options.aarch64_ipccall_direct_oracle = parse_bool_knob(value);

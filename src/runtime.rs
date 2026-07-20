@@ -3269,6 +3269,22 @@ impl SharedKernel {
         });
     }
 
+    /// Stage 199A2D2A: read the cross-CPU wake TARGET for the SMP request oracle — a blocked
+    /// server's authoritative home CPU (assigned via `set_task_home_cpu`). The accepted NR6
+    /// transaction enqueues the woken server on this CPU (its captured affinity), so the woken
+    /// server lands on its HOME run queue, never the enqueueing/BSP CPU. `None` when unpinned.
+    pub(crate) fn smp_request_wake_target_split_read(&self, tid: u64) -> Option<CpuId> {
+        self.with(|k| k.task_home_cpu(tid))
+    }
+
+    /// Stage 199A2D2A: assign a task's authoritative home CPU (internal placement only; not a
+    /// syscall). The x86_64 SMP cross-CPU request oracle binds its server to CPU 1 with this before
+    /// the server blocks in recv-v2, so the accepted NR6 transaction's affinity-targeted enqueue
+    /// remotely places the woken server on CPU 1's run queue.
+    pub(crate) fn smp_assign_task_home_cpu(&self, tid: u64, cpu: CpuId) -> bool {
+        self.with(|k| k.set_task_home_cpu(tid, cpu).is_ok())
+    }
+
     /// Origin-neutral finalize + wake for a shared-region delivery, entirely off-lock. For a blocked
     /// endpoint waiter (`snap.blocked_endpoint_waiter`) it runs the Stage 198E3B2B1 CLAIM-THEN-COMMIT
     /// protocol: Phase 1 prevalidate (rank 2, no mutation) → Phase 2 exact generation-bearing waiter
