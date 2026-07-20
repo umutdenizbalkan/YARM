@@ -78809,3 +78809,235 @@ mod stage199a2c2_riscv_guards {
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2C3 — Exact-Commit Three-Architecture DIRECT IpcCall/IpcReply matrix guards.
+// The live proof is the matrix seal (scripts/qemu-ipccall-reply-direct-matrix-seal.sh, which runs
+// all three per-arch smokes serially at one exact clean-tree commit). These hosted guards pin the
+// matrix runner's exact-commit/clean-tree discipline, serial one-shot invocation of each per-arch
+// smoke, the unique six-cell coordinate grid, the combined-seal authority (runner-only), and the
+// preserved invariants.
+mod stage199a2c3_matrix_guards {
+    use super::*;
+
+    const MATRIX_SRC: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-matrix-seal.sh");
+    const X86_SMOKE: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh");
+    const AARCH64_SMOKE: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-aarch64-smoke.sh");
+    const RISCV_SMOKE: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const COMBINED_SEAL_PREFIX: &str = "STAGE_199_IPCCALL_REPLY_DIRECT_MATRIX_SEAL";
+
+    // (all three per-arch scripts exist and are invoked exactly once, serially)
+    #[test]
+    fn matrix_invokes_each_script_once_serially() {
+        // All three per-arch scripts exist (include_str! above would fail to compile otherwise).
+        assert!(X86_SMOKE.contains("STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=x86_64"));
+        assert!(AARCH64_SMOKE.contains("STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=aarch64"));
+        assert!(RISCV_SMOKE.contains("STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=riscv64"));
+        // The matrix names each smoke exactly once (one serial invocation per arch via the loop).
+        for s in [
+            "scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh",
+            "scripts/qemu-ipccall-reply-direct-aarch64-smoke.sh",
+            "scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh",
+        ] {
+            assert_eq!(
+                MATRIX_SRC.matches(s).count(),
+                1,
+                "the matrix must reference each per-arch smoke exactly once: {s}"
+            );
+        }
+        // The arches run serially in a single loop (not backgrounded).
+        assert!(MATRIX_SRC.contains("for arch in \"${ARCHES[@]}\""));
+        assert!(
+            !MATRIX_SRC.contains("bash \"$smoke\" &"),
+            "smokes must run serially, not backgrounded"
+        );
+    }
+
+    // (exact-commit + clean-tree discipline) The runner captures the SHA + porcelain, requires a
+    // clean tree, and re-verifies after each child (commit mismatch / dirty tree / stale log fail).
+    #[test]
+    fn matrix_enforces_exact_commit_and_clean_tree() {
+        assert!(MATRIX_SRC.contains("git rev-parse HEAD"));
+        assert!(MATRIX_SRC.contains("git status --porcelain"));
+        assert!(
+            MATRIX_SRC.contains("dirty tracked tree at start")
+                && MATRIX_SRC.contains("reason=dirty_tree"),
+            "a dirty tree must fail the matrix"
+        );
+        assert!(
+            MATRIX_SRC.contains("commit_changed_") && MATRIX_SRC.contains("verify_clean_still"),
+            "a commit change mid-run must fail the matrix"
+        );
+        // Fresh-log discipline: clear each log dir + require the boot log to post-date matrix start.
+        assert!(MATRIX_SRC.contains("rm -rf \"$bootdir\""));
+        assert!(
+            MATRIX_SRC.contains("MATRIX_START=$(date +%s)")
+                && MATRIX_SRC.contains("stale_boot_log"),
+            "an old (pre-matrix-start) boot log must fail the matrix"
+        );
+    }
+
+    // (per-arch seal exactly once + cell evidence) The runner requires exactly one per-arch seal and
+    // the four class-evidence markers + userspace completion per arch.
+    #[test]
+    fn matrix_requires_one_seal_and_cell_evidence_per_arch() {
+        // The runner requires the exact per-arch live seal (parameterized on ${arch}) exactly once.
+        assert!(MATRIX_SRC.contains(
+            "STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=${arch} classes=2 live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok"
+        ));
+        // Class evidence (both classes) + the two kernel attestations required per arch.
+        assert!(MATRIX_SRC.contains(
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcCallDirectRequest result=ok"
+        ));
+        assert!(
+            MATRIX_SRC.contains(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcReplyDirect result=ok"
+            )
+        );
+        assert!(MATRIX_SRC.contains("IPCCALL_DIRECT_REQUEST_OK arch=${arch} source_copy_offlock=1 reply_cap=1 server_wakes=1"));
+        assert!(MATRIX_SRC.contains(
+            "IPCREPLY_DIRECT_OK arch=${arch} source_copy_offlock=1 caller_wakes=1 one_shot=1"
+        ));
+        // Userspace completion with the exact per-cell counts (built from the arch's prefix).
+        assert!(MATRIX_SRC.contains("request_ok=1 reply_ok=1 duplicate_reply=rejected server_wakes=1 caller_wakes=1 client_continuations=1 server_continuations=1 result=ok"));
+        // A duplicate/missing per-arch seal or missing cell evidence fails (count != 1 die codes).
+        assert!(MATRIX_SRC.contains("seal_count_"));
+        assert!(MATRIX_SRC.contains("class_evidence_count_"));
+        assert!(MATRIX_SRC.contains("userspace_completion_count_"));
+    }
+
+    // (the six cell coordinates are unique) 2 classes × 3 arches = 6 distinct (arch, class) cells.
+    #[test]
+    fn six_cell_coordinates_are_unique() {
+        use std::collections::BTreeSet;
+        let mut cells = BTreeSet::new();
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            for class in ["IpcCallDirectRequest", "IpcReplyDirect"] {
+                assert!(cells.insert((arch, class)), "duplicate cell coordinate");
+            }
+        }
+        assert_eq!(
+            cells.len(),
+            6,
+            "the matrix is exactly six unique live cells"
+        );
+        // Each arch has exactly one IPCCALL_DIRECT_ORACLE_ARCH attribution.
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert_eq!(
+                MOD_SRC
+                    .matches(&format!(
+                        "pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = \"{arch}\";"
+                    ))
+                    .count(),
+                1,
+                "exactly one {arch} arch attribution"
+            );
+        }
+    }
+
+    // (combined-seal authority) ONLY the matrix runner emits the combined seal; no per-arch smoke and
+    // no userspace source emits the combined-seal prefix.
+    #[test]
+    fn combined_seal_is_runner_only() {
+        assert!(
+            MATRIX_SRC.contains(COMBINED_SEAL_PREFIX),
+            "the matrix runner emits the combined seal"
+        );
+        // Emitted only after all three PASS (guarded by the final verify + the per-arch die()s).
+        assert!(MATRIX_SRC.contains("all three architectures PASS at exact commit"));
+        for (name, src) in [
+            ("x86 smoke", X86_SMOKE),
+            ("aarch64 smoke", AARCH64_SMOKE),
+            ("riscv smoke", RISCV_SMOKE),
+            ("userspace init", INIT_SRC),
+        ] {
+            assert!(
+                !src.contains(COMBINED_SEAL_PREFIX),
+                "{name} must NOT emit the combined matrix seal (runner-only authority)"
+            );
+        }
+    }
+
+    // (feature-off marker cleanliness enforced by each child) Every per-arch smoke builds a
+    // feature-OFF kernel and asserts it is marker-clean.
+    #[test]
+    fn each_smoke_enforces_feature_off_marker_clean() {
+        for (name, src) in [
+            ("x86", X86_SMOKE),
+            ("aarch64", AARCH64_SMOKE),
+            ("riscv", RISCV_SMOKE),
+        ] {
+            assert!(
+                src.contains("feature-OFF kernel unexpectedly contains a direct class literal"),
+                "{name} smoke must assert a feature-off marker-clean kernel"
+            );
+        }
+    }
+
+    // (shared implementation integrity) Exactly one of each transaction / core / payload definition.
+    #[test]
+    fn shared_implementation_is_single_source() {
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        assert_eq!(
+            TXN_SRC.matches("fn ipc_call_direct_request_txn").count(),
+            1,
+            "one NR6 request transaction implementation"
+        );
+        assert_eq!(
+            TXN_SRC.matches("fn ipc_reply_direct_txn").count(),
+            1,
+            "one NR7 reply transaction implementation"
+        );
+        assert_eq!(
+            INIT_SRC.matches("mod ipccall_direct_oracle_core").count(),
+            1,
+            "one arch-neutral oracle core"
+        );
+        assert_eq!(
+            INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(),
+            1,
+            "one request payload definition"
+        );
+        assert_eq!(
+            INIT_SRC.matches("const REPLY_DATA: [u8; 8]").count(),
+            1,
+            "one reply payload definition"
+        );
+    }
+
+    // (reachability guards remain) NR6/NR7 are admitted through the split whitelist only while the
+    // direct oracle gate is armed — on all three real trap routes.
+    #[test]
+    fn split_reachability_guards_remain() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+        const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        // Shared whitelist reachability guard (x86_64 + AArch64 via the shared entry).
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+        assert!(SPLIT_SRC.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"));
+        // AArch64 import + RISC-V trap both gate NR6/NR7 on the direct proof gate.
+        assert!(TRAP_ENTRY_SRC.contains("ipccall_direct_proof_enabled()"));
+        assert!(RISCV_TRAP_SRC.contains("|| is_ipc_direct"));
+    }
+
+    // (preservation) Stage 198F 10 classes / 30 cells + ABI + reply-cap queueing policy preserved,
+    // and the excluded features remain unretired.
+    #[test]
+    fn stage198f_and_exclusions_preserved() {
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+    }
+}
