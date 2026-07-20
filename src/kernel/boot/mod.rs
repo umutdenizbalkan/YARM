@@ -3318,6 +3318,17 @@ pub(crate) fn emit_ipcreply_direct_live_markers() {}
 /// store with a monotonic `commit_seq` and an atomic CLAIMED guard so a duplicate
 /// trap/drain cannot claim the same acknowledgement twice; `restore` re-arms it only
 /// for a retryable rollback of the exact same publication.
+///
+/// # Concurrency classification (Stage 199A2D1)
+/// This is ORACLE-ONLY, SINGLE-OUTSTANDING-PAIR proof infrastructure — NOT a general
+/// production concurrency store. It correctly hands ONE committed acknowledgement across
+/// CPUs (Release publication → Acquire/AcqRel claim), but it holds exactly ONE slot: a
+/// SECOND simultaneous oracle pair would overwrite (or steal) the active unclaimed
+/// acknowledgement. Endpoint confinement + the single provisioning slot already keep the
+/// system to one pair; on a REAL boot the fail-closed overwrite fuse below additionally
+/// REFUSES to overwrite an active (VALID && !CLAIMED) acknowledgement and marks the fuse.
+/// Multi-pair production concurrency would require replacing this slot with an
+/// endpoint-indexed, generation-bearing bounded store (see the Stage 199A2D1 report).
 pub mod ipccall_direct_ack {
     use crate::kernel::boot::ReceiverWaiterIdentity;
     use crate::kernel::ipc::ThreadId;
@@ -3327,6 +3338,9 @@ pub mod ipccall_direct_ack {
 
     static VALID: AtomicBool = AtomicBool::new(false);
     static CLAIMED: AtomicBool = AtomicBool::new(false);
+    /// Fail-closed fuse: counts refused overwrites of an ACTIVE (VALID && !CLAIMED) ack — a
+    /// second-simultaneous-pair condition. Must be 0 in the sealed single-pair oracle boot.
+    static OVERWRITE_FUSE: AtomicU64 = AtomicU64::new(0);
     static SEQ: AtomicU64 = AtomicU64::new(0);
     static SERVER_TID: AtomicU64 = AtomicU64::new(0);
     static SERVER_ASID: AtomicU16 = AtomicU16::new(0);
@@ -3341,6 +3355,13 @@ pub mod ipccall_direct_ack {
     pub fn reset() {
         VALID.store(false, Ordering::Release);
         CLAIMED.store(false, Ordering::Release);
+        OVERWRITE_FUSE.store(0, Ordering::Release);
+    }
+
+    /// Count of refused overwrites of an active acknowledgement (a second-pair fuse trip).
+    /// Must be 0 in the sealed single-pair oracle boot.
+    pub fn overwrite_fuse_count() -> u64 {
+        OVERWRITE_FUSE.load(Ordering::Acquire)
     }
 
     fn next_seq() -> u64 {
@@ -3350,7 +3371,20 @@ pub mod ipccall_direct_ack {
 
     /// Publish the ack (fields first, `VALID` released last). Clears the claim so a
     /// fresh publication is independently claimable exactly once. Returns the seq.
+    ///
+    /// Stage 199A2D1 fail-closed overwrite fuse (REAL builds only): refuse to overwrite an
+    /// ACTIVE (VALID && !CLAIMED) acknowledgement — that is a second-simultaneous-pair
+    /// condition this single-slot store does not support. The active ack is preserved and the
+    /// fuse is marked. Never trips in the sealed one-pair flow (the slot is published exactly
+    /// once, from VALID=false, then claimed). Hosted builds keep last-writer-wins so the
+    /// wiring-test fixtures (which share these process-global statics) are unaffected.
     pub(crate) fn publish(ack: BlockedServerAck) -> u64 {
+        #[cfg(not(feature = "hosted-dev"))]
+        if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {
+            OVERWRITE_FUSE.fetch_add(1, Ordering::Relaxed);
+            crate::yarm_log!("IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server");
+            return SEQ.load(Ordering::Relaxed);
+        }
         let seq = next_seq();
         SERVER_TID.store(ack.server.tid.0, Ordering::Relaxed);
         SERVER_ASID.store(ack.server.asid.0, Ordering::Relaxed);
@@ -3482,6 +3516,17 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
 /// Stage 199A2B3: single-slot committed blocked-CALLER acknowledgement for the NR7
 /// direct reply transaction. Mirrors [`ipccall_direct_ack`] with the same claim/restore
 /// lifecycle (an atomic CLAIMED guard so a duplicate reply drain cannot claim twice).
+///
+/// # Concurrency classification (Stage 199A2D1)
+/// This is ORACLE-ONLY, SINGLE-OUTSTANDING-PAIR proof infrastructure — NOT a general
+/// production concurrency store. It correctly hands ONE committed acknowledgement across
+/// CPUs (Release publication → Acquire/AcqRel claim), but it holds exactly ONE slot: a
+/// SECOND simultaneous oracle pair would overwrite (or steal) the active unclaimed
+/// acknowledgement. Endpoint confinement + the single provisioning slot already keep the
+/// system to one pair; on a REAL boot the fail-closed overwrite fuse below additionally
+/// REFUSES to overwrite an active (VALID && !CLAIMED) acknowledgement and marks the fuse.
+/// Multi-pair production concurrency would require replacing this slot with an
+/// endpoint-indexed, generation-bearing bounded store (see the Stage 199A2D1 report).
 pub mod ipcreply_direct_ack {
     use crate::kernel::boot::ReceiverWaiterIdentity;
     use crate::kernel::ipc::ThreadId;
@@ -3491,6 +3536,9 @@ pub mod ipcreply_direct_ack {
 
     static VALID: AtomicBool = AtomicBool::new(false);
     static CLAIMED: AtomicBool = AtomicBool::new(false);
+    /// Fail-closed fuse: counts refused overwrites of an ACTIVE (VALID && !CLAIMED) ack — a
+    /// second-simultaneous-pair condition. Must be 0 in the sealed single-pair oracle boot.
+    static OVERWRITE_FUSE: AtomicU64 = AtomicU64::new(0);
     static SEQ: AtomicU64 = AtomicU64::new(0);
     static CALLER_TID: AtomicU64 = AtomicU64::new(0);
     static CALLER_ASID: AtomicU16 = AtomicU16::new(0);
@@ -3504,6 +3552,13 @@ pub mod ipcreply_direct_ack {
     pub fn reset() {
         VALID.store(false, Ordering::Release);
         CLAIMED.store(false, Ordering::Release);
+        OVERWRITE_FUSE.store(0, Ordering::Release);
+    }
+
+    /// Count of refused overwrites of an active acknowledgement (a second-pair fuse trip).
+    /// Must be 0 in the sealed single-pair oracle boot.
+    pub fn overwrite_fuse_count() -> u64 {
+        OVERWRITE_FUSE.load(Ordering::Acquire)
     }
 
     fn next_seq() -> u64 {
@@ -3511,7 +3566,18 @@ pub mod ipcreply_direct_ack {
         NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Publish the ack (fields first, `VALID` released last). Stage 199A2D1 fail-closed
+    /// overwrite fuse (REAL builds only): refuse to overwrite an ACTIVE (VALID && !CLAIMED)
+    /// acknowledgement — a second-simultaneous-pair condition this single-slot store does not
+    /// support. The active ack is preserved and the fuse is marked. Never trips in the sealed
+    /// one-pair flow. Hosted builds keep last-writer-wins for the wiring-test fixtures.
     pub(crate) fn publish(ack: BlockedCallerAck) -> u64 {
+        #[cfg(not(feature = "hosted-dev"))]
+        if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {
+            OVERWRITE_FUSE.fetch_add(1, Ordering::Relaxed);
+            crate::yarm_log!("IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE slot=caller");
+            return SEQ.load(Ordering::Relaxed);
+        }
         let seq = next_seq();
         CALLER_TID.store(ack.caller.tid.0, Ordering::Relaxed);
         CALLER_ASID.store(ack.caller.asid.0, Ordering::Relaxed);
