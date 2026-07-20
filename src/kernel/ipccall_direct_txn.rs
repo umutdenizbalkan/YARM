@@ -336,3 +336,238 @@ impl SharedKernel {
         }
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Stage 199A2B3 — the composed OFF-LOCK NR7 `IpcReplyDirect` transaction.
+// ═════════════════════════════════════════════════════════════════════════════
+
+use crate::kernel::ipccall_direct::{BlockedCallerAck, IpcReplyDirectSnapshot};
+
+/// Success payload of a committed direct reply transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IpcReplyDirectSuccess {
+    pub(crate) record_index: usize,
+    pub(crate) record_generation: u64,
+}
+
+/// Failure classification for the NR7 direct reply. Every variant leaves the caller
+/// blocked, no duplicate wake, and either restores the acknowledgement (exact caller
+/// retryable) or discards it (stale authority).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IpcReplyDirectError {
+    /// No committed caller acknowledgement — canonical `WouldBlock`, no mutation.
+    WouldBlock,
+    /// The reply cap did not resolve to a live `Reply` object.
+    ReplyCapResolve(KernelError),
+    /// The reservation precondition failed (generation mismatch, wrong bound replier,
+    /// a non-`Available` / aliased record, or a reservation-precondition violation).
+    ReservePreconditionFailed,
+    /// The exact caller reply-endpoint waiter was changed/missing.
+    WaiterLost,
+    /// The caller exited / was replaced (before or after the claim).
+    CallerGone,
+    /// The reply payload copy to the caller faulted.
+    PayloadCopyFault,
+    /// The recv-v2 metadata copy to the caller faulted.
+    MetaCopyFault,
+    /// The one-shot record consume unexpectedly failed (defensive; unreachable for an
+    /// owned reservation).
+    RecordConsumeFailed,
+    /// The lease was not `ClaimedByWork` by this work item (duplicate/aliased drain).
+    LeaseNotClaimed,
+}
+
+/// Bounded, owned NR7 reply post-work item (Stage 199A2B3). Owned data only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DirectReplyPostWork {
+    pub(crate) snapshot: IpcReplyDirectSnapshot,
+    pub(crate) ack: BlockedCallerAck,
+    pub(crate) ack_seq: u64,
+}
+
+impl SharedKernel {
+    /// True iff the EXACT caller is still committed-blocked on its reply endpoint with
+    /// the intact waiter identity + generation — the sole condition under which a
+    /// caller-copy-fault rollback may restore usable reply authority + the ack.
+    fn direct_caller_exact_still_blocked(&self, ack: &BlockedCallerAck) -> bool {
+        self.sr_prevalidate_blocked_receiver_split(ack.caller.tid.0, ack.caller.asid)
+            && self.endpoint_waiter_is_split_read(
+                ack.endpoint_index,
+                ack.endpoint_generation,
+                ack.caller,
+            )
+    }
+
+    /// Run the composed off-lock NR7 direct reply transaction. `lease` must already be
+    /// `ClaimedByWork { commit_seq: lease_commit_seq }`. Source payload was copied at
+    /// trap entry (into `snapshot`) BEFORE any record claim. On success the record is
+    /// `Consumed` (the one-shot barrier), the caller is enqueued exactly once, and the
+    /// lease is consumed; on failure the reservation + lease are settled by the
+    /// exact-caller policy.
+    pub(crate) fn ipc_reply_direct_txn(
+        &self,
+        snapshot: &IpcReplyDirectSnapshot,
+        ack: &BlockedCallerAck,
+        lease: &mut AckLease,
+        lease_commit_seq: u64,
+    ) -> Result<IpcReplyDirectSuccess, IpcReplyDirectError> {
+        // (0) committed ack, else non-mutating WouldBlock (no lease touch).
+        if !ack.is_committed() {
+            return Err(IpcReplyDirectError::WouldBlock);
+        }
+        if !matches!(lease, AckLease::ClaimedByWork { commit_seq } if *commit_seq == lease_commit_seq)
+        {
+            return Err(IpcReplyDirectError::LeaseNotClaimed);
+        }
+
+        // (1) resolve the reply object {index, generation} the replier's cap names.
+        let (idx, rgen) =
+            match self.resolve_reply_cap_split_read(snapshot.replier.tid.0, snapshot.reply_cap) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.settle_reply_pre_reserve(ack, lease, lease_commit_seq);
+                    return Err(IpcReplyDirectError::ReplyCapResolve(e));
+                }
+            };
+
+        // (2) require the exact caller reply-endpoint waiter (fast pre-check).
+        if !self.endpoint_waiter_is_split_read(
+            ack.endpoint_index,
+            ack.endpoint_generation,
+            ack.caller,
+        ) {
+            self.settle_reply_pre_reserve(ack, lease, lease_commit_seq);
+            return Err(IpcReplyDirectError::WaiterLost);
+        }
+
+        // (3) reserve the EXISTING record Available→Reserved (bound replier + exact
+        // generation enforced). The source payload is ALREADY owned in `snapshot`, so
+        // the claim happens strictly AFTER the source copy. An alias / non-Available /
+        // wrong-replier record fails here.
+        if !self.reserve_existing_reply_record_split(idx, rgen, snapshot.replier) {
+            self.settle_reply_pre_reserve(ack, lease, lease_commit_seq);
+            return Err(IpcReplyDirectError::ReservePreconditionFailed);
+        }
+
+        // (4) copy the owned reply payload + recv-v2 metadata to the caller OFF-LOCK.
+        let caller_asid_raw = ack.caller.asid.0 as u64;
+        if self
+            .copy_slice_to_user_asid_split_write(
+                caller_asid_raw,
+                ack.payload_user_ptr,
+                snapshot.payload(),
+            )
+            .is_err()
+        {
+            self.settle_reply_after_reserve(ack, idx, rgen, lease, lease_commit_seq);
+            return Err(IpcReplyDirectError::PayloadCopyFault);
+        }
+        let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
+            0,
+            crate::kernel::syscall::OPCODE_INLINE,
+            0,
+            snapshot.payload_len as u32,
+            0,
+            0,
+            snapshot.replier.tid.0,
+        );
+        if self
+            .copy_slice_to_user_asid_split_write(caller_asid_raw, ack.meta_user_ptr, &meta)
+            .is_err()
+        {
+            self.settle_reply_after_reserve(ack, idx, rgen, lease, lease_commit_seq);
+            return Err(IpcReplyDirectError::MetaCopyFault);
+        }
+
+        // (5) atomically claim the EXACT caller waiter (remove once).
+        let claim = match self.sr_claim_endpoint_waiter_split(
+            ack.endpoint_index,
+            ack.endpoint_generation,
+            ack.caller,
+        ) {
+            Some(c) => c,
+            None => {
+                self.settle_reply_after_reserve(ack, idx, rgen, lease, lease_commit_seq);
+                return Err(IpcReplyDirectError::WaiterLost);
+            }
+        };
+
+        // (6) commit the blocked caller (Runnable + wake plan) strictly after the claim.
+        match self.sr_commit_blocked_receiver_split(ack.caller.tid.0, ack.caller.asid) {
+            ReceiverCommit::Committed(affinity) => {
+                // (7) record Reserved → Consumed — the authoritative one-shot barrier,
+                // BEFORE the rank-1 enqueue. Infallible for our exact reservation.
+                if !self.consume_reply_record_split(idx, rgen) {
+                    // Defensive/unreachable: caller Runnable but not enqueued (cannot
+                    // dispatch). Discard record + ack; zero wake.
+                    let _ = self.discard_reply_record_split(idx, rgen);
+                    lease.discard();
+                    return Err(IpcReplyDirectError::RecordConsumeFailed);
+                }
+                // (8) enqueue the caller LAST — the single, non-fallible wake.
+                self.sr_enqueue_committed_receiver_split(ack.caller.tid.0, affinity);
+                let _ = lease.consume(lease_commit_seq);
+                Ok(IpcReplyDirectSuccess {
+                    record_index: idx,
+                    record_generation: rgen,
+                })
+            }
+            // Caller exited / replaced after the claim: the claimed waiter belonged to
+            // the vanished incarnation — do NOT restore it. Consume the record (barrier),
+            // discard the ack; zero wake.
+            ReceiverCommit::GoneDead | ReceiverCommit::Replaced => {
+                let _ = claim;
+                let _ = self.discard_reply_record_split(idx, rgen);
+                lease.discard();
+                Err(IpcReplyDirectError::CallerGone)
+            }
+        }
+    }
+
+    /// Settle after a PRE-reservation failure (no record reserved): restore the ack
+    /// only when the exact caller remains retryable, else discard.
+    fn settle_reply_pre_reserve(&self, ack: &BlockedCallerAck, lease: &mut AckLease, seq: u64) {
+        if self.direct_caller_exact_still_blocked(ack) {
+            let _ = lease.restore(seq);
+        } else {
+            lease.discard();
+        }
+    }
+
+    /// Settle after the record is `Reserved` (caller-copy fault / waiter lost): for an
+    /// exact still-blocked caller, `Reserved → Available` (reply authority stays usable)
+    /// and restore the ack; for stale authority, `Reserved → Consumed` (permanently
+    /// non-invokable) and discard the ack. Zero wake in both cases.
+    fn settle_reply_after_reserve(
+        &self,
+        ack: &BlockedCallerAck,
+        idx: usize,
+        rgen: u64,
+        lease: &mut AckLease,
+        seq: u64,
+    ) {
+        if self.direct_caller_exact_still_blocked(ack) {
+            let _ = self.release_reply_record_split(idx, rgen);
+            let _ = lease.restore(seq);
+        } else {
+            let _ = self.discard_reply_record_split(idx, rgen);
+            lease.discard();
+        }
+    }
+
+    /// Drain one owned NR7 reply post-work item post-lock: run the transaction, then
+    /// reconcile the published caller-ack claim with the in-transaction lease (retryable
+    /// rollback re-arms the ack; success/stale-discard leaves it claimed).
+    pub(crate) fn drain_direct_reply_post_work(
+        &self,
+        work: &DirectReplyPostWork,
+    ) -> Result<IpcReplyDirectSuccess, IpcReplyDirectError> {
+        let mut lease = AckLease::new_available();
+        let _ = lease.claim(work.ack_seq);
+        let result = self.ipc_reply_direct_txn(&work.snapshot, &work.ack, &mut lease, work.ack_seq);
+        if lease.is_available() {
+            crate::kernel::boot::ipcreply_direct_ack::restore(work.ack_seq);
+        }
+        result
+    }
+}

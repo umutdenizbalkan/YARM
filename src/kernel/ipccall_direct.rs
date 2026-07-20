@@ -312,6 +312,39 @@ impl BlockedServerAck {
     }
 }
 
+/// Authoritative committed blocked-CALLER acknowledgement for the NR7 direct reply
+/// transaction (Stage 199A2B3, Part 2). Structurally identical to [`BlockedServerAck`]
+/// but names the CALLER blocked recv-v2 on its REPLY endpoint. Produced ONLY after the
+/// caller's blocked recv-v2 state is fully committed; carries the caller's
+/// generation-bearing identity, the reply endpoint index+generation (the exact-waiter
+/// claim authority), and the caller-side payload/metadata destinations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockedCallerAck {
+    /// Generation-bearing caller (blocked requester awaiting the reply) identity.
+    pub(crate) caller: ReceiverWaiterIdentity,
+    /// Reply endpoint slot index whose waiter is the caller.
+    pub(crate) endpoint_index: usize,
+    /// Reply endpoint generation at acknowledgement time (exact-waiter authority).
+    pub(crate) endpoint_generation: u64,
+    /// The caller's blocked receive is a committed RecvV2 operation.
+    pub(crate) recv_v2_committed: bool,
+    /// Caller userspace destination for the reply payload.
+    pub(crate) payload_user_ptr: usize,
+    /// Caller userspace payload destination length bound.
+    pub(crate) payload_user_len: usize,
+    /// Caller userspace destination for the recv-v2 metadata.
+    pub(crate) meta_user_ptr: usize,
+    /// Caller userspace metadata destination length bound.
+    pub(crate) meta_user_len: usize,
+}
+
+impl BlockedCallerAck {
+    /// Well-formed for a direct reply: committed RecvV2 with a payload destination.
+    pub(crate) const fn is_committed(&self) -> bool {
+        self.recv_v2_committed && self.payload_user_ptr != 0
+    }
+}
+
 /// Outcome of an [`AckLease`] transition. Every error is a fail-closed rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AckLeaseError {

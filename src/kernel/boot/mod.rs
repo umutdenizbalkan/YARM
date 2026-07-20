@@ -3248,6 +3248,143 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
     let _seq = ipccall_direct_ack::publish(ack);
 }
 
+/// Stage 199A2B3: single-slot committed blocked-CALLER acknowledgement for the NR7
+/// direct reply transaction. Mirrors [`ipccall_direct_ack`] with the same claim/restore
+/// lifecycle (an atomic CLAIMED guard so a duplicate reply drain cannot claim twice).
+pub mod ipcreply_direct_ack {
+    use crate::kernel::boot::ReceiverWaiterIdentity;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::ipccall_direct::BlockedCallerAck;
+    use crate::kernel::vm::Asid;
+    use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+
+    static VALID: AtomicBool = AtomicBool::new(false);
+    static CLAIMED: AtomicBool = AtomicBool::new(false);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static CALLER_TID: AtomicU64 = AtomicU64::new(0);
+    static CALLER_ASID: AtomicU16 = AtomicU16::new(0);
+    static EP_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static EP_GEN: AtomicU64 = AtomicU64::new(0);
+    static PAYLOAD_PTR: AtomicUsize = AtomicUsize::new(0);
+    static PAYLOAD_LEN: AtomicUsize = AtomicUsize::new(0);
+    static META_PTR: AtomicUsize = AtomicUsize::new(0);
+    static META_LEN: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        VALID.store(false, Ordering::Release);
+        CLAIMED.store(false, Ordering::Release);
+    }
+
+    fn next_seq() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn publish(ack: BlockedCallerAck) -> u64 {
+        let seq = next_seq();
+        CALLER_TID.store(ack.caller.tid.0, Ordering::Relaxed);
+        CALLER_ASID.store(ack.caller.asid.0, Ordering::Relaxed);
+        EP_IDX.store(ack.endpoint_index, Ordering::Relaxed);
+        EP_GEN.store(ack.endpoint_generation, Ordering::Relaxed);
+        PAYLOAD_PTR.store(ack.payload_user_ptr, Ordering::Relaxed);
+        PAYLOAD_LEN.store(ack.payload_user_len, Ordering::Relaxed);
+        META_PTR.store(ack.meta_user_ptr, Ordering::Relaxed);
+        META_LEN.store(ack.meta_user_len, Ordering::Relaxed);
+        SEQ.store(seq, Ordering::Relaxed);
+        CLAIMED.store(false, Ordering::Relaxed);
+        VALID.store(true, Ordering::Release);
+        seq
+    }
+
+    pub fn snapshot() -> Option<BlockedCallerAck> {
+        if !VALID.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(BlockedCallerAck {
+            caller: ReceiverWaiterIdentity::new(
+                ThreadId(CALLER_TID.load(Ordering::Relaxed)),
+                Asid(CALLER_ASID.load(Ordering::Relaxed)),
+            ),
+            endpoint_index: EP_IDX.load(Ordering::Relaxed),
+            endpoint_generation: EP_GEN.load(Ordering::Relaxed),
+            recv_v2_committed: true,
+            payload_user_ptr: PAYLOAD_PTR.load(Ordering::Relaxed),
+            payload_user_len: PAYLOAD_LEN.load(Ordering::Relaxed),
+            meta_user_ptr: META_PTR.load(Ordering::Relaxed),
+            meta_user_len: META_LEN.load(Ordering::Relaxed),
+        })
+    }
+
+    pub fn claim() -> Option<(BlockedCallerAck, u64)> {
+        let ack = snapshot()?;
+        if CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        Some((ack, SEQ.load(Ordering::Relaxed)))
+    }
+
+    pub fn restore(seq: u64) -> bool {
+        if SEQ.load(Ordering::Relaxed) == seq && VALID.load(Ordering::Acquire) {
+            CLAIMED.store(false, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_claimable() -> bool {
+        VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire)
+    }
+}
+
+/// Publish the NR7 committed blocked-CALLER acknowledgement from the recv-v2 commit
+/// point (the caller blocking on its reply endpoint) — proof-gated, and only when the
+/// FULLY-committed identity exists. No wake / mint / copy / scheduler mutation /
+/// retirement marker; a strict no-op off the gate or on any partial/stale state.
+pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
+    kernel: &KernelState,
+    receiver_tid: u64,
+    endpoint: crate::kernel::capabilities::CapObject,
+    state: &crate::kernel::task::BlockedRecvState,
+) {
+    use crate::kernel::capabilities::CapObject;
+    if !ipccall_direct_proof_enabled() {
+        return;
+    }
+    let CapObject::Endpoint { index, generation } = endpoint else {
+        return;
+    };
+    if state.recv_abi != crate::kernel::task::RecvAbiVariant::RecvV2
+        || state.payload_user_ptr == 0
+        || state.meta_user_ptr == 0
+    {
+        return;
+    }
+    let Some(asid) = kernel.task_asid(receiver_tid) else {
+        return;
+    };
+    let caller = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
+    // Re-read the endpoint waiter identity under the IPC lock immediately before publish.
+    let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
+    if waiter != Some(caller) {
+        return;
+    }
+    let ack = crate::kernel::ipccall_direct::BlockedCallerAck {
+        caller,
+        endpoint_index: index,
+        endpoint_generation: generation,
+        recv_v2_committed: true,
+        payload_user_ptr: state.payload_user_ptr,
+        payload_user_len: state.payload_user_len,
+        meta_user_ptr: state.meta_user_ptr,
+        meta_user_len: state.meta_user_len,
+    };
+    let _seq = ipcreply_direct_ack::publish(ack);
+}
+
 // ─── Stage 197A-C: mandatory init ELF loading (no synthetic fallback) ──────────────────
 //
 // Why an init load can be fatal. There is NO synthetic/placeholder init ELF fallback anymore

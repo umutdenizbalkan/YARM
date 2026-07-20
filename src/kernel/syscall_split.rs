@@ -293,6 +293,18 @@ pub(crate) fn try_split_dispatch_into_frame(
         }
     }
 
+    // Stage 199A2B3 (proof-gated, default-OFF): IpcReply (NR 7) direct reply. Only
+    // attempted when the internal proof gate is armed; the helper snapshots the reply
+    // payload off-lock (owned) and drives the accepted off-lock reply transaction
+    // (reserve → caller-copy → exact-waiter claim → record Consumed → single enqueue).
+    // Off the gate — or for any case it cannot service — it returns `None`, so NR 7
+    // stays on its existing global-lock path.
+    if matches!(syscall, Syscall::IpcReply) && crate::kernel::boot::ipccall_direct_proof_enabled() {
+        if let Some(result) = try_split_ipcreply_direct_into_frame(shared, cpu, frame) {
+            return Some(result);
+        }
+    }
+
     // The requester TID is what the global-lock handler reads via
     // `current_tid(kernel)` (i.e. `kernel.current_tid()`).
     //
@@ -627,6 +639,66 @@ fn try_split_ipccall_direct_into_frame(
 ) -> Option<Result<(), TrapHandleError>> {
     // Hosted: the off-lock user-read seam uses the direct map (real targets only). The
     // drain + transaction are exercised directly by the stage199a2b2f hosted tests.
+    None
+}
+
+/// Stage 199A2B3 (proof-gated, default-OFF): intercept `IpcReply` (NR 7) BEFORE the
+/// broad `KernelState` lock and drive the accepted off-lock direct-reply transaction.
+///
+/// Part 1 — owned pre-lock reply snapshot. Order:
+///   read args → capture replier `{tid,asid}` → validate `len<=128` → copy the reply
+///   payload through `copy_from_user_asid_split_read` (NO lock held) → build the owned
+///   `IpcReplyDirectSnapshot` → CLAIM the exact published blocked-caller acknowledgement
+///   → build one owned `DirectReplyPostWork` → drain it through the accepted
+///   `SharedKernel::ipc_reply_direct_txn`. No userspace payload pointer survives the
+///   snapshot. On invalid length / copy fault / no committed ack, returns `None` (the
+///   ack is never claimed, nothing is mutated) so NR7 stays on its existing path.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_ipcreply_direct_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipccall_direct::{IPC_DIRECT_PAYLOAD_MAX, IpcReplyDirectSnapshot};
+    use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
+    // NR7 ABI: arg(CAP)=reply cap, arg(PTR)=payload ptr, arg(LEN)=len.
+    let reply_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let user_ptr = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    if len > IPC_DIRECT_PAYLOAD_MAX {
+        return None; // invalid length: no ack claim, no mutation — legacy path
+    }
+    let tid = shared.current_tid_authoritative(cpu)?;
+    let asid_raw = shared.task_asid_for_tid_split_read(tid);
+    let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(
+        crate::kernel::ipc::ThreadId(tid),
+        crate::kernel::vm::Asid(asid_raw as u16),
+    );
+    // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing.
+    let payload = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len)?;
+    let snapshot = IpcReplyDirectSnapshot::build(replier, reply_cap, &payload[..len])?;
+    // Claim the exact published blocked-caller acknowledgement (atomic single claim).
+    let (ack, ack_seq) = crate::kernel::boot::ipcreply_direct_ack::claim()?;
+    let work = crate::kernel::ipccall_direct_txn::DirectReplyPostWork {
+        snapshot,
+        ack,
+        ack_seq,
+    };
+    let _ = shared.drain_direct_reply_post_work(&work);
+    // NR7 delivers the reply and wakes the caller; the replier itself returns Ok.
+    frame.set_ok(0, 0, 0);
+    Some(Ok(()))
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_ipcreply_direct_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    // Hosted: the off-lock user-read seam uses the direct map (real targets only). The
+    // drain + transaction are exercised directly by the stage199a2b3 hosted tests.
     None
 }
 

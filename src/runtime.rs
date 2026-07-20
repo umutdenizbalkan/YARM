@@ -2874,6 +2874,85 @@ impl SharedKernel {
         })
     }
 
+    // ── Stage 199A2B3: off-lock NR7 reply-record reservation seams (rank 3) ───────
+    //
+    // These operate the SAME single `reply_caps` slot lifecycle for the reply side
+    // (`Available → Reserved → Consumed`), reserving an EXISTING record (the one the
+    // caller's reply cap names) rather than creating one. Bound replier + exact
+    // generation are required to reserve; `Consumed` is the authoritative one-shot
+    // barrier (`resolve_reply_index` rejects a non-`Available` record). No second
+    // reply-record or reservation table.
+
+    /// rank 3 — reserve an EXISTING record `(index, generation)` for a direct reply:
+    /// the slot must be present, generation-matched, `Available`, and its bound replier
+    /// `{tid, asid}` must equal `replier`. On success `Available → Reserved` (making it
+    /// non-invokable so an alias cannot reserve concurrently or reply). `false`
+    /// otherwise. The record is NOT claimed here — the reply payload is copied first.
+    pub(crate) fn reserve_existing_reply_record_split(
+        &self,
+        index: usize,
+        generation: u64,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Available
+                    && record.responder_tid == Some(replier.tid)
+                    && record.replier_asid == Some(replier.asid) =>
+            {
+                record.reservation = ReplyRecordReservation::Reserved;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — `Reserved → Consumed`: the authoritative one-shot barrier. After this a
+    /// stale/aliased reply cap resolving to the same `(index, generation)` fails through
+    /// the `Consumed` record even before its physical cnode slot is reclaimed. Runs
+    /// strictly before the rank-1 caller enqueue. `false` on generation mismatch or a
+    /// non-`Reserved` state (never for our exact owned reservation).
+    pub(crate) fn consume_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Reserved =>
+            {
+                record.reservation = ReplyRecordReservation::Consumed;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — `Reserved → Available`: caller-destination-copy-fault rollback for an
+    /// EXACT still-valid caller. The reply authority stays usable and the caller stays
+    /// blocked with zero wake. `false` on mismatch.
+    pub(crate) fn release_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Reserved =>
+            {
+                record.reservation = ReplyRecordReservation::Available;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — discard a `Reserved` record for STALE authority (caller exited/replaced,
+    /// endpoint/waiter drifted): transition `Reserved → Consumed` so the reply cap is
+    /// permanently non-invokable (the physical cnode slot is reclaimed idempotently at
+    /// the caller's teardown). Never restores usable authority. `false` on mismatch.
+    pub(crate) fn discard_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        self.consume_reply_record_split(index, generation)
+    }
+
     /// rank 5: map EXACTLY one user page and return the owned follow-up needed for rank-6 accounting
     /// (and exact rollback). NX/rights/alignment are enforced by the caller (the runner); this seam
     /// additionally asserts alignment + NX and never lets a page-table reference escape the guard.
@@ -3664,6 +3743,23 @@ impl SharedKernel {
             )
         }?;
         Ok(endpoint)
+    }
+
+    /// Stage 199A2B3: off-lock resolution of a `Reply` cap the caller/replier holds
+    /// (task rank-2 pid read → capability rank-4 resolve), returning the reply object
+    /// `(index, generation)`. Requires the `SEND` right on the cap.
+    pub(crate) fn resolve_reply_cap_split_read(
+        &self,
+        requester_tid: u64,
+        cap: CapId,
+    ) -> Result<(usize, u64), KernelError> {
+        let state = self.state.data_ptr();
+        let requester_pid =
+            unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
+                .ok_or(KernelError::InvalidCapability)?;
+        unsafe {
+            KernelState::resolve_reply_cap_in_pid_from_raw(state as *const _, requester_pid, cap)
+        }
     }
 
     /// Stage 199A2B2E: GENERATION-BEARING off-lock cnode resolution. Resolves the

@@ -2094,6 +2094,45 @@ impl KernelState {
     ///
     /// # Safety
     /// As `cnode_registered_from_raw`.
+    /// Stage 199A2B3: resolve a `Reply` cap `cap` in `requester_pid`'s cnode under ONLY
+    /// `capability_state_lock` (rank 4), requiring the `SEND` right, and return the
+    /// reply object `(index, generation)`. Same error mapping as the endpoint resolvers.
+    ///
+    /// # Safety
+    /// As `resolve_endpoint_recv_cap_in_pid_from_raw`.
+    pub(crate) unsafe fn resolve_reply_cap_in_pid_from_raw(
+        state: *const KernelState,
+        requester_pid: u64,
+        cap: CapId,
+    ) -> Result<(usize, u64), KernelError> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };
+        let _guard = lock_ref.lock();
+        let capability: &CapabilitySubsystem =
+            unsafe { &*core::ptr::addr_of!((*state).capability) };
+        let cnode = kernel_ref(&capability.process_cnodes)
+            .iter()
+            .flatten()
+            .find(|record| record.pid == requester_pid)
+            .map(|record| record.cnode)
+            .ok_or(KernelError::InvalidCapability)?;
+        let capability_obj = capability
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .find(|space| space.id == cnode)
+            .and_then(|space| kernel_ref(&space.cspace).get(cap))
+            .ok_or(KernelError::InvalidCapability)?;
+        match capability_obj.object {
+            CapObject::Reply { index, generation } => {
+                if !capability_obj.has_right(CapRights::SEND) {
+                    return Err(KernelError::MissingRight);
+                }
+                Ok((index, generation))
+            }
+            _ => Err(KernelError::WrongObject),
+        }
+    }
+
     pub(crate) unsafe fn process_cnode_for_pid_from_raw(
         state: *const KernelState,
         pid: u64,

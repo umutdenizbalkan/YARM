@@ -742,6 +742,12 @@ pub(super) fn handle_ipc_recv(
             crate::kernel::boot::maybe_publish_ipccall_direct_blocked_server_ack(
                 kernel, recv_tid, endpoint, &state,
             );
+            // Stage 199A2B3: publish the NR7 committed blocked-CALLER acknowledgement
+            // from the same fully-committed recv-v2 point (caller blocking on its reply
+            // endpoint). Proof-gated; no wake / mint / copy / scheduler mutation.
+            crate::kernel::boot::maybe_publish_ipcreply_direct_blocked_caller_ack(
+                kernel, recv_tid, endpoint, &state,
+            );
         }
         return Err(SyscallError::WouldBlock);
     }
