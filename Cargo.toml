@@ -58,13 +58,19 @@ x86-shared-region-direct-oracle = ["shared-region-direct-oracle"]
 aarch64-shared-region-direct-oracle = ["shared-region-direct-oracle"]
 riscv-shared-region-direct-oracle = ["shared-region-direct-oracle"]
 
-# Stage 199A2B4: compile-time gate for the x86_64 DIRECT IpcCall/IpcReply live round-trip
-# oracle (kernel success attestations + `IpcCallDirectRequest`/`IpcReplyDirect` retirement
-# literals). OFF by default so a NORMAL artifact is marker-clean (contains none of the two
-# class literals). Enabling the feature only COMPILES the marker paths; the runtime selector
-# (`yarm.x86_64_ipccall_direct_oracle=1`) is still required to execute the oracle — the feature
-# alone activates no runtime behavior. x86_64-only; enables NO queued class or non-x86 arch.
-x86-ipccall-direct-oracle = []
+# Stage 199A2B4/199A2C1: compile-time gate for the DIRECT IpcCall/IpcReply live round-trip oracle
+# (kernel success attestations + `IpcCallDirectRequest`/`IpcReplyDirect` retirement literals + the
+# transactional provisioning + the arch-neutral userspace round-trip core). OFF by default so a
+# NORMAL artifact is marker-clean (contains neither class literal). `ipccall-direct-oracle` is the
+# ARCH-NEUTRAL umbrella that compiles the shared kernel logic; each per-arch feature enables it AND
+# gates that arch's marker literals + boot caller (the marker literals are additionally
+# `target_arch`-gated so the AArch64 feature never activates x86 markers, and vice versa). Enabling
+# a feature only COMPILES the marker paths; the runtime selector (`yarm.<arch>_ipccall_direct_oracle
+# =1`) is still required to execute the oracle. Enables NO queued class, timeout, notification, or
+# server-death wake.
+ipccall-direct-oracle = []
+x86-ipccall-direct-oracle = ["ipccall-direct-oracle"]
+aarch64-ipccall-direct-oracle = ["ipccall-direct-oracle"]
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }

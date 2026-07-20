@@ -78215,25 +78215,39 @@ mod stage199a2b4_live_oracle_guards {
     // inert (the setter is what flips the gate).
     #[test]
     fn feature_and_selector_both_required() {
+        // The arch-neutral umbrella + both per-arch features (each enabling the umbrella).
         assert!(
-            CARGO_SRC.contains("x86-ipccall-direct-oracle = []"),
-            "the default-off compile feature must exist"
+            CARGO_SRC.contains("ipccall-direct-oracle = []")
+                && CARGO_SRC.contains("x86-ipccall-direct-oracle = [\"ipccall-direct-oracle\"]")
+                && CARGO_SRC
+                    .contains("aarch64-ipccall-direct-oracle = [\"ipccall-direct-oracle\"]"),
+            "the umbrella + per-arch compile features must exist (per-arch enables umbrella)"
         );
-        assert!(
-            CMDLINE_SRC.contains("yarm.x86_64_ipccall_direct_oracle")
-                && CMDLINE_SRC.contains("set_x86_ipccall_direct_oracle_enabled("),
-            "the selector knob must parse + apply"
-        );
-        // The selector arms the proof gate (activation requires BOTH feature and selector).
-        let setter = MOD_SRC
-            .split("pub(crate) fn set_x86_ipccall_direct_oracle_enabled")
-            .nth(1)
-            .expect("setter body");
-        let setter = &setter[..setter.len().min(400)];
-        assert!(
-            setter.contains("set_ipccall_direct_proof_enabled(true)"),
-            "selecting the workload must arm the NR6/NR7 proof gate"
-        );
+        // Both selector knobs parse + apply, and each setter arms the SHARED proof gate (activation
+        // requires BOTH feature and selector).
+        for (knob, setter_name) in [
+            (
+                "yarm.x86_64_ipccall_direct_oracle",
+                "set_x86_ipccall_direct_oracle_enabled",
+            ),
+            (
+                "yarm.aarch64_ipccall_direct_oracle",
+                "set_aarch64_ipccall_direct_oracle_enabled",
+            ),
+        ] {
+            assert!(
+                CMDLINE_SRC.contains(knob) && CMDLINE_SRC.contains(&format!("{setter_name}(")),
+                "the {knob} selector knob must parse + apply"
+            );
+            let setter = MOD_SRC
+                .split(&format!("pub(crate) fn {setter_name}"))
+                .nth(1)
+                .expect("setter body");
+            assert!(
+                setter[..setter.len().min(400)].contains("set_ipccall_direct_proof_enabled(true)"),
+                "selecting {setter_name} must arm the NR6/NR7 proof gate"
+            );
+        }
     }
 
     // Runtime: the selector arms the proof gate; the gate defaults off.
@@ -78268,10 +78282,16 @@ mod stage199a2b4_live_oracle_guards {
             .nth(1)
             .expect("reply emitter");
         assert!(reply_emit[..reply_emit.len().min(600)].contains("class=IpcReplyDirect"));
-        // Each emitter is guarded by the x86-oracle feature + target_arch + not(hosted-dev).
+        // Each emitter is guarded by the UMBRELLA oracle feature + (x86_64|aarch64) + not(hosted-dev),
+        // and the literal carries the arch-parameterized `arch={}` tag (one emitter, both arches).
         assert!(MOD_SRC.contains(
-            "feature = \"x86-ipccall-direct-oracle\",\n    target_arch = \"x86_64\",\n    not(feature = \"hosted-dev\")"
+            "feature = \"ipccall-direct-oracle\",\n    any(target_arch = \"x86_64\", target_arch = \"aarch64\"),\n    not(feature = \"hosted-dev\")"
         ));
+        assert!(
+            MOD_SRC.contains("arch={} class=IpcCallDirectRequest")
+                && MOD_SRC.contains("arch={} class=IpcReplyDirect"),
+            "the class literals must be arch-parameterized via IPCCALL_DIRECT_ORACLE_ARCH"
+        );
         // A no-op stub keeps the drain call sites compiling on every other config (marker-clean).
         assert!(MOD_SRC.contains("pub(crate) fn emit_ipccall_direct_request_live_markers() {}"));
         assert!(MOD_SRC.contains("pub(crate) fn emit_ipcreply_direct_live_markers() {}"));
@@ -78401,5 +78421,192 @@ mod stage199a2b4_live_oracle_guards {
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
         assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2C1 — AArch64 DIRECT IpcCall/IpcReply LIVE round-trip oracle guards.
+// The live proof itself is the QEMU seal (scripts/qemu-ipccall-reply-direct-aarch64-smoke.sh);
+// these hosted guards pin the AArch64 feature+selector activation, the slot-5 selector, the AArch64
+// NR6/NR7 split eligibility + six-argument import, the arch-parameterized markers, the arch-neutral
+// core reuse (no duplication), and the preservation of the x86_64 sealed paths.
+mod stage199a2c1_aarch64_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        aarch64_ipccall_direct_oracle_enabled, ipccall_direct_oracle_enabled,
+        set_aarch64_ipccall_direct_oracle_enabled, set_ipccall_direct_proof_enabled,
+        set_x86_ipccall_direct_oracle_enabled, x86_ipccall_direct_oracle_enabled,
+    };
+
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // Runtime: the AArch64 selector arms the SHARED proof gate but NOT the x86 oracle-enabled flag
+    // (the AArch64 selector must not arm x86_64 state).
+    #[test]
+    fn aarch64_selector_arms_shared_gate_not_x86() {
+        set_ipccall_direct_proof_enabled(false);
+        set_x86_ipccall_direct_oracle_enabled(false);
+        set_aarch64_ipccall_direct_oracle_enabled(false);
+        assert!(!ipccall_direct_oracle_enabled());
+        set_aarch64_ipccall_direct_oracle_enabled(true);
+        assert!(aarch64_ipccall_direct_oracle_enabled());
+        assert!(
+            !x86_ipccall_direct_oracle_enabled(),
+            "the AArch64 selector must NOT arm the x86_64 oracle-enabled flag"
+        );
+        assert!(
+            ipccall_direct_oracle_enabled(),
+            "the combined predicate is true when any arch is armed"
+        );
+        assert!(
+            crate::kernel::boot::ipccall_direct_proof_enabled(),
+            "the AArch64 selector arms the shared NR6/NR7 proof gate"
+        );
+        set_aarch64_ipccall_direct_oracle_enabled(false);
+        set_ipccall_direct_proof_enabled(false);
+    }
+
+    // (AArch64 NR6/NR7 split eligibility) The shared trap entry imports the six-argument ABI + admits
+    // NR6/NR7 into the split dispatcher ONLY behind the direct proof gate, and finalizes a handled
+    // NR6/NR7 via the AArch64 syscall-return ABI (export x0..x5 + advance ELR).
+    #[test]
+    fn aarch64_nr6_nr7_split_eligibility_gated() {
+        // Import admits NR6/NR7 only behind the proof gate (all six args imported via split_import).
+        assert!(TRAP_ENTRY_SRC.contains("split_import_syscall_abi(frame)"));
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "(raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || raw_nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ),
+            "NR6/NR7 ABI import must be admitted only behind the direct proof gate"
+        );
+        // Finalize (export results + advance ELR) admits a handled NR6/NR7 behind the gate.
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "(frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ),
+            "a handled NR6/NR7 must finalize via the AArch64 syscall-return ABI"
+        );
+        assert!(TRAP_ENTRY_SRC.contains("split_finalize_handled_syscall(kernel, cpu, frame)"));
+    }
+
+    // (six trap arguments) The off-lock gates read all six NR6/NR7 arguments from the imported frame
+    // (send/reply cap, ptr, len, and — for NR6 — the reply-endpoint RECEIVE cap in arg5), the same
+    // frame the AArch64 import populates. A reachability guard proves the drains are not DCE'd.
+    #[test]
+    fn all_six_args_imported_and_drains_reachable() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        // NR6 gate reads CAP, PTR, LEN, and the arg5 reply-endpoint cap (SYSCALL_ARG_TRANSFER_CAP).
+        let call_gate = SPLIT_SRC
+            .split("fn try_split_ipccall_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        assert!(call_gate.contains("SYSCALL_ARG_CAP"));
+        assert!(call_gate.contains("SYSCALL_ARG_TRANSFER_CAP"));
+        assert!(call_gate.contains("SYSCALL_ARG_PTR") && call_gate.contains("SYSCALL_ARG_LEN"));
+        // The whitelist reachability guard keeps the live drains from being silently DCE'd.
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+        assert!(
+            SPLIT_SRC.contains("matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"),
+            "IpcCall/IpcReply must pass the NR whitelist only behind the armed proof gate"
+        );
+    }
+
+    // (slot-5 selector + collision) AArch64 boot provisions the oracle transactionally under BOTH the
+    // feature and the knob, on the free selector 7, only when slots 5/13/14 are all still zero
+    // (mutually exclusive with every AArch64 slot-5/13/14 oracle above it).
+    #[test]
+    fn aarch64_slot5_selector_and_collision() {
+        assert!(
+            MOD_SRC.contains("pub const AARCH64_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 7;"),
+            "free AArch64 slot-5 selector 7 (after 1..6)"
+        );
+        assert!(AARCH64_BOOT_SRC.contains("#[cfg(feature = \"aarch64-ipccall-direct-oracle\")]"));
+        assert!(
+            AARCH64_BOOT_SRC.contains("provision_init_ipccall_direct_oracle(")
+                && AARCH64_BOOT_SRC.contains("AARCH64_IPCCALL_DIRECT_ORACLE_SELECTOR"),
+            "AArch64 boot must provision the oracle + set slot-5 selector 7"
+        );
+        // Fail-closed mutual exclusion: only fires when slots 5/13/14 are all zero.
+        let block = AARCH64_BOOT_SRC
+            .split("aarch64_ipccall_direct_oracle_enabled()")
+            .nth(1)
+            .expect("aarch64 provision block");
+        assert!(
+            AARCH64_BOOT_SRC.contains("init_args[5] == 0\n        && init_args[13] == 0\n        && init_args[14] == 0\n        && crate::kernel::boot::aarch64_ipccall_direct_oracle_enabled()"),
+            "AArch64 oracle provisioning must be mutually exclusive with every slot-5/13/14 oracle"
+        );
+        let _ = block;
+        // init dispatches the AArch64 oracle on slot-5 selector 7.
+        assert!(
+            INIT_SRC.contains("run_aarch64_ipccall_direct_oracle(ctx.task_id)")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(7)"),
+            "init must dispatch the AArch64 oracle on slot-5 selector 7"
+        );
+    }
+
+    // (arch-neutral core NOT duplicated) The request/reply payload logic, WouldBlock retry, recv-v2
+    // construction, duplicate-reply test, and continuation counting live ONCE in the arch-neutral
+    // `ipccall_direct_oracle_core`; each arch adds only a thin wrapper (spawn + arch-named markers).
+    #[test]
+    fn arch_neutral_core_not_duplicated() {
+        assert!(INIT_SRC.contains("mod ipccall_direct_oracle_core"));
+        // The bounded retry + duplicate-reply + payload contract appear exactly once (in the core).
+        assert_eq!(
+            INIT_SRC
+                .matches("unsafe fn server_run() -> ServerOutcome")
+                .count(),
+            1,
+            "the server round-trip logic must exist exactly once (arch-neutral core)"
+        );
+        assert_eq!(
+            INIT_SRC
+                .matches("unsafe fn parent_run(request_ep: u32, reply_ep: u32)")
+                .count(),
+            1,
+            "the parent round-trip logic must exist exactly once (arch-neutral core)"
+        );
+        assert_eq!(
+            INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(),
+            1,
+            "the request payload contract must not be duplicated per arch"
+        );
+        // Both arch wrappers call the SAME core.
+        assert!(INIT_SRC.contains("fn run_x86_ipccall_direct_oracle"));
+        assert!(INIT_SRC.contains("fn run_aarch64_ipccall_direct_oracle"));
+        assert!(INIT_SRC.contains("AARCH64_IPCREPLY_DIRECT_SEND"));
+        assert!(INIT_SRC.contains("AARCH64_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        // Cross-arch hygiene: no RISC-V userspace completion for this oracle.
+        assert!(!INIT_SRC.contains("RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+    }
+
+    // (x86_64 sealed source paths unchanged) The x86 transaction, gates, and sealed x86 markers are
+    // untouched by the AArch64 port: the x86 wrapper + x86-named markers remain, and the shared
+    // transaction / reservation seams are unchanged.
+    #[test]
+    fn x86_sealed_paths_unchanged() {
+        assert!(INIT_SRC.contains("X86_IPCREPLY_DIRECT_SEND"));
+        assert!(INIT_SRC.contains("X86_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        // The shared transaction still emits the arch-parameterized live markers from the drains.
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        assert!(TXN_SRC.contains("emit_ipccall_direct_request_live_markers()"));
+        assert!(TXN_SRC.contains("emit_ipcreply_direct_live_markers()"));
+        // The reservation lifecycle single-store authority is unchanged.
+        const DEFS_SRC: &str = include_str!("defs.rs");
+        assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
+    }
+
+    // Stage 198F + ABI preserved (10 classes / 30 cells).
+    #[test]
+    fn stage198f_and_abi_preserved() {
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
     }
 }

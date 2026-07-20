@@ -1356,7 +1356,7 @@ fn run_x86_shared_region_direct_oracle(init_tid: u64) {
     );
 }
 
-// ─── Stage 199A2B4: x86_64 DIRECT IpcCall(NR6)/IpcReply(NR7) live round-trip oracle ──────────
+// ─── Stage 199A2B4/199A2C1: DIRECT IpcCall(NR6)/IpcReply(NR7) live round-trip oracle ─────────
 // Parent(init/client)/child(server) topology proving BOTH accepted off-lock transactions in a
 // single `-smp 1` round trip:
 //   server child recv-v2-blocks on the request endpoint (→ authoritative BlockedServerAck)
@@ -1364,14 +1364,20 @@ fn run_x86_shared_region_direct_oracle(init_tid: u64) {
 //   (→ authoritative BlockedCallerAck) → server resumes with the request + a FRESH receiver-local
 //   reply cap → server invokes NR7 IpcReply (bounded pre-ack retry) → client resumes ONCE with the
 //   reply payload → server's duplicate reply through the same cap is canonically rejected.
-// Both tasks share init's CSpace + address space (thread spawn); each uses its role's caps. The two
-// class literals live ONLY in the feature-armed kernel; this userspace scaffold is arch-gated.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-mod x86_ipccall_direct_oracle {
-    use core::sync::atomic::{AtomicU32, AtomicU64};
-
-    pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
-    pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
+// Both tasks share init's CSpace + address space (thread spawn); each uses its role's caps.
+//
+// ARCH-NEUTRAL CORE (`ipccall_direct_oracle_core`): ALL request/reply payload logic, recv-v2
+// construction, the bounded WouldBlock retry, the duplicate-reply test, and continuation counting.
+// Each arch adds only a thin wrapper: the child stack/TLS statics, the child entry (naked
+// trampoline on x86 for RSP alignment; plain `extern "C"` on AArch64), the thread spawn, and the
+// two arch-named completion markers. The two class literals live ONLY in the feature-armed kernel;
+// this userspace scaffold is arch-gated.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod ipccall_direct_oracle_core {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
     /// Parent↔server liveness handshake word (server wakes the parent, then recv-blocks).
     pub(super) static HANDSHAKE: AtomicU32 = AtomicU32::new(0x00D0);
@@ -1389,169 +1395,306 @@ mod x86_ipccall_direct_oracle {
 
     /// Request/reply payload contract. `ipc_call` frames the request as `[opcode_le(2)] ++
     /// REQUEST_DATA`; `ipc_reply` sends `REPLY_DATA` raw (no opcode prefix).
-    pub(super) const REQUEST_OPCODE: u16 = 0x0607;
-    pub(super) const REQUEST_DATA: [u8; 8] = *b"NR6call!";
-    pub(super) const REPLY_OPCODE: u16 = 0x0707;
-    pub(super) const REPLY_DATA: [u8; 8] = *b"NR7repl!";
+    const REQUEST_OPCODE: u16 = 0x0607;
+    const REQUEST_DATA: [u8; 8] = *b"NR6call!";
+    const REPLY_OPCODE: u16 = 0x0707;
+    const REPLY_DATA: [u8; 8] = *b"NR7repl!";
     /// Bounded pre-ack retry cap (task contract: MAX_REPLY_ATTEMPTS <= 64).
-    pub(super) const MAX_ATTEMPTS: u32 = 64;
+    const MAX_ATTEMPTS: u32 = 64;
 
-    /// Naked server-child entry trampoline (RSP-alignment; see the FutexWake oracle rationale).
-    #[unsafe(naked)]
-    pub(super) extern "C" fn child_entry() -> ! {
-        core::arch::naked_asm!("call {body}", "ud2", body = sym super::ipccall_direct_server_body)
+    /// Read the oracle request + reply endpoint caps from startup slots 13/14 (shared CSpace).
+    pub(super) fn oracle_caps() -> (u32, u32) {
+        let req = yarm_user_rt::runtime::startup_arg_slot(
+            yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_0,
+        )
+        .unwrap_or(0) as u32;
+        let rep = yarm_user_rt::runtime::startup_arg_slot(
+            yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_1,
+        )
+        .unwrap_or(0) as u32;
+        (req, rep)
     }
 
-    /// Park forever after the server completes.
+    /// Typed outcome of the server child's recv → validate → bounded-retry reply → duplicate.
+    #[derive(Clone, Copy)]
+    pub(super) struct ServerOutcome {
+        pub request_ok: bool,
+        pub replied: bool,
+        pub attempts: u32,
+        pub dup_rejected: bool,
+    }
+
+    /// Server child core (ARCH-NEUTRAL): raise the liveness handshake, recv-v2-block on the request
+    /// endpoint (the NR6 off-lock delivery wakes it with the request + a FRESH receiver-local reply
+    /// cap), validate the request + reply cap, run the BOUNDED pre-ack retry NR7 reply, then prove
+    /// the duplicate reply is canonically rejected. Publishes the shared statics and returns the
+    /// typed outcome; the arch wrapper emits its own `<ARCH>_IPCREPLY_DIRECT_SEND` marker.
+    ///
+    /// # Safety
+    /// Must run on a freshly-spawned oracle child sharing init's CSpace/address space.
+    pub(super) unsafe fn server_run() -> ServerOutcome {
+        yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_SERVER_STARTED");
+        // Handshake: wake the parent, then recv-block. On a single CPU the parent resumes only after
+        // we are committed-blocked here (the wake enqueues the parent but does not preempt us).
+        let handshake = HANDSHAKE.as_ptr();
+        let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+        let (request_ep, _rep) = oracle_caps();
+        let mut out = ServerOutcome {
+            request_ok: false,
+            replied: false,
+            attempts: 0,
+            dup_rejected: false,
+        };
+        // SAFETY: shared-CSpace request endpoint cap; a blocking recv-v2.
+        let recv = unsafe { yarm_user_rt::syscall::ipc_recv_v2(request_ep) };
+        let rm = match recv {
+            Ok(Some(rm)) => rm,
+            Ok(None) => {
+                yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_SERVER_WOULDBLOCK");
+                return out;
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_SERVER_RECV_FAIL err={:?}", e);
+                return out;
+            }
+        };
+        SERVER_CONTINUATIONS.fetch_add(1, Relaxed);
+        let msg = rm.message;
+        let plen = msg.len as usize;
+        // The NR6 off-lock delivery preserves the framed request (`[opcode_le] ++ data`).
+        let framed_ok = plen == 2 + REQUEST_DATA.len()
+            && msg.payload[0..2] == REQUEST_OPCODE.to_le_bytes()
+            && msg.payload[2..plen] == REQUEST_DATA;
+        let reply_cap = rm.reply_cap.unwrap_or(0);
+        // Fresh, receiver-local, resolvable reply cap (nonzero + distinct from the request cap).
+        let reply_cap_ok = reply_cap != 0 && reply_cap != request_ep;
+        out.request_ok = framed_ok && reply_cap_ok;
+        SERVER_REQUEST_OK.store(u32::from(out.request_ok), Relaxed);
+        yarm_user_rt::user_log!(
+            "IPCCALL_DIRECT_ORACLE_SERVER_RECV framed_ok={} reply_cap={} reply_cap_ok={} plen={}",
+            framed_ok as u32,
+            reply_cap,
+            reply_cap_ok as u32,
+            plen
+        );
+        let reply_msg =
+            match yarm_user_rt::ipc::Message::with_header(0, REPLY_OPCODE, 0, None, &REPLY_DATA) {
+                Ok(m) => m,
+                Err(_) => {
+                    SERVER_REPLY_OK.store(0, Relaxed);
+                    return out;
+                }
+            };
+        // Bounded pre-caller-ack retry: retry ONLY on canonical WouldBlock (yield the CPU so the
+        // client can commit its reply-endpoint waiter), stop on success, fail on any other error.
+        let mut attempts: u32 = 0;
+        while attempts < MAX_ATTEMPTS {
+            attempts += 1;
+            // SAFETY: `reply_cap` is the fresh receiver-local one-shot Reply cap.
+            match unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply_msg) } {
+                Ok(()) => {
+                    out.replied = true;
+                    break;
+                }
+                Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                }
+                Err(e) => {
+                    yarm_user_rt::user_log!(
+                        "IPCCALL_DIRECT_ORACLE_SERVER_REPLY_HARD_FAIL err={:?}",
+                        e
+                    );
+                    break;
+                }
+            }
+        }
+        out.attempts = attempts;
+        SERVER_REPLY_ATTEMPTS.store(attempts, Relaxed);
+        SERVER_REPLY_OK.store(u32::from(out.replied), Relaxed);
+        // Duplicate reply through the SAME cap: the record is now Consumed → canonical stale/invalid
+        // rejection (StaleCapability maps to WrongObject). No wake, no copy, no new post-work.
+        // SAFETY: intentional duplicate to observe the one-shot barrier rejection.
+        let dup = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply_msg) };
+        out.dup_rejected = matches!(
+            dup,
+            Err(yarm_user_rt::syscall::SyscallError::WrongObject)
+                | Err(yarm_user_rt::syscall::SyscallError::InvalidCapability)
+                | Err(yarm_user_rt::syscall::SyscallError::InvalidArgs)
+        );
+        SERVER_DUP_REJECTED.store(u32::from(out.dup_rejected), Relaxed);
+        yarm_user_rt::user_log!(
+            "IPCCALL_DIRECT_ORACLE_SERVER_DUP dup_rejected={} err={:?}",
+            out.dup_rejected as u32,
+            dup
+        );
+        out
+    }
+
+    /// Park forever after the server completes (arch-neutral).
     pub(super) fn server_park() -> ! {
         let park = PARK.as_ptr();
         loop {
-            let pv = PARK.load(core::sync::atomic::Ordering::Relaxed);
+            let pv = PARK.load(Relaxed);
             let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
         }
     }
-}
 
-/// Server child body (x86_64): raise the liveness handshake, recv-v2-block on the request endpoint
-/// (the NR6 off-lock delivery wakes it with the request + a fresh receiver-local reply cap),
-/// validate the request + reply cap, run the BOUNDED pre-ack retry NR7 reply, then prove the
-/// duplicate reply is canonically rejected. Publishes result statics; never returns.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-extern "C" fn ipccall_direct_server_body() -> ! {
-    use core::sync::atomic::Ordering::Relaxed;
-    use x86_ipccall_direct_oracle as o;
-    yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_SERVER_STARTED");
-    // Handshake: wake the parent, then recv-block. On a single CPU the parent resumes only after we
-    // are committed-blocked here (the wake enqueues the parent but does not preempt us).
-    let handshake = o::HANDSHAKE.as_ptr();
-    let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
-    let request_ep = yarm_user_rt::runtime::startup_arg_slot(
-        yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_0,
-    )
-    .unwrap_or(0) as u32;
-    // SAFETY: shared-CSpace request endpoint cap; a blocking recv-v2.
-    let recv = unsafe { yarm_user_rt::syscall::ipc_recv_v2(request_ep) };
-    match recv {
-        Ok(Some(rm)) => {
-            o::SERVER_CONTINUATIONS.fetch_add(1, Relaxed);
-            let msg = rm.message;
-            let plen = msg.len as usize;
-            // The NR6 off-lock delivery preserves the framed request (`[opcode_le] ++ data`).
-            let framed_ok = plen == 2 + o::REQUEST_DATA.len()
-                && msg.payload[0..2] == o::REQUEST_OPCODE.to_le_bytes()
-                && msg.payload[2..plen] == o::REQUEST_DATA;
-            let reply_cap = rm.reply_cap.unwrap_or(0);
-            // Fresh, receiver-local, resolvable reply cap (nonzero + distinct from the request cap).
-            let reply_cap_ok = reply_cap != 0 && reply_cap != request_ep;
-            let request_ok = framed_ok && reply_cap_ok;
-            o::SERVER_REQUEST_OK.store(u32::from(request_ok), Relaxed);
-            yarm_user_rt::user_log!(
-                "IPCCALL_DIRECT_ORACLE_SERVER_RECV framed_ok={} reply_cap={} reply_cap_ok={} plen={}",
-                framed_ok as u32,
-                reply_cap,
-                reply_cap_ok as u32,
-                plen
-            );
-            let reply_msg = match yarm_user_rt::ipc::Message::with_header(
-                0,
-                o::REPLY_OPCODE,
-                0,
-                None,
-                &o::REPLY_DATA,
-            ) {
-                Ok(m) => m,
-                Err(_) => {
-                    o::SERVER_REPLY_OK.store(0, Relaxed);
-                    o::server_park();
-                }
-            };
-            // Bounded pre-caller-ack retry: retry ONLY on canonical WouldBlock (yield the CPU so the
-            // client can commit its reply-endpoint waiter), stop on success, fail on any other error.
-            let mut attempts: u32 = 0;
-            let mut replied = false;
-            while attempts < o::MAX_ATTEMPTS {
-                attempts += 1;
-                // SAFETY: `reply_cap` is the fresh receiver-local one-shot Reply cap.
-                match unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply_msg) } {
-                    Ok(()) => {
-                        replied = true;
-                        break;
-                    }
-                    Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
-                        let _ = yarm_user_rt::syscall::yield_now();
-                    }
-                    Err(e) => {
-                        yarm_user_rt::user_log!(
-                            "IPCCALL_DIRECT_ORACLE_SERVER_REPLY_HARD_FAIL err={:?}",
-                            e
-                        );
-                        break;
-                    }
-                }
-            }
-            o::SERVER_REPLY_ATTEMPTS.store(attempts, Relaxed);
-            o::SERVER_REPLY_OK.store(u32::from(replied), Relaxed);
-            let early = attempts.saturating_sub(1);
-            if replied {
-                yarm_user_rt::user_log!(
-                    "X86_IPCREPLY_DIRECT_SEND attempts={} early_retries={} result=ok",
-                    attempts,
-                    early
-                );
-            } else {
-                yarm_user_rt::user_log!(
-                    "X86_IPCREPLY_DIRECT_SEND attempts={} early_retries={} result=fail",
-                    attempts,
-                    early
-                );
-            }
-            // Duplicate reply through the SAME cap: the record is now Consumed → canonical
-            // stale/invalid rejection (StaleCapability maps to WrongObject). No wake, no copy.
-            // SAFETY: intentional duplicate to observe the one-shot barrier rejection.
-            let dup = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply_msg) };
-            let dup_rejected = matches!(
-                dup,
-                Err(yarm_user_rt::syscall::SyscallError::WrongObject)
-                    | Err(yarm_user_rt::syscall::SyscallError::InvalidCapability)
-                    | Err(yarm_user_rt::syscall::SyscallError::InvalidArgs)
-            );
-            o::SERVER_DUP_REJECTED.store(u32::from(dup_rejected), Relaxed);
-            yarm_user_rt::user_log!(
-                "IPCCALL_DIRECT_ORACLE_SERVER_DUP dup_rejected={} err={:?}",
-                dup_rejected as u32,
-                dup
-            );
-        }
-        Ok(None) => {
-            yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_SERVER_WOULDBLOCK");
-        }
-        Err(e) => {
-            yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_SERVER_RECV_FAIL err={:?}", e);
-        }
+    /// Typed outcome of the parent(client)'s NR6 call + reply recv + validation.
+    #[derive(Clone, Copy)]
+    pub(super) struct ParentOutcome {
+        pub called: bool,
+        pub call_attempts: u32,
+        pub reply_ok: bool,
+        pub request_ok: u32,
+        pub server_reply_ok: u32,
+        pub dup_rejected: u32,
+        pub server_cont: u32,
+        pub client_cont: u32,
     }
-    x86_ipccall_direct_oracle::server_park();
+
+    /// Parent(client) core (ARCH-NEUTRAL): wait on the liveness handshake (server then recv-blocks),
+    /// invoke NR6 IpcCall (bounded retry on WouldBlock), recv-v2-block on the reply endpoint
+    /// (committing the BlockedCallerAck + dispatching the woken server), validate the reply payload,
+    /// and read the server's outcome statics. Returns the typed outcome; the arch wrapper emits its
+    /// own `<ARCH>_IPCCALL_DIRECT_ROUNDTRIP_DONE` completion marker.
+    ///
+    /// # Safety
+    /// `request_ep`/`reply_ep` must be the provisioned oracle caps.
+    pub(super) unsafe fn parent_run(request_ep: u32, reply_ep: u32) -> ParentOutcome {
+        let mut out = ParentOutcome {
+            called: false,
+            call_attempts: 0,
+            reply_ok: false,
+            request_ok: 0,
+            server_reply_ok: 0,
+            dup_rejected: 0,
+            server_cont: 0,
+            client_cont: 0,
+        };
+        // Authoritative liveness handshake: block until the server wakes us. On a single CPU the
+        // server then commits its blocked recv before we resume (its wake enqueues us, no preempt).
+        let handshake = HANDSHAKE.as_ptr();
+        let hv = HANDSHAKE.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
+        yarm_user_rt::user_log!("IPCCALL_DIRECT_ROUNDTRIP_ORACLE_PARENT_RESUMED");
+        // NR6 IpcCall — bounded retry on WouldBlock (deterministically succeeds on attempt 1 because
+        // the server is a committed waiter; the retry only fires if the ordering ever slipped).
+        let request_msg = match yarm_user_rt::ipc::Message::with_header(
+            0,
+            REQUEST_OPCODE,
+            0,
+            None,
+            &REQUEST_DATA,
+        ) {
+            Ok(m) => m,
+            Err(_) => {
+                yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_REQUEST_BUILD_FAIL");
+                return out;
+            }
+        };
+        while out.call_attempts < MAX_ATTEMPTS {
+            out.call_attempts += 1;
+            // SAFETY: `request_ep` = request SEND cap; `reply_ep` = reply-endpoint RECEIVE cap.
+            match unsafe { yarm_user_rt::syscall::ipc_call(request_ep, reply_ep, &request_msg) } {
+                Ok(()) => {
+                    out.called = true;
+                    break;
+                }
+                Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                }
+                Err(e) => {
+                    yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_CALL_HARD_FAIL err={:?}", e);
+                    break;
+                }
+            }
+        }
+        if !out.called {
+            yarm_user_rt::user_log!(
+                "IPCCALL_DIRECT_ORACLE_CALL_FAIL attempts={}",
+                out.call_attempts
+            );
+            return out;
+        }
+        yarm_user_rt::user_log!(
+            "IPCCALL_DIRECT_ORACLE_CLIENT_CALL_OK attempts={}",
+            out.call_attempts
+        );
+        // Block on the reply endpoint — commits the BlockedCallerAck and dispatches the woken server,
+        // which replies (NR7) and wakes us exactly once.
+        // SAFETY: `reply_ep` carries RECEIVE; a blocking recv-v2.
+        let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_ep) };
+        out.reply_ok = match reply {
+            Ok(Some(rm)) => {
+                CLIENT_CONTINUATIONS.fetch_add(1, Relaxed);
+                let msg = rm.message;
+                let plen = msg.len as usize;
+                let ok = plen == REPLY_DATA.len() && msg.payload[0..plen] == REPLY_DATA;
+                yarm_user_rt::user_log!(
+                    "IPCCALL_DIRECT_ORACLE_CLIENT_REPLY_RECV plen={} reply_ok={}",
+                    plen,
+                    ok as u32
+                );
+                ok
+            }
+            Ok(None) => {
+                yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_CLIENT_REPLY_WOULDBLOCK");
+                false
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_CLIENT_REPLY_FAIL err={:?}", e);
+                false
+            }
+        };
+        // The server has replied, run its duplicate reply, and parked before we resumed here.
+        out.request_ok = SERVER_REQUEST_OK.load(Relaxed);
+        out.server_reply_ok = SERVER_REPLY_OK.load(Relaxed);
+        out.dup_rejected = SERVER_DUP_REJECTED.load(Relaxed);
+        out.server_cont = SERVER_CONTINUATIONS.load(Relaxed);
+        out.client_cont = CLIENT_CONTINUATIONS.load(Relaxed);
+        out
+    }
 }
 
-/// Parent/client entry (x86_64): read the provisioned request+reply endpoint caps, spawn the server
-/// child, wait for the liveness handshake (server then recv-blocks), invoke NR6 IpcCall (bounded
-/// retry), recv-v2-block on the reply endpoint (committing the BlockedCallerAck + dispatching the
-/// server), validate the reply payload, and emit the round-trip completion marker with exact counts.
+// ── x86_64 arch wrapper: naked child trampoline (RSP alignment) + arch-named markers. ────────────
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+mod x86_ipccall_direct_oracle {
+    pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
+    pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
+
+    #[unsafe(naked)]
+    pub(super) extern "C" fn child_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::x86_ipccall_direct_child_body)
+    }
+}
+
+/// x86_64 server child body: run the arch-neutral server core, emit the x86 send marker, park.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn x86_ipccall_direct_child_body() -> ! {
+    use ipccall_direct_oracle_core as core_oracle;
+    // SAFETY: freshly-spawned oracle child sharing init's CSpace/address space.
+    let o = unsafe { core_oracle::server_run() };
+    let early = o.attempts.saturating_sub(1);
+    yarm_user_rt::user_log!(
+        "X86_IPCREPLY_DIRECT_SEND attempts={} early_retries={} result={}",
+        o.attempts,
+        early,
+        if o.replied { "ok" } else { "fail" }
+    );
+    core_oracle::server_park();
+}
+
+/// x86_64 parent/client entry: read caps, spawn the server child via the naked trampoline, run the
+/// arch-neutral parent core, emit the x86 round-trip completion marker with exact counts.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn run_x86_ipccall_direct_oracle(init_tid: u64) {
     use core::sync::atomic::Ordering::Relaxed;
-    use x86_ipccall_direct_oracle as o;
+    use ipccall_direct_oracle_core as core_oracle;
     yarm_user_rt::user_log!(
         "IPCCALL_DIRECT_ROUNDTRIP_ORACLE_BEGIN init_tid={}",
         init_tid
     );
-    let request_ep = yarm_user_rt::runtime::startup_arg_slot(
-        yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_0,
-    )
-    .unwrap_or(0) as u32;
-    let reply_ep = yarm_user_rt::runtime::startup_arg_slot(
-        yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_1,
-    )
-    .unwrap_or(0) as u32;
+    let (request_ep, reply_ep) = core_oracle::oracle_caps();
     if request_ep == 0 || reply_ep == 0 {
         yarm_user_rt::user_log!(
             "IPCCALL_DIRECT_ORACLE_MISSING_CAPS request_ep={} reply_ep={}",
@@ -1561,11 +1704,11 @@ fn run_x86_ipccall_direct_oracle(init_tid: u64) {
         return;
     }
     let stack_top = {
-        let base = core::ptr::addr_of_mut!(o::CHILD_STACK) as usize;
+        let base = core::ptr::addr_of_mut!(x86_ipccall_direct_oracle::CHILD_STACK) as usize;
         (base + 16384) & !0xF
     };
-    let entry = o::child_entry as *const () as usize;
-    let tls_base = core::ptr::addr_of_mut!(o::CHILD_TLS) as usize;
+    let entry = x86_ipccall_direct_oracle::child_entry as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(x86_ipccall_direct_oracle::CHILD_TLS) as usize;
     // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
     let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
     {
@@ -1575,97 +1718,19 @@ fn run_x86_ipccall_direct_oracle(init_tid: u64) {
             return;
         }
     };
-    o::CHILD_TID.store(child_tid, Relaxed);
+    core_oracle::CHILD_TID.store(child_tid, Relaxed);
     yarm_user_rt::user_log!(
         "IPCCALL_DIRECT_ROUNDTRIP_ORACLE_CHILD_SPAWNED child_tid={}",
         child_tid
     );
-    // Authoritative liveness handshake: block until the server wakes us. On a single CPU the server
-    // then commits its blocked recv before we resume (its wake enqueues us but does not preempt it).
-    let handshake = o::HANDSHAKE.as_ptr();
-    let hv = o::HANDSHAKE.load(Relaxed);
-    let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
-    yarm_user_rt::user_log!("IPCCALL_DIRECT_ROUNDTRIP_ORACLE_PARENT_RESUMED");
-    // NR6 IpcCall — bounded retry on WouldBlock (deterministically succeeds on attempt 1 because the
-    // server is a committed waiter; the retry only fires if the ordering ever slipped).
-    let request_msg = match yarm_user_rt::ipc::Message::with_header(
-        0,
-        o::REQUEST_OPCODE,
-        0,
-        None,
-        &o::REQUEST_DATA,
-    ) {
-        Ok(m) => m,
-        Err(_) => {
-            yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_REQUEST_BUILD_FAIL");
-            return;
-        }
-    };
-    let mut call_attempts: u32 = 0;
-    let mut called = false;
-    while call_attempts < o::MAX_ATTEMPTS {
-        call_attempts += 1;
-        // SAFETY: `request_ep` = request SEND cap; `reply_ep` = reply-endpoint RECEIVE cap.
-        match unsafe { yarm_user_rt::syscall::ipc_call(request_ep, reply_ep, &request_msg) } {
-            Ok(()) => {
-                called = true;
-                break;
-            }
-            Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
-                let _ = yarm_user_rt::syscall::yield_now();
-            }
-            Err(e) => {
-                yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_CALL_HARD_FAIL err={:?}", e);
-                break;
-            }
-        }
-    }
-    if !called {
-        yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_CALL_FAIL attempts={}", call_attempts);
-        return;
-    }
-    yarm_user_rt::user_log!(
-        "IPCCALL_DIRECT_ORACLE_CLIENT_CALL_OK attempts={}",
-        call_attempts
-    );
-    // Block on the reply endpoint — commits the BlockedCallerAck and dispatches the woken server,
-    // which replies (NR7) and wakes us exactly once.
-    // SAFETY: `reply_ep` carries RECEIVE; a blocking recv-v2.
-    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_ep) };
-    let reply_ok = match reply {
-        Ok(Some(rm)) => {
-            o::CLIENT_CONTINUATIONS.fetch_add(1, Relaxed);
-            let msg = rm.message;
-            let plen = msg.len as usize;
-            let ok = plen == o::REPLY_DATA.len() && msg.payload[0..plen] == o::REPLY_DATA;
-            yarm_user_rt::user_log!(
-                "IPCCALL_DIRECT_ORACLE_CLIENT_REPLY_RECV plen={} reply_ok={}",
-                plen,
-                ok as u32
-            );
-            ok
-        }
-        Ok(None) => {
-            yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_CLIENT_REPLY_WOULDBLOCK");
-            false
-        }
-        Err(e) => {
-            yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_CLIENT_REPLY_FAIL err={:?}", e);
-            false
-        }
-    };
-    // The server has replied, run its duplicate reply, and parked before we resumed here.
-    let request_ok = o::SERVER_REQUEST_OK.load(Relaxed);
-    let server_reply_ok = o::SERVER_REPLY_OK.load(Relaxed);
-    let dup_rejected = o::SERVER_DUP_REJECTED.load(Relaxed);
-    let server_cont = o::SERVER_CONTINUATIONS.load(Relaxed);
-    let client_cont = o::CLIENT_CONTINUATIONS.load(Relaxed);
-    if reply_ok
-        && request_ok == 1
-        && server_reply_ok == 1
-        && dup_rejected == 1
-        && server_cont == 1
-        && client_cont == 1
+    // SAFETY: the provisioned oracle caps.
+    let out = unsafe { core_oracle::parent_run(request_ep, reply_ep) };
+    if out.reply_ok
+        && out.request_ok == 1
+        && out.server_reply_ok == 1
+        && out.dup_rejected == 1
+        && out.server_cont == 1
+        && out.client_cont == 1
     {
         yarm_user_rt::user_log!(
             "X86_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok=1 reply_ok=1 duplicate_reply=rejected server_wakes=1 caller_wakes=1 client_continuations=1 server_continuations=1 result=ok"
@@ -1673,13 +1738,103 @@ fn run_x86_ipccall_direct_oracle(init_tid: u64) {
     } else {
         yarm_user_rt::user_log!(
             "X86_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok={} reply_ok={} duplicate_reply={} server_wakes={} caller_wakes={} client_continuations={} server_continuations={} result=fail",
-            request_ok,
-            reply_ok as u32,
-            dup_rejected,
-            server_cont,
-            client_cont,
-            client_cont,
-            server_cont
+            out.request_ok,
+            out.reply_ok as u32,
+            out.dup_rejected,
+            out.server_cont,
+            out.client_cont,
+            out.client_cont,
+            out.server_cont
+        );
+    }
+}
+
+// ── AArch64 arch wrapper: plain `extern "C"` child entry (no naked trampoline — AAPCS64 has no
+//    x86-style initial-SP call-alignment hazard) + arch-named markers. Reuses the SAME arch-neutral
+//    `ipccall_direct_oracle_core`; duplicates NONE of the round-trip logic. ─────────────────────────
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+mod aarch64_ipccall_direct_oracle {
+    pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
+    pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
+}
+
+/// AArch64 server child body: run the arch-neutral server core, emit the AArch64 send marker, park.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+extern "C" fn aarch64_ipccall_direct_child_body() -> ! {
+    use ipccall_direct_oracle_core as core_oracle;
+    // SAFETY: freshly-spawned oracle child sharing init's CSpace/address space.
+    let o = unsafe { core_oracle::server_run() };
+    let early = o.attempts.saturating_sub(1);
+    yarm_user_rt::user_log!(
+        "AARCH64_IPCREPLY_DIRECT_SEND attempts={} early_retries={} result={}",
+        o.attempts,
+        early,
+        if o.replied { "ok" } else { "fail" }
+    );
+    core_oracle::server_park();
+}
+
+/// AArch64 parent/client entry: read caps, spawn the server child, run the arch-neutral parent core,
+/// emit the AArch64 round-trip completion marker with exact counts.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn run_aarch64_ipccall_direct_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use ipccall_direct_oracle_core as core_oracle;
+    yarm_user_rt::user_log!(
+        "IPCCALL_DIRECT_ROUNDTRIP_ORACLE_BEGIN init_tid={}",
+        init_tid
+    );
+    let (request_ep, reply_ep) = core_oracle::oracle_caps();
+    if request_ep == 0 || reply_ep == 0 {
+        yarm_user_rt::user_log!(
+            "IPCCALL_DIRECT_ORACLE_MISSING_CAPS request_ep={} reply_ep={}",
+            request_ep,
+            reply_ep
+        );
+        return;
+    }
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(aarch64_ipccall_direct_oracle::CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = aarch64_ipccall_direct_child_body as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(aarch64_ipccall_direct_oracle::CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    core_oracle::CHILD_TID.store(child_tid, Relaxed);
+    yarm_user_rt::user_log!(
+        "IPCCALL_DIRECT_ROUNDTRIP_ORACLE_CHILD_SPAWNED child_tid={}",
+        child_tid
+    );
+    // SAFETY: the provisioned oracle caps.
+    let out = unsafe { core_oracle::parent_run(request_ep, reply_ep) };
+    if out.reply_ok
+        && out.request_ok == 1
+        && out.server_reply_ok == 1
+        && out.dup_rejected == 1
+        && out.server_cont == 1
+        && out.client_cont == 1
+    {
+        yarm_user_rt::user_log!(
+            "AARCH64_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok=1 reply_ok=1 duplicate_reply=rejected server_wakes=1 caller_wakes=1 client_continuations=1 server_continuations=1 result=ok"
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "AARCH64_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok={} reply_ok={} duplicate_reply={} server_wakes={} caller_wakes={} client_continuations={} server_continuations={} result=fail",
+            out.request_ok,
+            out.reply_ok as u32,
+            out.dup_rejected,
+            out.server_cont,
+            out.client_cont,
+            out.client_cont,
+            out.server_cont
         );
     }
 }
@@ -2947,6 +3102,15 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if ctx.supervisor_control_recv_ep == Some(6) {
         run_aarch64_shared_region_direct_oracle(ctx.task_id);
+    }
+    // Stage 199A2C1: default-off + feature-gated AArch64 DIRECT IpcCall/IpcReply live round-trip
+    // oracle. Slot-5 selector 7 (the next free AArch64 selector, mutually exclusive with 1-6) tells
+    // init to run the parent(client)/child(server) NR6 request + NR7 reply round trip through the
+    // accepted off-lock transactions, reusing the SAME arch-neutral core as x86. Requires both the
+    // build feature AND the runtime knob.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+    if ctx.supervisor_control_recv_ep == Some(7) {
+        run_aarch64_ipccall_direct_oracle(ctx.task_id);
     }
     // Stage 196C: default-off RISC-V FutexWake live oracle. Slot-5 sentinel 1 (set by the RISC-V
     // boot under `yarm.riscv64_futex_wake_oracle=1`) tells init to run the parent/child split

@@ -1152,6 +1152,13 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
     if raw_nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || raw_nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
+        // Stage 199A2C1: admit IpcCall (NR 6) + IpcReply (NR 7) ONLY when the direct proof gate is
+        // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply
+        // gates. With the gate off, `nr` stays 0 and the split dispatcher declines them (unchanged
+        // global-lock fallback) — this keeps a normal boot byte-identical.
+        || ((raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
+            || raw_nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)
+            && crate::kernel::boot::ipccall_direct_proof_enabled())
     {
         super::aarch64::trap::split_import_syscall_abi(frame);
     }
@@ -1174,6 +1181,11 @@ fn finalize_split_handled_syscall(
     if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
+        // Stage 199A2C1: a HANDLED off-lock IpcCall/IpcReply returns via the AArch64 syscall-return
+        // ABI (export x0..x5 + advance ELR past the SVC) — mirroring the selective import above.
+        || ((frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
+            || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)
+            && crate::kernel::boot::ipccall_direct_proof_enabled())
     {
         let _ = shared.with_cpu(cpu, |kernel| {
             super::aarch64::trap::split_finalize_handled_syscall(kernel, cpu, frame)

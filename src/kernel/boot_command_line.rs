@@ -400,6 +400,14 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_x86_ipccall_direct_oracle_enabled(enabled);
         crate::yarm_log!("YARM_X86_64_IPCCALL_DIRECT_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.aarch64_ipccall_direct_oracle {
+        // Stage 199A2C1: default-off AArch64 DIRECT IpcCall/IpcReply live round-trip oracle knob.
+        // Provisions init startup slot 5 (=7) so init runs the SAME arch-neutral round trip AND arms
+        // the shared NR6/NR7 off-lock proof gate. Does NOT arm the x86_64 oracle-enabled flag or any
+        // non-AArch64 arch; does NOT enable queued calls, timeouts, notifications, or server-death wake.
+        crate::kernel::boot::set_aarch64_ipccall_direct_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_AARCH64_IPCCALL_DIRECT_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.force_init_zc_load_fail {
         // Stage 197A: default-off fault-injection knob. Forces the required init ELF load to
         // fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path is exercisable under QEMU.
@@ -712,6 +720,12 @@ pub struct YarmBootOptions<'a> {
     /// direct classes; queued calls, timeouts, notifications, server-death wake, and all non-x86
     /// architectures stay disabled.
     pub x86_64_ipccall_direct_oracle: Option<bool>,
+    /// Stage 199A2C1: `yarm.aarch64_ipccall_direct_oracle=1` DEFAULT-OFF knob. Mirror of the x86_64
+    /// knob on AArch64: provisions init startup slot 5 (=7) so init runs the SAME arch-neutral
+    /// parent(client)/child(server) NR6 request + NR7 reply round trip, and arms the shared NR6/NR7
+    /// proof gate. Selects the workload + enables exactly the two AArch64 direct classes; queued
+    /// calls, timeouts, notifications, the x86_64 oracle, and RISC-V stay disabled.
+    pub aarch64_ipccall_direct_oracle: Option<bool>,
     /// Stage 197A: `yarm.force_init_zc_load_fail=1` DEFAULT-OFF fault-injection knob. Forces the
     /// required init ELF load to fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path is
     /// exercisable under QEMU. NEVER set on a normal boot.
@@ -911,6 +925,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.x86_64_ipccall_direct_oracle" {
             options.x86_64_ipccall_direct_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.aarch64_ipccall_direct_oracle" {
+            options.aarch64_ipccall_direct_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.force_init_zc_load_fail" {
             options.force_init_zc_load_fail = parse_bool_knob(value);

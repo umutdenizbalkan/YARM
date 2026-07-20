@@ -3097,6 +3097,11 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// selector after FutexWake(1) and shared-region-direct(2).
 pub const IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 3;
 
+/// Stage 199A2C1: AArch64 startup slot-5 selector for the DIRECT IpcCall/IpcReply round-trip oracle.
+/// Value 7 is the next free AArch64 selector after FutexWake(1)/FutexWait(2)/idle(3)/yield(4,5)/
+/// shared-region-direct(6); the AArch64 init dispatch keys on `Some(7)`.
+pub const AARCH64_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 7;
+
 /// Stage 199A2B4: default-off x86_64 DIRECT IpcCall/IpcReply live-oracle WORKLOAD selector
 /// (`yarm.x86_64_ipccall_direct_oracle=1`). Provisions init startup slot 5 (=3) so init runs
 /// the parent(client)/child(server) NR6 request + NR7 reply round trip through the accepted
@@ -3117,6 +3122,43 @@ pub(crate) fn set_x86_ipccall_direct_oracle_enabled(enabled: bool) {
 pub fn x86_ipccall_direct_oracle_enabled() -> bool {
     X86_IPCCALL_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
+
+/// Stage 199A2C1: default-off AArch64 DIRECT IpcCall/IpcReply live-oracle WORKLOAD selector
+/// (`yarm.aarch64_ipccall_direct_oracle=1`). Mirror of the x86_64 knob: provisions init startup
+/// slot 5 (=7, the next free AArch64 selector after FutexWake/FutexWait/Yield/shared-region 1..6) so
+/// init runs the SAME arch-neutral parent(client)/child(server) NR6 request + NR7 reply round trip
+/// through the accepted off-lock transactions, and arms the shared NR6/NR7 proof gate so both direct
+/// gates go live. INERT on a normal boot; does NOT enable queued calls, timeouts, notifications,
+/// server-death wake, the x86_64 oracle, or RISC-V.
+pub(crate) static AARCH64_IPCCALL_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_ipccall_direct_oracle_enabled(enabled: bool) {
+    AARCH64_IPCCALL_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        // Selecting the workload arms the SHARED NR6/NR7 off-lock proof gate for this run. This is
+        // the arch-neutral gate; it does NOT arm the x86-specific oracle-enabled flag.
+        set_ipccall_direct_proof_enabled(true);
+    }
+}
+
+pub fn aarch64_ipccall_direct_oracle_enabled() -> bool {
+    AARCH64_IPCCALL_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The DIRECT IpcCall/IpcReply oracle is live when ANY arch's workload selector is armed. The
+/// provisioning + arch-parameterized live markers key on this arch-neutral predicate; the per-arch
+/// marker literals are additionally `target_arch`-gated at their emitter.
+pub fn ipccall_direct_oracle_enabled() -> bool {
+    x86_ipccall_direct_oracle_enabled() || aarch64_ipccall_direct_oracle_enabled()
+}
+
+/// The compiled architecture tag for the DIRECT IpcCall/IpcReply oracle markers (mirrors the
+/// shared-region oracle's `SHARED_REGION_ORACLE_ARCH`). Confined to the armed-oracle build.
+#[cfg(all(feature = "ipccall-direct-oracle", target_arch = "x86_64"))]
+pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = "x86_64";
+#[cfg(all(feature = "ipccall-direct-oracle", target_arch = "aarch64"))]
+pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = "aarch64";
 
 /// Stage 199A2B4: the oracle's request + reply endpoint SLOT INDICES. The off-lock NR6/NR7 gates
 /// take the direct path ONLY for these exact endpoints, so a NORMAL system IpcCall/IpcReply (the
@@ -3145,66 +3187,81 @@ pub fn ipccall_direct_oracle_reply_endpoint_is(eidx: usize) -> bool {
     IPCCALL_DIRECT_ORACLE_REP_EIDX.load(core::sync::atomic::Ordering::Acquire) == eidx
 }
 
-/// Stage 199A2B4: emit the NR6 `IpcCallDirectRequest` success + retirement markers EXACTLY ONCE,
-/// from the production off-lock request drain, ONLY under the x86 oracle feature+selector. A normal
-/// (feature-off) artifact never compiles these class literals; a feature-on-but-selector-off boot
-/// never reaches them (the gate is not armed and the drain never runs a live delivery). One-shot.
+/// Stage 199A2B4/199A2C1: emit the NR6 `IpcCallDirectRequest` success + retirement markers EXACTLY
+/// ONCE, from the production off-lock request drain, ONLY under the umbrella oracle feature (x86_64
+/// or aarch64) + the arch's selector. A normal (feature-off) artifact never compiles the class
+/// literal; a feature-on-but-selector-off boot never reaches it (the gate is not armed and the drain
+/// never runs a live delivery). ARCH-PARAMETERIZED via `IPCCALL_DIRECT_ORACLE_ARCH` — one emitter
+/// serves both arches; the literal is `target_arch`-gated so an artifact carries only its arch tag.
 #[cfg(all(
-    feature = "x86-ipccall-direct-oracle",
-    target_arch = "x86_64",
+    feature = "ipccall-direct-oracle",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
     not(feature = "hosted-dev")
 ))]
 pub(crate) fn emit_ipccall_direct_request_live_markers() {
-    if !x86_ipccall_direct_oracle_enabled() {
+    if !ipccall_direct_oracle_enabled() {
         return;
     }
     static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if ONCE.swap(true, core::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcCallDirectRequest");
     crate::yarm_log!(
-        "IPCCALL_DIRECT_REQUEST_OK arch=x86_64 source_copy_offlock=1 reply_cap=1 server_wakes=1"
+        "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch={} class=IpcCallDirectRequest",
+        IPCCALL_DIRECT_ORACLE_ARCH
     );
     crate::yarm_log!(
-        "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcCallDirectRequest result=ok"
+        "IPCCALL_DIRECT_REQUEST_OK arch={} source_copy_offlock=1 reply_cap=1 server_wakes=1",
+        IPCCALL_DIRECT_ORACLE_ARCH
+    );
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcCallDirectRequest result=ok",
+        IPCCALL_DIRECT_ORACLE_ARCH
     );
 }
 
-/// Stage 199A2B4: emit the NR7 `IpcReplyDirect` success + retirement markers EXACTLY ONCE, from
-/// the production off-lock reply drain, ONLY under the x86 oracle feature+selector. One-shot.
+/// Stage 199A2B4/199A2C1: emit the NR7 `IpcReplyDirect` success + retirement markers EXACTLY ONCE,
+/// from the production off-lock reply drain, ONLY under the umbrella oracle feature + selector.
+/// Arch-parameterized; one-shot.
 #[cfg(all(
-    feature = "x86-ipccall-direct-oracle",
-    target_arch = "x86_64",
+    feature = "ipccall-direct-oracle",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
     not(feature = "hosted-dev")
 ))]
 pub(crate) fn emit_ipcreply_direct_live_markers() {
-    if !x86_ipccall_direct_oracle_enabled() {
+    if !ipccall_direct_oracle_enabled() {
         return;
     }
     static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     if ONCE.swap(true, core::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch=x86_64 class=IpcReplyDirect");
     crate::yarm_log!(
-        "IPCREPLY_DIRECT_OK arch=x86_64 source_copy_offlock=1 caller_wakes=1 one_shot=1"
+        "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch={} class=IpcReplyDirect",
+        IPCCALL_DIRECT_ORACLE_ARCH
     );
-    crate::yarm_log!("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyDirect result=ok");
+    crate::yarm_log!(
+        "IPCREPLY_DIRECT_OK arch={} source_copy_offlock=1 caller_wakes=1 one_shot=1",
+        IPCCALL_DIRECT_ORACLE_ARCH
+    );
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyDirect result=ok",
+        IPCCALL_DIRECT_ORACLE_ARCH
+    );
 }
 
 /// No-op stubs so the production drain call sites compile unconditionally (normal artifacts +
 /// hosted builds never emit the class literals).
 #[cfg(not(all(
-    feature = "x86-ipccall-direct-oracle",
-    target_arch = "x86_64",
+    feature = "ipccall-direct-oracle",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
     not(feature = "hosted-dev")
 )))]
 pub(crate) fn emit_ipccall_direct_request_live_markers() {}
 
 #[cfg(not(all(
-    feature = "x86-ipccall-direct-oracle",
-    target_arch = "x86_64",
+    feature = "ipccall-direct-oracle",
+    any(target_arch = "x86_64", target_arch = "aarch64"),
     not(feature = "hosted-dev")
 )))]
 pub(crate) fn emit_ipcreply_direct_live_markers() {}
@@ -4366,7 +4423,7 @@ pub fn provision_init_shared_region_oracle(
 /// oracle. Both endpoint caps carry `SEND | RECEIVE` and live in init's (shared) CNode — the
 /// client uses the request SEND side + the reply RECEIVE side, and the spawned server child
 /// (sharing init's CSpace) uses the request RECEIVE side.
-#[cfg(feature = "x86-ipccall-direct-oracle")]
+#[cfg(feature = "ipccall-direct-oracle")]
 pub struct IpccallDirectOracleCaps {
     /// init-local request endpoint cap (`SEND | RECEIVE`) → startup slot 13.
     pub request_ep_cap: u32,
@@ -4379,7 +4436,7 @@ pub struct IpccallDirectOracleCaps {
 }
 
 /// Rollback scratch for the IpcCall/IpcReply oracle provisioning transaction.
-#[cfg(feature = "x86-ipccall-direct-oracle")]
+#[cfg(feature = "ipccall-direct-oracle")]
 #[derive(Default, Clone, Copy)]
 struct IpccallDirectProvisionScratch {
     req_send_root: Option<crate::kernel::capabilities::CapId>,
@@ -4392,7 +4449,7 @@ struct IpccallDirectProvisionScratch {
     init_rep_cap: Option<crate::kernel::capabilities::CapId>,
 }
 
-#[cfg(feature = "x86-ipccall-direct-oracle")]
+#[cfg(feature = "ipccall-direct-oracle")]
 fn rollback_ipccall_direct_provision(
     kernel: &mut KernelState,
     init_tid: u64,
@@ -4434,12 +4491,12 @@ fn rollback_ipccall_direct_provision(
 /// on ANY step failure it emits a precise failure marker, rolls back every resource created so
 /// far, and returns `None` (the caller then leaves the oracle un-armed). Provisions NO
 /// MemoryObject and NO queued/timeout/notification authority.
-#[cfg(feature = "x86-ipccall-direct-oracle")]
+#[cfg(feature = "ipccall-direct-oracle")]
 pub fn provision_init_ipccall_direct_oracle(
     kernel: &mut KernelState,
     init_tid: u64,
 ) -> Option<IpccallDirectOracleCaps> {
-    if !x86_ipccall_direct_oracle_enabled() {
+    if !ipccall_direct_oracle_enabled() {
         return None;
     }
     use crate::kernel::capabilities::{CapObject, CapRights, Capability};
