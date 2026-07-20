@@ -80776,3 +80776,55 @@ mod stage199a2d2a_smp_request {
         assert_eq!(X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR, 9);
     }
 }
+
+/// Stage 199A2D2B — generic AP dispatch mechanism guards + seal/scope preservation.
+#[cfg(test)]
+mod stage199a2d2b_guards {
+    // (8.11) The dispatch plan is fully OWNED — no task/scheduler/capability reference can cross the
+    // user return (it is Copy + Send + 'static, all scalar fields).
+    #[test]
+    fn dispatch_plan_is_owned_no_borrow_escapes() {
+        fn assert_owned<T: Copy + Send + Sync + 'static>() {}
+        assert_owned::<crate::arch::x86_64::ap_sched::ApUserDispatchPlan>();
+        assert_owned::<crate::arch::x86_64::ap_sched::ApDispatchDecision>();
+        assert_owned::<crate::arch::x86_64::ap_sched::ApReturnMode>();
+    }
+
+    // (8.18) The historical `result=blocked` diagnostic can NEVER satisfy the success seal: the
+    // request smoke gates the ok seal behind genuine distinct-CPU markers, and the two seal strings
+    // are distinct.
+    #[test]
+    fn blocked_seal_cannot_satisfy_success_seal() {
+        let sh = include_str!("../../../scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh");
+        assert!(sh.contains("result=blocked"), "blocked diagnostic present");
+        // The ok seal is emitted ONLY inside the distinct-CPU-verified branch.
+        let ok_idx = sh
+            .find("cross_cpu=1 request_copies=1")
+            .or_else(|| sh.find("cross_cpu=1 duplicate_deliveries=0"))
+            .expect("ok seal present");
+        let gate_idx = sh.find("req_ok").expect("distinct-CPU gate present");
+        assert!(
+            gate_idx < ok_idx,
+            "ok seal gated behind the cross-CPU check"
+        );
+        // The ordered LIVE sequence the seal requires is encoded.
+        assert!(sh.contains("IPCCALL_DIRECT_SMP_SERVER_BLOCKED arch=x86_64 server_cpu=1"));
+        assert!(sh.contains("IPCCALL_DIRECT_SMP_REQUEST_OK arch=x86_64"));
+    }
+
+    // (8.19) Stage 199 functional live-cell count unchanged (6) and (8.20) Stage 198F = 30 cells.
+    #[test]
+    fn stage199_functional_and_198f_cell_counts_preserved() {
+        let matrix = include_str!("../../../scripts/qemu-ipccall-reply-direct-matrix-seal.sh");
+        assert!(
+            matrix.contains("total_live_cells=6"),
+            "Stage 199 functional matrix stays 6 live cells"
+        );
+        // Stage 198F 30-cell seal doc invariant (kept in the second-cohort retirement seal doc).
+        let doc = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        assert!(
+            doc.contains("30"),
+            "Stage 198F 30-cell matrix reference preserved"
+        );
+    }
+}

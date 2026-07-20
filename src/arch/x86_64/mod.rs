@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 pub mod ap_dispatch;
+pub mod ap_sched;
 pub mod boot;
 pub mod console;
 pub mod context_switch;

@@ -13,16 +13,17 @@
 #
 # with sender_cpu != receiver_cpu.
 #
-# HONEST STATUS (Stage 199A2D2A): the LIVE cross-CPU round trip is NOT producible with the current
-# x86 AP infrastructure. `live_ap_user_dispatch` enters ring 3 via a FRESH pre-built plan (a
-# hardcoded probe), and the AP idle loop (`ap_idle_halt_loop`) is a bare `sti;hlt`; the remote-wake
-# IPI handler only counts + EOIs and returns to that loop. There is NO AP dispatch-on-wake and NO
-# context-restore path, so a server cannot block in recv-v2 on CPU 1 and later be woken + RESUMED
-# there. The kernel MECHANISM (CPU-targeted remote enqueue via the accepted NR6 transaction's
-# captured affinity, single-slot ack, one-pair fuse) is implemented and proven by the
-# `stage199a2d2a_smp_request` hosted tests; the LIVE resume is blocked pending an AP
-# dispatch-on-wake + context-restore path (the Stage 199A2D2B prerequisite). Presenting same-CPU
-# execution as cross-CPU is a HARD-STOP, so this script NEVER emits `result=ok`.
+# HONEST STATUS (Stage 199A2D2B): the GENERIC AP dispatch-on-wake MECHANISM now exists and is
+# proven by hosted tests — the per-CPU reschedule-pending coalescing flag, the lost-wakeup-safe idle
+# decision, and the owned scheduler-selected dispatch plan that distinguishes a FreshUserEntry from a
+# BlockedUserResume (`src/arch/x86_64/ap_sched.rs`; `arch::x86_64::ap_sched::tests`). The CPU-targeted
+# remote enqueue (via the accepted NR6 transaction's captured affinity), single-slot ack, and
+# one-pair fuse were proven in Stage 199A2D2A (`stage199a2d1`/`stage199a2d2a_smp_request`). The
+# remaining LIVE piece is the ARCH ASM half: the AP context-restore `iretq` that installs per-CPU
+# CR3/TSS-RSP0/GS/FS and resumes a blocked task's saved continuation, plus the real recv-v2 server
+# provisioned on CPU 1. Until that asm is wired + proven under QEMU, a server cannot actually block
+# in recv-v2 on CPU 1 and be woken + RESUMED there. Presenting same-CPU execution as cross-CPU is a
+# HARD-STOP, so this script NEVER emits `result=ok` without the genuine distinct-CPU markers.
 #
 # What this script proves honestly: the SMP request oracle knob boots CLEAN under QEMU_SMP=2 (no
 # panic/fault/stall), both CPUs online, no ack overwrite, no service regression — i.e. arming the
@@ -41,7 +42,7 @@ TIMEOUT_SECS=${TIMEOUT_SECS:-150}
 mkdir -p "$LOGDIR"
 BOOT_LOG="$LOGDIR/boot.log"
 
-SEAL_BLOCKED="STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 pairs=1 sender_cpu=0 receiver_cpu=1 cross_cpu=0 duplicate_deliveries=0 duplicate_wakes=0 wrong_waiter_mutations=0 result=blocked reason=ap_dispatch_on_wake_and_context_restore_not_wired"
+SEAL_BLOCKED="STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 pairs=1 sender_cpu=0 receiver_cpu=1 cross_cpu=0 duplicate_deliveries=0 duplicate_wakes=0 wrong_waiter_mutations=0 result=blocked reason=ap_context_restore_asm_not_wired"
 
 fail=0
 note() { echo "[ipccall-direct-smp-request] $*"; }
