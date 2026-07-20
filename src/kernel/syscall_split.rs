@@ -233,7 +233,15 @@ pub(crate) fn try_split_dispatch_into_frame(
         }
         return None;
     };
-    if classify_split_eligible_nr_only(syscall).is_none() {
+    // Stage 199A2B3/199A2B4: IpcCall (NR 6) + IpcReply (NR 7) are NOT in the static NR-only
+    // whitelist (a normal boot must reach neither off-lock gate), but they ARE eligible for the
+    // proof-gated direct request/reply gates below when the internal proof gate is armed. Passing
+    // them through the NR-gate ONLY under `ipccall_direct_proof_enabled()` keeps normal boots
+    // byte-identical (gate off → this early-return fires exactly as before) while making the live
+    // gates genuinely reachable (the runtime gate prevents the compiler proving the routes dead).
+    let direct_ipc_gate_armed = matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)
+        && crate::kernel::boot::ipccall_direct_proof_enabled();
+    if classify_split_eligible_nr_only(syscall).is_none() && !direct_ipc_gate_armed {
         if probe {
             crate::yarm_log!(
                 "YARM_SPLIT_DISPATCH_FALLBACK reason=nr_not_eligible nr={}",
@@ -610,6 +618,19 @@ fn try_split_ipccall_direct_into_frame(
         return None; // invalid length: no ack claim, no mutation — legacy path
     }
     let tid = shared.current_tid_authoritative(cpu)?;
+    // Stage 199A2B4: confine the off-lock request path to the oracle's request endpoint so a
+    // NORMAL system IpcCall (the live service chain) stays byte-identical on its legacy path even
+    // while the proof gate is armed. Any other endpoint → None (legacy). No ack claim, no copy.
+    let send_endpoint = shared
+        .resolve_endpoint_send_cap_split_read(tid, send_cap)
+        .ok()?;
+    let send_eidx = match send_endpoint {
+        crate::kernel::capabilities::CapObject::Endpoint { index, .. } => index,
+        _ => return None,
+    };
+    if !crate::kernel::boot::ipccall_direct_oracle_request_endpoint_is(send_eidx) {
+        return None;
+    }
     let asid_raw = shared.task_asid_for_tid_split_read(tid);
     let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(
         crate::kernel::ipc::ThreadId(tid),
@@ -670,6 +691,15 @@ fn try_split_ipcreply_direct_into_frame(
         return None; // invalid length: no ack claim, no mutation — legacy path
     }
     let tid = shared.current_tid_authoritative(cpu)?;
+    // Stage 199A2B4: confine the off-lock reply path to the oracle's reply endpoint so a NORMAL
+    // system IpcReply (the live service chain) stays byte-identical on its legacy path even while
+    // the proof gate is armed. Resolve the reply cap → record → its bound reply endpoint index; any
+    // other reply endpoint → None (legacy). No ack claim, no copy, no mutation.
+    let (rec_idx, rec_gen) = shared.resolve_reply_cap_split_read(tid, reply_cap).ok()?;
+    let reply_eidx = shared.reply_record_endpoint_index_split_read(rec_idx, rec_gen)?;
+    if !crate::kernel::boot::ipccall_direct_oracle_reply_endpoint_is(reply_eidx) {
+        return None;
+    }
     let asid_raw = shared.task_asid_for_tid_split_read(tid);
     let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(
         crate::kernel::ipc::ThreadId(tid),

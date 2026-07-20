@@ -70592,20 +70592,27 @@ mod stage199a1_ipccall_direct_audit {
         );
     }
 
-    // (classification) Neither IpcCall (NR6) nor IpcReply (NR7) is in the pre-lock split-dispatch
-    // bridge, so the sender/replier payload read runs under the broad lock → both are NEEDS_BOUNDED_FIX.
+    // (classification — bounded fix LANDED) The Stage 199A1 audit classified IpcCall (NR6) +
+    // IpcReply (NR7) as NEEDS_BOUNDED_FIX (the sender/replier payload read ran under the broad
+    // lock). Stage 199A2B3 landed the accepted off-lock request + reply transactions with a pre-lock
+    // OWNED source snapshot, and Stage 199A2B4 proved them LIVE end-to-end under QEMU. The bounded
+    // fix is therefore DONE: both NR6/NR7 now have proof-gated pre-lock split-dispatch gates.
     #[test]
-    fn ipccall_and_ipcreply_not_split_dispatched_needs_bounded_fix() {
-        assert!(!SPLIT_SRC.contains("IpcCall"));
-        assert!(!SPLIT_SRC.contains("IpcReply"));
-        // The reply handler is documented as the global-lock slow path (not split-wired).
+    fn ipccall_and_ipcreply_bounded_fix_landed_and_proof_gated() {
+        // The off-lock gates exist in the split-dispatch bridge (the bounded fix).
+        assert!(SPLIT_SRC.contains("fn try_split_ipccall_direct_into_frame"));
+        assert!(SPLIT_SRC.contains("fn try_split_ipcreply_direct_into_frame"));
+        // Both are reached ONLY behind the default-off proof gate, so a normal boot is unchanged.
         assert!(
-            SYSCALL_SRC.contains("NR 7 IpcReply is not yet split-wired off the trap-entry seam")
+            SPLIT_SRC.contains(
+                "matches!(syscall, Syscall::IpcCall) && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ) && SPLIT_SRC.contains(
+                "matches!(syscall, Syscall::IpcReply) && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ),
+            "the NR6/NR7 off-lock gates must be reached only behind the proof gate"
         );
-        // The audit doc records both as NEEDS_BOUNDED_FIX.
-        assert!(
-            AUDIT_DOC.contains("request_direct=needs_bounded_fix reply_direct=needs_bounded_fix")
-        );
+        // The pre-lock OWNED source snapshot is copied off-lock (no broad/ranked lock).
+        assert!(SPLIT_SRC.contains("copy_from_user_asid_split_read"));
     }
 
     // (18) Reply-cap enqueue remains UNSUPPORTED (Stage 198F policy): forbidden by the artifact guard
@@ -75910,7 +75917,8 @@ mod stage199a2b1_offlock_foundations {
         // The proof gate itself defaults to false (default-off in production).
         const MOD_SRC: &str = include_str!("mod.rs");
         assert!(
-            MOD_SRC.contains("static IPCCALL_DIRECT_PROOF_ENABLED: core::sync::atomic::AtomicBool =")
+            MOD_SRC
+                .contains("static IPCCALL_DIRECT_PROOF_ENABLED: core::sync::atomic::AtomicBool =")
                 && MOD_SRC.contains("core::sync::atomic::AtomicBool::new(false)"),
             "the direct proof gate must default to false"
         );
@@ -78175,5 +78183,223 @@ result=ok";
         }
         const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B4 — x86_64 DIRECT IpcCall/IpcReply LIVE round-trip oracle guards.
+// The live proof itself is the QEMU seal (scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh);
+// these hosted guards pin the feature+selector activation contract, the marker-literal confinement,
+// the oracle-endpoint gating that keeps the live service chain on its unchanged legacy path, and the
+// pre-ack / duplicate / preservation invariants.
+mod stage199a2b4_live_oracle_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        ipccall_direct_oracle_reply_endpoint_is, ipccall_direct_oracle_request_endpoint_is,
+        ipccall_direct_proof_enabled, set_ipccall_direct_oracle_endpoints,
+        set_ipccall_direct_proof_enabled, set_x86_ipccall_direct_oracle_enabled,
+        x86_ipccall_direct_oracle_enabled,
+    };
+
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+
+    // (feature + selector required) The Cargo feature exists default-off, and the workload SELECTOR
+    // knob both parses AND arms the shared NR6/NR7 proof gate — feature-on without the selector is
+    // inert (the setter is what flips the gate).
+    #[test]
+    fn feature_and_selector_both_required() {
+        assert!(
+            CARGO_SRC.contains("x86-ipccall-direct-oracle = []"),
+            "the default-off compile feature must exist"
+        );
+        assert!(
+            CMDLINE_SRC.contains("yarm.x86_64_ipccall_direct_oracle")
+                && CMDLINE_SRC.contains("set_x86_ipccall_direct_oracle_enabled("),
+            "the selector knob must parse + apply"
+        );
+        // The selector arms the proof gate (activation requires BOTH feature and selector).
+        let setter = MOD_SRC
+            .split("pub(crate) fn set_x86_ipccall_direct_oracle_enabled")
+            .nth(1)
+            .expect("setter body");
+        let setter = &setter[..setter.len().min(400)];
+        assert!(
+            setter.contains("set_ipccall_direct_proof_enabled(true)"),
+            "selecting the workload must arm the NR6/NR7 proof gate"
+        );
+    }
+
+    // Runtime: the selector arms the proof gate; the gate defaults off.
+    #[test]
+    fn selector_arms_proof_gate() {
+        set_ipccall_direct_proof_enabled(false);
+        assert!(!x86_ipccall_direct_oracle_enabled());
+        set_x86_ipccall_direct_oracle_enabled(true);
+        assert!(x86_ipccall_direct_oracle_enabled());
+        assert!(
+            ipccall_direct_proof_enabled(),
+            "arming the oracle selector arms the proof gate"
+        );
+        set_x86_ipccall_direct_oracle_enabled(false);
+        set_ipccall_direct_proof_enabled(false);
+    }
+
+    // (two class exceptions are x86-oracle-only) The `IpcCallDirectRequest` / `IpcReplyDirect`
+    // retirement literals are emitted ONLY from functions gated on the x86 oracle feature, so a
+    // NORMAL (feature-off) artifact is marker-clean. The QEMU smoke additionally asserts a
+    // feature-OFF ELF contains NEITHER literal.
+    #[test]
+    fn class_literals_are_feature_gated_only() {
+        // The retirement literals appear only inside the feature+arch+non-hosted cfg emit helpers.
+        let call_emit = MOD_SRC
+            .split("pub(crate) fn emit_ipccall_direct_request_live_markers")
+            .nth(1)
+            .expect("request emitter");
+        assert!(call_emit[..call_emit.len().min(600)].contains("class=IpcCallDirectRequest"));
+        let reply_emit = MOD_SRC
+            .split("pub(crate) fn emit_ipcreply_direct_live_markers")
+            .nth(1)
+            .expect("reply emitter");
+        assert!(reply_emit[..reply_emit.len().min(600)].contains("class=IpcReplyDirect"));
+        // Each emitter is guarded by the x86-oracle feature + target_arch + not(hosted-dev).
+        assert!(MOD_SRC.contains(
+            "feature = \"x86-ipccall-direct-oracle\",\n    target_arch = \"x86_64\",\n    not(feature = \"hosted-dev\")"
+        ));
+        // A no-op stub keeps the drain call sites compiling on every other config (marker-clean).
+        assert!(MOD_SRC.contains("pub(crate) fn emit_ipccall_direct_request_live_markers() {}"));
+        assert!(MOD_SRC.contains("pub(crate) fn emit_ipcreply_direct_live_markers() {}"));
+    }
+
+    // (NR6/NR7 direct gates publish exactly one work item) The trap gates build ONE
+    // DirectRequestPostWork / DirectReplyPostWork and drain it once; the kernel success markers are
+    // emitted from the drain (kernel), never fabricated by userspace.
+    #[test]
+    fn gates_publish_one_work_item_and_kernel_emits_markers() {
+        let call_gate = SPLIT_SRC
+            .split("fn try_split_ipccall_direct_into_frame")
+            .nth(1)
+            .expect("nr6 gate");
+        let call_gate = &call_gate[..call_gate
+            .find("\n#[cfg(feature = \"hosted-dev\")]")
+            .unwrap_or(call_gate.len())];
+        assert_eq!(
+            call_gate.matches("DirectRequestPostWork").count(),
+            1,
+            "the NR6 gate builds exactly one request post-work item"
+        );
+        assert!(call_gate.contains("drain_direct_request_post_work"));
+        let reply_gate = SPLIT_SRC
+            .split("fn try_split_ipcreply_direct_into_frame")
+            .nth(1)
+            .expect("nr7 gate");
+        let reply_gate = &reply_gate[..reply_gate
+            .find("\n#[cfg(feature = \"hosted-dev\")]")
+            .unwrap_or(reply_gate.len())];
+        assert_eq!(
+            reply_gate.matches("DirectReplyPostWork").count(),
+            1,
+            "the NR7 gate builds exactly one reply post-work item"
+        );
+        assert!(reply_gate.contains("drain_direct_reply_post_work"));
+        // The kernel success markers are emitted from the drains (kernel), not userspace.
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        assert!(TXN_SRC.contains("emit_ipccall_direct_request_live_markers()"));
+        assert!(TXN_SRC.contains("emit_ipcreply_direct_live_markers()"));
+    }
+
+    // (oracle-endpoint confinement) On a REAL boot the gates + publishers service ONLY the oracle's
+    // request/reply endpoints, so every other IpcCall/IpcReply (the live service chain) stays on its
+    // unchanged legacy path. Provisioning binds the endpoint indices.
+    #[test]
+    fn offlock_path_is_oracle_endpoint_confined() {
+        // Gate selectivity.
+        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_request_endpoint_is(send_eidx)"));
+        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_reply_endpoint_is(reply_eidx)"));
+        // Publisher selectivity (real builds only).
+        assert!(MOD_SRC.contains("ipccall_direct_oracle_request_endpoint_is(index)"));
+        assert!(MOD_SRC.contains("ipccall_direct_oracle_reply_endpoint_is(index)"));
+        // Provisioning binds the endpoints.
+        assert!(MOD_SRC.contains("set_ipccall_direct_oracle_endpoints(req_idx, rep_idx)"));
+        // Runtime: only the exact provisioned endpoint indices match.
+        set_ipccall_direct_oracle_endpoints(6, 7);
+        assert!(ipccall_direct_oracle_request_endpoint_is(6));
+        assert!(!ipccall_direct_oracle_request_endpoint_is(7));
+        assert!(ipccall_direct_oracle_reply_endpoint_is(7));
+        assert!(!ipccall_direct_oracle_reply_endpoint_is(6));
+        assert!(!ipccall_direct_oracle_request_endpoint_is(usize::MAX));
+        set_ipccall_direct_oracle_endpoints(usize::MAX, usize::MAX);
+        assert!(!ipccall_direct_oracle_request_endpoint_is(6));
+    }
+
+    // The NR6/NR7 live routes are reachable only behind the runtime proof gate (so a normal boot is
+    // byte-identical — the NR-only whitelist early-return still fires with the gate off).
+    #[test]
+    fn live_routes_reachable_only_behind_proof_gate() {
+        assert!(SPLIT_SRC.contains(
+            "matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"
+        ));
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+    }
+
+    // (userspace completion cannot substitute for kernel markers) The userspace round-trip
+    // completion marker and the KERNEL success/retirement markers are distinct: the smoke requires
+    // BOTH the kernel-emitted markers (from the drains) AND the userspace completion.
+    #[test]
+    fn userspace_completion_is_distinct_from_kernel_attestation() {
+        // Userspace emits its own completion (no kernel attestation/retirement prefix).
+        assert!(INIT_SRC.contains("X86_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        assert!(INIT_SRC.contains("X86_IPCREPLY_DIRECT_SEND"));
+        assert!(
+            !INIT_SRC.contains("IPCCALL_DIRECT_REQUEST_OK arch=x86_64")
+                && !INIT_SRC.contains("class=IpcReplyDirect result=ok"),
+            "userspace must not emit kernel attestation/retirement markers"
+        );
+        // The smoke requires the kernel markers (from the drains) separately from userspace.
+        const SMOKE_SRC: &str =
+            include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh");
+        assert!(SMOKE_SRC.contains("IPCCALL_DIRECT_REQUEST_OK arch=x86_64"));
+        assert!(SMOKE_SRC.contains("IPCREPLY_DIRECT_OK arch=x86_64"));
+        assert!(SMOKE_SRC.contains("X86_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+    }
+
+    // (boot provisioning + slot-5 selector) x86 boot provisions the oracle transactionally under
+    // BOTH the feature and the knob, reusing slot-5 selector 3 + slots 13/14, mutually exclusive
+    // with the slot-5/13/14 oracles above it.
+    #[test]
+    fn boot_provisioning_and_selector_wiring() {
+        assert!(
+            X86_BOOT_SRC.contains("provision_init_ipccall_direct_oracle(")
+                && X86_BOOT_SRC.contains("IPCCALL_DIRECT_ORACLE_SELECTOR"),
+            "x86 boot must provision the oracle + set slot-5 selector"
+        );
+        assert!(X86_BOOT_SRC.contains("#[cfg(feature = \"x86-ipccall-direct-oracle\")]"));
+        assert!(
+            MOD_SRC.contains("pub const IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 3;"),
+            "slot-5 selector value 3 (after FutexWake=1, shared-region=2)"
+        );
+        assert!(
+            INIT_SRC.contains("run_x86_ipccall_direct_oracle(ctx.task_id)")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(3)"),
+            "init dispatches the oracle on slot-5 selector 3"
+        );
+    }
+
+    // (Stage 198F preserved) 10 classes / 30 cells + ABI preserved.
+    #[test]
+    fn stage198f_and_abi_preserved() {
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }

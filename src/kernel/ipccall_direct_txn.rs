@@ -103,6 +103,12 @@ impl SharedKernel {
             // Retryable pre-claim rollback: re-arm the published acknowledgement.
             crate::kernel::boot::ipccall_direct_ack::restore(work.ack_seq);
         }
+        if result.is_ok() {
+            // Stage 199A2B4: a genuine off-lock request delivery completed — emit the NR6
+            // live success + retirement markers (one-shot; no-op unless the x86 oracle
+            // feature+selector are both active).
+            crate::kernel::boot::emit_ipccall_direct_request_live_markers();
+        }
         result
     }
 
@@ -567,6 +573,12 @@ impl SharedKernel {
         let result = self.ipc_reply_direct_txn(&work.snapshot, &work.ack, &mut lease, work.ack_seq);
         if lease.is_available() {
             crate::kernel::boot::ipcreply_direct_ack::restore(work.ack_seq);
+        }
+        if result.is_ok() {
+            // Stage 199A2B4: a genuine off-lock reply delivery completed — emit the NR7 live
+            // success + retirement markers (one-shot; no-op unless the x86 oracle
+            // feature+selector are both active).
+            crate::kernel::boot::emit_ipcreply_direct_live_markers();
         }
         result
     }

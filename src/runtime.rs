@@ -2953,6 +2953,26 @@ impl SharedKernel {
         self.consume_reply_record_split(index, generation)
     }
 
+    /// rank 3 — read the reply endpoint SLOT INDEX bound in a present, generation-matched
+    /// reply record. Used ONLY by the Stage 199A2B4 NR7 gate to confine the off-lock reply
+    /// path to the oracle's reply endpoint (every other reply stays on the legacy path).
+    /// `None` when absent or generation-mismatched.
+    pub(crate) fn reply_record_endpoint_index_split_read(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> Option<usize> {
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get(index) {
+            Some(Some(record)) if ipc.reply_cap_generations[index] == generation => {
+                match record.reply_endpoint {
+                    CapObject::Endpoint { index: eidx, .. } => Some(eidx),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
+
     /// rank 5: map EXACTLY one user page and return the owned follow-up needed for rank-6 accounting
     /// (and exact rollback). NX/rights/alignment are enforced by the caller (the runner); this seam
     /// additionally asserts alignment + NX and never lets a page-table reference escape the guard.
