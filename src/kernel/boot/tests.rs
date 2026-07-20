@@ -80829,3 +80829,82 @@ mod stage199a2d2b_guards {
         );
     }
 }
+
+/// Stage 199A2D2C2 — saved-continuation / canonical-frame invariant guards.
+#[cfg(test)]
+mod stage199a2d2c2_guards {
+    // (8.2) The x86 user-return path EXPLICITLY normalizes user RFLAGS to 0x202 — the canonical
+    // invariant that justifies `SavedUserReturnFrame::rflags = USER_RFLAGS`. Source-guarded so the
+    // fixed value is never a silent substitution: it mirrors the canonical BSP return policy.
+    #[test]
+    fn user_rflags_normalization_is_canonical() {
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            dt.contains("frame.rflags = 0x202;"),
+            "the canonical user-return path normalizes RFLAGS to 0x202"
+        );
+        assert_eq!(
+            crate::arch::x86_64::ap_sched::USER_RFLAGS,
+            0x202,
+            "the saved-frame RFLAGS matches the canonical normalization"
+        );
+    }
+
+    // (8.3) YARM guarantees a SINGLE user code/data selector pair (CS=0x23, SS=0x1b), so the
+    // synthesized canonical CS/SS in the saved frame are invariant-safe.
+    #[test]
+    fn single_user_cs_ss_selector_pair_invariant() {
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            dt.contains("const USER_CODE_SELECTOR: u16 = 0x23;"),
+            "single user CS = 0x23"
+        );
+        assert!(
+            dt.contains("0x23   // user CS"),
+            "iret frame uses CS = 0x23"
+        );
+        assert!(
+            dt.contains("0x1b   // user SS"),
+            "iret frame uses SS = 0x1b"
+        );
+        assert_eq!(crate::arch::x86_64::ap_sched::USER_CS, 0x23);
+        assert_eq!(crate::arch::x86_64::ap_sched::USER_SS, 0x1b);
+    }
+
+    // (8.18) The previous generic fresh-entry seal remains valid (its smoke is untouched by C2).
+    #[test]
+    fn generic_fresh_entry_seal_smoke_intact() {
+        let sh = include_str!("../../../scripts/qemu-x86_64-ap-generic-return-smoke.sh");
+        assert!(sh.contains("STAGE_199_X86_AP_GENERIC_RETURN_SEAL"));
+        assert!(sh.contains("X86_AP_GENERIC_USER_ENTRY cpu=1 scheduler_selected=1 result=ok"));
+    }
+
+    // (8.19) The `cross_cpu=0 result=blocked` diagnostic cannot satisfy the request success seal.
+    #[test]
+    fn blocked_diagnostic_cannot_satisfy_request_success() {
+        let sh = include_str!("../../../scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh");
+        assert!(
+            sh.contains("cross_cpu=0"),
+            "the blocked diagnostic is cross_cpu=0"
+        );
+        assert!(sh.contains("result=blocked"));
+        // ok seal is gated behind the distinct-CPU request markers AND the recv-v2 continuation.
+        let gate = sh.find("req_ok").expect("gate");
+        let ok = sh.find("cross_cpu=1 request_copies=1").expect("ok seal");
+        assert!(
+            gate < ok,
+            "ok seal gated behind cross-CPU + continuation verification"
+        );
+        assert!(
+            sh.contains("X86_AP_RECV_V2_CONTINUED cpu=1"),
+            "ok seal requires the live recv-v2 continuation marker"
+        );
+    }
+
+    // (8.20) Stage 199 functional live-cell count unchanged (6).
+    #[test]
+    fn stage199_functional_cells_unchanged() {
+        let matrix = include_str!("../../../scripts/qemu-ipccall-reply-direct-matrix-seal.sh");
+        assert!(matrix.contains("total_live_cells=6"));
+    }
+}

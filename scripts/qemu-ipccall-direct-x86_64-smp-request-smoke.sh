@@ -42,7 +42,7 @@ TIMEOUT_SECS=${TIMEOUT_SECS:-150}
 mkdir -p "$LOGDIR"
 BOOT_LOG="$LOGDIR/boot.log"
 
-SEAL_BLOCKED="STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 pairs=1 sender_cpu=0 receiver_cpu=1 cross_cpu=0 duplicate_deliveries=0 duplicate_wakes=0 wrong_waiter_mutations=0 result=blocked reason=ap_context_restore_asm_not_wired"
+SEAL_BLOCKED="STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 pairs=1 sender_cpu=0 receiver_cpu=1 cross_cpu=0 duplicate_deliveries=0 duplicate_wakes=0 wrong_waiter_mutations=0 result=blocked reason=ap_saved_frame_restore_and_recv_v2_server_not_wired"
 
 fail=0
 note() { echo "[ipccall-direct-smp-request] $*"; }
@@ -123,14 +123,18 @@ if (( fail )); then
   exit 1
 fi
 
-if (( req_ok )); then
-  # A GENUINE cross-CPU NR6 request WAS observed (the AP dispatch-on-wake + resume path has been
-  # wired in a later stage). Enforce the exact-count contract before sealing request-only ok.
+# Stage 199A2D2C2: the request-only cross-CPU seal requires the FULL live continuation sequence — a
+# real CPU-1 recv-v2 block AND a real saved-continuation resume — not merely the cross-CPU request
+# markers. Require the authoritative block marker + the userspace recv-v2 continuation.
+blocked_ok=$(count "IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1")
+cont_ok=$(count "X86_AP_RECV_V2_CONTINUED cpu=1")
+if (( req_ok )) && [[ "$blocked_ok" == "1" && "$cont_ok" == "1" ]]; then
+  # A GENUINE cross-CPU NR6 request with a real CPU-1 recv-v2 blocked continuation was observed.
   dup_deliv=$(count "IPCCALL_DIRECT_SMP_DUP_DELIVERY")
   dup_wake=$(count "IPCCALL_DIRECT_SMP_DUP_WAKE")
   [[ "$dup_deliv" == "0" && "$dup_wake" == "0" ]] || { echo "STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 result=fail reason=duplicate"; exit 1; }
-  note "GENUINE cross-CPU NR6 request observed under SMP=2 (distinct CPU IDs)"
-  echo "STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 pairs=1 sender_cpu=0 receiver_cpu=1 cross_cpu=1 duplicate_deliveries=0 duplicate_wakes=0 wrong_waiter_mutations=0 result=ok"
+  note "GENUINE cross-CPU NR6 request + CPU-1 recv-v2 continuation observed under SMP=2"
+  echo "STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 pairs=1 sender_cpu=0 receiver_cpu=1 cross_cpu=1 request_copies=1 server_wakes=1 server_continuations=1 duplicate_deliveries=0 duplicate_wakes=0 wrong_cpu_continuations=0 result=ok"
   exit 0
 fi
 

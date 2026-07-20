@@ -307,6 +307,41 @@ pub(crate) fn plan_is_fresh(plan: &ApUserDispatchPlan) -> bool {
     matches!(plan.source, ApUserReturnSource::FreshEntry(_))
 }
 
+// ── Stage 199A2D2C2: BlockedUnfinalized → RunnableSaved wake finalization ───────────────────────
+
+/// The result of a cross-CPU wake-finalization attempt for a blocked receiver. The CPU-0 NR6
+/// transaction MUST complete the blocked recv-v2 syscall's result state INTO the saved frame BEFORE
+/// the task is published `RunnableSaved` — so the CPU-1 dispatcher only ever sees a fully-completed
+/// continuation. A `BlockedUnfinalized` task is never dispatchable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeFinalization {
+    /// The saved frame's syscall result was completed and committed → the task is RunnableSaved.
+    RunnableSaved(SavedUserReturnFrame),
+    /// Finalization was refused (result not completed / frame not committed) → stays not
+    /// dispatchable. The dispatcher must NOT build a SavedUserFrame plan from this.
+    NotFinalized,
+}
+
+/// Finalize a blocked receiver's wake: complete the recv-v2 syscall result state (`ret0/1/2`,
+/// `err`) into the saved frame, then commit it. Returns `RunnableSaved` only when `result_completed`
+/// (the NR6 transaction copied the request + wrote the recv-v2 return registers) is true AND the
+/// frame carries a valid RIP/RSP. Otherwise `NotFinalized` (the task is NOT made dispatchable).
+pub(crate) fn finalize_wake_to_runnable_saved(
+    mut saved: SavedUserReturnFrame,
+    recv_ret: [u64; 3],
+    recv_err: u64,
+    result_completed: bool,
+) -> WakeFinalization {
+    if !result_completed || saved.rip == 0 || saved.rsp == 0 {
+        return WakeFinalization::NotFinalized;
+    }
+    // Complete the blocked recv-v2 syscall's result registers in the saved continuation, THEN commit.
+    saved.syscall_ret = recv_ret;
+    saved.syscall_err = recv_err;
+    saved.committed = true;
+    WakeFinalization::RunnableSaved(saved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,5 +632,75 @@ mod tests {
             select_return_source(TaskDispatchState::NeverEntered, Some(fresh(0, 0)), None),
             Err(DispatchReject::NoValidSource)
         );
+    }
+
+    // ── Stage 199A2D2C2 wake finalization ──
+
+    // (8.4) BlockedUnfinalized cannot be dispatched.
+    #[test]
+    fn blocked_unfinalized_is_not_dispatchable() {
+        let saved =
+            SavedUserReturnFrame::from_trap_frame(&trap_with(0x1, 0x2, [0; 32], [0; 3], 0), true);
+        // Even with a committed frame available, a BlockedUnfinalized state is not dispatchable.
+        assert_eq!(
+            select_return_source(TaskDispatchState::BlockedUnfinalized, None, Some(saved)),
+            Err(DispatchReject::NotFinalized)
+        );
+    }
+
+    // (8.5) Wake finalization creates RunnableSaved; (8.6) result registers completed BEFORE that.
+    #[test]
+    fn wake_finalization_completes_result_then_runnable_saved() {
+        let saved = SavedUserReturnFrame::from_trap_frame(
+            &trap_with(0x4000, 0x8000, [0; 32], [0, 0, 0], 0),
+            false, // not yet committed while blocked
+        );
+        // Not completed → stays not dispatchable.
+        assert_eq!(
+            finalize_wake_to_runnable_saved(saved, [0x11, 0x22, 0x33], 0, false),
+            WakeFinalization::NotFinalized
+        );
+        // Completed → RunnableSaved with the recv-v2 result committed into the frame.
+        match finalize_wake_to_runnable_saved(saved, [0x11, 0x22, 0x33], 0, true) {
+            WakeFinalization::RunnableSaved(f) => {
+                assert!(f.committed, "frame committed for later completion");
+                assert_eq!(
+                    f.syscall_ret,
+                    [0x11, 0x22, 0x33],
+                    "recv-v2 result completed"
+                );
+                assert!(f.is_valid_resume_source());
+                // The RunnableSaved frame is now a valid SavedUserFrame source.
+                assert!(matches!(
+                    select_return_source(TaskDispatchState::RunnableSaved, None, Some(f)),
+                    Ok(ApUserReturnSource::SavedUserFrame(_))
+                ));
+            }
+            _ => panic!("expected RunnableSaved"),
+        }
+    }
+
+    // (8.7) saved RIP/RSP + GPRs survive the block/wake cycle (finalization preserves them).
+    #[test]
+    fn finalization_preserves_rip_rsp_gprs() {
+        let mut gprs = [0usize; 32];
+        for (i, g) in gprs.iter_mut().enumerate() {
+            *g = 0x500 + i;
+        }
+        let saved = SavedUserReturnFrame::from_trap_frame(
+            &trap_with(0xC0DE, 0x5747, gprs, [0; 3], 0),
+            false,
+        );
+        match finalize_wake_to_runnable_saved(saved, [1, 2, 3], 7, true) {
+            WakeFinalization::RunnableSaved(f) => {
+                assert_eq!(f.rip, 0xC0DE, "RIP survives");
+                assert_eq!(f.rsp, 0x5747, "RSP survives");
+                for i in 0..16 {
+                    assert_eq!(f.user_gprs[i], (0x500 + i) as u64, "GPR {i} survives");
+                }
+                assert_eq!(f.syscall_err, 7);
+            }
+            _ => panic!(),
+        }
     }
 }
