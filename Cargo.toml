@@ -71,6 +71,7 @@ riscv-shared-region-direct-oracle = ["shared-region-direct-oracle"]
 ipccall-direct-oracle = []
 x86-ipccall-direct-oracle = ["ipccall-direct-oracle"]
 aarch64-ipccall-direct-oracle = ["ipccall-direct-oracle"]
+riscv-ipccall-direct-oracle = ["ipccall-direct-oracle"]
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }

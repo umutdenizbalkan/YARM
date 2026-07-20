@@ -351,16 +351,30 @@ pub fn handle_riscv_trap_entry_shared(
     // (sepc+4 once, sstatus preserved, a0 result lane from `set_ok`) finalizes them.
     // Every other syscall falls through to the unchanged broad-lock handler once.
     let nr = frame.syscall_num();
+    // Stage 199A2C2: admit IpcCall (NR 6) + IpcReply (NR 7) into the shared split dispatcher ONLY
+    // while the common direct proof gate is armed, so the off-lock request/reply gates run on
+    // RISC-V. The RISC-V bridge has already imported a7→nr + a0..a5→args into the portable frame, so
+    // all six arguments are present. With the gate off, NR6/NR7 are NOT split-eligible and fall
+    // through UNCHANGED to the broad-lock handler (a normal boot is byte-identical). A handled
+    // NR6/NR7 finalizes via the SAME same-task ecall write-back as DebugLog/FutexWake (sepc+4 once,
+    // sstatus preserved, a0 result lane from `set_ok`) → `ReturnToCurrent`.
+    let is_ipc_direct = (nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
+        || nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)
+        && crate::kernel::boot::ipccall_direct_proof_enabled();
     let split_eligible = is_syscall
         && (nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
-            || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR);
+            || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
+            || is_ipc_direct);
     if split_eligible {
-        // Per-class one-shot latch so BOTH classes' markers appear once (without
-        // flooding: DebugLog fires thousands of times, FutexWake a handful).
+        // Per-class one-shot latch so BOTH DebugLog + FutexWake markers appear once (without
+        // flooding). NR6/NR7 emit their arch-tagged retirement markers from the drain (kernel), not
+        // here, so they never touch the DebugLog/FutexWake latches.
         let log_split = if nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR {
             !RISCV_DEBUGLOG_SPLIT_MARKERS_LOGGED.swap(true, Ordering::Relaxed)
-        } else {
+        } else if nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR {
             !RISCV_FUTEXWAKE_SPLIT_MARKERS_LOGGED.swap(true, Ordering::Relaxed)
+        } else {
+            false
         };
         if log_split {
             crate::yarm_log!("RISCV_SPLIT_ABI_IMPORT_OK nr={}", nr);

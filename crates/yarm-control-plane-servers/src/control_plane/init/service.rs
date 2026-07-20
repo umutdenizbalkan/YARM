@@ -1374,7 +1374,11 @@ fn run_x86_shared_region_direct_oracle(init_tid: u64) {
 // this userspace scaffold is arch-gated.
 #[cfg(all(
     not(feature = "hosted-dev"),
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
 ))]
 mod ipccall_direct_oracle_core {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -1828,6 +1832,96 @@ fn run_aarch64_ipccall_direct_oracle(init_tid: u64) {
     } else {
         yarm_user_rt::user_log!(
             "AARCH64_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok={} reply_ok={} duplicate_reply={} server_wakes={} caller_wakes={} client_continuations={} server_continuations={} result=fail",
+            out.request_ok,
+            out.reply_ok as u32,
+            out.dup_rejected,
+            out.server_cont,
+            out.client_cont,
+            out.client_cont,
+            out.server_cont
+        );
+    }
+}
+
+// ── RISC-V arch wrapper: plain `extern "C"` child entry (the RISC-V ABI has no x86-style initial-SP
+//    call-alignment hazard) + arch-named markers. Reuses the SAME arch-neutral
+//    `ipccall_direct_oracle_core`; duplicates NONE of the round-trip logic. ─────────────────────────
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+mod riscv_ipccall_direct_oracle {
+    pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
+    pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
+}
+
+/// RISC-V server child body: run the arch-neutral server core, emit the RISC-V send marker, park.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+extern "C" fn riscv_ipccall_direct_child_body() -> ! {
+    use ipccall_direct_oracle_core as core_oracle;
+    // SAFETY: freshly-spawned oracle child sharing init's CSpace/address space.
+    let o = unsafe { core_oracle::server_run() };
+    let early = o.attempts.saturating_sub(1);
+    yarm_user_rt::user_log!(
+        "RISCV_IPCREPLY_DIRECT_SEND attempts={} early_retries={} result={}",
+        o.attempts,
+        early,
+        if o.replied { "ok" } else { "fail" }
+    );
+    core_oracle::server_park();
+}
+
+/// RISC-V parent/client entry: read caps, spawn the server child, run the arch-neutral parent core,
+/// emit the RISC-V round-trip completion marker with exact counts.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn run_riscv_ipccall_direct_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use ipccall_direct_oracle_core as core_oracle;
+    yarm_user_rt::user_log!(
+        "IPCCALL_DIRECT_ROUNDTRIP_ORACLE_BEGIN init_tid={}",
+        init_tid
+    );
+    let (request_ep, reply_ep) = core_oracle::oracle_caps();
+    if request_ep == 0 || reply_ep == 0 {
+        yarm_user_rt::user_log!(
+            "IPCCALL_DIRECT_ORACLE_MISSING_CAPS request_ep={} reply_ep={}",
+            request_ep,
+            reply_ep
+        );
+        return;
+    }
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(riscv_ipccall_direct_oracle::CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = riscv_ipccall_direct_child_body as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(riscv_ipccall_direct_oracle::CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("IPCCALL_DIRECT_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    core_oracle::CHILD_TID.store(child_tid, Relaxed);
+    yarm_user_rt::user_log!(
+        "IPCCALL_DIRECT_ROUNDTRIP_ORACLE_CHILD_SPAWNED child_tid={}",
+        child_tid
+    );
+    // SAFETY: the provisioned oracle caps.
+    let out = unsafe { core_oracle::parent_run(request_ep, reply_ep) };
+    if out.reply_ok
+        && out.request_ok == 1
+        && out.server_reply_ok == 1
+        && out.dup_rejected == 1
+        && out.server_cont == 1
+        && out.client_cont == 1
+    {
+        yarm_user_rt::user_log!(
+            "RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok=1 reply_ok=1 duplicate_reply=rejected server_wakes=1 caller_wakes=1 client_continuations=1 server_continuations=1 result=ok"
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok={} reply_ok={} duplicate_reply={} server_wakes={} caller_wakes={} client_continuations={} server_continuations={} result=fail",
             out.request_ok,
             out.reply_ok as u32,
             out.dup_rejected,
@@ -3159,6 +3253,15 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
     if ctx.supervisor_control_recv_ep == Some(7) {
         run_riscv_shared_region_direct_oracle(ctx.task_id);
+    }
+    // Stage 199A2C2: default-off + feature-gated RISC-V DIRECT IpcCall/IpcReply live round-trip
+    // oracle. Slot-5 selector 8 (the next free RISC-V selector, mutually exclusive with 1-7) tells
+    // init to run the parent(client)/child(server) NR6 request + NR7 reply round trip through the
+    // accepted off-lock transactions, reusing the SAME arch-neutral core as x86/AArch64. Requires
+    // both the build feature AND the runtime knob.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if ctx.supervisor_control_recv_ep == Some(8) {
+        run_riscv_ipccall_direct_oracle(ctx.task_id);
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

@@ -78282,11 +78282,20 @@ mod stage199a2b4_live_oracle_guards {
             .nth(1)
             .expect("reply emitter");
         assert!(reply_emit[..reply_emit.len().min(600)].contains("class=IpcReplyDirect"));
-        // Each emitter is guarded by the UMBRELLA oracle feature + (x86_64|aarch64) + not(hosted-dev),
-        // and the literal carries the arch-parameterized `arch={}` tag (one emitter, both arches).
-        assert!(MOD_SRC.contains(
-            "feature = \"ipccall-direct-oracle\",\n    any(target_arch = \"x86_64\", target_arch = \"aarch64\"),\n    not(feature = \"hosted-dev\")"
-        ));
+        // The emitters compile only under the UMBRELLA feature (a normal artifact is marker-clean),
+        // and the arch tag is parameterized per target_arch — one emitter serves all three arches, so
+        // an artifact carries only its own arch tag. (Fmt-stable: assert the per-arch ARCH consts +
+        // the umbrella-gated no-op stubs rather than the exact wrapped cfg whitespace.)
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                MOD_SRC.contains(&format!(
+                    "#[cfg(all(feature = \"ipccall-direct-oracle\", target_arch = \"{arch}\"))]"
+                )) && MOD_SRC.contains(&format!(
+                    "pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = \"{arch}\";"
+                )),
+                "the {arch} oracle arch tag must be umbrella-feature + target_arch gated"
+            );
+        }
         assert!(
             MOD_SRC.contains("arch={} class=IpcCallDirectRequest")
                 && MOD_SRC.contains("arch={} class=IpcReplyDirect"),
@@ -78580,8 +78589,6 @@ mod stage199a2c1_aarch64_guards {
         assert!(INIT_SRC.contains("fn run_aarch64_ipccall_direct_oracle"));
         assert!(INIT_SRC.contains("AARCH64_IPCREPLY_DIRECT_SEND"));
         assert!(INIT_SRC.contains("AARCH64_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
-        // Cross-arch hygiene: no RISC-V userspace completion for this oracle.
-        assert!(!INIT_SRC.contains("RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
     }
 
     // (x86_64 sealed source paths unchanged) The x86 transaction, gates, and sealed x86 markers are
@@ -78608,5 +78615,197 @@ mod stage199a2c1_aarch64_guards {
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
         assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2C2 — RISC-V DIRECT IpcCall/IpcReply LIVE round-trip oracle guards.
+// The live proof itself is the QEMU seal (scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh);
+// these hosted guards pin the RISC-V feature+selector activation, the slot-5 selector 8, the RISC-V
+// NR6/NR7 split eligibility (a0..a5 / x10..x15 import behind the proof gate) with the drain
+// reachability guard, the arch-parameterized markers, the arch-neutral core reuse, and the
+// preservation of the x86_64 + AArch64 sealed paths.
+mod stage199a2c2_riscv_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        aarch64_ipccall_direct_oracle_enabled, ipccall_direct_oracle_enabled,
+        riscv_ipccall_direct_oracle_enabled, set_aarch64_ipccall_direct_oracle_enabled,
+        set_ipccall_direct_proof_enabled, set_riscv_ipccall_direct_oracle_enabled,
+        set_x86_ipccall_direct_oracle_enabled, x86_ipccall_direct_oracle_enabled,
+    };
+
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // (feature + selector) The RISC-V feature enables the umbrella; the selector arms the SHARED
+    // proof gate but NOT the x86/AArch64 oracle-enabled flags.
+    #[test]
+    fn riscv_feature_and_selector_activation() {
+        assert!(
+            CARGO_SRC.contains("riscv-ipccall-direct-oracle = [\"ipccall-direct-oracle\"]"),
+            "the RISC-V per-arch feature must enable the umbrella"
+        );
+        assert!(
+            CMDLINE_SRC.contains("yarm.riscv_ipccall_direct_oracle")
+                && CMDLINE_SRC.contains("set_riscv_ipccall_direct_oracle_enabled("),
+            "the RISC-V selector knob must parse + apply"
+        );
+        set_ipccall_direct_proof_enabled(false);
+        set_x86_ipccall_direct_oracle_enabled(false);
+        set_aarch64_ipccall_direct_oracle_enabled(false);
+        set_riscv_ipccall_direct_oracle_enabled(false);
+        assert!(!ipccall_direct_oracle_enabled());
+        set_riscv_ipccall_direct_oracle_enabled(true);
+        assert!(riscv_ipccall_direct_oracle_enabled());
+        assert!(
+            !x86_ipccall_direct_oracle_enabled() && !aarch64_ipccall_direct_oracle_enabled(),
+            "the RISC-V selector must NOT arm the x86_64 or AArch64 oracle-enabled flags"
+        );
+        assert!(ipccall_direct_oracle_enabled());
+        assert!(
+            crate::kernel::boot::ipccall_direct_proof_enabled(),
+            "the RISC-V selector arms the shared NR6/NR7 proof gate"
+        );
+        set_riscv_ipccall_direct_oracle_enabled(false);
+        set_ipccall_direct_proof_enabled(false);
+    }
+
+    // (slot selector 8 + collision) RISC-V boot provisions the oracle transactionally under BOTH the
+    // feature and the knob, on the free selector 8, only when slots 5/13/14 are all still zero.
+    #[test]
+    fn riscv_slot8_selector_and_collision() {
+        assert!(
+            MOD_SRC.contains("pub const RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 8;"),
+            "free RISC-V slot-5 selector 8 (after 1..7)"
+        );
+        assert!(RISCV_BOOT_SRC.contains("#[cfg(feature = \"riscv-ipccall-direct-oracle\")]"));
+        assert!(
+            RISCV_BOOT_SRC.contains("provision_init_ipccall_direct_oracle(")
+                && RISCV_BOOT_SRC.contains("RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR"),
+            "RISC-V boot must provision the oracle + set slot-5 selector 8"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("init_args[5] == 0\n        && init_args[13] == 0\n        && init_args[14] == 0\n        && crate::kernel::boot::riscv_ipccall_direct_oracle_enabled()"),
+            "RISC-V oracle provisioning must be mutually exclusive with every slot-5/13/14 oracle"
+        );
+        assert!(
+            INIT_SRC.contains("run_riscv_ipccall_direct_oracle(ctx.task_id)")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(8)"),
+            "init must dispatch the RISC-V oracle on slot-5 selector 8"
+        );
+    }
+
+    // (RISC-V NR6/NR7 split eligibility + reachability) The RISC-V trap route admits NR6/NR7 into the
+    // shared split dispatcher ONLY behind the direct proof gate (the a7→nr + a0..a5→args import is
+    // done by the bridge); a handled NR6/NR7 finalizes via ReturnToCurrent. The whitelist reachability
+    // guard keeps the live drains from being DCE'd.
+    #[test]
+    fn riscv_nr6_nr7_split_eligibility_gated_and_reachable() {
+        assert!(
+            TRAP_SRC.contains("(nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n        || nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"),
+            "RISC-V must admit NR6/NR7 into the split dispatcher only behind the direct proof gate"
+        );
+        assert!(TRAP_SRC.contains("|| is_ipc_direct"));
+        assert!(
+            TRAP_SRC.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "the RISC-V route reaches the shared split dispatcher"
+        );
+        assert!(
+            TRAP_SRC.contains("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)"),
+            "a handled off-lock NR6/NR7 finalizes ReturnToCurrent (sepc+4 once, sstatus preserved)"
+        );
+        // The whitelist reachability guard (syscall_split) keeps the drains from being DCE'd.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+    }
+
+    // (six args a0..a5) The off-lock gates read all six NR6/NR7 arguments the RISC-V bridge imported.
+    #[test]
+    fn riscv_six_args_and_arg5_reply_cap() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        let call_gate = SPLIT_SRC
+            .split("fn try_split_ipccall_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        // NR6: a0=send cap (CAP), a1=ptr, a2=len, a5=reply-endpoint RECEIVE cap (TRANSFER_CAP).
+        assert!(call_gate.contains("SYSCALL_ARG_CAP"));
+        assert!(call_gate.contains("SYSCALL_ARG_PTR") && call_gate.contains("SYSCALL_ARG_LEN"));
+        assert!(call_gate.contains("SYSCALL_ARG_TRANSFER_CAP"));
+        let reply_gate = SPLIT_SRC
+            .split("fn try_split_ipcreply_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        // NR7: a0=reply cap, a1=ptr, a2=len.
+        assert!(reply_gate.contains("SYSCALL_ARG_CAP"));
+        assert!(reply_gate.contains("SYSCALL_ARG_PTR") && reply_gate.contains("SYSCALL_ARG_LEN"));
+    }
+
+    // (arch-neutral core NOT duplicated) The round-trip logic lives ONCE; the RISC-V wrapper adds only
+    // the child entry + spawn + RISCV_-prefixed markers.
+    #[test]
+    fn riscv_wrapper_reuses_core_no_duplication() {
+        assert_eq!(
+            INIT_SRC.matches("mod ipccall_direct_oracle_core").count(),
+            1
+        );
+        assert_eq!(
+            INIT_SRC
+                .matches("unsafe fn server_run() -> ServerOutcome")
+                .count(),
+            1
+        );
+        assert_eq!(INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(), 1);
+        assert!(INIT_SRC.contains("fn run_riscv_ipccall_direct_oracle"));
+        assert!(INIT_SRC.contains("RISCV_IPCREPLY_DIRECT_SEND"));
+        assert!(INIT_SRC.contains("RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        // Userspace must not emit kernel retirement prefixes.
+        assert!(
+            !INIT_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64")
+                && !INIT_SRC.contains("IPCREPLY_DIRECT_OK arch=riscv64"),
+            "userspace must not emit kernel retirement/attestation markers"
+        );
+    }
+
+    // (arch-parameterized markers) The RISC-V arch tag exists; the emitter is arch-parameterized.
+    #[test]
+    fn riscv_arch_tag_and_parameterized_emitter() {
+        assert!(
+            MOD_SRC.contains("pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = \"riscv64\";")
+        );
+        assert!(MOD_SRC.contains("arch={} class=IpcCallDirectRequest"));
+        assert!(MOD_SRC.contains("arch={} class=IpcReplyDirect"));
+    }
+
+    // (x86_64 + AArch64 sealed paths unchanged) The prior arch wrappers + markers remain.
+    #[test]
+    fn x86_and_aarch64_sealed_paths_unchanged() {
+        assert!(INIT_SRC.contains("X86_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        assert!(INIT_SRC.contains("AARCH64_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        assert!(INIT_SRC.contains("fn run_x86_ipccall_direct_oracle"));
+        assert!(INIT_SRC.contains("fn run_aarch64_ipccall_direct_oracle"));
+        // The shared transaction + reservation authority are unchanged.
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        assert!(TXN_SRC.contains("emit_ipccall_direct_request_live_markers()"));
+        assert!(TXN_SRC.contains("emit_ipcreply_direct_live_markers()"));
+        const DEFS_SRC: &str = include_str!("defs.rs");
+        assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
+    }
+
+    // Stage 198F + ABI preserved (10 classes / 30 cells).
+    #[test]
+    fn stage198f_and_abi_preserved() {
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }

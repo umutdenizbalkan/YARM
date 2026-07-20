@@ -3102,6 +3102,11 @@ pub const IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 3;
 /// shared-region-direct(6); the AArch64 init dispatch keys on `Some(7)`.
 pub const AARCH64_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 7;
 
+/// Stage 199A2C2: RISC-V startup slot-5 selector for the DIRECT IpcCall/IpcReply round-trip oracle.
+/// Value 8 is the next free RISC-V selector after FutexWake(1)/queue-switch(2)/FutexWait(3)/
+/// FutexWait-idle(4)/yield(5,6)/shared-region-direct(7); the RISC-V init dispatch keys on `Some(8)`.
+pub const RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 8;
+
 /// Stage 199A2B4: default-off x86_64 DIRECT IpcCall/IpcReply live-oracle WORKLOAD selector
 /// (`yarm.x86_64_ipccall_direct_oracle=1`). Provisions init startup slot 5 (=3) so init runs
 /// the parent(client)/child(server) NR6 request + NR7 reply round trip through the accepted
@@ -3146,11 +3151,35 @@ pub fn aarch64_ipccall_direct_oracle_enabled() -> bool {
     AARCH64_IPCCALL_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 199A2C2: default-off RISC-V DIRECT IpcCall/IpcReply live-oracle WORKLOAD selector
+/// (`yarm.riscv_ipccall_direct_oracle=1`). Mirror of the x86_64/AArch64 knobs: provisions init
+/// startup slot 5 (=8, the next free RISC-V selector after FutexWake/FutexWait/Yield/shared-region
+/// 1..7) so init runs the SAME arch-neutral parent(client)/child(server) NR6 request + NR7 reply
+/// round trip, and arms the shared NR6/NR7 proof gate. INERT on a normal boot; does NOT enable
+/// queued calls, timeouts, notifications, server-death wake, the x86_64 oracle, or the AArch64 oracle.
+pub(crate) static RISCV_IPCCALL_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_ipccall_direct_oracle_enabled(enabled: bool) {
+    RISCV_IPCCALL_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        // Selecting the workload arms the SHARED NR6/NR7 off-lock proof gate for this run. It does
+        // NOT arm the x86- or AArch64-specific oracle-enabled flags.
+        set_ipccall_direct_proof_enabled(true);
+    }
+}
+
+pub fn riscv_ipccall_direct_oracle_enabled() -> bool {
+    RISCV_IPCCALL_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// The DIRECT IpcCall/IpcReply oracle is live when ANY arch's workload selector is armed. The
 /// provisioning + arch-parameterized live markers key on this arch-neutral predicate; the per-arch
 /// marker literals are additionally `target_arch`-gated at their emitter.
 pub fn ipccall_direct_oracle_enabled() -> bool {
-    x86_ipccall_direct_oracle_enabled() || aarch64_ipccall_direct_oracle_enabled()
+    x86_ipccall_direct_oracle_enabled()
+        || aarch64_ipccall_direct_oracle_enabled()
+        || riscv_ipccall_direct_oracle_enabled()
 }
 
 /// The compiled architecture tag for the DIRECT IpcCall/IpcReply oracle markers (mirrors the
@@ -3159,6 +3188,8 @@ pub fn ipccall_direct_oracle_enabled() -> bool {
 pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = "x86_64";
 #[cfg(all(feature = "ipccall-direct-oracle", target_arch = "aarch64"))]
 pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = "aarch64";
+#[cfg(all(feature = "ipccall-direct-oracle", target_arch = "riscv64"))]
+pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = "riscv64";
 
 /// Stage 199A2B4: the oracle's request + reply endpoint SLOT INDICES. The off-lock NR6/NR7 gates
 /// take the direct path ONLY for these exact endpoints, so a NORMAL system IpcCall/IpcReply (the
@@ -3195,7 +3226,11 @@ pub fn ipccall_direct_oracle_reply_endpoint_is(eidx: usize) -> bool {
 /// serves both arches; the literal is `target_arch`-gated so an artifact carries only its arch tag.
 #[cfg(all(
     feature = "ipccall-direct-oracle",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ),
     not(feature = "hosted-dev")
 ))]
 pub(crate) fn emit_ipccall_direct_request_live_markers() {
@@ -3225,7 +3260,11 @@ pub(crate) fn emit_ipccall_direct_request_live_markers() {
 /// Arch-parameterized; one-shot.
 #[cfg(all(
     feature = "ipccall-direct-oracle",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ),
     not(feature = "hosted-dev")
 ))]
 pub(crate) fn emit_ipcreply_direct_live_markers() {
@@ -3254,14 +3293,22 @@ pub(crate) fn emit_ipcreply_direct_live_markers() {
 /// hosted builds never emit the class literals).
 #[cfg(not(all(
     feature = "ipccall-direct-oracle",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ),
     not(feature = "hosted-dev")
 )))]
 pub(crate) fn emit_ipccall_direct_request_live_markers() {}
 
 #[cfg(not(all(
     feature = "ipccall-direct-oracle",
-    any(target_arch = "x86_64", target_arch = "aarch64"),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ),
     not(feature = "hosted-dev")
 )))]
 pub(crate) fn emit_ipcreply_direct_live_markers() {}
