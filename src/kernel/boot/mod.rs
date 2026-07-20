@@ -3075,6 +3075,554 @@ pub fn shared_region_direct_oracle_enabled() -> bool {
         || riscv_shared_region_direct_oracle_enabled()
 }
 
+// ─── Stage 199A2B2F: NR6 direct-request proof gate + committed-server ack ───────────────
+/// Default-OFF internal proof gate for the x86_64 off-lock `IpcCallDirectRequest` path
+/// (trap-entry snapshot publication + production recv-v2 acknowledgement publication).
+/// Off the gate the existing NR6 path is unchanged.
+pub(crate) static IPCCALL_DIRECT_PROOF_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_ipccall_direct_proof_enabled(enabled: bool) {
+    IPCCALL_DIRECT_PROOF_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ipccall_direct_proof_enabled() -> bool {
+    IPCCALL_DIRECT_PROOF_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+// ─── Stage 199A2B4: x86_64 DIRECT IpcCall/IpcReply live round-trip oracle ───────────────
+/// Startup slot-5 selector value that tells init to run the x86_64 DIRECT IpcCall/IpcReply
+/// live round-trip oracle (mirrors `yarm_user_rt::syscall::IPCCALL_DIRECT_ORACLE_SELECTOR`).
+/// Slot 5 is mutually exclusive across all init oracles; value 3 is the next free x86_64
+/// selector after FutexWake(1) and shared-region-direct(2).
+pub const IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 3;
+
+/// Stage 199A2C1: AArch64 startup slot-5 selector for the DIRECT IpcCall/IpcReply round-trip oracle.
+/// Value 7 is the next free AArch64 selector after FutexWake(1)/FutexWait(2)/idle(3)/yield(4,5)/
+/// shared-region-direct(6); the AArch64 init dispatch keys on `Some(7)`.
+pub const AARCH64_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 7;
+
+/// Stage 199A2C2: RISC-V startup slot-5 selector for the DIRECT IpcCall/IpcReply round-trip oracle.
+/// Value 8 is the next free RISC-V selector after FutexWake(1)/queue-switch(2)/FutexWait(3)/
+/// FutexWait-idle(4)/yield(5,6)/shared-region-direct(7); the RISC-V init dispatch keys on `Some(8)`.
+pub const RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 8;
+
+/// Stage 199A2B4: default-off x86_64 DIRECT IpcCall/IpcReply live-oracle WORKLOAD selector
+/// (`yarm.x86_64_ipccall_direct_oracle=1`). Provisions init startup slot 5 (=3) so init runs
+/// the parent(client)/child(server) NR6 request + NR7 reply round trip through the accepted
+/// off-lock transactions. Selecting the workload also arms the shared NR6/NR7 proof gate so the
+/// direct request + reply gates become live. INERT on a normal boot (which never sets this);
+/// does NOT enable queued calls, timeouts, notifications, server-death wake, or any non-x86 arch.
+pub(crate) static X86_IPCCALL_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_ipccall_direct_oracle_enabled(enabled: bool) {
+    X86_IPCCALL_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        // Selecting the workload arms the NR6/NR7 off-lock proof gate for this run.
+        set_ipccall_direct_proof_enabled(true);
+    }
+}
+
+pub fn x86_ipccall_direct_oracle_enabled() -> bool {
+    X86_IPCCALL_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2C1: default-off AArch64 DIRECT IpcCall/IpcReply live-oracle WORKLOAD selector
+/// (`yarm.aarch64_ipccall_direct_oracle=1`). Mirror of the x86_64 knob: provisions init startup
+/// slot 5 (=7, the next free AArch64 selector after FutexWake/FutexWait/Yield/shared-region 1..6) so
+/// init runs the SAME arch-neutral parent(client)/child(server) NR6 request + NR7 reply round trip
+/// through the accepted off-lock transactions, and arms the shared NR6/NR7 proof gate so both direct
+/// gates go live. INERT on a normal boot; does NOT enable queued calls, timeouts, notifications,
+/// server-death wake, the x86_64 oracle, or RISC-V.
+pub(crate) static AARCH64_IPCCALL_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_aarch64_ipccall_direct_oracle_enabled(enabled: bool) {
+    AARCH64_IPCCALL_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        // Selecting the workload arms the SHARED NR6/NR7 off-lock proof gate for this run. This is
+        // the arch-neutral gate; it does NOT arm the x86-specific oracle-enabled flag.
+        set_ipccall_direct_proof_enabled(true);
+    }
+}
+
+pub fn aarch64_ipccall_direct_oracle_enabled() -> bool {
+    AARCH64_IPCCALL_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2C2: default-off RISC-V DIRECT IpcCall/IpcReply live-oracle WORKLOAD selector
+/// (`yarm.riscv_ipccall_direct_oracle=1`). Mirror of the x86_64/AArch64 knobs: provisions init
+/// startup slot 5 (=8, the next free RISC-V selector after FutexWake/FutexWait/Yield/shared-region
+/// 1..7) so init runs the SAME arch-neutral parent(client)/child(server) NR6 request + NR7 reply
+/// round trip, and arms the shared NR6/NR7 proof gate. INERT on a normal boot; does NOT enable
+/// queued calls, timeouts, notifications, server-death wake, the x86_64 oracle, or the AArch64 oracle.
+pub(crate) static RISCV_IPCCALL_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_riscv_ipccall_direct_oracle_enabled(enabled: bool) {
+    RISCV_IPCCALL_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if enabled {
+        // Selecting the workload arms the SHARED NR6/NR7 off-lock proof gate for this run. It does
+        // NOT arm the x86- or AArch64-specific oracle-enabled flags.
+        set_ipccall_direct_proof_enabled(true);
+    }
+}
+
+pub fn riscv_ipccall_direct_oracle_enabled() -> bool {
+    RISCV_IPCCALL_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// The DIRECT IpcCall/IpcReply oracle is live when ANY arch's workload selector is armed. The
+/// provisioning + arch-parameterized live markers key on this arch-neutral predicate; the per-arch
+/// marker literals are additionally `target_arch`-gated at their emitter.
+pub fn ipccall_direct_oracle_enabled() -> bool {
+    x86_ipccall_direct_oracle_enabled()
+        || aarch64_ipccall_direct_oracle_enabled()
+        || riscv_ipccall_direct_oracle_enabled()
+}
+
+/// The compiled architecture tag for the DIRECT IpcCall/IpcReply oracle markers (mirrors the
+/// shared-region oracle's `SHARED_REGION_ORACLE_ARCH`). Confined to the armed-oracle build.
+#[cfg(all(feature = "ipccall-direct-oracle", target_arch = "x86_64"))]
+pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = "x86_64";
+#[cfg(all(feature = "ipccall-direct-oracle", target_arch = "aarch64"))]
+pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = "aarch64";
+#[cfg(all(feature = "ipccall-direct-oracle", target_arch = "riscv64"))]
+pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = "riscv64";
+
+/// Stage 199A2B4: the oracle's request + reply endpoint SLOT INDICES. The off-lock NR6/NR7 gates
+/// take the direct path ONLY for these exact endpoints, so a NORMAL system IpcCall/IpcReply (the
+/// live service chain) always stays on its unchanged legacy path even while the proof gate is armed.
+/// This confines the off-lock retirement to the oracle's own round trip — the service chain is never
+/// routed through the direct transactions. `usize::MAX` = un-provisioned (no endpoint matches).
+pub(crate) static IPCCALL_DIRECT_ORACLE_REQ_EIDX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+pub(crate) static IPCCALL_DIRECT_ORACLE_REP_EIDX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub(crate) fn set_ipccall_direct_oracle_endpoints(req_eidx: usize, rep_eidx: usize) {
+    IPCCALL_DIRECT_ORACLE_REQ_EIDX.store(req_eidx, core::sync::atomic::Ordering::Release);
+    IPCCALL_DIRECT_ORACLE_REP_EIDX.store(rep_eidx, core::sync::atomic::Ordering::Release);
+}
+
+/// True iff `eidx` is the oracle's request endpoint (the ONLY endpoint whose IpcCall is serviced
+/// off-lock). `false` for every other endpoint (legacy path) and when un-provisioned.
+pub fn ipccall_direct_oracle_request_endpoint_is(eidx: usize) -> bool {
+    IPCCALL_DIRECT_ORACLE_REQ_EIDX.load(core::sync::atomic::Ordering::Acquire) == eidx
+}
+
+/// True iff `eidx` is the oracle's reply endpoint (the ONLY reply whose IpcReply is serviced
+/// off-lock). `false` for every other endpoint (legacy path) and when un-provisioned.
+pub fn ipccall_direct_oracle_reply_endpoint_is(eidx: usize) -> bool {
+    IPCCALL_DIRECT_ORACLE_REP_EIDX.load(core::sync::atomic::Ordering::Acquire) == eidx
+}
+
+/// Stage 199A2B4/199A2C1: emit the NR6 `IpcCallDirectRequest` success + retirement markers EXACTLY
+/// ONCE, from the production off-lock request drain, ONLY under the umbrella oracle feature (x86_64
+/// or aarch64) + the arch's selector. A normal (feature-off) artifact never compiles the class
+/// literal; a feature-on-but-selector-off boot never reaches it (the gate is not armed and the drain
+/// never runs a live delivery). ARCH-PARAMETERIZED via `IPCCALL_DIRECT_ORACLE_ARCH` — one emitter
+/// serves both arches; the literal is `target_arch`-gated so an artifact carries only its arch tag.
+#[cfg(all(
+    feature = "ipccall-direct-oracle",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ),
+    not(feature = "hosted-dev")
+))]
+pub(crate) fn emit_ipccall_direct_request_live_markers() {
+    if !ipccall_direct_oracle_enabled() {
+        return;
+    }
+    static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if ONCE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch={} class=IpcCallDirectRequest",
+        IPCCALL_DIRECT_ORACLE_ARCH
+    );
+    crate::yarm_log!(
+        "IPCCALL_DIRECT_REQUEST_OK arch={} source_copy_offlock=1 reply_cap=1 server_wakes=1",
+        IPCCALL_DIRECT_ORACLE_ARCH
+    );
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcCallDirectRequest result=ok",
+        IPCCALL_DIRECT_ORACLE_ARCH
+    );
+}
+
+/// Stage 199A2B4/199A2C1: emit the NR7 `IpcReplyDirect` success + retirement markers EXACTLY ONCE,
+/// from the production off-lock reply drain, ONLY under the umbrella oracle feature + selector.
+/// Arch-parameterized; one-shot.
+#[cfg(all(
+    feature = "ipccall-direct-oracle",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ),
+    not(feature = "hosted-dev")
+))]
+pub(crate) fn emit_ipcreply_direct_live_markers() {
+    if !ipccall_direct_oracle_enabled() {
+        return;
+    }
+    static ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if ONCE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_BEGIN arch={} class=IpcReplyDirect",
+        IPCCALL_DIRECT_ORACLE_ARCH
+    );
+    crate::yarm_log!(
+        "IPCREPLY_DIRECT_OK arch={} source_copy_offlock=1 caller_wakes=1 one_shot=1",
+        IPCCALL_DIRECT_ORACLE_ARCH
+    );
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyDirect result=ok",
+        IPCCALL_DIRECT_ORACLE_ARCH
+    );
+}
+
+/// No-op stubs so the production drain call sites compile unconditionally (normal artifacts +
+/// hosted builds never emit the class literals).
+#[cfg(not(all(
+    feature = "ipccall-direct-oracle",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ),
+    not(feature = "hosted-dev")
+)))]
+pub(crate) fn emit_ipccall_direct_request_live_markers() {}
+
+#[cfg(not(all(
+    feature = "ipccall-direct-oracle",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ),
+    not(feature = "hosted-dev")
+)))]
+pub(crate) fn emit_ipcreply_direct_live_markers() {}
+
+/// Authoritative committed blocked-server acknowledgement for the NR6 direct request
+/// transaction, published ONLY from the fully-committed recv-v2 path. A single-slot
+/// store with a monotonic `commit_seq` and an atomic CLAIMED guard so a duplicate
+/// trap/drain cannot claim the same acknowledgement twice; `restore` re-arms it only
+/// for a retryable rollback of the exact same publication.
+pub mod ipccall_direct_ack {
+    use crate::kernel::boot::ReceiverWaiterIdentity;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::ipccall_direct::BlockedServerAck;
+    use crate::kernel::vm::Asid;
+    use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+
+    static VALID: AtomicBool = AtomicBool::new(false);
+    static CLAIMED: AtomicBool = AtomicBool::new(false);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static SERVER_TID: AtomicU64 = AtomicU64::new(0);
+    static SERVER_ASID: AtomicU16 = AtomicU16::new(0);
+    static EP_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static EP_GEN: AtomicU64 = AtomicU64::new(0);
+    static PAYLOAD_PTR: AtomicUsize = AtomicUsize::new(0);
+    static PAYLOAD_LEN: AtomicUsize = AtomicUsize::new(0);
+    static META_PTR: AtomicUsize = AtomicUsize::new(0);
+    static META_LEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Reset (test setup / between boots).
+    pub fn reset() {
+        VALID.store(false, Ordering::Release);
+        CLAIMED.store(false, Ordering::Release);
+    }
+
+    fn next_seq() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Publish the ack (fields first, `VALID` released last). Clears the claim so a
+    /// fresh publication is independently claimable exactly once. Returns the seq.
+    pub(crate) fn publish(ack: BlockedServerAck) -> u64 {
+        let seq = next_seq();
+        SERVER_TID.store(ack.server.tid.0, Ordering::Relaxed);
+        SERVER_ASID.store(ack.server.asid.0, Ordering::Relaxed);
+        EP_IDX.store(ack.endpoint_index, Ordering::Relaxed);
+        EP_GEN.store(ack.endpoint_generation, Ordering::Relaxed);
+        PAYLOAD_PTR.store(ack.payload_user_ptr, Ordering::Relaxed);
+        PAYLOAD_LEN.store(ack.payload_user_len, Ordering::Relaxed);
+        META_PTR.store(ack.meta_user_ptr, Ordering::Relaxed);
+        META_LEN.store(ack.meta_user_len, Ordering::Relaxed);
+        SEQ.store(seq, Ordering::Relaxed);
+        CLAIMED.store(false, Ordering::Relaxed);
+        VALID.store(true, Ordering::Release);
+        seq
+    }
+
+    /// The current committed acknowledgement, or `None` if nothing is published.
+    pub fn snapshot() -> Option<BlockedServerAck> {
+        if !VALID.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(BlockedServerAck {
+            server: ReceiverWaiterIdentity::new(
+                ThreadId(SERVER_TID.load(Ordering::Relaxed)),
+                Asid(SERVER_ASID.load(Ordering::Relaxed)),
+            ),
+            endpoint_index: EP_IDX.load(Ordering::Relaxed),
+            endpoint_generation: EP_GEN.load(Ordering::Relaxed),
+            recv_v2_committed: true,
+            payload_user_ptr: PAYLOAD_PTR.load(Ordering::Relaxed),
+            payload_user_len: PAYLOAD_LEN.load(Ordering::Relaxed),
+            meta_user_ptr: META_PTR.load(Ordering::Relaxed),
+            meta_user_len: META_LEN.load(Ordering::Relaxed),
+        })
+    }
+
+    /// The published commit sequence (for the claimer).
+    pub fn commit_seq() -> u64 {
+        SEQ.load(Ordering::Relaxed)
+    }
+
+    /// Atomically CLAIM the current ack exactly once. Returns `Some((ack, seq))` on a
+    /// fresh claim; `None` if there is no ack or it is already claimed (a duplicate
+    /// trap/drain). The claim is the single ownership transfer of the acknowledgement.
+    pub fn claim() -> Option<(BlockedServerAck, u64)> {
+        let ack = snapshot()?;
+        if CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None; // already claimed — duplicate cannot claim twice
+        }
+        Some((ack, SEQ.load(Ordering::Relaxed)))
+    }
+
+    /// Re-arm (restore) a claimed ack for a retryable rollback of the SAME publication
+    /// (matching seq). Returns `true` if restored. A stale/changed publication (seq
+    /// advanced) cannot be restored — the stale ack stays claimed (discarded).
+    pub fn restore(seq: u64) -> bool {
+        if SEQ.load(Ordering::Relaxed) == seq && VALID.load(Ordering::Acquire) {
+            CLAIMED.store(false, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// True iff an unclaimed committed ack is present.
+    pub fn is_claimable() -> bool {
+        VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire)
+    }
+}
+
+/// Publish the NR6 committed blocked-server acknowledgement from the recv-v2 commit
+/// point — ONLY when the proof gate is armed and the FULLY-committed recv-v2 identity
+/// exists. It does NOT wake, mint, copy user memory, mutate scheduler state, or emit a
+/// retirement marker. A strict no-op off the gate or on any partial/stale state.
+pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
+    kernel: &KernelState,
+    receiver_tid: u64,
+    endpoint: crate::kernel::capabilities::CapObject,
+    state: &crate::kernel::task::BlockedRecvState,
+) {
+    use crate::kernel::capabilities::CapObject;
+    if !ipccall_direct_proof_enabled() {
+        return;
+    }
+    let CapObject::Endpoint { index, generation } = endpoint else {
+        return;
+    };
+    // Stage 199A2B4: on a REAL boot, publish ONLY for the oracle's request endpoint, so a
+    // service-chain recv-v2 never populates the single-slot ack (the off-lock request path is
+    // oracle-confined). Hosted wiring tests have no service chain and no provisioned oracle
+    // endpoint, so they keep the unconfined publish the fixtures rely on.
+    #[cfg(not(feature = "hosted-dev"))]
+    if !ipccall_direct_oracle_request_endpoint_is(index) {
+        return;
+    }
+    // Complete-commit contract: recv-v2, valid payload dest, non-null meta dest.
+    if state.recv_abi != crate::kernel::task::RecvAbiVariant::RecvV2
+        || state.payload_user_ptr == 0
+        || state.meta_user_ptr == 0
+    {
+        return;
+    }
+    let Some(asid) = kernel.task_asid(receiver_tid) else {
+        return;
+    };
+    let server = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
+    // Re-read the endpoint waiter identity under the IPC lock immediately before
+    // publication and require an EXACT match (else the record is not fully committed
+    // for this endpoint — publish nothing).
+    let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
+    if waiter != Some(server) {
+        return;
+    }
+    let ack = crate::kernel::ipccall_direct::BlockedServerAck {
+        server,
+        endpoint_index: index,
+        endpoint_generation: generation,
+        recv_v2_committed: true,
+        payload_user_ptr: state.payload_user_ptr,
+        payload_user_len: state.payload_user_len,
+        meta_user_ptr: state.meta_user_ptr,
+        meta_user_len: state.meta_user_len,
+    };
+    let _seq = ipccall_direct_ack::publish(ack);
+}
+
+/// Stage 199A2B3: single-slot committed blocked-CALLER acknowledgement for the NR7
+/// direct reply transaction. Mirrors [`ipccall_direct_ack`] with the same claim/restore
+/// lifecycle (an atomic CLAIMED guard so a duplicate reply drain cannot claim twice).
+pub mod ipcreply_direct_ack {
+    use crate::kernel::boot::ReceiverWaiterIdentity;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::ipccall_direct::BlockedCallerAck;
+    use crate::kernel::vm::Asid;
+    use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+
+    static VALID: AtomicBool = AtomicBool::new(false);
+    static CLAIMED: AtomicBool = AtomicBool::new(false);
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static CALLER_TID: AtomicU64 = AtomicU64::new(0);
+    static CALLER_ASID: AtomicU16 = AtomicU16::new(0);
+    static EP_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static EP_GEN: AtomicU64 = AtomicU64::new(0);
+    static PAYLOAD_PTR: AtomicUsize = AtomicUsize::new(0);
+    static PAYLOAD_LEN: AtomicUsize = AtomicUsize::new(0);
+    static META_PTR: AtomicUsize = AtomicUsize::new(0);
+    static META_LEN: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn reset() {
+        VALID.store(false, Ordering::Release);
+        CLAIMED.store(false, Ordering::Release);
+    }
+
+    fn next_seq() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn publish(ack: BlockedCallerAck) -> u64 {
+        let seq = next_seq();
+        CALLER_TID.store(ack.caller.tid.0, Ordering::Relaxed);
+        CALLER_ASID.store(ack.caller.asid.0, Ordering::Relaxed);
+        EP_IDX.store(ack.endpoint_index, Ordering::Relaxed);
+        EP_GEN.store(ack.endpoint_generation, Ordering::Relaxed);
+        PAYLOAD_PTR.store(ack.payload_user_ptr, Ordering::Relaxed);
+        PAYLOAD_LEN.store(ack.payload_user_len, Ordering::Relaxed);
+        META_PTR.store(ack.meta_user_ptr, Ordering::Relaxed);
+        META_LEN.store(ack.meta_user_len, Ordering::Relaxed);
+        SEQ.store(seq, Ordering::Relaxed);
+        CLAIMED.store(false, Ordering::Relaxed);
+        VALID.store(true, Ordering::Release);
+        seq
+    }
+
+    pub fn snapshot() -> Option<BlockedCallerAck> {
+        if !VALID.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(BlockedCallerAck {
+            caller: ReceiverWaiterIdentity::new(
+                ThreadId(CALLER_TID.load(Ordering::Relaxed)),
+                Asid(CALLER_ASID.load(Ordering::Relaxed)),
+            ),
+            endpoint_index: EP_IDX.load(Ordering::Relaxed),
+            endpoint_generation: EP_GEN.load(Ordering::Relaxed),
+            recv_v2_committed: true,
+            payload_user_ptr: PAYLOAD_PTR.load(Ordering::Relaxed),
+            payload_user_len: PAYLOAD_LEN.load(Ordering::Relaxed),
+            meta_user_ptr: META_PTR.load(Ordering::Relaxed),
+            meta_user_len: META_LEN.load(Ordering::Relaxed),
+        })
+    }
+
+    pub fn claim() -> Option<(BlockedCallerAck, u64)> {
+        let ack = snapshot()?;
+        if CLAIMED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        Some((ack, SEQ.load(Ordering::Relaxed)))
+    }
+
+    pub fn restore(seq: u64) -> bool {
+        if SEQ.load(Ordering::Relaxed) == seq && VALID.load(Ordering::Acquire) {
+            CLAIMED.store(false, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_claimable() -> bool {
+        VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire)
+    }
+}
+
+/// Publish the NR7 committed blocked-CALLER acknowledgement from the recv-v2 commit
+/// point (the caller blocking on its reply endpoint) — proof-gated, and only when the
+/// FULLY-committed identity exists. No wake / mint / copy / scheduler mutation /
+/// retirement marker; a strict no-op off the gate or on any partial/stale state.
+pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
+    kernel: &KernelState,
+    receiver_tid: u64,
+    endpoint: crate::kernel::capabilities::CapObject,
+    state: &crate::kernel::task::BlockedRecvState,
+) {
+    use crate::kernel::capabilities::CapObject;
+    if !ipccall_direct_proof_enabled() {
+        return;
+    }
+    let CapObject::Endpoint { index, generation } = endpoint else {
+        return;
+    };
+    // Stage 199A2B4: on a REAL boot, publish ONLY for the oracle's reply endpoint, so a
+    // service-chain recv-v2 never populates the single-slot caller ack (the off-lock reply path is
+    // oracle-confined). Hosted wiring tests keep the unconfined publish their fixtures rely on.
+    #[cfg(not(feature = "hosted-dev"))]
+    if !ipccall_direct_oracle_reply_endpoint_is(index) {
+        return;
+    }
+    if state.recv_abi != crate::kernel::task::RecvAbiVariant::RecvV2
+        || state.payload_user_ptr == 0
+        || state.meta_user_ptr == 0
+    {
+        return;
+    }
+    let Some(asid) = kernel.task_asid(receiver_tid) else {
+        return;
+    };
+    let caller = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
+    // Re-read the endpoint waiter identity under the IPC lock immediately before publish.
+    let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
+    if waiter != Some(caller) {
+        return;
+    }
+    let ack = crate::kernel::ipccall_direct::BlockedCallerAck {
+        caller,
+        endpoint_index: index,
+        endpoint_generation: generation,
+        recv_v2_committed: true,
+        payload_user_ptr: state.payload_user_ptr,
+        payload_user_len: state.payload_user_len,
+        meta_user_ptr: state.meta_user_ptr,
+        meta_user_len: state.meta_user_len,
+    };
+    let _seq = ipcreply_direct_ack::publish(ack);
+}
+
 // ─── Stage 197A-C: mandatory init ELF loading (no synthetic fallback) ──────────────────
 //
 // Why an init load can be fatal. There is NO synthetic/placeholder init ELF fallback anymore
@@ -3918,6 +4466,205 @@ pub fn provision_init_shared_region_oracle(
     })
 }
 
+/// Stage 199A2B4: caps provisioned for the x86_64 DIRECT IpcCall/IpcReply live round-trip
+/// oracle. Both endpoint caps carry `SEND | RECEIVE` and live in init's (shared) CNode — the
+/// client uses the request SEND side + the reply RECEIVE side, and the spawned server child
+/// (sharing init's CSpace) uses the request RECEIVE side.
+#[cfg(feature = "ipccall-direct-oracle")]
+pub struct IpccallDirectOracleCaps {
+    /// init-local request endpoint cap (`SEND | RECEIVE`) → startup slot 13.
+    pub request_ep_cap: u32,
+    /// init-local reply endpoint cap (`SEND | RECEIVE`) → startup slot 14.
+    pub reply_ep_cap: u32,
+    /// The request endpoint's slot index (bookkeeping / hosted assertions).
+    pub request_endpoint_idx: usize,
+    /// The reply endpoint's slot index (bookkeeping / hosted assertions).
+    pub reply_endpoint_idx: usize,
+}
+
+/// Rollback scratch for the IpcCall/IpcReply oracle provisioning transaction.
+#[cfg(feature = "ipccall-direct-oracle")]
+#[derive(Default, Clone, Copy)]
+struct IpccallDirectProvisionScratch {
+    req_send_root: Option<crate::kernel::capabilities::CapId>,
+    req_recv_root: Option<crate::kernel::capabilities::CapId>,
+    req_endpoint_idx: Option<usize>,
+    init_req_cap: Option<crate::kernel::capabilities::CapId>,
+    rep_send_root: Option<crate::kernel::capabilities::CapId>,
+    rep_recv_root: Option<crate::kernel::capabilities::CapId>,
+    rep_endpoint_idx: Option<usize>,
+    init_rep_cap: Option<crate::kernel::capabilities::CapId>,
+}
+
+#[cfg(feature = "ipccall-direct-oracle")]
+fn rollback_ipccall_direct_provision(
+    kernel: &mut KernelState,
+    init_tid: u64,
+    scratch: &IpccallDirectProvisionScratch,
+) {
+    if let Some(cnode) = kernel.task_cnode(init_tid) {
+        for cap in [scratch.init_rep_cap, scratch.init_req_cap]
+            .into_iter()
+            .flatten()
+        {
+            let _ = kernel.revoke_capability_in_cnode(cnode, cap);
+        }
+    }
+    if let Some(cnode) = kernel.task_cnode(0) {
+        for root in [
+            scratch.rep_send_root,
+            scratch.rep_recv_root,
+            scratch.req_send_root,
+            scratch.req_recv_root,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _ = kernel.revoke_capability_in_cnode(cnode, root);
+        }
+    }
+    for eidx in [scratch.rep_endpoint_idx, scratch.req_endpoint_idx]
+        .into_iter()
+        .flatten()
+    {
+        let _ = kernel.destroy_endpoint(eidx);
+    }
+}
+
+/// Stage 199A2B4: provision the x86_64 DIRECT IpcCall/IpcReply live round-trip oracle
+/// TRANSACTIONALLY. Under BOTH the compile-time feature and the runtime selector, it creates
+/// a request endpoint + a reply endpoint and mints a `SEND | RECEIVE` cap for each into init's
+/// CNode. Returns `IpccallDirectOracleCaps` for the startup slots. Fail-closed AND leak-free:
+/// on ANY step failure it emits a precise failure marker, rolls back every resource created so
+/// far, and returns `None` (the caller then leaves the oracle un-armed). Provisions NO
+/// MemoryObject and NO queued/timeout/notification authority.
+#[cfg(feature = "ipccall-direct-oracle")]
+pub fn provision_init_ipccall_direct_oracle(
+    kernel: &mut KernelState,
+    init_tid: u64,
+) -> Option<IpccallDirectOracleCaps> {
+    if !ipccall_direct_oracle_enabled() {
+        return None;
+    }
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    let mut scratch = IpccallDirectProvisionScratch::default();
+
+    // Step 1: request endpoint.
+    let (req_idx, req_send_root, req_recv_root) = match kernel.create_endpoint(8) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_ORACLE_PROVISION_FAIL step=create_req err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    scratch.req_send_root = Some(req_send_root);
+    scratch.req_recv_root = Some(req_recv_root);
+    scratch.req_endpoint_idx = Some(req_idx);
+
+    let req_object = match kernel.current_task_capability(req_recv_root) {
+        Some(c) => c.object,
+        None => {
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_ORACLE_PROVISION_FAIL step=resolve_req eidx={}",
+                req_idx
+            );
+            rollback_ipccall_direct_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    debug_assert!(matches!(req_object, CapObject::Endpoint { .. }));
+
+    let init_cnode = match kernel.task_cnode(init_tid) {
+        Some(c) => c,
+        None => {
+            crate::yarm_log!("IPCCALL_DIRECT_ORACLE_PROVISION_FAIL step=init_cnode");
+            rollback_ipccall_direct_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    let init_req_cap = match kernel.mint_capability_in_cnode(
+        init_cnode,
+        Capability::new(req_object, CapRights::SEND | CapRights::RECEIVE),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_ORACLE_PROVISION_FAIL step=mint_req err={:?}",
+                e
+            );
+            rollback_ipccall_direct_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    scratch.init_req_cap = Some(init_req_cap);
+
+    // Step 2: reply endpoint.
+    let (rep_idx, rep_send_root, rep_recv_root) = match kernel.create_endpoint(8) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_ORACLE_PROVISION_FAIL step=create_rep err={:?}",
+                e
+            );
+            rollback_ipccall_direct_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    scratch.rep_send_root = Some(rep_send_root);
+    scratch.rep_recv_root = Some(rep_recv_root);
+    scratch.rep_endpoint_idx = Some(rep_idx);
+
+    let rep_object = match kernel.current_task_capability(rep_recv_root) {
+        Some(c) => c.object,
+        None => {
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_ORACLE_PROVISION_FAIL step=resolve_rep eidx={}",
+                rep_idx
+            );
+            rollback_ipccall_direct_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    debug_assert!(matches!(rep_object, CapObject::Endpoint { .. }));
+
+    let init_rep_cap = match kernel.mint_capability_in_cnode(
+        init_cnode,
+        Capability::new(rep_object, CapRights::SEND | CapRights::RECEIVE),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_ORACLE_PROVISION_FAIL step=mint_rep err={:?}",
+                e
+            );
+            rollback_ipccall_direct_provision(kernel, init_tid, &scratch);
+            return None;
+        }
+    };
+    scratch.init_rep_cap = Some(init_rep_cap);
+
+    // Confine the off-lock NR6/NR7 gates to EXACTLY these two endpoints — every other
+    // IpcCall/IpcReply in the running system stays on its unchanged legacy path.
+    set_ipccall_direct_oracle_endpoints(req_idx, rep_idx);
+    crate::yarm_log!(
+        "IPCCALL_DIRECT_ORACLE_PROVISION_OK init_tid={} req_cap={} rep_cap={} req_eidx={} rep_eidx={}",
+        init_tid,
+        init_req_cap.0,
+        init_rep_cap.0,
+        req_idx,
+        rep_idx
+    );
+    Some(IpccallDirectOracleCaps {
+        request_ep_cap: init_req_cap.0 as u32,
+        reply_ep_cap: init_rep_cap.0 as u32,
+        request_endpoint_idx: req_idx,
+        reply_endpoint_idx: rep_idx,
+    })
+}
+
 /// Stage 193D: provision the reply-cap live oracle. Under BOTH the base proof knob and
 /// the send-reply-cap sub-knob, this (a) creates the coordination endpoint + grants init
 /// a RECV cap (slot 13), and (b) mints a transferable one-shot Reply cap directly into
@@ -4157,7 +4904,7 @@ const MAX_DRIVER_DMA_CAPS: usize = 8;
 const MAX_TRANSFER_ENVELOPES: usize = 256;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_TRANSFER_ENVELOPES: usize = 64;
-const MAX_REPLY_CAPS: usize = MAX_TASKS;
+pub(crate) const MAX_REPLY_CAPS: usize = MAX_TASKS;
 #[cfg(feature = "hosted-dev")]
 const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
 #[cfg(not(feature = "hosted-dev"))]

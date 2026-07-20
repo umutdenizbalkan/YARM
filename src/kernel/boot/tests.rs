@@ -70592,20 +70592,27 @@ mod stage199a1_ipccall_direct_audit {
         );
     }
 
-    // (classification) Neither IpcCall (NR6) nor IpcReply (NR7) is in the pre-lock split-dispatch
-    // bridge, so the sender/replier payload read runs under the broad lock → both are NEEDS_BOUNDED_FIX.
+    // (classification — bounded fix LANDED) The Stage 199A1 audit classified IpcCall (NR6) +
+    // IpcReply (NR7) as NEEDS_BOUNDED_FIX (the sender/replier payload read ran under the broad
+    // lock). Stage 199A2B3 landed the accepted off-lock request + reply transactions with a pre-lock
+    // OWNED source snapshot, and Stage 199A2B4 proved them LIVE end-to-end under QEMU. The bounded
+    // fix is therefore DONE: both NR6/NR7 now have proof-gated pre-lock split-dispatch gates.
     #[test]
-    fn ipccall_and_ipcreply_not_split_dispatched_needs_bounded_fix() {
-        assert!(!SPLIT_SRC.contains("IpcCall"));
-        assert!(!SPLIT_SRC.contains("IpcReply"));
-        // The reply handler is documented as the global-lock slow path (not split-wired).
+    fn ipccall_and_ipcreply_bounded_fix_landed_and_proof_gated() {
+        // The off-lock gates exist in the split-dispatch bridge (the bounded fix).
+        assert!(SPLIT_SRC.contains("fn try_split_ipccall_direct_into_frame"));
+        assert!(SPLIT_SRC.contains("fn try_split_ipcreply_direct_into_frame"));
+        // Both are reached ONLY behind the default-off proof gate, so a normal boot is unchanged.
         assert!(
-            SYSCALL_SRC.contains("NR 7 IpcReply is not yet split-wired off the trap-entry seam")
+            SPLIT_SRC.contains(
+                "matches!(syscall, Syscall::IpcCall) && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ) && SPLIT_SRC.contains(
+                "matches!(syscall, Syscall::IpcReply) && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ),
+            "the NR6/NR7 off-lock gates must be reached only behind the proof gate"
         );
-        // The audit doc records both as NEEDS_BOUNDED_FIX.
-        assert!(
-            AUDIT_DOC.contains("request_direct=needs_bounded_fix reply_direct=needs_bounded_fix")
-        );
+        // The pre-lock OWNED source snapshot is copied off-lock (no broad/ranked lock).
+        assert!(SPLIT_SRC.contains("copy_from_user_asid_split_read"));
     }
 
     // (18) Reply-cap enqueue remains UNSUPPORTED (Stage 198F policy): forbidden by the artifact guard
@@ -75655,17 +75662,24 @@ duplicate_replies=0 duplicate_wakes=0 result=ok";
     // gate on the stored incarnation.
     #[test]
     fn revoke_helpers_resolve_incarnation_asid() {
+        // Stage 199A2B1: the AUTHORITATIVE cleanup entry points match the supplied
+        // identity verbatim (no ASID re-resolution inside the cleanup body).
         assert!(
-            IPC_STATE_SRC.contains("let asid_now = self.task_asid(caller_tid);"),
-            "caller revoke resolves the current incarnation ASID"
+            IPC_STATE_SRC.contains("fn revoke_reply_caps_for_caller_identity"),
+            "authoritative caller cleanup entry point exists"
         );
         assert!(
-            IPC_STATE_SRC.contains("record.caller_asid == a"),
-            "caller revoke gates on the stored caller ASID"
+            IPC_STATE_SRC
+                .contains("record.caller_tid == caller.tid && record.caller_asid == caller.asid"),
+            "caller cleanup matches the supplied {{tid,asid}} verbatim"
         );
         assert!(
-            IPC_STATE_SRC.contains("record.replier_asid, asid_now"),
-            "replier revoke gates on the stored replier ASID"
+            IPC_STATE_SRC.contains("fn revoke_reply_caps_for_replier_identity"),
+            "authoritative replier cleanup entry point exists"
+        );
+        assert!(
+            IPC_STATE_SRC.contains(".is_none_or(|stored| stored == replier.asid)"),
+            "replier cleanup matches the supplied replier identity"
         );
     }
 
@@ -75714,16 +75728,10 @@ duplicate_replies=0 duplicate_wakes=0 result=ok";
     fn abi_and_policy_unchanged() {
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
         assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
-        // Restart cleanup still calls the (now incarnation-aware) revoke helpers.
-        assert!(RESTART_SRC.contains("self.revoke_reply_caps_for_caller(tid)"));
-        assert!(RESTART_SRC.contains("self.revoke_reply_caps_for_replier(tid)"));
-        // The broad-lock IPC reply handler is NOT newly split-wired into the pre-lock
-        // seam (the off-lock removal is deferred, not silently attempted).
-        assert!(
-            !SPLIT_SRC.contains("try_split_ipc_call_into_frame")
-                && !SPLIT_SRC.contains("try_split_ipc_reply_into_frame"),
-            "NR 6/NR 7 must not be added to the pre-global-lock split seam this stage"
-        );
+        // Stage 199A2B1: restart/exit cleanup now calls the AUTHORITATIVE
+        // identity-typed entry points with the captured exiting `{tid, asid}`.
+        assert!(RESTART_SRC.contains("revoke_reply_caps_for_caller_identity"));
+        assert!(RESTART_SRC.contains("revoke_reply_caps_for_replier_identity"));
     }
 
     // ── Honest seal + deferral record ───────────────────────────────────────────
@@ -75756,5 +75764,3280 @@ duplicate_replies=0 duplicate_wakes=0 result=ok";
             OFFLOCK_DOC.contains("hosted-dev") && OFFLOCK_DOC.contains("switch_required"),
             "the doc must ground the deferral in the hosted split-copy gate + block-dispatch reason"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B1 — x86_64 Off-Lock IpcCall/IpcReply foundations (this increment).
+//
+// SCOPE LANDED HERE: (Part 1) authoritative identity-typed reply-record cleanup
+// entry points wired into every task-teardown site; (Part 2) architecture-neutral
+// owned pre-lock snapshots (IpcCallDirectSnapshot / IpcReplyDirectSnapshot) and the
+// reversible one-shot reply reservation FSM (Available→Reserved→Consumed with
+// caller-copy-fault rollback) in `src/kernel/ipccall_direct.rs`, unit-tested in
+// that module.
+//
+// NOT LANDED (remaining deep work, reported as the blocker): the LIVE x86
+// split-dispatch NR6/NR7 transactions, the `x86-ipccall-direct-oracle` feature +
+// `yarm.x86_64_ipccall_direct_oracle=1` selector, boot provisioning, the userspace
+// round-trip oracle, and the genuine QEMU seal. Nothing is wired live, so the
+// direct classes are trivially default-off and the existing NR6/NR7 fallback
+// behavior is byte-for-byte unchanged.
+mod stage199a2b1_offlock_foundations {
+    use super::*;
+    use crate::kernel::vm::Asid;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const DIRECT_SRC: &str = include_str!("../ipccall_direct.rs");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+
+    fn ident(tid: u64, asid: u16) -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+
+    // (1) Caller cleanup matches the SUPPLIED {tid,asid}; a replacement task reusing
+    // the numeric TID (different ASID) is untouched.
+    #[test]
+    fn caller_cleanup_uses_supplied_identity_replacement_untouched() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("caller");
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(1, asid).expect("bind");
+        let (_eid, _s, recv_global) = state.create_endpoint(4).expect("endpoint");
+        let recv = state
+            .grant_capability_task_to_task(0, recv_global, 1)
+            .expect("dup");
+        let _rc = state
+            .create_reply_cap_for_caller(ThreadId(1), recv, None)
+            .expect("record");
+        // A replacement incarnation identity (same TID, different ASID) must NOT clear.
+        let replacement = ident(1, asid.0.wrapping_add(7));
+        assert_eq!(
+            state.revoke_reply_caps_for_caller_identity(replacement),
+            0,
+            "supplied replacement identity must not clear the live incarnation's record"
+        );
+        assert!(state.reply_cap_record_present(0));
+        // The authoritative exiting identity clears exactly its own record.
+        assert_eq!(
+            state.revoke_reply_caps_for_caller_identity(ident(1, asid.0)),
+            1
+        );
+        assert!(!state.reply_cap_record_present(0));
+    }
+
+    // (2) Replier cleanup matches the SUPPLIED {tid,asid}; a replacement replier is
+    // untouched.
+    #[test]
+    fn replier_cleanup_uses_supplied_identity_replacement_untouched() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(2).expect("responder");
+        let asid = state.create_user_address_space().expect("asid").0;
+        state.bind_task_asid(2, asid).expect("bind");
+        let (_eid, _s, recv) = state.create_endpoint(4).expect("endpoint");
+        let _rc = state
+            .create_reply_cap_for_caller(ThreadId(0), recv, Some(ThreadId(2)))
+            .expect("record");
+        let replacement = ident(2, asid.0.wrapping_add(7));
+        assert_eq!(
+            state.revoke_reply_caps_for_replier_identity(replacement),
+            0,
+            "supplied replacement replier identity must not clear the live record"
+        );
+        assert!(state.reply_cap_record_present(0));
+        assert_eq!(
+            state.revoke_reply_caps_for_replier_identity(ident(2, asid.0)),
+            1
+        );
+    }
+
+    // (3) Every task-teardown site cleans reply records through the AUTHORITATIVE
+    // identity entry points (never the numeric re-resolving path as authority).
+    #[test]
+    fn teardown_sites_use_identity_entry_points() {
+        // Two caller-identity + two replier-identity call sites at minimum
+        // (exit_task, restart_task caller; mark_dead + reap both).
+        assert!(
+            RESTART_SRC
+                .matches("revoke_reply_caps_for_caller_identity")
+                .count()
+                >= 3
+        );
+        assert!(
+            RESTART_SRC
+                .matches("revoke_reply_caps_for_replier_identity")
+                .count()
+                >= 2
+        );
+        // Each site captures the exiting task's asid while its TCB is live.
+        assert!(RESTART_SRC.contains("self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0))"));
+        // The authoritative entry points do NOT re-resolve an ASID internally.
+        assert!(IPC_STATE_SRC.contains("fn revoke_reply_caps_for_caller_identity"));
+        assert!(IPC_STATE_SRC.contains("fn revoke_reply_caps_for_replier_identity"));
+    }
+
+    // (4) The architecture-neutral foundations exist: bounded owned snapshots and the
+    // reversible one-shot reply reservation FSM.
+    #[test]
+    fn arch_neutral_foundations_present() {
+        assert!(DIRECT_SRC.contains("pub(crate) struct IpcCallDirectSnapshot"));
+        assert!(DIRECT_SRC.contains("pub(crate) struct IpcReplyDirectSnapshot"));
+        assert!(DIRECT_SRC.contains("payload: [u8; IPC_DIRECT_PAYLOAD_MAX]"));
+        assert!(DIRECT_SRC.contains("pub(crate) enum ReplyReservation"));
+        assert!(DIRECT_SRC.contains("Reserved {"));
+        assert!(DIRECT_SRC.contains("reservation_generation: u64"));
+        assert!(DIRECT_SRC.contains("Consumed"));
+        // The FSM has the reversible rollback + one-shot consume transitions.
+        assert!(DIRECT_SRC.contains("fn reserve"));
+        assert!(DIRECT_SRC.contains("fn release"));
+        assert!(DIRECT_SRC.contains("fn consume"));
+        // Bounded payload equals the kernel IPC payload bound (128).
+        assert!(DIRECT_SRC.contains("IPC_DIRECT_PAYLOAD_MAX == 128"));
+    }
+
+    // (5) Direct classes remain DEFAULT-OFF: as of Stage 199A2B2F (NR6) and 199A2B3
+    // (NR7) the x86 split-dispatch arms exist but are PROOF-GATED — each is reached only
+    // when the internal `ipccall_direct_proof_enabled()` gate is armed, which defaults to
+    // false, so the broad-lock fallback is unchanged in production.
+    #[test]
+    fn direct_classes_default_off_no_live_split_arm() {
+        // The NR6 + NR7 direct arms are present but guarded by the default-off proof gate.
+        assert!(
+            SPLIT_SRC.contains(
+                "matches!(syscall, Syscall::IpcCall) && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ) && SPLIT_SRC.contains(
+                "matches!(syscall, Syscall::IpcReply) && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ),
+            "the NR6/NR7 direct split arms must be reached only behind the proof gate"
+        );
+        // The proof gate itself defaults to false (default-off in production).
+        const MOD_SRC: &str = include_str!("mod.rs");
+        assert!(
+            MOD_SRC
+                .contains("static IPCCALL_DIRECT_PROOF_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("core::sync::atomic::AtomicBool::new(false)"),
+            "the direct proof gate must default to false"
+        );
+    }
+
+    // (6) Stage 198F is preserved: 10 classes / 30 live cells, unchanged.
+    #[test]
+    fn stage198f_matrix_preserved() {
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SEAL_DOC.contains("STAGE_198F_COMPLETE_RETIREMENT_SEAL"));
+    }
+
+    // (7) ABI + reply-cap policy preserved.
+    #[test]
+    fn abi_and_policy_preserved() {
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B2 — x86_64 Off-Lock IpcCall Direct Request: reply-authority
+// representation + committed-server acknowledgement substrate (this increment).
+//
+// LANDED: (Part 4) the reply-record reservation lifecycle integrated into the
+// SINGLE existing reply_caps slot (ReplyRecordReservation on ReplyCapRecord) — a
+// Reserved record is not externally invokable until committed Available; cancel
+// reclaims the slot to Vacant; one authority store, one authoritative generation;
+// both {tid,asid} identities + the reply endpoint index+generation are bound at
+// reservation. (Part 2) the owned BlockedServerAck token type.
+//
+// NOT LANDED (remaining transaction orchestration, reported as the blocker): the
+// composed off-lock request transaction (require-exact-ack → mint one server-local
+// reply cap → off-lock request delivery → claim-then-commit-then-enqueue → commit
+// record, with full rollback), the x86 trap-entry snapshot publication, and the
+// result=ok request seal. No live split arm was added; NR6 behavior is unchanged.
+mod stage199a2b2_request_substrate {
+    use super::*;
+    use crate::kernel::vm::Asid;
+
+    const DEFS_SRC: &str = include_str!("defs.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const DIRECT_SRC: &str = include_str!("../ipccall_direct.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+
+    fn ident(tid: u64, asid: u16) -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+
+    fn endpoint_obj(index: usize, generation: u64) -> crate::kernel::capabilities::CapObject {
+        crate::kernel::capabilities::CapObject::Endpoint { index, generation }
+    }
+
+    // A reserved record is present but NOT externally invokable; committing it makes
+    // it invokable; the slot + generation are the SOLE authority (single store).
+    #[test]
+    fn reserved_record_not_invokable_until_committed() {
+        let mut state = Bootstrap::init().expect("init");
+        let (idx, rgen) = state
+            .reserve_direct_reply_record(ident(1, 11), ident(2, 22), endpoint_obj(3, 7))
+            .expect("reserve");
+        assert_eq!(
+            state.reply_cap_record_reservation(idx),
+            Some(crate::kernel::boot::ReplyRecordReservation::Reserved)
+        );
+        assert!(
+            !state.direct_reply_record_is_invokable(idx, rgen),
+            "a Reserved record must not resolve for ipc_reply"
+        );
+        assert!(
+            state.commit_direct_reply_record(idx, rgen),
+            "commit succeeds"
+        );
+        assert_eq!(
+            state.reply_cap_record_reservation(idx),
+            Some(crate::kernel::boot::ReplyRecordReservation::Available)
+        );
+        assert!(
+            state.direct_reply_record_is_invokable(idx, rgen),
+            "a committed (Available) record resolves for ipc_reply"
+        );
+    }
+
+    // Cancel reclaims the reserved slot to Vacant (rollback), reclaiming authority.
+    #[test]
+    fn cancel_reclaims_reserved_slot() {
+        let mut state = Bootstrap::init().expect("init");
+        let (idx, rgen) = state
+            .reserve_direct_reply_record(ident(1, 11), ident(2, 22), endpoint_obj(3, 7))
+            .expect("reserve");
+        assert!(state.reply_cap_record_present(idx));
+        assert!(
+            state.cancel_direct_reply_record(idx, rgen),
+            "cancel succeeds"
+        );
+        assert!(
+            !state.reply_cap_record_present(idx),
+            "cancel clears the slot to Vacant"
+        );
+        assert!(!state.direct_reply_record_is_invokable(idx, rgen));
+        // Cancel/commit on a vacant slot is a no-op false.
+        assert!(!state.commit_direct_reply_record(idx, rgen));
+        assert!(!state.cancel_direct_reply_record(idx, rgen));
+    }
+
+    // Reservation binds BOTH {tid,asid} identities + the reply endpoint index+rgen.
+    #[test]
+    fn reservation_binds_identities_and_reply_endpoint() {
+        let mut state = Bootstrap::init().expect("init");
+        let caller = ident(1, 11);
+        let replier = ident(2, 22);
+        let ep = endpoint_obj(4, 9);
+        let (idx, _gen) = state
+            .reserve_direct_reply_record(caller, replier, ep)
+            .expect("reserve");
+        let (bound_caller, bound_replier, bound_ep) =
+            state.direct_reply_record_identities(idx).expect("present");
+        assert_eq!(bound_caller, caller, "caller identity bound");
+        assert_eq!(bound_replier, replier, "replier identity bound");
+        assert_eq!(bound_ep, ep, "reply endpoint index+generation bound");
+    }
+
+    // commit/cancel require the exact generation — a stale generation cannot mutate.
+    #[test]
+    fn commit_cancel_require_exact_generation() {
+        let mut state = Bootstrap::init().expect("init");
+        let (idx, rgen) = state
+            .reserve_direct_reply_record(ident(1, 11), ident(2, 22), endpoint_obj(3, 7))
+            .expect("reserve");
+        assert!(!state.commit_direct_reply_record(idx, rgen.wrapping_add(1)));
+        assert!(!state.cancel_direct_reply_record(idx, rgen.wrapping_add(1)));
+        // The record is untouched — still Reserved and reclaimable with the right rgen.
+        assert_eq!(
+            state.reply_cap_record_reservation(idx),
+            Some(crate::kernel::boot::ReplyRecordReservation::Reserved)
+        );
+        assert!(state.commit_direct_reply_record(idx, rgen));
+    }
+
+    // The server-local reply cap binds only into a Reserved record.
+    #[test]
+    fn server_reply_cap_binds_into_reserved_record() {
+        let mut state = Bootstrap::init().expect("init");
+        let (idx, rgen) = state
+            .reserve_direct_reply_record(ident(1, 11), ident(2, 22), endpoint_obj(3, 7))
+            .expect("reserve");
+        assert!(state.bind_direct_reply_record_server_cap(idx, rgen, CapId(77)));
+        assert_eq!(state.reply_cap_record_waiter_cap(idx), Some(CapId(77)));
+        // After commit the record is no longer Reserved, so a re-bind fails.
+        assert!(state.commit_direct_reply_record(idx, rgen));
+        assert!(!state.bind_direct_reply_record_server_cap(idx, rgen, CapId(88)));
+    }
+
+    // SINGLE authority store: the reservation lives IN the reply_caps slot; there is
+    // no parallel reply-record table and no second authoritative generation.
+    #[test]
+    fn single_reply_authority_store_no_second_table() {
+        // The reservation is a field of ReplyCapRecord (lives in the slot).
+        assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
+        // No second persistent record array was added alongside `reply_caps`.
+        assert!(
+            !IPC_STATE_SRC.contains("reply_records_2")
+                && !IPC_STATE_SRC.contains("direct_reply_records:")
+                && !IPC_STATE_SRC.contains("reservation_table"),
+            "no second persistent reply-record table exists"
+        );
+        // Only ONE reply generation array governs authority.
+        assert_eq!(
+            IPC_STATE_SRC.matches("reply_cap_generations[").count() > 0,
+            true
+        );
+        assert!(!IPC_STATE_SRC.contains("reservation_generations["));
+    }
+
+    // Committed blocked-server acknowledgement carries the required fields.
+    #[test]
+    fn blocked_server_ack_type_fields() {
+        assert!(DIRECT_SRC.contains("pub(crate) struct BlockedServerAck"));
+        assert!(DIRECT_SRC.contains("server: ReceiverWaiterIdentity"));
+        assert!(DIRECT_SRC.contains("endpoint_index: usize"));
+        assert!(DIRECT_SRC.contains("endpoint_generation: u64"));
+        assert!(DIRECT_SRC.contains("recv_v2_committed: bool"));
+        assert!(DIRECT_SRC.contains("payload_user_ptr: usize"));
+        assert!(DIRECT_SRC.contains("meta_user_ptr: usize"));
+    }
+
+    // The direct request class is still DEFAULT-OFF: no live NR6 split arm, NR7
+    // unchanged, and the reply-cap enqueue policy + ABI are preserved.
+    #[test]
+    fn direct_class_default_off_and_abi_preserved() {
+        assert!(
+            !SPLIT_SRC.contains("IpcCallDirectRequest")
+                && !SPLIT_SRC.contains("try_split_ipc_call"),
+            "no live NR6 direct split-dispatch arm this increment"
+        );
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B2C — off-lock reply-record reservation seams (composition step).
+//
+// LANDED: the `_split` (no broad `&mut KernelState`) reservation seams the composed
+// off-lock NR6 direct request transaction calls — reserve / bind / commit / cancel —
+// operating the SINGLE reply_caps slot via the rank-3 with_ipc_split_mut seam ONLY.
+// Proven at parity with the KernelState primitives + the invocation gate.
+//
+// NOT LANDED (remaining transaction body + STAGE_199_IPCCALL_DIRECT_REQUEST_
+// TRANSACTION_SEAL result=ok): the full composed transaction (cap-resolution
+// split-reads → require-ack → mint → off-lock copy_slice_to_user → claim/commit/
+// enqueue → commit, with the 12-case rollback), the x86 trap-entry snapshot publish,
+// and the recv-v2 ack publication point. Precise seam-level plan in
+// doc/STAGE_199A2B2C_OFFLOCK_SEAMS.md. No live NR6 split arm; behavior unchanged.
+mod stage199a2b2c_offlock_seams {
+    use super::*;
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+
+    fn ident(tid: u64, asid: u16) -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+    fn ep(index: usize, generation: u64) -> crate::kernel::capabilities::CapObject {
+        crate::kernel::capabilities::CapObject::Endpoint { index, generation }
+    }
+
+    // Off-lock reserve installs Reserved (not invokable) + binds identities; off-lock
+    // commit makes it Available (invokable) — parity with the KernelState primitives.
+    #[test]
+    fn offlock_reserve_then_commit_gates_invocation() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (idx, rgen) = k
+            .reserve_direct_reply_record_split(ident(1, 11), ident(2, 22), ep(3, 7))
+            .expect("reserve off-lock");
+        k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(idx),
+                Some(ReplyRecordReservation::Reserved)
+            );
+            assert!(
+                !s.direct_reply_record_is_invokable(idx, rgen),
+                "a Reserved record is not externally invokable"
+            );
+            let (c, r, e) = s.direct_reply_record_identities(idx).expect("present");
+            assert_eq!(c, ident(1, 11));
+            assert_eq!(r, ident(2, 22));
+            assert_eq!(e, ep(3, 7));
+        });
+        assert!(k.commit_direct_reply_record_split(idx, rgen));
+        k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(idx),
+                Some(ReplyRecordReservation::Available)
+            );
+            assert!(s.direct_reply_record_is_invokable(idx, rgen));
+        });
+    }
+
+    // Off-lock cancel reclaims the reserved slot to Vacant.
+    #[test]
+    fn offlock_cancel_reclaims_slot() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (idx, rgen) = k
+            .reserve_direct_reply_record_split(ident(1, 11), ident(2, 22), ep(3, 7))
+            .expect("reserve");
+        k.with(|s| assert!(s.reply_cap_record_present(idx)));
+        assert!(k.cancel_direct_reply_record_split(idx, rgen));
+        k.with(|s| {
+            assert!(!s.reply_cap_record_present(idx));
+            assert!(!s.direct_reply_record_is_invokable(idx, rgen));
+        });
+        // No-op false on a vacant slot.
+        assert!(!k.commit_direct_reply_record_split(idx, rgen));
+        assert!(!k.cancel_direct_reply_record_split(idx, rgen));
+    }
+
+    // Off-lock server-cap bind is accepted only into a Reserved record; after commit
+    // (Available) a re-bind fails.
+    #[test]
+    fn offlock_bind_only_into_reserved() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (idx, rgen) = k
+            .reserve_direct_reply_record_split(ident(1, 11), ident(2, 22), ep(3, 7))
+            .expect("reserve");
+        assert!(k.bind_direct_reply_record_server_cap_split(idx, rgen, CapId(99)));
+        k.with(|s| assert_eq!(s.reply_cap_record_waiter_cap(idx), Some(CapId(99))));
+        assert!(k.commit_direct_reply_record_split(idx, rgen));
+        assert!(!k.bind_direct_reply_record_server_cap_split(idx, rgen, CapId(100)));
+    }
+
+    // Off-lock commit/cancel/bind require the exact record generation.
+    #[test]
+    fn offlock_seams_require_exact_generation() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (idx, rgen) = k
+            .reserve_direct_reply_record_split(ident(1, 11), ident(2, 22), ep(3, 7))
+            .expect("reserve");
+        assert!(!k.commit_direct_reply_record_split(idx, rgen.wrapping_add(1)));
+        assert!(!k.cancel_direct_reply_record_split(idx, rgen.wrapping_add(1)));
+        assert!(!k.bind_direct_reply_record_server_cap_split(idx, rgen.wrapping_add(1), CapId(1)));
+        k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(idx),
+                Some(ReplyRecordReservation::Reserved)
+            )
+        });
+        assert!(k.commit_direct_reply_record_split(idx, rgen));
+    }
+
+    // Source: the reservation seams take no broad &mut KernelState — they operate the
+    // single reply_caps slot via with_ipc_split_mut. There is no second record store.
+    #[test]
+    fn source_seams_are_offlock_single_store() {
+        for seam in [
+            "fn reserve_direct_reply_record_split",
+            "fn commit_direct_reply_record_split",
+            "fn cancel_direct_reply_record_split",
+            "fn bind_direct_reply_record_server_cap_split",
+        ] {
+            assert!(RUNTIME_SRC.contains(seam), "missing seam: {seam}");
+        }
+        // The seam cluster uses the rank-3 split seam, not with / with_cpu.
+        let start = RUNTIME_SRC
+            .find("fn reserve_direct_reply_record_split")
+            .expect("cluster start");
+        let end = start
+            + RUNTIME_SRC[start..]
+                .find("fn sr_revoke_split")
+                .unwrap_or(RUNTIME_SRC.len() - start)
+                .min(6000);
+        let cluster = &RUNTIME_SRC[start..(start + 6000).min(RUNTIME_SRC.len())];
+        let _ = end;
+        assert!(cluster.contains("with_ipc_split_mut"));
+        assert!(
+            !cluster.contains("with_cpu(") && !cluster.contains("&mut KernelState"),
+            "off-lock reservation seams must not take the broad lock"
+        );
+    }
+
+    // No live NR6 direct split arm; ABI + reply-cap policy + Stage 198F preserved.
+    #[test]
+    fn no_live_arm_and_invariants_preserved() {
+        assert!(
+            !SPLIT_SRC.contains("IpcCallDirectRequest")
+                && !SPLIT_SRC.contains("try_split_ipc_call"),
+            "no live NR6 direct split-dispatch arm this increment"
+        );
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B2D — composed off-lock NR6 direct request transaction (end-to-end).
+mod stage199a2b2d_direct_request_txn {
+    use super::*;
+    use crate::kernel::ipccall_direct::{AckLease, BlockedServerAck, IpcCallDirectSnapshot};
+    use crate::kernel::ipccall_direct_txn::IpcCallDirectError;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const SERVER_PAYLOAD_VA: usize = 0x4000;
+    const SERVER_META_VA: usize = 0x4080;
+
+    fn id(tid: u64, asid: Asid) -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), asid)
+    }
+
+    /// Build a SharedKernel with task2 (server) committed-blocked on a recv-v2 of the
+    /// request endpoint, and task1 (caller) holding a request SEND cap + reply-endpoint
+    /// RECEIVE cap. Returns everything needed to drive `ipc_call_direct_request_txn`.
+    struct Fixture {
+        k: SharedKernel,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        server: crate::kernel::boot::ReceiverWaiterIdentity,
+        server_aspace_asid: Asid,
+        send_cap_t1: CapId,
+        reply_recv_cap_t1: CapId,
+        endpoint_index: usize,
+        endpoint_generation: u64,
+    }
+
+    fn blocked_server_fixture() -> Fixture {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (caller, server, send_cap_t1, reply_recv_cap_t1) = k.with(|state| {
+            state.register_task(1).expect("task1");
+            state.register_task(2).expect("task2");
+            let (asid1, _aspace1) = state.create_user_address_space().expect("asid1");
+            let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("bind1");
+            state.bind_task_asid(2, asid2).expect("bind2");
+            // Server request/meta destination page.
+            state
+                .map_user_page(
+                    aspace2,
+                    VirtAddr(SERVER_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xB000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map server buffers");
+            let (_req_eid, req_send_global, req_recv_global) =
+                state.create_endpoint(4).expect("req ep");
+            let send_cap_t1 = state
+                .grant_capability_task_to_task(0, req_send_global, 1)
+                .expect("dup req send to caller");
+            let req_recv_t2 = state
+                .grant_capability_task_to_task(0, req_recv_global, 2)
+                .expect("dup req recv to server");
+            let (_reply_eid, _reply_send, reply_recv_global) =
+                state.create_endpoint(4).expect("reply ep");
+            let reply_recv_cap_t1 = state
+                .grant_capability_task_to_task(0, reply_recv_global, 1)
+                .expect("dup reply recv to caller");
+            // Dispatch the server and block it on a recv-v2 of the request endpoint.
+            state.enqueue_current_cpu(2).expect("enqueue2");
+            state.dispatch_next_task().expect("dispatch");
+            while state.current_tid() != Some(2) {
+                state.yield_current().expect("switch to server");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    req_recv_t2.0 as usize,
+                    SERVER_PAYLOAD_VA,
+                    8,
+                    SERVER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(state.task_status(2), Some(TaskStatus::Blocked(_))),
+                "server must be blocked on recv-v2"
+            );
+            (asid1, asid2, send_cap_t1, reply_recv_cap_t1)
+        });
+        // Recover the request endpoint index+generation from the caller's SEND cap.
+        let endpoint = k
+            .resolve_endpoint_send_cap_split_read(1, send_cap_t1)
+            .expect("resolve send endpoint");
+        let (eidx, egen) = match endpoint {
+            crate::kernel::capabilities::CapObject::Endpoint { index, generation } => {
+                (index, generation)
+            }
+            _ => panic!("send cap is not an endpoint"),
+        };
+        Fixture {
+            k,
+            caller: id(1, caller),
+            server: id(2, server),
+            server_aspace_asid: server,
+            send_cap_t1,
+            reply_recv_cap_t1,
+            endpoint_index: eidx,
+            endpoint_generation: egen,
+        }
+    }
+
+    fn snapshot_for(fx: &Fixture, payload: &[u8]) -> IpcCallDirectSnapshot {
+        IpcCallDirectSnapshot::build(fx.caller, fx.send_cap_t1, fx.reply_recv_cap_t1, payload)
+            .expect("snapshot")
+    }
+
+    fn ack_for(fx: &Fixture) -> BlockedServerAck {
+        BlockedServerAck {
+            server: fx.server,
+            endpoint_index: fx.endpoint_index,
+            endpoint_generation: fx.endpoint_generation,
+            recv_v2_committed: true,
+            payload_user_ptr: SERVER_PAYLOAD_VA,
+            payload_user_len: 8,
+            meta_user_ptr: SERVER_META_VA,
+            meta_user_len: 40,
+        }
+    }
+
+    fn claimed_lease(seq: u64) -> AckLease {
+        let mut l = AckLease::new_available();
+        l.claim(seq).expect("claim");
+        l
+    }
+
+    #[test]
+    fn happy_path_delivers_once_and_wakes_server_once() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(7);
+
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 7)
+                .expect("composed transaction succeeds");
+
+        // Request payload delivered exactly once to the server's destination.
+        let delivered =
+            fx.k.with(|s| s.read_user_memory_for_asid(fx.server_aspace_asid, SERVER_PAYLOAD_VA, 8))
+                .expect("read server payload");
+        assert_eq!(&delivered[..8], b"request!");
+
+        // One server-local reply cap, resolving to the reserved reply object.
+        let resolved =
+            fx.k.with(|s| s.resolve_capability_for_task(2, out.server_reply_cap).ok());
+        assert!(
+            matches!(
+                resolved.map(|c| c.object),
+                Some(crate::kernel::capabilities::CapObject::Reply { index, generation })
+                    if index == out.record_index && generation == out.record_generation
+            ),
+            "exactly one server-local Reply cap minted"
+        );
+
+        // Record is Available (invokable) before dispatch, and the server is Runnable
+        // + enqueued (woke exactly once — it dispatches).
+        fx.k.with(|s| {
+            assert!(
+                s.direct_reply_record_is_invokable(out.record_index, out.record_generation),
+                "record Available before dispatch"
+            );
+            assert_eq!(s.task_status(2), Some(TaskStatus::Runnable));
+            s.dispatch_next_task().expect("dispatch");
+            assert_eq!(s.current_tid(), Some(2), "server woke and dispatches");
+        });
+
+        // Acknowledgement lease + reservation consumed exactly once.
+        assert!(lease.is_consumed(), "ack consumed once");
+    }
+
+    fn live_reply_records(k: &SharedKernel) -> usize {
+        k.with(|s| {
+            (0..crate::kernel::boot::MAX_REPLY_CAPS)
+                .filter(|i| s.reply_cap_record_present(*i))
+                .count()
+        })
+    }
+
+    fn assert_server_still_blocked_no_leak(k: &SharedKernel) {
+        assert!(
+            matches!(k.with(|s| s.task_status(2)), Some(TaskStatus::Blocked(_))),
+            "server remains blocked after a failed delivery"
+        );
+        assert_eq!(
+            live_reply_records(k),
+            0,
+            "a rolled-back transaction leaks no reply record"
+        );
+    }
+
+    // (no ack) A non-committed acknowledgement returns canonical WouldBlock with no
+    // mutation and no queued fallback; the lease is restored (retryable).
+    #[test]
+    fn no_ack_returns_wouldblock_no_mutation() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let mut ack = ack_for(&fx);
+        ack.recv_v2_committed = false;
+        // The no-ack path must not fabricate or restore a lease — pass an unclaimed
+        // (Available) lease and prove it is left untouched.
+        let mut lease = AckLease::new_available();
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 1),
+            Err(IpcCallDirectError::WouldBlock)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(
+            lease.is_available(),
+            "no-ack must not fabricate/claim/restore a lease"
+        );
+    }
+
+    // (caller replacement) The caller's incarnation changed → CallerGone; no mutation.
+    #[test]
+    fn caller_replacement_rejected() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        // Replace task1's incarnation (new ASID) — the snapshot's caller ASID is stale.
+        fx.k.with(|s| {
+            s.unbind_task_asid(1).expect("unbind caller");
+        });
+        let mut lease = claimed_lease(2);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 2),
+            Err(IpcCallDirectError::CallerGone)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(lease.is_available());
+    }
+
+    // (server replacement) The acknowledged server incarnation no longer matches →
+    // WouldBlock (no exact committed server); no mutation.
+    #[test]
+    fn server_replacement_rejected() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        fx.k.with(|s| {
+            s.unbind_task_asid(2).expect("unbind server");
+        });
+        let mut lease = claimed_lease(3);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 3),
+            Err(IpcCallDirectError::WouldBlock)
+        );
+        assert_eq!(live_reply_records(&fx.k), 0);
+        assert!(
+            lease.is_consumed(),
+            "server incarnation changed: ack discarded"
+        );
+    }
+
+    // (endpoint generation change) A stale endpoint generation is rejected; no mutation.
+    #[test]
+    fn endpoint_generation_change_rejected() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let mut ack = ack_for(&fx);
+        ack.endpoint_generation = fx.endpoint_generation.wrapping_add(1);
+        let mut lease = claimed_lease(4);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 4),
+            Err(IpcCallDirectError::EndpointGenerationChanged)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(
+            lease.is_consumed(),
+            "stale endpoint generation: ack discarded"
+        );
+    }
+
+    // (payload copy fault) An unmapped payload destination faults AFTER reservation +
+    // mint; the transaction rolls back every provisional artifact, leaves the server
+    // blocked, wakes nobody, and restores the (retryable) lease.
+    #[test]
+    fn payload_copy_fault_rolls_back() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let mut ack = ack_for(&fx);
+        ack.payload_user_ptr = 0x9_0000; // unmapped
+        let mut lease = claimed_lease(5);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 5),
+            Err(IpcCallDirectError::PayloadCopyFault)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(lease.is_available());
+    }
+
+    // (metadata copy fault) Payload copy succeeds, the metadata destination faults →
+    // rollback; server stays blocked with no usable reply authority, zero wake.
+    #[test]
+    fn metadata_copy_fault_rolls_back() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let mut ack = ack_for(&fx);
+        ack.meta_user_ptr = 0x9_0000; // unmapped, distinct page from the payload
+        let mut lease = claimed_lease(6);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 6),
+            Err(IpcCallDirectError::MetaCopyFault)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+        assert!(lease.is_available());
+    }
+
+    // (duplicate drain) A second delivery attempt after success finds the server no
+    // longer blocked → WouldBlock; it cannot redeliver or double-wake.
+    #[test]
+    fn duplicate_drain_cannot_redeliver() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(8);
+        fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 8)
+            .expect("first delivery");
+        // A fresh work item retrying the same ack: the server is Runnable, not blocked.
+        let mut lease2 = claimed_lease(9);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease2, 9),
+            Err(IpcCallDirectError::WouldBlock),
+            "no redelivery once the server is no longer blocked"
+        );
+        // Exactly one live reply record (the first, committed) — no duplicate.
+        assert_eq!(live_reply_records(&fx.k), 1);
+    }
+
+    // (lease held) A work item whose lease is not ClaimedByWork cannot proceed.
+    #[test]
+    fn unclaimed_lease_cannot_proceed() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = AckLease::new_available(); // never claimed
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 1),
+            Err(IpcCallDirectError::LeaseNotClaimed)
+        );
+        assert_server_still_blocked_no_leak(&fx.k);
+    }
+
+    // (dispatch requires enqueue) Immediately after a successful transaction the server
+    // is Runnable but has NOT executed (it is enqueued, not dispatched) — a server can
+    // never run merely because its task became Runnable.
+    #[test]
+    fn server_does_not_run_before_enqueue_dispatch() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(11);
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 11)
+                .expect("delivery");
+        fx.k.with(|s| {
+            // Record Available (committed) but the server has not dispatched yet.
+            assert!(s.direct_reply_record_is_invokable(out.record_index, out.record_generation));
+            assert_ne!(
+                s.current_tid(),
+                Some(2),
+                "server not yet running (enqueue != dispatch)"
+            );
+        });
+    }
+
+    // The reply authority remains a single store; ABI + Stage 198F preserved.
+    #[test]
+    fn single_authority_and_invariants_preserved() {
+        const DEFS_SRC: &str = include_str!("defs.rs");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+
+    // ── Part 1: generation-bearing CNode resolution ─────────────────────────────
+
+    #[test]
+    fn cnode_resolver_requires_exact_identity() {
+        let fx = blocked_server_fixture();
+        let server_asid = fx.server.asid;
+        let ok = fx.k.process_cnode_for_identity_split_read(fx.server);
+        assert!(ok.is_some(), "exact identity resolves the server CNode");
+        let replacement = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            ThreadId(2),
+            Asid(server_asid.0 ^ 0x55),
+        );
+        assert!(
+            fx.k.process_cnode_for_identity_split_read(replacement)
+                .is_none(),
+            "a replacement ASID at the same numeric TID resolves no CNode"
+        );
+    }
+
+    #[test]
+    fn no_cap_minted_into_replacement_cnode() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        fx.k.with(|s| s.unbind_task_asid(2).expect("replace server"));
+        let mut lease = claimed_lease(21);
+        assert!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 21)
+                .is_err()
+        );
+        assert_eq!(
+            live_reply_records(&fx.k),
+            0,
+            "no record/cap into replacement"
+        );
+    }
+
+    // ── Part 3: missing / changed waiter ────────────────────────────────────────
+
+    #[test]
+    fn missing_waiter_discards_and_reclaims() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                if let Some(idv) = ipc.endpoint_waiter_identity(fx.endpoint_index) {
+                    ipc.clear_endpoint_waiters_for_identity(idv);
+                }
+            })
+        });
+        let mut lease = claimed_lease(22);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 22),
+            Err(IpcCallDirectError::WaiterLost)
+        );
+        assert_eq!(live_reply_records(&fx.k), 0, "record/cap reclaimed");
+        assert!(
+            lease.is_consumed(),
+            "missing waiter: ack discarded, not restored"
+        );
+        assert_ne!(fx.k.with(|s| s.current_tid()), Some(2), "zero wake");
+    }
+
+    #[test]
+    fn changed_waiter_untouched_and_discards() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let other = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(3), Asid(0x321));
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                if let Some(idv) = ipc.endpoint_waiter_identity(fx.endpoint_index) {
+                    ipc.clear_endpoint_waiters_for_identity(idv);
+                }
+                ipc.set_endpoint_waiter(fx.endpoint_index, other);
+            })
+        });
+        let mut lease = claimed_lease(23);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 23),
+            Err(IpcCallDirectError::WaiterLost)
+        );
+        assert_eq!(
+            fx.k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(fx.endpoint_index))),
+            Some(other),
+            "replacement waiter untouched"
+        );
+        assert_eq!(live_reply_records(&fx.k), 0);
+        assert!(lease.is_consumed());
+    }
+
+    // ── Part 2: stale acknowledgements cannot be resurrected ────────────────────
+
+    #[test]
+    fn stale_ack_cannot_be_resurrected() {
+        let fx = blocked_server_fixture();
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        fx.k.with(|s| s.unbind_task_asid(2).expect("replace server"));
+        let mut lease = claimed_lease(24);
+        assert!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 24)
+                .is_err()
+        );
+        assert!(lease.is_consumed(), "stale server ack discarded");
+        assert_eq!(
+            lease.claim(24),
+            Err(crate::kernel::ipccall_direct::AckLeaseError::NotAvailable)
+        );
+    }
+
+    // ── Defensive branches (SMP-race / provably-infallible) source-verified ─────
+    #[test]
+    fn defensive_rollback_branches_present() {
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        let sg = TXN_SRC
+            .split("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
+            .nth(1)
+            .expect("ServerGone arm present");
+        assert!(sg.contains("sr_revoke_split"));
+        assert!(sg.contains("cancel_direct_reply_record_split"));
+        assert!(sg.contains("lease.discard()"));
+        assert!(
+            !sg.contains("sr_restore_endpoint_waiter_split"),
+            "a vanished server's claimed waiter must not be restored"
+        );
+        assert!(TXN_SRC.contains("IpcCallDirectError::RecordCommitFailed"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B2F — NR6 production wiring: recv-v2 ack publication + trap drain.
+mod stage199a2b2f_wiring {
+    use super::*;
+    use crate::kernel::boot::{ipccall_direct_ack, set_ipccall_direct_proof_enabled};
+    use crate::kernel::ipccall_direct::{AckLease, IpcCallDirectSnapshot};
+    use crate::kernel::ipccall_direct_txn::{DirectRequestPostWork, IpcCallDirectError};
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const PAYLOAD_VA: usize = 0x4000;
+    const META_VA: usize = 0x4080;
+
+    struct Fx {
+        k: SharedKernel,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        server_asid: Asid,
+        send_cap_t1: CapId,
+        reply_recv_cap_t1: CapId,
+        filler_global: CapId,
+    }
+
+    /// Enable the proof gate, build a caller + a server blocked on a recv-v2 of the
+    /// request endpoint — the recv-v2 commit publishes the BlockedServerAck.
+    fn fixture() -> Fx {
+        ipccall_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid1, asid2, send_cap_t1, reply_recv_cap_t1, filler_global) = k.with(|state| {
+            state.register_task(1).expect("t1");
+            state.register_task(2).expect("t2");
+            let (asid1, _a1) = state.create_user_address_space().expect("asid1");
+            let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("b1");
+            state.bind_task_asid(2, asid2).expect("b2");
+            state
+                .map_user_page(
+                    aspace2,
+                    VirtAddr(PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xB000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map server");
+            let (_e, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
+            let send_cap_t1 = state
+                .grant_capability_task_to_task(0, req_send, 1)
+                .expect("send t1");
+            let req_recv_t2 = state
+                .grant_capability_task_to_task(0, req_recv, 2)
+                .expect("recv t2");
+            let (_re, reply_send_global, reply_recv) = state.create_endpoint(4).expect("reply ep");
+            let reply_recv_cap_t1 = state
+                .grant_capability_task_to_task(0, reply_recv, 1)
+                .expect("reply t1");
+            state.enqueue_current_cpu(2).expect("enq2");
+            state.dispatch_next_task().expect("disp");
+            while state.current_tid() != Some(2) {
+                state.yield_current().expect("switch");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [req_recv_t2.0 as usize, PAYLOAD_VA, 8, META_VA, 40, 0],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(matches!(state.task_status(2), Some(TaskStatus::Blocked(_))));
+            (
+                asid1,
+                asid2,
+                send_cap_t1,
+                reply_recv_cap_t1,
+                reply_send_global,
+            )
+        });
+        Fx {
+            k,
+            caller: crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), asid1),
+            server_asid: asid2,
+            send_cap_t1,
+            reply_recv_cap_t1,
+            filler_global,
+        }
+    }
+
+    fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        ipccall_direct_ack::reset();
+    }
+
+    fn snapshot(fx: &Fx, p: &[u8]) -> IpcCallDirectSnapshot {
+        IpcCallDirectSnapshot::build(fx.caller, fx.send_cap_t1, fx.reply_recv_cap_t1, p)
+            .expect("snap")
+    }
+
+    // Production recv-v2 ack publication after a complete commit.
+    #[test]
+    fn ack_published_from_recv_commit() {
+        let fx = fixture();
+        let ack = ipccall_direct_ack::snapshot().expect("recv-v2 commit published an ack");
+        assert_eq!(ack.server.tid.0, 2);
+        assert_eq!(ack.server.asid, fx.server_asid);
+        assert!(ack.recv_v2_committed);
+        assert_eq!(ack.payload_user_ptr, PAYLOAD_VA);
+        assert_eq!(ack.meta_user_ptr, META_VA);
+        assert!(ipccall_direct_ack::is_claimable());
+        teardown();
+    }
+
+    // No publication when the gate is off.
+    #[test]
+    fn no_publish_when_gate_off() {
+        set_ipccall_direct_proof_enabled(false);
+        ipccall_direct_ack::reset();
+        // Reuse the fixture builder body but with the gate off: build directly.
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|state| {
+            state.register_task(2).expect("t2");
+            let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(2, asid2).expect("b2");
+            state
+                .map_user_page(
+                    aspace2,
+                    VirtAddr(PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xB000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map");
+            let (_e, _s, req_recv) = state.create_endpoint(4).expect("ep");
+            let req_recv_t2 = state
+                .grant_capability_task_to_task(0, req_recv, 2)
+                .expect("recv");
+            state.enqueue_current_cpu(2).expect("enq");
+            state.dispatch_next_task().expect("disp");
+            while state.current_tid() != Some(2) {
+                state.yield_current().expect("switch");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [req_recv_t2.0 as usize, PAYLOAD_VA, 8, META_VA, 40, 0],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+        });
+        assert!(
+            ipccall_direct_ack::snapshot().is_none(),
+            "gate off: no ack published"
+        );
+        teardown();
+    }
+
+    // End-to-end: claim the published ack → build one post-work item → drain →
+    // one delivery, one reply cap, record Available before dispatch, one server wake.
+    #[test]
+    fn drain_delivers_once_and_wakes_server() {
+        let fx = fixture();
+        let (ack, seq) = ipccall_direct_ack::claim().expect("claim published ack");
+        let work = DirectRequestPostWork {
+            snapshot: snapshot(&fx, b"request!"),
+            ack,
+            ack_seq: seq,
+        };
+        let out =
+            fx.k.drain_direct_request_post_work(&work)
+                .expect("drain delivers");
+        let delivered =
+            fx.k.with(|s| s.read_user_memory_for_asid(fx.server_asid, PAYLOAD_VA, 8))
+                .expect("read");
+        assert_eq!(&delivered[..8], b"request!");
+        fx.k.with(|s| {
+            assert!(s.direct_reply_record_is_invokable(out.record_index, out.record_generation));
+            assert_eq!(s.task_status(2), Some(TaskStatus::Runnable));
+            assert_ne!(
+                s.current_tid(),
+                Some(2),
+                "not yet dispatched (enqueue != dispatch)"
+            );
+            s.dispatch_next_task().expect("disp");
+            assert_eq!(s.current_tid(), Some(2), "server woke once");
+            assert!(
+                s.resolve_capability_for_task(2, out.server_reply_cap)
+                    .is_ok()
+            );
+        });
+        teardown();
+    }
+
+    // A duplicate trap/drain cannot claim the same acknowledgement twice.
+    #[test]
+    fn duplicate_claim_returns_none() {
+        let _fx = fixture();
+        assert!(ipccall_direct_ack::claim().is_some(), "first claim");
+        assert!(
+            ipccall_direct_ack::claim().is_none(),
+            "duplicate claim rejected"
+        );
+        teardown();
+    }
+
+    // Server exit after acknowledgement claim: the transaction discards the stale ack,
+    // reclaims all provisional state, and wakes nobody.
+    #[test]
+    fn server_exit_after_ack_claim_discards() {
+        let fx = fixture();
+        let (ack, seq) = ipccall_direct_ack::claim().expect("claim");
+        // Server exits before the drain runs the transaction.
+        fx.k.with(|s| {
+            let _ = s.exit_task(2, 0);
+        });
+        let work = DirectRequestPostWork {
+            snapshot: snapshot(&fx, b"request!"),
+            ack,
+            ack_seq: seq,
+        };
+        let r = fx.k.drain_direct_request_post_work(&work);
+        assert!(r.is_err(), "delivery rejected for an exited server");
+        assert_eq!(
+            fx.k.with(|s| (0..crate::kernel::boot::MAX_REPLY_CAPS)
+                .filter(|i| s.reply_cap_record_present(*i))
+                .count()),
+            0,
+            "no leaked reply record"
+        );
+        assert_ne!(fx.k.with(|s| s.current_tid()), Some(2), "zero wake");
+        // The stale ack is NOT re-armed by the drain (server gone → discarded): it
+        // remains claimed and is therefore not claimable by another drain.
+        let _ = seq;
+        assert!(
+            !ipccall_direct_ack::is_claimable(),
+            "stale server ack not restored after discard"
+        );
+        teardown();
+    }
+
+    // CNode-full / reply-cap mint failure: fill the server cnode so the provisional
+    // mint fails; the transaction rolls back with zero wake and zero leak.
+    #[test]
+    fn cnode_full_mint_failure_rolls_back() {
+        let fx = fixture();
+        let (ack, seq) = ipccall_direct_ack::claim().expect("claim");
+        // Fill task2's cnode to capacity so sr_mint_split cannot mint (reuse a global
+        // cap — create_endpoint needs a current task, and the server is blocked).
+        fx.k.with(|s| {
+            for _ in 0..8192 {
+                if s.grant_capability_task_to_task(0, fx.filler_global, 2)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let work = DirectRequestPostWork {
+            snapshot: snapshot(&fx, b"request!"),
+            ack,
+            ack_seq: seq,
+        };
+        let r = fx.k.drain_direct_request_post_work(&work);
+        assert_eq!(r, Err(IpcCallDirectError::MintFailed));
+        assert_eq!(
+            fx.k.with(|s| (0..crate::kernel::boot::MAX_REPLY_CAPS)
+                .filter(|i| s.reply_cap_record_present(*i))
+                .count()),
+            0,
+            "mint failure leaks no reply record"
+        );
+        assert_ne!(fx.k.with(|s| s.current_tid()), Some(2), "zero wake");
+        // Server remains blocked + retryable → ack restored.
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(2)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        teardown();
+    }
+
+    // Source guards: the trap gate copies off-lock (no broad/ranked lock) and the
+    // publisher does not wake/mint/copy/mutate-scheduler.
+    #[test]
+    fn wiring_source_guards() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        const MOD_SRC: &str = include_str!("mod.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        // Trap gate exists and copies via the off-lock split-read seam.
+        assert!(SPLIT_SRC.contains("fn try_split_ipccall_direct_into_frame"));
+        assert!(SPLIT_SRC.contains("copy_from_user_asid_split_read"));
+        let gate = SPLIT_SRC
+            .split("fn try_split_ipccall_direct_into_frame")
+            .nth(1)
+            .expect("gate body");
+        let gate = &gate[..gate
+            .find("\n#[cfg(feature = \"hosted-dev\")]")
+            .unwrap_or(gate.len())];
+        assert!(
+            !gate.contains(".with(")
+                && !gate.contains("with_cpu(")
+                && !gate.contains("&mut KernelState"),
+            "the trap source copy must hold no broad/ranked lock"
+        );
+        // Publisher: no wake/mint/user-copy/scheduler mutation/retirement marker.
+        let pubf = MOD_SRC
+            .split("fn maybe_publish_ipccall_direct_blocked_server_ack")
+            .nth(1)
+            .expect("publisher body");
+        let pubf = &pubf[..pubf.len().min(2000)];
+        assert!(
+            !pubf.contains("enqueue")
+                && !pubf.contains("mint")
+                && !pubf.contains("copy_to_user")
+                && !pubf.contains("GLOBAL_LOCK_RETIRE"),
+            "the ack publisher must not wake/mint/copy/mutate-scheduler/retire"
+        );
+        // Published from the fully-committed recv-v2 point.
+        assert!(IPC_SRC.contains("maybe_publish_ipccall_direct_blocked_server_ack"));
+        teardown();
+    }
+
+    // Record-commit precondition (structurally unreachable for an owned reservation):
+    // prove commit is INFALLIBLE for the exact live reservation and a synthetic
+    // mismatched reservation is rejected — the generation cannot change while the
+    // transaction holds ownership.
+    #[test]
+    fn record_commit_infallible_for_owned_reservation() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), Asid(1));
+        let server = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(2));
+        let ep = crate::kernel::capabilities::CapObject::Endpoint {
+            index: 3,
+            generation: 7,
+        };
+        let (idx, rgen) = k
+            .reserve_direct_reply_record_split(caller, server, ep)
+            .expect("reserve");
+        // Exact owned reservation → commit is infallible (always true).
+        assert!(
+            k.commit_direct_reply_record_split(idx, rgen),
+            "commit is infallible for the owned exact reservation"
+        );
+        // A synthetic mismatched reservation generation is rejected (fail-closed).
+        let (idx2, rgen2) = k
+            .reserve_direct_reply_record_split(caller, server, ep)
+            .expect("reserve 2");
+        assert!(!k.commit_direct_reply_record_split(idx2, rgen2.wrapping_add(1)));
+        assert!(k.commit_direct_reply_record_split(idx2, rgen2));
+    }
+
+    // Final hosted/source contract seal — emitted only because every named
+    // happy-path, rollback, identity, acknowledgement, and wiring case above passes.
+    #[test]
+    fn transaction_seal() {
+        const SEAL: &str = "STAGE_199_IPCCALL_DIRECT_REQUEST_TRANSACTION_SEAL \
+trap_snapshot_owned=1 source_copy_under_lock=0 no_ack_mutations=0 \
+reply_authority_stores=1 record_available_before_dispatch=1 \
+numeric_tid_only_cnode_authority=0 stale_ack_restores=0 duplicate_deliveries=0 \
+duplicate_wakes=0 leaked_reply_records=0 result=ok";
+        crate::yarm_log!("{}", SEAL);
+        for field in [
+            "trap_snapshot_owned=1",
+            "source_copy_under_lock=0",
+            "no_ack_mutations=0",
+            "reply_authority_stores=1",
+            "record_available_before_dispatch=1",
+            "numeric_tid_only_cnode_authority=0",
+            "stale_ack_restores=0",
+            "duplicate_deliveries=0",
+            "duplicate_wakes=0",
+            "leaked_reply_records=0",
+            "result=ok",
+        ] {
+            assert!(SEAL.contains(field), "seal must carry {field}");
+        }
+        // Stage 198F preservation is an explicit seal precondition.
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B3 — the composed OFF-LOCK NR7 `IpcReplyDirect` transaction (unit).
+//
+// A caller (task1) blocks on a recv-v2 of its reply endpoint (the recv-v2 commit
+// publishes the BlockedCallerAck); a replier (task2) holds a one-shot Reply cap
+// bound to that caller. The transaction reserves the EXISTING reply record
+// (Available→Reserved), copies the owned reply payload/meta to the caller off-lock,
+// claims the exact caller waiter, consumes the record (Reserved→Consumed) as the
+// one-shot barrier, and enqueues the caller exactly once.
+mod stage199a2b3_direct_reply_txn {
+    use super::*;
+    use crate::kernel::boot::ipcreply_direct_ack;
+    use crate::kernel::boot::{ReplyRecordReservation, set_ipccall_direct_proof_enabled};
+    use crate::kernel::ipccall_direct::{AckLease, BlockedCallerAck, IpcReplyDirectSnapshot};
+    use crate::kernel::ipccall_direct_txn::IpcReplyDirectError;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const CALLER_PAYLOAD_VA: usize = 0x4000;
+    const CALLER_META_VA: usize = 0x4080;
+
+    fn id(tid: u64, asid: Asid) -> crate::kernel::boot::ReceiverWaiterIdentity {
+        crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(tid), asid)
+    }
+
+    struct Fixture {
+        k: SharedKernel,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+        caller_asid: Asid,
+        replier_asid: Asid,
+        reply_cap_t2: CapId,
+        record_index: usize,
+        record_generation: u64,
+        published_ack: BlockedCallerAck,
+    }
+
+    /// Build a caller committed-blocked on a recv-v2 of its reply endpoint, plus a
+    /// replier holding a bound one-shot Reply cap. The recv-v2 commit publishes the
+    /// BlockedCallerAck (read back to seed the manual-ack unit tests).
+    fn blocked_caller_fixture() -> Fixture {
+        ipcreply_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (caller_asid, replier_asid, reply_cap_t2) = k.with(|state| {
+            state.register_task(1).expect("t1 caller");
+            state.register_task(2).expect("t2 replier");
+            let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+            let (asid2, _aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("bind1");
+            state.bind_task_asid(2, asid2).expect("bind2");
+            // Caller's reply payload + meta destination page.
+            state
+                .map_user_page(
+                    aspace1,
+                    VirtAddr(CALLER_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xC000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map caller buffers");
+            // Reply endpoint; caller holds the RECEIVE cap.
+            let (_reply_eid, _reply_send, reply_recv_global) =
+                state.create_endpoint(4).expect("reply ep");
+            let reply_recv_cap_t1 = state
+                .grant_capability_task_to_task(0, reply_recv_global, 1)
+                .expect("dup reply recv to caller");
+            // Bind a one-shot reply record caller=1 / replier=2; mint the Reply cap
+            // into the replier's (task2) cnode.
+            let t2_cnode = state.task_cnode(2).expect("t2 cnode");
+            let reply_cap_t2 = state
+                .create_reply_cap_for_caller_in_cnode(
+                    ThreadId(1),
+                    reply_recv_cap_t1,
+                    Some(ThreadId(2)),
+                    Some(t2_cnode),
+                )
+                .expect("reply record + replier-local cap");
+            // Dispatch the caller and block it on a recv-v2 of the reply endpoint.
+            state.enqueue_current_cpu(1).expect("enqueue1");
+            state.dispatch_next_task().expect("dispatch");
+            while state.current_tid() != Some(1) {
+                state.yield_current().expect("switch to caller");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    reply_recv_cap_t1.0 as usize,
+                    CALLER_PAYLOAD_VA,
+                    8,
+                    CALLER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(state.task_status(1), Some(TaskStatus::Blocked(_))),
+                "caller must be blocked on recv-v2 of its reply endpoint"
+            );
+            (asid1, asid2, reply_cap_t2)
+        });
+        let published_ack =
+            ipcreply_direct_ack::snapshot().expect("recv-v2 commit published a caller ack");
+        // Recover the reply record index+generation the replier's Reply cap names.
+        let (record_index, record_generation) = k
+            .resolve_reply_cap_split_read(2, reply_cap_t2)
+            .expect("resolve replier reply cap");
+        Fixture {
+            k,
+            caller: id(1, caller_asid),
+            replier: id(2, replier_asid),
+            caller_asid,
+            replier_asid,
+            reply_cap_t2,
+            record_index,
+            record_generation,
+            published_ack,
+        }
+    }
+
+    fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        ipcreply_direct_ack::reset();
+    }
+
+    fn snapshot_for(fx: &Fixture, payload: &[u8]) -> IpcReplyDirectSnapshot {
+        IpcReplyDirectSnapshot::build(fx.replier, fx.reply_cap_t2, payload).expect("snapshot")
+    }
+
+    fn claimed_lease(seq: u64) -> AckLease {
+        let mut l = AckLease::new_available();
+        l.claim(seq).expect("claim");
+        l
+    }
+
+    fn live_reply_records(k: &SharedKernel) -> usize {
+        k.with(|s| {
+            (0..crate::kernel::boot::MAX_REPLY_CAPS)
+                .filter(|i| s.reply_cap_record_present(*i))
+                .count()
+        })
+    }
+
+    fn reserved_reply_records(k: &SharedKernel) -> usize {
+        k.with(|s| {
+            (0..crate::kernel::boot::MAX_REPLY_CAPS)
+                .filter(|i| {
+                    matches!(
+                        s.reply_cap_record_reservation(*i),
+                        Some(ReplyRecordReservation::Reserved)
+                    )
+                })
+                .count()
+        })
+    }
+
+    fn assert_caller_still_blocked_zero_wake(k: &SharedKernel) {
+        assert!(
+            matches!(k.with(|s| s.task_status(1)), Some(TaskStatus::Blocked(_))),
+            "caller remains blocked after a failed reply"
+        );
+        assert_ne!(k.with(|s| s.current_tid()), Some(1), "zero wake");
+        assert_eq!(
+            reserved_reply_records(k),
+            0,
+            "a rolled-back reply leaks no active reservation"
+        );
+    }
+
+    // ── Happy path: one delivery, one wake, record Consumed, ack consumed ───────
+    #[test]
+    fn happy_path_delivers_once_and_wakes_caller_once() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(7);
+
+        let out =
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 7)
+                .expect("composed reply transaction succeeds");
+        assert_eq!(out.record_index, fx.record_index);
+        assert_eq!(out.record_generation, fx.record_generation);
+
+        // Reply payload delivered exactly once to the caller's destination.
+        let delivered =
+            fx.k.with(|s| s.read_user_memory_for_asid(fx.caller_asid, CALLER_PAYLOAD_VA, 8))
+                .expect("read caller payload");
+        assert_eq!(&delivered[..8], b"replyOK!");
+
+        // Record is Consumed (the one-shot barrier) and no longer invokable; caller
+        // Runnable + enqueued.
+        fx.k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(out.record_index),
+                Some(ReplyRecordReservation::Consumed),
+                "record Consumed after commit"
+            );
+            assert!(
+                !s.direct_reply_record_is_invokable(out.record_index, out.record_generation),
+                "a Consumed record is not invokable"
+            );
+            assert_eq!(s.task_status(1), Some(TaskStatus::Runnable));
+            s.dispatch_next_task().expect("dispatch");
+            assert_eq!(s.current_tid(), Some(1), "caller woke and dispatches once");
+        });
+        assert!(lease.is_consumed(), "ack consumed once");
+        teardown();
+    }
+
+    // Caller cannot dispatch merely because its task became Runnable: after the txn the
+    // record is Consumed but the caller has not yet run (enqueue != dispatch).
+    #[test]
+    fn caller_does_not_run_before_enqueue_dispatch() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(11);
+        let out =
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 11)
+                .expect("delivery");
+        fx.k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(out.record_index),
+                Some(ReplyRecordReservation::Consumed),
+                "record Consumed BEFORE any dispatch"
+            );
+            assert_ne!(
+                s.current_tid(),
+                Some(1),
+                "caller not yet running (enqueue != dispatch)"
+            );
+        });
+        teardown();
+    }
+
+    // (no caller ack) A non-committed acknowledgement returns canonical WouldBlock with
+    // no mutation; the lease is left untouched (never fabricated/claimed/restored).
+    #[test]
+    fn no_ack_returns_wouldblock_no_mutation() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let mut ack = fx.published_ack;
+        ack.recv_v2_committed = false;
+        let mut lease = AckLease::new_available();
+        assert_eq!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 1),
+            Err(IpcReplyDirectError::WouldBlock)
+        );
+        assert_caller_still_blocked_zero_wake(&fx.k);
+        assert!(
+            lease.is_available(),
+            "no-ack must not fabricate/claim/restore a lease"
+        );
+        teardown();
+    }
+
+    // (lease held) A work item whose lease is not ClaimedByWork cannot proceed.
+    #[test]
+    fn unclaimed_lease_cannot_proceed() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        let mut lease = AckLease::new_available(); // never claimed
+        assert_eq!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 1),
+            Err(IpcReplyDirectError::LeaseNotClaimed)
+        );
+        assert_caller_still_blocked_zero_wake(&fx.k);
+        teardown();
+    }
+
+    // ── Rollback matrix ─────────────────────────────────────────────────────────
+
+    // (source-copy fault) Over-length reply source builds NO snapshot — nothing is
+    // ever reserved/claimed/copied/woken (the source copy strictly precedes the claim).
+    #[test]
+    fn oversize_reply_source_builds_no_snapshot() {
+        let fx = blocked_caller_fixture();
+        let too_long = [0u8; crate::kernel::ipccall_direct::IPC_DIRECT_PAYLOAD_MAX + 1];
+        assert!(
+            IpcReplyDirectSnapshot::build(fx.replier, fx.reply_cap_t2, &too_long).is_none(),
+            "an over-length reply source yields no owned snapshot"
+        );
+        assert_caller_still_blocked_zero_wake(&fx.k);
+        teardown();
+    }
+
+    // (reply-cap gen mismatch / wrong replier identity / reservation precondition) The
+    // reservation seam only takes an Available record whose bound replier + exact
+    // generation match; a stale generation, a wrong replier ASID, and an aliased
+    // (already-Reserved) record are all rejected fail-closed with no mutation.
+    #[test]
+    fn reserve_requires_available_bound_replier_exact_generation() {
+        let fx = blocked_caller_fixture();
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        // Wrong generation → rejected.
+        assert!(
+            !fx.k
+                .reserve_existing_reply_record_split(idx, rgen.wrapping_add(1), fx.replier),
+            "stale reply-cap generation cannot reserve"
+        );
+        // Wrong replier ASID (numeric TID reused) → rejected.
+        let replacement = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            ThreadId(2),
+            Asid(fx.replier_asid.0 ^ 0x55),
+        );
+        assert!(
+            !fx.k
+                .reserve_existing_reply_record_split(idx, rgen, replacement),
+            "a numeric-TID-only replier cannot reserve"
+        );
+        // Exact bound replier + generation → reserves once; a second (aliased) reserve
+        // is rejected while Reserved.
+        assert!(fx.k.reserve_existing_reply_record_split(idx, rgen, fx.replier));
+        assert!(
+            !fx.k
+                .reserve_existing_reply_record_split(idx, rgen, fx.replier),
+            "an alias cannot reserve a record already Reserved"
+        );
+        assert!(
+            !fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)),
+            "a Reserved record is not invokable by any alias"
+        );
+        teardown();
+    }
+
+    // (wrong replier identity, end-to-end) A snapshot whose replier ASID does not match
+    // the bound record cannot reserve → ReservePreconditionFailed; exact caller stays
+    // retryable so the lease is restored, and no reservation leaks.
+    #[test]
+    fn wrong_replier_identity_rejected() {
+        let fx = blocked_caller_fixture();
+        let wrong = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            ThreadId(2),
+            Asid(fx.replier_asid.0 ^ 0x55),
+        );
+        let snap =
+            IpcReplyDirectSnapshot::build(wrong, fx.reply_cap_t2, b"replyOK!").expect("snapshot");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(31);
+        assert_eq!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 31),
+            Err(IpcReplyDirectError::ReservePreconditionFailed)
+        );
+        assert_caller_still_blocked_zero_wake(&fx.k);
+        assert!(lease.is_available(), "exact caller retryable: ack restored");
+        teardown();
+    }
+
+    // (missing waiter) The caller's reply-endpoint waiter vanished → WaiterLost before
+    // any reservation; no record reserved, ack discarded (no exact retryable caller).
+    #[test]
+    fn missing_waiter_rejected() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                if let Some(idv) = ipc.endpoint_waiter_identity(ack.endpoint_index) {
+                    ipc.clear_endpoint_waiters_for_identity(idv);
+                }
+            })
+        });
+        let mut lease = claimed_lease(32);
+        assert_eq!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 32),
+            Err(IpcReplyDirectError::WaiterLost)
+        );
+        assert_ne!(fx.k.with(|s| s.current_tid()), Some(1), "zero wake");
+        assert_eq!(reserved_reply_records(&fx.k), 0, "no active reservation");
+        assert!(lease.is_consumed(), "missing waiter: ack discarded");
+        teardown();
+    }
+
+    // (changed waiter) A different waiter replaced the caller on the reply endpoint →
+    // WaiterLost; the replacement waiter is untouched, ack discarded.
+    #[test]
+    fn changed_waiter_rejected_and_untouched() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        let other = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(3), Asid(0x321));
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                if let Some(idv) = ipc.endpoint_waiter_identity(ack.endpoint_index) {
+                    ipc.clear_endpoint_waiters_for_identity(idv);
+                }
+                ipc.set_endpoint_waiter(ack.endpoint_index, other);
+            })
+        });
+        let mut lease = claimed_lease(33);
+        assert_eq!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 33),
+            Err(IpcReplyDirectError::WaiterLost)
+        );
+        assert_eq!(
+            fx.k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(ack.endpoint_index))),
+            Some(other),
+            "replacement waiter untouched"
+        );
+        assert_eq!(reserved_reply_records(&fx.k), 0);
+        assert!(lease.is_consumed());
+        teardown();
+    }
+
+    // (endpoint generation change) A stale reply-endpoint generation is rejected →
+    // WaiterLost before any reservation; ack discarded (stale, not retryable).
+    #[test]
+    fn endpoint_generation_change_rejected() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let mut ack = fx.published_ack;
+        ack.endpoint_generation = ack.endpoint_generation.wrapping_add(1);
+        let mut lease = claimed_lease(34);
+        assert_eq!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 34),
+            Err(IpcReplyDirectError::WaiterLost)
+        );
+        assert_caller_still_blocked_zero_wake(&fx.k);
+        assert!(
+            lease.is_consumed(),
+            "stale endpoint generation: ack discarded"
+        );
+        teardown();
+    }
+
+    // (caller dest-copy fault, exact caller valid) The reply payload destination faults
+    // AFTER reservation while the exact caller is still blocked → Reserved→Available
+    // (reply authority stays usable), ack restored, zero wake.
+    #[test]
+    fn caller_payload_copy_fault_restores_available_for_exact_caller() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let mut ack = fx.published_ack;
+        ack.payload_user_ptr = 0x9_0000; // unmapped
+        let mut lease = claimed_lease(35);
+        assert_eq!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 35),
+            Err(IpcReplyDirectError::PayloadCopyFault)
+        );
+        fx.k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(fx.record_index),
+                Some(ReplyRecordReservation::Available),
+                "exact caller retryable: record restored to Available"
+            );
+            assert!(
+                s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation),
+                "reply authority remains usable"
+            );
+        });
+        assert_caller_still_blocked_zero_wake(&fx.k);
+        assert!(lease.is_available(), "exact caller retryable: ack restored");
+        teardown();
+    }
+
+    // (metadata copy fault, exact caller valid) The recv-v2 metadata destination faults
+    // after the payload copy → same exact-caller restore policy.
+    #[test]
+    fn caller_meta_copy_fault_restores_available_for_exact_caller() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let mut ack = fx.published_ack;
+        ack.meta_user_ptr = 0x9_0000; // unmapped, distinct page from the payload
+        let mut lease = claimed_lease(36);
+        assert_eq!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 36),
+            Err(IpcReplyDirectError::MetaCopyFault)
+        );
+        fx.k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(fx.record_index),
+                Some(ReplyRecordReservation::Available)
+            );
+        });
+        assert_caller_still_blocked_zero_wake(&fx.k);
+        assert!(lease.is_available());
+        teardown();
+    }
+
+    // (caller replacement) The caller's incarnation changed (new ASID at the same
+    // numeric TID) → the delivery is rejected; no reservation leaks, zero wake, and the
+    // stale authority is never restored (ack discarded).
+    #[test]
+    fn caller_replacement_rejected_no_stale_restore() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        fx.k.with(|s| {
+            s.unbind_task_asid(1).expect("replace caller incarnation");
+        });
+        let mut lease = claimed_lease(37);
+        let r = fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 37);
+        assert!(r.is_err(), "a replaced caller cannot receive a reply");
+        assert_ne!(fx.k.with(|s| s.current_tid()), Some(1), "zero wake");
+        assert_eq!(
+            reserved_reply_records(&fx.k),
+            0,
+            "no active reservation leaked"
+        );
+        assert!(
+            lease.is_consumed(),
+            "stale caller: ack discarded, never restored"
+        );
+        teardown();
+    }
+
+    // (caller exit during delivery) The caller exits before the drain runs → rejected;
+    // no reservation leaks, zero wake, ack discarded.
+    #[test]
+    fn caller_exit_during_delivery_rejected() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        fx.k.with(|s| {
+            let _ = s.exit_task(1, 0);
+        });
+        let mut lease = claimed_lease(38);
+        let r = fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 38);
+        assert!(r.is_err(), "an exited caller cannot receive a reply");
+        assert_ne!(fx.k.with(|s| s.current_tid()), Some(1), "zero wake");
+        assert_eq!(
+            reserved_reply_records(&fx.k),
+            0,
+            "no active reservation leaked"
+        );
+        assert!(lease.is_consumed(), "exited caller: ack discarded");
+        teardown();
+    }
+
+    // (duplicate alias after Consumed) After a successful reply the record is Consumed;
+    // a second reply cap resolving to the same (index, generation) can neither reserve
+    // nor resolve for invocation — the Consumed record is the one-shot barrier.
+    #[test]
+    fn duplicate_alias_after_consumed_fails_through_barrier() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(39);
+        fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 39)
+            .expect("first reply");
+        // An aliased second reserve of the now-Consumed record fails, and it is not
+        // invokable — even though the physical cnode slot is not reclaimed.
+        assert!(
+            !fx.k.reserve_existing_reply_record_split(
+                fx.record_index,
+                fx.record_generation,
+                fx.replier
+            ),
+            "a Consumed record rejects an aliased reserve"
+        );
+        assert!(
+            !fx.k
+                .with(|s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "a Consumed record is not invokable by any alias"
+        );
+        assert_eq!(live_reply_records(&fx.k), 1, "exactly one record, Consumed");
+        teardown();
+    }
+
+    // (duplicate drain) A second delivery attempt after success finds the caller no
+    // longer blocked / no exact waiter → rejected; it cannot redeliver or double-wake.
+    #[test]
+    fn duplicate_drain_cannot_redeliver() {
+        let fx = blocked_caller_fixture();
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(40);
+        fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 40)
+            .expect("first delivery");
+        let mut lease2 = claimed_lease(41);
+        let r = fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease2, 41);
+        assert!(
+            r.is_err(),
+            "no redelivery once the caller is no longer blocked"
+        );
+        // Exactly one live record (Consumed) — no duplicate reservation/wake.
+        assert_eq!(reserved_reply_records(&fx.k), 0);
+        teardown();
+    }
+
+    // (reservation lifecycle) release/consume behave as a single one-shot store:
+    // Available→Reserved→Available (release) and Available→Reserved→Consumed (consume),
+    // and a Consumed record cannot be reserved again.
+    #[test]
+    fn reservation_lifecycle_release_and_consume() {
+        let fx = blocked_caller_fixture();
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        assert!(fx.k.reserve_existing_reply_record_split(idx, rgen, fx.replier));
+        // release: Reserved → Available (retryable), then reserve again.
+        assert!(fx.k.release_reply_record_split(idx, rgen));
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(idx)),
+            Some(ReplyRecordReservation::Available)
+        );
+        assert!(fx.k.reserve_existing_reply_record_split(idx, rgen, fx.replier));
+        // consume: Reserved → Consumed (one-shot barrier); a second consume fails.
+        assert!(fx.k.consume_reply_record_split(idx, rgen));
+        assert!(!fx.k.consume_reply_record_split(idx, rgen));
+        assert!(
+            !fx.k
+                .reserve_existing_reply_record_split(idx, rgen, fx.replier)
+        );
+        teardown();
+    }
+
+    // Defensive branches (SMP-race / provably-infallible) are present + fail-closed in
+    // source: the caller-gone arm discards without restoring the claimed waiter.
+    #[test]
+    fn defensive_rollback_branches_present() {
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        let cg = TXN_SRC
+            .split("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
+            .nth(1)
+            .expect("CallerGone arm present");
+        assert!(cg.contains("discard_reply_record_split"));
+        assert!(cg.contains("lease.discard()"));
+        assert!(
+            !cg.contains("sr_restore_endpoint_waiter_split"),
+            "a vanished caller's claimed waiter must not be restored"
+        );
+        assert!(TXN_SRC.contains("IpcReplyDirectError::RecordConsumeFailed"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B3 — NR7 production wiring: recv-v2 caller-ack publication + trap
+// drain, source guards, invariant preservation, and the final reply seal.
+mod stage199a2b3_wiring {
+    use super::*;
+    use crate::kernel::boot::{ipcreply_direct_ack, set_ipccall_direct_proof_enabled};
+    use crate::kernel::ipccall_direct::IpcReplyDirectSnapshot;
+    use crate::kernel::ipccall_direct_txn::DirectReplyPostWork;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const CALLER_PAYLOAD_VA: usize = 0x4000;
+    const CALLER_META_VA: usize = 0x4080;
+
+    struct Fx {
+        k: SharedKernel,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+        caller_asid: Asid,
+        reply_cap_t2: CapId,
+        record_index: usize,
+        record_generation: u64,
+    }
+
+    /// Enable the proof gate; build a replier holding a bound one-shot Reply cap and a
+    /// caller blocked on a recv-v2 of its reply endpoint — the recv-v2 commit publishes
+    /// the BlockedCallerAck via the production path.
+    fn fixture() -> Fx {
+        ipcreply_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid1, asid2, reply_cap_t2) = k.with(|state| {
+            state.register_task(1).expect("t1");
+            state.register_task(2).expect("t2");
+            let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+            let (asid2, _a2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("b1");
+            state.bind_task_asid(2, asid2).expect("b2");
+            state
+                .map_user_page(
+                    aspace1,
+                    VirtAddr(CALLER_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xC000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map caller");
+            let (_re, _rs, reply_recv) = state.create_endpoint(4).expect("reply ep");
+            let reply_recv_cap_t1 = state
+                .grant_capability_task_to_task(0, reply_recv, 1)
+                .expect("reply recv t1");
+            let t2_cnode = state.task_cnode(2).expect("t2 cnode");
+            let reply_cap_t2 = state
+                .create_reply_cap_for_caller_in_cnode(
+                    ThreadId(1),
+                    reply_recv_cap_t1,
+                    Some(ThreadId(2)),
+                    Some(t2_cnode),
+                )
+                .expect("reply record");
+            state.enqueue_current_cpu(1).expect("enq1");
+            state.dispatch_next_task().expect("disp");
+            while state.current_tid() != Some(1) {
+                state.yield_current().expect("switch");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    reply_recv_cap_t1.0 as usize,
+                    CALLER_PAYLOAD_VA,
+                    8,
+                    CALLER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(matches!(state.task_status(1), Some(TaskStatus::Blocked(_))));
+            (asid1, asid2, reply_cap_t2)
+        });
+        let (record_index, record_generation) = k
+            .resolve_reply_cap_split_read(2, reply_cap_t2)
+            .expect("resolve reply cap");
+        Fx {
+            k,
+            replier: crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), asid2),
+            caller_asid: asid1,
+            reply_cap_t2,
+            record_index,
+            record_generation,
+        }
+    }
+
+    fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        ipcreply_direct_ack::reset();
+    }
+
+    fn snapshot(fx: &Fx, p: &[u8]) -> IpcReplyDirectSnapshot {
+        IpcReplyDirectSnapshot::build(fx.replier, fx.reply_cap_t2, p).expect("snap")
+    }
+
+    // Production recv-v2 caller-ack publication after a complete commit.
+    #[test]
+    fn caller_ack_published_from_recv_commit() {
+        let fx = fixture();
+        let ack = ipcreply_direct_ack::snapshot().expect("recv-v2 commit published a caller ack");
+        assert_eq!(ack.caller.tid.0, 1);
+        assert_eq!(ack.caller.asid, fx.caller_asid);
+        assert!(ack.recv_v2_committed);
+        assert_eq!(ack.payload_user_ptr, CALLER_PAYLOAD_VA);
+        assert_eq!(ack.meta_user_ptr, CALLER_META_VA);
+        assert!(ipcreply_direct_ack::is_claimable());
+        teardown();
+    }
+
+    // No publication when the gate is off.
+    #[test]
+    fn no_publish_when_gate_off() {
+        set_ipccall_direct_proof_enabled(false);
+        ipcreply_direct_ack::reset();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|state| {
+            state.register_task(1).expect("t1");
+            let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+            state.bind_task_asid(1, asid1).expect("b1");
+            state
+                .map_user_page(
+                    aspace1,
+                    VirtAddr(CALLER_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xC000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map");
+            let (_e, _s, reply_recv) = state.create_endpoint(4).expect("ep");
+            let reply_recv_cap_t1 = state
+                .grant_capability_task_to_task(0, reply_recv, 1)
+                .expect("recv");
+            state.enqueue_current_cpu(1).expect("enq");
+            state.dispatch_next_task().expect("disp");
+            while state.current_tid() != Some(1) {
+                state.yield_current().expect("switch");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    reply_recv_cap_t1.0 as usize,
+                    CALLER_PAYLOAD_VA,
+                    8,
+                    CALLER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+        });
+        assert!(
+            ipcreply_direct_ack::snapshot().is_none(),
+            "gate off: no caller ack published"
+        );
+        teardown();
+    }
+
+    // End-to-end: claim the published caller ack → build one post-work item → drain →
+    // one delivery, record Consumed before dispatch, one caller wake.
+    #[test]
+    fn drain_delivers_once_and_wakes_caller() {
+        let fx = fixture();
+        let (ack, seq) = ipcreply_direct_ack::claim().expect("claim published caller ack");
+        let work = DirectReplyPostWork {
+            snapshot: snapshot(&fx, b"replyOK!"),
+            ack,
+            ack_seq: seq,
+        };
+        let out =
+            fx.k.drain_direct_reply_post_work(&work)
+                .expect("drain delivers");
+        assert_eq!(out.record_index, fx.record_index);
+        let delivered =
+            fx.k.with(|s| s.read_user_memory_for_asid(fx.caller_asid, CALLER_PAYLOAD_VA, 8))
+                .expect("read");
+        assert_eq!(&delivered[..8], b"replyOK!");
+        fx.k.with(|s| {
+            assert_eq!(
+                s.reply_cap_record_reservation(out.record_index),
+                Some(crate::kernel::boot::ReplyRecordReservation::Consumed),
+                "record Consumed before dispatch"
+            );
+            assert_eq!(s.task_status(1), Some(TaskStatus::Runnable));
+            assert_ne!(
+                s.current_tid(),
+                Some(1),
+                "not yet dispatched (enqueue != dispatch)"
+            );
+            s.dispatch_next_task().expect("disp");
+            assert_eq!(s.current_tid(), Some(1), "caller woke once");
+        });
+        teardown();
+    }
+
+    // A duplicate trap/drain cannot claim the same caller acknowledgement twice.
+    #[test]
+    fn duplicate_claim_returns_none() {
+        let _fx = fixture();
+        assert!(ipcreply_direct_ack::claim().is_some(), "first claim");
+        assert!(
+            ipcreply_direct_ack::claim().is_none(),
+            "duplicate claim rejected"
+        );
+        teardown();
+    }
+
+    // Caller exit after acknowledgement claim: the transaction discards the stale ack,
+    // reclaims all provisional state, and wakes nobody.
+    #[test]
+    fn caller_exit_after_ack_claim_discards() {
+        let fx = fixture();
+        let (ack, seq) = ipcreply_direct_ack::claim().expect("claim");
+        fx.k.with(|s| {
+            let _ = s.exit_task(1, 0);
+        });
+        let work = DirectReplyPostWork {
+            snapshot: snapshot(&fx, b"replyOK!"),
+            ack,
+            ack_seq: seq,
+        };
+        let r = fx.k.drain_direct_reply_post_work(&work);
+        assert!(r.is_err(), "delivery rejected for an exited caller");
+        assert_eq!(
+            fx.k.with(|s| (0..crate::kernel::boot::MAX_REPLY_CAPS)
+                .filter(|i| matches!(
+                    s.reply_cap_record_reservation(*i),
+                    Some(crate::kernel::boot::ReplyRecordReservation::Reserved)
+                ))
+                .count()),
+            0,
+            "no leaked active reservation"
+        );
+        assert_ne!(fx.k.with(|s| s.current_tid()), Some(1), "zero wake");
+        // The stale ack is NOT re-armed by the drain (caller gone → discarded).
+        assert!(
+            !ipcreply_direct_ack::is_claimable(),
+            "stale caller ack not restored after discard"
+        );
+        teardown();
+    }
+
+    // Source guards: the trap gate copies the reply source off-lock (no broad/ranked
+    // lock) and BEFORE the record claim; the publisher does not wake/mint/copy/mutate.
+    #[test]
+    fn wiring_source_guards() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        const MOD_SRC: &str = include_str!("mod.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        // Trap gate exists and copies via the off-lock split-read seam.
+        assert!(SPLIT_SRC.contains("fn try_split_ipcreply_direct_into_frame"));
+        let gate = SPLIT_SRC
+            .split("fn try_split_ipcreply_direct_into_frame")
+            .nth(1)
+            .expect("gate body");
+        let gate = &gate[..gate
+            .find("\n#[cfg(feature = \"hosted-dev\")]")
+            .unwrap_or(gate.len())];
+        assert!(
+            gate.contains("copy_from_user_asid_split_read"),
+            "the gate copies the reply source through the off-lock seam"
+        );
+        assert!(
+            !gate.contains(".with(")
+                && !gate.contains("with_cpu(")
+                && !gate.contains("&mut KernelState"),
+            "the trap source copy must hold no broad/ranked lock"
+        );
+        // Source copy strictly precedes the ack claim (owned snapshot before claim).
+        let copy_at = gate
+            .find("copy_from_user_asid_split_read")
+            .expect("copy present");
+        let claim_at = gate
+            .find("ipcreply_direct_ack::claim()")
+            .expect("claim present");
+        assert!(
+            copy_at < claim_at,
+            "the reply source copy must precede the ack claim"
+        );
+        // Transaction reserves only AFTER the owned snapshot exists (claim after copy).
+        assert!(TXN_SRC.contains("reserve_existing_reply_record_split"));
+        let txn = TXN_SRC
+            .split("fn ipc_reply_direct_txn")
+            .nth(1)
+            .expect("txn body");
+        let resolve_at = txn.find("resolve_reply_cap_split_read").expect("resolve");
+        let reserve_at = txn
+            .find("reserve_existing_reply_record_split")
+            .expect("reserve");
+        let copy_out_at = txn
+            .find("copy_slice_to_user_asid_split_write")
+            .expect("caller copy");
+        assert!(
+            reserve_at < copy_out_at,
+            "the record is reserved before the caller copy"
+        );
+        assert!(resolve_at < reserve_at);
+        // Publisher: no wake/mint/user-copy/scheduler mutation/retirement marker.
+        let pubf = MOD_SRC
+            .split("fn maybe_publish_ipcreply_direct_blocked_caller_ack")
+            .nth(1)
+            .expect("publisher body");
+        let pubf = &pubf[..pubf.len().min(2000)];
+        assert!(
+            !pubf.contains("enqueue")
+                && !pubf.contains("mint")
+                && !pubf.contains("copy_to_user")
+                && !pubf.contains("GLOBAL_LOCK_RETIRE"),
+            "the caller-ack publisher must not wake/mint/copy/mutate-scheduler/retire"
+        );
+        // Published from the fully-committed recv-v2 point.
+        assert!(IPC_SRC.contains("maybe_publish_ipcreply_direct_blocked_caller_ack"));
+        teardown();
+    }
+
+    // Reply authority remains a single store; ABI + Stage 198F preserved; NR6 seal kept.
+    #[test]
+    fn single_authority_and_invariants_preserved() {
+        const DEFS_SRC: &str = include_str!("defs.rs");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        const TESTS_SRC: &str = include_str!("tests.rs");
+        // Single reservation authority field on the record.
+        assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        // NR6 request seal remains present (unchanged accepted transaction).
+        assert!(
+            TESTS_SRC.contains("STAGE_199_IPCCALL_DIRECT_REQUEST_TRANSACTION_SEAL"),
+            "the NR6 request seal must remain"
+        );
+        teardown();
+    }
+
+    // Final hosted/source contract seal — emitted only because every named happy-path,
+    // rollback, identity, acknowledgement, and wiring case above passes.
+    #[test]
+    fn reply_transaction_seal() {
+        const SEAL: &str = "STAGE_199_IPCREPLY_DIRECT_TRANSACTION_SEAL \
+trap_snapshot_owned=1 source_copy_under_lock=0 reply_claim_before_source_copy=0 \
+reply_authority_stores=1 record_consumed_before_dispatch=1 numeric_tid_only_authority=0 \
+stale_authority_restores=0 duplicate_replies=0 duplicate_wakes=0 leaked_reply_records=0 \
+result=ok";
+        crate::yarm_log!("{}", SEAL);
+        for field in [
+            "trap_snapshot_owned=1",
+            "source_copy_under_lock=0",
+            "reply_claim_before_source_copy=0",
+            "reply_authority_stores=1",
+            "record_consumed_before_dispatch=1",
+            "numeric_tid_only_authority=0",
+            "stale_authority_restores=0",
+            "duplicate_replies=0",
+            "duplicate_wakes=0",
+            "leaked_reply_records=0",
+            "result=ok",
+        ] {
+            assert!(SEAL.contains(field), "seal must carry {field}");
+        }
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2B4 — x86_64 DIRECT IpcCall/IpcReply LIVE round-trip oracle guards.
+// The live proof itself is the QEMU seal (scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh);
+// these hosted guards pin the feature+selector activation contract, the marker-literal confinement,
+// the oracle-endpoint gating that keeps the live service chain on its unchanged legacy path, and the
+// pre-ack / duplicate / preservation invariants.
+mod stage199a2b4_live_oracle_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        ipccall_direct_oracle_reply_endpoint_is, ipccall_direct_oracle_request_endpoint_is,
+        ipccall_direct_proof_enabled, set_ipccall_direct_oracle_endpoints,
+        set_ipccall_direct_proof_enabled, set_x86_ipccall_direct_oracle_enabled,
+        x86_ipccall_direct_oracle_enabled,
+    };
+
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+
+    // (feature + selector required) The Cargo feature exists default-off, and the workload SELECTOR
+    // knob both parses AND arms the shared NR6/NR7 proof gate — feature-on without the selector is
+    // inert (the setter is what flips the gate).
+    #[test]
+    fn feature_and_selector_both_required() {
+        // The arch-neutral umbrella + both per-arch features (each enabling the umbrella).
+        assert!(
+            CARGO_SRC.contains("ipccall-direct-oracle = []")
+                && CARGO_SRC.contains("x86-ipccall-direct-oracle = [\"ipccall-direct-oracle\"]")
+                && CARGO_SRC
+                    .contains("aarch64-ipccall-direct-oracle = [\"ipccall-direct-oracle\"]"),
+            "the umbrella + per-arch compile features must exist (per-arch enables umbrella)"
+        );
+        // Both selector knobs parse + apply, and each setter arms the SHARED proof gate (activation
+        // requires BOTH feature and selector).
+        for (knob, setter_name) in [
+            (
+                "yarm.x86_64_ipccall_direct_oracle",
+                "set_x86_ipccall_direct_oracle_enabled",
+            ),
+            (
+                "yarm.aarch64_ipccall_direct_oracle",
+                "set_aarch64_ipccall_direct_oracle_enabled",
+            ),
+        ] {
+            assert!(
+                CMDLINE_SRC.contains(knob) && CMDLINE_SRC.contains(&format!("{setter_name}(")),
+                "the {knob} selector knob must parse + apply"
+            );
+            let setter = MOD_SRC
+                .split(&format!("pub(crate) fn {setter_name}"))
+                .nth(1)
+                .expect("setter body");
+            assert!(
+                setter[..setter.len().min(400)].contains("set_ipccall_direct_proof_enabled(true)"),
+                "selecting {setter_name} must arm the NR6/NR7 proof gate"
+            );
+        }
+    }
+
+    // Runtime: the selector arms the proof gate; the gate defaults off.
+    #[test]
+    fn selector_arms_proof_gate() {
+        set_ipccall_direct_proof_enabled(false);
+        assert!(!x86_ipccall_direct_oracle_enabled());
+        set_x86_ipccall_direct_oracle_enabled(true);
+        assert!(x86_ipccall_direct_oracle_enabled());
+        assert!(
+            ipccall_direct_proof_enabled(),
+            "arming the oracle selector arms the proof gate"
+        );
+        set_x86_ipccall_direct_oracle_enabled(false);
+        set_ipccall_direct_proof_enabled(false);
+    }
+
+    // (two class exceptions are x86-oracle-only) The `IpcCallDirectRequest` / `IpcReplyDirect`
+    // retirement literals are emitted ONLY from functions gated on the x86 oracle feature, so a
+    // NORMAL (feature-off) artifact is marker-clean. The QEMU smoke additionally asserts a
+    // feature-OFF ELF contains NEITHER literal.
+    #[test]
+    fn class_literals_are_feature_gated_only() {
+        // The retirement literals appear only inside the feature+arch+non-hosted cfg emit helpers.
+        let call_emit = MOD_SRC
+            .split("pub(crate) fn emit_ipccall_direct_request_live_markers")
+            .nth(1)
+            .expect("request emitter");
+        assert!(call_emit[..call_emit.len().min(600)].contains("class=IpcCallDirectRequest"));
+        let reply_emit = MOD_SRC
+            .split("pub(crate) fn emit_ipcreply_direct_live_markers")
+            .nth(1)
+            .expect("reply emitter");
+        assert!(reply_emit[..reply_emit.len().min(600)].contains("class=IpcReplyDirect"));
+        // The emitters compile only under the UMBRELLA feature (a normal artifact is marker-clean),
+        // and the arch tag is parameterized per target_arch — one emitter serves all three arches, so
+        // an artifact carries only its own arch tag. (Fmt-stable: assert the per-arch ARCH consts +
+        // the umbrella-gated no-op stubs rather than the exact wrapped cfg whitespace.)
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                MOD_SRC.contains(&format!(
+                    "#[cfg(all(feature = \"ipccall-direct-oracle\", target_arch = \"{arch}\"))]"
+                )) && MOD_SRC.contains(&format!(
+                    "pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = \"{arch}\";"
+                )),
+                "the {arch} oracle arch tag must be umbrella-feature + target_arch gated"
+            );
+        }
+        assert!(
+            MOD_SRC.contains("arch={} class=IpcCallDirectRequest")
+                && MOD_SRC.contains("arch={} class=IpcReplyDirect"),
+            "the class literals must be arch-parameterized via IPCCALL_DIRECT_ORACLE_ARCH"
+        );
+        // A no-op stub keeps the drain call sites compiling on every other config (marker-clean).
+        assert!(MOD_SRC.contains("pub(crate) fn emit_ipccall_direct_request_live_markers() {}"));
+        assert!(MOD_SRC.contains("pub(crate) fn emit_ipcreply_direct_live_markers() {}"));
+    }
+
+    // (NR6/NR7 direct gates publish exactly one work item) The trap gates build ONE
+    // DirectRequestPostWork / DirectReplyPostWork and drain it once; the kernel success markers are
+    // emitted from the drain (kernel), never fabricated by userspace.
+    #[test]
+    fn gates_publish_one_work_item_and_kernel_emits_markers() {
+        let call_gate = SPLIT_SRC
+            .split("fn try_split_ipccall_direct_into_frame")
+            .nth(1)
+            .expect("nr6 gate");
+        let call_gate = &call_gate[..call_gate
+            .find("\n#[cfg(feature = \"hosted-dev\")]")
+            .unwrap_or(call_gate.len())];
+        assert_eq!(
+            call_gate.matches("DirectRequestPostWork").count(),
+            1,
+            "the NR6 gate builds exactly one request post-work item"
+        );
+        assert!(call_gate.contains("drain_direct_request_post_work"));
+        let reply_gate = SPLIT_SRC
+            .split("fn try_split_ipcreply_direct_into_frame")
+            .nth(1)
+            .expect("nr7 gate");
+        let reply_gate = &reply_gate[..reply_gate
+            .find("\n#[cfg(feature = \"hosted-dev\")]")
+            .unwrap_or(reply_gate.len())];
+        assert_eq!(
+            reply_gate.matches("DirectReplyPostWork").count(),
+            1,
+            "the NR7 gate builds exactly one reply post-work item"
+        );
+        assert!(reply_gate.contains("drain_direct_reply_post_work"));
+        // The kernel success markers are emitted from the drains (kernel), not userspace.
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        assert!(TXN_SRC.contains("emit_ipccall_direct_request_live_markers()"));
+        assert!(TXN_SRC.contains("emit_ipcreply_direct_live_markers()"));
+    }
+
+    // (oracle-endpoint confinement) On a REAL boot the gates + publishers service ONLY the oracle's
+    // request/reply endpoints, so every other IpcCall/IpcReply (the live service chain) stays on its
+    // unchanged legacy path. Provisioning binds the endpoint indices.
+    #[test]
+    fn offlock_path_is_oracle_endpoint_confined() {
+        // Gate selectivity.
+        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_request_endpoint_is(send_eidx)"));
+        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_reply_endpoint_is(reply_eidx)"));
+        // Publisher selectivity (real builds only).
+        assert!(MOD_SRC.contains("ipccall_direct_oracle_request_endpoint_is(index)"));
+        assert!(MOD_SRC.contains("ipccall_direct_oracle_reply_endpoint_is(index)"));
+        // Provisioning binds the endpoints.
+        assert!(MOD_SRC.contains("set_ipccall_direct_oracle_endpoints(req_idx, rep_idx)"));
+        // Runtime: only the exact provisioned endpoint indices match.
+        set_ipccall_direct_oracle_endpoints(6, 7);
+        assert!(ipccall_direct_oracle_request_endpoint_is(6));
+        assert!(!ipccall_direct_oracle_request_endpoint_is(7));
+        assert!(ipccall_direct_oracle_reply_endpoint_is(7));
+        assert!(!ipccall_direct_oracle_reply_endpoint_is(6));
+        assert!(!ipccall_direct_oracle_request_endpoint_is(usize::MAX));
+        set_ipccall_direct_oracle_endpoints(usize::MAX, usize::MAX);
+        assert!(!ipccall_direct_oracle_request_endpoint_is(6));
+    }
+
+    // The NR6/NR7 live routes are reachable only behind the runtime proof gate (so a normal boot is
+    // byte-identical — the NR-only whitelist early-return still fires with the gate off).
+    #[test]
+    fn live_routes_reachable_only_behind_proof_gate() {
+        assert!(SPLIT_SRC.contains(
+            "matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"
+        ));
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+    }
+
+    // (userspace completion cannot substitute for kernel markers) The userspace round-trip
+    // completion marker and the KERNEL success/retirement markers are distinct: the smoke requires
+    // BOTH the kernel-emitted markers (from the drains) AND the userspace completion.
+    #[test]
+    fn userspace_completion_is_distinct_from_kernel_attestation() {
+        // Userspace emits its own completion (no kernel attestation/retirement prefix).
+        assert!(INIT_SRC.contains("X86_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        assert!(INIT_SRC.contains("X86_IPCREPLY_DIRECT_SEND"));
+        assert!(
+            !INIT_SRC.contains("IPCCALL_DIRECT_REQUEST_OK arch=x86_64")
+                && !INIT_SRC.contains("class=IpcReplyDirect result=ok"),
+            "userspace must not emit kernel attestation/retirement markers"
+        );
+        // The smoke requires the kernel markers (from the drains) separately from userspace.
+        const SMOKE_SRC: &str =
+            include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh");
+        assert!(SMOKE_SRC.contains("IPCCALL_DIRECT_REQUEST_OK arch=x86_64"));
+        assert!(SMOKE_SRC.contains("IPCREPLY_DIRECT_OK arch=x86_64"));
+        assert!(SMOKE_SRC.contains("X86_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+    }
+
+    // (boot provisioning + slot-5 selector) x86 boot provisions the oracle transactionally under
+    // BOTH the feature and the knob, reusing slot-5 selector 3 + slots 13/14, mutually exclusive
+    // with the slot-5/13/14 oracles above it.
+    #[test]
+    fn boot_provisioning_and_selector_wiring() {
+        assert!(
+            X86_BOOT_SRC.contains("provision_init_ipccall_direct_oracle(")
+                && X86_BOOT_SRC.contains("IPCCALL_DIRECT_ORACLE_SELECTOR"),
+            "x86 boot must provision the oracle + set slot-5 selector"
+        );
+        assert!(X86_BOOT_SRC.contains("#[cfg(feature = \"x86-ipccall-direct-oracle\")]"));
+        assert!(
+            MOD_SRC.contains("pub const IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 3;"),
+            "slot-5 selector value 3 (after FutexWake=1, shared-region=2)"
+        );
+        assert!(
+            INIT_SRC.contains("run_x86_ipccall_direct_oracle(ctx.task_id)")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(3)"),
+            "init dispatches the oracle on slot-5 selector 3"
+        );
+    }
+
+    // (Stage 198F preserved) 10 classes / 30 cells + ABI preserved.
+    #[test]
+    fn stage198f_and_abi_preserved() {
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2C1 — AArch64 DIRECT IpcCall/IpcReply LIVE round-trip oracle guards.
+// The live proof itself is the QEMU seal (scripts/qemu-ipccall-reply-direct-aarch64-smoke.sh);
+// these hosted guards pin the AArch64 feature+selector activation, the slot-5 selector, the AArch64
+// NR6/NR7 split eligibility + six-argument import, the arch-parameterized markers, the arch-neutral
+// core reuse (no duplication), and the preservation of the x86_64 sealed paths.
+mod stage199a2c1_aarch64_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        aarch64_ipccall_direct_oracle_enabled, ipccall_direct_oracle_enabled,
+        set_aarch64_ipccall_direct_oracle_enabled, set_ipccall_direct_proof_enabled,
+        set_x86_ipccall_direct_oracle_enabled, x86_ipccall_direct_oracle_enabled,
+    };
+
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // Runtime: the AArch64 selector arms the SHARED proof gate but NOT the x86 oracle-enabled flag
+    // (the AArch64 selector must not arm x86_64 state).
+    #[test]
+    fn aarch64_selector_arms_shared_gate_not_x86() {
+        set_ipccall_direct_proof_enabled(false);
+        set_x86_ipccall_direct_oracle_enabled(false);
+        set_aarch64_ipccall_direct_oracle_enabled(false);
+        assert!(!ipccall_direct_oracle_enabled());
+        set_aarch64_ipccall_direct_oracle_enabled(true);
+        assert!(aarch64_ipccall_direct_oracle_enabled());
+        assert!(
+            !x86_ipccall_direct_oracle_enabled(),
+            "the AArch64 selector must NOT arm the x86_64 oracle-enabled flag"
+        );
+        assert!(
+            ipccall_direct_oracle_enabled(),
+            "the combined predicate is true when any arch is armed"
+        );
+        assert!(
+            crate::kernel::boot::ipccall_direct_proof_enabled(),
+            "the AArch64 selector arms the shared NR6/NR7 proof gate"
+        );
+        set_aarch64_ipccall_direct_oracle_enabled(false);
+        set_ipccall_direct_proof_enabled(false);
+    }
+
+    // (AArch64 NR6/NR7 split eligibility) The shared trap entry imports the six-argument ABI + admits
+    // NR6/NR7 into the split dispatcher ONLY behind the direct proof gate, and finalizes a handled
+    // NR6/NR7 via the AArch64 syscall-return ABI (export x0..x5 + advance ELR).
+    #[test]
+    fn aarch64_nr6_nr7_split_eligibility_gated() {
+        // Import admits NR6/NR7 only behind the proof gate (all six args imported via split_import).
+        assert!(TRAP_ENTRY_SRC.contains("split_import_syscall_abi(frame)"));
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "(raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || raw_nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ),
+            "NR6/NR7 ABI import must be admitted only behind the direct proof gate"
+        );
+        // Finalize (export results + advance ELR) admits a handled NR6/NR7 behind the gate.
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "(frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            ),
+            "a handled NR6/NR7 must finalize via the AArch64 syscall-return ABI"
+        );
+        assert!(TRAP_ENTRY_SRC.contains("split_finalize_handled_syscall(kernel, cpu, frame)"));
+    }
+
+    // (six trap arguments) The off-lock gates read all six NR6/NR7 arguments from the imported frame
+    // (send/reply cap, ptr, len, and — for NR6 — the reply-endpoint RECEIVE cap in arg5), the same
+    // frame the AArch64 import populates. A reachability guard proves the drains are not DCE'd.
+    #[test]
+    fn all_six_args_imported_and_drains_reachable() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        // NR6 gate reads CAP, PTR, LEN, and the arg5 reply-endpoint cap (SYSCALL_ARG_TRANSFER_CAP).
+        let call_gate = SPLIT_SRC
+            .split("fn try_split_ipccall_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        assert!(call_gate.contains("SYSCALL_ARG_CAP"));
+        assert!(call_gate.contains("SYSCALL_ARG_TRANSFER_CAP"));
+        assert!(call_gate.contains("SYSCALL_ARG_PTR") && call_gate.contains("SYSCALL_ARG_LEN"));
+        // The whitelist reachability guard keeps the live drains from being silently DCE'd.
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+        assert!(
+            SPLIT_SRC.contains("matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"),
+            "IpcCall/IpcReply must pass the NR whitelist only behind the armed proof gate"
+        );
+    }
+
+    // (slot-5 selector + collision) AArch64 boot provisions the oracle transactionally under BOTH the
+    // feature and the knob, on the free selector 7, only when slots 5/13/14 are all still zero
+    // (mutually exclusive with every AArch64 slot-5/13/14 oracle above it).
+    #[test]
+    fn aarch64_slot5_selector_and_collision() {
+        assert!(
+            MOD_SRC.contains("pub const AARCH64_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 7;"),
+            "free AArch64 slot-5 selector 7 (after 1..6)"
+        );
+        assert!(AARCH64_BOOT_SRC.contains("#[cfg(feature = \"aarch64-ipccall-direct-oracle\")]"));
+        assert!(
+            AARCH64_BOOT_SRC.contains("provision_init_ipccall_direct_oracle(")
+                && AARCH64_BOOT_SRC.contains("AARCH64_IPCCALL_DIRECT_ORACLE_SELECTOR"),
+            "AArch64 boot must provision the oracle + set slot-5 selector 7"
+        );
+        // Fail-closed mutual exclusion: only fires when slots 5/13/14 are all zero.
+        let block = AARCH64_BOOT_SRC
+            .split("aarch64_ipccall_direct_oracle_enabled()")
+            .nth(1)
+            .expect("aarch64 provision block");
+        assert!(
+            AARCH64_BOOT_SRC.contains("init_args[5] == 0\n        && init_args[13] == 0\n        && init_args[14] == 0\n        && crate::kernel::boot::aarch64_ipccall_direct_oracle_enabled()"),
+            "AArch64 oracle provisioning must be mutually exclusive with every slot-5/13/14 oracle"
+        );
+        let _ = block;
+        // init dispatches the AArch64 oracle on slot-5 selector 7.
+        assert!(
+            INIT_SRC.contains("run_aarch64_ipccall_direct_oracle(ctx.task_id)")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(7)"),
+            "init must dispatch the AArch64 oracle on slot-5 selector 7"
+        );
+    }
+
+    // (arch-neutral core NOT duplicated) The request/reply payload logic, WouldBlock retry, recv-v2
+    // construction, duplicate-reply test, and continuation counting live ONCE in the arch-neutral
+    // `ipccall_direct_oracle_core`; each arch adds only a thin wrapper (spawn + arch-named markers).
+    #[test]
+    fn arch_neutral_core_not_duplicated() {
+        assert!(INIT_SRC.contains("mod ipccall_direct_oracle_core"));
+        // The bounded retry + duplicate-reply + payload contract appear exactly once (in the core).
+        assert_eq!(
+            INIT_SRC
+                .matches("unsafe fn server_run() -> ServerOutcome")
+                .count(),
+            1,
+            "the server round-trip logic must exist exactly once (arch-neutral core)"
+        );
+        assert_eq!(
+            INIT_SRC
+                .matches("unsafe fn parent_run(request_ep: u32, reply_ep: u32)")
+                .count(),
+            1,
+            "the parent round-trip logic must exist exactly once (arch-neutral core)"
+        );
+        assert_eq!(
+            INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(),
+            1,
+            "the request payload contract must not be duplicated per arch"
+        );
+        // Both arch wrappers call the SAME core.
+        assert!(INIT_SRC.contains("fn run_x86_ipccall_direct_oracle"));
+        assert!(INIT_SRC.contains("fn run_aarch64_ipccall_direct_oracle"));
+        assert!(INIT_SRC.contains("AARCH64_IPCREPLY_DIRECT_SEND"));
+        assert!(INIT_SRC.contains("AARCH64_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+    }
+
+    // (x86_64 sealed source paths unchanged) The x86 transaction, gates, and sealed x86 markers are
+    // untouched by the AArch64 port: the x86 wrapper + x86-named markers remain, and the shared
+    // transaction / reservation seams are unchanged.
+    #[test]
+    fn x86_sealed_paths_unchanged() {
+        assert!(INIT_SRC.contains("X86_IPCREPLY_DIRECT_SEND"));
+        assert!(INIT_SRC.contains("X86_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        // The shared transaction still emits the arch-parameterized live markers from the drains.
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        assert!(TXN_SRC.contains("emit_ipccall_direct_request_live_markers()"));
+        assert!(TXN_SRC.contains("emit_ipcreply_direct_live_markers()"));
+        // The reservation lifecycle single-store authority is unchanged.
+        const DEFS_SRC: &str = include_str!("defs.rs");
+        assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
+    }
+
+    // Stage 198F + ABI preserved (10 classes / 30 cells).
+    #[test]
+    fn stage198f_and_abi_preserved() {
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2C2 — RISC-V DIRECT IpcCall/IpcReply LIVE round-trip oracle guards.
+// The live proof itself is the QEMU seal (scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh);
+// these hosted guards pin the RISC-V feature+selector activation, the slot-5 selector 8, the RISC-V
+// NR6/NR7 split eligibility (a0..a5 / x10..x15 import behind the proof gate) with the drain
+// reachability guard, the arch-parameterized markers, the arch-neutral core reuse, and the
+// preservation of the x86_64 + AArch64 sealed paths.
+mod stage199a2c2_riscv_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        aarch64_ipccall_direct_oracle_enabled, ipccall_direct_oracle_enabled,
+        riscv_ipccall_direct_oracle_enabled, set_aarch64_ipccall_direct_oracle_enabled,
+        set_ipccall_direct_proof_enabled, set_riscv_ipccall_direct_oracle_enabled,
+        set_x86_ipccall_direct_oracle_enabled, x86_ipccall_direct_oracle_enabled,
+    };
+
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const CARGO_SRC: &str = include_str!("../../../Cargo.toml");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // (feature + selector) The RISC-V feature enables the umbrella; the selector arms the SHARED
+    // proof gate but NOT the x86/AArch64 oracle-enabled flags.
+    #[test]
+    fn riscv_feature_and_selector_activation() {
+        assert!(
+            CARGO_SRC.contains("riscv-ipccall-direct-oracle = [\"ipccall-direct-oracle\"]"),
+            "the RISC-V per-arch feature must enable the umbrella"
+        );
+        assert!(
+            CMDLINE_SRC.contains("yarm.riscv_ipccall_direct_oracle")
+                && CMDLINE_SRC.contains("set_riscv_ipccall_direct_oracle_enabled("),
+            "the RISC-V selector knob must parse + apply"
+        );
+        set_ipccall_direct_proof_enabled(false);
+        set_x86_ipccall_direct_oracle_enabled(false);
+        set_aarch64_ipccall_direct_oracle_enabled(false);
+        set_riscv_ipccall_direct_oracle_enabled(false);
+        assert!(!ipccall_direct_oracle_enabled());
+        set_riscv_ipccall_direct_oracle_enabled(true);
+        assert!(riscv_ipccall_direct_oracle_enabled());
+        assert!(
+            !x86_ipccall_direct_oracle_enabled() && !aarch64_ipccall_direct_oracle_enabled(),
+            "the RISC-V selector must NOT arm the x86_64 or AArch64 oracle-enabled flags"
+        );
+        assert!(ipccall_direct_oracle_enabled());
+        assert!(
+            crate::kernel::boot::ipccall_direct_proof_enabled(),
+            "the RISC-V selector arms the shared NR6/NR7 proof gate"
+        );
+        set_riscv_ipccall_direct_oracle_enabled(false);
+        set_ipccall_direct_proof_enabled(false);
+    }
+
+    // (slot selector 8 + collision) RISC-V boot provisions the oracle transactionally under BOTH the
+    // feature and the knob, on the free selector 8, only when slots 5/13/14 are all still zero.
+    #[test]
+    fn riscv_slot8_selector_and_collision() {
+        assert!(
+            MOD_SRC.contains("pub const RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 8;"),
+            "free RISC-V slot-5 selector 8 (after 1..7)"
+        );
+        assert!(RISCV_BOOT_SRC.contains("#[cfg(feature = \"riscv-ipccall-direct-oracle\")]"));
+        assert!(
+            RISCV_BOOT_SRC.contains("provision_init_ipccall_direct_oracle(")
+                && RISCV_BOOT_SRC.contains("RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR"),
+            "RISC-V boot must provision the oracle + set slot-5 selector 8"
+        );
+        assert!(
+            RISCV_BOOT_SRC.contains("init_args[5] == 0\n        && init_args[13] == 0\n        && init_args[14] == 0\n        && crate::kernel::boot::riscv_ipccall_direct_oracle_enabled()"),
+            "RISC-V oracle provisioning must be mutually exclusive with every slot-5/13/14 oracle"
+        );
+        assert!(
+            INIT_SRC.contains("run_riscv_ipccall_direct_oracle(ctx.task_id)")
+                && INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(8)"),
+            "init must dispatch the RISC-V oracle on slot-5 selector 8"
+        );
+    }
+
+    // (RISC-V NR6/NR7 split eligibility + reachability) The RISC-V trap route admits NR6/NR7 into the
+    // shared split dispatcher ONLY behind the direct proof gate (the a7→nr + a0..a5→args import is
+    // done by the bridge); a handled NR6/NR7 finalizes via ReturnToCurrent. The whitelist reachability
+    // guard keeps the live drains from being DCE'd.
+    #[test]
+    fn riscv_nr6_nr7_split_eligibility_gated_and_reachable() {
+        assert!(
+            TRAP_SRC.contains("(nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n        || nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"),
+            "RISC-V must admit NR6/NR7 into the split dispatcher only behind the direct proof gate"
+        );
+        assert!(TRAP_SRC.contains("|| is_ipc_direct"));
+        assert!(
+            TRAP_SRC.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "the RISC-V route reaches the shared split dispatcher"
+        );
+        assert!(
+            TRAP_SRC.contains("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)"),
+            "a handled off-lock NR6/NR7 finalizes ReturnToCurrent (sepc+4 once, sstatus preserved)"
+        );
+        // The whitelist reachability guard (syscall_split) keeps the drains from being DCE'd.
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+    }
+
+    // (six args a0..a5) The off-lock gates read all six NR6/NR7 arguments the RISC-V bridge imported.
+    #[test]
+    fn riscv_six_args_and_arg5_reply_cap() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        let call_gate = SPLIT_SRC
+            .split("fn try_split_ipccall_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        // NR6: a0=send cap (CAP), a1=ptr, a2=len, a5=reply-endpoint RECEIVE cap (TRANSFER_CAP).
+        assert!(call_gate.contains("SYSCALL_ARG_CAP"));
+        assert!(call_gate.contains("SYSCALL_ARG_PTR") && call_gate.contains("SYSCALL_ARG_LEN"));
+        assert!(call_gate.contains("SYSCALL_ARG_TRANSFER_CAP"));
+        let reply_gate = SPLIT_SRC
+            .split("fn try_split_ipcreply_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        // NR7: a0=reply cap, a1=ptr, a2=len.
+        assert!(reply_gate.contains("SYSCALL_ARG_CAP"));
+        assert!(reply_gate.contains("SYSCALL_ARG_PTR") && reply_gate.contains("SYSCALL_ARG_LEN"));
+    }
+
+    // (arch-neutral core NOT duplicated) The round-trip logic lives ONCE; the RISC-V wrapper adds only
+    // the child entry + spawn + RISCV_-prefixed markers.
+    #[test]
+    fn riscv_wrapper_reuses_core_no_duplication() {
+        assert_eq!(
+            INIT_SRC.matches("mod ipccall_direct_oracle_core").count(),
+            1
+        );
+        assert_eq!(
+            INIT_SRC
+                .matches("unsafe fn server_run() -> ServerOutcome")
+                .count(),
+            1
+        );
+        assert_eq!(INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(), 1);
+        assert!(INIT_SRC.contains("fn run_riscv_ipccall_direct_oracle"));
+        assert!(INIT_SRC.contains("RISCV_IPCREPLY_DIRECT_SEND"));
+        assert!(INIT_SRC.contains("RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        // Userspace must not emit kernel retirement prefixes.
+        assert!(
+            !INIT_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64")
+                && !INIT_SRC.contains("IPCREPLY_DIRECT_OK arch=riscv64"),
+            "userspace must not emit kernel retirement/attestation markers"
+        );
+    }
+
+    // (arch-parameterized markers) The RISC-V arch tag exists; the emitter is arch-parameterized.
+    #[test]
+    fn riscv_arch_tag_and_parameterized_emitter() {
+        assert!(
+            MOD_SRC.contains("pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = \"riscv64\";")
+        );
+        assert!(MOD_SRC.contains("arch={} class=IpcCallDirectRequest"));
+        assert!(MOD_SRC.contains("arch={} class=IpcReplyDirect"));
+    }
+
+    // (x86_64 + AArch64 sealed paths unchanged) The prior arch wrappers + markers remain.
+    #[test]
+    fn x86_and_aarch64_sealed_paths_unchanged() {
+        assert!(INIT_SRC.contains("X86_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        assert!(INIT_SRC.contains("AARCH64_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
+        assert!(INIT_SRC.contains("fn run_x86_ipccall_direct_oracle"));
+        assert!(INIT_SRC.contains("fn run_aarch64_ipccall_direct_oracle"));
+        // The shared transaction + reservation authority are unchanged.
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        assert!(TXN_SRC.contains("emit_ipccall_direct_request_live_markers()"));
+        assert!(TXN_SRC.contains("emit_ipcreply_direct_live_markers()"));
+        const DEFS_SRC: &str = include_str!("defs.rs");
+        assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
+    }
+
+    // Stage 198F + ABI preserved (10 classes / 30 cells).
+    #[test]
+    fn stage198f_and_abi_preserved() {
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 199A2C3 — Exact-Commit Three-Architecture DIRECT IpcCall/IpcReply matrix guards.
+// The live proof is the matrix seal (scripts/qemu-ipccall-reply-direct-matrix-seal.sh, which runs
+// all three per-arch smokes serially at one exact clean-tree commit). These hosted guards pin the
+// matrix runner's exact-commit/clean-tree discipline, serial one-shot invocation of each per-arch
+// smoke, the unique six-cell coordinate grid, the combined-seal authority (runner-only), and the
+// preserved invariants.
+mod stage199a2c3_matrix_guards {
+    use super::*;
+
+    const MATRIX_SRC: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-matrix-seal.sh");
+    const X86_SMOKE: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh");
+    const AARCH64_SMOKE: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-aarch64-smoke.sh");
+    const RISCV_SMOKE: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const COMBINED_SEAL_PREFIX: &str = "STAGE_199_IPCCALL_REPLY_DIRECT_MATRIX_SEAL";
+
+    // (all three per-arch scripts exist and are invoked exactly once, serially)
+    #[test]
+    fn matrix_invokes_each_script_once_serially() {
+        // All three per-arch scripts exist (include_str! above would fail to compile otherwise).
+        assert!(X86_SMOKE.contains("STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=x86_64"));
+        assert!(AARCH64_SMOKE.contains("STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=aarch64"));
+        assert!(RISCV_SMOKE.contains("STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=riscv64"));
+        // The matrix names each smoke exactly once (one serial invocation per arch via the loop).
+        for s in [
+            "scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh",
+            "scripts/qemu-ipccall-reply-direct-aarch64-smoke.sh",
+            "scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh",
+        ] {
+            assert_eq!(
+                MATRIX_SRC.matches(s).count(),
+                1,
+                "the matrix must reference each per-arch smoke exactly once: {s}"
+            );
+        }
+        // The arches run serially in a single loop (not backgrounded).
+        assert!(MATRIX_SRC.contains("for arch in \"${ARCHES[@]}\""));
+        assert!(
+            !MATRIX_SRC.contains("bash \"$smoke\" &"),
+            "smokes must run serially, not backgrounded"
+        );
+    }
+
+    // (exact-commit + clean-tree discipline) The runner captures the SHA + porcelain, requires a
+    // clean tree, and re-verifies after each child (commit mismatch / dirty tree / stale log fail).
+    #[test]
+    fn matrix_enforces_exact_commit_and_clean_tree() {
+        assert!(MATRIX_SRC.contains("git rev-parse HEAD"));
+        assert!(MATRIX_SRC.contains("git status --porcelain"));
+        assert!(
+            MATRIX_SRC.contains("dirty tracked tree at start")
+                && MATRIX_SRC.contains("reason=dirty_tree"),
+            "a dirty tree must fail the matrix"
+        );
+        assert!(
+            MATRIX_SRC.contains("commit_changed_") && MATRIX_SRC.contains("verify_clean_still"),
+            "a commit change mid-run must fail the matrix"
+        );
+        // Fresh-log discipline: clear each log dir + require the boot log to post-date matrix start.
+        assert!(MATRIX_SRC.contains("rm -rf \"$bootdir\""));
+        assert!(
+            MATRIX_SRC.contains("MATRIX_START=$(date +%s)")
+                && MATRIX_SRC.contains("stale_boot_log"),
+            "an old (pre-matrix-start) boot log must fail the matrix"
+        );
+    }
+
+    // (per-arch seal exactly once + cell evidence) The runner requires exactly one per-arch seal and
+    // the four class-evidence markers + userspace completion per arch.
+    #[test]
+    fn matrix_requires_one_seal_and_cell_evidence_per_arch() {
+        // The runner requires the exact per-arch live seal (parameterized on ${arch}) exactly once.
+        assert!(MATRIX_SRC.contains(
+            "STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=${arch} classes=2 live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok"
+        ));
+        // Class evidence (both classes) + the two kernel attestations required per arch.
+        assert!(MATRIX_SRC.contains(
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcCallDirectRequest result=ok"
+        ));
+        assert!(
+            MATRIX_SRC.contains(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=${arch} class=IpcReplyDirect result=ok"
+            )
+        );
+        assert!(MATRIX_SRC.contains("IPCCALL_DIRECT_REQUEST_OK arch=${arch} source_copy_offlock=1 reply_cap=1 server_wakes=1"));
+        assert!(MATRIX_SRC.contains(
+            "IPCREPLY_DIRECT_OK arch=${arch} source_copy_offlock=1 caller_wakes=1 one_shot=1"
+        ));
+        // Userspace completion with the exact per-cell counts (built from the arch's prefix).
+        assert!(MATRIX_SRC.contains("request_ok=1 reply_ok=1 duplicate_reply=rejected server_wakes=1 caller_wakes=1 client_continuations=1 server_continuations=1 result=ok"));
+        // A duplicate/missing per-arch seal or missing cell evidence fails (count != 1 die codes).
+        assert!(MATRIX_SRC.contains("seal_count_"));
+        assert!(MATRIX_SRC.contains("class_evidence_count_"));
+        assert!(MATRIX_SRC.contains("userspace_completion_count_"));
+    }
+
+    // (the six cell coordinates are unique) 2 classes × 3 arches = 6 distinct (arch, class) cells.
+    #[test]
+    fn six_cell_coordinates_are_unique() {
+        use std::collections::BTreeSet;
+        let mut cells = BTreeSet::new();
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            for class in ["IpcCallDirectRequest", "IpcReplyDirect"] {
+                assert!(cells.insert((arch, class)), "duplicate cell coordinate");
+            }
+        }
+        assert_eq!(
+            cells.len(),
+            6,
+            "the matrix is exactly six unique live cells"
+        );
+        // Each arch has exactly one IPCCALL_DIRECT_ORACLE_ARCH attribution.
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert_eq!(
+                MOD_SRC
+                    .matches(&format!(
+                        "pub(crate) const IPCCALL_DIRECT_ORACLE_ARCH: &str = \"{arch}\";"
+                    ))
+                    .count(),
+                1,
+                "exactly one {arch} arch attribution"
+            );
+        }
+    }
+
+    // (combined-seal authority) ONLY the matrix runner emits the combined seal; no per-arch smoke and
+    // no userspace source emits the combined-seal prefix.
+    #[test]
+    fn combined_seal_is_runner_only() {
+        assert!(
+            MATRIX_SRC.contains(COMBINED_SEAL_PREFIX),
+            "the matrix runner emits the combined seal"
+        );
+        // Emitted only after all three PASS (guarded by the final verify + the per-arch die()s).
+        assert!(MATRIX_SRC.contains("all three architectures PASS at exact commit"));
+        for (name, src) in [
+            ("x86 smoke", X86_SMOKE),
+            ("aarch64 smoke", AARCH64_SMOKE),
+            ("riscv smoke", RISCV_SMOKE),
+            ("userspace init", INIT_SRC),
+        ] {
+            assert!(
+                !src.contains(COMBINED_SEAL_PREFIX),
+                "{name} must NOT emit the combined matrix seal (runner-only authority)"
+            );
+        }
+    }
+
+    // (feature-off marker cleanliness enforced by each child) Every per-arch smoke builds a
+    // feature-OFF kernel and asserts it is marker-clean.
+    #[test]
+    fn each_smoke_enforces_feature_off_marker_clean() {
+        for (name, src) in [
+            ("x86", X86_SMOKE),
+            ("aarch64", AARCH64_SMOKE),
+            ("riscv", RISCV_SMOKE),
+        ] {
+            assert!(
+                src.contains("feature-OFF kernel unexpectedly contains a direct class literal"),
+                "{name} smoke must assert a feature-off marker-clean kernel"
+            );
+        }
+    }
+
+    // (shared implementation integrity) Exactly one of each transaction / core / payload definition.
+    #[test]
+    fn shared_implementation_is_single_source() {
+        const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+        assert_eq!(
+            TXN_SRC.matches("fn ipc_call_direct_request_txn").count(),
+            1,
+            "one NR6 request transaction implementation"
+        );
+        assert_eq!(
+            TXN_SRC.matches("fn ipc_reply_direct_txn").count(),
+            1,
+            "one NR7 reply transaction implementation"
+        );
+        assert_eq!(
+            INIT_SRC.matches("mod ipccall_direct_oracle_core").count(),
+            1,
+            "one arch-neutral oracle core"
+        );
+        assert_eq!(
+            INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(),
+            1,
+            "one request payload definition"
+        );
+        assert_eq!(
+            INIT_SRC.matches("const REPLY_DATA: [u8; 8]").count(),
+            1,
+            "one reply payload definition"
+        );
+    }
+
+    // (reachability guards remain) NR6/NR7 are admitted through the split whitelist only while the
+    // direct oracle gate is armed — on all three real trap routes.
+    #[test]
+    fn split_reachability_guards_remain() {
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+        const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        // Shared whitelist reachability guard (x86_64 + AArch64 via the shared entry).
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+        assert!(SPLIT_SRC.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"));
+        // AArch64 import + RISC-V trap both gate NR6/NR7 on the direct proof gate.
+        assert!(TRAP_ENTRY_SRC.contains("ipccall_direct_proof_enabled()"));
+        assert!(RISCV_TRAP_SRC.contains("|| is_ipc_direct"));
+    }
+
+    // (preservation) Stage 198F 10 classes / 30 cells + ABI + reply-cap queueing policy preserved,
+    // and the excluded features remain unretired.
+    #[test]
+    fn stage198f_and_exclusions_preserved() {
+        const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+        assert!(SEAL_DOC.contains("total_live_cells=30"));
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }

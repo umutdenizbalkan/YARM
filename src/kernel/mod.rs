@@ -9,6 +9,8 @@ pub mod dispatch_post_work;
 pub mod frame_allocator;
 pub mod global_allocator;
 pub mod ipc;
+pub mod ipccall_direct;
+pub mod ipccall_direct_txn;
 pub mod lock;
 pub mod printk;
 pub mod process;

@@ -989,6 +989,34 @@ pub fn bootstrap_first_user_task(
         init_args[5] = 1;
         crate::yarm_log!("X86_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1");
     }
+    // Stage 199A2B4: default-off + feature-gated x86_64 DIRECT IpcCall/IpcReply live round-trip
+    // oracle. Reuses init startup slot 5 (=3 selector) + the two free service-extra slots 13/14 for
+    // the request + reply endpoint caps (each SEND|RECEIVE, in init's shared CNode). Mutually
+    // exclusive with EVERY slot-5/13/14 oracle above (it only fires when all three are still zero),
+    // so a conflicting oracle already armed leaves this one stood down. Transactional + leak-free —
+    // a provisioning failure rolls back and leaves the oracle un-armed.
+    #[cfg(feature = "x86-ipccall-direct-oracle")]
+    if crate::kernel::boot::x86_ipccall_direct_oracle_enabled()
+        && init_args[5] == 0
+        && init_args[13] == 0
+        && init_args[14] == 0
+    {
+        if let Some(caps) =
+            crate::kernel::boot::provision_init_ipccall_direct_oracle(kernel, RING3_INIT_SERVER_TID)
+        {
+            init_args[5] = crate::kernel::boot::IPCCALL_DIRECT_ORACLE_SELECTOR;
+            init_args[13] = caps.request_ep_cap as u64;
+            init_args[14] = caps.reply_ep_cap as u64;
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_ORACLE_SLOTS slot5={} slot13={} slot14={} req_eidx={} rep_eidx={}",
+                init_args[5],
+                init_args[13],
+                init_args[14],
+                caps.request_endpoint_idx,
+                caps.reply_endpoint_idx
+            );
+        }
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

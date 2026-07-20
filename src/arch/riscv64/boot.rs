@@ -1636,6 +1636,34 @@ pub fn bootstrap_first_user_task(
             );
         }
     }
+    // Stage 199A2C2: default-off + feature-gated RISC-V DIRECT IpcCall/IpcReply live round-trip
+    // oracle. Reuses init startup slot 5 (=8 selector) + slots 13/14 for the request + reply endpoint
+    // caps (each SEND|RECEIVE, in init's shared CNode), calling the SAME arch-neutral provisioning
+    // helper as x86/AArch64. Mutually exclusive with EVERY slot-5/13/14 oracle above (it only fires
+    // when all three are still zero, so a conflicting oracle already armed leaves this one stood
+    // down). Transactional + leak-free.
+    #[cfg(feature = "riscv-ipccall-direct-oracle")]
+    if init_args[5] == 0
+        && init_args[13] == 0
+        && init_args[14] == 0
+        && crate::kernel::boot::riscv_ipccall_direct_oracle_enabled()
+    {
+        if let Some(caps) =
+            crate::kernel::boot::provision_init_ipccall_direct_oracle(kernel, RING3_INIT_SERVER_TID)
+        {
+            init_args[5] = crate::kernel::boot::RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR;
+            init_args[13] = caps.request_ep_cap as u64;
+            init_args[14] = caps.reply_ep_cap as u64;
+            crate::yarm_log!(
+                "IPCCALL_DIRECT_ORACLE_SLOTS slot5={} slot13={} slot14={} req_eidx={} rep_eidx={}",
+                init_args[5],
+                init_args[13],
+                init_args[14],
+                caps.request_endpoint_idx,
+                caps.reply_endpoint_idx
+            );
+        }
+    }
     // Stage 196C/196D/196E/196F: default-off RISC-V oracle WORKLOADS reuse init slot 5
     // (supervisor_control_recv_ep, unused by init on RISC-V) as a sentinel: 7 = Stage 198E3C2C DIRECT
     // shared-region oracle; 1 = FutexWake live oracle (196C); 2 = queue-switch context-switch

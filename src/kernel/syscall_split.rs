@@ -233,7 +233,15 @@ pub(crate) fn try_split_dispatch_into_frame(
         }
         return None;
     };
-    if classify_split_eligible_nr_only(syscall).is_none() {
+    // Stage 199A2B3/199A2B4: IpcCall (NR 6) + IpcReply (NR 7) are NOT in the static NR-only
+    // whitelist (a normal boot must reach neither off-lock gate), but they ARE eligible for the
+    // proof-gated direct request/reply gates below when the internal proof gate is armed. Passing
+    // them through the NR-gate ONLY under `ipccall_direct_proof_enabled()` keeps normal boots
+    // byte-identical (gate off → this early-return fires exactly as before) while making the live
+    // gates genuinely reachable (the runtime gate prevents the compiler proving the routes dead).
+    let direct_ipc_gate_armed = matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)
+        && crate::kernel::boot::ipccall_direct_proof_enabled();
+    if classify_split_eligible_nr_only(syscall).is_none() && !direct_ipc_gate_armed {
         if probe {
             crate::yarm_log!(
                 "YARM_SPLIT_DISPATCH_FALLBACK reason=nr_not_eligible nr={}",
@@ -281,6 +289,28 @@ pub(crate) fn try_split_dispatch_into_frame(
     // propagates UNCHANGED to the global-lock fallback (producing the exact error).
     if matches!(syscall, Syscall::FutexWake) {
         return try_split_futex_wake_into_frame(shared, cpu, frame);
+    }
+
+    // Stage 199A2B2F (proof-gated, default-OFF): IpcCall (NR 6) direct request. Only
+    // attempted when the internal proof gate is armed; the helper snapshots the request
+    // off-lock and drives the accepted off-lock transaction. Off the gate — or for any
+    // case it cannot service — it returns `None`, so NR 6 stays on its existing path.
+    if matches!(syscall, Syscall::IpcCall) && crate::kernel::boot::ipccall_direct_proof_enabled() {
+        if let Some(result) = try_split_ipccall_direct_into_frame(shared, cpu, frame) {
+            return Some(result);
+        }
+    }
+
+    // Stage 199A2B3 (proof-gated, default-OFF): IpcReply (NR 7) direct reply. Only
+    // attempted when the internal proof gate is armed; the helper snapshots the reply
+    // payload off-lock (owned) and drives the accepted off-lock reply transaction
+    // (reserve → caller-copy → exact-waiter claim → record Consumed → single enqueue).
+    // Off the gate — or for any case it cannot service — it returns `None`, so NR 7
+    // stays on its existing global-lock path.
+    if matches!(syscall, Syscall::IpcReply) && crate::kernel::boot::ipccall_direct_proof_enabled() {
+        if let Some(result) = try_split_ipcreply_direct_into_frame(shared, cpu, frame) {
+            return Some(result);
+        }
     }
 
     // The requester TID is what the global-lock handler reads via
@@ -556,6 +586,149 @@ fn try_split_futex_wake_into_frame(
     _cpu: CpuId,
     _frame: &mut TrapFrame,
 ) -> Option<Result<(), TrapHandleError>> {
+    None
+}
+
+/// Stage 199A2B2F: x86 pre-lock NR6 direct-request snapshot publication + off-lock
+/// transaction drain (proof-gated). Runs ENTIRELY off the broad `KernelState` lock and
+/// off any ranked lock during the source copy:
+///   read args → capture caller `{tid,asid}` → validate `len<=128` → copy the request
+///   payload through `copy_from_user_asid_split_read` (NO lock held) → build the owned
+///   `IpcCallDirectSnapshot` → CLAIM the exact published blocked-server acknowledgement
+///   → build one owned `DirectRequestPostWork` → drain it through the accepted
+///   `SharedKernel::ipc_call_direct_request_txn`. No userspace payload pointer survives
+///   the snapshot. On invalid length / copy fault / no committed ack, returns `None`
+///   (the ack is never claimed, nothing is mutated) so NR6 stays on its existing path.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_ipccall_direct_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipccall_direct::{IPC_DIRECT_PAYLOAD_MAX, IpcCallDirectSnapshot};
+    use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
+    // NR6 ABI: arg(CAP)=send cap, arg(TRANSFER_CAP)=reply-endpoint recv cap,
+    // arg(PTR)=payload ptr, arg(LEN)=len.
+    let send_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let reply_cap = CapId(frame.arg(crate::kernel::syscall::SYSCALL_ARG_TRANSFER_CAP) as u64);
+    let user_ptr = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    if len > IPC_DIRECT_PAYLOAD_MAX {
+        return None; // invalid length: no ack claim, no mutation — legacy path
+    }
+    let tid = shared.current_tid_authoritative(cpu)?;
+    // Stage 199A2B4: confine the off-lock request path to the oracle's request endpoint so a
+    // NORMAL system IpcCall (the live service chain) stays byte-identical on its legacy path even
+    // while the proof gate is armed. Any other endpoint → None (legacy). No ack claim, no copy.
+    let send_endpoint = shared
+        .resolve_endpoint_send_cap_split_read(tid, send_cap)
+        .ok()?;
+    let send_eidx = match send_endpoint {
+        crate::kernel::capabilities::CapObject::Endpoint { index, .. } => index,
+        _ => return None,
+    };
+    if !crate::kernel::boot::ipccall_direct_oracle_request_endpoint_is(send_eidx) {
+        return None;
+    }
+    let asid_raw = shared.task_asid_for_tid_split_read(tid);
+    let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(
+        crate::kernel::ipc::ThreadId(tid),
+        crate::kernel::vm::Asid(asid_raw as u16),
+    );
+    // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing.
+    let payload = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len)?;
+    let snapshot = IpcCallDirectSnapshot::build(caller, send_cap, reply_cap, &payload[..len])?;
+    // Claim the exact published blocked-server acknowledgement (atomic single claim).
+    let (ack, ack_seq) = crate::kernel::boot::ipccall_direct_ack::claim()?;
+    let work = crate::kernel::ipccall_direct_txn::DirectRequestPostWork {
+        snapshot,
+        ack,
+        ack_seq,
+    };
+    let _ = shared.drain_direct_request_post_work(&work);
+    // NR6 is request-send-only: return Ok now (the caller blocks via a later recv).
+    frame.set_ok(0, 0, 0);
+    Some(Ok(()))
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_ipccall_direct_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    // Hosted: the off-lock user-read seam uses the direct map (real targets only). The
+    // drain + transaction are exercised directly by the stage199a2b2f hosted tests.
+    None
+}
+
+/// Stage 199A2B3 (proof-gated, default-OFF): intercept `IpcReply` (NR 7) BEFORE the
+/// broad `KernelState` lock and drive the accepted off-lock direct-reply transaction.
+///
+/// Part 1 — owned pre-lock reply snapshot. Order:
+///   read args → capture replier `{tid,asid}` → validate `len<=128` → copy the reply
+///   payload through `copy_from_user_asid_split_read` (NO lock held) → build the owned
+///   `IpcReplyDirectSnapshot` → CLAIM the exact published blocked-caller acknowledgement
+///   → build one owned `DirectReplyPostWork` → drain it through the accepted
+///   `SharedKernel::ipc_reply_direct_txn`. No userspace payload pointer survives the
+///   snapshot. On invalid length / copy fault / no committed ack, returns `None` (the
+///   ack is never claimed, nothing is mutated) so NR7 stays on its existing path.
+#[cfg(not(feature = "hosted-dev"))]
+fn try_split_ipcreply_direct_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipccall_direct::{IPC_DIRECT_PAYLOAD_MAX, IpcReplyDirectSnapshot};
+    use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
+    // NR7 ABI: arg(CAP)=reply cap, arg(PTR)=payload ptr, arg(LEN)=len.
+    let reply_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+    let user_ptr = frame.arg(SYSCALL_ARG_PTR);
+    let len = frame.arg(SYSCALL_ARG_LEN);
+    if len > IPC_DIRECT_PAYLOAD_MAX {
+        return None; // invalid length: no ack claim, no mutation — legacy path
+    }
+    let tid = shared.current_tid_authoritative(cpu)?;
+    // Stage 199A2B4: confine the off-lock reply path to the oracle's reply endpoint so a NORMAL
+    // system IpcReply (the live service chain) stays byte-identical on its legacy path even while
+    // the proof gate is armed. Resolve the reply cap → record → its bound reply endpoint index; any
+    // other reply endpoint → None (legacy). No ack claim, no copy, no mutation.
+    let (rec_idx, rec_gen) = shared.resolve_reply_cap_split_read(tid, reply_cap).ok()?;
+    let reply_eidx = shared.reply_record_endpoint_index_split_read(rec_idx, rec_gen)?;
+    if !crate::kernel::boot::ipccall_direct_oracle_reply_endpoint_is(reply_eidx) {
+        return None;
+    }
+    let asid_raw = shared.task_asid_for_tid_split_read(tid);
+    let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(
+        crate::kernel::ipc::ThreadId(tid),
+        crate::kernel::vm::Asid(asid_raw as u16),
+    );
+    // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing.
+    let payload = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len)?;
+    let snapshot = IpcReplyDirectSnapshot::build(replier, reply_cap, &payload[..len])?;
+    // Claim the exact published blocked-caller acknowledgement (atomic single claim).
+    let (ack, ack_seq) = crate::kernel::boot::ipcreply_direct_ack::claim()?;
+    let work = crate::kernel::ipccall_direct_txn::DirectReplyPostWork {
+        snapshot,
+        ack,
+        ack_seq,
+    };
+    let _ = shared.drain_direct_reply_post_work(&work);
+    // NR7 delivers the reply and wakes the caller; the replier itself returns Ok.
+    frame.set_ok(0, 0, 0);
+    Some(Ok(()))
+}
+
+#[cfg(feature = "hosted-dev")]
+fn try_split_ipcreply_direct_into_frame(
+    _shared: &SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    // Hosted: the off-lock user-read seam uses the direct map (real targets only). The
+    // drain + transaction are exercised directly by the stage199a2b3 hosted tests.
     None
 }
 

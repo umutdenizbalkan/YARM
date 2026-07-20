@@ -248,24 +248,23 @@ impl KernelState {
         });
     }
 
-    pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
-        // Stage 199A2A: resolve the CURRENT incarnation's ASID before the mutable
-        // borrow. A record is cleared only when it matches the complete
-        // `{caller_tid, caller_asid}` identity, so a numeric-TID sweep can never
-        // clear a REPLACEMENT task's record (a reused numeric TID always carries a
-        // different ASID). All production call sites (exit / restart / mark-dead /
-        // reap) run while this task's TCB is still present with its original ASID,
-        // so `asid_now` equals the stored `caller_asid` and cleanup is leak-free.
-        // If the ASID is unresolvable (`None`, e.g. a kernel task or partial
-        // teardown) we fall back to the numeric-TID match — the safe (never-leak)
-        // direction for a one-shot record.
-        let asid_now = self.task_asid(caller_tid);
+    /// Stage 199A2B1 — AUTHORITATIVE caller-side reply-record cleanup keyed on the
+    /// complete exiting identity supplied by the caller. The exit site captures the
+    /// exiting task's `{tid, asid}` while its TCB is still live (the authoritative
+    /// moment), and this entry point matches records on that EXACT identity — it does
+    /// NOT re-resolve an ASID from the numeric TID. A replacement task that reuses the
+    /// numeric TID always carries a different ASID, so its records are untouched.
+    /// `caller_asid == Asid(0)` is the no-address-space sentinel captured at creation
+    /// and compared verbatim (both sides use `Asid(0)` for an ASID-less task).
+    pub(crate) fn revoke_reply_caps_for_caller_identity(
+        &mut self,
+        caller: ReceiverWaiterIdentity,
+    ) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
             for slot in ipc.reply_caps.iter_mut() {
                 if slot.is_some_and(|record| {
-                    record.caller_tid.0 == caller_tid
-                        && asid_now.is_none_or(|a| record.caller_asid == a)
+                    record.caller_tid == caller.tid && record.caller_asid == caller.asid
                 }) {
                     *slot = None;
                     revoked += 1;
@@ -273,6 +272,19 @@ impl KernelState {
             }
             revoked
         })
+    }
+
+    /// Numeric-TID convenience wrapper (tests / non-authoritative callers). Resolves
+    /// the ASID once and delegates to the authoritative identity entry point. NOT used
+    /// as the production cleanup authority — the exit sites call
+    /// `revoke_reply_caps_for_caller_identity` with the identity they captured while
+    /// the exiting task was live.
+    pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
+        let asid = self.task_asid(caller_tid).unwrap_or(Asid(0));
+        self.revoke_reply_caps_for_caller_identity(ReceiverWaiterIdentity::new(
+            ThreadId(caller_tid),
+            asid,
+        ))
     }
 
     /// Clear every global `ReplyCapRecord` whose `responder_tid` (the replier) is
@@ -294,34 +306,201 @@ impl KernelState {
     /// Idempotent: a slot already cleared by a prior caller- or replier-side
     /// revoke is `None` and is skipped, so repeated/interleaved teardown is a
     /// no-op past the first clear.
-    pub(crate) fn revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize {
-        // Stage 199A2A: resolve the CURRENT incarnation's ASID before the mutable
-        // borrow and match on the complete `{responder_tid, replier_asid}` identity.
-        // A record is SKIPPED only when we have BOTH a resolvable current ASID AND a
-        // stored `replier_asid` AND they DIFFER — i.e. the record belongs to a prior
-        // incarnation at the same numeric TID. Otherwise the record is cleared (the
-        // safe, never-leak direction). Production call sites (exit / mark-dead / reap)
-        // run while the replier's TCB is still present with its original ASID, so the
-        // stored and current ASIDs match and cleanup is leak-free.
-        let asid_now = self.task_asid(tid);
+    /// Stage 199A2B1 — AUTHORITATIVE replier-side reply-record cleanup keyed on the
+    /// complete exiting identity supplied by the caller (captured while the replier's
+    /// TCB was live). Matches records on the EXACT `{responder_tid, replier_asid}`
+    /// identity — no ASID is re-resolved from the numeric TID here. A record is
+    /// SKIPPED only when it stored a concrete `replier_asid` that DIFFERS from the
+    /// supplied identity (a prior incarnation at the same numeric TID); a record with
+    /// no stored replier ASID (`None`, an ASID-less responder at creation) carries no
+    /// incarnation evidence and is matched on the numeric TID (the safe, never-leak
+    /// direction).
+    pub(crate) fn revoke_reply_caps_for_replier_identity(
+        &mut self,
+        replier: ReceiverWaiterIdentity,
+    ) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
             for slot in ipc.reply_caps.iter_mut() {
                 if slot.is_some_and(|record| {
-                    record
-                        .responder_tid
-                        .is_some_and(|responder| responder.0 == tid)
-                        && match (record.replier_asid, asid_now) {
-                            (Some(stored), Some(now)) => stored == now,
-                            // No incarnation evidence on one side → numeric-TID match.
-                            _ => true,
-                        }
+                    record.responder_tid == Some(replier.tid)
+                        && record
+                            .replier_asid
+                            .is_none_or(|stored| stored == replier.asid)
                 }) {
                     *slot = None;
                     revoked += 1;
                 }
             }
             revoked
+        })
+    }
+
+    /// Numeric-TID convenience wrapper (tests / non-authoritative callers). Resolves
+    /// the ASID once and delegates to the authoritative identity entry point.
+    pub(crate) fn revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize {
+        let asid = self.task_asid(tid).unwrap_or(Asid(0));
+        self.revoke_reply_caps_for_replier_identity(ReceiverWaiterIdentity::new(
+            ThreadId(tid),
+            asid,
+        ))
+    }
+
+    // ── Stage 199A2B2: direct reply-record reservation lifecycle (single-authority) ──
+    //
+    // These operate the reservation lifecycle of ONE existing `reply_caps` slot (see
+    // `ReplyRecordReservation`). They are the record-side primitives the off-lock NR6
+    // direct request transaction composes (the live transaction wraps them via the
+    // rank-3 `with_ipc_split_mut` seam). There is NO second reply-record table and NO
+    // second authoritative generation — a reserved slot is a normal `reply_caps[idx]`
+    // record marked `Reserved`, invisible to `ipc_reply` until committed `Available`.
+
+    /// Reserve a vacant reply-record slot for an in-flight direct NR6 request. The
+    /// record is installed `Reserved` (NOT externally invokable) with both bound
+    /// `{tid, asid}` identities and the reply endpoint (index+generation carried in
+    /// `CapObject::Endpoint`). Returns the slot `(index, generation)` — the sole
+    /// record authority — or `CapabilityFull` when no slot is vacant.
+    pub(crate) fn reserve_direct_reply_record(
+        &mut self,
+        caller: ReceiverWaiterIdentity,
+        replier: ReceiverWaiterIdentity,
+        reply_endpoint: CapObject,
+    ) -> Result<(usize, u64), KernelError> {
+        self.with_ipc_state_mut(|ipc| {
+            for idx in 0..super::MAX_REPLY_CAPS {
+                if ipc.reply_caps[idx].is_none() {
+                    let mut generation = ipc.reply_cap_generations[idx].wrapping_add(1);
+                    if generation == 0 {
+                        generation = 1;
+                    }
+                    ipc.reply_cap_generations[idx] = generation;
+                    ipc.reply_caps[idx] = Some(ReplyCapRecord {
+                        reservation: super::ReplyRecordReservation::Reserved,
+                        caller_tid: caller.tid,
+                        caller_asid: caller.asid,
+                        reply_endpoint,
+                        responder_tid: Some(replier.tid),
+                        replier_asid: Some(replier.asid),
+                        caller_cap_id: CapId(0),
+                        waiter_cap_id: None,
+                    });
+                    return Ok((idx, generation));
+                }
+            }
+            Err(KernelError::CapabilityFull)
+        })
+    }
+
+    /// Commit a `Reserved` direct record → `Available` (externally invokable). Runs as
+    /// the LAST record mutation, only after server delivery + reply-cap materialization
+    /// are consistent. Returns `false` (no mutation) on slot/generation mismatch or a
+    /// non-`Reserved` state.
+    pub(crate) fn commit_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+        self.with_ipc_state_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(slot) => match slot {
+                Some(record)
+                    if ipc.reply_cap_generations[index] == generation
+                        && record.reservation == super::ReplyRecordReservation::Reserved =>
+                {
+                    record.reservation = super::ReplyRecordReservation::Available;
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        })
+    }
+
+    /// Cancel a `Reserved` direct record (rollback): mark `Cancelled` then clear the
+    /// slot to `Vacant`, so the reserved authority is reclaimed atomically and a
+    /// partially-built record can never be resolved. Returns `false` on mismatch.
+    pub(crate) fn cancel_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+        self.with_ipc_state_mut(|ipc| {
+            let matches = matches!(
+                ipc.reply_caps.get(index),
+                Some(Some(record))
+                    if ipc.reply_cap_generations[index] == generation
+                        && record.reservation == super::ReplyRecordReservation::Reserved
+            );
+            if matches {
+                // Transient `Cancelled` marker then clear to Vacant — the slot's
+                // reclaim is a single atomic ipc-state mutation.
+                if let Some(Some(record)) = ipc.reply_caps.get_mut(index) {
+                    record.reservation = super::ReplyRecordReservation::Cancelled;
+                }
+                ipc.reply_caps[index] = None;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Bind the server-local materialized reply CapId into a `Reserved` direct record
+    /// (the `waiter_cap_id`), so `ipc_reply`/cleanup can fast-revoke the exact slot.
+    /// Returns `false` on slot/generation mismatch or non-`Reserved` state.
+    pub(crate) fn bind_direct_reply_record_server_cap(
+        &mut self,
+        index: usize,
+        generation: u64,
+        server_cap: CapId,
+    ) -> bool {
+        self.with_ipc_state_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == super::ReplyRecordReservation::Reserved =>
+            {
+                record.waiter_cap_id = Some(server_cap);
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// Read the reservation lifecycle of a reply-record slot (`None` when vacant).
+    #[cfg(test)]
+    pub(crate) fn reply_cap_record_reservation(
+        &self,
+        index: usize,
+    ) -> Option<super::ReplyRecordReservation> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(index)
+                .and_then(|slot| slot.as_ref())
+                .map(|record| record.reservation)
+        })
+    }
+
+    /// Whether a `CapObject::Reply { index, generation }` currently resolves for
+    /// invocation (i.e. `ipc_reply` would accept it): present, generation-matched,
+    /// and `Available`. A `Reserved` record is NOT invokable.
+    #[cfg(test)]
+    pub(crate) fn direct_reply_record_is_invokable(&self, index: usize, generation: u64) -> bool {
+        self.resolve_reply_index(CapObject::Reply { index, generation })
+            .is_ok()
+    }
+
+    /// Read a reserved record's bound `{caller, replier}` identities + reply endpoint
+    /// for identity-binding assertions.
+    #[cfg(test)]
+    pub(crate) fn direct_reply_record_identities(
+        &self,
+        index: usize,
+    ) -> Option<(ReceiverWaiterIdentity, ReceiverWaiterIdentity, CapObject)> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(index)
+                .and_then(|slot| slot.as_ref())
+                .map(|r| {
+                    (
+                        ReceiverWaiterIdentity::new(r.caller_tid, r.caller_asid),
+                        ReceiverWaiterIdentity::new(
+                            r.responder_tid.unwrap_or(ThreadId(0)),
+                            r.replier_asid.unwrap_or(Asid(0)),
+                        ),
+                        r.reply_endpoint,
+                    )
+                })
         })
     }
 
@@ -1878,11 +2057,21 @@ impl KernelState {
                 if index >= super::MAX_REPLY_CAPS {
                     return Err(KernelError::WrongObject);
                 }
-                if ipc.reply_caps[index].is_none() || ipc.reply_cap_generations[index] != generation
-                {
-                    return Err(KernelError::StaleCapability);
+                // Stage 199A2B2: only an `Available` (committed / legacy) record is
+                // externally invokable. A `Reserved` record held by an in-flight
+                // direct NR6 transaction — or a `Consumed`/`Cancelled` one — resolves
+                // to `StaleCapability`, so a reply can never be delivered against a
+                // record whose server delivery + reply-cap materialization have not
+                // committed consistently.
+                match ipc.reply_caps[index] {
+                    Some(record)
+                        if ipc.reply_cap_generations[index] == generation
+                            && record.reservation.is_invokable() =>
+                    {
+                        Ok(index)
+                    }
+                    _ => Err(KernelError::StaleCapability),
                 }
-                Ok(index)
             }),
             _ => Err(KernelError::WrongObject),
         }
@@ -1954,6 +2143,8 @@ impl KernelState {
                         }
                         ipc.reply_cap_generations[idx] = next_generation;
                         ipc.reply_caps[idx] = Some(ReplyCapRecord {
+                            // Legacy create path: the record is immediately invokable.
+                            reservation: super::ReplyRecordReservation::Available,
                             caller_tid,
                             caller_asid,
                             reply_endpoint,

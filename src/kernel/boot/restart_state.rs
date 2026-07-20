@@ -113,8 +113,16 @@ impl KernelState {
                 .unwrap_or(0);
             crate::yarm_log!("CAP_CNODE_REVOKE_ON_EXIT tid={} count={}", tid, count);
         }
-        let _ = self.revoke_reply_caps_for_caller(tid);
-        let _ = self.revoke_reply_caps_for_replier(tid);
+        // Stage 199A2B1: capture the exiting task's AUTHORITATIVE identity while its
+        // TCB is still live (this is the exiting incarnation), then clean up reply
+        // records by that exact `{tid, asid}` — never by a numeric TID re-resolved
+        // later, so a replacement task reusing the numeric TID is untouched.
+        let exit_identity = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(tid),
+            self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0)),
+        );
+        let _ = self.revoke_reply_caps_for_caller_identity(exit_identity);
+        let _ = self.revoke_reply_caps_for_replier_identity(exit_identity);
         if cap_cnode {
             crate::yarm_log!("CAP_CNODE_REVOKE_ON_EXIT_OK tid={}", tid);
         }
@@ -201,7 +209,13 @@ impl KernelState {
             tcb.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
-        let _ = self.revoke_reply_caps_for_caller(tid);
+        // Stage 199A2B1: restart keeps the same TCB/ASID; capture the authoritative
+        // identity and clear any caller-side reply records by exact `{tid, asid}`.
+        let restart_identity = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(tid),
+            self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0)),
+        );
+        let _ = self.revoke_reply_caps_for_caller_identity(restart_identity);
         let result = match self.enqueue_task(tid) {
             Ok(_) | Err(KernelError::WouldBlock) => Ok(()),
             Err(err) => Err(err),
@@ -228,8 +242,13 @@ impl KernelState {
             tcb.restart.token = None;
             Ok::<_, KernelError>(())
         })?;
-        let _ = self.revoke_reply_caps_for_caller(tid);
-        let _ = self.revoke_reply_caps_for_replier(tid);
+        // Stage 199A2B1: authoritative-identity reply-record cleanup at task death.
+        let dead_identity = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(tid),
+            self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0)),
+        );
+        let _ = self.revoke_reply_caps_for_caller_identity(dead_identity);
+        let _ = self.revoke_reply_caps_for_replier_identity(dead_identity);
         self.clear_ipc_waiters_for_tid(tid);
         let _ = self.release_kernel_context(tid);
         let _ = self.revoke_driver_runtime_caps(tid);
@@ -261,8 +280,13 @@ impl KernelState {
             "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=reply_caps",
             tid
         );
-        let _ = self.revoke_reply_caps_for_caller(tid);
-        let _ = self.revoke_reply_caps_for_replier(tid);
+        // Stage 199A2B1: authoritative-identity reply-record cleanup at faulted reap.
+        let reap_identity = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(tid),
+            self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0)),
+        );
+        let _ = self.revoke_reply_caps_for_caller_identity(reap_identity);
+        let _ = self.revoke_reply_caps_for_replier_identity(reap_identity);
         crate::yarm_log!(
             "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=ipc_waiters",
             tid

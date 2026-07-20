@@ -2765,6 +2765,214 @@ impl SharedKernel {
         self.rollback_minted_cap_split(cnode, cap, object);
     }
 
+    // ── Stage 199A2B2C: off-lock reply-record reservation seams (rank 3) ──────────
+    //
+    // These are the `_split` (no broad `&mut KernelState`) counterparts of the
+    // KernelState reservation primitives (`reserve_direct_reply_record`, …). They
+    // operate the SINGLE `reply_caps` slot via the rank-3 `with_ipc_split_mut` seam
+    // ONLY — the exact seam the composed off-lock NR6 direct request transaction uses
+    // so its record reserve / bind / commit / cancel never take the broad lock. There
+    // is no second reply-record table and no second authoritative generation.
+
+    /// rank 3 — reserve one vacant `reply_caps` slot `Reserved` (NOT invokable),
+    /// binding both `{tid,asid}` identities + the reply endpoint (index+generation in
+    /// `CapObject::Endpoint`). Returns the slot `(index, generation)` — the sole
+    /// record authority — or `CapabilityFull`.
+    pub(crate) fn reserve_direct_reply_record_split(
+        &self,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+        reply_endpoint: CapObject,
+    ) -> Result<(usize, u64), KernelError> {
+        use crate::kernel::boot::{ReplyCapRecord, ReplyRecordReservation};
+        self.with_ipc_split_mut(|ipc| {
+            for idx in 0..crate::kernel::boot::MAX_REPLY_CAPS {
+                if ipc.reply_caps[idx].is_none() {
+                    let mut generation = ipc.reply_cap_generations[idx].wrapping_add(1);
+                    if generation == 0 {
+                        generation = 1;
+                    }
+                    ipc.reply_cap_generations[idx] = generation;
+                    ipc.reply_caps[idx] = Some(ReplyCapRecord {
+                        reservation: ReplyRecordReservation::Reserved,
+                        caller_tid: caller.tid,
+                        caller_asid: caller.asid,
+                        reply_endpoint,
+                        responder_tid: Some(replier.tid),
+                        replier_asid: Some(replier.asid),
+                        caller_cap_id: CapId(0),
+                        waiter_cap_id: None,
+                    });
+                    return Ok((idx, generation));
+                }
+            }
+            Err(KernelError::CapabilityFull)
+        })
+    }
+
+    /// rank 3 — bind the provisional server-local reply CapId into a `Reserved` record
+    /// (its `waiter_cap_id`). `false` on slot/generation mismatch or non-`Reserved`.
+    pub(crate) fn bind_direct_reply_record_server_cap_split(
+        &self,
+        index: usize,
+        generation: u64,
+        server_cap: CapId,
+    ) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Reserved =>
+            {
+                record.waiter_cap_id = Some(server_cap);
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — commit a `Reserved` record → `Available` (externally invokable). This
+    /// is INFALLIBLE for an exact live reservation (it only flips the state field) and
+    /// runs strictly BEFORE the rank-1 server enqueue, so the server is never enqueued
+    /// while the record is `Reserved`. `false` only on slot/generation mismatch or a
+    /// non-`Reserved` state (never for our own exact reservation).
+    pub(crate) fn commit_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Reserved =>
+            {
+                record.reservation = ReplyRecordReservation::Available;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — cancel a `Reserved` record (rollback): `Reserved → Cancelled → Vacant`
+    /// as a single atomic ipc-state mutation, reclaiming the reserved authority so a
+    /// partially-built record can never resolve. `false` on mismatch.
+    pub(crate) fn cancel_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| {
+            let matches = matches!(
+                ipc.reply_caps.get(index),
+                Some(Some(record))
+                    if ipc.reply_cap_generations[index] == generation
+                        && record.reservation == ReplyRecordReservation::Reserved
+            );
+            if matches {
+                if let Some(Some(record)) = ipc.reply_caps.get_mut(index) {
+                    record.reservation = ReplyRecordReservation::Cancelled;
+                }
+                ipc.reply_caps[index] = None;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    // ── Stage 199A2B3: off-lock NR7 reply-record reservation seams (rank 3) ───────
+    //
+    // These operate the SAME single `reply_caps` slot lifecycle for the reply side
+    // (`Available → Reserved → Consumed`), reserving an EXISTING record (the one the
+    // caller's reply cap names) rather than creating one. Bound replier + exact
+    // generation are required to reserve; `Consumed` is the authoritative one-shot
+    // barrier (`resolve_reply_index` rejects a non-`Available` record). No second
+    // reply-record or reservation table.
+
+    /// rank 3 — reserve an EXISTING record `(index, generation)` for a direct reply:
+    /// the slot must be present, generation-matched, `Available`, and its bound replier
+    /// `{tid, asid}` must equal `replier`. On success `Available → Reserved` (making it
+    /// non-invokable so an alias cannot reserve concurrently or reply). `false`
+    /// otherwise. The record is NOT claimed here — the reply payload is copied first.
+    pub(crate) fn reserve_existing_reply_record_split(
+        &self,
+        index: usize,
+        generation: u64,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Available
+                    && record.responder_tid == Some(replier.tid)
+                    && record.replier_asid == Some(replier.asid) =>
+            {
+                record.reservation = ReplyRecordReservation::Reserved;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — `Reserved → Consumed`: the authoritative one-shot barrier. After this a
+    /// stale/aliased reply cap resolving to the same `(index, generation)` fails through
+    /// the `Consumed` record even before its physical cnode slot is reclaimed. Runs
+    /// strictly before the rank-1 caller enqueue. `false` on generation mismatch or a
+    /// non-`Reserved` state (never for our exact owned reservation).
+    pub(crate) fn consume_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Reserved =>
+            {
+                record.reservation = ReplyRecordReservation::Consumed;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — `Reserved → Available`: caller-destination-copy-fault rollback for an
+    /// EXACT still-valid caller. The reply authority stays usable and the caller stays
+    /// blocked with zero wake. `false` on mismatch.
+    pub(crate) fn release_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Reserved =>
+            {
+                record.reservation = ReplyRecordReservation::Available;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// rank 3 — discard a `Reserved` record for STALE authority (caller exited/replaced,
+    /// endpoint/waiter drifted): transition `Reserved → Consumed` so the reply cap is
+    /// permanently non-invokable (the physical cnode slot is reclaimed idempotently at
+    /// the caller's teardown). Never restores usable authority. `false` on mismatch.
+    pub(crate) fn discard_reply_record_split(&self, index: usize, generation: u64) -> bool {
+        self.consume_reply_record_split(index, generation)
+    }
+
+    /// rank 3 — read the reply endpoint SLOT INDEX bound in a present, generation-matched
+    /// reply record. Used ONLY by the Stage 199A2B4 NR7 gate to confine the off-lock reply
+    /// path to the oracle's reply endpoint (every other reply stays on the legacy path).
+    /// `None` when absent or generation-mismatched.
+    pub(crate) fn reply_record_endpoint_index_split_read(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> Option<usize> {
+        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get(index) {
+            Some(Some(record)) if ipc.reply_cap_generations[index] == generation => {
+                match record.reply_endpoint {
+                    CapObject::Endpoint { index: eidx, .. } => Some(eidx),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
+
     /// rank 5: map EXACTLY one user page and return the owned follow-up needed for rank-6 accounting
     /// (and exact rollback). NX/rights/alignment are enforced by the caller (the runner); this seam
     /// additionally asserts alignment + NX and never lets a page-table reference escape the guard.
@@ -2946,6 +3154,24 @@ impl SharedKernel {
             } else {
                 None
             }
+        })
+    }
+
+    /// Stage 199A2B2E: read-only exact endpoint-waiter check (rank 3). True iff the
+    /// endpoint at `eidx` still carries generation `egen` AND its waiter slot holds the
+    /// EXACT `{tid, asid}` identity. Used by the direct request transaction's rollback
+    /// policy to decide whether the acknowledgement lease is restorable (server + waiter
+    /// intact) or must be discarded (waiter changed/missing). No mutation.
+    pub(crate) fn endpoint_waiter_is_split_read(
+        &self,
+        eidx: usize,
+        egen: u64,
+        identity: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            eidx < ipc.endpoint_waiters.len()
+                && ipc.endpoint_generations[eidx] == egen
+                && ipc.endpoint_waiter_identity(eidx) == Some(identity)
         })
     }
 
@@ -3514,6 +3740,65 @@ impl SharedKernel {
             requester_tid,
             requester_pid,
         })
+    }
+
+    /// Stage 199A2B2D: off-lock SEND-endpoint cap resolution (task rank-2 pid read →
+    /// capability rank-4 resolve), sibling of `resolve_endpoint_recv_cap_split_read`.
+    /// Returns the resolved `CapObject::Endpoint` (index+generation) the caller's
+    /// `cap` names, requiring the `SEND` right. No broad lock, no IPC lock.
+    pub(crate) fn resolve_endpoint_send_cap_split_read(
+        &self,
+        requester_tid: u64,
+        cap: CapId,
+    ) -> Result<CapObject, KernelError> {
+        let state = self.state.data_ptr();
+        let requester_pid =
+            unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
+                .ok_or(KernelError::InvalidCapability)?;
+        let (endpoint, _rights) = unsafe {
+            KernelState::resolve_endpoint_send_cap_in_pid_from_raw(
+                state as *const _,
+                requester_pid,
+                cap,
+            )
+        }?;
+        Ok(endpoint)
+    }
+
+    /// Stage 199A2B3: off-lock resolution of a `Reply` cap the caller/replier holds
+    /// (task rank-2 pid read → capability rank-4 resolve), returning the reply object
+    /// `(index, generation)`. Requires the `SEND` right on the cap.
+    pub(crate) fn resolve_reply_cap_split_read(
+        &self,
+        requester_tid: u64,
+        cap: CapId,
+    ) -> Result<(usize, u64), KernelError> {
+        let state = self.state.data_ptr();
+        let requester_pid =
+            unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
+                .ok_or(KernelError::InvalidCapability)?;
+        unsafe {
+            KernelState::resolve_reply_cap_in_pid_from_raw(state as *const _, requester_pid, cap)
+        }
+    }
+
+    /// Stage 199A2B2E: GENERATION-BEARING off-lock cnode resolution. Resolves the
+    /// `CNodeId` for the process owning the EXACT `{tid, asid}` incarnation (identity
+    /// verified under the task read, cnode resolved under the capability read). A
+    /// numeric TID reused by a replacement task (different ASID) yields `None`, so the
+    /// provisional server-local reply-cap mint can never target a replacement process.
+    pub(crate) fn process_cnode_for_identity_split_read(
+        &self,
+        identity: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> Option<crate::kernel::capabilities::CNodeId> {
+        let state = self.state.data_ptr();
+        unsafe {
+            KernelState::process_cnode_for_identity_from_raw(
+                state as *const _,
+                identity.tid.0,
+                identity.asid,
+            )
+        }
     }
 
     /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.

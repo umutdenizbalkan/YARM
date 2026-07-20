@@ -392,6 +392,30 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             enabled
         );
     }
+    if let Some(enabled) = parsed.x86_64_ipccall_direct_oracle {
+        // Stage 199A2B4: default-off x86_64 DIRECT IpcCall/IpcReply live round-trip oracle knob.
+        // Provisions init startup slot 5 (=3) so init runs the parent(client)/child(server) NR6
+        // request + NR7 reply round trip AND arms the NR6/NR7 off-lock proof gate so both direct
+        // gates go live. Does NOT enable queued calls, timeouts, notifications, or any non-x86 arch.
+        crate::kernel::boot::set_x86_ipccall_direct_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_X86_64_IPCCALL_DIRECT_ORACLE_SET enabled={}", enabled);
+    }
+    if let Some(enabled) = parsed.aarch64_ipccall_direct_oracle {
+        // Stage 199A2C1: default-off AArch64 DIRECT IpcCall/IpcReply live round-trip oracle knob.
+        // Provisions init startup slot 5 (=7) so init runs the SAME arch-neutral round trip AND arms
+        // the shared NR6/NR7 off-lock proof gate. Does NOT arm the x86_64 oracle-enabled flag or any
+        // non-AArch64 arch; does NOT enable queued calls, timeouts, notifications, or server-death wake.
+        crate::kernel::boot::set_aarch64_ipccall_direct_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_AARCH64_IPCCALL_DIRECT_ORACLE_SET enabled={}", enabled);
+    }
+    if let Some(enabled) = parsed.riscv_ipccall_direct_oracle {
+        // Stage 199A2C2: default-off RISC-V DIRECT IpcCall/IpcReply live round-trip oracle knob.
+        // Provisions init startup slot 5 (=8) so init runs the SAME arch-neutral round trip AND arms
+        // the shared NR6/NR7 off-lock proof gate. Does NOT arm the x86_64/AArch64 oracle-enabled
+        // flags; does NOT enable queued calls, timeouts, notifications, or server-death wake.
+        crate::kernel::boot::set_riscv_ipccall_direct_oracle_enabled(enabled);
+        crate::yarm_log!("YARM_RISCV_IPCCALL_DIRECT_ORACLE_SET enabled={}", enabled);
+    }
     if let Some(enabled) = parsed.force_init_zc_load_fail {
         // Stage 197A: default-off fault-injection knob. Forces the required init ELF load to
         // fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path is exercisable under QEMU.
@@ -697,6 +721,25 @@ pub struct YarmBootOptions<'a> {
     /// RISC-V, and arms the shared IPC/oracle-proof knob. Selects the workload + enables exactly one
     /// RISC-V shared-region class; the queued class, x86_64 oracle, and AArch64 oracle stay disabled.
     pub riscv_shared_region_direct_oracle: Option<bool>,
+    /// Stage 199A2B4: `yarm.x86_64_ipccall_direct_oracle=1` DEFAULT-OFF knob. Provisions init startup
+    /// slot 5 (=3) so init runs the parent(client)/child(server) DIRECT IpcCall(NR6) + IpcReply(NR7)
+    /// live round trip through the accepted off-lock transactions, and arms the NR6/NR7 proof gate so
+    /// both direct gates go live for the run. Selects the workload + enables exactly the two x86_64
+    /// direct classes; queued calls, timeouts, notifications, server-death wake, and all non-x86
+    /// architectures stay disabled.
+    pub x86_64_ipccall_direct_oracle: Option<bool>,
+    /// Stage 199A2C1: `yarm.aarch64_ipccall_direct_oracle=1` DEFAULT-OFF knob. Mirror of the x86_64
+    /// knob on AArch64: provisions init startup slot 5 (=7) so init runs the SAME arch-neutral
+    /// parent(client)/child(server) NR6 request + NR7 reply round trip, and arms the shared NR6/NR7
+    /// proof gate. Selects the workload + enables exactly the two AArch64 direct classes; queued
+    /// calls, timeouts, notifications, the x86_64 oracle, and RISC-V stay disabled.
+    pub aarch64_ipccall_direct_oracle: Option<bool>,
+    /// Stage 199A2C2: `yarm.riscv_ipccall_direct_oracle=1` DEFAULT-OFF knob. Mirror of the x86_64/
+    /// AArch64 knobs on RISC-V: provisions init startup slot 5 (=8) so init runs the SAME arch-neutral
+    /// parent(client)/child(server) NR6 request + NR7 reply round trip, and arms the shared NR6/NR7
+    /// proof gate. Selects the workload + enables exactly the two RISC-V direct classes; queued calls,
+    /// timeouts, notifications, the x86_64 oracle, and the AArch64 oracle stay disabled.
+    pub riscv_ipccall_direct_oracle: Option<bool>,
     /// Stage 197A: `yarm.force_init_zc_load_fail=1` DEFAULT-OFF fault-injection knob. Forces the
     /// required init ELF load to fail so the fatal `BOOT_FATAL_INIT_ZC_LOAD_FAILED` halt path is
     /// exercisable under QEMU. NEVER set on a normal boot.
@@ -893,6 +936,15 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.riscv_shared_region_direct_oracle" {
             options.riscv_shared_region_direct_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.x86_64_ipccall_direct_oracle" {
+            options.x86_64_ipccall_direct_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.aarch64_ipccall_direct_oracle" {
+            options.aarch64_ipccall_direct_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.riscv_ipccall_direct_oracle" {
+            options.riscv_ipccall_direct_oracle = parse_bool_knob(value);
         }
         if key == b"yarm.force_init_zc_load_fail" {
             options.force_init_zc_load_fail = parse_bool_knob(value);

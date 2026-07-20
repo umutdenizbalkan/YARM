@@ -2049,6 +2049,137 @@ impl KernelState {
         Ok((capability_obj.object, capability_obj.rights()))
     }
 
+    /// Stage 199A2B2D: SEND-side sibling of `resolve_endpoint_recv_cap_in_pid_from_raw`
+    /// (rank 4, `capability_state_lock` only). Resolves `cap` in `requester_pid`'s
+    /// cnode, requires a live `Endpoint` carrying `CapRights::SEND`, and returns the
+    /// `(CapObject::Endpoint, rights)`. Same error mapping as the RECEIVE resolver.
+    ///
+    /// # Safety
+    /// As `resolve_endpoint_recv_cap_in_pid_from_raw`.
+    pub(crate) unsafe fn resolve_endpoint_send_cap_in_pid_from_raw(
+        state: *const KernelState,
+        requester_pid: u64,
+        cap: CapId,
+    ) -> Result<(CapObject, CapRights), KernelError> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };
+        let _guard = lock_ref.lock();
+        let capability: &CapabilitySubsystem =
+            unsafe { &*core::ptr::addr_of!((*state).capability) };
+        let cnode = kernel_ref(&capability.process_cnodes)
+            .iter()
+            .flatten()
+            .find(|record| record.pid == requester_pid)
+            .map(|record| record.cnode)
+            .ok_or(KernelError::InvalidCapability)?;
+        let capability_obj = capability
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .find(|space| space.id == cnode)
+            .and_then(|space| kernel_ref(&space.cspace).get(cap))
+            .ok_or(KernelError::InvalidCapability)?;
+        if !matches!(capability_obj.object, CapObject::Endpoint { .. }) {
+            return Err(KernelError::WrongObject);
+        }
+        if !capability_obj.has_right(CapRights::SEND) {
+            return Err(KernelError::MissingRight);
+        }
+        Ok((capability_obj.object, capability_obj.rights()))
+    }
+
+    /// Stage 199A2B2D: resolve the `CNodeId` registered for `pid` under ONLY
+    /// `capability_state_lock` (rank 4). `None` if the pid has no registered cnode.
+    /// The off-lock direct request transaction uses this to target the provisional
+    /// server-local reply-cap mint. No mutation, no task/IPC lock.
+    ///
+    /// # Safety
+    /// As `cnode_registered_from_raw`.
+    /// Stage 199A2B3: resolve a `Reply` cap `cap` in `requester_pid`'s cnode under ONLY
+    /// `capability_state_lock` (rank 4), requiring the `SEND` right, and return the
+    /// reply object `(index, generation)`. Same error mapping as the endpoint resolvers.
+    ///
+    /// # Safety
+    /// As `resolve_endpoint_recv_cap_in_pid_from_raw`.
+    pub(crate) unsafe fn resolve_reply_cap_in_pid_from_raw(
+        state: *const KernelState,
+        requester_pid: u64,
+        cap: CapId,
+    ) -> Result<(usize, u64), KernelError> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };
+        let _guard = lock_ref.lock();
+        let capability: &CapabilitySubsystem =
+            unsafe { &*core::ptr::addr_of!((*state).capability) };
+        let cnode = kernel_ref(&capability.process_cnodes)
+            .iter()
+            .flatten()
+            .find(|record| record.pid == requester_pid)
+            .map(|record| record.cnode)
+            .ok_or(KernelError::InvalidCapability)?;
+        let capability_obj = capability
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .find(|space| space.id == cnode)
+            .and_then(|space| kernel_ref(&space.cspace).get(cap))
+            .ok_or(KernelError::InvalidCapability)?;
+        match capability_obj.object {
+            CapObject::Reply { index, generation } => {
+                if !capability_obj.has_right(CapRights::SEND) {
+                    return Err(KernelError::MissingRight);
+                }
+                Ok((index, generation))
+            }
+            _ => Err(KernelError::WrongObject),
+        }
+    }
+
+    pub(crate) unsafe fn process_cnode_for_pid_from_raw(
+        state: *const KernelState,
+        pid: u64,
+    ) -> Option<CNodeId> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };
+        let _guard = lock_ref.lock();
+        let capability: &CapabilitySubsystem =
+            unsafe { &*core::ptr::addr_of!((*state).capability) };
+        kernel_ref(&capability.process_cnodes)
+            .iter()
+            .flatten()
+            .find(|record| record.pid == pid)
+            .map(|record| record.cnode)
+    }
+
+    /// Stage 199A2B2E: GENERATION-BEARING cnode resolution. Under the task lock
+    /// (rank 2) it finds the tcb for `tid` and requires `tcb.asid == Some(asid)` — the
+    /// complete `{tid, asid}` identity — capturing the pid ONLY on an exact match;
+    /// then (task lock released) resolves that pid's cnode under `capability_state_lock`
+    /// (rank 4). A numeric TID reused by a replacement task (different ASID) yields
+    /// `None`, so no capability can be minted into a replacement process's cnode.
+    /// Numeric TID alone never authorizes cap materialization. Returns only the owned
+    /// `CNodeId`; no TCB/CNode reference escapes.
+    ///
+    /// # Safety
+    /// As `process_cnode_for_pid_from_raw` / `process_id_from_raw`.
+    pub(crate) unsafe fn process_cnode_for_identity_from_raw(
+        state: *const KernelState,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Option<CNodeId> {
+        // Task-domain read (rank 2): require the EXACT {tid, asid} incarnation and
+        // capture its pid atomically with the identity check.
+        let pid = {
+            let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
+            let _guard = lock_ref.lock();
+            let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
+                kernel_ref(unsafe { &*core::ptr::addr_of!((*state).tcbs) });
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid && tcb.asid == Some(asid))
+                .map(|tcb| tcb.thread_group_id.0)?
+        };
+        // Capability-domain read (rank 4): resolve the verified incarnation's cnode.
+        unsafe { KernelState::process_cnode_for_pid_from_raw(state, pid) }
+    }
+
     // ── Stage 27 split-mutation helper ───────────────────────────────────────
 
     /// STAGE 27: first mutating global-lock extraction. Apply a CNode-slot
