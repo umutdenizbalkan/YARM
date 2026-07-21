@@ -252,6 +252,19 @@ impl KernelState {
             .map(|tid| tid.0)
     }
 
+    /// Stage 199A2D2C2C: preempt the current task on a SPECIFIC `cpu`, preferring `preferred` as the
+    /// next task (re-enqueues the previous current, then makes `preferred` current if it is runnable on
+    /// that CPU). Returns the TID made current. Used by the BSP saved-frame resume to reliably make the
+    /// remotely-woken oracle client `current` on CPU 0 (so `current_tid` — and thus the DebugLog
+    /// user-copy asid — is the client), which a bare `dispatch_next_on_cpu` cannot guarantee when other
+    /// tasks are queued.
+    pub(crate) fn on_preempt_prefer_on_cpu(&mut self, cpu: CpuId, preferred: u64) -> Option<u64> {
+        let mut sched = self.scheduler_state();
+        kernel_mut(&mut sched.scheduler)
+            .on_preempt_prefer_on(cpu, ThreadId(preferred))
+            .map(|tid| tid.0)
+    }
+
     pub fn block_current_cpu(&mut self) -> Option<u64> {
         let cpu = self.current_cpu();
         let mut sched = self.scheduler_state();

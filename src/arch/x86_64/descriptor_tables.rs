@@ -253,6 +253,16 @@ struct X86InterruptStackFrameHeader {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_DISPATCH_DEPTH: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; crate::arch::platform_constants::MAX_CPUS];
+
+/// Stage 199A2D2C2C: clear a CPU's trap-dispatch nested-guard depth. Called immediately before the BSP
+/// saved-frame resume `iretq`s out of the trap handler (abandoning this kernel-stack frame WITHOUT
+/// reaching the normal depth-reset return points), so the resumed client's NEXT trap starts at depth 0
+/// rather than tripping the nested-trap fatal guard.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn clear_trap_dispatch_depth(cpu: crate::kernel::scheduler::CpuId) {
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    TRAP_DISPATCH_DEPTH[idx].store(0, Ordering::Release);
+}
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static FATAL_LOG_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -1148,6 +1158,23 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     };
     let cpu = current_cpu_id();
 
+    // Stage 199A2D2C2C: the reverse-direction reschedule IPI (vector 0xF1) delivered to CPU 0 (BSP).
+    // Handle it INLINE without running the scheduler (no dispatch in the handler): LAPIC EOI, record
+    // the BSP reschedule-pending flag, emit the one-shot RECEIVED marker, and iretq back. The woken
+    // recv-v2 caller is dispatched by CPU 0's NORMAL timer-driven scheduler on a later tick — this
+    // handler never dispatches. The AP uses a separate pure-asm 0xF1 stub (prepare_ap_idt), so only
+    // the BSP reaches this Rust dispatch for 0xF1.
+    #[cfg(not(feature = "hosted-dev"))]
+    if vector as usize == AP_REMOTE_WAKE_VECTOR as usize
+        && cpu.0 == 0
+        && crate::kernel::boot::x86_ipccall_direct_smp_reply_enabled()
+    {
+        crate::arch::x86_64::irq::acknowledge_interrupt(0);
+        crate::arch::x86_64::smp::c2c_bsp_handle_reschedule_ipi();
+        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
+        return;
+    }
+
     // Stage 133: pre-lock one-shot #PF diagnostic — fires before any KernelState
     // lock is acquired, giving access to raw trap-stub register values.
     #[cfg(not(feature = "hosted-dev"))]
@@ -1241,6 +1268,15 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // See entering_tid comment above for the revert rationale.
         let exiting_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
         let task_switched = entering_tid != exiting_tid;
+        // Stage 199A2D2C2C: on CPU 0 (BSP), drive the reverse-direction saved-frame resume of the
+        // remotely-woken oracle client on EVERY trap return (not only the idle transition), because in
+        // SMP=2 the passive scheduler (single-CPU D6 seam) never re-selects a caller enqueued on CPU 0's
+        // run queue while CPU 0 keeps dispatching init. It explicitly pulls + resumes the client via the
+        // canonical saved-frame iretq (diverges into ring 3 on success), clearing the nested-trap guard
+        // first. This is NOT the 0xF1 handler — dispatch happens on the trap-return path, never in the
+        // interrupt handler. A strict no-op off the reply path / before the reply is delivered / once done.
+        #[cfg(not(feature = "hosted-dev"))]
+        crate::arch::x86_64::smp::c2c_bsp_saved_frame_resume(shared, cpu);
         if matches!(exiting_tid, None | Some(0)) {
             // The scheduler uses TID 0 as its idle/supervisor sentinel.  It has
             // no user context to iretq back to; returning through the current

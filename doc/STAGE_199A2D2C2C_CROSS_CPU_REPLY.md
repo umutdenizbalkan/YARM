@@ -1,74 +1,105 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
-# Stage 199A2D2C2C — x86_64 Cross-CPU NR7 Reply and Complete SMP Round-Trip
+# Stage 199A2D2C2C — x86_64 Complete Bidirectional Cross-CPU Direct IPC (NR6 + NR7)
 
-Goal: complete the reverse direction of the sealed cross-CPU exchange (CPU-0 client blocks on its
-reply endpoint → CPU-1 server issues a genuine NR7 with the Reply cap it read in ring 3 → accepted
-off-lock reply transaction targets CPU 0 → CPU-1→CPU-0 reschedule IPI → CPU-0 saved-frame resume →
-CPU-0 ring-3 reply validation) and emit the complete request/reply SMP seal.
+Goal: complete the reverse (NR7 reply) half of the sealed cross-CPU exchange and earn the FINAL
+two-direction SMP seal. The forward (NR6 request) direction was sealed in Stage 199A2D2C2B2/B3 and is
+reused UNCHANGED. This increment adds only the reply direction and the two-direction seal.
 
-## Status — user-entry parity guard delivered (Part 11); reply round-trip NOT sealed
+## Outcome — GENUINE LIVE two-direction seal
 
-This increment delivers the verifiable, low-risk, permanent **user-entry EFER SCE|NXE parity guard**
-(Part 11) and does NOT emit any cross-CPU reply seal. The full bidirectional NR7 round-trip — a large
-integration on the scale of the B2 request direction — is scoped below and left for the next
-increment; per the stage's own hard-stops, a `result=ok` SMP seal is only permitted after a genuine
-clean two-direction boot, so none is emitted here.
+One fresh `QEMU_SMP=2` boot (`scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh`, reply sub-selector
+`yarm.x86_64_ipccall_direct_smp_reply=1`) drives the COMPLETE round trip and emits, after the sealed
+forward delivery:
 
-## Delivered (verifiable)
+```
+IPCREPLY_DIRECT_SMP_CALLER_BLOCKED arch=x86_64 caller_cpu=0 recv_v2_committed=1 saved_frame=1 waiter_exact=1 ack_published=1 absent_from_runqueue=1 ... result=ok
+X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0 reason=remote_enqueue count=1 result=ok
+X86_BSP_RESCHEDULE_IPI_RECEIVED cpu=0 pending=1 dispatch_in_handler=0 result=ok
+X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved scheduler_selected=1 continuations=1 ... result=ok
+USER_LOG tid=... msg=X86_BSP_RECV_V2_CONTINUED cpu=0 result=ok
+USER_LOG tid=... msg=X86_BSP_REPLY_USER_VALIDATED cpu=0 payload_ok=1 length_ok=1 meta_ok=1 continuations=1 result=ok
+IPCREPLY_DIRECT_SMP_REPLY_OK sender_cpu=1 receiver_cpu=0 cross_cpu=1 reply_copies=1 caller_wakes=1 one_shot=1 result=ok
+IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED arch=x86_64 reason=consumed_barrier reply_copies=1 caller_wakes=1 ipis=1 result=ok
+STAGE_199_IPCREPLY_DIRECT_SMP_REPLY_USER_SEAL arch=x86_64 smp=2 ... result=ok
+STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 cross_cpu_request=1 cross_cpu_reply=1 ... result=ok
+```
 
-### Permanent user-entry EFER parity guard — `descriptor_tables.rs`
-`configure_syscall_msrs_for_self` — run by EVERY x86 CPU that can enter ring 3, before it loads user
-mappings containing NX PTEs — now reads EFER back after writing `SCE | NXE` and REQUIRES both, failing
-closed (`X86_EFER_USER_ENTRY_PARITY_FAIL` + `halt_forever`) otherwise. It emits a one-shot per-CPU
-attestation `X86_EFER_USER_ENTRY_OK cpu=<n> sce=1 nxe=1 result=ok`. Live-proven on a fresh SMP=2 boot
-for both the BSP (cpu=0) and the AP (cpu=1); the B3 user-consumption seal re-runs green. This makes the
-Stage 199A2D2C2B3 defect (an AP reaching ring 3 without NXE, so NX data pages took reserved-bit #PFs)
-un-reintroducible without a fail-closed halt, and does NOT mask faults by clearing NX from data pages.
-BSP and AP now share the identical SCE/NXE requirement.
+## The reverse direction, end to end
 
-### Tests — `stage199a2d2c2c_efer_parity` (2)
-The user-entry path requires both SCE and NXE and fails closed; the guard attests per-CPU and keeps NX
-a hard requirement.
+1. **CPU-0 caller block.** After its NR6 succeeds (`X86_BSP_NR6_REQUEST_SENT`), the client issues a
+   GENUINE recv-v2 on its OWN reply endpoint (the reply RECEIVE cap it already holds + a mapped reply
+   payload/meta buffer). It blocks on CPU 0, committing a saved continuation and publishing the
+   authoritative blocked-caller ack; the oracle reply endpoint is now armed, so
+   `maybe_publish_ipcreply_direct_blocked_caller_ack` fires and, after independently re-verifying every
+   blocking-order invariant (saved frame, exact reply-endpoint waiter, absent from every runqueue, home
+   CPU 0, live ack seq), emits `IPCREPLY_DIRECT_SMP_CALLER_BLOCKED caller_cpu=0` — the reply-side analog
+   of B1's `IPCCALL_DIRECT_SMP_SERVER_BLOCKED`.
 
-## Remaining reply round-trip (the SMP seal requires ALL of it)
+2. **CPU-1 genuine NR7.** After `X86_AP_RECV_V2_USER_VALIDATED`, the resumed server loads the
+   receiver-local Reply CapId it read in ring 3 (recv-v2 meta offset 16) and issues a real NR7 IpcReply
+   on it (NEVER a kernel-injected cap), with a bounded pre-ack WouldBlock retry (≤64, each with a short
+   `pause` delay so the CPU-0 caller can block first). The NR7 split gate confines the off-lock reply to
+   exactly the oracle reply endpoint and: returns non-mutating WouldBlock while no caller-ack is
+   published; falls through to the accepted `ipc_reply_direct_txn` once the ack is claimable; and, after
+   the one success, refuses a duplicate NR7 with canonical `WrongObject` (zero further work).
 
-The reply machinery from the SMP=1 NR7 oracle already exists and is reused unchanged:
-`ipcreply_direct_ack` (BlockedCallerAck), `maybe_publish_ipcreply_direct_blocked_caller_ack`,
-`try_split_ipcreply_direct_into_frame`, `DirectReplyPostWork`, and `ipc_reply_direct_txn` (the
-reserve→copy→claim→commit→consume→enqueue ordering). The remaining cross-CPU integration, each piece
-mirroring the sealed request direction:
+3. **Accepted reply transaction (reused, no fork).** `ipc_reply_direct_txn` runs its sealed ordering:
+   resolve reply cap → validate replier → reserve Available→Reserved → copy reply payload+meta to the
+   caller OFF-LOCK → claim the exact caller waiter → commit the caller (Runnable + home affinity CPU 0)
+   → record Reserved→Consumed (the one-shot barrier, BEFORE the enqueue) → enqueue the caller LAST.
 
-1. **Arm the reply endpoint** — `set_ipccall_direct_oracle_endpoints(req_idx, reply_idx)` with the
-   real reply endpoint index (today the reply slot is `usize::MAX`), so the caller-ack publishes.
-2. **CPU-0 caller block** — extend the client stub: after NR6 success, issue recv-v2 on its reply
-   endpoint (RECEIVE cap it already holds + a mapped reply payload/meta buffer). It blocks, committing
-   a saved continuation and publishing the BlockedCallerAck; emit
-   `IPCREPLY_DIRECT_SMP_CALLER_BLOCKED caller_cpu=0 …` from the committed block point (the reply-side
-   analog of B1's `IPCCALL_DIRECT_SMP_SERVER_BLOCKED`).
-3. **CPU-1 genuine NR7** — extend the server stub: after `X86_AP_RECV_V2_USER_VALIDATED`, issue NR7
-   with the Reply CapId it read from its recv-v2 metadata in ring 3 (never a kernel-injected value),
-   a reply buffer, and the exact reply length, with a bounded pre-ack WouldBlock retry (≤64).
-4. **CPU-1→CPU-0 IPI** — on the accepted reply-txn success (client enqueued on CPU 0), CPU 1 sends the
-   canonical 0xF1 IPI to CPU 0 (`X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0`); the CPU-0
-   handler sets its own pending flag with no dispatch in the handler.
-5. **CPU-0 saved resume** — the BSP restores the client's committed recv-v2 continuation. Unlike the
-   AP, the BSP's normal timer-driven dispatch already resumes recv-v2 waiters via `user_context`
-   (RIP/RSP/GPRs + cleared result regs), so this is largely the existing BSP recv-v2 wake, tagged with
-   `X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved`; validate no fresh re-entry.
-6. **CPU-0 ring-3 reply validation** — the resumed client reads its reply buffer + metadata via direct
-   ring-3 loads (now safe on both CPUs thanks to the NXE parity guard) and emits
-   `X86_BSP_REPLY_USER_VALIDATED cpu=0 …`.
-7. **Duplicate reply proof** — a second NR7 through the same userspace cap yields canonical
-   WrongObject/StaleCapability with zero additional copies/claims/enqueues/IPIs/wakes (the Consumed
-   record is the one-shot barrier).
-8. **Markers + seals** — `IPCREPLY_DIRECT_SMP_REPLY_OK`, the reply user seal
-   `STAGE_199_IPCREPLY_DIRECT_SMP_REPLY_USER_SEAL`, and the complete
-   `STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL` (both directions, exact totals) — emitted ONLY after a
-   clean genuine two-direction boot.
+4. **CPU-1 → CPU-0 reschedule IPI.** On the accepted reply success (caller enqueued on CPU 0), the reply
+   drain sends the canonical 0xF1 IPI to CPU 0 STRICTLY AFTER the enqueue (`X86_BSP_RESCHEDULE_IPI_SENT
+   sender_cpu=1 receiver_cpu=0`). CPU 0's 0xF1 handler runs INLINE without dispatch: LAPIC EOI, records
+   its own pending flag, emits `X86_BSP_RESCHEDULE_IPI_RECEIVED cpu=0 pending=1 dispatch_in_handler=0`,
+   and iretqs. No self-set pending; no dispatch in the handler; no client migration.
+
+5. **CPU-0 saved-frame resume.** In SMP=2 the BSP's passive scheduler (the single-CPU-only D6 local
+   seam) never re-selects a caller enqueued on CPU 0's run queue, so an explicit saved-frame resume runs
+   from every CPU-0 trap-return (NOT the 0xF1 handler — dispatch never happens in the interrupt
+   handler), gated on one committed reply delivery + a one-shot latch. It makes the client the
+   scheduler's `current` on CPU 0 via `on_preempt_prefer_on_cpu` (re-enqueuing the running task, then
+   selecting the client — so `current_tid`, and thus the resumed client's DebugLog user-copy asid,
+   is the client), reads its committed recv-v2 continuation (CR3/FS/RIP/RSP/GPRs + cleared result regs),
+   clears the nested-trap depth guard, and `iretq`s to the instruction after its recv-v2 syscall — never
+   a fresh re-entry. `X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved`.
+
+6. **CPU-0 ring-3 reply validation.** The resumed client reads its reply buffer + metadata via direct
+   ring-3 loads (safe on both CPUs thanks to the Stage 199A2D2C2C EFER.NXE parity guard) and emits
+   `X86_BSP_RECV_V2_CONTINUED` + `X86_BSP_REPLY_USER_VALIDATED cpu=0` only when the reply bytes
+   ("RPLY-OK!"), the recv-v2 meta payload_len (== 8) and the meta sender_tid (!= 0) all check out.
+
+7. **Duplicate reply proof.** The server issues ONE deliberate second NR7 through the same userspace
+   cap; the Consumed record + claimed ack make it a duplicate, refused with `WrongObject` and ZERO
+   additional copies / claims / enqueues / IPIs / wakes (`IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED`).
+
+8. **Seals.** `IPCREPLY_DIRECT_SMP_REPLY_OK` (terminal, gated on the client's ring-3 validation + one
+   committed reply), the reply user seal `STAGE_199_IPCREPLY_DIRECT_SMP_REPLY_USER_SEAL`, and the
+   complete `STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL` (both directions, exact totals) — emitted ONLY
+   after a clean genuine two-direction boot.
+
+## Wiring (all default-off; gated on `yarm.x86_64_ipccall_direct_smp_reply=1`)
+- `mod.rs`: reply sub-selector flag (implies request) + reply/duplicate counters + terminal reply-OK
+  emitter + `maybe_emit_ipcreply_direct_smp_caller_blocked` + `ipcreply_direct_ack::commit_seq` +
+  the client-TID record for the BSP dispatch hook.
+- `exec_state.rs` (`build_ap_workload`): arms the reply endpoint; provisions the client reply meta
+  buffer + reply markers + the server reply source buffer; swaps in the recv-v2-capable client stub and
+  the NR7-capable server stub (both hand-asm, verified with `objdump`).
+- `ipccall_direct_txn.rs`: the reply drain notes the delivery + sends the reverse IPI on success (mirror
+  of the request drain; the accepted `ipc_reply_direct_txn` is UNCHANGED).
+- `syscall_split.rs`: NR7 early-WouldBlock + duplicate refusal (split gate only; no txn fork) + the
+  terminal reply-OK hook in the off-lock DebugLog path.
+- `smp.rs`: `c2c_send_reschedule_ipi_to_cpu0`, the BSP 0xF1 handler `c2c_bsp_handle_reschedule_ipi`, and
+  `maybe_emit_bsp_saved_dispatch_ok`.
+- `descriptor_tables.rs`: the BSP 0xF1 inline intercept (EOI + handler + no dispatch) and the
+  saved-dispatch attestation hook on the normal scheduler switch.
+- `debug.rs`: terminal reply-OK hook in the global DebugLog path.
+- `boot_command_line.rs`: `yarm.x86_64_ipccall_direct_smp_reply` knob.
 
 ## Preserved
-C2A / B1 / B2 / B3 seals re-run green with the parity guard on. SYSCALL_COUNT=32, VARIANT_COUNT=22,
-NR27 absent, DebugLog=192, REPLY_CAP_QUEUEING_SUPPORTED=false, Stage 198F cells=30, Stage 199
-functional cells=6, single-pair acknowledgement store, queued IpcCall unsupported, timeouts /
-notifications / server-death caller-wake unretired, multi-pair concurrency unclaimed. NR7 cross-CPU
-delivery not begun; no reply seal emitted.
+C2A / B1 / B2 / B3 / C2C-parity seals re-run green (the request path uses its unchanged stubs and the
+reply endpoint stays `usize::MAX` when the reply sub-selector is off). SYSCALL_COUNT=32,
+VARIANT_COUNT=22, NR27 absent, DebugLog=192, REPLY_CAP_QUEUEING_SUPPORTED=false, Stage 198F cells=30,
+Stage 199 functional cells=6, single-pair acknowledgement stores (both directions), queued IpcCall
+unsupported, timeouts / notifications / server-death caller-wake unretired, multi-pair concurrency
+unclaimed.

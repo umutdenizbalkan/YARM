@@ -65,6 +65,10 @@ pub(super) fn handle_debug_log(
     // the resumed CPU-1 server's userspace X86_AP_RECV_V2_CONTINUED marker is observed here (never
     // merely after enqueue/IPI) AND the kernel counters attest one complete delivery. Once, gated.
     crate::kernel::boot::maybe_emit_ipccall_direct_smp_request_ok(msg_str);
+    // Stage 199A2D2C2C: the cross-CPU REPLY seal's terminal kernel marker is emitted ONLY after the
+    // resumed CPU-0 client's userspace X86_BSP_REPLY_USER_VALIDATED marker is observed here AND the
+    // kernel counters attest one complete reply delivery. Once, gated.
+    crate::kernel::boot::maybe_emit_ipcreply_direct_smp_reply_ok(msg_str);
     frame.set_ok(0, 0, 0);
     Ok(())
 }

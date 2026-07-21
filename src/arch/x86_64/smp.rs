@@ -2371,6 +2371,170 @@ pub(crate) fn c2b2_send_reschedule_ipi_to_cpu1() {
 #[cfg(any(test, feature = "hosted-dev"))]
 pub(crate) fn c2b2_send_reschedule_ipi_to_cpu1() {}
 
+/// Stage 199A2D2C2C: count of cross-CPU reply reschedule IPIs this oracle REQUESTED (exactly one for
+/// the one committed caller enqueue on CPU 0).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static C2C_RESCHEDULE_IPI_SENT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 199A2D2C2C: sent from CPU 1 (the resumed server's NR7 reply context) STRICTLY AFTER the
+/// caller was enqueued on CPU 0 — the canonical reverse-direction remote-wake IPI. It sends vector
+/// 0xF1 to CPU 0 (APIC id 0). Unlike the forward IPI it does NOT re-arm any AP dispatch request: CPU 0
+/// is the BSP and dispatches the woken recv-v2 caller through its NORMAL timer-driven scheduler. It
+/// does NOT set CPU 0's reschedule-pending flag (CPU 0 sets that itself on IPI receipt) and performs no
+/// dispatch here. One IPI requested per reply delivery.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn c2c_send_reschedule_ipi_to_cpu0() {
+    use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+    let n = C2C_RESCHEDULE_IPI_SENT.fetch_add(1, Ordering::AcqRel) + 1;
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0 reason=remote_enqueue count={} result=ok",
+        n
+    ));
+    wait_for_icr_idle(0, "before_c2c_reschedule");
+    write_icr(0, AP_REMOTE_WAKE_VECTOR as u32);
+}
+
+#[cfg(any(test, feature = "hosted-dev"))]
+pub(crate) fn c2c_send_reschedule_ipi_to_cpu0() {}
+
+/// Stage 199A2D2C2C: the CPU-0 (BSP) saved-frame resume of the oracle client. In SMP=2 the BSP's
+/// steady-state trap handler dispatches via the D6 local seam, which is single-CPU-only, so a
+/// remotely-woken recv-v2 caller enqueued on CPU 0's run queue is NOT re-selected by the passive
+/// scheduler. This runs from the BSP trap-return idle transition (NOT the 0xF1 handler — dispatch is
+/// therefore not performed in the interrupt handler) once the reverse reschedule is pending and the
+/// caller's reply is delivered: it pulls the client from CPU 0's run queue (`dispatch_next_on_cpu`),
+/// reads its committed recv-v2 continuation, emits `X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved`, and
+/// resumes it through the SAME canonical saved-frame `iretq` the AP uses — restoring the client's
+/// CR3/FS/RIP/RSP/GPRs (result regs already cleared to RAX=0). Diverges into ring 3 on success (never a
+/// fresh re-entry); declines (returns) on a missing/partial saved frame. One-shot per boot. The BSP's
+/// already-configured per-CPU syscall/interrupt kernel stacks handle the resumed client's later entries.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn c2c_bsp_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if cpu.0 != 0 || !crate::kernel::boot::x86_ipccall_direct_smp_reply_enabled() {
+        return;
+    }
+    if DONE.load(Ordering::Acquire) {
+        return;
+    }
+    // The committed reply must already be delivered — the sole condition under which resuming the client
+    // is its SAVED recv-v2 resume (never the earlier fresh NR6 entry). This drives the resume directly
+    // (independent of the reverse-IPI pending flag, which is informational): the client is enqueued on
+    // CPU 0 by the accepted reply transaction, but in SMP=2 the passive scheduler never re-selects it,
+    // so every CPU-0 trap return polls this until the client is pulled + resumed exactly once.
+    if crate::kernel::boot::ipcreply_direct_smp_reply_delivered_count() < 1 {
+        return;
+    }
+    let client_tid = crate::kernel::boot::x86_c2c_client_tid();
+    if client_tid == 0 {
+        return;
+    }
+    // READ-ONLY pre-check FIRST (never mutating the scheduler's `current`): only proceed once the client
+    // is Runnable with a committed saved recv-v2 continuation. If it is not yet resumable, return WITHOUT
+    // touching `current`, so the normal trap-return path (which already read `exiting_tid`) stays
+    // consistent. Only after this check does the function commit to diverging via iretq.
+    let (asid, cr3, rip, rsp, gprs, fs_base, runnable_saved) =
+        match shared.with(|k| k.ap_saved_resume_context(client_tid)) {
+            Some(v) => v,
+            None => return,
+        };
+    if !runnable_saved || rip == 0 || rsp == 0 {
+        return;
+    }
+    // Make the client the scheduler's `current` on CPU 0 by PREEMPTING the running task (re-enqueued)
+    // in favour of the client (`on_preempt_prefer_on_cpu`) — reliable even with other tasks queued,
+    // unlike a bare `dispatch_next_on_cpu`. This must succeed so that `current_tid` (and thus the
+    // resumed client's DebugLog user-copy asid) is the client. If it cannot be made current (not
+    // queued), abort WITHOUT committing — no mutation escapes to the trap-return path, retry next tick.
+    let made_current = shared
+        .with_cpu(cpu, |k| k.on_preempt_prefer_on_cpu(cpu, client_tid))
+        .unwrap_or(None);
+    if made_current != Some(client_tid) {
+        return;
+    }
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    C2C_BSP_RESCHEDULE_PENDING.store(false, Ordering::Release);
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved scheduler_selected=1 continuations=1 tid={} asid={} result=ok",
+        client_tid, asid
+    ));
+    // Ensure this CPU's SYSCALL MSRs (SCE|NXE) are set before entering ring 3 (idempotent parity guard).
+    super::descriptor_tables::configure_syscall_msrs_for_self();
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0100u32, // IA32_FS_BASE
+            in("eax") (fs_base & 0xFFFF_FFFF) as u32,
+            in("edx") (fs_base >> 32) as u32,
+            options(nostack, preserves_flags),
+        );
+    }
+    crate::yarm_log!(
+        "{} cpu={} tid={} cr3=0x{:x} rip=0x{:x} rsp=0x{:x} (bsp saved-frame resume)",
+        super::ap_dispatch::MARK_RING3_ENTER,
+        cpu.0,
+        client_tid,
+        cr3,
+        rip,
+        rsp
+    );
+    let frame = super::descriptor_tables::ApSavedResumeFrame {
+        gprs,
+        rip,
+        rsp,
+        rflags: 0x202,
+        cs: 0x23,
+        ss: 0x1b,
+    };
+    // This iretq abandons the current trap kernel-stack frame without reaching the normal depth-reset
+    // return points, so clear the nested-trap guard first (else the resumed client's next trap on CPU 0
+    // trips the fatal nested-trap check).
+    super::descriptor_tables::clear_trap_dispatch_depth(cpu);
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+        super::descriptor_tables::resume_user_mode_iret(&frame);
+    }
+}
+
+#[cfg(any(test, feature = "hosted-dev"))]
+pub(crate) fn c2c_bsp_saved_frame_resume(_shared: &crate::runtime::SharedKernel, _cpu: CpuId) {}
+
+/// Stage 199A2D2C2C: BSP-side reschedule-pending flag, set by the CPU-0 0xF1 handler on receipt of the
+/// reverse-direction reschedule IPI (see `x86_trap_dispatch`). The handler does NO dispatch — it EOIs,
+/// records the flag, and emits the one-shot RECEIVED marker; the woken recv-v2 caller is dispatched by
+/// CPU 0's normal scheduler on the trap return.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) static C2C_BSP_RESCHEDULE_PENDING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 199A2D2C2C: count of reverse-direction reschedule IPIs RECEIVED + handled on CPU 0.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static C2C_RESCHEDULE_IPI_RECEIVED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 199A2D2C2C: the CPU-0 (BSP) reverse-direction reschedule-IPI handler. Called from the shared
+/// x86 trap dispatch on vector 0xF1 BEFORE any scheduler dispatch. It records CPU 0's own
+/// reschedule-pending flag (never self-set from the sender), emits the one-shot RECEIVED marker
+/// (pending=1, dispatch_in_handler=0), and returns — NO dispatch in the handler. The LAPIC EOI is
+/// performed by the caller. A strict no-op off the C2C reply path.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(crate) fn c2c_bsp_handle_reschedule_ipi() {
+    if !crate::kernel::boot::x86_ipccall_direct_smp_reply_enabled() {
+        return;
+    }
+    C2C_BSP_RESCHEDULE_PENDING.store(true, Ordering::Release);
+    let n = C2C_RESCHEDULE_IPI_RECEIVED.fetch_add(1, Ordering::AcqRel) + 1;
+    if n == 1 {
+        crate::kernel::printk::printk_emit_sync(format_args!(
+            "X86_BSP_RESCHEDULE_IPI_RECEIVED cpu=0 pending=1 dispatch_in_handler=0 result=ok"
+        ));
+    }
+}
+
 /// Stage 199A2D2C2B2: count of reschedule IPIs RECEIVED + handled on CPU 1 (pending set once).
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 static C2B2_RESCHEDULE_IPI_RECEIVED: core::sync::atomic::AtomicU64 =

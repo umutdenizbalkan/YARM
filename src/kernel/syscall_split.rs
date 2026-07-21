@@ -404,6 +404,9 @@ fn try_split_debug_log_into_frame(
             // Stage 199A2D2C2B2: terminal cross-CPU request-OK marker, gated on observing the resumed
             // CPU-1 server's X86_AP_RECV_V2_CONTINUED marker here (the off-lock DebugLog path).
             crate::kernel::boot::maybe_emit_ipccall_direct_smp_request_ok(msg);
+            // Stage 199A2D2C2C: terminal cross-CPU reply-OK marker, gated on observing the resumed
+            // CPU-0 client's X86_BSP_REPLY_USER_VALIDATED marker here (the off-lock DebugLog path).
+            crate::kernel::boot::maybe_emit_ipcreply_direct_smp_reply_ok(msg);
         }
         // Copy failed (no mapping / not user-readable) — same as the global handler's
         // `DEBUG_LOG_COPY_FAIL` path: OK, no log.
@@ -714,6 +717,34 @@ fn try_split_ipcreply_direct_into_frame(
     let reply_eidx = shared.reply_record_endpoint_index_split_read(rec_idx, rec_gen)?;
     if !crate::kernel::boot::ipccall_direct_oracle_reply_endpoint_is(reply_eidx) {
         return None;
+    }
+    // Stage 199A2D2C2C: on the cross-CPU REPLY path, bound the CPU-1 server's pre-ack NR7 retry and
+    // refuse a duplicate NR7 — WITHOUT touching the legacy path or the accepted transaction. The
+    // blocked-caller ack VALID bit is published exactly once (when the CPU-0 caller blocks on its reply
+    // endpoint) and never cleared; the CLAIMED bit distinguishes "not yet delivered" from "already
+    // delivered". So:
+    //   * no ack published yet (snapshot None) → the caller has not blocked: non-mutating WouldBlock
+    //     (the server retries, bounded ≤64 in userspace). No copy / claim / enqueue / IPI / wake.
+    //   * ack published but no longer claimable (VALID && CLAIMED) → the one successful reply already
+    //     consumed the record: a duplicate NR7. Refuse with canonical `WrongObject`; ZERO additional
+    //     copies / claims / enqueues / IPIs / wakes (the Consumed record is the one-shot barrier).
+    //   * ack claimable (VALID && !CLAIMED) → fall through to the accepted claim + reply transaction.
+    #[cfg(not(feature = "hosted-dev"))]
+    if crate::kernel::boot::x86_ipccall_direct_smp_reply_enabled() {
+        use crate::kernel::syscall::SyscallError;
+        if crate::kernel::boot::ipcreply_direct_ack::snapshot().is_none() {
+            crate::kernel::boot::ipcreply_direct_smp_reply_note_early_wouldblock();
+            frame.set_err(SyscallError::WouldBlock.code());
+            return Some(Ok(()));
+        }
+        if !crate::kernel::boot::ipcreply_direct_ack::is_claimable() {
+            crate::kernel::boot::ipcreply_direct_smp_note_duplicate_refused();
+            crate::yarm_log!(
+                "IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED arch=x86_64 reason=consumed_barrier reply_copies=1 caller_wakes=1 ipis=1 result=ok"
+            );
+            frame.set_err(SyscallError::WrongObject.code());
+            return Some(Ok(()));
+        }
     }
     let asid_raw = shared.task_asid_for_tid_split_read(tid);
     let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(

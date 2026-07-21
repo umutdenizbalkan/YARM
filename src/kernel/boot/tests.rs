@@ -81695,3 +81695,252 @@ mod stage199a2d2c2c_efer_parity {
         assert!(DT.contains("const IA32_EFER_NXE: u64 = 1 << 11;"));
     }
 }
+
+/// Stage 199A2D2C2C — source guards for the COMPLETE bidirectional cross-CPU direct IPC (NR6 request +
+/// NR7 reply). These pin the reply-direction wiring: the reply sub-selector + knob, the blocked-caller
+/// marker, the CPU1→CPU0 reverse IPI + BSP 0xF1 handler (no dispatch in handler) + BSP saved-frame
+/// resume, the NR7 early-WouldBlock + duplicate refusal (split gate only; the accepted transaction is
+/// reused unchanged), the terminal reply-OK marker + seals, and the two hand-asm stubs + provisioning.
+#[cfg(test)]
+mod stage199a2d2c2c_reply_guards {
+    const MODRS: &str = include_str!("mod.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const EXEC: &str = include_str!("exec_state.rs");
+    const BCL: &str = include_str!("../boot_command_line.rs");
+    const SEAL: &str = include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh");
+
+    // 1. The reply sub-selector is default-off and IMPLIES the whole forward request direction.
+    #[test]
+    fn reply_subselector_implies_request() {
+        assert!(MODRS.contains("X86_IPCCALL_DIRECT_SMP_REPLY_ENABLED"));
+        assert!(
+            MODRS.contains("pub(crate) fn set_x86_ipccall_direct_smp_reply_enabled(enabled: bool)")
+        );
+        let f = MODRS
+            .split("pub(crate) fn set_x86_ipccall_direct_smp_reply_enabled")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("set_x86_ipccall_direct_smp_request_enabled(true)"));
+    }
+
+    // 2. The reply knob is parsed and drives the setter.
+    #[test]
+    fn reply_knob_parsed() {
+        assert!(BCL.contains("yarm.x86_64_ipccall_direct_smp_reply"));
+        assert!(BCL.contains("pub x86_64_ipccall_direct_smp_reply: Option<bool>"));
+        assert!(BCL.contains("set_x86_ipccall_direct_smp_reply_enabled(enabled)"));
+    }
+
+    // 3. The blocked-CALLER marker mirrors the blocked-SERVER marker: caller_cpu=0, one-shot, and it
+    //    independently re-verifies every blocking-order invariant (never trusting the caller).
+    #[test]
+    fn caller_blocked_marker_reverifies() {
+        assert!(MODRS.contains("fn maybe_emit_ipcreply_direct_smp_caller_blocked("));
+        assert!(MODRS.contains("IPCREPLY_DIRECT_SMP_CALLER_BLOCKED arch=x86_64 caller_cpu=0"));
+        let f = MODRS
+            .split("fn maybe_emit_ipcreply_direct_smp_caller_blocked")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("task_has_saved_frame"));
+        assert!(body.contains("!kernel.task_present_in_any_runqueue"));
+        assert!(body.contains("CpuId(0)"));
+        assert!(body.contains("EMITTED.swap(true"));
+    }
+
+    // 4. The reply drain notes the delivery + sends the reverse IPI to CPU 0 on success — the accepted
+    //    ipc_reply_direct_txn is reused unchanged (no fork).
+    #[test]
+    fn reply_drain_sends_reverse_ipi_reusing_txn() {
+        let f = TXN
+            .split("pub(crate) fn drain_direct_reply_post_work")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n    }\n").unwrap()];
+        assert!(body.contains(
+            "self.ipc_reply_direct_txn(&work.snapshot, &work.ack, &mut lease, work.ack_seq)"
+        ));
+        assert!(body.contains("if result.is_ok()"));
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("ipcreply_direct_smp_reply_note_delivered()"));
+        assert!(body.contains("c2c_send_reschedule_ipi_to_cpu0()"));
+    }
+
+    // 5. The reverse IPI is sent AFTER the enqueue (from the success branch), targets APIC id 0, and
+    //    emits the canonical SENT marker; it never re-arms an AP dispatch request.
+    #[test]
+    fn reverse_ipi_targets_cpu0() {
+        assert!(SMP.contains("pub(crate) fn c2c_send_reschedule_ipi_to_cpu0()"));
+        assert!(SMP.contains("X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0"));
+        let f = SMP
+            .split("pub(crate) fn c2c_send_reschedule_ipi_to_cpu0() {")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("write_icr(0, AP_REMOTE_WAKE_VECTOR as u32)"));
+        assert!(!body.contains("set_ap_dispatch_request"));
+    }
+
+    // 6. The BSP 0xF1 handler records pending + emits RECEIVED (dispatch_in_handler=0) and does NO
+    //    dispatch; it is gated on the reply sub-selector.
+    #[test]
+    fn bsp_ipi_handler_no_dispatch() {
+        assert!(SMP.contains("pub(crate) fn c2c_bsp_handle_reschedule_ipi()"));
+        assert!(
+            SMP.contains("X86_BSP_RESCHEDULE_IPI_RECEIVED cpu=0 pending=1 dispatch_in_handler=0")
+        );
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_handle_reschedule_ipi() {")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("C2C_BSP_RESCHEDULE_PENDING.store(true"));
+        assert!(!body.contains("dispatch_next_on_cpu"));
+        assert!(!body.contains("resume_user_mode_iret"));
+    }
+
+    // 7. The trap dispatch intercepts vector 0xF1 on CPU 0 INLINE (EOI + handler + no scheduler) and
+    //    returns without running handle_trap_entry.
+    #[test]
+    fn trap_dispatch_intercepts_0xf1_on_bsp() {
+        assert!(DT.contains("vector as usize == AP_REMOTE_WAKE_VECTOR as usize"));
+        let f = DT
+            .split("vector as usize == AP_REMOTE_WAKE_VECTOR as usize")
+            .nth(1)
+            .unwrap();
+        let body = &f[..600];
+        assert!(body.contains("cpu.0 == 0"));
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("acknowledge_interrupt(0)"));
+        assert!(body.contains("c2c_bsp_handle_reschedule_ipi()"));
+        assert!(body.contains("return;"));
+    }
+
+    // 8. The BSP saved-frame resume runs from the trap-return path (NOT the 0xF1 handler), gated on one
+    //    committed reply delivery, and resumes via the canonical saved-frame iretq after clearing the
+    //    nested-trap depth guard.
+    #[test]
+    fn bsp_saved_frame_resume() {
+        assert!(SMP.contains("pub(crate) fn c2c_bsp_saved_frame_resume("));
+        assert!(SMP.contains("X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved"));
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_saved_frame_resume(")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("ipcreply_direct_smp_reply_delivered_count() < 1"));
+        assert!(body.contains("on_preempt_prefer_on_cpu(cpu, client_tid)"));
+        assert!(body.contains("ap_saved_resume_context(client_tid)"));
+        assert!(body.contains("clear_trap_dispatch_depth(cpu)"));
+        assert!(body.contains("resume_user_mode_iret(&frame)"));
+        // Invoked from the trap-return path, not the 0xF1 handler.
+        assert!(DT.contains("c2c_bsp_saved_frame_resume(shared, cpu)"));
+    }
+
+    // 9. The NR7 split gate returns a NON-MUTATING WouldBlock before the caller-ack is published (the
+    //    caller has not blocked yet) — no copy/claim/enqueue.
+    #[test]
+    fn nr7_early_wouldblock_pre_ack() {
+        let f = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        assert!(f.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(f.contains("ipcreply_direct_ack::snapshot().is_none()"));
+        assert!(f.contains("ipcreply_direct_smp_reply_note_early_wouldblock()"));
+        assert!(f.contains("SyscallError::WouldBlock.code()"));
+    }
+
+    // 10. The NR7 split gate refuses a DUPLICATE reply (ack claimed + record consumed) with canonical
+    //     WrongObject and zero further side effects.
+    #[test]
+    fn nr7_duplicate_refused() {
+        let f = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        assert!(f.contains("!crate::kernel::boot::ipcreply_direct_ack::is_claimable()"));
+        assert!(f.contains("ipcreply_direct_smp_note_duplicate_refused()"));
+        assert!(
+            f.contains("IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED arch=x86_64 reason=consumed_barrier")
+        );
+        assert!(f.contains("SyscallError::WrongObject.code()"));
+    }
+
+    // 11. The terminal reply-OK marker is gated on the client's X86_BSP_REPLY_USER_VALIDATED userspace
+    //     marker AND one committed reply delivery; one-shot.
+    #[test]
+    fn terminal_reply_ok_gated() {
+        assert!(MODRS.contains("pub(crate) fn maybe_emit_ipcreply_direct_smp_reply_ok(msg: &str)"));
+        let f = MODRS
+            .split("pub(crate) fn maybe_emit_ipcreply_direct_smp_reply_ok(msg: &str)")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("msg.starts_with(\"X86_BSP_REPLY_USER_VALIDATED\")"));
+        assert!(body.contains("ipcreply_direct_smp_reply_delivered_count() < 1"));
+        assert!(
+            body.contains("IPCREPLY_DIRECT_SMP_REPLY_OK sender_cpu=1 receiver_cpu=0 cross_cpu=1")
+        );
+    }
+
+    // 12. The reply endpoint is armed (previously usize::MAX) only on the reply path, and the client TID
+    //     is recorded for the BSP dispatch hook.
+    #[test]
+    fn reply_endpoint_armed_and_client_tid_recorded() {
+        assert!(EXEC.contains("if reply_flow {"));
+        assert!(EXEC.contains("set_ipccall_direct_oracle_endpoints("));
+        assert!(EXEC.contains("rep_idx,"));
+        assert!(EXEC.contains("set_x86_c2c_client_tid(client_tid)"));
+    }
+
+    // 13. The reply-capable client stub (recv-v2 + ring-3 validation) is selected on the reply path
+    //     with the reply RECEIVE cap patched into BOTH the NR6 arg5 slot and the recv-v2 arg0 slot.
+    #[test]
+    fn client_stub_recv_v2_and_markers() {
+        assert!(EXEC.contains("const CLIENT_STUB_C2C: [u8; 248]"));
+        assert!(EXEC.contains("const CLIENT_C2C_SEND_CAP_PATCH_OFFSET: usize = 10;"));
+        assert!(EXEC.contains("const CLIENT_C2C_REPLY_R9_PATCH_OFFSET: usize = 26;"));
+        assert!(EXEC.contains("const CLIENT_C2C_REPLY_RECV_PATCH_OFFSET: usize = 83;"));
+        assert!(EXEC.contains("X86_BSP_RECV_V2_CONTINUED cpu=0 result=ok"));
+        assert!(
+            EXEC.contains("X86_BSP_REPLY_USER_VALIDATED cpu=0 payload_ok=1 length_ok=1 meta_ok=1")
+        );
+    }
+
+    // 14. The NR7-capable server stub + its fixed reply source buffer are provisioned on the reply path;
+    //     recv_cap patch offset unchanged (23).
+    #[test]
+    fn server_stub_nr7_and_reply_source() {
+        assert!(EXEC.contains("const RECV_V2_SERVER_STUB_C2C: [u8; 262]"));
+        assert!(EXEC.contains("let mut stub = RECV_V2_SERVER_STUB_C2C;"));
+        assert!(EXEC.contains("const SERVER_REPLY_PAYLOAD: &[u8] = b\"RPLY-OK!\";"));
+        assert!(EXEC.contains("RECV_V2_SERVER_REPLY_SRC_VA"));
+    }
+
+    // 15. The seals are printed by the smoke script ONLY after ALL two-direction markers are asserted
+    //     (forward request + reverse reply + duplicate refusal, no fault/fuse), never before.
+    #[test]
+    fn seals_only_after_two_direction_boot() {
+        assert!(SEAL.contains("STAGE_199_IPCREPLY_DIRECT_SMP_REPLY_USER_SEAL"));
+        assert!(SEAL.contains("STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 cross_cpu_request=1 cross_cpu_reply=1"));
+        // The final seal echo is AFTER every acceptance check (the fail gate precedes it).
+        let seal_pos = SEAL
+            .find("STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 cross_cpu_request=1")
+            .unwrap();
+        let caller_blocked_pos = SEAL.find("caller-blocked != 1").unwrap();
+        let reply_ok_pos = SEAL.find("reply-ok != 1").unwrap();
+        let dup_pos = SEAL.find("duplicate-refused != 1").unwrap();
+        assert!(caller_blocked_pos < seal_pos);
+        assert!(reply_ok_pos < seal_pos);
+        assert!(dup_pos < seal_pos);
+    }
+}
