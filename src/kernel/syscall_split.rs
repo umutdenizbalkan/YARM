@@ -401,6 +401,9 @@ fn try_split_debug_log_into_frame(
         Some(payload) => {
             let msg = core::str::from_utf8(&payload[..len]).unwrap_or("<utf8_err>");
             crate::yarm_log!("USER_LOG tid={} msg={}", tid, msg);
+            // Stage 199A2D2C2B2: terminal cross-CPU request-OK marker, gated on observing the resumed
+            // CPU-1 server's X86_AP_RECV_V2_CONTINUED marker here (the off-lock DebugLog path).
+            crate::kernel::boot::maybe_emit_ipccall_direct_smp_request_ok(msg);
         }
         // Copy failed (no mapping / not user-readable) — same as the global handler's
         // `DEBUG_LOG_COPY_FAIL` path: OK, no log.
@@ -630,6 +633,18 @@ fn try_split_ipccall_direct_into_frame(
     };
     if !crate::kernel::boot::ipccall_direct_oracle_request_endpoint_is(send_eidx) {
         return None;
+    }
+    // Stage 199A2D2C2B2: on the cross-CPU REQUEST path, if the server has NOT yet published its
+    // blocked-server acknowledgement (it is not yet blocked in recv-v2), return a NON-MUTATING
+    // WouldBlock so the CPU-0 client retries — never the legacy blocking IpcCall path, and never any
+    // record reservation / Reply-cap mint / destination copy / waiter claim / enqueue / IPI. Counts
+    // the early retry. Confined to the C2B2 selector so the SMP=1 oracle is unaffected.
+    if crate::kernel::boot::x86_ipccall_direct_smp_request_enabled()
+        && !crate::kernel::boot::ipccall_direct_ack::is_claimable()
+    {
+        crate::kernel::boot::ipccall_direct_smp_request_note_early_wouldblock();
+        frame.set_err(crate::kernel::syscall::SyscallError::WouldBlock.code());
+        return Some(Ok(()));
     }
     let asid_raw = shared.task_asid_for_tid_split_read(tid);
     let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(

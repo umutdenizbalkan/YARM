@@ -499,6 +499,14 @@ fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
     }
 }
 
+/// Stage 199A2D2C2B2: the installed SharedKernel for the AP idle-dispatch path (the CPU-1 saved-frame
+/// resume runs from the managed idle loop's dispatch hook, which has no `shared` param). Same pointer
+/// the trap dispatcher uses; `None` before install.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
+    trap_shared_kernel()
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn raw_current_apic_id() -> u32 {
     core::arch::x86_64::__cpuid(1).ebx >> 24

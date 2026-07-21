@@ -422,6 +422,18 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             enabled
         );
     }
+    if let Some(enabled) = parsed.x86_64_ipccall_direct_smp_request {
+        // Stage 199A2D2C2B2: default-off sub-selector. Implies the recv-v2 server sub-selector and
+        // additionally provisions a REAL CPU-0 client that delivers ONE cross-CPU NR6 request to the
+        // CPU-1 server, sends the reschedule IPI, and resumes the server's recv-v2 continuation on
+        // CPU 1. Marks the cross-CPU request path active (the AP saved-frame resume takes its pending
+        // flag from the real IPI). Does NOT begin NR7.
+        crate::kernel::boot::set_x86_ipccall_direct_smp_request_enabled(enabled);
+        crate::yarm_log!(
+            "YARM_X86_64_IPCCALL_DIRECT_SMP_REQUEST_SET enabled={}",
+            enabled
+        );
+    }
     if let Some(enabled) = parsed.aarch64_ipccall_direct_oracle {
         // Stage 199A2C1: default-off AArch64 DIRECT IpcCall/IpcReply live round-trip oracle knob.
         // Provisions init startup slot 5 (=7) so init runs the SAME arch-neutral round trip AND arms
@@ -762,6 +774,10 @@ pub struct YarmBootOptions<'a> {
     /// on CPU 1 and publishes the authoritative blocked-server acknowledgement. Unset keeps the
     /// Stage 199A2D2C2A Yield saved-frame proof. Has no effect without the SMP oracle knob.
     pub x86_64_ipccall_direct_smp_recv_v2_server: Option<bool>,
+    /// Stage 199A2D2C2B2: `yarm.x86_64_ipccall_direct_smp_request=1` DEFAULT-OFF sub-selector. Implies
+    /// the recv-v2 server and additionally provisions a REAL CPU-0 client that delivers ONE cross-CPU
+    /// NR6 request to the CPU-1 server, sends the reschedule IPI, and resumes the server on CPU 1.
+    pub x86_64_ipccall_direct_smp_request: Option<bool>,
     /// Stage 199A2C1: `yarm.aarch64_ipccall_direct_oracle=1` DEFAULT-OFF knob. Mirror of the x86_64
     /// knob on AArch64: provisions init startup slot 5 (=7) so init runs the SAME arch-neutral
     /// parent(client)/child(server) NR6 request + NR7 reply round trip, and arms the shared NR6/NR7
@@ -979,6 +995,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.x86_64_ipccall_direct_smp_recv_v2_server" {
             options.x86_64_ipccall_direct_smp_recv_v2_server = parse_bool_knob(value);
+        }
+        if key == b"yarm.x86_64_ipccall_direct_smp_request" {
+            options.x86_64_ipccall_direct_smp_request = parse_bool_knob(value);
         }
         if key == b"yarm.aarch64_ipccall_direct_oracle" {
             options.aarch64_ipccall_direct_oracle = parse_bool_knob(value);

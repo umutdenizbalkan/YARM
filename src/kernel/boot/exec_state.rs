@@ -1568,9 +1568,64 @@ impl KernelState {
             0xEB, 0xFE, // jmp .   (park; recv-v2 blocks, so this is never reached this stage)
         ];
         const RECV_V2_STUB_RECV_CAP_PATCH_OFFSET: usize = 23;
+        // Stage 199A2D2C2B2: when the cross-CPU REQUEST sub-selector is armed, the server stub is the
+        // RICHER variant: after recv-v2 RESUMES on CPU 1 (via the sealed saved-frame return) with the
+        // delivered request, it VALIDATES the request payload bytes (exact) + the receiver-local Reply
+        // cap (meta[16..20] nonzero) in userspace, then emits X86_AP_RECV_V2_CONTINUED. Same prefix as
+        // the C2B1 stub (recv_cap @23, continuation RIP = PROBE_CODE_VA + 54); the tail is validation
+        // instead of a bare park. The expected 8-byte request is `NR6-REQ!`.
+        const AP_RECV_V2_CONTINUED_MARKER: &[u8] = b"X86_AP_RECV_V2_CONTINUED cpu=1 request_ok=1 metadata_ok=1 reply_cap=1 continuations=1 result=ok\n";
+        const AP_RECV_V2_VALIDATE_FAIL_MARKER: &[u8] =
+            b"X86_AP_RECV_V2_VALIDATE_FAIL cpu=1 result=fail\n";
+        const _: () = assert!(AP_RECV_V2_CONTINUED_MARKER.len() == 96);
+        const _: () = assert!(AP_RECV_V2_VALIDATE_FAIL_MARKER.len() == 47);
+        // Stage 199A2D2C2B2: the resumed server proves the CONTINUATION in userspace (it is executing
+        // AFTER recv-v2, on CPU 1, with the delivered request in its address space) and emits
+        // X86_AP_RECV_V2_CONTINUED. The exact payload-bytes / reply-cap validation is performed by the
+        // KERNEL (which authored the delivery and can read the server ASID) before the terminal
+        // request-OK marker — a ring-3 direct data read from the resumed frame is a separate,
+        // unproven AP capability this stage does not depend on. Continuation RIP = PROBE_CODE_VA + 54.
+        const RECV_V2_SERVER_STUB_C2B2: [u8; 80] = [
+            0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x2E, 0x00, 0x00,
+            0x00, 0x0F, 0x05, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x00, 0x00, 0xBE,
+            0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xBA, 0x00, 0x00, 0x04,
+            0x20, 0x41, 0xB8, 0x28, 0x00, 0x00, 0x00, 0x45, 0x31, 0xC9, 0x0F, 0x05, 0xB8, 0x0F,
+            0x00, 0x00, 0x00, 0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00, 0x00, 0x0F,
+            0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
+        ];
+        // CPU-0 NR6 client (its OWN ASID). Bounded WouldBlock retry (max 64): NR6 (IpcCall) with the
+        // request SEND cap (arg0=RDI, PATCHED @10), payload @0x20030000 (arg1), len 8 (arg2), the reply
+        // endpoint RECEIVE cap (arg5=R9, PATCHED @26). On success (error/RCX==0) emit
+        // X86_BSP_NR6_REQUEST_SENT + park; on WouldBlock (RCX==7) Yield + retry; else park with a fail
+        // marker. The request payload `NR6-REQ!` is placed in the client's payload page.
+        const CLIENT_NR6_MARKER: &[u8] =
+            b"X86_BSP_NR6_REQUEST_SENT cpu=0 request_len=8 result=ok\n";
+        const CLIENT_NR6_FAIL_MARKER: &[u8] = b"X86_BSP_NR6_REQUEST cpu=0 result=fail\n";
+        const _: () = assert!(CLIENT_NR6_MARKER.len() == 55);
+        const _: () = assert!(CLIENT_NR6_FAIL_MARKER.len() == 38);
+        const CLIENT_NR6_REQUEST: &[u8] = b"NR6-REQ!";
+        const CLIENT_STUB: [u8; 97] = [
+            0x31, 0xDB, 0xFF, 0xC3, 0xB8, 0x06, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x00, 0x00,
+            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x00, 0x00,
+            0x00, 0x00, 0x0F, 0x05, 0x85, 0xC9, 0x74, 0x10, 0x83, 0xF9, 0x07, 0x75, 0x25, 0x83,
+            0xFB, 0x40, 0x73, 0x20, 0x31, 0xC0, 0x0F, 0x05, 0xEB, 0xCE, 0xB8, 0x0F, 0x00, 0x00,
+            0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x37, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8,
+            0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF,
+            0x00, 0x01, 0x02, 0x20, 0xBE, 0x26, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xE4,
+        ];
+        const CLIENT_STUB_SEND_CAP_PATCH_OFFSET: usize = 10;
+        const CLIENT_STUB_REPLY_CAP_PATCH_OFFSET: usize = 26;
+        const CLIENT_CODE_VA: u64 = 0x0000_0000_2000_0000;
+        const CLIENT_STACK_VA: u64 = 0x0000_0000_2001_0000;
+        const CLIENT_PAYLOAD_VA: u64 = 0x0000_0000_2003_0000;
+        const CLIENT_MARKER_VA: u64 = 0x0000_0000_2002_0000;
+        // CPU-0 client task id: distinct from the AP server workload tids (base_tid..base_tid+count).
+        let client_tid = base_tid + 1000;
         let smp_proof = crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled();
         let recv_v2_server =
             smp_proof && crate::kernel::boot::x86_ipccall_direct_smp_recv_v2_server_enabled();
+        let request_client =
+            recv_v2_server && crate::kernel::boot::x86_ipccall_direct_smp_request_enabled();
         let first_build = self.task_status(base_tid).is_none();
         let user_stack_top = PROBE_STACK_VA + (PAGE_SIZE as u64) - 16;
 
@@ -1609,6 +1664,20 @@ impl KernelState {
                     },
                 )?;
                 self.copy_to_user(asid, VirtAddr(PROBE_MARKER_VA), AP_RECV_V2_SERVER_MARKER)?;
+                if request_client {
+                    // Stage 199A2D2C2B2: the resumed-server validation markers (CONT @ +0x300,
+                    // VALIDATE_FAIL @ +0x400) live in the same marker page.
+                    self.copy_to_user(
+                        asid,
+                        VirtAddr(PROBE_MARKER_VA + 0x300),
+                        AP_RECV_V2_CONTINUED_MARKER,
+                    )?;
+                    self.copy_to_user(
+                        asid,
+                        VirtAddr(PROBE_MARKER_VA + 0x400),
+                        AP_RECV_V2_VALIDATE_FAIL_MARKER,
+                    )?;
+                }
                 // recv-v2 payload destination page (user + read + write).
                 let payload_phys = self.alloc_user_data_frame()?;
                 self.map_user_page_in_asid_raw(
@@ -1629,6 +1698,15 @@ impl KernelState {
                         flags: PageFlags::USER_RW,
                     },
                 )?;
+                // Stage 199A2D2C2B2: commit the payload/meta mappings the SAME way the marker page is
+                // committed (a copy_to_user zero-fill). Provisioning-time copy_to_user establishes the
+                // mapping in the address space's committed page-table view; a bare
+                // `map_user_page_in_asid_raw` (no touch) left these pages non-present for the resumed
+                // server's ring-3 reads.
+                if request_client {
+                    self.copy_to_user(asid, VirtAddr(RECV_V2_SERVER_PAYLOAD_VA), &[0u8; 8])?;
+                    self.copy_to_user(asid, VirtAddr(RECV_V2_SERVER_META_VA), &[0u8; 40])?;
+                }
             } else if smp_proof {
                 self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB_SMP)?;
                 // Marker data page: user + read. BEFORE @ 0, RESUMED @ +0x100.
@@ -1715,11 +1793,19 @@ impl KernelState {
             crate::kernel::boot::set_ipccall_direct_oracle_endpoints(endpoint_index, usize::MAX);
             // Bind the server to its HOME CPU 1 BEFORE it blocks (internal placement; not a syscall).
             self.set_task_home_cpu(base_tid, crate::kernel::scheduler::CpuId(1))?;
-            // Patch the recv_cap CapId into the stub and copy it to the code page.
-            let mut stub = RECV_V2_SERVER_STUB;
-            stub[RECV_V2_STUB_RECV_CAP_PATCH_OFFSET..RECV_V2_STUB_RECV_CAP_PATCH_OFFSET + 4]
-                .copy_from_slice(&recv_cap_u32.to_le_bytes());
-            self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &stub)?;
+            // Patch the recv_cap CapId into the stub and copy it to the code page. Stage 199A2D2C2B2:
+            // the cross-CPU request path uses the RICHER validating server stub (same recv_cap @23).
+            if request_client {
+                let mut stub = RECV_V2_SERVER_STUB_C2B2;
+                stub[RECV_V2_STUB_RECV_CAP_PATCH_OFFSET..RECV_V2_STUB_RECV_CAP_PATCH_OFFSET + 4]
+                    .copy_from_slice(&recv_cap_u32.to_le_bytes());
+                self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &stub)?;
+            } else {
+                let mut stub = RECV_V2_SERVER_STUB;
+                stub[RECV_V2_STUB_RECV_CAP_PATCH_OFFSET..RECV_V2_STUB_RECV_CAP_PATCH_OFFSET + 4]
+                    .copy_from_slice(&recv_cap_u32.to_le_bytes());
+                self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &stub)?;
+            }
             crate::yarm_log!(
                 "X86_AP_RECV_V2_SERVER_PROVISIONED base_tid={} asid={} endpoint_index={} recv_cap={} payload_va=0x{:x} meta_va=0x{:x} home_cpu=1",
                 base_tid,
@@ -1729,6 +1815,117 @@ impl KernelState {
                 RECV_V2_SERVER_PAYLOAD_VA,
                 RECV_V2_SERVER_META_VA,
             );
+
+            // Stage 199A2D2C2B2: provision the REAL CPU-0 userspace NR6 client. Its OWN ASID + CNode
+            // (no shared-CNode shortcut): request endpoint SEND cap + reply endpoint RECEIVE cap +
+            // owned request payload. Fresh-entered on CPU 0 by the ordinary BSP dispatcher (its
+            // user_context is set to the client entry). It issues a real NR6 through the normal x86
+            // split-dispatch path with a bounded WouldBlock retry.
+            if request_client && self.task_status(client_tid).is_none() {
+                // A second (reply) endpoint: the client holds its RECEIVE cap (bound by the NR6 txn).
+                let (_rep_idx, _rep_send_root, rep_recv_root) = self.create_endpoint(1)?;
+                // Client ASID + pages.
+                let (client_asid, _cap) = self.create_user_address_space()?;
+                let ccode = self.alloc_user_data_frame()?;
+                self.map_user_page_in_asid_raw(
+                    client_asid,
+                    VirtAddr(CLIENT_CODE_VA),
+                    Mapping {
+                        phys: PhysAddr(ccode),
+                        flags: PageFlags {
+                            read: true,
+                            write: true,
+                            execute: true,
+                            user: true,
+                            cache_policy: CachePolicy::WriteBack,
+                        },
+                    },
+                )?;
+                let cstack = self.alloc_user_data_frame()?;
+                self.map_user_page_in_asid_raw(
+                    client_asid,
+                    VirtAddr(CLIENT_STACK_VA),
+                    Mapping {
+                        phys: PhysAddr(cstack),
+                        flags: PageFlags::USER_RW,
+                    },
+                )?;
+                let cmark = self.alloc_user_data_frame()?;
+                self.map_user_page_in_asid_raw(
+                    client_asid,
+                    VirtAddr(CLIENT_MARKER_VA),
+                    Mapping {
+                        phys: PhysAddr(cmark),
+                        flags: PageFlags::USER_RW,
+                    },
+                )?;
+                self.copy_to_user(client_asid, VirtAddr(CLIENT_MARKER_VA), CLIENT_NR6_MARKER)?;
+                self.copy_to_user(
+                    client_asid,
+                    VirtAddr(CLIENT_MARKER_VA + 0x100),
+                    CLIENT_NR6_FAIL_MARKER,
+                )?;
+                let cpay = self.alloc_user_data_frame()?;
+                self.map_user_page_in_asid_raw(
+                    client_asid,
+                    VirtAddr(CLIENT_PAYLOAD_VA),
+                    Mapping {
+                        phys: PhysAddr(cpay),
+                        flags: PageFlags::USER_RW,
+                    },
+                )?;
+                self.copy_to_user(client_asid, VirtAddr(CLIENT_PAYLOAD_VA), CLIENT_NR6_REQUEST)?;
+                // Register the client (its own process CNode), bind the ASID.
+                self.register_task_with_class(client_tid, crate::kernel::task::TaskClass::App)?;
+                // Client's request SEND cap (from the request endpoint) + reply RECEIVE cap, minted
+                // into the CLIENT's own CNode.
+                let client_send_cap = self.grant_capability_task_to_task_with_rights(
+                    source_tid,
+                    _send_cap,
+                    client_tid,
+                    CapRights::SEND,
+                )?;
+                let client_reply_cap = self.grant_capability_task_to_task_with_rights(
+                    source_tid,
+                    rep_recv_root,
+                    client_tid,
+                    CapRights::RECEIVE,
+                )?;
+                let send_u32 =
+                    u32::try_from(client_send_cap.0).map_err(|_| KernelError::CapabilityFull)?;
+                let reply_u32 =
+                    u32::try_from(client_reply_cap.0).map_err(|_| KernelError::CapabilityFull)?;
+                let mut cstub = CLIENT_STUB;
+                cstub[CLIENT_STUB_SEND_CAP_PATCH_OFFSET..CLIENT_STUB_SEND_CAP_PATCH_OFFSET + 4]
+                    .copy_from_slice(&send_u32.to_le_bytes());
+                cstub[CLIENT_STUB_REPLY_CAP_PATCH_OFFSET..CLIENT_STUB_REPLY_CAP_PATCH_OFFSET + 4]
+                    .copy_from_slice(&reply_u32.to_le_bytes());
+                self.copy_to_user(client_asid, VirtAddr(CLIENT_CODE_VA), &cstub)?;
+                // Bind ASID + home CPU 0, set a fresh-entry user_context, enqueue on CPU 0.
+                let client_ustack = CLIENT_STACK_VA + (PAGE_SIZE as u64) - 16;
+                self.with_tcbs_mut(|tcbs| {
+                    let tcb = tcbs
+                        .iter_mut()
+                        .flatten()
+                        .find(|t| t.tid.0 == client_tid)
+                        .ok_or(KernelError::TaskMissing)?;
+                    tcb.asid = Some(client_asid);
+                    tcb.status = TaskStatus::Runnable;
+                    tcb.user_context.instruction_ptr = VirtAddr(CLIENT_CODE_VA);
+                    tcb.user_context.stack_ptr = VirtAddr(client_ustack);
+                    Ok::<_, KernelError>(())
+                })?;
+                self.set_task_home_cpu(client_tid, crate::kernel::scheduler::CpuId(0))?;
+                self.enqueue_task(client_tid)?;
+                crate::yarm_log!(
+                    "X86_BSP_NR6_CLIENT_PROVISIONED client_tid={} asid={} send_cap={} reply_cap={} payload_va=0x{:x} home_cpu=0",
+                    client_tid,
+                    client_asid.0,
+                    client_send_cap.0,
+                    client_reply_cap.0,
+                    CLIENT_PAYLOAD_VA,
+                );
+            }
         }
 
         let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)

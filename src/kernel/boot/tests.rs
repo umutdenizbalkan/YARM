@@ -81198,8 +81198,13 @@ mod stage199a2d2c2b1_guards {
     // (Part 5) It must NOT emit IPCCALL_DIRECT_SMP_REQUEST_OK (this stage delivers no request).
     #[test]
     fn marker_never_emits_request_ok() {
-        // The whole recv-v2-block path must not reference the request-ok retirement marker.
-        assert!(!MODRS.contains("IPCCALL_DIRECT_SMP_REQUEST_OK"));
+        // The recv-v2-block MARKER function must not reference the request-ok retirement marker
+        // (that belongs to the C2B2 delivery path, a separate function).
+        let start = MODRS
+            .find("fn maybe_emit_ipccall_direct_smp_server_blocked")
+            .unwrap();
+        let body = &MODRS[start..start + 1800];
+        assert!(!body.contains("IPCCALL_DIRECT_SMP_REQUEST_OK"));
         assert!(!EXEC.contains("IPCCALL_DIRECT_SMP_REQUEST_OK"));
         assert!(
             SMOKE.contains("IPCCALL_DIRECT_SMP_REQUEST_OK") // only as a NEGATIVE guard
@@ -81299,5 +81304,230 @@ mod stage199a2d2c2b1_guards {
         assert!(c1.contains("STAGE_199_X86_AP_GENERIC_RETURN_SEAL"));
         let c2a = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
         assert!(c2a.contains("STAGE_199_X86_AP_SAVED_RETURN_SEAL"));
+    }
+}
+
+// Stage 199A2D2C2B2 — LIVE cross-CPU NR6 request: CPU-0 client → CPU-1 recv-v2 resume. 19 guards.
+mod stage199a2d2c2b2_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        ipccall_direct_smp_request_delivered_count,
+        ipccall_direct_smp_request_early_wouldblock_count,
+        set_x86_ipccall_direct_smp_request_enabled, x86_ipccall_direct_smp_recv_v2_server_enabled,
+        x86_ipccall_direct_smp_request_active, x86_ipccall_direct_smp_request_enabled,
+    };
+
+    const EXEC: &str = include_str!("exec_state.rs");
+    const MODRS: &str = include_str!("mod.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const CMDLINE: &str = include_str!("../boot_command_line.rs");
+    const SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-request-smoke.sh");
+
+    // (3) The CPU-0 client invokes the REAL NR6 syscall (IpcCall NR 6) through the normal split path.
+    #[test]
+    fn client_invokes_real_nr6() {
+        assert!(EXEC.contains("const CLIENT_STUB: [u8; 97]"));
+        assert!(EXEC.contains("0xB8, 0x06, 0x00, 0x00, 0x00")); // mov eax,6
+        assert!(!EXEC.contains("ipc_call_direct_request_txn(")); // provisioning never calls the txn
+    }
+
+    // (2) An early NR6 WouldBlock is NON-MUTATING: the split path returns WouldBlock BEFORE any
+    // reservation/mint/copy/claim/enqueue/IPI when the ack is not yet claimable.
+    #[test]
+    fn early_wouldblock_is_non_mutating() {
+        assert!(SPLIT.contains("x86_ipccall_direct_smp_request_enabled()"));
+        assert!(SPLIT.contains("!crate::kernel::boot::ipccall_direct_ack::is_claimable()"));
+        assert!(SPLIT.contains("ipccall_direct_smp_request_note_early_wouldblock()"));
+        assert!(SPLIT.contains("SyscallError::WouldBlock.code()"));
+        let wb = SPLIT.find("note_early_wouldblock").unwrap();
+        let claim = SPLIT.find("ipccall_direct_ack::claim()").unwrap();
+        assert!(wb < claim, "early WouldBlock precedes any ack claim");
+    }
+
+    // (3/8) Bounded retry: MAX_REQUEST_ATTEMPTS <= 64 (the client stub caps attempts at 64).
+    #[test]
+    fn client_retry_is_bounded() {
+        assert!(EXEC.contains("0xFB, 0x40, 0x73")); // cmp ebx,64 ; jae fail
+    }
+
+    // (4) Exactly one committed delivery / post-work item is recorded per request.
+    #[test]
+    fn one_delivery_recorded() {
+        assert!(TXN.contains("ipccall_direct_smp_request_note_delivered()"));
+        assert!(MODRS.contains("fn ipccall_direct_smp_request_note_delivered"));
+    }
+
+    // (4) Server CNode capacity is independent of endpoint depth: the reply cap is minted into the
+    // server CNode by the accepted txn's `sr_mint_split`, not carved from endpoint depth.
+    #[test]
+    fn server_cnode_capacity_independent_of_endpoint_depth() {
+        assert!(EXEC.contains("self.create_endpoint(1)?"));
+        assert!(TXN.contains("sr_mint_split(server_cnode"));
+    }
+
+    // (5) The reply cap is minted into the EXACT server incarnation (identity-resolved cnode).
+    #[test]
+    fn reply_cap_minted_into_exact_server() {
+        assert!(TXN.contains("process_cnode_for_identity_split_read(ack.server)"));
+    }
+
+    // (6) recv-v2 result registers are cleared/completed BEFORE the receiver is set Runnable.
+    #[test]
+    fn recv_v2_result_completed_before_runnable() {
+        let clear = RUNTIME
+            .find("clear_blocked_recv_return_regs_locked(tcbs, tid)")
+            .unwrap();
+        // The relevant Runnable transition is the one in the same commit, AFTER the register clear.
+        let runnable = clear
+            + RUNTIME[clear..]
+                .find("tcb.status = TaskStatus::Runnable;")
+                .unwrap();
+        assert!(clear < runnable, "regs cleared before Runnable");
+    }
+
+    // (7) BlockedUnfinalized is never selected for a saved-frame resume (reuses the C2 substrate).
+    #[test]
+    fn blocked_unfinalized_never_selected() {
+        use crate::arch::x86_64::ap_sched::{
+            DispatchReject, SavedUserReturnFrame, TaskDispatchState, select_return_source,
+        };
+        let mut tf = crate::kernel::trapframe::TrapFrame::zeroed();
+        tf.saved_pc = 0x20000036;
+        tf.saved_sp = 0x20010ff0;
+        let saved = SavedUserReturnFrame::from_trap_frame(&tf, false);
+        assert_eq!(
+            select_return_source(TaskDispatchState::BlockedUnfinalized, None, Some(saved)),
+            Err(DispatchReject::NotFinalized)
+        );
+    }
+
+    // (8) The record becomes Available BEFORE the remote enqueue (accepted txn ordering).
+    #[test]
+    fn record_available_before_enqueue() {
+        let avail = TXN
+            .find("commit_direct_reply_record_split(idx, rgen)")
+            .unwrap();
+        let enq = TXN
+            .find("sr_enqueue_committed_receiver_split(ack.server.tid.0")
+            .unwrap();
+        assert!(avail < enq, "record Available before enqueue");
+    }
+
+    // (9) The enqueue occurs BEFORE the reschedule IPI (no fallible work after enqueue).
+    #[test]
+    fn enqueue_before_ipi() {
+        let enq = TXN.find("sr_enqueue_committed_receiver_split").unwrap();
+        let ipi = TXN.find("c2b2_send_reschedule_ipi_to_cpu1()").unwrap();
+        assert!(enq < ipi, "enqueue precedes the IPI");
+    }
+
+    // (10) The request-success path does NOT self-set CPU 1's reschedule-pending flag: the CPU-0 IPI
+    // sender only re-arms the dispatch REQUEST + sends the IPI.
+    #[test]
+    fn request_path_does_not_self_set_pending() {
+        assert!(SMP.contains("fn c2b2_send_reschedule_ipi_to_cpu1"));
+        // The IPI sender body (between its fn header and the next fn) must not set_reschedule_pending.
+        let start = SMP
+            .find("pub(crate) fn c2b2_send_reschedule_ipi_to_cpu1")
+            .unwrap();
+        let body = &SMP[start..start + 700];
+        assert!(
+            !body.contains("set_reschedule_pending"),
+            "IPI sender must not set pending"
+        );
+        assert!(SMP.contains("if !crate::kernel::boot::x86_ipccall_direct_smp_request_active() {"));
+    }
+
+    // (11) The CPU-1 side sets its reschedule-pending flag (0→1) on the IPI-driven wake.
+    #[test]
+    fn cpu1_side_sets_pending_on_wake() {
+        assert!(SMP.contains("super::ap_sched::set_reschedule_pending(cpu);"));
+        assert!(SMP.contains("X86_AP_RESCHEDULE_IPI_RECEIVED cpu="));
+    }
+
+    // (12) The asm interrupt vector performs NO dispatch (dispatch_in_handler=0).
+    #[test]
+    fn handler_performs_no_dispatch() {
+        assert!(SMP.contains("dispatch_in_handler=0"));
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(dt.contains("yarm_ap_remote_wake_stub:"));
+    }
+
+    // (13) CPU 1 selects the EXACT server from its OWN run queue, never a hardcoded TID or CPU 0.
+    #[test]
+    fn cpu1_selects_exact_server_from_own_queue() {
+        assert!(SMP.contains("k.dispatch_next_on_cpu(cpu)"));
+        assert!(SMP.contains("Some(t) if t == expected => t,"));
+    }
+
+    // (14) Task FS base comes from the server task's saved TLS state (never a constant).
+    #[test]
+    fn task_fs_from_server_state() {
+        assert!(EXEC.contains("let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);"));
+        assert!(SMP.contains("in(\"eax\") (fs_base & 0xFFFF_FFFF) as u32"));
+    }
+
+    // (15) The SAVED path (yarm_x86_resume_ring3), not a fresh entry, reaches the continuation.
+    #[test]
+    fn saved_path_reaches_continuation() {
+        assert!(SMP.contains("resume_user_mode_iret(&frame)"));
+        assert!(SMP.contains("AP_DISPATCH_COUNT[idx].load(Ordering::Acquire) >= 1"));
+    }
+
+    // (16) One successful request creates exactly one continuation (one-shot request-OK marker).
+    #[test]
+    fn one_request_one_continuation() {
+        assert!(MODRS.contains("fn maybe_emit_ipccall_direct_smp_request_ok"));
+        assert!(MODRS.contains("if EMITTED.swap(true, Ordering::AcqRel)"));
+        assert!(MODRS.contains("msg.starts_with(\"X86_AP_RECV_V2_CONTINUED\")"));
+        assert!(MODRS.contains("ipccall_direct_smp_request_delivered_count() < 1"));
+    }
+
+    // (17) A duplicate IPI or duplicate drain cannot duplicate delivery.
+    #[test]
+    fn duplicate_ipi_or_drain_cannot_duplicate() {
+        assert!(TXN.contains("LeaseNotClaimed"));
+        assert!(SMP.contains("C2B2_RESCHEDULE_IPI_RECEIVED.fetch_add(1, Ordering::AcqRel)"));
+    }
+
+    // (18/19) B1 + C2A seals remain valid; the cross_cpu=0/result=blocked diagnostic cannot satisfy
+    // the cross-CPU success seal (which requires cross_cpu=1 + the full ordered live sequence).
+    #[test]
+    fn prior_seals_intact_and_blocked_diagnostic_excluded() {
+        let b1 = include_str!("../../../scripts/qemu-x86_64-ap-recv-v2-block-smoke.sh");
+        assert!(b1.contains("STAGE_199_X86_AP_RECV_V2_BLOCK_SEAL"));
+        let c2a = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
+        assert!(c2a.contains("STAGE_199_X86_AP_SAVED_RETURN_SEAL"));
+        assert!(
+            SMOKE.contains("IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0 receiver_cpu=1 cross_cpu=1")
+        );
+        assert!(SMOKE.contains("X86_AP_RECV_V2_CONTINUED cpu=1"));
+        assert!(
+            SMOKE.contains("STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 pairs=1")
+        );
+    }
+
+    // (selector) The C2B2 sub-selector is default-off, implies the recv-v2 server, marks the request
+    // path active, and the knob is parsed; attempt/delivery counters exist.
+    #[test]
+    fn sub_selector_wires_server_and_active_flag() {
+        assert!(!x86_ipccall_direct_smp_request_enabled(), "default off");
+        set_x86_ipccall_direct_smp_request_enabled(true);
+        assert!(x86_ipccall_direct_smp_request_enabled());
+        assert!(
+            x86_ipccall_direct_smp_recv_v2_server_enabled(),
+            "implies the recv-v2 server"
+        );
+        assert!(
+            x86_ipccall_direct_smp_request_active(),
+            "marks the request path active"
+        );
+        set_x86_ipccall_direct_smp_request_enabled(false);
+        assert!(CMDLINE.contains("yarm.x86_64_ipccall_direct_smp_request"));
+        let _ = ipccall_direct_smp_request_early_wouldblock_count();
+        let _ = ipccall_direct_smp_request_delivered_count();
     }
 }

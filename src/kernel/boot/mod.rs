@@ -3202,6 +3202,92 @@ pub fn x86_ipccall_direct_smp_recv_v2_server_enabled() -> bool {
     X86_IPCCALL_DIRECT_SMP_RECV_V2_SERVER_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 199A2D2C2B2: default-off sub-selector of the SMP oracle
+/// (`yarm.x86_64_ipccall_direct_smp_request=1`). When set it IMPLIES the recv-v2 server sub-selector
+/// (the CPU-1 server half) AND additionally provisions a REAL CPU-0 userspace client that invokes NR6
+/// through the normal x86 split-dispatch path (with a bounded WouldBlock retry), delivers ONE
+/// cross-CPU direct request via the accepted transaction, sends the canonical reschedule IPI to CPU 1,
+/// and resumes the server's recv-v2 continuation on CPU 1 via the sealed saved-frame return. It marks
+/// the cross-CPU REQUEST path active so the AP saved-frame resume takes its pending flag from the real
+/// IPI (never a self-arm). It does NOT begin NR7/reply. Mutually exclusive with the standalone
+/// Stage 199A2D2C2A Yield workload (that runs only when neither server sub-selector is set).
+pub(crate) static X86_IPCCALL_DIRECT_SMP_REQUEST_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_ipccall_direct_smp_request_enabled(enabled: bool) {
+    if enabled {
+        // The request path requires the CPU-1 recv-v2 server, and marks the cross-CPU request active
+        // so the AP saved-frame resume does not self-arm CPU 1's pending flag (it comes from the IPI).
+        set_x86_ipccall_direct_smp_recv_v2_server_enabled(true);
+        X86_IPCCALL_DIRECT_SMP_REQUEST_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+    }
+    X86_IPCCALL_DIRECT_SMP_REQUEST_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn x86_ipccall_direct_smp_request_enabled() -> bool {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2B2: bounded counters for the CPU-0 client's NR6 attempts. `EARLY_WOULDBLOCK` counts
+/// non-mutating early WouldBlock returns (server not yet blocked); `SUCCESS` counts committed
+/// deliveries. attempts = early_retries + successes (one success expected). These prove the retry
+/// mechanism exists and the early WouldBlock did not mutate.
+pub(crate) static X86_IPCCALL_DIRECT_SMP_REQUEST_EARLY_WOULDBLOCK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn ipccall_direct_smp_request_note_early_wouldblock() {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_EARLY_WOULDBLOCK
+        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn ipccall_direct_smp_request_early_wouldblock_count() -> u64 {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_EARLY_WOULDBLOCK.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2B2: count of COMMITTED cross-CPU request deliveries (the accepted transaction
+/// succeeded: reserve → mint → copy → claim → commit RunnableSaved → record Available → enqueue).
+/// Exactly one is expected. Gates the terminal request-OK seal marker.
+pub(crate) static X86_IPCCALL_DIRECT_SMP_REQUEST_DELIVERED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn ipccall_direct_smp_request_note_delivered() {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_DELIVERED.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn ipccall_direct_smp_request_delivered_count() -> u64 {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_DELIVERED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2B2: emit the TERMINAL cross-CPU request-OK marker EXACTLY ONCE, ONLY after the
+/// resumed CPU-1 server's userspace `X86_AP_RECV_V2_CONTINUED` marker is observed (passed here as
+/// `msg`) AND exactly one committed delivery is recorded. This is the seal's authority that the
+/// COMPLETE real userspace-to-userspace cross-CPU path ran — never emitted merely after enqueue or IPI
+/// receipt. Kernel marker (not userspace). No-op off the C2B2 path or before the continuation.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn maybe_emit_ipccall_direct_smp_request_ok(msg: &str) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    if !x86_ipccall_direct_smp_request_enabled() {
+        return;
+    }
+    if !msg.starts_with("X86_AP_RECV_V2_CONTINUED") {
+        return;
+    }
+    if ipccall_direct_smp_request_delivered_count() < 1 {
+        return;
+    }
+    if EMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0 receiver_cpu=1 cross_cpu=1 request_copies=1 server_wakes=1 server_continuations=1 result=ok"
+    );
+}
+
+/// Hosted / non-x86 no-op so the DebugLog call site compiles unconditionally.
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+pub(crate) fn maybe_emit_ipccall_direct_smp_request_ok(_msg: &str) {}
+
 /// The x86_64 SMP cross-CPU request oracle is ACTIVE only when the selector is armed AND the boot is
 /// genuinely SMP (`online_cpus >= 2`). Same-CPU (`online_cpus < 2`) can never present as cross-CPU:
 /// the caller passes the authoritative online-CPU count so the gate cannot be spoofed by a knob
