@@ -22,6 +22,7 @@ pub mod smp;
 pub mod syscall;
 pub mod syscall_split;
 pub mod task;
+pub mod terminal_ownership;
 pub mod time;
 pub mod topology;
 pub mod trap;

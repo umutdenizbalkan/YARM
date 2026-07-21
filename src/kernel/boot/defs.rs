@@ -324,6 +324,17 @@ pub(crate) struct IpcSubsystem {
     pub(crate) active_transfer_mappings: [Option<ActiveTransferMapping>; MAX_TRANSFER_ENVELOPES],
     pub(crate) reply_caps: [Option<ReplyCapRecord>; MAX_REPLY_CAPS],
     pub(crate) reply_cap_generations: [u64; MAX_REPLY_CAPS],
+    /// Stage 200A — the SINGLE persistent terminal-ownership authority store,
+    /// co-located with (and indexed identically to) `reply_caps`. Every terminal
+    /// outcome of a caller blocked on its reply endpoint — reply, timeout, peer
+    /// death, caller exit and endpoint destruction — claims through the SAME cell
+    /// for its record slot (`authority_stores = 1`; there is NO second timeout or
+    /// peer-death table). The accepted NR7 reply reservation is expressed as one
+    /// terminal claimant, not a competing authority. Dormant in production this
+    /// stage (no live path arms it yet — see the Stage 200A hosted mechanism seal);
+    /// later stages wire the live reserve/reply/timeout/exit paths onto it.
+    pub(crate) reply_terminal_ownership:
+        [crate::kernel::terminal_ownership::TerminalCell; MAX_REPLY_CAPS],
     /// Stage 198E2A1: bounded generation-bearing cancellation requests for in-flight shared-region
     /// transactions (executor-owned cleanup protocol). Not a queue/CNode/ABI capacity — an internal
     /// signal table matched by (receiver TID **and** ASID).
