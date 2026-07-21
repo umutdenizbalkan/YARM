@@ -81670,3 +81670,28 @@ mod stage199a2d2c2b3_guards {
         assert!(!EXEC.contains("ipc_reply_direct"));
     }
 }
+
+// Stage 199A2D2C2C (item 11/13) — permanent x86 user-entry EFER SCE|NXE parity guard.
+mod stage199a2d2c2c_efer_parity {
+    const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    // Every x86 CPU that can enter ring 3 runs configure_syscall_msrs_for_self, which requires BOTH
+    // SCE and NXE and fails closed (halt) otherwise — the same requirement for the BSP and every AP.
+    #[test]
+    fn user_entry_requires_sce_and_nxe() {
+        assert!(DT.contains("efer |= IA32_EFER_SCE | IA32_EFER_NXE;"));
+        assert!(DT.contains("let sce = (efer_back & IA32_EFER_SCE) != 0;"));
+        assert!(DT.contains("let nxe = (efer_back & IA32_EFER_NXE) != 0;"));
+        assert!(DT.contains("if !(sce && nxe) {"));
+        assert!(DT.contains("X86_EFER_USER_ENTRY_PARITY_FAIL"));
+        assert!(DT.contains("halt_forever();"));
+    }
+
+    // The parity guard emits a per-CPU attestation (BSP + AP) and does NOT clear NX from data pages.
+    #[test]
+    fn parity_guard_attests_and_keeps_nx() {
+        assert!(DT.contains("X86_EFER_USER_ENTRY_OK cpu={} sce=1 nxe=1 result=ok"));
+        // NXE stays a hard requirement; the fix never masks faults by dropping the NX bit.
+        assert!(DT.contains("const IA32_EFER_NXE: u64 = 1 << 11;"));
+    }
+}

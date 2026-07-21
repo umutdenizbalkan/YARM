@@ -381,6 +381,33 @@ pub(crate) fn configure_syscall_msrs_for_self() {
     write_msr(IA32_STAR_MSR, star);
     write_msr(IA32_LSTAR_MSR, yarm_x86_lstar_entry as *const () as u64);
     write_msr(IA32_FMASK_MSR, RFLAGS_IF_MASK);
+    // Stage 199A2D2C2C: PERMANENT user-entry parity guard. EVERY x86 CPU that can enter ring 3 runs
+    // this before loading user mappings that contain NX PTEs, so read EFER back and REQUIRE both SCE
+    // and NXE. A CPU that reached ring 3 without NXE would take reserved-bit #PFs on every NX data
+    // page (the Stage 199A2D2C2B3 AP defect) — fail closed instead of masking it by clearing NX. The
+    // BSP (early boot asm) and every AP share this identical requirement.
+    let efer_back = read_msr(IA32_EFER_MSR);
+    let sce = (efer_back & IA32_EFER_SCE) != 0;
+    let nxe = (efer_back & IA32_EFER_NXE) != 0;
+    let cpu = current_cpu_id();
+    if !(sce && nxe) {
+        crate::yarm_log!(
+            "X86_EFER_USER_ENTRY_PARITY_FAIL cpu={} sce={} nxe={} efer=0x{:x}",
+            cpu.0,
+            sce as u8,
+            nxe as u8,
+            efer_back
+        );
+        halt_forever();
+    }
+    static EFER_PARITY_OK: [core::sync::atomic::AtomicBool;
+        crate::arch::platform_constants::MAX_CPUS] =
+        [const { core::sync::atomic::AtomicBool::new(false) };
+            crate::arch::platform_constants::MAX_CPUS];
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    if !EFER_PARITY_OK[idx].swap(true, core::sync::atomic::Ordering::AcqRel) {
+        crate::yarm_log!("X86_EFER_USER_ENTRY_OK cpu={} sce=1 nxe=1 result=ok", cpu.0);
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
