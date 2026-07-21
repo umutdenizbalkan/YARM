@@ -2466,7 +2466,12 @@ pub(crate) fn ap_sched_next_or_idle(shared: &crate::runtime::SharedKernel, cpu: 
     // saved). Do exactly ONE saved-frame resume of it — the idle dispatcher selecting a RunnableSaved
     // task from CPU 1's real run queue and returning through the canonical saved-frame `iretq`. This
     // is a SECOND dispatch of the SAME task via the SAVED path (never a fresh re-entry).
+    // Stage 199A2D2C2B1: the recv-v2-server sub-selector must NOT attempt a saved-frame resume — the
+    // server has to STAY blocked (BlockedUnfinalized), absent from every runqueue, with no premature
+    // wake or continuation this stage. Skip the resume entirely (it would re-enqueue + re-select the
+    // task). The C2A Yield proof (sub-selector off) keeps the one-shot saved-frame resume unchanged.
     if crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled()
+        && !crate::kernel::boot::x86_ipccall_direct_smp_recv_v2_server_enabled()
         && !AP_SAVED_RESUME_DONE[idx].swap(true, Ordering::AcqRel)
     {
         ap_saved_frame_resume(shared, cpu);

@@ -3182,6 +3182,26 @@ pub fn x86_ipccall_direct_smp_request_active() -> bool {
     X86_IPCCALL_DIRECT_SMP_REQUEST_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 199A2D2C2B1: default-off sub-selector of the SMP oracle
+/// (`yarm.x86_64_ipccall_direct_smp_recv_v2_server=1`). When set (AND the SMP oracle is armed) the
+/// single AP workload becomes a REAL recv-v2 IPC server: it provisions a request endpoint + a RECEIVE
+/// cap in the server's own CNode + payload/meta buffers, and its userspace stub issues a genuine
+/// recv-v2 syscall that blocks on CPU 1 (committing a saved continuation + publishing the
+/// authoritative blocked-server acknowledgement). When UNSET the workload stays the Stage 199A2D2C2A
+/// Yield saved-frame proof (so that seal is untouched). This sub-selector does NOT deliver an NR6
+/// request, wake the server, or arm the functional x86 flag — it proves the server-block half only.
+pub(crate) static X86_IPCCALL_DIRECT_SMP_RECV_V2_SERVER_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_ipccall_direct_smp_recv_v2_server_enabled(enabled: bool) {
+    X86_IPCCALL_DIRECT_SMP_RECV_V2_SERVER_ENABLED
+        .store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn x86_ipccall_direct_smp_recv_v2_server_enabled() -> bool {
+    X86_IPCCALL_DIRECT_SMP_RECV_V2_SERVER_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// The x86_64 SMP cross-CPU request oracle is ACTIVE only when the selector is armed AND the boot is
 /// genuinely SMP (`online_cpus >= 2`). Same-CPU (`online_cpus < 2`) can never present as cross-CPU:
 /// the caller passes the authoritative online-CPU count so the gate cannot be spoofed by a knob
@@ -3572,7 +3592,61 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
         meta_user_ptr: state.meta_user_ptr,
         meta_user_len: state.meta_user_len,
     };
-    let _seq = ipccall_direct_ack::publish(ack);
+    let seq = ipccall_direct_ack::publish(ack);
+    // Stage 199A2D2C2B1: emit the AUTHORITATIVE cross-CPU blocked-server marker EXACTLY ONCE, only
+    // for the x86_64 SMP oracle's CPU-1 recv-v2 server, and ONLY once every authoritative
+    // blocking-order condition has committed: the saved continuation is captured, the exact endpoint
+    // waiter equals the server, the server is absent from every runqueue, its home CPU is 1, and the
+    // ack has published. Not a userspace log — a kernel marker. Never emits IPCCALL_DIRECT_SMP_
+    // REQUEST_OK (this stage does not deliver a request).
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    maybe_emit_ipccall_direct_smp_server_blocked(kernel, receiver_tid, index, generation, seq);
+    let _ = seq;
+}
+
+/// Stage 199A2D2C2B1: one-shot authoritative `IPCCALL_DIRECT_SMP_SERVER_BLOCKED` marker for the
+/// x86_64 SMP oracle CPU-1 recv-v2 server. Fires at most once per boot, only when the SMP oracle is
+/// armed and every blocking-order invariant is independently re-verified here against authoritative
+/// committed state (never trusting the caller): the server has a committed saved frame, it is absent
+/// from all runqueues (BlockedUnfinalized / not re-selectable), its home CPU is 1, the exact endpoint
+/// waiter identity still equals the server, and the ack sequence is live. A strict no-op otherwise.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn maybe_emit_ipccall_direct_smp_server_blocked(
+    kernel: &KernelState,
+    receiver_tid: u64,
+    endpoint_index: usize,
+    endpoint_generation: u64,
+    ack_seq: u64,
+) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    if !x86_ipccall_direct_smp_oracle_enabled() {
+        return;
+    }
+    // Independent re-verification of every authoritative condition.
+    let saved_frame = kernel.task_has_saved_frame(receiver_tid);
+    let absent_from_runqueue = !kernel.task_present_in_any_runqueue(receiver_tid);
+    let home_cpu_1 = kernel.task_home_cpu(receiver_tid) == Some(crate::kernel::scheduler::CpuId(1));
+    let Some(asid) = kernel.task_asid(receiver_tid) else {
+        return;
+    };
+    let server = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
+    let waiter_exact =
+        kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(endpoint_index)) == Some(server);
+    let ack_published = ipccall_direct_ack::commit_seq() == ack_seq && ack_seq != 0;
+    if !(saved_frame && absent_from_runqueue && home_cpu_1 && waiter_exact && ack_published) {
+        return;
+    }
+    if EMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1 recv_v2_committed=1 saved_frame=1 waiter_exact=1 ack_published=1 absent_from_runqueue=1 server_tid={} server_asid={} endpoint_index={} endpoint_generation={} result=ok",
+        receiver_tid,
+        asid.0,
+        endpoint_index,
+        endpoint_generation,
+    );
 }
 
 /// Stage 199A2B3: single-slot committed blocked-CALLER acknowledgement for the NR7

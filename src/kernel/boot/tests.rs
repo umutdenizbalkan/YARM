@@ -81052,11 +81052,11 @@ mod stage199a2d2c2b_guards {
             smp.contains("one-shot per-CPU latch"),
             "documented as a one-shot oracle latch"
         );
-        // It is gated behind the SMP oracle, not the generic dispatch path.
+        // It is gated behind the SMP oracle, not the generic dispatch path (the recv-v2-server
+        // sub-selector adds an intervening skip condition in Stage 199A2D2C2B1).
         assert!(
-            smp.contains(
-                "x86_ipccall_direct_smp_oracle_enabled()\n        && !AP_SAVED_RESUME_DONE"
-            )
+            smp.contains("x86_ipccall_direct_smp_oracle_enabled()")
+                && smp.contains("&& !AP_SAVED_RESUME_DONE")
         );
     }
 
@@ -81097,6 +81097,204 @@ mod stage199a2d2c2b_guards {
         assert!(req.contains("X86_AP_RECV_V2_CONTINUED cpu=1"));
         assert!(req.contains("cross_cpu=0") && req.contains("result=blocked"));
         // The C1 fresh-entry + C2A saved-return seals are independent + intact.
+        let c1 = include_str!("../../../scripts/qemu-x86_64-ap-generic-return-smoke.sh");
+        assert!(c1.contains("STAGE_199_X86_AP_GENERIC_RETURN_SEAL"));
+        let c2a = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
+        assert!(c2a.contains("STAGE_199_X86_AP_SAVED_RETURN_SEAL"));
+    }
+}
+
+// Stage 199A2D2C2B1 — LIVE CPU-1 recv-v2 server block + authoritative blocked-server ack. 15 guards.
+mod stage199a2d2c2b1_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        set_x86_ipccall_direct_smp_recv_v2_server_enabled,
+        x86_ipccall_direct_smp_recv_v2_server_enabled,
+    };
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const EXEC: &str = include_str!("exec_state.rs");
+    const MODRS: &str = include_str!("mod.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const CMDLINE: &str = include_str!("../boot_command_line.rs");
+    const SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-ap-recv-v2-block-smoke.sh");
+
+    // (Part 2) The recv-v2 server stub issues a GENUINE recv-v2 syscall (IpcRecv NR 2) with a
+    // recv_cap patched in — not a fixture or boot-code substitution.
+    #[test]
+    fn recv_v2_server_stub_issues_real_recv_v2_syscall() {
+        assert!(EXEC.contains("const RECV_V2_SERVER_STUB: [u8; 56]"));
+        // mov eax, 2 (IpcRecv NR) followed later by syscall (0F 05); recv_cap patch site.
+        assert!(EXEC.contains("0xB8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2"));
+        assert!(EXEC.contains("const RECV_V2_STUB_RECV_CAP_PATCH_OFFSET: usize = 23;"));
+        assert!(EXEC.contains("stub[RECV_V2_STUB_RECV_CAP_PATCH_OFFSET"));
+    }
+
+    // (Part 2) The server emits the userspace entry marker exactly (len 46).
+    #[test]
+    fn recv_v2_server_marker_string_is_canonical() {
+        assert!(EXEC.contains("b\"X86_AP_RECV_V2_SERVER_ENTERED cpu=1 result=ok\\n\""));
+        assert!(EXEC.contains("assert!(AP_RECV_V2_SERVER_MARKER.len() == 46)"));
+    }
+
+    // (Part 1) The RECEIVE cap is minted into the SERVER's OWN process CNode (no shared-CNode
+    // shortcut) — via the attenuated grant to base_tid with RECEIVE rights.
+    #[test]
+    fn server_recv_cap_minted_into_own_cnode() {
+        assert!(EXEC.contains("grant_capability_task_to_task_with_rights("));
+        assert!(EXEC.contains("base_tid,\n                CapRights::RECEIVE,"));
+    }
+
+    // (Part 1) Exactly the request endpoint is armed for the ack (reply endpoint sentinel unused).
+    #[test]
+    fn oracle_request_endpoint_armed() {
+        assert!(EXEC.contains("set_ipccall_direct_oracle_endpoints(endpoint_index, usize::MAX)"));
+        // Endpoint depth 1 = one reply-cap slot capacity.
+        assert!(EXEC.contains("self.create_endpoint(1)?"));
+    }
+
+    // (Part 1 / 4) The server is bound to home CPU 1 BEFORE it blocks.
+    #[test]
+    fn server_home_cpu_bound_to_1() {
+        assert!(
+            EXEC.contains("self.set_task_home_cpu(base_tid, crate::kernel::scheduler::CpuId(1))")
+        );
+    }
+
+    // (Part 1) Payload + IpcRecvMetaV2 destination buffers are provisioned (distinct pages).
+    #[test]
+    fn payload_and_meta_buffers_provisioned() {
+        assert!(EXEC.contains("const RECV_V2_SERVER_PAYLOAD_VA: u64 = 0x0000_0000_2003_0000;"));
+        assert!(EXEC.contains("const RECV_V2_SERVER_META_VA: u64 = 0x0000_0000_2004_0000;"));
+    }
+
+    // (Part 4/5) The marker independently re-verifies EVERY authoritative condition before emitting —
+    // never trusting the caller.
+    #[test]
+    fn marker_reverifies_every_committed_condition() {
+        assert!(MODRS.contains("fn maybe_emit_ipccall_direct_smp_server_blocked("));
+        assert!(MODRS.contains("let saved_frame = kernel.task_has_saved_frame(receiver_tid);"));
+        assert!(MODRS.contains(
+            "let absent_from_runqueue = !kernel.task_present_in_any_runqueue(receiver_tid);"
+        ));
+        assert!(MODRS.contains("== Some(crate::kernel::scheduler::CpuId(1));"));
+        assert!(MODRS.contains("let waiter_exact ="));
+        assert!(MODRS.contains("endpoint_waiter_identity(endpoint_index)) == Some(server)"));
+        assert!(MODRS.contains("let ack_published = ipccall_direct_ack::commit_seq() == ack_seq"));
+        assert!(MODRS.contains(
+            "if !(saved_frame && absent_from_runqueue && home_cpu_1 && waiter_exact && ack_published)"
+        ));
+    }
+
+    // (Part 5) The marker is emitted EXACTLY once (one-shot latch).
+    #[test]
+    fn marker_is_one_shot() {
+        assert!(MODRS.contains("static EMITTED: AtomicBool = AtomicBool::new(false);"));
+        assert!(MODRS.contains("if EMITTED.swap(true, Ordering::AcqRel) {"));
+        assert!(MODRS.contains("IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1"));
+    }
+
+    // (Part 5) It must NOT emit IPCCALL_DIRECT_SMP_REQUEST_OK (this stage delivers no request).
+    #[test]
+    fn marker_never_emits_request_ok() {
+        // The whole recv-v2-block path must not reference the request-ok retirement marker.
+        assert!(!MODRS.contains("IPCCALL_DIRECT_SMP_REQUEST_OK"));
+        assert!(!EXEC.contains("IPCCALL_DIRECT_SMP_REQUEST_OK"));
+        assert!(
+            SMOKE.contains("IPCCALL_DIRECT_SMP_REQUEST_OK") // only as a NEGATIVE guard
+            && SMOKE.contains("request-ok emitted")
+        );
+    }
+
+    // (Part 6) The recv-v2 server must STAY blocked — the AP saved-frame resume is skipped for it.
+    #[test]
+    fn recv_v2_server_declines_saved_frame_resume() {
+        assert!(
+            SMP.contains(
+                "&& !crate::kernel::boot::x86_ipccall_direct_smp_recv_v2_server_enabled()"
+            )
+        );
+    }
+
+    // (Part 6) `task_present_in_any_runqueue` is authoritative: false for a blocked task, true for a
+    // runnable enqueued task. This is the absent-from-runqueue proof the marker asserts.
+    #[test]
+    fn absent_from_runqueue_query_is_authoritative() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(7).expect("register");
+            // Not yet enqueued anywhere → absent.
+            assert!(!s.task_present_in_any_runqueue(7), "unenqueued task absent");
+            s.enqueue_task(7).expect("enqueue");
+            assert!(
+                s.task_present_in_any_runqueue(7),
+                "enqueued task present in a run queue"
+            );
+            // Dispatch it to `current` (still present via the current slot).
+            let placed = s.dispatch_next_on_cpu(CpuId(0));
+            assert_eq!(placed, Some(7), "server dispatches to current on CPU 0");
+            assert!(
+                s.task_present_in_any_runqueue(7),
+                "current task counts as present"
+            );
+            // Block it off CPU 0 (recv-v2 block semantics): removed from queue AND current.
+            let blocked = s.block_current_on_cpu(CpuId(0));
+            assert_eq!(blocked, Some(7));
+            assert!(
+                !s.task_present_in_any_runqueue(7),
+                "blocked task absent from all runqueues"
+            );
+        });
+    }
+
+    // (Part 7 support) The recv-v2-server sub-selector is DEFAULT-OFF and only meaningful under the
+    // SMP oracle (the workload local requires smp_proof AND this sub-selector).
+    #[test]
+    fn sub_selector_default_off_and_requires_oracle() {
+        assert!(
+            !x86_ipccall_direct_smp_recv_v2_server_enabled(),
+            "default off"
+        );
+        set_x86_ipccall_direct_smp_recv_v2_server_enabled(true);
+        assert!(x86_ipccall_direct_smp_recv_v2_server_enabled());
+        set_x86_ipccall_direct_smp_recv_v2_server_enabled(false);
+        // The workload only becomes a recv-v2 server when the SMP oracle is ALSO on.
+        assert!(EXEC.contains("let recv_v2_server ="));
+        assert!(EXEC.contains(
+            "smp_proof && crate::kernel::boot::x86_ipccall_direct_smp_recv_v2_server_enabled();"
+        ));
+    }
+
+    // (Part 7) The knob is parsed and stored (default-off Option).
+    #[test]
+    fn knob_is_parsed() {
+        assert!(CMDLINE.contains("yarm.x86_64_ipccall_direct_smp_recv_v2_server"));
+        assert!(CMDLINE.contains("pub x86_64_ipccall_direct_smp_recv_v2_server: Option<bool>"));
+    }
+
+    // (Part 9) The seal requires the full ordered live sequence AND proves NO premature wake/
+    // continuation; the wrong-CPU block is a hard stop.
+    #[test]
+    fn seal_requires_full_ordered_live_sequence() {
+        assert!(SMOKE.contains("X86_AP_ONLINE cpu=1"));
+        assert!(SMOKE.contains("X86_AP_GENERIC_DISPATCH_OK cpu=1 mode=fresh"));
+        assert!(SMOKE.contains("X86_AP_RECV_V2_SERVER_ENTERED cpu=1"));
+        assert!(SMOKE.contains(
+            "IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1 recv_v2_committed=1 saved_frame=1 waiter_exact=1 ack_published=1 absent_from_runqueue=1"
+        ));
+        assert!(SMOKE.contains("premature saved-frame dispatch"));
+        assert!(SMOKE.contains("server blocked on wrong CPU (0)"));
+        assert!(SMOKE.contains(
+            "STAGE_199_X86_AP_RECV_V2_BLOCK_SEAL arch=x86_64 smp=2 server_cpu=1 real_syscall=1 blocked_commits=1 ack_publications=1 premature_wakes=0 premature_continuations=0 wrong_cpu_blocks=0 result=ok"
+        ));
+    }
+
+    // (Preserve) The C1/C2A/C2B seals + the C2A Yield stub remain untouched by this sub-selector.
+    #[test]
+    fn prior_seals_and_yield_stub_intact() {
+        // The Yield saved-frame proof stub is still present (recv-v2 server does not replace it).
+        assert!(EXEC.contains("const PROBE_STUB_SMP: [u8; 64]"));
         let c1 = include_str!("../../../scripts/qemu-x86_64-ap-generic-return-smoke.sh");
         assert!(c1.contains("STAGE_199_X86_AP_GENERIC_RETURN_SEAL"));
         let c2a = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");

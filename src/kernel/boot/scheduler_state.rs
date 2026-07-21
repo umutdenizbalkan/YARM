@@ -288,6 +288,16 @@ impl KernelState {
         self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).runnable_count_on(cpu))
     }
 
+    /// Stage 199A2D2C2B1: true iff `tid` is present in any CPU's run queue or as any
+    /// CPU's dispatched current task. A blocked recv-v2 server must return `false`
+    /// (absent from all runqueues) before its blocked-server acknowledgement is
+    /// published — the authoritative no-premature-re-selection proof.
+    pub(crate) fn task_present_in_any_runqueue(&self, tid: u64) -> bool {
+        self.with_scheduler_state(|sched| {
+            kernel_ref(&sched.scheduler).task_present_anywhere(ThreadId(tid))
+        })
+    }
+
     /// Inspect TCB status and return the wake plan without mutating any state.
     ///
     /// Returns `SchedulerWakePlan::Wake(tid)` when the task is in a state that

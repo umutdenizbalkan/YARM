@@ -1537,7 +1537,41 @@ impl KernelState {
             0x0F, 0x05, // syscall
             0xEB, 0xFE, // jmp .
         ];
+        // Stage 199A2D2C2B1: when the recv-v2-server sub-selector is armed the SMP AP workload is a
+        // REAL IPC server instead of the C2A Yield proof. Its stub (a) emits the userspace marker
+        // X86_AP_RECV_V2_SERVER_ENTERED, then (b) issues a GENUINE recv-v2 syscall (NR 2) on the
+        // provisioned request-endpoint RECEIVE cap with payload+meta destinations — which blocks on
+        // CPU 1 (no message waiting), committing a saved continuation and publishing the authoritative
+        // blocked-server acknowledgement. The recv_cap CapId is patched in at provisioning time (the
+        // 4 bytes at offset 23). x86-64 SYSCALL passes recv-v2 arg3 (meta ptr) in R10, arg4 (meta len)
+        // in R8, arg5 (flags) in R9 — the LSTAR entry copies R10 into the RCX/arg3 slot.
+        const AP_RECV_V2_SERVER_MARKER: &[u8] = b"X86_AP_RECV_V2_SERVER_ENTERED cpu=1 result=ok\n";
+        const _: () = assert!(AP_RECV_V2_SERVER_MARKER.len() == 46); // 0x2E
+        const RECV_V2_SERVER_PAYLOAD_VA: u64 = 0x0000_0000_2003_0000;
+        const RECV_V2_SERVER_META_VA: u64 = 0x0000_0000_2004_0000;
+        // Base recv-v2 server stub (recv_cap bytes at offset 23..27 are zero here, patched later).
+        // 56 bytes; the post-recv-v2 continuation RIP = PROBE_CODE_VA + 54 (the `jmp .`).
+        const RECV_V2_SERVER_STUB: [u8; 56] = [
+            0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax, 15            (DebugLog NR)
+            0xBF, 0x00, 0x00, 0x02, 0x20, // mov edi, 0x20020000    (SERVER_ENTERED ptr)
+            0xBE, 0x2E, 0x00, 0x00, 0x00, // mov esi, 46            (SERVER_ENTERED len)
+            0x0F, 0x05, // syscall  (DebugLog SERVER_ENTERED)
+            0xB8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2             (IpcRecv NR)
+            0xBF, 0x00, 0x00, 0x00,
+            0x00, // mov edi, <recv_cap>    (arg0 = recv_cap; PATCHED @23)
+            0xBE, 0x00, 0x00, 0x03, 0x20, // mov esi, 0x20030000    (arg1 = payload ptr)
+            0xBA, 0x08, 0x00, 0x00, 0x00, // mov edx, 8             (arg2 = payload len)
+            0x41, 0xBA, 0x00, 0x00, 0x04, 0x20, // mov r10d, 0x20040000 (arg3 = meta ptr)
+            0x41, 0xB8, 0x28, 0x00, 0x00, 0x00, // mov r8d, 40      (arg4 = meta len = 40)
+            0x45, 0x31, 0xC9, // xor r9d, r9d                       (arg5 = flags = 0)
+            0x0F, 0x05, // syscall  (recv-v2) -- continuation RIP = PROBE_CODE_VA + 54
+            0xEB, 0xFE, // jmp .   (park; recv-v2 blocks, so this is never reached this stage)
+        ];
+        const RECV_V2_STUB_RECV_CAP_PATCH_OFFSET: usize = 23;
         let smp_proof = crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled();
+        let recv_v2_server =
+            smp_proof && crate::kernel::boot::x86_ipccall_direct_smp_recv_v2_server_enabled();
+        let first_build = self.task_status(base_tid).is_none();
         let user_stack_top = PROBE_STACK_VA + (PAGE_SIZE as u64) - 16;
 
         // Idempotent: reuse an already-built per-AP workload ASID.
@@ -1562,7 +1596,40 @@ impl KernelState {
                     flags: code_flags,
                 },
             )?;
-            if smp_proof {
+            if recv_v2_server {
+                // Marker data page (user + read): SERVER_ENTERED @ +0x000. The recv-v2 server stub
+                // itself is copied LATER (after the request cap is minted and patched in).
+                let marker_phys = self.alloc_user_data_frame()?;
+                self.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr(PROBE_MARKER_VA),
+                    Mapping {
+                        phys: PhysAddr(marker_phys),
+                        flags: PageFlags::USER_RW,
+                    },
+                )?;
+                self.copy_to_user(asid, VirtAddr(PROBE_MARKER_VA), AP_RECV_V2_SERVER_MARKER)?;
+                // recv-v2 payload destination page (user + read + write).
+                let payload_phys = self.alloc_user_data_frame()?;
+                self.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr(RECV_V2_SERVER_PAYLOAD_VA),
+                    Mapping {
+                        phys: PhysAddr(payload_phys),
+                        flags: PageFlags::USER_RW,
+                    },
+                )?;
+                // recv-v2 IpcRecvMetaV2 destination page (user + read + write).
+                let meta_phys = self.alloc_user_data_frame()?;
+                self.map_user_page_in_asid_raw(
+                    asid,
+                    VirtAddr(RECV_V2_SERVER_META_VA),
+                    Mapping {
+                        phys: PhysAddr(meta_phys),
+                        flags: PageFlags::USER_RW,
+                    },
+                )?;
+            } else if smp_proof {
                 self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB_SMP)?;
                 // Marker data page: user + read. BEFORE @ 0, RESUMED @ +0x100.
                 let marker_phys = self.alloc_user_data_frame()?;
@@ -1623,6 +1690,47 @@ impl KernelState {
             })?;
         }
 
+        // Stage 199A2D2C2B1: provision the REAL recv-v2 IPC server (once, on first build). The server
+        // (base_tid, home CPU 1) owns a RECEIVE cap on a dedicated request endpoint minted into its
+        // OWN process CNode (no shared-CNode shortcut), plus the payload/meta buffers mapped above and
+        // one reply-cap slot capacity in the endpoint. The oracle request endpoint is armed so the
+        // authoritative blocked-server acknowledgement publishes when the server's recv-v2 blocks. This
+        // does NOT deliver an NR6 request or wake the server — the server-block half only.
+        if recv_v2_server && first_build {
+            // Endpoint depth 1 = one reply-cap slot capacity (NR7 reply is not sent this stage).
+            let (endpoint_index, _send_cap, recv_cap_root) = self.create_endpoint(1)?;
+            // Mint the RECEIVE cap into the SERVER's own process CNode (grant from the provisioning
+            // context's CNode where create_endpoint minted it). The returned CapId is what the server
+            // stub passes in arg0 (RDI).
+            let source_tid = self.current_tid().ok_or(KernelError::TaskMissing)?;
+            let server_recv_cap = self.grant_capability_task_to_task_with_rights(
+                source_tid,
+                recv_cap_root,
+                base_tid,
+                CapRights::RECEIVE,
+            )?;
+            let recv_cap_u32 =
+                u32::try_from(server_recv_cap.0).map_err(|_| KernelError::CapabilityFull)?;
+            // Arm ONLY the request endpoint (reply endpoint sentinel = usize::MAX / unused this stage).
+            crate::kernel::boot::set_ipccall_direct_oracle_endpoints(endpoint_index, usize::MAX);
+            // Bind the server to its HOME CPU 1 BEFORE it blocks (internal placement; not a syscall).
+            self.set_task_home_cpu(base_tid, crate::kernel::scheduler::CpuId(1))?;
+            // Patch the recv_cap CapId into the stub and copy it to the code page.
+            let mut stub = RECV_V2_SERVER_STUB;
+            stub[RECV_V2_STUB_RECV_CAP_PATCH_OFFSET..RECV_V2_STUB_RECV_CAP_PATCH_OFFSET + 4]
+                .copy_from_slice(&recv_cap_u32.to_le_bytes());
+            self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &stub)?;
+            crate::yarm_log!(
+                "X86_AP_RECV_V2_SERVER_PROVISIONED base_tid={} asid={} endpoint_index={} recv_cap={} payload_va=0x{:x} meta_va=0x{:x} home_cpu=1",
+                base_tid,
+                asid.0,
+                endpoint_index,
+                server_recv_cap.0,
+                RECV_V2_SERVER_PAYLOAD_VA,
+                RECV_V2_SERVER_META_VA,
+            );
+        }
+
         let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)
             .ok_or(KernelError::UserMemoryFault)?;
         crate::yarm_log!(
@@ -1668,6 +1776,24 @@ impl KernelState {
             let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);
             let has_saved = rip != 0 && rsp != 0;
             Some((asid.0, cr3, rip, rsp, gprs, fs_base, runnable && has_saved))
+        })
+    }
+
+    /// Stage 199A2D2C2B1: true iff `tid` carries a COMMITTED saved userspace continuation
+    /// (non-null instruction pointer AND stack pointer captured in `user_context`). Unlike
+    /// [`ap_saved_resume_context`] this does NOT require the task to be runnable — it proves the
+    /// blocked recv-v2 server captured its post-syscall frame BEFORE the authoritative block, which
+    /// the blocked-server acknowledgement asserts (`saved_frame=1`). Read-only.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    pub(crate) fn task_has_saved_frame(&self, tid: u64) -> bool {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|tcb| {
+                    tcb.user_context.instruction_ptr.0 != 0 && tcb.user_context.stack_ptr.0 != 0
+                })
+                .unwrap_or(false)
         })
     }
 
