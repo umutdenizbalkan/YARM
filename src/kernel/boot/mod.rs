@@ -3288,6 +3288,117 @@ pub(crate) fn maybe_emit_ipccall_direct_smp_request_ok(msg: &str) {
 #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
 pub(crate) fn maybe_emit_ipccall_direct_smp_request_ok(_msg: &str) {}
 
+/// Stage 199A2D2C2C: default-off sub-selector of the SMP oracle
+/// (`yarm.x86_64_ipccall_direct_smp_reply=1`). When set it IMPLIES the request sub-selector (the whole
+/// forward direction) AND additionally drives the REVERSE (NR7 reply) direction: after the CPU-0
+/// client's NR6 succeeds it issues a genuine recv-v2 on its OWN reply endpoint (blocking on CPU 0,
+/// publishing the blocked-caller ack); the resumed CPU-1 server, after validating the request, issues
+/// a genuine NR7 with the Reply CapId it read in ring 3, driving the accepted off-lock reply
+/// transaction; on success CPU 1 sends the canonical reschedule IPI to CPU 0, whose saved-frame resume
+/// wakes the client to validate the reply bytes/metadata in ring 3. It arms the oracle's REPLY
+/// endpoint (the request path leaves it `usize::MAX`). Default-off until the reply path lands.
+pub(crate) static X86_IPCCALL_DIRECT_SMP_REPLY_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_ipccall_direct_smp_reply_enabled(enabled: bool) {
+    if enabled {
+        // The reply path requires the whole forward (request) direction.
+        set_x86_ipccall_direct_smp_request_enabled(true);
+    }
+    X86_IPCCALL_DIRECT_SMP_REPLY_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn x86_ipccall_direct_smp_reply_enabled() -> bool {
+    X86_IPCCALL_DIRECT_SMP_REPLY_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2C: count of COMMITTED cross-CPU reply deliveries (the accepted `ipc_reply_direct_txn`
+/// succeeded: resolve → reserve → caller-copy off-lock → claim caller waiter → commit → consume →
+/// enqueue caller on CPU 0). Exactly one is expected. Gates the terminal reply-OK seal marker.
+pub(crate) static X86_IPCREPLY_DIRECT_SMP_REPLY_DELIVERED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn ipcreply_direct_smp_reply_note_delivered() {
+    X86_IPCREPLY_DIRECT_SMP_REPLY_DELIVERED.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn ipcreply_direct_smp_reply_delivered_count() -> u64 {
+    X86_IPCREPLY_DIRECT_SMP_REPLY_DELIVERED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2C: count of non-mutating early WouldBlock returns from the CPU-1 server's NR7 (the
+/// CPU-0 caller has not yet blocked on its reply endpoint, so no blocked-caller ack is published).
+pub(crate) static X86_IPCREPLY_DIRECT_SMP_REPLY_EARLY_WOULDBLOCK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn ipcreply_direct_smp_reply_note_early_wouldblock() {
+    X86_IPCREPLY_DIRECT_SMP_REPLY_EARLY_WOULDBLOCK
+        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn ipcreply_direct_smp_reply_early_wouldblock_count() -> u64 {
+    X86_IPCREPLY_DIRECT_SMP_REPLY_EARLY_WOULDBLOCK.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2C: count of REFUSED duplicate NR7 replies (the blocked-caller ack was already
+/// claimed + the record consumed by the one successful reply; a second NR7 through the same userspace
+/// cap is refused with a canonical `WrongObject` and performs ZERO additional copies / claims /
+/// enqueues / IPIs / wakes). Exactly one is expected in the sealed flow (the server issues one
+/// deliberate duplicate to prove the one-shot barrier).
+pub(crate) static X86_IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn ipcreply_direct_smp_note_duplicate_refused() {
+    X86_IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn ipcreply_direct_smp_duplicate_refused_count() -> u64 {
+    X86_IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2C: emit the TERMINAL cross-CPU reply-OK marker EXACTLY ONCE, ONLY after the resumed
+/// CPU-0 client's userspace `X86_BSP_REPLY_USER_VALIDATED` marker is observed (passed here as `msg`)
+/// AND exactly one committed reply delivery is recorded. Kernel marker (not userspace). No-op off the
+/// C2C reply path or before the client's ring-3 reply validation.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn maybe_emit_ipcreply_direct_smp_reply_ok(msg: &str) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    if !x86_ipccall_direct_smp_reply_enabled() {
+        return;
+    }
+    if !msg.starts_with("X86_BSP_REPLY_USER_VALIDATED") {
+        return;
+    }
+    if ipcreply_direct_smp_reply_delivered_count() < 1 {
+        return;
+    }
+    if EMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "IPCREPLY_DIRECT_SMP_REPLY_OK sender_cpu=1 receiver_cpu=0 cross_cpu=1 reply_copies=1 caller_wakes=1 one_shot=1 result=ok"
+    );
+}
+
+/// Hosted / non-x86 no-op so the DebugLog call site compiles unconditionally.
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+pub(crate) fn maybe_emit_ipcreply_direct_smp_reply_ok(_msg: &str) {}
+
+/// Stage 199A2D2C2C: the CPU-0 oracle client's TID, recorded at provisioning so the BSP dispatch hook
+/// (`maybe_emit_bsp_saved_dispatch_ok`) can recognise the client's saved-frame resume without a
+/// hardcoded probe TID. 0 = unset.
+pub(crate) static X86_C2C_CLIENT_TID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn set_x86_c2c_client_tid(tid: u64) {
+    X86_C2C_CLIENT_TID.store(tid, core::sync::atomic::Ordering::Release);
+}
+
+pub fn x86_c2c_client_tid() -> u64 {
+    X86_C2C_CLIENT_TID.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// The x86_64 SMP cross-CPU request oracle is ACTIVE only when the selector is armed AND the boot is
 /// genuinely SMP (`online_cpus >= 2`). Same-CPU (`online_cpus < 2`) can never present as cross-CPU:
 /// the caller passes the authoritative online-CPU count so the gate cannot be spoofed by a knob
@@ -3857,6 +3968,11 @@ pub mod ipcreply_direct_ack {
     pub fn is_claimable() -> bool {
         VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire)
     }
+
+    /// The published commit sequence (for the caller-blocked attestation).
+    pub fn commit_seq() -> u64 {
+        SEQ.load(Ordering::Relaxed)
+    }
 }
 
 /// Publish the NR7 committed blocked-CALLER acknowledgement from the recv-v2 commit
@@ -3908,7 +4024,60 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
         meta_user_ptr: state.meta_user_ptr,
         meta_user_len: state.meta_user_len,
     };
-    let _seq = ipcreply_direct_ack::publish(ack);
+    let seq = ipcreply_direct_ack::publish(ack);
+    // Stage 199A2D2C2C: emit the AUTHORITATIVE cross-CPU blocked-CALLER marker EXACTLY ONCE, only for
+    // the x86_64 SMP oracle's CPU-0 client blocking on its reply endpoint, and ONLY once every
+    // authoritative blocking-order condition has committed (saved continuation captured, the exact
+    // reply-endpoint waiter equals the caller, the caller is absent from every runqueue, its home CPU
+    // is 0, and the ack has published). The reply-side analog of `IPCCALL_DIRECT_SMP_SERVER_BLOCKED`.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    maybe_emit_ipcreply_direct_smp_caller_blocked(kernel, receiver_tid, index, generation, seq);
+    let _ = seq;
+}
+
+/// Stage 199A2D2C2C: one-shot authoritative `IPCREPLY_DIRECT_SMP_CALLER_BLOCKED` marker for the x86_64
+/// SMP oracle CPU-0 client. Fires at most once per boot, only when the reply sub-selector is armed and
+/// every blocking-order invariant is independently re-verified here against authoritative committed
+/// state (never trusting the caller): the caller has a committed saved frame, it is absent from all
+/// runqueues, its home CPU is 0, the exact reply-endpoint waiter identity still equals the caller, and
+/// the ack sequence is live. A strict no-op otherwise.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn maybe_emit_ipcreply_direct_smp_caller_blocked(
+    kernel: &KernelState,
+    receiver_tid: u64,
+    endpoint_index: usize,
+    endpoint_generation: u64,
+    ack_seq: u64,
+) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    if !x86_ipccall_direct_smp_reply_enabled() {
+        return;
+    }
+    let saved_frame = kernel.task_has_saved_frame(receiver_tid);
+    let absent_from_runqueue = !kernel.task_present_in_any_runqueue(receiver_tid);
+    let home_cpu_0 = kernel.task_home_cpu(receiver_tid) == Some(crate::kernel::scheduler::CpuId(0));
+    let Some(asid) = kernel.task_asid(receiver_tid) else {
+        return;
+    };
+    let caller = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
+    let waiter_exact =
+        kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(endpoint_index)) == Some(caller);
+    let ack_published = ipcreply_direct_ack::commit_seq() == ack_seq && ack_seq != 0;
+    if !(saved_frame && absent_from_runqueue && home_cpu_0 && waiter_exact && ack_published) {
+        return;
+    }
+    if EMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "IPCREPLY_DIRECT_SMP_CALLER_BLOCKED arch=x86_64 caller_cpu=0 recv_v2_committed=1 saved_frame=1 waiter_exact=1 ack_published=1 absent_from_runqueue=1 caller_tid={} caller_asid={} endpoint_index={} endpoint_generation={} ack_seq={} result=ok",
+        receiver_tid,
+        asid.0,
+        endpoint_index,
+        endpoint_generation,
+        ack_seq,
+    );
 }
 
 // ─── Stage 197A-C: mandatory init ELF loading (no synthetic fallback) ──────────────────

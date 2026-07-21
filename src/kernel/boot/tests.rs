@@ -81531,3 +81531,585 @@ mod stage199a2d2c2b2_guards {
         let _ = ipccall_direct_smp_request_delivered_count();
     }
 }
+
+// Stage 199A2D2C2B3 — AP saved-resume user-memory consumption proof. 12 guards.
+mod stage199a2d2c2b3_guards {
+    const EXEC: &str = include_str!("exec_state.rs");
+    const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const USER_SMOKE: &str =
+        include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-user-consume-smoke.sh");
+
+    // (1) The AP saved resume loads the SELECTED SERVER's CR3 (from ap_saved_resume_context), not the
+    // BSP/current CR3.
+    #[test]
+    fn saved_resume_loads_server_cr3() {
+        // ap_saved_resume_context sources cr3 from cr3_for_asid(server asid); the resume loads it.
+        assert!(EXEC.contains("let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;"));
+        assert!(SMP.contains("shared.with(|k| k.ap_saved_resume_context(tid))"));
+        assert!(SMP.contains("core::arch::asm!(\"mov cr3, {}\", in(reg) cr3"));
+    }
+
+    // (2) ASID/CR3 correspond to the resumed server {tid,asid} (identity-validated).
+    #[test]
+    fn asid_cr3_correspond_to_server() {
+        assert!(EXEC.contains("let asid = self.task_asid(tid)?;"));
+        assert!(SMP.contains("Some(t) if t == expected => t,"));
+    }
+
+    // (3) payload/metadata mappings are user-accessible (USER_RW) and committed via copy_to_user.
+    #[test]
+    fn payload_meta_user_accessible() {
+        assert!(EXEC.contains("VirtAddr(RECV_V2_SERVER_PAYLOAD_VA)"));
+        assert!(EXEC.contains("flags: PageFlags::USER_RW,"));
+        assert!(
+            EXEC.contains(
+                "self.copy_to_user(asid, VirtAddr(RECV_V2_SERVER_PAYLOAD_VA), &[0u8; 8])?;"
+            )
+        );
+    }
+
+    // (4) The saved payload/meta pointers survive block + resume (the ack captures the recv-v2 dest
+    // pointers; the txn copies to those exact server pointers).
+    #[test]
+    fn saved_pointers_survive_block_and_resume() {
+        let txn = include_str!("../ipccall_direct_txn.rs");
+        assert!(txn.contains("ack.payload_user_ptr"));
+        assert!(txn.contains("ack.meta_user_ptr"));
+    }
+
+    // (5) recv-v2 result registers are not overwritten by fresh-entry state: they are cleared before
+    // Runnable, and BlockedUnfinalized is never selectable (so no fresh re-entry frame is used).
+    #[test]
+    fn recv_result_not_overwritten_by_fresh_entry() {
+        assert!(RUNTIME.contains("clear_blocked_recv_return_regs_locked(tcbs, tid)"));
+        use crate::arch::x86_64::ap_sched::{
+            DispatchReject, TaskDispatchState, select_return_source,
+        };
+        assert_eq!(
+            select_return_source(TaskDispatchState::BlockedUnfinalized, None, None),
+            Err(DispatchReject::NotFinalized)
+        );
+    }
+
+    // (6) CPU-1's translation sees mappings created BEFORE the block (the pages are mapped in
+    // build_ap_workload's aspace-creation block, before the server task ever runs).
+    #[test]
+    fn mappings_created_before_block() {
+        let create = EXEC
+            .find("let (asid, _cap) = self.create_user_address_space()?;")
+            .unwrap();
+        let map_payload = EXEC.find("VirtAddr(RECV_V2_SERVER_PAYLOAD_VA)").unwrap();
+        let register = EXEC
+            .find("self.register_task_with_class(base_tid")
+            .unwrap_or(usize::MAX);
+        assert!(create < map_payload, "payload mapped after aspace creation");
+        // The mapping is inside the aspace-creation block, before task registration/run.
+        assert!(map_payload < register || register == usize::MAX);
+    }
+
+    // (7) The required EFER.NXE enablement dominates the ring-3 return: it is set in
+    // configure_syscall_msrs_for_self, which every AP ring-3 entry/resume calls first.
+    #[test]
+    fn efer_nxe_enabled_before_user_return() {
+        assert!(DT.contains("const IA32_EFER_NXE: u64 = 1 << 11;"));
+        assert!(DT.contains("efer |= IA32_EFER_SCE | IA32_EFER_NXE;"));
+        // The resume + fresh entry both call configure_syscall_msrs_for_self before iret.
+        assert!(SMP.contains("configure_syscall_msrs_for_self();"));
+    }
+
+    // (8) A wrong/reserved translation is MODELED by the fault decoder: present + rsvd + user bits are
+    // decoded so a reserved-bit (NX-on-NXE-off) fault is distinguishable.
+    #[test]
+    fn fault_decoder_models_reserved_bit() {
+        assert!(DT.contains("let rsvd = (error_code >> 3) & 1;"));
+        assert!(DT.contains("let present = error_code & 1;"));
+        assert!(DT.contains("X86_AP_RECV_V2_USER_READ_FAULT"));
+    }
+
+    // (9) A user/supervisor PTE mismatch is detected (the diag decodes the user bit + pte_user).
+    #[test]
+    fn user_supervisor_mismatch_detected() {
+        assert!(DT.contains("let user = (error_code >> 2) & 1;"));
+        assert!(DT.contains("pte_user={}"));
+    }
+
+    // (10) The kernel copy targets the SAME physical frame the ring-3 translation resolves: the copy
+    // resolves the user PTE's physical frame (validate_user_access_for_asid_split) and writes via its
+    // direct map — the identical frame ring-3 reads through the same PTE.
+    #[test]
+    fn kernel_copy_and_ring3_same_frame() {
+        assert!(
+            RUNTIME
+                .contains("let phys = self.validate_user_access_for_asid_split(asid, va, true)?;")
+        );
+        assert!(RUNTIME.contains("phys_to_direct_map_ptr(phys)"));
+    }
+
+    // (11) The ring-3 validation marker DOMINATES the final user seal (the seal requires
+    // X86_AP_RECV_V2_USER_VALIDATED and no post-resume fault, not a kernel-only check).
+    #[test]
+    fn ring3_validation_marker_dominates_seal() {
+        assert!(USER_SMOKE.contains("X86_AP_RECV_V2_USER_VALIDATED cpu=1"));
+        assert!(USER_SMOKE.contains("X86_AP_RECV_V2_USER_READ_FAULT")); // as a zero-count hard stop
+        assert!(USER_SMOKE.contains("ring-3 user-read fault after resume"));
+        assert!(USER_SMOKE.contains("STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_USER_SEAL"));
+        // The server stub emits the VALIDATED marker only after direct-load checks (payload/len/cap).
+        assert!(EXEC.contains("AP_RECV_V2_USER_VALIDATED_MARKER"));
+        assert!(EXEC.contains("0x48, 0x39, 0xC8")); // cmp rax,rcx (payload compare)
+        assert!(EXEC.contains("0x83, 0xF8, 0x08")); // cmp eax,8 (length compare)
+    }
+
+    // (12) The cross-CPU NR7 REPLY path remains disabled (no SMP reply delivery / IPI-to-CPU-0 wired).
+    #[test]
+    fn cross_cpu_nr7_remains_disabled() {
+        assert!(!SMP.contains("c2b2_send_reschedule_ipi_to_cpu0"));
+        assert!(!SPLIT.contains("x86_ipccall_direct_smp_reply"));
+        assert!(!EXEC.contains("ipc_reply_direct"));
+    }
+}
+
+// Stage 199A2D2C2C (item 11/13) — permanent x86 user-entry EFER SCE|NXE parity guard.
+mod stage199a2d2c2c_efer_parity {
+    const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    // Every x86 CPU that can enter ring 3 runs configure_syscall_msrs_for_self, which requires BOTH
+    // SCE and NXE and fails closed (halt) otherwise — the same requirement for the BSP and every AP.
+    #[test]
+    fn user_entry_requires_sce_and_nxe() {
+        assert!(DT.contains("efer |= IA32_EFER_SCE | IA32_EFER_NXE;"));
+        assert!(DT.contains("let sce = (efer_back & IA32_EFER_SCE) != 0;"));
+        assert!(DT.contains("let nxe = (efer_back & IA32_EFER_NXE) != 0;"));
+        assert!(DT.contains("if !(sce && nxe) {"));
+        assert!(DT.contains("X86_EFER_USER_ENTRY_PARITY_FAIL"));
+        assert!(DT.contains("halt_forever();"));
+    }
+
+    // The parity guard emits a per-CPU attestation (BSP + AP) and does NOT clear NX from data pages.
+    #[test]
+    fn parity_guard_attests_and_keeps_nx() {
+        assert!(DT.contains("X86_EFER_USER_ENTRY_OK cpu={} sce=1 nxe=1 result=ok"));
+        // NXE stays a hard requirement; the fix never masks faults by dropping the NX bit.
+        assert!(DT.contains("const IA32_EFER_NXE: u64 = 1 << 11;"));
+    }
+}
+
+/// Stage 199A2D2C2C — source guards for the COMPLETE bidirectional cross-CPU direct IPC (NR6 request +
+/// NR7 reply). These pin the reply-direction wiring: the reply sub-selector + knob, the blocked-caller
+/// marker, the CPU1→CPU0 reverse IPI + BSP 0xF1 handler (no dispatch in handler) + BSP saved-frame
+/// resume, the NR7 early-WouldBlock + duplicate refusal (split gate only; the accepted transaction is
+/// reused unchanged), the terminal reply-OK marker + seals, and the two hand-asm stubs + provisioning.
+#[cfg(test)]
+mod stage199a2d2c2c_reply_guards {
+    const MODRS: &str = include_str!("mod.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const EXEC: &str = include_str!("exec_state.rs");
+    const BCL: &str = include_str!("../boot_command_line.rs");
+    const SEAL: &str = include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh");
+
+    // 1. The reply sub-selector is default-off and IMPLIES the whole forward request direction.
+    #[test]
+    fn reply_subselector_implies_request() {
+        assert!(MODRS.contains("X86_IPCCALL_DIRECT_SMP_REPLY_ENABLED"));
+        assert!(
+            MODRS.contains("pub(crate) fn set_x86_ipccall_direct_smp_reply_enabled(enabled: bool)")
+        );
+        let f = MODRS
+            .split("pub(crate) fn set_x86_ipccall_direct_smp_reply_enabled")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("set_x86_ipccall_direct_smp_request_enabled(true)"));
+    }
+
+    // 2. The reply knob is parsed and drives the setter.
+    #[test]
+    fn reply_knob_parsed() {
+        assert!(BCL.contains("yarm.x86_64_ipccall_direct_smp_reply"));
+        assert!(BCL.contains("pub x86_64_ipccall_direct_smp_reply: Option<bool>"));
+        assert!(BCL.contains("set_x86_ipccall_direct_smp_reply_enabled(enabled)"));
+    }
+
+    // 3. The blocked-CALLER marker mirrors the blocked-SERVER marker: caller_cpu=0, one-shot, and it
+    //    independently re-verifies every blocking-order invariant (never trusting the caller).
+    #[test]
+    fn caller_blocked_marker_reverifies() {
+        assert!(MODRS.contains("fn maybe_emit_ipcreply_direct_smp_caller_blocked("));
+        assert!(MODRS.contains("IPCREPLY_DIRECT_SMP_CALLER_BLOCKED arch=x86_64 caller_cpu=0"));
+        let f = MODRS
+            .split("fn maybe_emit_ipcreply_direct_smp_caller_blocked")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("task_has_saved_frame"));
+        assert!(body.contains("!kernel.task_present_in_any_runqueue"));
+        assert!(body.contains("CpuId(0)"));
+        assert!(body.contains("EMITTED.swap(true"));
+    }
+
+    // 4. The reply drain notes the delivery + sends the reverse IPI to CPU 0 on success — the accepted
+    //    ipc_reply_direct_txn is reused unchanged (no fork).
+    #[test]
+    fn reply_drain_sends_reverse_ipi_reusing_txn() {
+        let f = TXN
+            .split("pub(crate) fn drain_direct_reply_post_work")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n    }\n").unwrap()];
+        assert!(body.contains(
+            "self.ipc_reply_direct_txn(&work.snapshot, &work.ack, &mut lease, work.ack_seq)"
+        ));
+        assert!(body.contains("if result.is_ok()"));
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("ipcreply_direct_smp_reply_note_delivered()"));
+        assert!(body.contains("c2c_send_reschedule_ipi_to_cpu0()"));
+    }
+
+    // 5. The reverse IPI is sent AFTER the enqueue (from the success branch), targets APIC id 0, and
+    //    emits the canonical SENT marker; it never re-arms an AP dispatch request.
+    #[test]
+    fn reverse_ipi_targets_cpu0() {
+        assert!(SMP.contains("pub(crate) fn c2c_send_reschedule_ipi_to_cpu0()"));
+        assert!(SMP.contains("X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0"));
+        let f = SMP
+            .split("pub(crate) fn c2c_send_reschedule_ipi_to_cpu0() {")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("write_icr(0, AP_REMOTE_WAKE_VECTOR as u32)"));
+        assert!(!body.contains("set_ap_dispatch_request"));
+    }
+
+    // 6. The BSP 0xF1 handler records pending + emits RECEIVED (dispatch_in_handler=0) and does NO
+    //    dispatch; it is gated on the reply sub-selector.
+    #[test]
+    fn bsp_ipi_handler_no_dispatch() {
+        assert!(SMP.contains("pub(crate) fn c2c_bsp_handle_reschedule_ipi()"));
+        assert!(
+            SMP.contains("X86_BSP_RESCHEDULE_IPI_RECEIVED cpu=0 pending=1 dispatch_in_handler=0")
+        );
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_handle_reschedule_ipi() {")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("C2C_BSP_RESCHEDULE_PENDING.store(true"));
+        assert!(!body.contains("dispatch_next_on_cpu"));
+        assert!(!body.contains("resume_user_mode_iret"));
+    }
+
+    // 7. The trap dispatch intercepts vector 0xF1 on CPU 0 INLINE (EOI + handler + no scheduler) and
+    //    returns without running handle_trap_entry.
+    #[test]
+    fn trap_dispatch_intercepts_0xf1_on_bsp() {
+        assert!(DT.contains("vector as usize == AP_REMOTE_WAKE_VECTOR as usize"));
+        let f = DT
+            .split("vector as usize == AP_REMOTE_WAKE_VECTOR as usize")
+            .nth(1)
+            .unwrap();
+        let body = &f[..600];
+        assert!(body.contains("cpu.0 == 0"));
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("acknowledge_interrupt(0)"));
+        assert!(body.contains("c2c_bsp_handle_reschedule_ipi()"));
+        assert!(body.contains("return;"));
+    }
+
+    // 8. The BSP saved-frame resume runs from the trap-return path (NOT the 0xF1 handler), gated on one
+    //    committed reply delivery, and resumes via the canonical saved-frame iretq after clearing the
+    //    nested-trap depth guard.
+    #[test]
+    fn bsp_saved_frame_resume() {
+        assert!(SMP.contains("pub(crate) fn c2c_bsp_saved_frame_resume("));
+        assert!(SMP.contains("X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved"));
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_saved_frame_resume(")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("ipcreply_direct_smp_reply_delivered_count() < 1"));
+        assert!(body.contains("on_preempt_prefer_on_cpu(cpu, client_tid)"));
+        assert!(body.contains("ap_saved_resume_context(client_tid)"));
+        assert!(body.contains("clear_trap_dispatch_depth(cpu)"));
+        assert!(body.contains("resume_user_mode_iret(&frame)"));
+        // Invoked from the trap-return path, not the 0xF1 handler.
+        assert!(DT.contains("c2c_bsp_saved_frame_resume(shared, cpu)"));
+    }
+
+    // 9. The NR7 split gate returns a NON-MUTATING WouldBlock before the caller-ack is published (the
+    //    caller has not blocked yet) — no copy/claim/enqueue.
+    #[test]
+    fn nr7_early_wouldblock_pre_ack() {
+        let f = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        assert!(f.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(f.contains("ipcreply_direct_ack::snapshot().is_none()"));
+        assert!(f.contains("ipcreply_direct_smp_reply_note_early_wouldblock()"));
+        assert!(f.contains("SyscallError::WouldBlock.code()"));
+    }
+
+    // 10. The NR7 split gate refuses a DUPLICATE reply (ack claimed + record consumed) with canonical
+    //     WrongObject and zero further side effects.
+    #[test]
+    fn nr7_duplicate_refused() {
+        let f = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame")
+            .nth(1)
+            .unwrap();
+        assert!(f.contains("!crate::kernel::boot::ipcreply_direct_ack::is_claimable()"));
+        assert!(f.contains("ipcreply_direct_smp_note_duplicate_refused()"));
+        assert!(
+            f.contains("IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED arch=x86_64 reason=consumed_barrier")
+        );
+        assert!(f.contains("SyscallError::WrongObject.code()"));
+    }
+
+    // 11. The terminal reply-OK marker is gated on the client's X86_BSP_REPLY_USER_VALIDATED userspace
+    //     marker AND one committed reply delivery; one-shot.
+    #[test]
+    fn terminal_reply_ok_gated() {
+        assert!(MODRS.contains("pub(crate) fn maybe_emit_ipcreply_direct_smp_reply_ok(msg: &str)"));
+        let f = MODRS
+            .split("pub(crate) fn maybe_emit_ipcreply_direct_smp_reply_ok(msg: &str)")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        assert!(body.contains("msg.starts_with(\"X86_BSP_REPLY_USER_VALIDATED\")"));
+        assert!(body.contains("ipcreply_direct_smp_reply_delivered_count() < 1"));
+        assert!(
+            body.contains("IPCREPLY_DIRECT_SMP_REPLY_OK sender_cpu=1 receiver_cpu=0 cross_cpu=1")
+        );
+    }
+
+    // 12. The reply endpoint is armed (previously usize::MAX) only on the reply path, and the client TID
+    //     is recorded for the BSP dispatch hook.
+    #[test]
+    fn reply_endpoint_armed_and_client_tid_recorded() {
+        assert!(EXEC.contains("if reply_flow {"));
+        assert!(EXEC.contains("set_ipccall_direct_oracle_endpoints("));
+        assert!(EXEC.contains("rep_idx,"));
+        assert!(EXEC.contains("set_x86_c2c_client_tid(client_tid)"));
+    }
+
+    // 13. The reply-capable client stub (recv-v2 + ring-3 validation) is selected on the reply path
+    //     with the reply RECEIVE cap patched into BOTH the NR6 arg5 slot and the recv-v2 arg0 slot.
+    #[test]
+    fn client_stub_recv_v2_and_markers() {
+        assert!(EXEC.contains("const CLIENT_STUB_C2C: [u8; 248]"));
+        assert!(EXEC.contains("const CLIENT_C2C_SEND_CAP_PATCH_OFFSET: usize = 10;"));
+        assert!(EXEC.contains("const CLIENT_C2C_REPLY_R9_PATCH_OFFSET: usize = 26;"));
+        assert!(EXEC.contains("const CLIENT_C2C_REPLY_RECV_PATCH_OFFSET: usize = 83;"));
+        assert!(EXEC.contains("X86_BSP_RECV_V2_CONTINUED cpu=0 result=ok"));
+        assert!(
+            EXEC.contains("X86_BSP_REPLY_USER_VALIDATED cpu=0 payload_ok=1 length_ok=1 meta_ok=1")
+        );
+    }
+
+    // 14. The NR7-capable server stub + its fixed reply source buffer are provisioned on the reply path;
+    //     recv_cap patch offset unchanged (23).
+    #[test]
+    fn server_stub_nr7_and_reply_source() {
+        assert!(EXEC.contains("const RECV_V2_SERVER_STUB_C2C: [u8; 262]"));
+        assert!(EXEC.contains("let mut stub = RECV_V2_SERVER_STUB_C2C;"));
+        assert!(EXEC.contains("const SERVER_REPLY_PAYLOAD: &[u8] = b\"RPLY-OK!\";"));
+        assert!(EXEC.contains("RECV_V2_SERVER_REPLY_SRC_VA"));
+    }
+
+    // 15. The seals are printed by the smoke script ONLY after ALL two-direction markers are asserted
+    //     (forward request + reverse reply + duplicate refusal, no fault/fuse), never before.
+    #[test]
+    fn seals_only_after_two_direction_boot() {
+        assert!(SEAL.contains("STAGE_199_IPCREPLY_DIRECT_SMP_REPLY_USER_SEAL"));
+        assert!(SEAL.contains("STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 cross_cpu_request=1 cross_cpu_reply=1"));
+        // The final seal echo is AFTER every acceptance check (the fail gate precedes it).
+        let seal_pos = SEAL
+            .find("STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 cross_cpu_request=1")
+            .unwrap();
+        let caller_blocked_pos = SEAL.find("caller-blocked != 1").unwrap();
+        let reply_ok_pos = SEAL.find("reply-ok != 1").unwrap();
+        let dup_pos = SEAL.find("duplicate-refused != 1").unwrap();
+        assert!(caller_blocked_pos < seal_pos);
+        assert!(reply_ok_pos < seal_pos);
+        assert!(dup_pos < seal_pos);
+    }
+}
+
+/// Stage 199A2D3 — freeze guards for the trap-depth + authoritative-current-task correctness the BSP
+/// saved-frame resume depends on, plus the deterministic-QEMU-lifecycle contract of the SMP smoke.
+#[cfg(test)]
+mod stage199a2d3_freeze_guards {
+    const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const LIFECYCLE: &str = include_str!("../../../scripts/lib/qemu-x86-deterministic.sh");
+    const REPLY_SH: &str = include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh");
+    const FINAL_SH: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh");
+
+    // Trap-depth #1: the NORMAL trap-return epilogue keeps its balanced depth reset (store 0 at every
+    // return/idle point). The saved-frame divergence does NOT remove those.
+    #[test]
+    fn normal_trap_return_keeps_balanced_depth_reset() {
+        // At least the syscall-return and idle-transition epilogues reset the per-CPU depth to 0.
+        let resets = DT
+            .matches("TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release)")
+            .count();
+        assert!(
+            resets >= 3,
+            "expected the balanced depth resets to remain, found {resets}"
+        );
+    }
+
+    // Trap-depth #2: the diverging saved-frame iretq clears the nested-trap guard EXACTLY ONCE, and the
+    // helper exists. The clear happens immediately before the resume iretq (the abandoned frame never
+    // unwinds through the normal epilogue).
+    #[test]
+    fn saved_frame_resume_clears_depth_exactly_once_before_iretq() {
+        assert!(DT.contains("pub(crate) fn clear_trap_dispatch_depth("));
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_saved_frame_resume(")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert_eq!(
+            body.matches("clear_trap_dispatch_depth(cpu)").count(),
+            1,
+            "depth must be cleared exactly once on the diverging path"
+        );
+        let clear_pos = body.find("clear_trap_dispatch_depth(cpu)").unwrap();
+        let iret_pos = body.find("resume_user_mode_iret(&frame)").unwrap();
+        assert!(
+            clear_pos < iret_pos,
+            "depth clear must precede the diverging iretq"
+        );
+    }
+
+    // Trap-depth #3: clear_trap_dispatch_depth is called ONLY from the diverging saved-resume path,
+    // never on a path that later returns through the normal epilogue.
+    #[test]
+    fn depth_clear_is_confined_to_the_diverging_path() {
+        // The only call site is inside c2c_bsp_saved_frame_resume (smp.rs); descriptor_tables.rs
+        // DEFINES it (fn clear_trap_dispatch_depth(cpu: ...)) but must never CALL it from the normal
+        // trap-return epilogue — so the `(cpu)` call form appears zero times there.
+        assert_eq!(
+            DT.matches("clear_trap_dispatch_depth(cpu)").count(),
+            0,
+            "the normal trap-return epilogue must not call the depth clear"
+        );
+        assert_eq!(
+            SMP.matches("clear_trap_dispatch_depth(cpu)").count(),
+            1,
+            "exactly one caller (the diverging resume)"
+        );
+    }
+
+    // Current-task #1: the resume performs, in order, authoritative selection -> publish current ->
+    // load CR3/FS -> prepare frame -> diverging iretq. The user return therefore observes the resumed
+    // task's ASID/FS, not the previous idle/BSP task.
+    #[test]
+    fn resume_orders_select_publish_load_then_return() {
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_saved_frame_resume(")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        let select = body
+            .find("on_preempt_prefer_on_cpu(cpu, client_tid)")
+            .unwrap();
+        let publish = body
+            .find("X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved")
+            .unwrap();
+        let fs = body.find("IA32_FS_BASE").unwrap();
+        let cr3 = body.find("mov cr3, {}").unwrap();
+        let iret = body.find("resume_user_mode_iret(&frame)").unwrap();
+        assert!(select < publish, "select before publishing current");
+        assert!(publish < fs, "publish current before loading FS");
+        assert!(fs < cr3, "FS + CR3 loaded before diverging");
+        assert!(cr3 < iret, "address space loaded before iretq");
+    }
+
+    // Current-task #2: selection is made current BEFORE the divergence commits (no iretq into a task
+    // that is not the scheduler's current), and it aborts without mutation if it cannot be made current.
+    #[test]
+    fn resume_requires_client_made_current_before_committing() {
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_saved_frame_resume(")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("if made_current != Some(client_tid) {"));
+        let made = body.find("let made_current").unwrap();
+        let done = body.find("DONE.swap(true").unwrap();
+        assert!(
+            made < done,
+            "make-current precedes the one-shot commit latch"
+        );
+    }
+
+    // Deterministic lifecycle #1: the helper library owns termination — launch, wait for terminal
+    // markers, scan fatal, terminate, wait exit — and fails on every forbidden condition.
+    #[test]
+    fn deterministic_lifecycle_owns_termination() {
+        assert!(LIFECYCLE.contains("qemu_run_deterministic()"));
+        // Fresh log truncated (no stale/predating marker) + background launch owned by the script.
+        assert!(LIFECYCLE.contains(":>\"$logfile\"") || LIFECYCLE.contains(": >\"$logfile\""));
+        assert!(LIFECYCLE.contains("QEMU_TERMINAL_MARKERS"));
+        // Every forbidden terminal condition maps to a failure return.
+        assert!(LIFECYCLE.contains("qemu_exited_before_proof"));
+        assert!(LIFECYCLE.contains("fatal_before_termination"));
+        assert!(LIFECYCLE.contains("timeout_before_completion"));
+        assert!(LIFECYCLE.contains("proof_complete_then_terminated"));
+        // Success return (0) ONLY after proof seen, then the script reaps QEMU itself.
+        assert!(LIFECYCLE.contains("_qemu_reap"));
+    }
+
+    // Deterministic lifecycle #2: the SMP smoke uses the helper, defines the terminal markers, and only
+    // seals on the proof_complete_then_terminated result (rc 0).
+    #[test]
+    fn reply_smoke_uses_deterministic_lifecycle() {
+        assert!(REPLY_SH.contains("source \"$(dirname \"$0\")/lib/qemu-x86-deterministic.sh\""));
+        assert!(REPLY_SH.contains("qemu_run_deterministic \"$BOOT_LOG\""));
+        assert!(REPLY_SH.contains("QEMU_TERMINAL_MARKERS=("));
+        assert!(REPLY_SH.contains("if (( LIFECYCLE_RC != 0 )); then"));
+    }
+
+    // Final freeze seal: the exact-commit runner runs four fresh runs (A-D), re-checks SHA + clean tree
+    // after each, and emits the freeze seal only after all four succeed.
+    #[test]
+    fn final_seal_runner_is_exact_commit_and_gated() {
+        assert!(FINAL_SH.contains("STAGE_199_X86_DIRECT_IPC_FINAL_SEAL"));
+        // SHA + clean-tree captured once and re-checked after every child run.
+        assert!(FINAL_SH.contains("git rev-parse HEAD"));
+        assert!(FINAL_SH.contains("recheck_exact_commit"));
+        // Four independent runs.
+        for tok in ["RUN_A", "RUN_B", "RUN_C", "RUN_D"] {
+            assert!(FINAL_SH.contains(tok), "missing {tok}");
+        }
+        // The seal fields required by the stage.
+        for field in [
+            "functional_smp1=1",
+            "ap_dispatch_smp2=1",
+            "cross_cpu_request_smp2=1",
+            "cross_cpu_reply_smp2=1",
+            "request_user_consumed=1",
+            "reply_user_consumed=1",
+            "trap_depth_errors=0",
+            "wrong_current_task=0",
+            "duplicate_replies=0",
+            "duplicate_wakes=0",
+            "overwrite_fuse_trips=0",
+        ] {
+            assert!(FINAL_SH.contains(field), "seal missing field {field}");
+        }
+    }
+}

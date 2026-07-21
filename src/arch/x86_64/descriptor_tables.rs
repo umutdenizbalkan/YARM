@@ -184,6 +184,13 @@ const USER_CODE_SELECTOR: u16 = 0x23;
 const IA32_EFER_MSR: u32 = 0xC000_0080;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const IA32_EFER_SCE: u64 = 1 << 0;
+/// Stage 199A2D2C2B3: EFER.NXE (No-Execute Enable, bit 11). The BSP sets this in its early boot asm
+/// after a CPUID NX check; the AP path (`configure_syscall_msrs_for_self`) historically set ONLY SCE,
+/// so on an AP the NX bit (PTE bit 63) was treated as RESERVED — every ring-3 access to a non-
+/// executable data page (payload/meta/stack) took a reserved-bit #PF. The kernel page tables already
+/// use NX (proving NX is supported), so the AP must enable NXE too for a consistent user return.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+const IA32_EFER_NXE: u64 = 1 << 11;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const IA32_STAR_MSR: u32 = 0xC000_0081;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -246,6 +253,16 @@ struct X86InterruptStackFrameHeader {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static TRAP_DISPATCH_DEPTH: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; crate::arch::platform_constants::MAX_CPUS];
+
+/// Stage 199A2D2C2C: clear a CPU's trap-dispatch nested-guard depth. Called immediately before the BSP
+/// saved-frame resume `iretq`s out of the trap handler (abandoning this kernel-stack frame WITHOUT
+/// reaching the normal depth-reset return points), so the resumed client's NEXT trap starts at depth 0
+/// rather than tripping the nested-trap fatal guard.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn clear_trap_dispatch_depth(cpu: crate::kernel::scheduler::CpuId) {
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    TRAP_DISPATCH_DEPTH[idx].store(0, Ordering::Release);
+}
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static FATAL_LOG_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -366,11 +383,41 @@ pub(crate) fn configure_syscall_msrs_for_self() {
     // STAR[47:32] = kernel CS selector; STAR[63:48] = SYSRET CS base (CS-16).
     let star = ((KERNEL_CODE_SELECTOR as u64) << 32) | (((USER_CODE_SELECTOR as u64) - 16) << 48);
     let mut efer = read_msr(IA32_EFER_MSR);
-    efer |= IA32_EFER_SCE;
+    // SCE for the `syscall` fast path; NXE so the AP honors the NX bit (bit 63) that the kernel page
+    // tables set on non-executable user data pages — without it an AP ring-3 data read of an NX page
+    // takes a reserved-bit #PF (Stage 199A2D2C2B3). The BSP already enables both.
+    efer |= IA32_EFER_SCE | IA32_EFER_NXE;
     write_msr(IA32_EFER_MSR, efer);
     write_msr(IA32_STAR_MSR, star);
     write_msr(IA32_LSTAR_MSR, yarm_x86_lstar_entry as *const () as u64);
     write_msr(IA32_FMASK_MSR, RFLAGS_IF_MASK);
+    // Stage 199A2D2C2C: PERMANENT user-entry parity guard. EVERY x86 CPU that can enter ring 3 runs
+    // this before loading user mappings that contain NX PTEs, so read EFER back and REQUIRE both SCE
+    // and NXE. A CPU that reached ring 3 without NXE would take reserved-bit #PFs on every NX data
+    // page (the Stage 199A2D2C2B3 AP defect) — fail closed instead of masking it by clearing NX. The
+    // BSP (early boot asm) and every AP share this identical requirement.
+    let efer_back = read_msr(IA32_EFER_MSR);
+    let sce = (efer_back & IA32_EFER_SCE) != 0;
+    let nxe = (efer_back & IA32_EFER_NXE) != 0;
+    let cpu = current_cpu_id();
+    if !(sce && nxe) {
+        crate::yarm_log!(
+            "X86_EFER_USER_ENTRY_PARITY_FAIL cpu={} sce={} nxe={} efer=0x{:x}",
+            cpu.0,
+            sce as u8,
+            nxe as u8,
+            efer_back
+        );
+        halt_forever();
+    }
+    static EFER_PARITY_OK: [core::sync::atomic::AtomicBool;
+        crate::arch::platform_constants::MAX_CPUS] =
+        [const { core::sync::atomic::AtomicBool::new(false) };
+            crate::arch::platform_constants::MAX_CPUS];
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    if !EFER_PARITY_OK[idx].swap(true, core::sync::atomic::Ordering::AcqRel) {
+        crate::yarm_log!("X86_EFER_USER_ENTRY_OK cpu={} sce=1 nxe=1 result=ok", cpu.0);
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -1111,6 +1158,23 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     };
     let cpu = current_cpu_id();
 
+    // Stage 199A2D2C2C: the reverse-direction reschedule IPI (vector 0xF1) delivered to CPU 0 (BSP).
+    // Handle it INLINE without running the scheduler (no dispatch in the handler): LAPIC EOI, record
+    // the BSP reschedule-pending flag, emit the one-shot RECEIVED marker, and iretq back. The woken
+    // recv-v2 caller is dispatched by CPU 0's NORMAL timer-driven scheduler on a later tick — this
+    // handler never dispatches. The AP uses a separate pure-asm 0xF1 stub (prepare_ap_idt), so only
+    // the BSP reaches this Rust dispatch for 0xF1.
+    #[cfg(not(feature = "hosted-dev"))]
+    if vector as usize == AP_REMOTE_WAKE_VECTOR as usize
+        && cpu.0 == 0
+        && crate::kernel::boot::x86_ipccall_direct_smp_reply_enabled()
+    {
+        crate::arch::x86_64::irq::acknowledge_interrupt(0);
+        crate::arch::x86_64::smp::c2c_bsp_handle_reschedule_ipi();
+        TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
+        return;
+    }
+
     // Stage 133: pre-lock one-shot #PF diagnostic — fires before any KernelState
     // lock is acquired, giving access to raw trap-stub register values.
     #[cfg(not(feature = "hosted-dev"))]
@@ -1204,6 +1268,15 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // See entering_tid comment above for the revert rationale.
         let exiting_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
         let task_switched = entering_tid != exiting_tid;
+        // Stage 199A2D2C2C: on CPU 0 (BSP), drive the reverse-direction saved-frame resume of the
+        // remotely-woken oracle client on EVERY trap return (not only the idle transition), because in
+        // SMP=2 the passive scheduler (single-CPU D6 seam) never re-selects a caller enqueued on CPU 0's
+        // run queue while CPU 0 keeps dispatching init. It explicitly pulls + resumes the client via the
+        // canonical saved-frame iretq (diverges into ring 3 on success), clearing the nested-trap guard
+        // first. This is NOT the 0xF1 handler — dispatch happens on the trap-return path, never in the
+        // interrupt handler. A strict no-op off the reply path / before the reply is delivered / once done.
+        #[cfg(not(feature = "hosted-dev"))]
+        crate::arch::x86_64::smp::c2c_bsp_saved_frame_resume(shared, cpu);
         if matches!(exiting_tid, None | Some(0)) {
             // The scheduler uses TID 0 as its idle/supervisor sentinel.  It has
             // no user context to iretq back to; returning through the current
@@ -2070,6 +2143,26 @@ yarm_ap_remote_wake_stub:
     mov dword ptr [rax], 0
     pop rax
     iretq
+
+    .align 16
+    .global yarm_ap_page_fault_stub
+yarm_ap_page_fault_stub:
+    // Stage 199A2D2C2B3 AP #PF handler (vector 14). The AP IDT otherwise routes #PF to the catch-all
+    // park stub, so a resumed AP server's ring-3 data read faulted SILENTLY. This stub captures the
+    // fault (error code + CR2 + faulting RIP + CR3) and calls a Rust diagnostic that emits the fault
+    // marker + PTE walk. The #PF pushed an error code: [rsp]=err, +8=rip, +16=cs, +24=rflags,
+    // +32=user_rsp, +40=ss. We never resume the faulting instruction (the diag decides), so registers
+    // may be clobbered freely.
+    mov rdi, qword ptr [rsp]       // error code (SysV arg0)
+    mov rsi, cr2                   // CR2 (arg1)
+    mov rdx, qword ptr [rsp + 8]   // faulting RIP (arg2)
+    mov rcx, cr3                   // CR3 (arg3)
+    and rsp, -16                   // 16-align for the SysV call
+    call yarm_x86_ap_page_fault_diag
+    cli
+90:
+    hlt
+    jmp 90b
 "#,
     unexpected_off = const super::percpu::IRQ_UNEXPECTED_VEC_OFFSET,
     hit_count_off = const super::percpu::IRQ_HIT_COUNT_OFFSET,
@@ -2085,6 +2178,64 @@ unsafe extern "C" {
     static yarm_ap_idt_unexpected_stubs: u8;
     static yarm_ap_irq_smoke_stub: u8;
     static yarm_ap_remote_wake_stub: u8;
+    static yarm_ap_page_fault_stub: u8;
+}
+
+/// Stage 199A2D2C2B3: AP #PF diagnostic (called from `yarm_ap_page_fault_stub`). Emits the exact
+/// fault — decoded error bits + CR2 + faulting RIP + CR3 + a 4-level PTE walk of the CR2 page + the
+/// region classification (payload/meta/stack) — then returns to the stub which parks. Bounded/one-shot
+/// per CPU so a fault storm cannot flood the log.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+pub extern "C" fn yarm_x86_ap_page_fault_diag(error_code: u64, cr2: u64, rip: u64, cr3: u64) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static EMITTED: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
+        [const { AtomicBool::new(false) }; crate::arch::platform_constants::MAX_CPUS];
+    let cpu = current_cpu_id();
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    if EMITTED[idx].swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let present = error_code & 1;
+    let write = (error_code >> 1) & 1;
+    let user = (error_code >> 2) & 1;
+    let rsvd = (error_code >> 3) & 1;
+    let ifetch = (error_code >> 4) & 1;
+    let region = match cr2 & !0xfffu64 {
+        0x2003_0000 => "payload",
+        0x2004_0000 => "meta",
+        0x2001_0000 => "stack",
+        0x2000_0000 => "code",
+        0x2002_0000 => "marker",
+        _ => "unknown",
+    };
+    let (pml4e, pdpte, pde, pte) =
+        crate::arch::x86_64::page_table::hw_pte_walk_verbose(cr3 & !0xfffu64, cr2 & !0xfffu64);
+    crate::yarm_log!(
+        "X86_AP_RECV_V2_USER_READ_FAULT cpu={} cr2=0x{:x} error=0x{:x} present={} write={} user={} rsvd={} ifetch={} region={} result=fault",
+        cpu.0,
+        cr2,
+        error_code,
+        present,
+        write,
+        user,
+        rsvd,
+        ifetch,
+        region,
+    );
+    crate::yarm_log!(
+        "X86_AP_RECV_V2_USER_READ_FAULT_WALK cpu={} rip=0x{:x} cr3=0x{:x} pml4e=0x{:x} pdpte=0x{:x} pde=0x{:x} pte=0x{:x} pte_present={} pte_user={} pte_write={}",
+        cpu.0,
+        rip,
+        cr3,
+        pml4e,
+        pdpte,
+        pde,
+        pte,
+        pte & 1,
+        (pte >> 2) & 1,
+        (pte >> 1) & 1,
+    );
 }
 
 /// One shared AP IDT (identical gates for every AP; per-AP results land in the
@@ -2172,6 +2323,15 @@ pub(crate) fn prepare_ap_idt() -> (u16, u64) {
         // Stage 183.5: the scheduler remote-wake vector for online APs.
         (*idt)[AP_REMOTE_WAKE_VECTOR as usize] = X86IdtEntry::new_interrupt(
             core::ptr::addr_of!(yarm_ap_remote_wake_stub) as u64,
+            KERNEL_CODE_SELECTOR,
+            0,
+            0,
+        );
+        // Stage 199A2D2C2B3: a real AP #PF (vector 14) handler — otherwise a resumed AP server's
+        // ring-3 data read faults into the catch-all park stub and CPU 1 hangs silently. This stub
+        // captures + emits the exact fault (CR2/error/PTE walk) before parking.
+        (*idt)[VEC_PAGE_FAULT] = X86IdtEntry::new_interrupt(
+            core::ptr::addr_of!(yarm_ap_page_fault_stub) as u64,
             KERNEL_CODE_SELECTOR,
             0,
             0,

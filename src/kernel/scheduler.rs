@@ -1002,6 +1002,75 @@ mod tests {
         assert_eq!(next, Some(ThreadId(1)));
     }
 
+    // Stage 199A2D3 (freeze): the BSP saved-frame resume relies on on_preempt_prefer_on making the
+    // EXACT client the CPU-0 current, so the resumed task's user-copy resolves its own ASID. These pin
+    // the authoritative-selection preconditions.
+
+    // A "replacement" TID that is not runnable on the CPU is REJECTED as the preferred selection — it is
+    // never made current; the CPU falls back to its own FIFO instead.
+    #[test]
+    fn on_preempt_prefer_on_rejects_absent_replacement_tid() {
+        let mut sched = SmpScheduler::default();
+        sched
+            .enqueue_on_with_priority(CpuId(0), ThreadId(1), TaskPriority::Normal)
+            .expect("enqueue 1");
+        sched.dispatch_next_on(CpuId(0)); // TID 1 current on CPU 0
+        // TID 500 is not queued anywhere -> not selectable; FIFO re-picks TID 1, NOT TID 500.
+        let next = sched.on_preempt_prefer_on(CpuId(0), ThreadId(500));
+        assert_eq!(next, Some(ThreadId(1)));
+        assert_ne!(next, Some(ThreadId(500)));
+        assert_eq!(sched.current_tid_on(CpuId(0)), Some(ThreadId(1)));
+    }
+
+    // A task assigned to a DIFFERENT CPU is never selected as current on this CPU (no cross-CPU steal).
+    #[test]
+    fn on_preempt_prefer_on_does_not_select_wrong_cpu_task() {
+        let mut sched = SmpScheduler::default();
+        sched.bring_up_cpu(CpuId(1)).expect("cpu1");
+        sched
+            .enqueue_on_with_priority(CpuId(1), ThreadId(20), TaskPriority::Normal)
+            .expect("enqueue 20 on cpu1");
+        sched
+            .enqueue_on_with_priority(CpuId(0), ThreadId(10), TaskPriority::Normal)
+            .expect("enqueue 10 on cpu0");
+        sched.dispatch_next_on(CpuId(0)); // TID 10 current on CPU 0
+        // Prefer TID 20 (on CPU 1) while running on CPU 0: it must NOT be stolen onto CPU 0.
+        let next = sched.on_preempt_prefer_on(CpuId(0), ThreadId(20));
+        assert_ne!(next, Some(ThreadId(20)));
+        assert_eq!(sched.current_tid_on(CpuId(0)), Some(ThreadId(10)));
+        // TID 20 is still runnable on CPU 1.
+        assert_eq!(sched.dispatch_next_on(CpuId(1)), Some(ThreadId(20)));
+    }
+
+    // A duplicate runnable entry is never dispatched twice: once the preferred task is current, it is
+    // not in a queue, a re-enqueue is rejected, and the next dispatch does not hand it out again.
+    #[test]
+    fn on_preempt_prefer_on_does_not_dispatch_duplicate_twice() {
+        let mut sched = SmpScheduler::default();
+        sched
+            .enqueue_on_with_priority(CpuId(0), ThreadId(5), TaskPriority::Normal)
+            .expect("enqueue 5");
+        sched
+            .enqueue_on_with_priority(CpuId(0), ThreadId(6), TaskPriority::Normal)
+            .expect("enqueue 6");
+        sched.dispatch_next_on(CpuId(0)); // TID 5 current
+        // Prefer TID 6 -> current; TID 6 must be current EXACTLY once and not still queued.
+        assert_eq!(
+            sched.on_preempt_prefer_on(CpuId(0), ThreadId(6)),
+            Some(ThreadId(6))
+        );
+        assert_eq!(sched.current_tid_on(CpuId(0)), Some(ThreadId(6)));
+        // Exactly one OTHER runnable entry remains (TID 5, re-enqueued) — TID 6 is NOT duplicated in
+        // the queue while it is the current task.
+        assert_eq!(sched.runnable_count_on(CpuId(0)), 1);
+        // A second runnable copy of the current task is rejected (single-entry invariant).
+        assert_eq!(
+            sched.enqueue_on_with_priority(CpuId(0), ThreadId(6), TaskPriority::Normal),
+            Err(SchedulerError::AlreadyQueued)
+        );
+        assert_eq!(sched.runnable_count_on(CpuId(0)), 1);
+    }
+
     #[test]
     fn ring_queue_remove_tid_compacts_correctly() {
         let mut q = RingQueue::new();

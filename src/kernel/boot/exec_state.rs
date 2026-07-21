@@ -1577,21 +1577,64 @@ impl KernelState {
         const AP_RECV_V2_CONTINUED_MARKER: &[u8] = b"X86_AP_RECV_V2_CONTINUED cpu=1 request_ok=1 metadata_ok=1 reply_cap=1 continuations=1 result=ok\n";
         const AP_RECV_V2_VALIDATE_FAIL_MARKER: &[u8] =
             b"X86_AP_RECV_V2_VALIDATE_FAIL cpu=1 result=fail\n";
+        // Stage 199A2D2C2B3: the resumed server's DIRECT-LOAD validation marker (emitted only after
+        // ring-3 loads of the delivered payload + recv-v2 metadata + receiver-local Reply cap all
+        // succeed and compare exact). Lives at marker page +0x500.
+        const AP_RECV_V2_USER_VALIDATED_MARKER: &[u8] = b"X86_AP_RECV_V2_USER_VALIDATED cpu=1 payload_ok=1 length_ok=1 meta_ok=1 reply_cap_nonzero=1 continuations=1 result=ok\n";
         const _: () = assert!(AP_RECV_V2_CONTINUED_MARKER.len() == 96);
         const _: () = assert!(AP_RECV_V2_VALIDATE_FAIL_MARKER.len() == 47);
-        // Stage 199A2D2C2B2: the resumed server proves the CONTINUATION in userspace (it is executing
-        // AFTER recv-v2, on CPU 1, with the delivered request in its address space) and emits
-        // X86_AP_RECV_V2_CONTINUED. The exact payload-bytes / reply-cap validation is performed by the
-        // KERNEL (which authored the delivery and can read the server ASID) before the terminal
-        // request-OK marker — a ring-3 direct data read from the resumed frame is a separate,
-        // unproven AP capability this stage does not depend on. Continuation RIP = PROBE_CODE_VA + 54.
-        const RECV_V2_SERVER_STUB_C2B2: [u8; 80] = [
+        const _: () = assert!(AP_RECV_V2_USER_VALIDATED_MARKER.len() == 117);
+        // Stage 199A2D2C2B3: the resumed server VALIDATES the delivered request in USERSPACE via direct
+        // ring-3 loads — payload bytes == "NR6-REQ!", recv-v2 meta payload_len == 8, meta reply cap
+        // (offset 16) != 0 — then emits X86_AP_RECV_V2_CONTINUED and X86_AP_RECV_V2_USER_VALIDATED; on
+        // any mismatch it emits X86_AP_RECV_V2_VALIDATE_FAIL. This is possible now that EFER.NXE is
+        // enabled on the AP (see configure_syscall_msrs_for_self): the NX bit on non-executable data
+        // pages was previously treated as reserved, faulting every AP ring-3 data read. Continuation
+        // RIP = PROBE_CODE_VA + 54.
+        const RECV_V2_SERVER_STUB_C2B2: [u8; 174] = [
             0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x2E, 0x00, 0x00,
             0x00, 0x0F, 0x05, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x00, 0x00, 0xBE,
             0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xBA, 0x00, 0x00, 0x04,
-            0x20, 0x41, 0xB8, 0x28, 0x00, 0x00, 0x00, 0x45, 0x31, 0xC9, 0x0F, 0x05, 0xB8, 0x0F,
-            0x00, 0x00, 0x00, 0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00, 0x00, 0x0F,
-            0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
+            0x20, 0x41, 0xB8, 0x28, 0x00, 0x00, 0x00, 0x45, 0x31, 0xC9, 0x0F, 0x05, 0xBF, 0x00,
+            0x00, 0x03, 0x20, 0x48, 0x8B, 0x07, 0x48, 0xB9, 0x4E, 0x52, 0x36, 0x2D, 0x52, 0x45,
+            0x51, 0x21, 0x48, 0x39, 0xC8, 0x0F, 0x85, 0x4A, 0x00, 0x00, 0x00, 0xBF, 0x0C, 0x00,
+            0x04, 0x20, 0x8B, 0x07, 0x83, 0xF8, 0x08, 0x0F, 0x85, 0x3A, 0x00, 0x00, 0x00, 0xBF,
+            0x10, 0x00, 0x04, 0x20, 0x8B, 0x07, 0x85, 0xC0, 0x0F, 0x84, 0x2B, 0x00, 0x00, 0x00,
+            0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00,
+            0x00, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x05, 0x02, 0x20, 0xBE,
+            0x75, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB,
+            0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x04, 0x02, 0x20, 0xBE, 0x2F, 0x00,
+            0x00, 0x00, 0x0F, 0x05, 0xEB, 0xE4,
+        ];
+        // Stage 199A2D2C2C: the REVERSE-direction server stub. Prefix identical to RECV_V2_SERVER_STUB_
+        // C2B2 (SERVER_ENTERED marker, recv-v2 recv_cap @23, request validation, CONTINUED + USER_
+        // VALIDATED markers), but instead of parking after USER_VALIDATED it loads the receiver-local
+        // Reply CapId it read in ring 3 (meta offset 16, at 0x20040010) into r13 and issues a GENUINE
+        // NR7 IpcReply on it (arg0 = that cap, arg1 = reply source 0x20050000, arg2 = 8) with a bounded
+        // pre-ack WouldBlock retry (≤64, each with a short pause delay to let the CPU-0 caller block on
+        // its reply endpoint). After the reply succeeds it issues ONE deliberate DUPLICATE NR7 (proving
+        // the one-shot barrier: the kernel refuses it with WrongObject, zero side effects) then parks.
+        // recv_cap patch offset is 23 (identical to C2B2), so the existing patch logic applies.
+        const RECV_V2_SERVER_STUB_C2C: [u8; 262] = [
+            0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x2E, 0x00, 0x00,
+            0x00, 0x0F, 0x05, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x44, 0x44, 0x44, 0x44, 0xBE,
+            0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xBA, 0x00, 0x00, 0x04,
+            0x20, 0x41, 0xB8, 0x28, 0x00, 0x00, 0x00, 0x45, 0x31, 0xC9, 0x0F, 0x05, 0xBF, 0x00,
+            0x00, 0x03, 0x20, 0x48, 0x8B, 0x07, 0x48, 0xB9, 0x4E, 0x52, 0x36, 0x2D, 0x52, 0x45,
+            0x51, 0x21, 0x48, 0x39, 0xC8, 0x0F, 0x85, 0xA2, 0x00, 0x00, 0x00, 0xBF, 0x0C, 0x00,
+            0x04, 0x20, 0x8B, 0x07, 0x83, 0xF8, 0x08, 0x0F, 0x85, 0x92, 0x00, 0x00, 0x00, 0xBF,
+            0x10, 0x00, 0x04, 0x20, 0x8B, 0x07, 0x85, 0xC0, 0x0F, 0x84, 0x83, 0x00, 0x00, 0x00,
+            0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00,
+            0x00, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x05, 0x02, 0x20, 0xBE,
+            0x75, 0x00, 0x00, 0x00, 0x0F, 0x05, 0x41, 0xBD, 0x10, 0x00, 0x04, 0x20, 0x45, 0x8B,
+            0x6D, 0x00, 0x31, 0xDB, 0xFF, 0xC3, 0xB8, 0x07, 0x00, 0x00, 0x00, 0x44, 0x89, 0xEF,
+            0xBE, 0x00, 0x00, 0x05, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x0F, 0x05, 0x85, 0xC9,
+            0x74, 0x17, 0x83, 0xF9, 0x07, 0x75, 0x2D, 0x83, 0xFB, 0x40, 0x73, 0x28, 0xB9, 0x00,
+            0x00, 0x04, 0x00, 0xF3, 0x90, 0xFF, 0xC9, 0x75, 0xFA, 0xEB, 0xCF, 0xB8, 0x07, 0x00,
+            0x00, 0x00, 0x44, 0x89, 0xEF, 0xBE, 0x00, 0x00, 0x05, 0x20, 0xBA, 0x08, 0x00, 0x00,
+            0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00,
+            0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x04, 0x02,
+            0x20, 0xBE, 0x2F, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xEB,
         ];
         // CPU-0 NR6 client (its OWN ASID). Bounded WouldBlock retry (max 64): NR6 (IpcCall) with the
         // request SEND cap (arg0=RDI, PATCHED @10), payload @0x20030000 (arg1), len 8 (arg2), the reply
@@ -1604,6 +1647,27 @@ impl KernelState {
         const _: () = assert!(CLIENT_NR6_MARKER.len() == 55);
         const _: () = assert!(CLIENT_NR6_FAIL_MARKER.len() == 38);
         const CLIENT_NR6_REQUEST: &[u8] = b"NR6-REQ!";
+        // Stage 199A2D2C2C: reverse-direction (NR7 reply) client markers. After the NR6 SEND, the C2C
+        // client issues a genuine recv-v2 on its OWN reply endpoint (blocking on CPU 0). When the CPU-1
+        // server's reply is delivered + the client's saved frame resumes, it validates the reply bytes
+        // ("RPLY-OK!"), the recv-v2 meta payload_len (== 8) and meta sender_tid (!= 0) via direct ring-3
+        // loads, then emits X86_BSP_RECV_V2_CONTINUED + X86_BSP_REPLY_USER_VALIDATED; on any mismatch it
+        // emits X86_BSP_REPLY_VALIDATE_FAIL. Markers live at marker-page +0x200/+0x300/+0x400.
+        const CLIENT_RECV_V2_CONTINUED_MARKER: &[u8] =
+            b"X86_BSP_RECV_V2_CONTINUED cpu=0 result=ok\n";
+        const CLIENT_REPLY_USER_VALIDATED_MARKER: &[u8] = b"X86_BSP_REPLY_USER_VALIDATED cpu=0 payload_ok=1 length_ok=1 meta_ok=1 continuations=1 result=ok\n";
+        const CLIENT_REPLY_VALIDATE_FAIL_MARKER: &[u8] =
+            b"X86_BSP_REPLY_VALIDATE_FAIL cpu=0 result=fail\n";
+        const _: () = assert!(CLIENT_RECV_V2_CONTINUED_MARKER.len() == 42);
+        const _: () = assert!(CLIENT_REPLY_USER_VALIDATED_MARKER.len() == 96);
+        const _: () = assert!(CLIENT_REPLY_VALIDATE_FAIL_MARKER.len() == 46);
+        // The client's recv-v2 reply metadata destination (its OWN asid); the reply payload lands back
+        // in the client's payload page (CLIENT_PAYLOAD_VA), reused after NR6 copied the request off-lock.
+        const CLIENT_META_VA: u64 = 0x0000_0000_2004_0000;
+        // The CPU-1 server's fixed 8-byte reply source buffer + its VA (server asid).
+        const SERVER_REPLY_PAYLOAD: &[u8] = b"RPLY-OK!";
+        const _: () = assert!(SERVER_REPLY_PAYLOAD.len() == 8);
+        const RECV_V2_SERVER_REPLY_SRC_VA: u64 = 0x0000_0000_2005_0000;
         const CLIENT_STUB: [u8; 97] = [
             0x31, 0xDB, 0xFF, 0xC3, 0xB8, 0x06, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x00, 0x00,
             0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x00, 0x00,
@@ -1615,6 +1679,38 @@ impl KernelState {
         ];
         const CLIENT_STUB_SEND_CAP_PATCH_OFFSET: usize = 10;
         const CLIENT_STUB_REPLY_CAP_PATCH_OFFSET: usize = 26;
+        // Stage 199A2D2C2C: the REVERSE-direction client stub. Prefix identical to CLIENT_STUB (bounded
+        // NR6 retry, SEND cap @10, reply RECEIVE cap in NR6 arg5/R9 @26), but after X86_BSP_NR6_REQUEST_
+        // SENT it issues a GENUINE recv-v2 on its reply endpoint (reply RECEIVE cap @83, payload dest =
+        // CLIENT_PAYLOAD_VA, meta dest = CLIENT_META_VA) which BLOCKS on CPU 0 (committing a saved
+        // continuation + publishing the blocked-caller ack). The post-recv-v2 continuation (offset 0x72)
+        // validates the reply via direct ring-3 loads: payload == "RPLY-OK!", meta payload_len == 8
+        // (offset 0x0C), meta sender_tid != 0 (offset 0x20); then emits X86_BSP_RECV_V2_CONTINUED +
+        // X86_BSP_REPLY_USER_VALIDATED and parks (else X86_BSP_REPLY_VALIDATE_FAIL). Both reply-cap sites
+        // (@26, @83) are patched to the SAME client reply RECEIVE cap.
+        const CLIENT_STUB_C2C: [u8; 248] = [
+            0x31, 0xDB, 0xFF, 0xC3, 0xB8, 0x06, 0x00, 0x00, 0x00, 0xBF, 0x11, 0x11, 0x11, 0x11,
+            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x22, 0x22,
+            0x22, 0x22, 0x0F, 0x05, 0x85, 0xC9, 0x74, 0x18, 0x83, 0xF9, 0x07, 0x0F, 0x85, 0xB1,
+            0x00, 0x00, 0x00, 0x83, 0xFB, 0x40, 0x0F, 0x83, 0xA8, 0x00, 0x00, 0x00, 0x31, 0xC0,
+            0x0F, 0x05, 0xEB, 0xC6, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x02, 0x20,
+            0xBE, 0x37, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x33,
+            0x33, 0x33, 0x33, 0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41,
+            0xBA, 0x00, 0x00, 0x04, 0x20, 0x41, 0xB8, 0x28, 0x00, 0x00, 0x00, 0x45, 0x31, 0xC9,
+            0x0F, 0x05, 0xBF, 0x00, 0x00, 0x03, 0x20, 0x48, 0x8B, 0x07, 0x48, 0xB9, 0x52, 0x50,
+            0x4C, 0x59, 0x2D, 0x4F, 0x4B, 0x21, 0x48, 0x39, 0xC8, 0x75, 0x42, 0xBF, 0x0C, 0x00,
+            0x04, 0x20, 0x8B, 0x07, 0x83, 0xF8, 0x08, 0x75, 0x36, 0xBF, 0x20, 0x00, 0x04, 0x20,
+            0x8B, 0x07, 0x85, 0xC0, 0x74, 0x2B, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x02,
+            0x02, 0x20, 0xBE, 0x2A, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00,
+            0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6,
+            0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00,
+            0x04, 0x02, 0x20, 0xBE, 0x2E, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F,
+            0x00, 0x00, 0x00, 0xBF, 0x00, 0x01, 0x02, 0x20, 0xBE, 0x26, 0x00, 0x00, 0x00, 0x0F,
+            0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
+        ];
+        const CLIENT_C2C_SEND_CAP_PATCH_OFFSET: usize = 10;
+        const CLIENT_C2C_REPLY_R9_PATCH_OFFSET: usize = 26;
+        const CLIENT_C2C_REPLY_RECV_PATCH_OFFSET: usize = 83;
         const CLIENT_CODE_VA: u64 = 0x0000_0000_2000_0000;
         const CLIENT_STACK_VA: u64 = 0x0000_0000_2001_0000;
         const CLIENT_PAYLOAD_VA: u64 = 0x0000_0000_2003_0000;
@@ -1626,6 +1722,11 @@ impl KernelState {
             smp_proof && crate::kernel::boot::x86_ipccall_direct_smp_recv_v2_server_enabled();
         let request_client =
             recv_v2_server && crate::kernel::boot::x86_ipccall_direct_smp_request_enabled();
+        // Stage 199A2D2C2C: the REVERSE (NR7 reply) direction. Implies the whole forward request path;
+        // additionally arms the oracle reply endpoint, provisions the client's reply metadata buffer +
+        // the server's reply source buffer, and swaps in the reply-capable client/server stubs.
+        let reply_flow =
+            request_client && crate::kernel::boot::x86_ipccall_direct_smp_reply_enabled();
         let first_build = self.task_status(base_tid).is_none();
         let user_stack_top = PROBE_STACK_VA + (PAGE_SIZE as u64) - 16;
 
@@ -1677,6 +1778,11 @@ impl KernelState {
                         VirtAddr(PROBE_MARKER_VA + 0x400),
                         AP_RECV_V2_VALIDATE_FAIL_MARKER,
                     )?;
+                    self.copy_to_user(
+                        asid,
+                        VirtAddr(PROBE_MARKER_VA + 0x500),
+                        AP_RECV_V2_USER_VALIDATED_MARKER,
+                    )?;
                 }
                 // recv-v2 payload destination page (user + read + write).
                 let payload_phys = self.alloc_user_data_frame()?;
@@ -1706,6 +1812,24 @@ impl KernelState {
                 if request_client {
                     self.copy_to_user(asid, VirtAddr(RECV_V2_SERVER_PAYLOAD_VA), &[0u8; 8])?;
                     self.copy_to_user(asid, VirtAddr(RECV_V2_SERVER_META_VA), &[0u8; 40])?;
+                }
+                // Stage 199A2D2C2C: the server's fixed NR7 reply SOURCE buffer (its own asid), holding
+                // the 8-byte reply "RPLY-OK!". Committed via copy_to_user (same reason as above).
+                if reply_flow {
+                    let reply_src_phys = self.alloc_user_data_frame()?;
+                    self.map_user_page_in_asid_raw(
+                        asid,
+                        VirtAddr(RECV_V2_SERVER_REPLY_SRC_VA),
+                        Mapping {
+                            phys: PhysAddr(reply_src_phys),
+                            flags: PageFlags::USER_RW,
+                        },
+                    )?;
+                    self.copy_to_user(
+                        asid,
+                        VirtAddr(RECV_V2_SERVER_REPLY_SRC_VA),
+                        SERVER_REPLY_PAYLOAD,
+                    )?;
                 }
             } else if smp_proof {
                 self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB_SMP)?;
@@ -1795,7 +1919,13 @@ impl KernelState {
             self.set_task_home_cpu(base_tid, crate::kernel::scheduler::CpuId(1))?;
             // Patch the recv_cap CapId into the stub and copy it to the code page. Stage 199A2D2C2B2:
             // the cross-CPU request path uses the RICHER validating server stub (same recv_cap @23).
-            if request_client {
+            // Stage 199A2D2C2C: the reply path uses the NR7-capable server stub (also recv_cap @23).
+            if reply_flow {
+                let mut stub = RECV_V2_SERVER_STUB_C2C;
+                stub[RECV_V2_STUB_RECV_CAP_PATCH_OFFSET..RECV_V2_STUB_RECV_CAP_PATCH_OFFSET + 4]
+                    .copy_from_slice(&recv_cap_u32.to_le_bytes());
+                self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &stub)?;
+            } else if request_client {
                 let mut stub = RECV_V2_SERVER_STUB_C2B2;
                 stub[RECV_V2_STUB_RECV_CAP_PATCH_OFFSET..RECV_V2_STUB_RECV_CAP_PATCH_OFFSET + 4]
                     .copy_from_slice(&recv_cap_u32.to_le_bytes());
@@ -1823,7 +1953,16 @@ impl KernelState {
             // split-dispatch path with a bounded WouldBlock retry.
             if request_client && self.task_status(client_tid).is_none() {
                 // A second (reply) endpoint: the client holds its RECEIVE cap (bound by the NR6 txn).
-                let (_rep_idx, _rep_send_root, rep_recv_root) = self.create_endpoint(1)?;
+                let (rep_idx, _rep_send_root, rep_recv_root) = self.create_endpoint(1)?;
+                // Stage 199A2D2C2C: ARM the oracle's REPLY endpoint (the request path left it
+                // usize::MAX). Now the caller-ack publishes when the client blocks on this reply
+                // endpoint, and the off-lock NR7 reply path is confined to exactly this endpoint.
+                if reply_flow {
+                    crate::kernel::boot::set_ipccall_direct_oracle_endpoints(
+                        endpoint_index,
+                        rep_idx,
+                    );
+                }
                 // Client ASID + pages.
                 let (client_asid, _cap) = self.create_user_address_space()?;
                 let ccode = self.alloc_user_data_frame()?;
@@ -1865,6 +2004,36 @@ impl KernelState {
                     VirtAddr(CLIENT_MARKER_VA + 0x100),
                     CLIENT_NR6_FAIL_MARKER,
                 )?;
+                // Stage 199A2D2C2C: reverse-direction client markers (CONTINUED @ +0x200,
+                // REPLY_USER_VALIDATED @ +0x300, REPLY_VALIDATE_FAIL @ +0x400) + the client recv-v2
+                // reply metadata destination page (CLIENT_META_VA), committed via copy_to_user.
+                if reply_flow {
+                    self.copy_to_user(
+                        client_asid,
+                        VirtAddr(CLIENT_MARKER_VA + 0x200),
+                        CLIENT_RECV_V2_CONTINUED_MARKER,
+                    )?;
+                    self.copy_to_user(
+                        client_asid,
+                        VirtAddr(CLIENT_MARKER_VA + 0x300),
+                        CLIENT_REPLY_USER_VALIDATED_MARKER,
+                    )?;
+                    self.copy_to_user(
+                        client_asid,
+                        VirtAddr(CLIENT_MARKER_VA + 0x400),
+                        CLIENT_REPLY_VALIDATE_FAIL_MARKER,
+                    )?;
+                    let cmeta = self.alloc_user_data_frame()?;
+                    self.map_user_page_in_asid_raw(
+                        client_asid,
+                        VirtAddr(CLIENT_META_VA),
+                        Mapping {
+                            phys: PhysAddr(cmeta),
+                            flags: PageFlags::USER_RW,
+                        },
+                    )?;
+                    self.copy_to_user(client_asid, VirtAddr(CLIENT_META_VA), &[0u8; 40])?;
+                }
                 let cpay = self.alloc_user_data_frame()?;
                 self.map_user_page_in_asid_raw(
                     client_asid,
@@ -1895,12 +2064,29 @@ impl KernelState {
                     u32::try_from(client_send_cap.0).map_err(|_| KernelError::CapabilityFull)?;
                 let reply_u32 =
                     u32::try_from(client_reply_cap.0).map_err(|_| KernelError::CapabilityFull)?;
-                let mut cstub = CLIENT_STUB;
-                cstub[CLIENT_STUB_SEND_CAP_PATCH_OFFSET..CLIENT_STUB_SEND_CAP_PATCH_OFFSET + 4]
-                    .copy_from_slice(&send_u32.to_le_bytes());
-                cstub[CLIENT_STUB_REPLY_CAP_PATCH_OFFSET..CLIENT_STUB_REPLY_CAP_PATCH_OFFSET + 4]
-                    .copy_from_slice(&reply_u32.to_le_bytes());
-                self.copy_to_user(client_asid, VirtAddr(CLIENT_CODE_VA), &cstub)?;
+                // Stage 199A2D2C2C: the reply path uses the recv-v2-capable client stub (SEND @10, reply
+                // RECEIVE cap in BOTH the NR6 arg5 slot @26 and the recv-v2 arg0 slot @83). The request
+                // path keeps the park-after-SEND stub (SEND @10, reply RECEIVE cap @26 only).
+                if reply_flow {
+                    let mut cstub = CLIENT_STUB_C2C;
+                    cstub[CLIENT_C2C_SEND_CAP_PATCH_OFFSET..CLIENT_C2C_SEND_CAP_PATCH_OFFSET + 4]
+                        .copy_from_slice(&send_u32.to_le_bytes());
+                    cstub[CLIENT_C2C_REPLY_R9_PATCH_OFFSET..CLIENT_C2C_REPLY_R9_PATCH_OFFSET + 4]
+                        .copy_from_slice(&reply_u32.to_le_bytes());
+                    cstub[CLIENT_C2C_REPLY_RECV_PATCH_OFFSET
+                        ..CLIENT_C2C_REPLY_RECV_PATCH_OFFSET + 4]
+                        .copy_from_slice(&reply_u32.to_le_bytes());
+                    self.copy_to_user(client_asid, VirtAddr(CLIENT_CODE_VA), &cstub)?;
+                    crate::kernel::boot::set_x86_c2c_client_tid(client_tid);
+                } else {
+                    let mut cstub = CLIENT_STUB;
+                    cstub[CLIENT_STUB_SEND_CAP_PATCH_OFFSET..CLIENT_STUB_SEND_CAP_PATCH_OFFSET + 4]
+                        .copy_from_slice(&send_u32.to_le_bytes());
+                    cstub[CLIENT_STUB_REPLY_CAP_PATCH_OFFSET
+                        ..CLIENT_STUB_REPLY_CAP_PATCH_OFFSET + 4]
+                        .copy_from_slice(&reply_u32.to_le_bytes());
+                    self.copy_to_user(client_asid, VirtAddr(CLIENT_CODE_VA), &cstub)?;
+                }
                 // Bind ASID + home CPU 0, set a fresh-entry user_context, enqueue on CPU 0.
                 let client_ustack = CLIENT_STACK_VA + (PAGE_SIZE as u64) - 16;
                 self.with_tcbs_mut(|tcbs| {
