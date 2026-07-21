@@ -1647,7 +1647,7 @@ impl KernelState {
     pub(crate) fn ap_saved_resume_context(
         &self,
         tid: u64,
-    ) -> Option<(u16, u64, u64, u64, [u64; 15], bool)> {
+    ) -> Option<(u16, u64, u64, u64, [u64; 15], u64, bool)> {
         let asid = self.task_asid(tid)?;
         let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;
         let runnable = matches!(
@@ -1663,8 +1663,11 @@ impl KernelState {
             }
             let rip = uc.instruction_ptr.0;
             let rsp = uc.stack_ptr.0;
+            // Stage 199A2D2C2B: FS base is sourced from the SELECTED TASK's saved TLS state, never a
+            // hardcoded constant (a task with a real TLS resumes with its own FS.base).
+            let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);
             let has_saved = rip != 0 && rsp != 0;
-            Some((asid.0, cr3, rip, rsp, gprs, runnable && has_saved))
+            Some((asid.0, cr3, rip, rsp, gprs, fs_base, runnable && has_saved))
         })
     }
 

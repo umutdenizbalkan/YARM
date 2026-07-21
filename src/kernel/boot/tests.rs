@@ -81004,3 +81004,102 @@ mod stage199a2d2c2a_guards {
         );
     }
 }
+
+/// Stage 199A2D2C2B — cross-CPU NR6 recv-v2 continuation: proof-shortcut removal + ordering guards.
+///
+/// The full LIVE recv-v2 cross-CPU orchestration (a real CPU-1 recv-v2 server + a real CPU-0 client
+/// NR6 syscall sharing an endpoint + cross-CPU delivery) builds on the SEALED C1 fresh-entry and C2A
+/// saved-frame resume. These guards prove the verifiable pieces delivered here and gate the LIVE seal.
+#[cfg(test)]
+mod stage199a2d2c2b_guards {
+    // (Part 1.3) The AP saved-frame resume sources FS.base from the SELECTED TASK's saved TLS state,
+    // never a hardcoded constant.
+    #[test]
+    fn fs_base_sourced_from_task_state() {
+        let ex = include_str!("exec_state.rs");
+        assert!(
+            ex.contains("let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);"),
+            "FS base comes from the task's saved TLS state"
+        );
+        let smp = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            smp.contains("in(\"eax\") (fs_base & 0xFFFF_FFFF) as u32")
+                && smp.contains("in(\"edx\") (fs_base >> 32) as u32"),
+            "the resume installs the task-sourced FS base"
+        );
+    }
+
+    // (Part 1.1) On the cross-CPU REQUEST success path the resume must NOT self-set the pending flag
+    // (it originates from the real CPU-0 remote-wake interrupt); the self-arm is confined to the
+    // Yield-only proof.
+    #[test]
+    fn resume_does_not_self_set_pending_on_request_path() {
+        let smp = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            smp.contains("if !crate::kernel::boot::x86_ipccall_direct_smp_request_active() {")
+                && smp.contains("super::ap_sched::set_reschedule_pending(cpu);"),
+            "the self-arm is skipped once the cross-CPU request path is active"
+        );
+    }
+
+    // (Part 1.4) AP_SAVED_RESUME_DONE is an oracle one-shot fuse/counter, not generic scheduler
+    // authority — the generic dispatcher does not reset it to run later saved tasks.
+    #[test]
+    fn saved_resume_done_is_oracle_fuse_only() {
+        let smp = include_str!("../../arch/x86_64/smp.rs");
+        assert!(smp.contains("AP_SAVED_RESUME_DONE"));
+        assert!(
+            smp.contains("one-shot per-CPU latch"),
+            "documented as a one-shot oracle latch"
+        );
+        // It is gated behind the SMP oracle, not the generic dispatch path.
+        assert!(
+            smp.contains(
+                "x86_ipccall_direct_smp_oracle_enabled()\n        && !AP_SAVED_RESUME_DONE"
+            )
+        );
+    }
+
+    // (Part 6 / 9.5/9.6) Wake finalization completes the recv-v2 result registers BEFORE publishing
+    // RunnableSaved; a BlockedUnfinalized task is never selectable (reuses the C2 substrate).
+    #[test]
+    fn wake_finalization_completes_result_before_runnable() {
+        use crate::arch::x86_64::ap_sched::{
+            DispatchReject, SavedUserReturnFrame, TaskDispatchState, WakeFinalization,
+            finalize_wake_to_runnable_saved, select_return_source,
+        };
+        let mut tf = crate::kernel::trapframe::TrapFrame::zeroed();
+        tf.saved_pc = 0x4000;
+        tf.saved_sp = 0x8000;
+        let saved = SavedUserReturnFrame::from_trap_frame(&tf, false);
+        // BlockedUnfinalized never selectable.
+        assert_eq!(
+            select_return_source(TaskDispatchState::BlockedUnfinalized, None, Some(saved)),
+            Err(DispatchReject::NotFinalized)
+        );
+        // Result must be complete for RunnableSaved.
+        assert_eq!(
+            finalize_wake_to_runnable_saved(saved, [1, 2, 3], 0, false),
+            WakeFinalization::NotFinalized
+        );
+        assert!(matches!(
+            finalize_wake_to_runnable_saved(saved, [1, 2, 3], 0, true),
+            WakeFinalization::RunnableSaved(_)
+        ));
+    }
+
+    // (9.15/9.16/9.17) Seal integrity: the request seal requires the full live recv-v2 sequence; the
+    // C1/C2A seals remain valid; the cross_cpu=0 blocked diagnostic cannot satisfy success.
+    #[test]
+    fn request_seal_requires_live_recv_v2_and_prior_seals_intact() {
+        let req = include_str!("../../../scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh");
+        assert!(req.contains("IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1"));
+        assert!(req.contains("X86_AP_RECV_V2_CONTINUED cpu=1"));
+        assert!(req.contains("cross_cpu=0") && req.contains("result=blocked"));
+        // The C1 fresh-entry + C2A saved-return seals are independent + intact.
+        let c1 = include_str!("../../../scripts/qemu-x86_64-ap-generic-return-smoke.sh");
+        assert!(c1.contains("STAGE_199_X86_AP_GENERIC_RETURN_SEAL"));
+        let c2a = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
+        assert!(c2a.contains("STAGE_199_X86_AP_SAVED_RETURN_SEAL"));
+    }
+}

@@ -3170,6 +3170,18 @@ pub fn x86_ipccall_direct_smp_oracle_enabled() -> bool {
     X86_IPCCALL_DIRECT_SMP_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 199A2D2C2B: true once the cross-CPU NR6 REQUEST path is live (a real CPU-0 client + a real
+/// CPU-1 recv-v2 server sharing an endpoint). In that path CPU 1's reschedule-pending flag
+/// ORIGINATES from the real CPU-0 remote-wake interrupt, so the AP saved-frame resume must NOT
+/// self-arm it. In the Stage 199A2D2C2A Yield-only proof (no client) this stays `false`, and the
+/// resume self-arms the flag to exercise the consume path. DEFAULT-OFF until the request path lands.
+pub(crate) static X86_IPCCALL_DIRECT_SMP_REQUEST_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn x86_ipccall_direct_smp_request_active() -> bool {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// The x86_64 SMP cross-CPU request oracle is ACTIVE only when the selector is armed AND the boot is
 /// genuinely SMP (`online_cpus >= 2`). Same-CPU (`online_cpus < 2`) can never present as cross-CPU:
 /// the caller passes the authoritative online-CPU count so the gate cannot be spoofed by a knob

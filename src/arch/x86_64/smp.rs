@@ -2330,9 +2330,15 @@ static AP_SAVED_RESUME_DONE: [AtomicBool; crate::arch::platform_constants::MAX_C
 fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
     use super::ap_dispatch;
     let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
-    // A genuine remote-wake/reschedule of an idle AP: mark + consume the CPU-local pending flag
-    // (Release/Acquire), then the idle dispatcher inspects CPU 1's real run queue.
-    super::ap_sched::set_reschedule_pending(cpu);
+    // Consume the CPU-local reschedule-pending flag (Release/Acquire), then the idle dispatcher
+    // inspects CPU 1's real run queue. In the Stage 199A2D2C2A Yield-only proof (no CPU-0 client) the
+    // flag is self-armed here to exercise the consume path; in the Stage 199A2D2C2B cross-CPU
+    // success path the flag ORIGINATES from the real CPU-0 remote-wake interrupt (see the AP
+    // reschedule IPI handler) and this self-arm is skipped. `x86_ipccall_direct_smp_request_active`
+    // distinguishes the two (false in the Yield-only proof).
+    if !crate::kernel::boot::x86_ipccall_direct_smp_request_active() {
+        super::ap_sched::set_reschedule_pending(cpu);
+    }
     let _pending = super::ap_sched::take_reschedule_pending(cpu);
     // Select the RunnableSaved task from CPU 1's REAL run queue (scheduler-selected). The proof task
     // yielded, so re-arm it on CPU 1's queue (the existing generic wake/finalization seam) and select
@@ -2348,8 +2354,8 @@ fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
         Some(t) if t == expected => t,
         _ => return, // nothing to resume — fall through to idle
     };
-    // Read the committed saved continuation (asid/cr3/rip/rsp/gprs) + validate RunnableSaved.
-    let (asid, cr3, rip, rsp, gprs, runnable_saved) =
+    // Read the committed saved continuation (asid/cr3/rip/rsp/gprs/fs) + validate RunnableSaved.
+    let (asid, cr3, rip, rsp, gprs, fs_base, runnable_saved) =
         match shared.with(|k| k.ap_saved_resume_context(tid)) {
             Some(v) => v,
             None => return,
@@ -2372,13 +2378,14 @@ fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
     super::descriptor_tables::configure_syscall_msrs_for_self();
     super::percpu::set_syscall_kernel_rsp0(cpu, kernel_rsp0);
     super::descriptor_tables::set_ap_tss_rsp0(idx, kernel_rsp0);
-    // User FS base = 0 (the proof task has no TLS); GS.base stays this CPU's per-CPU record.
+    // User FS base sourced from the SELECTED TASK's saved TLS state (Stage 199A2D2C2B) — 0 for a
+    // task with no TLS. GS.base stays this CPU's per-CPU record.
     unsafe {
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0xC000_0100u32, // IA32_FS_BASE
-            in("eax") 0u32,
-            in("edx") 0u32,
+            in("eax") (fs_base & 0xFFFF_FFFF) as u32,
+            in("edx") (fs_base >> 32) as u32,
             options(nostack, preserves_flags),
         );
     }
