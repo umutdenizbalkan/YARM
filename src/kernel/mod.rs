@@ -5,6 +5,7 @@ pub mod boot;
 pub(crate) mod boot_command_line;
 pub mod cap_transfer_split;
 pub mod capabilities;
+pub mod deadline_token;
 pub mod dispatch_post_work;
 pub mod frame_allocator;
 pub mod global_allocator;

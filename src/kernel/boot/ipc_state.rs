@@ -519,6 +519,61 @@ impl KernelState {
         });
     }
 
+    /// Stage 200B — re-arm the terminal cell of reply-record slot `index` for a
+    /// REUSED slot (a fresh record incarnation). Succeeds only when the reply-cap
+    /// generation has strictly ADVANCED past `previous_record_generation` (the slot
+    /// is recycled) and `new_identity` names this slot at the advanced generation.
+    /// Delegates to the exclusive `TerminalCell::try_rearm` (which additionally
+    /// refuses a `Reserved`/live-owner cell). Returns the new terminal epoch, or
+    /// `None`. Publication order: reply-cap generation advances → complete new
+    /// identity installed → new epoch installed → `Open` published with Release.
+    pub(crate) fn rearm_terminal_for_reply_record(
+        &mut self,
+        index: usize,
+        previous_record_generation: u64,
+        new_identity: crate::kernel::terminal_ownership::TerminalIdentity,
+    ) -> Option<u64> {
+        self.with_ipc_state_mut(|ipc| {
+            // The reply-cap generation must have strictly ADVANCED (slot recycled).
+            let cur_gen = *ipc.reply_cap_generations.get(index)?;
+            if cur_gen <= previous_record_generation {
+                return None;
+            }
+            // The new identity must name THIS slot at the advanced generation.
+            if new_identity.reply_record_index != index
+                || new_identity.reply_record_generation != cur_gen
+            {
+                return None;
+            }
+            let cell = ipc.reply_terminal_ownership.get_mut(index)?;
+            cell.try_rearm(previous_record_generation, new_identity)
+        })
+    }
+
+    /// Advance the reply-cap generation of slot `index` (simulates a recycled reply
+    /// slot); returns the new generation. Test-only reuse driver.
+    #[cfg(test)]
+    pub(crate) fn bump_reply_cap_generation_for_test(&mut self, index: usize) -> u64 {
+        self.with_ipc_state_mut(|ipc| {
+            let mut g = ipc.reply_cap_generations[index].wrapping_add(1);
+            if g == 0 {
+                g = 1;
+            }
+            ipc.reply_cap_generations[index] = g;
+            g
+        })
+    }
+
+    /// The current terminal epoch of reply-record slot `index` (for assertions).
+    #[cfg(test)]
+    pub(crate) fn reply_terminal_epoch(&self, index: usize) -> Option<u64> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_terminal_ownership
+                .get(index)
+                .map(|cell| cell.current_epoch())
+        })
+    }
+
     /// Try to claim the terminal outcome of a blocked caller's reply record via the
     /// single authority cell for slot `index`. Exactly one claimant across all
     /// terminal kinds can win. `expect` must match the armed identity exactly
@@ -590,6 +645,187 @@ impl KernelState {
             ipc.reply_terminal_ownership
                 .get(index)
                 .is_some_and(|cell| cell.is_open())
+        })
+    }
+
+    /// The claimant currently holding a `Reserved` claim on slot `index`, if any.
+    #[cfg(test)]
+    pub(crate) fn reply_terminal_reserved_claimant(
+        &self,
+        index: usize,
+    ) -> Option<crate::kernel::terminal_ownership::TerminalClaimant> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_terminal_ownership
+                .get(index)
+                .and_then(|cell| cell.reserved_claimant())
+        })
+    }
+
+    // ── Stage 200B: bounded deadline-registration store (one authority per reg) ──
+    //
+    // These seams operate the SINGLE `reply_deadline_tokens` store. A registration
+    // is keyed by the reply record `(index, generation)`; at most one active
+    // (Armed / ClaimedForFire) registration may exist per key. The store tracks
+    // registration OWNERSHIP only — a fire owner must still win the co-located
+    // terminal cell's timeout claim to make timeout the terminal outcome.
+
+    /// Arm a deadline registration for a blocked reply receive. Enforces Stage 200B
+    /// Part 5 arm-ordering: the co-located terminal cell must be `Open`, its identity
+    /// must match `terminal_identity` exactly, and its epoch must equal
+    /// `terminal_epoch`. Enforces one active registration per reply record (a second
+    /// arm ⇒ `AlreadyArmed`) and a bounded store (`StoreFull`). On success returns a
+    /// generation-bearing [`DeadlineTokenHandle`]; the token slot is published
+    /// `Armed` only after validation, so no partially armed token is visible.
+    pub(crate) fn arm_deadline_token(
+        &mut self,
+        record_index: usize,
+        record_generation: u64,
+        token_generation: u64,
+        terminal_epoch: u64,
+        terminal_identity: crate::kernel::terminal_ownership::TerminalIdentity,
+    ) -> Result<
+        crate::kernel::deadline_token::DeadlineTokenHandle,
+        crate::kernel::deadline_token::DeadlineArmError,
+    > {
+        use crate::kernel::deadline_token::{DeadlineArmError, DeadlineTokenIdentity};
+        self.with_ipc_state_mut(|ipc| {
+            // Part 5 — validate the CURRENT terminal identity/epoch (Open, exact).
+            let terminal_ok = ipc
+                .reply_terminal_ownership
+                .get(record_index)
+                .is_some_and(|cell| {
+                    cell.is_open()
+                        && *cell.identity() == terminal_identity
+                        && cell.current_epoch() == terminal_epoch
+                        && terminal_identity.reply_record_index == record_index
+                        && terminal_identity.reply_record_generation == record_generation
+                });
+            if !terminal_ok {
+                return Err(DeadlineArmError::TerminalNotOpen);
+            }
+            // One active registration per reply record (no silent overwrite).
+            let already = ipc.reply_deadline_tokens.iter().any(|t| {
+                (t.is_armed() || t.is_fire_claimed())
+                    && t.identity().terminal_identity.reply_record_index == record_index
+                    && t.identity().terminal_identity.reply_record_generation == record_generation
+            });
+            if already {
+                return Err(DeadlineArmError::AlreadyArmed);
+            }
+            // Reserve a free slot; bounded failure when the store is full.
+            let free = ipc.reply_deadline_tokens.iter().position(|t| t.is_free());
+            let Some(slot) = free else {
+                return Err(DeadlineArmError::StoreFull);
+            };
+            let identity = DeadlineTokenIdentity {
+                token_index: slot,
+                token_generation,
+                terminal_epoch,
+                terminal_identity,
+            };
+            ipc.reply_deadline_tokens[slot]
+                .arm(identity)
+                .ok_or(DeadlineArmError::AlreadyArmed)
+        })
+    }
+
+    /// Claim the synthetic fire for an armed deadline token (`Armed →
+    /// ClaimedForFire`). Exactly one fire owner wins; a duplicate/stale fire gets
+    /// `None`. The owner MUST then attempt the timeout terminal claim.
+    pub(crate) fn claim_deadline_fire_exact(
+        &self,
+        handle: &crate::kernel::deadline_token::DeadlineTokenHandle,
+    ) -> Option<crate::kernel::deadline_token::DeadlineFireOwner> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_deadline_tokens
+                .get(handle.token_index())
+                .and_then(|t| t.claim_fire(handle))
+        })
+    }
+
+    /// Exact cancellation of an armed token (`Armed → Disarmed`). Requires the exact
+    /// slot + generation/epoch; a late fire after cancellation mutates nothing.
+    pub(crate) fn cancel_deadline_exact(
+        &self,
+        handle: &crate::kernel::deadline_token::DeadlineTokenHandle,
+    ) -> bool {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_deadline_tokens
+                .get(handle.token_index())
+                .is_some_and(|t| t.cancel_exact(handle))
+        })
+    }
+
+    /// Disarm the exact armed token bound to a reply record because a NON-timeout
+    /// terminal won ownership. A stale disarm (wrong epoch/identity) mutates nothing
+    /// — it can never cancel a newer registration.
+    pub(crate) fn disarm_deadline_after_terminal_completion(
+        &self,
+        handle: &crate::kernel::deadline_token::DeadlineTokenHandle,
+    ) -> bool {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_deadline_tokens
+                .get(handle.token_index())
+                .is_some_and(|t| {
+                    t.disarm_after_terminal_completion(handle.identity(), handle.epoch())
+                })
+        })
+    }
+
+    /// Complete a fire that WON the timeout terminal claim (`ClaimedForFire →
+    /// Completed`). Only the exact fire owner succeeds.
+    pub(crate) fn complete_deadline_fire(
+        &self,
+        token_index: usize,
+        owner: &crate::kernel::deadline_token::DeadlineFireOwner,
+    ) -> bool {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_deadline_tokens
+                .get(token_index)
+                .is_some_and(|t| t.complete_fire(owner))
+        })
+    }
+
+    /// Disarm a fire that LOST the timeout terminal claim (`ClaimedForFire →
+    /// Disarmed`). No terminal release, no result copy, no wake.
+    pub(crate) fn disarm_deadline_fire(
+        &self,
+        token_index: usize,
+        owner: &crate::kernel::deadline_token::DeadlineFireOwner,
+    ) -> bool {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_deadline_tokens
+                .get(token_index)
+                .is_some_and(|t| t.disarm_fire(owner))
+        })
+    }
+
+    /// Fill EVERY deadline-registration slot with a distinct synthetic
+    /// registration so the next real `arm_deadline_token` observes a full store.
+    #[cfg(test)]
+    pub(crate) fn test_fill_deadline_store(&mut self) {
+        use crate::kernel::deadline_token::DeadlineTokenIdentity;
+        self.with_ipc_state_mut(|ipc| {
+            for slot in 0..super::MAX_DEADLINE_TOKENS {
+                let mut id = DeadlineTokenIdentity::ZERO;
+                id.token_index = slot;
+                id.token_generation = 1;
+                // Distinct registration key per slot (out of the real record range).
+                id.terminal_identity.reply_record_index = 10_000 + slot;
+                id.terminal_identity.reply_record_generation = 1;
+                let _ = ipc.reply_deadline_tokens[slot].arm(id);
+            }
+        });
+    }
+
+    /// Count of active (Armed / ClaimedForFire) deadline registrations (assertions).
+    #[cfg(test)]
+    pub(crate) fn active_deadline_registrations(&self) -> usize {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_deadline_tokens
+                .iter()
+                .filter(|t| t.is_armed() || t.is_fire_claimed())
+                .count()
         })
     }
 

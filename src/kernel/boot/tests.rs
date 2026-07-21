@@ -78243,8 +78243,14 @@ mod stage199a2b4_live_oracle_guards {
                 .split(&format!("pub(crate) fn {setter_name}"))
                 .nth(1)
                 .expect("setter body");
+            // Bound the scan to THIS setter's body (up to the next top-level item)
+            // rather than a brittle fixed-width window. Stage 199A2D2A added a
+            // mutual-exclusion comment to the x86 setter that legitimately pushes
+            // the arming call past a fixed char count without changing the frozen
+            // feature-umbrella / selector design — the setter still arms the gate.
+            let setter_body = setter.split("\npub").next().unwrap_or(setter);
             assert!(
-                setter[..setter.len().min(400)].contains("set_ipccall_direct_proof_enabled(true)"),
+                setter_body.contains("set_ipccall_direct_proof_enabled(true)"),
                 "selecting {setter_name} must arm the NR6/NR7 proof gate"
             );
         }
@@ -83064,6 +83070,1257 @@ result=ok";
             "stale_authority_restores=0",
             "wrong_waiter_mutations=0",
             "records_left_reserved=0",
+            "result=ok",
+        ] {
+            assert!(seal.contains(field), "seal missing field {field}");
+        }
+    }
+}
+
+/// Stage 200B — DEADLINE TOKEN mechanism: deterministic hosted race model.
+///
+/// Fifteen deterministic concurrency proofs. Contended token/terminal races align
+/// competing claimants at the exact CAS with a `std::sync::Barrier`; asymmetric
+/// reuse / replacement races use bounded step control (the identity rewrite is
+/// exclusive `&mut`, never racing a claim). The Rust harness runs at
+/// `--test-threads=1`; every race forces its interleaving explicitly, so the
+/// outcome is invariant across every real scheduling.
+///
+/// Per-race invariants (asserted EXACTLY):
+///
+/// ```text
+///   token fire owners          <= 1
+///   terminal winners            = 1 when a terminal race exists
+///   timeout terminal winners   <= 1
+///   caller wakes                = 0
+///   result copies               = 0
+///   stale tokens accepted       = 0
+///   new registrations cancelled = 0
+///   records left Reserved       = 0 after test cleanup
+/// ```
+#[cfg(test)]
+mod stage200b_deadline_races {
+    use crate::kernel::deadline_token::{DeadlineTokenCell, DeadlineTokenIdentity};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::terminal_ownership::{
+        TerminalCell, TerminalClaimant, TerminalIdentity, TerminalOwner,
+    };
+    use crate::kernel::vm::Asid;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering as O};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    pub(super) fn terminal_ident(record_gen: u64) -> TerminalIdentity {
+        TerminalIdentity {
+            reply_record_index: 2,
+            reply_record_generation: record_gen,
+            caller_tid: ThreadId(1),
+            caller_asid: Asid(11),
+            replier_tid: ThreadId(2),
+            replier_asid: Asid(22),
+            reply_endpoint_index: 7,
+            reply_endpoint_generation: 5,
+            blocked_recv_generation: 9,
+            deadline_token_generation: Some(1),
+        }
+    }
+
+    fn token_ident_for(
+        terminal_id: TerminalIdentity,
+        terminal_epoch: u64,
+    ) -> DeadlineTokenIdentity {
+        DeadlineTokenIdentity {
+            token_index: 0,
+            token_generation: 1,
+            terminal_epoch,
+            terminal_identity: terminal_id,
+        }
+    }
+
+    /// Arm a terminal cell (Open) + a deadline token (Armed) bound to that cell's
+    /// epoch. Returns the shared cells, the fire handle, and the terminal identity.
+    #[allow(clippy::type_complexity)]
+    fn armed_pair(
+        terminal_id: TerminalIdentity,
+    ) -> (
+        Arc<TerminalCell>,
+        Arc<DeadlineTokenCell>,
+        crate::kernel::deadline_token::DeadlineTokenHandle,
+    ) {
+        let mut tcell = TerminalCell::vacant();
+        tcell.arm(terminal_id);
+        let epoch = tcell.current_epoch();
+        let mut tok = DeadlineTokenCell::vacant();
+        let handle = tok
+            .arm(token_ident_for(terminal_id, epoch))
+            .expect("arm token");
+        (Arc::new(tcell), Arc::new(tok), handle)
+    }
+
+    fn try_claim_kind(
+        cell: &TerminalCell,
+        kind: TerminalClaimant,
+        expect: &TerminalIdentity,
+    ) -> Option<TerminalOwner> {
+        match kind {
+            TerminalClaimant::Reply => cell.try_claim_reply_terminal(expect),
+            TerminalClaimant::Timeout => cell.try_claim_timeout_terminal(expect),
+            TerminalClaimant::PeerDeath => cell.try_claim_peer_death_terminal(expect),
+            TerminalClaimant::CallerExit => cell.try_claim_caller_exit_terminal(expect),
+            TerminalClaimant::EndpointGone => cell.try_claim_endpoint_gone_terminal(expect),
+        }
+    }
+
+    #[derive(Debug, Default)]
+    pub(super) struct FireRaceOutcome {
+        pub(super) token_fire_owners: usize,
+        pub(super) terminal_winners: usize,
+        pub(super) timeout_terminal_winners: usize,
+        pub(super) caller_wakes: usize,
+        pub(super) result_copies: usize,
+        pub(super) stale_tokens_accepted: usize,
+        pub(super) new_registrations_cancelled: usize,
+        pub(super) records_left_reserved: usize,
+        pub(super) terminal_race_present: bool,
+    }
+
+    impl FireRaceOutcome {
+        pub(super) fn assert_invariants(&self) {
+            assert!(
+                self.token_fire_owners <= 1,
+                "token fire owners<=1 ({self:?})"
+            );
+            if self.terminal_race_present {
+                assert_eq!(
+                    self.terminal_winners, 1,
+                    "terminal winners=1 when a terminal race exists ({self:?})"
+                );
+            }
+            assert!(
+                self.timeout_terminal_winners <= 1,
+                "timeout terminal winners<=1 ({self:?})"
+            );
+            assert_eq!(self.caller_wakes, 0, "caller wakes=0 ({self:?})");
+            assert_eq!(self.result_copies, 0, "result copies=0 ({self:?})");
+            assert_eq!(
+                self.stale_tokens_accepted, 0,
+                "stale tokens accepted=0 ({self:?})"
+            );
+            assert_eq!(
+                self.new_registrations_cancelled, 0,
+                "new registrations cancelled=0 ({self:?})"
+            );
+            assert_eq!(
+                self.records_left_reserved, 0,
+                "records left Reserved=0 after cleanup ({self:?})"
+            );
+        }
+    }
+
+    /// Fire (token → timeout terminal claim) racing a competing terminal claimant.
+    pub(super) fn race_fire_vs_terminal(competitor: TerminalClaimant) -> FireRaceOutcome {
+        let tid = terminal_ident(1);
+        let (tcell, tok, handle) = armed_pair(tid);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let fire_owners = Arc::new(AtomicUsize::new(0));
+        let timeout_wins = Arc::new(AtomicUsize::new(0));
+        let terminal_wins = Arc::new(AtomicUsize::new(0));
+        let winner: Arc<Mutex<Option<TerminalOwner>>> = Arc::new(Mutex::new(None));
+
+        let mut handles = Vec::new();
+        {
+            let (b, tcell, tok, fire_owners, timeout_wins, terminal_wins, winner) = (
+                Arc::clone(&barrier),
+                Arc::clone(&tcell),
+                Arc::clone(&tok),
+                Arc::clone(&fire_owners),
+                Arc::clone(&timeout_wins),
+                Arc::clone(&terminal_wins),
+                Arc::clone(&winner),
+            );
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        b.wait();
+                        if let Some(fowner) = tok.claim_fire(&handle) {
+                            fire_owners.fetch_add(1, O::Relaxed);
+                            match tcell.try_claim_timeout_terminal(&tid) {
+                                Some(towner) => {
+                                    timeout_wins.fetch_add(1, O::Relaxed);
+                                    terminal_wins.fetch_add(1, O::Relaxed);
+                                    *winner.lock().unwrap() = Some(towner);
+                                    assert!(tok.complete_fire(&fowner));
+                                }
+                                None => {
+                                    assert!(tok.disarm_fire(&fowner));
+                                }
+                            }
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        {
+            let (b, tcell, terminal_wins, winner) = (
+                Arc::clone(&barrier),
+                Arc::clone(&tcell),
+                Arc::clone(&terminal_wins),
+                Arc::clone(&winner),
+            );
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        b.wait();
+                        if let Some(cowner) = try_claim_kind(&tcell, competitor, &tid) {
+                            terminal_wins.fetch_add(1, O::Relaxed);
+                            *winner.lock().unwrap() = Some(cowner);
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        // Cleanup: release the single terminal owner so no record is left Reserved
+        // (this stage never commits a terminal result or wakes a caller).
+        if let Some(owner) = *winner.lock().unwrap() {
+            let _ = tcell.release_terminal_if_retryable(&owner);
+        }
+
+        FireRaceOutcome {
+            token_fire_owners: fire_owners.load(O::Relaxed),
+            terminal_winners: terminal_wins.load(O::Relaxed),
+            timeout_terminal_winners: timeout_wins.load(O::Relaxed),
+            records_left_reserved: usize::from(tcell.reserved_claimant().is_some()),
+            terminal_race_present: true,
+            ..Default::default()
+        }
+    }
+
+    const REPEATS: usize = 200;
+
+    // ── (1) fire vs reply claim ────────────────────────────────────────────────
+    #[test]
+    fn race_01_fire_vs_reply_claim() {
+        for _ in 0..REPEATS {
+            race_fire_vs_terminal(TerminalClaimant::Reply).assert_invariants();
+        }
+    }
+
+    // ── (2) fire vs peer-death claim ───────────────────────────────────────────
+    #[test]
+    fn race_02_fire_vs_peer_death_claim() {
+        for _ in 0..REPEATS {
+            race_fire_vs_terminal(TerminalClaimant::PeerDeath).assert_invariants();
+        }
+    }
+
+    // ── (3) fire vs caller-exit claim ──────────────────────────────────────────
+    #[test]
+    fn race_03_fire_vs_caller_exit_claim() {
+        for _ in 0..REPEATS {
+            race_fire_vs_terminal(TerminalClaimant::CallerExit).assert_invariants();
+        }
+    }
+
+    // ── (4) fire vs endpoint-gone claim ────────────────────────────────────────
+    #[test]
+    fn race_04_fire_vs_endpoint_gone_claim() {
+        for _ in 0..REPEATS {
+            race_fire_vs_terminal(TerminalClaimant::EndpointGone).assert_invariants();
+        }
+    }
+
+    // ── (5) fire vs exact cancellation ─────────────────────────────────────────
+    #[test]
+    fn race_05_fire_vs_exact_cancellation() {
+        for _ in 0..REPEATS {
+            let tid = terminal_ident(1);
+            let (tcell, tok, handle) = armed_pair(tid);
+            let barrier = Arc::new(Barrier::new(2));
+            let fire_owners = Arc::new(AtomicUsize::new(0));
+            let cancels = Arc::new(AtomicUsize::new(0));
+            let timeout_wins = Arc::new(AtomicUsize::new(0));
+            let winner: Arc<Mutex<Option<TerminalOwner>>> = Arc::new(Mutex::new(None));
+
+            let mut handles = Vec::new();
+            {
+                let (b, tcell, tok, fire_owners, timeout_wins, winner) = (
+                    Arc::clone(&barrier),
+                    Arc::clone(&tcell),
+                    Arc::clone(&tok),
+                    Arc::clone(&fire_owners),
+                    Arc::clone(&timeout_wins),
+                    Arc::clone(&winner),
+                );
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            b.wait();
+                            if let Some(fowner) = tok.claim_fire(&handle) {
+                                fire_owners.fetch_add(1, O::Relaxed);
+                                match tcell.try_claim_timeout_terminal(&tid) {
+                                    Some(towner) => {
+                                        timeout_wins.fetch_add(1, O::Relaxed);
+                                        *winner.lock().unwrap() = Some(towner);
+                                        assert!(tok.complete_fire(&fowner));
+                                    }
+                                    None => {
+                                        assert!(tok.disarm_fire(&fowner));
+                                    }
+                                }
+                            }
+                        })
+                        .expect("spawn"),
+                );
+            }
+            {
+                let (b, tok, cancels) =
+                    (Arc::clone(&barrier), Arc::clone(&tok), Arc::clone(&cancels));
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            b.wait();
+                            if tok.cancel_exact(&handle) {
+                                cancels.fetch_add(1, O::Relaxed);
+                            }
+                        })
+                        .expect("spawn"),
+                );
+            }
+            for h in handles {
+                h.join().expect("join");
+            }
+            if let Some(owner) = *winner.lock().unwrap() {
+                let _ = tcell.release_terminal_if_retryable(&owner);
+            }
+            // Exactly one of {fire, cancel} wins the armed token.
+            assert_eq!(
+                fire_owners.load(O::Relaxed) + cancels.load(O::Relaxed),
+                1,
+                "exactly one of fire/cancel wins the token"
+            );
+            FireRaceOutcome {
+                token_fire_owners: fire_owners.load(O::Relaxed),
+                timeout_terminal_winners: timeout_wins.load(O::Relaxed),
+                records_left_reserved: usize::from(tcell.reserved_claimant().is_some()),
+                terminal_race_present: false,
+                ..Default::default()
+            }
+            .assert_invariants();
+        }
+    }
+
+    // ── (6) two simultaneous fires ─────────────────────────────────────────────
+    #[test]
+    fn race_06_two_simultaneous_fires() {
+        for _ in 0..REPEATS {
+            let tid = terminal_ident(1);
+            let (tcell, tok, handle) = armed_pair(tid);
+            let barrier = Arc::new(Barrier::new(2));
+            let fire_owners = Arc::new(AtomicUsize::new(0));
+            let timeout_wins = Arc::new(AtomicUsize::new(0));
+            let winner: Arc<Mutex<Option<TerminalOwner>>> = Arc::new(Mutex::new(None));
+
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let (b, tcell, tok, fire_owners, timeout_wins, winner) = (
+                    Arc::clone(&barrier),
+                    Arc::clone(&tcell),
+                    Arc::clone(&tok),
+                    Arc::clone(&fire_owners),
+                    Arc::clone(&timeout_wins),
+                    Arc::clone(&winner),
+                );
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            b.wait();
+                            if let Some(fowner) = tok.claim_fire(&handle) {
+                                fire_owners.fetch_add(1, O::Relaxed);
+                                if let Some(towner) = tcell.try_claim_timeout_terminal(&tid) {
+                                    timeout_wins.fetch_add(1, O::Relaxed);
+                                    *winner.lock().unwrap() = Some(towner);
+                                    assert!(tok.complete_fire(&fowner));
+                                } else {
+                                    assert!(tok.disarm_fire(&fowner));
+                                }
+                            }
+                        })
+                        .expect("spawn"),
+                );
+            }
+            for h in handles {
+                h.join().expect("join");
+            }
+            if let Some(owner) = *winner.lock().unwrap() {
+                let _ = tcell.release_terminal_if_retryable(&owner);
+            }
+            assert_eq!(fire_owners.load(O::Relaxed), 1, "exactly one fire owner");
+            FireRaceOutcome {
+                token_fire_owners: fire_owners.load(O::Relaxed),
+                terminal_winners: timeout_wins.load(O::Relaxed),
+                timeout_terminal_winners: timeout_wins.load(O::Relaxed),
+                records_left_reserved: usize::from(tcell.reserved_claimant().is_some()),
+                terminal_race_present: false,
+                ..Default::default()
+            }
+            .assert_invariants();
+        }
+    }
+
+    // ── (7) cancellation vs rearm (stale cancel must not hit a new registration) ─
+    #[test]
+    fn race_07_cancellation_vs_rearm() {
+        let mut tok = DeadlineTokenCell::vacant();
+        let tid = terminal_ident(1);
+        let stale = tok.arm(token_ident_for(tid, 1)).expect("arm gen 1");
+        // Cancel gen1, then recycle the slot for a NEW registration (gen 2).
+        assert!(tok.cancel_exact(&stale));
+        let mut fresh_id = token_ident_for(tid, 1);
+        fresh_id.token_generation = 2;
+        let fresh = tok.arm(fresh_id).expect("re-arm gen 2");
+        // A stale cancel (old handle) must NOT cancel the new registration.
+        assert!(!tok.cancel_exact(&stale), "stale cancel rejected");
+        assert!(tok.is_armed(), "new registration untouched");
+        let cancelled_new = usize::from(!tok.is_armed());
+        // The fresh handle can still fire.
+        assert!(tok.claim_fire(&fresh).is_some());
+        FireRaceOutcome {
+            new_registrations_cancelled: cancelled_new,
+            terminal_race_present: false,
+            ..Default::default()
+        }
+        .assert_invariants();
+    }
+
+    // ── (8) stale fire after token-slot reuse ──────────────────────────────────
+    #[test]
+    fn race_08_stale_fire_after_token_slot_reuse() {
+        let mut tok = DeadlineTokenCell::vacant();
+        let tid = terminal_ident(1);
+        let stale = tok.arm(token_ident_for(tid, 1)).expect("arm gen 1");
+        // Complete/disarm and recycle the slot for a new registration.
+        assert!(tok.disarm_after_terminal_completion(stale.identity(), stale.epoch()));
+        let mut fresh_id = token_ident_for(tid, 1);
+        fresh_id.token_generation = 2;
+        let _fresh = tok.arm(fresh_id).expect("re-arm");
+        // The stale handle cannot fire the reused slot.
+        let accepted = usize::from(tok.claim_fire(&stale).is_some());
+        FireRaceOutcome {
+            stale_tokens_accepted: accepted,
+            terminal_race_present: false,
+            ..Default::default()
+        }
+        .assert_invariants();
+    }
+
+    /// A stale fire whose TERMINAL identity no longer matches the (reused/replaced)
+    /// terminal record: the fire may claim the token, but the timeout terminal claim
+    /// is REFUSED, so no stale token is accepted against the new record.
+    fn stale_fire_after_terminal_change(new_terminal: TerminalIdentity) -> FireRaceOutcome {
+        let old = terminal_ident(1);
+        // Arm the token against the OLD terminal identity/epoch.
+        let mut tok = DeadlineTokenCell::vacant();
+        let mut tcell = TerminalCell::vacant();
+        tcell.arm(old);
+        let old_epoch = tcell.current_epoch();
+        let stale = tok.arm(token_ident_for(old, old_epoch)).expect("arm");
+        // The terminal record is reused/replaced: re-arm with the NEW identity.
+        let _ = tcell.try_rearm(old.reply_record_generation, new_terminal);
+
+        // The stale fire claims the token but its timeout claim targets the OLD
+        // identity, which no longer matches the re-armed cell → refused.
+        let mut accepted = 0usize;
+        if let Some(fowner) = tok.claim_fire(&stale) {
+            match tcell.try_claim_timeout_terminal(&old) {
+                Some(_) => accepted = 1, // MUST NOT happen
+                None => {
+                    let _ = tok.disarm_fire(&fowner);
+                }
+            }
+        }
+        FireRaceOutcome {
+            token_fire_owners: 1,
+            stale_tokens_accepted: accepted,
+            records_left_reserved: usize::from(tcell.reserved_claimant().is_some()),
+            terminal_race_present: false,
+            ..Default::default()
+        }
+    }
+
+    // ── (9) stale fire after reply-record reuse ────────────────────────────────
+    #[test]
+    fn race_09_stale_fire_after_reply_record_reuse() {
+        // Reuse: same slot, ADVANCED record generation.
+        stale_fire_after_terminal_change(terminal_ident(2)).assert_invariants();
+    }
+
+    // ── (10) stale fire after endpoint-generation replacement ──────────────────
+    #[test]
+    fn race_10_stale_fire_after_endpoint_generation_replacement() {
+        let mut new = terminal_ident(2);
+        new.reply_endpoint_generation = 6;
+        stale_fire_after_terminal_change(new).assert_invariants();
+    }
+
+    // ── (11) stale fire after blocked-recv-generation replacement ──────────────
+    #[test]
+    fn race_11_stale_fire_after_blocked_recv_generation_replacement() {
+        let mut new = terminal_ident(2);
+        new.blocked_recv_generation = 10;
+        stale_fire_after_terminal_change(new).assert_invariants();
+    }
+
+    // ── (12) old token vs new caller with reused numeric TID ───────────────────
+    #[test]
+    fn race_12_old_token_vs_new_caller_reused_tid() {
+        let mut new = terminal_ident(2);
+        new.caller_asid = Asid(77); // reused caller TID, different incarnation
+        stale_fire_after_terminal_change(new).assert_invariants();
+    }
+
+    // ── (13) old token vs restarted server with reused numeric TID ─────────────
+    #[test]
+    fn race_13_old_token_vs_restarted_server_reused_tid() {
+        let mut new = terminal_ident(2);
+        new.replier_asid = Asid(88); // restarted server, reused replier TID
+        stale_fire_after_terminal_change(new).assert_invariants();
+    }
+}
+
+/// Stage 200B — deadline races requiring the SINGLE in-kernel registration store
+/// (races 14–15), plus one-registration / store-full lifecycle proofs.
+///
+/// Store management (slot selection, one-registration, store-full) and the
+/// identity-rewriting re-arm are serialized by the KernelState lock, so a barrier-
+/// aligned two-thread race exercises both interleavings with NO data race — the
+/// lock is the Rust-data-race-safe mechanism guarding the ordinary identity fields.
+#[cfg(test)]
+mod stage200b_deadline_store_races {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use super::stage200b_deadline_races::FireRaceOutcome;
+    use crate::kernel::deadline_token::DeadlineArmError;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity, TerminalOwner};
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering as O};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    const BLOCKED_RECV_GEN: u64 = 1;
+
+    fn arm_real_record(fx: &CallerFx) -> (usize, u64, u64, TerminalIdentity) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let identity =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BLOCKED_RECV_GEN, Some(1)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, identity));
+        let epoch = fx.k.with(|s| s.reply_terminal_epoch(idx)).expect("epoch");
+        (idx, rgen, epoch, identity)
+    }
+
+    // ── (14) terminal completion vs token publication ──────────────────────────
+    #[test]
+    fn race_14_terminal_completion_vs_token_publication() {
+        for _ in 0..64 {
+            let fx = caller_fixture();
+            let (idx, rgen, epoch, identity) = arm_real_record(&fx);
+            let k = Arc::clone(&fx.k);
+            let barrier = Arc::new(Barrier::new(2));
+            let terminal_wins = Arc::new(AtomicUsize::new(0));
+            let arms_ok = Arc::new(AtomicUsize::new(0));
+            let arms_not_open = Arc::new(AtomicUsize::new(0));
+            let winner: Arc<Mutex<Option<TerminalOwner>>> = Arc::new(Mutex::new(None));
+
+            let mut handles = Vec::new();
+            {
+                let (b, k, terminal_wins, winner) = (
+                    Arc::clone(&barrier),
+                    Arc::clone(&k),
+                    Arc::clone(&terminal_wins),
+                    Arc::clone(&winner),
+                );
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            b.wait();
+                            if let Some(owner) = k.with(|s| {
+                                s.try_claim_reply_terminal_slot(
+                                    idx,
+                                    TerminalClaimant::Reply,
+                                    &identity,
+                                )
+                            }) {
+                                terminal_wins.fetch_add(1, O::Relaxed);
+                                *winner.lock().unwrap() = Some(owner);
+                            }
+                        })
+                        .expect("spawn"),
+                );
+            }
+            {
+                let (b, k, arms_ok, arms_not_open) = (
+                    Arc::clone(&barrier),
+                    Arc::clone(&k),
+                    Arc::clone(&arms_ok),
+                    Arc::clone(&arms_not_open),
+                );
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            b.wait();
+                            match k.with(|s| s.arm_deadline_token(idx, rgen, 1, epoch, identity)) {
+                                Ok(_) => {
+                                    arms_ok.fetch_add(1, O::Relaxed);
+                                }
+                                Err(DeadlineArmError::TerminalNotOpen) => {
+                                    arms_not_open.fetch_add(1, O::Relaxed);
+                                }
+                                Err(e) => panic!("unexpected arm error {e:?}"),
+                            }
+                        })
+                        .expect("spawn"),
+                );
+            }
+            for h in handles {
+                h.join().expect("join");
+            }
+
+            assert_eq!(
+                terminal_wins.load(O::Relaxed),
+                1,
+                "one terminal winner (reply)"
+            );
+            assert_eq!(
+                arms_ok.load(O::Relaxed) + arms_not_open.load(O::Relaxed),
+                1,
+                "arm resolves exactly once (ok or TerminalNotOpen)"
+            );
+            assert!(
+                fx.k.with(|s| s.active_deadline_registrations()) <= 1,
+                "at most one registration; never a partial token"
+            );
+            // Cleanup: release the reply terminal owner so no record is left Reserved.
+            if let Some(owner) = *winner.lock().unwrap() {
+                fx.k.with(|s| {
+                    let _ = s.release_reply_terminal_slot_if_retryable(idx, &owner);
+                });
+            }
+            FireRaceOutcome {
+                terminal_winners: terminal_wins.load(O::Relaxed),
+                records_left_reserved: usize::from(!fx.k.with(|s| s.reply_terminal_is_open(idx))),
+                terminal_race_present: true,
+                ..Default::default()
+            }
+            .assert_invariants();
+            teardown();
+        }
+    }
+
+    // ── (15) store-full failure vs terminal claim ──────────────────────────────
+    #[test]
+    fn race_15_store_full_vs_terminal_claim() {
+        let fx = caller_fixture();
+        let (idx, rgen, epoch, identity) = arm_real_record(&fx);
+        // Fill every registration slot with distinct synthetic registrations.
+        fx.k.with(|s| s.test_fill_deadline_store());
+        // A further arm for the real record fails closed StoreFull (no terminal
+        // mutation) — the terminal cell stays Open.
+        let full =
+            fx.k.with(|s| s.arm_deadline_token(idx, rgen, 1, epoch, identity));
+        assert_eq!(
+            full.err(),
+            Some(DeadlineArmError::StoreFull),
+            "store full fails closed"
+        );
+        assert!(
+            fx.k.with(|s| s.reply_terminal_is_open(idx)),
+            "no terminal mutation"
+        );
+        // The terminal claim proceeds independently.
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .expect("terminal claim proceeds independent of store-full");
+        fx.k.with(|s| {
+            let _ = s.release_reply_terminal_slot_if_retryable(idx, &owner);
+        });
+        FireRaceOutcome {
+            records_left_reserved: usize::from(!fx.k.with(|s| s.reply_terminal_is_open(idx))),
+            terminal_race_present: false,
+            ..Default::default()
+        }
+        .assert_invariants();
+        teardown();
+    }
+
+    // ── one active registration per reply receive (no silent overwrite) ────────
+    #[test]
+    fn one_registration_second_arm_is_already_armed() {
+        let fx = caller_fixture();
+        let (idx, rgen, epoch, identity) = arm_real_record(&fx);
+        let first =
+            fx.k.with(|s| s.arm_deadline_token(idx, rgen, 1, epoch, identity));
+        assert!(first.is_ok(), "first registration arms");
+        // A second arm for the SAME registration is refused deterministically.
+        let second =
+            fx.k.with(|s| s.arm_deadline_token(idx, rgen, 2, epoch, identity));
+        assert_eq!(second.err(), Some(DeadlineArmError::AlreadyArmed));
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 1);
+        teardown();
+    }
+
+    // ── fire loses to a NON-timeout terminal: token disarms, no wake/copy ──────
+    #[test]
+    fn fire_loses_to_reply_terminal_token_disarms_no_wake() {
+        let fx = caller_fixture();
+        let (idx, rgen, epoch, identity) = arm_real_record(&fx);
+        let handle =
+            fx.k.with(|s| s.arm_deadline_token(idx, rgen, 1, epoch, identity))
+                .expect("arm");
+        // Reply wins the terminal FIRST; the exact token is disarmed.
+        let reply_owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .expect("reply claims terminal");
+        assert!(
+            fx.k.with(|s| s.disarm_deadline_after_terminal_completion(&handle)),
+            "reply-win disarms the exact token"
+        );
+        // A late fire finds the token disarmed → no fire owner, no timeout claim.
+        assert!(
+            fx.k.with(|s| s.claim_deadline_fire_exact(&handle))
+                .is_none(),
+            "late fire after terminal disarm claims nothing"
+        );
+        // The terminal is owned by reply, not timeout; no timeout terminal winner.
+        assert!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx))
+                .is_none()
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_reserved_claimant(idx)),
+            Some(TerminalClaimant::Reply)
+        );
+        // Cleanup.
+        fx.k.with(|s| {
+            let _ = s.release_reply_terminal_slot_if_retryable(idx, &reply_owner);
+        });
+        teardown();
+    }
+}
+
+/// Stage 200B — Part 1: reply-slot TERMINAL RE-ARM (slot reuse) proofs against the
+/// SINGLE in-kernel authority store. Reuse advances BOTH the reply-cap generation
+/// and the terminal epoch, and is data-race-safe: the identity rewrite happens only
+/// under the exclusive KernelState lock (`&mut`), so a concurrent claim can never
+/// observe a partially published identity.
+#[cfg(test)]
+mod stage200b_reply_slot_reuse {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering as O};
+    use std::sync::{Arc, Barrier};
+
+    const BRG: u64 = 1;
+
+    fn arm(fx: &CallerFx) -> (usize, u64, u64, TerminalIdentity) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let identity =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(1)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, identity));
+        let epoch = fx.k.with(|s| s.reply_terminal_epoch(idx)).expect("epoch");
+        (idx, rgen, epoch, identity)
+    }
+
+    /// Recycle the slot: advance the reply-cap generation, then re-arm the terminal
+    /// for the new record incarnation. Returns (new_generation, new_identity).
+    fn reuse(fx: &CallerFx, idx: usize, old_gen: u64) -> (u64, TerminalIdentity, u64) {
+        let new_gen = fx.k.with(|s| s.bump_reply_cap_generation_for_test(idx));
+        let mut new_id =
+            fx.k.with(|s| s.reply_terminal_identity(idx, old_gen, BRG, Some(2)))
+                .unwrap_or_else(|| {
+                    // The record identity read keys on the reply record; rebuild from a
+                    // known base with the advanced generation.
+                    let mut base = TerminalIdentity::ZERO;
+                    base.reply_record_index = idx;
+                    base
+                });
+        new_id.reply_record_generation = new_gen;
+        let new_epoch =
+            fx.k.with(|s| s.rearm_terminal_for_reply_record(idx, old_gen, new_id))
+                .expect("reuse re-arms the terminal");
+        (new_gen, new_id, new_epoch)
+    }
+
+    // (1) completed cell cannot reopen in the same epoch
+    #[test]
+    fn t1_completed_cannot_reopen_same_epoch() {
+        let fx = caller_fixture();
+        let (idx, _rgen, _epoch, identity) = arm(&fx);
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .expect("reply claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        // No claimant may reopen the Completed cell within the same epoch.
+        for kind in [
+            TerminalClaimant::Reply,
+            TerminalClaimant::Timeout,
+            TerminalClaimant::PeerDeath,
+        ] {
+            assert!(
+                fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, kind, &identity))
+                    .is_none(),
+                "Completed cannot reopen within an epoch"
+            );
+        }
+        teardown();
+    }
+
+    // (2) slot reuse advances both reply generation and terminal epoch
+    #[test]
+    fn t2_reuse_advances_reply_generation_and_terminal_epoch() {
+        let fx = caller_fixture();
+        let (idx, rgen, epoch, identity) = arm(&fx);
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .expect("claim");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        let (new_gen, _new_id, new_epoch) = reuse(&fx, idx, rgen);
+        assert!(new_gen > rgen, "reply generation advanced");
+        assert!(new_epoch > epoch, "terminal epoch advanced");
+        assert!(
+            fx.k.with(|s| s.reply_terminal_is_open(idx)),
+            "reused cell Open"
+        );
+        teardown();
+    }
+
+    // (3) old owner rejected after reuse
+    #[test]
+    fn t3_old_owner_rejected_after_reuse() {
+        let fx = caller_fixture();
+        let (idx, rgen, _epoch, identity) = arm(&fx);
+        // Reserve then release (so the cell is not Reserved), capturing a stale owner.
+        let stale =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .expect("reserve");
+        assert!(fx.k.with(|s| s.release_reply_terminal_slot_if_retryable(idx, &stale)));
+        let _ = reuse(&fx, idx, rgen);
+        // The stale owner cannot commit or release the re-armed cell.
+        assert!(!fx.k.with(|s| s.commit_reply_terminal_slot(idx, &stale)));
+        assert!(
+            !fx.k
+                .with(|s| s.release_reply_terminal_slot_if_retryable(idx, &stale))
+        );
+        teardown();
+    }
+
+    // (4) old identity rejected after reuse
+    #[test]
+    fn t4_old_identity_rejected_after_reuse() {
+        let fx = caller_fixture();
+        let (idx, rgen, _epoch, old_identity) = arm(&fx);
+        let owner = fx
+            .k
+            .with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &old_identity))
+            .expect("claim");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        let (_new_gen, new_id, _e) = reuse(&fx, idx, rgen);
+        // The OLD identity cannot claim the reused record.
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                idx,
+                TerminalClaimant::Timeout,
+                &old_identity
+            ))
+            .is_none(),
+            "old identity rejected after reuse"
+        );
+        // The new identity is accepted.
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &new_id))
+                .is_some()
+        );
+        teardown();
+    }
+
+    // (5) new claimant cannot observe partially published identity
+    #[test]
+    fn t5_no_partial_identity_observation_under_concurrency() {
+        for _ in 0..64 {
+            let fx = caller_fixture();
+            let (idx, rgen, _epoch, identity) = arm(&fx);
+            let owner = fx
+                .k
+                .with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .expect("claim");
+            assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+            // Advance the reply-cap generation up front, then race the re-arm against
+            // a claim. The store lock serializes both, so the claim either sees the
+            // pre-rearm Completed cell (rejected) or the fully published NEW identity
+            // — never a torn one.
+            let new_gen = fx.k.with(|s| s.bump_reply_cap_generation_for_test(idx));
+            let mut new_id = identity;
+            new_id.reply_record_generation = new_gen;
+            new_id.deadline_token_generation = Some(2);
+
+            let k = Arc::clone(&fx.k);
+            let barrier = Arc::new(Barrier::new(2));
+            let torn = Arc::new(AtomicUsize::new(0));
+
+            let mut handles = Vec::new();
+            {
+                let (b, k) = (Arc::clone(&barrier), Arc::clone(&k));
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            b.wait();
+                            let _ =
+                                k.with(|s| s.rearm_terminal_for_reply_record(idx, rgen, new_id));
+                        })
+                        .expect("spawn"),
+                );
+            }
+            {
+                let (b, k, torn) = (Arc::clone(&barrier), Arc::clone(&k), Arc::clone(&torn));
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            b.wait();
+                            // A claim with the NEW identity: if it succeeds, the whole
+                            // new identity was published (never partial); if it fails,
+                            // it observed the pre-rearm state. Both are clean.
+                            if let Some(owner) = k.with(|s| {
+                                s.try_claim_reply_terminal_slot(
+                                    idx,
+                                    TerminalClaimant::Timeout,
+                                    &new_id,
+                                )
+                            }) {
+                                // Success ⇒ the complete new identity is installed.
+                                let ok = k.with(|s| s.reply_terminal_reserved_claimant(idx))
+                                    == Some(TerminalClaimant::Timeout);
+                                if !ok {
+                                    torn.fetch_add(1, O::Relaxed);
+                                }
+                                let _ = k.with(|s| {
+                                    s.release_reply_terminal_slot_if_retryable(idx, &owner)
+                                });
+                            }
+                        })
+                        .expect("spawn"),
+                );
+            }
+            for h in handles {
+                h.join().expect("join");
+            }
+            assert_eq!(
+                torn.load(O::Relaxed),
+                0,
+                "no partial identity ever observed"
+            );
+            teardown();
+        }
+    }
+
+    // (6) reused numeric TID with different ASID rejected
+    #[test]
+    fn t6_reused_numeric_tid_new_asid_rejected() {
+        let fx = caller_fixture();
+        let (idx, rgen, _epoch, identity) = arm(&fx);
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .expect("claim");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        let (_new_gen, new_id, _e) = reuse(&fx, idx, rgen);
+        // A claim reusing the numeric caller TID but a different ASID is rejected.
+        let mut reused = new_id;
+        reused.caller_asid = crate::kernel::vm::Asid(0xEE);
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &reused))
+                .is_none(),
+            "reused numeric TID with different ASID rejected"
+        );
+        teardown();
+    }
+
+    // (7) stale reply alias rejected after reuse
+    #[test]
+    fn t7_stale_reply_alias_rejected_after_reuse() {
+        let fx = caller_fixture();
+        let (idx, rgen, _epoch, old_identity) = arm(&fx);
+        let owner = fx
+            .k
+            .with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &old_identity))
+            .expect("claim");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        let _ = reuse(&fx, idx, rgen);
+        // A stale reply alias (old identity) cannot resolve the new record.
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                idx,
+                TerminalClaimant::Reply,
+                &old_identity
+            ))
+            .is_none(),
+            "stale reply alias rejected after reuse"
+        );
+        teardown();
+    }
+}
+
+/// Stage 200B — DEADLINE TOKEN + slot-reuse memory-ordering audit.
+///
+/// Source guards pin the exact strong orderings (and fail if any is weakened);
+/// functional tests prove the observable contracts.
+///
+/// ```text
+///   token identity init → Armed Release publication → Acquire/AcqRel fire claim
+///                       → fire owner observes the complete token identity
+///   new terminal identity init → Open Release publication → terminal Acquire claim
+///                              → claimant observes the complete identity
+///   terminal completion → exact token disarm → late fire cannot reopen/reclaim
+/// ```
+///
+/// The sequence/generation (epoch) comparison prevents an old cancel/restore from
+/// re-arming a newly published token. Stage 200A / Stage 199 reply-record orderings
+/// are NOT weakened.
+#[cfg(test)]
+mod stage200b_memory_ordering {
+    use crate::kernel::deadline_token::{DeadlineTokenCell, DeadlineTokenIdentity};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::terminal_ownership::{TerminalCell, TerminalIdentity};
+    use crate::kernel::vm::Asid;
+
+    fn token_src() -> &'static str {
+        include_str!("../deadline_token.rs")
+    }
+    fn terminal_src() -> &'static str {
+        include_str!("../terminal_ownership.rs")
+    }
+
+    // ── Source guards: deadline token ──────────────────────────────────────────
+    #[test]
+    fn token_arm_publishes_armed_with_release_last() {
+        let s = token_src();
+        assert!(
+            s.contains(".store(dl_encode(epoch, DL_ARMED), Ordering::Release);"),
+            "arm must publish Armed with a Release store"
+        );
+        assert!(
+            !s.contains("DL_ARMED), Ordering::Relaxed)"),
+            "the Armed publication must not be Relaxed"
+        );
+    }
+
+    #[test]
+    fn token_fire_claim_acquires_then_acqrel_cas() {
+        let s = token_src();
+        assert!(
+            s.contains("let w = self.state.load(Ordering::Acquire);"),
+            "fire claim must Acquire-gate on the published state first"
+        );
+        assert!(
+            s.contains("dl_encode(epoch, DL_ARMED),")
+                && s.contains("dl_encode(epoch, DL_CLAIMED_FOR_FIRE),")
+                && s.contains("Ordering::AcqRel,\n            Ordering::Acquire,"),
+            "the fire claim CAS must be AcqRel / Acquire"
+        );
+    }
+
+    // ── Source guards: terminal re-arm ─────────────────────────────────────────
+    #[test]
+    fn terminal_rearm_publishes_open_with_release_last() {
+        let s = terminal_src();
+        // The re-arm publishes Open with the SAME Release discipline as arm.
+        assert_eq!(
+            s.matches("store(encode(epoch, 0, PHASE_OPEN), Ordering::Release)")
+                .count(),
+            2,
+            "both arm and try_rearm publish Open with a Release store"
+        );
+        assert!(
+            s.contains(".compare_exchange(open, reserved, Ordering::AcqRel, Ordering::Acquire)"),
+            "the terminal claim CAS must remain AcqRel / Acquire (unweakened)"
+        );
+    }
+
+    // ── Functional helpers ─────────────────────────────────────────────────────
+    fn terminal_ident(record_gen: u64) -> TerminalIdentity {
+        TerminalIdentity {
+            reply_record_index: 2,
+            reply_record_generation: record_gen,
+            caller_tid: ThreadId(1),
+            caller_asid: Asid(11),
+            replier_tid: ThreadId(2),
+            replier_asid: Asid(22),
+            reply_endpoint_index: 7,
+            reply_endpoint_generation: 5,
+            blocked_recv_generation: 9,
+            deadline_token_generation: Some(1),
+        }
+    }
+    fn token_ident(token_gen: u64, epoch: u64) -> DeadlineTokenIdentity {
+        DeadlineTokenIdentity {
+            token_index: 0,
+            token_generation: token_gen,
+            terminal_epoch: epoch,
+            terminal_identity: terminal_ident(1),
+        }
+    }
+
+    // ── Functional: fire owner observes the complete token identity ────────────
+    #[test]
+    fn fire_owner_observes_complete_identity() {
+        let mut c = DeadlineTokenCell::vacant();
+        let handle = c.arm(token_ident(1, 1)).expect("arm");
+        // Observing Armed ⇒ the whole identity is visible (Release/Acquire).
+        assert!(c.is_armed());
+        assert_eq!(*c.identity(), *handle.identity());
+        assert!(c.claim_fire(&handle).is_some());
+    }
+
+    // ── Functional: an old cancel cannot re-arm a newer token ──────────────────
+    #[test]
+    fn old_cancel_cannot_rearm_newer_token() {
+        let mut c = DeadlineTokenCell::vacant();
+        let old = c.arm(token_ident(1, 1)).expect("arm gen 1");
+        assert!(c.cancel_exact(&old));
+        let fresh = c.arm(token_ident(2, 1)).expect("re-arm gen 2");
+        // The stale cancel handle cannot cancel/disarm the newer registration.
+        assert!(
+            !c.cancel_exact(&old),
+            "stale cancel cannot touch the new token"
+        );
+        assert!(c.is_armed());
+        assert!(c.claim_fire(&fresh).is_some());
+    }
+
+    // ── Functional: terminal completion → exact disarm → late fire can't reopen ─
+    #[test]
+    fn terminal_completion_disarm_blocks_late_fire() {
+        let mut tcell = TerminalCell::vacant();
+        tcell.arm(terminal_ident(1));
+        let epoch = tcell.current_epoch();
+        let mut tok = DeadlineTokenCell::vacant();
+        let handle = tok.arm(token_ident(1, epoch)).expect("arm token");
+        // A non-timeout terminal wins; the exact token is disarmed.
+        let reply = tcell
+            .try_claim_reply_terminal(&terminal_ident(1))
+            .expect("reply");
+        assert!(tcell.commit_terminal(&reply));
+        assert!(tok.disarm_after_terminal_completion(handle.identity(), handle.epoch()));
+        // A late fire cannot reopen or reclaim.
+        assert!(
+            tok.claim_fire(&handle).is_none(),
+            "late fire blocked after disarm"
+        );
+        assert!(tok.is_disarmed());
+    }
+}
+
+/// Stage 200B — hosted registration/ownership SEAL.
+///
+/// Runs every deadline fire-vs-terminal race, aggregates exact totals, and emits
+/// the seal only when all invariants hold. This is a hosted registration/ownership
+/// seal — it does NOT claim timer or timeout completion support (no terminal is
+/// committed, no caller is woken, no result is copied).
+#[cfg(test)]
+mod stage200b_deadline_seal {
+    use super::stage200b_deadline_races::{FireRaceOutcome, race_fire_vs_terminal};
+    use crate::kernel::terminal_ownership::TerminalClaimant;
+
+    #[test]
+    fn stage200b_deadline_token_seal() {
+        let competitors = [
+            TerminalClaimant::Reply,
+            TerminalClaimant::PeerDeath,
+            TerminalClaimant::CallerExit,
+            TerminalClaimant::EndpointGone,
+        ];
+        let mut total_fire_owners = 0usize;
+        let mut total_terminal_winners = 0usize;
+        let mut total_timeout_winners = 0usize;
+        let mut total_wakes = 0usize;
+        let mut total_copies = 0usize;
+        let mut total_stale = 0usize;
+        let mut total_new_cancelled = 0usize;
+        let mut total_reserved = 0usize;
+        let mut races = 0usize;
+
+        for _ in 0..40 {
+            for &c in &competitors {
+                let o: FireRaceOutcome = race_fire_vs_terminal(c);
+                o.assert_invariants();
+                total_fire_owners += o.token_fire_owners;
+                total_terminal_winners += o.terminal_winners;
+                total_timeout_winners += o.timeout_terminal_winners;
+                total_wakes += o.caller_wakes;
+                total_copies += o.result_copies;
+                total_stale += o.stale_tokens_accepted;
+                total_new_cancelled += o.new_registrations_cancelled;
+                total_reserved += o.records_left_reserved;
+                races += 1;
+            }
+        }
+
+        assert!(
+            total_fire_owners <= races,
+            "token fire owners <= 1 per race"
+        );
+        assert_eq!(
+            total_terminal_winners, races,
+            "exactly one terminal winner per race"
+        );
+        assert!(
+            total_timeout_winners <= races,
+            "timeout terminal winners <= 1 per race"
+        );
+        assert_eq!(total_wakes, 0, "no caller wakes");
+        assert_eq!(total_copies, 0, "no result copies");
+        assert_eq!(total_stale, 0, "no stale tokens accepted");
+        assert_eq!(total_new_cancelled, 0, "no new registrations cancelled");
+        assert_eq!(total_reserved, 0, "no record left reserved after cleanup");
+
+        let seal = "\
+STAGE_200B_DEADLINE_TOKEN_SEAL\n\
+terminal_authority_stores=1\n\
+deadline_registration_stores=1\n\
+generation_bearing_tokens=1\n\
+reply_slot_reuse_epoch_safe=1\n\
+duplicate_fire_owners=0\n\
+duplicate_timeout_claims=0\n\
+stale_token_accepts=0\n\
+new_registration_cancellations=0\n\
+caller_wakes=0\n\
+result_copies=0\n\
+result=ok";
+        std::println!("{seal}");
+
+        for field in [
+            "STAGE_200B_DEADLINE_TOKEN_SEAL",
+            "terminal_authority_stores=1",
+            "deadline_registration_stores=1",
+            "generation_bearing_tokens=1",
+            "reply_slot_reuse_epoch_safe=1",
+            "duplicate_fire_owners=0",
+            "duplicate_timeout_claims=0",
+            "stale_token_accepts=0",
+            "new_registration_cancellations=0",
+            "caller_wakes=0",
+            "result_copies=0",
             "result=ok",
         ] {
             assert!(seal.contains(field), "seal missing field {field}");

@@ -5362,6 +5362,12 @@ const MAX_TRANSFER_ENVELOPES: usize = 256;
 #[cfg(not(feature = "hosted-dev"))]
 const MAX_TRANSFER_ENVELOPES: usize = 64;
 pub(crate) const MAX_REPLY_CAPS: usize = MAX_TASKS;
+/// Stage 200B — bounded capacity of the single deadline-registration store
+/// (`IpcSubsystem::reply_deadline_tokens`). Small on purpose: this stage supports
+/// at most one active deadline registration per reply receive in a single-pair
+/// era, and a bounded store makes the fail-closed "store full" path testable. This
+/// is a registration/ownership store, NOT a terminal-result authority store.
+pub(crate) const MAX_DEADLINE_TOKENS: usize = 4;
 #[cfg(feature = "hosted-dev")]
 const MAX_DELEGATED_CAPABILITY_LINKS: usize = 4096;
 #[cfg(not(feature = "hosted-dev"))]
