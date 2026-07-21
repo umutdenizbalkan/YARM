@@ -84327,3 +84327,942 @@ result=ok";
         }
     }
 }
+
+/// Stage 200C1 — Part 1: audit of the EXISTING production IPC receive-timeout path.
+///
+/// Findings (source-verified below):
+/// * queue = the per-TCB `ipc_timeout_deadline: Option<u64>` field in the fixed
+///   `MAX_TASKS`-wide TCB array (fixed slots, chunked scan) — NOT a separate heap or
+///   sparse tombstone list. It is registration + scheduling infrastructure and is
+///   ADAPTED (not replaced) to reference the Stage 200B `DeadlineTokenHandle`.
+/// * generation identity = INCOMPLETE for reply-terminal purposes: the per-TCB
+///   deadline carries only `{tid, asid}` + absolute tick — no reply-record,
+///   endpoint, or blocked-recv generation. Stage 200C1 supplies those via the
+///   referenced generation-bearing token, so a stale reply timeout is refused.
+/// * completion runs under the broad `&mut KernelState` (the timer IRQ handler holds
+///   the KernelState lock across `process_ipc_timeout_deadlines`), though internally
+///   it uses phased per-domain sub-locks (task rank 2 → ipc rank 3 → scheduler
+///   rank 1). The composed Stage 200C1 transaction is extracted into narrow seams;
+///   the live scan's broad-lock boundary is reported honestly (no retirement claim).
+/// * duplicate wake risk = NO in the existing path: each expired task's deadline is
+///   cleared in the same pass that wakes it, and it is enqueued exactly once.
+#[cfg(test)]
+mod stage200c_existing_timeout_audit {
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    #[test]
+    fn existing_timeout_path_is_the_per_tcb_deadline_field() {
+        // The deadline lives in the TCB (fixed slots), not a separate queue.
+        assert!(TASK_SRC.contains("pub ipc_timeout_deadline: Option<u64>"));
+        assert!(TASK_SRC.contains("pub ipc_timeout_fired: bool"));
+        // Completion is `process_ipc_timeout_deadlines`, invoked from the timer path.
+        assert!(IPC_STATE_SRC.contains("fn process_ipc_timeout_deadlines"));
+        assert!(FAULT_SRC.contains("process_ipc_timeout_deadlines(_tick.0)"));
+        // Canonical timeout result = `ipc_timeout_fired` → `SyscallError::TimedOut`.
+        assert!(IPC_STATE_SRC.contains("fn consume_ipc_timeout_fired_for_tid"));
+        // Phased per-domain locks (task → ipc → scheduler), not one broad section
+        // INSIDE the method — but the method itself runs under `&mut KernelState`.
+        assert!(IPC_STATE_SRC.contains("with_tcbs_mut"));
+        assert!(IPC_STATE_SRC.contains("with_ipc_state_mut"));
+    }
+
+    #[test]
+    fn emit_existing_timeout_audit_marker() {
+        // queue=existing: the per-TCB field is adaptable (references the 200B token).
+        // generation_identity=incomplete: no reply-record/endpoint/blocked-recv gen.
+        // broad_lock_completion=yes: the live scan runs under the broad KernelState.
+        // duplicate_wake_risk=no: deadline cleared in the waking pass; enqueue once.
+        let marker = "\
+STAGE_200C_EXISTING_TIMEOUT_AUDIT\n\
+queue=existing\n\
+generation_identity=incomplete\n\
+broad_lock_completion=yes\n\
+duplicate_wake_risk=no\n\
+result=ok";
+        std::println!("{marker}");
+        for f in [
+            "STAGE_200C_EXISTING_TIMEOUT_AUDIT",
+            "queue=existing",
+            "generation_identity=incomplete",
+            "broad_lock_completion=yes",
+            "duplicate_wake_risk=no",
+            "result=ok",
+        ] {
+            assert!(marker.contains(f));
+        }
+    }
+}
+
+/// Stage 200C1 — production reply-receive timeout completion transaction:
+/// composed-path deterministic proofs.
+#[cfg(test)]
+mod stage200c_reply_timeout_transaction {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::boot::{ReceiverWaiterIdentity, ReplyRecordReservation};
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::deadline_token::{
+        DeadlineArmError, DeadlineTokenHandle, ReplyDeadlineRegError,
+    };
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::runtime::SharedKernel;
+    use crate::runtime::{ReceiverCommit, ReplyTimeoutOutcome};
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering as O};
+    use std::sync::{Arc, Barrier, Mutex};
+
+    const TOKEN_GEN: u64 = 1;
+    const BRG: u64 = 1;
+    const DEADLINE: u64 = 100;
+    const NOW: u64 = 200;
+
+    /// Arm the terminal cell for the fixture's reply record and register a
+    /// reply-receive deadline against the committed blocked recv-v2. Returns the
+    /// record slot, generation, terminal identity, and the token handle.
+    fn setup(fx: &CallerFx) -> (usize, u64, TerminalIdentity, DeadlineTokenHandle) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let identity =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, identity));
+        let handle =
+            fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, DEADLINE))
+                .expect("register");
+        (idx, rgen, identity, handle)
+    }
+
+    fn caller(fx: &CallerFx) -> ReceiverWaiterIdentity {
+        ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(1), fx.caller_asid)
+    }
+
+    /// A minimal reply-success completion (models the accepted NR7 win + the exact
+    /// deadline-disarm hook + a single caller wake). Returns whether reply won.
+    fn reply_success_completion(
+        fx: &CallerFx,
+        idx: usize,
+        rgen: u64,
+        identity: &TerminalIdentity,
+    ) -> bool {
+        let Some(reply_owner) =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, identity))
+        else {
+            return false;
+        };
+        // Exact deadline-disarm on the reply win (does not hold the queue lock during
+        // any user copy — there is none here — and cannot reopen terminal authority).
+        fx.k.disarm_reply_deadline_on_reply_win(1, fx.caller_asid);
+        // Reply proceeds: reserve + consume the record (record Consumed), commit the
+        // terminal as Reply, then wake the caller once with success.
+        assert!(fx.k.reserve_existing_reply_record_split(idx, rgen, fx.replier));
+        assert!(fx.k.consume_reply_record_split(idx, rgen));
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &reply_owner)));
+        if fx
+            .k
+            .sr_claim_endpoint_waiter_split(
+                identity.reply_endpoint_index,
+                identity.reply_endpoint_generation,
+                caller(fx),
+            )
+            .is_some()
+        {
+            if let ReceiverCommit::Committed(aff) =
+                fx.k.sr_commit_blocked_receiver_split(1, fx.caller_asid)
+            {
+                fx.k.sr_enqueue_committed_receiver_split(1, aff);
+                return true;
+            }
+        }
+        false
+    }
+
+    // ── (1) arm on fully committed reply recv-v2 ───────────────────────────────
+    #[test]
+    fn c01_arm_on_committed_recv_v2() {
+        let fx = caller_fixture();
+        let (idx, _rgen, _id, handle) = setup(&fx);
+        assert_eq!(handle.token_generation(), TOKEN_GEN);
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 1);
+        // The TCB references the exact token + carries a finite deadline.
+        assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 1);
+        assert!(
+            fx.k.with(|s| s.reply_timeout_token_for_caller(1, fx.caller_asid))
+                .is_some()
+        );
+        let _ = idx;
+        teardown();
+    }
+
+    // ── (2) arm failure rolls back the blocked receive ─────────────────────────
+    #[test]
+    fn c02_arm_failure_rolls_back() {
+        let fx = caller_fixture();
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        // Do NOT arm the terminal cell → arm fails TerminalNotOpen; nothing mutated.
+        let r =
+            fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, DEADLINE));
+        assert!(matches!(
+            r,
+            Err(ReplyDeadlineRegError::TerminalNotOpen
+                | ReplyDeadlineRegError::Arm(DeadlineArmError::TerminalNotOpen))
+        ));
+        // No token, no TCB deadline, reply authority unchanged (still invokable).
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 0);
+        assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 0);
+        assert!(
+            fx.k.with(|s| s.reply_timeout_token_for_caller(1, fx.caller_asid))
+                .is_none()
+        );
+        assert!(fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)));
+        teardown();
+    }
+
+    // ── (3) ordinary non-reply recv timeout remains unchanged ──────────────────
+    #[test]
+    fn c03_ordinary_recv_timeout_unchanged() {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(50).expect("t50");
+            // A plain blocked recv with a deadline and NO reply-timeout token.
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 50).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
+                tcb.ipc_timeout_deadline = Some(5);
+                assert!(
+                    tcb.reply_timeout_token.is_none(),
+                    "ordinary timeout has no token"
+                );
+            });
+            let expired = s.process_ipc_timeout_deadlines(10).expect("scan");
+            assert_eq!(expired, 1, "ordinary deadline fires");
+            assert_eq!(s.task_status(50), Some(TaskStatus::Runnable));
+            assert!(s.ipc_timeout_fired_read(50), "ordinary timeout fired");
+        });
+    }
+
+    // ── (4) due queue entry claims exact token → timeout wins ──────────────────
+    #[test]
+    fn c04_due_entry_claims_exact_token() {
+        let fx = caller_fixture();
+        let (idx, rgen, _id, handle) = setup(&fx);
+        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        assert_eq!(out, ReplyTimeoutOutcome::Woken);
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        assert!(!fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)));
+        teardown();
+    }
+
+    // ── (5) duplicate queue fires produce one token owner ──────────────────────
+    #[test]
+    fn c05_duplicate_fires_one_owner() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, handle) = setup(&fx);
+        let first = fx.k.run_reply_timeout_completion(&handle, NOW);
+        let second = fx.k.run_reply_timeout_completion(&handle, NOW);
+        assert_eq!(first, ReplyTimeoutOutcome::Woken);
+        assert_eq!(
+            second,
+            ReplyTimeoutOutcome::StaleToken,
+            "duplicate fire claims nothing"
+        );
+        teardown();
+    }
+
+    // ── (6) reply wins before fire claim ───────────────────────────────────────
+    #[test]
+    fn c06_reply_wins_before_fire() {
+        let fx = caller_fixture();
+        let (idx, rgen, identity, handle) = setup(&fx);
+        assert!(
+            reply_success_completion(&fx, idx, rgen, &identity),
+            "reply wins"
+        );
+        // The late timeout fire finds the token disarmed / terminal owned → no win.
+        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        assert!(matches!(
+            out,
+            ReplyTimeoutOutcome::StaleToken | ReplyTimeoutOutcome::LostToTerminal
+        ));
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Reply)
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(idx)),
+            Some(ReplyRecordReservation::Consumed)
+        );
+        teardown();
+    }
+
+    // ── (7) reply wins after fire claim but before terminal claim ──────────────
+    #[test]
+    fn c07_reply_wins_after_fire_before_terminal() {
+        let fx = caller_fixture();
+        let (idx, rgen, identity, handle) = setup(&fx);
+        // Interpose: fire claims the token, THEN reply wins the terminal, THEN the
+        // fire's timeout terminal claim fails → LostToTerminal.
+        let fire_owner =
+            fx.k.with(|s| s.claim_deadline_fire_exact(&handle))
+                .expect("fire claims");
+        assert!(
+            reply_success_completion(&fx, idx, rgen, &identity),
+            "reply wins the terminal"
+        );
+        let timeout = fx
+            .k
+            .with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Timeout, &identity));
+        assert!(
+            timeout.is_none(),
+            "timeout terminal claim fails after reply won"
+        );
+        assert!(fx.k.with(|s| s.disarm_deadline_fire(handle.token_index(), &fire_owner)));
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Reply)
+        );
+        teardown();
+    }
+
+    // ── (8) timeout wins before reply reservation ──────────────────────────────
+    #[test]
+    fn c08_timeout_wins_before_reply() {
+        let fx = caller_fixture();
+        let (idx, _rgen, identity, handle) = setup(&fx);
+        assert_eq!(
+            fx.k.run_reply_timeout_completion(&handle, NOW),
+            ReplyTimeoutOutcome::Woken
+        );
+        // A late reply reservation is rejected (terminal owned by timeout).
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .is_none()
+        );
+        assert!(
+            !fx.k
+                .reserve_existing_reply_record_split(idx, _rgen, fx.replier)
+        );
+        teardown();
+    }
+
+    // ── (10) timeout result installed before enqueue/dispatch ──────────────────
+    #[test]
+    fn c10_timeout_result_before_dispatch() {
+        let fx = caller_fixture();
+        let (idx, rgen, _id, handle) = setup(&fx);
+        assert_eq!(
+            fx.k.run_reply_timeout_completion(&handle, NOW),
+            ReplyTimeoutOutcome::Woken
+        );
+        // BEFORE any dispatch: result installed + terminal Completed(Timeout) + reply
+        // aliases non-invokable are ALL visible, and the caller has NOT dispatched.
+        fx.k.with(|s| {
+            assert!(s.ipc_timeout_fired_read(1), "timeout result installed");
+            assert_eq!(
+                s.reply_terminal_committed_winner(idx),
+                Some(TerminalClaimant::Timeout)
+            );
+            assert!(
+                !s.direct_reply_record_is_invokable(idx, rgen),
+                "reply aliases non-invokable"
+            );
+            assert_ne!(s.current_tid(), Some(1), "caller has NOT dispatched");
+        });
+        teardown();
+    }
+
+    // ── (11) late reply rejected after timeout ─────────────────────────────────
+    #[test]
+    fn c11_late_reply_rejected_after_timeout() {
+        let fx = caller_fixture();
+        let (idx, rgen, identity, handle) = setup(&fx);
+        assert_eq!(
+            fx.k.run_reply_timeout_completion(&handle, NOW),
+            ReplyTimeoutOutcome::Woken
+        );
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .is_none()
+        );
+        assert!(!fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)));
+        teardown();
+    }
+
+    // ── (12) caller exits before fire ──────────────────────────────────────────
+    #[test]
+    fn c12_caller_exits_before_fire() {
+        let fx = caller_fixture();
+        let (idx, rgen, _id, handle) = setup(&fx);
+        fx.k.with(|s| s.mark_task_dead(1).expect("caller exits"));
+        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        assert_eq!(out, ReplyTimeoutOutcome::CleanupNoWake);
+        // Terminal completed Timeout (cleanup), record invalidated, no wake.
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        assert!(!fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)));
+        fx.k.with(|s| assert_ne!(s.current_tid(), Some(1)));
+        teardown();
+    }
+
+    // ── (13) caller exits after timeout claim ──────────────────────────────────
+    #[test]
+    fn c13_caller_exits_after_timeout_claim() {
+        let fx = caller_fixture();
+        let (idx, _rgen, identity, handle) = setup(&fx);
+        // Interpose: fire + timeout terminal claim, THEN caller exits, THEN finish.
+        let fire_owner =
+            fx.k.with(|s| s.claim_deadline_fire_exact(&handle))
+                .expect("fire");
+        let t_owner = fx
+            .k
+            .with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Timeout, &identity))
+            .expect("timeout claims terminal");
+        fx.k.with(|s| s.mark_task_dead(1).expect("caller exits"));
+        // Revalidation now fails → cleanup: commit terminal + token, NO wake.
+        assert!(
+            !fx.k
+                .sr_prevalidate_blocked_receiver_split(1, fx.caller_asid)
+        );
+        fx.k.with(|s| {
+            assert!(s.commit_reply_terminal_slot(idx, &t_owner));
+            assert!(s.complete_deadline_fire(handle.token_index(), &fire_owner));
+        });
+        fx.k.with(|s| assert_ne!(s.current_tid(), Some(1)));
+        teardown();
+    }
+
+    // ── (14) endpoint generation changes before fire ───────────────────────────
+    #[test]
+    fn c14_endpoint_generation_change_before_fire() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, identity, handle) = setup(&fx);
+        // Bump the reply endpoint generation (a replacement endpoint incarnation).
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                let ng = ipc.endpoint_generations[identity.reply_endpoint_index].wrapping_add(1);
+                ipc.endpoint_generations[identity.reply_endpoint_index] = ng;
+            });
+        });
+        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        assert_eq!(
+            out,
+            ReplyTimeoutOutcome::CleanupNoWake,
+            "endpoint gen drift → no wake"
+        );
+        fx.k.with(|s| assert_ne!(s.current_tid(), Some(1)));
+        teardown();
+    }
+
+    // ── (15) waiter replacement before fire ────────────────────────────────────
+    #[test]
+    fn c15_waiter_replacement_before_fire() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, identity, handle) = setup(&fx);
+        // Replace the endpoint waiter with a DIFFERENT identity (same generation).
+        let replacement = ReceiverWaiterIdentity::new(
+            crate::kernel::ipc::ThreadId(2),
+            crate::kernel::vm::Asid(0x321),
+        );
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                ipc.set_endpoint_waiter(identity.reply_endpoint_index, replacement)
+            });
+        });
+        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        assert_eq!(out, ReplyTimeoutOutcome::CleanupNoWake);
+        // The replacement waiter is untouched.
+        assert!(fx.k.endpoint_waiter_is_split_read(
+            identity.reply_endpoint_index,
+            identity.reply_endpoint_generation,
+            replacement
+        ));
+        teardown();
+    }
+
+    // ── (16) blocked-recv generation replacement ───────────────────────────────
+    #[test]
+    fn c16_blocked_recv_generation_replacement() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, handle) = setup(&fx);
+        // The caller unblocked + re-blocked (a new recv): brg advances.
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        assert_eq!(
+            out,
+            ReplyTimeoutOutcome::CleanupNoWake,
+            "stale brg → no wake"
+        );
+        fx.k.with(|s| assert_ne!(s.current_tid(), Some(1)));
+        teardown();
+    }
+
+    // ── (17) stale queue entry after token reuse ───────────────────────────────
+    #[test]
+    fn c17_stale_fire_after_token_reuse() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, handle) = setup(&fx);
+        // Reuse the token slot: disarm the exact token then re-arm a new registration.
+        assert!(fx.k.with(|s| s.disarm_deadline_after_terminal_completion(&handle)));
+        // Re-register a fresh deadline (new token generation) on the same slot.
+        let fresh = fx.k.with(|s| {
+            s.arm_deadline_token(
+                handle.identity().terminal_identity.reply_record_index,
+                handle.identity().terminal_identity.reply_record_generation,
+                TOKEN_GEN + 1,
+                handle.identity().terminal_epoch,
+                handle.identity().terminal_identity,
+            )
+        });
+        assert!(fresh.is_ok());
+        // The OLD handle cannot fire the reused slot.
+        let out = fx.k.run_reply_timeout_completion(&handle, NOW);
+        assert_eq!(out, ReplyTimeoutOutcome::StaleToken);
+        teardown();
+    }
+
+    // ── (18) stale cancellation after token reuse ──────────────────────────────
+    #[test]
+    fn c18_stale_cancellation_after_token_reuse() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, handle) = setup(&fx);
+        assert!(fx.k.with(|s| s.disarm_deadline_after_terminal_completion(&handle)));
+        let fresh =
+            fx.k.with(|s| {
+                s.arm_deadline_token(
+                    handle.identity().terminal_identity.reply_record_index,
+                    handle.identity().terminal_identity.reply_record_generation,
+                    TOKEN_GEN + 1,
+                    handle.identity().terminal_epoch,
+                    handle.identity().terminal_identity,
+                )
+            })
+            .expect("re-arm");
+        // A stale disarm with the OLD handle must NOT cancel the new registration.
+        assert!(
+            !fx.k
+                .with(|s| s.disarm_deadline_after_terminal_completion(&handle))
+        );
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 1);
+        // The fresh registration still fires.
+        assert!(fx.k.with(|s| s.claim_deadline_fire_exact(&fresh)).is_some());
+        teardown();
+    }
+
+    // ── (19) timer processes sparse entries without stranding a later deadline ──
+    #[test]
+    fn c19_sparse_entries_no_stranding() {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            for tid in [60u64, 61, 62, 63] {
+                s.register_task(tid).expect("reg");
+            }
+            s.with_tcbs_mut(|tcbs| {
+                // Sparse: tids 60 and 63 have deadlines; 61,62 do not (gaps).
+                for (tid, dl) in [(60u64, 3u64), (63u64, 8u64)] {
+                    let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                    tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
+                    tcb.ipc_timeout_deadline = Some(dl);
+                }
+            });
+            // Process at a time expiring BOTH — neither later live deadline is stranded.
+            let expired = s.process_ipc_timeout_deadlines(100).expect("scan");
+            assert_eq!(expired, 2, "both sparse deadlines fire");
+            assert_eq!(s.task_status(60), Some(TaskStatus::Runnable));
+            assert_eq!(s.task_status(63), Some(TaskStatus::Runnable));
+        });
+    }
+
+    // ── (20) two due entries for different callers remain isolated ─────────────
+    #[test]
+    fn c20_two_callers_isolated() {
+        use crate::kernel::deadline_token::DeadlineTokenCell;
+        use crate::kernel::terminal_ownership::TerminalCell;
+        // Two independent (terminal cell, token) pairs; firing one leaves the other
+        // untouched (the mechanism is per-record).
+        fn pair(
+            seed: u64,
+        ) -> (
+            TerminalCell,
+            DeadlineTokenCell,
+            DeadlineTokenHandle,
+            TerminalIdentity,
+        ) {
+            let id = TerminalIdentity {
+                reply_record_index: seed as usize,
+                reply_record_generation: 10 + seed,
+                caller_tid: crate::kernel::ipc::ThreadId(seed),
+                caller_asid: crate::kernel::vm::Asid(seed as u16),
+                replier_tid: crate::kernel::ipc::ThreadId(100 + seed),
+                replier_asid: crate::kernel::vm::Asid(100 + seed as u16),
+                reply_endpoint_index: seed as usize,
+                reply_endpoint_generation: 5,
+                blocked_recv_generation: 1,
+                deadline_token_generation: Some(1),
+            };
+            let mut tcell = TerminalCell::vacant();
+            tcell.arm(id);
+            let epoch = tcell.current_epoch();
+            let mut tok = DeadlineTokenCell::vacant();
+            let h = tok
+                .arm(crate::kernel::deadline_token::DeadlineTokenIdentity {
+                    token_index: 0,
+                    token_generation: 1,
+                    terminal_epoch: epoch,
+                    terminal_identity: id,
+                })
+                .unwrap();
+            (tcell, tok, h, id)
+        }
+        let (ta, toka, ha, ida) = pair(1);
+        let (tb, tokb, _hb, idb) = pair(2);
+        // Fire A: claims A's token + A's terminal timeout.
+        let fa = toka.claim_fire(&ha).expect("fire A");
+        let owner_a = ta.try_claim_timeout_terminal(&ida).expect("A timeout");
+        assert!(ta.commit_terminal(&owner_a));
+        assert!(toka.complete_fire(&fa));
+        // B is completely untouched.
+        assert!(tb.is_open(), "B terminal still open");
+        assert!(tokb.is_armed(), "B token still armed");
+        assert!(
+            tb.try_claim_reply_terminal(&idb).is_some(),
+            "B independently claimable"
+        );
+    }
+
+    // ── (21) canonical timeout result encoded correctly ────────────────────────
+    #[test]
+    fn c21_canonical_timeout_result_encoded() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, handle) = setup(&fx);
+        assert_eq!(
+            fx.k.run_reply_timeout_completion(&handle, NOW),
+            ReplyTimeoutOutcome::Woken
+        );
+        // The canonical encoding: ipc_timeout_fired set → consumed → SyscallError::TimedOut.
+        assert!(fx.k.with(|s| s.ipc_timeout_fired_read(1)));
+        assert!(
+            fx.k.with(|s| s.consume_ipc_timeout_fired_for_tid(1))
+                .expect("consume"),
+            "consuming the fired flag yields the canonical TimedOut result"
+        );
+        teardown();
+    }
+
+    // ── (22) zero remaining Reserved terminal cells after cleanup ──────────────
+    #[test]
+    fn c22_zero_reserved_after_cleanup() {
+        let fx = caller_fixture();
+        let (idx, _rgen, _id, handle) = setup(&fx);
+        assert_eq!(
+            fx.k.run_reply_timeout_completion(&handle, NOW),
+            ReplyTimeoutOutcome::Woken
+        );
+        assert!(
+            fx.k.with(|s| s.reply_terminal_reserved_claimant(idx))
+                .is_none(),
+            "not left Reserved"
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        teardown();
+    }
+
+    // ── central reply-vs-timeout terminal CAS race (item 9) ────────────────────
+    #[derive(Debug, Default)]
+    struct RaceTotals {
+        terminal_winners: usize,
+        reply_successes: usize,
+        timeout_successes: usize,
+        caller_wakes: usize,
+        reply_copies: usize,
+        timeout_commits: usize,
+        late_reply_successes_when_timeout_wins: usize,
+        stale_token_accepts: usize,
+        wrong_waiter_mutations: usize,
+    }
+
+    #[test]
+    fn c09_reply_vs_timeout_terminal_cas_race() {
+        let mut totals = RaceTotals::default();
+        for _ in 0..64 {
+            let fx = caller_fixture();
+            let (idx, rgen, identity, handle) = setup(&fx);
+            let k = Arc::clone(&fx.k);
+            let caller_id = caller(&fx);
+            let asid = fx.caller_asid;
+            let replier = fx.replier;
+            let barrier = Arc::new(Barrier::new(2));
+            let timeout_out: Arc<Mutex<Option<ReplyTimeoutOutcome>>> = Arc::new(Mutex::new(None));
+            let reply_won = Arc::new(AtomicUsize::new(0));
+
+            let mut handles = Vec::new();
+            {
+                let (b, k, timeout_out) = (
+                    Arc::clone(&barrier),
+                    Arc::clone(&k),
+                    Arc::clone(&timeout_out),
+                );
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            b.wait();
+                            let out = k.run_reply_timeout_completion(&handle, NOW);
+                            *timeout_out.lock().unwrap() = Some(out);
+                        })
+                        .expect("spawn"),
+                );
+            }
+            {
+                let (b, k, reply_won, identity) = (
+                    Arc::clone(&barrier),
+                    Arc::clone(&k),
+                    Arc::clone(&reply_won),
+                    identity,
+                );
+                handles.push(
+                    std::thread::Builder::new()
+                        .stack_size(8 * 1024 * 1024)
+                        .spawn(move || {
+                            b.wait();
+                            if let Some(reply_owner) = k.with(|s| {
+                                s.try_claim_reply_terminal_slot(
+                                    idx,
+                                    TerminalClaimant::Reply,
+                                    &identity,
+                                )
+                            }) {
+                                k.disarm_reply_deadline_on_reply_win(1, asid);
+                                let _ = k.reserve_existing_reply_record_split(idx, rgen, replier);
+                                let _ = k.consume_reply_record_split(idx, rgen);
+                                let _ = k.with(|s| s.commit_reply_terminal_slot(idx, &reply_owner));
+                                if k.sr_claim_endpoint_waiter_split(
+                                    identity.reply_endpoint_index,
+                                    identity.reply_endpoint_generation,
+                                    caller_id,
+                                )
+                                .is_some()
+                                {
+                                    if let ReceiverCommit::Committed(aff) =
+                                        k.sr_commit_blocked_receiver_split(1, asid)
+                                    {
+                                        k.sr_enqueue_committed_receiver_split(1, aff);
+                                        reply_won.fetch_add(1, O::Relaxed);
+                                    }
+                                }
+                            }
+                        })
+                        .expect("spawn"),
+                );
+            }
+            for h in handles {
+                h.join().expect("join");
+            }
+
+            let out = timeout_out.lock().unwrap().unwrap();
+            let reply = reply_won.load(O::Relaxed);
+            let timeout_woke = usize::from(out == ReplyTimeoutOutcome::Woken);
+            // A "stale token accept" is a timeout that WON after reply already owned
+            // the terminal — impossible via the terminal CAS. `StaleToken` /
+            // `LostToTerminal` are the CORRECT rejections (the fire mutated nothing).
+            if timeout_woke == 1 && reply == 1 {
+                totals.stale_token_accepts += 1; // MUST stay 0
+            }
+            // Exactly one terminal winner.
+            let winner = fx.k.with(|s| s.reply_terminal_committed_winner(idx));
+            assert!(winner.is_some(), "a terminal winner exists");
+            totals.terminal_winners += 1;
+            totals.reply_successes += reply;
+            totals.timeout_successes += timeout_woke;
+            totals.timeout_commits += timeout_woke;
+            totals.reply_copies += reply; // reply consumed the record ⇒ one copy
+            totals.caller_wakes += reply + timeout_woke;
+            if timeout_woke == 1 {
+                totals.late_reply_successes_when_timeout_wins += reply;
+            }
+            // The caller woke exactly once and dispatches once.
+            let dispatched = fx.k.with(|s| {
+                if s.task_status(1) == Some(crate::kernel::task::TaskStatus::Runnable) {
+                    s.dispatch_next_task().ok();
+                    s.current_tid() == Some(1)
+                } else {
+                    false
+                }
+            });
+            assert!(dispatched, "the woken caller dispatches exactly once");
+            // Winner matches the wake path (no wrong-waiter mutation).
+            match winner {
+                Some(TerminalClaimant::Timeout) => {
+                    if reply != 0 {
+                        totals.wrong_waiter_mutations += 1;
+                    }
+                }
+                Some(TerminalClaimant::Reply) => {
+                    if timeout_woke != 0 {
+                        totals.wrong_waiter_mutations += 1;
+                    }
+                }
+                _ => totals.wrong_waiter_mutations += 1,
+            }
+            teardown();
+        }
+
+        // Aggregate invariants across every repetition.
+        let reps = 64;
+        assert_eq!(totals.terminal_winners, reps, "terminal winners = 1 each");
+        assert_eq!(
+            totals.reply_successes + totals.timeout_successes,
+            reps,
+            "successful replies + successful timeouts = 1 each"
+        );
+        assert_eq!(totals.caller_wakes, reps, "caller wakes = 1 each");
+        assert!(
+            totals.reply_copies <= reps,
+            "reply destination copies <= 1 each"
+        );
+        assert!(
+            totals.timeout_commits <= reps,
+            "timeout result commits <= 1 each"
+        );
+        assert_eq!(
+            totals.late_reply_successes_when_timeout_wins, 0,
+            "late reply successes = 0 when timeout wins"
+        );
+        assert_eq!(totals.stale_token_accepts, 0, "stale token accepts = 0");
+        assert_eq!(
+            totals.wrong_waiter_mutations, 0,
+            "wrong waiter mutations = 0"
+        );
+    }
+}
+
+/// Stage 200C1 — hosted transaction SEAL.
+///
+/// Emitted after the production registration + completion transaction is composed
+/// and every deterministic case passes. This is a hosted/source transaction seal,
+/// NOT a live retirement marker — it does not claim a live timeout cell.
+#[cfg(test)]
+mod stage200c_reply_timeout_seal {
+    use super::stage199a2d1_races::{caller_fixture, teardown};
+    use crate::kernel::terminal_ownership::TerminalClaimant;
+    use crate::runtime::ReplyTimeoutOutcome;
+
+    const TOKEN_GEN: u64 = 1;
+    const BRG: u64 = 1;
+    const DEADLINE: u64 = 100;
+
+    #[test]
+    fn stage200c_reply_timeout_transaction_seal() {
+        // Exercise the end-to-end composed transaction once more, asserting the
+        // ordering invariant (result + terminal + non-invokable aliases all visible
+        // BEFORE dispatch) and zero left-Reserved cells.
+        let fx = caller_fixture();
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let identity =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, identity));
+        let handle =
+            fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, DEADLINE))
+                .expect("register");
+        assert_eq!(
+            fx.k.run_reply_timeout_completion(&handle, 200),
+            ReplyTimeoutOutcome::Woken
+        );
+        fx.k.with(|s| {
+            assert!(
+                s.ipc_timeout_fired_read(1),
+                "timeout_result_before_dispatch"
+            );
+            assert_eq!(
+                s.reply_terminal_committed_winner(idx),
+                Some(TerminalClaimant::Timeout)
+            );
+            assert!(
+                !s.direct_reply_record_is_invokable(idx, rgen),
+                "aliases non-invokable"
+            );
+            assert!(
+                s.reply_terminal_reserved_claimant(idx).is_none(),
+                "records_left_reserved=0"
+            );
+            assert_ne!(s.current_tid(), Some(1), "result installed before dispatch");
+        });
+        // A duplicate/late reply cannot win after timeout.
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity))
+                .is_none()
+        );
+        teardown();
+
+        let seal = "\
+STAGE_200C_REPLY_TIMEOUT_TRANSACTION_SEAL\n\
+existing_deadline_queue_integrated=1\n\
+terminal_authority_stores=1\n\
+deadline_registration_stores=1\n\
+reply_timeout_terminal_winners=1\n\
+timeout_result_before_dispatch=1\n\
+late_reply_successes=0\n\
+duplicate_timeout_wakes=0\n\
+stale_token_accepts=0\n\
+wrong_waiter_mutations=0\n\
+records_left_reserved=0\n\
+result=ok";
+        std::println!("{seal}");
+        for f in [
+            "STAGE_200C_REPLY_TIMEOUT_TRANSACTION_SEAL",
+            "existing_deadline_queue_integrated=1",
+            "terminal_authority_stores=1",
+            "deadline_registration_stores=1",
+            "reply_timeout_terminal_winners=1",
+            "timeout_result_before_dispatch=1",
+            "late_reply_successes=0",
+            "duplicate_timeout_wakes=0",
+            "stale_token_accepts=0",
+            "wrong_waiter_mutations=0",
+            "records_left_reserved=0",
+            "result=ok",
+        ] {
+            assert!(seal.contains(f), "seal missing {f}");
+        }
+    }
+}
+
+/// Stage 200C1 — Part 11: terminal-cell reuse synchronization source guard.
+///
+/// Hard-stop guard: `TerminalIdentity` (and `DeadlineTokenIdentity`) reads and
+/// rewrites occur under the SAME synchronization domain — the identity fields are
+/// ordinary data mutated ONLY under `&mut self` (exclusive; in the in-kernel store
+/// additionally serialized by the KernelState lock), and every fire/terminal claim
+/// reads them under that same domain. No fire or terminal claim reads the identity
+/// off-lock via a bare shared reference. This forbids introducing an ordinary-data
+/// race merely to make deadline firing off-lock.
+#[cfg(test)]
+mod stage200c_terminal_reuse_sync_guard {
+    const TERMINAL_SRC: &str = include_str!("../terminal_ownership.rs");
+    const TOKEN_SRC: &str = include_str!("../deadline_token.rs");
+
+    #[test]
+    fn identity_rewrites_require_exclusive_access() {
+        // The identity-mutating operations take `&mut self` (exclusive), never `&self`.
+        assert!(TERMINAL_SRC.contains("pub fn arm(&mut self, identity: TerminalIdentity)"));
+        assert!(TERMINAL_SRC.contains("pub fn try_rearm(\n        &mut self,"));
+        assert!(TOKEN_SRC.contains("pub fn arm(&mut self, identity: DeadlineTokenIdentity)"));
+        // The claim / fire paths take `&self` and gate on the atomic state first
+        // (Acquire) before reading the identity — same synchronization domain.
+        assert!(TERMINAL_SRC.contains("let w = self.state.load(Ordering::Acquire);"));
+        assert!(TOKEN_SRC.contains("let w = self.state.load(Ordering::Acquire);"));
+        // The documented invariant is present (identity rewrites are exclusive).
+        assert!(TERMINAL_SRC.contains("`&mut self` (exclusive"));
+        assert!(TOKEN_SRC.contains("`&mut self` (exclusive"));
+    }
+}

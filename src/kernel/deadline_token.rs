@@ -77,6 +77,23 @@ impl DeadlineTokenIdentity {
     };
 }
 
+/// Stage 200C1 — a deterministic failure to REGISTER a reply-receive deadline
+/// (the composed production registration transaction). Every variant leaves the
+/// caller un-mutated so the block path can roll back cleanly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyDeadlineRegError {
+    /// The caller is not committed-blocked in recv-v2 (`Blocked(EndpointReceive)`).
+    CallerNotBlocked,
+    /// The exact endpoint waiter is not installed at the reply endpoint generation.
+    WaiterMissing,
+    /// The terminal cell is not `Open` / its identity/epoch drifted.
+    TerminalNotOpen,
+    /// The requested deadline is not finite/valid.
+    DeadlineInvalid,
+    /// The underlying token arm failed (`AlreadyArmed` / `StoreFull`).
+    Arm(DeadlineArmError),
+}
+
 /// A deterministic failure to arm a deadline token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeadlineArmError {

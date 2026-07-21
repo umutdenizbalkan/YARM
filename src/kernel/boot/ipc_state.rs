@@ -800,6 +800,198 @@ impl KernelState {
         })
     }
 
+    // ── Stage 200C1: production reply-receive deadline completion support ────────
+
+    /// Stage 200C1 — REGISTER a reply-receive deadline at the committed block point.
+    /// Adapts the existing per-TCB timeout "queue" to REFERENCE the exact Stage 200B
+    /// token (never a second queue / terminal authority). Validates the committed
+    /// blocked state, arms the token (Part 5 ordering), then — LAST — publishes the
+    /// blocked receive as timeout-capable (per-TCB deadline + token reference +
+    /// blocked-recv generation). On any failure it mutates NOTHING (no TCB deadline,
+    /// no token, no reply-authority change), so the block path rolls back cleanly.
+    pub(crate) fn register_reply_receive_deadline(
+        &mut self,
+        record_index: usize,
+        record_generation: u64,
+        blocked_recv_generation: u64,
+        token_generation: u64,
+        deadline_tick: u64,
+    ) -> Result<
+        crate::kernel::deadline_token::DeadlineTokenHandle,
+        crate::kernel::deadline_token::ReplyDeadlineRegError,
+    > {
+        use crate::kernel::deadline_token::ReplyDeadlineRegError as E;
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        if deadline_tick == 0 {
+            return Err(E::DeadlineInvalid);
+        }
+        // Build the terminal identity from the live reply record + captured gens.
+        let Some(identity) = self.reply_terminal_identity(
+            record_index,
+            record_generation,
+            blocked_recv_generation,
+            Some(token_generation),
+        ) else {
+            return Err(E::TerminalNotOpen);
+        };
+        let caller = ReceiverWaiterIdentity::new(identity.caller_tid, identity.caller_asid);
+        // Caller must be committed-blocked on recv-v2.
+        let blocked = self.with_tcbs(|tcbs| {
+            tcbs.iter().flatten().any(|t| {
+                t.tid == caller.tid
+                    && t.asid == Some(caller.asid)
+                    && matches!(
+                        t.status,
+                        TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                    )
+            })
+        });
+        if !blocked {
+            return Err(E::CallerNotBlocked);
+        }
+        // Exact endpoint waiter installed at the reply endpoint generation.
+        let waiter_ok = self.with_ipc_state(|ipc| {
+            ipc.endpoint_generations
+                .get(identity.reply_endpoint_index)
+                .copied()
+                == Some(identity.reply_endpoint_generation)
+                && ipc.endpoint_waiter_identity(identity.reply_endpoint_index) == Some(caller)
+        });
+        if !waiter_ok {
+            return Err(E::WaiterMissing);
+        }
+        // Terminal cell epoch (Open + identity exact are re-checked inside arm).
+        let Some(epoch) = self.with_ipc_state(|ipc| {
+            ipc.reply_terminal_ownership
+                .get(record_index)
+                .map(|c| c.current_epoch())
+        }) else {
+            return Err(E::TerminalNotOpen);
+        };
+        // Arm the token (validates terminal Open/identity/epoch, one-registration,
+        // store-full) — reserve + publish Armed BEFORE publishing the TCB deadline.
+        let handle = self
+            .arm_deadline_token(
+                record_index,
+                record_generation,
+                token_generation,
+                epoch,
+                identity,
+            )
+            .map_err(E::Arm)?;
+        // Publish the blocked receive as timeout-capable (LAST).
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid == caller.tid && t.asid == Some(caller.asid))
+            {
+                tcb.ipc_timeout_deadline = Some(deadline_tick);
+                tcb.reply_timeout_token = Some(handle);
+                tcb.blocked_recv_generation = blocked_recv_generation;
+            }
+        });
+        Ok(handle)
+    }
+
+    /// The reply-timeout token handle referenced by a blocked caller's TCB (the NR7
+    /// disarm hook reads it to cancel the exact deadline on a reply win). Matched by
+    /// the exact `{tid, asid}` incarnation.
+    pub(crate) fn reply_timeout_token_for_caller(
+        &self,
+        tid: u64,
+        asid: Asid,
+    ) -> Option<crate::kernel::deadline_token::DeadlineTokenHandle> {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid && t.asid == Some(asid))
+                .and_then(|t| t.reply_timeout_token)
+        })
+    }
+
+    /// Read the current endpoint generation of slot `index` (revalidation).
+    pub(crate) fn endpoint_generation_read(&self, index: usize) -> Option<u64> {
+        self.with_ipc_state(|ipc| ipc.endpoint_generations.get(index).copied())
+    }
+
+    /// Read a task's current blocked-receive generation (revalidation), matched by
+    /// the exact `{tid, asid}` incarnation. `None` if the task is absent or its ASID
+    /// differs (a replacement incarnation).
+    pub(crate) fn blocked_recv_generation_for(&self, tid: u64, asid: Asid) -> Option<u64> {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid && t.asid == Some(asid))
+                .map(|t| t.blocked_recv_generation)
+        })
+    }
+
+    /// Publish a fresh blocked-receive generation on a task (registration/test
+    /// driver): bumps the monotonic per-task counter and returns the new value.
+    pub(crate) fn bump_blocked_recv_generation(&mut self, tid: u64) -> Option<u64> {
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
+            tcb.blocked_recv_generation = tcb.blocked_recv_generation.wrapping_add(1);
+            Some(tcb.blocked_recv_generation)
+        })
+    }
+
+    /// Prepare the canonical recv-v2 TIMEOUT result on a still-blocked caller: set
+    /// `ipc_timeout_fired` (which the recv handler converts to `SyscallError::TimedOut`),
+    /// and clear the deadline + the reply-timeout token reference. Succeeds ONLY while
+    /// the EXACT `{tid, asid}` caller is still `Blocked(EndpointReceive)` — never
+    /// touches a replacement incarnation. Does NOT make the task Runnable (that is the
+    /// last-but-one step, after the terminal is Completed).
+    pub(crate) fn prepare_reply_timeout_result_for_caller(&mut self, tid: u64, asid: Asid) -> bool {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid && t.asid == Some(asid))
+            else {
+                return false;
+            };
+            if !matches!(
+                tcb.status,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+            ) {
+                return false;
+            }
+            tcb.ipc_timeout_fired = true;
+            tcb.ipc_timeout_deadline = None;
+            tcb.reply_timeout_token = None;
+            true
+        })
+    }
+
+    /// Invalidate a reply record's authority because Timeout won the terminal cell:
+    /// transition an `Available`/`Reserved` record → `Cancelled` (non-invokable), so
+    /// a late `ipc_reply` alias resolving the same `(index, generation)` fails closed.
+    /// Returns `false` on generation mismatch, a vacant slot, or an already
+    /// `Consumed`/`Cancelled` record.
+    pub(crate) fn invalidate_reply_record_for_terminal(
+        &mut self,
+        index: usize,
+        generation: u64,
+    ) -> bool {
+        self.with_ipc_state_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && matches!(
+                        record.reservation,
+                        super::ReplyRecordReservation::Available
+                            | super::ReplyRecordReservation::Reserved
+                    ) =>
+            {
+                record.reservation = super::ReplyRecordReservation::Cancelled;
+                true
+            }
+            _ => false,
+        })
+    }
+
     /// Fill EVERY deadline-registration slot with a distinct synthetic
     /// registration so the next real `arm_deadline_token` observes a full store.
     #[cfg(test)]
@@ -1112,6 +1304,17 @@ impl KernelState {
             tcb.ipc_timeout_deadline = None;
             tcb.ipc_timeout_fired = false;
             Ok::<_, KernelError>(())
+        })
+    }
+
+    /// Read `ipc_timeout_fired` without consuming it (assertions).
+    #[cfg(test)]
+    pub(crate) fn ipc_timeout_fired_read(&self, tid: u64) -> bool {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .is_some_and(|t| t.ipc_timeout_fired)
         })
     }
 

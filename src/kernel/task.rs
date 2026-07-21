@@ -178,6 +178,19 @@ pub struct ThreadControlBlock {
     pub ipc_timeout_fired: bool,
     /// Saved userspace recv buffers for blocked recv-v2 completion.
     pub blocked_recv_state: Option<BlockedRecvState>,
+    /// Stage 200C1 — the EXACT Stage 200B deadline-token handle for a reply-receive
+    /// timeout. This REFERENCES the token in the single deadline-registration store
+    /// from the existing per-TCB timeout "queue" (it is NOT a second queue, and NOT a
+    /// terminal-result authority). `None` for ordinary (non-reply) recv timeouts,
+    /// which keep their existing plain-deadline behavior unchanged. Dormant in
+    /// production this stage (no live path registers it yet).
+    pub reply_timeout_token: Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
+    /// Stage 200C1 — a monotonic per-task blocked-receive generation. Captured into
+    /// the reply-timeout token identity at registration and revalidated at timeout
+    /// completion, so a caller that unblocked and re-blocked (a new recv) advances
+    /// this and a stale timeout completion is refused. Bumped when a fresh blocked
+    /// recv is published.
+    pub blocked_recv_generation: u64,
 }
 
 impl ThreadControlBlock {
@@ -199,6 +212,8 @@ impl ThreadControlBlock {
             ipc_timeout_deadline: None,
             ipc_timeout_fired: false,
             blocked_recv_state: None,
+            reply_timeout_token: None,
+            blocked_recv_generation: 0,
         }
     }
 }
