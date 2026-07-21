@@ -457,6 +457,142 @@ impl KernelState {
         })
     }
 
+    // ── Stage 200A: terminal-ownership authority governing the reply record ──────
+    //
+    // The `reply_terminal_ownership` cell for slot `index` is the SINGLE authority
+    // through which every terminal outcome (reply / timeout / peer death / caller
+    // exit / endpoint destruction) of the blocked caller funnels — NOT a second
+    // store. These seams arm the cell FROM the existing reply record's identity and
+    // drive the bounded claim/commit/release primitives. No production path calls
+    // them yet (Stage 200A is a hosted mechanism); later stages wire the live
+    // reserve / reply / timeout / exit paths onto them.
+
+    /// Build the generation-bearing terminal identity of a present reply-record
+    /// slot, tying it to the record's caller/replier incarnations, reply endpoint,
+    /// and the given blocked-recv / deadline-token generations. `None` when the
+    /// slot is vacant or generation-mismatched.
+    pub(crate) fn reply_terminal_identity(
+        &self,
+        index: usize,
+        generation: u64,
+        blocked_recv_generation: u64,
+        deadline_token_generation: Option<u64>,
+    ) -> Option<crate::kernel::terminal_ownership::TerminalIdentity> {
+        self.with_ipc_state(|ipc| {
+            let record = ipc.reply_caps.get(index)?.as_ref()?;
+            if ipc.reply_cap_generations[index] != generation {
+                return None;
+            }
+            let (reply_endpoint_index, reply_endpoint_generation) = match record.reply_endpoint {
+                CapObject::Endpoint {
+                    index: eidx,
+                    generation: egen,
+                } => (eidx, egen),
+                _ => return None,
+            };
+            Some(crate::kernel::terminal_ownership::TerminalIdentity {
+                reply_record_index: index,
+                reply_record_generation: generation,
+                caller_tid: record.caller_tid,
+                caller_asid: record.caller_asid,
+                replier_tid: record.responder_tid.unwrap_or(ThreadId(0)),
+                replier_asid: record.replier_asid.unwrap_or(Asid(0)),
+                reply_endpoint_index,
+                reply_endpoint_generation,
+                blocked_recv_generation,
+                deadline_token_generation,
+            })
+        })
+    }
+
+    /// Arm the terminal-ownership cell co-located with reply-record slot `index`
+    /// for the given identity (bumps the cell's internal epoch, publishes `Open`).
+    pub(crate) fn arm_reply_terminal(
+        &mut self,
+        index: usize,
+        identity: crate::kernel::terminal_ownership::TerminalIdentity,
+    ) {
+        self.with_ipc_state_mut(|ipc| {
+            if let Some(cell) = ipc.reply_terminal_ownership.get_mut(index) {
+                cell.arm(identity);
+            }
+        });
+    }
+
+    /// Try to claim the terminal outcome of a blocked caller's reply record via the
+    /// single authority cell for slot `index`. Exactly one claimant across all
+    /// terminal kinds can win. `expect` must match the armed identity exactly
+    /// (generation-bearing; numeric TID alone never authorizes).
+    pub(crate) fn try_claim_reply_terminal_slot(
+        &self,
+        index: usize,
+        kind: crate::kernel::terminal_ownership::TerminalClaimant,
+        expect: &crate::kernel::terminal_ownership::TerminalIdentity,
+    ) -> Option<crate::kernel::terminal_ownership::TerminalOwner> {
+        use crate::kernel::terminal_ownership::TerminalClaimant;
+        self.with_ipc_state(|ipc| {
+            let cell = ipc.reply_terminal_ownership.get(index)?;
+            match kind {
+                TerminalClaimant::Reply => cell.try_claim_reply_terminal(expect),
+                TerminalClaimant::Timeout => cell.try_claim_timeout_terminal(expect),
+                TerminalClaimant::PeerDeath => cell.try_claim_peer_death_terminal(expect),
+                TerminalClaimant::CallerExit => cell.try_claim_caller_exit_terminal(expect),
+                TerminalClaimant::EndpointGone => cell.try_claim_endpoint_gone_terminal(expect),
+            }
+        })
+    }
+
+    /// Commit the owner's terminal outcome on slot `index` (one-shot, terminal).
+    /// Only the exact owner succeeds. Returns `false` on a non-owner / stale token.
+    pub(crate) fn commit_reply_terminal_slot(
+        &self,
+        index: usize,
+        owner: &crate::kernel::terminal_ownership::TerminalOwner,
+    ) -> bool {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_terminal_ownership
+                .get(index)
+                .is_some_and(|cell| cell.commit_terminal(owner))
+        })
+    }
+
+    /// Release the owner's claim on slot `index` back to `Open` for a retryable
+    /// rollback. Fails closed if any competing terminal claimant already won.
+    pub(crate) fn release_reply_terminal_slot_if_retryable(
+        &self,
+        index: usize,
+        owner: &crate::kernel::terminal_ownership::TerminalOwner,
+    ) -> bool {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_terminal_ownership
+                .get(index)
+                .is_some_and(|cell| cell.release_terminal_if_retryable(owner))
+        })
+    }
+
+    /// The committed terminal winner of slot `index`, if any (for assertions).
+    #[cfg(test)]
+    pub(crate) fn reply_terminal_committed_winner(
+        &self,
+        index: usize,
+    ) -> Option<crate::kernel::terminal_ownership::TerminalClaimant> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_terminal_ownership
+                .get(index)
+                .and_then(|cell| cell.committed_winner())
+        })
+    }
+
+    /// Whether slot `index`'s terminal cell is still `Open` (no claimant owns it).
+    #[cfg(test)]
+    pub(crate) fn reply_terminal_is_open(&self, index: usize) -> bool {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_terminal_ownership
+                .get(index)
+                .is_some_and(|cell| cell.is_open())
+        })
+    }
+
     /// Read the reservation lifecycle of a reply-record slot (`None` when vacant).
     #[cfg(test)]
     pub(crate) fn reply_cap_record_reservation(
