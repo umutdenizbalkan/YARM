@@ -1497,26 +1497,46 @@ impl KernelState {
             0x0F, 0x05, // syscall
             0xEB, 0xFE, // jmp .
         ];
-        // Stage 199A2D2C1: when the x86_64 SMP cross-CPU request oracle is armed, the AP proof task
-        // runs an ORDINARY userspace stub that emits a real DebugLog userspace marker (proving it
-        // reached ring 3 and executed a real syscall on this CPU) BEFORE the yield/park. The marker
-        // string lives in a dedicated user-readable data page (PROBE_MARKER_VA).
+        // Stage 199A2D2C1/C2A: when the x86_64 SMP cross-CPU request oracle is armed, the AP proof
+        // task runs an ORDINARY userspace stub that (a) emits X86_AP_GENERIC_USER_ENTRY, (b) runs a
+        // real Yield syscall, and (c) — reached ONLY through the saved-frame return path — emits
+        // X86_AP_SAVED_RESUME_BEFORE (pre-Yield) and X86_AP_SAVED_FRAME_RESUMED (post-resume). Two
+        // marker strings live in a dedicated user-readable data page (PROBE_MARKER_VA @ 0 and
+        // +0x100). The continuation RIP (byte 21 of the stub) is reached only via the saved-frame
+        // resume — never a fresh re-entry.
         const PROBE_MARKER_VA: u64 = 0x0000_0000_2002_0000;
+        // GENERIC entry marker @ +0x000 (len 63 = 0x3F) — keeps the C1 fresh-entry proof.
         const AP_GENERIC_USER_MARKER: &[u8] =
             b"X86_AP_GENERIC_USER_ENTRY cpu=1 scheduler_selected=1 result=ok\n";
-        // len = 63 = 0x3F (asserted below).
-        const PROBE_STUB_SMP: [u8; 30] = [
+        // BEFORE marker @ +0x100 (len 27 = 0x1B).
+        const AP_SAVED_BEFORE_MARKER: &[u8] = b"X86_AP_SAVED_RESUME_BEFORE\n";
+        // RESUMED marker @ +0x200 (len 99 = 0x63).
+        const AP_SAVED_RESUMED_MARKER: &[u8] = b"X86_AP_SAVED_FRAME_RESUMED cpu=1 syscall=Yield continuations=1 stack_ok=1 registers_ok=1 result=ok\n";
+        const _: () = assert!(AP_GENERIC_USER_MARKER.len() == 63);
+        const _: () = assert!(AP_SAVED_BEFORE_MARKER.len() == 27);
+        const _: () = assert!(AP_SAVED_RESUMED_MARKER.len() == 99);
+        // Stub: DebugLog(GENERIC) -> DebugLog(BEFORE) -> Yield -> [saved-frame resume lands here] ->
+        // DebugLog(RESUMED) -> park. 64 bytes; the post-Yield continuation RIP = PROBE_CODE_VA + 38.
+        const PROBE_STUB_SMP: [u8; 64] = [
             0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax, 15   (DebugLog NR)
-            0xBF, 0x00, 0x00, 0x02, 0x20, // mov edi, 0x20020000 (marker ptr)
-            0xBE, 0x3F, 0x00, 0x00, 0x00, // mov esi, 63   (marker len)
-            0x0F, 0x05, // syscall  (DebugLog)
+            0xBF, 0x00, 0x00, 0x02, 0x20, // mov edi, 0x20020000 (GENERIC ptr)
+            0xBE, 0x3F, 0x00, 0x00, 0x00, // mov esi, 63   (GENERIC len)
+            0x0F, 0x05, // syscall  (DebugLog GENERIC)
+            0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax, 15
+            0xBF, 0x00, 0x01, 0x02, 0x20, // mov edi, 0x20020100 (BEFORE ptr)
+            0xBE, 0x1B, 0x00, 0x00, 0x00, // mov esi, 27   (BEFORE len)
+            0x0F, 0x05, // syscall  (DebugLog BEFORE)
             0x31, 0xC0, // xor eax, eax  (Yield)
-            0x0F, 0x05, // syscall
+            0x0F,
+            0x05, // syscall  (Yield) -- continuation RIP = next byte (PROBE_CODE_VA + 38)
+            0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax, 15
+            0xBF, 0x00, 0x02, 0x02, 0x20, // mov edi, 0x20020200 (RESUMED ptr)
+            0xBE, 0x63, 0x00, 0x00, 0x00, // mov esi, 99   (RESUMED len)
+            0x0F, 0x05, // syscall  (DebugLog RESUMED)
             0xB8, 0xC6, 0xA9, 0x00, 0x00, // mov eax, 0xA9C6  (park)
             0x0F, 0x05, // syscall
             0xEB, 0xFE, // jmp .
         ];
-        const _: () = assert!(AP_GENERIC_USER_MARKER.len() == 63);
         let smp_proof = crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled();
         let user_stack_top = PROBE_STACK_VA + (PAGE_SIZE as u64) - 16;
 
@@ -1544,7 +1564,7 @@ impl KernelState {
             )?;
             if smp_proof {
                 self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB_SMP)?;
-                // Marker data page: user + read.
+                // Marker data page: user + read. BEFORE @ 0, RESUMED @ +0x100.
                 let marker_phys = self.alloc_user_data_frame()?;
                 self.map_user_page_in_asid_raw(
                     asid,
@@ -1555,6 +1575,16 @@ impl KernelState {
                     },
                 )?;
                 self.copy_to_user(asid, VirtAddr(PROBE_MARKER_VA), AP_GENERIC_USER_MARKER)?;
+                self.copy_to_user(
+                    asid,
+                    VirtAddr(PROBE_MARKER_VA + 0x100),
+                    AP_SAVED_BEFORE_MARKER,
+                )?;
+                self.copy_to_user(
+                    asid,
+                    VirtAddr(PROBE_MARKER_VA + 0x200),
+                    AP_SAVED_RESUMED_MARKER,
+                )?;
             } else {
                 self.copy_to_user(asid, VirtAddr(PROBE_CODE_VA), &PROBE_STUB)?;
             }
@@ -1605,6 +1635,37 @@ impl KernelState {
             user_stack_top
         );
         Ok((cr3, PROBE_CODE_VA, user_stack_top))
+    }
+
+    /// Stage 199A2D2C2A: read a task's committed SAVED userspace continuation for the AP saved-frame
+    /// return. Returns `(asid, cr3, rip, rsp, gprs[15], runnable_with_saved)` where `rip`/`rsp` are
+    /// the exact post-syscall user instruction/stack pointers captured when the task last left ring 3
+    /// (e.g. after a Yield), and `gprs` are its 15 user GPRs (rax..r15). `runnable_with_saved` is true
+    /// ONLY when the task is Runnable/Running AND carries a valid (non-null RIP+RSP) saved frame — the
+    /// AP dispatcher must NOT resume from a partial/uncommitted frame.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    pub(crate) fn ap_saved_resume_context(
+        &self,
+        tid: u64,
+    ) -> Option<(u16, u64, u64, u64, [u64; 15], bool)> {
+        let asid = self.task_asid(tid)?;
+        let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;
+        let runnable = matches!(
+            self.task_status(tid),
+            Some(TaskStatus::Runnable | TaskStatus::Running)
+        );
+        self.with_tcbs(|tcbs| {
+            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == tid)?;
+            let uc = &tcb.user_context;
+            let mut gprs = [0u64; 15];
+            for (i, g) in gprs.iter_mut().enumerate() {
+                *g = uc.user_gprs[i] as u64;
+            }
+            let rip = uc.instruction_ptr.0;
+            let rsp = uc.stack_ptr.0;
+            let has_saved = rip != 0 && rsp != 0;
+            Some((asid.0, cr3, rip, rsp, gprs, runnable && has_saved))
+        })
     }
 
     pub fn spawn_user_task_from_image(

@@ -80908,3 +80908,99 @@ mod stage199a2d2c2_guards {
         assert!(matrix.contains("total_live_cells=6"));
     }
 }
+
+/// Stage 199A2D2C2A — LIVE saved-frame return: asm + orchestration source guards.
+#[cfg(test)]
+mod stage199a2d2c2a_guards {
+    // The canonical saved-frame restore asm exists and restores the full context (15 GPRs + the
+    // canonical iret frame), distinct from the fresh-entry trampoline.
+    #[test]
+    fn saved_frame_restore_asm_present_and_canonical() {
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            dt.contains("yarm_x86_resume_ring3"),
+            "the saved-frame restore asm exists"
+        );
+        assert!(
+            dt.contains("fn resume_user_mode_iret"),
+            "the safe wrapper exists"
+        );
+        // Distinct from the fresh entry (both present).
+        assert!(
+            dt.contains("yarm_x86_enter_ring3"),
+            "fresh entry asm remains"
+        );
+        // The resume restores rbx/r15 (full GPR set), not just the arg registers a fresh entry sets.
+        assert!(dt.contains("mov rbx, qword ptr [rdi + 8]"));
+        assert!(dt.contains("mov r15, qword ptr [rdi + 112]"));
+        // rdi restored LAST (the frame pointer).
+        assert!(dt.contains("mov rdi, qword ptr [rdi + 40]"));
+    }
+
+    // The AP saved-frame orchestration is scheduler-selected (not a hardcoded probe dispatch) and
+    // runs exactly once, and the IPI/idle path never dispatches from the handler.
+    #[test]
+    fn ap_saved_frame_resume_orchestration_is_scheduler_selected_once() {
+        let smp = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            smp.contains("fn ap_saved_frame_resume"),
+            "resume orchestration present"
+        );
+        assert!(
+            smp.contains("AP_SAVED_RESUME_DONE"),
+            "one-shot latch present"
+        );
+        assert!(
+            smp.contains("dispatch_next_on_cpu(cpu)"),
+            "selects from CPU 1's real run queue"
+        );
+        assert!(
+            smp.contains("resume_user_mode_iret(&frame)"),
+            "returns via the saved-frame asm"
+        );
+        assert!(
+            smp.contains("set_reschedule_pending(cpu)"),
+            "reschedule flag wired"
+        );
+        assert!(
+            smp.contains("take_reschedule_pending(cpu)"),
+            "flag consumed by the dispatcher"
+        );
+        // The saved dispatch is gated on the SMP oracle + a RunnableSaved validation.
+        assert!(
+            smp.contains("runnable_saved"),
+            "resume validates RunnableSaved"
+        );
+    }
+
+    // Returning syscalls resume the SMP proof task inline; only Yield deschedules to RunnableSaved.
+    #[test]
+    fn returning_syscalls_resume_inline_only_yield_deschedules() {
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            dt.contains("let smp_returning =")
+                && dt.contains("x86_ipccall_direct_smp_oracle_enabled() && ap_seal_nr != 0"),
+            "returning SMP syscalls skip the force-block and resume inline; Yield (nr==0) deschedules"
+        );
+    }
+
+    // The saved-return seal is gated behind the FULL ordered live sequence (fresh + saved).
+    #[test]
+    fn saved_return_seal_requires_full_live_sequence() {
+        let sh = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
+        for m in [
+            "X86_AP_GENERIC_DISPATCH_OK cpu=1 mode=fresh",
+            "X86_AP_SAVED_RESUME_BEFORE",
+            "X86_AP_SAVED_FRAME_COMMITTED cpu=1 syscall=Yield",
+            "X86_AP_SAVED_DISPATCH_OK cpu=1 mode=saved",
+            "X86_AP_SAVED_FRAME_RESUMED cpu=1",
+        ] {
+            assert!(sh.contains(m), "seal requires marker: {m}");
+        }
+        assert!(sh.contains("STAGE_199_X86_AP_SAVED_RETURN_SEAL"));
+        // Continuation on CPU 0 is a hard fail.
+        assert!(
+            sh.contains("X86_AP_SAVED_FRAME_RESUMED cpu=0") && sh.contains("continuation on CPU 0")
+        );
+    }
+}

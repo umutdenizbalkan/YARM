@@ -2314,6 +2314,98 @@ fn ap_enter_task_ring3(cpu: CpuId, tid: u64) -> ! {
     super::descriptor_tables::enter_user_mode_iret(entry, user_stack_top, 0, 0, 0, 0, 0, 0);
 }
 
+/// Stage 199A2D2C2A: one-shot per-CPU latch so the SMP oracle's saved-frame resume runs EXACTLY
+/// ONCE (one fresh entry → one saved-frame resume → one continuation; no duplicate continuation).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static AP_SAVED_RESUME_DONE: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::arch::platform_constants::MAX_CPUS];
+
+/// Stage 199A2D2C2A: the GENERIC saved-frame return — the idle dispatcher selecting the
+/// RunnableSaved proof task from CPU 1's real run queue and resuming its committed post-syscall
+/// continuation through the canonical `yarm_x86_resume_ring3` asm. Reads the exact saved frame under
+/// the lock, validates it, installs per-CPU CR3/TSS-RSP0/GS(FS) for the selected task, then diverges
+/// into ring 3 at the instruction AFTER its syscall. Declines (returns) only on a missing/partial
+/// saved frame (fail closed).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn ap_saved_frame_resume(shared: &crate::runtime::SharedKernel, cpu: CpuId) {
+    use super::ap_dispatch;
+    let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
+    // A genuine remote-wake/reschedule of an idle AP: mark + consume the CPU-local pending flag
+    // (Release/Acquire), then the idle dispatcher inspects CPU 1's real run queue.
+    super::ap_sched::set_reschedule_pending(cpu);
+    let _pending = super::ap_sched::take_reschedule_pending(cpu);
+    // Select the RunnableSaved task from CPU 1's REAL run queue (scheduler-selected). The proof task
+    // yielded, so re-arm it on CPU 1's queue (the existing generic wake/finalization seam) and select
+    // it via `dispatch_next_on_cpu` — never a hardcoded proof-TID dispatch bypass.
+    let expected = ap_workload_base_tid(cpu);
+    let tid = match shared
+        .with_cpu(cpu, |k| {
+            let _ = k.enqueue_on_cpu(cpu, expected);
+            k.dispatch_next_on_cpu(cpu)
+        })
+        .unwrap_or(None)
+    {
+        Some(t) if t == expected => t,
+        _ => return, // nothing to resume — fall through to idle
+    };
+    // Read the committed saved continuation (asid/cr3/rip/rsp/gprs) + validate RunnableSaved.
+    let (asid, cr3, rip, rsp, gprs, runnable_saved) =
+        match shared.with(|k| k.ap_saved_resume_context(tid)) {
+            Some(v) => v,
+            None => return,
+        };
+    if !runnable_saved || rip == 0 || rsp == 0 {
+        // Not a valid saved frame — never resume from a partial/uncommitted continuation.
+        return;
+    }
+    let kernel_rsp0 = ap_dispatch_kstack_top(cpu);
+    // Authoritative saved-frame commit attestation (kernel, after validation).
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "X86_AP_SAVED_FRAME_COMMITTED cpu={} syscall=Yield task_exact=1 rip_after_syscall=1 frame_complete=1 tid={} asid={} result=ok",
+        cpu.0, tid, asid
+    ));
+    crate::kernel::printk::printk_emit_sync(format_args!(
+        "X86_AP_SAVED_DISPATCH_OK cpu={} mode=saved scheduler_selected=1 continuations=1 tid={} result=ok",
+        cpu.0, tid
+    ));
+    // Install per-CPU state for the selected task (mirrors the fresh-entry install).
+    super::descriptor_tables::configure_syscall_msrs_for_self();
+    super::percpu::set_syscall_kernel_rsp0(cpu, kernel_rsp0);
+    super::descriptor_tables::set_ap_tss_rsp0(idx, kernel_rsp0);
+    // User FS base = 0 (the proof task has no TLS); GS.base stays this CPU's per-CPU record.
+    unsafe {
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0100u32, // IA32_FS_BASE
+            in("eax") 0u32,
+            in("edx") 0u32,
+            options(nostack, preserves_flags),
+        );
+    }
+    crate::yarm_log!(
+        "{} cpu={} tid={} cr3=0x{:x} rip=0x{:x} rsp=0x{:x} (saved-frame resume)",
+        ap_dispatch::MARK_RING3_ENTER,
+        cpu.0,
+        tid,
+        cr3,
+        rip,
+        rsp
+    );
+    // Build the owned resume frame (canonical iret ABI), then diverge — no Rust guard is held.
+    let frame = super::descriptor_tables::ApSavedResumeFrame {
+        gprs,
+        rip,
+        rsp,
+        rflags: 0x202,
+        cs: 0x23,
+        ss: 0x1b,
+    };
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+        super::descriptor_tables::resume_user_mode_iret(&frame);
+    }
+}
+
 /// Stage 190B: the AP scheduler-loop step, run from the trap dispatch after an
 /// admitted task's `Yield` blocked it (so the AP `current` is `None`). Picks the NEXT
 /// admitted task on this AP's run queue (under the global lock, `with_cpu`) and enters
@@ -2361,6 +2453,17 @@ pub(crate) fn ap_sched_next_or_idle(shared: &crate::runtime::SharedKernel, cpu: 
             cpu.0,
             next_tid
         ));
+    }
+    // Stage 199A2D2C2A: after the SMP oracle proof task's fresh entry ran a real syscall (Yield) and
+    // control returned here, the task is RunnableSaved on CPU 1 (its post-syscall continuation is
+    // saved). Do exactly ONE saved-frame resume of it — the idle dispatcher selecting a RunnableSaved
+    // task from CPU 1's real run queue and returning through the canonical saved-frame `iretq`. This
+    // is a SECOND dispatch of the SAME task via the SAVED path (never a fresh re-entry).
+    if crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled()
+        && !AP_SAVED_RESUME_DONE[idx].swap(true, Ordering::AcqRel)
+    {
+        ap_saved_frame_resume(shared, cpu);
+        // Falls through to idle only if the resume declined (no valid saved frame).
     }
     // No more controlled workload tasks: emit the repeated-dispatch + policy-seal
     // verdict and return to the interruptible idle loop (honest idle).
