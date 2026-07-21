@@ -81531,3 +81531,142 @@ mod stage199a2d2c2b2_guards {
         let _ = ipccall_direct_smp_request_delivered_count();
     }
 }
+
+// Stage 199A2D2C2B3 — AP saved-resume user-memory consumption proof. 12 guards.
+mod stage199a2d2c2b3_guards {
+    const EXEC: &str = include_str!("exec_state.rs");
+    const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const USER_SMOKE: &str =
+        include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-user-consume-smoke.sh");
+
+    // (1) The AP saved resume loads the SELECTED SERVER's CR3 (from ap_saved_resume_context), not the
+    // BSP/current CR3.
+    #[test]
+    fn saved_resume_loads_server_cr3() {
+        // ap_saved_resume_context sources cr3 from cr3_for_asid(server asid); the resume loads it.
+        assert!(EXEC.contains("let cr3 = crate::arch::x86_64::page_table::cr3_for_asid(asid)?;"));
+        assert!(SMP.contains("shared.with(|k| k.ap_saved_resume_context(tid))"));
+        assert!(SMP.contains("core::arch::asm!(\"mov cr3, {}\", in(reg) cr3"));
+    }
+
+    // (2) ASID/CR3 correspond to the resumed server {tid,asid} (identity-validated).
+    #[test]
+    fn asid_cr3_correspond_to_server() {
+        assert!(EXEC.contains("let asid = self.task_asid(tid)?;"));
+        assert!(SMP.contains("Some(t) if t == expected => t,"));
+    }
+
+    // (3) payload/metadata mappings are user-accessible (USER_RW) and committed via copy_to_user.
+    #[test]
+    fn payload_meta_user_accessible() {
+        assert!(EXEC.contains("VirtAddr(RECV_V2_SERVER_PAYLOAD_VA)"));
+        assert!(EXEC.contains("flags: PageFlags::USER_RW,"));
+        assert!(
+            EXEC.contains(
+                "self.copy_to_user(asid, VirtAddr(RECV_V2_SERVER_PAYLOAD_VA), &[0u8; 8])?;"
+            )
+        );
+    }
+
+    // (4) The saved payload/meta pointers survive block + resume (the ack captures the recv-v2 dest
+    // pointers; the txn copies to those exact server pointers).
+    #[test]
+    fn saved_pointers_survive_block_and_resume() {
+        let txn = include_str!("../ipccall_direct_txn.rs");
+        assert!(txn.contains("ack.payload_user_ptr"));
+        assert!(txn.contains("ack.meta_user_ptr"));
+    }
+
+    // (5) recv-v2 result registers are not overwritten by fresh-entry state: they are cleared before
+    // Runnable, and BlockedUnfinalized is never selectable (so no fresh re-entry frame is used).
+    #[test]
+    fn recv_result_not_overwritten_by_fresh_entry() {
+        assert!(RUNTIME.contains("clear_blocked_recv_return_regs_locked(tcbs, tid)"));
+        use crate::arch::x86_64::ap_sched::{
+            DispatchReject, TaskDispatchState, select_return_source,
+        };
+        assert_eq!(
+            select_return_source(TaskDispatchState::BlockedUnfinalized, None, None),
+            Err(DispatchReject::NotFinalized)
+        );
+    }
+
+    // (6) CPU-1's translation sees mappings created BEFORE the block (the pages are mapped in
+    // build_ap_workload's aspace-creation block, before the server task ever runs).
+    #[test]
+    fn mappings_created_before_block() {
+        let create = EXEC
+            .find("let (asid, _cap) = self.create_user_address_space()?;")
+            .unwrap();
+        let map_payload = EXEC.find("VirtAddr(RECV_V2_SERVER_PAYLOAD_VA)").unwrap();
+        let register = EXEC
+            .find("self.register_task_with_class(base_tid")
+            .unwrap_or(usize::MAX);
+        assert!(create < map_payload, "payload mapped after aspace creation");
+        // The mapping is inside the aspace-creation block, before task registration/run.
+        assert!(map_payload < register || register == usize::MAX);
+    }
+
+    // (7) The required EFER.NXE enablement dominates the ring-3 return: it is set in
+    // configure_syscall_msrs_for_self, which every AP ring-3 entry/resume calls first.
+    #[test]
+    fn efer_nxe_enabled_before_user_return() {
+        assert!(DT.contains("const IA32_EFER_NXE: u64 = 1 << 11;"));
+        assert!(DT.contains("efer |= IA32_EFER_SCE | IA32_EFER_NXE;"));
+        // The resume + fresh entry both call configure_syscall_msrs_for_self before iret.
+        assert!(SMP.contains("configure_syscall_msrs_for_self();"));
+    }
+
+    // (8) A wrong/reserved translation is MODELED by the fault decoder: present + rsvd + user bits are
+    // decoded so a reserved-bit (NX-on-NXE-off) fault is distinguishable.
+    #[test]
+    fn fault_decoder_models_reserved_bit() {
+        assert!(DT.contains("let rsvd = (error_code >> 3) & 1;"));
+        assert!(DT.contains("let present = error_code & 1;"));
+        assert!(DT.contains("X86_AP_RECV_V2_USER_READ_FAULT"));
+    }
+
+    // (9) A user/supervisor PTE mismatch is detected (the diag decodes the user bit + pte_user).
+    #[test]
+    fn user_supervisor_mismatch_detected() {
+        assert!(DT.contains("let user = (error_code >> 2) & 1;"));
+        assert!(DT.contains("pte_user={}"));
+    }
+
+    // (10) The kernel copy targets the SAME physical frame the ring-3 translation resolves: the copy
+    // resolves the user PTE's physical frame (validate_user_access_for_asid_split) and writes via its
+    // direct map — the identical frame ring-3 reads through the same PTE.
+    #[test]
+    fn kernel_copy_and_ring3_same_frame() {
+        assert!(
+            RUNTIME
+                .contains("let phys = self.validate_user_access_for_asid_split(asid, va, true)?;")
+        );
+        assert!(RUNTIME.contains("phys_to_direct_map_ptr(phys)"));
+    }
+
+    // (11) The ring-3 validation marker DOMINATES the final user seal (the seal requires
+    // X86_AP_RECV_V2_USER_VALIDATED and no post-resume fault, not a kernel-only check).
+    #[test]
+    fn ring3_validation_marker_dominates_seal() {
+        assert!(USER_SMOKE.contains("X86_AP_RECV_V2_USER_VALIDATED cpu=1"));
+        assert!(USER_SMOKE.contains("X86_AP_RECV_V2_USER_READ_FAULT")); // as a zero-count hard stop
+        assert!(USER_SMOKE.contains("ring-3 user-read fault after resume"));
+        assert!(USER_SMOKE.contains("STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_USER_SEAL"));
+        // The server stub emits the VALIDATED marker only after direct-load checks (payload/len/cap).
+        assert!(EXEC.contains("AP_RECV_V2_USER_VALIDATED_MARKER"));
+        assert!(EXEC.contains("0x48, 0x39, 0xC8")); // cmp rax,rcx (payload compare)
+        assert!(EXEC.contains("0x83, 0xF8, 0x08")); // cmp eax,8 (length compare)
+    }
+
+    // (12) The cross-CPU NR7 REPLY path remains disabled (no SMP reply delivery / IPI-to-CPU-0 wired).
+    #[test]
+    fn cross_cpu_nr7_remains_disabled() {
+        assert!(!SMP.contains("c2b2_send_reschedule_ipi_to_cpu0"));
+        assert!(!SPLIT.contains("x86_ipccall_direct_smp_reply"));
+        assert!(!EXEC.contains("ipc_reply_direct"));
+    }
+}

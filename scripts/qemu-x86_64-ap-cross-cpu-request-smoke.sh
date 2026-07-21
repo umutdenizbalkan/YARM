@@ -68,7 +68,9 @@ have "X86_AP_ONLINE cpu=1" || die "CPU 1 not online"
 # The RECEIVED marker carries hardcoded `pending=1 dispatch_in_handler=0`; tolerate stray bytes from
 # concurrent CPU0/CPU1 UART interleaving (the semantic content is kernel-fixed). Reject only an
 # explicit in-handler dispatch.
-have "X86_AP_RESCHEDULE_IPI_RECEIVED cpu=1 pending=1" || die "IPI received without pending=1"
+# The RECEIVED marker (counted == 1 above) carries hardcoded `pending=1 dispatch_in_handler=0`;
+# tolerate stray bytes from concurrent CPU0/CPU1 UART interleaving. Reject only explicit negatives.
+have "pending=0" && die "IPI received without pending set"
 have "dispatch_in_handler=1" && die "IPI handler performed a dispatch"
 [[ "$(count "X86_AP_SAVED_DISPATCH_OK cpu=1 mode=saved")" == "1" ]] || die "saved dispatch != 1"
 [[ "$(count "X86_AP_RECV_V2_CONTINUED cpu=1")" == "1" ]] || die "recv-v2 continuation != 1"

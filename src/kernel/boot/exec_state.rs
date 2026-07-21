@@ -1577,21 +1577,34 @@ impl KernelState {
         const AP_RECV_V2_CONTINUED_MARKER: &[u8] = b"X86_AP_RECV_V2_CONTINUED cpu=1 request_ok=1 metadata_ok=1 reply_cap=1 continuations=1 result=ok\n";
         const AP_RECV_V2_VALIDATE_FAIL_MARKER: &[u8] =
             b"X86_AP_RECV_V2_VALIDATE_FAIL cpu=1 result=fail\n";
+        // Stage 199A2D2C2B3: the resumed server's DIRECT-LOAD validation marker (emitted only after
+        // ring-3 loads of the delivered payload + recv-v2 metadata + receiver-local Reply cap all
+        // succeed and compare exact). Lives at marker page +0x500.
+        const AP_RECV_V2_USER_VALIDATED_MARKER: &[u8] = b"X86_AP_RECV_V2_USER_VALIDATED cpu=1 payload_ok=1 length_ok=1 meta_ok=1 reply_cap_nonzero=1 continuations=1 result=ok\n";
         const _: () = assert!(AP_RECV_V2_CONTINUED_MARKER.len() == 96);
         const _: () = assert!(AP_RECV_V2_VALIDATE_FAIL_MARKER.len() == 47);
-        // Stage 199A2D2C2B2: the resumed server proves the CONTINUATION in userspace (it is executing
-        // AFTER recv-v2, on CPU 1, with the delivered request in its address space) and emits
-        // X86_AP_RECV_V2_CONTINUED. The exact payload-bytes / reply-cap validation is performed by the
-        // KERNEL (which authored the delivery and can read the server ASID) before the terminal
-        // request-OK marker — a ring-3 direct data read from the resumed frame is a separate,
-        // unproven AP capability this stage does not depend on. Continuation RIP = PROBE_CODE_VA + 54.
-        const RECV_V2_SERVER_STUB_C2B2: [u8; 80] = [
+        const _: () = assert!(AP_RECV_V2_USER_VALIDATED_MARKER.len() == 117);
+        // Stage 199A2D2C2B3: the resumed server VALIDATES the delivered request in USERSPACE via direct
+        // ring-3 loads — payload bytes == "NR6-REQ!", recv-v2 meta payload_len == 8, meta reply cap
+        // (offset 16) != 0 — then emits X86_AP_RECV_V2_CONTINUED and X86_AP_RECV_V2_USER_VALIDATED; on
+        // any mismatch it emits X86_AP_RECV_V2_VALIDATE_FAIL. This is possible now that EFER.NXE is
+        // enabled on the AP (see configure_syscall_msrs_for_self): the NX bit on non-executable data
+        // pages was previously treated as reserved, faulting every AP ring-3 data read. Continuation
+        // RIP = PROBE_CODE_VA + 54.
+        const RECV_V2_SERVER_STUB_C2B2: [u8; 174] = [
             0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x2E, 0x00, 0x00,
             0x00, 0x0F, 0x05, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x00, 0x00, 0xBE,
             0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xBA, 0x00, 0x00, 0x04,
-            0x20, 0x41, 0xB8, 0x28, 0x00, 0x00, 0x00, 0x45, 0x31, 0xC9, 0x0F, 0x05, 0xB8, 0x0F,
-            0x00, 0x00, 0x00, 0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00, 0x00, 0x0F,
-            0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
+            0x20, 0x41, 0xB8, 0x28, 0x00, 0x00, 0x00, 0x45, 0x31, 0xC9, 0x0F, 0x05, 0xBF, 0x00,
+            0x00, 0x03, 0x20, 0x48, 0x8B, 0x07, 0x48, 0xB9, 0x4E, 0x52, 0x36, 0x2D, 0x52, 0x45,
+            0x51, 0x21, 0x48, 0x39, 0xC8, 0x0F, 0x85, 0x4A, 0x00, 0x00, 0x00, 0xBF, 0x0C, 0x00,
+            0x04, 0x20, 0x8B, 0x07, 0x83, 0xF8, 0x08, 0x0F, 0x85, 0x3A, 0x00, 0x00, 0x00, 0xBF,
+            0x10, 0x00, 0x04, 0x20, 0x8B, 0x07, 0x85, 0xC0, 0x0F, 0x84, 0x2B, 0x00, 0x00, 0x00,
+            0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00,
+            0x00, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x05, 0x02, 0x20, 0xBE,
+            0x75, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB,
+            0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x04, 0x02, 0x20, 0xBE, 0x2F, 0x00,
+            0x00, 0x00, 0x0F, 0x05, 0xEB, 0xE4,
         ];
         // CPU-0 NR6 client (its OWN ASID). Bounded WouldBlock retry (max 64): NR6 (IpcCall) with the
         // request SEND cap (arg0=RDI, PATCHED @10), payload @0x20030000 (arg1), len 8 (arg2), the reply
@@ -1676,6 +1689,11 @@ impl KernelState {
                         asid,
                         VirtAddr(PROBE_MARKER_VA + 0x400),
                         AP_RECV_V2_VALIDATE_FAIL_MARKER,
+                    )?;
+                    self.copy_to_user(
+                        asid,
+                        VirtAddr(PROBE_MARKER_VA + 0x500),
+                        AP_RECV_V2_USER_VALIDATED_MARKER,
                     )?;
                 }
                 // recv-v2 payload destination page (user + read + write).
