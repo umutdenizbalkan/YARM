@@ -81944,3 +81944,172 @@ mod stage199a2d2c2c_reply_guards {
         assert!(dup_pos < seal_pos);
     }
 }
+
+/// Stage 199A2D3 — freeze guards for the trap-depth + authoritative-current-task correctness the BSP
+/// saved-frame resume depends on, plus the deterministic-QEMU-lifecycle contract of the SMP smoke.
+#[cfg(test)]
+mod stage199a2d3_freeze_guards {
+    const DT: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const LIFECYCLE: &str = include_str!("../../../scripts/lib/qemu-x86-deterministic.sh");
+    const REPLY_SH: &str = include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-reply-smoke.sh");
+    const FINAL_SH: &str =
+        include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh");
+
+    // Trap-depth #1: the NORMAL trap-return epilogue keeps its balanced depth reset (store 0 at every
+    // return/idle point). The saved-frame divergence does NOT remove those.
+    #[test]
+    fn normal_trap_return_keeps_balanced_depth_reset() {
+        // At least the syscall-return and idle-transition epilogues reset the per-CPU depth to 0.
+        let resets = DT
+            .matches("TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release)")
+            .count();
+        assert!(
+            resets >= 3,
+            "expected the balanced depth resets to remain, found {resets}"
+        );
+    }
+
+    // Trap-depth #2: the diverging saved-frame iretq clears the nested-trap guard EXACTLY ONCE, and the
+    // helper exists. The clear happens immediately before the resume iretq (the abandoned frame never
+    // unwinds through the normal epilogue).
+    #[test]
+    fn saved_frame_resume_clears_depth_exactly_once_before_iretq() {
+        assert!(DT.contains("pub(crate) fn clear_trap_dispatch_depth("));
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_saved_frame_resume(")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert_eq!(
+            body.matches("clear_trap_dispatch_depth(cpu)").count(),
+            1,
+            "depth must be cleared exactly once on the diverging path"
+        );
+        let clear_pos = body.find("clear_trap_dispatch_depth(cpu)").unwrap();
+        let iret_pos = body.find("resume_user_mode_iret(&frame)").unwrap();
+        assert!(
+            clear_pos < iret_pos,
+            "depth clear must precede the diverging iretq"
+        );
+    }
+
+    // Trap-depth #3: clear_trap_dispatch_depth is called ONLY from the diverging saved-resume path,
+    // never on a path that later returns through the normal epilogue.
+    #[test]
+    fn depth_clear_is_confined_to_the_diverging_path() {
+        // The only call site is inside c2c_bsp_saved_frame_resume (smp.rs); descriptor_tables.rs
+        // DEFINES it (fn clear_trap_dispatch_depth(cpu: ...)) but must never CALL it from the normal
+        // trap-return epilogue — so the `(cpu)` call form appears zero times there.
+        assert_eq!(
+            DT.matches("clear_trap_dispatch_depth(cpu)").count(),
+            0,
+            "the normal trap-return epilogue must not call the depth clear"
+        );
+        assert_eq!(
+            SMP.matches("clear_trap_dispatch_depth(cpu)").count(),
+            1,
+            "exactly one caller (the diverging resume)"
+        );
+    }
+
+    // Current-task #1: the resume performs, in order, authoritative selection -> publish current ->
+    // load CR3/FS -> prepare frame -> diverging iretq. The user return therefore observes the resumed
+    // task's ASID/FS, not the previous idle/BSP task.
+    #[test]
+    fn resume_orders_select_publish_load_then_return() {
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_saved_frame_resume(")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        let select = body
+            .find("on_preempt_prefer_on_cpu(cpu, client_tid)")
+            .unwrap();
+        let publish = body
+            .find("X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved")
+            .unwrap();
+        let fs = body.find("IA32_FS_BASE").unwrap();
+        let cr3 = body.find("mov cr3, {}").unwrap();
+        let iret = body.find("resume_user_mode_iret(&frame)").unwrap();
+        assert!(select < publish, "select before publishing current");
+        assert!(publish < fs, "publish current before loading FS");
+        assert!(fs < cr3, "FS + CR3 loaded before diverging");
+        assert!(cr3 < iret, "address space loaded before iretq");
+    }
+
+    // Current-task #2: selection is made current BEFORE the divergence commits (no iretq into a task
+    // that is not the scheduler's current), and it aborts without mutation if it cannot be made current.
+    #[test]
+    fn resume_requires_client_made_current_before_committing() {
+        let f = SMP
+            .split("pub(crate) fn c2c_bsp_saved_frame_resume(")
+            .nth(1)
+            .unwrap();
+        let body = &f[..f.find("\n}\n").unwrap()];
+        assert!(body.contains("if made_current != Some(client_tid) {"));
+        let made = body.find("let made_current").unwrap();
+        let done = body.find("DONE.swap(true").unwrap();
+        assert!(
+            made < done,
+            "make-current precedes the one-shot commit latch"
+        );
+    }
+
+    // Deterministic lifecycle #1: the helper library owns termination — launch, wait for terminal
+    // markers, scan fatal, terminate, wait exit — and fails on every forbidden condition.
+    #[test]
+    fn deterministic_lifecycle_owns_termination() {
+        assert!(LIFECYCLE.contains("qemu_run_deterministic()"));
+        // Fresh log truncated (no stale/predating marker) + background launch owned by the script.
+        assert!(LIFECYCLE.contains(":>\"$logfile\"") || LIFECYCLE.contains(": >\"$logfile\""));
+        assert!(LIFECYCLE.contains("QEMU_TERMINAL_MARKERS"));
+        // Every forbidden terminal condition maps to a failure return.
+        assert!(LIFECYCLE.contains("qemu_exited_before_proof"));
+        assert!(LIFECYCLE.contains("fatal_before_termination"));
+        assert!(LIFECYCLE.contains("timeout_before_completion"));
+        assert!(LIFECYCLE.contains("proof_complete_then_terminated"));
+        // Success return (0) ONLY after proof seen, then the script reaps QEMU itself.
+        assert!(LIFECYCLE.contains("_qemu_reap"));
+    }
+
+    // Deterministic lifecycle #2: the SMP smoke uses the helper, defines the terminal markers, and only
+    // seals on the proof_complete_then_terminated result (rc 0).
+    #[test]
+    fn reply_smoke_uses_deterministic_lifecycle() {
+        assert!(REPLY_SH.contains("source \"$(dirname \"$0\")/lib/qemu-x86-deterministic.sh\""));
+        assert!(REPLY_SH.contains("qemu_run_deterministic \"$BOOT_LOG\""));
+        assert!(REPLY_SH.contains("QEMU_TERMINAL_MARKERS=("));
+        assert!(REPLY_SH.contains("if (( LIFECYCLE_RC != 0 )); then"));
+    }
+
+    // Final freeze seal: the exact-commit runner runs four fresh runs (A-D), re-checks SHA + clean tree
+    // after each, and emits the freeze seal only after all four succeed.
+    #[test]
+    fn final_seal_runner_is_exact_commit_and_gated() {
+        assert!(FINAL_SH.contains("STAGE_199_X86_DIRECT_IPC_FINAL_SEAL"));
+        // SHA + clean-tree captured once and re-checked after every child run.
+        assert!(FINAL_SH.contains("git rev-parse HEAD"));
+        assert!(FINAL_SH.contains("recheck_exact_commit"));
+        // Four independent runs.
+        for tok in ["RUN_A", "RUN_B", "RUN_C", "RUN_D"] {
+            assert!(FINAL_SH.contains(tok), "missing {tok}");
+        }
+        // The seal fields required by the stage.
+        for field in [
+            "functional_smp1=1",
+            "ap_dispatch_smp2=1",
+            "cross_cpu_request_smp2=1",
+            "cross_cpu_reply_smp2=1",
+            "request_user_consumed=1",
+            "reply_user_consumed=1",
+            "trap_depth_errors=0",
+            "wrong_current_task=0",
+            "duplicate_replies=0",
+            "duplicate_wakes=0",
+            "overwrite_fuse_trips=0",
+        ] {
+            assert!(FINAL_SH.contains(field), "seal missing field {field}");
+        }
+    }
+}

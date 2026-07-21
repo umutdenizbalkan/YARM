@@ -41,17 +41,40 @@ fi
 if (( ! fail )); then cp "$KELF" build-x86_64/kernel_boot.elf; fi
 if (( fail )); then echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=build"; exit 1; fi
 
-note "booting QEMU -smp 2"
-env \
-  KERNEL_IMAGE=build-x86_64/kernel_boot.elf \
-  INITRAMFS_IMAGE=build-x86_64/initramfs-core.cpio \
-  KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.x86_64_ipccall_direct_smp_oracle=1 yarm.x86_64_ipccall_direct_smp_recv_v2_server=1 yarm.x86_64_ipccall_direct_smp_request=1 yarm.x86_64_ipccall_direct_smp_reply=1 yarm.ap_user_dispatch=1" \
-  QEMU_SMP=2 \
-  LOGFILE="$BOOT_LOG" \
-  SMOKE_LOG="$LOGDIR/smoke.log" \
-  TIMEOUT_SECS="$TIMEOUT_SECS" \
-  YARM_MODE_ISOLATION=0 \
-  scripts/qemu-x86_64-core-smoke.sh >"$LOGDIR/core-smoke.log" 2>&1 || true
+# ── Stage 199A2D3: DETERMINISTIC QEMU lifecycle — the SCRIPT owns termination. ────────────────
+# Launch fresh QEMU → monitor a fresh log → wait for ALL final bidirectional proof markers →
+# scan fatal each poll → terminate QEMU from the script → wait for exit → only then seal.
+source "$(dirname "$0")/lib/qemu-x86-deterministic.sh"
+
+if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+  die "qemu-system-x86_64 not installed"
+  echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=no_qemu"; exit 1
+fi
+
+QEMU_ARGV=(
+  qemu-system-x86_64
+  -machine "${QEMU_MACHINE:-q35}" -cpu "${QEMU_CPU:-qemu64}" -m "${QEMU_MEMORY:-512M}" -smp 2
+  -nographic -monitor none -serial stdio -no-reboot -no-shutdown
+  -kernel build-x86_64/kernel_boot.elf
+  -initrd build-x86_64/initramfs-core.cpio
+  -append "console=ttyS0 rdinit=/init yarm.x86_64_ipccall_direct_smp_oracle=1 yarm.x86_64_ipccall_direct_smp_recv_v2_server=1 yarm.x86_64_ipccall_direct_smp_request=1 yarm.x86_64_ipccall_direct_smp_reply=1 yarm.ap_user_dispatch=1"
+)
+# The terminal condition = the LAST bidirectional-proof markers of the reverse direction; once all
+# three are present the round trip is complete and the script terminates QEMU.
+QEMU_TERMINAL_MARKERS=(
+  "X86_BSP_REPLY_USER_VALIDATED cpu=0"
+  "IPCREPLY_DIRECT_SMP_REPLY_OK sender_cpu=1 receiver_cpu=0 cross_cpu=1"
+  "IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED arch=x86_64"
+)
+FATAL_RE="KERNEL PANIC|RUST PANIC|panicked at|DOUBLE FAULT|Unhandled|BOOTSTRAP_ERROR|IPCCALL_DIRECT_ACK_OVERWRITE_FUSE|IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE|X86_BSP_REPLY_VALIDATE_FAIL|X86_AP_RECV_V2_VALIDATE_FAIL|X86_AP_RECV_V2_USER_READ_FAULT"
+
+note "booting QEMU -smp 2 (script-owned deterministic lifecycle, ceiling ${TIMEOUT_SECS}s)"
+qemu_run_deterministic "$BOOT_LOG" "$FATAL_RE" "$TIMEOUT_SECS" "${QEMU_ARGV[@]}"
+LIFECYCLE_RC=$?
+note "qemu lifecycle: ${QEMU_LIFECYCLE_RESULT} (rc=${LIFECYCLE_RC})"
+if (( LIFECYCLE_RC != 0 )); then
+  echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=${QEMU_LIFECYCLE_RESULT}"; exit 1
+fi
 
 if [[ ! -s "$BOOT_LOG" ]]; then die "no boot log"; echo "STAGE_199_IPCCALL_REPLY_DIRECT_SMP_SEAL arch=x86_64 smp=2 result=fail reason=no_boot_log"; exit 1; fi
 NORM="$LOGDIR/boot.norm.log"; tr '\r' '\n' <"$BOOT_LOG" >"$NORM"
@@ -67,10 +90,18 @@ have()  { rg -a -q -F "$1" "$NORM"; }
 # ── Reverse (reply) direction — the new proof. ────────────────────────────────────────────────
 # 1. CPU-0 caller blocks on its reply endpoint (blocked-caller ack published).
 [[ "$(count "IPCREPLY_DIRECT_SMP_CALLER_BLOCKED arch=x86_64 caller_cpu=0")" == "1" ]] || die "caller-blocked != 1"
-# 2. CPU-1 → CPU-0 reverse reschedule IPI (sent by CPU 1 after the caller enqueue on CPU 0).
+# 2. CPU-1 → CPU-0 reverse reschedule IPI (sent by CPU 1 after the caller enqueue on CPU 0). This is
+#    the AUTHORITATIVE, deterministic IPI proof (exactly one requested per reply).
 [[ "$(count "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0")" == "1" ]] || die "reverse IPI sent != 1"
-# 3. CPU-0 receives it (pending=1, no dispatch in the handler).
-[[ "$(count "X86_BSP_RESCHEDULE_IPI_RECEIVED cpu=0")" == "1" ]] || die "reverse IPI received != 1"
+# 3. CPU-0's 0xF1 handler marker (pending=1, no dispatch in the handler) is BEST-EFFORT: the resume is
+#    driven by CPU-0's trap-return poll of the committed reply, so a timer tick can win the race and
+#    produce the terminal markers before the 0xF1 handler runs. Accept 0 or 1 (never a spurious >1),
+#    and — when present — require dispatch_in_handler=0 (never a dispatch inside the handler).
+RECEIVED_N="$(count "X86_BSP_RESCHEDULE_IPI_RECEIVED cpu=0")"
+[[ "$RECEIVED_N" == "0" || "$RECEIVED_N" == "1" ]] || die "reverse IPI received > 1 ($RECEIVED_N)"
+if [[ "$RECEIVED_N" == "1" ]]; then
+  [[ "$(count "X86_BSP_RESCHEDULE_IPI_RECEIVED cpu=0 pending=1 dispatch_in_handler=0")" == "1" ]] || die "reverse IPI received without dispatch_in_handler=0"
+fi
 # 4. CPU-0 saved-frame resume of the client's committed recv-v2 continuation (mode=saved).
 [[ "$(count "X86_BSP_SAVED_DISPATCH_OK cpu=0 mode=saved")" == "1" ]] || die "BSP saved-dispatch != 1"
 # 5. The resumed CPU-0 client validated the reply via DIRECT ring-3 loads (payload+length+meta).
