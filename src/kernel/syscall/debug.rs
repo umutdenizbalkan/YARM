@@ -61,6 +61,10 @@ pub(super) fn handle_debug_log(
     syscall_trace!("DEBUG_LOG_COPY_OK tid={} len={}", tid, len);
     let msg_str = core::str::from_utf8(&payload[..len]).unwrap_or("<utf8_err>");
     crate::yarm_log!("USER_LOG tid={} msg={}", tid, msg_str);
+    // Stage 199A2D2C2B2: the cross-CPU request seal's terminal kernel marker is emitted ONLY after
+    // the resumed CPU-1 server's userspace X86_AP_RECV_V2_CONTINUED marker is observed here (never
+    // merely after enqueue/IPI) AND the kernel counters attest one complete delivery. Once, gated.
+    crate::kernel::boot::maybe_emit_ipccall_direct_smp_request_ok(msg_str);
     frame.set_ok(0, 0, 0);
     Ok(())
 }

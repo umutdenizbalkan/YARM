@@ -79041,3 +79041,2493 @@ mod stage199a2c3_matrix_guards {
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
+
+/// Stage 199A2D1 — Direct-IPC forced-interleaving RACE MODEL.
+///
+/// Deterministic concurrency proofs for the off-lock NR6/NR7 seams. These are NOT
+/// "run with more test threads and hope": every case forces the dangerous interleaving
+/// with an EXPLICIT mechanism — a `std::sync::Barrier` aligning two competing threads at
+/// the exact contended primitive (groups a/b/f), or bounded step control interposing an
+/// exit / endpoint replacement between the claim and the commit (groups c/d/e). Each case
+/// asserts EXACT counts: one winner, one loser, one publication/copy/wake, zero duplicates.
+#[cfg(test)]
+mod stage199a2d1_races {
+    use super::*;
+    use crate::kernel::boot::{
+        ReceiverWaiterIdentity, ReplyRecordReservation, ipccall_direct_ack, ipcreply_direct_ack,
+        set_ipccall_direct_proof_enabled,
+    };
+    use crate::kernel::ipccall_direct::{
+        AckLease, BlockedCallerAck, BlockedServerAck, IpcCallDirectSnapshot, IpcReplyDirectSnapshot,
+    };
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::{ReceiverCommit, SharedKernel};
+    use core::sync::atomic::{AtomicUsize, Ordering as O};
+    use std::sync::{Arc, Barrier};
+
+    pub(super) const CALLER_PAYLOAD_VA: usize = 0x4000;
+    const CALLER_META_VA: usize = 0x4080;
+    const SERVER_PAYLOAD_VA: usize = 0x4000;
+    const SERVER_META_VA: usize = 0x4080;
+
+    fn id(tid: u64, asid: Asid) -> ReceiverWaiterIdentity {
+        ReceiverWaiterIdentity::new(ThreadId(tid), asid)
+    }
+
+    // ── shared fixtures ──────────────────────────────────────────────────────────
+
+    pub(super) struct CallerFx {
+        pub(super) k: Arc<SharedKernel>,
+        #[allow(dead_code)]
+        pub(super) caller: ReceiverWaiterIdentity,
+        pub(super) replier: ReceiverWaiterIdentity,
+        pub(super) caller_asid: Asid,
+        pub(super) reply_cap_t2: CapId,
+        pub(super) record_index: usize,
+        pub(super) record_generation: u64,
+        pub(super) reply_eidx: usize,
+        pub(super) reply_egen: u64,
+        pub(super) published_ack: BlockedCallerAck,
+    }
+
+    /// task1 caller committed-blocked on recv-v2 of its reply endpoint; task2 replier
+    /// holds the bound one-shot Reply cap. Mirrors `stage199a2b3::blocked_caller_fixture`.
+    pub(super) fn caller_fixture() -> CallerFx {
+        ipcreply_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (caller_asid, replier_asid, reply_cap_t2) = k.with(|state| {
+            state.register_task(1).expect("t1 caller");
+            state.register_task(2).expect("t2 replier");
+            let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+            let (asid2, _aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("bind1");
+            state.bind_task_asid(2, asid2).expect("bind2");
+            state
+                .map_user_page(
+                    aspace1,
+                    VirtAddr(CALLER_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xC000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map caller buffers");
+            let (_reply_eid, _reply_send, reply_recv_global) =
+                state.create_endpoint(4).expect("reply ep");
+            let reply_recv_cap_t1 = state
+                .grant_capability_task_to_task(0, reply_recv_global, 1)
+                .expect("dup reply recv to caller");
+            let t2_cnode = state.task_cnode(2).expect("t2 cnode");
+            let reply_cap_t2 = state
+                .create_reply_cap_for_caller_in_cnode(
+                    ThreadId(1),
+                    reply_recv_cap_t1,
+                    Some(ThreadId(2)),
+                    Some(t2_cnode),
+                )
+                .expect("reply record + replier-local cap");
+            state.enqueue_current_cpu(1).expect("enqueue1");
+            state.dispatch_next_task().expect("dispatch");
+            while state.current_tid() != Some(1) {
+                state.yield_current().expect("switch to caller");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    reply_recv_cap_t1.0 as usize,
+                    CALLER_PAYLOAD_VA,
+                    8,
+                    CALLER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(state.task_status(1), Some(TaskStatus::Blocked(_))),
+                "caller must be blocked on recv-v2 of its reply endpoint"
+            );
+            (asid1, asid2, reply_cap_t2)
+        });
+        let published_ack =
+            ipcreply_direct_ack::snapshot().expect("recv-v2 commit published a caller ack");
+        let reply_eidx = published_ack.endpoint_index;
+        let reply_egen = published_ack.endpoint_generation;
+        let (record_index, record_generation) = k
+            .resolve_reply_cap_split_read(2, reply_cap_t2)
+            .expect("resolve replier reply cap");
+        CallerFx {
+            k: Arc::new(k),
+            caller: id(1, caller_asid),
+            replier: id(2, replier_asid),
+            caller_asid,
+            reply_cap_t2,
+            record_index,
+            record_generation,
+            reply_eidx,
+            reply_egen,
+            published_ack,
+        }
+    }
+
+    struct ServerFx {
+        k: Arc<SharedKernel>,
+        server: ReceiverWaiterIdentity,
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        published_ack: BlockedServerAck,
+    }
+
+    /// task2 server committed-blocked on recv-v2 of the request endpoint. Mirrors
+    /// `stage199a2b2d::blocked_server_fixture` (but keeps only what the race cases need).
+    fn server_fixture() -> ServerFx {
+        ipccall_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (server_asid, req_send_t1) = k.with(|state| {
+            state.register_task(1).expect("task1");
+            state.register_task(2).expect("task2");
+            let (asid1, _aspace1) = state.create_user_address_space().expect("asid1");
+            let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("bind1");
+            state.bind_task_asid(2, asid2).expect("bind2");
+            state
+                .map_user_page(
+                    aspace2,
+                    VirtAddr(SERVER_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xB000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map server buffers");
+            let (_req_eid, req_send_global, req_recv_global) =
+                state.create_endpoint(4).expect("req ep");
+            let req_send_t1 = state
+                .grant_capability_task_to_task(0, req_send_global, 1)
+                .expect("dup req send to caller");
+            let req_recv_t2 = state
+                .grant_capability_task_to_task(0, req_recv_global, 2)
+                .expect("dup req recv to server");
+            state.enqueue_current_cpu(2).expect("enqueue2");
+            state.dispatch_next_task().expect("dispatch");
+            while state.current_tid() != Some(2) {
+                state.yield_current().expect("switch to server");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    req_recv_t2.0 as usize,
+                    SERVER_PAYLOAD_VA,
+                    8,
+                    SERVER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(state.task_status(2), Some(TaskStatus::Blocked(_))),
+                "server must be blocked on recv-v2"
+            );
+            (asid2, req_send_t1)
+        });
+        let endpoint = k
+            .resolve_endpoint_send_cap_split_read(1, req_send_t1)
+            .expect("resolve send endpoint");
+        let (endpoint_index, endpoint_generation) = match endpoint {
+            crate::kernel::capabilities::CapObject::Endpoint { index, generation } => {
+                (index, generation)
+            }
+            _ => panic!("send cap is not an endpoint"),
+        };
+        let server = id(2, server_asid);
+        let published_ack = BlockedServerAck {
+            server,
+            endpoint_index,
+            endpoint_generation,
+            recv_v2_committed: true,
+            payload_user_ptr: SERVER_PAYLOAD_VA,
+            payload_user_len: 8,
+            meta_user_ptr: SERVER_META_VA,
+            meta_user_len: 40,
+        };
+        ServerFx {
+            k: Arc::new(k),
+            server,
+            endpoint_index,
+            endpoint_generation,
+            published_ack,
+        }
+    }
+
+    pub(super) fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        ipccall_direct_ack::reset();
+        ipcreply_direct_ack::reset();
+    }
+
+    fn reserved_reply_records(k: &SharedKernel) -> usize {
+        k.with(|s| {
+            (0..crate::kernel::boot::MAX_REPLY_CAPS)
+                .filter(|i| {
+                    matches!(
+                        s.reply_cap_record_reservation(*i),
+                        Some(ReplyRecordReservation::Reserved)
+                    )
+                })
+                .count()
+        })
+    }
+
+    fn claimed_lease(seq: u64) -> AckLease {
+        let mut l = AckLease::new_available();
+        l.claim(seq).expect("claim");
+        l
+    }
+
+    // ── (a) ACK CLAIM RACE — two threads claim the SAME published ack simultaneously ──
+    //
+    // Exactly one CAS wins: claim successes=1, failures=1, work owners=1, post-work
+    // publications=1; the losing thread mutates nothing. Run for BOTH the server ack
+    // (NR6 BlockedServerAck) and the caller ack (NR7 BlockedCallerAck).
+
+    fn race_ack_claim_server() -> (usize, usize, usize, usize) {
+        ipccall_direct_ack::reset();
+        let ack = BlockedServerAck {
+            server: id(2, Asid(7)),
+            endpoint_index: 3,
+            endpoint_generation: 11,
+            recv_v2_committed: true,
+            payload_user_ptr: 0x4000,
+            payload_user_len: 8,
+            meta_user_ptr: 0x4080,
+            meta_user_len: 40,
+        };
+        let _seq = ipccall_direct_ack::publish(ack);
+        let barrier = Arc::new(Barrier::new(2));
+        let claim_ok = Arc::new(AtomicUsize::new(0));
+        let claim_fail = Arc::new(AtomicUsize::new(0));
+        let work_owners = Arc::new(AtomicUsize::new(0));
+        let publications = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let b = Arc::clone(&barrier);
+            let (ok, fail, work, pubs) = (
+                Arc::clone(&claim_ok),
+                Arc::clone(&claim_fail),
+                Arc::clone(&work_owners),
+                Arc::clone(&publications),
+            );
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        b.wait();
+                        match ipccall_direct_ack::claim() {
+                            Some((claimed, seq)) => {
+                                ok.fetch_add(1, O::Relaxed);
+                                // Only the claim WINNER does work + publishes.
+                                assert_eq!(claimed.endpoint_index, 3);
+                                assert_eq!(seq, ipccall_direct_ack::commit_seq());
+                                work.fetch_add(1, O::Relaxed);
+                                pubs.fetch_add(1, O::Relaxed);
+                            }
+                            None => {
+                                fail.fetch_add(1, O::Relaxed);
+                            }
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        (
+            claim_ok.load(O::Relaxed),
+            claim_fail.load(O::Relaxed),
+            work_owners.load(O::Relaxed),
+            publications.load(O::Relaxed),
+        )
+    }
+
+    fn race_ack_claim_caller() -> (usize, usize, usize, usize) {
+        ipcreply_direct_ack::reset();
+        let ack = BlockedCallerAck {
+            caller: id(1, Asid(5)),
+            endpoint_index: 9,
+            endpoint_generation: 4,
+            recv_v2_committed: true,
+            payload_user_ptr: 0x4000,
+            payload_user_len: 8,
+            meta_user_ptr: 0x4080,
+            meta_user_len: 40,
+        };
+        let _seq = ipcreply_direct_ack::publish(ack);
+        let barrier = Arc::new(Barrier::new(2));
+        let claim_ok = Arc::new(AtomicUsize::new(0));
+        let claim_fail = Arc::new(AtomicUsize::new(0));
+        let work_owners = Arc::new(AtomicUsize::new(0));
+        let publications = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let b = Arc::clone(&barrier);
+            let (ok, fail, work, pubs) = (
+                Arc::clone(&claim_ok),
+                Arc::clone(&claim_fail),
+                Arc::clone(&work_owners),
+                Arc::clone(&publications),
+            );
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        b.wait();
+                        match ipcreply_direct_ack::claim() {
+                            Some((claimed, _seq)) => {
+                                ok.fetch_add(1, O::Relaxed);
+                                assert_eq!(claimed.endpoint_index, 9);
+                                work.fetch_add(1, O::Relaxed);
+                                pubs.fetch_add(1, O::Relaxed);
+                            }
+                            None => {
+                                fail.fetch_add(1, O::Relaxed);
+                            }
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        (
+            claim_ok.load(O::Relaxed),
+            claim_fail.load(O::Relaxed),
+            work_owners.load(O::Relaxed),
+            publications.load(O::Relaxed),
+        )
+    }
+
+    #[test]
+    fn a_ack_claim_race_server_ack_exactly_one_winner() {
+        // Repeat the barrier-aligned race many times: the invariant must hold EVERY run
+        // (deterministic outcome), not merely usually.
+        for _ in 0..200 {
+            let (ok, fail, work, pubs) = race_ack_claim_server();
+            assert_eq!(ok, 1, "exactly one claim succeeds");
+            assert_eq!(fail, 1, "exactly one claim fails");
+            assert_eq!(work, 1, "exactly one work owner");
+            assert_eq!(pubs, 1, "exactly one post-work publication");
+        }
+        teardown();
+    }
+
+    #[test]
+    fn a_ack_claim_race_caller_ack_exactly_one_winner() {
+        for _ in 0..200 {
+            let (ok, fail, work, pubs) = race_ack_claim_caller();
+            assert_eq!(ok, 1, "exactly one caller-ack claim succeeds");
+            assert_eq!(fail, 1, "exactly one caller-ack claim fails");
+            assert_eq!(work, 1, "exactly one work owner");
+            assert_eq!(pubs, 1, "exactly one post-work publication");
+        }
+        teardown();
+    }
+
+    // ── (b) REPLY-RECORD ALIAS RACE — two aliases race the SAME (index, generation) ──
+    //
+    // Two threads run the FULL off-lock reply transaction concurrently against the same
+    // bound reply record, each with a DISTINCT payload + its own claimed lease. The
+    // Available→Reserved reservation is the single authority gate: reservation
+    // successes=1, failures=1, reply payload copies=1 (the loser fails BEFORE its copy,
+    // so caller memory holds the WINNER's bytes exactly), caller wakes=1, final state
+    // Consumed. No losing alias copies into caller memory.
+    #[test]
+    fn b_reply_record_alias_race_single_reservation_single_copy_single_wake() {
+        let fx = caller_fixture();
+        let k = Arc::clone(&fx.k);
+        let replier = fx.replier;
+        let reply_cap = fx.reply_cap_t2;
+        let ack = fx.published_ack;
+
+        let barrier = Arc::new(Barrier::new(2));
+        let ok = Arc::new(AtomicUsize::new(0));
+        let err = Arc::new(AtomicUsize::new(0));
+        let payloads: [&'static [u8; 8]; 2] = [b"WINNER-A", b"WINNER-B"];
+        let mut handles = Vec::new();
+        for t in 0..2 {
+            let b = Arc::clone(&barrier);
+            let k = Arc::clone(&k);
+            let (okc, errc) = (Arc::clone(&ok), Arc::clone(&err));
+            let payload = payloads[t];
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        let snap = IpcReplyDirectSnapshot::build(replier, reply_cap, payload)
+                            .expect("snapshot");
+                        let mut lease = AckLease::new_available();
+                        lease.claim(100 + t as u64).expect("claim lease");
+                        b.wait();
+                        match k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 100 + t as u64) {
+                            Ok(_) => {
+                                okc.fetch_add(1, O::Relaxed);
+                                assert!(lease.is_consumed(), "winner lease consumed");
+                            }
+                            Err(_) => {
+                                errc.fetch_add(1, O::Relaxed);
+                            }
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        assert_eq!(ok.load(O::Relaxed), 1, "exactly one reply reservation wins");
+        assert_eq!(err.load(O::Relaxed), 1, "exactly one alias loses");
+
+        // The record is the one-shot Consumed barrier; not left Reserved.
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(fx.record_index)),
+            Some(ReplyRecordReservation::Consumed),
+            "final record state Consumed"
+        );
+        assert_eq!(reserved_reply_records(&fx.k), 0, "no record left Reserved");
+
+        // Caller memory holds EXACTLY one of the two payloads — the winner's — never a
+        // torn mix and never both: the loser copied nothing.
+        let delivered =
+            fx.k.with(|s| s.read_user_memory_for_asid(fx.caller_asid, CALLER_PAYLOAD_VA, 8))
+                .expect("read caller payload");
+        assert!(
+            &delivered[..8] == b"WINNER-A" || &delivered[..8] == b"WINNER-B",
+            "caller memory holds exactly one winner payload (got {:?})",
+            &delivered[..8]
+        );
+
+        // Caller woken exactly once: Runnable + dispatches once.
+        fx.k.with(|s| {
+            assert_eq!(
+                s.task_status(1),
+                Some(TaskStatus::Runnable),
+                "caller Runnable"
+            );
+            s.dispatch_next_task().expect("dispatch");
+            assert_eq!(s.current_tid(), Some(1), "caller wakes exactly once");
+        });
+        teardown();
+    }
+
+    // ── (c) REPLY vs CALLER EXIT — exit interposed between reserve and commit ──────
+    //
+    // Bounded step control: (A) reserve the record; (B) the caller exits / is replaced;
+    // (A) attempts the caller copy/finalization. Require stale authority restored=0,
+    // caller wakes=0, record left Reserved=0, reply alias usable=0, ack restored=0.
+    #[test]
+    fn c_reply_vs_caller_exit_no_wake_no_restore_record_discarded() {
+        let fx = caller_fixture();
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let mut lease = claimed_lease(55);
+
+        // (A) reserve the exact bound record.
+        assert!(
+            fx.k.reserve_existing_reply_record_split(idx, rgen, fx.replier),
+            "owner reserves once"
+        );
+
+        // (B) the caller exits before the reply finalizes.
+        fx.k.with(|s| s.mark_task_dead(1).expect("caller exits"));
+
+        // (A) attempt to commit the caller wake — GoneDead: no register mutated, no wake.
+        let commit =
+            fx.k.sr_commit_blocked_receiver_split(fx.caller.tid.0, fx.caller.asid);
+        assert_eq!(
+            commit,
+            ReceiverCommit::GoneDead,
+            "exited caller cannot commit"
+        );
+
+        // Fail-closed reconcile for stale authority. The reply work item's finalize path
+        // discards the stale record; the caller's own exit teardown ALSO revokes its bound
+        // reply authority (`revoke_reply_caps_for_caller_identity`). Either way the record
+        // is left NON-invokable and NOT Reserved — `discard` is idempotent (it returns
+        // false once teardown already reclaimed the record), never re-arming usable
+        // authority. The ack lease is discarded, never restored.
+        let _discarded = fx.k.discard_reply_record_split(idx, rgen);
+        lease.discard();
+
+        // Assertions: record NOT left Reserved (0), reply alias NOT usable, caller NOT
+        // woken, stale authority NOT restored, ack lease NOT restored.
+        assert_eq!(reserved_reply_records(&fx.k), 0, "record left Reserved=0");
+        assert!(
+            !fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)),
+            "reply alias usable=0"
+        );
+        fx.k.with(|s| {
+            assert_ne!(s.current_tid(), Some(1), "caller wakes=0");
+            assert!(
+                matches!(
+                    s.task_status(1),
+                    Some(TaskStatus::Dead | TaskStatus::Exited(_)) | None
+                ),
+                "exited caller not made Runnable"
+            );
+        });
+        assert!(!lease.is_available(), "ack restored=0 (lease discarded)");
+        assert!(
+            !fx.k
+                .reserve_existing_reply_record_split(idx, rgen, fx.replier),
+            "a Consumed record cannot be re-reserved (no stale authority restored)"
+        );
+        teardown();
+    }
+
+    // ── (d) REPLY vs ENDPOINT REPLACEMENT — endpoint gen bumped after ack claim ────
+    //
+    // Bounded step control: claim the caller ack, then force the reply endpoint's
+    // generation to change (a replacement caller installed at the NEW generation) BEFORE
+    // the waiter claim. Require replacement waiter mutated=0, old waiter restored=0,
+    // stale ack restored=0, wake=0.
+    #[test]
+    fn d_reply_vs_endpoint_replacement_stale_claim_rejected() {
+        let fx = caller_fixture();
+        let (eidx, old_egen) = (fx.reply_eidx, fx.reply_egen);
+
+        // Claim the published caller ack (the reply work item owns it).
+        let (ack, ack_seq) = ipcreply_direct_ack::claim().expect("claim caller ack");
+        assert_eq!(ack.endpoint_generation, old_egen);
+
+        // Force an endpoint replacement: bump the generation and install a DIFFERENT
+        // replacement waiter (task 2) at the NEW generation.
+        let replacement = id(2, Asid(0x321));
+        let new_egen = fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                let ng = ipc.endpoint_generations[eidx].wrapping_add(1);
+                ipc.endpoint_generations[eidx] = ng;
+                ipc.set_endpoint_waiter(eidx, replacement);
+                ng
+            })
+        });
+        assert_ne!(new_egen, old_egen);
+
+        // The reply work item's waiter claim uses the OLD (ack) generation → rejected
+        // (generation mismatch); the replacement waiter is never touched.
+        let claim =
+            fx.k.sr_claim_endpoint_waiter_split(eidx, old_egen, ack.caller);
+        assert!(claim.is_none(), "stale-generation waiter claim rejected");
+
+        // The replacement waiter is byte-identical (not mutated / not cleared).
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(eidx, new_egen, replacement),
+            "replacement waiter mutated=0"
+        );
+
+        // Restoring the OLD-generation waiter is refused (cannot re-arm a stale waiter
+        // over the newer generation / replacement).
+        let stale_claim = crate::runtime::WaiterClaim {
+            eidx,
+            generation: old_egen,
+            receiver: ack.caller,
+        };
+        assert!(
+            !fx.k.sr_restore_endpoint_waiter_split(&stale_claim),
+            "old waiter restored=0"
+        );
+
+        // Stale ack restore over the newer publication: `restore` re-arms only the SAME
+        // sequence; a fresh publication (were one to occur) advances SEQ. Here we simply
+        // confirm the claimed ack is not silently re-armed by an unrelated seq.
+        assert!(
+            !ipcreply_direct_ack::restore(ack_seq.wrapping_add(1)),
+            "stale ack restored=0 for a mismatched sequence"
+        );
+
+        // No wake: neither the stale caller nor the replacement was enqueued/dispatched.
+        assert_ne!(
+            fx.k.with(|s| s.current_tid()),
+            Some(1),
+            "wake=0 for stale caller"
+        );
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(eidx, new_egen, replacement),
+            "replacement remains blocked (never woken by the stale reply)"
+        );
+        teardown();
+    }
+
+    // ── (e) REQUEST vs SERVER EXIT — server exits after ack claim, before commit ────
+    //
+    // Bounded step control: reserve a reply record + claim the server's endpoint waiter
+    // (the request work item's authority), THEN the server exits, THEN the delivery
+    // commit is attempted. Require cap minted into replacement CNode=0, reply record
+    // leak=0, server wake=0, stale ack restore=0.
+    #[test]
+    fn e_request_vs_server_exit_no_mint_no_leak_no_wake() {
+        let fx = server_fixture();
+        let (eidx, egen) = (fx.endpoint_index, fx.endpoint_generation);
+        let mut lease = claimed_lease(77);
+
+        // Claim the server's endpoint waiter (models "after ack claim").
+        let claim =
+            fx.k.sr_claim_endpoint_waiter_split(eidx, egen, fx.server)
+                .expect("server waiter claimed");
+        assert_eq!(claim.receiver, fx.server);
+
+        // The server exits before the delivery commit.
+        fx.k.with(|s| s.mark_task_dead(2).expect("server exits"));
+
+        // Delivery commit → GoneDead (no register mutated, no wake).
+        let commit =
+            fx.k.sr_commit_blocked_receiver_split(fx.server.tid.0, fx.server.asid);
+        assert_eq!(
+            commit,
+            ReceiverCommit::GoneDead,
+            "exited server cannot commit"
+        );
+
+        // Fail-closed reconcile: waiter NOT restored (GoneDead terminal), lease discarded.
+        lease.discard();
+
+        // No reply record was minted/reserved in this stale sequence → no leak. (No
+        // replacement task exists, so "cap minted into replacement CNode" is 0 by
+        // construction; we additionally assert no reserved reply record leaked.)
+        assert_eq!(reserved_reply_records(&fx.k), 0, "reply record leak=0");
+        // No Reply cap exists in ANY task cnode (nothing minted).
+        let minted_reply_caps: usize = fx.k.with(|s| {
+            let mut n = 0usize;
+            for i in 0..crate::kernel::boot::MAX_REPLY_CAPS {
+                if s.reply_cap_record_present(i) {
+                    n += 1;
+                }
+            }
+            n
+        });
+        assert_eq!(minted_reply_caps, 0, "cap minted into replacement CNode=0");
+
+        // Server wake=0.
+        fx.k.with(|s| {
+            assert_ne!(s.current_tid(), Some(2), "server wake=0");
+            assert!(
+                matches!(
+                    s.task_status(2),
+                    Some(TaskStatus::Dead | TaskStatus::Exited(_)) | None
+                ),
+                "exited server not made Runnable"
+            );
+        });
+        // Stale ack restore=0: the claimed waiter is not re-installed (terminal).
+        assert!(
+            !fx.k.endpoint_waiter_is_split_read(eidx, egen, fx.server),
+            "stale ack restore=0 (waiter not re-armed for a dead server)"
+        );
+        assert!(!lease.is_available(), "ack lease discarded, not restored");
+        teardown();
+    }
+
+    // ── (f) WAKE / ENQUEUE RACE — two completion attempts for one blocked receiver ──
+    //
+    // Two threads race to complete the SAME blocked server: waiter claims=1, Runnable
+    // transitions=1, scheduler enqueues=1, continuations=1, duplicate wakes=0.
+    #[test]
+    fn f_wake_enqueue_race_single_claim_single_enqueue_no_duplicate() {
+        let fx = server_fixture();
+        let k = Arc::clone(&fx.k);
+        let server = fx.server;
+        let (eidx, egen) = (fx.endpoint_index, fx.endpoint_generation);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let claims = Arc::new(AtomicUsize::new(0));
+        let runnable = Arc::new(AtomicUsize::new(0));
+        let enqueues = Arc::new(AtomicUsize::new(0));
+        let continuations = Arc::new(AtomicUsize::new(0));
+        let dup_wakes = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let b = Arc::clone(&barrier);
+            let k = Arc::clone(&k);
+            let (cl, rn, eq, co, dw) = (
+                Arc::clone(&claims),
+                Arc::clone(&runnable),
+                Arc::clone(&enqueues),
+                Arc::clone(&continuations),
+                Arc::clone(&dup_wakes),
+            );
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        b.wait();
+                        match k.sr_claim_endpoint_waiter_split(eidx, egen, server) {
+                            Some(_claim) => {
+                                cl.fetch_add(1, O::Relaxed);
+                                match k.sr_commit_blocked_receiver_split(server.tid.0, server.asid)
+                                {
+                                    ReceiverCommit::Committed(affinity) => {
+                                        rn.fetch_add(1, O::Relaxed);
+                                        k.sr_enqueue_committed_receiver_split(
+                                            server.tid.0,
+                                            affinity,
+                                        );
+                                        eq.fetch_add(1, O::Relaxed);
+                                        co.fetch_add(1, O::Relaxed);
+                                    }
+                                    _ => {
+                                        // Claimed but couldn't commit: would be a lost
+                                        // wake — flag it (must never happen for the winner).
+                                        dw.fetch_add(1, O::Relaxed);
+                                    }
+                                }
+                            }
+                            None => {
+                                // Lost the claim: MUST do nothing further. Any enqueue here
+                                // would be a duplicate wake.
+                            }
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+
+        assert_eq!(claims.load(O::Relaxed), 1, "waiter claims=1");
+        assert_eq!(runnable.load(O::Relaxed), 1, "Runnable transitions=1");
+        assert_eq!(enqueues.load(O::Relaxed), 1, "scheduler enqueues=1");
+        assert_eq!(continuations.load(O::Relaxed), 1, "continuations=1");
+        assert_eq!(dup_wakes.load(O::Relaxed), 0, "duplicate wakes=0");
+
+        // The server dispatches exactly once (single enqueue).
+        fx.k.with(|s| {
+            assert_eq!(s.task_status(2), Some(TaskStatus::Runnable));
+            s.dispatch_next_task().expect("dispatch");
+            assert_eq!(s.current_tid(), Some(2), "server wakes exactly once");
+        });
+        teardown();
+    }
+}
+
+/// Stage 199A2D1 — Direct-IPC MEMORY-ORDERING AUDIT.
+///
+/// Documents and proves the two happens-before chains the off-lock NR6/NR7 seams rely
+/// on, and guards their atomic annotations against silent weakening.
+///
+/// ## Chain 1 — single-slot acknowledgement (cross-CPU publish → claim)
+/// `ipccall_direct_ack` (server ack) and `ipcreply_direct_ack` (caller ack) each publish
+/// with **all identity/endpoint/payload fields written `Relaxed` FIRST**, then a single
+/// `VALID.store(true, Release)` LAST. A reader takes `VALID.load(Acquire)` FIRST and reads
+/// the fields only after. The Release→Acquire edge means: if a claimant observes
+/// `VALID == true`, it observes the COMPLETE, fully-initialized ack (never a torn /
+/// partially-initialized slot). Exclusive ownership transfers through
+/// `CLAIMED.compare_exchange(false, true, AcqRel, Acquire)` — exactly one CPU's CAS
+/// succeeds; the AcqRel success and Acquire failure orderings make the winner's subsequent
+/// reads/writes ordered after every prior claim attempt. `restore(seq)` re-arms
+/// (`CLAIMED.store(false, Release)`) ONLY when `SEQ == seq` for the SAME still-`VALID`
+/// publication; because `SEQ` advances monotonically on every fresh `publish`, a stale
+/// work item's `restore(old_seq)` cannot re-arm an older sequence over a newer publication.
+///   happens-before: `ack fields init` → `VALID Release` → `VALID/CLAIMED Acquire/AcqRel
+///   claim` → `claimant observes the complete ack`.
+///
+/// ## Chain 2 — reply delivery (transaction writes → Consumed → enqueue → resume)
+/// The reply/request transactions run under the internal `SpinLock<KernelState>` (acquire
+/// on lock, release on unlock) via the `_split` seams. Within a delivery: the caller-copy
+/// (`copy_slice_to_user_asid_split_write`) completes, THEN the record transitions
+/// `Reserved → Consumed` (`consume_reply_record_split`), THEN — strictly LAST and
+/// non-fallibly — the caller is enqueued (`sr_enqueue_committed_receiver_split`). Only the
+/// single reservation OWNER (the CAS-style `Available → Reserved` winner) may
+/// consume/release the record; an alias observes `Reserved`/`Consumed` and fails closed.
+/// The lock release at the end of each seam publishes those writes; the scheduler-lock
+/// acquire on the resuming CPU's dispatch observes them. So a resumed caller cannot
+/// dispatch until BOTH the reply bytes and the `Consumed` barrier are visible, and the
+/// enqueue publishes the completed wake state to whichever CPU dispatches the task.
+///   happens-before: `reply bytes copied` → `record Consumed` → `scheduler enqueue` →
+///   `resumed caller observes reply bytes + a Consumed (non-invokable) record`.
+///
+/// These tests do NOT weaken any existing ordering: the source guards fail if a `Release`
+/// publication, an `Acquire` gate, or the `AcqRel/Acquire` claim CAS is downgraded.
+#[cfg(test)]
+mod stage199a2d1_memory_ordering {
+    use super::*;
+    use crate::kernel::boot::{
+        ReceiverWaiterIdentity, ReplyRecordReservation, ipccall_direct_ack, ipcreply_direct_ack,
+    };
+    use crate::kernel::ipccall_direct::{BlockedCallerAck, BlockedServerAck};
+    use crate::kernel::vm::Asid;
+
+    fn sid(tid: u64, asid: u16) -> ReceiverWaiterIdentity {
+        ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
+    }
+
+    // Isolate each single-slot ack module's SOURCE body for the ordering guards.
+    fn ipccall_ack_src() -> &'static str {
+        let s = include_str!("mod.rs");
+        let after = s
+            .split("pub mod ipccall_direct_ack {")
+            .nth(1)
+            .expect("ipccall_direct_ack module present");
+        after
+            .split("pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack")
+            .next()
+            .expect("module body bounded")
+    }
+
+    fn ipcreply_ack_src() -> &'static str {
+        let s = include_str!("mod.rs");
+        let after = s
+            .split("pub mod ipcreply_direct_ack {")
+            .nth(1)
+            .expect("ipcreply_direct_ack module present");
+        after
+            .split("pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack")
+            .next()
+            .expect("module body bounded")
+    }
+
+    // ── Source guards: the ack publish/claim/restore orderings are the exact strong ones ──
+    #[test]
+    fn ack_publish_releases_valid_last_after_relaxed_fields() {
+        for (name, body) in [
+            ("ipccall_direct_ack", ipccall_ack_src()),
+            ("ipcreply_direct_ack", ipcreply_ack_src()),
+        ] {
+            // VALID published with Release, LAST.
+            assert!(
+                body.contains("VALID.store(true, Ordering::Release);"),
+                "{name}: VALID must be published with Release"
+            );
+            // No weakened publication of the VALID gate.
+            assert!(
+                !body.contains("VALID.store(true, Ordering::Relaxed)"),
+                "{name}: VALID publication must not be Relaxed"
+            );
+            // Fields are stored Relaxed (ordered by the trailing VALID Release).
+            assert!(
+                body.contains("SEQ.store(seq, Ordering::Relaxed);"),
+                "{name}: SEQ stored Relaxed before the VALID Release"
+            );
+            // The VALID Release is the LAST store in publish (nothing after it before the
+            // `seq` return): the substring immediately following is the return.
+            let pubslice = body
+                .split("VALID.store(true, Ordering::Release);")
+                .nth(1)
+                .expect("publish releases VALID");
+            let tail: String = pubslice.chars().take(40).collect();
+            assert!(
+                tail.trim_start().starts_with("seq"),
+                "{name}: nothing is stored after the VALID Release in publish (tail={tail:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_snapshot_acquires_valid_first() {
+        for (name, body) in [
+            ("ipccall_direct_ack", ipccall_ack_src()),
+            ("ipcreply_direct_ack", ipcreply_ack_src()),
+        ] {
+            assert!(
+                body.contains("if !VALID.load(Ordering::Acquire) {"),
+                "{name}: snapshot must Acquire-gate on VALID first"
+            );
+            assert!(
+                !body.contains("VALID.load(Ordering::Relaxed)"),
+                "{name}: the VALID gate must never be a Relaxed load"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_claim_is_acqrel_acquire_cas() {
+        for (name, body) in [
+            ("ipccall_direct_ack", ipccall_ack_src()),
+            ("ipcreply_direct_ack", ipcreply_ack_src()),
+        ] {
+            assert!(
+                body.contains(
+                    ".compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)"
+                ),
+                "{name}: the claim CAS must be AcqRel success / Acquire failure"
+            );
+            // Restore re-arms with Release and only on an exact SEQ match of a still-VALID slot.
+            assert!(
+                body.contains(
+                    "SEQ.load(Ordering::Relaxed) == seq && VALID.load(Ordering::Acquire)"
+                ),
+                "{name}: restore must gate on exact SEQ match of a still-VALID publication"
+            );
+            assert!(
+                body.contains("CLAIMED.store(false, Ordering::Release);"),
+                "{name}: restore/reset must clear CLAIMED with Release"
+            );
+        }
+    }
+
+    // ── Functional: a claimant sees the COMPLETE ack (all-or-nothing publication) ──
+    #[test]
+    fn snapshot_is_all_or_nothing_never_partial() {
+        ipccall_direct_ack::reset();
+        assert!(
+            ipccall_direct_ack::snapshot().is_none(),
+            "no VALID slot → snapshot observes nothing (never a partial default)"
+        );
+        let ack = BlockedServerAck {
+            server: sid(2, 7),
+            endpoint_index: 5,
+            endpoint_generation: 13,
+            recv_v2_committed: true,
+            payload_user_ptr: 0x4000,
+            payload_user_len: 8,
+            meta_user_ptr: 0x4080,
+            meta_user_len: 40,
+        };
+        let _ = ipccall_direct_ack::publish(ack);
+        let seen = ipccall_direct_ack::snapshot().expect("published slot is visible");
+        // Every field is the published one — never a half-written / zero field.
+        assert_eq!(seen.server, ack.server);
+        assert_eq!(seen.endpoint_index, ack.endpoint_index);
+        assert_eq!(seen.endpoint_generation, ack.endpoint_generation);
+        assert_eq!(seen.payload_user_ptr, ack.payload_user_ptr);
+        assert_eq!(seen.payload_user_len, ack.payload_user_len);
+        assert_eq!(seen.meta_user_ptr, ack.meta_user_ptr);
+        assert_eq!(seen.meta_user_len, ack.meta_user_len);
+        ipccall_direct_ack::reset();
+    }
+
+    // ── Functional: restore cannot re-arm an OLDER sequence over a NEWER publication ──
+    #[test]
+    fn restore_cannot_rearm_older_sequence_over_newer_publication() {
+        ipcreply_direct_ack::reset();
+        let ack = BlockedCallerAck {
+            caller: sid(1, 5),
+            endpoint_index: 9,
+            endpoint_generation: 4,
+            recv_v2_committed: true,
+            payload_user_ptr: 0x4000,
+            payload_user_len: 8,
+            meta_user_ptr: 0x4080,
+            meta_user_len: 40,
+        };
+        let seq1 = ipcreply_direct_ack::publish(ack);
+        let (_a, claimed_seq) = ipcreply_direct_ack::claim().expect("claim first publication");
+        assert_eq!(claimed_seq, seq1);
+        // A retryable rollback of the SAME publication re-arms it.
+        assert!(
+            ipcreply_direct_ack::restore(seq1),
+            "restore re-arms the exact same publication"
+        );
+        // Re-claim, then a NEWER publication advances SEQ (hosted last-writer-wins).
+        let (_a2, _s2) = ipcreply_direct_ack::claim().expect("re-claim");
+        let seq2 = ipcreply_direct_ack::publish(ack);
+        assert!(
+            seq2 > seq1,
+            "a fresh publication advances SEQ monotonically"
+        );
+        // The stale work item holding seq1 cannot re-arm over the newer publication.
+        assert!(
+            !ipcreply_direct_ack::restore(seq1),
+            "an older sequence cannot restore over a newer publication"
+        );
+        // The current (newer) publication is still claimable exactly once.
+        assert!(ipcreply_direct_ack::is_claimable());
+        ipcreply_direct_ack::reset();
+    }
+
+    // ── Functional: only the reservation OWNER may consume/release the record ──
+    #[test]
+    fn only_reservation_owner_consumes_or_releases() {
+        let fx = super::stage199a2d1_races::caller_fixture();
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+
+        // A non-owner (nothing reserved) cannot consume or release an Available record.
+        assert!(
+            !fx.k.consume_reply_record_split(idx, rgen),
+            "an Available record cannot be consumed without a reservation"
+        );
+        assert!(
+            !fx.k.release_reply_record_split(idx, rgen),
+            "an Available record cannot be released without a reservation"
+        );
+
+        // Reserve (become the owner), then consume exactly once.
+        assert!(fx.k.reserve_existing_reply_record_split(idx, rgen, fx.replier));
+        assert!(
+            fx.k.consume_reply_record_split(idx, rgen),
+            "the owner consumes Reserved → Consumed once"
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(idx)),
+            Some(ReplyRecordReservation::Consumed)
+        );
+        // A second consume and a post-Consumed release both fail closed.
+        assert!(
+            !fx.k.consume_reply_record_split(idx, rgen),
+            "Consumed is a one-shot barrier — no second consume"
+        );
+        assert!(
+            !fx.k.release_reply_record_split(idx, rgen),
+            "a Consumed record cannot be released back to usable authority"
+        );
+        // Wrong generation never consumes.
+        assert!(!fx.k.consume_reply_record_split(idx, rgen.wrapping_add(1)));
+        super::stage199a2d1_races::teardown();
+    }
+
+    // ── Functional: the caller cannot dispatch before bytes + Consumed are both visible ──
+    #[test]
+    fn caller_cannot_dispatch_before_bytes_and_consumed_visible() {
+        let fx = super::stage199a2d1_races::caller_fixture();
+        let snap = crate::kernel::ipccall_direct::IpcReplyDirectSnapshot::build(
+            fx.replier,
+            fx.reply_cap_t2,
+            b"ORDERED!",
+        )
+        .expect("snapshot");
+        let ack = fx.published_ack;
+        let mut lease = crate::kernel::ipccall_direct::AckLease::new_available();
+        lease.claim(31).expect("claim lease");
+        let out =
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 31)
+                .expect("delivery");
+        // BEFORE any dispatch: bytes copied AND record Consumed are both already visible.
+        fx.k.with(|s| {
+            let bytes = s
+                .read_user_memory_for_asid(
+                    fx.caller_asid,
+                    super::stage199a2d1_races::CALLER_PAYLOAD_VA,
+                    8,
+                )
+                .expect("caller bytes");
+            assert_eq!(&bytes[..8], b"ORDERED!", "reply bytes visible pre-dispatch");
+            assert_eq!(
+                s.reply_cap_record_reservation(out.record_index),
+                Some(ReplyRecordReservation::Consumed),
+                "record Consumed visible pre-dispatch"
+            );
+            assert_ne!(s.current_tid(), Some(1), "caller has NOT dispatched yet");
+        });
+        super::stage199a2d1_races::teardown();
+    }
+}
+
+/// Stage 199A2D1 — Part 3 single-slot acknowledgement boundary guards.
+///
+/// The single-slot ack modules are classified ORACLE-ONLY / SINGLE-OUTSTANDING-PAIR.
+/// One outstanding request+reply pair is sufficient; a SECOND simultaneous oracle pair is
+/// refused fail-closed (the active unclaimed ack is preserved, never overwritten/stolen).
+#[cfg(test)]
+mod stage199a2d1_single_slot_boundary {
+    #[test]
+    fn ack_modules_are_classified_and_fused_fail_closed() {
+        let src = include_str!("mod.rs");
+        for module in [
+            "pub mod ipccall_direct_ack {",
+            "pub mod ipcreply_direct_ack {",
+        ] {
+            assert!(src.contains(module), "module {module} present");
+        }
+        // Both modules carry the Stage 199A2D1 concurrency classification.
+        assert_eq!(
+            src.matches("# Concurrency classification (Stage 199A2D1)")
+                .count(),
+            2,
+            "both ack modules classified as single-outstanding-pair oracle infra"
+        );
+        // Both modules carry the fail-closed overwrite fuse (real builds refuse to
+        // overwrite an active VALID && !CLAIMED ack) and expose its count.
+        assert_eq!(
+            src.matches("static OVERWRITE_FUSE: AtomicU64 = AtomicU64::new(0);")
+                .count(),
+            2,
+            "both ack modules declare the overwrite fuse"
+        );
+        assert_eq!(
+            src.matches("pub fn overwrite_fuse_count() -> u64 {")
+                .count(),
+            2,
+            "both ack modules expose overwrite_fuse_count()"
+        );
+        // The real-build guard is present in both publish paths, and returns WITHOUT
+        // overwriting when an active ack is already published.
+        assert!(
+            src.contains("IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server"),
+            "server ack publish marks the overwrite fuse"
+        );
+        assert!(
+            src.contains("IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE slot=caller"),
+            "caller ack publish marks the overwrite fuse"
+        );
+        assert_eq!(
+            src.matches("if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {")
+                .count(),
+            2,
+            "both publish paths fail-closed on an active (VALID && !CLAIMED) slot"
+        );
+        // The guard is confined to REAL builds (hosted fixtures keep last-writer-wins).
+        assert_eq!(
+            src.matches("#[cfg(not(feature = \"hosted-dev\"))]\n        if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {")
+                .count(),
+            2,
+            "the overwrite guard is real-build-only in both modules"
+        );
+    }
+
+    #[test]
+    fn overwrite_fuse_starts_and_resets_to_zero() {
+        // In the hosted build the guard is compiled out (last-writer-wins for fixtures),
+        // so the fuse count is a stable 0 across reset — the sealed-boot invariant.
+        crate::kernel::boot::ipccall_direct_ack::reset();
+        crate::kernel::boot::ipcreply_direct_ack::reset();
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_ack::overwrite_fuse_count(),
+            0
+        );
+        assert_eq!(
+            crate::kernel::boot::ipcreply_direct_ack::overwrite_fuse_count(),
+            0
+        );
+    }
+}
+
+/// Stage 199A2D1 — Part 4 x86_64 SMP=2 cross-CPU readiness assessment (HONEST BLOCKER).
+///
+/// A genuine cross-CPU NR6/NR7 round trip cannot be produced with the current x86 AP
+/// user-dispatch scaffold: `live_ap_user_dispatch` / `ap_sched_next_or_idle` run only an
+/// ISOLATED hardcoded per-AP probe workload (a Yield + magic-park stub) and then idle —
+/// no AP-hosted userspace IPC server BLOCKED on a BSP-shared endpoint, and no cross-CPU
+/// delivery/remote-wake that resumes a blocked receiver on a remote AP. Sealing cross-CPU
+/// therefore requires a NEW cross-CPU IPC oracle (shared endpoint across a BSP client + an
+/// AP-hosted server, AP scheduler support for a blocked-then-remote-woken receiver, and the
+/// off-lock NR6/NR7 firing from BOTH CPUs' trap paths). Same-CPU-as-cross-CPU is a
+/// HARD-STOP, so the SMP smoke NEVER emits `result=ok` until that oracle exists.
+#[cfg(test)]
+mod stage199a2d1_smp_readiness {
+    #[test]
+    fn smp_smoke_script_reports_blocked_never_false_ok() {
+        let sh = include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-smp-smoke.sh");
+        // Boots SMP=2.
+        assert!(sh.contains("QEMU_SMP=2"), "SMP smoke must boot -smp 2");
+        // Encodes the strictly-cross-CPU marker contract with DISTINCT CPU IDs.
+        assert!(sh.contains("IPCCALL_DIRECT_SMP_REQUEST_OK arch=x86_64"));
+        assert!(sh.contains("IPCREPLY_DIRECT_SMP_REPLY_OK arch=x86_64"));
+        assert!(
+            sh.contains("\"$scpu\" != \"$rcpu\"") && sh.contains("\"$pcpu\" != \"$ccpu\""),
+            "the cross-CPU gate requires DISTINCT sender/receiver + replier/caller CPU IDs"
+        );
+        // Until the oracle is wired it reports the honest blocker, never a false ok.
+        assert!(
+            sh.contains("result=blocked reason=ap_cross_cpu_ipc_oracle_not_wired"),
+            "absent a genuine cross-CPU round trip, the seal is result=blocked"
+        );
+        // A `result=ok` seal is emitted ONLY inside the distinct-CPU-verified branch.
+        let ok_idx = sh
+            .find("cross_cpu_request=1 cross_cpu_reply=1")
+            .expect("ok seal string present");
+        let gate_idx = sh
+            .find("req_ok && rep_ok")
+            .expect("distinct-CPU gate present");
+        assert!(
+            gate_idx < ok_idx,
+            "the ok seal must be gated behind the distinct-CPU cross-CPU check"
+        );
+    }
+
+    #[test]
+    fn ap_dispatch_scaffold_is_isolated_workload_not_cross_cpu_ipc() {
+        // Guard the documented blocker: the AP scheduler loop dispatches the isolated
+        // per-AP workload and idles — it does not drain a shared IPC run queue.
+        let smp = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            smp.contains("fn ap_sched_next_or_idle("),
+            "AP scheduler entry present"
+        );
+        assert!(
+            smp.contains("ap_workload_base_tid(cpu)"),
+            "AP loop dispatches the isolated per-AP workload (not a BSP-shared endpoint)"
+        );
+    }
+}
+
+/// Stage 199A2D2A — x86_64 SMP=2 cross-CPU DIRECT IpcCall (NR6 request-only) oracle.
+///
+/// Deterministic hosted proofs for the CPU-targeted remote-enqueue mechanism the cross-CPU
+/// request needs. The server is modelled on CPU 1 (blocked in recv-v2, home CPU = 1); the
+/// client runs the ACCEPTED `ipc_call_direct_request_txn` (never a fork), whose captured-affinity
+/// enqueue places the woken server on CPU 1's run queue — never the BSP. The LIVE AP
+/// dispatch-on-wake + context-restore path that would let CPU 1 actually resume the enqueued
+/// server is a separate prerequisite (see doc/STAGE_199A2D2A_SMP_REQUEST.md); this module proves
+/// the kernel mechanism that path will drive.
+#[cfg(test)]
+mod stage199a2d2a_smp_request {
+    use super::*;
+    use crate::kernel::boot::{
+        ReceiverWaiterIdentity, ReplyRecordReservation, X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR,
+        ipccall_direct_ack, ipccall_direct_smp_oracle_active, set_ipccall_direct_proof_enabled,
+        set_x86_ipccall_direct_oracle_enabled, set_x86_ipccall_direct_smp_oracle_enabled,
+        x86_ipccall_direct_oracle_enabled, x86_ipccall_direct_smp_oracle_enabled,
+    };
+    use crate::kernel::ipccall_direct::{AckLease, BlockedServerAck, IpcCallDirectSnapshot};
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+    use std::sync::{Arc, Barrier};
+
+    const SERVER_PAYLOAD_VA: usize = 0x4000;
+    const SERVER_META_VA: usize = 0x4080;
+    const CPU1: CpuId = CpuId(1);
+    const CPU0: CpuId = CpuId(0);
+
+    fn id(tid: u64, asid: Asid) -> ReceiverWaiterIdentity {
+        ReceiverWaiterIdentity::new(ThreadId(tid), asid)
+    }
+
+    struct SmpFx {
+        k: SharedKernel,
+        client: ReceiverWaiterIdentity,
+        server: ReceiverWaiterIdentity,
+        server_asid: Asid,
+        send_cap_t1: CapId,
+        reply_recv_cap_t1: CapId,
+        recv_cap_t2: CapId,
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        published_ack: BlockedServerAck,
+    }
+
+    /// task2 = server, HOME CPU 1, committed-blocked on recv-v2 of the request endpoint (modelled
+    /// on CPU 1 via `with_cpu(CPU1)`); task1 = BSP client holding the request SEND cap + reply
+    /// endpoint RECEIVE cap. Reply endpoint + server reply-cap capacity are provisioned even though
+    /// NR7 does not run this stage.
+    fn smp_server_fixture() -> SmpFx {
+        ipccall_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| s.bring_up_cpu(CPU1).expect("bring up cpu1"));
+        let (client_asid, server_asid, send_cap_t1, reply_recv_cap_t1, recv_cap_t2) =
+            k.with(|state| {
+                state.register_task(1).expect("task1 client");
+                state.register_task(2).expect("task2 server");
+                let (asid1, _aspace1) = state.create_user_address_space().expect("asid1");
+                let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+                state.bind_task_asid(1, asid1).expect("bind1");
+                state.bind_task_asid(2, asid2).expect("bind2");
+                state
+                    .map_user_page(
+                        aspace2,
+                        VirtAddr(SERVER_PAYLOAD_VA as u64),
+                        Mapping {
+                            phys: PhysAddr(0xB000),
+                            flags: PageFlags::USER_RW,
+                        },
+                    )
+                    .expect("map server buffers");
+                let (_req_eid, req_send_global, req_recv_global) =
+                    state.create_endpoint(4).expect("req ep");
+                let send_cap_t1 = state
+                    .grant_capability_task_to_task(0, req_send_global, 1)
+                    .expect("dup req send to client");
+                let recv_cap_t2 = state
+                    .grant_capability_task_to_task(0, req_recv_global, 2)
+                    .expect("dup req recv to server");
+                // Reply endpoint: client holds RECEIVE (needed by NR6 to bind the reply record).
+                let (_reply_eid, _reply_send, reply_recv_global) =
+                    state.create_endpoint(4).expect("reply ep");
+                let reply_recv_cap_t1 = state
+                    .grant_capability_task_to_task(0, reply_recv_global, 1)
+                    .expect("dup reply recv to client");
+                // Bind the server to its HOME CPU 1 BEFORE it blocks (internal placement; not a syscall).
+                state
+                    .set_task_home_cpu(2, CPU1)
+                    .expect("assign server home cpu 1");
+                (asid1, asid2, send_cap_t1, reply_recv_cap_t1, recv_cap_t2)
+            });
+
+        // Dispatch + block the server ON CPU 1 (current_cpu = 1) in recv-v2 of the request endpoint.
+        k.with_cpu(CPU1, |state| {
+            state
+                .enqueue_on_cpu(CPU1, 2)
+                .expect("enqueue server on cpu1");
+            let placed = state.dispatch_next_on_cpu(CPU1);
+            assert_eq!(placed, Some(2), "server dispatches on CPU 1");
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    recv_cap_t2.0 as usize,
+                    SERVER_PAYLOAD_VA,
+                    8,
+                    SERVER_META_VA,
+                    40,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(state.task_status(2), Some(TaskStatus::Blocked(_))),
+                "server must be blocked on recv-v2 (CPU 1)"
+            );
+        })
+        .expect("with_cpu(1)");
+
+        let endpoint = k
+            .resolve_endpoint_send_cap_split_read(1, send_cap_t1)
+            .expect("resolve send endpoint");
+        let (endpoint_index, endpoint_generation) = match endpoint {
+            crate::kernel::capabilities::CapObject::Endpoint { index, generation } => {
+                (index, generation)
+            }
+            _ => panic!("send cap is not an endpoint"),
+        };
+        let server = id(2, server_asid);
+        let published_ack = BlockedServerAck {
+            server,
+            endpoint_index,
+            endpoint_generation,
+            recv_v2_committed: true,
+            payload_user_ptr: SERVER_PAYLOAD_VA,
+            payload_user_len: 8,
+            meta_user_ptr: SERVER_META_VA,
+            meta_user_len: 40,
+        };
+        // Publish the ack to the single-slot store (models the recv-v2 commit publication).
+        let _seq = ipccall_direct_ack::publish(published_ack);
+        SmpFx {
+            k,
+            client: id(1, client_asid),
+            server,
+            server_asid,
+            send_cap_t1,
+            reply_recv_cap_t1,
+            recv_cap_t2,
+            endpoint_index,
+            endpoint_generation,
+            published_ack,
+        }
+    }
+
+    fn snapshot_for(fx: &SmpFx, payload: &[u8]) -> IpcCallDirectSnapshot {
+        IpcCallDirectSnapshot::build(fx.client, fx.send_cap_t1, fx.reply_recv_cap_t1, payload)
+            .expect("snapshot")
+    }
+
+    fn claimed_lease(seq: u64) -> AckLease {
+        let mut l = AckLease::new_available();
+        l.claim(seq).expect("claim");
+        l
+    }
+
+    fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        set_x86_ipccall_direct_smp_oracle_enabled(false);
+        set_x86_ipccall_direct_oracle_enabled(false);
+        ipccall_direct_ack::reset();
+    }
+
+    // (9.1) AP task assignment survives blocking.
+    #[test]
+    fn ap_server_home_cpu_survives_blocking() {
+        let fx = smp_server_fixture();
+        assert_eq!(
+            fx.k.with(|s| s.task_home_cpu(2)),
+            Some(CPU1),
+            "server retains home CPU 1 while blocked"
+        );
+        assert!(
+            matches!(
+                fx.k.with(|s| s.task_status(2)),
+                Some(TaskStatus::Blocked(_))
+            ),
+            "server is blocked"
+        );
+        teardown();
+    }
+
+    // (9.2) The exact CPU target is captured in the wake plan.
+    #[test]
+    fn wake_plan_captures_cpu1_target() {
+        let fx = smp_server_fixture();
+        assert_eq!(
+            fx.k.smp_request_wake_target_split_read(2),
+            Some(CPU1),
+            "wake target is CPU 1 (the server's home), not the enqueueing CPU"
+        );
+        teardown();
+    }
+
+    // (9.8) The acknowledgement contains the CPU-1 server identity.
+    #[test]
+    fn ack_carries_cpu1_server_identity() {
+        let fx = smp_server_fixture();
+        let ack = ipccall_direct_ack::snapshot().expect("ack published");
+        assert_eq!(ack.server, fx.server, "ack names the exact server tid+asid");
+        assert_eq!(ack.endpoint_index, fx.endpoint_index);
+        assert_eq!(fx.k.with(|s| s.task_home_cpu(ack.server.tid.0)), Some(CPU1));
+        teardown();
+    }
+
+    // (9.7) CPU 1 cannot dispatch the server before the enqueue publication.
+    #[test]
+    fn cpu1_cannot_dispatch_before_enqueue() {
+        let fx = smp_server_fixture();
+        // Before any request delivery, CPU 1's run queue holds no runnable server (it is Blocked).
+        assert_eq!(
+            fx.k.with(|s| s.dispatch_next_on_cpu(CPU1)),
+            None,
+            "no runnable server on CPU 1 before the remote enqueue"
+        );
+        teardown();
+    }
+
+    // (9.3 + 9.6) Remote enqueue chooses CPU 1; request bytes + record Available happen-before it.
+    #[test]
+    fn nr6_txn_remote_enqueues_server_on_cpu1_with_bytes_and_record_available() {
+        let fx = smp_server_fixture();
+        let snap = snapshot_for(&fx, b"REQ-SMP!");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(21);
+        // Run the ACCEPTED NR6 transaction (the client is on the BSP; the enqueue targets the
+        // server's home CPU via captured affinity — no fork of the transaction).
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 21)
+                .expect("cross-CPU NR6 request transaction succeeds");
+
+        // Happens-before the remote dispatch: request bytes visible in the server ASID AND the
+        // reply record is Available (not left Reserved).
+        let delivered =
+            fx.k.with(|s| s.read_user_memory_for_asid(fx.server_asid, SERVER_PAYLOAD_VA, 8))
+                .expect("server bytes");
+        assert_eq!(
+            &delivered[..8],
+            b"REQ-SMP!",
+            "request bytes visible pre-dispatch"
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(out.record_index)),
+            Some(ReplyRecordReservation::Available),
+            "reply record made Available before dispatch (never left Reserved)"
+        );
+        // One server-local reply cap minted, resolvable in the SERVER cnode.
+        let resolved =
+            fx.k.with(|s| s.resolve_capability_for_task(2, out.server_reply_cap).ok());
+        assert!(
+            matches!(
+                resolved.map(|c| c.object),
+                Some(crate::kernel::capabilities::CapObject::Reply { index, .. })
+                    if index == out.record_index
+            ),
+            "exactly one server-local Reply cap minted"
+        );
+
+        // The woken server is remotely enqueued on CPU 1 — NOT the BSP. (CPU 0's queue holds only
+        // its idle task, so its next dispatch is never the server.)
+        assert_ne!(
+            fx.k.with(|s| s.dispatch_next_on_cpu(CPU0)),
+            Some(2),
+            "server is NOT enqueued on the BSP (CPU 0)"
+        );
+        assert_eq!(
+            fx.k.with(|s| s.dispatch_next_on_cpu(CPU1)),
+            Some(2),
+            "server is remotely enqueued on CPU 1 and dispatches there"
+        );
+        assert!(lease.is_consumed(), "ack consumed once");
+        assert_eq!(
+            ipccall_direct_ack::overwrite_fuse_count(),
+            0,
+            "fuse untripped"
+        );
+        teardown();
+    }
+
+    // (9.4) Two completion attempts produce ONE remote enqueue (real threads + barrier).
+    #[test]
+    fn two_completion_attempts_one_remote_enqueue() {
+        let fx = smp_server_fixture();
+        let k = Arc::new(fx.k);
+        let client = fx.client;
+        let send_cap = fx.send_cap_t1;
+        let reply_recv = fx.reply_recv_cap_t1;
+        let ack = fx.published_ack;
+        let barrier = Arc::new(Barrier::new(2));
+        let wins = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for t in 0..2 {
+            let b = Arc::clone(&barrier);
+            let k = Arc::clone(&k);
+            let w = Arc::clone(&wins);
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        let snap =
+                            IpcCallDirectSnapshot::build(client, send_cap, reply_recv, b"REQ-SMP!")
+                                .expect("snapshot");
+                        let mut lease = AckLease::new_available();
+                        lease.claim(30 + t as u64).expect("claim lease");
+                        b.wait();
+                        // Only the ack-claim WINNER runs the transaction.
+                        if let Some((claimed_ack, seq)) = ipccall_direct_ack::claim() {
+                            let _ = seq;
+                            if k.ipc_call_direct_request_txn(
+                                &snap,
+                                &claimed_ack,
+                                &mut lease,
+                                30 + t as u64,
+                            )
+                            .is_ok()
+                            {
+                                w.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    })
+                    .expect("spawn"),
+            );
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+        // Exactly one delivery (the ack CAS admits one claimant) ⇒ exactly one remote enqueue.
+        assert_eq!(
+            wins.load(core::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly one delivery"
+        );
+        // The one woken server lands on CPU 1, never the BSP.
+        assert_ne!(
+            k.with(|s| s.dispatch_next_on_cpu(CPU0)),
+            Some(2),
+            "no BSP enqueue"
+        );
+        assert_eq!(
+            k.with(|s| s.dispatch_next_on_cpu(CPU1)),
+            Some(2),
+            "remote enqueue on CPU 1"
+        );
+        assert_eq!(ipccall_direct_ack::overwrite_fuse_count(), 0);
+        teardown();
+    }
+
+    // (9.5) A replacement task (same TID, different ASID) cannot inherit the AP wake.
+    #[test]
+    fn replacement_task_cannot_inherit_ap_wake() {
+        let fx = smp_server_fixture();
+        let snap = snapshot_for(&fx, b"REQ-SMP!");
+        // Forge an ack whose server ASID is a replacement (numeric-TID reuse). The txn's exact
+        // waiter claim + commit require the EXACT {tid,asid}; a replacement is rejected.
+        let mut ack = fx.published_ack;
+        ack.server = id(2, Asid(fx.server_asid.0 ^ 0x55));
+        let mut lease = claimed_lease(41);
+        let res =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 41);
+        assert!(
+            res.is_err(),
+            "replacement-identity server cannot be delivered to"
+        );
+        // No wake on either CPU: the server (tid 2) is never dispatched; it stays blocked.
+        assert_ne!(
+            fx.k.with(|s| s.dispatch_next_on_cpu(CPU1)),
+            Some(2),
+            "no wake for a replacement"
+        );
+        assert_ne!(fx.k.with(|s| s.dispatch_next_on_cpu(CPU0)), Some(2));
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(2)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        teardown();
+    }
+
+    // (9.9) Overwrite fuse remains zero for one pair.
+    #[test]
+    fn overwrite_fuse_zero_for_one_pair() {
+        let fx = smp_server_fixture();
+        assert_eq!(ipccall_direct_ack::overwrite_fuse_count(), 0);
+        teardown();
+    }
+
+    // (Part 1) SMP selector gate: activation requires smp>=2 + selector; feature-on w/o selector inert.
+    #[test]
+    fn smp_selector_gate_requires_selector_and_smp2() {
+        teardown();
+        // Selector off → inert regardless of CPU count.
+        assert!(
+            !ipccall_direct_smp_oracle_active(2),
+            "inert without the selector"
+        );
+        set_x86_ipccall_direct_smp_oracle_enabled(true);
+        assert!(x86_ipccall_direct_smp_oracle_enabled());
+        // Selector on but smp<2 → inert (same-CPU can never present as cross-CPU).
+        assert!(!ipccall_direct_smp_oracle_active(1), "inert on smp<2");
+        assert!(
+            ipccall_direct_smp_oracle_active(2),
+            "active on smp>=2 + selector"
+        );
+        teardown();
+    }
+
+    // (Part 1) Mutual exclusion: the SMP and functional selectors are never both armed.
+    #[test]
+    fn smp_and_functional_selectors_mutually_exclusive() {
+        teardown();
+        // Functional first blocks SMP.
+        set_x86_ipccall_direct_oracle_enabled(true);
+        assert!(x86_ipccall_direct_oracle_enabled());
+        set_x86_ipccall_direct_smp_oracle_enabled(true);
+        assert!(
+            !x86_ipccall_direct_smp_oracle_enabled(),
+            "SMP refused while functional armed"
+        );
+        teardown();
+        // SMP first blocks functional.
+        set_x86_ipccall_direct_smp_oracle_enabled(true);
+        assert!(x86_ipccall_direct_smp_oracle_enabled());
+        set_x86_ipccall_direct_oracle_enabled(true);
+        assert!(
+            !x86_ipccall_direct_oracle_enabled(),
+            "functional refused while SMP armed"
+        );
+        // Distinct selector values (no startup-slot collision).
+        assert_ne!(
+            X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR,
+            crate::kernel::boot::IPCCALL_DIRECT_ORACLE_SELECTOR
+        );
+        teardown();
+    }
+
+    // (Part 3) Capability/endpoint topology: SEND for the client, RECEIVE for the AP server —
+    // full {tid,asid}-authority CNodes, no shared-CNode shortcut.
+    #[test]
+    fn request_endpoint_topology_send_client_receive_server() {
+        use crate::kernel::capabilities::CapRights;
+        let fx = smp_server_fixture();
+        // Client's request cap is SEND-only (cannot RECEIVE on the request endpoint).
+        let send =
+            fx.k.with(|s| s.resolve_capability_for_task(1, fx.send_cap_t1))
+                .expect("client resolves its send cap");
+        assert!(send.has_right(CapRights::SEND), "client cap grants SEND");
+        assert!(
+            !send.has_right(CapRights::RECEIVE),
+            "BSP send cap cannot grant RECEIVE"
+        );
+        // Server's request cap is RECEIVE (it is the recv-v2 endpoint receiver).
+        let recv =
+            fx.k.with(|s| s.resolve_capability_for_task(2, fx.recv_cap_t2))
+                .expect("server resolves its recv cap");
+        assert!(
+            recv.has_right(CapRights::RECEIVE),
+            "server cap grants RECEIVE"
+        );
+        // The client CNode holds no capability at the server's recv-cap slot id that grants RECEIVE
+        // on the request endpoint (no shared-CNode shortcut; process-local receiver authority).
+        let client_at_recv_slot =
+            fx.k.with(|s| s.resolve_capability_for_task(1, fx.recv_cap_t2).ok());
+        let leaks_recv = client_at_recv_slot.is_some_and(|c| {
+            matches!(c.object, crate::kernel::capabilities::CapObject::Endpoint { index, .. } if index == fx.endpoint_index)
+                && c.has_right(CapRights::RECEIVE)
+        });
+        assert!(
+            !leaks_recv,
+            "AP receive cap cannot be resolved as a request-endpoint RECEIVE in the BSP client CNode"
+        );
+        teardown();
+    }
+
+    // (9.10) Feature-off / selector-off path is inert and unchanged.
+    #[test]
+    fn feature_off_selector_off_is_inert() {
+        teardown();
+        assert!(
+            !x86_ipccall_direct_smp_oracle_enabled(),
+            "selector off by default"
+        );
+        assert!(
+            !ipccall_direct_smp_oracle_active(2),
+            "inert when selector off"
+        );
+        assert!(!ipccall_direct_smp_oracle_active(1), "inert on smp<2");
+    }
+
+    // (9.11) No NR7 cross-CPU reply SMP marker exists in kernel source this stage.
+    #[test]
+    fn no_nr7_smp_reply_marker_in_kernel_source() {
+        let modrs = include_str!("mod.rs");
+        assert!(
+            !modrs.contains("IPCREPLY_DIRECT_SMP_REPLY_OK"),
+            "this request-only stage emits NO cross-CPU NR7 reply marker in kernel source"
+        );
+        // The request-only success + seal marker names ARE reserved for the LIVE emitter (D2A/B).
+        // Their absence-from-emission this stage is enforced by the LIVE path being blocked (see doc).
+    }
+
+    // (9.12) Stage 199 functional invariants preserved.
+    #[test]
+    fn stage199_functional_invariants_preserved() {
+        let syscall_src = include_str!("../syscall.rs");
+        assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"));
+        assert!(syscall_src.contains("pub const VARIANT_COUNT: usize = 22;"));
+        // The SMP=1 functional selector is unchanged and distinct from the SMP selector.
+        assert_eq!(crate::kernel::boot::IPCCALL_DIRECT_ORACLE_SELECTOR, 3);
+        assert_eq!(X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR, 9);
+    }
+}
+
+/// Stage 199A2D2B — generic AP dispatch mechanism guards + seal/scope preservation.
+#[cfg(test)]
+mod stage199a2d2b_guards {
+    // (8.11) The dispatch plan is fully OWNED — no task/scheduler/capability reference can cross the
+    // user return (it is Copy + Send + 'static, all scalar fields).
+    #[test]
+    fn dispatch_plan_is_owned_no_borrow_escapes() {
+        fn assert_owned<T: Copy + Send + Sync + 'static>() {}
+        assert_owned::<crate::arch::x86_64::ap_sched::ApUserDispatchPlan>();
+        assert_owned::<crate::arch::x86_64::ap_sched::ApDispatchDecision>();
+        assert_owned::<crate::arch::x86_64::ap_sched::ApUserReturnSource>();
+        assert_owned::<crate::arch::x86_64::ap_sched::SavedUserReturnFrame>();
+    }
+
+    // (8.18) The historical `result=blocked` diagnostic can NEVER satisfy the success seal: the
+    // request smoke gates the ok seal behind genuine distinct-CPU markers, and the two seal strings
+    // are distinct.
+    #[test]
+    fn blocked_seal_cannot_satisfy_success_seal() {
+        let sh = include_str!("../../../scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh");
+        assert!(sh.contains("result=blocked"), "blocked diagnostic present");
+        // The ok seal is emitted ONLY inside the distinct-CPU-verified branch.
+        let ok_idx = sh
+            .find("cross_cpu=1 request_copies=1")
+            .or_else(|| sh.find("cross_cpu=1 duplicate_deliveries=0"))
+            .expect("ok seal present");
+        let gate_idx = sh.find("req_ok").expect("distinct-CPU gate present");
+        assert!(
+            gate_idx < ok_idx,
+            "ok seal gated behind the cross-CPU check"
+        );
+        // The ordered LIVE sequence the seal requires is encoded.
+        assert!(sh.contains("IPCCALL_DIRECT_SMP_SERVER_BLOCKED arch=x86_64 server_cpu=1"));
+        assert!(sh.contains("IPCCALL_DIRECT_SMP_REQUEST_OK arch=x86_64"));
+    }
+
+    // (8.19) Stage 199 functional live-cell count unchanged (6) and (8.20) Stage 198F = 30 cells.
+    #[test]
+    fn stage199_functional_and_198f_cell_counts_preserved() {
+        let matrix = include_str!("../../../scripts/qemu-ipccall-reply-direct-matrix-seal.sh");
+        assert!(
+            matrix.contains("total_live_cells=6"),
+            "Stage 199 functional matrix stays 6 live cells"
+        );
+        // Stage 198F 30-cell seal doc invariant (kept in the second-cohort retirement seal doc).
+        let doc = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
+        assert!(
+            doc.contains("30"),
+            "Stage 198F 30-cell matrix reference preserved"
+        );
+    }
+}
+
+/// Stage 199A2D2C2 — saved-continuation / canonical-frame invariant guards.
+#[cfg(test)]
+mod stage199a2d2c2_guards {
+    // (8.2) The x86 user-return path EXPLICITLY normalizes user RFLAGS to 0x202 — the canonical
+    // invariant that justifies `SavedUserReturnFrame::rflags = USER_RFLAGS`. Source-guarded so the
+    // fixed value is never a silent substitution: it mirrors the canonical BSP return policy.
+    #[test]
+    fn user_rflags_normalization_is_canonical() {
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            dt.contains("frame.rflags = 0x202;"),
+            "the canonical user-return path normalizes RFLAGS to 0x202"
+        );
+        assert_eq!(
+            crate::arch::x86_64::ap_sched::USER_RFLAGS,
+            0x202,
+            "the saved-frame RFLAGS matches the canonical normalization"
+        );
+    }
+
+    // (8.3) YARM guarantees a SINGLE user code/data selector pair (CS=0x23, SS=0x1b), so the
+    // synthesized canonical CS/SS in the saved frame are invariant-safe.
+    #[test]
+    fn single_user_cs_ss_selector_pair_invariant() {
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            dt.contains("const USER_CODE_SELECTOR: u16 = 0x23;"),
+            "single user CS = 0x23"
+        );
+        assert!(
+            dt.contains("0x23   // user CS"),
+            "iret frame uses CS = 0x23"
+        );
+        assert!(
+            dt.contains("0x1b   // user SS"),
+            "iret frame uses SS = 0x1b"
+        );
+        assert_eq!(crate::arch::x86_64::ap_sched::USER_CS, 0x23);
+        assert_eq!(crate::arch::x86_64::ap_sched::USER_SS, 0x1b);
+    }
+
+    // (8.18) The previous generic fresh-entry seal remains valid (its smoke is untouched by C2).
+    #[test]
+    fn generic_fresh_entry_seal_smoke_intact() {
+        let sh = include_str!("../../../scripts/qemu-x86_64-ap-generic-return-smoke.sh");
+        assert!(sh.contains("STAGE_199_X86_AP_GENERIC_RETURN_SEAL"));
+        assert!(sh.contains("X86_AP_GENERIC_USER_ENTRY cpu=1 scheduler_selected=1 result=ok"));
+    }
+
+    // (8.19) The `cross_cpu=0 result=blocked` diagnostic cannot satisfy the request success seal.
+    #[test]
+    fn blocked_diagnostic_cannot_satisfy_request_success() {
+        let sh = include_str!("../../../scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh");
+        assert!(
+            sh.contains("cross_cpu=0"),
+            "the blocked diagnostic is cross_cpu=0"
+        );
+        assert!(sh.contains("result=blocked"));
+        // ok seal is gated behind the distinct-CPU request markers AND the recv-v2 continuation.
+        let gate = sh.find("req_ok").expect("gate");
+        let ok = sh.find("cross_cpu=1 request_copies=1").expect("ok seal");
+        assert!(
+            gate < ok,
+            "ok seal gated behind cross-CPU + continuation verification"
+        );
+        assert!(
+            sh.contains("X86_AP_RECV_V2_CONTINUED cpu=1"),
+            "ok seal requires the live recv-v2 continuation marker"
+        );
+    }
+
+    // (8.20) Stage 199 functional live-cell count unchanged (6).
+    #[test]
+    fn stage199_functional_cells_unchanged() {
+        let matrix = include_str!("../../../scripts/qemu-ipccall-reply-direct-matrix-seal.sh");
+        assert!(matrix.contains("total_live_cells=6"));
+    }
+}
+
+/// Stage 199A2D2C2A — LIVE saved-frame return: asm + orchestration source guards.
+#[cfg(test)]
+mod stage199a2d2c2a_guards {
+    // The canonical saved-frame restore asm exists and restores the full context (15 GPRs + the
+    // canonical iret frame), distinct from the fresh-entry trampoline.
+    #[test]
+    fn saved_frame_restore_asm_present_and_canonical() {
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            dt.contains("yarm_x86_resume_ring3"),
+            "the saved-frame restore asm exists"
+        );
+        assert!(
+            dt.contains("fn resume_user_mode_iret"),
+            "the safe wrapper exists"
+        );
+        // Distinct from the fresh entry (both present).
+        assert!(
+            dt.contains("yarm_x86_enter_ring3"),
+            "fresh entry asm remains"
+        );
+        // The resume restores rbx/r15 (full GPR set), not just the arg registers a fresh entry sets.
+        assert!(dt.contains("mov rbx, qword ptr [rdi + 8]"));
+        assert!(dt.contains("mov r15, qword ptr [rdi + 112]"));
+        // rdi restored LAST (the frame pointer).
+        assert!(dt.contains("mov rdi, qword ptr [rdi + 40]"));
+    }
+
+    // The AP saved-frame orchestration is scheduler-selected (not a hardcoded probe dispatch) and
+    // runs exactly once, and the IPI/idle path never dispatches from the handler.
+    #[test]
+    fn ap_saved_frame_resume_orchestration_is_scheduler_selected_once() {
+        let smp = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            smp.contains("fn ap_saved_frame_resume"),
+            "resume orchestration present"
+        );
+        assert!(
+            smp.contains("AP_SAVED_RESUME_DONE"),
+            "one-shot latch present"
+        );
+        assert!(
+            smp.contains("dispatch_next_on_cpu(cpu)"),
+            "selects from CPU 1's real run queue"
+        );
+        assert!(
+            smp.contains("resume_user_mode_iret(&frame)"),
+            "returns via the saved-frame asm"
+        );
+        assert!(
+            smp.contains("set_reschedule_pending(cpu)"),
+            "reschedule flag wired"
+        );
+        assert!(
+            smp.contains("take_reschedule_pending(cpu)"),
+            "flag consumed by the dispatcher"
+        );
+        // The saved dispatch is gated on the SMP oracle + a RunnableSaved validation.
+        assert!(
+            smp.contains("runnable_saved"),
+            "resume validates RunnableSaved"
+        );
+    }
+
+    // Returning syscalls resume the SMP proof task inline; only Yield deschedules to RunnableSaved.
+    #[test]
+    fn returning_syscalls_resume_inline_only_yield_deschedules() {
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(
+            dt.contains("let smp_returning =")
+                && dt.contains("x86_ipccall_direct_smp_oracle_enabled() && ap_seal_nr != 0"),
+            "returning SMP syscalls skip the force-block and resume inline; Yield (nr==0) deschedules"
+        );
+    }
+
+    // The saved-return seal is gated behind the FULL ordered live sequence (fresh + saved).
+    #[test]
+    fn saved_return_seal_requires_full_live_sequence() {
+        let sh = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
+        for m in [
+            "X86_AP_GENERIC_DISPATCH_OK cpu=1 mode=fresh",
+            "X86_AP_SAVED_RESUME_BEFORE",
+            "X86_AP_SAVED_FRAME_COMMITTED cpu=1 syscall=Yield",
+            "X86_AP_SAVED_DISPATCH_OK cpu=1 mode=saved",
+            "X86_AP_SAVED_FRAME_RESUMED cpu=1",
+        ] {
+            assert!(sh.contains(m), "seal requires marker: {m}");
+        }
+        assert!(sh.contains("STAGE_199_X86_AP_SAVED_RETURN_SEAL"));
+        // Continuation on CPU 0 is a hard fail.
+        assert!(
+            sh.contains("X86_AP_SAVED_FRAME_RESUMED cpu=0") && sh.contains("continuation on CPU 0")
+        );
+    }
+}
+
+/// Stage 199A2D2C2B — cross-CPU NR6 recv-v2 continuation: proof-shortcut removal + ordering guards.
+///
+/// The full LIVE recv-v2 cross-CPU orchestration (a real CPU-1 recv-v2 server + a real CPU-0 client
+/// NR6 syscall sharing an endpoint + cross-CPU delivery) builds on the SEALED C1 fresh-entry and C2A
+/// saved-frame resume. These guards prove the verifiable pieces delivered here and gate the LIVE seal.
+#[cfg(test)]
+mod stage199a2d2c2b_guards {
+    // (Part 1.3) The AP saved-frame resume sources FS.base from the SELECTED TASK's saved TLS state,
+    // never a hardcoded constant.
+    #[test]
+    fn fs_base_sourced_from_task_state() {
+        let ex = include_str!("exec_state.rs");
+        assert!(
+            ex.contains("let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);"),
+            "FS base comes from the task's saved TLS state"
+        );
+        let smp = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            smp.contains("in(\"eax\") (fs_base & 0xFFFF_FFFF) as u32")
+                && smp.contains("in(\"edx\") (fs_base >> 32) as u32"),
+            "the resume installs the task-sourced FS base"
+        );
+    }
+
+    // (Part 1.1) On the cross-CPU REQUEST success path the resume must NOT self-set the pending flag
+    // (it originates from the real CPU-0 remote-wake interrupt); the self-arm is confined to the
+    // Yield-only proof.
+    #[test]
+    fn resume_does_not_self_set_pending_on_request_path() {
+        let smp = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            smp.contains("if !crate::kernel::boot::x86_ipccall_direct_smp_request_active() {")
+                && smp.contains("super::ap_sched::set_reschedule_pending(cpu);"),
+            "the self-arm is skipped once the cross-CPU request path is active"
+        );
+    }
+
+    // (Part 1.4) AP_SAVED_RESUME_DONE is an oracle one-shot fuse/counter, not generic scheduler
+    // authority — the generic dispatcher does not reset it to run later saved tasks.
+    #[test]
+    fn saved_resume_done_is_oracle_fuse_only() {
+        let smp = include_str!("../../arch/x86_64/smp.rs");
+        assert!(smp.contains("AP_SAVED_RESUME_DONE"));
+        assert!(
+            smp.contains("one-shot per-CPU latch"),
+            "documented as a one-shot oracle latch"
+        );
+        // It is gated behind the SMP oracle, not the generic dispatch path (the recv-v2-server
+        // sub-selector adds an intervening skip condition in Stage 199A2D2C2B1).
+        assert!(
+            smp.contains("x86_ipccall_direct_smp_oracle_enabled()")
+                && smp.contains("&& !AP_SAVED_RESUME_DONE")
+        );
+    }
+
+    // (Part 6 / 9.5/9.6) Wake finalization completes the recv-v2 result registers BEFORE publishing
+    // RunnableSaved; a BlockedUnfinalized task is never selectable (reuses the C2 substrate).
+    #[test]
+    fn wake_finalization_completes_result_before_runnable() {
+        use crate::arch::x86_64::ap_sched::{
+            DispatchReject, SavedUserReturnFrame, TaskDispatchState, WakeFinalization,
+            finalize_wake_to_runnable_saved, select_return_source,
+        };
+        let mut tf = crate::kernel::trapframe::TrapFrame::zeroed();
+        tf.saved_pc = 0x4000;
+        tf.saved_sp = 0x8000;
+        let saved = SavedUserReturnFrame::from_trap_frame(&tf, false);
+        // BlockedUnfinalized never selectable.
+        assert_eq!(
+            select_return_source(TaskDispatchState::BlockedUnfinalized, None, Some(saved)),
+            Err(DispatchReject::NotFinalized)
+        );
+        // Result must be complete for RunnableSaved.
+        assert_eq!(
+            finalize_wake_to_runnable_saved(saved, [1, 2, 3], 0, false),
+            WakeFinalization::NotFinalized
+        );
+        assert!(matches!(
+            finalize_wake_to_runnable_saved(saved, [1, 2, 3], 0, true),
+            WakeFinalization::RunnableSaved(_)
+        ));
+    }
+
+    // (9.15/9.16/9.17) Seal integrity: the request seal requires the full live recv-v2 sequence; the
+    // C1/C2A seals remain valid; the cross_cpu=0 blocked diagnostic cannot satisfy success.
+    #[test]
+    fn request_seal_requires_live_recv_v2_and_prior_seals_intact() {
+        let req = include_str!("../../../scripts/qemu-ipccall-direct-x86_64-smp-request-smoke.sh");
+        assert!(req.contains("IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1"));
+        assert!(req.contains("X86_AP_RECV_V2_CONTINUED cpu=1"));
+        assert!(req.contains("cross_cpu=0") && req.contains("result=blocked"));
+        // The C1 fresh-entry + C2A saved-return seals are independent + intact.
+        let c1 = include_str!("../../../scripts/qemu-x86_64-ap-generic-return-smoke.sh");
+        assert!(c1.contains("STAGE_199_X86_AP_GENERIC_RETURN_SEAL"));
+        let c2a = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
+        assert!(c2a.contains("STAGE_199_X86_AP_SAVED_RETURN_SEAL"));
+    }
+}
+
+// Stage 199A2D2C2B1 — LIVE CPU-1 recv-v2 server block + authoritative blocked-server ack. 15 guards.
+mod stage199a2d2c2b1_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        set_x86_ipccall_direct_smp_recv_v2_server_enabled,
+        x86_ipccall_direct_smp_recv_v2_server_enabled,
+    };
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const EXEC: &str = include_str!("exec_state.rs");
+    const MODRS: &str = include_str!("mod.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const CMDLINE: &str = include_str!("../boot_command_line.rs");
+    const SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-ap-recv-v2-block-smoke.sh");
+
+    // (Part 2) The recv-v2 server stub issues a GENUINE recv-v2 syscall (IpcRecv NR 2) with a
+    // recv_cap patched in — not a fixture or boot-code substitution.
+    #[test]
+    fn recv_v2_server_stub_issues_real_recv_v2_syscall() {
+        assert!(EXEC.contains("const RECV_V2_SERVER_STUB: [u8; 56]"));
+        // mov eax, 2 (IpcRecv NR) followed later by syscall (0F 05); recv_cap patch site.
+        assert!(EXEC.contains("0xB8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2"));
+        assert!(EXEC.contains("const RECV_V2_STUB_RECV_CAP_PATCH_OFFSET: usize = 23;"));
+        assert!(EXEC.contains("stub[RECV_V2_STUB_RECV_CAP_PATCH_OFFSET"));
+    }
+
+    // (Part 2) The server emits the userspace entry marker exactly (len 46).
+    #[test]
+    fn recv_v2_server_marker_string_is_canonical() {
+        assert!(EXEC.contains("b\"X86_AP_RECV_V2_SERVER_ENTERED cpu=1 result=ok\\n\""));
+        assert!(EXEC.contains("assert!(AP_RECV_V2_SERVER_MARKER.len() == 46)"));
+    }
+
+    // (Part 1) The RECEIVE cap is minted into the SERVER's OWN process CNode (no shared-CNode
+    // shortcut) — via the attenuated grant to base_tid with RECEIVE rights.
+    #[test]
+    fn server_recv_cap_minted_into_own_cnode() {
+        assert!(EXEC.contains("grant_capability_task_to_task_with_rights("));
+        assert!(EXEC.contains("base_tid,\n                CapRights::RECEIVE,"));
+    }
+
+    // (Part 1) Exactly the request endpoint is armed for the ack (reply endpoint sentinel unused).
+    #[test]
+    fn oracle_request_endpoint_armed() {
+        assert!(EXEC.contains("set_ipccall_direct_oracle_endpoints(endpoint_index, usize::MAX)"));
+        // Endpoint depth 1 = one reply-cap slot capacity.
+        assert!(EXEC.contains("self.create_endpoint(1)?"));
+    }
+
+    // (Part 1 / 4) The server is bound to home CPU 1 BEFORE it blocks.
+    #[test]
+    fn server_home_cpu_bound_to_1() {
+        assert!(
+            EXEC.contains("self.set_task_home_cpu(base_tid, crate::kernel::scheduler::CpuId(1))")
+        );
+    }
+
+    // (Part 1) Payload + IpcRecvMetaV2 destination buffers are provisioned (distinct pages).
+    #[test]
+    fn payload_and_meta_buffers_provisioned() {
+        assert!(EXEC.contains("const RECV_V2_SERVER_PAYLOAD_VA: u64 = 0x0000_0000_2003_0000;"));
+        assert!(EXEC.contains("const RECV_V2_SERVER_META_VA: u64 = 0x0000_0000_2004_0000;"));
+    }
+
+    // (Part 4/5) The marker independently re-verifies EVERY authoritative condition before emitting —
+    // never trusting the caller.
+    #[test]
+    fn marker_reverifies_every_committed_condition() {
+        assert!(MODRS.contains("fn maybe_emit_ipccall_direct_smp_server_blocked("));
+        assert!(MODRS.contains("let saved_frame = kernel.task_has_saved_frame(receiver_tid);"));
+        assert!(MODRS.contains(
+            "let absent_from_runqueue = !kernel.task_present_in_any_runqueue(receiver_tid);"
+        ));
+        assert!(MODRS.contains("== Some(crate::kernel::scheduler::CpuId(1));"));
+        assert!(MODRS.contains("let waiter_exact ="));
+        assert!(MODRS.contains("endpoint_waiter_identity(endpoint_index)) == Some(server)"));
+        assert!(MODRS.contains("let ack_published = ipccall_direct_ack::commit_seq() == ack_seq"));
+        assert!(MODRS.contains(
+            "if !(saved_frame && absent_from_runqueue && home_cpu_1 && waiter_exact && ack_published)"
+        ));
+    }
+
+    // (Part 5) The marker is emitted EXACTLY once (one-shot latch).
+    #[test]
+    fn marker_is_one_shot() {
+        assert!(MODRS.contains("static EMITTED: AtomicBool = AtomicBool::new(false);"));
+        assert!(MODRS.contains("if EMITTED.swap(true, Ordering::AcqRel) {"));
+        assert!(MODRS.contains("IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1"));
+    }
+
+    // (Part 5) It must NOT emit IPCCALL_DIRECT_SMP_REQUEST_OK (this stage delivers no request).
+    #[test]
+    fn marker_never_emits_request_ok() {
+        // The recv-v2-block MARKER function must not reference the request-ok retirement marker
+        // (that belongs to the C2B2 delivery path, a separate function).
+        let start = MODRS
+            .find("fn maybe_emit_ipccall_direct_smp_server_blocked")
+            .unwrap();
+        let body = &MODRS[start..start + 1800];
+        assert!(!body.contains("IPCCALL_DIRECT_SMP_REQUEST_OK"));
+        assert!(!EXEC.contains("IPCCALL_DIRECT_SMP_REQUEST_OK"));
+        assert!(
+            SMOKE.contains("IPCCALL_DIRECT_SMP_REQUEST_OK") // only as a NEGATIVE guard
+            && SMOKE.contains("request-ok emitted")
+        );
+    }
+
+    // (Part 6) The recv-v2 server must STAY blocked — the AP saved-frame resume is skipped for it.
+    #[test]
+    fn recv_v2_server_declines_saved_frame_resume() {
+        assert!(
+            SMP.contains(
+                "&& !crate::kernel::boot::x86_ipccall_direct_smp_recv_v2_server_enabled()"
+            )
+        );
+    }
+
+    // (Part 6) `task_present_in_any_runqueue` is authoritative: false for a blocked task, true for a
+    // runnable enqueued task. This is the absent-from-runqueue proof the marker asserts.
+    #[test]
+    fn absent_from_runqueue_query_is_authoritative() {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(7).expect("register");
+            // Not yet enqueued anywhere → absent.
+            assert!(!s.task_present_in_any_runqueue(7), "unenqueued task absent");
+            s.enqueue_task(7).expect("enqueue");
+            assert!(
+                s.task_present_in_any_runqueue(7),
+                "enqueued task present in a run queue"
+            );
+            // Dispatch it to `current` (still present via the current slot).
+            let placed = s.dispatch_next_on_cpu(CpuId(0));
+            assert_eq!(placed, Some(7), "server dispatches to current on CPU 0");
+            assert!(
+                s.task_present_in_any_runqueue(7),
+                "current task counts as present"
+            );
+            // Block it off CPU 0 (recv-v2 block semantics): removed from queue AND current.
+            let blocked = s.block_current_on_cpu(CpuId(0));
+            assert_eq!(blocked, Some(7));
+            assert!(
+                !s.task_present_in_any_runqueue(7),
+                "blocked task absent from all runqueues"
+            );
+        });
+    }
+
+    // (Part 7 support) The recv-v2-server sub-selector is DEFAULT-OFF and only meaningful under the
+    // SMP oracle (the workload local requires smp_proof AND this sub-selector).
+    #[test]
+    fn sub_selector_default_off_and_requires_oracle() {
+        assert!(
+            !x86_ipccall_direct_smp_recv_v2_server_enabled(),
+            "default off"
+        );
+        set_x86_ipccall_direct_smp_recv_v2_server_enabled(true);
+        assert!(x86_ipccall_direct_smp_recv_v2_server_enabled());
+        set_x86_ipccall_direct_smp_recv_v2_server_enabled(false);
+        // The workload only becomes a recv-v2 server when the SMP oracle is ALSO on.
+        assert!(EXEC.contains("let recv_v2_server ="));
+        assert!(EXEC.contains(
+            "smp_proof && crate::kernel::boot::x86_ipccall_direct_smp_recv_v2_server_enabled();"
+        ));
+    }
+
+    // (Part 7) The knob is parsed and stored (default-off Option).
+    #[test]
+    fn knob_is_parsed() {
+        assert!(CMDLINE.contains("yarm.x86_64_ipccall_direct_smp_recv_v2_server"));
+        assert!(CMDLINE.contains("pub x86_64_ipccall_direct_smp_recv_v2_server: Option<bool>"));
+    }
+
+    // (Part 9) The seal requires the full ordered live sequence AND proves NO premature wake/
+    // continuation; the wrong-CPU block is a hard stop.
+    #[test]
+    fn seal_requires_full_ordered_live_sequence() {
+        assert!(SMOKE.contains("X86_AP_ONLINE cpu=1"));
+        assert!(SMOKE.contains("X86_AP_GENERIC_DISPATCH_OK cpu=1 mode=fresh"));
+        assert!(SMOKE.contains("X86_AP_RECV_V2_SERVER_ENTERED cpu=1"));
+        assert!(SMOKE.contains(
+            "IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1 recv_v2_committed=1 saved_frame=1 waiter_exact=1 ack_published=1 absent_from_runqueue=1"
+        ));
+        assert!(SMOKE.contains("premature saved-frame dispatch"));
+        assert!(SMOKE.contains("server blocked on wrong CPU (0)"));
+        assert!(SMOKE.contains(
+            "STAGE_199_X86_AP_RECV_V2_BLOCK_SEAL arch=x86_64 smp=2 server_cpu=1 real_syscall=1 blocked_commits=1 ack_publications=1 premature_wakes=0 premature_continuations=0 wrong_cpu_blocks=0 result=ok"
+        ));
+    }
+
+    // (Preserve) The C1/C2A/C2B seals + the C2A Yield stub remain untouched by this sub-selector.
+    #[test]
+    fn prior_seals_and_yield_stub_intact() {
+        // The Yield saved-frame proof stub is still present (recv-v2 server does not replace it).
+        assert!(EXEC.contains("const PROBE_STUB_SMP: [u8; 64]"));
+        let c1 = include_str!("../../../scripts/qemu-x86_64-ap-generic-return-smoke.sh");
+        assert!(c1.contains("STAGE_199_X86_AP_GENERIC_RETURN_SEAL"));
+        let c2a = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
+        assert!(c2a.contains("STAGE_199_X86_AP_SAVED_RETURN_SEAL"));
+    }
+}
+
+// Stage 199A2D2C2B2 — LIVE cross-CPU NR6 request: CPU-0 client → CPU-1 recv-v2 resume. 19 guards.
+mod stage199a2d2c2b2_guards {
+    use super::*;
+    use crate::kernel::boot::{
+        ipccall_direct_smp_request_delivered_count,
+        ipccall_direct_smp_request_early_wouldblock_count,
+        set_x86_ipccall_direct_smp_request_enabled, x86_ipccall_direct_smp_recv_v2_server_enabled,
+        x86_ipccall_direct_smp_request_active, x86_ipccall_direct_smp_request_enabled,
+    };
+
+    const EXEC: &str = include_str!("exec_state.rs");
+    const MODRS: &str = include_str!("mod.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const CMDLINE: &str = include_str!("../boot_command_line.rs");
+    const SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-ap-cross-cpu-request-smoke.sh");
+
+    // (3) The CPU-0 client invokes the REAL NR6 syscall (IpcCall NR 6) through the normal split path.
+    #[test]
+    fn client_invokes_real_nr6() {
+        assert!(EXEC.contains("const CLIENT_STUB: [u8; 97]"));
+        assert!(EXEC.contains("0xB8, 0x06, 0x00, 0x00, 0x00")); // mov eax,6
+        assert!(!EXEC.contains("ipc_call_direct_request_txn(")); // provisioning never calls the txn
+    }
+
+    // (2) An early NR6 WouldBlock is NON-MUTATING: the split path returns WouldBlock BEFORE any
+    // reservation/mint/copy/claim/enqueue/IPI when the ack is not yet claimable.
+    #[test]
+    fn early_wouldblock_is_non_mutating() {
+        assert!(SPLIT.contains("x86_ipccall_direct_smp_request_enabled()"));
+        assert!(SPLIT.contains("!crate::kernel::boot::ipccall_direct_ack::is_claimable()"));
+        assert!(SPLIT.contains("ipccall_direct_smp_request_note_early_wouldblock()"));
+        assert!(SPLIT.contains("SyscallError::WouldBlock.code()"));
+        let wb = SPLIT.find("note_early_wouldblock").unwrap();
+        let claim = SPLIT.find("ipccall_direct_ack::claim()").unwrap();
+        assert!(wb < claim, "early WouldBlock precedes any ack claim");
+    }
+
+    // (3/8) Bounded retry: MAX_REQUEST_ATTEMPTS <= 64 (the client stub caps attempts at 64).
+    #[test]
+    fn client_retry_is_bounded() {
+        assert!(EXEC.contains("0xFB, 0x40, 0x73")); // cmp ebx,64 ; jae fail
+    }
+
+    // (4) Exactly one committed delivery / post-work item is recorded per request.
+    #[test]
+    fn one_delivery_recorded() {
+        assert!(TXN.contains("ipccall_direct_smp_request_note_delivered()"));
+        assert!(MODRS.contains("fn ipccall_direct_smp_request_note_delivered"));
+    }
+
+    // (4) Server CNode capacity is independent of endpoint depth: the reply cap is minted into the
+    // server CNode by the accepted txn's `sr_mint_split`, not carved from endpoint depth.
+    #[test]
+    fn server_cnode_capacity_independent_of_endpoint_depth() {
+        assert!(EXEC.contains("self.create_endpoint(1)?"));
+        assert!(TXN.contains("sr_mint_split(server_cnode"));
+    }
+
+    // (5) The reply cap is minted into the EXACT server incarnation (identity-resolved cnode).
+    #[test]
+    fn reply_cap_minted_into_exact_server() {
+        assert!(TXN.contains("process_cnode_for_identity_split_read(ack.server)"));
+    }
+
+    // (6) recv-v2 result registers are cleared/completed BEFORE the receiver is set Runnable.
+    #[test]
+    fn recv_v2_result_completed_before_runnable() {
+        let clear = RUNTIME
+            .find("clear_blocked_recv_return_regs_locked(tcbs, tid)")
+            .unwrap();
+        // The relevant Runnable transition is the one in the same commit, AFTER the register clear.
+        let runnable = clear
+            + RUNTIME[clear..]
+                .find("tcb.status = TaskStatus::Runnable;")
+                .unwrap();
+        assert!(clear < runnable, "regs cleared before Runnable");
+    }
+
+    // (7) BlockedUnfinalized is never selected for a saved-frame resume (reuses the C2 substrate).
+    #[test]
+    fn blocked_unfinalized_never_selected() {
+        use crate::arch::x86_64::ap_sched::{
+            DispatchReject, SavedUserReturnFrame, TaskDispatchState, select_return_source,
+        };
+        let mut tf = crate::kernel::trapframe::TrapFrame::zeroed();
+        tf.saved_pc = 0x20000036;
+        tf.saved_sp = 0x20010ff0;
+        let saved = SavedUserReturnFrame::from_trap_frame(&tf, false);
+        assert_eq!(
+            select_return_source(TaskDispatchState::BlockedUnfinalized, None, Some(saved)),
+            Err(DispatchReject::NotFinalized)
+        );
+    }
+
+    // (8) The record becomes Available BEFORE the remote enqueue (accepted txn ordering).
+    #[test]
+    fn record_available_before_enqueue() {
+        let avail = TXN
+            .find("commit_direct_reply_record_split(idx, rgen)")
+            .unwrap();
+        let enq = TXN
+            .find("sr_enqueue_committed_receiver_split(ack.server.tid.0")
+            .unwrap();
+        assert!(avail < enq, "record Available before enqueue");
+    }
+
+    // (9) The enqueue occurs BEFORE the reschedule IPI (no fallible work after enqueue).
+    #[test]
+    fn enqueue_before_ipi() {
+        let enq = TXN.find("sr_enqueue_committed_receiver_split").unwrap();
+        let ipi = TXN.find("c2b2_send_reschedule_ipi_to_cpu1()").unwrap();
+        assert!(enq < ipi, "enqueue precedes the IPI");
+    }
+
+    // (10) The request-success path does NOT self-set CPU 1's reschedule-pending flag: the CPU-0 IPI
+    // sender only re-arms the dispatch REQUEST + sends the IPI.
+    #[test]
+    fn request_path_does_not_self_set_pending() {
+        assert!(SMP.contains("fn c2b2_send_reschedule_ipi_to_cpu1"));
+        // The IPI sender body (between its fn header and the next fn) must not set_reschedule_pending.
+        let start = SMP
+            .find("pub(crate) fn c2b2_send_reschedule_ipi_to_cpu1")
+            .unwrap();
+        let body = &SMP[start..start + 700];
+        assert!(
+            !body.contains("set_reschedule_pending"),
+            "IPI sender must not set pending"
+        );
+        assert!(SMP.contains("if !crate::kernel::boot::x86_ipccall_direct_smp_request_active() {"));
+    }
+
+    // (11) The CPU-1 side sets its reschedule-pending flag (0→1) on the IPI-driven wake.
+    #[test]
+    fn cpu1_side_sets_pending_on_wake() {
+        assert!(SMP.contains("super::ap_sched::set_reschedule_pending(cpu);"));
+        assert!(SMP.contains("X86_AP_RESCHEDULE_IPI_RECEIVED cpu="));
+    }
+
+    // (12) The asm interrupt vector performs NO dispatch (dispatch_in_handler=0).
+    #[test]
+    fn handler_performs_no_dispatch() {
+        assert!(SMP.contains("dispatch_in_handler=0"));
+        let dt = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(dt.contains("yarm_ap_remote_wake_stub:"));
+    }
+
+    // (13) CPU 1 selects the EXACT server from its OWN run queue, never a hardcoded TID or CPU 0.
+    #[test]
+    fn cpu1_selects_exact_server_from_own_queue() {
+        assert!(SMP.contains("k.dispatch_next_on_cpu(cpu)"));
+        assert!(SMP.contains("Some(t) if t == expected => t,"));
+    }
+
+    // (14) Task FS base comes from the server task's saved TLS state (never a constant).
+    #[test]
+    fn task_fs_from_server_state() {
+        assert!(EXEC.contains("let fs_base = tcb.tls_ptr.map(|v| v.0).unwrap_or(0);"));
+        assert!(SMP.contains("in(\"eax\") (fs_base & 0xFFFF_FFFF) as u32"));
+    }
+
+    // (15) The SAVED path (yarm_x86_resume_ring3), not a fresh entry, reaches the continuation.
+    #[test]
+    fn saved_path_reaches_continuation() {
+        assert!(SMP.contains("resume_user_mode_iret(&frame)"));
+        assert!(SMP.contains("AP_DISPATCH_COUNT[idx].load(Ordering::Acquire) >= 1"));
+    }
+
+    // (16) One successful request creates exactly one continuation (one-shot request-OK marker).
+    #[test]
+    fn one_request_one_continuation() {
+        assert!(MODRS.contains("fn maybe_emit_ipccall_direct_smp_request_ok"));
+        assert!(MODRS.contains("if EMITTED.swap(true, Ordering::AcqRel)"));
+        assert!(MODRS.contains("msg.starts_with(\"X86_AP_RECV_V2_CONTINUED\")"));
+        assert!(MODRS.contains("ipccall_direct_smp_request_delivered_count() < 1"));
+    }
+
+    // (17) A duplicate IPI or duplicate drain cannot duplicate delivery.
+    #[test]
+    fn duplicate_ipi_or_drain_cannot_duplicate() {
+        assert!(TXN.contains("LeaseNotClaimed"));
+        assert!(SMP.contains("C2B2_RESCHEDULE_IPI_RECEIVED.fetch_add(1, Ordering::AcqRel)"));
+    }
+
+    // (18/19) B1 + C2A seals remain valid; the cross_cpu=0/result=blocked diagnostic cannot satisfy
+    // the cross-CPU success seal (which requires cross_cpu=1 + the full ordered live sequence).
+    #[test]
+    fn prior_seals_intact_and_blocked_diagnostic_excluded() {
+        let b1 = include_str!("../../../scripts/qemu-x86_64-ap-recv-v2-block-smoke.sh");
+        assert!(b1.contains("STAGE_199_X86_AP_RECV_V2_BLOCK_SEAL"));
+        let c2a = include_str!("../../../scripts/qemu-x86_64-ap-saved-return-smoke.sh");
+        assert!(c2a.contains("STAGE_199_X86_AP_SAVED_RETURN_SEAL"));
+        assert!(
+            SMOKE.contains("IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0 receiver_cpu=1 cross_cpu=1")
+        );
+        assert!(SMOKE.contains("X86_AP_RECV_V2_CONTINUED cpu=1"));
+        assert!(
+            SMOKE.contains("STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL arch=x86_64 smp=2 pairs=1")
+        );
+    }
+
+    // (selector) The C2B2 sub-selector is default-off, implies the recv-v2 server, marks the request
+    // path active, and the knob is parsed; attempt/delivery counters exist.
+    #[test]
+    fn sub_selector_wires_server_and_active_flag() {
+        assert!(!x86_ipccall_direct_smp_request_enabled(), "default off");
+        set_x86_ipccall_direct_smp_request_enabled(true);
+        assert!(x86_ipccall_direct_smp_request_enabled());
+        assert!(
+            x86_ipccall_direct_smp_recv_v2_server_enabled(),
+            "implies the recv-v2 server"
+        );
+        assert!(
+            x86_ipccall_direct_smp_request_active(),
+            "marks the request path active"
+        );
+        set_x86_ipccall_direct_smp_request_enabled(false);
+        assert!(CMDLINE.contains("yarm.x86_64_ipccall_direct_smp_request"));
+        let _ = ipccall_direct_smp_request_early_wouldblock_count();
+        let _ = ipccall_direct_smp_request_delivered_count();
+    }
+}

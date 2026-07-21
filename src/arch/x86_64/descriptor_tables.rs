@@ -499,6 +499,14 @@ fn trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
     }
 }
 
+/// Stage 199A2D2C2B2: the installed SharedKernel for the AP idle-dispatch path (the CPU-1 saved-frame
+/// resume runs from the managed idle loop's dispatch hook, which has no `shared` param). Same pointer
+/// the trap dispatcher uses; `None` before install.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_trap_shared_kernel() -> Option<&'static crate::runtime::SharedKernel> {
+    trap_shared_kernel()
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn raw_current_apic_id() -> u32 {
     core::arch::x86_64::__cpuid(1).ebx >> 24
@@ -1180,8 +1188,17 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // NOT re-run the one-shot probe forever nor park — it falls through to the
         // interruptible idle loop below (return-to-idle).
         if ap_seal {
-            crate::arch::x86_64::smp::ap_seal_syscall_ok(cpu, ap_seal_nr);
-            crate::arch::x86_64::smp::ap_seal_return_to_idle(shared, cpu, ap_seal_nr);
+            // Stage 199A2D2C2A: for the SMP oracle, a RETURNING syscall (e.g. DebugLog, nr != 0)
+            // resumes the proof task INLINE (a multi-syscall stub: two DebugLogs then a Yield),
+            // keeping the seal probe active. ONLY Yield (nr == 0) runs the one-shot seal-done +
+            // deschedule so the task becomes RunnableSaved and the AP scheduler (`ap_sched_next_or_
+            // idle`) performs the saved-frame resume. The legacy probe blocks after every syscall.
+            let smp_returning =
+                crate::kernel::boot::x86_ipccall_direct_smp_oracle_enabled() && ap_seal_nr != 0;
+            if !smp_returning {
+                crate::arch::x86_64::smp::ap_seal_syscall_ok(cpu, ap_seal_nr);
+                crate::arch::x86_64::smp::ap_seal_return_to_idle(shared, cpu, ap_seal_nr);
+            }
         }
         // Stage 4T+6R: reverted to conservative with_cpu→current_tid path.
         // See entering_tid comment above for the revert rationale.
@@ -2236,6 +2253,44 @@ unsafe extern "C" {
         arg4: u64,
         arg5: u64,
     ) -> !;
+    fn yarm_x86_resume_ring3(frame: *const ApSavedResumeFrame) -> !;
+}
+
+/// Stage 199A2D2C2A: the owned, `repr(C)` saved-frame the `yarm_x86_resume_ring3` asm consumes. The
+/// GPR lanes are in `user_gprs` order (rax..r15); `rip/rsp/rflags/cs/ss` are the canonical iret
+/// frame. Offsets are asserted to match the asm.
+#[cfg(any(all(not(feature = "hosted-dev"), target_arch = "x86_64"), test))]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct ApSavedResumeFrame {
+    pub(crate) gprs: [u64; 15],
+    pub(crate) rip: u64,
+    pub(crate) rsp: u64,
+    pub(crate) rflags: u64,
+    pub(crate) cs: u64,
+    pub(crate) ss: u64,
+}
+
+#[cfg(any(all(not(feature = "hosted-dev"), target_arch = "x86_64"), test))]
+const _: () = {
+    assert!(core::mem::offset_of!(ApSavedResumeFrame, gprs) == 0);
+    assert!(core::mem::offset_of!(ApSavedResumeFrame, rip) == 120);
+    assert!(core::mem::offset_of!(ApSavedResumeFrame, rsp) == 128);
+    assert!(core::mem::offset_of!(ApSavedResumeFrame, rflags) == 136);
+    assert!(core::mem::offset_of!(ApSavedResumeFrame, cs) == 144);
+    assert!(core::mem::offset_of!(ApSavedResumeFrame, ss) == 152);
+};
+
+/// Stage 199A2D2C2A: return to ring 3 by RESTORING a committed saved userspace continuation (the
+/// canonical saved-frame return). Diverges. The caller must have already installed this task's CR3,
+/// per-CPU syscall/TSS RSP0, GS and FS, and released every Rust guard.
+///
+/// # Safety
+/// `frame` must be a fully-committed saved frame for the task whose CR3 is active, with a valid
+/// user RIP/RSP; all per-CPU state must be installed for this CPU/task.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) unsafe fn resume_user_mode_iret(frame: &ApSavedResumeFrame) -> ! {
+    unsafe { yarm_x86_resume_ring3(frame as *const ApSavedResumeFrame) }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -2275,6 +2330,52 @@ yarm_x86_enter_ring3:
     push 0x202
     push 0x23
     push r10
+    iretq
+"#
+);
+
+/// Stage 199A2D2C2A: the GENERIC saved-frame context-restore return — the counterpart to
+/// `yarm_x86_enter_ring3` (fresh entry). It restores a task's COMPLETE committed userspace
+/// continuation (all 15 GPRs + the exact iret frame RIP/RSP/RFLAGS/CS/SS) and `iretq`s to the
+/// instruction AFTER its trapping syscall — NOT a fresh entry. `rdi` points at an
+/// [`ApSavedResumeFrame`]; its layout (15 GPR lanes in `user_gprs` order rax..r15, then
+/// rip/rsp/rflags/cs/ss) matches the offsets below. The GPR that carries the frame pointer (`rdi`)
+/// is restored LAST. This is the canonical BSP iret frame ABI (SS/RSP/RFLAGS/CS/RIP), never a
+/// reduced AP-only frame.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .section .text, "ax", @progbits
+    .global yarm_x86_resume_ring3
+    .type yarm_x86_resume_ring3, @function
+yarm_x86_resume_ring3:
+    mov ax, 0x1b
+    mov ds, ax
+    mov es, ax
+    // Build the canonical iret frame from the committed saved frame (offsets: rip=120, rsp=128,
+    // rflags=136, cs=144, ss=152; 15 GPR lanes precede at 0..112).
+    push qword ptr [rdi + 152]   // SS
+    push qword ptr [rdi + 128]   // RSP
+    push qword ptr [rdi + 136]   // RFLAGS
+    push qword ptr [rdi + 144]   // CS
+    push qword ptr [rdi + 120]   // RIP
+    // Restore every GPR (user_gprs order: [0]=rax [1]=rbx [2]=rcx [3]=rdx [4]=rsi [5]=rdi
+    // [6]=rbp [7]=r8 [8]=r9 [9]=r10 [10]=r11 [11]=r12 [12]=r13 [13]=r14 [14]=r15). rdi LAST.
+    mov rax, qword ptr [rdi + 0]
+    mov rbx, qword ptr [rdi + 8]
+    mov rcx, qword ptr [rdi + 16]
+    mov rdx, qword ptr [rdi + 24]
+    mov rsi, qword ptr [rdi + 32]
+    mov rbp, qword ptr [rdi + 48]
+    mov r8,  qword ptr [rdi + 56]
+    mov r9,  qword ptr [rdi + 64]
+    mov r10, qword ptr [rdi + 72]
+    mov r11, qword ptr [rdi + 80]
+    mov r12, qword ptr [rdi + 88]
+    mov r13, qword ptr [rdi + 96]
+    mov r14, qword ptr [rdi + 104]
+    mov r15, qword ptr [rdi + 112]
+    mov rdi, qword ptr [rdi + 40]
     iretq
 "#
 );

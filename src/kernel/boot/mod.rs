@@ -3117,15 +3117,183 @@ pub(crate) static X86_IPCCALL_DIRECT_ORACLE_ENABLED: core::sync::atomic::AtomicB
     core::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn set_x86_ipccall_direct_oracle_enabled(enabled: bool) {
-    X86_IPCCALL_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
     if enabled {
+        // Mutual exclusion (Stage 199A2D2A): the SMP=1 functional selector and the SMP=2 cross-CPU
+        // selector are never both armed. Refuse to arm the functional oracle if the SMP one is on.
+        if x86_ipccall_direct_smp_oracle_enabled() {
+            crate::yarm_log!("IPCCALL_DIRECT_ORACLE_REFUSED reason=smp_selector_active");
+            return;
+        }
         // Selecting the workload arms the NR6/NR7 off-lock proof gate for this run.
         set_ipccall_direct_proof_enabled(true);
     }
+    X86_IPCCALL_DIRECT_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
 }
 
 pub fn x86_ipccall_direct_oracle_enabled() -> bool {
     X86_IPCCALL_DIRECT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+// ─── Stage 199A2D2A: x86_64 SMP=2 cross-CPU DIRECT IpcCall (NR6 request) oracle ─────────────
+/// Startup selector value for the x86_64 SMP=2 cross-CPU DIRECT IpcCall (request-only) oracle.
+/// Distinct from the SMP=1 functional selector (`IPCCALL_DIRECT_ORACLE_SELECTOR` = 3) so the two
+/// are mutually exclusive: at most one of them may be armed on any boot. Value 9 is the next free
+/// x86_64 selector after the functional direct oracle (3).
+pub const X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR: u64 = 9;
+
+/// Stage 199A2D2A: default-off x86_64 SMP=2 cross-CPU DIRECT IpcCall request oracle
+/// (`yarm.x86_64_ipccall_direct_smp_oracle=1`). This oracle runs ONE userspace IPC server on an
+/// application processor (CPU 1) blocked in recv-v2, delivers ONE NR6 direct request from a BSP
+/// (CPU 0) client, and remotely wakes + resumes the server on CPU 1. It proves ONLY the cross-CPU
+/// request direction (no NR7 reply, no complete Stage 199 SMP seal). It is MUTUALLY EXCLUSIVE with
+/// the SMP=1 functional selector, requires `target_arch = x86_64`, `QEMU_SMP >= 2`, the
+/// `x86-ipccall-direct-smp-oracle` feature, AND this selector. Feature-on without the selector is
+/// inert. Selecting it arms the shared NR6 off-lock proof gate but NOT the functional x86 flag, and
+/// NOT queued calls, timeouts, notifications, server-death wake, or any non-x86 arch. The single-slot
+/// acknowledgement overwrite fuse stays enabled (one outstanding pair).
+pub(crate) static X86_IPCCALL_DIRECT_SMP_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_ipccall_direct_smp_oracle_enabled(enabled: bool) {
+    if enabled {
+        // Mutual exclusion: refuse to arm the SMP oracle if the SMP=1 functional selector is on.
+        if x86_ipccall_direct_oracle_enabled() {
+            crate::yarm_log!("IPCCALL_DIRECT_SMP_ORACLE_REFUSED reason=functional_selector_active");
+            return;
+        }
+        set_ipccall_direct_proof_enabled(true);
+    }
+    X86_IPCCALL_DIRECT_SMP_ORACLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn x86_ipccall_direct_smp_oracle_enabled() -> bool {
+    X86_IPCCALL_DIRECT_SMP_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2B: true once the cross-CPU NR6 REQUEST path is live (a real CPU-0 client + a real
+/// CPU-1 recv-v2 server sharing an endpoint). In that path CPU 1's reschedule-pending flag
+/// ORIGINATES from the real CPU-0 remote-wake interrupt, so the AP saved-frame resume must NOT
+/// self-arm it. In the Stage 199A2D2C2A Yield-only proof (no client) this stays `false`, and the
+/// resume self-arms the flag to exercise the consume path. DEFAULT-OFF until the request path lands.
+pub(crate) static X86_IPCCALL_DIRECT_SMP_REQUEST_ACTIVE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn x86_ipccall_direct_smp_request_active() -> bool {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_ACTIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2B1: default-off sub-selector of the SMP oracle
+/// (`yarm.x86_64_ipccall_direct_smp_recv_v2_server=1`). When set (AND the SMP oracle is armed) the
+/// single AP workload becomes a REAL recv-v2 IPC server: it provisions a request endpoint + a RECEIVE
+/// cap in the server's own CNode + payload/meta buffers, and its userspace stub issues a genuine
+/// recv-v2 syscall that blocks on CPU 1 (committing a saved continuation + publishing the
+/// authoritative blocked-server acknowledgement). When UNSET the workload stays the Stage 199A2D2C2A
+/// Yield saved-frame proof (so that seal is untouched). This sub-selector does NOT deliver an NR6
+/// request, wake the server, or arm the functional x86 flag — it proves the server-block half only.
+pub(crate) static X86_IPCCALL_DIRECT_SMP_RECV_V2_SERVER_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_ipccall_direct_smp_recv_v2_server_enabled(enabled: bool) {
+    X86_IPCCALL_DIRECT_SMP_RECV_V2_SERVER_ENABLED
+        .store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn x86_ipccall_direct_smp_recv_v2_server_enabled() -> bool {
+    X86_IPCCALL_DIRECT_SMP_RECV_V2_SERVER_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2B2: default-off sub-selector of the SMP oracle
+/// (`yarm.x86_64_ipccall_direct_smp_request=1`). When set it IMPLIES the recv-v2 server sub-selector
+/// (the CPU-1 server half) AND additionally provisions a REAL CPU-0 userspace client that invokes NR6
+/// through the normal x86 split-dispatch path (with a bounded WouldBlock retry), delivers ONE
+/// cross-CPU direct request via the accepted transaction, sends the canonical reschedule IPI to CPU 1,
+/// and resumes the server's recv-v2 continuation on CPU 1 via the sealed saved-frame return. It marks
+/// the cross-CPU REQUEST path active so the AP saved-frame resume takes its pending flag from the real
+/// IPI (never a self-arm). It does NOT begin NR7/reply. Mutually exclusive with the standalone
+/// Stage 199A2D2C2A Yield workload (that runs only when neither server sub-selector is set).
+pub(crate) static X86_IPCCALL_DIRECT_SMP_REQUEST_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_x86_ipccall_direct_smp_request_enabled(enabled: bool) {
+    if enabled {
+        // The request path requires the CPU-1 recv-v2 server, and marks the cross-CPU request active
+        // so the AP saved-frame resume does not self-arm CPU 1's pending flag (it comes from the IPI).
+        set_x86_ipccall_direct_smp_recv_v2_server_enabled(true);
+        X86_IPCCALL_DIRECT_SMP_REQUEST_ACTIVE.store(true, core::sync::atomic::Ordering::Release);
+    }
+    X86_IPCCALL_DIRECT_SMP_REQUEST_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn x86_ipccall_direct_smp_request_enabled() -> bool {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2B2: bounded counters for the CPU-0 client's NR6 attempts. `EARLY_WOULDBLOCK` counts
+/// non-mutating early WouldBlock returns (server not yet blocked); `SUCCESS` counts committed
+/// deliveries. attempts = early_retries + successes (one success expected). These prove the retry
+/// mechanism exists and the early WouldBlock did not mutate.
+pub(crate) static X86_IPCCALL_DIRECT_SMP_REQUEST_EARLY_WOULDBLOCK: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn ipccall_direct_smp_request_note_early_wouldblock() {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_EARLY_WOULDBLOCK
+        .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn ipccall_direct_smp_request_early_wouldblock_count() -> u64 {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_EARLY_WOULDBLOCK.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2B2: count of COMMITTED cross-CPU request deliveries (the accepted transaction
+/// succeeded: reserve → mint → copy → claim → commit RunnableSaved → record Available → enqueue).
+/// Exactly one is expected. Gates the terminal request-OK seal marker.
+pub(crate) static X86_IPCCALL_DIRECT_SMP_REQUEST_DELIVERED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn ipccall_direct_smp_request_note_delivered() {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_DELIVERED.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+}
+
+pub fn ipccall_direct_smp_request_delivered_count() -> u64 {
+    X86_IPCCALL_DIRECT_SMP_REQUEST_DELIVERED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 199A2D2C2B2: emit the TERMINAL cross-CPU request-OK marker EXACTLY ONCE, ONLY after the
+/// resumed CPU-1 server's userspace `X86_AP_RECV_V2_CONTINUED` marker is observed (passed here as
+/// `msg`) AND exactly one committed delivery is recorded. This is the seal's authority that the
+/// COMPLETE real userspace-to-userspace cross-CPU path ran — never emitted merely after enqueue or IPI
+/// receipt. Kernel marker (not userspace). No-op off the C2B2 path or before the continuation.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn maybe_emit_ipccall_direct_smp_request_ok(msg: &str) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    if !x86_ipccall_direct_smp_request_enabled() {
+        return;
+    }
+    if !msg.starts_with("X86_AP_RECV_V2_CONTINUED") {
+        return;
+    }
+    if ipccall_direct_smp_request_delivered_count() < 1 {
+        return;
+    }
+    if EMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "IPCCALL_DIRECT_SMP_REQUEST_OK sender_cpu=0 receiver_cpu=1 cross_cpu=1 request_copies=1 server_wakes=1 server_continuations=1 result=ok"
+    );
+}
+
+/// Hosted / non-x86 no-op so the DebugLog call site compiles unconditionally.
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "x86_64")))]
+pub(crate) fn maybe_emit_ipccall_direct_smp_request_ok(_msg: &str) {}
+
+/// The x86_64 SMP cross-CPU request oracle is ACTIVE only when the selector is armed AND the boot is
+/// genuinely SMP (`online_cpus >= 2`). Same-CPU (`online_cpus < 2`) can never present as cross-CPU:
+/// the caller passes the authoritative online-CPU count so the gate cannot be spoofed by a knob
+/// alone. The `x86-ipccall-direct-smp-oracle` feature is enforced at the marker emitters (cfg-gated).
+pub fn ipccall_direct_smp_oracle_active(online_cpus: usize) -> bool {
+    x86_ipccall_direct_smp_oracle_enabled() && online_cpus >= 2
 }
 
 /// Stage 199A2C1: default-off AArch64 DIRECT IpcCall/IpcReply live-oracle WORKLOAD selector
@@ -3318,6 +3486,17 @@ pub(crate) fn emit_ipcreply_direct_live_markers() {}
 /// store with a monotonic `commit_seq` and an atomic CLAIMED guard so a duplicate
 /// trap/drain cannot claim the same acknowledgement twice; `restore` re-arms it only
 /// for a retryable rollback of the exact same publication.
+///
+/// # Concurrency classification (Stage 199A2D1)
+/// This is ORACLE-ONLY, SINGLE-OUTSTANDING-PAIR proof infrastructure — NOT a general
+/// production concurrency store. It correctly hands ONE committed acknowledgement across
+/// CPUs (Release publication → Acquire/AcqRel claim), but it holds exactly ONE slot: a
+/// SECOND simultaneous oracle pair would overwrite (or steal) the active unclaimed
+/// acknowledgement. Endpoint confinement + the single provisioning slot already keep the
+/// system to one pair; on a REAL boot the fail-closed overwrite fuse below additionally
+/// REFUSES to overwrite an active (VALID && !CLAIMED) acknowledgement and marks the fuse.
+/// Multi-pair production concurrency would require replacing this slot with an
+/// endpoint-indexed, generation-bearing bounded store (see the Stage 199A2D1 report).
 pub mod ipccall_direct_ack {
     use crate::kernel::boot::ReceiverWaiterIdentity;
     use crate::kernel::ipc::ThreadId;
@@ -3327,6 +3506,9 @@ pub mod ipccall_direct_ack {
 
     static VALID: AtomicBool = AtomicBool::new(false);
     static CLAIMED: AtomicBool = AtomicBool::new(false);
+    /// Fail-closed fuse: counts refused overwrites of an ACTIVE (VALID && !CLAIMED) ack — a
+    /// second-simultaneous-pair condition. Must be 0 in the sealed single-pair oracle boot.
+    static OVERWRITE_FUSE: AtomicU64 = AtomicU64::new(0);
     static SEQ: AtomicU64 = AtomicU64::new(0);
     static SERVER_TID: AtomicU64 = AtomicU64::new(0);
     static SERVER_ASID: AtomicU16 = AtomicU16::new(0);
@@ -3341,6 +3523,13 @@ pub mod ipccall_direct_ack {
     pub fn reset() {
         VALID.store(false, Ordering::Release);
         CLAIMED.store(false, Ordering::Release);
+        OVERWRITE_FUSE.store(0, Ordering::Release);
+    }
+
+    /// Count of refused overwrites of an active acknowledgement (a second-pair fuse trip).
+    /// Must be 0 in the sealed single-pair oracle boot.
+    pub fn overwrite_fuse_count() -> u64 {
+        OVERWRITE_FUSE.load(Ordering::Acquire)
     }
 
     fn next_seq() -> u64 {
@@ -3350,7 +3539,20 @@ pub mod ipccall_direct_ack {
 
     /// Publish the ack (fields first, `VALID` released last). Clears the claim so a
     /// fresh publication is independently claimable exactly once. Returns the seq.
+    ///
+    /// Stage 199A2D1 fail-closed overwrite fuse (REAL builds only): refuse to overwrite an
+    /// ACTIVE (VALID && !CLAIMED) acknowledgement — that is a second-simultaneous-pair
+    /// condition this single-slot store does not support. The active ack is preserved and the
+    /// fuse is marked. Never trips in the sealed one-pair flow (the slot is published exactly
+    /// once, from VALID=false, then claimed). Hosted builds keep last-writer-wins so the
+    /// wiring-test fixtures (which share these process-global statics) are unaffected.
     pub(crate) fn publish(ack: BlockedServerAck) -> u64 {
+        #[cfg(not(feature = "hosted-dev"))]
+        if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {
+            OVERWRITE_FUSE.fetch_add(1, Ordering::Relaxed);
+            crate::yarm_log!("IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server");
+            return SEQ.load(Ordering::Relaxed);
+        }
         let seq = next_seq();
         SERVER_TID.store(ack.server.tid.0, Ordering::Relaxed);
         SERVER_ASID.store(ack.server.asid.0, Ordering::Relaxed);
@@ -3476,12 +3678,77 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
         meta_user_ptr: state.meta_user_ptr,
         meta_user_len: state.meta_user_len,
     };
-    let _seq = ipccall_direct_ack::publish(ack);
+    let seq = ipccall_direct_ack::publish(ack);
+    // Stage 199A2D2C2B1: emit the AUTHORITATIVE cross-CPU blocked-server marker EXACTLY ONCE, only
+    // for the x86_64 SMP oracle's CPU-1 recv-v2 server, and ONLY once every authoritative
+    // blocking-order condition has committed: the saved continuation is captured, the exact endpoint
+    // waiter equals the server, the server is absent from every runqueue, its home CPU is 1, and the
+    // ack has published. Not a userspace log — a kernel marker. Never emits IPCCALL_DIRECT_SMP_
+    // REQUEST_OK (this stage does not deliver a request).
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    maybe_emit_ipccall_direct_smp_server_blocked(kernel, receiver_tid, index, generation, seq);
+    let _ = seq;
+}
+
+/// Stage 199A2D2C2B1: one-shot authoritative `IPCCALL_DIRECT_SMP_SERVER_BLOCKED` marker for the
+/// x86_64 SMP oracle CPU-1 recv-v2 server. Fires at most once per boot, only when the SMP oracle is
+/// armed and every blocking-order invariant is independently re-verified here against authoritative
+/// committed state (never trusting the caller): the server has a committed saved frame, it is absent
+/// from all runqueues (BlockedUnfinalized / not re-selectable), its home CPU is 1, the exact endpoint
+/// waiter identity still equals the server, and the ack sequence is live. A strict no-op otherwise.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn maybe_emit_ipccall_direct_smp_server_blocked(
+    kernel: &KernelState,
+    receiver_tid: u64,
+    endpoint_index: usize,
+    endpoint_generation: u64,
+    ack_seq: u64,
+) {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static EMITTED: AtomicBool = AtomicBool::new(false);
+    if !x86_ipccall_direct_smp_oracle_enabled() {
+        return;
+    }
+    // Independent re-verification of every authoritative condition.
+    let saved_frame = kernel.task_has_saved_frame(receiver_tid);
+    let absent_from_runqueue = !kernel.task_present_in_any_runqueue(receiver_tid);
+    let home_cpu_1 = kernel.task_home_cpu(receiver_tid) == Some(crate::kernel::scheduler::CpuId(1));
+    let Some(asid) = kernel.task_asid(receiver_tid) else {
+        return;
+    };
+    let server = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
+    let waiter_exact =
+        kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(endpoint_index)) == Some(server);
+    let ack_published = ipccall_direct_ack::commit_seq() == ack_seq && ack_seq != 0;
+    if !(saved_frame && absent_from_runqueue && home_cpu_1 && waiter_exact && ack_published) {
+        return;
+    }
+    if EMITTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "IPCCALL_DIRECT_SMP_SERVER_BLOCKED server_cpu=1 recv_v2_committed=1 saved_frame=1 waiter_exact=1 ack_published=1 absent_from_runqueue=1 server_tid={} server_asid={} endpoint_index={} endpoint_generation={} result=ok",
+        receiver_tid,
+        asid.0,
+        endpoint_index,
+        endpoint_generation,
+    );
 }
 
 /// Stage 199A2B3: single-slot committed blocked-CALLER acknowledgement for the NR7
 /// direct reply transaction. Mirrors [`ipccall_direct_ack`] with the same claim/restore
 /// lifecycle (an atomic CLAIMED guard so a duplicate reply drain cannot claim twice).
+///
+/// # Concurrency classification (Stage 199A2D1)
+/// This is ORACLE-ONLY, SINGLE-OUTSTANDING-PAIR proof infrastructure — NOT a general
+/// production concurrency store. It correctly hands ONE committed acknowledgement across
+/// CPUs (Release publication → Acquire/AcqRel claim), but it holds exactly ONE slot: a
+/// SECOND simultaneous oracle pair would overwrite (or steal) the active unclaimed
+/// acknowledgement. Endpoint confinement + the single provisioning slot already keep the
+/// system to one pair; on a REAL boot the fail-closed overwrite fuse below additionally
+/// REFUSES to overwrite an active (VALID && !CLAIMED) acknowledgement and marks the fuse.
+/// Multi-pair production concurrency would require replacing this slot with an
+/// endpoint-indexed, generation-bearing bounded store (see the Stage 199A2D1 report).
 pub mod ipcreply_direct_ack {
     use crate::kernel::boot::ReceiverWaiterIdentity;
     use crate::kernel::ipc::ThreadId;
@@ -3491,6 +3758,9 @@ pub mod ipcreply_direct_ack {
 
     static VALID: AtomicBool = AtomicBool::new(false);
     static CLAIMED: AtomicBool = AtomicBool::new(false);
+    /// Fail-closed fuse: counts refused overwrites of an ACTIVE (VALID && !CLAIMED) ack — a
+    /// second-simultaneous-pair condition. Must be 0 in the sealed single-pair oracle boot.
+    static OVERWRITE_FUSE: AtomicU64 = AtomicU64::new(0);
     static SEQ: AtomicU64 = AtomicU64::new(0);
     static CALLER_TID: AtomicU64 = AtomicU64::new(0);
     static CALLER_ASID: AtomicU16 = AtomicU16::new(0);
@@ -3504,6 +3774,13 @@ pub mod ipcreply_direct_ack {
     pub fn reset() {
         VALID.store(false, Ordering::Release);
         CLAIMED.store(false, Ordering::Release);
+        OVERWRITE_FUSE.store(0, Ordering::Release);
+    }
+
+    /// Count of refused overwrites of an active acknowledgement (a second-pair fuse trip).
+    /// Must be 0 in the sealed single-pair oracle boot.
+    pub fn overwrite_fuse_count() -> u64 {
+        OVERWRITE_FUSE.load(Ordering::Acquire)
     }
 
     fn next_seq() -> u64 {
@@ -3511,7 +3788,18 @@ pub mod ipcreply_direct_ack {
         NEXT.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Publish the ack (fields first, `VALID` released last). Stage 199A2D1 fail-closed
+    /// overwrite fuse (REAL builds only): refuse to overwrite an ACTIVE (VALID && !CLAIMED)
+    /// acknowledgement — a second-simultaneous-pair condition this single-slot store does not
+    /// support. The active ack is preserved and the fuse is marked. Never trips in the sealed
+    /// one-pair flow. Hosted builds keep last-writer-wins for the wiring-test fixtures.
     pub(crate) fn publish(ack: BlockedCallerAck) -> u64 {
+        #[cfg(not(feature = "hosted-dev"))]
+        if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {
+            OVERWRITE_FUSE.fetch_add(1, Ordering::Relaxed);
+            crate::yarm_log!("IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE slot=caller");
+            return SEQ.load(Ordering::Relaxed);
+        }
         let seq = next_seq();
         CALLER_TID.store(ack.caller.tid.0, Ordering::Relaxed);
         CALLER_ASID.store(ack.caller.asid.0, Ordering::Relaxed);

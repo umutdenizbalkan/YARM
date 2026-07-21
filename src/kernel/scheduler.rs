@@ -239,6 +239,20 @@ impl PriorityScheduler {
         }
     }
 
+    /// Stage 199A2D2C2B1: true iff `tid` is present on this CPU either as the
+    /// dispatched `current` task or somewhere in a priority run queue. Used to
+    /// prove a blocked recv-v2 server is ABSENT from every runqueue before its
+    /// authoritative blocked-server acknowledgement is published (no premature
+    /// re-selection). Read-only.
+    pub fn contains_or_current(&self, tid: ThreadId) -> bool {
+        if let Some(current) = self.current {
+            if current.tid == tid {
+                return true;
+            }
+        }
+        self.contains_tid(tid)
+    }
+
     pub fn enqueue_with_priority(
         &mut self,
         tid: ThreadId,
@@ -691,6 +705,16 @@ impl SmpScheduler {
             return 0;
         };
         self.schedulers[idx].runnable_count()
+    }
+
+    /// Stage 199A2D2C2B1: true iff `tid` appears in ANY CPU's run queue or as ANY
+    /// CPU's dispatched `current` task. Used to prove a blocked recv-v2 server is
+    /// absent from every runqueue (not merely the home CPU's) before its
+    /// authoritative blocked-server acknowledgement is published. Read-only.
+    pub fn task_present_anywhere(&self, tid: ThreadId) -> bool {
+        self.schedulers
+            .iter()
+            .any(|sched| sched.contains_or_current(tid))
     }
 
     /// Non-mutating peek of the next-runnable dispatch candidate on `cpu`: the TID

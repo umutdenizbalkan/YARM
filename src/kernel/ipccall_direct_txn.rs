@@ -108,6 +108,15 @@ impl SharedKernel {
             // live success + retirement markers (one-shot; no-op unless the x86 oracle
             // feature+selector are both active).
             crate::kernel::boot::emit_ipccall_direct_request_live_markers();
+            // Stage 199A2D2C2B2: the server was just enqueued on CPU 1 (its captured affinity). On the
+            // cross-CPU REQUEST path, CPU 0 now sends the canonical reschedule/remote-wake IPI to CPU 1
+            // — the request path never self-sets CPU 1's pending flag; the CPU-1 side sets it on IPI
+            // receipt. Strictly AFTER the enqueue (no fallible work follows). No-op off the C2B2 path.
+            #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+            if crate::kernel::boot::x86_ipccall_direct_smp_request_enabled() {
+                crate::kernel::boot::ipccall_direct_smp_request_note_delivered();
+                crate::arch::x86_64::smp::c2b2_send_reschedule_ipi_to_cpu1();
+            }
         }
         result
     }
