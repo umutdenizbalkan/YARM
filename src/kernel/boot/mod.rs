@@ -17,6 +17,10 @@ mod exec_state;
 mod fault_endpoint_state;
 mod fault_state;
 mod ipc_state;
+// Stage 200C2B: the reply-timeout completion transaction abstraction + single generic
+// body are re-exported so the OFF-LOCK drain in `crate::runtime` can run the SAME body
+// through the `SharedKernel` split-mut seams (no duplicated transaction).
+pub(crate) use ipc_state::{ReplyTimeoutDomains, complete_reply_timeout_over};
 mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;
@@ -3554,6 +3558,174 @@ pub(crate) fn ipc_reply_timeout_rw_deadline() -> u64 {
 /// One-shot latch: `true` on the first call, `false` afterwards.
 pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
     !IPC_REPLY_TIMEOUT_RW_LATE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+
+// ── Stage 200C2B: per-CPU bounded DEFERRED reply-timeout work queue ─────────────────
+//
+// The narrow collector (`SharedKernel::collect_due_reply_timeout_work`) publishes one
+// owned work item per DUE token-bearing reply-receive deadline into this queue OFF the
+// broad lock; the off-lock drain (`SharedKernel::drain_reply_timeout_post_work`) then
+// runs the Stage 200C1 completion transaction for each. The queue is a per-CPU bounded
+// array guarded by its own IRQ-safe lock — NOT the broad `SpinLock<KernelState>` — so
+// neither collection nor completion holds a broad lock. A full queue leaves the DUE
+// deadline armed (the collector does not clear the TCB entry), to be retried on a later
+// scan. Duplicate collection of the same exact token yields only ONE work owner.
+
+/// One owned unit of deferred reply-timeout completion work. The `handle` embeds the
+/// full generation-bearing identity (token slot+generation, terminal epoch, caller
+/// `{tid,asid}`, reply record index+generation, reply endpoint index+generation, and
+/// blocked-recv generation); `deadline` is the DUE tick that selected it.
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReplyTimeoutPostWork {
+    pub handle: crate::kernel::deadline_token::DeadlineTokenHandle,
+    pub deadline: u64,
+}
+
+/// Per-CPU deferred-work slots — bounded by the whole deadline-token store, so a
+/// full store cannot overflow it.
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) const RT_POST_WORK_SLOTS: usize = MAX_DEADLINE_TOKENS;
+
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+static REPLY_TIMEOUT_POST_WORK: [crate::kernel::lock::SpinLockIrq<
+    [Option<ReplyTimeoutPostWork>; RT_POST_WORK_SLOTS],
+>; crate::kernel::scheduler::MAX_CPUS] =
+    [const { crate::kernel::lock::SpinLockIrq::new([None; RT_POST_WORK_SLOTS]) };
+        crate::kernel::scheduler::MAX_CPUS];
+
+/// Live counters (retirement-seal evidence): total deferred-work items published by the
+/// collector and total drained by the off-lock drain.
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+static REPLY_TIMEOUT_WORK_PUBLISHED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+static REPLY_TIMEOUT_WORK_DRAINED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Publish one owned work item for `cpu_idx`. A DUPLICATE (a work item for the exact
+/// same token slot + generation already queued and not yet drained) yields only ONE
+/// owner — the collector's re-publication returns `true` without adding a second. A
+/// FULL queue returns `false`; the collector then leaves the DUE deadline armed to be
+/// retried on a later scan. Returns `true` iff the item is now published (or already
+/// present).
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) fn reply_timeout_work_publish(cpu_idx: usize, work: ReplyTimeoutPostWork) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    let mut q = REPLY_TIMEOUT_POST_WORK[cpu_idx].lock();
+    // One owner per exact token: a re-published duplicate is not added twice.
+    for slot in q.iter().flatten() {
+        if slot.handle.token_index() == work.handle.token_index()
+            && slot.handle.token_generation() == work.handle.token_generation()
+        {
+            return true;
+        }
+    }
+    if let Some(free) = q.iter_mut().find(|s| s.is_none()) {
+        *free = Some(work);
+        REPLY_TIMEOUT_WORK_PUBLISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        true
+    } else {
+        false // queue full — leave the deadline armed + due for a later scan
+    }
+}
+
+/// Drain (remove + return) the next published work item for `cpu_idx`, or `None` when
+/// the queue is empty.
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) fn reply_timeout_work_drain_next(cpu_idx: usize) -> Option<ReplyTimeoutPostWork> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let mut q = REPLY_TIMEOUT_POST_WORK[cpu_idx].lock();
+    let taken = q.iter_mut().find(|s| s.is_some()).and_then(|s| s.take());
+    if taken.is_some() {
+        REPLY_TIMEOUT_WORK_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    taken
+}
+
+/// `true` iff the per-CPU deferred-work queue for `cpu_idx` holds no items (assertions).
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) fn reply_timeout_work_is_empty(cpu_idx: usize) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return true;
+    }
+    REPLY_TIMEOUT_POST_WORK[cpu_idx]
+        .lock()
+        .iter()
+        .all(|s| s.is_none())
+}
+
+/// Total deferred-work items published by the collector (retirement-seal evidence).
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) fn reply_timeout_work_published_count() -> u64 {
+    REPLY_TIMEOUT_WORK_PUBLISHED.load(core::sync::atomic::Ordering::Relaxed)
+}
+/// Total deferred-work items drained by the off-lock drain (retirement-seal evidence).
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) fn reply_timeout_work_drained_count() -> u64 {
+    REPLY_TIMEOUT_WORK_DRAINED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// One-shot latch guarding the retired lock-status + class retirement seal: `true` on
+/// the FIRST off-lock completion (proving the class scan runs with the broad lock
+/// retired), `false` afterwards.
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+static REPLY_TIMEOUT_LOCK_STATUS_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) fn reply_timeout_lock_status_once() -> bool {
+    !REPLY_TIMEOUT_LOCK_STATUS_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// `true` once at least one reply-timeout deadline has been armed this boot — the gate
+/// for attesting the retired off-lock scan (the scan is meaningful only after an arm).
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+static REPLY_TIMEOUT_ARMED_ANY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) fn set_reply_timeout_armed_any() {
+    REPLY_TIMEOUT_ARMED_ANY.store(true, core::sync::atomic::Ordering::Release);
+}
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) fn reply_timeout_armed_any() -> bool {
+    REPLY_TIMEOUT_ARMED_ANY.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// One-shot latch for the deferred-work publish/drain evidence marker.
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+static REPLY_TIMEOUT_DEFERRED_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) fn reply_timeout_deferred_once() -> bool {
+    !REPLY_TIMEOUT_DEFERRED_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// Test-only: empty a CPU's deferred-work queue WITHOUT running completions, so a test
+/// starts from a known-clean per-CPU queue (the queue statics are process-global).
+#[cfg(all(test, feature = "x86-ipc-reply-timeout-oracle"))]
+pub(crate) fn reply_timeout_work_clear(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        for slot in REPLY_TIMEOUT_POST_WORK[cpu_idx].lock().iter_mut() {
+            *slot = None;
+        }
+    }
+}
+
+/// Test-only: count queued (not-yet-drained) work items for `cpu_idx`.
+#[cfg(all(test, feature = "x86-ipc-reply-timeout-oracle"))]
+pub(crate) fn reply_timeout_work_len(cpu_idx: usize) -> usize {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return 0;
+    }
+    REPLY_TIMEOUT_POST_WORK[cpu_idx]
+        .lock()
+        .iter()
+        .filter(|s| s.is_some())
+        .count()
 }
 /// True iff `eidx` is the oracle's reply endpoint (the ONLY recv-v2 timeout that registers a
 /// reply-terminal deadline). `false` for every other endpoint and when un-provisioned.

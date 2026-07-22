@@ -85272,17 +85272,20 @@ mod stage200c_terminal_reuse_sync_guard {
 /// These prove the WIRING is correct + correctly gated, without a live boot (the
 /// two live boots are proven by `scripts/qemu-ipc-reply-timeout-x86_64-smoke.sh`).
 #[cfg(test)]
-mod stage200c2a_guards {
+mod stage200c2b_guards {
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TRAP_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const DEADLINE_SRC: &str = include_str!("../deadline_token.rs");
     const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
     const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
     const IPC_SYSCALL_SRC: &str = include_str!("../syscall/ipc.rs");
     const INIT_SRC: &str = include_str!(
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
-    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-ipc-reply-timeout-x86_64-smoke.sh");
+    const SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-x86_64-retirement-smoke.sh");
 
     // (1) feature AND a valid selector are both required.
     #[test]
@@ -85329,19 +85332,20 @@ mod stage200c2a_guards {
         assert!(IPC_STATE_SRC.contains("Blocked(WaitReason::EndpointReceive"));
     }
 
-    // (4) the production scan calls the accepted token/terminal transaction (no dup body).
+    // (4) the OFF-LOCK drain calls the SINGLE accepted transaction; the broad scan no
+    // longer completes token-bearing reply deadlines (no duplicated body).
     #[test]
-    fn g04_scan_calls_accepted_transaction() {
-        assert!(IPC_STATE_SRC.contains("fn process_ipc_timeout_deadlines"));
-        assert!(IPC_STATE_SRC.contains("self.run_due_reply_timeout_completions(now_tick)"));
-        assert!(
-            IPC_STATE_SRC.contains("self.run_reply_timeout_completion_locked(handle, now_tick)")
-        );
-        // The SharedKernel wrapper delegates to the SAME single body (no duplication).
-        assert!(
-            RUNTIME_SRC
-                .contains("self.with(|k| k.run_reply_timeout_completion_locked(handle, now_tick))")
-        );
+    fn g04_offlock_drain_calls_accepted_transaction() {
+        // Stage 200C2B: the broad-lock scan no longer completes token-bearing deadlines.
+        assert!(!IPC_STATE_SRC.contains("run_due_reply_timeout_completions"));
+        // There is exactly ONE generic completion body, run by both paths.
+        assert!(IPC_STATE_SRC.contains("fn complete_reply_timeout_over"));
+        assert!(RUNTIME_SRC.contains("complete_reply_timeout_over(&mut d, &work.handle, now)"));
+        // The hosted broad wrapper delegates to the SAME single body.
+        assert!(IPC_STATE_SRC.contains("complete_reply_timeout_over(self, handle, now_tick)"));
+        // Collection + drain are invoked at the trap-entry post-lock area (broad lock dropped).
+        assert!(TRAP_SRC.contains("shared.collect_due_reply_timeout_work(now, cpu)"));
+        assert!(TRAP_SRC.contains("shared.drain_reply_timeout_post_work(cpu, now)"));
     }
 
     // (5) ordinary (non-token) receive timeout remains unchanged.
@@ -85355,33 +85359,49 @@ mod stage200c2a_guards {
         );
     }
 
-    // (6) the timeout result is installed before the enqueue (ordering).
+    // (6) the timeout result + terminal completion are installed before the enqueue
+    // (the enqueue is the LAST, non-fallible step in the single generic body).
     #[test]
     fn g06_timeout_result_precedes_enqueue() {
         let body = IPC_STATE_SRC
-            .split("fn run_reply_timeout_completion_locked")
+            .split("fn complete_reply_timeout_over")
             .nth(1)
-            .expect("locked body");
-        let prep = body
-            .find("prepare_reply_timeout_result_for_caller")
-            .expect("prep");
-        let commit = body.find("commit_reply_terminal_slot").expect("commit");
-        let enqueue = body
-            .find("self.enqueue_task(caller.tid.0)")
-            .expect("enqueue");
+            .expect("generic body");
+        let prep = body.find("rt_prepare_timeout_result(d").expect("prep");
+        let commit = body
+            .find("rt_commit_reply_terminal(d, record_index")
+            .expect("commit");
+        let enqueue = body.find("d.rtd_enqueue(caller.tid.0)").expect("enqueue");
         assert!(
             prep < enqueue && commit < enqueue,
             "result + terminal precede enqueue"
         );
     }
 
-    // (7) reply disarms the EXACT token (slot + generation + epoch).
+    // (7) the reply win is REVERSIBLE before the fallible caller copy: a Reserved(Reply)
+    // terminal + a ClaimedByReply deadline lease taken before delivery, committed after,
+    // rolled back on a copy fault. No irreversible terminal completion precedes the copy.
     #[test]
-    fn g07_reply_disarms_exact_token() {
-        assert!(IPC_STATE_SRC.contains("fn maybe_win_reply_terminal_on_reply"));
-        assert!(IPC_STATE_SRC.contains("disarm_deadline_after_terminal_completion(&handle)"));
-        // Wired as the ONLY NR7 integration.
-        assert!(IPC_SYSCALL_SRC.contains("kernel.maybe_win_reply_terminal_on_reply(reply_cap)"));
+    fn g07_reply_win_reversible_before_copy() {
+        assert!(IPC_STATE_SRC.contains("fn reserve_reply_win_before_copy"));
+        assert!(IPC_STATE_SRC.contains("claim_deadline_reply_lease"));
+        assert!(IPC_STATE_SRC.contains("fn commit_reply_win_after_delivery"));
+        assert!(IPC_STATE_SRC.contains("fn rollback_reply_win"));
+        // The reversible deadline lease is a distinct lifecycle in the token cell.
+        assert!(DEADLINE_SRC.contains("fn claim_reply_lease"));
+        assert!(DEADLINE_SRC.contains("DL_CLAIMED_BY_REPLY"));
+        // Wired around the delivery: reserve BEFORE the caller copy, commit AFTER success,
+        // rollback on fault — the ONLY NR7 integration.
+        let s = IPC_SYSCALL_SRC;
+        let reserve = s.find("reserve_reply_win_before_copy").expect("reserve");
+        let deliver = s.find("kernel.ipc_reply(reply_cap, msg)").expect("deliver");
+        let commit = s.find("commit_reply_win_after_delivery").expect("commit");
+        assert!(
+            reserve < deliver,
+            "reserve precedes the caller copy/delivery"
+        );
+        assert!(deliver < commit, "commit follows successful delivery");
+        assert!(s.contains("rollback_reply_win"));
     }
 
     // (8) a late scan cannot cancel a newer token (exact epoch/identity).
@@ -85398,7 +85418,7 @@ mod stage200c2a_guards {
     fn g09_late_reply_rejected_normally() {
         // Timeout completion invalidates the reply record (→ Cancelled), so the frozen
         // reply-cap resolve rejects a late NR7 — no oracle-specific shortcut.
-        assert!(IPC_STATE_SRC.contains("fn invalidate_reply_record_for_terminal"));
+        assert!(IPC_STATE_SRC.contains("fn rt_invalidate_reply_record"));
         assert!(IPC_STATE_SRC.contains("ReplyRecordReservation::Cancelled"));
     }
 
@@ -85408,8 +85428,13 @@ mod stage200c2a_guards {
         // The init-server oracle emits ONLY its own X86_IPC_REPLY_*_DONE markers.
         assert!(INIT_SRC.contains("X86_IPC_REPLY_TIMEOUT_DONE"));
         assert!(INIT_SRC.contains("X86_IPC_REPLY_BEATS_TIMEOUT_DONE"));
-        // It never emits the KERNEL markers or the RUNNER seal.
+        // It never emits the KERNEL markers or the RUNNER seals (live or retirement), and
+        // never the reply-timeout class retirement marker.
         assert!(!INIT_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_LIVE_SEAL"));
+        assert!(!INIT_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL"));
+        assert!(
+            !INIT_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout")
+        );
         assert!(!INIT_SRC.contains("IPC_REPLY_TIMEOUT_OK arch=x86_64"));
         assert!(!INIT_SRC.contains("IPC_REPLY_BEATS_TIMEOUT_OK arch=x86_64"));
     }
@@ -85417,54 +85442,633 @@ mod stage200c2a_guards {
     // (11) the live marker literals live only in feature-gated kernel code.
     #[test]
     fn g11_live_literals_are_feature_gated() {
-        // Every kernel emit of a live literal is inside a feature-gated fn/block.
+        // The ARM marker + the reply-win reserve are feature-gated in ipc_state.rs.
+        assert!(IPC_STATE_SRC.contains("IPC_REPLY_TIMEOUT_ARMED"));
+        // The OFF-LOCK completion markers (Stage 200C2B) live in the feature-gated drain
+        // in runtime.rs — the completion no longer runs under the broad lock.
         for lit in [
-            "IPC_REPLY_TIMEOUT_ARMED",
             "IPC_REPLY_TIMEOUT_OK arch=x86_64",
-            "IPC_REPLY_BEATS_TIMEOUT_OK",
-            "IPC_REPLY_TIMEOUT_LOCK_STATUS",
+            "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0",
             "IPC_REPLY_TIMEOUT_LATE_SCAN",
+            "IPC_REPLY_TIMEOUT_DEFERRED",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout",
         ] {
-            assert!(
-                IPC_STATE_SRC.contains(lit),
-                "literal {lit} present (feature build)"
-            );
+            assert!(RUNTIME_SRC.contains(lit), "literal {lit} present (drain)");
         }
         // The emitting fns are all `#[cfg(feature = "x86-ipc-reply-timeout-oracle")]`.
         assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn maybe_arm_reply_timeout_oracle"));
-        assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn run_due_reply_timeout_completions"));
-        assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn maybe_win_reply_terminal_on_reply"));
+        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn collect_due_reply_timeout_work"));
+        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn drain_reply_timeout_post_work"));
     }
 
-    // (12) no global-lock retirement marker exists for the reply-timeout class.
+    // (12) the reply-timeout CLASS is honestly retired: scan_broad_lock=0 + the class
+    // retirement seal are emitted, and no scan_broad_lock=1 claim remains.
     #[test]
-    fn g12_no_global_lock_retirement_for_class() {
+    fn g12_class_retirement_present_and_honest() {
+        assert!(RUNTIME_SRC.contains("IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok"));
         assert!(
-            !IPC_STATE_SRC
-                .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout")
+            RUNTIME_SRC.contains(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout result=ok"
+            )
         );
+        // No lingering honest-broad-lock (scan_broad_lock=1) claim for this class.
+        assert!(!IPC_STATE_SRC.contains("scan_broad_lock=1"));
+        assert!(!RUNTIME_SRC.contains("scan_broad_lock=1"));
         assert!(!INIT_SRC.contains("class=IpcReplyTimeout"));
-        // The runner honestly reports the broad-lock boundary and FORBIDS (never
-        // emits) a retirement seal — the only mention is in its forbidden-marker list.
-        assert!(SMOKE_SRC.contains("scan_broad_lock=1"));
-        assert!(SMOKE_SRC.contains("die \"forbidden marker present"));
-        assert!(!SMOKE_SRC.contains("echo \"GLOBAL_LOCK_RETIRE_CLASS_DONE"));
-        assert!(
-            !SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_LIVE_SEAL arch=x86_64 lock_retired")
-        );
-        // The lock-status marker is honest.
-        assert!(IPC_STATE_SRC.contains("IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=1 completion_transaction_narrow=1 result=ok"));
+        // The retirement seal is emitted ONLY by the runner script, gated behind both boots.
+        assert!(SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL"));
+        assert!(SMOKE_SRC.contains("scan_broad_lock=0"));
     }
 
-    // (13) the smoke runner requires BOTH fresh boots + emits the live seal only then.
+    // (13) the retirement smoke runner requires BOTH fresh boots + emits the seal only then.
     #[test]
     fn g13_runner_requires_two_fresh_boots() {
         assert!(SMOKE_SRC.contains("yarm.x86_64_ipc_reply_timeout_oracle=${mode}"));
         assert!(SMOKE_SRC.contains("boot_mode timeout-wins"));
         assert!(SMOKE_SRC.contains("boot_mode reply-wins"));
         assert!(SMOKE_SRC.contains("recheck_sha_clean"));
-        assert!(SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_LIVE_SEAL"));
+        assert!(SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL"));
         // The seal is gated behind BOTH scenarios passing.
         assert!(SMOKE_SRC.contains("\"$TW_OK\" != \"1\" || \"$RW_OK\" != \"1\""));
+    }
+
+    // ── Stage 200C2B source hard-stops (item 6) ─────────────────────────────────────
+
+    // (h1) the OFF-LOCK collector + drain never form a broad `&mut KernelState`, never
+    // call `with` / `with_cpu`, and never take the broad runtime lock.
+    #[test]
+    fn h1_offlock_path_takes_no_broad_lock() {
+        for name in [
+            "fn collect_due_reply_timeout_work",
+            "fn drain_reply_timeout_post_work",
+        ] {
+            let body = RUNTIME_SRC.split(name).nth(1).expect(name);
+            // Bound the scan to this fn's body (up to the next `pub(crate) fn`).
+            let body = body.split("\n    pub(crate) fn ").next().unwrap();
+            assert!(
+                !body.contains(".with(|"),
+                "{name} must not take the broad lock"
+            );
+            assert!(!body.contains(".with_cpu("), "{name} must not use with_cpu");
+            assert!(
+                !body.contains("&mut KernelState"),
+                "{name} must not form a broad &mut KernelState"
+            );
+        }
+    }
+
+    // (h2) the off-lock domain access reaches state ONLY through the per-domain split-mut
+    // seams (ipc / task / scheduler), never a broad reference.
+    #[test]
+    fn h2_offlock_domain_access_uses_split_seams() {
+        let imp = RUNTIME_SRC
+            .split("impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout")
+            .nth(1)
+            .expect("OffLock impl");
+        let imp = imp.split("\nimpl ").next().unwrap();
+        assert!(imp.contains("with_ipc_split_mut"));
+        assert!(imp.contains("with_task_tcbs_split_mut"));
+        assert!(imp.contains("enqueue_reply_timeout_wake_split"));
+        assert!(!imp.contains(".with(|"));
+        // The enqueue seam takes the scheduler split seam, no broad lock.
+        let enq = RUNTIME_SRC
+            .split("fn enqueue_reply_timeout_wake_split")
+            .nth(1)
+            .expect("enqueue seam");
+        let enq = enq.split("\n    pub").next().unwrap();
+        assert!(enq.contains("with_scheduler_split_mut"));
+        assert!(!enq.contains(".with(|"));
+    }
+
+    // (h3) the off-lock completion performs NO user-memory copy.
+    #[test]
+    fn h3_offlock_completion_no_user_copy() {
+        let drain = RUNTIME_SRC
+            .split("fn drain_reply_timeout_post_work")
+            .nth(1)
+            .expect("drain");
+        let drain = drain.split("\n    fn ").next().unwrap();
+        assert!(!drain.contains("copy_from_user"));
+        assert!(!drain.contains("copy_to_user"));
+        assert!(!drain.contains("copy_from_current_user"));
+    }
+
+    // (h4) the enqueue is the LAST step of the single generic body (no ipc/task op after).
+    #[test]
+    fn h4_enqueue_is_last_step() {
+        let body = IPC_STATE_SRC
+            .split("fn complete_reply_timeout_over")
+            .nth(1)
+            .expect("body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        let enqueue = body.find("d.rtd_enqueue(caller.tid.0)").expect("enqueue");
+        let after = &body[enqueue..];
+        // Nothing after the enqueue may touch the ipc or task domains (only the return).
+        assert!(!after.contains("d.rtd_ipc"));
+        assert!(!after.contains("d.rtd_tcbs"));
+        assert!(!after.contains("rt_commit_reply_terminal"));
+    }
+
+    // (h5) `TerminalIdentity` / `DeadlineTokenIdentity` are immutable-per-epoch (the
+    // collector reads them without an ordinary mutable-data race): the token cell writes
+    // the identity ONLY under `&mut self` at arm time, published Release-last.
+    #[test]
+    fn h5_identities_are_race_free() {
+        // The identity is written only in `arm(&mut self, ...)`, Release-published last.
+        assert!(DEADLINE_SRC.contains("pub fn arm(&mut self, identity: DeadlineTokenIdentity)"));
+        assert!(DEADLINE_SRC.contains(
+            "self.state\n            .store(dl_encode(epoch, DL_ARMED), Ordering::Release);"
+        ));
+        // The collector copies the whole immutable `DeadlineTokenHandle` by value — it
+        // never reads a mutable identity field across the synchronization domain.
+        assert!(RUNTIME_SRC.contains("ReplyTimeoutPostWork { handle, deadline }"));
+    }
+
+    // (h6) NO token-bearing reply deadline reaches the OLD broad completion loop: the
+    // ordinary in-lock scan still SKIPS token-bearing TCBs, and completes none of them.
+    #[test]
+    fn h6_no_token_bearing_entry_in_broad_loop() {
+        assert!(IPC_STATE_SRC.contains("if tcb.reply_timeout_token.is_some() {"));
+        // The broad scan does not call the completion transaction at all any more.
+        let scan = IPC_STATE_SRC
+            .split("fn process_ipc_timeout_deadlines")
+            .nth(1)
+            .expect("scan");
+        let scan = scan.split("\n    pub(crate) fn ").next().unwrap();
+        assert!(!scan.contains("complete_reply_timeout_over"));
+        assert!(!scan.contains("run_reply_timeout_completion"));
+    }
+}
+
+/// Stage 200C2B — deterministic OFF-LOCK reply-timeout collection + completion proofs.
+/// Each exercises the narrow collector (`collect_due_reply_timeout_work`) and/or the
+/// off-lock drain (`drain_reply_timeout_post_work`) — the production timer-path entry
+/// with the broad lock retired — plus the reversible reply lease that governs the
+/// reply-copy-fault race. Run single-threaded (the per-CPU deferred queue is a
+/// process-global static; each test clears CPU 0's queue first).
+mod stage200c2b_offlock {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::boot::{ReceiverWaiterIdentity, ReplyRecordReservation};
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::deadline_token::DeadlineTokenHandle;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::runtime::{ReplyTimeoutOutcome, SharedKernel};
+
+    const TOKEN_GEN: u64 = 1;
+    const BRG: u64 = 1;
+    const DEADLINE: u64 = 100;
+    const NOW: u64 = 200;
+    const CPU: CpuId = CpuId(0);
+
+    fn clear_queue() {
+        crate::kernel::boot::reply_timeout_work_clear(0);
+    }
+    fn queue_len() -> usize {
+        crate::kernel::boot::reply_timeout_work_len(0)
+    }
+
+    /// Arm the terminal cell + register a reply-receive deadline against the fixture's
+    /// committed blocked recv-v2. Returns `(record slot, generation, identity, handle)`.
+    fn setup(fx: &CallerFx) -> (usize, u64, TerminalIdentity, DeadlineTokenHandle) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let identity =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, identity));
+        let handle =
+            fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, DEADLINE))
+                .expect("register");
+        (idx, rgen, identity, handle)
+    }
+
+    // (1) a DUE reply deadline is collected off-lock, then drained → timeout wins.
+    #[test]
+    fn t01_due_deadline_collected_and_completed_offlock() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, _rgen, _id, _h) = setup(&fx);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(queue_len(), 1, "one due entry collected off-lock");
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert_eq!(queue_len(), 0, "drained");
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        assert_eq!(fx.k.with(|s| s.task_status(1)), Some(TaskStatus::Runnable));
+        clear_queue();
+        teardown();
+    }
+
+    // (2) an ordinary (non-token) receive deadline is NOT collected by the new path.
+    #[test]
+    fn t02_ordinary_deadline_not_collected() {
+        clear_queue();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(50).expect("t50");
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 50).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
+                tcb.ipc_timeout_deadline = Some(5);
+                assert!(tcb.reply_timeout_token.is_none());
+            });
+        });
+        k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(queue_len(), 0, "ordinary deadline is not token-bearing");
+        clear_queue();
+    }
+
+    // (3) the exact due work item is published exactly ONCE across repeat collections.
+    #[test]
+    fn t03_exact_work_published_once() {
+        clear_queue();
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(queue_len(), 1, "duplicate collection → one work owner");
+        clear_queue();
+        teardown();
+    }
+
+    // (4) a FULL queue leaves the due deadline armed (the TCB entry is NOT cleared).
+    #[test]
+    fn t04_queue_full_leaves_deadline_armed() {
+        clear_queue();
+        // Fill all slots with distinct synthetic works (out of the real token range).
+        for i in 10..(10 + crate::kernel::boot::RT_POST_WORK_SLOTS) {
+            assert!(crate::kernel::boot::reply_timeout_work_publish(
+                0,
+                crate::kernel::boot::ReplyTimeoutPostWork {
+                    handle: DeadlineTokenHandle::test_new(i, 1),
+                    deadline: 1,
+                },
+            ));
+        }
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, handle) = setup(&fx);
+        let before = queue_len();
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(queue_len(), before, "full queue → not added");
+        // The real registration is untouched: TCB deadline + token still present, armed.
+        assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 1);
+        assert!(fx.k.with(|s| s.deadline_token_is_armed(handle.token_index())));
+        clear_queue();
+        teardown();
+    }
+
+    // (5) duplicate collector passes produce ONE work owner → exactly one completion.
+    #[test]
+    fn t05_duplicate_passes_one_completion() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, _rgen, _id, _h) = setup(&fx);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(queue_len(), 1);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        // A single terminal commit — a second would require a second work owner.
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        assert_eq!(queue_len(), 0);
+        clear_queue();
+        teardown();
+    }
+
+    // (6) a STALE token work item mutates nothing (fails at the exact fire claim).
+    #[test]
+    fn t06_stale_work_mutates_nothing() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, rgen, _id, handle) = setup(&fx);
+        // A stale work item for the SAME slot but a wrong generation.
+        assert!(crate::kernel::boot::reply_timeout_work_publish(
+            0,
+            crate::kernel::boot::ReplyTimeoutPostWork {
+                handle: DeadlineTokenHandle::test_new(handle.token_index(), 999),
+                deadline: 1,
+            },
+        ));
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        // The real terminal stays Open, the real token stays Armed, caller stays blocked.
+        assert!(fx.k.with(|s| s.reply_terminal_is_open(idx)));
+        assert!(fx.k.with(|s| s.deadline_token_is_armed(handle.token_index())));
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(1)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        assert!(fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)));
+        clear_queue();
+        teardown();
+    }
+
+    // (7) endpoint replacement before the drain mutates NO replacement waiter (no wake).
+    #[test]
+    fn t07_endpoint_replacement_no_wake() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, _rgen, id, _h) = setup(&fx);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        // Advance the reply endpoint generation → the drain's endpoint revalidation fails.
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                let ng = ipc.endpoint_generations[id.reply_endpoint_index].wrapping_add(1);
+                ipc.endpoint_generations[id.reply_endpoint_index] = ng;
+            });
+        });
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        // Timeout owns the terminal (cleanup) but NO caller was woken.
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(1)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        assert!(!fx.k.with(|s| s.ipc_timeout_fired_read(1)), "no wake");
+        let _ = idx;
+        clear_queue();
+        teardown();
+    }
+
+    // (8) caller replacement before the drain mutates NO replacement task (no wake).
+    #[test]
+    fn t08_caller_replacement_no_wake() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, _h) = setup(&fx);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        // Replace the caller incarnation (advance its blocked-recv generation).
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert!(!fx.k.with(|s| s.ipc_timeout_fired_read(1)), "no wake");
+        clear_queue();
+        teardown();
+    }
+
+    // (9) the canonical TimedOut result is installed on the caller before the enqueue.
+    #[test]
+    fn t09_timeout_result_installed() {
+        clear_queue();
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert!(
+            fx.k.with(|s| s.ipc_timeout_fired_read(1)),
+            "TimedOut installed"
+        );
+        assert_eq!(fx.k.with(|s| s.task_status(1)), Some(TaskStatus::Runnable));
+        clear_queue();
+        teardown();
+    }
+
+    // (10) terminal completion happens before the enqueue (Timeout committed + Runnable).
+    #[test]
+    fn t10_terminal_completed_before_enqueue() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, _rgen, _id, handle) = setup(&fx);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        assert!(fx.k.with(|s| s.deadline_token_is_completed(handle.token_index())));
+        clear_queue();
+        teardown();
+    }
+
+    // (11) a late reply after a timeout win is rejected (record Cancelled, not invokable).
+    #[test]
+    fn t11_late_reply_rejected_after_timeout() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, rgen, _id, _h) = setup(&fx);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(idx)),
+            Some(ReplyRecordReservation::Cancelled)
+        );
+        assert!(!fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)));
+        clear_queue();
+        teardown();
+    }
+
+    // (12) a reply lease completes and blocks a concurrent due-timeout fire (one winner).
+    #[test]
+    fn t12_reply_lease_completes_and_blocks_timeout() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, _rgen, id, handle) = setup(&fx);
+        // Reply takes the REVERSIBLE deadline lease + a Reserved(Reply) terminal claim.
+        let lease =
+            fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
+                .expect("reply lease");
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("reply terminal");
+        // A concurrent due timeout cannot fire the leased token.
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert!(
+            !fx.k.with(|s| s.ipc_timeout_fired_read(1)),
+            "timeout blocked by lease"
+        );
+        // Reply commits: lease → Completed, terminal → Completed(Reply).
+        assert!(fx.k.with(|s| s.complete_deadline_reply_lease(handle.token_index(), &lease)));
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Reply)
+        );
+        assert!(fx.k.with(|s| s.deadline_token_is_completed(handle.token_index())));
+        clear_queue();
+        teardown();
+    }
+
+    // (13) a caller-copy fault restores BOTH reply and deadline retryability.
+    #[test]
+    fn t13_copy_fault_restores_reply_and_deadline() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, rgen, id, handle) = setup(&fx);
+        let lease =
+            fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
+                .expect("reply lease");
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("reply terminal");
+        // Model a retryable caller-copy fault: restore the lease + release the terminal.
+        assert!(fx.k.with(|s| s.restore_deadline_reply_lease(handle.token_index(), &lease)));
+        assert!(fx.k.with(|s| s.release_reply_terminal_slot_if_retryable(idx, &owner)));
+        // Deadline retryable (Armed), terminal Open, record still Available/invokable.
+        assert!(fx.k.with(|s| s.deadline_token_is_armed(handle.token_index())));
+        assert!(fx.k.with(|s| s.reply_terminal_is_open(idx)));
+        assert!(fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)));
+        clear_queue();
+        teardown();
+    }
+
+    // (14) timeout racing a reply-copy rollback has ONE winner: while leased, timeout
+    // cannot fire; after a restore, a due timeout wins cleanly.
+    #[test]
+    fn t14_timeout_vs_reply_rollback_one_winner() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, _rgen, _id, handle) = setup(&fx);
+        let lease =
+            fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
+                .expect("reply lease");
+        // While leased, a due timeout cannot claim the terminal.
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert!(
+            fx.k.with(|s| s.reply_terminal_is_open(idx)),
+            "no timeout claim while leased"
+        );
+        // Copy fault → restore the lease; now a due timeout wins the SINGLE terminal.
+        assert!(fx.k.with(|s| s.restore_deadline_reply_lease(handle.token_index(), &lease)));
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout),
+            "exactly one winner after the rollback"
+        );
+        clear_queue();
+        teardown();
+    }
+
+    // (15) sparse TCB scanning does not strand a later due entry (high-slot caller).
+    #[test]
+    fn t15_sparse_scan_no_stranding() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, _rgen, _id, _h) = setup(&fx);
+        // Register several higher-TID tasks to force a sparse scan ahead of tid 1.
+        fx.k.with(|s| {
+            for t in [40u64, 41, 42] {
+                let _ = s.register_task(t);
+            }
+        });
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(queue_len(), 1, "the due entry is not stranded");
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        clear_queue();
+        teardown();
+    }
+
+    // (16) the ordinary in-lock timeout scan still fires ordinary deadlines (regression).
+    #[test]
+    fn t16_ordinary_timeout_regression_green() {
+        clear_queue();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(60).expect("t60");
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 60).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
+                tcb.ipc_timeout_deadline = Some(5);
+            });
+            let expired = s.process_ipc_timeout_deadlines(10).expect("scan");
+            assert_eq!(expired, 1, "ordinary deadline still fires in-lock");
+            assert_eq!(s.task_status(60), Some(TaskStatus::Runnable));
+        });
+        clear_queue();
+    }
+
+    // (17) NO token-bearing entry reaches the OLD broad completion loop: the in-lock scan
+    // SKIPS the token-bearing TCB and completes none of it.
+    #[test]
+    fn t17_no_token_bearing_in_broad_loop() {
+        clear_queue();
+        let fx = caller_fixture();
+        let (idx, _rgen, _id, handle) = setup(&fx);
+        // The broad in-lock scan must SKIP the token-bearing caller entirely.
+        let expired =
+            fx.k.with(|s| s.process_ipc_timeout_deadlines(NOW).expect("scan"));
+        assert_eq!(
+            expired, 0,
+            "token-bearing deadline is not handled by the broad loop"
+        );
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(1)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        assert!(fx.k.with(|s| s.deadline_token_is_armed(handle.token_index())));
+        assert!(fx.k.with(|s| s.reply_terminal_is_open(idx)));
+        clear_queue();
+        teardown();
+    }
+
+    // (18) an armed-but-NOT-due deadline is not collected (respects `now >= deadline`).
+    #[test]
+    fn t18_not_yet_due_not_collected() {
+        clear_queue();
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        // now < DEADLINE → nothing due.
+        fx.k.collect_due_reply_timeout_work(DEADLINE - 1, CPU);
+        assert_eq!(queue_len(), 0, "not-yet-due is not collected");
+        clear_queue();
+        teardown();
+    }
+
+    // (19) Stage 199 frozen NR7 behavior is unchanged with NO deadline registered: a
+    // reserve is a strict no-op (oracle inert in hosted), and a plain reply still works.
+    #[test]
+    fn t19_frozen_nr7_without_deadline() {
+        let fx = caller_fixture();
+        // No deadline registered, oracle inert (hosted) → reserve is a strict no-op.
+        #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+        {
+            let cap = crate::kernel::capabilities::CapId(0);
+            assert!(
+                fx.k.with(|s| s.reserve_reply_win_before_copy(cap))
+                    .is_none(),
+                "reserve is inert without the oracle armed"
+            );
+        }
+        // The reply record remains invokable (frozen NR7 path is untouched).
+        assert!(
+            fx.k.with(|s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation))
+        );
+        teardown();
+    }
+
+    // (20) the per-CPU deferred slot is EMPTY after both a successful drain and a rollback.
+    #[test]
+    fn t20_deferred_slot_empty_after_success_and_rollback() {
+        clear_queue();
+        // Success path: collect + drain leaves the queue empty.
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, _h) = setup(&fx);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        assert_eq!(queue_len(), 0, "empty after a successful drain");
+        teardown();
+        // Rollback path: a stale work item drains to nothing and leaves the queue empty.
+        assert!(crate::kernel::boot::reply_timeout_work_publish(
+            0,
+            crate::kernel::boot::ReplyTimeoutPostWork {
+                handle: DeadlineTokenHandle::test_new(77, 1),
+                deadline: 1,
+            },
+        ));
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.drain_reply_timeout_post_work(CPU, NOW);
+        assert_eq!(queue_len(), 0, "empty after a stale (rollback) drain");
+        clear_queue();
     }
 }

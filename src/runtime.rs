@@ -232,6 +232,31 @@ pub struct SharedKernel {
     state: SpinLock<KernelState>,
 }
 
+/// Stage 200C2B — the OFF-LOCK per-domain access for the reply-timeout completion
+/// transaction. Wraps `&SharedKernel` and implements `ReplyTimeoutDomains` via the
+/// per-domain split-mut seams (`with_ipc_split_mut`, `with_task_tcbs_split_mut`, and
+/// the rank-1 scheduler enqueue seam). It NEVER forms a broad `&mut KernelState` and
+/// NEVER takes the broad `SpinLock<KernelState>` — each primitive is a SHORT bounded
+/// claim of exactly one domain, so the composed transaction holds no broad lock.
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub(crate) struct OffLockReplyTimeout<'a>(pub(crate) &'a SharedKernel);
+
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout<'_> {
+    fn rtd_ipc<R>(&mut self, f: impl FnOnce(&mut crate::kernel::boot::IpcSubsystem) -> R) -> R {
+        self.0.with_ipc_split_mut(f)
+    }
+    fn rtd_tcbs<R>(
+        &mut self,
+        f: impl FnOnce(&mut [Option<crate::kernel::task::ThreadControlBlock>]) -> R,
+    ) -> R {
+        self.0.with_task_tcbs_split_mut(f)
+    }
+    fn rtd_enqueue(&mut self, tid: u64) {
+        self.0.enqueue_reply_timeout_wake_split(tid);
+    }
+}
+
 impl SharedKernel {
     /// Stage 114 fix: this used to also cache `scheduler_state` /
     /// `boot_config_state_lock` / `boot_config` raw pointers computed from
@@ -3304,6 +3329,172 @@ impl SharedKernel {
         now_tick: u64,
     ) -> ReplyTimeoutOutcome {
         self.with(|k| k.run_reply_timeout_completion_locked(handle, now_tick))
+    }
+
+    // ── Stage 200C2B: OFF-LOCK reply-timeout collection + completion ────────────────
+
+    /// Stage 200C2B — the NARROW collector. Scans ONLY token-bearing reply-receive
+    /// deadlines through the rank-2 task split-mut seam (NO broad `&mut KernelState`,
+    /// NO `with` / `with_cpu`, NO broad runtime lock) and publishes one owned
+    /// `ReplyTimeoutPostWork` per DUE entry into the per-CPU bounded deferred queue. It
+    /// makes NO timeout decision, mutates NO waiter and wakes NO task. A full queue
+    /// leaves the DUE deadline armed (the TCB entry is NOT cleared here) for a later
+    /// scan — no due registration is ever silently dropped.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    pub(crate) fn collect_due_reply_timeout_work(&self, now: u64, cpu: CpuId) {
+        // Snapshot due (handle, deadline) pairs under ONLY the task lock; publish after
+        // the task lock is dropped so the queue lock never nests inside the task lock.
+        let mut due: [Option<crate::kernel::boot::ReplyTimeoutPostWork>;
+            crate::kernel::boot::RT_POST_WORK_SLOTS] =
+            [None; crate::kernel::boot::RT_POST_WORK_SLOTS];
+        let mut n = 0usize;
+        self.with_task_tcbs_split_mut(|tcbs| {
+            for tcb in tcbs.iter().flatten() {
+                if n >= crate::kernel::boot::RT_POST_WORK_SLOTS {
+                    break;
+                }
+                let (Some(deadline), Some(handle)) =
+                    (tcb.ipc_timeout_deadline, tcb.reply_timeout_token)
+                else {
+                    continue;
+                };
+                if now >= deadline {
+                    due[n] = Some(crate::kernel::boot::ReplyTimeoutPostWork { handle, deadline });
+                    n += 1;
+                }
+            }
+        });
+        let cpu_idx = cpu.0 as usize;
+        for work in due.iter().flatten() {
+            // A full queue leaves the deadline armed + due (retry on a later scan); a
+            // duplicate token yields only one work owner.
+            let _ = crate::kernel::boot::reply_timeout_work_publish(cpu_idx, *work);
+        }
+    }
+
+    /// Stage 200C2B — the OFF-LOCK drain. Runs the SINGLE Stage 200C1 completion
+    /// transaction (`complete_reply_timeout_over`) for each deferred work item through
+    /// `OffLockReplyTimeout` — per-domain split-mut seams, NO broad lock surrounding the
+    /// composed transaction. A stale/duplicate work item fails at the exact token fire
+    /// claim BEFORE any waiter mutation. Reports the honest retired lock status
+    /// (`scan_broad_lock=0`) and emits the reply-timeout class retirement seal exactly
+    /// once. On a non-`Woken` outcome it clears the caller's stale TCB registration so it
+    /// is not re-collected.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    pub(crate) fn drain_reply_timeout_post_work(&self, cpu: CpuId, now: u64) {
+        // Once ANY reply-timeout deadline has been armed this boot, the class's deadline
+        // scan runs HERE — off the broad `SpinLock<KernelState>` — whether or not a
+        // completion drains. Attest the retired lock status + emit the class retirement
+        // seal ONCE. (In reply-wins the reply retires the registration before the scan,
+        // so no completion drains, yet the off-lock scan still genuinely runs.)
+        if crate::kernel::boot::reply_timeout_armed_any()
+            && crate::kernel::boot::reply_timeout_lock_status_once()
+        {
+            crate::yarm_log!(
+                "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok"
+            );
+            crate::yarm_log!(
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout result=ok"
+            );
+        }
+        let cpu_idx = cpu.0 as usize;
+        while let Some(work) = crate::kernel::boot::reply_timeout_work_drain_next(cpu_idx) {
+            let mut d = OffLockReplyTimeout(self);
+            let outcome =
+                crate::kernel::boot::complete_reply_timeout_over(&mut d, &work.handle, now);
+            // The FIRST drained work item carries the deferred-work publish/drain evidence.
+            if crate::kernel::boot::reply_timeout_deferred_once() {
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_DEFERRED arch=x86_64 published={} drained={} result=ok",
+                    crate::kernel::boot::reply_timeout_work_published_count(),
+                    crate::kernel::boot::reply_timeout_work_drained_count()
+                );
+            }
+            match outcome {
+                ReplyTimeoutOutcome::Woken => {
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_OK arch=x86_64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok"
+                    );
+                }
+                other => {
+                    // Harmless late expiry (the reply disarmed/completed the token, or the
+                    // caller already resumed): no timeout claim, no wake.
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_LATE_SCAN arch=x86_64 outcome={:?} late_timeout_claims=0 result=ok",
+                        other
+                    );
+                    // Clear the caller's stale TCB registration so a later scan does not
+                    // re-collect it — but ONLY when the token is genuinely RETIRED
+                    // (Completed/Disarmed) AND the TCB still references THIS exact handle.
+                    // A transiently reply-LEASED token (ClaimedByReply) is NOT retired, so a
+                    // reply-copy fault can still restore + re-fire it; and a newer
+                    // registration on the same caller is never clobbered.
+                    let retired = self.with_ipc_split_mut(|ipc| {
+                        ipc.reply_deadline_tokens
+                            .get(work.handle.token_index())
+                            .is_some_and(|t| t.is_completed() || t.is_disarmed())
+                    });
+                    if retired {
+                        let tid = work.handle.identity().terminal_identity.caller_tid.0;
+                        let this = work.handle;
+                        self.with_task_tcbs_split_mut(|tcbs| {
+                            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                                if tcb.reply_timeout_token == Some(this) {
+                                    tcb.ipc_timeout_deadline = None;
+                                    tcb.reply_timeout_token = None;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        // Reply-wins genuine-late-expiry proof: the reply disarmed the token and the
+        // caller resumed, so the collector genuinely scanned PAST the reply-wins deadline
+        // and found no claimable timeout registration. Emit a ONE-SHOT positive marker.
+        if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS
+        {
+            let rw = crate::kernel::boot::ipc_reply_timeout_rw_deadline();
+            if rw != 0 && now >= rw && crate::kernel::boot::ipc_reply_timeout_rw_late_scan_once() {
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_LATE_SCAN arch=x86_64 outcome=reply_won late_timeout_claims=0 result=ok"
+                );
+            }
+        }
+    }
+
+    /// Stage 200C2B — the OFF-LOCK scheduler enqueue for a timeout-woken caller. Reads
+    /// the task's class (priority) and CPU affinity under SHORT rank-2 task claims, each
+    /// released BEFORE the rank-1 scheduler claim performs the enqueue — so no task lock
+    /// is held while enqueuing, and no broad lock is ever taken. Mirrors
+    /// `KernelState::enqueue_task`'s placement (pinned → its CPU; unpinned → balanced).
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    fn enqueue_reply_timeout_wake_split(&self, tid: u64) {
+        use crate::kernel::ipc::ThreadId;
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::TaskClass;
+        let priority = match self.task_class_split_read(tid) {
+            Some(TaskClass::SystemServer) => TaskPriority::High,
+            _ => TaskPriority::Normal,
+        };
+        let affinity = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.cpu_affinity)
+        });
+        self.with_scheduler_split_mut(|sched| {
+            let s = kernel_mut(&mut sched.scheduler);
+            match affinity {
+                Some(cpu) => {
+                    let _ = s.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
+                }
+                None => {
+                    let _ = s.enqueue_balanced(ThreadId(tid), priority);
+                }
+            }
+        });
     }
 
     /// Stage 200C1 — the NR7 reply-win deadline-disarm hook. When reply obtains

@@ -17,7 +17,9 @@
 //!
 //! ```text
 //!   Vacant → Armed → ClaimedForFire → Disarmed | Completed
-//!              │                          ▲
+//!              │  ▲                       ▲
+//!              │  └── ClaimedByReply ──────┤  (reply lease: Completed on success,
+//!              │          (Stage 200C2B)   │   Armed on retryable reply-copy fault)
 //!              └── cancel / terminal-disarm┘  (Armed → Disarmed)
 //! ```
 //!
@@ -27,6 +29,13 @@
 //! * `disarm_fire` — fire lost the timeout terminal; `ClaimedForFire → Disarmed`.
 //! * `restore_fire_claim_if_retryable` — retryable rollback; `ClaimedForFire → Armed`.
 //! * `cancel_exact` / `disarm_after_terminal_completion` — `Armed → Disarmed`.
+//! * `claim_reply_lease` — Stage 200C2B REVERSIBLE reply hold; `Armed → ClaimedByReply`
+//!   (one owner). It is registration OWNERSHIP only — never a terminal-result
+//!   authority — taken BEFORE the fallible caller copy so the deadline is never
+//!   permanently lost by a copy that later faults.
+//! * `complete_reply_lease` — the reply delivery succeeded; `ClaimedByReply → Completed`.
+//! * `restore_reply_lease` — the reply copy faulted retryably; `ClaimedByReply → Armed`
+//!   (the exact deadline is restored so a later timeout scan can still fire it).
 //!
 //! ## Generation-bearing identity
 //!
@@ -116,6 +125,11 @@ const DL_ARMED: u64 = 1;
 const DL_CLAIMED_FOR_FIRE: u64 = 2;
 const DL_DISARMED: u64 = 3;
 const DL_COMPLETED: u64 = 4;
+/// Stage 200C2B — a reversible REPLY lease held while a winning reply performs its
+/// (fallible) caller copy. A leased token is NOT free and NOT fire-claimable, so a
+/// concurrent due timeout fire fails until the lease resolves to `Completed`
+/// (reply delivered) or back to `Armed` (retryable reply-copy fault).
+const DL_CLAIMED_BY_REPLY: u64 = 5;
 
 #[inline]
 const fn dl_encode(epoch: u64, phase: u64) -> u64 {
@@ -140,6 +154,17 @@ pub struct DeadlineTokenHandle {
 }
 
 impl DeadlineTokenHandle {
+    /// Test-only synthetic handle for a given slot/generation (zeroed identity
+    /// otherwise). Used by Stage 200C2B deferred-work-queue tests to fabricate DISTINCT
+    /// stale work items without arming real registrations.
+    #[cfg(test)]
+    pub fn test_new(token_index: usize, token_generation: u64) -> Self {
+        let mut identity = DeadlineTokenIdentity::ZERO;
+        identity.token_index = token_index;
+        identity.token_generation = token_generation;
+        Self { identity, epoch: 1 }
+    }
+
     #[inline]
     pub const fn identity(&self) -> &DeadlineTokenIdentity {
         &self.identity
@@ -163,6 +188,15 @@ impl DeadlineTokenHandle {
 /// this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeadlineFireOwner {
+    epoch: u64,
+}
+
+/// Stage 200C2B — the exclusive reply-lease token minted by a successful
+/// `claim_reply_lease`. Only its holder can complete (`ClaimedByReply → Completed`)
+/// or restore (`ClaimedByReply → Armed`) the lease. Cannot be constructed outside
+/// this module, so a reply lease can never be forged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineReplyLeaseOwner {
     epoch: u64,
 }
 
@@ -360,6 +394,76 @@ impl DeadlineTokenCell {
             )
             .is_ok()
     }
+
+    /// `true` iff a reply lease is currently held (`ClaimedByReply`).
+    #[inline]
+    pub fn is_reply_leased(&self) -> bool {
+        dl_phase(self.state.load(Ordering::Acquire)) == DL_CLAIMED_BY_REPLY
+    }
+
+    /// Stage 200C2B — take a REVERSIBLE reply lease on an armed token:
+    /// `Armed → ClaimedByReply` with a single AcqRel CAS. Requires the exact handle
+    /// identity + epoch, so a stale reply cannot lease a newer registration. Exactly
+    /// one lease owner wins; a token already leased/fired/completed gets `None`. This
+    /// is taken BEFORE the winning reply's fallible caller copy, so the deadline is
+    /// never permanently disarmed by a copy that later faults. It is registration
+    /// ownership only — the reply still had to win the terminal cell separately.
+    #[must_use]
+    pub fn claim_reply_lease(
+        &self,
+        handle: &DeadlineTokenHandle,
+    ) -> Option<DeadlineReplyLeaseOwner> {
+        let w = self.state.load(Ordering::Acquire);
+        if dl_phase(w) != DL_ARMED {
+            return None;
+        }
+        if self.identity != handle.identity {
+            return None; // stale/mismatched registration identity
+        }
+        let epoch = dl_epoch(w);
+        if epoch != handle.epoch {
+            return None;
+        }
+        match self.state.compare_exchange(
+            dl_encode(epoch, DL_ARMED),
+            dl_encode(epoch, DL_CLAIMED_BY_REPLY),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Some(DeadlineReplyLeaseOwner { epoch }),
+            Err(_) => None,
+        }
+    }
+
+    /// The winning reply delivered successfully: `ClaimedByReply → Completed`. Only
+    /// the exact lease owner succeeds. The deadline is now permanently retired.
+    #[must_use]
+    pub fn complete_reply_lease(&self, owner: &DeadlineReplyLeaseOwner) -> bool {
+        self.state
+            .compare_exchange(
+                dl_encode(owner.epoch, DL_CLAIMED_BY_REPLY),
+                dl_encode(owner.epoch, DL_COMPLETED),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// The winning reply's caller copy faulted retryably: `ClaimedByReply → Armed`.
+    /// Only the exact lease owner succeeds. The EXACT deadline registration is
+    /// restored (same epoch/identity), so a later timeout scan can still fire it —
+    /// no permanent deadline loss after a retryable reply-copy failure.
+    #[must_use]
+    pub fn restore_reply_lease(&self, owner: &DeadlineReplyLeaseOwner) -> bool {
+        self.state
+            .compare_exchange(
+                dl_encode(owner.epoch, DL_CLAIMED_BY_REPLY),
+                dl_encode(owner.epoch, DL_ARMED),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -471,6 +575,58 @@ mod tests {
         assert!(c.is_armed(), "token reopened for retry");
         // A fresh fire can claim again.
         assert!(c.claim_fire(&h).is_some());
+    }
+
+    #[test]
+    fn reply_lease_completes_and_blocks_concurrent_fire() {
+        // Stage 200C2B: a reply lease holds the token reversibly; a concurrent due
+        // timeout fire cannot claim while leased, and the lease completes cleanly.
+        let (c, h) = armed(1);
+        let lease = c.claim_reply_lease(&h).expect("reply leases armed token");
+        assert!(c.is_reply_leased());
+        assert!(!c.is_free(), "a leased token is not recyclable");
+        // A concurrent due timeout fire fails (token is not Armed while leased).
+        assert!(
+            c.claim_fire(&h).is_none(),
+            "fire blocked while reply-leased"
+        );
+        // A duplicate reply lease fails.
+        assert!(c.claim_reply_lease(&h).is_none());
+        // The reply delivered — complete the lease.
+        assert!(c.complete_reply_lease(&lease), "lease owner completes");
+        assert!(c.is_completed());
+        assert!(!c.complete_reply_lease(&lease), "no second completion");
+    }
+
+    #[test]
+    fn reply_lease_restore_reopens_for_timeout_fire() {
+        // Stage 200C2B: a retryable reply-copy fault restores the EXACT deadline so a
+        // later timeout scan can still fire it — no permanent deadline loss.
+        let (c, h) = armed(1);
+        let lease = c.claim_reply_lease(&h).expect("reply leases");
+        assert!(c.restore_reply_lease(&lease), "retryable reply-copy fault");
+        assert!(c.is_armed(), "exact deadline restored to Armed");
+        // A due timeout fire can now claim the restored token.
+        let owner = c
+            .claim_fire(&h)
+            .expect("timeout fire claims restored token");
+        assert!(c.complete_fire(&owner));
+        assert!(c.is_completed());
+    }
+
+    #[test]
+    fn stale_reply_lease_rejected_after_rearm() {
+        let mut c = DeadlineTokenCell::vacant();
+        let stale = c.arm(token_ident(1, 1, 1)).expect("arm gen 1");
+        assert!(c.disarm_after_terminal_completion(stale.identity(), stale.epoch()));
+        let fresh = c.arm(token_ident(2, 1, 1)).expect("re-arm gen 2");
+        // The stale handle cannot lease the freshly-armed token.
+        assert!(
+            c.claim_reply_lease(&stale).is_none(),
+            "stale-epoch reply lease rejected"
+        );
+        assert!(c.is_armed());
+        assert!(c.claim_reply_lease(&fresh).is_some(), "fresh lease works");
     }
 
     #[test]
