@@ -1017,6 +1017,38 @@ pub fn bootstrap_first_user_task(
             );
         }
     }
+    // Stage 200C2A: default-off + feature-gated x86_64 LIVE reply-receive TIMEOUT oracle. Reuses init
+    // startup slot 5 (=10) + the two service-extra slots 13/14 for the request + reply endpoint caps,
+    // plus slot 15 for the mode (1=timeout-wins, 2=reply-wins). Mutually exclusive with EVERY slot-5/
+    // 13/14 oracle above (it only fires when they are all zero), so a conflicting oracle already armed
+    // leaves this one stood down. Transactional + fail-closed.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled()
+        && init_args[5] == 0
+        && init_args[13] == 0
+        && init_args[14] == 0
+    {
+        if let Some(caps) = crate::kernel::boot::provision_init_ipc_reply_timeout_oracle(
+            kernel,
+            RING3_INIT_SERVER_TID,
+        ) {
+            // Encode the mode in the slot-5 value: 10 = timeout-wins, 11 = reply-wins
+            // (both mutually exclusive with every other slot-5 oracle).
+            init_args[5] = crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR
+                + (crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode() as u64 - 1);
+            init_args[13] = caps.request_ep_cap as u64;
+            init_args[14] = caps.reply_ep_cap as u64;
+            crate::yarm_log!(
+                "IPC_REPLY_TIMEOUT_ORACLE_SLOTS slot5={} slot13={} slot14={} req_eidx={} rep_eidx={} mode={}",
+                init_args[5],
+                init_args[13],
+                init_args[14],
+                caps.request_endpoint_idx,
+                caps.reply_endpoint_idx,
+                crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            );
+        }
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

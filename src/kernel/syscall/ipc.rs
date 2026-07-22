@@ -1292,7 +1292,21 @@ pub(super) fn handle_ipc_reply(
         msg.flags,
         transfer_handle.is_some(),
     );
+    // Stage 200C2B: oracle-gated NR7 reply-win RESERVE, taken immediately BEFORE the
+    // fallible caller copy/delivery. It takes only REVERSIBLE holds (Reserved(Reply)
+    // terminal + ClaimedByReply deadline lease) — no irreversible completion precedes
+    // the copy. A strict no-op off the oracle / off the confined reply endpoint / when
+    // timeout already won. The server payload was already snapshot above.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    let reply_win_lease = kernel.reserve_reply_win_before_copy(reply_cap);
     if let Err(err) = kernel.ipc_reply(reply_cap, msg) {
+        // Stage 200C2B: the caller copy/delivery FAILED — roll the reservation back
+        // exactly (terminal → Open, deadline → Armed). The reply record was never
+        // consumed and the caller never woken, so a later timeout scan still claims.
+        #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+        if let Some(lease) = reply_win_lease {
+            kernel.rollback_reply_win(lease);
+        }
         // If ipc_reply failed and we stashed a transfer envelope, clean it up.
         // Use the endpoint captured before ipc_reply: ipc_reply revokes the reply
         // cap cnode slot on the fast path, so re-probing reply_cap_peek_endpoint
@@ -1323,6 +1337,14 @@ pub(super) fn handle_ipc_reply(
             mapped
         );
         return Err(mapped);
+    }
+    // Stage 200C2B: the caller copy/delivery SUCCEEDED — commit the reservation
+    // (deadline lease → Completed, terminal → Completed(Reply)) AFTER the frozen reply
+    // flow delivered + enqueued the caller. The commit is non-fallible bookkeeping by
+    // the exact owner; no irreversible completion preceded the caller copy.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    if let Some(lease) = reply_win_lease {
+        kernel.commit_reply_win_after_delivery(lease);
     }
     frame.set_ok(0, 0, 0);
     encode_transfer_cap_ret(frame, None)?;

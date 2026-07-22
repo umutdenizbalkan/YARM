@@ -258,10 +258,67 @@ impl TerminalCell {
             .store(encode(epoch, 0, PHASE_OPEN), Ordering::Release);
     }
 
+    /// Stage 200B — re-arm the cell for a REUSED reply-record slot (a fresh record
+    /// incarnation at an advanced generation). Succeeds only when:
+    ///
+    /// * the current phase is `Completed` or a canonical unused `Open` (never
+    ///   `Reserved` — no live [`TerminalOwner`] may exist);
+    /// * the cell's current identity generation equals `previous_record_generation`
+    ///   (the slot the caller believes it is recycling);
+    /// * the new record generation has strictly ADVANCED past the previous one.
+    ///
+    /// On success it bumps the epoch, installs the complete new identity, then
+    /// publishes `Open` with a single `Release` store LAST (the same publication
+    /// discipline as [`arm`]); returns the new terminal epoch. Requires `&mut self`
+    /// (exclusive), so the identity rewrite can NEVER race a concurrent claim — the
+    /// borrow checker (and, in the in-kernel store, the serializing KernelState
+    /// lock) is the Rust-data-race-safe mechanism guarding the ordinary identity
+    /// fields. On a precondition failure it returns `None` and mutates nothing.
+    ///
+    /// Reuse safety: because the epoch is bumped, a stale [`TerminalOwner`] from the
+    /// prior incarnation cannot `commit`/`release` the re-armed cell, and a stale
+    /// deadline token (whose identity carries the old generation/epoch) cannot
+    /// claim it. A `Completed` cell is never reopened WITHIN an epoch — reopening
+    /// only ever happens via this explicit generation-advancing re-arm.
+    pub fn try_rearm(
+        &mut self,
+        previous_record_generation: u64,
+        new_identity: TerminalIdentity,
+    ) -> Option<u64> {
+        let cur = self.state.load(Ordering::Relaxed);
+        // No live owner may exist: a Reserved cell cannot be reused.
+        if phase_of(cur) == PHASE_RESERVED {
+            return None;
+        }
+        // The slot the caller believes it is recycling must match the current one.
+        if self.identity.reply_record_generation != previous_record_generation {
+            return None;
+        }
+        // The reply-record generation must have strictly ADVANCED.
+        if new_identity.reply_record_generation <= previous_record_generation {
+            return None;
+        }
+        let mut epoch = epoch_of(cur).wrapping_add(1);
+        if epoch == 0 {
+            epoch = 1;
+        }
+        self.identity = new_identity;
+        // Release publication (identity written first, Open published LAST).
+        self.state
+            .store(encode(epoch, 0, PHASE_OPEN), Ordering::Release);
+        Some(epoch)
+    }
+
     /// The generation-bearing identity this cell is armed for.
     #[inline]
     pub fn identity(&self) -> &TerminalIdentity {
         &self.identity
+    }
+
+    /// The cell's current terminal epoch (the ABA nonce bumped on every arm/rearm).
+    #[inline]
+    pub fn current_epoch(&self) -> u64 {
+        epoch_of(self.state.load(Ordering::Acquire))
     }
 
     /// `true` iff no claimant currently owns the record (claimable).
@@ -560,5 +617,84 @@ mod tests {
             "wrong claimant tag fails closed"
         );
         assert!(c.commit_terminal(&reply), "the true owner still commits");
+    }
+
+    // ── Stage 200B: reply-slot terminal re-arm (slot reuse) ────────────────────
+
+    #[test]
+    fn rearm_reuse_advances_epoch_and_reopens_only_via_generation_advance() {
+        let mut c = armed(1);
+        let e1 = c.current_epoch();
+        let owner = c.try_claim_reply_terminal(&ident(1)).expect("claim gen 1");
+        assert!(c.commit_terminal(&owner), "gen 1 completes");
+        assert!(c.is_completed());
+        // Completed cannot reopen WITHIN the same epoch.
+        assert!(c.try_claim_timeout_terminal(&ident(1)).is_none());
+
+        // Reuse the slot for gen 2 (advanced). Epoch bumps; phase Open again.
+        let e2 = c
+            .try_rearm(1, ident(2))
+            .expect("reuse advances generation → rearm");
+        assert!(e2 > e1, "terminal epoch advanced");
+        assert!(c.is_open());
+        assert_eq!(c.identity().reply_record_generation, 2);
+    }
+
+    #[test]
+    fn rearm_rejects_non_advancing_generation_and_reserved_cell() {
+        let mut c = armed(5);
+        // Non-advancing generation is refused.
+        assert!(
+            c.try_rearm(5, ident(5)).is_none(),
+            "same generation refused"
+        );
+        assert!(
+            c.try_rearm(5, ident(4)).is_none(),
+            "older generation refused"
+        );
+        // Wrong previous generation is refused.
+        assert!(
+            c.try_rearm(4, ident(6)).is_none(),
+            "wrong previous gen refused"
+        );
+        // A Reserved cell (live owner) cannot be reused.
+        let _owner = c.try_claim_reply_terminal(&ident(5)).expect("reserve");
+        assert!(
+            c.try_rearm(5, ident(6)).is_none(),
+            "reserved cell not reusable"
+        );
+    }
+
+    #[test]
+    fn old_owner_rejected_after_reuse() {
+        let mut c = armed(1);
+        let stale = c
+            .try_claim_reply_terminal(&ident(1))
+            .expect("reserve gen 1");
+        // Release so the cell is not Reserved, then reuse for gen 2.
+        assert!(c.release_terminal_if_retryable(&stale));
+        let _e2 = c.try_rearm(1, ident(2)).expect("reuse");
+        // The old owner token (old epoch) cannot commit or release the new epoch.
+        assert!(
+            !c.commit_terminal(&stale),
+            "old owner cannot commit new epoch"
+        );
+        assert!(!c.release_terminal_if_retryable(&stale));
+    }
+
+    #[test]
+    fn old_identity_and_reused_tid_rejected_after_reuse() {
+        let mut c = armed(1);
+        let owner = c.try_claim_reply_terminal(&ident(1)).expect("claim");
+        assert!(c.commit_terminal(&owner));
+        let _e2 = c.try_rearm(1, ident(2)).expect("reuse");
+        // Old identity (gen 1) rejected against the reused slot.
+        assert!(c.try_claim_timeout_terminal(&ident(1)).is_none());
+        // A reused numeric caller TID with a different ASID is rejected.
+        let mut reused_tid = ident(2);
+        reused_tid.caller_asid = Asid(77);
+        assert!(c.try_claim_reply_terminal(&reused_tid).is_none());
+        // The exact new identity is accepted.
+        assert!(c.try_claim_reply_terminal(&ident(2)).is_some());
     }
 }

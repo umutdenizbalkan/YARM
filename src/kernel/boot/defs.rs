@@ -335,6 +335,14 @@ pub(crate) struct IpcSubsystem {
     /// later stages wire the live reserve/reply/timeout/exit paths onto it.
     pub(crate) reply_terminal_ownership:
         [crate::kernel::terminal_ownership::TerminalCell; MAX_REPLY_CAPS],
+    /// Stage 200B — the SINGLE bounded deadline-registration store
+    /// (`deadline_registration_stores = 1`). It tracks registration ownership for a
+    /// blocked reply receive and mints generation-bearing fire tokens, but it is NOT
+    /// a terminal-result authority: a fire owner must still win the co-located
+    /// `reply_terminal_ownership` cell's timeout claim. Dormant in production this
+    /// stage (no live timer arms it); later stages wire a real deadline queue onto it.
+    pub(crate) reply_deadline_tokens:
+        [crate::kernel::deadline_token::DeadlineTokenCell; MAX_DEADLINE_TOKENS],
     /// Stage 198E2A1: bounded generation-bearing cancellation requests for in-flight shared-region
     /// transactions (executor-owned cleanup protocol). Not a queue/CNode/ABI capacity — an internal
     /// signal table matched by (receiver TID **and** ASID).
