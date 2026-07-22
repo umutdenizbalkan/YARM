@@ -85266,3 +85266,205 @@ mod stage200c_terminal_reuse_sync_guard {
         assert!(TOKEN_SRC.contains("`&mut self` (exclusive"));
     }
 }
+
+/// Stage 200C2A — hosted/source guards for the x86_64 LIVE reply-timeout oracle.
+///
+/// These prove the WIRING is correct + correctly gated, without a live boot (the
+/// two live boots are proven by `scripts/qemu-ipc-reply-timeout-x86_64-smoke.sh`).
+#[cfg(test)]
+mod stage200c2a_guards {
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const IPC_SYSCALL_SRC: &str = include_str!("../syscall/ipc.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-ipc-reply-timeout-x86_64-smoke.sh");
+
+    // (1) feature AND a valid selector are both required.
+    #[test]
+    fn g01_feature_and_valid_selector_required() {
+        // The provisioning + boot wiring are feature-gated.
+        assert!(MOD_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]"));
+        assert!(X86_BOOT_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]"));
+        // The boot provisioning additionally requires the runtime selector armed.
+        assert!(X86_BOOT_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
+        // Feature-on without a VALID selector is inert: unrecognized values → None.
+        assert!(CMDLINE_SRC.contains("b\"timeout-wins\" | b\"1\""));
+        assert!(CMDLINE_SRC.contains("b\"reply-wins\" | b\"2\""));
+        assert!(CMDLINE_SRC.contains("_ => None,"));
+    }
+
+    // (2) the two selector modes are mutually exclusive (single mode discriminator).
+    #[test]
+    fn g02_selector_modes_mutually_exclusive() {
+        assert!(MOD_SRC.contains("IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS: u8 = 1;"));
+        assert!(MOD_SRC.contains("IPC_REPLY_TIMEOUT_MODE_REPLY_WINS: u8 = 2;"));
+        // A single per-boot mode atomic (never both) + a single slot-5 value (10|11).
+        assert!(
+            MOD_SRC.contains("X86_IPC_REPLY_TIMEOUT_ORACLE_MODE: core::sync::atomic::AtomicU8")
+        );
+        assert!(X86_BOOT_SRC.contains("X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR"));
+        // Mutually exclusive with every other slot-5 oracle (fires only when 5/13/14 = 0).
+        assert!(
+            X86_BOOT_SRC.contains("init_args[5] == 0")
+                && X86_BOOT_SRC.contains("init_args[13] == 0")
+                && X86_BOOT_SRC.contains("init_args[14] == 0")
+        );
+    }
+
+    // (3) registration occurs only on a committed reply recv-v2 block.
+    #[test]
+    fn g03_registration_only_on_committed_block() {
+        // The arm hook fires from AFTER the committed block publish (IPC_RECV_BLOCK_REGISTER).
+        assert!(IPC_STATE_SRC.contains("IPC_RECV_BLOCK_REGISTER"));
+        assert!(IPC_STATE_SRC.contains("self.maybe_arm_reply_timeout_oracle(plan.blocked_tid.0"));
+        // register_reply_receive_deadline validates the committed blocked state.
+        assert!(IPC_STATE_SRC.contains("fn register_reply_receive_deadline"));
+        assert!(IPC_STATE_SRC.contains("CallerNotBlocked"));
+        assert!(IPC_STATE_SRC.contains("WaiterMissing"));
+        assert!(IPC_STATE_SRC.contains("Blocked(WaitReason::EndpointReceive"));
+    }
+
+    // (4) the production scan calls the accepted token/terminal transaction (no dup body).
+    #[test]
+    fn g04_scan_calls_accepted_transaction() {
+        assert!(IPC_STATE_SRC.contains("fn process_ipc_timeout_deadlines"));
+        assert!(IPC_STATE_SRC.contains("self.run_due_reply_timeout_completions(now_tick)"));
+        assert!(
+            IPC_STATE_SRC.contains("self.run_reply_timeout_completion_locked(handle, now_tick)")
+        );
+        // The SharedKernel wrapper delegates to the SAME single body (no duplication).
+        assert!(
+            RUNTIME_SRC
+                .contains("self.with(|k| k.run_reply_timeout_completion_locked(handle, now_tick))")
+        );
+    }
+
+    // (5) ordinary (non-token) receive timeout remains unchanged.
+    #[test]
+    fn g05_ordinary_recv_timeout_unchanged() {
+        // Only token-bearing TCBs are diverted; the ordinary loop is otherwise untouched.
+        assert!(IPC_STATE_SRC.contains("if tcb.reply_timeout_token.is_some() {"));
+        // The ordinary due condition is preserved byte-for-byte.
+        assert!(
+            IPC_STATE_SRC.contains("now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline")
+        );
+    }
+
+    // (6) the timeout result is installed before the enqueue (ordering).
+    #[test]
+    fn g06_timeout_result_precedes_enqueue() {
+        let body = IPC_STATE_SRC
+            .split("fn run_reply_timeout_completion_locked")
+            .nth(1)
+            .expect("locked body");
+        let prep = body
+            .find("prepare_reply_timeout_result_for_caller")
+            .expect("prep");
+        let commit = body.find("commit_reply_terminal_slot").expect("commit");
+        let enqueue = body
+            .find("self.enqueue_task(caller.tid.0)")
+            .expect("enqueue");
+        assert!(
+            prep < enqueue && commit < enqueue,
+            "result + terminal precede enqueue"
+        );
+    }
+
+    // (7) reply disarms the EXACT token (slot + generation + epoch).
+    #[test]
+    fn g07_reply_disarms_exact_token() {
+        assert!(IPC_STATE_SRC.contains("fn maybe_win_reply_terminal_on_reply"));
+        assert!(IPC_STATE_SRC.contains("disarm_deadline_after_terminal_completion(&handle)"));
+        // Wired as the ONLY NR7 integration.
+        assert!(IPC_SYSCALL_SRC.contains("kernel.maybe_win_reply_terminal_on_reply(reply_cap)"));
+    }
+
+    // (8) a late scan cannot cancel a newer token (exact epoch/identity).
+    #[test]
+    fn g08_late_scan_cannot_cancel_newer_token() {
+        // The disarm is exact-identity+epoch (Stage 200B `disarm_after_terminal_completion`).
+        let dt = include_str!("../deadline_token.rs");
+        assert!(dt.contains("fn disarm_after_terminal_completion"));
+        assert!(dt.contains("self.identity != *expect || dl_epoch(w) != expect_epoch"));
+    }
+
+    // (9) a late reply after timeout is rejected through NORMAL authority checks.
+    #[test]
+    fn g09_late_reply_rejected_normally() {
+        // Timeout completion invalidates the reply record (→ Cancelled), so the frozen
+        // reply-cap resolve rejects a late NR7 — no oracle-specific shortcut.
+        assert!(IPC_STATE_SRC.contains("fn invalidate_reply_record_for_terminal"));
+        assert!(IPC_STATE_SRC.contains("ReplyRecordReservation::Cancelled"));
+    }
+
+    // (10) userspace cannot emit kernel or runner seal prefixes.
+    #[test]
+    fn g10_userspace_cannot_emit_kernel_or_runner_seals() {
+        // The init-server oracle emits ONLY its own X86_IPC_REPLY_*_DONE markers.
+        assert!(INIT_SRC.contains("X86_IPC_REPLY_TIMEOUT_DONE"));
+        assert!(INIT_SRC.contains("X86_IPC_REPLY_BEATS_TIMEOUT_DONE"));
+        // It never emits the KERNEL markers or the RUNNER seal.
+        assert!(!INIT_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_LIVE_SEAL"));
+        assert!(!INIT_SRC.contains("IPC_REPLY_TIMEOUT_OK arch=x86_64"));
+        assert!(!INIT_SRC.contains("IPC_REPLY_BEATS_TIMEOUT_OK arch=x86_64"));
+    }
+
+    // (11) the live marker literals live only in feature-gated kernel code.
+    #[test]
+    fn g11_live_literals_are_feature_gated() {
+        // Every kernel emit of a live literal is inside a feature-gated fn/block.
+        for lit in [
+            "IPC_REPLY_TIMEOUT_ARMED",
+            "IPC_REPLY_TIMEOUT_OK arch=x86_64",
+            "IPC_REPLY_BEATS_TIMEOUT_OK",
+            "IPC_REPLY_TIMEOUT_LOCK_STATUS",
+            "IPC_REPLY_TIMEOUT_LATE_SCAN",
+        ] {
+            assert!(
+                IPC_STATE_SRC.contains(lit),
+                "literal {lit} present (feature build)"
+            );
+        }
+        // The emitting fns are all `#[cfg(feature = "x86-ipc-reply-timeout-oracle")]`.
+        assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn maybe_arm_reply_timeout_oracle"));
+        assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn run_due_reply_timeout_completions"));
+        assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn maybe_win_reply_terminal_on_reply"));
+    }
+
+    // (12) no global-lock retirement marker exists for the reply-timeout class.
+    #[test]
+    fn g12_no_global_lock_retirement_for_class() {
+        assert!(
+            !IPC_STATE_SRC
+                .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout")
+        );
+        assert!(!INIT_SRC.contains("class=IpcReplyTimeout"));
+        // The runner honestly reports the broad-lock boundary and FORBIDS (never
+        // emits) a retirement seal — the only mention is in its forbidden-marker list.
+        assert!(SMOKE_SRC.contains("scan_broad_lock=1"));
+        assert!(SMOKE_SRC.contains("die \"forbidden marker present"));
+        assert!(!SMOKE_SRC.contains("echo \"GLOBAL_LOCK_RETIRE_CLASS_DONE"));
+        assert!(
+            !SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_LIVE_SEAL arch=x86_64 lock_retired")
+        );
+        // The lock-status marker is honest.
+        assert!(IPC_STATE_SRC.contains("IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=1 completion_transaction_narrow=1 result=ok"));
+    }
+
+    // (13) the smoke runner requires BOTH fresh boots + emits the live seal only then.
+    #[test]
+    fn g13_runner_requires_two_fresh_boots() {
+        assert!(SMOKE_SRC.contains("yarm.x86_64_ipc_reply_timeout_oracle=${mode}"));
+        assert!(SMOKE_SRC.contains("boot_mode timeout-wins"));
+        assert!(SMOKE_SRC.contains("boot_mode reply-wins"));
+        assert!(SMOKE_SRC.contains("recheck_sha_clean"));
+        assert!(SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_LIVE_SEAL"));
+        // The seal is gated behind BOTH scenarios passing.
+        assert!(SMOKE_SRC.contains("\"$TW_OK\" != \"1\" || \"$RW_OK\" != \"1\""));
+    }
+}

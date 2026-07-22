@@ -400,6 +400,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_x86_ipccall_direct_oracle_enabled(enabled);
         crate::yarm_log!("YARM_X86_64_IPCCALL_DIRECT_ORACLE_SET enabled={}", enabled);
     }
+    if let Some(mode) = parsed.x86_64_ipc_reply_timeout_oracle {
+        // Stage 200C2A: arm the reply-timeout oracle mode (1=timeout-wins, 2=reply-wins). The slot-5
+        // provisioning + registration/scan wiring are additionally feature- and arch-gated.
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(mode);
+        crate::yarm_log!("YARM_X86_64_IPC_REPLY_TIMEOUT_ORACLE_SET mode={}", mode);
+    }
     if let Some(enabled) = parsed.x86_64_ipccall_direct_smp_oracle {
         // Stage 199A2D2A: default-off x86_64 SMP=2 cross-CPU DIRECT IpcCall (request-only) oracle.
         // Mutually exclusive with the SMP=1 functional selector (the setter refuses if that is on);
@@ -773,6 +779,12 @@ pub struct YarmBootOptions<'a> {
     /// direct classes; queued calls, timeouts, notifications, server-death wake, and all non-x86
     /// architectures stay disabled.
     pub x86_64_ipccall_direct_oracle: Option<bool>,
+    /// Stage 200C2A: `yarm.x86_64_ipc_reply_timeout_oracle=timeout-wins|reply-wins` DEFAULT-OFF knob.
+    /// Provisions init startup slot 5 (=10) so init runs the reply-receive TIMEOUT live oracle, and
+    /// arms the production reply-timeout registration + scan wiring for the run. `Some(1)` =
+    /// timeout-wins, `Some(2)` = reply-wins; `None` = off. Mutually exclusive with every other slot-5
+    /// oracle. Requires `target_arch = x86_64` + the `x86-ipc-reply-timeout-oracle` feature.
+    pub x86_64_ipc_reply_timeout_oracle: Option<u8>,
     /// Stage 199A2D2A: `yarm.x86_64_ipccall_direct_smp_oracle=1` DEFAULT-OFF knob. Arms the x86_64
     /// SMP=2 cross-CPU DIRECT IpcCall (request-only) oracle: one userspace IPC server blocked in
     /// recv-v2 on CPU 1, one NR6 direct request from a CPU 0 client, remote wake + resume on CPU 1.
@@ -1005,6 +1017,19 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.x86_64_ipccall_direct_oracle" {
             options.x86_64_ipccall_direct_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.x86_64_ipc_reply_timeout_oracle" {
+            // Stage 200C2A: two mutually-exclusive string modes. An unrecognized value leaves the
+            // oracle inert (feature-on without a VALID selector is a no-op).
+            options.x86_64_ipc_reply_timeout_oracle = match value {
+                b"timeout-wins" | b"1" => {
+                    Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS)
+                }
+                b"reply-wins" | b"2" => {
+                    Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS)
+                }
+                _ => None,
+            };
         }
         if key == b"yarm.x86_64_ipccall_direct_smp_oracle" {
             options.x86_64_ipccall_direct_smp_oracle = parse_bool_knob(value);

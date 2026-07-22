@@ -564,8 +564,7 @@ impl KernelState {
         })
     }
 
-    /// The current terminal epoch of reply-record slot `index` (for assertions).
-    #[cfg(test)]
+    /// The current terminal epoch of reply-record slot `index`.
     pub(crate) fn reply_terminal_epoch(&self, index: usize) -> Option<u64> {
         self.with_ipc_state(|ipc| {
             ipc.reply_terminal_ownership
@@ -990,6 +989,424 @@ impl KernelState {
             }
             _ => false,
         })
+    }
+
+    /// Stage 200C2A — oracle-gated: at the committed reply-receive block point, arm
+    /// the terminal cell for the caller's reply record and register a reply-timeout
+    /// deadline referencing the exact token. Fires ONLY for the oracle's confined
+    /// reply endpoint with a finite deadline; every ordinary receive is untouched.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    pub(crate) fn maybe_arm_reply_timeout_oracle(
+        &mut self,
+        caller_tid: u64,
+        reply_eidx: usize,
+        deadline: Option<u64>,
+    ) {
+        let mode = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        if mode == 0 || !crate::kernel::boot::ipc_reply_timeout_oracle_reply_endpoint_is(reply_eidx)
+        {
+            return;
+        }
+        // timeout-wins arrives via recv-timeout (a finite user deadline is supplied);
+        // reply-wins arrives via infinite recv-v2 (deadline is `None`), so the kernel
+        // injects a fixed later deadline — the prompt reply wins well before it, and a
+        // subsequent scan passes it harmlessly.
+        let deadline_tick = match mode {
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS => match deadline {
+                Some(d) => d,
+                None => return,
+            },
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS => {
+                let d = self.scheduler_tick_now().wrapping_add(8);
+                // Record it so the scan can prove it later ran PAST this deadline
+                // harmlessly (the reply disarms the token before it is reached).
+                crate::kernel::boot::set_ipc_reply_timeout_rw_deadline(d);
+                d
+            }
+            _ => return,
+        };
+        let Some(caller_asid) = self.task_asid(caller_tid) else {
+            return;
+        };
+        let caller = ReceiverWaiterIdentity::new(ThreadId(caller_tid), caller_asid);
+        let Some((record_index, record_generation)) =
+            self.find_reply_record_for_caller_endpoint(caller, reply_eidx)
+        else {
+            crate::yarm_log!(
+                "IPC_REPLY_TIMEOUT_ARM_SKIP reason=no_record caller_tid={}",
+                caller_tid
+            );
+            return;
+        };
+        let token_gen = 1u64;
+        let brg = self.bump_blocked_recv_generation(caller_tid).unwrap_or(1);
+        let Some(identity) =
+            self.reply_terminal_identity(record_index, record_generation, brg, Some(token_gen))
+        else {
+            return;
+        };
+        self.arm_reply_terminal(record_index, identity);
+        let epoch = self.reply_terminal_epoch(record_index).unwrap_or(0);
+        match self.register_reply_receive_deadline(
+            record_index,
+            record_generation,
+            brg,
+            token_gen,
+            deadline_tick,
+        ) {
+            Ok(handle) => {
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_ARMED arch=x86_64 caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
+                    caller_tid,
+                    caller_asid.0,
+                    record_index,
+                    record_generation,
+                    epoch,
+                    handle.token_index(),
+                    handle.token_generation(),
+                    deadline_tick
+                );
+            }
+            Err(e) => {
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_ARM_FAIL caller_tid={} err={:?}",
+                    caller_tid,
+                    e
+                );
+            }
+        }
+    }
+
+    /// Stage 200C2A — oracle-gated NR7 reply-win hook. When the server issues a
+    /// genuine NR7 through the oracle's reply cap and reply STILL owns the terminal
+    /// (timeout has not fired), claim + commit the Reply terminal and disarm the
+    /// EXACT deadline token BEFORE any user copy / wake — so a stale queued fire can
+    /// no longer claim. A strict no-op off the oracle, off the confined reply
+    /// endpoint, or when timeout already won (the normal reply-authority check then
+    /// rejects the late reply). This is the ONLY NR7 integration.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    pub(crate) fn maybe_win_reply_terminal_on_reply(&mut self, reply_cap: CapId) {
+        use crate::kernel::terminal_ownership::TerminalClaimant;
+        if !crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
+            return;
+        }
+        let Some((idx, generation)) = self.reply_cap_record_index_generation(reply_cap) else {
+            return;
+        };
+        let reply_eidx = self.with_ipc_state(|ipc| match ipc.reply_caps.get(idx) {
+            Some(Some(record)) => match record.reply_endpoint {
+                CapObject::Endpoint { index, .. } => Some(index),
+                _ => None,
+            },
+            _ => None,
+        });
+        if reply_eidx.map(crate::kernel::boot::ipc_reply_timeout_oracle_reply_endpoint_is)
+            != Some(true)
+        {
+            return;
+        }
+        let Some((caller_tid, caller_asid)) = self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(idx)
+                .and_then(|s| s.as_ref())
+                .map(|r| (r.caller_tid.0, r.caller_asid))
+        }) else {
+            return;
+        };
+        let brg = self
+            .blocked_recv_generation_for(caller_tid, caller_asid)
+            .unwrap_or(1);
+        let Some(identity) = self.reply_terminal_identity(idx, generation, brg, Some(1)) else {
+            return;
+        };
+        if let Some(owner) =
+            self.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity)
+        {
+            // Exact deadline-disarm on the reply win (no queue lock held over a copy —
+            // this runs before the payload copy; cannot reopen terminal authority).
+            if let Some(handle) = self.reply_timeout_token_for_caller(caller_tid, caller_asid) {
+                let _ = self.disarm_deadline_after_terminal_completion(&handle);
+            }
+            let _ = self.commit_reply_terminal_slot(idx, &owner);
+            crate::yarm_log!(
+                "IPC_REPLY_BEATS_TIMEOUT_OK arch=x86_64 terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok"
+            );
+        }
+    }
+
+    /// Resolve a reply cap in the current task's CNode to its `(record index,
+    /// generation)`. `None` if the cap is absent or not a `Reply` object.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    pub(crate) fn reply_cap_record_index_generation(
+        &self,
+        reply_cap: CapId,
+    ) -> Option<(usize, u64)> {
+        let cnode = self.current_task_cnode()?;
+        let cap = self.capability_for_cnode_local(cnode, reply_cap)?;
+        match cap.object {
+            CapObject::Reply { index, generation } => Some((index, generation)),
+            _ => None,
+        }
+    }
+
+    /// Find the present, `Available` reply record whose caller `{tid, asid}` and
+    /// reply endpoint slot match — the record a blocked reply receive registers a
+    /// deadline against. `None` when no unique match exists.
+    pub(crate) fn find_reply_record_for_caller_endpoint(
+        &self,
+        caller: ReceiverWaiterIdentity,
+        reply_eidx: usize,
+    ) -> Option<(usize, u64)> {
+        self.with_ipc_state(|ipc| {
+            for idx in 0..super::MAX_REPLY_CAPS {
+                let Some(Some(record)) = ipc.reply_caps.get(idx) else {
+                    continue;
+                };
+                if record.reservation != super::ReplyRecordReservation::Available {
+                    continue;
+                }
+                if record.caller_tid != caller.tid || record.caller_asid != caller.asid {
+                    continue;
+                }
+                if let CapObject::Endpoint { index, .. } = record.reply_endpoint {
+                    if index == reply_eidx {
+                        return Some((idx, ipc.reply_cap_generations[idx]));
+                    }
+                }
+            }
+            None
+        })
+    }
+
+    /// `true` iff the exact `{tid, asid}` task is still `Blocked(EndpointReceive)`.
+    pub(crate) fn is_blocked_receiver_exact(&self, tid: u64, asid: Asid) -> bool {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        self.with_tcbs(|tcbs| {
+            tcbs.iter().flatten().any(|t| {
+                t.tid.0 == tid
+                    && t.asid == Some(asid)
+                    && matches!(
+                        t.status,
+                        TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                    )
+            })
+        })
+    }
+
+    /// Claim (remove) the EXACT endpoint waiter `{eidx, egen, receiver}`. `true` iff
+    /// the slot held the complete identity at the generation and was taken.
+    pub(crate) fn claim_endpoint_waiter_exact(
+        &mut self,
+        eidx: usize,
+        egen: u64,
+        receiver: ReceiverWaiterIdentity,
+    ) -> bool {
+        self.with_ipc_state_mut(|ipc| {
+            if eidx < ipc.endpoint_waiters.len()
+                && ipc.endpoint_generations[eidx] == egen
+                && ipc.endpoint_waiter_identity(eidx) == Some(receiver)
+            {
+                ipc.take_endpoint_waiter(eidx);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    /// Commit a still-blocked exact receiver to `Runnable`, returning its captured
+    /// CPU affinity. `None` if the task is no longer the exact blocked receiver.
+    ///
+    /// This is a TIMEOUT wake, NOT a reply delivery: it does exactly what the ordinary
+    /// receive-timeout scan does — set `Runnable` only — and MUST NOT clear the
+    /// blocked-recv return registers (the timeout resume re-enters the recv handler and
+    /// returns the canonical `TimedOut` from the `ipc_timeout_fired` flag set earlier).
+    pub(crate) fn commit_blocked_receiver_runnable(
+        &mut self,
+        tid: u64,
+        asid: Asid,
+    ) -> Option<Option<crate::kernel::scheduler::CpuId>> {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let timed_out = crate::kernel::syscall::SyscallError::TimedOut as u64;
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| {
+                t.tid.0 == tid
+                    && t.asid == Some(asid)
+                    && matches!(
+                        t.status,
+                        TaskStatus::Blocked(WaitReason::EndpointReceive(_))
+                    )
+            })?;
+            // Install the canonical recv-v2 TIMEOUT return into the saved frame: the
+            // blocked recv-v2 resumes via saved-frame return, so the error register must
+            // carry `SyscallError::TimedOut` (the userspace wrapper maps it to Ok(None)).
+            tcb.user_context.arg0 = 0;
+            tcb.user_context.user_gprs[0] = 0; // ret0
+            #[cfg(target_arch = "x86_64")]
+            {
+                tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error
+                tcb.user_context.user_gprs[3] = 0; // RDX
+                tcb.user_context.user_gprs[7] = 0; // R8
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                tcb.user_context.user_gprs[0] = timed_out as usize;
+            }
+            let _ = timed_out;
+            tcb.status = TaskStatus::Runnable;
+            Some(tcb.cpu_affinity)
+        })
+    }
+
+    /// Stage 200C1/200C2A — the SINGLE reply-timeout completion body, expressed as
+    /// `&mut KernelState` operations so it can run BOTH from the hosted `SharedKernel`
+    /// wrapper (`self.with(...)`) and directly from the broad-lock production timer
+    /// scan — with NO duplicated body. Short bounded domain claims (each helper locks
+    /// only its own domain), the enqueue is LAST and non-fallible, no user copy.
+    pub(crate) fn run_reply_timeout_completion_locked(
+        &mut self,
+        handle: &crate::kernel::deadline_token::DeadlineTokenHandle,
+        _now_tick: u64,
+    ) -> crate::runtime::ReplyTimeoutOutcome {
+        use crate::kernel::terminal_ownership::TerminalClaimant;
+        use crate::runtime::ReplyTimeoutOutcome;
+        let identity = handle.identity().terminal_identity;
+        let record_index = identity.reply_record_index;
+        let record_generation = identity.reply_record_generation;
+        let token_index = handle.token_index();
+
+        // (1) Claim the exact due token. Stale/duplicate fires fail HERE.
+        let Some(fire_owner) = self.claim_deadline_fire_exact(handle) else {
+            return ReplyTimeoutOutcome::StaleToken;
+        };
+        // (2) Claim Timeout terminal ownership. Reply/peer/exit/endpoint may have won.
+        let Some(terminal_owner) =
+            self.try_claim_reply_terminal_slot(record_index, TerminalClaimant::Timeout, &identity)
+        else {
+            self.disarm_deadline_fire(token_index, &fire_owner);
+            return ReplyTimeoutOutcome::LostToTerminal;
+        };
+        // (3–5) Revalidate exact caller / endpoint gen / blocked-recv gen; claim waiter.
+        let caller = ReceiverWaiterIdentity::new(identity.caller_tid, identity.caller_asid);
+        let caller_ok = self.is_blocked_receiver_exact(caller.tid.0, caller.asid);
+        let endpoint_ok = self.endpoint_generation_read(identity.reply_endpoint_index)
+            == Some(identity.reply_endpoint_generation);
+        let brg_ok = self.blocked_recv_generation_for(caller.tid.0, caller.asid)
+            == Some(identity.blocked_recv_generation);
+        let waiter_ok = caller_ok
+            && endpoint_ok
+            && brg_ok
+            && self.claim_endpoint_waiter_exact(
+                identity.reply_endpoint_index,
+                identity.reply_endpoint_generation,
+                caller,
+            );
+        if !waiter_ok {
+            // Timeout owns the terminal but the caller/endpoint/waiter changed:
+            // cleanup (invalidate + Complete terminal + token), wake NOBODY.
+            let _ = self.invalidate_reply_record_for_terminal(record_index, record_generation);
+            let _ = self.commit_reply_terminal_slot(record_index, &terminal_owner);
+            let _ = self.complete_deadline_fire(token_index, &fire_owner);
+            return ReplyTimeoutOutcome::CleanupNoWake;
+        }
+        // (6) Prepare the canonical recv-v2 TIMEOUT result on the still-blocked caller.
+        let _ = self.prepare_reply_timeout_result_for_caller(caller.tid.0, caller.asid);
+        // (7) Invalidate reply authority — late reply aliases become non-invokable.
+        let _ = self.invalidate_reply_record_for_terminal(record_index, record_generation);
+        // (8) Complete the TerminalCell as Timeout. (9) Complete the token.
+        let _ = self.commit_reply_terminal_slot(record_index, &terminal_owner);
+        let _ = self.complete_deadline_fire(token_index, &fire_owner);
+        // (10–11) Commit the caller → Runnable.
+        let Some(affinity) = self.commit_blocked_receiver_runnable(caller.tid.0, caller.asid)
+        else {
+            return ReplyTimeoutOutcome::CleanupNoWake;
+        };
+        // (12) Scheduler enqueue LAST — the sole externally visible action.
+        let _ = self.enqueue_task(caller.tid.0);
+        let _ = affinity;
+        ReplyTimeoutOutcome::Woken
+    }
+
+    /// Clear a caller's reply-timeout registration reference from its TCB (deadline
+    /// + token), so a resolved/late registration is not re-processed by the scan.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    pub(crate) fn clear_reply_timeout_registration(&mut self, tid: u64) {
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                tcb.ipc_timeout_deadline = None;
+                tcb.reply_timeout_token = None;
+            }
+        });
+    }
+
+    /// Stage 200C2A — the production scan branch for token-bearing REPLY-receive
+    /// deadlines (distinct from ordinary receive deadlines). For each due reply
+    /// registration it runs the SHARED Stage 200C1 completion body (no duplication).
+    /// A `Woken` completion is a timeout win; any other outcome is a harmless late
+    /// expiry (the token was disarmed by a reply / the caller already resumed) that
+    /// wakes nobody — proving the scan genuinely ran PAST the deadline. Uses a
+    /// correct `now >= deadline` gate (the ordinary deadline path is unchanged).
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    pub(crate) fn run_due_reply_timeout_completions(&mut self, now_tick: u64) {
+        use crate::runtime::ReplyTimeoutOutcome;
+        let mut pending: [Option<(u64, crate::kernel::deadline_token::DeadlineTokenHandle)>;
+            super::MAX_DEADLINE_TOKENS] = [None; super::MAX_DEADLINE_TOKENS];
+        let mut n = 0usize;
+        self.with_tcbs(|tcbs| {
+            for tcb in tcbs.iter().flatten() {
+                if n >= super::MAX_DEADLINE_TOKENS {
+                    break;
+                }
+                let (Some(deadline), Some(handle)) =
+                    (tcb.ipc_timeout_deadline, tcb.reply_timeout_token)
+                else {
+                    continue;
+                };
+                if now_tick >= deadline {
+                    pending[n] = Some((tcb.tid.0, handle));
+                    n += 1;
+                }
+            }
+        });
+        for (tid, handle) in pending.iter().flatten() {
+            match self.run_reply_timeout_completion_locked(handle, now_tick) {
+                ReplyTimeoutOutcome::Woken => {
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_OK arch=x86_64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok"
+                    );
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=1 completion_transaction_narrow=1 result=ok"
+                    );
+                }
+                other => {
+                    // Harmless late expiry: the reply already disarmed the token / the
+                    // caller already resumed. No timeout claim, no wake.
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_LATE_SCAN arch=x86_64 outcome={:?} late_timeout_claims=0 result=ok",
+                        other
+                    );
+                    self.clear_reply_timeout_registration(*tid);
+                }
+            }
+        }
+        // Reply-wins genuine-late-expiry proof: the reply disarmed the token and the
+        // caller resumed (clearing its TCB deadline), so the loop above finds nothing.
+        // Emit a ONE-SHOT late-scan marker the first time the scan runs PAST the
+        // recorded reply-wins deadline — positive evidence the scan executed late and
+        // made no timeout claim (the terminal was already Completed as Reply).
+        if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS
+        {
+            let rw = crate::kernel::boot::ipc_reply_timeout_rw_deadline();
+            if rw != 0
+                && now_tick >= rw
+                && crate::kernel::boot::ipc_reply_timeout_rw_late_scan_once()
+            {
+                crate::yarm_log!(
+                    "IPC_REPLY_TIMEOUT_LATE_SCAN arch=x86_64 outcome=reply_won late_timeout_claims=0 result=ok"
+                );
+            }
+        }
     }
 
     /// Fill EVERY deadline-registration slot with a distinct synthetic
@@ -1576,6 +1993,12 @@ impl KernelState {
             plan.endpoint_idx,
             plan.blocked_tid.0
         );
+        // Stage 200C2A: the committed reply-receive block is now published (Blocked
+        // TCB + deadline + waiter). Oracle-gated, this arms the terminal + registers
+        // the reply-timeout token; a strict no-op off the oracle / off the confined
+        // reply endpoint / with no finite deadline, so ordinary receives are unchanged.
+        #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+        self.maybe_arm_reply_timeout_oracle(plan.blocked_tid.0, plan.endpoint_idx, deadline);
         if crate::kernel::boot::d2_recv_genuine_enabled() {
             // Stage 168 (D2-GENUINE-RECV): ipc publish done; enter dispatch.
             crate::yarm_log!("D2_RECV_GENUINE_PHASE_IPC_LOCK tid={}", plan.blocked_tid.0);
@@ -1792,6 +2215,14 @@ impl KernelState {
         // nested, so no lower-rank lock is ever taken while a higher-rank lock is
         // held.
         const TIMEOUT_SCAN_CHUNK: usize = 32;
+        // Stage 200C2A: FIRST, complete any DUE token-bearing reply-receive deadlines
+        // through the shared Stage 200C1 transaction (distinct from ordinary receive
+        // deadlines, which the loop below handles byte-for-byte unchanged). Oracle-
+        // gated + confined to token-bearing entries; a strict no-op otherwise.
+        #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+        if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
+            self.run_due_reply_timeout_completions(now_tick);
+        }
         let proof = crate::kernel::boot::sched_timeout_enabled();
         let mut total = 0usize;
         let mut scan_announced = false;
@@ -1811,6 +2242,14 @@ impl KernelState {
                     let Some(deadline) = tcb.ipc_timeout_deadline else {
                         continue;
                     };
+                    // Stage 200C2A: a token-bearing REPLY-receive deadline is completed
+                    // by the reply-timeout pre-pass above (the shared terminal
+                    // transaction), never by this ordinary loop — so an ordinary and a
+                    // reply-receive deadline are cleanly distinguished.
+                    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+                    if tcb.reply_timeout_token.is_some() {
+                        continue;
+                    }
                     let is_send = match tcb.status {
                         TaskStatus::Blocked(WaitReason::EndpointReceive(_)) => false,
                         TaskStatus::Blocked(WaitReason::EndpointSend(_)) => true,

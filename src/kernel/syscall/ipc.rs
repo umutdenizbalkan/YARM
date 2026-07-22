@@ -1215,6 +1215,13 @@ pub(super) fn handle_ipc_reply(
         return Err(SyscallError::InvalidArgs);
     }
 
+    // Stage 200C2A: oracle-gated NR7 reply-win deadline-disarm hook. Runs BEFORE the
+    // user payload copy (holds no deadline-queue lock over any copy) and is a strict
+    // no-op off the oracle / off the confined reply endpoint / when timeout already
+    // won. This is the ONLY NR7 integration; the frozen reply flow below is unchanged.
+    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    kernel.maybe_win_reply_terminal_on_reply(reply_cap);
+
     // ── Build raw payload bytes ────────────────────────────────────────────────
     let payload_bytes: [u8; Message::MAX_PAYLOAD] = if current_task_has_user_asid(kernel)? {
         let payload = match kernel.copy_from_current_user(user_ptr, len) {

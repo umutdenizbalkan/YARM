@@ -3293,96 +3293,17 @@ impl SharedKernel {
     /// ownership, and only if BOTH succeed does it install the canonical timeout
     /// result and wake the caller — with the terminal outcome `Completed(Timeout)`
     /// and the reply aliases non-invokable BEFORE the enqueue.
+    ///
+    /// Stage 200C2A: this is a thin wrapper that runs the SINGLE completion body
+    /// (`KernelState::run_reply_timeout_completion_locked`) under the broad lock — so
+    /// the hosted proof and the production timer scan share ONE body (no duplication).
+    /// The scan calls the `_locked` body directly (it already holds the broad lock).
     pub(crate) fn run_reply_timeout_completion(
         &self,
         handle: &crate::kernel::deadline_token::DeadlineTokenHandle,
         now_tick: u64,
     ) -> ReplyTimeoutOutcome {
-        use crate::kernel::boot::ReceiverWaiterIdentity;
-        use crate::kernel::terminal_ownership::TerminalClaimant;
-        let _ = now_tick; // the queue entry's due-ness is the caller's precondition
-        let identity = handle.identity().terminal_identity;
-        let record_index = identity.reply_record_index;
-        let record_generation = identity.reply_record_generation;
-        let token_index = handle.token_index();
-
-        // (1) Claim the exact due token (Armed → ClaimedForFire). Stale/duplicate
-        // fires fail HERE, before any waiter mutation or wake.
-        let Some(fire_owner) = self.with(|s| s.claim_deadline_fire_exact(handle)) else {
-            return ReplyTimeoutOutcome::StaleToken;
-        };
-
-        // (2) Claim Timeout terminal ownership. If reply / peer-death / caller-exit /
-        // endpoint-gone already won, the fire LOSES: disarm it, mutate no result,
-        // wake nobody.
-        let Some(terminal_owner) = self.with(|s| {
-            s.try_claim_reply_terminal_slot(record_index, TerminalClaimant::Timeout, &identity)
-        }) else {
-            self.with(|s| s.disarm_deadline_fire(token_index, &fire_owner));
-            return ReplyTimeoutOutcome::LostToTerminal;
-        };
-
-        // (3–5) Revalidate the exact caller, reply endpoint generation and
-        // blocked-recv generation, then claim the exact endpoint waiter.
-        let caller = ReceiverWaiterIdentity::new(identity.caller_tid, identity.caller_asid);
-        let caller_ok = self.sr_prevalidate_blocked_receiver_split(caller.tid.0, caller.asid);
-        let endpoint_ok = self.with(|s| s.endpoint_generation_read(identity.reply_endpoint_index))
-            == Some(identity.reply_endpoint_generation);
-        let brg_ok = self.with(|s| s.blocked_recv_generation_for(caller.tid.0, caller.asid))
-            == Some(identity.blocked_recv_generation);
-        let waiter = if caller_ok && endpoint_ok && brg_ok {
-            self.sr_claim_endpoint_waiter_split(
-                identity.reply_endpoint_index,
-                identity.reply_endpoint_generation,
-                caller,
-            )
-        } else {
-            None
-        };
-        if waiter.is_none() {
-            // The exact caller vanished / the endpoint or waiter changed AFTER the
-            // Timeout terminal claim: complete cleanup (invalidate reply authority,
-            // Complete the terminal + token) but wake NOBODY and mutate no
-            // replacement waiter.
-            self.with(|s| {
-                let _ = s.invalidate_reply_record_for_terminal(record_index, record_generation);
-                let _ = s.commit_reply_terminal_slot(record_index, &terminal_owner);
-                let _ = s.complete_deadline_fire(token_index, &fire_owner);
-            });
-            return ReplyTimeoutOutcome::CleanupNoWake;
-        }
-
-        // (6) Prepare the canonical recv-v2 TIMEOUT result on the still-blocked caller.
-        let prepared =
-            self.with(|s| s.prepare_reply_timeout_result_for_caller(caller.tid.0, caller.asid));
-        debug_assert!(
-            prepared,
-            "waiter was claimed ⇒ caller is still exact-blocked"
-        );
-
-        // (7) Invalidate reply authority — late reply aliases become non-invokable.
-        // (8) Complete the TerminalCell as Timeout (one-shot).
-        // (9) Mark the deadline token Completed.
-        self.with(|s| {
-            let _ = s.invalidate_reply_record_for_terminal(record_index, record_generation);
-            let committed = s.commit_reply_terminal_slot(record_index, &terminal_owner);
-            debug_assert!(
-                committed,
-                "terminal owner commits Reserved(Timeout) → Completed"
-            );
-            let _ = s.complete_deadline_fire(token_index, &fire_owner);
-        });
-
-        // (10–11) Commit the caller blocked-state completion → Runnable. If the caller
-        // vanished in the tiny window after the waiter claim, cleanup with no enqueue.
-        let affinity = match self.sr_commit_blocked_receiver_split(caller.tid.0, caller.asid) {
-            ReceiverCommit::Committed(a) => a,
-            _ => return ReplyTimeoutOutcome::CleanupNoWake,
-        };
-
-        // (12) Scheduler enqueue LAST — the sole externally visible action, non-fallible.
-        self.sr_enqueue_committed_receiver_split(caller.tid.0, affinity);
-        ReplyTimeoutOutcome::Woken
+        self.with(|k| k.run_reply_timeout_completion_locked(handle, now_tick))
     }
 
     /// Stage 200C1 — the NR7 reply-win deadline-disarm hook. When reply obtains

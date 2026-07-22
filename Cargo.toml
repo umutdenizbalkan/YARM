@@ -79,6 +79,16 @@ riscv-ipccall-direct-oracle = ["ipccall-direct-oracle"]
 # direct-transaction logic + class literals compile.
 x86-ipccall-direct-smp-oracle = ["ipccall-direct-oracle"]
 
+# Stage 200C2A: default-off x86_64 LIVE reply-receive TIMEOUT functional oracle. COMPILES the
+# Stage 200C live reply-timeout marker paths (registration hook at the recv-v2 reply block, the
+# token-bearing branch in `process_ipc_timeout_deadlines`, and the NR7 exact deadline-disarm hook).
+# Activation additionally requires `target_arch = x86_64` and the runtime selector
+# `yarm.x86_64_ipc_reply_timeout_oracle=timeout-wins|reply-wins`. Feature-OFF artifacts contain none
+# of the Stage 200C live marker literals. Wires the accepted Stage 200C1 transaction into the real
+# production deadline registration + scan; adds NO server-death/notification/multi-pair/second-queue
+# support and no non-x86 live cell. This is a live FUNCTIONAL oracle, NOT a global-lock retirement.
+x86-ipc-reply-timeout-oracle = []
+
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }
 yarm-kernel = { path = "crates/yarm-kernel" }

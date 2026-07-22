@@ -3497,6 +3497,134 @@ pub fn ipccall_direct_oracle_reply_endpoint_is(eidx: usize) -> bool {
     IPCCALL_DIRECT_ORACLE_REP_EIDX.load(core::sync::atomic::Ordering::Acquire) == eidx
 }
 
+// ─── Stage 200C2A: x86_64 LIVE reply-receive TIMEOUT functional oracle ─────────────────────
+//
+// Wires the accepted Stage 200C1 reply-timeout transaction into the REAL production recv-v2
+// deadline registration + `process_ipc_timeout_deadlines` scan. Two runtime modes prove the two
+// live outcomes (timeout wins before NR7; NR7 reply wins before timeout). The activation state is a
+// per-boot mode (`0` off, `1` timeout-wins, `2` reply-wins), mutually exclusive with every existing
+// slot-5 oracle, plus the oracle's confined reply endpoint index (the ONLY recv-v2 timeout that
+// registers a reply-terminal deadline — every ordinary receive stays on its unchanged path).
+
+/// Slot-5 selector for the x86_64 reply-timeout oracle. Next free value after the direct/SMP
+/// oracles (3/9), so it is mutually exclusive with every other slot-5 oracle.
+pub const X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 10;
+
+/// Oracle mode discriminator (also written to init startup slot 15 for the userspace scenario):
+/// `1` = timeout-wins, `2` = reply-wins.
+pub const IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS: u8 = 1;
+pub const IPC_REPLY_TIMEOUT_MODE_REPLY_WINS: u8 = 2;
+
+static X86_IPC_REPLY_TIMEOUT_ORACLE_MODE: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+static IPC_REPLY_TIMEOUT_ORACLE_REP_EIDX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Arm the reply-timeout oracle mode from the parsed selector (`0` disarms).
+pub(crate) fn set_x86_ipc_reply_timeout_oracle_mode(mode: u8) {
+    X86_IPC_REPLY_TIMEOUT_ORACLE_MODE.store(mode, core::sync::atomic::Ordering::Release);
+}
+/// The armed oracle mode (`0` when off).
+pub fn x86_ipc_reply_timeout_oracle_mode() -> u8 {
+    X86_IPC_REPLY_TIMEOUT_ORACLE_MODE.load(core::sync::atomic::Ordering::Acquire)
+}
+/// True iff the reply-timeout oracle is armed (either mode).
+pub fn x86_ipc_reply_timeout_oracle_enabled() -> bool {
+    x86_ipc_reply_timeout_oracle_mode() != 0
+}
+/// Confine the reply-timeout registration hook to EXACTLY the oracle's reply endpoint.
+pub(crate) fn set_ipc_reply_timeout_oracle_reply_endpoint(eidx: usize) {
+    IPC_REPLY_TIMEOUT_ORACLE_REP_EIDX.store(eidx, core::sync::atomic::Ordering::Release);
+}
+
+/// The reply-wins scenario's armed deadline tick (`0` = unset). Recorded at arm so
+/// the production scan can prove it genuinely executed PAST the deadline harmlessly
+/// (the reply already disarmed the token, so the late scan wakes nobody).
+static IPC_REPLY_TIMEOUT_RW_DEADLINE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static IPC_REPLY_TIMEOUT_RW_LATE_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_ipc_reply_timeout_rw_deadline(tick: u64) {
+    IPC_REPLY_TIMEOUT_RW_DEADLINE.store(tick, core::sync::atomic::Ordering::Release);
+}
+pub(crate) fn ipc_reply_timeout_rw_deadline() -> u64 {
+    IPC_REPLY_TIMEOUT_RW_DEADLINE.load(core::sync::atomic::Ordering::Acquire)
+}
+/// One-shot latch: `true` on the first call, `false` afterwards.
+pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
+    !IPC_REPLY_TIMEOUT_RW_LATE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+/// True iff `eidx` is the oracle's reply endpoint (the ONLY recv-v2 timeout that registers a
+/// reply-terminal deadline). `false` for every other endpoint and when un-provisioned.
+pub fn ipc_reply_timeout_oracle_reply_endpoint_is(eidx: usize) -> bool {
+    IPC_REPLY_TIMEOUT_ORACLE_REP_EIDX.load(core::sync::atomic::Ordering::Acquire) == eidx
+}
+
+/// The init-local caps a provisioned reply-timeout oracle hands to init (mirrors the direct oracle).
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub struct IpcReplyTimeoutOracleCaps {
+    /// init-local request endpoint cap (`SEND | RECEIVE`) → startup slot 13.
+    pub request_ep_cap: u32,
+    /// init-local reply endpoint cap (`SEND | RECEIVE`) → startup slot 14.
+    pub reply_ep_cap: u32,
+    pub request_endpoint_idx: usize,
+    pub reply_endpoint_idx: usize,
+}
+
+/// Stage 200C2A: provision the x86_64 reply-timeout oracle TRANSACTIONALLY — a request endpoint + a
+/// reply endpoint, each minted `SEND | RECEIVE` into init's CNode, and the reply endpoint confined as
+/// the ONLY registration endpoint. Fail-closed: on any step failure it emits a precise marker and
+/// returns `None` (the oracle stays un-armed). Provisions NO MemoryObject, NO queued/notification
+/// authority, and NO second deadline queue.
+#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+pub fn provision_init_ipc_reply_timeout_oracle(
+    kernel: &mut KernelState,
+    init_tid: u64,
+) -> Option<IpcReplyTimeoutOracleCaps> {
+    if !x86_ipc_reply_timeout_oracle_enabled() {
+        return None;
+    }
+    use crate::kernel::capabilities::{CapObject, CapRights, Capability};
+    let init_cnode = kernel.task_cnode(init_tid)?;
+    let mint = |kernel: &mut KernelState, recv_root: crate::kernel::capabilities::CapId| {
+        let object = kernel.current_task_capability(recv_root)?.object;
+        debug_assert!(matches!(object, CapObject::Endpoint { .. }));
+        kernel
+            .mint_capability_in_cnode(
+                init_cnode,
+                Capability::new(object, CapRights::SEND | CapRights::RECEIVE),
+            )
+            .ok()
+    };
+    let (req_idx, _req_send, req_recv_root) = kernel.create_endpoint(8).ok()?;
+    let Some(req_cap) = mint(kernel, req_recv_root) else {
+        crate::yarm_log!("IPC_REPLY_TIMEOUT_ORACLE_PROVISION_FAIL step=mint_req");
+        return None;
+    };
+    let (rep_idx, _rep_send, rep_recv_root) = kernel.create_endpoint(8).ok()?;
+    let Some(rep_cap) = mint(kernel, rep_recv_root) else {
+        crate::yarm_log!("IPC_REPLY_TIMEOUT_ORACLE_PROVISION_FAIL step=mint_rep");
+        return None;
+    };
+    set_ipc_reply_timeout_oracle_reply_endpoint(rep_idx);
+    crate::yarm_log!(
+        "IPC_REPLY_TIMEOUT_ORACLE_PROVISION_OK init_tid={} req_cap={} rep_cap={} req_eidx={} rep_eidx={} mode={}",
+        init_tid,
+        req_cap.0,
+        rep_cap.0,
+        req_idx,
+        rep_idx,
+        x86_ipc_reply_timeout_oracle_mode(),
+    );
+    Some(IpcReplyTimeoutOracleCaps {
+        request_ep_cap: req_cap.0 as u32,
+        reply_ep_cap: rep_cap.0 as u32,
+        request_endpoint_idx: req_idx,
+        reply_endpoint_idx: rep_idx,
+    })
+}
+
 /// Stage 199A2B4/199A2C1: emit the NR6 `IpcCallDirectRequest` success + retirement markers EXACTLY
 /// ONCE, from the production off-lock request drain, ONLY under the umbrella oracle feature (x86_64
 /// or aarch64) + the arch's selector. A normal (feature-off) artifact never compiles the class

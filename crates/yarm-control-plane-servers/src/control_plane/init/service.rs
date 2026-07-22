@@ -1753,6 +1753,340 @@ fn run_x86_ipccall_direct_oracle(init_tid: u64) {
     }
 }
 
+// ─── Stage 200C2A: x86_64 LIVE reply-receive TIMEOUT functional oracle ────────────────────────────
+// Parent(init/client)/child(server) topology proving the two live reply-timeout outcomes on `-smp 1`:
+//   server recv-v2-blocks on the request endpoint → client NR6 IpcCall → client recv-v2-blocks on its
+//   reply endpoint WITH A FINITE DEADLINE (the kernel arms the reply-timeout token here) → then:
+//     * timeout-wins (slot5=10): the server DELAYS NR7 until it observes the client's TimedOut wake
+//       (delivered by the PRODUCTION deadline scan); its late NR7 through the original Reply cap is
+//       then rejected by the normal reply-authority check.
+//     * reply-wins (slot5=11): the server issues NR7 BEFORE the (later) deadline; the exact token is
+//       disarmed on the reply win; the client resumes with the reply payload; a subsequent scan
+//       passes the old deadline harmlessly.
+// Both tasks share init's CSpace/address space (thread spawn). The kernel emits the authoritative
+// IPC_REPLY_TIMEOUT_OK / IPC_REPLY_BEATS_TIMEOUT_OK markers; this userspace scaffold emits the two
+// completion markers. Arch-gated (x86_64) — activation requires the kernel feature + selector.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+mod ipc_reply_timeout_oracle {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
+    pub(super) static HANDSHAKE: AtomicU32 = AtomicU32::new(0x00E0);
+    pub(super) static PARK: AtomicU32 = AtomicU32::new(0x00E1);
+    pub(super) static CHILD_TID: AtomicU64 = AtomicU64::new(0);
+    /// Set by the client once it resumes from the production TIMEOUT wake (Ok(None)).
+    pub(super) static CLIENT_TIMED_OUT: AtomicU32 = AtomicU32::new(0);
+    /// Set by the client once it resumes with the reply payload (reply-wins).
+    pub(super) static CLIENT_GOT_REPLY: AtomicU32 = AtomicU32::new(0);
+    /// Set by the server after its late NR7 is REJECTED (timeout-wins).
+    pub(super) static SERVER_LATE_REPLY_REJECTED: AtomicU32 = AtomicU32::new(0);
+    /// Set by the server after its prompt NR7 SUCCEEDS (reply-wins).
+    pub(super) static SERVER_REPLIED_OK: AtomicU32 = AtomicU32::new(0);
+    pub(super) static CLIENT_CONTINUATIONS: AtomicU32 = AtomicU32::new(0);
+
+    const REQUEST_OPCODE: u16 = 0x0C0A;
+    const REQUEST_DATA: [u8; 8] = *b"RTOreq!!";
+    const REPLY_OPCODE: u16 = 0x0C0B;
+    pub(super) const REPLY_DATA: [u8; 8] = *b"RTOrep!!";
+    const MAX_ATTEMPTS: u32 = 64;
+    /// timeout-wins: short deadline so the production scan fires BEFORE the (delayed) reply.
+    const TIMEOUT_WINS_TICKS: u64 = 3;
+    /// reply-wins: later deadline so the prompt reply wins, then the scan passes it harmlessly.
+    const REPLY_WINS_TICKS: u64 = 30;
+    /// Bounded cross-thread spin cap (deterministic termination, never wall-clock correctness).
+    const SPIN_CAP: u64 = 2_000_000;
+
+    pub(super) fn oracle_caps() -> (u32, u32) {
+        let req = yarm_user_rt::runtime::startup_arg_slot(
+            yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_0,
+        )
+        .unwrap_or(0) as u32;
+        let rep = yarm_user_rt::runtime::startup_arg_slot(
+            yarm_user_rt::runtime::STARTUP_SLOT_SERVICE_EXTRA_CAP_1,
+        )
+        .unwrap_or(0) as u32;
+        (req, rep)
+    }
+
+    /// The oracle mode from slot 5 (10 = timeout-wins, 11 = reply-wins).
+    pub(super) fn mode() -> u64 {
+        yarm_user_rt::runtime::startup_arg_slot(
+            yarm_user_rt::runtime::STARTUP_SLOT_SUPERVISOR_CONTROL_RECV_EP,
+        )
+        .unwrap_or(0)
+    }
+    pub(super) fn is_timeout_wins() -> bool {
+        mode() == 10
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct ClientOutcome {
+        pub timed_out: bool,
+        pub reply_ok: bool,
+        pub continuations: u32,
+        pub late_reply_rejected: u32,
+        pub server_replied_ok: u32,
+    }
+
+    /// Server child (ARCH-NEUTRAL core): handshake, recv the request + reply cap, then reply per mode.
+    ///
+    /// # Safety
+    /// Runs on a freshly-spawned oracle child sharing init's CSpace/address space.
+    pub(super) unsafe fn server_run() {
+        yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_SERVER_STARTED");
+        let handshake = HANDSHAKE.as_ptr();
+        let _ = yarm_user_rt::syscall::futex_wake(handshake, 1);
+        let (request_ep, _rep) = oracle_caps();
+        // SAFETY: shared-CSpace request endpoint cap; a blocking recv-v2.
+        let recv = unsafe { yarm_user_rt::syscall::ipc_recv_v2(request_ep) };
+        let rm = match recv {
+            Ok(Some(rm)) => rm,
+            other => {
+                yarm_user_rt::user_log!(
+                    "IPC_REPLY_TIMEOUT_ORACLE_SERVER_RECV_FAIL other={:?}",
+                    other.is_err()
+                );
+                return;
+            }
+        };
+        let reply_cap = rm.reply_cap.unwrap_or(0);
+        let reply_msg =
+            match yarm_user_rt::ipc::Message::with_header(0, REPLY_OPCODE, 0, None, &REPLY_DATA) {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+        if is_timeout_wins() {
+            // Delay NR7 until the client has TIMED OUT (delivered by the production scan).
+            let mut spun = 0u64;
+            while CLIENT_TIMED_OUT.load(Relaxed) == 0 && spun < SPIN_CAP {
+                let _ = yarm_user_rt::syscall::yield_now();
+                spun += 1;
+            }
+            // The record is now Cancelled (timeout won) → this late NR7 is rejected.
+            let r = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply_msg) };
+            let rejected = u32::from(r.is_err());
+            SERVER_LATE_REPLY_REJECTED.store(rejected, Relaxed);
+            yarm_user_rt::user_log!(
+                "IPC_REPLY_TIMEOUT_ORACLE_SERVER_LATE_REPLY rejected={} err={:?}",
+                rejected,
+                r.is_err()
+            );
+        } else {
+            // reply-wins: issue NR7 promptly (bounded pre-ack retry on WouldBlock).
+            let mut attempts = 0u32;
+            let mut ok = false;
+            while attempts < MAX_ATTEMPTS {
+                attempts += 1;
+                match unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply_msg) } {
+                    Ok(()) => {
+                        ok = true;
+                        break;
+                    }
+                    Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+                        let _ = yarm_user_rt::syscall::yield_now();
+                    }
+                    Err(e) => {
+                        yarm_user_rt::user_log!(
+                            "IPC_REPLY_TIMEOUT_ORACLE_SERVER_REPLY_FAIL err={:?}",
+                            e
+                        );
+                        break;
+                    }
+                }
+            }
+            SERVER_REPLIED_OK.store(u32::from(ok), Relaxed);
+            yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_SERVER_REPLIED ok={}", ok as u32);
+        }
+    }
+
+    pub(super) fn server_park() -> ! {
+        let park = PARK.as_ptr();
+        loop {
+            let pv = PARK.load(Relaxed);
+            let _ = yarm_user_rt::syscall::futex_wait(park, pv, pv);
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+    }
+
+    /// Client core: handshake, NR6 IpcCall, then recv-v2 with a FINITE deadline; resolve per mode.
+    ///
+    /// # Safety
+    /// `request_ep`/`reply_ep` must be the provisioned oracle caps.
+    pub(super) unsafe fn client_run(request_ep: u32, reply_ep: u32) -> ClientOutcome {
+        let mut out = ClientOutcome::default();
+        let handshake = HANDSHAKE.as_ptr();
+        let hv = HANDSHAKE.load(Relaxed);
+        let _ = yarm_user_rt::syscall::futex_wait(handshake, hv, hv);
+        yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_RESUMED mode={}", mode());
+        let request_msg = match yarm_user_rt::ipc::Message::with_header(
+            0,
+            REQUEST_OPCODE,
+            0,
+            None,
+            &REQUEST_DATA,
+        ) {
+            Ok(m) => m,
+            Err(_) => return out,
+        };
+        let mut called = false;
+        let mut attempts = 0u32;
+        while attempts < MAX_ATTEMPTS {
+            attempts += 1;
+            // SAFETY: `request_ep` = request SEND cap; `reply_ep` = reply-endpoint RECEIVE cap.
+            match unsafe { yarm_user_rt::syscall::ipc_call(request_ep, reply_ep, &request_msg) } {
+                Ok(()) => {
+                    called = true;
+                    break;
+                }
+                Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                }
+                Err(e) => {
+                    yarm_user_rt::user_log!(
+                        "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_CALL_FAIL err={:?}",
+                        e
+                    );
+                    return out;
+                }
+            }
+        }
+        if !called {
+            return out;
+        }
+        yarm_user_rt::user_log!(
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_CALL_OK attempts={}",
+            attempts
+        );
+        // timeout-wins blocks with an explicit finite recv-timeout deadline (the kernel
+        // arms the token on the recv-timeout block path). reply-wins blocks with an
+        // INFINITE recv-v2 so the server's reply delivers through the recv-v2 waiter
+        // path; the kernel arms a fixed reply deadline on THAT block path. Either way,
+        // Ok(None) ⇒ the production scan delivered TimedOut; Ok(Some) ⇒ the reply won.
+        let reply = if is_timeout_wins() {
+            // SAFETY: `reply_ep` carries RECEIVE.
+            unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_ep, TIMEOUT_WINS_TICKS) }
+        } else {
+            // SAFETY: `reply_ep` carries RECEIVE.
+            unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_ep) }.map(|o| o.map(|rm| rm.message))
+        };
+        let _ = REPLY_WINS_TICKS;
+        match reply {
+            // Ok(None) ⇒ the production deadline scan delivered the canonical TIMEOUT.
+            Ok(None) => {
+                CLIENT_CONTINUATIONS.fetch_add(1, Relaxed);
+                out.continuations = CLIENT_CONTINUATIONS.load(Relaxed);
+                out.timed_out = true;
+                CLIENT_TIMED_OUT.store(1, Relaxed);
+                yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_TIMED_OUT");
+                // Let the server attempt (and fail) its late NR7.
+                let mut spun = 0u64;
+                while SERVER_LATE_REPLY_REJECTED.load(Relaxed) == 0 && spun < SPIN_CAP {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                    spun += 1;
+                }
+                out.late_reply_rejected = SERVER_LATE_REPLY_REJECTED.load(Relaxed);
+            }
+            // Ok(Some) ⇒ the server's reply won before the deadline.
+            Ok(Some(msg)) => {
+                CLIENT_CONTINUATIONS.fetch_add(1, Relaxed);
+                out.continuations = CLIENT_CONTINUATIONS.load(Relaxed);
+                CLIENT_GOT_REPLY.store(1, Relaxed);
+                let plen = msg.len as usize;
+                out.reply_ok = plen == REPLY_DATA.len() && msg.payload[0..plen] == REPLY_DATA;
+                out.server_replied_ok = SERVER_REPLIED_OK.load(Relaxed);
+                yarm_user_rt::user_log!(
+                    "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen={} reply_ok={}",
+                    plen,
+                    out.reply_ok as u32
+                );
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_RECV_FAIL err={:?}", e);
+            }
+        }
+        out
+    }
+
+    pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
+    pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
+
+    #[unsafe(naked)]
+    pub(super) extern "C" fn child_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::x86_ipc_reply_timeout_child_body)
+    }
+}
+
+/// x86_64 server child body: run the server core, then park.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+extern "C" fn x86_ipc_reply_timeout_child_body() -> ! {
+    // SAFETY: freshly-spawned oracle child sharing init's CSpace/address space.
+    unsafe { ipc_reply_timeout_oracle::server_run() };
+    ipc_reply_timeout_oracle::server_park();
+}
+
+/// x86_64 reply-timeout oracle entry: spawn the server child, run the client, emit the mode-specific
+/// completion marker with exact counts.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn run_x86_ipc_reply_timeout_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use ipc_reply_timeout_oracle as oracle;
+    yarm_user_rt::user_log!(
+        "IPC_REPLY_TIMEOUT_ORACLE_BEGIN init_tid={} mode={}",
+        init_tid,
+        oracle::mode()
+    );
+    let (request_ep, reply_ep) = oracle::oracle_caps();
+    if request_ep == 0 || reply_ep == 0 {
+        yarm_user_rt::user_log!(
+            "IPC_REPLY_TIMEOUT_ORACLE_MISSING_CAPS request_ep={} reply_ep={}",
+            request_ep,
+            reply_ep
+        );
+        return;
+    }
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(oracle::CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = oracle::child_entry as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(oracle::CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    oracle::CHILD_TID.store(child_tid, Relaxed);
+    // SAFETY: the provisioned oracle caps.
+    let out = unsafe { oracle::client_run(request_ep, reply_ep) };
+    if oracle::is_timeout_wins() {
+        if out.timed_out && out.continuations == 1 && out.late_reply_rejected == 1 {
+            yarm_user_rt::user_log!(
+                "X86_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok"
+            );
+        } else {
+            yarm_user_rt::user_log!(
+                "X86_IPC_REPLY_TIMEOUT_DONE caller_result={} caller_continuations={} late_reply={} result=fail",
+                out.timed_out as u32,
+                out.continuations,
+                out.late_reply_rejected
+            );
+        }
+    } else if out.reply_ok && out.continuations == 1 && out.server_replied_ok == 1 {
+        yarm_user_rt::user_log!(
+            "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 result=ok"
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 result=fail",
+            out.reply_ok as u32,
+            out.continuations
+        );
+    }
+}
+
 // ── AArch64 arch wrapper: plain `extern "C"` child entry (no naked trampoline — AAPCS64 has no
 //    x86-style initial-SP call-alignment hazard) + arch-named markers. Reuses the SAME arch-neutral
 //    `ipccall_direct_oracle_core`; duplicates NONE of the round-trip logic. ─────────────────────────
@@ -3159,6 +3493,13 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     if ctx.supervisor_control_recv_ep == Some(3) {
         run_x86_ipccall_direct_oracle(ctx.task_id);
+    }
+    // Stage 200C2A: x86_64 LIVE reply-receive TIMEOUT oracle. Slot-5 selector 10 = timeout-wins,
+    // 11 = reply-wins (mutually exclusive with every other slot-5 oracle). Arch-gated; activation
+    // requires the kernel feature + `yarm.x86_64_ipc_reply_timeout_oracle=timeout-wins|reply-wins`.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+    if ctx.supervisor_control_recv_ep == Some(10) || ctx.supervisor_control_recv_ep == Some(11) {
+        run_x86_ipc_reply_timeout_oracle(ctx.task_id);
     }
 
     // Stage 195C: default-off AArch64 FutexWake live oracle. The kernel reuses init
