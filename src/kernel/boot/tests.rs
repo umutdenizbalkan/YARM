@@ -78586,7 +78586,9 @@ mod stage199a2c1_aarch64_guards {
             "the parent round-trip logic must exist exactly once (arch-neutral core)"
         );
         assert_eq!(
-            INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(),
+            INIT_SRC
+                .matches("const REQUEST_DATA: [u8; 8] = *b\"NR6call!")
+                .count(),
             1,
             "the request payload contract must not be duplicated per arch"
         );
@@ -78766,7 +78768,12 @@ mod stage199a2c2_riscv_guards {
                 .count(),
             1
         );
-        assert_eq!(INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(), 1);
+        assert_eq!(
+            INIT_SRC
+                .matches("const REQUEST_DATA: [u8; 8] = *b\"NR6call!")
+                .count(),
+            1
+        );
         assert!(INIT_SRC.contains("fn run_riscv_ipccall_direct_oracle"));
         assert!(INIT_SRC.contains("RISCV_IPCREPLY_DIRECT_SEND"));
         assert!(INIT_SRC.contains("RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
@@ -79008,12 +79015,16 @@ mod stage199a2c3_matrix_guards {
             "one arch-neutral oracle core"
         );
         assert_eq!(
-            INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(),
+            INIT_SRC
+                .matches("const REQUEST_DATA: [u8; 8] = *b\"NR6call!")
+                .count(),
             1,
             "one request payload definition"
         );
         assert_eq!(
-            INIT_SRC.matches("const REPLY_DATA: [u8; 8]").count(),
+            INIT_SRC
+                .matches("const REPLY_DATA: [u8; 8] = *b\"NR7repl!")
+                .count(),
             1,
             "one reply payload definition"
         );
@@ -80759,16 +80770,35 @@ mod stage199a2d2a_smp_request {
         assert!(!ipccall_direct_smp_oracle_active(1), "inert on smp<2");
     }
 
-    // (9.11) No NR7 cross-CPU reply SMP marker exists in kernel source this stage.
+    // (9.11) The cross-CPU NR7 reply marker is a properly GATED ONE-SHOT emit.
+    //
+    // Stage 200C2C1 (stale-guard correction): the request-only Stage 199A2D2A RESERVED the
+    // `IPCREPLY_DIRECT_SMP_REPLY_OK` name for the LIVE emitter (D2B), which a later stage
+    // legitimately wired. This guard no longer asserts the marker's ABSENCE (true only at
+    // 199A2D2A); it inspects the CURRENT canonical definition — the marker is emitted ONLY behind
+    // the BSP-validated gate + delivered-count + one-shot `EMITTED` latch, never ad-hoc.
     #[test]
-    fn no_nr7_smp_reply_marker_in_kernel_source() {
+    fn nr7_smp_reply_marker_is_gated_one_shot() {
         let modrs = include_str!("mod.rs");
+        assert!(modrs.contains("fn maybe_emit_ipcreply_direct_smp_reply_ok"));
+        let body = modrs
+            .split("fn maybe_emit_ipcreply_direct_smp_reply_ok")
+            .nth(1)
+            .expect("emit helper body");
+        let emit = body
+            .find("IPCREPLY_DIRECT_SMP_REPLY_OK")
+            .expect("marker emit");
+        let latch = body.find("EMITTED.swap(true").expect("one-shot latch");
+        let delivered = body
+            .find("ipcreply_direct_smp_reply_delivered_count() < 1")
+            .expect("delivered-count gate");
+        let validated = body
+            .find("X86_BSP_REPLY_USER_VALIDATED")
+            .expect("bsp-validated gate");
         assert!(
-            !modrs.contains("IPCREPLY_DIRECT_SMP_REPLY_OK"),
-            "this request-only stage emits NO cross-CPU NR7 reply marker in kernel source"
+            latch < emit && delivered < emit && validated < emit,
+            "the cross-CPU NR7 reply marker is emitted only through the gated one-shot path"
         );
-        // The request-only success + seal marker names ARE reserved for the LIVE emitter (D2A/B).
-        // Their absence-from-emission this stage is enforced by the LIVE path being blocked (see doc).
     }
 
     // (9.12) Stage 199 functional invariants preserved.
@@ -81668,11 +81698,20 @@ mod stage199a2d2c2b3_guards {
         assert!(EXEC.contains("0x83, 0xF8, 0x08")); // cmp eax,8 (length compare)
     }
 
-    // (12) The cross-CPU NR7 REPLY path remains disabled (no SMP reply delivery / IPI-to-CPU-0 wired).
+    // (12) The cross-CPU NR7 reply is admitted ONLY behind its explicit gate; the unrelated IPI +
+    // exec-stub sub-paths remain absent.
+    //
+    // Stage 200C2C1 (stale-guard correction): the NR7 reply direction — absent at the request-only
+    // Stage 199A2D2C2B3 — was legitimately wired by a later stage behind
+    // `x86_ipccall_direct_smp_reply_enabled()`. This guard no longer asserts its blanket absence; it
+    // verifies the reply admission is GATED (never unconditional in the split whitelist) and that the
+    // c2b2 reschedule IPI + the exec-stub direct-reply remain absent (unchanged since the request stage).
     #[test]
-    fn cross_cpu_nr7_remains_disabled() {
+    fn cross_cpu_nr7_reply_is_gated() {
+        // The NR7 reply is admitted through the split whitelist ONLY while its gate is armed.
+        assert!(SPLIT.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        // The unrelated sub-paths remain absent (unchanged since the request-only stage).
         assert!(!SMP.contains("c2b2_send_reschedule_ipi_to_cpu0"));
-        assert!(!SPLIT.contains("x86_ipccall_direct_smp_reply"));
         assert!(!EXEC.contains("ipc_reply_direct"));
     }
 }
@@ -85272,6 +85311,7 @@ mod stage200c_terminal_reuse_sync_guard {
 /// These prove the WIRING is correct + correctly gated, without a live boot (the
 /// two live boots are proven by `scripts/qemu-ipc-reply-timeout-x86_64-smoke.sh`).
 #[cfg(test)]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 mod stage200c2b_guards {
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
@@ -85284,21 +85324,34 @@ mod stage200c2b_guards {
     const INIT_SRC: &str = include_str!(
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
-    const SMOKE_SRC: &str =
+    const X86_SMOKE_SRC: &str =
         include_str!("../../../scripts/qemu-ipc-reply-timeout-x86_64-retirement-smoke.sh");
+    const AARCH64_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-aarch64-retirement-smoke.sh");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
 
-    // (1) feature AND a valid selector are both required.
+    // (1) each per-arch feature AND a valid selector are both required.
     #[test]
     fn g01_feature_and_valid_selector_required() {
-        // The provisioning + boot wiring are feature-gated.
-        assert!(MOD_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]"));
+        // The arch-neutral provisioning is gated on the shared umbrella; each arch's boot wiring is
+        // gated on its own per-arch feature (which enables the umbrella).
+        assert!(MOD_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"));
         assert!(X86_BOOT_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]"));
-        // The boot provisioning additionally requires the runtime selector armed.
+        assert!(
+            AARCH64_BOOT_SRC.contains("#[cfg(feature = \"aarch64-ipc-reply-timeout-oracle\")]")
+        );
+        // Each boot provisioning additionally requires the runtime selector armed (shared mode read).
         assert!(X86_BOOT_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
-        // Feature-on without a VALID selector is inert: unrecognized values → None.
-        assert!(CMDLINE_SRC.contains("b\"timeout-wins\" | b\"1\""));
-        assert!(CMDLINE_SRC.contains("b\"reply-wins\" | b\"2\""));
-        assert!(CMDLINE_SRC.contains("_ => None,"));
+        assert!(AARCH64_BOOT_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
+        // Feature-on without a VALID selector is inert: unrecognized values → None, for BOTH knobs.
+        assert!(CMDLINE_SRC.contains("yarm.x86_64_ipc_reply_timeout_oracle"));
+        assert!(CMDLINE_SRC.contains("yarm.aarch64_ipc_reply_timeout_oracle"));
+        assert_eq!(
+            CMDLINE_SRC.matches("b\"timeout-wins\" | b\"1\"").count(),
+            2,
+            "both arch knobs parse timeout-wins"
+        );
+        assert_eq!(CMDLINE_SRC.matches("b\"reply-wins\" | b\"2\"").count(), 2);
     }
 
     // (2) the two selector modes are mutually exclusive (single mode discriminator).
@@ -85444,52 +85497,68 @@ mod stage200c2b_guards {
     fn g11_live_literals_are_feature_gated() {
         // The ARM marker + the reply-win reserve are feature-gated in ipc_state.rs.
         assert!(IPC_STATE_SRC.contains("IPC_REPLY_TIMEOUT_ARMED"));
-        // The OFF-LOCK completion markers (Stage 200C2B) live in the feature-gated drain
-        // in runtime.rs — the completion no longer runs under the broad lock.
+        // The OFF-LOCK completion markers (Stage 200C2B/200C2C1) live in the feature-gated
+        // drain in runtime.rs — the completion no longer runs under the broad lock. The
+        // arch tag is stamped at runtime via `REPLY_TIMEOUT_ARCH` (`arch={}`), so the SAME
+        // emit sites report x86_64 or aarch64 without duplicating the marker per arch.
         for lit in [
-            "IPC_REPLY_TIMEOUT_OK arch=x86_64",
-            "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0",
-            "IPC_REPLY_TIMEOUT_LATE_SCAN",
-            "IPC_REPLY_TIMEOUT_DEFERRED",
-            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout",
+            "IPC_REPLY_TIMEOUT_OK arch={} terminal=Timeout",
+            "IPC_REPLY_TIMEOUT_LOCK_STATUS arch={} scan_broad_lock=0",
+            "IPC_REPLY_TIMEOUT_LATE_SCAN arch={}",
+            "IPC_REPLY_TIMEOUT_DEFERRED arch={}",
+            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout",
         ] {
             assert!(RUNTIME_SRC.contains(lit), "literal {lit} present (drain)");
         }
-        // The emitting fns are all `#[cfg(feature = "x86-ipc-reply-timeout-oracle")]`.
-        assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn maybe_arm_reply_timeout_oracle"));
-        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn collect_due_reply_timeout_work"));
-        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn drain_reply_timeout_post_work"));
+        assert!(RUNTIME_SRC.contains("REPLY_TIMEOUT_ARCH"));
+        // The emitting fns are all `#[cfg(feature = "ipc-reply-timeout-oracle-core")]`.
+        assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn maybe_arm_reply_timeout_oracle"));
+        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn collect_due_reply_timeout_work"));
+        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn drain_reply_timeout_post_work"));
     }
 
     // (12) the reply-timeout CLASS is honestly retired: scan_broad_lock=0 + the class
     // retirement seal are emitted, and no scan_broad_lock=1 claim remains.
     #[test]
     fn g12_class_retirement_present_and_honest() {
-        assert!(RUNTIME_SRC.contains("IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok"));
+        assert!(RUNTIME_SRC.contains("IPC_REPLY_TIMEOUT_LOCK_STATUS arch={} scan_broad_lock=0 completion_transaction_narrow=1 result=ok"));
         assert!(
-            RUNTIME_SRC.contains(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout result=ok"
-            )
+            RUNTIME_SRC
+                .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout result=ok")
         );
         // No lingering honest-broad-lock (scan_broad_lock=1) claim for this class.
         assert!(!IPC_STATE_SRC.contains("scan_broad_lock=1"));
         assert!(!RUNTIME_SRC.contains("scan_broad_lock=1"));
         assert!(!INIT_SRC.contains("class=IpcReplyTimeout"));
-        // The retirement seal is emitted ONLY by the runner script, gated behind both boots.
-        assert!(SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL"));
-        assert!(SMOKE_SRC.contains("scan_broad_lock=0"));
+        // The retirement seal is emitted ONLY by a runner script, gated behind both boots.
+        assert!(X86_SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL"));
+        assert!(X86_SMOKE_SRC.contains("scan_broad_lock=0"));
+        assert!(AARCH64_SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_AARCH64_RETIREMENT_SEAL"));
+        assert!(AARCH64_SMOKE_SRC.contains("scan_broad_lock=0"));
     }
 
-    // (13) the retirement smoke runner requires BOTH fresh boots + emits the seal only then.
+    // (13) each retirement smoke runner requires BOTH fresh boots + emits its seal only then.
     #[test]
     fn g13_runner_requires_two_fresh_boots() {
-        assert!(SMOKE_SRC.contains("yarm.x86_64_ipc_reply_timeout_oracle=${mode}"));
-        assert!(SMOKE_SRC.contains("boot_mode timeout-wins"));
-        assert!(SMOKE_SRC.contains("boot_mode reply-wins"));
-        assert!(SMOKE_SRC.contains("recheck_sha_clean"));
-        assert!(SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL"));
-        // The seal is gated behind BOTH scenarios passing.
-        assert!(SMOKE_SRC.contains("\"$TW_OK\" != \"1\" || \"$RW_OK\" != \"1\""));
+        for (src, sel, seal) in [
+            (
+                X86_SMOKE_SRC,
+                "yarm.x86_64_ipc_reply_timeout_oracle=${mode}",
+                "STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL",
+            ),
+            (
+                AARCH64_SMOKE_SRC,
+                "yarm.aarch64_ipc_reply_timeout_oracle=${mode}",
+                "STAGE_200C_REPLY_TIMEOUT_AARCH64_RETIREMENT_SEAL",
+            ),
+        ] {
+            assert!(src.contains(sel));
+            assert!(src.contains("boot_mode timeout-wins"));
+            assert!(src.contains("boot_mode reply-wins"));
+            assert!(src.contains("recheck_sha_clean"));
+            assert!(src.contains(seal));
+            assert!(src.contains("\"$TW_OK\" != \"1\" || \"$RW_OK\" != \"1\""));
+        }
     }
 
     // ── Stage 200C2B source hard-stops (item 6) ─────────────────────────────────────
@@ -85598,6 +85667,115 @@ mod stage200c2b_guards {
         assert!(!scan.contains("complete_reply_timeout_over"));
         assert!(!scan.contains("run_reply_timeout_completion"));
     }
+
+    // ── Stage 200C2C1 AArch64 port guards ───────────────────────────────────────────
+
+    // (a1) AArch64 boot provisions the SAME arch-neutral oracle behind its OWN slot-5 pair (8/9),
+    // reusing `provision_init_ipc_reply_timeout_oracle`, mutually exclusive with the other slot-5s.
+    #[test]
+    fn a1_aarch64_provisioning_reuses_neutral_core() {
+        assert!(MOD_SRC.contains("pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 8;"));
+        assert!(AARCH64_BOOT_SRC.contains("provision_init_ipc_reply_timeout_oracle"));
+        assert!(AARCH64_BOOT_SRC.contains("AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR"));
+        assert!(
+            AARCH64_BOOT_SRC.contains("init_args[5] == 0")
+                && AARCH64_BOOT_SRC.contains("init_args[13] == 0")
+                && AARCH64_BOOT_SRC.contains("init_args[14] == 0")
+        );
+    }
+
+    // (a2) the collector + drain are wired into the SHARED trap-entry post-lock area behind the
+    // umbrella feature, so BOTH arches reach them after the broad guard drops (reachability, no DCE).
+    #[test]
+    fn a2_shared_postlock_reachability() {
+        assert!(
+            TRAP_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+            "the collector/drain call is gated on the shared umbrella (both arches reach it)"
+        );
+        // The call sits in the shared entry AFTER `with_cpu` returns (broad lock dropped).
+        let idx_call = TRAP_SRC
+            .find("shared.collect_due_reply_timeout_work")
+            .expect("collect call");
+        let idx_ret = TRAP_SRC
+            .find("// `with_cpu` has returned")
+            .expect("post-lock marker");
+        assert!(
+            idx_ret < idx_call,
+            "collector runs after the broad guard drops"
+        );
+    }
+
+    // (a3) single-source: the terminal + completion + reserve/commit/rollback logic exists EXACTLY
+    // once (the arch wrappers duplicate NONE of it).
+    #[test]
+    fn a3_single_source_no_arch_duplication() {
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("fn collect_due_reply_timeout_work")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn complete_reply_timeout_over")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn reserve_reply_win_before_copy")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn commit_reply_win_after_delivery")
+                .count(),
+            1
+        );
+        assert_eq!(IPC_STATE_SRC.matches("fn rollback_reply_win").count(), 1);
+        // The AArch64 userspace wrapper reuses the shared oracle core (no duplicated round-trip).
+        assert!(INIT_SRC.contains("fn run_aarch64_ipc_reply_timeout_oracle"));
+        assert!(INIT_SRC.contains("AARCH64_IPC_REPLY_TIMEOUT_DONE"));
+        assert!(INIT_SRC.contains("AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE"));
+        // The client/server core (server_run/client_run) is defined once, shared by both arch runners.
+        assert_eq!(
+            INIT_SRC.matches("pub(super) unsafe fn client_run").count(),
+            1
+        );
+    }
+
+    // (a4) the AArch64 timeout return uses NO x86 error-register assumption: the saved-frame register
+    // write is x86_64-ONLY (saved-frame return). AArch64 RE-RUNS the recv syscall on resume, so the
+    // completion must NOT touch the saved GPRs (that would corrupt the re-run's x0..x5 args); it
+    // relies on the `ipc_timeout_fired` flag to drive the canonical TimedOut, like the ordinary path.
+    #[test]
+    fn a4_aarch64_timeout_return_frame() {
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        // The saved-frame register write is x86_64-ONLY (that arch resumes via saved-frame return,
+        // RCX = error). AArch64 RE-RUNS the recv handler, re-importing its args from x0..x5, so any
+        // result-register write there would corrupt the re-run's endpoint-cap/pointer arguments.
+        assert!(body.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(
+            body.contains("tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error")
+        );
+        // There is exactly ONE saved-frame mutation block, and it is x86_64-gated: no non-x86
+        // branch writes any saved register (the recv handler re-runs and re-imports x0..x5).
+        assert_eq!(
+            body.matches("tcb.user_context").count(),
+            5,
+            "the only saved-frame writes are the five x86_64-gated result-register writes"
+        );
+        assert!(!body.contains("#[cfg(not(target_arch = \"x86_64\"))]"));
+        // The TimedOut result is driven by the `ipc_timeout_fired` flag (the prepare step).
+        assert!(IPC_STATE_SRC.contains("tcb.ipc_timeout_fired = true;"));
+        // No ELR mutation in the completion.
+        assert!(!body.contains("elr =") && !body.contains("set_elr") && !body.contains(".elr"));
+    }
 }
 
 /// Stage 200C2B — deterministic OFF-LOCK reply-timeout collection + completion proofs.
@@ -85606,6 +85784,7 @@ mod stage200c2b_guards {
 /// with the broad lock retired — plus the reversible reply lease that governs the
 /// reply-copy-fault race. Run single-threaded (the per-CPU deferred queue is a
 /// process-global static; each test clears CPU 0's queue first).
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 mod stage200c2b_offlock {
     use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
     use crate::kernel::boot::Bootstrap;
@@ -86031,7 +86210,7 @@ mod stage200c2b_offlock {
     fn t19_frozen_nr7_without_deadline() {
         let fx = caller_fixture();
         // No deadline registered, oracle inert (hosted) → reserve is a strict no-op.
-        #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
         {
             let cap = crate::kernel::capabilities::CapId(0);
             assert!(

@@ -1076,18 +1076,20 @@ pub fn handle_trap_entry_shared(
         }
     }
 
-    // Stage 200C2B (IpcReplyTimeout OFF-LOCK RETIREMENT): with the broad
+    // Stage 200C2B/200C2C1 (IpcReplyTimeout OFF-LOCK RETIREMENT): with the broad
     // `SpinLock<KernelState>` from `with_cpu` already dropped above, collect DUE
     // token-bearing reply-receive deadlines through the NARROW collector (rank-2 task
     // split seam) and drain the per-CPU deferred work through the OFF-LOCK completion
     // transaction (per-domain split-mut seams). Neither holds the broad lock — this is
-    // the production timer/deadline entry for the retired reply-timeout class. Ordinary
-    // receive-timeout deadlines stay on the in-lock scan (they are skipped by the
-    // collector's token-bearing filter). Default-off: a strict no-op unless the oracle
-    // feature is built AND its selector is active.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    // the production timer/deadline entry for the retired reply-timeout class, SHARED by
+    // the x86_64 and AArch64 cells (this seam runs for every arch that flows through
+    // `handle_trap_entry_shared`, so the AArch64 timer IRQ reaches it after `with_cpu`
+    // returns). Ordinary receive-timeout deadlines stay on the in-lock scan (they are
+    // skipped by the collector's token-bearing filter). Default-off: a strict no-op
+    // unless a per-arch oracle feature is built AND its selector is active.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
-        let now = shared.scheduler_tick_now_split_read();
+        let now = shared.reply_timeout_now_split_read();
         shared.collect_due_reply_timeout_work(now, cpu);
         shared.drain_reply_timeout_post_work(cpu, now);
     }

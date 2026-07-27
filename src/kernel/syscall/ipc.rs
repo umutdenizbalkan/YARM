@@ -1297,13 +1297,13 @@ pub(super) fn handle_ipc_reply(
     // terminal + ClaimedByReply deadline lease) — no irreversible completion precedes
     // the copy. A strict no-op off the oracle / off the confined reply endpoint / when
     // timeout already won. The server payload was already snapshot above.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     let reply_win_lease = kernel.reserve_reply_win_before_copy(reply_cap);
     if let Err(err) = kernel.ipc_reply(reply_cap, msg) {
         // Stage 200C2B: the caller copy/delivery FAILED — roll the reservation back
         // exactly (terminal → Open, deadline → Armed). The reply record was never
         // consumed and the caller never woken, so a later timeout scan still claims.
-        #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
         if let Some(lease) = reply_win_lease {
             kernel.rollback_reply_win(lease);
         }
@@ -1342,7 +1342,7 @@ pub(super) fn handle_ipc_reply(
     // (deadline lease → Completed, terminal → Completed(Reply)) AFTER the frozen reply
     // flow delivered + enqueued the caller. The commit is non-fallible bookkeeping by
     // the exact owner; no irreversible completion preceded the caller copy.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     if let Some(lease) = reply_win_lease {
         kernel.commit_reply_win_after_delivery(lease);
     }

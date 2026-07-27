@@ -7838,6 +7838,36 @@ pub fn bootstrap_first_user_task(
             );
         }
     }
+    // Stage 200C2C1: default-off AArch64 reply-receive TIMEOUT retirement oracle. Provisions a
+    // request + a confined reply endpoint into init's CNode (the SAME arch-neutral
+    // `provision_init_ipc_reply_timeout_oracle`), and encodes the mode in the slot-5 value: 8 =
+    // timeout-wins, 9 = reply-wins — mutually exclusive with every other AArch64 slot-5 oracle
+    // (only fires when slots 5/13/14 are all still zero). Transactional + fail-closed.
+    #[cfg(feature = "aarch64-ipc-reply-timeout-oracle")]
+    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled()
+        && init_args[5] == 0
+        && init_args[13] == 0
+        && init_args[14] == 0
+    {
+        if let Some(caps) = crate::kernel::boot::provision_init_ipc_reply_timeout_oracle(
+            kernel,
+            RING3_INIT_SERVER_TID,
+        ) {
+            init_args[5] = crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR
+                + (crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode() as u64 - 1);
+            init_args[13] = caps.request_ep_cap as u64;
+            init_args[14] = caps.reply_ep_cap as u64;
+            crate::yarm_log!(
+                "IPC_REPLY_TIMEOUT_ORACLE_SLOTS slot5={} slot13={} slot14={} req_eidx={} rep_eidx={} mode={}",
+                init_args[5],
+                init_args[13],
+                init_args[14],
+                caps.request_endpoint_idx,
+                caps.reply_endpoint_idx,
+                crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            );
+        }
+    }
     // Stage 195C: default-off AArch64 FutexWake live oracle. Slot 5
     // (supervisor_control_recv_ep) is unused by init, so under
     // `yarm.aarch64_futex_wake_oracle=1` we reuse it as a sentinel (=1) that tells init to

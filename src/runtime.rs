@@ -238,10 +238,10 @@ pub struct SharedKernel {
 /// the rank-1 scheduler enqueue seam). It NEVER forms a broad `&mut KernelState` and
 /// NEVER takes the broad `SpinLock<KernelState>` — each primitive is a SHORT bounded
 /// claim of exactly one domain, so the composed transaction holds no broad lock.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) struct OffLockReplyTimeout<'a>(pub(crate) &'a SharedKernel);
 
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout<'_> {
     fn rtd_ipc<R>(&mut self, f: impl FnOnce(&mut crate::kernel::boot::IpcSubsystem) -> R) -> R {
         self.0.with_ipc_split_mut(f)
@@ -3333,6 +3333,22 @@ impl SharedKernel {
 
     // ── Stage 200C2B: OFF-LOCK reply-timeout collection + completion ────────────────
 
+    /// Stage 200C2C1 — the monotonic "now" that the off-lock collector scans in. x86_64: the
+    /// LAPIC-advanced scheduler tick (read off-lock). AArch64: the generic-timer physical counter,
+    /// since the cooperative port has no periodic scheduler tick. Matches the units the deadline is
+    /// armed in (`maybe_arm_reply_timeout_oracle`).
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn reply_timeout_now_split_read(&self) -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            crate::kernel::boot::reply_timeout_hw_now()
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            self.scheduler_tick_now_split_read()
+        }
+    }
+
     /// Stage 200C2B — the NARROW collector. Scans ONLY token-bearing reply-receive
     /// deadlines through the rank-2 task split-mut seam (NO broad `&mut KernelState`,
     /// NO `with` / `with_cpu`, NO broad runtime lock) and publishes one owned
@@ -3340,7 +3356,7 @@ impl SharedKernel {
     /// makes NO timeout decision, mutates NO waiter and wakes NO task. A full queue
     /// leaves the DUE deadline armed (the TCB entry is NOT cleared here) for a later
     /// scan — no due registration is ever silently dropped.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn collect_due_reply_timeout_work(&self, now: u64, cpu: CpuId) {
         // Snapshot due (handle, deadline) pairs under ONLY the task lock; publish after
         // the task lock is dropped so the queue lock never nests inside the task lock.
@@ -3380,7 +3396,7 @@ impl SharedKernel {
     /// (`scan_broad_lock=0`) and emits the reply-timeout class retirement seal exactly
     /// once. On a non-`Woken` outcome it clears the caller's stale TCB registration so it
     /// is not re-collected.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn drain_reply_timeout_post_work(&self, cpu: CpuId, now: u64) {
         // Once ANY reply-timeout deadline has been armed this boot, the class's deadline
         // scan runs HERE — off the broad `SpinLock<KernelState>` — whether or not a
@@ -3391,10 +3407,12 @@ impl SharedKernel {
             && crate::kernel::boot::reply_timeout_lock_status_once()
         {
             crate::yarm_log!(
-                "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok"
+                "IPC_REPLY_TIMEOUT_LOCK_STATUS arch={} scan_broad_lock=0 completion_transaction_narrow=1 result=ok",
+                crate::kernel::boot::REPLY_TIMEOUT_ARCH
             );
             crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout result=ok"
+                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout result=ok",
+                crate::kernel::boot::REPLY_TIMEOUT_ARCH
             );
         }
         let cpu_idx = cpu.0 as usize;
@@ -3405,7 +3423,8 @@ impl SharedKernel {
             // The FIRST drained work item carries the deferred-work publish/drain evidence.
             if crate::kernel::boot::reply_timeout_deferred_once() {
                 crate::yarm_log!(
-                    "IPC_REPLY_TIMEOUT_DEFERRED arch=x86_64 published={} drained={} result=ok",
+                    "IPC_REPLY_TIMEOUT_DEFERRED arch={} published={} drained={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
                     crate::kernel::boot::reply_timeout_work_published_count(),
                     crate::kernel::boot::reply_timeout_work_drained_count()
                 );
@@ -3413,14 +3432,16 @@ impl SharedKernel {
             match outcome {
                 ReplyTimeoutOutcome::Woken => {
                     crate::yarm_log!(
-                        "IPC_REPLY_TIMEOUT_OK arch=x86_64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok"
+                        "IPC_REPLY_TIMEOUT_OK arch={} terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok",
+                        crate::kernel::boot::REPLY_TIMEOUT_ARCH
                     );
                 }
                 other => {
                     // Harmless late expiry (the reply disarmed/completed the token, or the
                     // caller already resumed): no timeout claim, no wake.
                     crate::yarm_log!(
-                        "IPC_REPLY_TIMEOUT_LATE_SCAN arch=x86_64 outcome={:?} late_timeout_claims=0 result=ok",
+                        "IPC_REPLY_TIMEOUT_LATE_SCAN arch={} outcome={:?} late_timeout_claims=0 result=ok",
+                        crate::kernel::boot::REPLY_TIMEOUT_ARCH,
                         other
                     );
                     // Clear the caller's stale TCB registration so a later scan does not
@@ -3458,7 +3479,8 @@ impl SharedKernel {
             let rw = crate::kernel::boot::ipc_reply_timeout_rw_deadline();
             if rw != 0 && now >= rw && crate::kernel::boot::ipc_reply_timeout_rw_late_scan_once() {
                 crate::yarm_log!(
-                    "IPC_REPLY_TIMEOUT_LATE_SCAN arch=x86_64 outcome=reply_won late_timeout_claims=0 result=ok"
+                    "IPC_REPLY_TIMEOUT_LATE_SCAN arch={} outcome=reply_won late_timeout_claims=0 result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH
                 );
             }
         }
@@ -3469,7 +3491,7 @@ impl SharedKernel {
     /// released BEFORE the rank-1 scheduler claim performs the enqueue — so no task lock
     /// is held while enqueuing, and no broad lock is ever taken. Mirrors
     /// `KernelState::enqueue_task`'s placement (pinned → its CPU; unpinned → balanced).
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     fn enqueue_reply_timeout_wake_split(&self, tid: u64) {
         use crate::kernel::ipc::ThreadId;
         use crate::kernel::scheduler::TaskPriority;

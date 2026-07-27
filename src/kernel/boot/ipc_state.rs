@@ -38,7 +38,7 @@ struct RecvBlockPhasePlan {
 /// `commit_reply_win_after_delivery` (copy succeeded) or `rollback_reply_win` (copy
 /// faulted) consumes it, so an irreversible terminal completion never precedes a
 /// fallible caller copy and the deadline is never permanently lost by a faulting copy.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 #[derive(Debug)]
 pub(crate) struct ReplyWinLease {
     record_index: usize,
@@ -274,21 +274,24 @@ fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
                     TaskStatus::Blocked(WaitReason::EndpointReceive(_))
                 )
         })?;
-        // Install the canonical recv-v2 TIMEOUT return into the saved frame: the
-        // blocked recv-v2 resumes via saved-frame return, so the error register must
-        // carry `SyscallError::TimedOut` (the userspace wrapper maps it to Ok(None)).
-        tcb.user_context.arg0 = 0;
-        tcb.user_context.user_gprs[0] = 0; // ret0
+        // x86_64: the blocked recv-v2 resumes via SAVED-FRAME return (NO syscall re-run),
+        // so install the canonical recv-v2 TIMEOUT into the saved result registers directly
+        // — RAX=ret0 (user_gprs[0]) = 0, RCX=error (user_gprs[2]) = `TimedOut`. The userspace
+        // wrapper reads RCX and maps `TimedOut` to `Ok(None)`.
         #[cfg(target_arch = "x86_64")]
         {
+            tcb.user_context.arg0 = 0;
+            tcb.user_context.user_gprs[0] = 0; // RAX = ret0
             tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error
             tcb.user_context.user_gprs[3] = 0; // RDX
             tcb.user_context.user_gprs[7] = 0; // R8
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            tcb.user_context.user_gprs[0] = timed_out as usize;
-        }
+        // AArch64 (and other non-x86): the blocked recv RE-RUNS its syscall handler on resume,
+        // re-importing its arguments from the saved GPRs (x0..x5). Writing a result register here
+        // would CORRUPT that re-run (an x0 write becomes a bogus endpoint-cap argument), so the
+        // saved frame is left ENTIRELY untouched — exactly as the ordinary receive-timeout scan
+        // leaves it. The re-run observes `ipc_timeout_fired` (set in the prepare step) and returns
+        // the canonical `TimedOut` itself, which is the ordinary receive-timeout contract.
         let _ = timed_out;
         tcb.status = TaskStatus::Runnable;
         Some(tcb.cpu_affinity)
@@ -1314,7 +1317,7 @@ impl KernelState {
     /// the terminal cell for the caller's reply record and register a reply-timeout
     /// deadline referencing the exact token. Fires ONLY for the oracle's confined
     /// reply endpoint with a finite deadline; every ordinary receive is untouched.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn maybe_arm_reply_timeout_oracle(
         &mut self,
         caller_tid: u64,
@@ -1326,16 +1329,32 @@ impl KernelState {
         {
             return;
         }
-        // timeout-wins arrives via recv-timeout (a finite user deadline is supplied);
-        // reply-wins arrives via infinite recv-v2 (deadline is `None`), so the kernel
-        // injects a fixed later deadline — the prompt reply wins well before it, and a
-        // subsequent scan passes it harmlessly.
+        // The deadline is armed in the SAME monotonic units the off-lock collector scans in
+        // (`reply_timeout_now`): x86_64 uses the LAPIC-advanced scheduler tick; AArch64 uses the
+        // generic-timer physical counter (no periodic scheduler tick on the cooperative port). On
+        // x86_64, timeout-wins arrives via recv-timeout (a finite user deadline is supplied) and
+        // reply-wins via infinite recv-v2 (deadline `None`), so the kernel injects a fixed later
+        // deadline. On AArch64 BOTH scenarios inject a hw-counter-relative deadline (the supplied
+        // recv-timeout deadline is in the stuck scheduler-tick base and is not comparable).
+        #[cfg(target_arch = "aarch64")]
+        let now = crate::kernel::boot::reply_timeout_hw_now();
         let deadline_tick = match mode {
-            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS => match deadline {
-                Some(d) => d,
-                None => return,
-            },
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let _ = deadline;
+                    now.wrapping_add(4)
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                match deadline {
+                    Some(d) => d,
+                    None => return,
+                }
+            }
             crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS => {
+                #[cfg(target_arch = "aarch64")]
+                let d = now.wrapping_add(20);
+                #[cfg(not(target_arch = "aarch64"))]
                 let d = self.scheduler_tick_now().wrapping_add(8);
                 // Record it so the scan can prove it later ran PAST this deadline
                 // harmlessly (the reply disarms the token before it is reached).
@@ -1377,7 +1396,8 @@ impl KernelState {
                 // Gate the retired off-lock scan attestation: a deadline is now live.
                 crate::kernel::boot::set_reply_timeout_armed_any();
                 crate::yarm_log!(
-                    "IPC_REPLY_TIMEOUT_ARMED arch=x86_64 caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
+                    "IPC_REPLY_TIMEOUT_ARMED arch={} caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
                     caller_tid,
                     caller_asid.0,
                     record_index,
@@ -1409,7 +1429,7 @@ impl KernelState {
     /// reply-authority check rejects the late reply). This is the ONLY NR7
     /// integration. `commit_reply_win_after_delivery` / `rollback_reply_win`
     /// resolve the reservation.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn reserve_reply_win_before_copy(
         &mut self,
         reply_cap: CapId,
@@ -1474,14 +1494,15 @@ impl KernelState {
     /// (`Reserved(Reply) → Completed(Reply)`). Both are non-fallible bookkeeping by
     /// the exact owner; the caller has already been delivered + enqueued by the
     /// frozen reply flow. Emits the reply-win marker.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn commit_reply_win_after_delivery(&mut self, lease: ReplyWinLease) {
         if let Some((token_index, owner)) = lease.deadline_lease {
             let _ = self.complete_deadline_reply_lease(token_index, &owner);
         }
         let _ = self.commit_reply_terminal_slot(lease.record_index, &lease.terminal_owner);
         crate::yarm_log!(
-            "IPC_REPLY_BEATS_TIMEOUT_OK arch=x86_64 terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok"
+            "IPC_REPLY_BEATS_TIMEOUT_OK arch={} terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok",
+            crate::kernel::boot::REPLY_TIMEOUT_ARCH
         );
     }
 
@@ -1491,7 +1512,7 @@ impl KernelState {
     /// (`Reserved(Reply) → Open`). The reply record was never consumed and the caller
     /// never woken, so a later timeout scan (or a retried reply) still sees a clean,
     /// claimable state.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn rollback_reply_win(&mut self, lease: ReplyWinLease) {
         if let Some((token_index, owner)) = lease.deadline_lease {
             let _ = self.restore_deadline_reply_lease(token_index, &owner);
@@ -1499,13 +1520,14 @@ impl KernelState {
         let _ = self
             .release_reply_terminal_slot_if_retryable(lease.record_index, &lease.terminal_owner);
         crate::yarm_log!(
-            "IPC_REPLY_WIN_ROLLBACK arch=x86_64 terminal=Open deadline=Armed reply_copies=0 caller_wakes=0 result=ok"
+            "IPC_REPLY_WIN_ROLLBACK arch={} terminal=Open deadline=Armed reply_copies=0 caller_wakes=0 result=ok",
+            crate::kernel::boot::REPLY_TIMEOUT_ARCH
         );
     }
 
     /// Resolve a reply cap in the current task's CNode to its `(record index,
     /// generation)`. `None` if the cap is absent or not a `Reply` object.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn reply_cap_record_index_generation(
         &self,
         reply_cap: CapId,
@@ -2175,7 +2197,7 @@ impl KernelState {
         // TCB + deadline + waiter). Oracle-gated, this arms the terminal + registers
         // the reply-timeout token; a strict no-op off the oracle / off the confined
         // reply endpoint / with no finite deadline, so ordinary receives are unchanged.
-        #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
         self.maybe_arm_reply_timeout_oracle(plan.blocked_tid.0, plan.endpoint_idx, deadline);
         if crate::kernel::boot::d2_recv_genuine_enabled() {
             // Stage 168 (D2-GENUINE-RECV): ipc publish done; enter dispatch.
@@ -2423,7 +2445,7 @@ impl KernelState {
                     // by the reply-timeout pre-pass above (the shared terminal
                     // transaction), never by this ordinary loop — so an ordinary and a
                     // reply-receive deadline are cleanly distinguished.
-                    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
                     if tcb.reply_timeout_token.is_some() {
                         continue;
                     }
