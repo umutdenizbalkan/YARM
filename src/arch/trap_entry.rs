@@ -1109,18 +1109,6 @@ pub fn handle_trap_entry_shared(
     #[cfg(not(target_arch = "riscv64"))]
     let _ = shared.drain_server_death_post_work(cpu);
 
-    // Stage 200D-0B1: reaching here means the broad `SpinLock<KernelState>` taken by the
-    // in-lock phase has been dropped and the post-lock deferred work has drained. Attest it
-    // only when an exit disposition is actually pending, so ordinary traps stay silent.
-    #[cfg(not(target_arch = "riscv64"))]
-    if crate::kernel::boot::post_lock_trap_disposition_pending(cpu.0 as usize) {
-        crate::yarm_log!(
-            "EXIT_TASK_BROAD_LOCK_RELEASED arch={} cpu={} result=ok",
-            crate::kernel::boot::REPLY_TIMEOUT_ARCH,
-            cpu.0
-        );
-    }
-
     inner_result
 }
 

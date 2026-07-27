@@ -2006,16 +2006,20 @@ fn handle_exit_current_task(
             if !published {
                 crate::yarm_log!("EXIT_TASK_DUPLICATE_DISPOSITION tid={} result=fail", tid);
             }
+            // Emitted in CAUSAL order: `exit_task` above already performed the lifecycle
+            // transition, and only then was the disposition published. The first live run
+            // logged these the other way round, which made the attested order contradict
+            // the real one.
+            crate::yarm_log!(
+                "EXIT_TASK_LIFECYCLE_TRANSITION tid={} asid={} syscall_returns=0 result=ok",
+                tid,
+                asid.0
+            );
             crate::yarm_log!(
                 "EXIT_TASK_DISPOSITION_PUBLISHED tid={} asid={} cpu={} result=ok",
                 tid,
                 asid.0,
                 kernel.current_cpu().0
-            );
-            crate::yarm_log!(
-                "EXIT_TASK_LIFECYCLE_TRANSITION tid={} asid={} syscall_returns=0 result=ok",
-                tid,
-                asid.0
             );
             Ok(())
         }

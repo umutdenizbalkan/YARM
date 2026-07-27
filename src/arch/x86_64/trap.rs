@@ -401,6 +401,15 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     if let crate::kernel::boot::PostLockTrapDisposition::CurrentTaskExited { tid, asid } =
         crate::kernel::boot::take_post_lock_trap_disposition(cpu.0 as usize)
     {
+        // Reaching this point PROVES the broad `SpinLock<KernelState>` taken by the in-lock
+        // phase has been dropped: `handle_trap_event` has returned and the post-lock
+        // deferred work has drained. Attesting it here rather than in the shared entry is
+        // what makes it observable — the shared entry runs before the syscall publishes the
+        // disposition, so a pending-check there never fired.
+        crate::yarm_log!(
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64 cpu={} result=ok",
+            cpu.0
+        );
         crate::yarm_log!(
             "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64 tid={} asid={} cpu={} result=ok",
             tid,

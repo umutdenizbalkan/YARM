@@ -90942,15 +90942,21 @@ mod stage200d0b1_x86_exit_prep {
         // The post-lock deferred drain is wired into the shared entry, which the in-lock
         // phase returns through, so the drain precedes the consumer.
         assert!(TRAP_ENTRY_SRC.contains("shared.drain_server_death_post_work(cpu)"));
-        let se = TRAP_ENTRY_SRC
-            .split("fn handle_trap_entry_shared")
-            .nth(1)
-            .expect("shared");
-        let drain = se.find("drain_server_death_post_work").expect("drain");
-        let attest = se
+        // Stage 200D-0B2: the broad-lock-release attestation lives in the CONSUMER, not the
+        // shared entry. The shared entry runs before the syscall publishes the disposition,
+        // so a pending-check there could never fire; reaching the consumer is itself the
+        // proof that the lock dropped and the drain ran.
+        let cb = consumer_block();
+        let released = cb
             .find("EXIT_TASK_BROAD_LOCK_RELEASED")
             .expect("release attestation");
-        assert!(drain < attest, "drain precedes the release attestation");
+        let consumed = cb
+            .find("EXIT_TASK_DISPOSITION_CONSUMED")
+            .expect("consumed attestation");
+        assert!(
+            released < consumed,
+            "the release attestation precedes the consumption attestation"
+        );
     }
 
     // ── identity validation (10–13) ─────────────────────────────────────────────────
