@@ -4000,46 +4000,82 @@ pub fn server_death_work_capacity_available(cpu_idx: usize) -> bool {
         .any(|s| s.is_none())
 }
 
-// ── Stage 200D-0: the NON-RETURNING current-task-exit disposition ───────────────────
+// ── Stage 200D-0A: the TYPED non-returning trap disposition ─────────────────────────
 //
 // A successful `ExitCurrentTask` abandons its own syscall frame. Rather than have each
-// architecture infer that from missing scheduler state — which is exactly how divergent,
+// architecture infer that from missing scheduler state — which is how divergent,
 // duplicated lifecycle logic creeps into trap paths — the syscall publishes an explicit
-// per-CPU disposition and every arch return path consumes it the same way:
+// per-CPU typed disposition and every arch return path will consume it the same way:
 //
 //   do not restore the exiting frame
 //   drain post-lock work
 //   dispatch the audited replacement, or enter idle
 //
-// It is per-CPU and one-shot: `take_current_task_exited` clears it, so exactly one return
-// path can act on it and a normally returning syscall can never observe a stale one.
-static CURRENT_TASK_EXITED: [core::sync::atomic::AtomicU64; crate::kernel::scheduler::MAX_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+// This is CONTROL-FLOW OWNERSHIP, not a second lifecycle authority: `exit_task` remains
+// the only teardown authority, and nothing here mutates task, record or terminal state.
+//
+// It is generation-bearing (`{tid, asid}`, not a bare TID or a global boolean), per-CPU,
+// and single-shot. A duplicate publication is REJECTED rather than overwriting, so a
+// second exit on the same CPU cannot silently displace a pending one.
 
-/// Publish "the task that just trapped on this CPU has exited and must not be resumed".
-pub fn publish_current_task_exited(cpu_idx: usize, tid: u64) {
-    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
-        CURRENT_TASK_EXITED[cpu_idx].store(tid, core::sync::atomic::Ordering::Release);
-    }
+/// What the post-lock trap path must do with the frame that just trapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostLockTrapDisposition {
+    /// The ordinary case: finalize the syscall result and restore the same frame.
+    ReturnNormally,
+    /// The task that trapped has exited. Its frame must never be restored; the post-lock
+    /// path drains deferred work and dispatches a replacement or idles.
+    CurrentTaskExited { tid: u64, asid: Asid },
 }
 
-/// Consume the disposition, if present. One-shot: the second caller sees `None`.
+/// Per-CPU slot. `None` means `ReturnNormally` — the overwhelmingly common case costs a
+/// single relaxed load and no allocation.
+static POST_LOCK_TRAP_DISPOSITION: [crate::kernel::lock::SpinLockIrq<Option<(u64, Asid)>>;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { crate::kernel::lock::SpinLockIrq::new(None) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Publish `CurrentTaskExited` for `cpu_idx`. Returns `false` WITHOUT overwriting when a
+/// disposition is already pending — a duplicate publication is a bug, not a last-writer-wins
+/// race, and the caller must be able to see that it lost.
 #[must_use]
-pub fn take_current_task_exited(cpu_idx: usize) -> Option<u64> {
+pub fn publish_current_task_exited(cpu_idx: usize, tid: u64, asid: Asid) -> bool {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
-        return None;
+        return false;
     }
-    match CURRENT_TASK_EXITED[cpu_idx].swap(u64::MAX, core::sync::atomic::Ordering::AcqRel) {
-        u64::MAX => None,
-        tid => Some(tid),
+    let mut slot = POST_LOCK_TRAP_DISPOSITION[cpu_idx].lock();
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some((tid, asid));
+    true
+}
+
+/// Consume the disposition for `cpu_idx`. One-shot: the second caller sees
+/// `ReturnNormally`, so a normally returning syscall can never act on a stale exit.
+#[must_use]
+pub fn take_post_lock_trap_disposition(cpu_idx: usize) -> PostLockTrapDisposition {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return PostLockTrapDisposition::ReturnNormally;
+    }
+    match POST_LOCK_TRAP_DISPOSITION[cpu_idx].lock().take() {
+        Some((tid, asid)) => PostLockTrapDisposition::CurrentTaskExited { tid, asid },
+        None => PostLockTrapDisposition::ReturnNormally,
     }
 }
 
 /// Non-consuming peek (assertions/telemetry only).
 #[must_use]
-pub fn current_task_exited_pending(cpu_idx: usize) -> bool {
+pub fn post_lock_trap_disposition_pending(cpu_idx: usize) -> bool {
     cpu_idx < crate::kernel::scheduler::MAX_CPUS
-        && CURRENT_TASK_EXITED[cpu_idx].load(core::sync::atomic::Ordering::Acquire) != u64::MAX
+        && POST_LOCK_TRAP_DISPOSITION[cpu_idx].lock().is_some()
+}
+
+/// Clear the slot (hosted test isolation only).
+#[cfg(any(test, feature = "hosted-dev"))]
+pub fn clear_post_lock_trap_disposition(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        *POST_LOCK_TRAP_DISPOSITION[cpu_idx].lock() = None;
+    }
 }
 
 pub(crate) fn server_death_work_published_count() -> u64 {

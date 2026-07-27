@@ -35,6 +35,13 @@ pub const SYSCALL_DEBUG_LOG_NR: usize = 15;
 /// The syscall takes NO target identity: it terminates the current task and nothing else,
 /// so there is no capability to check and no way to name another task.
 pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;
+
+/// Stage 200D-0A — the exit status recorded for a task that ended itself via NR 16.
+///
+/// `0` is the existing neutral "no fault, no supervisor policy" value that teardown already
+/// records; this names it so the call site does not read as a magic literal. No new
+/// exit-code ABI is introduced — userspace passes no status and cannot choose one.
+pub const EXIT_STATUS_SELF_REQUESTED: u64 = 0;
 pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
 pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
 pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
@@ -139,7 +146,7 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 // off. The "preferred safe groups" (debug, initramfs, control/cap, process,
 // sched, vm) all landed in earlier stages. Stage 152 instead locks the full
 // boundary surface (module set, visibilities, dispatch ownership,
-// SYSCALL_COUNT==32 / VARIANT_COUNT==23, the pinned IPC/cap functions, low-risk
+// SYSCALL_COUNT==32 / VARIANT_COUNT==24, the pinned IPC/cap functions, low-risk
 // module hygiene, no stale nonexistent-`mm`-submodule reference) via boot::tests::
 // stage152_syscall_decomposition_completeness_audit so future agents cannot
 // silently undo the boundaries. See doc/KERNEL_UNLOCKING.md §5.1.
@@ -320,12 +327,47 @@ pub enum Syscall {
     ExitCurrentTask = SYSCALL_EXIT_CURRENT_TASK_NR,
 }
 
+/// Stage 200D-0A — the CANONICAL list of every `Syscall` variant.
+///
+/// `VARIANT_COUNT` used to be a hand-maintained literal, and it drifted: it read `22` while
+/// the enum declared 23 variants, because `ReapFaultedTask` (NR 31) was added without
+/// bumping it. A guard even named itself `stage42_variant_count_is_23` while asserting
+/// `22`. Deriving the count from this list removes the class of bug entirely — adding a
+/// variant without listing it here is caught by `s04_variant_list_is_exhaustive`, which
+/// round-trips every listed variant through `decode` and cross-checks the enum's own
+/// declaration count parsed from source.
+pub const ALL_SYSCALL_VARIANTS: &[Syscall] = &[
+    Syscall::Yield,
+    Syscall::IpcSend,
+    Syscall::IpcRecv,
+    Syscall::VmMap,
+    Syscall::TransferRelease,
+    Syscall::IpcRecvTimeout,
+    Syscall::IpcCall,
+    Syscall::IpcReply,
+    Syscall::ControlPlaneSetCnodeSlots,
+    Syscall::FutexWait,
+    Syscall::FutexWake,
+    Syscall::SpawnThread,
+    Syscall::Fork,
+    Syscall::VmAnonMap,
+    Syscall::VmBrk,
+    Syscall::DebugLog,
+    Syscall::ExitCurrentTask,
+    Syscall::SpawnProcess,
+    Syscall::SpawnProcessFromUserBuf,
+    Syscall::SpawnFromInitramfsFile,
+    Syscall::CreateInitramfsFileSliceMo,
+    Syscall::SpawnFromMemoryObject,
+    Syscall::RecvSharedV3,
+    Syscall::ReapFaultedTask,
+];
+
 impl Syscall {
-    // Stage 200D-0: bumped 22 -> 23 for `ExitCurrentTask`. NOTE: this constant has been
-    // one behind the enum since `ReapFaultedTask` (NR 31) was added without bumping it, and
-    // that off-by-one is deliberately preserved here rather than silently corrected — the
-    // drift is tracked for a separate cleanup.
-    pub const VARIANT_COUNT: usize = 23;
+    /// The number of assigned syscall variants, DERIVED from [`ALL_SYSCALL_VARIANTS`] so a
+    /// manual count can never drift from the enum again. This is a genuine count of
+    /// variants, not a highest-index: with `ExitCurrentTask` it is 24.
+    pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -1945,10 +1987,16 @@ fn handle_exit_current_task(
     // caller `exit_task` previously lacked. Its broad-lock phase reserves the deferred slot,
     // detaches the exact link and publishes the item; the PeerDeath claim, caller result and
     // caller enqueue all happen later in the post-lock drain.
-    match kernel.exit_task(tid, 0) {
+    match kernel.exit_task(tid, EXIT_STATUS_SELF_REQUESTED) {
         Ok(_token) => {
-            // (4) Publish the non-returning disposition. The trap-return path consumes it.
-            crate::kernel::boot::publish_current_task_exited(kernel.current_cpu().0 as usize, tid);
+            // (4) Publish the typed non-returning disposition. It is generation-bearing and
+            // single-shot: a duplicate publication is REJECTED rather than overwriting.
+            let published = crate::kernel::boot::publish_current_task_exited(
+                kernel.current_cpu().0 as usize,
+                tid,
+                asid,
+            );
+            debug_assert!(published, "exactly one disposition per exiting trap");
             crate::yarm_log!(
                 "EXIT_TASK_LIFECYCLE_COMMITTED tid={} asid={} syscall_returns=0 result=ok",
                 tid,
@@ -5280,7 +5328,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 2 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            24,
             "D4 step 2 must not change syscall variant count"
         );
         assert!(
@@ -5344,7 +5392,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 3 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            24,
             "D4 step 3 must not change syscall variant count"
         );
         assert!(
@@ -5413,7 +5461,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 4 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            23,
+            24,
             "D4 step 4 must not change syscall variant count"
         );
         assert!(

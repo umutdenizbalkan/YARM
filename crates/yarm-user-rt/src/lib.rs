@@ -236,30 +236,39 @@ pub mod syscall {
         }
     }
 
-    /// Stage 200D-0 — terminate the CALLING task. Takes no arguments: the kernel derives
-    /// the exact `{tid, asid}` from scheduler state, so a task can only ever end itself.
+    /// Stage 200D-0A — terminate the CALLING task (NR 16).
     ///
-    /// # Returns
-    /// On success this DOES NOT RETURN. A return means the exit was declined before
-    /// anything irreversible happened (for example the deferred server-death queue was
-    /// momentarily full while this task still owed a reply) and the caller is still
-    /// runnable — retrying later is valid.
+    /// Takes no arguments: the kernel derives the exact `{tid, asid}` from scheduler
+    /// state, so a task can only ever end itself and no capability is involved.
+    ///
+    /// # Return contract
+    ///
+    /// There are exactly two outcomes, and the signature makes the asymmetry explicit
+    /// rather than promising a `!` the kernel cannot always deliver:
+    ///
+    /// * **Accepted** — the call does not return. The task transitions to `Exiting`,
+    ///   teardown takes ownership, and the instruction after the trap never executes. The
+    ///   `Infallible` in the success position encodes that: there is no success value to
+    ///   observe, because observing one would mean the task resumed.
+    /// * **Preflight refusal** — `Err(SyscallError::WouldBlock)`. This is the ONLY
+    ///   returning outcome, and it happens strictly BEFORE anything irreversible: the
+    ///   kernel could not reserve the bounded deferred capacity needed to hand off a reply
+    ///   this task still owes. Nothing changed; the task is still runnable and retrying
+    ///   later is valid. A partially-exited task is never returned to.
     ///
     /// # Safety
-    /// Ends the current thread of execution; nothing after a successful call runs.
+    /// On acceptance this ends the current thread of execution; nothing after it runs.
     #[inline]
-    pub unsafe fn exit_current_task() -> SyscallError {
+    pub unsafe fn exit_current_task()
+    -> core::result::Result<core::convert::Infallible, SyscallError> {
         // SAFETY: no pointer arguments; the kernel reads no user memory for this call.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_EXIT_CURRENT_TASK_NR, [0; 6]) };
-        // Only reached when the kernel DECLINED the exit.
+        // Only reached when the kernel DECLINED the exit before mutating anything.
         #[cfg(target_arch = "x86_64")]
-        {
-            decode_syscall_error(ret.error)
-        }
+        let code = ret.error;
         #[cfg(not(target_arch = "x86_64"))]
-        {
-            decode_syscall_error(ret.ret0)
-        }
+        let code = ret.ret0;
+        Err(decode_syscall_error(code))
     }
 
     #[inline]
