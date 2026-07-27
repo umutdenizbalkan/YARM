@@ -87404,3 +87404,163 @@ mod stage200c2c2b_riscv_final_frame {
         );
     }
 }
+
+/// Stage 200C2C2C-R2A — RISC-V blocked-syscall RESULT PUBLICATION into the saved continuation.
+///
+/// `UserRegisterContext` carries two mirrors of the same userspace state — the raw `user_gprs`
+/// register file and the decoded `arg0..arg5` syscall-argument lanes. They are captured and
+/// restored together, so publishing a completed result into only ONE lets the resume reconstruct
+/// a stale value from the other. That was the proven defect (userspace saw its own endpoint-cap
+/// argument, 65540, instead of the timeout code 9). One canonical helper now owns the mirroring.
+mod stage200c2c2c_r2a_riscv_publication {
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::task::ThreadControlBlock;
+    use crate::kernel::vm::Asid;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+
+    /// `SyscallError::TimedOut as usize` — the canonical timeout code.
+    const TIMED_OUT: usize = 9;
+    /// The exact stale argument userspace observed before the repair (a reply-endpoint cap).
+    const STALE_ARG: usize = 65540;
+
+    fn tcb_blocked_on_recv() -> ThreadControlBlock {
+        let mut t = ThreadControlBlock::new(ThreadId(1), Some(Asid(1)));
+        // Model the saved continuation of a blocked recv: BOTH mirrors hold the original
+        // syscall arguments (a0 = the endpoint capability).
+        t.user_context.user_gprs[10] = STALE_ARG;
+        t.user_context.arg0 = STALE_ARG;
+        t.user_context.user_gprs[11] = 0x1111;
+        t.user_context.arg1 = 0x1111;
+        // A distinct unrelated saved register that must survive untouched.
+        t.user_context.user_gprs[20] = 0xDEAD;
+        t
+    }
+
+    // (1) the stale argument a0 is replaced by the timeout result in BOTH mirrors.
+    #[test]
+    fn p01_stale_argument_replaced_by_timeout_result() {
+        let mut t = tcb_blocked_on_recv();
+        assert_eq!(t.user_context.user_gprs[10], STALE_ARG);
+        t.publish_riscv_user_return(0, 0, TIMED_OUT);
+        assert_eq!(t.user_context.user_gprs[10], TIMED_OUT, "register mirror");
+        assert_eq!(t.user_context.arg0, TIMED_OUT, "argument-lane mirror");
+    }
+
+    // (2) a success result (0) replaces a nonzero original argument.
+    #[test]
+    fn p02_success_replaces_nonzero_argument() {
+        let mut t = tcb_blocked_on_recv();
+        t.publish_riscv_user_return(0, 0, 0);
+        assert_eq!(t.user_context.user_gprs[10], 0);
+        assert_eq!(t.user_context.arg0, 0);
+    }
+
+    // (3) the two stored mirrors cannot diverge after publication (any result shape).
+    #[test]
+    fn p03_mirrors_cannot_diverge() {
+        for (ret0, ret1, err) in [(0, 0, TIMED_OUT), (0, 0, 0), (42, 7, 0), (0, 0, 2)] {
+            let mut t = tcb_blocked_on_recv();
+            t.publish_riscv_user_return(ret0, ret1, err);
+            assert_eq!(
+                t.user_context.user_gprs[10], t.user_context.arg0,
+                "a0 mirrors agree"
+            );
+            assert_eq!(
+                t.user_context.user_gprs[11], t.user_context.arg1,
+                "a1 mirrors agree"
+            );
+        }
+    }
+
+    // (4) an error result clears the secondary lane, so a stale success value cannot be read
+    // alongside a canonical error.
+    #[test]
+    fn p04_error_clears_secondary_lane() {
+        let mut t = tcb_blocked_on_recv();
+        t.publish_riscv_user_return(0, 0, TIMED_OUT);
+        assert_eq!(t.user_context.user_gprs[11], 0);
+        assert_eq!(t.user_context.arg1, 0);
+    }
+
+    // (5) unrelated saved registers are untouched.
+    #[test]
+    fn p05_other_registers_unchanged() {
+        let mut t = tcb_blocked_on_recv();
+        let pc = t.user_context.instruction_ptr;
+        let sp = t.user_context.stack_ptr;
+        t.publish_riscv_user_return(0, 0, TIMED_OUT);
+        assert_eq!(t.user_context.user_gprs[20], 0xDEAD);
+        assert_eq!(t.user_context.instruction_ptr, pc, "sepc untouched");
+        assert_eq!(t.user_context.stack_ptr, sp, "sp untouched");
+    }
+
+    // (6) publication happens BEFORE the task is made Runnable / enqueued, so the scheduler can
+    // never dispatch a task whose stored result is still stale.
+    #[test]
+    fn p06_publication_precedes_runnable_and_enqueue() {
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        let publish = body
+            .find("publish_riscv_user_return")
+            .expect("publication call");
+        let runnable = body
+            .find("tcb.status = TaskStatus::Runnable")
+            .expect("runnable");
+        assert!(publish < runnable, "publish before Runnable");
+        // The enqueue is the transaction's last step, strictly after this helper returns.
+        let txn = IPC_STATE_SRC
+            .split("fn complete_reply_timeout_over")
+            .nth(1)
+            .expect("txn");
+        let txn = txn.split("\npub(crate) fn ").next().unwrap();
+        let commit = txn
+            .find("rt_commit_receiver_runnable(d")
+            .expect("commit call");
+        let enqueue = txn.find("d.rtd_enqueue(caller.tid.0)").expect("enqueue");
+        assert!(commit < enqueue, "publication precedes scheduler enqueue");
+    }
+
+    // (7) SOURCE GUARD: no completion path writes only one mirror — every RISC-V result
+    // publication goes through the canonical helper.
+    #[test]
+    fn p07_no_unmirrored_a0_writes_outside_helper() {
+        // The helper is the single definition owning the mirror pair.
+        assert_eq!(
+            TASK_SRC.matches("pub fn publish_riscv_user_return").count(),
+            2,
+            "one riscv64 definition + one hosted mirror, no third"
+        );
+        // The completion boundary uses the helper, not paired ad-hoc writes.
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        assert!(body.contains("tcb.publish_riscv_user_return(0, 0, timed_out as usize);"));
+        // No RISC-V a0/a1 lane is written directly at this boundary.
+        let riscv_direct =
+            body.matches("user_gprs[10]").count() + body.matches("user_gprs[11]").count();
+        assert_eq!(
+            riscv_direct, 0,
+            "no direct RISC-V lane writes outside the helper"
+        );
+    }
+
+    // (8) the timeout completion still performs NO user-memory copy.
+    #[test]
+    fn p08_no_user_memory_copy_in_completion() {
+        let txn = IPC_STATE_SRC
+            .split("fn complete_reply_timeout_over")
+            .nth(1)
+            .expect("txn");
+        let txn = txn.split("\npub(crate) fn ").next().unwrap();
+        for c in ["copy_to_user", "copy_from_user", "copy_to_current_user"] {
+            assert!(!txn.contains(c), "timeout completion must not {c}");
+        }
+    }
+}

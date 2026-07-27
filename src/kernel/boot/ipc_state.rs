@@ -286,6 +286,15 @@ fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
             tcb.user_context.user_gprs[3] = 0; // RDX
             tcb.user_context.user_gprs[7] = 0; // R8
         }
+        // RISC-V: publish the completed result through the CANONICAL helper, which owns the
+        // saved-continuation mirror synchronization (`user_gprs` a0/a1 AND their argument lanes).
+        // Publishing here — before the task is made Runnable, and long before the scheduler
+        // enqueue — guarantees the result is already visible when the resume path reconstructs the
+        // outgoing frame. No user-memory copy, no lock; the enclosing lookup already matched the
+        // exact `{tid, asid}` incarnation and blocked state, so this is never a numeric-TID-only
+        // publication.
+        #[cfg(target_arch = "riscv64")]
+        tcb.publish_riscv_user_return(0, 0, timed_out as usize);
         // AArch64 (and other non-x86 saved-frame-resume ports): the blocked recv is NEVER
         // re-entered — its SVC `ELR_EL1` already points past the instruction, so the caller
         // resumes straight to userspace from its saved context. A remote completion therefore

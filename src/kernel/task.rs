@@ -235,6 +235,55 @@ pub struct BlockedSyscallCompletion {
 }
 
 impl ThreadControlBlock {
+    /// Stage 200C2C2C-R2A — the CANONICAL publication of a completed blocked syscall's user-visible
+    /// return registers into this task's saved continuation (RISC-V).
+    ///
+    /// ## Why two stores exist
+    ///
+    /// [`UserRegisterContext`] keeps two mirrors of the same userspace state: `user_gprs` (the raw
+    /// register file) and `arg0..arg5` (the decoded syscall-argument lanes). They are populated
+    /// together by `TrapFrame::capture_user_context` (frame → TCB) and restored together by
+    /// `TrapFrame::apply_user_context` (TCB → frame), so on entry they agree. They are NOT
+    /// redundant: the argument lanes are what the RISC-V syscall ABI import/restore path treats as
+    /// authoritative for a resumed continuation, which is why publishing a completed result into
+    /// only ONE of them lets the resume reconstruct `a0` from the other, stale mirror. That is
+    /// exactly the proven defect: a timed-out receive published `a0 = 9` into the register mirror
+    /// while the argument mirror still held the original endpoint capability, and userspace
+    /// observed `a0 = 65540` — its own stale argument — instead of the result.
+    ///
+    /// This helper owns that mirror synchronization so no completion path has to know about it.
+    /// It performs no user-memory copy, takes no lock, and must be called BEFORE the task is
+    /// enqueued (the result must already be visible when the scheduler can dispatch it).
+    ///
+    /// `error` is the canonical `SyscallError` code (`0` = success). Only the RISC-V result lanes
+    /// (`a0`/`a1` and their argument mirrors) are touched; every other saved register, `sepc`,
+    /// `sstatus`, `satp`, `sp` and `tp` are left exactly as the continuation saved them.
+    #[cfg(target_arch = "riscv64")]
+    pub fn publish_riscv_user_return(&mut self, ret0: usize, ret1: usize, error: usize) {
+        // RISC-V syscall ABI: a0 carries the error code when non-zero, otherwise ret0; a1 carries
+        // ret1. `a0` is `user_gprs[10]`, `a1` is `user_gprs[11]`.
+        let a0 = if error != 0 { error } else { ret0 };
+        let a1 = if error != 0 { 0 } else { ret1 };
+        self.user_context.user_gprs[10] = a0;
+        self.user_context.user_gprs[11] = a1;
+        // The argument-lane mirror MUST be published in the same operation, or the resume can
+        // reconstruct a stale `a0` from it (the proven defect above).
+        self.user_context.arg0 = a0;
+        self.user_context.arg1 = a1;
+    }
+
+    /// Hosted mirror of [`Self::publish_riscv_user_return`] so the publication contract is
+    /// testable on any host. Same lane semantics; compiled when not targeting RISC-V.
+    #[cfg(not(target_arch = "riscv64"))]
+    pub fn publish_riscv_user_return(&mut self, ret0: usize, ret1: usize, error: usize) {
+        let a0 = if error != 0 { error } else { ret0 };
+        let a1 = if error != 0 { 0 } else { ret1 };
+        self.user_context.user_gprs[10] = a0;
+        self.user_context.user_gprs[11] = a1;
+        self.user_context.arg0 = a0;
+        self.user_context.arg1 = a1;
+    }
+
     pub fn new(tid: ThreadId, asid: Option<Asid>) -> Self {
         Self {
             tid,
