@@ -3574,6 +3574,45 @@ pub fn x86_exit_oracle_enabled() -> bool {
 #[cfg(feature = "x86-exit-current-task-oracle")]
 pub const X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR: u64 = 20;
 
+// ── Stage 200D-0C1: the AArch64 ExitCurrentTask live-oracle activation ──────────────
+//
+// The AArch64 sibling of the block above, with one deliberate difference: the selector
+// is NOT hand-written here. It comes from the shared
+// `yarm_ipc_abi::exit_current_task_abi` encoder — the exact inverse of the decoder the
+// init server applies — so the kernel and userspace ends cannot drift apart the way the
+// reply-timeout selectors did in Stage 200C2C2C-R2B.
+#[cfg(feature = "aarch64-exit-current-task-oracle")]
+static AARCH64_EXIT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "aarch64-exit-current-task-oracle")]
+pub(crate) fn set_aarch64_exit_oracle_enabled(on: bool) {
+    AARCH64_EXIT_ORACLE_ENABLED.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// `true` only when the feature is built AND the boot knob armed it.
+#[must_use]
+pub fn aarch64_exit_oracle_enabled() -> bool {
+    #[cfg(feature = "aarch64-exit-current-task-oracle")]
+    {
+        AARCH64_EXIT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(feature = "aarch64-exit-current-task-oracle"))]
+    {
+        false
+    }
+}
+
+/// The startup slot-5 selector this build's kernel must publish for the disposable exit
+/// task, produced by the SHARED ABI encoder rather than a local literal.
+#[cfg(feature = "aarch64-exit-current-task-oracle")]
+#[must_use]
+pub fn aarch64_exit_current_task_selector() -> u64 {
+    yarm_ipc_abi::exit_current_task_abi::exit_current_task_selector_for_current_arch(
+        yarm_ipc_abi::exit_current_task_abi::ExitCurrentTaskScenario::SelfExit,
+    ) as u64
+}
+
 pub const IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS: u8 = 1;
 pub const IPC_REPLY_TIMEOUT_MODE_REPLY_WINS: u8 = 2;
 

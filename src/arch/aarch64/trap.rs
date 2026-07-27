@@ -49,6 +49,24 @@ pub(crate) fn enter_post_lock_idle(cpu: CpuId) -> ! {
     idle_no_eret_loop();
 }
 
+/// Stage 200D-0C1: the accepted-`ExitCurrentTask` idle outcome, entered from the post-lock
+/// disposition consumer when the exiting task left no replacement.
+///
+/// This is NOT a second idle policy: it delegates to the identical `idle_no_eret_loop()`
+/// primitive the normal path and the Stage 195F FutexWait idle outcome both use. Only the
+/// attestation differs, so a live log can tell WHICH retirement class idled. Like 195F it runs
+/// with the broad `KernelState` guard already dropped, so a wake IRQ re-enters the trap path
+/// and dispatches normally. `current` is None, so no stale EL0 ELR/SPSR is ever returned.
+/// Never returns.
+pub(crate) fn enter_post_lock_idle_after_exit(cpu: CpuId, exiting_tid: u64) -> ! {
+    crate::yarm_log!(
+        "EXIT_TASK_IDLE_ENTERED arch=aarch64 cpu={} exiting_tid={} primitive=idle_no_eret_loop result=ok",
+        cpu.0,
+        exiting_tid
+    );
+    idle_no_eret_loop();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Aarch64TrapContext {
     pub esr_el1: u32,
@@ -499,9 +517,45 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         idx < crate::kernel::scheduler::MAX_CPUS
             && crate::kernel::boot::yield_dispatch_is_deferred(idx)
     };
-    let post_lock_bypass = futex_wait_bypass || yield_bypass;
+    // Stage 200D-0C1 (AARCH64 EXITCURRENTTASK HANDLER BYPASS): the third — and structurally
+    // different — member of this family. An accepted NR16 published a
+    // `PostLockTrapDisposition::CurrentTaskExited` for this CPU while the broad lock was held.
+    //
+    // Both effects of this bypass are REQUIRED for the consumer to exist at all:
+    //
+    //   * the idle divergence below calls `idle_no_eret_loop()` INSIDE `with_cpu` and never
+    //     returns, so an exit that leaves no replacement would strand the disposition forever
+    //     (unconsumed, with the broad lock held) — the post-lock section could never run;
+    //   * `restore_arch_thread_state` below runs INSIDE `with_cpu`, so leaving it enabled would
+    //     commit the outgoing frame BEFORE the post-lock consumer had validated anything.
+    //
+    // Skipping both relocates the outgoing selection to the post-lock consumer in
+    // `arch/trap_entry.rs`, which runs after the broad guard is dropped AND after every shared
+    // post-lock drain. Strictly disposition-specific: only an accepted NR16 ever publishes one,
+    // so every other trap on every other path is bit-identical to before.
+    let exit_disposition_bypass = {
+        let idx = cpu.0 as usize;
+        idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::post_lock_trap_disposition_pending(idx)
+    };
+    if exit_disposition_bypass {
+        crate::yarm_log!(
+            "EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64 cpu={} exiting_tid={} inlock_restore=0 inlock_idle=0 result=ok",
+            cpu.0,
+            entering_tid.unwrap_or(0)
+        );
+    }
+    let post_lock_bypass = futex_wait_bypass || yield_bypass || exit_disposition_bypass;
     if matches!(exiting_tid, None | Some(0)) {
-        if futex_wait_bypass {
+        if exit_disposition_bypass {
+            // No in-lock idle: the post-lock consumer names the idle outcome and enters the
+            // SAME `idle_no_eret_loop()` primitive after the broad guard has dropped.
+            crate::yarm_log!(
+                "EXIT_TASK_INLOCK_IDLE_DEFERRED arch=aarch64 cpu={} outgoing_tid={} result=ok",
+                cpu.0,
+                entering_tid.unwrap_or(0)
+            );
+        } else if futex_wait_bypass {
             crate::yarm_log!(
                 "AARCH64_FUTEX_WAIT_HANDLER_BYPASS_BEGIN cpu={} outgoing_tid={}",
                 cpu.0,
@@ -519,7 +573,12 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         }
     }
 
-    if task_switched {
+    // Stage 200D-0C1: an accepted NR16 makes `task_switched` true (entering = the exiting task,
+    // exiting = its replacement or None), but the outgoing task is DEAD. Saving a resume context
+    // into an `Exited` TCB — and stamping the exiting task's ELR into the shared trap frame —
+    // would be exactly the "old frame" state the consumer must prove is never produced. The
+    // exiting incarnation is never resumed, so there is nothing to save.
+    if task_switched && !exit_disposition_bypass {
         // Save the original task's post-syscall resume PC to its TCB.
         // sync_current_thread_from_frame already ran (before yield), but we also
         // fix the frame's saved_pc here and re-save so the original task resumes at

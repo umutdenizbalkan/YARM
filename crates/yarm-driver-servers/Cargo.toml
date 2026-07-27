@@ -12,6 +12,10 @@ autobins = false
 # `yarm` and `yarm-control-plane-servers` implement must still resolve here. This crate
 # compiles no oracle code under it — the real gating stays where the oracle lives.
 x86-exit-current-task-oracle = []
+# Stage 200D-0C1: the AArch64 sibling, accepted as an UNUSED pass-through for the same
+# reason — `build-qemu-aarch64-artifacts.sh` applies one feature set to every server
+# package. This crate compiles no oracle code under it.
+aarch64-exit-current-task-oracle = []
 default = ["hosted-dev"]
 hosted-dev = []
 

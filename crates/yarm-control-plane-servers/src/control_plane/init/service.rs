@@ -2287,6 +2287,116 @@ fn run_x86_ipc_reply_timeout_oracle(init_tid: u64) {
     }
 }
 
+// ── Stage 200D-0C1: the AArch64 DISPOSABLE ExitCurrentTask oracle task ───────────────
+//
+// A spawned, non-essential thread — never init, the process manager, the supervisor, or a
+// server the boot needs — so its disappearance cannot itself end the boot. init keeps
+// running afterwards and is the surviving task that proves continued progress.
+//
+// The whole module is feature-gated, so a feature-off binary carries none of these literals.
+// It is spawned only AFTER the normal service chain is healthy.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "aarch64-exit-current-task-oracle"
+))]
+mod aarch64_exit_current_task_oracle {
+    pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
+    pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
+
+    /// Decode init's startup slot 5 through the SHARED ABI helper — the exact inverse of the
+    /// encoder the kernel used to write it. Userspace never compares against a bare literal,
+    /// so the two ends cannot drift apart.
+    pub(super) fn armed(slot5: Option<u32>) -> bool {
+        match slot5 {
+            Some(v) => matches!(
+                yarm_ipc_abi::exit_current_task_abi::exit_current_task_scenario_for_current_arch(
+                    v as usize
+                ),
+                Some(yarm_ipc_abi::exit_current_task_abi::ExitCurrentTaskScenario::SelfExit)
+            ),
+            None => false,
+        }
+    }
+}
+
+/// The disposable AArch64 task body. It emits one entry marker, calls NR 16, and must never
+/// execute another instruction. `EXIT_TASK_SYSCALL_RETURNED` is a HARD-FAIL marker: it can only
+/// appear if an accepted exit returned to EL0, which the runner treats as an immediate failure.
+/// A preflight refusal would also land here — this task owns no reply record, so that path is
+/// unreachable for it and either outcome is a defect.
+///
+/// A plain `extern "C"` entry is correct here, and this is not an assumption: it is the same
+/// convention `aarch64_ipc_reply_timeout_child_body` and every other AArch64 oracle child
+/// already uses in live-sealed boots. AAPCS64 has no x86-style initial-SP alignment hazard, so
+/// the naked trampoline the x86_64 cell needs (Stage 200D-0B2) has no AArch64 analogue.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "aarch64-exit-current-task-oracle"
+))]
+extern "C" fn aarch64_exit_task_child_body() -> ! {
+    yarm_user_rt::user_log!("EXIT_TASK_USER_ENTERED role=disposable arch=aarch64");
+    // SAFETY: terminates this thread; nothing after it may run.
+    let outcome = unsafe { yarm_user_rt::syscall::exit_current_task() };
+    yarm_user_rt::user_log!(
+        "EXIT_TASK_SYSCALL_RETURNED arch=aarch64 err={:?} result=fail",
+        outcome.err()
+    );
+    loop {
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
+}
+
+/// Spawn the disposable AArch64 exit task. Runs late, after the service chain is up, so the
+/// boot's terminal health marker still has to be reached by the SURVIVING tasks afterwards.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "aarch64-exit-current-task-oracle"
+))]
+fn run_aarch64_exit_current_task_oracle(_init_tid: u64) {
+    use aarch64_exit_current_task_oracle as oracle;
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(oracle::CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = aarch64_exit_task_child_body as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(oracle::CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) } {
+        Ok(tid) => {
+            yarm_user_rt::user_log!(
+                "EXIT_TASK_ORACLE_SPAWNED arch=aarch64 disposable_tid={}",
+                tid
+            );
+            // Keep init alive and yielding so the disposable task is scheduled, then keep making
+            // progress afterwards — that continued progress is the live evidence that the
+            // exiting task's EL0 frame was never restored and the CPU moved on.
+            let mut spun = 0u32;
+            while spun < 4096 {
+                let _ = yarm_user_rt::syscall::yield_now();
+                spun += 1;
+            }
+            yarm_user_rt::user_log!(
+                "EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64 disposable_tid={} yields={}",
+                tid,
+                spun
+            );
+            // Terminal health: emitted LAST, by a task that outlived the exit. The runner treats
+            // its absence as "QEMU exited before terminal proof", so a boot that died anywhere
+            // earlier cannot pass.
+            yarm_user_rt::user_log!(
+                "EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64 survivor=init disposable_tid={} result=ok",
+                tid
+            );
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("EXIT_TASK_ORACLE_SPAWN_FAIL arch=aarch64 err={:?}", e);
+        }
+    }
+}
+
 /// AArch64 server child body: run the arch-neutral reply-timeout server core, then park. A plain
 /// `extern "C"` entry (no naked trampoline — AAPCS64 has no x86-style initial-SP alignment hazard).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
@@ -3926,6 +4036,19 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if ctx.supervisor_control_recv_ep == Some(8) || ctx.supervisor_control_recv_ep == Some(9) {
         run_aarch64_ipc_reply_timeout_oracle(ctx.task_id);
+    }
+    // Stage 200D-0C1: default-off + feature-gated AArch64 LIVE ExitCurrentTask oracle. The slot-5
+    // value is DECODED through the shared `yarm_ipc_abi::exit_current_task_abi` helper rather than
+    // compared to a literal, so this arm cannot be reached by another architecture's selector and
+    // cannot drift from the kernel's encoder. Requires the kernel feature +
+    // `yarm.aarch64_exit_current_task_oracle=1`.
+    #[cfg(all(
+        not(feature = "hosted-dev"),
+        target_arch = "aarch64",
+        feature = "aarch64-exit-current-task-oracle"
+    ))]
+    if aarch64_exit_current_task_oracle::armed(ctx.supervisor_control_recv_ep) {
+        run_aarch64_exit_current_task_oracle(ctx.task_id);
     }
     // Stage 200C2C2: default-off + feature-gated RISC-V LIVE reply-receive TIMEOUT retirement
     // oracle. Slot-5 selector 9 = timeout-wins, 10 = reply-wins (mutually exclusive with every

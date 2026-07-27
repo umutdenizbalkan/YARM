@@ -406,6 +406,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_x86_exit_oracle_enabled(true);
         crate::yarm_log!("YARM_X86_64_EXIT_CURRENT_TASK_ORACLE_SET enabled=1");
     }
+    // Stage 200D-0C1: DEFAULT-OFF AArch64 ExitCurrentTask live-oracle knob.
+    #[cfg(feature = "aarch64-exit-current-task-oracle")]
+    if parsed.aarch64_exit_current_task_oracle == Some(true) {
+        crate::kernel::boot::set_aarch64_exit_oracle_enabled(true);
+        crate::yarm_log!("YARM_AARCH64_EXIT_CURRENT_TASK_ORACLE_SET enabled=1");
+    }
     if let Some(mode) = parsed.x86_64_ipc_reply_timeout_oracle {
         // Stage 200C2A: arm the reply-timeout oracle mode (1=timeout-wins, 2=reply-wins). The slot-5
         // provisioning + registration/scan wiring are additionally feature- and arch-gated.
@@ -806,6 +812,10 @@ pub struct YarmBootOptions<'a> {
     /// Stage 200D-0B1: `yarm.x86_64_exit_current_task_oracle=1` DEFAULT-OFF knob. Spawns one
     /// disposable, non-essential userspace task that invokes NR 16 and must never return.
     pub x86_64_exit_current_task_oracle: Option<bool>,
+    /// Stage 200D-0C1: `yarm.aarch64_exit_current_task_oracle=1` DEFAULT-OFF knob — the AArch64
+    /// sibling of the knob above. Spawns one disposable, non-essential userspace task that
+    /// invokes NR 16 and must never return to EL0.
+    pub aarch64_exit_current_task_oracle: Option<bool>,
     /// Stage 200C2C1: `yarm.aarch64_ipc_reply_timeout_oracle=timeout-wins|reply-wins` DEFAULT-OFF
     /// knob — the AArch64 port of the reply-receive TIMEOUT retirement oracle. Same per-boot mode
     /// discriminator as the x86 knob (`Some(1)` = timeout-wins, `Some(2)` = reply-wins; `None` = off),
@@ -1054,6 +1064,14 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.x86_64_exit_current_task_oracle" {
             options.x86_64_exit_current_task_oracle = Some(matches!(value, b"1" | b"true"));
+        }
+        // Stage 200D-0C1: the PARSE arm is feature-gated, not just the arming site. Leaving it
+        // unconditional keeps the key's byte literal in `.rodata` of a feature-off image — the
+        // literal-cleanliness requirement is about the shipped bytes, not about reachability,
+        // and a knob that can arm nothing is dead weight regardless.
+        #[cfg(feature = "aarch64-exit-current-task-oracle")]
+        if key == b"yarm.aarch64_exit_current_task_oracle" {
+            options.aarch64_exit_current_task_oracle = Some(matches!(value, b"1" | b"true"));
         }
         if key == b"yarm.x86_64_ipc_reply_timeout_oracle" {
             // Stage 200C2A: two mutually-exclusive string modes. An unrecognized value leaves the

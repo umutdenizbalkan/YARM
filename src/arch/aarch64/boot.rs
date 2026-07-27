@@ -7896,6 +7896,24 @@ pub fn bootstrap_first_user_task(
         init_args[5] = 1;
         crate::yarm_log!("AARCH64_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1");
     }
+    // Stage 200D-0C1: the AArch64 ExitCurrentTask live-oracle slot-5 write. This IS the
+    // production activation — without it the feature and the knob arm nothing and init never
+    // sees the scenario (the exact defect that produced two dead x86 runs in Stage 200D-0B2,
+    // where the selector constant existed but nothing assigned it).
+    //
+    // The value is NOT written literally: it comes from the shared
+    // `yarm_ipc_abi::exit_current_task_abi` encoder via `aarch64_exit_current_task_selector()`,
+    // and the init server decodes it through the inverse of that same helper. This oracle needs
+    // no capabilities, so it takes slot 5 only, and is mutually exclusive with every slot-5
+    // oracle above (guarded by `init_args[5] == 0`).
+    #[cfg(feature = "aarch64-exit-current-task-oracle")]
+    if crate::kernel::boot::aarch64_exit_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::aarch64_exit_current_task_selector();
+        crate::yarm_log!(
+            "EXIT_TASK_ORACLE_SLOTS arch=aarch64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

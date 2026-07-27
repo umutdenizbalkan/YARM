@@ -1109,6 +1109,175 @@ pub fn handle_trap_entry_shared(
     #[cfg(not(target_arch = "riscv64"))]
     let _ = shared.drain_server_death_post_work(cpu);
 
+    // ── Stage 200D-0C1: the AArch64 `CurrentTaskExited` consumer ────────────────────────────
+    //
+    // THE single AArch64 production call to `take_post_lock_trap_disposition`. Its position is
+    // the whole contract, and every clause of it is a property of THIS line, not of a comment:
+    //
+    //   after broad-lock release  — `shared.with_cpu(...)` above returned, dropping the
+    //                               `SpinLock<KernelState>` guard. The brief `with_cpu`
+    //                               re-acquires below are only possible BECAUSE it was
+    //                               dropped; a still-held guard would deadlock here, so
+    //                               reaching the restore at all is the proof.
+    //   after post-lock drains    — this is the LAST statement of the post-lock section:
+    //                               dispatch, AArch64 FutexWait (195E), AArch64 Yield (195G),
+    //                               the switch-plan stash (117), the reply-timeout collector
+    //                               (200C2C1) and the server-death drain (200D-2A) have all run.
+    //   before outgoing restore   — the in-lock `restore_arch_thread_state` was SKIPPED by the
+    //                               Stage 200D-0C1 handler bypass, so no user thread state has
+    //                               been restored yet; this block selects and performs it.
+    //   before frame commit       — the vector only calls `write_trapframe_back_to_vector_frame`
+    //                               after `handle_trap_entry_shared` returns.
+    //
+    // This is deliberately NOT the x86_64 shape. x86_64 consumes inside the arch handler
+    // (Stage 200D-0B2); AArch64 cannot, because its idle divergence never returns from inside
+    // `with_cpu`. See the Stage 200D-0C1 audit note in `arch/aarch64/trap.rs`.
+    //
+    // The consumer performs NO teardown, NO enqueue, NO terminal claim, NO PeerDeath claim and
+    // NO user-memory access. It validates the exact `{tid, asid}` incarnation, attests the
+    // outcome, and either performs the replacement's arch restore or enters the established
+    // idle primitive. It fails closed through the existing fatal trap path.
+    #[cfg(target_arch = "aarch64")]
+    if let crate::kernel::boot::PostLockTrapDisposition::CurrentTaskExited { tid, asid } =
+        crate::kernel::boot::take_post_lock_trap_disposition(cpu_idx)
+    {
+        crate::yarm_log!(
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} holder=with_cpu result=ok",
+            cpu.0
+        );
+        crate::yarm_log!(
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64 cpu={} broad_lock=0 drains=all result=ok",
+            cpu.0
+        );
+        crate::yarm_log!(
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64 tid={} asid={} cpu={} result=ok",
+            tid,
+            asid.0,
+            cpu.0
+        );
+        // Re-acquiring the broad guard here is itself the lock-dropped proof (Stage 195F
+        // pattern). Inside, read ONLY: is the exiting incarnation still current, is its ASID
+        // still the published one, is it terminal, and is it absent from runnable state.
+        let (current, identity_ok, terminal, in_runqueue) = shared
+            .with_cpu(cpu, |kernel| {
+                let current = kernel.current_tid();
+                // Identity is the FULL incarnation. A numeric TID match alone would let a
+                // restarted task satisfy a stale disposition, so the ASID recorded at
+                // publication must still be bound to that TID — or the TCB must be gone.
+                let identity_ok = match kernel.task_asid(tid) {
+                    Some(bound) => bound == asid,
+                    None => true,
+                };
+                // The lifecycle has no distinct `Exiting` state: `exit_task` commits straight
+                // to `Exited(status)`, and a reaped TCB is `Dead` or absent. All three are
+                // terminal; anything else means the disposition does not describe reality.
+                let terminal = matches!(
+                    kernel.task_status(tid),
+                    Some(crate::kernel::task::TaskStatus::Exited(_))
+                        | Some(crate::kernel::task::TaskStatus::Dead)
+                        | None
+                );
+                // Absence proof: not merely "off this CPU's queue" — the exiting incarnation
+                // must be present in NO runqueue on ANY CPU, so it can never be re-selected.
+                (
+                    current,
+                    identity_ok,
+                    terminal,
+                    kernel.task_present_in_any_runqueue(tid),
+                )
+            })
+            .map_err(|err| TrapHandleError::Syscall(err.into()))?;
+        if current == Some(tid) {
+            crate::yarm_log!(
+                "EXIT_TASK_EXITING_STILL_CURRENT arch=aarch64 tid={} cpu={} result=fail",
+                tid,
+                cpu.0
+            );
+            return Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            ));
+        }
+        if !identity_ok || !terminal || in_runqueue {
+            crate::yarm_log!(
+                "EXIT_TASK_WRONG_IDENTITY arch=aarch64 tid={} asid={} identity_ok={} terminal={} in_runqueue={} result=fail",
+                tid,
+                asid.0,
+                u32::from(identity_ok),
+                u32::from(terminal),
+                u32::from(in_runqueue)
+            );
+            return Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            ));
+        }
+        crate::yarm_log!(
+            "EXIT_TASK_EXITING_NOT_CURRENT arch=aarch64 tid={} asid={} cpu={} result=ok",
+            tid,
+            asid.0,
+            cpu.0
+        );
+        crate::yarm_log!(
+            "EXIT_TASK_ABSENCE_VALIDATED arch=aarch64 tid={} asid={} current=0 runqueue=0 restore_owner=0 identity=tid_asid result=ok",
+            tid,
+            asid.0
+        );
+        // Trap-depth ownership (Stage 200D-0C1 §4 audit): AArch64 has NO software
+        // trap-dispatch depth counter — x86_64's `TRAP_DISPATCH_DEPTH` has no AArch64
+        // analogue. Nested-entry state is owned entirely by the hardware exception return,
+        // so the correct number of consumer-side clears is ZERO. None is made here.
+        crate::yarm_log!(
+            "EXIT_TASK_TRAP_DEPTH_OWNER arch=aarch64 cpu={} owner=hardware_eret clears=0 result=ok",
+            cpu.0
+        );
+        match current {
+            Some(next) if next != 0 => {
+                if next == tid {
+                    crate::yarm_log!(
+                        "EXIT_TASK_RESELECTED_EXITING_TASK arch=aarch64 tid={} cpu={} result=fail",
+                        tid,
+                        cpu.0
+                    );
+                    return Err(TrapHandleError::Syscall(
+                        crate::kernel::syscall::SyscallError::Internal,
+                    ));
+                }
+                crate::yarm_log!(
+                    "EXIT_TASK_RESTORE_OWNER arch=aarch64 owner=replacement exiting_tid={} next_tid={} cpu={} result=ok",
+                    tid,
+                    next,
+                    cpu.0
+                );
+                // Arch restore for the REPLACEMENT only: incoming TTBR0_EL1/ASID switch (via
+                // the generic HAL hook, carrying the DSB/ISB/TLBI ordering) + EL0 SPSR/ELR/GPR
+                // frame restore — the same brief `with_cpu` shape the 195E/195G drains use.
+                // The exiting task's ELR/SP_EL0 are never a source here.
+                let restore = shared
+                    .with_cpu(cpu, |kernel| {
+                        kernel.d2_recv_switch_incoming_asid(next);
+                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
+                    })
+                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                restore??;
+                crate::yarm_log!(
+                    "EXIT_TASK_RESTORE_DONE arch=aarch64 owner=replacement next_tid={} cpu={} result=ok",
+                    next,
+                    cpu.0
+                );
+            }
+            _ => {
+                crate::yarm_log!(
+                    "EXIT_TASK_RESTORE_OWNER arch=aarch64 owner=idle exiting_tid={} cpu={} result=ok",
+                    tid,
+                    cpu.0
+                );
+                // No replacement: restore NOTHING and enter the established idle primitive
+                // with the broad guard dropped. Diverges — never returns to the vector, so no
+                // exception-return frame is ever committed for the exiting task.
+                super::aarch64::trap::enter_post_lock_idle_after_exit(cpu, tid);
+            }
+        }
+    }
+
     inner_result
 }
 
