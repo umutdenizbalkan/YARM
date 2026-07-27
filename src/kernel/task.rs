@@ -191,6 +191,47 @@ pub struct ThreadControlBlock {
     /// this and a stale timeout completion is refused. Bumped when a fresh blocked
     /// recv is published.
     pub blocked_recv_generation: u64,
+    /// Stage 200C2C1B — a generation-bearing PENDING COMPLETION for a blocked syscall that
+    /// was completed remotely (off-lock) while its caller was descheduled.
+    ///
+    /// On architectures whose blocked syscalls resume by SAVED-FRAME return (the AArch64
+    /// port: the SVC's `ELR_EL1` already points past the instruction, so the handler is
+    /// NEVER re-entered), a remote completion cannot deliver its result by "returning" from
+    /// the handler — there is no second handler entry. It instead parks the outcome HERE,
+    /// and the resume boundary consumes it exactly once while encoding the canonical
+    /// syscall result into the resumed frame. One producer (the completion transaction),
+    /// one consumer (the resume boundary); a stale generation or a replacement `{tid, asid}`
+    /// incarnation is refused, so a NEW receive can never observe an OLD result and no
+    /// completion is observed twice.
+    pub pending_syscall_completion: Option<BlockedSyscallCompletion>,
+}
+
+/// Stage 200C2C1B — which blocked syscall class a [`BlockedSyscallCompletion`] completes.
+/// Arch-neutral: RISC-V (whose port shares the saved-frame resume shape) can consume the
+/// same mechanism later; only AArch64 is wired in this stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedSyscallClass {
+    /// A blocked `ipc_recv` / `ipc_recv_with_deadline` (recv-v2) receive.
+    IpcRecv,
+}
+
+/// Stage 200C2C1B — the exact, generation-bearing outcome of a remotely completed blocked
+/// syscall. Carries full identity so consumption is unambiguous: the consumer must match
+/// the EXACT `{tid, asid}` incarnation AND the `blocked_generation` captured when the
+/// caller blocked. Purely internal — this is NOT a public ABI type and adds no syscall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockedSyscallCompletion {
+    /// Which blocked syscall class this completes.
+    pub syscall_class: BlockedSyscallClass,
+    /// The canonical syscall error code to encode on resume (e.g. `TimedOut`).
+    pub result: u64,
+    /// The exact caller thread id.
+    pub tid: u64,
+    /// The exact caller address-space id (a replacement incarnation differs).
+    pub asid: Asid,
+    /// The blocked-receive generation captured when the caller blocked; a caller that
+    /// unblocked and re-blocked advances this, so a stale completion is refused.
+    pub blocked_generation: u64,
 }
 
 impl ThreadControlBlock {
@@ -214,6 +255,7 @@ impl ThreadControlBlock {
             blocked_recv_state: None,
             reply_timeout_token: None,
             blocked_recv_generation: 0,
+            pending_syscall_completion: None,
         }
     }
 }

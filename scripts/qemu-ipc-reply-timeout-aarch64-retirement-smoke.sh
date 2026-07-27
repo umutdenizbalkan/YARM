@@ -155,10 +155,30 @@ if (( ! fail )); then
   verify_log "$TW" \
     "IPC_REPLY_TIMEOUT_ARMED arch=aarch64" \
     "IPC_REPLY_TIMEOUT_OK arch=aarch64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok" \
+    "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64 terminal=Timeout result=ok" \
     "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=aarch64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok" \
     "IPC_REPLY_TIMEOUT_DEFERRED arch=aarch64 published=1 drained=1 result=ok" \
+    "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED" \
     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcReplyTimeout result=ok" \
     "AARCH64_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok"
+  # ORDERED sequence: the class-retirement marker is authorized ONLY after the resumed caller
+  # consumed its exact completion (which is what encodes the canonical TimedOut). A
+  # committed-but-undelivered completion must never claim the class retired.
+  ci=$(rg -a -n -F "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64" "$TW" | head -1 | cut -d: -f1)
+  cn=$(rg -a -n -F "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED" "$TW" | head -1 | cut -d: -f1)
+  rt=$(rg -a -n -F "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64 class=IpcReplyTimeout" "$TW" | head -1 | cut -d: -f1)
+  ud=$(rg -a -n -F "AARCH64_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut" "$TW" | head -1 | cut -d: -f1)
+  if [[ -n "$ci" && -n "$cn" && -n "$rt" && -n "$ud" ]]; then
+    (( ci < cn )) || die "completion committed must precede the resume-boundary consumption"
+    (( cn <= rt )) || die "retirement marker must follow the completion consumption"
+    (( rt < ud )) || die "retirement marker must precede the userspace completion"
+  else
+    die "ordered marker sequence incomplete (ci=$ci cn=$cn rt=$rt ud=$ud)"
+  fi
+  # Exactly one completion consumption ⇒ one timeout encoding, one ELR-advance boundary,
+  # no duplicate wake and no re-blocked waiter after the wake.
+  [[ "$(rg -a -c -F "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED" "$TW" 2>/dev/null || echo 0)" == "1" ]] \
+    || die "completion consumed more than once (duplicate timeout encoding)"
   forbid_log "$TW" \
     "IPC_REPLY_BEATS_TIMEOUT_OK" \
     "scan_broad_lock=1" \
@@ -202,6 +222,9 @@ classes=1
 live_cells=1
 timeout_wins=1
 reply_wins=1
+canonical_timeout_result=1
+completion_reentry=1
+elr_single_advance=1
 scan_broad_lock=0
 completion_transaction_narrow=1
 late_reply_successes=0

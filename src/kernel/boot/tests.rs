@@ -85506,10 +85506,17 @@ mod stage200c2b_guards {
             "IPC_REPLY_TIMEOUT_LOCK_STATUS arch={} scan_broad_lock=0",
             "IPC_REPLY_TIMEOUT_LATE_SCAN arch={}",
             "IPC_REPLY_TIMEOUT_DEFERRED arch={}",
-            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout",
+            "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch={}",
         ] {
             assert!(RUNTIME_SRC.contains(lit), "literal {lit} present (drain)");
         }
+        // Stage 200C2C1B: the class-retirement emit moved OUT of the drain into the gated
+        // one-shot helper, so it can fire only from a genuine delivery point.
+        assert!(
+            MOD_SRC
+                .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout result=ok")
+        );
+        assert!(!RUNTIME_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={}"));
         assert!(RUNTIME_SRC.contains("REPLY_TIMEOUT_ARCH"));
         // The emitting fns are all `#[cfg(feature = "ipc-reply-timeout-oracle-core")]`.
         assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn maybe_arm_reply_timeout_oracle"));
@@ -85522,10 +85529,15 @@ mod stage200c2b_guards {
     #[test]
     fn g12_class_retirement_present_and_honest() {
         assert!(RUNTIME_SRC.contains("IPC_REPLY_TIMEOUT_LOCK_STATUS arch={} scan_broad_lock=0 completion_transaction_narrow=1 result=ok"));
+        // The retirement marker lives in the ARMED one-shot helper: the transaction only arms it,
+        // and it fires from the delivery point — a committed-but-undelivered completion can never
+        // claim the class retired.
         assert!(
-            RUNTIME_SRC
+            MOD_SRC
                 .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout result=ok")
         );
+        assert!(MOD_SRC.contains("fn arm_reply_timeout_class_retired"));
+        assert!(MOD_SRC.contains("REPLY_TIMEOUT_RETIRE_ARMED.load"));
         // No lingering honest-broad-lock (scan_broad_lock=1) claim for this class.
         assert!(!IPC_STATE_SRC.contains("scan_broad_lock=1"));
         assert!(!RUNTIME_SRC.contains("scan_broad_lock=1"));
@@ -86249,5 +86261,499 @@ mod stage200c2b_offlock {
         k.drain_reply_timeout_post_work(CPU, NOW);
         assert_eq!(queue_len(), 0, "empty after a stale (rollback) drain");
         clear_queue();
+    }
+}
+
+/// Stage 200C2C1B — AArch64 blocked-recv TIMEOUT RE-ENTRY proofs.
+///
+/// The AArch64 port resumes a blocked syscall by SAVED-FRAME return (its `SVC` `ELR_EL1`
+/// already points past the instruction), so the handler is never re-entered and the resume
+/// boundary MIRRORS `arg0..arg5` into `x0..x5`. A remotely completed caller therefore parks a
+/// generation-bearing [`BlockedSyscallCompletion`] that the resume boundary consumes exactly
+/// once while encoding the canonical result. These tests pin that contract.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage200c2c1b_aarch64_reentry {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::kernel::deadline_token::DeadlineTokenHandle;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{BlockedSyscallClass, TaskStatus};
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+
+    const TOKEN_GEN: u64 = 1;
+    const BRG: u64 = 1;
+    const DEADLINE: u64 = 100;
+    const NOW: u64 = 200;
+    const CPU: CpuId = CpuId(0);
+    /// `SyscallError::TimedOut as u64` — the canonical timeout result code.
+    const TIMED_OUT: u64 = 9;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const AARCH64_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-aarch64-retirement-smoke.sh");
+
+    fn clear_queue() {
+        crate::kernel::boot::reply_timeout_work_clear(0);
+    }
+
+    fn setup(fx: &CallerFx) -> (usize, u64, TerminalIdentity, DeadlineTokenHandle) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let identity =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, identity));
+        let handle =
+            fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, DEADLINE))
+                .expect("register");
+        (idx, rgen, identity, handle)
+    }
+
+    /// Drive a full off-lock timeout completion for the fixture's caller.
+    fn complete_timeout(fx: &CallerFx) {
+        clear_queue();
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        clear_queue();
+    }
+
+    /// Snapshot the caller's saved `arg0..arg5` (the AArch64 resume lanes).
+    fn saved_args(fx: &CallerFx) -> [usize; 6] {
+        fx.k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                let t = tcbs
+                    .iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("caller");
+                let c = &t.user_context;
+                [c.arg0, c.arg1, c.arg2, c.arg3, c.arg4, c.arg5]
+            })
+        })
+    }
+
+    /// Seed distinct saved arguments so a clobber is detectable.
+    fn seed_args(fx: &CallerFx) {
+        fx.k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("caller");
+                let c = &mut t.user_context;
+                c.arg0 = 0x1111;
+                c.arg1 = 0x2222;
+                c.arg2 = 0x3333;
+                c.arg3 = 0x4444;
+                c.arg4 = 0x5555;
+                c.arg5 = 0x6666;
+                c.instruction_ptr = crate::kernel::vm::VirtAddr(0xDEAD_0000);
+            });
+        });
+    }
+
+    fn saved_pc(fx: &CallerFx) -> u64 {
+        fx.k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("caller")
+                    .user_context
+                    .instruction_ptr
+                    .0
+            })
+        })
+    }
+
+    // (1) the initial blocked entry retains x0–x5 (the completion must not disturb them).
+    #[test]
+    fn t01_initial_blocked_entry_retains_args() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        seed_args(&fx);
+        let before = saved_args(&fx);
+        assert_eq!(before, [0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666]);
+        // Still blocked, args untouched while blocked.
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(1)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        assert_eq!(saved_args(&fx), before);
+        teardown();
+    }
+
+    // (2) the timeout completion writes NO AArch64 argument register.
+    //
+    // The hosted suite runs on x86_64, so the AArch64 half is source-proven: the ONLY saved-frame
+    // write in the transaction is x86_64-gated (that arch delivers by saved-frame return), and no
+    // `arg`/`user_gprs` write exists outside it. The behavioural half — that a generation-bearing
+    // completion is parked instead — is exercised directly.
+    #[test]
+    fn t02_completion_writes_no_arg_register() {
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        let x86_blk = body
+            .split("#[cfg(target_arch = \"x86_64\")]")
+            .nth(1)
+            .expect("x86 block")
+            .split("\n        }")
+            .next()
+            .unwrap();
+        assert!(x86_blk.contains("user_gprs[2] = timed_out"));
+        // Every saved-frame write lives inside that x86_64-gated block.
+        assert_eq!(
+            body.matches("tcb.user_context").count(),
+            x86_blk.matches("tcb.user_context").count(),
+            "no saved-frame write outside the x86_64-gated block (AArch64 lanes untouched)"
+        );
+        // The AArch64 delivery mechanism is the parked, generation-bearing completion.
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        assert!(fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (3) the completion is detected BEFORE the endpoint-cap/argument decoding at the boundary.
+    #[test]
+    fn t03_completion_detected_before_arg_decoding() {
+        // Source contract: in the AArch64 resume boundary the consume call precedes the
+        // arg0..arg5 -> x0..x5 mirror (which is what would re-expose the stale endpoint cap).
+        let blk = AARCH64_TRAP_SRC
+            .split("if !syscall_return {")
+            .nth(1)
+            .expect("resume mirror block");
+        let consume = blk
+            .find("take_blocked_syscall_completion")
+            .expect("consume call");
+        let mirror = blk.find("REG_X0, frame.arg(0)").expect("arg mirror");
+        assert!(
+            consume < mirror,
+            "the pending completion must be consumed BEFORE the argument mirror"
+        );
+    }
+
+    // (4) the exact canonical TimedOut is encoded on the completion (resume) boundary.
+    #[test]
+    fn t04_exact_timedout_encoded() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        let done =
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .expect("pending completion");
+        assert_eq!(done.result, TIMED_OUT, "canonical SyscallError::TimedOut");
+        assert_eq!(done.syscall_class, BlockedSyscallClass::IpcRecv);
+        assert_eq!(done.tid, 1);
+        assert_eq!(done.blocked_generation, BRG);
+        teardown();
+    }
+
+    // (5) the saved ELR is unchanged while blocked (advanced once, at block time).
+    #[test]
+    fn t05_elr_unchanged_while_blocked() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        seed_args(&fx);
+        let pc = saved_pc(&fx);
+        complete_timeout(&fx);
+        assert_eq!(
+            saved_pc(&fx),
+            pc,
+            "the completion must not move the saved ELR"
+        );
+    }
+
+    // (6) the resume boundary advances the ELR exactly once — i.e. it never re-advances it.
+    #[test]
+    fn t06_elr_single_advance() {
+        // Source contract: the consume block performs NO ELR/PC mutation; the SVC return address
+        // was established once at block time (`syscall_resume_pc`).
+        let blk = AARCH64_TRAP_SRC
+            .split("take_blocked_syscall_completion")
+            .nth(1)
+            .expect("consume block");
+        let blk = blk.split("REG_X0, frame.arg(0)").next().unwrap();
+        assert!(
+            !blk.contains("set_saved_pc"),
+            "no ELR mutation on the completion path"
+        );
+        assert!(!blk.contains("instruction_ptr ="));
+        assert!(!blk.contains("+ 4"));
+    }
+
+    // (7) the completion is consumed exactly ONCE.
+    #[test]
+    fn t07_completion_consumed_once() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_some()
+        );
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none(),
+            "a completion must never be observable twice"
+        );
+        teardown();
+    }
+
+    // (8) a third boundary entry cannot observe a stale TimedOut.
+    #[test]
+    fn t08_third_entry_sees_no_stale_result() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        let _ = fx.k.with(|s| s.take_blocked_syscall_completion(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (9) a blocked-recv GENERATION mismatch rejects the stale completion.
+    #[test]
+    fn t09_generation_mismatch_rejected() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        assert!(fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        // The caller re-blocked with a NEW receive (generation advances).
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none(),
+            "a stale-generation completion must be refused"
+        );
+        // ...and dropped, so it cannot linger for a later receive.
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (10) a replacement TID incarnation with a DIFFERENT ASID is untouched.
+    #[test]
+    fn t10_replacement_asid_untouched() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        // Replace the caller incarnation (same numeric TID, different ASID).
+        fx.k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("caller");
+                t.asid = Some(crate::kernel::vm::Asid(0xBEEF));
+            });
+        });
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none(),
+            "a replacement ASID incarnation must not consume the old completion"
+        );
+        teardown();
+    }
+
+    // (11) a NEW receive cannot consume an OLD timeout result.
+    #[test]
+    fn t11_new_receive_cannot_consume_old_result() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        // The caller starts a fresh receive: generation advances BEFORE the boundary runs.
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        // The fresh receive therefore sees NO parked result at all.
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (12) no endpoint waiter is reinstalled by the completion.
+    #[test]
+    fn t12_no_waiter_reinstalled() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, id, _h) = setup(&fx);
+        complete_timeout(&fx);
+        let waiter = fx.k.with(|s| {
+            s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(id.reply_endpoint_index))
+        });
+        assert!(
+            waiter.is_none(),
+            "the exact waiter is claimed, never reinstalled"
+        );
+        teardown();
+    }
+
+    // (13) no deadline is re-armed by the completion.
+    #[test]
+    fn t13_no_deadline_rearmed() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, handle) = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(|s| s.deadline_token_is_completed(handle.token_index())),
+            "the token is COMPLETED, not re-armed"
+        );
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 0);
+        assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 0);
+        teardown();
+    }
+
+    // (14) the reply-wins path still delivers the EXACT payload (no completion interception).
+    #[test]
+    fn t14_reply_wins_payload_preserved() {
+        let fx = caller_fixture();
+        let (idx, _rgen, id, handle) = setup(&fx);
+        // Reply wins: lease + terminal, then commit.
+        let lease =
+            fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
+                .expect("reply lease");
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("reply terminal");
+        assert!(fx.k.with(|s| s.complete_deadline_reply_lease(handle.token_index(), &lease)));
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        // NO pending completion is parked for a reply win, so the resume boundary cannot
+        // intercept the successful reply continuation.
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Reply)
+        );
+        teardown();
+    }
+
+    // (15) ordinary receive-timeout behavior is unchanged (still fires on the in-lock scan).
+    #[test]
+    fn t15_ordinary_recv_timeout_unchanged() {
+        use crate::kernel::boot::Bootstrap;
+        use crate::kernel::capabilities::CapId;
+        use crate::kernel::task::WaitReason;
+        use crate::runtime::SharedKernel;
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(70).expect("t70");
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 70).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
+                tcb.ipc_timeout_deadline = Some(5);
+            });
+            let expired = s.process_ipc_timeout_deadlines(10).expect("scan");
+            assert_eq!(expired, 1, "ordinary deadline still fires in-lock");
+            assert_eq!(s.task_status(70), Some(TaskStatus::Runnable));
+            // The ordinary path parks NO pending completion (it is unretired + unchanged).
+            assert!(!s.has_pending_syscall_completion(70));
+        });
+    }
+
+    // (16) the retirement marker is emitted only AFTER the result is encoded at the boundary.
+    #[test]
+    fn t16_retirement_marker_follows_result_encoding() {
+        // The class-retirement emit is ARMED by the transaction and FIRED at the boundary,
+        // strictly after the result is written into the resume lane.
+        assert!(MOD_SRC.contains("fn arm_reply_timeout_class_retired"));
+        assert!(MOD_SRC.contains("fn maybe_emit_reply_timeout_class_retired"));
+        assert!(RUNTIME_SRC.contains("arm_reply_timeout_class_retired()"));
+        let blk = AARCH64_TRAP_SRC
+            .split("take_blocked_syscall_completion")
+            .nth(1)
+            .expect("consume block");
+        let encode = blk.find("frame.set_arg(0, done.result").expect("encode");
+        let emit = blk
+            .find("maybe_emit_reply_timeout_class_retired")
+            .expect("retire emit");
+        assert!(
+            encode < emit,
+            "encode the canonical result BEFORE claiming retirement"
+        );
+    }
+
+    // (17) the COMMITTED marker alone cannot satisfy the smoke — the runner additionally
+    // requires the boundary consumption, the retirement marker and the userspace completion,
+    // in order.
+    #[test]
+    fn t17_committed_marker_alone_insufficient() {
+        assert!(AARCH64_SMOKE_SRC.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64"));
+        assert!(AARCH64_SMOKE_SRC.contains("AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED"));
+        assert!(AARCH64_SMOKE_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64"));
+        assert!(
+            AARCH64_SMOKE_SRC.contains("AARCH64_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut")
+        );
+        // The ordering assertions are present (committed -> consumed -> retired -> userspace).
+        assert!(AARCH64_SMOKE_SRC.contains("must precede the resume-boundary consumption"));
+        assert!(AARCH64_SMOKE_SRC.contains("must follow the completion consumption"));
+        assert!(AARCH64_SMOKE_SRC.contains("must precede the userspace completion"));
+    }
+
+    // (18) NO RISC-V behavior is claimed by this stage.
+    #[test]
+    fn t18_no_riscv_claimed() {
+        assert!(!MOD_SRC.contains("riscv64-ipc-reply-timeout-oracle"));
+        assert!(!INIT_SRC.contains("RISCV_IPC_REPLY_TIMEOUT_DONE"));
+        // The AArch64 runner mentions riscv ONLY to FORBID a cross-arch attribution leaking into
+        // the AArch64 artifact — it never asserts or claims any RISC-V behavior.
+        assert!(!AARCH64_SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_RISCV"));
+        assert!(!AARCH64_SMOKE_SRC.contains("yarm.riscv64_ipc_reply_timeout_oracle"));
+        // The completion mechanism is arch-neutral but wired for AArch64 only this stage.
+        assert!(IPC_STATE_SRC.contains("BlockedSyscallCompletion"));
+        assert!(!crate::kernel::boot::REPLY_TIMEOUT_ARCH.contains("riscv"));
+    }
+
+    // (extra) after consumption the exact post-state holds: no pending completion, no deadline,
+    // token completed, waiter absent, task runnable, terminal Completed(Timeout), record Cancelled.
+    #[test]
+    fn t19_post_consumption_state_exact() {
+        let fx = caller_fixture();
+        let (idx, _rgen, id, handle) = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_some()
+        );
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 0);
+        assert!(fx.k.with(|s| s.deadline_token_is_completed(handle.token_index())));
+        assert!(
+            fx.k.with(
+                |s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(id.reply_endpoint_index))
+            )
+            .is_none()
+        );
+        assert_eq!(fx.k.with(|s| s.task_status(1)), Some(TaskStatus::Runnable));
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(idx)),
+            Some(ReplyRecordReservation::Cancelled)
+        );
+        teardown();
     }
 }

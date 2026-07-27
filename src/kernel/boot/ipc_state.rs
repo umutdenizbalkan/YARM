@@ -286,12 +286,29 @@ fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
             tcb.user_context.user_gprs[3] = 0; // RDX
             tcb.user_context.user_gprs[7] = 0; // R8
         }
-        // AArch64 (and other non-x86): the blocked recv RE-RUNS its syscall handler on resume,
-        // re-importing its arguments from the saved GPRs (x0..x5). Writing a result register here
-        // would CORRUPT that re-run (an x0 write becomes a bogus endpoint-cap argument), so the
-        // saved frame is left ENTIRELY untouched — exactly as the ordinary receive-timeout scan
-        // leaves it. The re-run observes `ipc_timeout_fired` (set in the prepare step) and returns
-        // the canonical `TimedOut` itself, which is the ordinary receive-timeout contract.
+        // AArch64 (and other non-x86 saved-frame-resume ports): the blocked recv is NEVER
+        // re-entered — its SVC `ELR_EL1` already points past the instruction, so the caller
+        // resumes straight to userspace from its saved context. A remote completion therefore
+        // cannot deliver its result by "returning" from the handler, and it must NOT write a
+        // result register here: the AArch64 resume boundary MIRRORS `arg0..arg5` into `x0..x5`,
+        // so any `user_gprs` write is overwritten (that is precisely the defect this stage
+        // fixes — the caller observed its own stale endpoint-cap argument as a bogus result).
+        //
+        // Instead PARK a generation-bearing pending completion. The resume boundary consumes it
+        // exactly once, validates the exact `{tid, asid}` + blocked generation, and encodes the
+        // canonical result into the resumed frame. No register write, no ELR mutation here.
+        // Parked UNCONDITIONALLY: it is the arch-neutral record of "this blocked caller was
+        // completed remotely, with this exact outcome and identity". AArch64 consumes it at its
+        // resume boundary (its only delivery mechanism); x86_64 has already installed the
+        // equivalent saved-frame result above and simply never consumes the record — a later
+        // receive on that caller bumps `blocked_recv_generation`, which invalidates it.
+        tcb.pending_syscall_completion = Some(crate::kernel::task::BlockedSyscallCompletion {
+            syscall_class: crate::kernel::task::BlockedSyscallClass::IpcRecv,
+            result: timed_out,
+            tid,
+            asid,
+            blocked_generation: tcb.blocked_recv_generation,
+        });
         let _ = timed_out;
         tcb.status = TaskStatus::Runnable;
         Some(tcb.cpu_affinity)
@@ -1300,6 +1317,51 @@ impl KernelState {
                 .flatten()
                 .find(|t| t.tid.0 == tid && t.asid == Some(asid))
                 .map(|t| t.blocked_recv_generation)
+        })
+    }
+
+    /// Stage 200C2C1B — CONSUME the exact pending blocked-syscall completion for `tid`, if one
+    /// is parked and still valid. This is the SINGLE consumer (the resume boundary): it matches
+    /// the EXACT `{tid, asid}` incarnation and the `blocked_generation` captured when the caller
+    /// blocked, then takes the completion (so it can never be observed twice) and clears the
+    /// exact residue that belongs to it. A stale generation, a replacement ASID, or a caller that
+    /// re-blocked with a NEW receive is refused and the parked entry is dropped without effect.
+    ///
+    /// Returns the canonical syscall result to encode, or `None` when nothing applies. The caller
+    /// encodes the result FIRST and only then observes the cleared state — this function performs
+    /// no register or ELR mutation of its own.
+    pub(crate) fn take_blocked_syscall_completion(
+        &mut self,
+        tid: u64,
+    ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
+            let pending = tcb.pending_syscall_completion?;
+            // Exact identity: same incarnation AND the generation captured at block time.
+            let exact = pending.tid == tid
+                && tcb.asid == Some(pending.asid)
+                && tcb.blocked_recv_generation == pending.blocked_generation;
+            // Take it either way — a stale entry must not linger to be seen by a later receive.
+            tcb.pending_syscall_completion = None;
+            if !exact {
+                return None;
+            }
+            // Clear the residue that belongs to THIS completion only (the deadline + token were
+            // already retired by the completion transaction; this drops the consumed flag).
+            tcb.ipc_timeout_fired = false;
+            tcb.blocked_recv_state = None;
+            Some(pending)
+        })
+    }
+
+    /// `true` iff a pending blocked-syscall completion is parked for `tid` (assertions).
+    #[cfg(test)]
+    pub(crate) fn has_pending_syscall_completion(&self, tid: u64) -> bool {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .is_some_and(|t| t.pending_syscall_completion.is_some())
         })
     }
 

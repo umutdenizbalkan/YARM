@@ -109,6 +109,36 @@ pub(crate) fn restore_arch_thread_state(
     // user_gprs[x0..x2] from the syscall return values.  Mirroring here would
     // overwrite those correct values with the original syscall input args.
     if !syscall_return {
+        // Stage 200C2C1B — BLOCKED-SYSCALL COMPLETION boundary. A blocked recv on this port is
+        // never re-entered (its `ELR_EL1` already points past the `SVC`), so a remotely completed
+        // caller resumes straight to userspace from here. Consume the EXACT parked completion —
+        // BEFORE the argument mirror below — and encode its canonical syscall error into the
+        // resume lanes. This is the one and only consumer: the completion is taken (never
+        // observable twice), its identity `{tid, asid, blocked_generation}` must match exactly, and
+        // the result is ENCODED BEFORE the state is observed as cleared.
+        //
+        // Encoding follows the established AArch64 error convention (mirrors
+        // `export_syscall_result_to_user_gprs`'s error path): the error code lands in the x0 lane
+        // and x1..x5 are zeroed, so the stale receive ARGUMENTS can never be mistaken for a result.
+        // ELR is deliberately untouched — it was advanced exactly once at block time.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        if let Some(done) = kernel.take_blocked_syscall_completion(current_tid) {
+            frame.set_arg(0, done.result as usize);
+            for lane in 1..=5 {
+                frame.set_arg(lane, 0);
+            }
+            crate::yarm_log!(
+                "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid={} class={:?} result={} blocked_generation={} elr=0x{:016x} result=ok",
+                current_tid,
+                done.syscall_class,
+                done.result,
+                done.blocked_generation,
+                frame.saved_pc() as u64
+            );
+            // The retirement marker is authorized ONLY here — after the resumed caller's exact
+            // completion was consumed and its canonical result encoded (never at production time).
+            crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
+        }
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X0, frame.arg(0));
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X1, frame.arg(1));
         frame.set_user_gpr(crate::arch::aarch64::syscall_abi::REG_X2, frame.arg(2));

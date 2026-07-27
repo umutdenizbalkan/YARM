@@ -3726,6 +3726,42 @@ pub(crate) fn reply_timeout_lock_status_once() -> bool {
     !REPLY_TIMEOUT_LOCK_STATUS_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
 }
 
+/// Stage 200C2C1B — the class RETIREMENT marker is authorized only AFTER a resumed caller has
+/// consumed its exact pending completion and had the canonical result encoded. On x86_64 the
+/// completion transaction itself IS the delivery point (saved-frame return), so the drain arms
+/// this immediately; on AArch64 the drain only ARMS it and the resume boundary fires it, so a
+/// committed-but-never-delivered completion can never claim the class retired.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static REPLY_TIMEOUT_RETIRE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static REPLY_TIMEOUT_RETIRE_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the class-retirement marker (called by the off-lock completion transaction once it has
+/// COMMITTED a timeout terminal). Arming alone never emits.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn arm_reply_timeout_class_retired() {
+    REPLY_TIMEOUT_RETIRE_ARMED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Emit `GLOBAL_LOCK_RETIRE_CLASS_DONE` exactly once, and ONLY if a committed completion armed
+/// it. Called from the delivery point (the resume boundary), so the marker attests an
+/// end-to-end retirement: collected off-lock, completed off-lock, and actually delivered.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn maybe_emit_reply_timeout_class_retired() {
+    if !REPLY_TIMEOUT_RETIRE_ARMED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if REPLY_TIMEOUT_RETIRE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout result=ok",
+        REPLY_TIMEOUT_ARCH
+    );
+}
+
 /// `true` once at least one reply-timeout deadline has been armed this boot — the gate
 /// for attesting the retired off-lock scan (the scan is meaningful only after an arm).
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]

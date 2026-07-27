@@ -3410,10 +3410,6 @@ impl SharedKernel {
                 "IPC_REPLY_TIMEOUT_LOCK_STATUS arch={} scan_broad_lock=0 completion_transaction_narrow=1 result=ok",
                 crate::kernel::boot::REPLY_TIMEOUT_ARCH
             );
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout result=ok",
-                crate::kernel::boot::REPLY_TIMEOUT_ARCH
-            );
         }
         let cpu_idx = cpu.0 as usize;
         while let Some(work) = crate::kernel::boot::reply_timeout_work_drain_next(cpu_idx) {
@@ -3435,6 +3431,19 @@ impl SharedKernel {
                         "IPC_REPLY_TIMEOUT_OK arch={} terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok",
                         crate::kernel::boot::REPLY_TIMEOUT_ARCH
                     );
+                    // The terminal is COMMITTED off-lock — but the caller has not yet been
+                    // delivered its result. Attest the commit here and ARM the class-retirement
+                    // marker; it fires only from the delivery point.
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch={} terminal=Timeout result=ok",
+                        crate::kernel::boot::REPLY_TIMEOUT_ARCH
+                    );
+                    crate::kernel::boot::arm_reply_timeout_class_retired();
+                    // x86_64 delivers via SAVED-FRAME return installed by the transaction itself,
+                    // so the completion IS the delivery point and the marker fires now. AArch64
+                    // defers it to its resume boundary (which consumes the parked completion).
+                    #[cfg(target_arch = "x86_64")]
+                    crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
                 }
                 other => {
                     // Harmless late expiry (the reply disarmed/completed the token, or the

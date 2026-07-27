@@ -2016,8 +2016,12 @@ mod ipc_reply_timeout_oracle {
                 // compiled there (keeps the x86 client path byte-identical).
                 #[cfg(target_arch = "aarch64")]
                 {
+                    // Bounded: the injected reply-wins deadline is ~20 coarse counter ticks out,
+                    // and every yield is a trap that re-runs the off-lock collector, so this is
+                    // comfortably enough for the scan to pass the deadline while still finishing
+                    // well inside the boot budget.
                     let mut spun = 0u64;
-                    while spun < 200_000 {
+                    while spun < 20_000 {
                         let _ = yarm_user_rt::syscall::yield_now();
                         spun += 1;
                     }
