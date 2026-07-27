@@ -327,6 +327,35 @@ impl SharedKernel {
                     lease.discard();
                     return Err(IpcCallDirectError::RecordCommitFailed);
                 }
+                // Stage 200D (11b) — register the BOUNDED reverse link from the exact
+                // server incarnation to the record it now owes, so teardown can find it
+                // by index instead of scanning every reply record.
+                //
+                // Ordering is deliberate: the record is already `Available` (fully
+                // initialized and authoritative), and the server is Runnable but NOT yet
+                // enqueued, so it cannot have dispatched and no NR7 can be in flight. The
+                // link therefore cannot miss a window.
+                //
+                // Capacity is one outstanding record. A second registration FAILS rather
+                // than silently overwriting, and we then roll the whole publication back
+                // BEFORE the request becomes externally visible — the server is never
+                // enqueued, so userspace observes nothing.
+                if !self.register_server_reply_link_split(
+                    ack.server.tid.0,
+                    ack.server.asid,
+                    idx,
+                    rgen,
+                ) {
+                    self.sr_revoke_split(server_cnode, server_cap, reply_object);
+                    let _ = self.cancel_direct_reply_record_split(idx, rgen);
+                    lease.discard();
+                    crate::yarm_log!(
+                        "IPC_SERVER_REPLY_LINK_REGISTER_FAIL server_tid={} record_index={} reason=capacity result=rolled_back",
+                        ack.server.tid.0,
+                        idx
+                    );
+                    return Err(IpcCallDirectError::RecordCommitFailed);
+                }
                 // (12) scheduler enqueue LAST — the single, non-fallible wake.
                 self.sr_enqueue_committed_receiver_split(ack.server.tid.0, affinity);
                 // (13) consume the acknowledgement lease exactly once.

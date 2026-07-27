@@ -365,6 +365,14 @@ pub enum SyscallError {
     WouldBlock = 7,
     PageFault = 8,
     TimedOut = 9,
+    /// Stage 200D — the authorized IPC replier ceased to exist before completing the
+    /// reply. Distinct from `TimedOut` (a deadline expired while the peer was alive)
+    /// and from `Internal` (an unclassified kernel fault): a caller that receives this
+    /// knows its request will never be answered, by that incarnation or any other.
+    ///
+    /// `10` was audited unused across the whole syscall-error space before being taken
+    /// (see the Stage 200D `d0*` guards, which re-derive the used set from source).
+    ServerDied = 10,
     Internal = 255,
 }
 
@@ -384,6 +392,8 @@ impl SyscallError {
             7 => Self::WouldBlock,
             8 => Self::PageFault,
             9 => Self::TimedOut,
+            10 => Self::ServerDied,
+            // Unknown codes still fall back to `Internal` — unchanged by Stage 200D.
             _ => Self::Internal,
         }
     }

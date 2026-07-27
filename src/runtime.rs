@@ -2878,6 +2878,74 @@ impl SharedKernel {
     /// rank 3 — cancel a `Reserved` record (rollback): `Reserved → Cancelled → Vacant`
     /// as a single atomic ipc-state mutation, reclaiming the reserved authority so a
     /// partially-built record can never resolve. `false` on mismatch.
+    /// Stage 200D — register the bounded reverse link through the rank-2 TASK seam (never
+    /// the broad lock). Returns `false` with no mutation when the server incarnation is
+    /// absent or already holds a DIFFERENT live link; re-registering the identical link is
+    /// idempotent. Allocation-free: the link is a fixed `Option` field on the TCB.
+    pub(crate) fn register_server_reply_link_split(
+        &self,
+        server_tid: u64,
+        server_asid: crate::kernel::vm::Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> bool {
+        let link = crate::kernel::task::ServerReplyLink {
+            server_tid,
+            server_asid,
+            reply_record_index: record_index,
+            reply_record_generation: record_generation,
+        };
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+            else {
+                return false;
+            };
+            match tcb.server_reply_link {
+                Some(existing) if existing == link => true,
+                Some(_) => false,
+                None => {
+                    tcb.server_reply_link = Some(link);
+                    true
+                }
+            }
+        })
+    }
+
+    /// Stage 200D — remove the reverse link, but ONLY when it still describes this exact
+    /// record incarnation. A stale removal (reused slot, replaced server incarnation,
+    /// already removed) mutates nothing. Idempotent by construction, so every terminal
+    /// outcome can call it unconditionally.
+    pub(crate) fn unregister_server_reply_link_split(
+        &self,
+        server_tid: u64,
+        server_asid: crate::kernel::vm::Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+            else {
+                return false;
+            };
+            match tcb.server_reply_link {
+                Some(link)
+                    if link.matches_server(server_tid, server_asid)
+                        && link.matches_record(record_index, record_generation) =>
+                {
+                    tcb.server_reply_link = None;
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+
     pub(crate) fn cancel_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
         use crate::kernel::boot::ReplyRecordReservation;
         self.with_ipc_split_mut(|ipc| {

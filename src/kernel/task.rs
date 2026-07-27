@@ -185,6 +185,22 @@ pub struct ThreadControlBlock {
     /// which keep their existing plain-deadline behavior unchanged. Dormant in
     /// production this stage (no live path registers it yet).
     pub reply_timeout_token: Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
+    /// Stage 200D — the BOUNDED, generation-bearing REVERSE link from this task (as the
+    /// authorized replier) to the reply record it must answer.
+    ///
+    /// Teardown needs to find the records a dying server owed a reply to. Scanning every
+    /// reply record on every task exit is O(MAX_REPLY_CAPS) of unrelated work and would
+    /// make the death path's cost depend on unrelated IPC traffic, so the link is stored
+    /// HERE — directly on the exact server TCB — and read by index at exit.
+    ///
+    /// Capacity is deliberately ONE. That is the honest current contract: this kernel
+    /// does not support queued `IpcCall` or multiple simultaneous call/reply pairs, so a
+    /// live server incarnation owes at most one outstanding reply. A second registration
+    /// while one is live FAILS (it never silently overwrites), and the caller rolls the
+    /// whole reply-record publication back before the request becomes externally visible.
+    /// It is a fixed-size `Option`, so registration allocates nothing and is safe to run
+    /// under the ranked lifecycle/IPC locks.
+    pub server_reply_link: Option<ServerReplyLink>,
     /// Stage 200C1 — a monotonic per-task blocked-receive generation. Captured into
     /// the reply-timeout token identity at registration and revalidated at timeout
     /// completion, so a caller that unblocked and re-blocked (a new recv) advances
@@ -204,6 +220,40 @@ pub struct ThreadControlBlock {
     /// incarnation is refused, so a NEW receive can never observe an OLD result and no
     /// completion is observed twice.
     pub pending_syscall_completion: Option<BlockedSyscallCompletion>,
+}
+
+/// Stage 200D — a generation-bearing reverse link from an authorized replier to the reply
+/// record it owes. Stored on the replier's own TCB (see `ThreadControlBlock::server_reply_link`).
+///
+/// Both the SERVER identity and the RECORD identity are generation-bearing, and both are
+/// re-checked at use. A restarted task that reuses the numeric TID always carries a different
+/// ASID, so it can neither inherit an old link's authority nor have its own link cancelled by a
+/// stale numeric-TID sweep; a reply-record slot that was reclaimed and reused advances its
+/// generation, so a link left behind by an earlier occupant refers to nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerReplyLink {
+    /// The authorized replier's numeric thread id. Never authorizes on its own.
+    pub server_tid: u64,
+    /// The replier INCARNATION. Together with `server_tid` this is the authority key.
+    pub server_asid: crate::kernel::vm::Asid,
+    /// Slot index in the single reply-record store.
+    pub reply_record_index: usize,
+    /// The slot's generation at registration — what makes a reused slot detectable.
+    pub reply_record_generation: u64,
+}
+
+impl ServerReplyLink {
+    /// `true` when this link still describes the given server incarnation.
+    #[must_use]
+    pub fn matches_server(&self, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
+        self.server_tid == tid && self.server_asid == asid
+    }
+
+    /// `true` when this link still describes the given record incarnation.
+    #[must_use]
+    pub fn matches_record(&self, index: usize, generation: u64) -> bool {
+        self.reply_record_index == index && self.reply_record_generation == generation
+    }
 }
 
 /// Stage 200C2C1B — which blocked syscall class a [`BlockedSyscallCompletion`] completes.
@@ -303,6 +353,7 @@ impl ThreadControlBlock {
             ipc_timeout_fired: false,
             blocked_recv_state: None,
             reply_timeout_token: None,
+            server_reply_link: None,
             blocked_recv_generation: 0,
             pending_syscall_completion: None,
         }

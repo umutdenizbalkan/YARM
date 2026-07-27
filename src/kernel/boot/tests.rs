@@ -87189,7 +87189,7 @@ mod stage200c2c2_riscv_port {
             .expect("body");
         let body = body.split("\npub(crate) fn ").next().unwrap();
         let prep = body.find("rt_prepare_timeout_result(d").expect("prepare");
-        let commit = body.find("rt_commit_receiver_runnable(d").expect("commit");
+        let commit = body.find("rt_commit_receiver_runnable(").expect("commit");
         let enqueue = body.find("d.rtd_enqueue(caller.tid.0)").expect("enqueue");
         assert!(prep < enqueue && commit < enqueue);
     }
@@ -87576,7 +87576,7 @@ mod stage200c2c2c_r2a_riscv_publication {
             .expect("txn");
         let txn = txn.split("\npub(crate) fn ").next().unwrap();
         let commit = txn
-            .find("rt_commit_receiver_runnable(d")
+            .find("rt_commit_receiver_runnable(")
             .expect("commit call");
         let enqueue = txn.find("d.rtd_enqueue(caller.tid.0)").expect("enqueue");
         assert!(commit < enqueue, "publication precedes scheduler enqueue");
@@ -88360,7 +88360,11 @@ mod stage200c2c2c_r2c_selector_matrix {
     /// observations of a0 (stored, final, first-userspace) are independently attestable.
     #[test]
     fn s11_riscv_stored_return_lanes_are_attested() {
-        assert!(IPC_STATE_SRC.contains("RISCV_BLOCKED_RETURN_PUBLISHED tid={} stored_a0={}"));
+        // Stage 200D: the marker also reports the canonical code it published, because the
+        // same publication now serves TimedOut and ServerDied.
+        assert!(
+            IPC_STATE_SRC.contains("RISCV_BLOCKED_RETURN_PUBLISHED tid={} code={} stored_a0={}")
+        );
         // Emitted AFTER the canonical publication helper, never before it.
         let block = IPC_STATE_SRC
             .split("tcb.publish_riscv_user_return(0, 0, timed_out as usize);")

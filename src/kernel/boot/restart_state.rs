@@ -122,7 +122,28 @@ impl KernelState {
             self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0)),
         );
         let _ = self.revoke_reply_caps_for_caller_identity(exit_identity);
-        let _ = self.revoke_reply_caps_for_replier_identity(exit_identity);
+        // ── Stage 200D: SERVER-DEATH caller liveness ────────────────────────────────
+        //
+        // Before the replier-side revoke sweep destroys the record, take this exact
+        // incarnation's BOUNDED reverse link and complete the blocked caller through the
+        // single terminal authority. The link is read by index off this TCB — teardown
+        // never scans the reply-record store, so its cost does not depend on unrelated
+        // IPC traffic.
+        //
+        // The task's status was already set to `Exited` above (inside its own scoped
+        // `with_tcbs_mut`), which is what prevents this incarnation from publishing any
+        // new reply authority; the snapshot below therefore cannot race a fresh
+        // registration. `take_server_reply_link` detaches the link before the TCB can be
+        // reused, so no dangling reference survives into a replacement incarnation.
+        //
+        // The record is EXCLUDED from the replier sweep that follows: the death
+        // transaction invalidates it itself as part of its terminal commit, and clearing
+        // the slot first would destroy the authority the claim needs.
+        let death_link = self.take_server_reply_link(tid, exit_identity.asid);
+        if let Some(link) = death_link {
+            self.complete_server_death_for_link(link);
+        }
+        let _ = self.revoke_reply_caps_for_replier_identity_except(exit_identity, death_link);
         if cap_cnode {
             crate::yarm_log!("CAP_CNODE_REVOKE_ON_EXIT_OK tid={}", tid);
         }

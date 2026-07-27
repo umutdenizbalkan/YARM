@@ -47,6 +47,10 @@ pub mod syscall {
         WouldBlock = 7,
         PageFault = 8,
         TimedOut = 9,
+        /// Stage 200D — the authorized IPC replier ceased to exist before completing
+        /// the reply. Must stay numerically identical to `kernel::syscall::SyscallError`
+        /// (both are `10`); the Stage 200D ABI guards assert the two enums agree.
+        ServerDied = 10,
         Internal = 255,
     }
 
@@ -223,6 +227,8 @@ pub mod syscall {
             7 => SyscallError::WouldBlock,
             8 => SyscallError::PageFault,
             9 => SyscallError::TimedOut,
+            10 => SyscallError::ServerDied,
+            // Unknown codes still fall back to `Internal` — unchanged by Stage 200D.
             _ => SyscallError::Internal,
         }
     }

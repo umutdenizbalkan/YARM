@@ -273,16 +273,22 @@ fn rt_prepare_timeout_result<D: ReplyTimeoutDomains>(d: &mut D, tid: u64, asid: 
     })
 }
 
-/// Commit a still-blocked exact receiver to `Runnable`, installing the canonical
-/// recv-v2 TIMEOUT return into the saved frame. Returns the captured CPU affinity, or
-/// `None` if the task is no longer the exact blocked receiver. This is a TIMEOUT wake,
-/// not a reply delivery.
-fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
+/// Commit a still-blocked exact receiver to `Runnable`, installing a canonical recv-v2
+/// ERROR return into the saved frame. Returns the captured CPU affinity, or `None` if the
+/// task is no longer the exact blocked receiver. This is a completion WAKE, not a reply
+/// delivery: no user memory is copied on any path through this function.
+///
+/// Stage 200D parameterizes the result code so SERVER DEATH publishes through this exact
+/// function rather than introducing a second resume path. `error_code` is the canonical
+/// `SyscallError` discriminant to deliver — `TimedOut` for a fired deadline, `ServerDied`
+/// for a dead replier — and it is the ONLY thing that differs between the two outcomes.
+pub(crate) fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
     d: &mut D,
     tid: u64,
     asid: Asid,
+    error_code: u64,
 ) -> Option<Option<crate::kernel::scheduler::CpuId>> {
-    let timed_out = crate::kernel::syscall::SyscallError::TimedOut as u64;
+    let timed_out = error_code;
     d.rtd_tcbs(|tcbs| {
         let tcb = tcbs.iter_mut().flatten().find(|t| {
             t.tid.0 == tid
@@ -320,8 +326,9 @@ fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
             // what makes the three independently observed values comparable; a metadata lane
             // can never override the raw error this way.
             crate::yarm_log!(
-                "RISCV_BLOCKED_RETURN_PUBLISHED tid={} stored_a0={} stored_a1={} stored_arg0={} stored_arg1={} result=ok",
+                "RISCV_BLOCKED_RETURN_PUBLISHED tid={} code={} stored_a0={} stored_a1={} stored_arg0={} stored_arg1={} result=ok",
                 tid,
+                error_code,
                 tcb.user_context.user_gprs[10],
                 tcb.user_context.user_gprs[11],
                 tcb.user_context.arg0,
@@ -418,12 +425,110 @@ pub(crate) fn complete_reply_timeout_over<D: ReplyTimeoutDomains>(
     let _ = rt_commit_reply_terminal(d, record_index, &terminal_owner);
     let _ = rt_complete_deadline_fire(d, token_index, &fire_owner);
     // (10–11) Commit the caller → Runnable.
-    let Some(affinity) = rt_commit_receiver_runnable(d, caller.tid.0, caller.asid) else {
+    let Some(affinity) = rt_commit_receiver_runnable(
+        d,
+        caller.tid.0,
+        caller.asid,
+        crate::kernel::syscall::SyscallError::TimedOut as u64,
+    ) else {
         return ReplyTimeoutOutcome::CleanupNoWake;
     };
     // (12) Scheduler enqueue LAST — the sole externally visible action, no lock held.
     d.rtd_enqueue(caller.tid.0);
     let _ = affinity;
+    ReplyTimeoutOutcome::Woken
+}
+
+/// Stage 200D — the SINGLE server-death completion transaction, generic over the same
+/// per-domain access `D` the reply-timeout transaction uses.
+///
+/// This is deliberately the timeout transaction's sibling, not a new mechanism: it claims
+/// the SAME terminal cell through the SAME compare-exchange, revalidates the SAME caller /
+/// endpoint / blocked-receive generations, and publishes its result through the SAME
+/// `rt_commit_receiver_runnable` — differing only in the claimant (`PeerDeath`) and the
+/// canonical code (`ServerDied`). There is no second authority store and no second resume
+/// path.
+///
+/// The deadline is SUBORDINATE here. Death does not need a token to win: if one is armed
+/// it simply becomes stale work, and a later scan loses at its own terminal claim. That is
+/// the correct direction — deadline bookkeeping must never gate terminal ownership.
+///
+/// Ordering (each a short bounded domain claim, released before the next; enqueue LAST and
+/// non-fallible; NO user-memory copy anywhere):
+/// (1) claim `PeerDeath` terminal — Reply/Timeout/CallerExit/EndpointGone may have won;
+/// (2–4) revalidate exact caller / endpoint generation / blocked-recv generation;
+/// (5) claim the exact endpoint waiter; (6) prepare the canonical result;
+/// (7) invalidate reply authority so late reply aliases are non-invokable;
+/// (8) commit the terminal; (9) publish the caller's return state + `Runnable`;
+/// (10) enqueue exactly once.
+pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
+    d: &mut D,
+    identity: &crate::kernel::terminal_ownership::TerminalIdentity,
+) -> crate::runtime::ReplyTimeoutOutcome {
+    use crate::runtime::ReplyTimeoutOutcome;
+    let record_index = identity.reply_record_index;
+    let record_generation = identity.reply_record_generation;
+
+    // (1) The SINGLE authority. A reply that already reserved, a timeout that already
+    // claimed, or a caller that already exited all make this fail — death then loses,
+    // exactly as the accepted one-winner model requires.
+    let Some(terminal_owner) = d.rtd_ipc(|ipc| {
+        ipc.reply_terminal_ownership
+            .get(record_index)
+            .and_then(|cell| cell.try_claim_peer_death_terminal(identity))
+    }) else {
+        return ReplyTimeoutOutcome::LostToTerminal;
+    };
+    // (2–5) Revalidate the exact caller incarnation, endpoint generation and blocked
+    // receive generation, then claim the exact waiter. A restarted caller reusing the
+    // numeric TID fails here, so death can never wake a replacement incarnation.
+    let caller = ReceiverWaiterIdentity::new(identity.caller_tid, identity.caller_asid);
+    let caller_ok = rt_is_blocked_receiver_exact(d, caller.tid.0, caller.asid);
+    let endpoint_ok = rt_endpoint_generation_read(d, identity.reply_endpoint_index)
+        == Some(identity.reply_endpoint_generation);
+    let brg_ok = rt_blocked_recv_generation_for(d, caller.tid.0, caller.asid)
+        == Some(identity.blocked_recv_generation);
+    let waiter_ok = caller_ok
+        && endpoint_ok
+        && brg_ok
+        && rt_claim_endpoint_waiter_exact(
+            d,
+            identity.reply_endpoint_index,
+            identity.reply_endpoint_generation,
+            caller,
+        );
+    if !waiter_ok {
+        // Death owns the terminal but the caller/endpoint/waiter changed: invalidate and
+        // complete the terminal, wake NOBODY. (The caller-exit case lands here, which is
+        // why caller exit yields `caller wake = 0`.)
+        let _ = rt_invalidate_reply_record(d, record_index, record_generation);
+        let _ = rt_commit_reply_terminal(d, record_index, &terminal_owner);
+        return ReplyTimeoutOutcome::CleanupNoWake;
+    }
+    // (6) Mark the blocked receive as completed-by-error, reusing the timeout path's
+    // preparation step (it sets no result register of its own).
+    let _ = rt_prepare_timeout_result(d, caller.tid.0, caller.asid);
+    // (7) Late reply aliases become non-invokable.
+    let _ = rt_invalidate_reply_record(d, record_index, record_generation);
+    // (8) Complete the TerminalCell as PeerDeath — one-shot, terminal.
+    let _ = rt_commit_reply_terminal(d, record_index, &terminal_owner);
+    // (9) Publish the canonical ServerDied return into the caller's saved context and
+    // make it Runnable — the SAME publication the timeout path uses.
+    let Some(affinity) = rt_commit_receiver_runnable(
+        d,
+        caller.tid.0,
+        caller.asid,
+        crate::kernel::syscall::SyscallError::ServerDied as u64,
+    ) else {
+        return ReplyTimeoutOutcome::CleanupNoWake;
+    };
+    // (10) Scheduler enqueue LAST — the sole externally visible action, exactly once.
+    d.rtd_enqueue(caller.tid.0);
+    let _ = affinity;
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_OK arch={} terminal=PeerDeath death_result=ServerDied caller_wakes=1 reply_aliases_invalid=1 reply_copies=0 result=ok",
+        crate::kernel::boot::REPLY_TIMEOUT_ARCH
+    );
     ReplyTimeoutOutcome::Woken
 }
 
@@ -715,9 +820,31 @@ impl KernelState {
         &mut self,
         replier: ReceiverWaiterIdentity,
     ) -> usize {
+        self.revoke_reply_caps_for_replier_identity_except(replier, None)
+    }
+
+    /// Stage 200D — the replier-side revoke sweep, with an EXCLUSION for the record whose
+    /// server-death terminal has just been completed.
+    ///
+    /// Teardown completes the linked record through the terminal authority (which
+    /// invalidates it as part of the commit). Clearing the slot here as well would either
+    /// destroy the authority before the claim, or drop a record whose outcome another
+    /// claimant legitimately won. The exclusion is generation-bearing: a slot that was
+    /// reclaimed and reused since the link was taken does NOT match, so a reused slot is
+    /// still swept normally.
+    pub(crate) fn revoke_reply_caps_for_replier_identity_except(
+        &mut self,
+        replier: ReceiverWaiterIdentity,
+        except: Option<crate::kernel::task::ServerReplyLink>,
+    ) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
-            for slot in ipc.reply_caps.iter_mut() {
+            for (idx, slot) in ipc.reply_caps.iter_mut().enumerate() {
+                if except
+                    .is_some_and(|link| link.matches_record(idx, ipc.reply_cap_generations[idx]))
+                {
+                    continue;
+                }
                 if slot.is_some_and(|record| {
                     record.responder_tid == Some(replier.tid)
                         && record
@@ -730,6 +857,49 @@ impl KernelState {
             }
             revoked
         })
+    }
+
+    /// Stage 200D — complete the blocked caller of `link` with the canonical server-death
+    /// result, through the single terminal authority.
+    ///
+    /// Builds the generation-bearing terminal identity from the LIVE record (so a slot
+    /// that was reclaimed since registration yields no identity and nothing happens), then
+    /// runs the shared `complete_server_death_over` transaction. Returns the outcome.
+    pub(crate) fn complete_server_death_for_link(
+        &mut self,
+        link: crate::kernel::task::ServerReplyLink,
+    ) -> crate::runtime::ReplyTimeoutOutcome {
+        use crate::runtime::ReplyTimeoutOutcome;
+        let idx = link.reply_record_index;
+        let gen_ = link.reply_record_generation;
+        // The slot must still be THIS record incarnation; a reused slot is a stale link.
+        if self.with_ipc_state(|ipc| ipc.reply_cap_generations.get(idx).copied()) != Some(gen_) {
+            return ReplyTimeoutOutcome::StaleToken;
+        }
+        let Some((caller_tid, caller_asid)) = self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(idx)
+                .and_then(|s| s.as_ref())
+                .map(|r| (r.caller_tid.0, r.caller_asid))
+        }) else {
+            return ReplyTimeoutOutcome::StaleToken;
+        };
+        let brg = self
+            .blocked_recv_generation_for(caller_tid, caller_asid)
+            .unwrap_or(0);
+        let Some(identity) = self.reply_terminal_identity(idx, gen_, brg, None) else {
+            return ReplyTimeoutOutcome::StaleToken;
+        };
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_CLAIM server_tid={} server_asid={} record_index={} record_generation={} caller_tid={} caller_asid={} result=ok",
+            link.server_tid,
+            link.server_asid.0,
+            idx,
+            gen_,
+            caller_tid,
+            caller_asid.0
+        );
+        complete_server_death_over(self, &identity)
     }
 
     /// Numeric-TID convenience wrapper (tests / non-authoritative callers). Resolves
@@ -804,6 +974,126 @@ impl KernelState {
                 _ => false,
             },
             None => false,
+        })
+    }
+
+    // ── Stage 200D: bounded, generation-bearing REVERSE registration ─────────────
+    //
+    // Teardown must find the reply records a dying server owed a reply to WITHOUT
+    // scanning the whole reply-record store: the cost of a task exit must not depend on
+    // unrelated IPC traffic. The link therefore lives on the exact server TCB and is read
+    // by index. It is NOT a second authority — the terminal cell still decides every
+    // outcome; the link only says *which cell to look at*.
+
+    /// Register the reverse link on the exact server incarnation. Returns `false` — with
+    /// NO mutation — when the server TCB is absent, its incarnation does not match, or a
+    /// DIFFERENT live link is already registered. Capacity is one outstanding record (the
+    /// honest single-pair contract): a second registration never silently overwrites the
+    /// first, so the caller must roll the reply-record publication back.
+    ///
+    /// Re-registering the IDENTICAL link is idempotent and succeeds, so a retried commit
+    /// cannot fail spuriously.
+    pub(crate) fn register_server_reply_link(
+        &mut self,
+        server_tid: u64,
+        server_asid: Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> bool {
+        let link = crate::kernel::task::ServerReplyLink {
+            server_tid,
+            server_asid,
+            reply_record_index: record_index,
+            reply_record_generation: record_generation,
+        };
+        self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+            else {
+                return false;
+            };
+            match tcb.server_reply_link {
+                Some(existing) if existing == link => true,
+                Some(_) => false,
+                None => {
+                    tcb.server_reply_link = Some(link);
+                    true
+                }
+            }
+        })
+    }
+
+    /// Remove the reverse link, but ONLY when it still describes this exact record
+    /// incarnation. Idempotent: a stale unregister (wrong generation, wrong slot, wrong
+    /// server incarnation, or already removed) mutates NOTHING and returns `false`.
+    pub(crate) fn unregister_server_reply_link(
+        &mut self,
+        server_tid: u64,
+        server_asid: Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> bool {
+        self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+            else {
+                return false;
+            };
+            match tcb.server_reply_link {
+                Some(link)
+                    if link.matches_server(server_tid, server_asid)
+                        && link.matches_record(record_index, record_generation) =>
+                {
+                    tcb.server_reply_link = None;
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Read the link registered on the exact server incarnation (no mutation).
+    pub(crate) fn server_reply_link_for(
+        &self,
+        server_tid: u64,
+        server_asid: Asid,
+    ) -> Option<crate::kernel::task::ServerReplyLink> {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+                .and_then(|t| t.server_reply_link)
+        })
+    }
+
+    /// Drop whatever link the exact server incarnation holds, whatever it points at.
+    /// Used ONLY by teardown after it has already snapshot the link — so a TCB that is
+    /// about to be reclaimed cannot leave a dangling reference behind. Returns the link
+    /// that was removed.
+    pub(crate) fn take_server_reply_link(
+        &mut self,
+        server_tid: u64,
+        server_asid: Asid,
+    ) -> Option<crate::kernel::task::ServerReplyLink> {
+        self.with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+                .and_then(|t| t.server_reply_link.take())
+        })
+    }
+
+    /// Total live reverse links (hosted leak accounting only).
+    pub(crate) fn live_server_reply_link_count(&self) -> usize {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .filter(|t| t.server_reply_link.is_some())
+                .count()
         })
     }
 
