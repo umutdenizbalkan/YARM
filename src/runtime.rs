@@ -238,10 +238,14 @@ pub struct SharedKernel {
 /// the rank-1 scheduler enqueue seam). It NEVER forms a broad `&mut KernelState` and
 /// NEVER takes the broad `SpinLock<KernelState>` — each primitive is a SHORT bounded
 /// claim of exactly one domain, so the composed transaction holds no broad lock.
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+// CLASSIFICATION (Stage 200D-F0): **production mechanism**. Despite the historical
+// `ReplyTimeout` name this is the generic OFF-LOCK IPC TERMINAL-COMPLETION domain: the
+// ungated server-death path composes its transaction through exactly these seams on every
+// build. Gating it on `ipc-reply-timeout-oracle-core` made the feature-off kernel fail to
+// compile. It is deliberately NOT renamed here — this stage's first commit is the minimal
+// repair, and a rename would spread an unrelated diff across every call site.
 pub(crate) struct OffLockReplyTimeout<'a>(pub(crate) &'a SharedKernel);
 
-#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout<'_> {
     fn rtd_ipc<R>(&mut self, f: impl FnOnce(&mut crate::kernel::boot::IpcSubsystem) -> R) -> R {
         self.0.with_ipc_split_mut(f)
@@ -3733,7 +3737,8 @@ impl SharedKernel {
     /// released BEFORE the rank-1 scheduler claim performs the enqueue — so no task lock
     /// is held while enqueuing, and no broad lock is ever taken. Mirrors
     /// `KernelState::enqueue_task`'s placement (pinned → its CPU; unpinned → balanced).
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    // CLASSIFICATION (Stage 200D-F0): **production mechanism**. The server-death
+    // completion enqueues its woken caller through this seam on every build.
     fn enqueue_reply_timeout_wake_split(&self, tid: u64) {
         use crate::kernel::ipc::ThreadId;
         use crate::kernel::scheduler::TaskPriority;

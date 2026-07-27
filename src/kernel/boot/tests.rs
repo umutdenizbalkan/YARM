@@ -90045,3 +90045,182 @@ mod stage200d2a_deferred_death {
         teardown();
     }
 }
+
+/// Stage 200D-F0 — PRODUCTION-versus-ORACLE feature gating.
+///
+/// The server-death mechanism is production behaviour on every build; the reply-timeout
+/// oracle's selectors, markers, causal gates and seals are proof scaffolding that must
+/// vanish without the feature. Stage 200D-2A conflated the two: ungated production code
+/// referenced oracle-gated items, so NO feature-off kernel compiled on ANY architecture,
+/// and that stage's validation never caught it because it only ever built feature-on.
+///
+/// These guards pin the classification so the mistake cannot recur silently.
+mod stage200df0_feature_gating {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+
+    /// Extract the `#[cfg(...)]` attributes immediately preceding `needle` in `src`.
+    fn preceding_cfgs<'a>(src: &'a str, needle: &str) -> alloc::string::String {
+        let at = src
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing: {needle}"));
+        let head = &src[..at];
+        head.lines()
+            .rev()
+            .take_while(|l| {
+                let t = l.trim();
+                t.starts_with("#[") || t.starts_with("//") || t.starts_with("///") || t.is_empty()
+            })
+            .filter(|l| l.trim().starts_with("#["))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    const ORACLE_FEATURE: &str = "ipc-reply-timeout-oracle-core";
+
+    /// (1) the PRODUCTION server-death mechanism is never gated on the oracle feature.
+    #[test]
+    fn f01_production_server_death_is_not_oracle_gated() {
+        for (what, src, needle) in [
+            (
+                "deferred item type",
+                MOD_SRC,
+                "pub(crate) struct DeferredServerDeathCompletion {",
+            ),
+            (
+                "per-CPU work queue",
+                MOD_SRC,
+                "static SERVER_DEATH_POST_WORK:",
+            ),
+            (
+                "work reserve",
+                MOD_SRC,
+                "pub(crate) fn server_death_work_reserve(",
+            ),
+            (
+                "work publish",
+                MOD_SRC,
+                "pub(crate) fn server_death_work_publish(",
+            ),
+            (
+                "post-lock drain",
+                RUNTIME_SRC,
+                "pub(crate) fn drain_server_death_post_work(",
+            ),
+            (
+                "completion domain",
+                RUNTIME_SRC,
+                "pub(crate) struct OffLockReplyTimeout<",
+            ),
+            (
+                "caller-enqueue helper",
+                RUNTIME_SRC,
+                "fn enqueue_reply_timeout_wake_split(",
+            ),
+            (
+                "peer-death completion transaction",
+                IPC_STATE_SRC,
+                "pub(crate) fn complete_server_death_over<",
+            ),
+            (
+                "arch tag",
+                MOD_SRC,
+                "pub(crate) const REPLY_TIMEOUT_ARCH: &str = \"x86_64\";",
+            ),
+        ] {
+            let cfgs = preceding_cfgs(src, needle);
+            assert!(
+                !cfgs.contains(ORACLE_FEATURE),
+                "{what} is production mechanism and must not be gated on {ORACLE_FEATURE}: {cfgs}"
+            );
+        }
+        // Teardown's handoff is likewise ungated.
+        let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let exit = exit.split("\n    pub fn ").next().unwrap();
+        assert!(exit.contains("server_death_work_reserve(cpu_idx)"));
+        assert!(
+            !exit.contains(ORACLE_FEATURE),
+            "the teardown handoff must not be oracle-gated"
+        );
+    }
+
+    /// (2) the ORACLE's own scaffolding stays gated — the repair widened nothing.
+    #[test]
+    fn f02_oracle_scaffolding_remains_gated() {
+        for (what, src, needle) in [
+            (
+                "causal collector gate hold",
+                MOD_SRC,
+                "pub(crate) fn hold_reply_timeout_collector()",
+            ),
+            (
+                "causal gate release",
+                MOD_SRC,
+                "pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str)",
+            ),
+            (
+                "collector hold flag",
+                MOD_SRC,
+                "static IPC_REPLY_TIMEOUT_COLLECTOR_HOLD:",
+            ),
+            (
+                "reply-timeout work queue",
+                MOD_SRC,
+                "static REPLY_TIMEOUT_POST_WORK:",
+            ),
+            (
+                "narrow collector",
+                RUNTIME_SRC,
+                "pub(crate) fn collect_due_reply_timeout_work(",
+            ),
+            (
+                "reply-timeout drain",
+                RUNTIME_SRC,
+                "pub(crate) fn drain_reply_timeout_post_work(",
+            ),
+            (
+                "reply-win reserve",
+                IPC_STATE_SRC,
+                "pub(crate) fn reserve_reply_win_before_copy(",
+            ),
+        ] {
+            let cfgs = preceding_cfgs(src, needle);
+            assert!(
+                cfgs.contains(ORACLE_FEATURE),
+                "{what} is oracle scaffolding and must stay gated on {ORACLE_FEATURE}: {cfgs}"
+            );
+        }
+    }
+
+    /// (3) the repair removed ONLY the feature condition from the arch tag — the per-arch
+    /// `cfg`s remain, so a foreign arch literal still cannot be linked.
+    #[test]
+    fn f03_arch_tag_keeps_its_per_arch_cfgs() {
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                MOD_SRC.contains(&alloc::format!(
+                    "#[cfg(target_arch = \"{arch}\")]\npub(crate) const REPLY_TIMEOUT_ARCH: &str = \"{arch}\";"
+                )),
+                "{arch} tag must keep its per-arch cfg"
+            );
+        }
+        // Exactly one tag is linked per build.
+        assert!(MOD_SRC.contains("pub(crate) const REPLY_TIMEOUT_ARCH: &str = \"unknown\";"));
+    }
+
+    /// (4) the classification is documented at each repaired site, so the next person
+    /// reaching for a `cfg` there sees why it is absent.
+    #[test]
+    fn f04_classification_is_documented() {
+        assert!(MOD_SRC.contains("CLASSIFICATION (Stage 200D-F0): **production mechanism**"));
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("CLASSIFICATION (Stage 200D-F0): **production mechanism**")
+                .count(),
+            2,
+            "both repaired runtime.rs items carry the classification"
+        );
+    }
+}

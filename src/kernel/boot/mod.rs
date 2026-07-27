@@ -3612,24 +3612,28 @@ pub(crate) fn reply_timeout_hw_now() -> u64 {
     cnt >> REPLY_TIMEOUT_AARCH64_TICK_SHIFT
 }
 
-/// Stage 200C2C1 — the compile-time arch tag stamped into every reply-timeout retirement
-/// marker (`arch={REPLY_TIMEOUT_ARCH}`), so the SAME arch-neutral emit sites report
-/// `x86_64` on the x86 cell and `aarch64` on the AArch64 cell. A feature-off / other-arch
-/// build never links these emits, so no foreign arch literal leaks into an artifact.
-#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "x86_64"))]
+/// Stage 200C2C1 — the compile-time arch tag stamped into arch-neutral IPC terminal
+/// markers (`arch={REPLY_TIMEOUT_ARCH}`), so the SAME emit sites report `x86_64` on the x86
+/// build and `aarch64` on the AArch64 build. Only the current architecture's tag is ever
+/// linked, so no foreign arch literal leaks into an artifact.
+///
+/// CLASSIFICATION (Stage 200D-F0): **production mechanism**, not an oracle literal. It is
+/// consumed by the ungated server-death completion path, which exists on every build, so
+/// gating it on `ipc-reply-timeout-oracle-core` made the feature-off kernel fail to
+/// compile on all three architectures. The per-arch `cfg`s are retained; only the feature
+/// condition is removed. This widens no oracle marker: the marker STRINGS that embed the
+/// tag remain wherever they were already gated.
+#[cfg(target_arch = "x86_64")]
 pub(crate) const REPLY_TIMEOUT_ARCH: &str = "x86_64";
-#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 pub(crate) const REPLY_TIMEOUT_ARCH: &str = "aarch64";
-#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 pub(crate) const REPLY_TIMEOUT_ARCH: &str = "riscv64";
-#[cfg(all(
-    feature = "ipc-reply-timeout-oracle-core",
-    not(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "riscv64"
-    ))
-))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+)))]
 pub(crate) const REPLY_TIMEOUT_ARCH: &str = "unknown";
 
 // ── Stage 200C2C2C-R2C: the BOOT-INSTANCE identifier ────────────────────────────────
