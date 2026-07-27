@@ -598,6 +598,11 @@ pub fn handle_riscv_trap_entry_shared(
         shared.drain_reply_timeout_post_work(cpu, now);
     }
 
+    // Stage 200D-2A: the SERVER-DEATH post-lock drain, ungated (production behaviour on
+    // every build). RISC-V drives its own post-lock area, so the drain is wired here for
+    // the same reason the collector above is — one driver per port.
+    let _ = shared.drain_server_death_post_work(cpu);
+
     // Foundation-oracle DRAIN — consume the token published in-lock, proving the
     // outer guard is genuinely dropped by RE-ACQUIRING `with_cpu` here (a held
     // guard would deadlock). Reads only `current_tid`; performs no mutation.

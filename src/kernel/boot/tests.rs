@@ -89175,14 +89175,17 @@ mod stage200d1_publication_and_guards {
         let body = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
         let body = body.split("\n    pub fn ").next().unwrap();
         assert!(body.contains("take_server_reply_link(tid, exit_identity.asid)"));
-        assert!(body.contains("complete_server_death_for_link(link)"));
+        // Stage 200D-2A: teardown no longer claims in place — it publishes a deferred item
+        // the post-lock drain claims from. The no-scan property this case guards is
+        // unchanged, and is now stronger: teardown touches no record at all.
+        assert!(body.contains("server_death_work_publish("));
         assert!(
             !body.contains("for slot in") && !body.contains("reply_caps.iter"),
             "teardown must not scan the reply-record store for death authority"
         );
-        // The death claim runs BEFORE the revoke sweep, which would otherwise destroy the
-        // record the claim needs.
-        let death_at = body.find("complete_server_death_for_link").expect("death");
+        // The link handoff runs BEFORE the revoke sweep, which would otherwise destroy the
+        // record the deferred item needs.
+        let death_at = body.find("take_server_reply_link").expect("handoff");
         let sweep_at = body
             .find("revoke_reply_caps_for_replier_identity_except")
             .expect("sweep");
@@ -89377,8 +89380,9 @@ mod stage200d1_publication_and_guards {
             identity < capture,
             "the exact exiting identity precedes link capture"
         );
-        // Waiter/CNode cleanup and reporting all follow the death claim.
-        let death = body.find("complete_server_death_for_link").expect("death");
+        // Waiter/CNode cleanup and reporting all follow the deferred handoff (Stage
+        // 200D-2A: authority is captured into the deferred item, not claimed here).
+        let handoff = body.find("server_death_work_publish(").expect("handoff");
         for later in [
             "clear_ipc_waiters_for_tid",
             "report_task_exit_to_supervisor",
@@ -89386,7 +89390,658 @@ mod stage200d1_publication_and_guards {
             let at = body
                 .find(later)
                 .unwrap_or_else(|| panic!("missing {later}"));
-            assert!(death < at, "{later} must follow the death claim");
+            assert!(handoff < at, "{later} must follow the deferred handoff");
         }
+    }
+}
+
+/// Stage 200D-2A — DEFERRED post-lock server-death completion.
+///
+/// The Stage 200D-1 mechanism was lifecycle-correct but did all of its authority work
+/// inside the broad `SpinLock<KernelState>`. These cases prove the new split: the
+/// broad-lock phase only reserves a slot, detaches the exact link and publishes an
+/// immutable generation-bearing item; the post-lock drain does the PeerDeath claim, the
+/// result publication and the single enqueue.
+///
+/// Hosted and source-guarded — no live retirement cell is claimed.
+mod stage200d2a_deferred_death {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::DeferredServerDeathCompletion;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::kernel::vm::Asid;
+
+    const TOKEN_GEN: u64 = 1;
+    const SERVER_DIED: u64 = 10;
+    const CPU: CpuId = CpuId(0);
+
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    fn clear_queue() {
+        crate::kernel::boot::server_death_work_clear(0);
+    }
+    fn queued() -> usize {
+        crate::kernel::boot::server_death_work_len(0)
+    }
+
+    fn arm(fx: &CallerFx) -> TerminalIdentity {
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(1);
+        let id =
+            fx.k.with(|s| {
+                s.reply_terminal_identity(
+                    fx.record_index,
+                    fx.record_generation,
+                    brg,
+                    Some(TOKEN_GEN),
+                )
+            })
+            .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(fx.record_index, id));
+        id
+    }
+
+    fn link(fx: &CallerFx) -> bool {
+        fx.k.with(|s| {
+            s.register_server_reply_link(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        })
+    }
+
+    /// The BROAD-LOCK phase exactly as `exit_task` performs it: reserve → detach → publish.
+    fn broad_lock_exit_phase(fx: &CallerFx) -> bool {
+        let reservation = match crate::kernel::boot::server_death_work_reserve(0) {
+            Some(r) => r,
+            None => return false,
+        };
+        match fx
+            .k
+            .with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+        {
+            Some(l) => crate::kernel::boot::server_death_work_publish(
+                reservation,
+                DeferredServerDeathCompletion {
+                    exiting_server: fx.replier,
+                    reply_record_index: l.reply_record_index,
+                    reply_record_generation: l.reply_record_generation,
+                },
+            ),
+            None => {
+                crate::kernel::boot::server_death_work_release(reservation);
+                false
+            }
+        }
+    }
+
+    fn drain(fx: &CallerFx) -> usize {
+        fx.k.drain_server_death_post_work(CPU)
+    }
+
+    fn winner(fx: &CallerFx) -> Option<TerminalClaimant> {
+        fx.k.with(|s| s.reply_terminal_committed_winner(fx.record_index))
+    }
+    fn caller_result(fx: &CallerFx) -> Option<u64> {
+        fx.k.with(|s| s.pending_syscall_completion_result(1))
+    }
+    fn live_links(fx: &CallerFx) -> usize {
+        fx.k.with(|s| s.live_server_reply_link_count())
+    }
+
+    /// Set up armed terminal + registered link, then run the broad-lock phase.
+    fn armed_and_deferred(fx: &CallerFx) -> TerminalIdentity {
+        let id = arm(fx);
+        assert!(link(fx));
+        assert!(broad_lock_exit_phase(fx));
+        id
+    }
+
+    // ── (1)(2) publication integrity ────────────────────────────────────────────────
+    #[test]
+    fn f01_exit_publishes_exactly_one_item() {
+        clear_queue();
+        let fx = caller_fixture();
+        armed_and_deferred(&fx);
+        assert_eq!(queued(), 1, "one detached link ⇒ exactly one deferred item");
+        assert_eq!(live_links(&fx), 0, "the link is no longer the owner");
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f02_duplicate_exit_publishes_no_duplicate() {
+        clear_queue();
+        let fx = caller_fixture();
+        armed_and_deferred(&fx);
+        // A second exit notification finds no link, so it publishes nothing.
+        assert!(!broad_lock_exit_phase(&fx));
+        assert_eq!(queued(), 1, "no duplicate deferred item");
+        // Even a forced duplicate publication collapses to one owner.
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert!(!crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation,
+            }
+        ));
+        assert_eq!(queued(), 1);
+        clear_queue();
+        teardown();
+    }
+
+    // ── (3)(4) another claimant wins BEFORE the drain ───────────────────────────────
+    fn losing_race(kind: TerminalClaimant, expect_result: Option<u64>) {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(fx.record_index, kind, &id))
+                .expect("rival claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &owner)));
+        // The deferred item still runs, loses, and is CONSUMED exactly once.
+        assert_eq!(drain(&fx), 1, "the losing item must be consumed");
+        assert_eq!(queued(), 0, "a losing item must never remain queued");
+        assert_eq!(winner(&fx), Some(kind), "no result overwrite");
+        assert_eq!(caller_result(&fx), expect_result, "death added no wake");
+        assert_eq!(drain(&fx), 0, "nothing left to drain");
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f03_reply_wins_before_drain() {
+        losing_race(TerminalClaimant::Reply, None);
+    }
+
+    #[test]
+    fn f04_timeout_wins_before_drain() {
+        losing_race(TerminalClaimant::Timeout, None);
+    }
+
+    // ── (5)(6) deferred PeerDeath wins ──────────────────────────────────────────────
+    #[test]
+    fn f05_deferred_peer_death_wins_before_reply() {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::Reply,
+                &id
+            ))
+            .is_none(),
+            "a late reply cannot claim a completed terminal"
+        );
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f06_deferred_peer_death_wins_before_timeout() {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::Timeout,
+                &id
+            ))
+            .is_none()
+        );
+        clear_queue();
+        teardown();
+    }
+
+    // ── (7)(8) caller exit / endpoint destruction before the drain ──────────────────
+    #[test]
+    fn f07_caller_exit_before_drain() {
+        losing_race(TerminalClaimant::CallerExit, None);
+    }
+
+    #[test]
+    fn f08_endpoint_gone_before_drain() {
+        losing_race(TerminalClaimant::EndpointGone, None);
+    }
+
+    // ── (9) record slot reused before the stale drain runs ──────────────────────────
+    #[test]
+    fn f09_record_slot_reuse_makes_item_stale() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // Publish an item that names a generation the record no longer has.
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation.wrapping_add(1),
+            }
+        ));
+        assert_eq!(drain(&fx), 1, "the stale item is consumed");
+        assert_eq!(winner(&fx), None, "a stale item must claim nothing");
+        assert_eq!(caller_result(&fx), None);
+        clear_queue();
+        teardown();
+    }
+
+    // ── (10)(11) reused numeric TIDs with different ASIDs ───────────────────────────
+    #[test]
+    fn f10_server_tid_reused_with_different_asid() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // An item naming the SAME numeric server TID but a different incarnation.
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    fx.replier.tid,
+                    Asid(fx.replier.asid.0.wrapping_add(64)),
+                ),
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation,
+            }
+        ));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(
+            winner(&fx),
+            None,
+            "numeric TID alone must never authorize a deferred claim"
+        );
+        assert_eq!(caller_result(&fx), None);
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f11_caller_tid_reused_with_different_asid() {
+        clear_queue();
+        let fx = caller_fixture();
+        armed_and_deferred(&fx);
+        // The caller re-blocked: its blocked-receive generation advanced.
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert_eq!(drain(&fx), 1, "the item is still consumed");
+        assert_eq!(
+            caller_result(&fx),
+            None,
+            "no replacement incarnation is woken"
+        );
+        clear_queue();
+        teardown();
+    }
+
+    // ── (12) capacity failure ───────────────────────────────────────────────────────
+    #[test]
+    fn f12_capacity_failure_retains_the_link() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // Exhaust every slot.
+        let mut held = alloc::vec::Vec::new();
+        while let Some(r) = crate::kernel::boot::server_death_work_reserve(0) {
+            held.push(r);
+        }
+        // The broad-lock phase must NOT detach the link when it cannot reserve.
+        assert!(!broad_lock_exit_phase(&fx));
+        assert_eq!(
+            live_links(&fx),
+            1,
+            "a full queue must leave the link attached — never strand the caller"
+        );
+        for r in held {
+            crate::kernel::boot::server_death_work_release(r);
+        }
+        clear_queue();
+        teardown();
+    }
+
+    // ── (13)(14) handoff failpoints ─────────────────────────────────────────────────
+    #[test]
+    fn f13_failpoint_before_link_detach_restores_nothing() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // Reserve, then abort before detaching: the link remains the exact owner.
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        crate::kernel::boot::server_death_work_release(r);
+        assert_eq!(live_links(&fx), 1, "the exact link is still the owner");
+        assert_eq!(queued(), 0, "no deferred item leaked");
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f14_failpoint_after_detach_publishes_exactly_one() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        let l =
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+                .expect("link");
+        // Detached: from here the ONLY permitted end states are one published item.
+        assert!(crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: l.reply_record_index,
+                reply_record_generation: l.reply_record_generation,
+            }
+        ));
+        assert_eq!(live_links(&fx), 0);
+        assert_eq!(queued(), 1, "exactly one deferred owner after detach");
+        clear_queue();
+        teardown();
+    }
+
+    // ── (15)(16) exactly-once execution ─────────────────────────────────────────────
+    #[test]
+    fn f15_deferred_work_executes_exactly_once() {
+        clear_queue();
+        let fx = caller_fixture();
+        armed_and_deferred(&fx);
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(drain(&fx), 0, "a drained item must not run twice");
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f16_losing_item_consumed_exactly_once() {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        let owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Reply, &id)
+            })
+            .expect("reply");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &owner)));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(drain(&fx), 0);
+        assert_eq!(queued(), 0, "deferred items leaked");
+        clear_queue();
+        teardown();
+    }
+
+    // ── (17)(18) registration versus Exiting ────────────────────────────────────────
+    #[test]
+    fn f17_registration_then_immediate_exit_yields_one_item() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx), "registration completes first");
+        fx.k.with(|s| s.set_task_status_for_test(2, crate::kernel::task::TaskStatus::Exited(0)));
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(queued(), 1, "exactly one deferred item");
+        assert_eq!(live_links(&fx), 0);
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f18_registration_loses_to_exiting() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        fx.k.with(|s| s.set_task_status_for_test(2, crate::kernel::task::TaskStatus::Exited(0)));
+        assert!(!link(&fx), "registration must fail once Exiting won");
+        assert!(!broad_lock_exit_phase(&fx), "nothing to defer");
+        assert_eq!(queued(), 0);
+        clear_queue();
+        teardown();
+    }
+
+    // ── (19)(20)(21)(22) publication ordering + no late overwrite ───────────────────
+    #[test]
+    fn f19_result_publication_precedes_runnable() {
+        // Source contract: the publication write happens before the status flip, inside
+        // the single completion helper both timeout and death share.
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("body");
+        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        let publish = body
+            .find("tcb.pending_syscall_completion = Some(")
+            .expect("publish");
+        let runnable = body
+            .find("tcb.status = TaskStatus::Runnable")
+            .expect("runnable");
+        assert!(publish < runnable, "result publication precedes Runnable");
+    }
+
+    #[test]
+    fn f20_runnable_precedes_enqueue() {
+        let txn = IPC_STATE_SRC
+            .split("fn complete_server_death_over")
+            .nth(1)
+            .expect("txn");
+        let txn = txn.split("\nimpl IpcSubsystem").next().unwrap();
+        let commit = txn.find("rt_commit_receiver_runnable(").expect("commit");
+        let enqueue = txn.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        assert!(commit < enqueue, "Runnable precedes the enqueue");
+    }
+
+    #[test]
+    fn f21_enqueue_happens_after_broad_lock_release() {
+        // The broad-lock phase in exit_task performs no claim, publication or enqueue.
+        let body = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let body = body.split("\n    pub fn ").next().unwrap();
+        for forbidden in [
+            "complete_server_death_for_link",
+            "complete_server_death_over",
+            "rt_commit_receiver_runnable",
+            "rtd_enqueue",
+            "enqueue_woken_task",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the broad-lock phase must not {forbidden}"
+            );
+        }
+        // It only reserves, detaches and publishes.
+        assert!(body.contains("server_death_work_reserve(cpu_idx)"));
+        assert!(body.contains("take_server_reply_link(tid, exit_identity.asid)"));
+        assert!(body.contains("server_death_work_publish("));
+        // And the drain is wired into every port's POST-LOCK area.
+        assert!(TRAP_ENTRY_SRC.contains("shared.drain_server_death_post_work(cpu)"));
+        assert!(RISCV_TRAP_SRC.contains("shared.drain_server_death_post_work(cpu)"));
+        // The drain itself uses only the split seams, never `with(`.
+        let drain = RUNTIME_SRC
+            .split("pub(crate) fn drain_server_death_post_work")
+            .nth(1)
+            .expect("drain");
+        let drain = drain.split("\n    /// Stage 200D —").next().unwrap();
+        assert!(
+            !drain.contains("self.with(|"),
+            "the drain must never take the broad lock"
+        );
+        assert!(drain.contains("with_ipc_split_mut"));
+        assert!(drain.contains("OffLockReplyTimeout(self)"));
+    }
+
+    // ── 8. Lock-rank and structural guards ─────────────────────────────────────────
+    //
+    // Documented lock sequence after this stage:
+    //
+    //   broad `SpinLock<KernelState>` (exit_task)
+    //     └─ scoped `with_tcbs_mut`  — mark Exited, then RELEASED
+    //     └─ scoped task claim       — take the exact link, then RELEASED
+    //     └─ per-CPU work queue lock — reserve/publish (rank-independent, own IrqSpinLock)
+    //   ── broad lock RELEASED ──
+    //   post-lock drain
+    //     └─ rank 3 ipc  — read armed identity, claim PeerDeath, invalidate record
+    //     └─ rank 2 task — revalidate caller, publish result, mark Runnable
+    //     └─ rank 1 sched— enqueue (LAST, non-fallible)
+    //
+    // No claim spans a release boundary, and no domain claim is held across the enqueue.
+
+    /// The deferred item carries only immutable, generation-bearing identity — no raw
+    /// pointer, no borrowed reference, no userspace pointer, no second completion state.
+    #[test]
+    fn f23_deferred_item_representation() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let def = MOD_SRC
+            .split("pub(crate) struct DeferredServerDeathCompletion {")
+            .nth(1)
+            .expect("item");
+        let def = def.split("\n}").next().unwrap();
+        assert!(def.contains("pub exiting_server: ReceiverWaiterIdentity,"));
+        assert!(def.contains("pub reply_record_index: usize,"));
+        assert!(def.contains("pub reply_record_generation: u64,"));
+        for forbidden in ["*mut", "*const", "&'", "&mut", "user_ptr", "TerminalOwner"] {
+            assert!(
+                !def.contains(forbidden),
+                "deferred item must not carry {forbidden}"
+            );
+        }
+    }
+
+    /// No PeerDeath claim, result publication or enqueue happens under the broad lock,
+    /// anywhere in the kernel.
+    #[test]
+    fn f24_no_broad_lock_death_authority_anywhere() {
+        // `complete_server_death_over` has exactly one production call site, and it is the
+        // post-lock drain.
+        // The only PRODUCTION caller is the post-lock drain. The one remaining broad-lock
+        // entry (`complete_server_death_for_link`) is `cfg`-gated to hosted builds, so it
+        // cannot be linked into a freestanding kernel at all.
+        assert_eq!(
+            RUNTIME_SRC.matches("complete_server_death_over(").count(),
+            1
+        );
+        assert_eq!(RESTART_SRC.matches("complete_server_death_over").count(), 0);
+        assert!(IPC_STATE_SRC.contains(
+            "#[cfg(any(test, feature = \"hosted-dev\"))]\n    pub(crate) fn complete_server_death_for_link("
+        ));
+        assert!(
+            RUNTIME_SRC
+                .contains("crate::kernel::boot::complete_server_death_over(&mut d, &identity)")
+        );
+        // The in-lock helper that used to claim from exit_task is gone from that path.
+        let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit");
+        let exit = exit.split("\n    pub fn ").next().unwrap();
+        assert!(!exit.contains("complete_server_death"));
+        // Teardown holds no reply-record guard: it touches no ipc state at all beyond the
+        // sweep that follows the handoff.
+        let handoff = exit.find("server_death_work_publish(").expect("handoff");
+        let before = &exit[..handoff];
+        assert!(
+            !before.contains("with_ipc_state") && !before.contains("reply_terminal"),
+            "the broad-lock phase must not hold a reply-record guard"
+        );
+    }
+
+    /// The drain reuses the accepted publication machinery — no second resume path — and
+    /// the per-arch contracts still hold with code 10.
+    #[test]
+    fn f25_arch_return_contracts_survive_deferral() {
+        use crate::kernel::task::ThreadControlBlock;
+        // RISC-V: both mirrors, secondary lanes zero, canonical helper only.
+        let mut tcb = ThreadControlBlock::new(crate::kernel::ipc::ThreadId(9), Some(Asid(4)));
+        tcb.publish_riscv_user_return(0, 0, SERVER_DIED as usize);
+        assert_eq!(tcb.user_context.user_gprs[10], SERVER_DIED as usize);
+        assert_eq!(tcb.user_context.arg0, SERVER_DIED as usize);
+        assert_eq!(tcb.user_context.user_gprs[11], 0);
+        assert_eq!(tcb.user_context.arg1, 0);
+        // The drain publishes through the shared completion helper, not a new path.
+        let drain = RUNTIME_SRC
+            .split("pub(crate) fn drain_server_death_post_work")
+            .nth(1)
+            .expect("drain");
+        let drain = drain.split("\n    /// Stage 200D —").next().unwrap();
+        for forbidden in [
+            "publish_riscv_user_return",
+            "user_gprs[",
+            "pending_syscall_completion =",
+            "TaskStatus::Runnable",
+        ] {
+            assert!(
+                !drain.contains(forbidden),
+                "the drain must delegate publication, not perform it ({forbidden})"
+            );
+        }
+    }
+
+    /// Bounded queue: no allocation on the teardown path, capacity tied to the record
+    /// store, and reserved-but-unpublished slots are never drained.
+    #[test]
+    fn f26_queue_is_bounded_and_allocation_free() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        assert!(MOD_SRC.contains("pub(crate) const SD_POST_WORK_SLOTS: usize = MAX_REPLY_CAPS;"));
+        assert!(
+            MOD_SRC.contains("static SERVER_DEATH_POST_WORK: [crate::kernel::lock::SpinLockIrq<")
+        );
+        let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit");
+        let exit = exit.split("\n    pub fn ").next().unwrap();
+        for forbidden in ["Vec::", "Box::", "alloc::", "to_vec()"] {
+            assert!(
+                !exit.contains(forbidden),
+                "no allocation in teardown ({forbidden})"
+            );
+        }
+        // A reserved placeholder is not drainable.
+        clear_queue();
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert_eq!(queued(), 0, "a reservation is not drainable work");
+        assert!(crate::kernel::boot::server_death_work_drain_next(0).is_none());
+        crate::kernel::boot::server_death_work_release(r);
+        clear_queue();
+    }
+
+    #[test]
+    fn f22_late_drain_never_overwrites_a_result() {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        // Timeout wins and publishes ITS result first.
+        let owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Timeout, &id)
+            })
+            .expect("timeout");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &owner)));
+        fx.k.with(|s| {
+            s.set_pending_syscall_completion_for_test(
+                1,
+                crate::kernel::syscall::SyscallError::TimedOut as u64,
+            )
+        });
+        assert_eq!(caller_result(&fx), Some(9));
+        assert_eq!(drain(&fx), 1, "the losing item is consumed");
+        assert_eq!(
+            caller_result(&fx),
+            Some(9),
+            "a late death drain must not overwrite the committed result"
+        );
+        clear_queue();
+        teardown();
     }
 }

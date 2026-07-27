@@ -3824,6 +3824,170 @@ pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str) {
 #[cfg(not(feature = "ipc-reply-timeout-oracle-core"))]
 pub(crate) fn maybe_release_reply_timeout_collector_gate(_msg: &str) {}
 
+// ── Stage 200D-2A: per-CPU bounded DEFERRED SERVER-DEATH work queue ─────────────────
+//
+// The sibling of the Stage 200C2B reply-timeout queue below, with the SAME ownership
+// model — a per-CPU bounded array under its own IRQ-safe lock, never the broad
+// `SpinLock<KernelState>` — but deliberately NOT behind the oracle feature: server death
+// is production behaviour on every build, whereas the reply-timeout collector is an
+// oracle-gated proof path.
+//
+// Why a deferred queue at all: `exit_task` runs under the broad lock. Claiming PeerDeath,
+// publishing the caller's result and enqueueing it there is correct but keeps the whole
+// completion inside the broad lock, which is exactly the unlocking this stage removes.
+// Teardown now only RESERVES a slot, detaches the exact link and publishes an immutable
+// generation-bearing item; the post-lock drain does all the authority work.
+//
+// Reservation precedes the irreversible link detach on purpose: a detached link with no
+// deferred owner would strand the caller blocked forever, so capacity is proven available
+// before the link stops being the owner.
+
+/// One owned unit of deferred server-death completion work.
+///
+/// Everything here is immutable and generation-bearing: no raw pointer, no borrowed TCB
+/// reference, no userspace pointer, and no second authoritative completion state — the
+/// terminal cell remains the only authority. `exiting_server` is a full `{tid, asid}`
+/// identity, so a replacement incarnation reusing the numeric TID can never inherit this
+/// item's authority, and `reply_record_generation` makes a reclaimed-and-reused record
+/// slot detectable at drain time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeferredServerDeathCompletion {
+    /// The exact exiting replier incarnation, captured while its TCB was still stable.
+    pub exiting_server: ReceiverWaiterIdentity,
+    /// The reply record it owed, by slot.
+    pub reply_record_index: usize,
+    /// …and by generation, so a reused slot is a stale item rather than a wrong target.
+    pub reply_record_generation: u64,
+}
+
+/// Per-CPU deferred server-death slots, bounded by the reply-record store itself: there
+/// cannot be more outstanding records than slots, so the queue cannot overflow through
+/// legitimate use. No allocation happens on the teardown path.
+pub(crate) const SD_POST_WORK_SLOTS: usize = MAX_REPLY_CAPS;
+
+static SERVER_DEATH_POST_WORK: [crate::kernel::lock::SpinLockIrq<
+    [Option<DeferredServerDeathCompletion>; SD_POST_WORK_SLOTS],
+>; crate::kernel::scheduler::MAX_CPUS] =
+    [const { crate::kernel::lock::SpinLockIrq::new([None; SD_POST_WORK_SLOTS]) };
+        crate::kernel::scheduler::MAX_CPUS];
+
+static SERVER_DEATH_WORK_PUBLISHED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static SERVER_DEATH_WORK_DRAINED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// A proof that one queue slot is available for `cpu_idx`. Held across the link detach so
+/// the handoff can never lose the work; consuming it publishes, dropping it releases.
+#[derive(Debug)]
+#[must_use = "a reservation must be published or explicitly released"]
+pub(crate) struct ServerDeathWorkReservation {
+    cpu_idx: usize,
+    slot: usize,
+}
+
+impl ServerDeathWorkReservation {
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
+}
+
+/// Reserve one slot BEFORE the reverse link is detached. `None` when the queue is full —
+/// teardown then leaves the link attached and does not detach, so the record keeps an
+/// exact owner rather than being stranded.
+pub(crate) fn server_death_work_reserve(cpu_idx: usize) -> Option<ServerDeathWorkReservation> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let mut q = SERVER_DEATH_POST_WORK[cpu_idx].lock();
+    let slot = q.iter().position(|s| s.is_none())?;
+    // Mark the slot taken with a placeholder the drain skips: a reserved-but-unpublished
+    // slot must not be drainable, and must not be handed out twice.
+    q[slot] = Some(DeferredServerDeathCompletion {
+        exiting_server: ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(0), Asid(0)),
+        reply_record_index: usize::MAX,
+        reply_record_generation: 0,
+    });
+    Some(ServerDeathWorkReservation { cpu_idx, slot })
+}
+
+/// Publish into a held reservation. A DUPLICATE (an item for the same record slot and
+/// generation already queued and not yet drained) collapses to ONE owner: the reservation
+/// is released and `false` is returned, so a repeated task-exit notification cannot
+/// produce two deferred items. A different record can never overwrite a pending item
+/// because each reservation owns its own slot.
+pub(crate) fn server_death_work_publish(
+    reservation: ServerDeathWorkReservation,
+    work: DeferredServerDeathCompletion,
+) -> bool {
+    let mut q = SERVER_DEATH_POST_WORK[reservation.cpu_idx].lock();
+    let duplicate = q.iter().enumerate().any(|(i, s)| {
+        i != reservation.slot
+            && s.is_some_and(|w| {
+                w.reply_record_index == work.reply_record_index
+                    && w.reply_record_generation == work.reply_record_generation
+            })
+    });
+    if duplicate {
+        q[reservation.slot] = None;
+        return false;
+    }
+    q[reservation.slot] = Some(work);
+    SERVER_DEATH_WORK_PUBLISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Release a reservation without publishing (a failpoint or an aborted handoff).
+pub(crate) fn server_death_work_release(reservation: ServerDeathWorkReservation) {
+    SERVER_DEATH_POST_WORK[reservation.cpu_idx].lock()[reservation.slot] = None;
+}
+
+/// Drain the next PUBLISHED item for `cpu_idx`. Reserved-but-unpublished placeholders are
+/// skipped, so a reservation in flight is never drained as if it were work.
+pub(crate) fn server_death_work_drain_next(
+    cpu_idx: usize,
+) -> Option<DeferredServerDeathCompletion> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let mut q = SERVER_DEATH_POST_WORK[cpu_idx].lock();
+    let idx = q
+        .iter()
+        .position(|s| s.is_some_and(|w| w.reply_record_index != usize::MAX))?;
+    let taken = q[idx].take();
+    if taken.is_some() {
+        SERVER_DEATH_WORK_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    taken
+}
+
+/// Number of PUBLISHED (drainable) items queued for `cpu_idx`.
+pub(crate) fn server_death_work_len(cpu_idx: usize) -> usize {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return 0;
+    }
+    SERVER_DEATH_POST_WORK[cpu_idx]
+        .lock()
+        .iter()
+        .filter(|s| s.is_some_and(|w| w.reply_record_index != usize::MAX))
+        .count()
+}
+
+/// Clear every slot for `cpu_idx` (hosted test isolation only).
+pub(crate) fn server_death_work_clear(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        for slot in SERVER_DEATH_POST_WORK[cpu_idx].lock().iter_mut() {
+            *slot = None;
+        }
+    }
+}
+
+pub(crate) fn server_death_work_published_count() -> u64 {
+    SERVER_DEATH_WORK_PUBLISHED.load(core::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn server_death_work_drained_count() -> u64 {
+    SERVER_DEATH_WORK_DRAINED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // ── Stage 200C2B: per-CPU bounded DEFERRED reply-timeout work queue ─────────────────
 //
 // The narrow collector (`SharedKernel::collect_due_reply_timeout_work`) publishes one

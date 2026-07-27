@@ -1101,6 +1101,14 @@ pub fn handle_trap_entry_shared(
         shared.drain_reply_timeout_post_work(cpu, now);
     }
 
+    // Stage 200D-2A: the SERVER-DEATH post-lock drain. Unlike the reply-timeout collector
+    // above this is NOT feature-gated — server death is production behaviour on every
+    // build. It runs here, after the broad guard has dropped, so the PeerDeath terminal
+    // claim, the caller's result publication and the single scheduler enqueue all happen
+    // outside `SpinLock<KernelState>`. An empty queue makes this a cheap no-op.
+    #[cfg(not(target_arch = "riscv64"))]
+    let _ = shared.drain_server_death_post_work(cpu);
+
     inner_result
 }
 

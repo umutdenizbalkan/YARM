@@ -968,6 +968,16 @@ impl KernelState {
     /// Builds the generation-bearing terminal identity from the LIVE record (so a slot
     /// that was reclaimed since registration yields no identity and nothing happens), then
     /// runs the shared `complete_server_death_over` transaction. Returns the outcome.
+    ///
+    /// **HOSTED-ONLY as of Stage 200D-2A.** This takes `&mut KernelState`, i.e. it runs
+    /// under the broad lock — exactly what that stage removed from the production path.
+    /// `exit_task` now only reserves a slot, detaches the exact link and publishes a
+    /// deferred item; `SharedKernel::drain_server_death_post_work` does all authority work
+    /// after the broad lock is released. This entry is retained, `cfg`-gated out of
+    /// freestanding builds, as the SINGLE-STEP entry the Stage 200D-1 lifecycle proofs
+    /// drive. Because it cannot be linked into a production kernel, no production path can
+    /// claim PeerDeath under the broad lock.
+    #[cfg(any(test, feature = "hosted-dev"))]
     pub(crate) fn complete_server_death_for_link(
         &mut self,
         link: crate::kernel::task::ServerReplyLink,
@@ -1907,6 +1917,25 @@ impl KernelState {
     /// Stage 200D-1 — the live generation of reply-record slot `index`.
     pub(crate) fn reply_record_slot_generation(&self, index: usize) -> Option<u64> {
         self.with_ipc_state(|ipc| ipc.reply_cap_generations.get(index).copied())
+    }
+
+    /// Stage 200D-2A — hosted-only: install a parked completion result directly, so the
+    /// "a late drain must not overwrite a committed result" case can be stepped.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn set_pending_syscall_completion_for_test(&mut self, tid: u64, result: u64) {
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                let asid = tcb.asid.unwrap_or(Asid(0));
+                tcb.pending_syscall_completion =
+                    Some(crate::kernel::task::BlockedSyscallCompletion {
+                        syscall_class: crate::kernel::task::BlockedSyscallClass::IpcRecv,
+                        result,
+                        tid,
+                        asid,
+                        blocked_generation: tcb.blocked_recv_generation,
+                    });
+            }
+        });
     }
 
     /// Stage 200D-1 — hosted-only: drive a task's status directly, so the

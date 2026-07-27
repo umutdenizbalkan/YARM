@@ -2878,6 +2878,77 @@ impl SharedKernel {
     /// rank 3 — cancel a `Reserved` record (rollback): `Reserved → Cancelled → Vacant`
     /// as a single atomic ipc-state mutation, reclaiming the reserved authority so a
     /// partially-built record can never resolve. `false` on mismatch.
+    /// Stage 200D-2A — the POST-LOCK server-death drain.
+    ///
+    /// Runs after the broad `SpinLock<KernelState>` has been released. Every remaining
+    /// piece of authority work happens here: the PeerDeath terminal claim, all identity
+    /// and generation revalidation, the canonical `ServerDied` publication, and the single
+    /// scheduler enqueue. The broad-lock phase in `exit_task` only reserved a slot,
+    /// detached the exact link and published this item.
+    ///
+    /// It reuses the accepted machinery verbatim — `OffLockReplyTimeout`'s per-domain
+    /// split-mut seams and `complete_server_death_over`, which publishes through
+    /// `rt_commit_receiver_runnable(error_code)` and therefore through the SAME arch return
+    /// paths as timeout completion. No second completion or resume path is created.
+    ///
+    /// A LOSING item (reply, timeout, caller exit or endpoint destruction already won) is
+    /// still consumed exactly once: it is removed from the queue before the transaction
+    /// runs, so it can never loop or remain queued.
+    pub(crate) fn drain_server_death_post_work(&self, cpu: CpuId) -> usize {
+        let cpu_idx = cpu.0 as usize;
+        let mut drained = 0usize;
+        while let Some(work) = crate::kernel::boot::server_death_work_drain_next(cpu_idx) {
+            drained += 1;
+            // Resolve the identity the terminal cell was ARMED with. A record slot that was
+            // reclaimed and reused since publication yields no matching identity, so a
+            // stale item claims nothing.
+            let armed = self.with_ipc_split_mut(|ipc| {
+                if ipc
+                    .reply_cap_generations
+                    .get(work.reply_record_index)
+                    .copied()
+                    != Some(work.reply_record_generation)
+                {
+                    return None;
+                }
+                ipc.reply_terminal_ownership
+                    .get(work.reply_record_index)
+                    .map(|cell| *cell.identity())
+            });
+            let Some(identity) = armed else {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DRAIN outcome=stale_record record_index={} record_generation={} caller_wakes=0 result=ok",
+                    work.reply_record_index,
+                    work.reply_record_generation
+                );
+                continue;
+            };
+            // The item must still describe the record it was published for, and that record
+            // must still name the exact exiting incarnation — numeric TID alone never
+            // authorizes, so a replacement server cannot inherit this item's authority.
+            if identity.reply_record_index != work.reply_record_index
+                || identity.reply_record_generation != work.reply_record_generation
+                || identity.replier_tid != work.exiting_server.tid
+                || identity.replier_asid != work.exiting_server.asid
+            {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DRAIN outcome=stale_identity record_index={} caller_wakes=0 result=ok",
+                    work.reply_record_index
+                );
+                continue;
+            }
+            let mut d = OffLockReplyTimeout(self);
+            let outcome = crate::kernel::boot::complete_server_death_over(&mut d, &identity);
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_DRAIN outcome={:?} record_index={} record_generation={} broad_lock=0 result=ok",
+                outcome,
+                work.reply_record_index,
+                work.reply_record_generation
+            );
+        }
+        drained
+    }
+
     /// Stage 200D — register the bounded reverse link through the rank-2 TASK seam (never
     /// the broad lock). Returns `false` with no mutation when the server incarnation is
     /// absent or already holds a DIFFERENT live link; re-registering the identical link is
