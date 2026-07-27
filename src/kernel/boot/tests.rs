@@ -90859,3 +90859,391 @@ mod stage200d0a_exit_foundation {
         );
     }
 }
+
+/// Stage 200D-0B1 — the x86_64 `CurrentTaskExited` consumer and live-oracle preparation.
+///
+/// Hosted and source only. `p26` asserts this stage runs no QEMU and claims no live cell.
+mod stage200d0b1_x86_exit_prep {
+    use crate::kernel::boot::PostLockTrapDisposition;
+    use crate::kernel::vm::Asid;
+
+    const X86_TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RUNNER: &str = include_str!("../../../scripts/qemu-x86-exit-current-task-smoke.sh");
+
+    /// Comment-stripped consumer body: these guards are about CODE, and the block's own
+    /// prose legitimately names `exit_task`, frames and depth while explaining why it
+    /// touches none of them.
+    fn consumer_code() -> alloc::string::String {
+        consumer_block()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn consumer_block() -> &'static str {
+        let b = X86_TRAP_SRC
+            .split("// ── Stage 200D-0B1: the x86_64 CurrentTaskExited consumer")
+            .nth(1)
+            .expect("consumer");
+        b.split("// Stage 117: skip restore_arch_thread_state")
+            .next()
+            .unwrap()
+    }
+
+    // ── consumer uniqueness and ordering (1–4) ──────────────────────────────────────
+    #[test]
+    fn p01_exactly_one_production_consumer() {
+        assert_eq!(
+            X86_TRAP_SRC
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1,
+            "exactly one x86_64 consumer call site"
+        );
+        // No other architecture consumes it in this stage.
+        const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+        const AARCH64: &str = include_str!("../../arch/aarch64/trap.rs");
+        for (n, s) in [("riscv64", RISCV), ("aarch64", AARCH64)] {
+            assert!(
+                !s.contains("take_post_lock_trap_disposition"),
+                "{n} must not consume the disposition in this stage"
+            );
+        }
+    }
+
+    #[test]
+    fn p02_p03_p04_consumer_ordering() {
+        // The consumer sits AFTER the in-lock handler returns (which releases the broad
+        // lock) and BEFORE restore_arch_thread_state.
+        let body = X86_TRAP_SRC
+            .split("fn handle_trap_entry_with_fault_bookkeeping_mode")
+            .nth(1)
+            .expect("entry");
+        let inlock = body.find("handle_trap_event").expect("in-lock phase");
+        let consumer = body
+            .find("take_post_lock_trap_disposition")
+            .expect("consumer");
+        let restore = body
+            .find("restore_arch_thread_state(kernel, cpu, frame)")
+            .expect("restore");
+        assert!(
+            inlock < consumer,
+            "consumer runs after the broad-lock phase"
+        );
+        assert!(consumer < restore, "consumer runs before the arch restore");
+        // The post-lock deferred drain is wired into the shared entry, which the in-lock
+        // phase returns through, so the drain precedes the consumer.
+        assert!(TRAP_ENTRY_SRC.contains("shared.drain_server_death_post_work(cpu)"));
+        let se = TRAP_ENTRY_SRC
+            .split("fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared");
+        let drain = se.find("drain_server_death_post_work").expect("drain");
+        let attest = se
+            .find("EXIT_TASK_BROAD_LOCK_RELEASED")
+            .expect("release attestation");
+        assert!(drain < attest, "drain precedes the release attestation");
+    }
+
+    // ── identity validation (10–13) ─────────────────────────────────────────────────
+    #[test]
+    fn p10_p11_exact_identity_not_numeric_tid() {
+        let b = consumer_block();
+        // ASID participates in the check; a numeric-TID-only comparison would not mention it.
+        assert!(b.contains("current_asid == asid"));
+        assert!(b.contains("EXIT_TASK_WRONG_IDENTITY"));
+        assert!(b.contains("EXIT_TASK_EXITING_STILL_CURRENT"));
+        // Reused TID with a different ASID is rejected by that comparison.
+        let a = Asid(7);
+        let reused = Asid(8);
+        assert!(
+            !(a == reused),
+            "different incarnations must not compare equal"
+        );
+    }
+
+    #[test]
+    fn p12_wrong_cpu_disposition_not_consumable() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        crate::kernel::boot::clear_post_lock_trap_disposition(1);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            0,
+            4,
+            Asid(2)
+        ));
+        assert_eq!(
+            crate::kernel::boot::take_post_lock_trap_disposition(1),
+            PostLockTrapDisposition::ReturnNormally,
+            "another CPU must not consume it"
+        );
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::CurrentTaskExited { tid: 4, .. }
+        ));
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+    }
+
+    #[test]
+    fn p13_duplicate_consumption_rejected() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            0,
+            6,
+            Asid(5)
+        ));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::CurrentTaskExited { .. }
+        ));
+        assert_eq!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::ReturnNormally,
+            "a second consumer sees nothing"
+        );
+    }
+
+    // ── replacement and idle models (5–9) ───────────────────────────────────────────
+    #[test]
+    fn p05_p06_p07_replacement_path_restores_replacement_only() {
+        let k = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        let (a, b) = k.with(|s| {
+            s.register_task(41).expect("A");
+            s.register_task(42).expect("B");
+            let (aa, _) = s.create_user_address_space().expect("asid a");
+            let (ab, _) = s.create_user_address_space().expect("asid b");
+            s.bind_task_asid(41, aa).expect("bind a");
+            s.bind_task_asid(42, ab).expect("bind b");
+            s.enqueue_current_cpu(41).expect("enq a");
+            s.enqueue_current_cpu(42).expect("enq b");
+            s.dispatch_next_task().expect("dispatch");
+            (aa, ab)
+        });
+        let _ = (a, b);
+        let owner = k.with(|s| s.current_tid()).expect("current");
+        // The current task exits; exit_task removes it and dispatches the other.
+        let _ = k.with(|s| s.exit_task(owner, 0));
+        let restore_owner = k.with(|s| s.current_tid());
+        assert_ne!(
+            restore_owner,
+            Some(owner),
+            "the exiting task must not remain the restore owner"
+        );
+        assert!(restore_owner.is_some(), "the replacement is published");
+        assert!(matches!(
+            k.with(|s| s.task_status(owner)),
+            Some(crate::kernel::task::TaskStatus::Exited(_))
+        ));
+    }
+
+    #[test]
+    fn p08_p09_idle_path_clears_current() {
+        let k = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        let lone = k.with(|s| {
+            s.register_task(51).expect("lone");
+            let (asid, _) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(51, asid).expect("bind");
+            s.enqueue_current_cpu(51).expect("enq");
+            s.dispatch_next_task().expect("dispatch");
+            s.current_tid()
+        });
+        assert_eq!(lone, Some(51));
+        let _ = k.with(|s| s.exit_task(51, 0));
+        // With no replacement the exiting task must not stay current; the established idle
+        // outcome is whatever `dispatch_next_task` selected, never task 51.
+        assert_ne!(
+            k.with(|s| s.current_tid()),
+            Some(51),
+            "the exiting task must never remain current on the idle path"
+        );
+        // The consumer names the idle owner explicitly.
+        assert!(consumer_block().contains("owner=idle"));
+    }
+
+    // ── frame and epilogue (14–15) ──────────────────────────────────────────────────
+    #[test]
+    fn p14_p15_no_old_frame_write_or_restore() {
+        let b = consumer_code();
+        for w in [
+            "frame.set_ok",
+            "frame.set_err",
+            "frame.set_user_gpr",
+            "apply_user_context",
+            "resume_current_thread_with_frame",
+        ] {
+            assert!(!b.contains(w), "the consumer must not touch a frame ({w})");
+        }
+        // It performs no teardown, enqueue or terminal claim either.
+        for forbidden in [
+            "exit_task",
+            "enqueue",
+            "try_claim",
+            "complete_server_death",
+            "copy_to_user",
+        ] {
+            assert!(!b.contains(forbidden), "consumer must not {forbidden}");
+        }
+    }
+
+    // ── WouldBlock preservation (16–17) ─────────────────────────────────────────────
+    #[test]
+    fn p16_p17_wouldblock_uses_the_normal_return() {
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("handler");
+        let h = h.split("\nfn handle_reap_faulted_task").next().unwrap();
+        let refuse = h.find("Err(SyscallError::WouldBlock)").expect("refusal");
+        let publish = h.find("publish_current_task_exited").expect("publish");
+        assert!(
+            refuse < publish,
+            "the refusal returns before any disposition is published"
+        );
+        // A refusal leaves no disposition, so the normal epilogue is the only outcome.
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        assert!(!crate::kernel::boot::post_lock_trap_disposition_pending(0));
+        assert_eq!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::ReturnNormally
+        );
+    }
+
+    // ── trap-depth ownership (18–19) ────────────────────────────────────────────────
+    #[test]
+    fn p18_p19_common_epilogue_owns_trap_depth() {
+        // The consumer makes no depth write of its own.
+        let b = consumer_code();
+        for d in ["TRAP_DISPATCH_DEPTH", "trap_depth", "depth -=", "depth +="] {
+            assert!(
+                !b.contains(d),
+                "the consumer must not touch trap depth ({d})"
+            );
+        }
+        // The generic NR16 handler makes none either.
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("handler");
+        let h = h.split("\nfn handle_reap_faulted_task").next().unwrap();
+        assert!(!h.contains("TRAP_DISPATCH_DEPTH"));
+        // The common epilogue still owns the cleanup, unchanged.
+        assert!(
+            DESC_SRC
+                .matches("TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release)")
+                .count()
+                >= 1,
+            "the common epilogue retains its depth cleanup"
+        );
+        // No exit-specific cleanup helper was introduced anywhere.
+        assert!(!DESC_SRC.contains("exit_clear_trap_depth"));
+        assert!(!X86_TRAP_SRC.contains("exit_clear_trap_depth"));
+        // The consumer documents the ownership rather than duplicating it.
+        assert!(consumer_block().contains("owner=common_epilogue"));
+    }
+
+    // ── oracle preparation (20–21) ──────────────────────────────────────────────────
+    #[test]
+    fn p20_oracle_task_has_hard_fail_marker_after_the_call() {
+        let m_raw = INIT_SRC
+            .split("mod x86_exit_current_task_oracle")
+            .nth(1)
+            .expect("oracle module");
+        // Compare CODE positions: the module's prose explains the hard-fail marker before
+        // the call site, which is documentation rather than an emission.
+        let m: alloc::string::String = m_raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(m.contains("EXIT_TASK_USER_ENTERED"));
+        let call = m.find("exit_current_task()").expect("the NR16 call");
+        let fail = m
+            .find("EXIT_TASK_SYSCALL_RETURNED")
+            .expect("hard-fail marker");
+        assert!(
+            call < fail,
+            "the hard-fail marker must sit AFTER the call, so it can only print on a return"
+        );
+        // The disposable task is spawned, not init/PM/supervisor.
+        assert!(INIT_SRC.contains("EXIT_TASK_ORACLE_SPAWNED disposable_tid="));
+        assert!(INIT_SRC.contains("spawn_thread(tls_base, stack_top, entry)"));
+        // A surviving task proves continued progress afterwards.
+        assert!(INIT_SRC.contains("EXIT_TASK_SURVIVOR_PROGRESS_OK"));
+    }
+
+    #[test]
+    fn p21_absence_validation_uses_full_identity() {
+        let b = consumer_block();
+        // Absence is validated on {tid, asid}: not current, correct ASID, terminal.
+        assert!(b.contains("kernel.current_tid() == Some(tid)"));
+        assert!(b.contains("kernel.task_asid(tid)"));
+        assert!(b.contains("EXIT_TASK_EXITING_NOT_CURRENT"));
+        assert!(b.contains("EXIT_TASK_RESTORE_OWNER"));
+        // No new task-inspection syscall was added for the oracle.
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+    }
+
+    // ── feature gating (22) ─────────────────────────────────────────────────────────
+    #[test]
+    fn p22_oracle_literals_are_feature_gated() {
+        // The whole oracle module and its dispatch are behind the feature.
+        assert!(INIT_SRC.contains("feature = \"x86-exit-current-task-oracle\""));
+        let m = INIT_SRC
+            .split("mod x86_exit_current_task_oracle")
+            .nth(1)
+            .expect("module");
+        let head = &INIT_SRC[..INIT_SRC.find("mod x86_exit_current_task_oracle").unwrap()];
+        assert!(
+            head.rfind("feature = \"x86-exit-current-task-oracle\"")
+                .is_some(),
+            "the oracle module is feature-gated"
+        );
+        let _ = m;
+        // The kernel-side selector and knob are gated too; the production consumer is not.
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"x86-exit-current-task-oracle\")]\npub const X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR: u64 = 20;"
+        ));
+        assert!(
+            !consumer_block().contains("x86-exit-current-task-oracle"),
+            "the production consumer must NOT be oracle-gated"
+        );
+    }
+
+    // ── runner static contract (23–26) ──────────────────────────────────────────────
+    #[test]
+    fn p23_p24_p25_p26_runner_contract() {
+        // Terminal health required.
+        assert!(RUNNER.contains("EXIT_TASK_SYSTEM_HEALTH_OK"));
+        // Early QEMU exit and fatal markers fail closed.
+        assert!(RUNNER.contains("qemu exited before terminal proof"));
+        assert!(RUNNER.contains("EXIT_TASK_SYSCALL_RETURNED"));
+        // Single boot instance.
+        assert!(RUNNER.contains("DISTINCT boot instances != 1"));
+        // `-no-reboot -no-shutdown` are supplied by the core runner's QEMU_SINGLE_BOOT
+        // passthrough, which this runner sets; asserting the passthrough is the accurate
+        // check, since duplicating the flags here would not reach QEMU.
+        assert!(RUNNER.contains("QEMU_SINGLE_BOOT=1"));
+        const CORE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+        assert!(CORE.contains("-no-reboot"));
+        assert!(CORE.contains("-no-shutdown"));
+        // Exact-commit discipline.
+        assert!(RUNNER.contains("reason=dirty_tree"));
+        assert!(RUNNER.contains("recheck_exact_commit"));
+        assert!(RUNNER.contains("log reuse"));
+        // This stage runs NO live boot: the runner is prepared, not executed, and emits no
+        // live seal of its own without a completed run.
+        assert!(RUNNER.contains("STAGE_200D0B2_X86_EXIT_CURRENT_TASK_LIVE_SEAL"));
+        assert!(!RUNNER.contains("STAGE_200D0B1"));
+    }
+}

@@ -10,6 +10,9 @@ autobins = false
 default = ["hosted-dev"]
 hosted-dev = ["yarm/hosted-dev"]
 legacy-tests = []
+# Stage 200D-0B1: gates the disposable x86_64 ExitCurrentTask oracle task. Feature-off
+# builds carry none of its literals.
+x86-exit-current-task-oracle = []
 
 [dependencies]
 yarm = { package = "yarm-server-runtime", path = "../yarm-server-runtime", default-features = false }

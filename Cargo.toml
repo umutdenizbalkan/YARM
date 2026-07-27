@@ -93,6 +93,10 @@ ipc-reply-timeout-oracle-core = []
 # class off the broad `SpinLock<KernelState>` (scan_broad_lock=0); ordinary receive timeouts stay
 # in-lock. Feature-OFF x86_64 artifacts contain none of the Stage 200C live marker literals.
 x86-ipc-reply-timeout-oracle = ["ipc-reply-timeout-oracle-core"]
+# Stage 200D-0B1: the x86_64 disposable-task ExitCurrentTask live oracle. Selector, marker
+# and gate literals compile ONLY with this feature; the production NR16 syscall, its
+# decoder and the disposition consumer are unconditional.
+x86-exit-current-task-oracle = []
 
 # Stage 200C2C1: default-off AArch64 LIVE reply-receive TIMEOUT retirement oracle. The AArch64 port
 # of the accepted x86_64 cell — it REUSES the arch-neutral core verbatim and only adds the AArch64

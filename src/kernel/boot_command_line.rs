@@ -400,6 +400,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_x86_ipccall_direct_oracle_enabled(enabled);
         crate::yarm_log!("YARM_X86_64_IPCCALL_DIRECT_ORACLE_SET enabled={}", enabled);
     }
+    // Stage 200D-0B1: DEFAULT-OFF x86_64 ExitCurrentTask live-oracle knob.
+    #[cfg(feature = "x86-exit-current-task-oracle")]
+    if parsed.x86_64_exit_current_task_oracle == Some(true) {
+        crate::kernel::boot::set_x86_exit_oracle_enabled(true);
+        crate::yarm_log!("YARM_X86_64_EXIT_CURRENT_TASK_ORACLE_SET enabled=1");
+    }
     if let Some(mode) = parsed.x86_64_ipc_reply_timeout_oracle {
         // Stage 200C2A: arm the reply-timeout oracle mode (1=timeout-wins, 2=reply-wins). The slot-5
         // provisioning + registration/scan wiring are additionally feature- and arch-gated.
@@ -797,6 +803,9 @@ pub struct YarmBootOptions<'a> {
     /// timeout-wins, `Some(2)` = reply-wins; `None` = off. Mutually exclusive with every other slot-5
     /// oracle. Requires `target_arch = x86_64` + the `x86-ipc-reply-timeout-oracle` feature.
     pub x86_64_ipc_reply_timeout_oracle: Option<u8>,
+    /// Stage 200D-0B1: `yarm.x86_64_exit_current_task_oracle=1` DEFAULT-OFF knob. Spawns one
+    /// disposable, non-essential userspace task that invokes NR 16 and must never return.
+    pub x86_64_exit_current_task_oracle: Option<bool>,
     /// Stage 200C2C1: `yarm.aarch64_ipc_reply_timeout_oracle=timeout-wins|reply-wins` DEFAULT-OFF
     /// knob — the AArch64 port of the reply-receive TIMEOUT retirement oracle. Same per-boot mode
     /// discriminator as the x86 knob (`Some(1)` = timeout-wins, `Some(2)` = reply-wins; `None` = off),
@@ -1042,6 +1051,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.x86_64_ipccall_direct_oracle" {
             options.x86_64_ipccall_direct_oracle = parse_bool_knob(value);
+        }
+        if key == b"yarm.x86_64_exit_current_task_oracle" {
+            options.x86_64_exit_current_task_oracle = Some(matches!(value, b"1" | b"true"));
         }
         if key == b"yarm.x86_64_ipc_reply_timeout_oracle" {
             // Stage 200C2A: two mutually-exclusive string modes. An unrecognized value leaves the

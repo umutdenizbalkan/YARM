@@ -2122,6 +2122,88 @@ extern "C" fn x86_ipc_reply_timeout_child_body() -> ! {
     ipc_reply_timeout_oracle::server_park();
 }
 
+// ── Stage 200D-0B1: the x86_64 DISPOSABLE ExitCurrentTask oracle task ────────────────
+//
+// A spawned, non-essential thread — never init, the process manager, the supervisor, or a
+// server the boot needs — so its disappearance cannot itself end the boot. init keeps
+// running afterwards and is the surviving task that proves continued progress.
+//
+// The whole module is feature-gated, so a feature-off binary carries none of these
+// literals. It is spawned only AFTER the normal service chain is healthy.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64",
+    feature = "x86-exit-current-task-oracle"
+))]
+mod x86_exit_current_task_oracle {
+    pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
+    pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
+
+    /// The disposable task body. It emits one entry marker, calls NR 16, and must never
+    /// execute another instruction. `EXIT_TASK_SYSCALL_RETURNED` is a HARD-FAIL marker: it
+    /// can only appear if an accepted exit returned to userspace, which the runner treats
+    /// as an immediate failure. A preflight refusal would also land here — this task owns
+    /// no reply record, so that path is unreachable for it and either outcome is a defect.
+    pub(super) extern "C" fn body() -> ! {
+        yarm_user_rt::user_log!("EXIT_TASK_USER_ENTERED role=disposable arch=x86_64");
+        // SAFETY: terminates this thread; nothing after it may run.
+        let outcome = unsafe { yarm_user_rt::syscall::exit_current_task() };
+        yarm_user_rt::user_log!(
+            "EXIT_TASK_SYSCALL_RETURNED err={:?} result=fail",
+            outcome.err()
+        );
+        loop {
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+    }
+}
+
+/// Spawn the disposable exit task. Runs late, after the service chain is up, so the boot's
+/// terminal health marker still has to be reached by the SURVIVING tasks afterwards.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64",
+    feature = "x86-exit-current-task-oracle"
+))]
+fn run_x86_exit_current_task_oracle(_init_tid: u64) {
+    use x86_exit_current_task_oracle as oracle;
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(oracle::CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = oracle::body as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(oracle::CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the statics outlive the thread.
+    match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) } {
+        Ok(tid) => {
+            yarm_user_rt::user_log!("EXIT_TASK_ORACLE_SPAWNED disposable_tid={}", tid);
+            // Keep init alive and yielding so the disposable task is scheduled, then keep
+            // making progress afterwards — that continued progress is the live evidence
+            // that the exiting task's frame was never restored and the CPU moved on.
+            let mut spun = 0u32;
+            while spun < 4096 {
+                let _ = yarm_user_rt::syscall::yield_now();
+                spun += 1;
+            }
+            yarm_user_rt::user_log!(
+                "EXIT_TASK_SURVIVOR_PROGRESS_OK disposable_tid={} yields={}",
+                tid,
+                spun
+            );
+            // Terminal health: emitted LAST, by a task that outlived the exit. The runner
+            // treats its absence as "QEMU exited before terminal proof", so a boot that
+            // died anywhere earlier cannot pass.
+            yarm_user_rt::user_log!(
+                "EXIT_TASK_SYSTEM_HEALTH_OK arch=x86_64 survivor=init disposable_tid={} result=ok",
+                tid
+            );
+        }
+        Err(e) => {
+            yarm_user_rt::user_log!("EXIT_TASK_ORACLE_SPAWN_FAIL err={:?}", e);
+        }
+    }
+}
+
 /// x86_64 reply-timeout oracle entry: spawn the server child, run the client, emit the mode-specific
 /// completion marker with exact counts.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -3764,6 +3846,19 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
     if ctx.supervisor_control_recv_ep == Some(10) || ctx.supervisor_control_recv_ep == Some(11) {
         run_x86_ipc_reply_timeout_oracle(ctx.task_id);
+    }
+
+    // Stage 200D-0B1: x86_64 ExitCurrentTask live oracle, slot-5 selector 20. Distinct from
+    // every reply-liveness selector, so the two oracles stay mutually exclusive. Requires
+    // the `x86-exit-current-task-oracle` feature AND
+    // `yarm.x86_64_exit_current_task_oracle=1`.
+    #[cfg(all(
+        not(feature = "hosted-dev"),
+        target_arch = "x86_64",
+        feature = "x86-exit-current-task-oracle"
+    ))]
+    if ctx.supervisor_control_recv_ep == Some(20) {
+        run_x86_exit_current_task_oracle(ctx.task_id);
     }
 
     // Stage 195C: default-off AArch64 FutexWake live oracle. The kernel reuses init

@@ -1962,7 +1962,8 @@ fn handle_exit_current_task(
     };
     let asid = kernel.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0));
     crate::yarm_log!(
-        "EXIT_TASK_SYSCALL_ENTER tid={} asid={} target=self result=ok",
+        "EXIT_TASK_SYSCALL_DISPATCHED nr={} tid={} asid={} target=self result=ok",
+        SYSCALL_EXIT_CURRENT_TASK_NR,
         tid,
         asid.0
     );
@@ -1987,6 +1988,11 @@ fn handle_exit_current_task(
     // caller `exit_task` previously lacked. Its broad-lock phase reserves the deferred slot,
     // detaches the exact link and publishes the item; the PeerDeath claim, caller result and
     // caller enqueue all happen later in the post-lock drain.
+    crate::yarm_log!(
+        "EXIT_TASK_PREFLIGHT_OK tid={} asid={} deferred_capacity=ok result=ok",
+        tid,
+        asid.0
+    );
     match kernel.exit_task(tid, EXIT_STATUS_SELF_REQUESTED) {
         Ok(_token) => {
             // (4) Publish the typed non-returning disposition. It is generation-bearing and
@@ -1997,8 +2003,17 @@ fn handle_exit_current_task(
                 asid,
             );
             debug_assert!(published, "exactly one disposition per exiting trap");
+            if !published {
+                crate::yarm_log!("EXIT_TASK_DUPLICATE_DISPOSITION tid={} result=fail", tid);
+            }
             crate::yarm_log!(
-                "EXIT_TASK_LIFECYCLE_COMMITTED tid={} asid={} syscall_returns=0 result=ok",
+                "EXIT_TASK_DISPOSITION_PUBLISHED tid={} asid={} cpu={} result=ok",
+                tid,
+                asid.0,
+                kernel.current_cpu().0
+            );
+            crate::yarm_log!(
+                "EXIT_TASK_LIFECYCLE_TRANSITION tid={} asid={} syscall_returns=0 result=ok",
                 tid,
                 asid.0
             );

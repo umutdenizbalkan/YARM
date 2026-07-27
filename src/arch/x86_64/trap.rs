@@ -381,6 +381,99 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         frame.as_deref_mut(),
         fault_bookkeeping_mode,
     )?;
+    // ── Stage 200D-0B1: the x86_64 CurrentTaskExited consumer ────────────────────────
+    //
+    // THE single production consumer of the Stage 200D-0A disposition. Placement is the
+    // contract: `handle_trap_event` above has released the broad `SpinLock<KernelState>`
+    // and `handle_trap_entry_shared` has drained the post-lock deferred work, and this runs
+    // strictly BEFORE `restore_arch_thread_state` picks the outgoing frame owner.
+    //
+    // STRUCTURAL NON-RETURN. There is no second assembly return path here, and none is
+    // needed: `restore_arch_thread_state` restores whatever task is CURRENT, and
+    // `exit_task` has already removed the exiting task from `current` and either installed
+    // a replacement or cleared it for idle. The exiting frame therefore cannot be restored
+    // because its owner is no longer the restore owner. The common trap epilogue still
+    // runs — it simply operates on the replacement's state.
+    //
+    // This consumer performs NO teardown, NO enqueue, NO terminal claim, NO frame write and
+    // NO user-memory access. It validates the invariant the model depends on, attests it,
+    // and fails closed if it does not hold.
+    if let crate::kernel::boot::PostLockTrapDisposition::CurrentTaskExited { tid, asid } =
+        crate::kernel::boot::take_post_lock_trap_disposition(cpu.0 as usize)
+    {
+        crate::yarm_log!(
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64 tid={} asid={} cpu={} result=ok",
+            tid,
+            asid.0,
+            cpu.0
+        );
+        // (a) The exiting incarnation must no longer be current. If it were, the epilogue
+        // would restore a dead task's frame — fail closed through the existing fatal path.
+        if kernel.current_tid() == Some(tid) {
+            crate::yarm_log!(
+                "EXIT_TASK_EXITING_STILL_CURRENT arch=x86_64 tid={} result=fail",
+                tid
+            );
+            return Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            ));
+        }
+        // (b) Identity is the FULL incarnation. A numeric TID match alone would let a
+        // restarted task satisfy a stale disposition, so the ASID recorded at publication
+        // must still be the one bound to that TID — or the TCB must be gone entirely.
+        let identity_ok = match kernel.task_asid(tid) {
+            Some(current_asid) => current_asid == asid,
+            None => true, // fully reaped: nothing can impersonate it
+        };
+        let terminal = matches!(
+            kernel.task_status(tid),
+            Some(crate::kernel::task::TaskStatus::Exited(_)) | None
+        );
+        if !identity_ok || !terminal {
+            crate::yarm_log!(
+                "EXIT_TASK_WRONG_IDENTITY arch=x86_64 tid={} asid={} identity_ok={} terminal={} result=fail",
+                tid,
+                asid.0,
+                u32::from(identity_ok),
+                u32::from(terminal)
+            );
+            return Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            ));
+        }
+        crate::yarm_log!(
+            "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64 tid={} asid={} cpu={} result=ok",
+            tid,
+            asid.0,
+            cpu.0
+        );
+        crate::yarm_log!(
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64 cpu={} broad_lock=0 result=ok",
+            cpu.0
+        );
+        // (c) Trap-depth ownership is UNCHANGED: the dispatcher's common epilogue zeroes the
+        // per-CPU depth on every return path, including this one. No exit-specific store is
+        // made here — adding one would double-clear.
+        crate::yarm_log!(
+            "EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64 cpu={} owner=common_epilogue clears=1 result=ok",
+            cpu.0
+        );
+        // (d) Name the outgoing restore owner. It is never the exiting task.
+        match kernel.current_tid() {
+            Some(next) => crate::yarm_log!(
+                "EXIT_TASK_RESTORE_OWNER arch=x86_64 owner=replacement exiting_tid={} next_tid={} cpu={} result=ok",
+                tid,
+                next,
+                cpu.0
+            ),
+            None => crate::yarm_log!(
+                "EXIT_TASK_RESTORE_OWNER arch=x86_64 owner=idle exiting_tid={} cpu={} result=ok",
+                tid,
+                cpu.0
+            ),
+        }
+    }
+
     // Stage 117: skip restore_arch_thread_state when a global-lock-drop plan
     // is stashed for this CPU. The restore will be called post-switch in
     // `handle_trap_entry_shared` after `switch_frames` runs outside the lock.

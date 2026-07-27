@@ -3540,6 +3540,40 @@ pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
 
 /// Oracle mode discriminator (also written to init startup slot 15 for the userspace scenario):
 /// `1` = timeout-wins, `2` = reply-wins.
+// ── Stage 200D-0B1: the x86_64 ExitCurrentTask live-oracle activation ───────────────
+//
+// DEFAULT-OFF and feature-gated. When armed, init spawns ONE disposable, non-essential
+// userspace task that calls NR 16 and must never execute another instruction. Every
+// literal below lives behind `x86-exit-current-task-oracle`, so a feature-off binary
+// contains none of it — while the production syscall, decoder and disposition consumer
+// remain compiled unconditionally.
+#[cfg(feature = "x86-exit-current-task-oracle")]
+static X86_EXIT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "x86-exit-current-task-oracle")]
+pub(crate) fn set_x86_exit_oracle_enabled(on: bool) {
+    X86_EXIT_ORACLE_ENABLED.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// `true` only when the feature is built AND the boot knob armed it.
+#[must_use]
+pub fn x86_exit_oracle_enabled() -> bool {
+    #[cfg(feature = "x86-exit-current-task-oracle")]
+    {
+        X86_EXIT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(feature = "x86-exit-current-task-oracle"))]
+    {
+        false
+    }
+}
+
+/// Startup slot-5 selector for the disposable exit task. Distinct from every
+/// reply-liveness selector, so the two oracles remain mutually exclusive.
+#[cfg(feature = "x86-exit-current-task-oracle")]
+pub const X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR: u64 = 20;
+
 pub const IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS: u8 = 1;
 pub const IPC_REPLY_TIMEOUT_MODE_REPLY_WINS: u8 = 2;
 
