@@ -26906,7 +26906,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -34044,7 +34044,7 @@ mod stage116_solution1_lock_drop_before_switch {
         );
         // The VARIANT_COUNT must be exactly 23 (Stage 115 baseline).
         assert!(
-            syscall_src.contains("pub const VARIANT_COUNT: usize = 22"),
+            syscall_src.contains("pub const VARIANT_COUNT: usize = 23"),
             "Syscall::VARIANT_COUNT must still equal 23 (Stage 115 baseline; no new syscalls)"
         );
     }
@@ -34328,7 +34328,7 @@ mod stage117_global_lock_drop_before_switch {
     fn stage117_syscall_count_unchanged() {
         let syscall_src = include_str!("../syscall.rs");
         assert!(
-            syscall_src.contains("pub const VARIANT_COUNT: usize = 22"),
+            syscall_src.contains("pub const VARIANT_COUNT: usize = 23"),
             "Syscall::VARIANT_COUNT must still equal 23 (Stage 115 baseline)"
         );
     }
@@ -34937,7 +34937,7 @@ mod stage120_controlled_switch_proof {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35077,7 +35077,7 @@ mod stage121_first_resume_abi_diagnostics {
                 && SYSCALL_SRC.contains("mod sched;")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "D4 module split and syscall counts must remain intact"
         );
     }
@@ -35229,7 +35229,7 @@ mod stage122_first_instruction_proof {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35307,7 +35307,7 @@ mod stage123_no_pre_rust_marker_bridge_call {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35407,7 +35407,7 @@ mod stage124_rust_tail_jump_stack_shape {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35522,7 +35522,7 @@ mod stage125_first_resume_rust_entry_bridge {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35675,7 +35675,7 @@ mod stage126_kernel_switch_stack_mapping_backing {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -35828,7 +35828,7 @@ mod stage127_target_asid_switch_stack_mapping {
     fn stage127_d4_and_syscall_counts_remain_intact() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -35968,11 +35968,11 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "VARIANT_COUNT source must remain 23"
         );
     }
@@ -36235,7 +36235,7 @@ mod stage129_active_root_repair {
     fn stage129_d4_modules_and_syscall_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -36420,7 +36420,7 @@ mod stage128_active_cr3_switch_stack_mapping {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -36714,7 +36714,7 @@ mod stage130_d6_proof_cleanup {
     fn stage130_d4_modules_and_syscall_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -37976,7 +37976,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38103,7 +38103,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38278,7 +38278,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38435,7 +38435,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38568,7 +38568,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38731,7 +38731,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38913,7 +38913,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39137,7 +39137,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39347,7 +39347,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39464,7 +39464,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39599,7 +39599,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39795,7 +39795,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40224,11 +40224,11 @@ mod stage148_decomposition_map {
         );
     }
 
-    // 5. VARIANT_COUNT == 22 compile-time declaration is present in syscall.rs.
+    // 5. VARIANT_COUNT == 23 compile-time declaration is present in syscall.rs.
     #[test]
     fn stage148_variant_count_declaration() {
         assert!(
-            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 22"),
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 23"),
             "VARIANT_COUNT must be 23 in syscall.rs"
         );
     }
@@ -40669,7 +40669,7 @@ mod stage150_ipc_abi_extraction {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 22"),
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 23"),
             "VARIANT_COUNT must remain 23"
         );
     }
@@ -40897,7 +40897,7 @@ mod stage151_ipc_abi_boundary_audit {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 22"),
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 23"),
             "VARIANT_COUNT must remain 23"
         );
     }
@@ -41033,11 +41033,11 @@ mod stage152_syscall_decomposition_completeness_audit {
         );
     }
 
-    // 5. Syscall::VARIANT_COUNT == 22 preserved.
+    // 5. Syscall::VARIANT_COUNT == 23 preserved.
     #[test]
     fn stage152_variant_count_is_23() {
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -41533,7 +41533,7 @@ mod stage153_ipc_cap_boundary_audit {
             "compile-time SYSCALL_COUNT==32 assertion must remain"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -41680,7 +41680,7 @@ mod stage154_ipc_recv_core_boundary {
             "compile-time SYSCALL_COUNT==32 assertion must remain"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42044,7 +42044,7 @@ mod stage155_recv_v2_codec_convergence {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42293,7 +42293,7 @@ mod stage156_ipc_smoke_oracle {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42776,7 +42776,7 @@ mod stage159bcd_ipc_recv_proof_workload {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42910,7 +42910,7 @@ mod stage160_aarch64_split_recv_routing {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -42993,7 +42993,7 @@ mod stage160b_aarch64_recv_split_dispatch_audit {
     fn stage160b_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -43127,7 +43127,7 @@ mod stage160c_aarch64_trap_abi_bracketing {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts must be unchanged"
         );
         // The x86_64 D6 proof hook lives in the same trap-entry file I edited; it
@@ -43262,7 +43262,7 @@ mod stage160d_aarch64_split_error_export_parity {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts must be unchanged"
         );
         assert!(
@@ -43414,7 +43414,7 @@ mod stage161_sender_wake_deferred {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -43538,7 +43538,7 @@ mod stage162_sender_wake_infra_deferred {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -43783,7 +43783,7 @@ mod stage163_sender_wake_proven {
     fn stage163_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts must be unchanged"
         );
         assert!(
@@ -44247,7 +44247,7 @@ mod stage163_sender_wake_proven {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;")
                 && USER_RT_SRC.contains("const SYSCALL_FORK_NR: usize = 12;"),
             "counts unchanged and fork still NR 12"
         );
@@ -44339,7 +44339,7 @@ mod stage163_sender_wake_proven {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts unchanged"
         );
         // The vm_layout bump touches only the address-space bound — not RPi5 boot
@@ -44455,7 +44455,7 @@ mod stage163_sender_wake_proven {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts unchanged"
         );
         // The COW clone change is confined to VM state — it must not reference RPi5
@@ -44577,7 +44577,7 @@ mod stage163g_cow_pagefault {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -44711,7 +44711,7 @@ mod stage163h_fork_child_pte_mismatch {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -44919,7 +44919,7 @@ mod stage163i_stale_tlb_recovery {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -45121,7 +45121,7 @@ mod stage163j_fork_return_lane {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -45258,7 +45258,7 @@ mod stage163k_no_smoke_interference {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -45502,7 +45502,7 @@ mod stage163l_nonx86_fork_return {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -52666,7 +52666,7 @@ mod stage166_d6_switch_a {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -52892,7 +52892,7 @@ mod stage167_d6_genuine {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -53249,7 +53249,7 @@ mod stage168_d6_genuine_b_and_d2_recv {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -53499,7 +53499,7 @@ mod stage168b_d2_recv_genuine_completion {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -53854,7 +53854,7 @@ mod stage169_d2_send_genuine {
     fn stage169_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -54093,7 +54093,7 @@ mod stage170_ipc_final {
     fn stage170_invariants_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -54410,7 +54410,7 @@ mod stage171_sched_timeout {
     fn stage171_invariants_and_no_scope_creep() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -54788,7 +54788,7 @@ mod stage172_vm_cow {
     fn stage172_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55071,7 +55071,7 @@ mod stage173_cap_cnode {
     fn stage173_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55441,7 +55441,7 @@ mod stage174_fault_delivery {
     fn stage174_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55663,7 +55663,7 @@ mod stage175_spawn_lifecycle {
     fn stage175_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55785,7 +55785,7 @@ mod stage175b_duplicate_tid_gate {
     fn stage175b_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
     }
@@ -55999,7 +55999,7 @@ mod stage176_global_state {
     fn stage176_invariants_and_fallbacks_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56279,7 +56279,7 @@ mod stage177_smp_ready {
     fn stage177_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56562,7 +56562,7 @@ mod stage178_cross_arch_d6 {
     fn stage178_invariants_and_x86_d6_untouched() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56711,7 +56711,7 @@ mod stage178b_cross_arch_d6_hook {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56936,7 +56936,7 @@ mod stage179_d3_full {
     fn stage179_invariants_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57144,7 +57144,7 @@ mod stage180_ci_profiles {
     fn stage180_counts_and_docs() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57402,7 +57402,7 @@ mod stage181_graduate_knobs {
     fn stage181_counts_and_docs() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57521,7 +57521,7 @@ mod stage181b_sender_wake_plumbing {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57882,7 +57882,7 @@ mod stage181c_fork_internal {
     fn stage181c_counts_and_graduation_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -58025,7 +58025,7 @@ mod stage182_remove_fallbacks {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -58200,7 +58200,7 @@ mod stage183_smp_live {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -59152,7 +59152,7 @@ mod stage183_ap_idle_admit {
     fn stage183_inc2_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -70628,7 +70628,7 @@ mod stage199a1_ipccall_direct_audit {
     #[test]
     fn stage198f_policy_constants_unchanged() {
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         // Supported = 10 classes / 30 cells; enqueue classes excluded (per the seal doc).
         const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
@@ -72037,7 +72037,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -72386,7 +72386,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -72544,7 +72544,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -72613,7 +72613,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -73144,7 +73144,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -73354,7 +73354,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -73597,7 +73597,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -73650,7 +73650,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -74084,7 +74084,7 @@ mod stage197b_nr27_removed_zc_mandatory {
             Err(SyscallError::InvalidNumber)
         ));
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(Syscall::VARIANT_COUNT, 22);
+        assert_eq!(Syscall::VARIANT_COUNT, 23);
         // Needles are split so these assertions do not match themselves via include_str!.
         let variant_decl = concat!("InitramfsRead", "Chunk = ");
         let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
@@ -74474,7 +74474,7 @@ mod stage197b_riscv_typed_idle_outcome {
     #[test]
     fn baseline_and_cohort_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 23);
         assert!(matches!(
             crate::kernel::syscall::Syscall::decode(27),
             Err(crate::kernel::syscall::SyscallError::InvalidNumber)
@@ -75727,7 +75727,7 @@ duplicate_replies=0 duplicate_wakes=0 result=ok";
     #[test]
     fn abi_and_policy_unchanged() {
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         // Stage 199A2B1: restart/exit cleanup now calls the AUTHORITATIVE
         // identity-typed entry points with the captured exiting `{tid, asid}`.
         assert!(RESTART_SRC.contains("revoke_reply_caps_for_caller_identity"));
@@ -75935,7 +75935,7 @@ mod stage199a2b1_offlock_foundations {
     #[test]
     fn abi_and_policy_preserved() {
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
@@ -76119,7 +76119,7 @@ mod stage199a2b2_request_substrate {
             "no live NR6 direct split-dispatch arm this increment"
         );
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
         assert!(SEAL_DOC.contains("total_live_cells=30"));
     }
@@ -76280,7 +76280,7 @@ mod stage199a2b2c_offlock_seams {
             "no live NR6 direct split-dispatch arm this increment"
         );
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
         assert!(SEAL_DOC.contains("total_live_cells=30"));
     }
@@ -76669,7 +76669,7 @@ mod stage199a2b2d_direct_request_txn {
         const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
         assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
         assert!(SEAL_DOC.contains("total_live_cells=30"));
     }
@@ -78145,7 +78145,7 @@ mod stage199a2b3_wiring {
         // Single reservation authority field on the record.
         assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         // NR6 request seal remains present (unchanged accepted transaction).
@@ -78434,7 +78434,7 @@ mod stage199a2b4_live_oracle_guards {
         const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
@@ -78622,7 +78622,7 @@ mod stage199a2c1_aarch64_guards {
         const SYSCALL_SRC: &str = include_str!("../syscall.rs");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
     }
 }
 
@@ -78818,7 +78818,7 @@ mod stage199a2c2_riscv_guards {
         const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
@@ -79054,7 +79054,7 @@ mod stage199a2c3_matrix_guards {
         const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"));
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
@@ -80806,7 +80806,7 @@ mod stage199a2d2a_smp_request {
     fn stage199_functional_invariants_preserved() {
         let syscall_src = include_str!("../syscall.rs");
         assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(syscall_src.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(syscall_src.contains("pub const VARIANT_COUNT: usize = 23;"));
         // The SMP=1 functional selector is unchanged and distinct from the SMP selector.
         assert_eq!(crate::kernel::boot::IPCCALL_DIRECT_ORACLE_SELECTOR, 3);
         assert_eq!(X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR, 9);
@@ -90222,5 +90222,251 @@ mod stage200df0_feature_gating {
             2,
             "both repaired runtime.rs items carry the classification"
         );
+/// Stage 200D-0 — `ExitCurrentTask` (NR 16): the current-task exit syscall.
+///
+/// Proves the ABI change, that the syscall converges on the ONE authoritative teardown
+/// implementation, that success is non-returning, and that deferred server-death capacity
+/// is reserved before anything irreversible happens.
+mod stage200d0_current_task_exit {
+    use crate::kernel::syscall::{SYSCALL_EXIT_CURRENT_TASK_NR, Syscall, SyscallError};
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+
+    // ── 1. Syscall-number space ─────────────────────────────────────────────────────
+
+    /// `16` was previously unused, NR27 stays absent, and no existing number moved.
+    #[test]
+    fn e01_number_space_audit() {
+        assert_eq!(SYSCALL_EXIT_CURRENT_TASK_NR, 16);
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+        assert_eq!(Syscall::VARIANT_COUNT, 23);
+        // Every previously assigned number is unchanged.
+        for (nr, expect) in [
+            (0usize, Syscall::Yield),
+            (1, Syscall::IpcSend),
+            (2, Syscall::IpcRecv),
+            (3, Syscall::VmMap),
+            (4, Syscall::TransferRelease),
+            (5, Syscall::IpcRecvTimeout),
+            (6, Syscall::IpcCall),
+            (7, Syscall::IpcReply),
+            (8, Syscall::ControlPlaneSetCnodeSlots),
+            (9, Syscall::FutexWait),
+            (10, Syscall::FutexWake),
+            (11, Syscall::SpawnThread),
+            (12, Syscall::Fork),
+            (13, Syscall::VmAnonMap),
+            (14, Syscall::VmBrk),
+            (15, Syscall::DebugLog),
+            (23, Syscall::SpawnProcess),
+            (24, Syscall::SpawnProcessFromUserBuf),
+            (26, Syscall::SpawnFromInitramfsFile),
+            (28, Syscall::CreateInitramfsFileSliceMo),
+            (29, Syscall::SpawnFromMemoryObject),
+            (30, Syscall::RecvSharedV3),
+            (31, Syscall::ReapFaultedTask),
+        ] {
+            assert_eq!(
+                Syscall::decode(nr),
+                Ok(expect),
+                "syscall number {nr} must not move"
+            );
+        }
+        // The new number decodes, and NR27 plus the other free numbers stay unassigned.
+        assert_eq!(Syscall::decode(16), Ok(Syscall::ExitCurrentTask));
+        for free in [17usize, 18, 19, 20, 21, 22, 25, 27] {
+            assert!(
+                Syscall::decode(free).is_err(),
+                "number {free} must remain unassigned"
+            );
+        }
+        // Unknown-number behaviour is unchanged.
+        assert!(Syscall::decode(32).is_err());
+        assert!(Syscall::decode(999).is_err());
+    }
+
+    /// Kernel and userspace encode the same number.
+    #[test]
+    fn e02_kernel_and_userspace_agree() {
+        assert!(SYSCALL_SRC.contains("pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;"));
+        assert!(USER_RT_SRC.contains("pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;"));
+        assert!(USER_RT_SRC.contains("pub unsafe fn exit_current_task() -> SyscallError"));
+        // NR27 remains absent — no tombstone constant reappeared.
+        assert!(!SYSCALL_SRC.contains("_NR: usize = 27;"));
+    }
+
+    // ── 2. Mechanism-only: no user-supplied target ──────────────────────────────────
+
+    /// The handler takes no target identity and derives `{tid, asid}` from scheduler state.
+    #[test]
+    fn e03_no_user_supplied_target_identity() {
+        let body = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("handler");
+        let body = body.split("\nfn handle_reap_faulted_task").next().unwrap();
+        // The frame is never read for a target.
+        assert!(
+            !body.contains("frame.arg("),
+            "the exit syscall must not read any userspace argument"
+        );
+        assert!(body.contains("kernel.current_tid()"));
+        assert!(body.contains("kernel.task_asid(tid)"));
+        // No capability check, because self-termination needs no authority.
+        assert!(!body.contains("resolve_send_cap") && !body.contains("has_right"));
+    }
+
+    /// The syscall converges on the shared lifecycle — it does not reimplement teardown,
+    /// and this is the production caller `exit_task` previously lacked.
+    #[test]
+    fn e04_reuses_one_authoritative_lifecycle() {
+        let body = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("handler");
+        let body = body.split("\nfn handle_reap_faulted_task").next().unwrap();
+        assert!(body.contains("kernel.exit_task(tid, 0)"));
+        // No duplicated teardown steps in the handler.
+        for dup in [
+            "revoke_reply_caps_for",
+            "take_server_reply_link",
+            "clear_ipc_waiters_for_tid",
+            "report_task_exit_to",
+            "TaskStatus::Exited",
+        ] {
+            assert!(
+                !body.contains(dup),
+                "teardown step {dup} must live only in exit_task"
+            );
+        }
+    }
+
+    // ── 3/4. Capacity reserved before the irreversible transition ───────────────────
+
+    /// A task that still owes a reply must not pass the point of no return unless its
+    /// deferred completion can be handed off.
+    #[test]
+    fn e05_capacity_checked_before_irreversible_transition() {
+        let body = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("handler");
+        let body = body.split("\nfn handle_reap_faulted_task").next().unwrap();
+        let probe = body
+            .find("server_death_work_capacity_available")
+            .expect("capacity probe");
+        let commit = body.find("kernel.exit_task(tid, 0)").expect("commit");
+        assert!(
+            probe < commit,
+            "capacity must be probed BEFORE the irreversible transition"
+        );
+        // The probe is gated on actually owing a reply.
+        assert!(body.contains("kernel.server_reply_link_for(tid, asid).is_some()"));
+        // Declining is a canonical retryable error, and nothing was changed.
+        assert!(body.contains("Err(SyscallError::WouldBlock)"));
+        assert!(body.contains("link_retained=1"));
+    }
+
+    /// The capacity probe is non-mutating and answers truthfully at both extremes.
+    #[test]
+    fn e06_capacity_probe_is_non_mutating() {
+        crate::kernel::boot::server_death_work_clear(0);
+        assert!(crate::kernel::boot::server_death_work_capacity_available(0));
+        let mut held = alloc::vec::Vec::new();
+        while let Some(r) = crate::kernel::boot::server_death_work_reserve(0) {
+            held.push(r);
+        }
+        assert!(!crate::kernel::boot::server_death_work_capacity_available(
+            0
+        ));
+        for r in held {
+            crate::kernel::boot::server_death_work_release(r);
+        }
+        assert!(crate::kernel::boot::server_death_work_capacity_available(0));
+        crate::kernel::boot::server_death_work_clear(0);
+    }
+
+    // ── 7. Non-returning disposition ────────────────────────────────────────────────
+
+    /// The disposition is per-CPU, one-shot, and published only on a committed exit.
+    #[test]
+    fn e07_exit_disposition_is_one_shot() {
+        assert!(crate::kernel::boot::take_current_task_exited(0).is_none());
+        crate::kernel::boot::publish_current_task_exited(0, 42);
+        assert!(crate::kernel::boot::current_task_exited_pending(0));
+        assert_eq!(crate::kernel::boot::take_current_task_exited(0), Some(42));
+        // One-shot: a second consumer sees nothing, so a normally returning syscall can
+        // never observe a stale disposition.
+        assert_eq!(crate::kernel::boot::take_current_task_exited(0), None);
+        assert!(!crate::kernel::boot::current_task_exited_pending(0));
+    }
+
+    /// The handler writes NO result into the exiting task's frame.
+    #[test]
+    fn e08_no_result_written_into_exiting_frame() {
+        let body = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("handler");
+        let body = body.split("\nfn handle_reap_faulted_task").next().unwrap();
+        for w in [
+            "frame.set_ok",
+            "frame.set_err",
+            "frame.set_user_gpr",
+            "set_ret",
+        ] {
+            assert!(
+                !body.contains(w),
+                "no result may be published into a frame that will not resume ({w})"
+            );
+        }
+        // The frame parameter is explicitly unused.
+        assert!(body.contains("_frame: &mut TrapFrame"));
+    }
+
+    /// The disposition exists as an explicit shared outcome rather than per-arch inference.
+    #[test]
+    fn e09_shared_disposition_not_per_arch_inference() {
+        assert!(MOD_SRC.contains("static CURRENT_TASK_EXITED:"));
+        assert!(MOD_SRC.contains("pub fn publish_current_task_exited(cpu_idx: usize, tid: u64)"));
+        assert!(MOD_SRC.contains("pub fn take_current_task_exited(cpu_idx: usize) -> Option<u64>"));
+        // One publisher: the syscall handler.
+        assert_eq!(
+            SYSCALL_SRC.matches("publish_current_task_exited(").count(),
+            1,
+            "exactly one publisher of the exit disposition"
+        );
+    }
+
+    // ── 12. Source guards ───────────────────────────────────────────────────────────
+
+    /// `exit_task` now has a real production caller, and the exit path keeps every Stage
+    /// 200D-2A lock property.
+    #[test]
+    fn e10_production_caller_and_lock_properties() {
+        assert!(
+            SYSCALL_SRC.contains("kernel.exit_task(tid, 0)"),
+            "exit_task must have a production caller"
+        );
+        const RESTART_SRC: &str = include_str!("restart_state.rs");
+        let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let exit = exit.split("\n    pub fn ").next().unwrap();
+        // Unchanged from Stage 200D-2A: no claim, publication or enqueue under the lock.
+        for forbidden in [
+            "complete_server_death",
+            "rt_commit_receiver_runnable",
+            "rtd_enqueue",
+            "for slot in",
+            "reply_caps.iter",
+        ] {
+            assert!(
+                !exit.contains(forbidden),
+                "the broad-lock exit phase must not {forbidden}"
+            );
+        }
+        assert!(exit.contains("server_death_work_reserve(cpu_idx)"));
+        assert!(exit.contains("server_death_work_publish("));
     }
 }

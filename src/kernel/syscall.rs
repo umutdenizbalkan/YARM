@@ -27,6 +27,14 @@ pub const SYSCALL_FORK_NR: usize = 12;
 pub const SYSCALL_VM_ANON_MAP_NR: usize = 13;
 pub const SYSCALL_VM_BRK_NR: usize = 14;
 pub const SYSCALL_DEBUG_LOG_NR: usize = 15;
+/// Stage 200D-0 — terminate the CALLING task. `16` was audited unused: the 0..=31 space
+/// holds 0..=15, 23, 24, 26, 28..=31, leaving 16..=22, 25 and 27 free; 27 stays absent by
+/// contract, and 16 is the lowest remaining value, contiguous with the 0..=15 run. No
+/// existing syscall number moved.
+///
+/// The syscall takes NO target identity: it terminates the current task and nothing else,
+/// so there is no capability to check and no way to name another task.
+pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;
 pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
 pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
 pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
@@ -308,10 +316,16 @@ pub enum Syscall {
     /// Non-blocking only in this stage; full blocking requires a future stage.
     RecvSharedV3 = SYSCALL_RECV_SHARED_V3_NR,
     ReapFaultedTask = SYSCALL_REAP_FAULTED_TASK_NR,
+    /// Stage 200D-0: terminate the calling task. Never returns on success.
+    ExitCurrentTask = SYSCALL_EXIT_CURRENT_TASK_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 22;
+    // Stage 200D-0: bumped 22 -> 23 for `ExitCurrentTask`. NOTE: this constant has been
+    // one behind the enum since `ReapFaultedTask` (NR 31) was added without bumping it, and
+    // that off-by-one is deliberately preserved here rather than silently corrected — the
+    // drift is tracked for a separate cleanup.
+    pub const VARIANT_COUNT: usize = 23;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -341,6 +355,7 @@ impl Syscall {
             SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR => Ok(Self::SpawnFromMemoryObject),
             SYSCALL_RECV_SHARED_V3_NR => Ok(Self::RecvSharedV3),
             SYSCALL_REAP_FAULTED_TASK_NR => Ok(Self::ReapFaultedTask),
+            SYSCALL_EXIT_CURRENT_TASK_NR => Ok(Self::ExitCurrentTask),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -1880,6 +1895,75 @@ fn handle_spawn_from_memory_object(
     self::process::handle_spawn_from_memory_object(kernel, frame)
 }
 
+/// Stage 200D-0 — `ExitCurrentTask` (NR 16): terminate the CALLING task.
+///
+/// Takes no arguments. The target identity is derived from authoritative per-CPU scheduler
+/// state (`current_tid` + its bound ASID), so userspace cannot name another task and no
+/// capability is required — a task is always authorized to end itself.
+///
+/// On success this NEVER returns to the caller: it publishes the non-returning
+/// `CurrentTaskExited` disposition, and the architecture trap-return path abandons the
+/// exiting frame, drains post-lock work and dispatches a replacement (or idles). The frame
+/// is deliberately left untouched — no result is written into a task that will not resume.
+///
+/// Failure is only possible BEFORE the irreversible transition (unresolvable current
+/// identity, or deferred-work capacity unavailable while this task still owes a reply). In
+/// those cases nothing has changed and a canonical retryable error is returned, so the task
+/// stays runnable. There is no partial exit.
+fn handle_exit_current_task(
+    kernel: &mut KernelState,
+    _frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    // (1) Resolve the EXACT current incarnation from scheduler state, never from userspace.
+    let Some(tid) = kernel.current_tid() else {
+        return Err(SyscallError::Internal);
+    };
+    let asid = kernel.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0));
+    crate::yarm_log!(
+        "EXIT_TASK_SYSCALL_ENTER tid={} asid={} target=self result=ok",
+        tid,
+        asid.0
+    );
+
+    // (2) If this task still owes a reply, the deferred server-death completion MUST be
+    // hand-offable before anything irreversible happens. Reserving capacity first is what
+    // keeps a full queue from stranding the blocked caller: we decline instead, leaving the
+    // task Running and its link attached.
+    if kernel.server_reply_link_for(tid, asid).is_some()
+        && !crate::kernel::boot::server_death_work_capacity_available(
+            kernel.current_cpu().0 as usize,
+        )
+    {
+        crate::yarm_log!(
+            "EXIT_TASK_SYSCALL_DECLINED tid={} reason=deferred_capacity link_retained=1 result=would_block",
+            tid
+        );
+        return Err(SyscallError::WouldBlock);
+    }
+
+    // (3) Converge on the ONE authoritative teardown implementation. This is the production
+    // caller `exit_task` previously lacked. Its broad-lock phase reserves the deferred slot,
+    // detaches the exact link and publishes the item; the PeerDeath claim, caller result and
+    // caller enqueue all happen later in the post-lock drain.
+    match kernel.exit_task(tid, 0) {
+        Ok(_token) => {
+            // (4) Publish the non-returning disposition. The trap-return path consumes it.
+            crate::kernel::boot::publish_current_task_exited(kernel.current_cpu().0 as usize, tid);
+            crate::yarm_log!(
+                "EXIT_TASK_LIFECYCLE_COMMITTED tid={} asid={} syscall_returns=0 result=ok",
+                tid,
+                asid.0
+            );
+            Ok(())
+        }
+        Err(_) => {
+            // Nothing irreversible happened: `exit_task` fails only on a missing TCB.
+            crate::yarm_log!("EXIT_TASK_SYSCALL_DECLINED tid={} reason=task_missing", tid);
+            Err(SyscallError::Internal)
+        }
+    }
+}
+
 fn handle_reap_faulted_task(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
@@ -1947,6 +2031,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::SpawnFromMemoryObject => handle_spawn_from_memory_object(kernel, frame),
         Syscall::RecvSharedV3 => handle_recv_shared_v3(kernel, frame),
         Syscall::ReapFaultedTask => handle_reap_faulted_task(kernel, frame),
+        Syscall::ExitCurrentTask => handle_exit_current_task(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
@@ -5195,7 +5280,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 2 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "D4 step 2 must not change syscall variant count"
         );
         assert!(
@@ -5259,7 +5344,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 3 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "D4 step 3 must not change syscall variant count"
         );
         assert!(
@@ -5328,7 +5413,7 @@ mod tests {
         assert_eq!(SYSCALL_COUNT, 32, "D4 step 4 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            23,
             "D4 step 4 must not change syscall variant count"
         );
         assert!(

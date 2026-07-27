@@ -3985,6 +3985,63 @@ pub(crate) fn server_death_work_clear(cpu_idx: usize) {
     }
 }
 
+/// Stage 200D-0 — is at least one deferred server-death slot free for `cpu_idx`?
+///
+/// A non-mutating probe used by `ExitCurrentTask` BEFORE anything irreversible happens: a
+/// task that still owes a reply must not be allowed to reach the point of no return unless
+/// its deferred completion can be handed off, or the blocked caller would be stranded.
+pub fn server_death_work_capacity_available(cpu_idx: usize) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    SERVER_DEATH_POST_WORK[cpu_idx]
+        .lock()
+        .iter()
+        .any(|s| s.is_none())
+}
+
+// ── Stage 200D-0: the NON-RETURNING current-task-exit disposition ───────────────────
+//
+// A successful `ExitCurrentTask` abandons its own syscall frame. Rather than have each
+// architecture infer that from missing scheduler state — which is exactly how divergent,
+// duplicated lifecycle logic creeps into trap paths — the syscall publishes an explicit
+// per-CPU disposition and every arch return path consumes it the same way:
+//
+//   do not restore the exiting frame
+//   drain post-lock work
+//   dispatch the audited replacement, or enter idle
+//
+// It is per-CPU and one-shot: `take_current_task_exited` clears it, so exactly one return
+// path can act on it and a normally returning syscall can never observe a stale one.
+static CURRENT_TASK_EXITED: [core::sync::atomic::AtomicU64; crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Publish "the task that just trapped on this CPU has exited and must not be resumed".
+pub fn publish_current_task_exited(cpu_idx: usize, tid: u64) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        CURRENT_TASK_EXITED[cpu_idx].store(tid, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Consume the disposition, if present. One-shot: the second caller sees `None`.
+#[must_use]
+pub fn take_current_task_exited(cpu_idx: usize) -> Option<u64> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    match CURRENT_TASK_EXITED[cpu_idx].swap(u64::MAX, core::sync::atomic::Ordering::AcqRel) {
+        u64::MAX => None,
+        tid => Some(tid),
+    }
+}
+
+/// Non-consuming peek (assertions/telemetry only).
+#[must_use]
+pub fn current_task_exited_pending(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && CURRENT_TASK_EXITED[cpu_idx].load(core::sync::atomic::Ordering::Acquire) != u64::MAX
+}
+
 pub(crate) fn server_death_work_published_count() -> u64 {
     SERVER_DEATH_WORK_PUBLISHED.load(core::sync::atomic::Ordering::Relaxed)
 }

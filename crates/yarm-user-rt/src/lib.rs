@@ -81,6 +81,9 @@ pub mod syscall {
     pub const SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR: usize = 29;
     /// SUP-L7K-A: PM-only reap of a terminal faulted/exited task after restart.
     pub const SYSCALL_REAP_FAULTED_TASK_NR: usize = 31;
+    /// Stage 200D-0: terminate the CALLING task (NR 16). Must match
+    /// `kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR`.
+    pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
     const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
@@ -230,6 +233,32 @@ pub mod syscall {
             10 => SyscallError::ServerDied,
             // Unknown codes still fall back to `Internal` — unchanged by Stage 200D.
             _ => SyscallError::Internal,
+        }
+    }
+
+    /// Stage 200D-0 — terminate the CALLING task. Takes no arguments: the kernel derives
+    /// the exact `{tid, asid}` from scheduler state, so a task can only ever end itself.
+    ///
+    /// # Returns
+    /// On success this DOES NOT RETURN. A return means the exit was declined before
+    /// anything irreversible happened (for example the deferred server-death queue was
+    /// momentarily full while this task still owed a reply) and the caller is still
+    /// runnable — retrying later is valid.
+    ///
+    /// # Safety
+    /// Ends the current thread of execution; nothing after a successful call runs.
+    #[inline]
+    pub unsafe fn exit_current_task() -> SyscallError {
+        // SAFETY: no pointer arguments; the kernel reads no user memory for this call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_EXIT_CURRENT_TASK_NR, [0; 6]) };
+        // Only reached when the kernel DECLINED the exit.
+        #[cfg(target_arch = "x86_64")]
+        {
+            decode_syscall_error(ret.error)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            decode_syscall_error(ret.ret0)
         }
     }
 
