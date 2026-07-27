@@ -1779,6 +1779,9 @@ fn run_x86_ipccall_direct_oracle(init_tid: u64) {
 ))]
 mod ipc_reply_timeout_oracle {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+    use yarm_ipc_abi::ipc_reply_timeout_abi::{
+        IpcReplyTimeoutScenario, ipc_reply_timeout_scenario_for_current_arch,
+    };
 
     pub(super) static HANDSHAKE: AtomicU32 = AtomicU32::new(0x00E0);
     pub(super) static PARK: AtomicU32 = AtomicU32::new(0x00E1);
@@ -1791,6 +1794,11 @@ mod ipc_reply_timeout_oracle {
     pub(super) static SERVER_LATE_REPLY_REJECTED: AtomicU32 = AtomicU32::new(0);
     /// Set by the server after its prompt NR7 SUCCEEDS (reply-wins).
     pub(super) static SERVER_REPLIED_OK: AtomicU32 = AtomicU32::new(0);
+    /// Stage 200C2C2C-R2C: set by the server after a SECOND NR7 through the SAME reply cap
+    /// is rejected (reply-wins). The reply capability is single-use: the winning reply
+    /// consumed the record and committed the terminal as `Reply`, so a duplicate can never
+    /// deliver a second payload or wake the caller twice.
+    pub(super) static SERVER_DUP_REPLY_REJECTED: AtomicU32 = AtomicU32::new(0);
     pub(super) static CLIENT_CONTINUATIONS: AtomicU32 = AtomicU32::new(0);
 
     const REQUEST_OPCODE: u16 = 0x0C0A;
@@ -1817,34 +1825,32 @@ mod ipc_reply_timeout_oracle {
         (req, rep)
     }
 
-    /// This arch's slot-5 selector BASE. Each arch owns a distinct free PAIR
-    /// `(base, base + 1)` = `(timeout-wins, reply-wins)`:
-    ///   AArch64 `8`/`9`, RISC-V `9`/`10`, x86_64 `10`/`11`.
-    /// It must mirror `X86_/AARCH64_/RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR` in
-    /// `kernel::boot`, which is what the kernel writes into slot 5.
-    #[cfg(target_arch = "aarch64")]
-    pub(super) const SELECTOR_BASE: u64 = 8;
-    #[cfg(target_arch = "riscv64")]
-    pub(super) const SELECTOR_BASE: u64 = 9;
-    #[cfg(target_arch = "x86_64")]
-    pub(super) const SELECTOR_BASE: u64 = 10;
-
-    /// The oracle mode from slot 5 — always one of THIS arch's own pair.
+    /// The raw slot-5 selector this boot published. It is a NUMBER with no meaning of its
+    /// own — only `scenario()` may interpret it.
     pub(super) fn mode() -> u64 {
         yarm_user_rt::runtime::startup_arg_slot(
             yarm_user_rt::runtime::STARTUP_SLOT_SUPERVISOR_CONTROL_RECV_EP,
         )
         .unwrap_or(0)
     }
-    /// Stage 200C2C2C-R2B: decode the scenario RELATIVE TO THIS ARCH's base. The pairs
-    /// OVERLAP across arches (x86_64 timeout-wins and RISC-V reply-wins are both the
-    /// literal `10`), so an absolute value set cannot decode them. The previous
-    /// `matches!(mode(), 8 | 9 | 10)` classified RISC-V's reply-wins selector as
-    /// timeout-wins, which made the server withhold its NR7 until the client had
-    /// already timed out — the reply then lost the terminal for a genuine reason
-    /// (`TimeoutAlreadyClaimed`) and RISC-V reply-wins could never be observed.
+
+    /// Stage 200C2C2C-R2C: decode through the SHARED, ARCHITECTURE-LOCAL decoder in
+    /// `yarm_ipc_abi::ipc_reply_timeout_abi` — the same module whose encoder the kernel
+    /// used to publish the selector, so the two directions cannot drift.
+    ///
+    /// The per-arch pairs overlap (AArch64 8/9, RISC-V 9/10, x86_64 10/11), so a shared
+    /// numeric match has no single meaning. Stage 200C2C2C-R2B found that
+    /// `matches!(mode(), 8 | 9 | 10)` classified AArch64's AND RISC-V's reply-wins
+    /// selectors as timeout-wins, making the server withhold its NR7 until the client had
+    /// already timed out — the reply then lost the terminal for a genuine reason and
+    /// reply-wins was unreachable on both ports. A selector belonging to another
+    /// architecture now decodes to `None` here rather than to the wrong scenario.
+    pub(super) fn scenario() -> Option<IpcReplyTimeoutScenario> {
+        ipc_reply_timeout_scenario_for_current_arch(mode() as usize)
+    }
+
     pub(super) fn is_timeout_wins() -> bool {
-        mode() == SELECTOR_BASE
+        matches!(scenario(), Some(IpcReplyTimeoutScenario::TimeoutWins))
     }
 
     #[derive(Clone, Copy, Default)]
@@ -1854,6 +1860,9 @@ mod ipc_reply_timeout_oracle {
         pub continuations: u32,
         pub late_reply_rejected: u32,
         pub server_replied_ok: u32,
+        /// Stage 200C2C2C-R2C: the server's duplicate NR7 through the consumed reply cap
+        /// was rejected (reply-wins only).
+        pub dup_reply_rejected: u32,
     }
 
     /// Server child (ARCH-NEUTRAL core): handshake, recv the request + reply cap, then reply per mode.
@@ -1921,6 +1930,20 @@ mod ipc_reply_timeout_oracle {
                         break;
                     }
                 }
+            }
+            // Stage 200C2C2C-R2C: a DUPLICATE reply through the same cap must be rejected.
+            // The winning NR7 consumed the reply record and committed the terminal as
+            // `Reply`, so this second attempt can neither deliver a payload nor produce a
+            // second caller wake. Attempted BEFORE publishing `SERVER_REPLIED_OK`, so a
+            // client that observes the success flag also observes this verdict.
+            if ok {
+                let dup = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply_msg) };
+                SERVER_DUP_REPLY_REJECTED.store(u32::from(dup.is_err()), Relaxed);
+                yarm_user_rt::user_log!(
+                    "IPC_REPLY_TIMEOUT_ORACLE_SERVER_DUP_REPLY rejected={} err={:?}",
+                    u32::from(dup.is_err()),
+                    dup.is_err()
+                );
             }
             SERVER_REPLIED_OK.store(u32::from(ok), Relaxed);
             yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_SERVER_REPLIED ok={}", ok as u32);
@@ -2023,7 +2046,18 @@ mod ipc_reply_timeout_oracle {
                 CLIENT_GOT_REPLY.store(1, Relaxed);
                 let plen = msg.len as usize;
                 out.reply_ok = plen == REPLY_DATA.len() && msg.payload[0..plen] == REPLY_DATA;
+                // Stage 200C2C2C-R2C: bounded wait for the server's own verdicts (its prompt
+                // NR7 succeeded AND its duplicate NR7 was rejected). On `-smp 1` the server
+                // has normally published both before the woken client next runs; the bounded
+                // spin removes the dependence on that scheduling detail without introducing
+                // any wall-clock margin.
+                let mut spun = 0u64;
+                while SERVER_REPLIED_OK.load(Relaxed) == 0 && spun < SPIN_CAP {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                    spun += 1;
+                }
                 out.server_replied_ok = SERVER_REPLIED_OK.load(Relaxed);
+                out.dup_reply_rejected = SERVER_DUP_REPLY_REJECTED.load(Relaxed);
                 yarm_user_rt::user_log!(
                     "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen={} reply_ok={}",
                     plen,
@@ -2139,15 +2173,20 @@ fn run_x86_ipc_reply_timeout_oracle(init_tid: u64) {
                 out.late_reply_rejected
             );
         }
-    } else if out.reply_ok && out.continuations == 1 && out.server_replied_ok == 1 {
+    } else if out.reply_ok
+        && out.continuations == 1
+        && out.server_replied_ok == 1
+        && out.dup_reply_rejected == 1
+    {
         yarm_user_rt::user_log!(
-            "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 result=ok"
+            "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok"
         );
     } else {
         yarm_user_rt::user_log!(
-            "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 result=fail",
+            "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 duplicate_reply={} result=fail",
             out.reply_ok as u32,
-            out.continuations
+            out.continuations,
+            out.dup_reply_rejected
         );
     }
 }
@@ -2214,15 +2253,20 @@ fn run_aarch64_ipc_reply_timeout_oracle(init_tid: u64) {
                 out.late_reply_rejected
             );
         }
-    } else if out.reply_ok && out.continuations == 1 && out.server_replied_ok == 1 {
+    } else if out.reply_ok
+        && out.continuations == 1
+        && out.server_replied_ok == 1
+        && out.dup_reply_rejected == 1
+    {
         yarm_user_rt::user_log!(
-            "AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 result=ok"
+            "AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok"
         );
     } else {
         yarm_user_rt::user_log!(
-            "AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 result=fail",
+            "AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 duplicate_reply={} result=fail",
             out.reply_ok as u32,
-            out.continuations
+            out.continuations,
+            out.dup_reply_rejected
         );
     }
 }
@@ -2289,15 +2333,20 @@ fn run_riscv_ipc_reply_timeout_oracle(init_tid: u64) {
                 out.late_reply_rejected
             );
         }
-    } else if out.reply_ok && out.continuations == 1 && out.server_replied_ok == 1 {
+    } else if out.reply_ok
+        && out.continuations == 1
+        && out.server_replied_ok == 1
+        && out.dup_reply_rejected == 1
+    {
         yarm_user_rt::user_log!(
-            "RISCV_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 result=ok"
+            "RISCV_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok"
         );
     } else {
         yarm_user_rt::user_log!(
-            "RISCV_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 result=fail",
+            "RISCV_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 duplicate_reply={} result=fail",
             out.reply_ok as u32,
-            out.continuations
+            out.continuations,
+            out.dup_reply_rejected
         );
     }
 }

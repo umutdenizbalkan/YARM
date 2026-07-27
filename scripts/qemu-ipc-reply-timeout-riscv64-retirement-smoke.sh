@@ -266,7 +266,8 @@ run_reply_wins() {
     "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch=riscv64 outcome=released trigger=userspace_reply_validated result=ok" \
     "IPC_REPLY_TIMEOUT_LATE_SCAN arch=riscv64 outcome=reply_won late_timeout_claims=0 result=ok" \
     "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=riscv64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok" \
-    "RISCV_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 result=ok"
+    "RISCV_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok" \
+    "IPC_REPLY_TIMEOUT_ORACLE_SERVER_DUP_REPLY rejected=1"
   # The reply must never be declined here, and NO decline reason may ever be raised by deadline
   # bookkeeping: terminal ownership is the single authority.
   forbid_log "$rw" \

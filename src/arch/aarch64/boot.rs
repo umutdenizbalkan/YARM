@@ -7853,8 +7853,11 @@ pub fn bootstrap_first_user_task(
             kernel,
             RING3_INIT_SERVER_TID,
         ) {
-            init_args[5] = crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR
-                + (crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode() as u64 - 1);
+            // Stage 200C2C2C-R2C: the selector is produced by the ARCHITECTURE-LOCAL encoder
+            // in `yarm_ipc_abi::ipc_reply_timeout_abi` — the exact inverse of the decoder
+            // userspace applies — so the kernel never hand-writes a slot-5 number and the
+            // two sides cannot drift apart.
+            init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);
             init_args[13] = caps.request_ep_cap as u64;
             init_args[14] = caps.reply_ep_cap as u64;
             crate::yarm_log!(
@@ -8113,6 +8116,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.online_cpu_count(),
         kernel.present_cpu_count()
     );
+    // Stage 200C2C2C-R2C: one-shot boot-instance identifier (see `emit_boot_instance_nonce`).
+    crate::kernel::boot::emit_boot_instance_nonce("aarch64");
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),

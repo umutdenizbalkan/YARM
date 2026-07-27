@@ -11,6 +11,7 @@ pub mod dhcp_abi;
 pub mod dns_abi;
 pub mod driver_abi;
 pub mod gpio_abi;
+pub mod ipc_reply_timeout_abi;
 pub mod irqmux_abi;
 pub mod mailbox_abi;
 pub mod netdev_abi;

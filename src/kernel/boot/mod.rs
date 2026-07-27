@@ -3510,27 +3510,60 @@ pub fn ipccall_direct_oracle_reply_endpoint_is(eidx: usize) -> bool {
 // slot-5 oracle, plus the oracle's confined reply endpoint index (the ONLY recv-v2 timeout that
 // registers a reply-terminal deadline — every ordinary receive stays on its unchanged path).
 
+// Stage 200C2C2C-R2C: the three per-arch selector BASES are the registry — they are all
+// visible here because provisioning must name them — but their INTERPRETATION lives in
+// `yarm_ipc_abi::ipc_reply_timeout_abi`, which is compiled for the current architecture and
+// is the single decoder shared with userspace. These aliases exist so there is exactly one
+// numeric source of truth; they must never be decoded by a shared numeric match.
+
 /// Slot-5 selector for the x86_64 reply-timeout oracle. Next free value after the direct/SMP
 /// oracles (3/9), so it is mutually exclusive with every other slot-5 oracle.
-pub const X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 10;
+pub const X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::ipc_reply_timeout_abi::X86_64_SELECTOR_BASE as u64;
 
 /// Stage 200C2C1 — slot-5 selector base for the AArch64 reply-timeout oracle. AArch64 slot-5 values
 /// 1..=7 are taken (FutexWake=1, FutexWait switch=2, FutexWait idle=3, two-task Yield=4, lone
 /// Yield=5, shared-region direct=6, ipccall-direct=7), so this oracle uses the next free PAIR: `8`
 /// (timeout-wins) / `9` (reply-wins), mutually exclusive with every other AArch64 slot-5 oracle.
-pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 8;
+pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::ipc_reply_timeout_abi::AARCH64_SELECTOR_BASE as u64;
 
 /// Stage 200C2C2 — slot-5 selector base for the RISC-V reply-timeout oracle. RISC-V slot-5 values
 /// 1..=8 are taken (FutexWake=1, FutexWait=2, FutexWait-idle=3, two-task Yield=4, lone Yield=5,
 /// queue-switch=6, shared-region direct=7, ipccall-direct=8), so this oracle uses the next free
 /// PAIR: `9` (timeout-wins) / `10` (reply-wins), mutually exclusive with every other RISC-V slot-5
 /// oracle.
-pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 9;
+pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::ipc_reply_timeout_abi::RISCV64_SELECTOR_BASE as u64;
 
 /// Oracle mode discriminator (also written to init startup slot 15 for the userspace scenario):
 /// `1` = timeout-wins, `2` = reply-wins.
 pub const IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS: u8 = 1;
 pub const IPC_REPLY_TIMEOUT_MODE_REPLY_WINS: u8 = 2;
+
+/// Stage 200C2C2C-R2C — the armed scenario as the TYPED value both sides agree on, or
+/// `None` when the oracle is off. The per-boot mode knob is the only input; the numeric
+/// slot-5 selector is derived from this by `ipc_reply_timeout_selector_for_current_arch`,
+/// so the kernel never hand-writes a selector number.
+#[must_use]
+pub fn ipc_reply_timeout_scenario()
+-> Option<yarm_ipc_abi::ipc_reply_timeout_abi::IpcReplyTimeoutScenario> {
+    use yarm_ipc_abi::ipc_reply_timeout_abi::IpcReplyTimeoutScenario as S;
+    match x86_ipc_reply_timeout_oracle_mode() {
+        IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS => Some(S::TimeoutWins),
+        IPC_REPLY_TIMEOUT_MODE_REPLY_WINS => Some(S::ReplyWins),
+        _ => None,
+    }
+}
+
+/// The slot-5 selector to publish for the armed scenario, decided by the ARCHITECTURE-LOCAL
+/// encoder. `None` when the oracle is off.
+#[must_use]
+pub fn ipc_reply_timeout_selector() -> Option<u64> {
+    ipc_reply_timeout_scenario().map(|s| {
+        yarm_ipc_abi::ipc_reply_timeout_abi::ipc_reply_timeout_selector_for_current_arch(s) as u64
+    })
+}
 
 /// Stage 200C2C1 — the monotonic "now" that drives reply-timeout deadlines, per arch.
 ///
@@ -3596,6 +3629,69 @@ pub(crate) const REPLY_TIMEOUT_ARCH: &str = "riscv64";
     ))
 ))]
 pub(crate) const REPLY_TIMEOUT_ARCH: &str = "unknown";
+
+// ── Stage 200C2C2C-R2C: the BOOT-INSTANCE identifier ────────────────────────────────
+//
+// Every "this marker appears exactly once" assertion in the live runners is only sound if
+// the captured log holds exactly ONE boot instance. Banner and kernel-entry counts catch a
+// firmware or payload re-entry, but a runner that concatenated two logs, or a guest that
+// reset and re-ran an identical boot, would produce identical counts of identical lines.
+//
+// The nonce closes that: it is read ONCE per boot from the architecture's free-running
+// hardware counter and never stored across a reset, so two boot instances cannot produce
+// the same value. A runner asserts BOTH that the marker appears once AND that exactly one
+// DISTINCT nonce value is present — the second check is what distinguishes "one boot" from
+// "two boots that happened to look alike".
+static BOOT_INSTANCE_NONCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BOOT_INSTANCE_NONCE_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The architecture's free-running counter, used only as a boot-instance discriminator.
+#[must_use]
+fn boot_instance_counter() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: `rdtsc` is unprivileged and has no memory or state effects.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        // SAFETY: `CNTPCT_EL0` is a readable EL1 system register on every supported core.
+        unsafe { core::arch::asm!("mrs {0}, CNTPCT_EL0", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let v: u64;
+        // SAFETY: `time` is an unprivileged read-only CSR.
+        unsafe { core::arch::asm!("csrr {0}, time", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
+    {
+        0
+    }
+}
+
+/// Emit this boot instance's identifier exactly once. Idempotent: later calls are no-ops,
+/// so it can be placed on any path that every boot reaches.
+pub fn emit_boot_instance_nonce(arch: &str) {
+    if BOOT_INSTANCE_NONCE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let nonce = boot_instance_counter();
+    BOOT_INSTANCE_NONCE.store(nonce, core::sync::atomic::Ordering::Release);
+    crate::yarm_log!(
+        "YARM_BOOT_INSTANCE arch={} nonce=0x{:016x} result=ok",
+        arch,
+        nonce
+    );
+}
 
 static X86_IPC_REPLY_TIMEOUT_ORACLE_MODE: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);

@@ -85363,7 +85363,15 @@ mod stage200c2b_guards {
         assert!(
             MOD_SRC.contains("X86_IPC_REPLY_TIMEOUT_ORACLE_MODE: core::sync::atomic::AtomicU8")
         );
-        assert!(X86_BOOT_SRC.contains("X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR"));
+        // Stage 200C2C2C-R2C: x86 boot no longer names the selector constant — it publishes
+        // slot 5 through the ARCHITECTURE-LOCAL encoder, whose x86 pair is still 10/11.
+        assert!(X86_BOOT_SRC.contains(
+            "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);"
+        ));
+        assert_eq!(
+            crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            10
+        );
         // Mutually exclusive with every other slot-5 oracle (fires only when 5/13/14 = 0).
         assert!(
             X86_BOOT_SRC.contains("init_args[5] == 0")
@@ -85686,9 +85694,21 @@ mod stage200c2b_guards {
     // reusing `provision_init_ipc_reply_timeout_oracle`, mutually exclusive with the other slot-5s.
     #[test]
     fn a1_aarch64_provisioning_reuses_neutral_core() {
-        assert!(MOD_SRC.contains("pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 8;"));
+        // Stage 200C2C2C-R2C: the constant is now an ALIAS of the shared ABI base, so the
+        // registry and the architecture-local decoder cannot drift. Assert the alias AND the
+        // value it resolves to (8 = AArch64 timeout-wins, 9 = AArch64 reply-wins).
+        assert!(MOD_SRC.contains(
+            "pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =\n    yarm_ipc_abi::ipc_reply_timeout_abi::AARCH64_SELECTOR_BASE as u64;"
+        ));
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            8
+        );
         assert!(AARCH64_BOOT_SRC.contains("provision_init_ipc_reply_timeout_oracle"));
-        assert!(AARCH64_BOOT_SRC.contains("AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR"));
+        // Stage 200C2C2C-R2C: slot 5 is published by the architecture-local encoder.
+        assert!(AARCH64_BOOT_SRC.contains(
+            "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);"
+        ));
         assert!(
             AARCH64_BOOT_SRC.contains("init_args[5] == 0")
                 && AARCH64_BOOT_SRC.contains("init_args[13] == 0")
@@ -85781,8 +85801,20 @@ mod stage200c2b_guards {
         );
         // There is exactly ONE saved-frame mutation block, and it is x86_64-gated: no non-x86
         // branch writes any saved register (the recv handler re-runs and re-imports x0..x5).
+        //
+        // Stage 200C2C2C-R2C: count ASSIGNMENTS, not mentions. The RISC-V stored-lane
+        // attestation added by this stage READS `tcb.user_context` to report the published
+        // values; reads cannot clobber a resumed register, and the guard's subject is writes.
+        let saved_frame_writes = |t: &str| {
+            t.lines()
+                .filter(|l| {
+                    let l = l.trim_start();
+                    l.starts_with("tcb.user_context") && l.contains(" = ")
+                })
+                .count()
+        };
         assert_eq!(
-            body.matches("tcb.user_context").count(),
+            saved_frame_writes(body),
             5,
             "the only saved-frame writes are the five x86_64-gated result-register writes"
         );
@@ -86414,10 +86446,19 @@ mod stage200c2c1b_aarch64_reentry {
             .next()
             .unwrap();
         assert!(x86_blk.contains("user_gprs[2] = timed_out"));
-        // Every saved-frame write lives inside that x86_64-gated block.
+        // Every saved-frame write lives inside that x86_64-gated block. Stage 200C2C2C-R2C:
+        // compare ASSIGNMENTS — the RISC-V stored-lane attestation only reads the context.
+        let writes = |t: &str| {
+            t.lines()
+                .filter(|l| {
+                    let l = l.trim_start();
+                    l.starts_with("tcb.user_context") && l.contains(" = ")
+                })
+                .count()
+        };
         assert_eq!(
-            body.matches("tcb.user_context").count(),
-            x86_blk.matches("tcb.user_context").count(),
+            writes(body),
+            writes(x86_blk),
             "no saved-frame write outside the x86_64-gated block (AArch64 lanes untouched)"
         );
         // The AArch64 delivery mechanism is the parked, generation-bearing completion.
@@ -86843,14 +86884,27 @@ mod stage200c2c2_riscv_port {
     // (2) a slot collision fails closed (the oracle stands down, never overwrites).
     #[test]
     fn r02_slot_collision_fails_closed() {
+        // Stage 200C2C2C-R2C: aliased to the shared ABI base (single numeric source of truth).
         assert!(
-            MOD_SRC.contains("pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 9;"),
+            MOD_SRC.contains(
+                "pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =\n    yarm_ipc_abi::ipc_reply_timeout_abi::RISCV64_SELECTOR_BASE as u64;"
+            ),
             "next genuinely free RISC-V slot-5 pair is 9/10 (1..=8 are taken)"
         );
+        assert_eq!(
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            9
+        );
+        // Stage 200C2C2C-R2C: the provisioning site now calls the architecture-local encoder,
+        // so anchor the guard on that call rather than on the constant's name.
         let blk = RISCV_BOOT_SRC
-            .split("RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR")
+            .split("init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector()")
             .next()
             .expect("provisioning guard");
+        assert!(
+            blk.len() < RISCV_BOOT_SRC.len(),
+            "riscv64 boot must publish slot 5 through the shared encoder"
+        );
         // The guard immediately preceding the selector assignment requires all three slots empty.
         let tail = &blk[blk.len().saturating_sub(1200)..];
         assert!(tail.contains("init_args[5] == 0"));
@@ -87170,8 +87224,11 @@ mod stage200c2c2_riscv_port {
     // are single-source (the RISC-V wrapper duplicates no terminal/deadline/completion logic).
     #[test]
     fn r20_sealed_paths_and_single_source() {
-        // Sealed arch cells still present.
-        assert!(X86_BOOT_SRC.contains("X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR"));
+        // Sealed arch cells still present. Stage 200C2C2C-R2C routes slot-5 publication
+        // through the shared architecture-local encoder on every arch.
+        assert!(X86_BOOT_SRC.contains(
+            "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);"
+        ));
         assert!(AARCH64_TRAP_SRC.contains("take_blocked_syscall_completion"));
         assert!(INIT_SRC.contains("X86_IPC_REPLY_TIMEOUT_DONE"));
         assert!(INIT_SRC.contains("AARCH64_IPC_REPLY_TIMEOUT_DONE"));
@@ -87542,9 +87599,13 @@ mod stage200c2c2c_r2a_riscv_publication {
             .expect("commit body");
         let body = body.split("\npub(crate) fn ").next().unwrap();
         assert!(body.contains("tcb.publish_riscv_user_return(0, 0, timed_out as usize);"));
-        // No RISC-V a0/a1 lane is written directly at this boundary.
-        let riscv_direct =
-            body.matches("user_gprs[10]").count() + body.matches("user_gprs[11]").count();
+        // No RISC-V a0/a1 lane is written directly at this boundary. Stage 200C2C2C-R2C:
+        // the stored-lane attestation READS both lanes to report them, so the guard targets
+        // assignment specifically — a read can never clobber the published result.
+        let riscv_direct = body.matches("user_gprs[10] =").count()
+            + body.matches("user_gprs[11] =").count()
+            + body.matches("set_user_gpr(10").count()
+            + body.matches("set_user_gpr(11").count();
         assert_eq!(
             riscv_direct, 0,
             "no direct RISC-V lane writes outside the helper"
@@ -87828,20 +87889,18 @@ mod stage200c2c2c_r2b_reply_authority {
             "the collapsed absolute selector set decodes AArch64/RISC-V reply-wins as timeout-wins"
         );
         assert!(!code.contains("matches!(mode(), 8 | 10)"));
+        // Stage 200C2C2C-R2C superseded R2B's per-file base copy with the SHARED typed
+        // decoder in `yarm_ipc_abi`, which the kernel's encoder is the exact inverse of. The
+        // property this case guards — interpretation is architecture-local — is unchanged and
+        // now stronger: the userspace copy of the base table no longer exists at all.
+        assert!(
+            SERVICE_SRC.contains("ipc_reply_timeout_scenario_for_current_arch(mode() as usize)")
+        );
         assert!(
             SERVICE_SRC
-                .contains("fn is_timeout_wins() -> bool {\n        mode() == SELECTOR_BASE\n    }")
+                .contains("matches!(scenario(), Some(IpcReplyTimeoutScenario::TimeoutWins))")
         );
-        // The per-arch bases mirror the kernel-side selector constants exactly.
-        assert!(SERVICE_SRC.contains(
-            "#[cfg(target_arch = \"aarch64\")]\n    pub(super) const SELECTOR_BASE: u64 = 8;"
-        ));
-        assert!(SERVICE_SRC.contains(
-            "#[cfg(target_arch = \"riscv64\")]\n    pub(super) const SELECTOR_BASE: u64 = 9;"
-        ));
-        assert!(SERVICE_SRC.contains(
-            "#[cfg(target_arch = \"x86_64\")]\n    pub(super) const SELECTOR_BASE: u64 = 10;"
-        ));
+        assert!(!SERVICE_SRC.contains("pub(super) const SELECTOR_BASE: u64"));
     }
 
     // ── Stage 200C2C2C-R2B: the CAUSAL collector gate ────────────────────────────────
@@ -87972,5 +88031,385 @@ mod stage200c2c2c_r2b_reply_authority {
         assert!(SPLIT_SRC.contains("maybe_release_reply_timeout_collector_gate(msg)"));
         // The reply-wins late-scan attestation requires the gate released.
         assert!(RUNTIME_SRC.contains("&& !crate::kernel::boot::reply_timeout_collector_held()"));
+    }
+}
+
+/// Stage 200C2C2C-R2C — the THREE-ARCHITECTURE selector/matrix guards.
+///
+/// The direct-reply timeout oracle's slot-5 selector pairs OVERLAP across architectures
+/// (AArch64 8/9, RISC-V 9/10, x86_64 10/11), so a number alone never identifies a scenario.
+/// These cases pin the architecture-local decoder, the encode/decode inverse, the
+/// registry constants, and the source-level absence of any shared ambiguous match.
+mod stage200c2c2c_r2c_selector_matrix {
+    use yarm_ipc_abi::ipc_reply_timeout_abi::{
+        AARCH64_SELECTOR_BASE, CURRENT_ARCH_SELECTOR_BASE, IpcReplyTimeoutScenario,
+        RISCV64_SELECTOR_BASE, X86_64_SELECTOR_BASE, ipc_reply_timeout_scenario_for_base,
+        ipc_reply_timeout_scenario_for_current_arch, ipc_reply_timeout_selector_for_current_arch,
+    };
+
+    const ABI_SRC: &str = include_str!("../../../crates/yarm-ipc-abi/src/ipc_reply_timeout_abi.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    /// (1) each architecture's own pair decodes to its own two scenarios.
+    #[test]
+    fn s01_each_arch_pair_decodes_to_its_own_scenarios() {
+        for (base, name) in [
+            (AARCH64_SELECTOR_BASE, "aarch64"),
+            (RISCV64_SELECTOR_BASE, "riscv64"),
+            (X86_64_SELECTOR_BASE, "x86_64"),
+        ] {
+            assert_eq!(
+                ipc_reply_timeout_scenario_for_base(base, base),
+                Some(IpcReplyTimeoutScenario::TimeoutWins),
+                "{name}: base must be TimeoutWins"
+            );
+            assert_eq!(
+                ipc_reply_timeout_scenario_for_base(base, base + 1),
+                Some(IpcReplyTimeoutScenario::ReplyWins),
+                "{name}: base+1 must be ReplyWins"
+            );
+        }
+        // The exact table the stage requires.
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 8),
+            Some(IpcReplyTimeoutScenario::TimeoutWins)
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 9),
+            Some(IpcReplyTimeoutScenario::ReplyWins)
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 9),
+            Some(IpcReplyTimeoutScenario::TimeoutWins)
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 10),
+            Some(IpcReplyTimeoutScenario::ReplyWins)
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 10),
+            Some(IpcReplyTimeoutScenario::TimeoutWins)
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 11),
+            Some(IpcReplyTimeoutScenario::ReplyWins)
+        );
+    }
+
+    /// (2) THE regression this stage freezes: the same number means different things on
+    /// different architectures, so a decoder must never be shared numerically.
+    #[test]
+    fn s02_same_number_means_different_scenarios_per_arch() {
+        // `9` is AArch64 ReplyWins but RISC-V TimeoutWins.
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 9),
+            Some(IpcReplyTimeoutScenario::ReplyWins)
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 9),
+            Some(IpcReplyTimeoutScenario::TimeoutWins)
+        );
+        // `10` is RISC-V ReplyWins but x86_64 TimeoutWins.
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 10),
+            Some(IpcReplyTimeoutScenario::ReplyWins)
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 10),
+            Some(IpcReplyTimeoutScenario::TimeoutWins)
+        );
+    }
+
+    /// (3) a selector belonging ONLY to another architecture cannot activate any scenario
+    /// in a given build.
+    #[test]
+    fn s03_foreign_only_selectors_activate_nothing() {
+        // AArch64 build: x86_64's pair (10/11) is foreign; 10 is also RISC-V ReplyWins.
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 11),
+            None
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 10),
+            None
+        );
+        // RISC-V build: AArch64's TimeoutWins (8) and x86_64's ReplyWins (11) are foreign.
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 8),
+            None
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 11),
+            None
+        );
+        // x86_64 build: AArch64's whole pair (8/9) is foreign.
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 8),
+            None
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 9),
+            None
+        );
+        // Nothing outside a pair activates anything, including the off value 0.
+        for base in [
+            AARCH64_SELECTOR_BASE,
+            RISCV64_SELECTOR_BASE,
+            X86_64_SELECTOR_BASE,
+        ] {
+            for sel in [0usize, 1, 7, 12, 100, usize::MAX] {
+                assert_eq!(ipc_reply_timeout_scenario_for_base(base, sel), None);
+            }
+        }
+    }
+
+    /// (4) the CURRENT build decodes only its own pair, and encode/decode are exact
+    /// inverses — so the kernel cannot publish a selector userspace would misread.
+    #[test]
+    fn s04_current_arch_encode_decode_round_trip() {
+        for scenario in [
+            IpcReplyTimeoutScenario::TimeoutWins,
+            IpcReplyTimeoutScenario::ReplyWins,
+        ] {
+            let sel = ipc_reply_timeout_selector_for_current_arch(scenario);
+            assert_eq!(
+                ipc_reply_timeout_scenario_for_current_arch(sel),
+                Some(scenario),
+                "encode/decode must round-trip for {scenario:?}"
+            );
+        }
+        // Values just outside this build's own pair are inert.
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE - 1),
+            None
+        );
+        assert_eq!(
+            ipc_reply_timeout_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE + 2),
+            None
+        );
+    }
+
+    /// (5) the kernel's selector registry constants ARE the ABI bases — one numeric source
+    /// of truth, so the registry cannot drift from the decoder.
+    #[test]
+    fn s05_kernel_registry_constants_are_the_abi_bases() {
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            AARCH64_SELECTOR_BASE as u64
+        );
+        assert_eq!(
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            RISCV64_SELECTOR_BASE as u64
+        );
+        assert_eq!(
+            crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            X86_64_SELECTOR_BASE as u64
+        );
+        assert!(
+            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_timeout_abi::X86_64_SELECTOR_BASE as u64")
+        );
+        assert!(
+            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_timeout_abi::AARCH64_SELECTOR_BASE as u64")
+        );
+        assert!(
+            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_timeout_abi::RISCV64_SELECTOR_BASE as u64")
+        );
+    }
+
+    /// (6) the per-boot mode maps to the typed scenario, and the published selector is
+    /// produced by the architecture-local encoder.
+    #[test]
+    fn s06_mode_maps_to_typed_scenario() {
+        let prior = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(0);
+        assert_eq!(crate::kernel::boot::ipc_reply_timeout_scenario(), None);
+        assert_eq!(crate::kernel::boot::ipc_reply_timeout_selector(), None);
+
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS,
+        );
+        assert_eq!(
+            crate::kernel::boot::ipc_reply_timeout_scenario(),
+            Some(IpcReplyTimeoutScenario::TimeoutWins)
+        );
+        assert_eq!(
+            crate::kernel::boot::ipc_reply_timeout_selector(),
+            Some(CURRENT_ARCH_SELECTOR_BASE as u64)
+        );
+
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS,
+        );
+        assert_eq!(
+            crate::kernel::boot::ipc_reply_timeout_scenario(),
+            Some(IpcReplyTimeoutScenario::ReplyWins)
+        );
+        assert_eq!(
+            crate::kernel::boot::ipc_reply_timeout_selector(),
+            Some(CURRENT_ARCH_SELECTOR_BASE as u64 + 1)
+        );
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prior);
+    }
+
+    /// (7) SOURCE: NO shared ambiguous numeric selector match survives anywhere, and the
+    /// current-arch base is chosen by `cfg` rather than by a runtime value.
+    #[test]
+    fn s07_no_shared_ambiguous_selector_match() {
+        let code_of = |src: &str| -> alloc::string::String {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n")
+        };
+        for (name, src) in [
+            ("service.rs", SERVICE_SRC),
+            ("boot/mod.rs", MOD_SRC),
+            ("ipc_state.rs", IPC_STATE_SRC),
+        ] {
+            let code = code_of(src);
+            for bad in [
+                "matches!(mode(), 8 | 9 | 10)",
+                "matches!(mode(), 8 | 10)",
+                "matches!(selector, 8 | 9 | 10)",
+            ] {
+                assert!(
+                    !code.contains(bad),
+                    "{name} still decodes selectors with the ambiguous shared match {bad}"
+                );
+            }
+        }
+        // The ABI selects the current base by `cfg`, never at runtime.
+        assert!(
+            ABI_SRC.contains("#[cfg(target_arch = \"aarch64\")]\npub const CURRENT_ARCH_SELECTOR_BASE: usize = AARCH64_SELECTOR_BASE;")
+        );
+        assert!(
+            ABI_SRC.contains("#[cfg(target_arch = \"riscv64\")]\npub const CURRENT_ARCH_SELECTOR_BASE: usize = RISCV64_SELECTOR_BASE;")
+        );
+        assert!(
+            ABI_SRC.contains("#[cfg(target_arch = \"x86_64\")]\npub const CURRENT_ARCH_SELECTOR_BASE: usize = X86_64_SELECTOR_BASE;")
+        );
+    }
+
+    /// (8) SOURCE: all three architectures publish slot 5 through the shared encoder, and
+    /// none hand-writes `base + (mode - 1)` any more.
+    #[test]
+    fn s08_provisioning_uses_the_shared_encoder() {
+        for (name, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains(
+                    "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);"
+                ),
+                "{name} must publish slot 5 via the architecture-local encoder"
+            );
+            assert!(
+                !src.contains("x86_ipc_reply_timeout_oracle_mode() as u64 - 1"),
+                "{name} must not hand-compute the selector from the mode"
+            );
+        }
+    }
+
+    /// (9) SOURCE: userspace decodes through the SAME shared module the kernel encodes
+    /// with, so the two directions cannot drift apart again.
+    #[test]
+    fn s09_userspace_uses_the_shared_decoder() {
+        assert!(SERVICE_SRC.contains("use yarm_ipc_abi::ipc_reply_timeout_abi::{"));
+        assert!(
+            SERVICE_SRC.contains("ipc_reply_timeout_scenario_for_current_arch(mode() as usize)")
+        );
+        assert!(
+            SERVICE_SRC
+                .contains("matches!(scenario(), Some(IpcReplyTimeoutScenario::TimeoutWins))")
+        );
+        // The userspace copy of the per-arch base table is gone.
+        assert!(!SERVICE_SRC.contains("pub(super) const SELECTOR_BASE: u64"));
+    }
+
+    /// (10) SOURCE: the reply-wins scenario proves a DUPLICATE NR7 through the consumed
+    /// reply cap is rejected, and all three arch wrappers require that verdict.
+    #[test]
+    fn s10_duplicate_reply_is_proven_rejected() {
+        assert!(SERVICE_SRC.contains("SERVER_DUP_REPLY_REJECTED"));
+        assert!(SERVICE_SRC.contains("IPC_REPLY_TIMEOUT_ORACLE_SERVER_DUP_REPLY rejected={}"));
+        assert_eq!(
+            SERVICE_SRC
+                .matches("duplicate_reply=rejected result=ok")
+                .count(),
+            3,
+            "each arch wrapper must require the duplicate-reply rejection"
+        );
+        assert_eq!(
+            SERVICE_SRC
+                .matches("&& out.dup_reply_rejected == 1")
+                .count(),
+            3
+        );
+    }
+
+    /// (11) SOURCE: the RISC-V return chain publishes the STORED TCB lanes, so all three
+    /// observations of a0 (stored, final, first-userspace) are independently attestable.
+    #[test]
+    fn s11_riscv_stored_return_lanes_are_attested() {
+        assert!(IPC_STATE_SRC.contains("RISCV_BLOCKED_RETURN_PUBLISHED tid={} stored_a0={}"));
+        // Emitted AFTER the canonical publication helper, never before it.
+        let block = IPC_STATE_SRC
+            .split("tcb.publish_riscv_user_return(0, 0, timed_out as usize);")
+            .nth(1)
+            .expect("publication site");
+        assert!(
+            block
+                .split("\n        }")
+                .next()
+                .unwrap()
+                .contains("RISCV_BLOCKED_RETURN_PUBLISHED"),
+            "the stored-lane attestation must follow the publication"
+        );
+    }
+
+    /// (12) SOURCE: the boot-instance identifier is one-shot and emitted by every
+    /// architecture, so a runner can assert exactly one DISTINCT boot per log.
+    #[test]
+    fn s12_boot_instance_nonce_is_one_shot_per_arch() {
+        assert!(MOD_SRC.contains(
+            "if BOOT_INSTANCE_NONCE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel) {\n        return;\n    }"
+        ));
+        assert!(MOD_SRC.contains("YARM_BOOT_INSTANCE arch={} nonce=0x{:016x} result=ok"));
+        assert!(X86_BOOT_SRC.contains("emit_boot_instance_nonce(\"x86_64\")"));
+        assert!(AARCH64_BOOT_SRC.contains("emit_boot_instance_nonce(\"aarch64\")"));
+        assert!(RISCV_BOOT_SRC.contains("emit_boot_instance_nonce(\"riscv64\")"));
+        // No reset path anywhere: a re-armable latch could fake a single boot.
+        assert!(!MOD_SRC.contains("BOOT_INSTANCE_NONCE_EMITTED.store(false"));
+    }
+
+    /// (13) SOURCE: the matrix runner enforces the exact-commit, log-freshness and
+    /// single-boot contracts, and seals only on six cells.
+    #[test]
+    fn s13_matrix_runner_contract() {
+        const RUNNER: &str =
+            include_str!("../../../scripts/qemu-ipc-reply-timeout-matrix-smoke.sh");
+        // Clean tree required; SHA + tree hash re-checked after every child.
+        assert!(RUNNER.contains("reason=dirty_tree"));
+        assert!(RUNNER.contains("recheck_exact_commit"));
+        assert!(RUNNER.contains("git rev-parse HEAD^{tree}"));
+        // Fresh logs only.
+        assert!(RUNNER.contains("log reuse: $path was already used by another cell"));
+        assert!(RUNNER.contains("log reuse: $path already exists before its cell ran"));
+        // Five single-boot witnesses, including DISTINCT nonces.
+        assert!(RUNNER.contains("DISTINCT boot instances != 1"));
+        assert!(RUNNER.contains("QEMU_SINGLE_BOOT=1"));
+        // Six cells or no seal.
+        assert!(RUNNER.contains("(( TW_PASS != 3 )) || (( RW_PASS != 3 ))"));
+        assert!(RUNNER.contains("STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL"));
+        assert!(RUNNER.contains("total_live_cells=6"));
     }
 }

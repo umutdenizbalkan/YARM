@@ -152,6 +152,12 @@ QEMU_ARGS=(
 if [[ -n "$KERNEL_CMDLINE" ]]; then
   QEMU_ARGS+=(-append "$KERNEL_CMDLINE")
 fi
+# Stage 200C2C2C-R2C: opt-in SINGLE-BOOT-INSTANCE enforcement. With `QEMU_SINGLE_BOOT=1`,
+# QEMU is told never to restart the guest, so a reset can never silently produce a second
+# boot inside one log. Default-off: every existing caller keeps its exact prior invocation.
+if [[ "${QEMU_SINGLE_BOOT:-0}" == "1" ]]; then
+  QEMU_ARGS+=(-no-reboot -no-shutdown)
+fi
 
 echo "[info] qemu command: $QEMU_BIN ${QEMU_ARGS[*]}"
 
