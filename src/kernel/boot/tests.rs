@@ -88417,3 +88417,976 @@ mod stage200c2c2c_r2c_selector_matrix {
         assert!(RUNNER.contains("total_live_cells=6"));
     }
 }
+
+/// Stage 200D-1 — the SERVER-DEATH terminal mechanism: lifecycle closure, exactly-once
+/// terminal ownership, reverse-registration integrity and teardown safety.
+///
+/// Every case drives real state transitions through the production seams (terminal
+/// compare-exchange, record reservation lifecycle, TCB link seam) in a controlled ORDER
+/// rather than by racing threads, so each interleaving is exercised deterministically.
+///
+/// Hosted only: this module proves the ARCHITECTURE-NEUTRAL mechanism. It claims no live
+/// retirement cell, no scenario-selector generalization and no multi-pair support.
+mod stage200d1_server_death {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::DetachOutcome;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::kernel::vm::Asid;
+
+    const BRG: u64 = 1;
+    const TOKEN_GEN: u64 = 1;
+    /// The canonical server-death code, as the ABI defines it.
+    const SERVER_DIED: u64 = 10;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+
+    fn arm(fx: &CallerFx) -> TerminalIdentity {
+        // Arm with the caller's LIVE blocked-receive generation — the same value the
+        // production block path captures — so the transaction's revalidation compares like
+        // with like instead of against a hand-picked constant.
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(BRG);
+        let id =
+            fx.k.with(|s| {
+                s.reply_terminal_identity(
+                    fx.record_index,
+                    fx.record_generation,
+                    brg,
+                    Some(TOKEN_GEN),
+                )
+            })
+            .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(fx.record_index, id));
+        id
+    }
+
+    /// Register the reverse link the way the NR6 transaction does.
+    fn link(fx: &CallerFx) -> bool {
+        fx.k.with(|s| {
+            s.register_server_reply_link(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        })
+    }
+
+    fn live_links(fx: &CallerFx) -> usize {
+        fx.k.with(|s| s.live_server_reply_link_count())
+    }
+
+    fn link_present(fx: &CallerFx) -> bool {
+        fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+            .is_some()
+    }
+
+    fn record_live(fx: &CallerFx) -> bool {
+        fx.k.with(|s| {
+            s.reply_cap_record_caller_asid(fx.record_index).is_some()
+                && s.reply_record_slot_generation(fx.record_index) == Some(fx.record_generation)
+        })
+    }
+
+    fn winner(fx: &CallerFx) -> Option<TerminalClaimant> {
+        fx.k.with(|s| s.reply_terminal_committed_winner(fx.record_index))
+    }
+
+    fn caller_result(fx: &CallerFx) -> Option<u64> {
+        fx.k.with(|s| s.pending_syscall_completion_result(1))
+    }
+
+    /// Run the production death transaction for the registered link.
+    fn kill_server(fx: &CallerFx) -> crate::runtime::ReplyTimeoutOutcome {
+        let l =
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+                .expect("link registered");
+        fx.k.with(|s| s.complete_server_death_for_link(l))
+    }
+
+    // ── (1) the base case ────────────────────────────────────────────────────────────
+    #[test]
+    fn d01_server_death_claims_available_record() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx), "registration must succeed on a live server");
+        assert_eq!(live_links(&fx), 1);
+        let outcome = kill_server(&fx);
+        assert!(matches!(
+            outcome,
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert_eq!(live_links(&fx), 0, "links leaked");
+        teardown();
+    }
+
+    // ── (2)(3) reply versus server death, both orders ────────────────────────────────
+    #[test]
+    fn d02_reply_wins_before_server_death() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        // Reply claims first.
+        let reply_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Reply, &id)
+            })
+            .expect("reply claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &reply_owner)));
+        // Death now loses at the single authority; no caller result is published.
+        let outcome = kill_server(&fx);
+        assert!(matches!(
+            outcome,
+            crate::runtime::ReplyTimeoutOutcome::LostToTerminal
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::Reply));
+        assert_eq!(
+            caller_result(&fx),
+            None,
+            "no death result may overwrite a reply"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn d03_server_death_wins_before_reply() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        // A late reply can no longer claim the terminal.
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::Reply,
+                &id
+            ))
+            .is_none(),
+            "late reply must not claim a completed terminal"
+        );
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert_eq!(live_links(&fx), 0);
+        teardown();
+    }
+
+    // ── (4)(5) timeout versus server death, both orders ──────────────────────────────
+    #[test]
+    fn d04_timeout_wins_before_server_death() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let t_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Timeout, &id)
+            })
+            .expect("timeout claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &t_owner)));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::LostToTerminal
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::Timeout));
+        teardown();
+    }
+
+    #[test]
+    fn d05_server_death_wins_before_timeout() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::Timeout,
+                &id
+            ))
+            .is_none(),
+            "a later deadline is subordinate stale work once death won"
+        );
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        teardown();
+    }
+
+    // ── (6)(7) caller exit versus server death ───────────────────────────────────────
+    #[test]
+    fn d06_caller_exit_wins_before_server_death() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let c_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::CallerExit, &id)
+            })
+            .expect("caller exit claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &c_owner)));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::LostToTerminal
+        ));
+        assert_eq!(
+            caller_result(&fx),
+            None,
+            "caller exit ⇒ server-death cleanup with caller wake = 0"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn d07_server_death_wins_before_caller_exit() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::CallerExit,
+                &id
+            ))
+            .is_none()
+        );
+        teardown();
+    }
+
+    // ── (8) endpoint destruction versus server death ─────────────────────────────────
+    #[test]
+    fn d08_endpoint_gone_versus_server_death() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let e_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(
+                    fx.record_index,
+                    TerminalClaimant::EndpointGone,
+                    &id,
+                )
+            })
+            .expect("endpoint gone claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &e_owner)));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::LostToTerminal
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::EndpointGone));
+        teardown();
+    }
+
+    // ── (9) duplicate server-exit notifications ──────────────────────────────────────
+    #[test]
+    fn d09_duplicate_server_exit_wakes_once() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        let l =
+            fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+                .expect("link");
+        let first = fx.k.with(|s| s.complete_server_death_for_link(l));
+        let second = fx.k.with(|s| s.complete_server_death_for_link(l));
+        assert!(matches!(first, crate::runtime::ReplyTimeoutOutcome::Woken));
+        assert!(
+            !matches!(second, crate::runtime::ReplyTimeoutOutcome::Woken),
+            "a duplicate teardown notification must not wake the caller twice"
+        );
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    // ── (10)(11) restarted incarnations with reused numeric TIDs ─────────────────────
+    #[test]
+    fn d10_restarted_server_reused_tid_different_asid() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // A replacement server carries the SAME numeric TID but a different ASID.
+        let other = Asid(fx.replier.asid.0.wrapping_add(77));
+        assert!(
+            !fx.k.with(|s| s.register_server_reply_link(
+                fx.replier.tid.0,
+                other,
+                fx.record_index,
+                fx.record_generation
+            )),
+            "a different incarnation must not inherit reply authority"
+        );
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                other,
+                fx.record_index,
+                fx.record_generation
+            )),
+            DetachOutcome::StaleServerIdentity,
+            "a replacement incarnation must not cancel the old link"
+        );
+        assert!(link_present(&fx), "the original link survives untouched");
+        teardown();
+    }
+
+    #[test]
+    fn d11_restarted_caller_reused_tid_different_asid() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // Rebind the caller's blocked-receive generation: the caller re-blocked, so the
+        // identity captured at registration is stale.
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        let outcome = kill_server(&fx);
+        assert!(
+            !matches!(outcome, crate::runtime::ReplyTimeoutOutcome::Woken),
+            "death must not wake a caller whose blocked receive advanced"
+        );
+        assert_eq!(caller_result(&fx), None);
+        teardown();
+    }
+
+    // ── (12) reply-record slot reuse with a stale reverse link ───────────────────────
+    #[test]
+    fn d12_slot_reuse_makes_link_stale() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        let stale_gen = fx.record_generation.wrapping_add(1);
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                stale_gen
+            )),
+            DetachOutcome::StaleRecordGeneration,
+            "an unlink for a reused slot must mutate nothing"
+        );
+        assert!(link_present(&fx));
+        teardown();
+    }
+
+    // ── (13) reply copy fault while the server begins exit ───────────────────────────
+    #[test]
+    fn d13_retryable_copy_fault_retains_link_then_death_claims() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        // Reply reserves, then its caller copy faults retryably and releases the terminal.
+        let reply_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Reply, &id)
+            })
+            .expect("reply reserves");
+        assert!(
+            fx.k.with(|s| s
+                .release_reply_terminal_slot_if_retryable(fx.record_index, &reply_owner))
+        );
+        // A retryable release keeps the record available for the SAME server, so the link
+        // is deliberately retained — the server still owes that reply.
+        assert!(
+            link_present(&fx),
+            "a retryable rollback must retain the link"
+        );
+        // The server then dies: death can now claim the released terminal.
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        teardown();
+    }
+
+    // ── (14) NR6 registration versus the server entering Exiting ─────────────────────
+    #[test]
+    fn d14_registration_refused_once_server_is_exiting() {
+        let fx = caller_fixture();
+        arm(&fx);
+        // The server commits to exit BEFORE registration is attempted.
+        fx.k.with(|s| s.set_task_status_for_test(2, crate::kernel::task::TaskStatus::Exited(0)));
+        assert!(
+            !link(&fx),
+            "an exiting incarnation must never be published as an authorized replier"
+        );
+        assert_eq!(live_links(&fx), 0);
+        assert!(
+            !fx.k
+                .can_reserve_server_reply_link_split(fx.replier.tid.0, fx.replier.asid),
+            "the capacity probe must also refuse an exiting incarnation"
+        );
+        teardown();
+    }
+
+    // ── (15) reverse-link capacity failure ───────────────────────────────────────────
+    #[test]
+    fn d15_capacity_one_second_link_fails_without_overwrite() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // A SECOND, different record on the same live server must be refused.
+        let other_index = fx.record_index.wrapping_add(1);
+        assert!(
+            !fx.k.with(|s| s.register_server_reply_link(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                other_index,
+                fx.record_generation
+            )),
+            "capacity is one; a second live link must fail"
+        );
+        let held =
+            fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+                .expect("link");
+        assert_eq!(
+            held.reply_record_index, fx.record_index,
+            "the original link must not be silently overwritten"
+        );
+        // Re-registering the IDENTICAL link is idempotent.
+        assert!(link(&fx));
+        assert_eq!(live_links(&fx), 1);
+        // Detaching a different live link is refused, not silently applied.
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                other_index,
+                fx.record_generation
+            )),
+            DetachOutcome::DifferentLiveLink
+        );
+        assert!(link_present(&fx));
+        teardown();
+    }
+
+    // ── (16)(17) publication failpoints ──────────────────────────────────────────────
+    #[test]
+    fn d16_failure_after_record_reservation_before_link_leaves_nothing() {
+        let fx = caller_fixture();
+        // Reserve a fresh record, then fail before publishing any link.
+        let (idx, gen_) =
+            fx.k.with(|s| {
+                s.reserve_direct_reply_record(
+                    fx.caller,
+                    fx.replier,
+                    crate::kernel::boot::CapObject::Endpoint {
+                        index: fx.reply_eidx,
+                        generation: fx.reply_egen,
+                    },
+                )
+            })
+            .expect("reserve");
+        assert_eq!(live_links(&fx), 0, "no link is published yet");
+        assert!(fx.k.with(|s| s.cancel_direct_reply_record(idx, gen_)));
+        assert_eq!(live_links(&fx), 0, "rollback leaves zero links");
+        assert!(
+            fx.k.with(|s| s.reply_record_slot_generation(idx)) != Some(gen_)
+                || fx.k.with(|s| s.reply_cap_record_caller_asid(idx)).is_none(),
+            "rollback leaves zero live records"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn d17_failure_after_link_before_exposure_rolls_both_back() {
+        let fx = caller_fixture();
+        let (idx, gen_) =
+            fx.k.with(|s| {
+                s.reserve_direct_reply_record(
+                    fx.caller,
+                    fx.replier,
+                    crate::kernel::boot::CapObject::Endpoint {
+                        index: fx.reply_eidx,
+                        generation: fx.reply_egen,
+                    },
+                )
+            })
+            .expect("reserve");
+        assert!(fx.k.with(|s| s.register_server_reply_link(
+            fx.replier.tid.0,
+            fx.replier.asid,
+            idx,
+            gen_
+        )));
+        assert_eq!(live_links(&fx), 1);
+        // Roll back: cancellation closes the link on the same edge.
+        assert!(fx.k.with(|s| s.cancel_direct_reply_record(idx, gen_)));
+        assert_eq!(live_links(&fx), 0, "cancellation must close the link");
+        teardown();
+    }
+
+    // ── (18–21) terminal unregistration table ────────────────────────────────────────
+    fn terminal_unlink_case(kind: TerminalClaimant) {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(fx.record_index, kind, &id))
+                .expect("claim");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &owner)));
+        // Every terminal path funnels through the SAME finalization seam.
+        assert_eq!(
+            fx.k.with(
+                |s| s.finalize_server_reply_link_for_record(fx.record_index, fx.record_generation)
+            ),
+            DetachOutcome::Detached,
+            "{kind:?} terminal must close the reverse link exactly once"
+        );
+        assert_eq!(live_links(&fx), 0);
+        // Repeating it is idempotent and mutates nothing.
+        assert_eq!(
+            fx.k.with(
+                |s| s.finalize_server_reply_link_for_record(fx.record_index, fx.record_generation)
+            ),
+            DetachOutcome::AlreadyAbsent
+        );
+        teardown();
+    }
+
+    #[test]
+    fn d18_reply_terminal_unlinks() {
+        terminal_unlink_case(TerminalClaimant::Reply);
+    }
+
+    #[test]
+    fn d19_timeout_terminal_unlinks() {
+        terminal_unlink_case(TerminalClaimant::Timeout);
+    }
+
+    #[test]
+    fn d20_caller_exit_terminal_unlinks() {
+        terminal_unlink_case(TerminalClaimant::CallerExit);
+    }
+
+    #[test]
+    fn d21_endpoint_gone_terminal_unlinks() {
+        terminal_unlink_case(TerminalClaimant::EndpointGone);
+    }
+
+    // ── (22) stale duplicate unregistration after record reuse ───────────────────────
+    #[test]
+    fn d22_stale_duplicate_unregistration_after_reuse() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        assert!(fx.k.with(|s| s.unregister_server_reply_link(
+            fx.replier.tid.0,
+            fx.replier.asid,
+            fx.record_index,
+            fx.record_generation
+        )));
+        assert_eq!(live_links(&fx), 0);
+        // A repeat, and a repeat at a reused generation, both mutate nothing.
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation
+            )),
+            DetachOutcome::AlreadyAbsent
+        );
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation.wrapping_add(9)
+            )),
+            DetachOutcome::AlreadyAbsent
+        );
+        assert_eq!(live_links(&fx), 0, "links leaked");
+        teardown();
+    }
+}
+
+/// Stage 200D-1 — architecture result-publication contracts and mechanism source guards.
+///
+/// These prove that `ServerDied` rides the EXISTING blocked-completion machinery on all
+/// three ports rather than introducing a fourth resume path, and that the mechanism's
+/// hard-stops hold at the source level. Hosted contracts only — no live retirement cell.
+mod stage200d1_publication_and_guards {
+    use crate::kernel::task::ThreadControlBlock;
+
+    const SERVER_DIED: usize = 10;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+    const KSYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+
+    // ── 1. Error ABI ────────────────────────────────────────────────────────────────
+
+    /// Both enums agree on 10, both decoders map it, and the unknown-code fallback is
+    /// untouched. `10` is unused elsewhere in the SYSCALL-error namespace; the other
+    /// enums that happen to use 10 (`netmgr`, `process`, `socket`, `irqmux`) are
+    /// service-local ABIs in separate namespaces and are not conflicts.
+    #[test]
+    fn g01_error_abi_agrees_on_both_sides() {
+        assert_eq!(
+            crate::kernel::syscall::SyscallError::ServerDied as usize,
+            10
+        );
+        assert_eq!(
+            crate::kernel::syscall::SyscallError::from_code(10),
+            crate::kernel::syscall::SyscallError::ServerDied
+        );
+        // Unknown codes still fall back to Internal — unchanged by this stage.
+        for code in [0usize, 11, 12, 99, 254, 255, 4096] {
+            assert_eq!(
+                crate::kernel::syscall::SyscallError::from_code(code),
+                crate::kernel::syscall::SyscallError::Internal,
+                "code {code} must keep the existing Internal fallback"
+            );
+        }
+        // Source-level agreement with the userspace enum + decoder.
+        assert!(KSYSCALL_SRC.contains("ServerDied = 10,"));
+        assert!(KSYSCALL_SRC.contains("10 => Self::ServerDied,"));
+        assert!(USER_RT_SRC.contains("ServerDied = 10,"));
+        assert!(USER_RT_SRC.contains("10 => SyscallError::ServerDied,"));
+        assert!(USER_RT_SRC.contains("_ => SyscallError::Internal,"));
+    }
+
+    /// No oracle-specific translation layer: the death path publishes the canonical
+    /// `SyscallError::ServerDied` discriminant directly.
+    #[test]
+    fn g02_no_oracle_specific_error_translation() {
+        assert!(
+            IPC_STATE_SRC.contains("crate::kernel::syscall::SyscallError::ServerDied as u64"),
+            "death must publish the canonical discriminant"
+        );
+        assert!(!IPC_STATE_SRC.contains("SERVER_DEATH_ERROR_CODE"));
+        assert!(!IPC_STATE_SRC.contains("fn map_server_death_error"));
+    }
+
+    // ── 9. Architecture result-publication contracts ────────────────────────────────
+
+    /// RISC-V: BOTH saved-context mirrors carry code 10 and the secondary lane is 0,
+    /// published through the canonical helper.
+    #[test]
+    fn g03_riscv_publication_contract() {
+        let mut tcb = ThreadControlBlock::new(
+            crate::kernel::ipc::ThreadId(7),
+            Some(crate::kernel::vm::Asid(3)),
+        );
+        tcb.publish_riscv_user_return(0, 0, SERVER_DIED);
+        assert_eq!(tcb.user_context.user_gprs[10], SERVER_DIED, "a0 lane");
+        assert_eq!(tcb.user_context.arg0, SERVER_DIED, "arg0 mirror");
+        assert_eq!(tcb.user_context.user_gprs[11], 0, "secondary result lane");
+        assert_eq!(tcb.user_context.arg1, 0, "secondary mirror");
+        // The completion helper publishes RISC-V lanes ONLY through the canonical helper.
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("body");
+        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        assert!(body.contains("tcb.publish_riscv_user_return(0, 0, timed_out as usize);"));
+        let direct =
+            body.matches("user_gprs[10] =").count() + body.matches("user_gprs[11] =").count();
+        assert_eq!(
+            direct, 0,
+            "no direct single-mirror RISC-V write is permitted"
+        );
+        // Publication happens BEFORE the task becomes Runnable and before any enqueue.
+        let pub_at = body.find("publish_riscv_user_return").expect("publish");
+        let runnable_at = body
+            .find("tcb.status = TaskStatus::Runnable")
+            .expect("runnable");
+        assert!(pub_at < runnable_at, "publication precedes Runnable");
+    }
+
+    /// AArch64: the death result rides the EXISTING parked blocked completion, which the
+    /// normal resume boundary consumes — no new resume path.
+    #[test]
+    fn g04_aarch64_parked_completion_contract() {
+        const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("body");
+        // The parked completion carries the parameterized code, so ServerDied uses it too.
+        assert!(body.contains("result: timed_out,"));
+        assert!(body.contains("pending_syscall_completion = Some("));
+        // The resume boundary consumes it through the existing single consumer.
+        assert!(AARCH64_TRAP_SRC.contains("take_blocked_syscall_completion"));
+        // Death does not add a second consumer anywhere.
+        assert_eq!(
+            AARCH64_TRAP_SRC
+                .matches("take_blocked_syscall_completion")
+                .count(),
+            1,
+            "exactly one consumer at the AArch64 resume boundary"
+        );
+    }
+
+    /// x86_64: the saved-frame error lane carries the code, and no metadata field is
+    /// written by the completion that could override it.
+    #[test]
+    fn g05_x86_saved_frame_contract() {
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("body");
+        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        assert!(body.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(
+            body.contains("tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error")
+        );
+        // The error lane is the LAST word on the result: the completion writes no recv
+        // metadata at all, so nothing can override the raw error. Comments are stripped
+        // first — prose about the mechanism is not a metadata write.
+        let code: alloc::string::String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in ["recv_meta", "IpcRecvMeta", "meta.status", "meta_ptr"] {
+            assert!(
+                !code.contains(forbidden),
+                "no metadata write in the completion ({forbidden})"
+            );
+        }
+    }
+
+    // ── 10. Mechanism source guards ─────────────────────────────────────────────────
+
+    /// Teardown resolves the record BY INDEX from the exact TCB link — it never scans the
+    /// reply-record store to find death authority. (The pre-existing capability-revoke
+    /// sweeps still iterate, but they revoke caps; they are not the authority path, and
+    /// the death claim strictly precedes them.)
+    #[test]
+    fn g06_no_global_scan_for_death_authority() {
+        let body = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let body = body.split("\n    pub fn ").next().unwrap();
+        assert!(body.contains("take_server_reply_link(tid, exit_identity.asid)"));
+        assert!(body.contains("complete_server_death_for_link(link)"));
+        assert!(
+            !body.contains("for slot in") && !body.contains("reply_caps.iter"),
+            "teardown must not scan the reply-record store for death authority"
+        );
+        // The death claim runs BEFORE the revoke sweep, which would otherwise destroy the
+        // record the claim needs.
+        let death_at = body.find("complete_server_death_for_link").expect("death");
+        let sweep_at = body
+            .find("revoke_reply_caps_for_replier_identity_except")
+            .expect("sweep");
+        assert!(
+            death_at < sweep_at,
+            "the death claim must precede the revoke sweep"
+        );
+    }
+
+    /// Numeric TID alone never authorizes: every link operation and the death claim carry
+    /// the ASID incarnation too.
+    #[test]
+    fn g07_no_numeric_tid_only_authority() {
+        for needle in [
+            "fn register_server_reply_link(\n        &mut self,\n        server_tid: u64,\n        server_asid: Asid,",
+            "fn detach_server_reply_link_exact(\n        &mut self,\n        server_tid: u64,\n        server_asid: Asid,",
+            "fn take_server_reply_link(\n        &mut self,\n        server_tid: u64,\n        server_asid: Asid,",
+        ] {
+            assert!(
+                IPC_STATE_SRC.contains(needle),
+                "missing identity-keyed seam: {needle}"
+            );
+        }
+        // The link type itself binds both halves and exposes exact matchers.
+        assert!(TASK_SRC.contains("pub server_asid: crate::kernel::vm::Asid,"));
+        assert!(
+            TASK_SRC.contains(
+                "fn matches_server(&self, tid: u64, asid: crate::kernel::vm::Asid) -> bool"
+            )
+        );
+        assert!(
+            TASK_SRC.contains("fn matches_record(&self, index: usize, generation: u64) -> bool")
+        );
+    }
+
+    /// The death completion performs NO user-memory copy.
+    #[test]
+    fn g08_no_user_copy_in_death_completion() {
+        let body = IPC_STATE_SRC
+            .split("fn complete_server_death_over")
+            .nth(1)
+            .expect("death txn");
+        let body = body.split("\nimpl IpcSubsystem").next().unwrap();
+        for forbidden in [
+            "copy_to_user",
+            "copy_from_user",
+            "copy_from_current_user",
+            "write_user",
+            "user_slice",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "server-death completion must not touch user memory ({forbidden})"
+            );
+        }
+    }
+
+    /// There is ONE terminal authority store; death claims through the same cell.
+    #[test]
+    fn g09_single_terminal_authority_store() {
+        let body = IPC_STATE_SRC
+            .split("fn complete_server_death_over")
+            .nth(1)
+            .expect("death txn");
+        assert!(body.contains("ipc.reply_terminal_ownership"));
+        assert!(body.contains("try_claim_peer_death_terminal(identity)"));
+        // No parallel death table or flag anywhere.
+        for forbidden in [
+            "death_claimed",
+            "peer_death_table",
+            "server_death_flags",
+            "death_authority",
+        ] {
+            assert!(
+                !IPC_STATE_SRC.contains(forbidden),
+                "second authority store: {forbidden}"
+            );
+        }
+    }
+
+    /// A reverse link is never silently overwritten, and registration refuses an exiting
+    /// incarnation on BOTH the broad and the split seam.
+    #[test]
+    fn g10_no_silent_link_overwrite_and_exiting_gate() {
+        for src in [IPC_STATE_SRC, RUNTIME_SRC] {
+            assert!(
+                src.contains(
+                    "Some(existing) if existing == link => true,\n                Some(_) => false,"
+                ),
+                "a different live link must fail, never overwrite"
+            );
+        }
+        assert!(
+            IPC_STATE_SRC
+                .contains("TaskStatus::Runnable | TaskStatus::Running | TaskStatus::Blocked(_)")
+        );
+        assert!(RUNTIME_SRC.contains("crate::kernel::task::TaskStatus::Runnable"));
+    }
+
+    /// The NR6 transaction reserves link capacity BEFORE publishing the record, so no
+    /// failure window can expose a request whose link is missing.
+    #[test]
+    fn g11_capacity_reserved_before_publication() {
+        let probe = TXN_SRC
+            .find("can_reserve_server_reply_link_split")
+            .expect("capacity probe");
+        let reserve = TXN_SRC
+            .find("reserve_direct_reply_record_split")
+            .expect("record reservation");
+        let register = TXN_SRC
+            .find("register_server_reply_link_split")
+            .expect("registration");
+        // Anchor on the actual CALL: the module doc comment names the helper too.
+        let enqueue = TXN_SRC
+            .find("self.sr_enqueue_committed_receiver_split(ack.server.tid.0")
+            .expect("enqueue");
+        assert!(
+            probe < reserve,
+            "link capacity is probed before the record is reserved"
+        );
+        assert!(
+            register < enqueue,
+            "the link is published before the server is enqueued"
+        );
+        // Registration failure rolls the publication back.
+        let after = &TXN_SRC[register..];
+        assert!(after.contains("cancel_direct_reply_record_split(idx, rgen)"));
+    }
+
+    /// Every terminal finalization path funnels through the single unlink seam.
+    #[test]
+    fn g12_all_terminal_paths_use_the_finalization_seam() {
+        // Narrow transactions (timeout + death) close it inside record invalidation.
+        assert!(IPC_STATE_SRC.contains("let _ = rt_detach_server_link(d, index, generation);"));
+        // Broad paths.
+        assert!(IPC_STATE_SRC.contains("fn finalize_server_reply_link_for_record"));
+        assert!(
+            IPC_STATE_SRC
+                .split("fn cancel_direct_reply_record")
+                .nth(1)
+                .unwrap()
+                .contains("finalize_server_reply_link_for_record(index, generation)")
+        );
+        assert!(
+            IPC_STATE_SRC
+                .split("pub fn ipc_reply(")
+                .nth(1)
+                .unwrap()
+                .contains("finalize_server_reply_link_for_record(slot, record_generation)")
+        );
+        // Direct NR7 consumption.
+        assert!(
+            RUNTIME_SRC.contains("finalize_server_reply_link_for_record_split(index, generation)")
+        );
+        // A RETRYABLE copy-fault rollback deliberately does NOT detach.
+        let release = RUNTIME_SRC
+            .split("fn release_reply_record_split")
+            .nth(1)
+            .expect("release");
+        let release = release.split("\n    pub(crate) fn ").next().unwrap();
+        assert!(
+            !release.contains("finalize_server_reply_link"),
+            "a retryable rollback must retain the link — the server still owes the reply"
+        );
+    }
+
+    /// The reply-record claim and the caller enqueue do not happen inside a TCB claim.
+    #[test]
+    fn g13_no_enqueue_inside_tcb_claim() {
+        let body = IPC_STATE_SRC
+            .split("fn complete_server_death_over")
+            .nth(1)
+            .expect("death txn");
+        let body = body.split("\nimpl IpcSubsystem").next().unwrap();
+        // The enqueue is the last statement and is not nested in any domain closure.
+        let enqueue = body.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        let commit = body.find("rt_commit_receiver_runnable(").expect("commit");
+        assert!(commit < enqueue, "publication precedes the enqueue");
+        // `rtd_enqueue` is the scheduler seam; no tcb closure wraps it.
+        let tail = &body[enqueue..];
+        assert!(!tail.contains("rtd_tcbs"), "no TCB claim spans the enqueue");
+    }
+
+    /// Authority is captured before any capability/CNode reclamation in teardown.
+    #[test]
+    fn g14_authority_captured_before_cnode_reclamation() {
+        let body = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let body = body.split("\n    pub fn ").next().unwrap();
+        let capture = body.find("take_server_reply_link").expect("capture");
+        let identity = body.find("let exit_identity").expect("identity");
+        assert!(
+            identity < capture,
+            "the exact exiting identity precedes link capture"
+        );
+        // Waiter/CNode cleanup and reporting all follow the death claim.
+        let death = body.find("complete_server_death_for_link").expect("death");
+        for later in [
+            "clear_ipc_waiters_for_tid",
+            "report_task_exit_to_supervisor",
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("missing {later}"));
+            assert!(death < at, "{later} must follow the death claim");
+        }
+    }
+}

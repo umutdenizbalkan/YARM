@@ -2903,6 +2903,20 @@ impl SharedKernel {
             else {
                 return false;
             };
+            // Stage 200D-1: an incarnation that has already committed to exit must never
+            // be published as an authorized replier. Teardown snapshots the link AFTER the
+            // status flips, so registering here would install an authority nobody will
+            // ever look at — the caller would block forever with no death claim. Refusing
+            // makes the NR6 publication roll back instead, which is the only other
+            // permitted outcome of this race.
+            if !matches!(
+                tcb.status,
+                crate::kernel::task::TaskStatus::Runnable
+                    | crate::kernel::task::TaskStatus::Running
+                    | crate::kernel::task::TaskStatus::Blocked(_)
+            ) {
+                return false;
+            }
             match tcb.server_reply_link {
                 Some(existing) if existing == link => true,
                 Some(_) => false,
@@ -2911,6 +2925,39 @@ impl SharedKernel {
                     true
                 }
             }
+        })
+    }
+
+    /// Stage 200D-1 — RESERVE reverse-link capacity BEFORE the reply record becomes
+    /// externally visible.
+    ///
+    /// The NR6 transaction must not expose a request whose link it then fails to install:
+    /// that would be a live record with no teardown-visible link, which is a hard-stop.
+    /// This probe answers "would `register_server_reply_link_split` succeed for this exact
+    /// server right now" without mutating anything, so the transaction can decline early
+    /// — before the record is published and long before the server is enqueued.
+    ///
+    /// It is a reservation in the single-pair sense only: capacity is one, the server is
+    /// not yet Runnable-and-enqueued at the call site, and the real registration re-checks
+    /// every condition, so a probe that passes cannot be invalidated by the server itself.
+    pub(crate) fn can_reserve_server_reply_link_split(
+        &self,
+        server_tid: u64,
+        server_asid: crate::kernel::vm::Asid,
+    ) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+                .is_some_and(|t| {
+                    t.server_reply_link.is_none()
+                        && matches!(
+                            t.status,
+                            crate::kernel::task::TaskStatus::Runnable
+                                | crate::kernel::task::TaskStatus::Running
+                                | crate::kernel::task::TaskStatus::Blocked(_)
+                        )
+                })
         })
     }
 
@@ -3009,7 +3056,7 @@ impl SharedKernel {
     /// non-`Reserved` state (never for our exact owned reservation).
     pub(crate) fn consume_reply_record_split(&self, index: usize, generation: u64) -> bool {
         use crate::kernel::boot::ReplyRecordReservation;
-        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+        let consumed = self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
             Some(Some(record))
                 if ipc.reply_cap_generations[index] == generation
                     && record.reservation == ReplyRecordReservation::Reserved =>
@@ -3018,7 +3065,39 @@ impl SharedKernel {
                 true
             }
             _ => false,
-        })
+        });
+        // Stage 200D-1: consumption is the REPLY terminal becoming irrevocable, so the
+        // reverse link closes on the same edge. Note the contrast with
+        // `release_reply_record_split` below: a RETRYABLE copy-fault rollback returns the
+        // record to `Available` for the same exact server, so it deliberately does NOT
+        // detach — the server still owes that reply.
+        if consumed {
+            let _ = self.finalize_server_reply_link_for_record_split(index, generation);
+        }
+        consumed
+    }
+
+    /// Stage 200D-1 — close the reverse link for a record finalized on a narrow path.
+    /// Reads the bound replier under the rank-3 ipc claim, then writes the TCB under the
+    /// rank-2 task claim; the claims never nest. Exact on both identities.
+    pub(crate) fn finalize_server_reply_link_for_record_split(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> bool {
+        let bound = self.with_ipc_split_mut(|ipc| {
+            if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
+                return None;
+            }
+            ipc.reply_caps
+                .get(index)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.responder_tid.zip(r.replier_asid))
+        });
+        let Some((tid, asid)) = bound else {
+            return false;
+        };
+        self.unregister_server_reply_link_split(tid.0, asid, index, generation)
     }
 
     /// rank 3 — `Reserved → Available`: caller-destination-copy-fault rollback for an

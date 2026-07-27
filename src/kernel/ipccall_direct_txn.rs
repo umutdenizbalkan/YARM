@@ -222,6 +222,21 @@ impl SharedKernel {
             return Err(IpcCallDirectError::WouldBlock);
         }
 
+        // (4b) Stage 200D-1: RESERVE reverse-link capacity BEFORE anything becomes
+        // externally visible. The record slot below is `Reserved` (not invokable), but
+        // failing the link registration only at step (11b) would mean the record had
+        // already been published `Available` in the failing window. Probing here keeps the
+        // externally atomic order: both resources are known-available before either is
+        // published, so every failure from this point leaves zero live records, zero live
+        // links, no visible request and no enqueued server.
+        //
+        // The probe also rejects a server incarnation that has already committed to exit,
+        // so an exiting server can never have a request exposed to it.
+        if !self.can_reserve_server_reply_link_split(ack.server.tid.0, ack.server.asid) {
+            self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
+            return Err(IpcCallDirectError::RecordFull);
+        }
+
         // (5) reserve one ReplyCapRecord slot (Reserved → NOT externally invokable).
         let (idx, rgen) = match self.reserve_direct_reply_record_split(
             snapshot.caller,

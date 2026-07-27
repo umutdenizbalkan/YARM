@@ -20,7 +20,9 @@ mod ipc_state;
 // Stage 200C2B: the reply-timeout completion transaction abstraction + single generic
 // body are re-exported so the OFF-LOCK drain in `crate::runtime` can run the SAME body
 // through the `SharedKernel` split-mut seams (no duplicated transaction).
-pub(crate) use ipc_state::{ReplyTimeoutDomains, complete_reply_timeout_over};
+pub(crate) use ipc_state::{
+    DetachOutcome, ReplyTimeoutDomains, complete_reply_timeout_over, complete_server_death_over,
+};
 mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;

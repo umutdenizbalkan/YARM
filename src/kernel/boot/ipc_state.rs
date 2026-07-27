@@ -198,11 +198,53 @@ fn rt_claim_endpoint_waiter_exact<D: ReplyTimeoutDomains>(
 
 /// Invalidate a reply record because Timeout won the terminal cell: `Available` /
 /// `Reserved` → `Cancelled` (non-invokable), so a late `ipc_reply` alias fails closed.
+/// Stage 200D-1 — detach the reverse link for a record that is being finalized, through
+/// the narrow per-domain seams (rank-3 ipc read for the bound replier, then rank-2 task
+/// write). Exact on both identities, so a stale or different link is never touched.
+///
+/// This is the narrow-transaction counterpart of
+/// `KernelState::finalize_server_reply_link_for_record`; both close the SAME single
+/// lifecycle edge, so no terminal path can complete a record and leave its link live.
+fn rt_detach_server_link<D: ReplyTimeoutDomains>(d: &mut D, index: usize, generation: u64) -> bool {
+    let bound = d.rtd_ipc(|ipc| {
+        if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
+            return None;
+        }
+        ipc.reply_caps
+            .get(index)
+            .and_then(|s| s.as_ref())
+            .and_then(|r| r.responder_tid.zip(r.replier_asid))
+    });
+    let Some((tid, asid)) = bound else {
+        return false;
+    };
+    d.rtd_tcbs(|tcbs| {
+        let Some(tcb) = tcbs
+            .iter_mut()
+            .flatten()
+            .find(|t| t.tid.0 == tid.0 && t.asid == Some(asid))
+        else {
+            return false;
+        };
+        match tcb.server_reply_link {
+            Some(link) if link.matches_record(index, generation) => {
+                tcb.server_reply_link = None;
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
 fn rt_invalidate_reply_record<D: ReplyTimeoutDomains>(
     d: &mut D,
     index: usize,
     generation: u64,
 ) -> bool {
+    // Stage 200D-1: close the reverse link on the SAME edge that retires the record's
+    // reply authority. Done FIRST, while the record is still readable — the bound replier
+    // identity is read off the record itself.
+    let _ = rt_detach_server_link(d, index, generation);
     d.rtd_ipc(|ipc| match ipc.reply_caps.get_mut(index) {
         Some(Some(record))
             if ipc.reply_cap_generations[index] == generation
@@ -603,6 +645,34 @@ impl IpcSubsystem {
     }
 }
 
+/// Stage 200D-1 — the outcome of an exact reverse-link detach. Production callers
+/// collapse every non-`Detached` value to "nothing to do"; the distinction exists so the
+/// hosted lifecycle tests can tell "the link was never there" apart from "a DIFFERENT link
+/// is live", which are very different bugs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachOutcome {
+    /// The exact link was present and has been removed. This is the only mutating result.
+    Detached,
+    /// No link is registered on that server incarnation — the idempotent repeat case.
+    AlreadyAbsent,
+    /// The server `{tid, asid}` does not resolve to a live task incarnation.
+    StaleServerIdentity,
+    /// A link is present for this record SLOT, but at a different record generation:
+    /// the slot was reclaimed and reused since registration.
+    StaleRecordGeneration,
+    /// A link is present and live, but for a DIFFERENT record. Never removed — removing
+    /// it would silently strip a valid outstanding authority.
+    DifferentLiveLink,
+}
+
+impl DetachOutcome {
+    /// `true` only when this call actually removed the link.
+    #[must_use]
+    pub(crate) fn detached(self) -> bool {
+        matches!(self, Self::Detached)
+    }
+}
+
 impl KernelState {
     fn wake_tid_to_runnable(&mut self, tid: ThreadId) -> Result<(), KernelError> {
         let old_status = self.task_status(tid.0).ok_or(KernelError::TaskMissing)?;
@@ -761,18 +831,35 @@ impl KernelState {
         &mut self,
         caller: ReceiverWaiterIdentity,
     ) -> usize {
-        self.with_ipc_state_mut(|ipc| {
+        // Stage 200D-1: caller exit is a terminal outcome for every record the caller
+        // owns, so each retired record's reverse link closes on the same edge. The bound
+        // replier identities are SNAPSHOT under the ipc claim (bounded, allocation-free)
+        // and the TCB writes happen after it is released — the two ranks never nest.
+        let mut closing: [Option<(u64, Asid, usize, u64)>; super::MAX_REPLY_CAPS] =
+            [None; super::MAX_REPLY_CAPS];
+        let revoked = self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
-            for slot in ipc.reply_caps.iter_mut() {
+            for (idx, slot) in ipc.reply_caps.iter_mut().enumerate() {
                 if slot.is_some_and(|record| {
                     record.caller_tid == caller.tid && record.caller_asid == caller.asid
                 }) {
+                    if let Some((stid, sasid)) = slot
+                        .as_ref()
+                        .and_then(|r| r.responder_tid.zip(r.replier_asid))
+                    {
+                        closing[idx] = Some((stid.0, sasid, idx, ipc.reply_cap_generations[idx]));
+                    }
                     *slot = None;
                     revoked += 1;
                 }
             }
             revoked
-        })
+        });
+        for entry in closing.iter().flatten() {
+            let (stid, sasid, idx, gen_) = *entry;
+            let _ = self.detach_server_reply_link_exact(stid, sasid, idx, gen_);
+        }
+        revoked
     }
 
     /// Numeric-TID convenience wrapper (tests / non-authoritative callers). Resolves
@@ -837,7 +924,12 @@ impl KernelState {
         replier: ReceiverWaiterIdentity,
         except: Option<crate::kernel::task::ServerReplyLink>,
     ) -> usize {
-        self.with_ipc_state_mut(|ipc| {
+        // Stage 200D-1: same lifecycle edge as the caller sweep — each record this
+        // removes is terminal, so its reverse link closes with it. Snapshot under the ipc
+        // claim, detach after it is released.
+        let mut closing: [Option<(u64, Asid, usize, u64)>; super::MAX_REPLY_CAPS] =
+            [None; super::MAX_REPLY_CAPS];
+        let revoked = self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
             for (idx, slot) in ipc.reply_caps.iter_mut().enumerate() {
                 if except
@@ -851,12 +943,23 @@ impl KernelState {
                             .replier_asid
                             .is_none_or(|stored| stored == replier.asid)
                 }) {
+                    if let Some((stid, sasid)) = slot
+                        .as_ref()
+                        .and_then(|r| r.responder_tid.zip(r.replier_asid))
+                    {
+                        closing[idx] = Some((stid.0, sasid, idx, ipc.reply_cap_generations[idx]));
+                    }
                     *slot = None;
                     revoked += 1;
                 }
             }
             revoked
-        })
+        });
+        for entry in closing.iter().flatten() {
+            let (stid, sasid, idx, gen_) = *entry;
+            let _ = self.detach_server_reply_link_exact(stid, sasid, idx, gen_);
+        }
+        revoked
     }
 
     /// Stage 200D — complete the blocked caller of `link` with the canonical server-death
@@ -884,11 +987,20 @@ impl KernelState {
         }) else {
             return ReplyTimeoutOutcome::StaleToken;
         };
-        let brg = self
-            .blocked_recv_generation_for(caller_tid, caller_asid)
-            .unwrap_or(0);
-        let Some(identity) = self.reply_terminal_identity(idx, gen_, brg, None) else {
-            return ReplyTimeoutOutcome::StaleToken;
+        // Claim against the identity the cell was ARMED with (see
+        // `reply_terminal_armed_identity`). Falling back to a reconstruction only covers
+        // the un-armed case, where no other claimant can exist either.
+        let identity = match self.reply_terminal_armed_identity(idx) {
+            Some(id) if id.reply_record_index == idx && id.reply_record_generation == gen_ => id,
+            _ => {
+                let brg = self
+                    .blocked_recv_generation_for(caller_tid, caller_asid)
+                    .unwrap_or(0);
+                match self.reply_terminal_identity(idx, gen_, brg, None) {
+                    Some(id) => id,
+                    None => return ReplyTimeoutOutcome::StaleToken,
+                }
+            }
         };
         crate::yarm_log!(
             "IPC_SERVER_DEATH_CLAIM server_tid={} server_asid={} record_index={} record_generation={} caller_tid={} caller_asid={} result=ok",
@@ -1014,6 +1126,17 @@ impl KernelState {
             else {
                 return false;
             };
+            // Stage 200D-1: an incarnation that has already committed to exit must never be
+            // published as an authorized replier. Teardown snapshots the link AFTER the
+            // status flips, so a link installed now would never be looked at and the caller
+            // would block forever with no death claim. Refusing forces the NR6 publication
+            // to roll back, which is the only other permitted outcome of that race.
+            if !matches!(
+                tcb.status,
+                TaskStatus::Runnable | TaskStatus::Running | TaskStatus::Blocked(_)
+            ) {
+                return false;
+            }
             match tcb.server_reply_link {
                 Some(existing) if existing == link => true,
                 Some(_) => false,
@@ -1025,9 +1148,51 @@ impl KernelState {
         })
     }
 
-    /// Remove the reverse link, but ONLY when it still describes this exact record
-    /// incarnation. Idempotent: a stale unregister (wrong generation, wrong slot, wrong
-    /// server incarnation, or already removed) mutates NOTHING and returns `false`.
+    /// Stage 200D-1 — THE single reverse-link finalization seam.
+    ///
+    /// Every terminal outcome (reply, timeout, server death, caller exit, endpoint
+    /// destruction, explicit record cancellation, NR6 publication rollback, and a
+    /// permanently-cancelling reply-copy rollback) funnels through here, so the link's
+    /// lifecycle has exactly one closing edge rather than scattered TCB field writes.
+    ///
+    /// The detach is EXACT on both identities. A link is removed only when it still
+    /// names this server incarnation AND this record incarnation; anything else is
+    /// reported and left untouched. That is what makes the call safe to make
+    /// unconditionally from every terminal path, including the ones that lose a race.
+    pub(crate) fn detach_server_reply_link_exact(
+        &mut self,
+        server_tid: u64,
+        server_asid: Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> DetachOutcome {
+        self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+            else {
+                return DetachOutcome::StaleServerIdentity;
+            };
+            match tcb.server_reply_link {
+                None => DetachOutcome::AlreadyAbsent,
+                Some(link) if link.matches_record(record_index, record_generation) => {
+                    tcb.server_reply_link = None;
+                    DetachOutcome::Detached
+                }
+                // Same slot, different generation: the slot was reclaimed and reused, so
+                // this unlink belongs to a previous occupant and must mutate nothing.
+                Some(link) if link.reply_record_index == record_index => {
+                    DetachOutcome::StaleRecordGeneration
+                }
+                // A different outstanding record is live on this server. Removing it
+                // would silently strip a valid authority, so it is refused.
+                Some(_) => DetachOutcome::DifferentLiveLink,
+            }
+        })
+    }
+
+    /// Backwards-compatible boolean wrapper: `true` iff the exact link was removed.
     pub(crate) fn unregister_server_reply_link(
         &mut self,
         server_tid: u64,
@@ -1035,25 +1200,42 @@ impl KernelState {
         record_index: usize,
         record_generation: u64,
     ) -> bool {
-        self.with_tcbs_mut(|tcbs| {
-            let Some(tcb) = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
-            else {
-                return false;
-            };
-            match tcb.server_reply_link {
-                Some(link)
-                    if link.matches_server(server_tid, server_asid)
-                        && link.matches_record(record_index, record_generation) =>
-                {
-                    tcb.server_reply_link = None;
-                    true
-                }
-                _ => false,
+        self.detach_server_reply_link_exact(
+            server_tid,
+            server_asid,
+            record_index,
+            record_generation,
+        )
+        .detached()
+    }
+
+    /// Stage 200D-1 — finalize the reverse link for a record whose terminal outcome just
+    /// became irrevocable, WITHOUT the caller having to know the server identity.
+    ///
+    /// The bound replier `{tid, asid}` is read from the record itself (the same identity
+    /// registration used), so a terminal path only needs the record it just completed.
+    /// Returns the detach outcome; `StaleServerIdentity` when the record is gone or was
+    /// never bound to a replier, which is the normal, harmless repeat case.
+    pub(crate) fn finalize_server_reply_link_for_record(
+        &mut self,
+        record_index: usize,
+        record_generation: u64,
+    ) -> DetachOutcome {
+        let bound = self.with_ipc_state(|ipc| {
+            if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+                return None;
             }
-        })
+            ipc.reply_caps
+                .get(record_index)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.responder_tid.zip(r.replier_asid))
+        });
+        match bound {
+            Some((tid, asid)) => {
+                self.detach_server_reply_link_exact(tid.0, asid, record_index, record_generation)
+            }
+            None => DetachOutcome::StaleServerIdentity,
+        }
     }
 
     /// Read the link registered on the exact server incarnation (no mutation).
@@ -1101,6 +1283,10 @@ impl KernelState {
     /// slot to `Vacant`, so the reserved authority is reclaimed atomically and a
     /// partially-built record can never be resolved. Returns `false` on mismatch.
     pub(crate) fn cancel_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+        // Stage 200D-1: cancellation is a terminal outcome for the record, so it closes the
+        // reverse link on the same edge. Done FIRST, while the record still resolves its
+        // bound replier. Exact on both identities, so a reused slot is untouched.
+        let _ = self.finalize_server_reply_link_for_record(index, generation);
         self.with_ipc_state_mut(|ipc| {
             let matches = matches!(
                 ipc.reply_caps.get(index),
@@ -1157,6 +1343,25 @@ impl KernelState {
     /// slot, tying it to the record's caller/replier incarnations, reply endpoint,
     /// and the given blocked-recv / deadline-token generations. `None` when the
     /// slot is vacant or generation-mismatched.
+    /// Stage 200D-1 — the identity the terminal cell for `index` was ARMED with.
+    ///
+    /// Server death must claim against exactly that identity, not a reconstructed one: the
+    /// armed identity carries the blocked-receive generation and deadline-token generation
+    /// captured when the caller blocked, and reconstructing them at teardown time would
+    /// produce a different key and fail the compare-exchange for the wrong reason. The
+    /// death transaction still revalidates caller / endpoint / blocked-receive generation
+    /// against LIVE state afterwards, so using the armed identity widens nothing.
+    pub(crate) fn reply_terminal_armed_identity(
+        &self,
+        index: usize,
+    ) -> Option<crate::kernel::terminal_ownership::TerminalIdentity> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_terminal_ownership
+                .get(index)
+                .map(|cell| *cell.identity())
+        })
+    }
+
     pub(crate) fn reply_terminal_identity(
         &self,
         index: usize,
@@ -1688,6 +1893,33 @@ impl KernelState {
 
     /// `true` iff a pending blocked-syscall completion is parked for `tid` (assertions).
     #[cfg(test)]
+    /// Stage 200D-1 — the parked completion's canonical result code for `tid`, if any.
+    /// Read-only; used by the hosted lifecycle proofs to assert exactly-once publication.
+    pub(crate) fn pending_syscall_completion_result(&self, tid: u64) -> Option<u64> {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.pending_syscall_completion.map(|c| c.result))
+        })
+    }
+
+    /// Stage 200D-1 — the live generation of reply-record slot `index`.
+    pub(crate) fn reply_record_slot_generation(&self, index: usize) -> Option<u64> {
+        self.with_ipc_state(|ipc| ipc.reply_cap_generations.get(index).copied())
+    }
+
+    /// Stage 200D-1 — hosted-only: drive a task's status directly, so the
+    /// registration-versus-exit race can be stepped deterministically instead of raced.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn set_task_status_for_test(&mut self, tid: u64, status: TaskStatus) {
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                tcb.status = status;
+            }
+        });
+    }
+
     pub(crate) fn has_pending_syscall_completion(&self, tid: u64) -> bool {
         self.with_tcbs(|tcbs| {
             tcbs.iter()
@@ -4296,6 +4528,12 @@ impl KernelState {
             );
             return Err(KernelError::MissingRight);
         }
+        // Stage 200D-1: the REPLY terminal outcome becomes irrevocable here (the record is
+        // consumed). Close the reverse link on the same edge, using the bound replier
+        // identity read off the record itself — exact on both identities, so a reused slot
+        // or a replaced server incarnation is never touched.
+        let record_generation = self.with_ipc_state(|ipc| ipc.reply_cap_generations[slot]);
+        let _ = self.finalize_server_reply_link_for_record(slot, record_generation);
         let record = self.with_ipc_state_mut(|ipc| {
             let rec = ipc.reply_caps[slot].ok_or(KernelError::StaleCapability)?;
             ipc.reply_caps[slot] = None;
