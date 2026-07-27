@@ -91220,6 +91220,39 @@ mod stage200d0b1_x86_exit_prep {
         );
     }
 
+    /// Stage 200D-0B2: the boot knob must actually PROVISION the selector into init's
+    /// slot 5. Declaring the constant and parsing the knob is not enough — Stage 200D-0B1
+    /// did both and still produced a boot with zero exit markers, because nothing ever
+    /// wrote `init_args[5]`. This guard closes that gap.
+    #[test]
+    fn p27_selector_is_actually_provisioned() {
+        const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+        assert!(
+            X86_BOOT_SRC.contains(
+                "init_args[5] = crate::kernel::boot::X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR;"
+            ),
+            "the exit-oracle selector must be written into init's startup slot 5"
+        );
+        // Gated on the knob AND on slot 5 still being free, so it stays mutually exclusive
+        // with every other slot-5 oracle.
+        assert!(X86_BOOT_SRC.contains("x86_exit_oracle_enabled() && init_args[5] == 0"));
+        // Feature-gated, so a feature-off image provisions nothing.
+        let at = X86_BOOT_SRC
+            .find("init_args[5] = crate::kernel::boot::X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR;")
+            .expect("provisioning site");
+        let head = &X86_BOOT_SRC[..at];
+        assert!(
+            head.rfind("#[cfg(feature = \"x86-exit-current-task-oracle\")]")
+                .is_some(),
+            "the provisioning must be feature-gated"
+        );
+        // Userspace decodes the SAME number.
+        assert!(INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(20)"));
+        // Assert the declared value from SOURCE rather than the constant itself: the
+        // constant is feature-gated, and this guard must hold in every configuration.
+        assert!(MOD_SRC.contains("pub const X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR: u64 = 20;"));
+    }
+
     // ── runner static contract (23–26) ──────────────────────────────────────────────
     #[test]
     fn p23_p24_p25_p26_runner_contract() {

@@ -1052,6 +1052,22 @@ pub fn bootstrap_first_user_task(
             );
         }
     }
+    // Stage 200D-0B2: provision the x86_64 ExitCurrentTask oracle's slot-5 selector (20).
+    //
+    // Stage 200D-0B1 declared the selector constant and the boot knob but never wired this
+    // step, so the knob armed and init's slot 5 stayed 0 — the disposable task was never
+    // reached and the first live run produced zero exit markers. Feature-gated, and taken
+    // only when slot 5 is still free, so it stays mutually exclusive with every other
+    // slot-5 oracle. This oracle needs no provisioned caps: the disposable task performs
+    // no IPC, it only calls NR 16.
+    #[cfg(feature = "x86-exit-current-task-oracle")]
+    if crate::kernel::boot::x86_exit_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR;
+        crate::yarm_log!(
+            "EXIT_TASK_ORACLE_SLOTS slot5={} caps=none result=ok",
+            init_args[5]
+        );
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,
