@@ -158,14 +158,14 @@ if (( ! fail )); then
     "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64 terminal=Timeout result=ok" \
     "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=riscv64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok" \
     "IPC_REPLY_TIMEOUT_DEFERRED arch=riscv64 published=1 drained=1 result=ok" \
-    "RISCV_BLOCKED_SYSCALL_COMPLETION_CONSUMED" \
+    "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED" \
     "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReplyTimeout result=ok" \
     "RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok"
   # ORDERED sequence: the class-retirement marker is authorized ONLY after the resumed caller
   # consumed its exact completion (which is what encodes the canonical TimedOut). A
   # committed-but-undelivered completion must never claim the class retired.
   ci=$(rg -a -n -F "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64" "$TW" | head -1 | cut -d: -f1)
-  cn=$(rg -a -n -F "RISCV_BLOCKED_SYSCALL_COMPLETION_CONSUMED" "$TW" | head -1 | cut -d: -f1)
+  cn=$(rg -a -n -F "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED" "$TW" | head -1 | cut -d: -f1)
   rt=$(rg -a -n -F "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcReplyTimeout" "$TW" | head -1 | cut -d: -f1)
   ud=$(rg -a -n -F "RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut" "$TW" | head -1 | cut -d: -f1)
   if [[ -n "$ci" && -n "$cn" && -n "$rt" && -n "$ud" ]]; then
@@ -177,7 +177,7 @@ if (( ! fail )); then
   fi
   # Exactly one completion consumption ⇒ one timeout encoding, one ELR-advance boundary,
   # no duplicate wake and no re-blocked waiter after the wake.
-  [[ "$(rg -a -c -F "RISCV_BLOCKED_SYSCALL_COMPLETION_CONSUMED" "$TW" 2>/dev/null || echo 0)" == "1" ]] \
+  [[ "$(rg -a -c -F "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED" "$TW" 2>/dev/null || echo 0)" == "1" ]] \
     || die "completion consumed more than once (duplicate timeout encoding)"
   forbid_log "$TW" \
     "IPC_REPLY_BEATS_TIMEOUT_OK" \

@@ -3756,7 +3756,18 @@ static REPLY_TIMEOUT_LOCK_STATUS_EMITTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_lock_status_once() -> bool {
-    !REPLY_TIMEOUT_LOCK_STATUS_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
+    // Stage 200C2C2B: an explicit compare-exchange is the single authority for this attestation.
+    // Exactly one caller can observe the false -> true transition, so the marker is emitted once
+    // per boot even if several trap paths race the drain. The latch is a `static` with no reset
+    // path anywhere (asserted by a guard), so it cannot be re-armed mid-boot.
+    REPLY_TIMEOUT_LOCK_STATUS_EMITTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
 }
 
 /// Stage 200C2C1B — the class RETIREMENT marker is authorized only AFTER a resumed caller has

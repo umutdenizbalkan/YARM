@@ -85700,9 +85700,13 @@ mod stage200c2b_guards {
     // umbrella feature, so BOTH arches reach them after the broad guard drops (reachability, no DCE).
     #[test]
     fn a2_shared_postlock_reachability() {
+        // Stage 200C2C2B: the shared entry drives x86_64 + AArch64; RISC-V is excluded because it
+        // wires the identical collector/drain into its OWN trap wrapper (single-driver invariant
+        // for the one-shot lock-status attestation).
         assert!(
-            TRAP_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
-            "the collector/drain call is gated on the shared umbrella (both arches reach it)"
+            TRAP_SRC.contains("feature = \"ipc-reply-timeout-oracle-core\"")
+                && TRAP_SRC.contains("not(target_arch = \"riscv64\")"),
+            "the collector/drain call is gated on the umbrella, excluding RISC-V"
         );
         // The call sits in the shared entry AFTER `with_cpu` returns (broad lock dropped).
         let idx_call = TRAP_SRC
@@ -87158,7 +87162,7 @@ mod stage200c2c2_riscv_port {
             "encode the canonical result BEFORE claiming retirement"
         );
         // The runner additionally enforces the ordered live sequence.
-        assert!(RISCV_SMOKE_SRC.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_CONSUMED"));
+        assert!(RISCV_SMOKE_SRC.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED"));
         assert!(RISCV_SMOKE_SRC.contains("must follow the completion consumption"));
     }
 
@@ -87244,5 +87248,159 @@ mod stage200c2c2_riscv_port {
             Some(ReplyRecordReservation::Cancelled)
         );
         teardown();
+    }
+}
+
+/// Stage 200C2C2B — RISC-V FINAL-FRAME completion delivery + one-shot lock-status authority.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage200c2c2b_riscv_final_frame {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const RISCV_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh");
+
+    /// The single restore function both return routes funnel through.
+    fn restore_body() -> &'static str {
+        let b = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .expect("restore body");
+        b.split("\npub fn ").next().unwrap()
+    }
+
+    // (1)+(2) the completion is applied to the ACTUAL outgoing frame, AFTER the generic
+    // context restoration that would otherwise overwrite it.
+    #[test]
+    fn f01_applied_to_final_frame_after_restore() {
+        let b = restore_body();
+        let restore = b
+            .find("resume_current_thread_with_frame")
+            .expect("generic restore");
+        let consume = b.find("take_blocked_syscall_completion").expect("consume");
+        let encode = b
+            .find("frame.set_user_gpr(10, done.result as usize)")
+            .expect("encode");
+        assert!(restore < consume, "generic restoration precedes delivery");
+        assert!(consume < encode, "identity validated before encoding");
+    }
+
+    // (3) the same-task result export cannot overwrite the completion: the export re-derives a0
+    // from the frame ERROR lane, which the delivery sets.
+    #[test]
+    fn f03_same_task_export_cannot_overwrite() {
+        assert!(RISCV_TRAP_SRC.contains("f.set_user_gpr(10, err);"));
+        assert!(restore_body().contains("frame.set_err(done.result as usize);"));
+    }
+
+    // (4) post-switch synchronization cannot overwrite it — that route calls the SAME restore.
+    #[test]
+    fn f04_post_switch_uses_same_helper() {
+        let ps = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state_post_switch")
+            .nth(1)
+            .expect("post-switch");
+        assert!(ps.contains("restore_arch_thread_state(kernel, cpu, frame)"));
+    }
+
+    // (5)+(6) the established RISC-V error encoding is reused; the userspace-visible code is
+    // exactly TimedOut (9).
+    #[test]
+    fn f05_reuses_riscv_error_abi() {
+        let b = restore_body();
+        assert!(b.contains("frame.set_err(done.result as usize);"));
+        assert!(b.contains("frame.set_user_gpr(10, done.result as usize);"));
+        assert!(b.contains("frame.set_user_gpr(11, 0);"));
+        assert_eq!(crate::kernel::syscall::SyscallError::TimedOut as u64, 9);
+    }
+
+    // (13)+(14) delivery changes NO architectural state: no sepc/sstatus/satp/sp/tp writes.
+    #[test]
+    fn f13_no_arch_state_mutation() {
+        let b = restore_body();
+        let blk = b.split("take_blocked_syscall_completion").nth(1).unwrap();
+        let blk = blk.split("let idx = cpu.0").next().unwrap();
+        for forbidden in [
+            "set_saved_pc",
+            "saved_sp",
+            "sstatus",
+            "satp",
+            "set_user_gpr(2,",
+            "set_user_gpr(4,",
+            "+ 4",
+        ] {
+            assert!(
+                !blk.contains(forbidden),
+                "delivery must not touch {forbidden}"
+            );
+        }
+    }
+
+    // (16) the retirement marker follows final-frame encoding.
+    #[test]
+    fn f16_retirement_follows_final_encoding() {
+        let b = restore_body();
+        let encode = b
+            .find("frame.set_user_gpr(10, done.result as usize)")
+            .unwrap();
+        let emit = b.find("maybe_emit_reply_timeout_class_retired").unwrap();
+        assert!(encode < emit);
+    }
+
+    // (17) the transaction-commit marker alone cannot satisfy the smoke.
+    #[test]
+    fn f17_commit_marker_alone_insufficient() {
+        assert!(RISCV_SMOKE_SRC.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64"));
+        assert!(RISCV_SMOKE_SRC.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED"));
+        assert!(RISCV_SMOKE_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64"));
+        assert!(RISCV_SMOKE_SRC.contains("RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut"));
+    }
+
+    // (18) the lock-status marker has ONE authoritative emit site.
+    #[test]
+    fn f18_lock_status_single_emit_site() {
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("IPC_REPLY_TIMEOUT_LOCK_STATUS arch={}")
+                .count(),
+            1,
+            "exactly one lock-status emit site"
+        );
+        assert_eq!(MOD_SRC.matches("IPC_REPLY_TIMEOUT_LOCK_STATUS").count(), 0);
+        // RISC-V drives the drain from its OWN wrapper only — the shared entry excludes it, so the
+        // one-shot attestation can never be driven by two wrappers.
+        assert!(TRAP_ENTRY_SRC.contains("not(target_arch = \"riscv64\")"));
+        assert!(RISCV_TRAP_SRC.contains("shared.drain_reply_timeout_post_work(cpu, now)"));
+    }
+
+    // (19) the latch is a compare-exchange authority with NO reset path anywhere.
+    #[test]
+    fn f19_latch_cannot_reset() {
+        let f = MOD_SRC
+            .split("fn reply_timeout_lock_status_once")
+            .nth(1)
+            .expect("latch fn");
+        let f = f.split("\n#[cfg").next().unwrap();
+        assert!(f.contains("compare_exchange"), "compare-exchange authority");
+        // The only writes to the latch are that compare_exchange — no `store(false)` reset.
+        assert_eq!(
+            MOD_SRC.matches("REPLY_TIMEOUT_LOCK_STATUS_EMITTED").count(),
+            2,
+            "one definition + one compare_exchange use; no reset path"
+        );
+        assert!(!MOD_SRC.contains("REPLY_TIMEOUT_LOCK_STATUS_EMITTED.store(false"));
+    }
+
+    // (20) both return routes use ONE final delivery helper (no duplicated implementation).
+    #[test]
+    fn f20_single_delivery_implementation() {
+        assert_eq!(
+            RISCV_TRAP_SRC
+                .matches("take_blocked_syscall_completion")
+                .count(),
+            1,
+            "exactly one delivery site, shared by both return routes"
+        );
     }
 }

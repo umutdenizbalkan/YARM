@@ -109,13 +109,17 @@ fn restore_arch_thread_state(
             frame.set_err(done.result as usize);
             frame.set_user_gpr(10, done.result as usize);
             frame.set_user_gpr(11, 0);
+            // Delivery-authoritative: emitted only AFTER the canonical result is encoded into the
+            // outgoing frame's established error lanes, and reporting those FINAL lane values.
             crate::yarm_log!(
-                "RISCV_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid={} class={:?} result=TimedOut code={} blocked_generation={} sepc=0x{:016x} result=ok",
+                "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid={} class={:?} result=TimedOut code={} blocked_generation={} sepc=0x{:016x} final_a0={} final_a1={} result=ok",
                 current_tid,
                 done.syscall_class,
                 done.result,
                 done.blocked_generation,
-                frame.saved_pc() as u64
+                frame.saved_pc() as u64,
+                frame.user_gpr(10),
+                frame.user_gpr(11)
             );
             // Retirement is authorized ONLY here — after the exact completion was consumed and
             // the canonical result encoded into a valid `sret` frame.

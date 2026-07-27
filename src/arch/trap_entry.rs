@@ -1087,7 +1087,14 @@ pub fn handle_trap_entry_shared(
     // returns). Ordinary receive-timeout deadlines stay on the in-lock scan (they are
     // skipped by the collector's token-bearing filter). Default-off: a strict no-op
     // unless a per-arch oracle feature is built AND its selector is active.
-    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    // NB: RISC-V does NOT flow through this shared entry — it wires the identical collector/drain
+    // into its own trap wrapper's Phase 3. The explicit `not(riscv64)` gate keeps that a
+    // single-driver invariant even if a future path routes RISC-V here, so the one-shot
+    // attestation can never be driven from two wrappers.
+    #[cfg(all(
+        feature = "ipc-reply-timeout-oracle-core",
+        not(target_arch = "riscv64")
+    ))]
     if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
         let now = shared.reply_timeout_now_split_read();
         shared.collect_due_reply_timeout_work(now, cpu);
