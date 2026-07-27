@@ -2139,22 +2139,36 @@ mod x86_exit_current_task_oracle {
     pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
     pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
 
-    /// The disposable task body. It emits one entry marker, calls NR 16, and must never
-    /// execute another instruction. `EXIT_TASK_SYSCALL_RETURNED` is a HARD-FAIL marker: it
-    /// can only appear if an accepted exit returned to userspace, which the runner treats
-    /// as an immediate failure. A preflight refusal would also land here — this task owns
-    /// no reply record, so that path is unreachable for it and either outcome is a defect.
-    pub(super) extern "C" fn body() -> ! {
-        yarm_user_rt::user_log!("EXIT_TASK_USER_ENTERED role=disposable arch=x86_64");
-        // SAFETY: terminates this thread; nothing after it may run.
-        let outcome = unsafe { yarm_user_rt::syscall::exit_current_task() };
-        yarm_user_rt::user_log!(
-            "EXIT_TASK_SYSCALL_RETURNED err={:?} result=fail",
-            outcome.err()
-        );
-        loop {
-            let _ = yarm_user_rt::syscall::yield_now();
-        }
+    /// x86_64 requires a NAKED trampoline for a spawned thread: the initial stack pointer
+    /// is not call-aligned, so a plain `extern "C"` entry faults before its first line runs.
+    /// This is the same shape every other x86_64 oracle child uses. The first attempt used
+    /// a plain entry and the child spawned but never logged — that is the hazard.
+    #[unsafe(naked)]
+    pub(super) extern "C" fn child_entry() -> ! {
+        core::arch::naked_asm!("call {body}", "ud2", body = sym super::x86_exit_task_child_body)
+    }
+}
+
+/// The disposable task body. It emits one entry marker, calls NR 16, and must never execute
+/// another instruction. `EXIT_TASK_SYSCALL_RETURNED` is a HARD-FAIL marker: it can only
+/// appear if an accepted exit returned to userspace, which the runner treats as an immediate
+/// failure. A preflight refusal would also land here — this task owns no reply record, so
+/// that path is unreachable for it and either outcome is a defect.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "x86_64",
+    feature = "x86-exit-current-task-oracle"
+))]
+extern "C" fn x86_exit_task_child_body() -> ! {
+    yarm_user_rt::user_log!("EXIT_TASK_USER_ENTERED role=disposable arch=x86_64");
+    // SAFETY: terminates this thread; nothing after it may run.
+    let outcome = unsafe { yarm_user_rt::syscall::exit_current_task() };
+    yarm_user_rt::user_log!(
+        "EXIT_TASK_SYSCALL_RETURNED err={:?} result=fail",
+        outcome.err()
+    );
+    loop {
+        let _ = yarm_user_rt::syscall::yield_now();
     }
 }
 
@@ -2171,7 +2185,7 @@ fn run_x86_exit_current_task_oracle(_init_tid: u64) {
         let base = core::ptr::addr_of_mut!(oracle::CHILD_STACK) as usize;
         (base + 16384) & !0xF
     };
-    let entry = oracle::body as *const () as usize;
+    let entry = oracle::child_entry as *const () as usize;
     let tls_base = core::ptr::addr_of_mut!(oracle::CHILD_TLS) as usize;
     // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the statics outlive the thread.
     match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) } {

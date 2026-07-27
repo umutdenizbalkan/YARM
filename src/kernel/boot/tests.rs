@@ -91175,6 +91175,11 @@ mod stage200d0b1_x86_exit_prep {
             call < fail,
             "the hard-fail marker must sit AFTER the call, so it can only print on a return"
         );
+        // Stage 200D-0B2: x86_64 spawned threads need a NAKED trampoline — the initial SP
+        // is not call-aligned, so a plain `extern "C"` entry faults before its first line.
+        // The first live attempt used one and the child spawned but never logged.
+        assert!(INIT_SRC.contains("pub(super) extern \"C\" fn child_entry() -> !"));
+        assert!(INIT_SRC.contains("let entry = oracle::child_entry as *const () as usize;"));
         // The disposable task is spawned, not init/PM/supervisor.
         assert!(INIT_SRC.contains("EXIT_TASK_ORACLE_SPAWNED disposable_tid="));
         assert!(INIT_SRC.contains("spawn_thread(tls_base, stack_top, entry)"));
