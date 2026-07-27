@@ -7,6 +7,11 @@ edition = "2024"
 autobins = false
 
 [features]
+# Stage 200D-0B2: accepted as an UNUSED pass-through. `build-qemu-x86_64-artifacts.sh`
+# applies one `BOOTSTRAP_FEATURE_ARGS` to every server package, so a feature that only
+# `yarm` and `yarm-control-plane-servers` implement must still resolve here. This crate
+# compiles no oracle code under it — the real gating stays where the oracle lives.
+x86-exit-current-task-oracle = []
 default = ["hosted-dev"]
 hosted-dev = []
 
