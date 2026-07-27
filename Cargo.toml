@@ -102,6 +102,15 @@ x86-ipc-reply-timeout-oracle = ["ipc-reply-timeout-oracle-core"]
 # contain none of the Stage 200C live/retirement marker literals.
 aarch64-ipc-reply-timeout-oracle = ["ipc-reply-timeout-oracle-core"]
 
+# Stage 200C2C2: default-off RISC-V LIVE reply-receive TIMEOUT retirement oracle — the third and
+# final arch cell. REUSES the arch-neutral core verbatim (collector, deferred work, completion
+# transaction, reversible reply lease, BlockedSyscallCompletion); only the selector, monotonic
+# clock source, trap wiring, saved-context consumer, userspace wrapper and live proof differ.
+# Activation requires `target_arch = riscv64`, this feature, and the selector
+# `yarm.riscv_ipc_reply_timeout_oracle=timeout-wins|reply-wins`. Feature-OFF RISC-V artifacts
+# contain none of the Stage 200C retirement marker literals.
+riscv64-ipc-reply-timeout-oracle = ["ipc-reply-timeout-oracle-core"]
+
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }
 yarm-kernel = { path = "crates/yarm-kernel" }

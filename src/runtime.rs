@@ -3339,11 +3339,11 @@ impl SharedKernel {
     /// armed in (`maybe_arm_reply_timeout_oracle`).
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn reply_timeout_now_split_read(&self) -> u64 {
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         {
             crate::kernel::boot::reply_timeout_hw_now()
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
         {
             self.scheduler_tick_now_split_read()
         }

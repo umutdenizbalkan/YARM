@@ -1398,25 +1398,25 @@ impl KernelState {
         // reply-wins via infinite recv-v2 (deadline `None`), so the kernel injects a fixed later
         // deadline. On AArch64 BOTH scenarios inject a hw-counter-relative deadline (the supplied
         // recv-timeout deadline is in the stuck scheduler-tick base and is not comparable).
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         let now = crate::kernel::boot::reply_timeout_hw_now();
         let deadline_tick = match mode {
             crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS => {
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
                 {
                     let _ = deadline;
                     now.wrapping_add(4)
                 }
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
                 match deadline {
                     Some(d) => d,
                     None => return,
                 }
             }
             crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS => {
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
                 let d = now.wrapping_add(20);
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
                 let d = self.scheduler_tick_now().wrapping_add(8);
                 // Record it so the scan can prove it later ran PAST this deadline
                 // harmlessly (the reply disarms the token before it is reached).

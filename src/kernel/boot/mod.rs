@@ -3520,6 +3520,13 @@ pub const X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 10;
 /// (timeout-wins) / `9` (reply-wins), mutually exclusive with every other AArch64 slot-5 oracle.
 pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 8;
 
+/// Stage 200C2C2 — slot-5 selector base for the RISC-V reply-timeout oracle. RISC-V slot-5 values
+/// 1..=8 are taken (FutexWake=1, FutexWait=2, FutexWait-idle=3, two-task Yield=4, lone Yield=5,
+/// queue-switch=6, shared-region direct=7, ipccall-direct=8), so this oracle uses the next free
+/// PAIR: `9` (timeout-wins) / `10` (reply-wins), mutually exclusive with every other RISC-V slot-5
+/// oracle.
+pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 9;
+
 /// Oracle mode discriminator (also written to init startup slot 15 for the userspace scenario):
 /// `1` = timeout-wins, `2` = reply-wins.
 pub const IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS: u8 = 1;
@@ -3537,6 +3544,26 @@ pub const IPC_REPLY_TIMEOUT_MODE_REPLY_WINS: u8 = 2;
 /// SAME units (`reply_timeout_hw_now() + delta`), so arm and scan share one clock.
 #[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
 pub(crate) const REPLY_TIMEOUT_AARCH64_TICK_SHIFT: u64 = 16;
+
+/// Stage 200C2C2 — the RISC-V monotonic reply-timeout tick. Like AArch64, the RISC-V port has no
+/// reliable periodic scheduler tick under a user workload, so deadlines use the architectural
+/// monotonic counter: the `time` CSR (the SBI/`mtime`-backed real-time counter, which is
+/// monotonic, never moves backwards, is available before userspace, and is readable from S-mode).
+/// It is scaled down by the same shift so the arm and the scan share ONE clock domain. `time` is
+/// 64-bit on RV64, so wrap is not reachable in any realistic uptime; the comparison is a plain
+/// `now >= deadline` in the scaled domain.
+#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "riscv64"))]
+pub(crate) const REPLY_TIMEOUT_RISCV_TICK_SHIFT: u64 = 13;
+
+#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "riscv64"))]
+pub(crate) fn reply_timeout_hw_now() -> u64 {
+    let t: u64;
+    // SAFETY: `time` is a read-only architectural CSR; the read has no side effects.
+    unsafe {
+        core::arch::asm!("csrr {0}, time", out(reg) t, options(nostack, nomem, preserves_flags));
+    }
+    t >> REPLY_TIMEOUT_RISCV_TICK_SHIFT
+}
 
 /// Read the AArch64 generic-timer physical counter scaled to a coarse reply-timeout tick.
 #[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
@@ -3558,9 +3585,15 @@ pub(crate) fn reply_timeout_hw_now() -> u64 {
 pub(crate) const REPLY_TIMEOUT_ARCH: &str = "x86_64";
 #[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
 pub(crate) const REPLY_TIMEOUT_ARCH: &str = "aarch64";
+#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "riscv64"))]
+pub(crate) const REPLY_TIMEOUT_ARCH: &str = "riscv64";
 #[cfg(all(
     feature = "ipc-reply-timeout-oracle-core",
-    not(any(target_arch = "x86_64", target_arch = "aarch64"))
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    ))
 ))]
 pub(crate) const REPLY_TIMEOUT_ARCH: &str = "unknown";
 

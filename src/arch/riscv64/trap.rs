@@ -81,6 +81,47 @@ fn restore_arch_thread_state(
         .resume_current_thread_with_frame(frame)
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
+    // Stage 200C2C2 — BLOCKED-SYSCALL COMPLETION boundary (RISC-V).
+    //
+    // Like AArch64, a blocked recv on this port is NEVER re-entered: the boot bridge
+    // pre-advances `sepc` by +4 before `handle_trap_entry`, so the TCB captures `sepc+4` and a
+    // resumed caller `sret`s to the instruction after its `ecall`. A remotely completed caller
+    // therefore cannot receive its result by "returning" from the handler — it consumes the
+    // exact parked completion HERE.
+    //
+    // Placement is deliberate: this runs AFTER `resume_current_thread_with_frame` (whose
+    // `apply_user_context` reloads the saved `user_gprs` — the very write that would otherwise
+    // clobber a result lane, cf. the Stage 163L a0-zeroing note below), so the canonical result
+    // is written LAST and cannot be overwritten by the restored pre-block snapshot. `sepc`,
+    // `sstatus`, `satp`/ASID, `sp` and `tp`/TLS are all left exactly as restored — the ecall
+    // return address was advanced once, at block time.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    if let Some(current_tid) = kernel.current_tid() {
+        if let Some(done) = kernel.take_blocked_syscall_completion(current_tid) {
+            // RISC-V syscall-error convention. The result is written to BOTH lanes so it survives
+            // either resume route:
+            //   * post-switch resume — nothing runs after this, so a0 (`user_gprs[10]`) is what
+            //     userspace sees; a1 is cleared so a stale success lane cannot be read as payload;
+            //   * same-task return — the `EXC_USER_ECALL` export below re-derives a0 from the
+            //     frame's ERROR lane (`if let Some(err) = f.error_code()`), which would otherwise
+            //     overwrite the GPR write. Setting `set_err` makes that export carry the canonical
+            //     code instead of clobbering it.
+            frame.set_err(done.result as usize);
+            frame.set_user_gpr(10, done.result as usize);
+            frame.set_user_gpr(11, 0);
+            crate::yarm_log!(
+                "RISCV_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid={} class={:?} result=TimedOut code={} blocked_generation={} sepc=0x{:016x} result=ok",
+                current_tid,
+                done.syscall_class,
+                done.result,
+                done.blocked_generation,
+                frame.saved_pc() as u64
+            );
+            // Retirement is authorized ONLY here — after the exact completion was consumed and
+            // the canonical result encoded into a valid `sret` frame.
+            crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
+        }
+    }
     let idx = cpu.0 as usize;
     if idx < MAX_CPUS {
         LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
@@ -535,6 +576,23 @@ pub fn handle_riscv_trap_entry_shared(
     // nothing (the common case). This is the mechanism that makes the RISC-V
     // deferred-snapshot wake path complete AFTER the broad borrow drops.
     shared.drain_dispatch_post_work(cpu)?;
+
+    // Stage 200C2C2 (IpcReplyTimeout OFF-LOCK RETIREMENT, RISC-V cell): with the broad
+    // `SpinLock<KernelState>` from Phase 2's `with_cpu` genuinely released, collect DUE
+    // token-bearing reply-receive deadlines through the NARROW collector (rank-2 task split seam)
+    // and drain the per-CPU deferred work through the OFF-LOCK completion transaction (per-domain
+    // split-mut seams). This is the arch-neutral machinery accepted for x86_64 and AArch64 — only
+    // the call site and the monotonic clock differ. `now` comes from the RISC-V `time` CSR (the
+    // scheduler tick does not advance reliably under a user workload on this port), the SAME clock
+    // domain the deadline is armed in. Ordinary receive-timeout deadlines stay on the in-lock scan
+    // (the collector's token-bearing filter skips them). Default-off: a strict no-op unless the
+    // RISC-V oracle feature is built AND its selector is active.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
+        let now = shared.reply_timeout_now_split_read();
+        shared.collect_due_reply_timeout_work(now, cpu);
+        shared.drain_reply_timeout_post_work(cpu, now);
+    }
 
     // Foundation-oracle DRAIN — consume the token published in-lock, proving the
     // outer guard is genuinely dropped by RE-ACQUIRING `with_cpu` here (a held

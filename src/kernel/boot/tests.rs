@@ -85348,10 +85348,10 @@ mod stage200c2b_guards {
         assert!(CMDLINE_SRC.contains("yarm.aarch64_ipc_reply_timeout_oracle"));
         assert_eq!(
             CMDLINE_SRC.matches("b\"timeout-wins\" | b\"1\"").count(),
-            2,
-            "both arch knobs parse timeout-wins"
+            3,
+            "all three arch knobs parse timeout-wins"
         );
-        assert_eq!(CMDLINE_SRC.matches("b\"reply-wins\" | b\"2\"").count(), 2);
+        assert_eq!(CMDLINE_SRC.matches("b\"reply-wins\" | b\"2\"").count(), 3);
     }
 
     // (2) the two selector modes are mutually exclusive (single mode discriminator).
@@ -86711,18 +86711,23 @@ mod stage200c2c1b_aarch64_reentry {
         assert!(AARCH64_SMOKE_SRC.contains("must precede the userspace completion"));
     }
 
-    // (18) NO RISC-V behavior is claimed by this stage.
+    // (18) the AArch64 cell claims no RISC-V behavior OF ITS OWN.
+    //
+    // Stage 200C2C2 correction: Stage 200C2C1 asserted the blanket ABSENCE of RISC-V wiring, which
+    // was true only while RISC-V was unported. The RISC-V cell now legitimately exists, so this
+    // guard instead pins that the AArch64 cell's own surfaces stay AArch64-attributed and that the
+    // arch cells remain separately gated (no cell silently activates another arch).
     #[test]
     fn t18_no_riscv_claimed() {
-        assert!(!MOD_SRC.contains("riscv64-ipc-reply-timeout-oracle"));
-        assert!(!INIT_SRC.contains("RISCV_IPC_REPLY_TIMEOUT_DONE"));
+        assert!(AARCH64_SMOKE_SRC.contains("FEATURE=aarch64-ipc-reply-timeout-oracle"));
+        assert!(!AARCH64_SMOKE_SRC.contains("FEATURE=riscv64-ipc-reply-timeout-oracle"));
+        assert!(INIT_SRC.contains("RISCV_IPC_REPLY_TIMEOUT_DONE"));
         // The AArch64 runner mentions riscv ONLY to FORBID a cross-arch attribution leaking into
         // the AArch64 artifact — it never asserts or claims any RISC-V behavior.
         assert!(!AARCH64_SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_RISCV"));
-        assert!(!AARCH64_SMOKE_SRC.contains("yarm.riscv64_ipc_reply_timeout_oracle"));
+        assert!(!AARCH64_SMOKE_SRC.contains("yarm.riscv_ipc_reply_timeout_oracle"));
         // The completion mechanism is arch-neutral but wired for AArch64 only this stage.
         assert!(IPC_STATE_SRC.contains("BlockedSyscallCompletion"));
-        assert!(!crate::kernel::boot::REPLY_TIMEOUT_ARCH.contains("riscv"));
     }
 
     // (extra) after consumption the exact post-state holds: no pending completion, no deadline,
@@ -86746,6 +86751,490 @@ mod stage200c2c1b_aarch64_reentry {
             .is_none()
         );
         assert_eq!(fx.k.with(|s| s.task_status(1)), Some(TaskStatus::Runnable));
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(idx)),
+            Some(ReplyRecordReservation::Cancelled)
+        );
+        teardown();
+    }
+}
+
+/// Stage 200C2C2 — RISC-V reply-timeout retirement port proofs.
+///
+/// The RISC-V cell REUSES the arch-neutral machinery verbatim; only the feature/selector, the
+/// monotonic clock source (`time` CSR), the Phase-3 post-lock wiring, the saved-context completion
+/// consumer, the userspace wrapper and the live proof differ. These tests pin exactly that.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage200c2c2_riscv_port {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::kernel::deadline_token::DeadlineTokenHandle;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{BlockedSyscallClass, TaskStatus};
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+
+    const TOKEN_GEN: u64 = 1;
+    const BRG: u64 = 1;
+    const DEADLINE: u64 = 100;
+    const NOW: u64 = 200;
+    const CPU: CpuId = CpuId(0);
+    const TIMED_OUT: u64 = 9;
+
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RISCV_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh");
+
+    fn clear_queue() {
+        crate::kernel::boot::reply_timeout_work_clear(0);
+    }
+
+    fn setup(fx: &CallerFx) -> (usize, u64, TerminalIdentity, DeadlineTokenHandle) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let identity =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, identity));
+        let handle =
+            fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, DEADLINE))
+                .expect("register");
+        (idx, rgen, identity, handle)
+    }
+
+    fn complete_timeout(fx: &CallerFx) {
+        clear_queue();
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        clear_queue();
+    }
+
+    // (1) feature AND a valid selector are both required.
+    #[test]
+    fn r01_feature_and_selector_required() {
+        assert!(RISCV_BOOT_SRC.contains("#[cfg(feature = \"riscv64-ipc-reply-timeout-oracle\")]"));
+        assert!(RISCV_BOOT_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
+        assert!(CMDLINE_SRC.contains("yarm.riscv_ipc_reply_timeout_oracle"));
+        // Unrecognized selector values leave the oracle inert.
+        assert_eq!(
+            CMDLINE_SRC.matches("b\"timeout-wins\" | b\"1\"").count(),
+            3,
+            "all three arch knobs parse timeout-wins"
+        );
+        assert_eq!(CMDLINE_SRC.matches("b\"reply-wins\" | b\"2\"").count(), 3);
+    }
+
+    // (2) a slot collision fails closed (the oracle stands down, never overwrites).
+    #[test]
+    fn r02_slot_collision_fails_closed() {
+        assert!(
+            MOD_SRC.contains("pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 9;"),
+            "next genuinely free RISC-V slot-5 pair is 9/10 (1..=8 are taken)"
+        );
+        let blk = RISCV_BOOT_SRC
+            .split("RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR")
+            .next()
+            .expect("provisioning guard");
+        // The guard immediately preceding the selector assignment requires all three slots empty.
+        let tail = &blk[blk.len().saturating_sub(1200)..];
+        assert!(tail.contains("init_args[5] == 0"));
+        assert!(tail.contains("init_args[13] == 0"));
+        assert!(tail.contains("init_args[14] == 0"));
+    }
+
+    // (3) the deadline is armed and evaluated in the SAME monotonic clock domain.
+    #[test]
+    fn r03_monotonic_source_consistency() {
+        // RISC-V arms from `reply_timeout_hw_now` (the `time` CSR) ...
+        assert!(MOD_SRC.contains("csrr {0}, time"));
+        assert!(MOD_SRC.contains("REPLY_TIMEOUT_RISCV_TICK_SHIFT"));
+        assert!(IPC_STATE_SRC.contains(
+            "#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]\n        let now = crate::kernel::boot::reply_timeout_hw_now();"
+        ));
+        // ... and the collector reads the SAME source through one seam.
+        let seam = RUNTIME_SRC
+            .split("fn reply_timeout_now_split_read")
+            .nth(1)
+            .expect("clock seam");
+        let seam = seam.split("\n    ///").next().unwrap();
+        assert!(seam.contains("target_arch = \"riscv64\""));
+        assert!(seam.contains("reply_timeout_hw_now()"));
+        // The scheduler-tick fallback is excluded for RISC-V (it does not advance reliably).
+        assert!(seam.contains("not(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))"));
+    }
+
+    // (4) a token-bearing deadline reaches the RISC-V post-lock collector + drain.
+    #[test]
+    fn r04_reaches_postlock_collector() {
+        assert!(RISCV_TRAP_SRC.contains("shared.collect_due_reply_timeout_work(now, cpu)"));
+        assert!(RISCV_TRAP_SRC.contains("shared.drain_reply_timeout_post_work(cpu, now)"));
+        // It sits in Phase 3, AFTER the broad guard is released.
+        let p3 = RISCV_TRAP_SRC
+            .find("Phase 3: post-lock drain (broad guard released)")
+            .expect("phase 3 marker");
+        let call = RISCV_TRAP_SRC
+            .find("shared.collect_due_reply_timeout_work")
+            .expect("collector call");
+        assert!(p3 < call, "the collector runs in the post-lock phase");
+        // Reachability: gated only on the umbrella feature + the runtime selector (never dead).
+        assert!(RISCV_TRAP_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"));
+        assert!(RISCV_TRAP_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
+    }
+
+    // (5) the ordinary receive timeout remains on the old broad path, unretired.
+    #[test]
+    fn r05_ordinary_timeout_unchanged() {
+        use crate::kernel::boot::Bootstrap;
+        use crate::kernel::capabilities::CapId;
+        use crate::kernel::task::WaitReason;
+        use crate::runtime::SharedKernel;
+        assert!(IPC_STATE_SRC.contains("if tcb.reply_timeout_token.is_some() {"));
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(80).expect("t80");
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 80).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
+                tcb.ipc_timeout_deadline = Some(5);
+            });
+            assert_eq!(s.process_ipc_timeout_deadlines(10).expect("scan"), 1);
+            assert_eq!(s.task_status(80), Some(TaskStatus::Runnable));
+            assert!(!s.has_pending_syscall_completion(80));
+        });
+    }
+
+    // (6) the completion is consumed at the RISC-V saved-context resume boundary.
+    #[test]
+    fn r06_consumed_at_saved_context_resume() {
+        assert!(RISCV_TRAP_SRC.contains("take_blocked_syscall_completion"));
+        let restore = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .expect("restore body");
+        let restore = restore.split("\npub fn ").next().unwrap();
+        assert!(restore.contains("take_blocked_syscall_completion"));
+        // Both the same-task and post-switch restores funnel through this ONE function.
+        assert!(RISCV_TRAP_SRC.contains("restore_arch_thread_state(kernel, cpu, frame)"));
+    }
+
+    // (7) stale saved arguments cannot overwrite the encoded TimedOut: the completion write
+    // happens AFTER the saved-context restore that reloads the pre-block snapshot.
+    #[test]
+    fn r07_stale_args_cannot_overwrite_result() {
+        let restore = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .expect("restore body");
+        let restore = restore.split("\npub fn ").next().unwrap();
+        let apply = restore
+            .find("resume_current_thread_with_frame")
+            .expect("context restore");
+        let consume = restore
+            .find("take_blocked_syscall_completion")
+            .expect("completion consume");
+        assert!(
+            apply < consume,
+            "the canonical result must be written AFTER the saved-context restore"
+        );
+    }
+
+    // (8) the completion is detected before the result frame is published to userspace.
+    #[test]
+    fn r08_completion_before_result_publication() {
+        let restore = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .expect("restore body");
+        let restore = restore.split("\npub fn ").next().unwrap();
+        let consume = restore.find("take_blocked_syscall_completion").unwrap();
+        let encode = restore
+            .find("frame.set_user_gpr(10, done.result as usize)")
+            .expect("a0 encode");
+        assert!(consume < encode);
+    }
+
+    // (9) the exact RISC-V TimedOut ABI encoding (a0 = error lane, a1 cleared).
+    #[test]
+    fn r09_exact_timedout_abi() {
+        // The consumer uses the SAME lane the RISC-V ecall error export uses (`set_user_gpr(10)`).
+        assert!(RISCV_TRAP_SRC.contains("f.set_user_gpr(10, err);"));
+        assert!(RISCV_TRAP_SRC.contains("frame.set_user_gpr(10, done.result as usize);"));
+        assert!(RISCV_TRAP_SRC.contains("frame.set_user_gpr(11, 0);"));
+        // It is NOT the AArch64 convention (which zeroes x1..x5 as args).
+        let restore = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .unwrap()
+            .split("\npub fn ")
+            .next()
+            .unwrap();
+        assert!(!restore.contains("set_arg(0, done.result"));
+        // The parked result is the canonical TimedOut code.
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        let done =
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .expect("pending");
+        assert_eq!(done.result, TIMED_OUT);
+        assert_eq!(done.syscall_class, BlockedSyscallClass::IpcRecv);
+        teardown();
+    }
+
+    // (10) `sepc` advances exactly once — the consumer performs no PC mutation.
+    #[test]
+    fn r10_sepc_single_advance() {
+        let blk = RISCV_TRAP_SRC
+            .split("take_blocked_syscall_completion")
+            .nth(1)
+            .expect("consume block");
+        let blk = blk.split("let idx = cpu.0").next().unwrap();
+        assert!(!blk.contains("set_saved_pc"));
+        assert!(!blk.contains("+ 4"));
+        assert!(!blk.contains("sepc +="));
+        // The single advance is the bridge's documented pre-advance.
+        assert!(RISCV_TRAP_SRC.contains("pre-advances tframe.saved_pc by +4"));
+    }
+
+    // (11) the completion is consumed exactly once.
+    #[test]
+    fn r11_consumed_once() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_some()
+        );
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        teardown();
+    }
+
+    // (12) a stale blocked-recv generation is rejected.
+    #[test]
+    fn r12_stale_generation_rejected() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (13) a replacement TID/ASID incarnation is unaffected.
+    #[test]
+    fn r13_replacement_incarnation_unaffected() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        fx.k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 1).unwrap();
+                t.asid = Some(crate::kernel::vm::Asid(0xFACE));
+            });
+        });
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        teardown();
+    }
+
+    // (14) a NEW receive cannot consume an old timeout result.
+    #[test]
+    fn r14_new_receive_cannot_consume_old_result() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (15) no endpoint waiter is reinstalled by the completion.
+    #[test]
+    fn r15_no_waiter_reinstall() {
+        let fx = caller_fixture();
+        let (_i, _g, id, _h) = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(
+                |s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(id.reply_endpoint_index))
+            )
+            .is_none()
+        );
+        teardown();
+    }
+
+    // (16) no deadline is re-armed by the completion.
+    #[test]
+    fn r16_no_deadline_rearm() {
+        let fx = caller_fixture();
+        let (_i, _g, _id, handle) = setup(&fx);
+        complete_timeout(&fx);
+        assert!(fx.k.with(|s| s.deadline_token_is_completed(handle.token_index())));
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 0);
+        assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 0);
+        teardown();
+    }
+
+    // (17) the reply-wins path bypasses the completion consumer entirely.
+    #[test]
+    fn r17_reply_wins_bypasses_consumer() {
+        let fx = caller_fixture();
+        let (idx, _g, id, handle) = setup(&fx);
+        let lease =
+            fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
+                .expect("lease");
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("terminal");
+        assert!(fx.k.with(|s| s.complete_deadline_reply_lease(handle.token_index(), &lease)));
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        teardown();
+    }
+
+    // (18) the timeout result precedes the scheduler dispatch (enqueue is last).
+    #[test]
+    fn r18_result_precedes_dispatch() {
+        let body = IPC_STATE_SRC
+            .split("fn complete_reply_timeout_over")
+            .nth(1)
+            .expect("body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        let prep = body.find("rt_prepare_timeout_result(d").expect("prepare");
+        let commit = body.find("rt_commit_receiver_runnable(d").expect("commit");
+        let enqueue = body.find("d.rtd_enqueue(caller.tid.0)").expect("enqueue");
+        assert!(prep < enqueue && commit < enqueue);
+    }
+
+    // (19) the retirement marker follows the completion DELIVERY (never the kernel commit alone).
+    #[test]
+    fn r19_retirement_follows_delivery() {
+        // The transaction only ARMS; the delivery point fires.
+        assert!(RUNTIME_SRC.contains("arm_reply_timeout_class_retired()"));
+        assert!(RUNTIME_SRC.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch={}"));
+        assert!(!RUNTIME_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={}"));
+        let blk = RISCV_TRAP_SRC
+            .split("take_blocked_syscall_completion")
+            .nth(1)
+            .expect("consume block");
+        let encode = blk
+            .find("frame.set_user_gpr(10, done.result as usize)")
+            .expect("encode");
+        let emit = blk
+            .find("maybe_emit_reply_timeout_class_retired")
+            .expect("retire emit");
+        assert!(
+            encode < emit,
+            "encode the canonical result BEFORE claiming retirement"
+        );
+        // The runner additionally enforces the ordered live sequence.
+        assert!(RISCV_SMOKE_SRC.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_CONSUMED"));
+        assert!(RISCV_SMOKE_SRC.contains("must follow the completion consumption"));
+    }
+
+    // (20) the x86_64 + AArch64 sealed source paths remain intact, and the shared implementations
+    // are single-source (the RISC-V wrapper duplicates no terminal/deadline/completion logic).
+    #[test]
+    fn r20_sealed_paths_and_single_source() {
+        // Sealed arch cells still present.
+        assert!(X86_BOOT_SRC.contains("X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR"));
+        assert!(AARCH64_TRAP_SRC.contains("take_blocked_syscall_completion"));
+        assert!(INIT_SRC.contains("X86_IPC_REPLY_TIMEOUT_DONE"));
+        assert!(INIT_SRC.contains("AARCH64_IPC_REPLY_TIMEOUT_DONE"));
+        assert!(INIT_SRC.contains("RISCV_IPC_REPLY_TIMEOUT_DONE"));
+        // Exactly ONE implementation of each shared piece.
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("fn collect_due_reply_timeout_work")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn complete_reply_timeout_over")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn reserve_reply_win_before_copy")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn commit_reply_win_after_delivery")
+                .count(),
+            1
+        );
+        assert_eq!(IPC_STATE_SRC.matches("fn rollback_reply_win").count(), 1);
+        assert_eq!(
+            include_str!("../task.rs")
+                .matches("pub struct BlockedSyscallCompletion")
+                .count(),
+            1
+        );
+        // One shared userspace client core across all three arch wrappers.
+        assert_eq!(
+            INIT_SRC.matches("pub(super) unsafe fn client_run").count(),
+            1
+        );
+    }
+
+    // (21) reversible reply-copy failure preserves the common contract on the RISC-V route.
+    #[test]
+    fn r21_reply_copy_fault_rollback() {
+        let fx = caller_fixture();
+        let (idx, rgen, id, handle) = setup(&fx);
+        let lease =
+            fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
+                .expect("lease");
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("terminal");
+        // Copy fault → restore both holds.
+        assert!(fx.k.with(|s| s.restore_deadline_reply_lease(handle.token_index(), &lease)));
+        assert!(fx.k.with(|s| s.release_reply_terminal_slot_if_retryable(idx, &owner)));
+        assert!(fx.k.with(|s| s.deadline_token_is_armed(handle.token_index())));
+        assert!(fx.k.with(|s| s.reply_terminal_is_open(idx)));
+        assert!(fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)));
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(1)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        // A due timeout after the rollback yields EXACTLY ONE terminal outcome.
+        complete_timeout(&fx);
         assert_eq!(
             fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
             Some(TerminalClaimant::Timeout)

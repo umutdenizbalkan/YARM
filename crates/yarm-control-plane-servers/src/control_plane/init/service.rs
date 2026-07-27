@@ -1771,7 +1771,11 @@ fn run_x86_ipccall_direct_oracle(init_tid: u64) {
 // feature + selector.
 #[cfg(all(
     not(feature = "hosted-dev"),
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
 ))]
 mod ipc_reply_timeout_oracle {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
@@ -1821,9 +1825,10 @@ mod ipc_reply_timeout_oracle {
         )
         .unwrap_or(0)
     }
-    /// timeout-wins is the LOWER value of each arch's slot-5 pair (8 on AArch64, 10 on x86_64).
+    /// timeout-wins is the LOWER value of each arch's slot-5 pair
+    /// (8 on AArch64, 9 on RISC-V, 10 on x86_64).
     pub(super) fn is_timeout_wins() -> bool {
-        matches!(mode(), 8 | 10)
+        matches!(mode(), 8 | 9 | 10)
     }
 
     #[derive(Clone, Copy, Default)]
@@ -2014,7 +2019,7 @@ mod ipc_reply_timeout_oracle {
                 // reply-wins deadline and emits the harmless `IPC_REPLY_TIMEOUT_LATE_SCAN
                 // outcome=reply_won`. On x86_64 the periodic timer drives that scan, so no spin is
                 // compiled there (keeps the x86 client path byte-identical).
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
                 {
                     // Bounded: the injected reply-wins deadline is ~20 coarse counter ticks out,
                     // and every yield is a trap that re-runs the off-lock collector, so this is
@@ -2187,6 +2192,81 @@ fn run_aarch64_ipc_reply_timeout_oracle(init_tid: u64) {
     } else {
         yarm_user_rt::user_log!(
             "AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 result=fail",
+            out.reply_ok as u32,
+            out.continuations
+        );
+    }
+}
+
+/// RISC-V server child body: run the arch-neutral reply-timeout server core, then park. A plain
+/// `extern "C"` entry (the RISC-V ABI has no x86-style initial-SP call-alignment hazard).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+extern "C" fn riscv_ipc_reply_timeout_child_body() -> ! {
+    // SAFETY: freshly-spawned oracle child sharing init's CSpace/address space.
+    unsafe { ipc_reply_timeout_oracle::server_run() };
+    ipc_reply_timeout_oracle::server_park();
+}
+
+/// RISC-V reply-timeout oracle entry: spawn the server child, run the SHARED client core, and emit
+/// the RISC-V-named mode-specific completion marker with exact counts. Reuses
+/// `ipc_reply_timeout_oracle::{client_run, oracle_caps, is_timeout_wins}` verbatim — duplicates
+/// NONE of the terminal, deadline or completion logic (all of that lives in the kernel).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn run_riscv_ipc_reply_timeout_oracle(init_tid: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    use ipc_reply_timeout_oracle as oracle;
+    yarm_user_rt::user_log!(
+        "IPC_REPLY_TIMEOUT_ORACLE_BEGIN init_tid={} mode={}",
+        init_tid,
+        oracle::mode()
+    );
+    let (request_ep, reply_ep) = oracle::oracle_caps();
+    if request_ep == 0 || reply_ep == 0 {
+        yarm_user_rt::user_log!(
+            "IPC_REPLY_TIMEOUT_ORACLE_MISSING_CAPS request_ep={} reply_ep={}",
+            request_ep,
+            reply_ep
+        );
+        return;
+    }
+    let stack_top = {
+        let base = core::ptr::addr_of_mut!(oracle::CHILD_STACK) as usize;
+        (base + 16384) & !0xF
+    };
+    let entry = riscv_ipc_reply_timeout_child_body as *const () as usize;
+    let tls_base = core::ptr::addr_of_mut!(oracle::CHILD_TLS) as usize;
+    // SAFETY: `entry` is a valid `extern "C" fn() -> !`; the static stack + TLS outlive the thread.
+    let child_tid = match unsafe { yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry) }
+    {
+        Ok(t) => t,
+        Err(e) => {
+            yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_SPAWN_FAIL err={:?}", e);
+            return;
+        }
+    };
+    oracle::CHILD_TID.store(child_tid, Relaxed);
+    // SAFETY: the provisioned oracle caps.
+    let out = unsafe { oracle::client_run(request_ep, reply_ep) };
+    if oracle::is_timeout_wins() {
+        if out.timed_out && out.continuations == 1 && out.late_reply_rejected == 1 {
+            yarm_user_rt::user_log!(
+                "RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut caller_continuations=1 late_reply=rejected result=ok"
+            );
+        } else {
+            yarm_user_rt::user_log!(
+                "RISCV_IPC_REPLY_TIMEOUT_DONE caller_result={} caller_continuations={} late_reply={} result=fail",
+                out.timed_out as u32,
+                out.continuations,
+                out.late_reply_rejected
+            );
+        }
+    } else if out.reply_ok && out.continuations == 1 && out.server_replied_ok == 1 {
+        yarm_user_rt::user_log!(
+            "RISCV_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 result=ok"
+        );
+    } else {
+        yarm_user_rt::user_log!(
+            "RISCV_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 result=fail",
             out.reply_ok as u32,
             out.continuations
         );
@@ -3659,6 +3739,14 @@ pub fn run() {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if ctx.supervisor_control_recv_ep == Some(8) || ctx.supervisor_control_recv_ep == Some(9) {
         run_aarch64_ipc_reply_timeout_oracle(ctx.task_id);
+    }
+    // Stage 200C2C2: default-off + feature-gated RISC-V LIVE reply-receive TIMEOUT retirement
+    // oracle. Slot-5 selector 9 = timeout-wins, 10 = reply-wins (mutually exclusive with every
+    // other RISC-V slot-5 oracle). Requires the kernel feature + `yarm.riscv_ipc_reply_timeout_
+    // oracle=...`.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if ctx.supervisor_control_recv_ep == Some(9) || ctx.supervisor_control_recv_ep == Some(10) {
+        run_riscv_ipc_reply_timeout_oracle(ctx.task_id);
     }
     // Stage 196C: default-off RISC-V FutexWake live oracle. Slot-5 sentinel 1 (set by the RISC-V
     // boot under `yarm.riscv64_futex_wake_oracle=1`) tells init to run the parent/child split

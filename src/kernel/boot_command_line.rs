@@ -406,6 +406,11 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(mode);
         crate::yarm_log!("YARM_X86_64_IPC_REPLY_TIMEOUT_ORACLE_SET mode={}", mode);
     }
+    if let Some(mode) = parsed.riscv_ipc_reply_timeout_oracle {
+        // Stage 200C2C2: arm the SAME arch-neutral reply-timeout oracle mode from the RISC-V knob.
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(mode);
+        crate::yarm_log!("YARM_RISCV_IPC_REPLY_TIMEOUT_ORACLE_SET mode={}", mode);
+    }
     if let Some(mode) = parsed.aarch64_ipc_reply_timeout_oracle {
         // Stage 200C2C1: arm the SAME arch-neutral reply-timeout oracle mode from the AArch64 knob.
         // The slot-5 provisioning + off-lock collector/drain wiring are additionally feature- and
@@ -799,6 +804,12 @@ pub struct YarmBootOptions<'a> {
     /// with every other slot-5 oracle. Requires `target_arch = aarch64` + the
     /// `aarch64-ipc-reply-timeout-oracle` feature.
     pub aarch64_ipc_reply_timeout_oracle: Option<u8>,
+    /// Stage 200C2C2: `yarm.riscv_ipc_reply_timeout_oracle=timeout-wins|reply-wins` DEFAULT-OFF
+    /// knob — the RISC-V port of the reply-receive TIMEOUT retirement oracle. Same per-boot mode
+    /// discriminator as the x86/AArch64 knobs, arming the SAME arch-neutral registration +
+    /// off-lock collector/drain wiring. Mutually exclusive with every other slot-5 oracle.
+    /// Requires `target_arch = riscv64` + the `riscv64-ipc-reply-timeout-oracle` feature.
+    pub riscv_ipc_reply_timeout_oracle: Option<u8>,
     /// Stage 199A2D2A: `yarm.x86_64_ipccall_direct_smp_oracle=1` DEFAULT-OFF knob. Arms the x86_64
     /// SMP=2 cross-CPU DIRECT IpcCall (request-only) oracle: one userspace IPC server blocked in
     /// recv-v2 on CPU 1, one NR6 direct request from a CPU 0 client, remote wake + resume on CPU 1.
@@ -1036,6 +1047,19 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
             // Stage 200C2A: two mutually-exclusive string modes. An unrecognized value leaves the
             // oracle inert (feature-on without a VALID selector is a no-op).
             options.x86_64_ipc_reply_timeout_oracle = match value {
+                b"timeout-wins" | b"1" => {
+                    Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS)
+                }
+                b"reply-wins" | b"2" => {
+                    Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS)
+                }
+                _ => None,
+            };
+        }
+        if key == b"yarm.riscv_ipc_reply_timeout_oracle" {
+            // Stage 200C2C2: same two mutually-exclusive string modes; an unrecognized value
+            // leaves the oracle inert (feature-on without a valid selector).
+            options.riscv_ipc_reply_timeout_oracle = match value {
                 b"timeout-wins" | b"1" => {
                     Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS)
                 }
