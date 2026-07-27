@@ -38,6 +38,24 @@ struct RecvBlockPhasePlan {
 /// `commit_reply_win_after_delivery` (copy succeeded) or `rollback_reply_win` (copy
 /// faulted) consumes it, so an irreversible terminal completion never precedes a
 /// fallible caller copy and the deadline is never permanently lost by a faulting copy.
+/// Stage 200C2C2C-R2B — why a reply-win reservation declined. TERMINAL OWNERSHIP is the single
+/// authority; deadline registration is subordinate bookkeeping and can NEVER appear here as a
+/// decline reason (a token that cannot be leased leaves the reply's terminal claim intact).
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyReserveDecline {
+    /// The reply capability did not resolve to a present reply record.
+    RecordMissing,
+    /// The record is not the oracle's confined reply endpoint (a strict no-op for this hook).
+    RecordNotLive,
+    /// The reply record's caller `{tid, asid}` no longer resolves.
+    CallerIdentityMismatch,
+    /// The terminal identity could not be constructed (endpoint/record generation drift).
+    EndpointGenerationMismatch,
+    /// A timeout (or other) terminal claimant already owns the terminal cell.
+    TimeoutAlreadyClaimed,
+}
+
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]
 #[derive(Debug)]
 pub(crate) struct ReplyWinLease {
@@ -1430,6 +1448,10 @@ impl KernelState {
                 // Record it so the scan can prove it later ran PAST this deadline
                 // harmlessly (the reply disarms the token before it is reached).
                 crate::kernel::boot::set_ipc_reply_timeout_rw_deadline(d);
+                // Stage 200C2C2C-R2B: arm the CAUSAL collector gate HERE — strictly before the
+                // terminal cell is armed below, so no timeout claimant can ever reach it while
+                // the reply is in flight. Reply-wins only; released by userspace validation.
+                crate::kernel::boot::hold_reply_timeout_collector();
                 d
             }
             _ => return,
@@ -1505,11 +1527,51 @@ impl KernelState {
         &mut self,
         reply_cap: CapId,
     ) -> Option<ReplyWinLease> {
-        use crate::kernel::terminal_ownership::TerminalClaimant;
         if !crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
             return None;
         }
-        let (idx, generation) = self.reply_cap_record_index_generation(reply_cap)?;
+        match self.try_reserve_reply_win_before_copy(reply_cap) {
+            Ok(lease) => {
+                // Stage 200C2C2C-R2B: the reply won the terminal. `token_lease` is the
+                // SUBORDINATE deadline bookkeeping result and is deliberately reported
+                // separately from the outcome — 0 is a normal, non-declining value.
+                crate::yarm_log!(
+                    "IPC_REPLY_WIN_RESERVE arch={} outcome=ok terminal=Reserved(Reply) token_lease={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                    u32::from(lease.deadline_lease.is_some())
+                );
+                Some(lease)
+            }
+            // The two confinement outcomes are strict, SILENT no-ops: every ordinary NR7
+            // in the system takes them, and they are not oracle events.
+            Err(ReplyReserveDecline::RecordMissing) | Err(ReplyReserveDecline::RecordNotLive) => {
+                None
+            }
+            Err(reason) => {
+                crate::yarm_log!(
+                    "IPC_REPLY_WIN_RESERVE arch={} outcome=decline reason={:?} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                    reason
+                );
+                None
+            }
+        }
+    }
+
+    /// Stage 200C2C2C-R2B — the reservation body, with the decline reason made EXPLICIT
+    /// and typed. `ReplyReserveDecline` has no deadline-bookkeeping variant by
+    /// construction: once the terminal claim succeeds this function cannot fail, so a
+    /// deadline registration (present, absent, far, unreachable, re-armed, or already
+    /// detached) can never decide reply eligibility.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn try_reserve_reply_win_before_copy(
+        &mut self,
+        reply_cap: CapId,
+    ) -> Result<ReplyWinLease, ReplyReserveDecline> {
+        use crate::kernel::terminal_ownership::TerminalClaimant;
+        let (idx, generation) = self
+            .reply_cap_record_index_generation(reply_cap)
+            .ok_or(ReplyReserveDecline::RecordMissing)?;
         let reply_eidx = self.with_ipc_state(|ipc| match ipc.reply_caps.get(idx) {
             Some(Some(record)) => match record.reply_endpoint {
                 CapObject::Endpoint { index, .. } => Some(index),
@@ -1520,39 +1582,49 @@ impl KernelState {
         if reply_eidx.map(crate::kernel::boot::ipc_reply_timeout_oracle_reply_endpoint_is)
             != Some(true)
         {
-            return None;
+            return Err(ReplyReserveDecline::RecordNotLive);
         }
-        let (caller_tid, caller_asid) = self.with_ipc_state(|ipc| {
-            ipc.reply_caps
-                .get(idx)
-                .and_then(|s| s.as_ref())
-                .map(|r| (r.caller_tid.0, r.caller_asid))
-        })?;
+        let (caller_tid, caller_asid) = self
+            .with_ipc_state(|ipc| {
+                ipc.reply_caps
+                    .get(idx)
+                    .and_then(|s| s.as_ref())
+                    .map(|r| (r.caller_tid.0, r.caller_asid))
+            })
+            .ok_or(ReplyReserveDecline::CallerIdentityMismatch)?;
         let brg = self
             .blocked_recv_generation_for(caller_tid, caller_asid)
             .unwrap_or(1);
-        let identity = self.reply_terminal_identity(idx, generation, brg, Some(1))?;
+        let identity = self
+            .reply_terminal_identity(idx, generation, brg, Some(1))
+            .ok_or(ReplyReserveDecline::EndpointGenerationMismatch)?;
         // (1) Owned reply source snapshot is the caller of this hook (handle_ipc_reply
         // has already snapshot the server payload). (2) Claim the terminal REVERSIBLY.
-        let terminal_owner =
-            self.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity)?;
-        // (3) Obtain REVERSIBLE ownership of the exact deadline registration — a lease,
+        // This is the SINGLE authority deciding reply eligibility — the LAST fallible
+        // step of the reservation.
+        let terminal_owner = self
+            .try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity)
+            .ok_or(ReplyReserveDecline::TimeoutAlreadyClaimed)?;
+        // (3) OPTIONALLY obtain REVERSIBLE ownership of the exact deadline registration — a lease,
         // NOT a permanent disarm — so a subsequent copy fault can restore it exactly.
-        let lease = match self.reply_timeout_token_for_caller(caller_tid, caller_asid) {
-            Some(handle) => match self.claim_deadline_reply_lease(&handle) {
-                Some(owner) => Some((handle.token_index(), owner)),
-                None => {
-                    // The deadline token exists but could not be leased (already
-                    // fired/completed by a due timeout) — timeout is winning. Release
-                    // the terminal reservation and decline; the frozen reply flow will
-                    // reject the late reply through normal authority.
-                    let _ = self.release_reply_terminal_slot_if_retryable(idx, &terminal_owner);
-                    return None;
-                }
-            },
-            None => None,
-        };
-        Some(ReplyWinLease {
+        //
+        // Stage 200C2C2C-R2B: this is SUBORDINATE BOOKKEEPING, never terminal authority. Reaching
+        // this point means the reply already WON the terminal cell above, which is the single
+        // authority: a competing timeout/cancellation claimant could only have won by making that
+        // claim fail. Previously a token that could not be leased (missing, re-armed, far, or
+        // already detached) caused this hook to RELEASE the terminal it legitimately owned and
+        // decline — letting deadline-queue bookkeeping veto a valid reply. It no longer can.
+        //
+        // When the token cannot be leased we simply take no lease: we mutate no token (so a stale
+        // or re-armed generation is never touched), and the reply keeps terminal ownership. Any
+        // later timeout fire then loses at its own terminal claim, which is the correct authority.
+        let lease = self
+            .reply_timeout_token_for_caller(caller_tid, caller_asid)
+            .and_then(|handle| {
+                self.claim_deadline_reply_lease(&handle)
+                    .map(|owner| (handle.token_index(), owner))
+            });
+        Ok(ReplyWinLease {
             record_index: idx,
             terminal_owner,
             deadline_lease: lease,

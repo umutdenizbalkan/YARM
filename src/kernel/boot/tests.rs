@@ -87564,3 +87564,413 @@ mod stage200c2c2c_r2a_riscv_publication {
         }
     }
 }
+
+/// Stage 200C2C2C-R2B — reply-win reservation is governed by TERMINAL OWNERSHIP ONLY.
+///
+/// Deadline registration is subordinate bookkeeping: its presence, absence, numeric value or
+/// leasability must never decide whether a reply may win. These tests pin that separation and the
+/// reply-versus-timeout races around it.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage200c2c2c_r2b_reply_authority {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::deadline_token::DeadlineTokenHandle;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+
+    const TOKEN_GEN: u64 = 1;
+    const BRG: u64 = 1;
+    const NOW: u64 = 200;
+    const CPU: CpuId = CpuId(0);
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+
+    fn arm_terminal(fx: &CallerFx) -> (usize, u64, TerminalIdentity) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let id =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, id));
+        (idx, rgen, id)
+    }
+
+    fn register_deadline(
+        fx: &CallerFx,
+        idx: usize,
+        rgen: u64,
+        deadline: u64,
+    ) -> DeadlineTokenHandle {
+        fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, deadline))
+            .expect("register")
+    }
+
+    /// The reply's terminal claim — the SINGLE authority the reservation depends on.
+    fn reply_claims_terminal(fx: &CallerFx, idx: usize, id: &TerminalIdentity) -> bool {
+        fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, id))
+            .is_some()
+    }
+
+    // (1) live record, NO deadline token → reply may win.
+    #[test]
+    fn a01_no_deadline_token_reply_wins() {
+        let fx = caller_fixture();
+        let (idx, _g, id) = arm_terminal(&fx);
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 0);
+        assert!(
+            reply_claims_terminal(&fx, idx, &id),
+            "no token must not block a reply"
+        );
+        teardown();
+    }
+
+    // (2) FINITE armed token → reply may win, and the token is not an authority.
+    #[test]
+    fn a02_finite_token_reply_wins() {
+        let fx = caller_fixture();
+        let (idx, rgen, id) = arm_terminal(&fx);
+        let h = register_deadline(&fx, idx, rgen, 100);
+        assert!(fx.k.with(|s| s.deadline_token_is_armed(h.token_index())));
+        assert!(reply_claims_terminal(&fx, idx, &id));
+        teardown();
+    }
+
+    // (3) FAR / effectively unreachable token → reply may still win. This is the case that
+    // previously declined, because an unleasable token vetoed the reply.
+    #[test]
+    fn a03_far_token_reply_wins() {
+        let fx = caller_fixture();
+        let (idx, rgen, id) = arm_terminal(&fx);
+        let _h = register_deadline(&fx, idx, rgen, u64::MAX / 2);
+        assert!(
+            reply_claims_terminal(&fx, idx, &id),
+            "a far deadline value must not gate reply eligibility"
+        );
+        teardown();
+    }
+
+    // (4) reply wins, THEN the collector sees the old token → the timeout is rejected because the
+    // terminal is already owned; no caller is woken by the timeout.
+    #[test]
+    fn a04_reply_then_late_collector_rejected() {
+        let fx = caller_fixture();
+        let (idx, rgen, id) = arm_terminal(&fx);
+        let _h = register_deadline(&fx, idx, rgen, 100);
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("reply terminal");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        // The collector now runs on the still-registered token.
+        crate::kernel::boot::reply_timeout_work_clear(0);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        crate::kernel::boot::reply_timeout_work_clear(0);
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Reply),
+            "exactly one terminal winner — the reply"
+        );
+        assert!(
+            !fx.k.with(|s| s.ipc_timeout_fired_read(1)),
+            "no timeout wake"
+        );
+        teardown();
+    }
+
+    // (5) timeout reserves FIRST → the reply is rejected by the terminal authority.
+    #[test]
+    fn a05_timeout_first_reply_rejected() {
+        let fx = caller_fixture();
+        let (idx, _g, id) = arm_terminal(&fx);
+        let t =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Timeout, &id))
+                .expect("timeout terminal");
+        assert!(
+            !reply_claims_terminal(&fx, idx, &id),
+            "a committed/reserved timeout must defeat the reply"
+        );
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &t)));
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        teardown();
+    }
+
+    // (6) a duplicate reply alias race yields exactly ONE winner.
+    #[test]
+    fn a06_duplicate_reply_one_winner() {
+        let fx = caller_fixture();
+        let (idx, _g, id) = arm_terminal(&fx);
+        let first =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id));
+        let second =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id));
+        assert!(first.is_some());
+        assert!(second.is_none(), "duplicate reply alias must lose");
+        teardown();
+    }
+
+    // (7) a restarted caller with a REUSED numeric TID (different generation) is rejected — the
+    // reply cannot win against a replacement incarnation.
+    #[test]
+    fn a07_restarted_caller_rejected() {
+        let fx = caller_fixture();
+        let (idx, _g, id) = arm_terminal(&fx);
+        // The caller re-blocked with a NEW receive: its blocked generation advances, so the
+        // terminal identity built for the OLD receive no longer matches.
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        let stale = fx.k.with(|s| {
+            s.reply_terminal_identity(idx, fx.record_generation, BRG + 1, Some(TOKEN_GEN))
+        });
+        if let Some(fresh_id) = stale {
+            assert_ne!(
+                fresh_id.blocked_recv_generation, id.blocked_recv_generation,
+                "generation must differ after restart"
+            );
+            // The OLD identity must not claim against the NEW incarnation's cell identity.
+            assert!(
+                fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                    idx,
+                    TerminalClaimant::Reply,
+                    &fresh_id
+                ))
+                .is_none()
+            );
+        }
+        teardown();
+    }
+
+    // (8) SOURCE: deadline bookkeeping can never decline the reservation, and a failed lease
+    // never releases the terminal the reply already owns.
+    #[test]
+    fn a08_deadline_is_not_terminal_authority() {
+        let body = IPC_STATE_SRC
+            .split("fn try_reserve_reply_win_before_copy")
+            .nth(1)
+            .expect("reserve body");
+        let body = body.split("\n    /// Stage").next().unwrap();
+        // The terminal claim is the LAST fallible step of the reservation.
+        assert!(body.contains(
+            ".try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity)\n            .ok_or(ReplyReserveDecline::TimeoutAlreadyClaimed)?"
+        ));
+        // A failed lease must NOT release the terminal nor early-return.
+        let after_claim = body.split("try_claim_reply_terminal_slot").nth(1).unwrap();
+        assert!(
+            !after_claim.contains("release_reply_terminal_slot_if_retryable"),
+            "a failed deadline lease must never release the won terminal"
+        );
+        assert!(
+            !after_claim.contains("return Err"),
+            "deadline bookkeeping must never decline the reservation"
+        );
+        // The lease is optional cleanup.
+        assert!(body.contains(".and_then(|handle|"));
+        // The typed decline classification exists and excludes any deadline-bookkeeping reason.
+        assert!(IPC_STATE_SRC.contains("enum ReplyReserveDecline"));
+        assert!(!IPC_STATE_SRC.contains("DeadlineTokenMismatch,"));
+        assert!(!IPC_STATE_SRC.contains("DeadlineLeaseUnavailable"));
+        assert!(!IPC_STATE_SRC.contains("DeadlineNotRegistered"));
+    }
+
+    // ── Stage 200C2C2C-R2B: the live blocker — the userspace slot-5 SCENARIO DECODER ──
+    //
+    // Each arch owns a distinct free PAIR (base, base+1) = (timeout-wins, reply-wins), and the
+    // pairs OVERLAP: AArch64 8/9, RISC-V 9/10, x86_64 10/11. Commit 998589f widened the
+    // userspace decoder from `matches!(mode(), 8 | 10)` to `matches!(mode(), 8 | 9 | 10)` to add
+    // RISC-V's timeout-wins `9` — but `9` was already AArch64's REPLY-wins and `10` was already
+    // RISC-V's REPLY-wins. Both non-x86 ports therefore ran the TIMEOUT-wins userspace scenario
+    // (server withholds NR7 until the client times out) under their reply-wins selector, so the
+    // reply genuinely lost the terminal (`TimeoutAlreadyClaimed`) no matter what deadline value
+    // the kernel armed. The decoder must be relative to THIS arch's own base.
+
+    // (9) the three per-arch selector bases are exactly the kernel-side constants, and the three
+    // (base, base+1) pairs are pairwise OVERLAPPING — which is precisely why an absolute value
+    // set cannot decode the scenario.
+    #[test]
+    fn a09_selector_pairs_overlap_across_arches() {
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            8
+        );
+        assert_eq!(
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            9
+        );
+        assert_eq!(
+            crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            10
+        );
+        // AArch64 reply-wins == RISC-V timeout-wins; RISC-V reply-wins == x86_64 timeout-wins.
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR + 1,
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR
+        );
+        assert_eq!(
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR + 1,
+            crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR
+        );
+    }
+
+    // (10) SOURCE: the userspace decoder is arch-relative, the collapsed absolute set is gone,
+    // and every arch's declared base matches the kernel constant it must mirror.
+    #[test]
+    fn a10_userspace_decoder_is_arch_relative() {
+        const SERVICE_SRC: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        // Search CODE only — the fix's own comment names the defective expression verbatim.
+        let code: alloc::string::String = SERVICE_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("matches!(mode(), 8 | 9 | 10)"),
+            "the collapsed absolute selector set decodes AArch64/RISC-V reply-wins as timeout-wins"
+        );
+        assert!(!code.contains("matches!(mode(), 8 | 10)"));
+        assert!(
+            SERVICE_SRC
+                .contains("fn is_timeout_wins() -> bool {\n        mode() == SELECTOR_BASE\n    }")
+        );
+        // The per-arch bases mirror the kernel-side selector constants exactly.
+        assert!(SERVICE_SRC.contains(
+            "#[cfg(target_arch = \"aarch64\")]\n    pub(super) const SELECTOR_BASE: u64 = 8;"
+        ));
+        assert!(SERVICE_SRC.contains(
+            "#[cfg(target_arch = \"riscv64\")]\n    pub(super) const SELECTOR_BASE: u64 = 9;"
+        ));
+        assert!(SERVICE_SRC.contains(
+            "#[cfg(target_arch = \"x86_64\")]\n    pub(super) const SELECTOR_BASE: u64 = 10;"
+        ));
+    }
+
+    // ── Stage 200C2C2C-R2B: the CAUSAL collector gate ────────────────────────────────
+
+    // (11) while HELD the narrow collector publishes NOTHING — so no timeout claimant can reach
+    // the terminal cell at all. Releasing it restores collection of the very same due deadline.
+    // This is what makes reply-wins causal rather than a wall-clock race.
+    #[test]
+    fn a11_held_gate_suppresses_collection() {
+        crate::kernel::boot::reply_timeout_work_clear(0);
+        let prior = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS,
+        );
+        let fx = caller_fixture();
+        let (idx, rgen, _id) = arm_terminal(&fx);
+        let _h = register_deadline(&fx, idx, rgen, 100);
+
+        crate::kernel::boot::hold_reply_timeout_collector();
+        assert!(crate::kernel::boot::reply_timeout_collector_held());
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(
+            crate::kernel::boot::reply_timeout_work_len(0),
+            0,
+            "a held gate must publish no timeout work for a DUE deadline"
+        );
+
+        // The exact userspace validation marker is the release trigger.
+        crate::kernel::boot::maybe_release_reply_timeout_collector_gate(
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=8 reply_ok=1",
+        );
+        assert!(!crate::kernel::boot::reply_timeout_collector_held());
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(
+            crate::kernel::boot::reply_timeout_work_len(0),
+            1,
+            "after release the same due deadline is collected normally"
+        );
+        crate::kernel::boot::reply_timeout_work_clear(0);
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prior);
+        teardown();
+    }
+
+    // (12) the gate is REPLY-WINS ONLY: it can never be armed in timeout-wins mode or with the
+    // oracle off, so no production or timeout-wins deadline is ever suppressed.
+    #[test]
+    fn a12_gate_never_arms_outside_reply_wins() {
+        let prior = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        for mode in [
+            0u8,
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS,
+        ] {
+            crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(mode);
+            crate::kernel::boot::hold_reply_timeout_collector();
+            assert!(
+                !crate::kernel::boot::reply_timeout_collector_held(),
+                "the causal gate must never arm outside reply-wins (mode={mode})"
+            );
+        }
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prior);
+    }
+
+    // (13) release requires the EXACT post-validation marker: a failed validation
+    // (`reply_ok=0`), an unrelated userspace line, or the wrong mode all leave it held.
+    #[test]
+    fn a13_gate_release_requires_validated_reply() {
+        let prior = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS,
+        );
+        crate::kernel::boot::hold_reply_timeout_collector();
+        assert!(crate::kernel::boot::reply_timeout_collector_held());
+        for msg in [
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=0 reply_ok=0",
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_TIMED_OUT",
+            "reply_ok=1",
+            "",
+        ] {
+            crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg);
+            assert!(
+                crate::kernel::boot::reply_timeout_collector_held(),
+                "gate must stay held for {msg:?}"
+            );
+        }
+        crate::kernel::boot::maybe_release_reply_timeout_collector_gate(
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=8 reply_ok=1",
+        );
+        assert!(!crate::kernel::boot::reply_timeout_collector_held());
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prior);
+    }
+
+    // (14) SOURCE: the gate is armed BEFORE the terminal is armed (so no claimant can ever race
+    // it), the collector honours it, both DebugLog seams release it, and the reply-wins
+    // late-scan attestation is only allowed once the gate is RELEASED (a "scan claimed nothing"
+    // claim made while collection is suppressed would be vacuous).
+    #[test]
+    fn a14_gate_wiring_is_ordered_and_non_vacuous() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const DEBUG_SRC: &str = include_str!("../syscall/debug.rs");
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        // Armed strictly before `arm_reply_terminal`.
+        let arm = IPC_STATE_SRC
+            .split("fn maybe_arm_reply_timeout_oracle")
+            .nth(1)
+            .expect("arm body");
+        let hold_at = arm
+            .find("hold_reply_timeout_collector()")
+            .expect("gate armed");
+        let terminal_at = arm
+            .find("self.arm_reply_terminal(")
+            .expect("terminal armed");
+        assert!(
+            hold_at < terminal_at,
+            "the causal gate must be armed BEFORE the terminal cell"
+        );
+        // The collector honours the gate as its FIRST action.
+        let collect = RUNTIME_SRC
+            .split("pub(crate) fn collect_due_reply_timeout_work")
+            .nth(1)
+            .expect("collector body");
+        assert!(collect.contains("if crate::kernel::boot::reply_timeout_collector_held() {\n            return;\n        }"));
+        assert!(
+            collect.find("reply_timeout_collector_held").unwrap()
+                < collect.find("with_task_tcbs_split_mut").unwrap()
+        );
+        // Both DebugLog seams release it.
+        assert!(DEBUG_SRC.contains("maybe_release_reply_timeout_collector_gate(msg_str)"));
+        assert!(SPLIT_SRC.contains("maybe_release_reply_timeout_collector_gate(msg)"));
+        // The reply-wins late-scan attestation requires the gate released.
+        assert!(RUNTIME_SRC.contains("&& !crate::kernel::boot::reply_timeout_collector_held()"));
+    }
+}

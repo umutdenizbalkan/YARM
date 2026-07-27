@@ -1817,18 +1817,34 @@ mod ipc_reply_timeout_oracle {
         (req, rep)
     }
 
-    /// The oracle mode from slot 5. x86_64: 10 = timeout-wins, 11 = reply-wins.
-    /// AArch64: 8 = timeout-wins, 9 = reply-wins. (Distinct slot-5 pairs, same behavior.)
+    /// This arch's slot-5 selector BASE. Each arch owns a distinct free PAIR
+    /// `(base, base + 1)` = `(timeout-wins, reply-wins)`:
+    ///   AArch64 `8`/`9`, RISC-V `9`/`10`, x86_64 `10`/`11`.
+    /// It must mirror `X86_/AARCH64_/RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR` in
+    /// `kernel::boot`, which is what the kernel writes into slot 5.
+    #[cfg(target_arch = "aarch64")]
+    pub(super) const SELECTOR_BASE: u64 = 8;
+    #[cfg(target_arch = "riscv64")]
+    pub(super) const SELECTOR_BASE: u64 = 9;
+    #[cfg(target_arch = "x86_64")]
+    pub(super) const SELECTOR_BASE: u64 = 10;
+
+    /// The oracle mode from slot 5 — always one of THIS arch's own pair.
     pub(super) fn mode() -> u64 {
         yarm_user_rt::runtime::startup_arg_slot(
             yarm_user_rt::runtime::STARTUP_SLOT_SUPERVISOR_CONTROL_RECV_EP,
         )
         .unwrap_or(0)
     }
-    /// timeout-wins is the LOWER value of each arch's slot-5 pair
-    /// (8 on AArch64, 9 on RISC-V, 10 on x86_64).
+    /// Stage 200C2C2C-R2B: decode the scenario RELATIVE TO THIS ARCH's base. The pairs
+    /// OVERLAP across arches (x86_64 timeout-wins and RISC-V reply-wins are both the
+    /// literal `10`), so an absolute value set cannot decode them. The previous
+    /// `matches!(mode(), 8 | 9 | 10)` classified RISC-V's reply-wins selector as
+    /// timeout-wins, which made the server withhold its NR7 until the client had
+    /// already timed out — the reply then lost the terminal for a genuine reason
+    /// (`TimeoutAlreadyClaimed`) and RISC-V reply-wins could never be observed.
     pub(super) fn is_timeout_wins() -> bool {
-        matches!(mode(), 8 | 9 | 10)
+        mode() == SELECTOR_BASE
     }
 
     #[derive(Clone, Copy, Default)]
@@ -2025,8 +2041,21 @@ mod ipc_reply_timeout_oracle {
                     // and every yield is a trap that re-runs the off-lock collector, so this is
                     // comfortably enough for the scan to pass the deadline while still finishing
                     // well inside the boot budget.
+                    //
+                    // Stage 200C2C2C-R2B: RISC-V needs only a SHORT nudge. The kernel's causal
+                    // collector gate is released by the `..._CLIENT_REPLY_RECV` marker logged
+                    // immediately above, and the deadline is already far in the past by then, so
+                    // the very next trap's collector pass performs the harmless late scan. The
+                    // long AArch64-sized spin is actively harmful here: it keeps init (tid 1)
+                    // yielding for tens of thousands of traps while the remaining boot proof
+                    // suites run, and the boot ends in a trap failure. AArch64 keeps its exact
+                    // prior bound so its accepted cell is unchanged.
+                    #[cfg(target_arch = "aarch64")]
+                    const REPLY_WINS_LATE_SCAN_YIELDS: u64 = 20_000;
+                    #[cfg(target_arch = "riscv64")]
+                    const REPLY_WINS_LATE_SCAN_YIELDS: u64 = 64;
                     let mut spun = 0u64;
-                    while spun < 20_000 {
+                    while spun < REPLY_WINS_LATE_SCAN_YIELDS {
                         let _ = yarm_user_rt::syscall::yield_now();
                         spun += 1;
                     }

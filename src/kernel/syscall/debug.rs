@@ -69,6 +69,10 @@ pub(super) fn handle_debug_log(
     // resumed CPU-0 client's userspace X86_BSP_REPLY_USER_VALIDATED marker is observed here AND the
     // kernel counters attest one complete reply delivery. Once, gated.
     crate::kernel::boot::maybe_emit_ipcreply_direct_smp_reply_ok(msg_str);
+    // Stage 200C2C2C-R2B: release the causal reply-wins collector gate ONLY on observing the
+    // oracle client's post-validation marker here — so the reply-timeout collector provably
+    // could not publish any work until userspace had compared the delivered reply payload.
+    crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg_str);
     frame.set_ok(0, 0, 0);
     Ok(())
 }

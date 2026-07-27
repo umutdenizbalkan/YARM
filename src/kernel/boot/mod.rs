@@ -3638,6 +3638,94 @@ pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
     !IPC_REPLY_TIMEOUT_RW_LATE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
 }
 
+// ── Stage 200C2C2C-R2B: the CAUSAL reply-wins collector gate ────────────────────────
+//
+// The reply-wins scenario must prove that a REPLY wins terminal ownership over a
+// TIMEOUT. Before this gate that outcome depended on wall-clock luck: the deadline was
+// armed at `now + N` hardware ticks and the server merely had to issue its NR7 "fast
+// enough". On the ports without a periodic scheduler tick the collector advances only on
+// TRAPS, so the elapsed time between the caller's block and the server's reply is a
+// property of QEMU host load, not of the kernel's ownership model — exactly the
+// non-determinism Stage 200C2C2C-R1 measured.
+//
+// The gate replaces that timing dependence with a CAUSAL one. While HELD, the narrow
+// collector publishes NO work, so no timeout claimant can reach the terminal cell at
+// all. It is armed at reply-wins ARM time — strictly BEFORE any terminal claim is
+// possible — and released only when the DebugLog seam observes the oracle client's own
+// post-validation marker, i.e. after userspace has compared the delivered reply payload.
+// The reply therefore wins because it is the ONLY claimant that could run, and the
+// subsequent scan genuinely executes past the (long-since passed) deadline.
+//
+// STRICTLY TEST-ONLY and doubly confined: the whole mechanism is behind
+// `ipc-reply-timeout-oracle-core`, and every entry point additionally requires the
+// oracle to be in REPLY-WINS mode. Timeout-wins and every production deadline are
+// untouched — the gate is never armed for them.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static IPC_REPLY_TIMEOUT_COLLECTOR_HOLD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Arm the causal gate (reply-wins only). Idempotent; emits the `held` marker once.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn hold_reply_timeout_collector() {
+    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_REPLY_WINS {
+        return;
+    }
+    if IPC_REPLY_TIMEOUT_COLLECTOR_HOLD
+        .compare_exchange(
+            0,
+            1,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!(
+            "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch={} outcome=held phase=before_terminal_claim result=ok",
+            REPLY_TIMEOUT_ARCH
+        );
+    }
+}
+
+/// `true` while the causal gate suppresses collection. Always `false` outside
+/// reply-wins, so it can never suppress a production or timeout-wins deadline.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn reply_timeout_collector_held() -> bool {
+    IPC_REPLY_TIMEOUT_COLLECTOR_HOLD.load(core::sync::atomic::Ordering::Acquire) == 1
+}
+
+/// The DebugLog-seam release: the oracle client logs this marker only AFTER comparing
+/// the delivered reply payload, so observing it here is proof that userspace validated
+/// the reply before any timeout claimant could run. Same idiom as the Stage 199A2D2C
+/// cross-CPU seals. One-shot.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str) {
+    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_REPLY_WINS {
+        return;
+    }
+    if !msg.starts_with("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV") || !msg.contains("reply_ok=1")
+    {
+        return;
+    }
+    if IPC_REPLY_TIMEOUT_COLLECTOR_HOLD
+        .compare_exchange(
+            1,
+            0,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!(
+            "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch={} outcome=released trigger=userspace_reply_validated result=ok",
+            REPLY_TIMEOUT_ARCH
+        );
+    }
+}
+
+/// Off-feature no-op so the DebugLog seams stay unconditional call sites.
+#[cfg(not(feature = "ipc-reply-timeout-oracle-core"))]
+pub(crate) fn maybe_release_reply_timeout_collector_gate(_msg: &str) {}
+
 // ── Stage 200C2B: per-CPU bounded DEFERRED reply-timeout work queue ─────────────────
 //
 // The narrow collector (`SharedKernel::collect_due_reply_timeout_work`) publishes one

@@ -3358,6 +3358,13 @@ impl SharedKernel {
     /// scan — no due registration is ever silently dropped.
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn collect_due_reply_timeout_work(&self, now: u64, cpu: CpuId) {
+        // Stage 200C2C2C-R2B — the CAUSAL reply-wins gate. While held, publish NOTHING, so
+        // no timeout claimant can reach the terminal cell while a reply is in flight. It is
+        // armed ONLY in reply-wins mode (never for a production or timeout-wins deadline)
+        // and released by the oracle client's own post-validation DebugLog marker.
+        if crate::kernel::boot::reply_timeout_collector_held() {
+            return;
+        }
         // Snapshot due (handle, deadline) pairs under ONLY the task lock; publish after
         // the task lock is dropped so the queue lock never nests inside the task lock.
         let mut due: [Option<crate::kernel::boot::ReplyTimeoutPostWork>;
@@ -3486,7 +3493,15 @@ impl SharedKernel {
             == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS
         {
             let rw = crate::kernel::boot::ipc_reply_timeout_rw_deadline();
-            if rw != 0 && now >= rw && crate::kernel::boot::ipc_reply_timeout_rw_late_scan_once() {
+            // Stage 200C2C2C-R2B: require the causal gate to be RELEASED first, so this
+            // attestation can only be made by a drain whose collector was genuinely free to
+            // publish timeout work — and still claimed none. While held the collector is
+            // suppressed, and a "late scan claimed nothing" claim would be vacuous.
+            if rw != 0
+                && now >= rw
+                && !crate::kernel::boot::reply_timeout_collector_held()
+                && crate::kernel::boot::ipc_reply_timeout_rw_late_scan_once()
+            {
                 crate::yarm_log!(
                     "IPC_REPLY_TIMEOUT_LATE_SCAN arch={} outcome=reply_won late_timeout_claims=0 result=ok",
                     crate::kernel::boot::REPLY_TIMEOUT_ARCH
