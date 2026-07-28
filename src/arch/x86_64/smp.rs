@@ -305,13 +305,16 @@ fn emit_ap_percpu_scaffold(cpu: CpuId) {
 /// The scaffold contract (this pass):
 /// - **STACK**: real, AP-owned (`ap_stack_top` derives it from the per-CPU
 ///   slot allocated by the trampoline). Marker: `X86_AP_STACK_READY`.
-/// - **GDT**: BSP GDT inherited via the trampoline. Safe for the parked
-///   AP because the AP runs no user code and takes no interrupts. Marker:
-///   `X86_AP_GDT_READY reason=bsp_gdt_shared_safe_while_ap_masked`.
-/// - **TSS / IDT / GS / FPU**: explicitly **DEFERRED** with real reasons.
-///   The AP parks with interrupts masked and runs no FP code, so none of
-///   these are required for safe parking. Future AP scheduler participation
-///   will need to flip these to READY with real per-CPU allocations.
+/// - **GDT / TSS**: real and PER-AP since Stage 183 inc.3 — prepared by
+///   `prepare_ap_descriptor_tables` before SIPI and loaded by the AP itself
+///   (`lgdt` + kernel CS/SS reload + `ltr`). This emitter only announces
+///   them (`X86_AP_GDT_READY reason=ap_local_gdt_graded_by_admit_poll`);
+///   the admit poll grades the AP's own evidence into
+///   `X86_AP_GDT_LOCAL_OK` and `X86_AP_TSS_OK` / `X86_AP_TSS_BAD`.
+/// - **IDT / FPU**: still explicitly **DEFERRED** with real reasons. The AP
+///   parks with interrupts masked and runs no FP code, so neither is
+///   required for safe parking. (GS is neither deferred nor emitted here —
+///   the AP writes `IA32_GS_BASE` itself; see `emit_ap_percpu_scaffold`.)
 ///
 /// All markers are emitted from the BSP — the AP itself cannot safely use
 /// `yarm_log!` (no AP-safe printk lock yet). The values are deterministic
