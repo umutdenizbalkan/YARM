@@ -194,10 +194,21 @@ fn feature_off_audit_is_two_sided() {
 
 #[test]
 fn runner_prepares_but_does_not_claim_a_live_cell_in_this_stage() {
-    for (arch, src) in arch_runners() {
+    // Stage 200D-2B1D-x86 executed the x86_64 runner, so that port is no longer
+    // prepare-only; the other two still are, and must say so. Each port's status is asserted
+    // explicitly rather than the whole set being relaxed to whichever is loosest.
+    assert!(
+        X86.contains("Stage 200D-2B1D-x86 is the first stage to run it"),
+        "the x86_64 runner must record which stage executed it"
+    );
+    for (arch, src) in [("aarch64", AARCH64), ("riscv64", RISCV64)] {
         assert!(
             src.contains("does NOT execute it") || src.contains("claims no live cell"),
-            "{arch} runner must state that Stage 200D-2B1C only prepares it"
+            "{arch} runner must still state that Stage 200D-2B1C only prepares it"
+        );
+        assert!(
+            !src.contains("2B1D"),
+            "{arch} has no live stage yet and must not reference one"
         );
     }
     // The seal the runner emits is the LIVE one, distinct from the readiness seal the stage

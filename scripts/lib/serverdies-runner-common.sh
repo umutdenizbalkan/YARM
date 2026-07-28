@@ -154,6 +154,13 @@ serverdies_run_b_live_cell() {
     || { die "RUN_B feature-on kernel build failed"; return; }
   serverdies_recheck_commit "RUN_B build"
 
+  # Stage the bootable artifacts if the port needs a staging step (x86_64 boots a staged
+  # kernel + initramfs, not the raw build product). Ports without one boot directly.
+  if declare -F serverdies_stage_boot_artifacts >/dev/null; then
+    serverdies_stage_boot_artifacts || { die "RUN_B artifact staging failed"; return; }
+    serverdies_recheck_commit "RUN_B stage"
+  fi
+
   local log="$LOGDIR/run-b.log"
   rm -f "$log"
   note "boot cmdline: ${SELECTOR}=server-dies"
