@@ -52,8 +52,16 @@ BASE_CMDLINE=${BASE_CMDLINE:-"console=ttyS0 rdinit=/init"}
 # initramfs are staged normally, and only the kernel image is replaced with the feature-on
 # build that RUN_B already produced. The staged kernel is then re-verified to actually carry
 # the oracle, so a silent fallback to the feature-off image cannot pass as a live cell.
+# ORDER IS LOAD-BEARING: the artifact script rebuilds the kernel feature-OFF into the same
+# target path RUN_B used, so it must run FIRST and the feature-on kernel must be rebuilt
+# AFTER it. Staging first and copying RUN_B's earlier build would copy an image the artifact
+# script had already overwritten — which is exactly what the oracle-on check below caught on
+# the first attempt.
 serverdies_stage_boot_artifacts() {
   ./scripts/build-qemu-x86_64-artifacts.sh >"$LOGDIR/stage.log" 2>&1 || return 1
+  cargo +nightly build -Z build-std="$BUILD_STD" -Z json-target-spec \
+    --target "$KTARGET" --profile "$KPROFILE" --no-default-features \
+    --features "$FEATURE" -p yarm --bin kernel_boot >>"$LOGDIR/stage.log" 2>&1 || return 1
   [[ -f "$KELF" ]] || { echo "[serverdies] missing feature-on kernel: $KELF"; return 1; }
   cp "$KELF" "$BOOT_KERNEL" || return 1
   [[ -f "$BOOT_INITRD" ]] || { echo "[serverdies] missing initramfs: $BOOT_INITRD"; return 1; }
