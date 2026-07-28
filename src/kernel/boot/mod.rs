@@ -4151,6 +4151,117 @@ pub fn clear_post_lock_trap_disposition(cpu_idx: usize) {
     }
 }
 
+// ── Stage 200D-0B3: the bounded exit-attestation latch ──────────────────────────────
+//
+// Stage 200D-0B1 attested "broad lock released" and "post-lock drain done" from INSIDE
+// `SharedKernel::with_cpu`, where neither was true, and Stage 200D-0B2 sealed a live boot
+// against those claims. The correction is not a rewording: each of the three claims now has
+// to be emitted from the place that actually performs it, and those places are three
+// different stack frames spanning the lock boundary.
+//
+// This latch is what lets a later frame know that THIS trap accepted an exit. It carries no
+// authority whatsoever: no scheduling, teardown, frame selection or terminal-claim decision
+// reads it. Its only consumers are markers and one fail-closed stage check, so an
+// attestation can never run ahead of the operation it describes.
+//
+// `stage` is monotonic within one trap:
+//   0 = idle           no accepted exit on this CPU
+//   1 = consumed       the in-lock consumer validated the identity and prepared the owner
+//   2 = lock_released  `with_cpu` has returned; the broad guard is dropped
+//   3 = drained        every shared post-lock drain has completed
+// The vector epilogue consumes the latch back to 0. A frame that finds an unexpected stage
+// emits `EXIT_TASK_TRAP_DEPTH_ERROR` rather than a reassuring marker.
+pub const EXIT_ATTEST_IDLE: u8 = 0;
+pub const EXIT_ATTEST_CONSUMED: u8 = 1;
+pub const EXIT_ATTEST_LOCK_RELEASED: u8 = 2;
+pub const EXIT_ATTEST_DRAINED: u8 = 3;
+
+static EXIT_ATTEST_STAGE: [core::sync::atomic::AtomicU8; crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU8::new(EXIT_ATTEST_IDLE) };
+        crate::kernel::scheduler::MAX_CPUS];
+static EXIT_ATTEST_TID: [core::sync::atomic::AtomicU64; crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+static EXIT_ATTEST_ASID: [core::sync::atomic::AtomicU16; crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU16::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Arm the latch from the in-lock consumer. Returns `false` if one is already armed for this
+/// CPU — a second accepted exit in one trap is a defect, not a last-writer-wins race.
+#[must_use]
+pub fn arm_exit_attestation(cpu_idx: usize, tid: u64, asid: Asid) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    use core::sync::atomic::Ordering;
+    if EXIT_ATTEST_STAGE[cpu_idx]
+        .compare_exchange(
+            EXIT_ATTEST_IDLE,
+            EXIT_ATTEST_CONSUMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    EXIT_ATTEST_TID[cpu_idx].store(tid, Ordering::Release);
+    EXIT_ATTEST_ASID[cpu_idx].store(asid.0, Ordering::Release);
+    true
+}
+
+/// Advance the latch exactly one stage. Returns the armed `{tid, asid}` on success, or `None`
+/// when this CPU has no armed attestation at `expected` — which is the ordinary case for every
+/// trap that is not an accepted exit, and makes the marker sites strict no-ops there.
+#[must_use]
+pub fn advance_exit_attestation(cpu_idx: usize, expected: u8, next: u8) -> Option<(u64, Asid)> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    use core::sync::atomic::Ordering;
+    EXIT_ATTEST_STAGE[cpu_idx]
+        .compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    Some((
+        EXIT_ATTEST_TID[cpu_idx].load(Ordering::Acquire),
+        Asid(EXIT_ATTEST_ASID[cpu_idx].load(Ordering::Acquire)),
+    ))
+}
+
+/// Read the current stage without changing it.
+#[must_use]
+pub fn exit_attestation_stage(cpu_idx: usize) -> u8 {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return EXIT_ATTEST_IDLE;
+    }
+    EXIT_ATTEST_STAGE[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Consume the latch in the vector epilogue, returning the armed identity and the stage it
+/// had reached. `None` when nothing was armed.
+#[must_use]
+pub fn take_exit_attestation(cpu_idx: usize) -> Option<(u64, Asid, u8)> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    use core::sync::atomic::Ordering;
+    let stage = EXIT_ATTEST_STAGE[cpu_idx].swap(EXIT_ATTEST_IDLE, Ordering::AcqRel);
+    if stage == EXIT_ATTEST_IDLE {
+        return None;
+    }
+    Some((
+        EXIT_ATTEST_TID[cpu_idx].load(Ordering::Acquire),
+        Asid(EXIT_ATTEST_ASID[cpu_idx].load(Ordering::Acquire)),
+        stage,
+    ))
+}
+
+/// Clear the latch (hosted test isolation only).
+#[cfg(any(test, feature = "hosted-dev"))]
+pub fn clear_exit_attestation(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        EXIT_ATTEST_STAGE[cpu_idx].store(EXIT_ATTEST_IDLE, core::sync::atomic::Ordering::Release);
+    }
+}
+
 pub(crate) fn server_death_work_published_count() -> u64 {
     SERVER_DEATH_WORK_PUBLISHED.load(core::sync::atomic::Ordering::Relaxed)
 }

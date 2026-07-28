@@ -329,6 +329,25 @@ pub fn handle_trap_entry_shared(
     // `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.
     // `inner_result: Result<(), TrapHandleError>` from the arch handler.
 
+    // Stage 200D-0B3: the x86_64 broad-lock-release attestation, emitted HERE — the first
+    // statement after `with_cpu` returned — and nowhere else. Stage 200D-0B1 emitted this from
+    // inside the arch handler, where the guard was still held; that is the false claim this
+    // stage removes. A strict no-op unless the in-lock consumer armed the latch on this CPU,
+    // so no ordinary trap pays for it.
+    #[cfg(target_arch = "x86_64")]
+    if let Some((exit_tid, exit_asid)) = crate::kernel::boot::advance_exit_attestation(
+        cpu_idx,
+        crate::kernel::boot::EXIT_ATTEST_CONSUMED,
+        crate::kernel::boot::EXIT_ATTEST_LOCK_RELEASED,
+    ) {
+        crate::yarm_log!(
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64 tid={} asid={} cpu={} broad_lock=0 holder=with_cpu result=ok",
+            exit_tid,
+            exit_asid.0,
+            cpu.0
+        );
+    }
+
     // Stage 188A: dispatch-return delivery channel drain. With the broad
     // `&mut KernelState` borrow dropped above, execute any post-boundary work a
     // handler stashed under the broad borrow, through `&SharedKernel` seams.
@@ -1108,6 +1127,27 @@ pub fn handle_trap_entry_shared(
     // outside `SpinLock<KernelState>`. An empty queue makes this a cheap no-op.
     #[cfg(not(target_arch = "riscv64"))]
     let _ = shared.drain_server_death_post_work(cpu);
+
+    // Stage 200D-0B3: the x86_64 post-lock-drain attestation. Emitted only after EVERY shared
+    // post-lock drain above has actually completed — dispatch, the D2/D6 seams, FutexWait,
+    // Yield, the switch-plan stash, the reply-timeout collector and the server-death drain.
+    // Stage 200D-0B1 emitted a "drain done" marker from inside `with_cpu`, before any of them
+    // had run; naming an operation "done" before performing it is precisely what this stage
+    // forbids. The stage CAS is what enforces it: this cannot fire unless the release
+    // attestation above already fired for the same trap.
+    #[cfg(target_arch = "x86_64")]
+    if let Some((exit_tid, exit_asid)) = crate::kernel::boot::advance_exit_attestation(
+        cpu_idx,
+        crate::kernel::boot::EXIT_ATTEST_LOCK_RELEASED,
+        crate::kernel::boot::EXIT_ATTEST_DRAINED,
+    ) {
+        crate::yarm_log!(
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64 tid={} asid={} cpu={} broad_lock=0 drains=all result=ok",
+            exit_tid,
+            exit_asid.0,
+            cpu.0
+        );
+    }
 
     // ── Stage 200D-0C1: the AArch64 `CurrentTaskExited` consumer ────────────────────────────
     //

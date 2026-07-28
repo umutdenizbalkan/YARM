@@ -381,43 +381,51 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         frame.as_deref_mut(),
         fault_bookkeeping_mode,
     )?;
-    // ── Stage 200D-0B1: the x86_64 CurrentTaskExited consumer ────────────────────────
+    // ── Stage 200D-0B3: the x86_64 CurrentTaskExited consumer (in-lock, corrected) ───
     //
-    // THE single production consumer of the Stage 200D-0A disposition. Placement is the
-    // contract: `handle_trap_event` above has released the broad `SpinLock<KernelState>`
-    // and `handle_trap_entry_shared` has drained the post-lock deferred work, and this runs
-    // strictly BEFORE `restore_arch_thread_state` picks the outgoing frame owner.
+    // THE single production consumer of the Stage 200D-0A disposition.
     //
-    // STRUCTURAL NON-RETURN. There is no second assembly return path here, and none is
-    // needed: `restore_arch_thread_state` restores whatever task is CURRENT, and
-    // `exit_task` has already removed the exiting task from `current` and either installed
-    // a replacement or cleared it for idle. The exiting frame therefore cannot be restored
-    // because its owner is no longer the restore owner. The common trap epilogue still
-    // runs — it simply operates on the replacement's state.
+    // CORRECTION (supersedes the Stage 200D-0B1 text sealed by Stage 200D-0B2). The previous
+    // comment here claimed `handle_trap_event` had "released the broad `SpinLock<KernelState>`"
+    // and that the post-lock deferred work had drained. Both were false, and the markers built
+    // on them were false with them. `handle_trap_entry_with_fault_bookkeeping_mode` runs inside
+    // `SharedKernel::with_cpu`, which holds the broad guard across this entire body; the shared
+    // post-lock drains do not run until `with_cpu` returns, which is after this function exits.
     //
-    // This consumer performs NO teardown, NO enqueue, NO terminal claim, NO frame write and
-    // NO user-memory access. It validates the invariant the model depends on, attests it,
-    // and fails closed if it does not hold.
+    // The consumer STAYS here, because in-lock is where it belongs — this is where the exiting
+    // task's identity is still coherent and where the outgoing owner is selected. What changed
+    // is that it now says so. Its whole in-lock job is:
+    //
+    //   * take exactly one typed disposition;
+    //   * validate the exact {tid, asid} incarnation against live TCB state;
+    //   * confirm the exiting task is terminal, is not current, and is not the restore owner;
+    //   * name the PREPARED restore owner (replacement or idle);
+    //   * arm one bounded attestation latch so the two later frames — the post-lock section and
+    //     the vector epilogue — can attest what THEY actually do.
+    //
+    // It performs NO teardown, NO PeerDeath or timeout terminal claim, NO caller-result
+    // publication, NO scheduler enqueue, NO userspace copy, NO reply-record scan, NO frame
+    // write and NO trap-depth write. Those six production side effects are exactly what must
+    // not happen under the broad lock, and `c0b3_no_production_side_effects_under_broad_lock`
+    // guards each of them at zero.
+    //
+    // "Prepared" is not "restored". `restore_arch_thread_state` below writes the replacement's
+    // context into the kernel-side `TrapFrame` only. The hardware iret frame is not touched
+    // until `flush_trap_context_to_iret_frame` in the vector epilogue, which runs after
+    // `with_cpu` returns AND after every post-lock drain. The exiting task cannot be restored
+    // because it is no longer the restore owner, and no user return happens from here at all.
     if let crate::kernel::boot::PostLockTrapDisposition::CurrentTaskExited { tid, asid } =
         crate::kernel::boot::take_post_lock_trap_disposition(cpu.0 as usize)
     {
-        // Reaching this point PROVES the broad `SpinLock<KernelState>` taken by the in-lock
-        // phase has been dropped: `handle_trap_event` has returned and the post-lock
-        // deferred work has drained. Attesting it here rather than in the shared entry is
-        // what makes it observable — the shared entry runs before the syscall publishes the
-        // disposition, so a pending-check there never fired.
         crate::yarm_log!(
-            "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64 cpu={} result=ok",
-            cpu.0
-        );
-        crate::yarm_log!(
-            "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64 tid={} asid={} cpu={} result=ok",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64 tid={} asid={} cpu={} broad_lock=1 result=ok",
             tid,
             asid.0,
             cpu.0
         );
         // (a) The exiting incarnation must no longer be current. If it were, the epilogue
-        // would restore a dead task's frame — fail closed through the existing fatal path.
+        // would flush a dead task's context into the iret frame — fail closed through the
+        // existing fatal path.
         if kernel.current_tid() == Some(tid) {
             crate::yarm_log!(
                 "EXIT_TASK_EXITING_STILL_CURRENT arch=x86_64 tid={} result=fail",
@@ -436,50 +444,75 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         };
         let terminal = matches!(
             kernel.task_status(tid),
-            Some(crate::kernel::task::TaskStatus::Exited(_)) | None
+            Some(crate::kernel::task::TaskStatus::Exited(_))
+                | Some(crate::kernel::task::TaskStatus::Dead)
+                | None
         );
-        if !identity_ok || !terminal {
+        // (c) Absence is not merely "off this CPU's queue": the exiting incarnation must be
+        // present in NO runqueue on ANY CPU, so it can never be re-selected.
+        let in_runqueue = kernel.task_present_in_any_runqueue(tid);
+        if !identity_ok || !terminal || in_runqueue {
             crate::yarm_log!(
-                "EXIT_TASK_WRONG_IDENTITY arch=x86_64 tid={} asid={} identity_ok={} terminal={} result=fail",
+                "EXIT_TASK_WRONG_IDENTITY arch=x86_64 tid={} asid={} identity_ok={} terminal={} in_runqueue={} result=fail",
                 tid,
                 asid.0,
                 u32::from(identity_ok),
-                u32::from(terminal)
+                u32::from(terminal),
+                u32::from(in_runqueue)
             );
             return Err(TrapHandleError::Syscall(
                 crate::kernel::syscall::SyscallError::Internal,
             ));
         }
         crate::yarm_log!(
-            "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64 tid={} asid={} cpu={} result=ok",
+            "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64 tid={} asid={} cpu={} broad_lock=1 result=ok",
             tid,
             asid.0,
             cpu.0
         );
         crate::yarm_log!(
-            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64 cpu={} broad_lock=0 result=ok",
-            cpu.0
+            "EXIT_TASK_ABSENCE_VALIDATED arch=x86_64 tid={} asid={} current=0 runqueue=0 restore_owner=0 identity=tid_asid broad_lock=1 result=ok",
+            tid,
+            asid.0
         );
-        // (c) Trap-depth ownership is UNCHANGED: the dispatcher's common epilogue zeroes the
-        // per-CPU depth on every return path, including this one. No exit-specific store is
-        // made here — adding one would double-clear.
-        crate::yarm_log!(
-            "EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64 cpu={} owner=common_epilogue clears=1 result=ok",
-            cpu.0
-        );
-        // (d) Name the outgoing restore owner. It is never the exiting task.
+        // (d) Name the PREPARED restore owner. It is never the exiting task. This selects the
+        // owner; it does not restore anything to userspace.
         match kernel.current_tid() {
-            Some(next) => crate::yarm_log!(
-                "EXIT_TASK_RESTORE_OWNER arch=x86_64 owner=replacement exiting_tid={} next_tid={} cpu={} result=ok",
+            Some(next) if next != 0 => {
+                if next == tid {
+                    crate::yarm_log!(
+                        "EXIT_TASK_RESELECTED_EXITING_TASK arch=x86_64 tid={} cpu={} result=fail",
+                        tid,
+                        cpu.0
+                    );
+                    return Err(TrapHandleError::Syscall(
+                        crate::kernel::syscall::SyscallError::Internal,
+                    ));
+                }
+                crate::yarm_log!(
+                    "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64 owner=replacement exiting_tid={} next_tid={} cpu={} broad_lock=1 result=ok",
+                    tid,
+                    next,
+                    cpu.0
+                );
+            }
+            _ => crate::yarm_log!(
+                "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64 owner=idle exiting_tid={} cpu={} broad_lock=1 result=ok",
                 tid,
-                next,
                 cpu.0
             ),
-            None => crate::yarm_log!(
-                "EXIT_TASK_RESTORE_OWNER arch=x86_64 owner=idle exiting_tid={} cpu={} result=ok",
+        }
+        // (e) Arm the bounded latch. It drives markers only — no scheduling, teardown, frame
+        // selection or terminal-claim decision reads it.
+        if !crate::kernel::boot::arm_exit_attestation(cpu.0 as usize, tid, asid) {
+            crate::yarm_log!(
+                "EXIT_TASK_DUPLICATE_DISPOSITION arch=x86_64 tid={} cpu={} result=fail",
                 tid,
                 cpu.0
-            ),
+            );
+            return Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            ));
         }
     }
 

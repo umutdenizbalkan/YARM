@@ -90880,10 +90880,14 @@ mod stage200d0a_exit_foundation {
     }
 }
 
-/// Stage 200D-0B1 — the x86_64 `CurrentTaskExited` consumer and live-oracle preparation.
+/// Stage 200D-0B3 — the x86_64 `CurrentTaskExited` consumer contract, CORRECTED.
 ///
-/// Hosted and source only. `p26` asserts this stage runs no QEMU and claims no live cell.
-mod stage200d0b1_x86_exit_prep {
+/// Supersedes the Stage 200D-0B1 module of the same shape. Stage 200D-0B1 asserted that the
+/// consumer ran after the broad lock was released and after the post-lock drains; both were
+/// false, because the consumer runs inside `SharedKernel::with_cpu`. Those guards are replaced
+/// here by ones that assert the REAL pipeline, and the properties that were always true
+/// (identity, `WouldBlock`, feature gating, the oracle wiring) are retained unchanged.
+mod stage200d0b3_x86_exit_corrected {
     use crate::kernel::boot::PostLockTrapDisposition;
     use crate::kernel::vm::Asid;
 
@@ -90896,6 +90900,7 @@ mod stage200d0b1_x86_exit_prep {
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
     const RUNNER: &str = include_str!("../../../scripts/qemu-x86-exit-current-task-smoke.sh");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
 
     /// Comment-stripped consumer body: these guards are about CODE, and the block's own
     /// prose legitimately names `exit_task`, frames and depth while explaining why it
@@ -90910,7 +90915,9 @@ mod stage200d0b1_x86_exit_prep {
 
     fn consumer_block() -> &'static str {
         let b = X86_TRAP_SRC
-            .split("// ── Stage 200D-0B1: the x86_64 CurrentTaskExited consumer")
+            .split(
+                "// ── Stage 200D-0B3: the x86_64 CurrentTaskExited consumer (in-lock, corrected)",
+            )
             .nth(1)
             .expect("consumer");
         b.split("// Stage 117: skip restore_arch_thread_state")
@@ -90942,10 +90949,13 @@ mod stage200d0b1_x86_exit_prep {
         }
     }
 
+    /// (2/3/4) CORRECTED ordering. Stage 200D-0B1 asserted the consumer ran after the broad
+    /// lock was released and after the post-lock drains. Neither was true: the consumer is
+    /// inside `SharedKernel::with_cpu`, and the drains do not run until it returns. The real
+    /// order — and the one now asserted — is: syscall dispatch, consumer, owner preparation,
+    /// in-lock restore preparation, `with_cpu` returns, drains, epilogue.
     #[test]
     fn p02_p03_p04_consumer_ordering() {
-        // The consumer sits AFTER the in-lock handler returns (which releases the broad
-        // lock) and BEFORE restore_arch_thread_state.
         let body = X86_TRAP_SRC
             .split("fn handle_trap_entry_with_fault_bookkeeping_mode")
             .nth(1)
@@ -90959,27 +90969,109 @@ mod stage200d0b1_x86_exit_prep {
             .expect("restore");
         assert!(
             inlock < consumer,
-            "consumer runs after the broad-lock phase"
+            "the consumer follows the syscall dispatch"
         );
-        assert!(consumer < restore, "consumer runs before the arch restore");
-        // The post-lock deferred drain is wired into the shared entry, which the in-lock
-        // phase returns through, so the drain precedes the consumer.
-        assert!(TRAP_ENTRY_SRC.contains("shared.drain_server_death_post_work(cpu)"));
-        // Stage 200D-0B2: the broad-lock-release attestation lives in the CONSUMER, not the
-        // shared entry. The shared entry runs before the syscall publishes the disposition,
-        // so a pending-check there could never fire; reaching the consumer is itself the
-        // proof that the lock dropped and the drain ran.
-        let cb = consumer_block();
-        let released = cb
-            .find("EXIT_TASK_BROAD_LOCK_RELEASED")
-            .expect("release attestation");
-        let consumed = cb
-            .find("EXIT_TASK_DISPOSITION_CONSUMED")
-            .expect("consumed attestation");
         assert!(
-            released < consumed,
-            "the release attestation precedes the consumption attestation"
+            consumer < restore,
+            "the consumer precedes the in-lock restore PREPARATION"
         );
+        // The whole handler body runs inside `with_cpu`, so the consumer is in-lock. This is
+        // the fact Stage 200D-0B1 got wrong, so it is asserted against the source of the lock
+        // rather than against any comment.
+        assert!(RUNTIME_SRC.contains(
+            "pub fn with_cpu<R>(\n        &self,\n        cpu: CpuId,\n        f: impl FnOnce(&mut KernelState) -> R,\n    ) -> Result<R, KernelError> {\n        let mut guard = self.state.lock();"
+        ));
+        let entry = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        let with_cpu = entry
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("lock acquire");
+        let inner_call = entry
+            .find("handle_trap_entry_with_fault_bookkeeping_mode(")
+            .expect("arch handler call");
+        let released = entry
+            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .expect("release boundary");
+        assert!(
+            with_cpu < inner_call && inner_call < released,
+            "the arch handler — and therefore the consumer — runs between lock acquire and release"
+        );
+        // The consumer itself must NOT claim the lock was released or that drains ran.
+        let cb = consumer_block();
+        assert!(
+            !cb.contains("EXIT_TASK_BROAD_LOCK_RELEASED"),
+            "the false release attestation must not be emitted from inside the broad lock"
+        );
+        assert!(
+            !cb.contains("EXIT_TASK_POST_LOCK_DRAIN_DONE"),
+            "the false drain attestation must not be emitted from inside the broad lock"
+        );
+        assert!(
+            !cb.contains("broad_lock=0"),
+            "no in-lock marker may claim broad_lock=0"
+        );
+        // Every marker the consumer does emit states broad_lock=1.
+        for m in [
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64",
+            "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64",
+            "EXIT_TASK_ABSENCE_VALIDATED arch=x86_64",
+            "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64",
+        ] {
+            let at = cb.find(m).unwrap_or_else(|| panic!("marker present: {m}"));
+            let line_end = cb[at..]
+                .find("result=ok")
+                .unwrap_or_else(|| panic!("terminated: {m}"));
+            assert!(
+                cb[at..at + line_end].contains("broad_lock=1"),
+                "in-lock marker must state broad_lock=1: {m}"
+            );
+        }
+    }
+
+    /// (2b) The two post-lock markers are emitted from the shared entry, on the correct side
+    /// of the boundary, and the drain marker only after every drain has completed.
+    #[test]
+    fn p02b_post_lock_markers_sit_after_the_real_boundary() {
+        let entry = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        let released_boundary = entry
+            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .expect("release boundary");
+        let release_marker = entry
+            .find("EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64")
+            .expect("release marker");
+        let drain_marker = entry
+            .find("EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64")
+            .expect("drain marker");
+        assert!(
+            released_boundary < release_marker,
+            "the release marker is emitted after with_cpu returned"
+        );
+        assert!(
+            release_marker < drain_marker,
+            "the drain marker follows the release marker"
+        );
+        // EVERY shared post-lock drain precedes the drain marker.
+        for drain in [
+            "shared.drain_dispatch_post_work(cpu)?;",
+            "shared.drain_reply_timeout_post_work(cpu, now);",
+            "shared.drain_server_death_post_work(cpu)",
+            "DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()",
+        ] {
+            let at = entry
+                .find(drain)
+                .unwrap_or_else(|| panic!("drain present: {drain}"));
+            assert!(at < drain_marker, "{drain} must complete before drains=all");
+        }
+        // The stage CAS makes the ordering enforceable at runtime, not merely by layout: the
+        // drain marker cannot fire unless the release marker already advanced the latch.
+        assert!(entry.contains("crate::kernel::boot::EXIT_ATTEST_CONSUMED,\n        crate::kernel::boot::EXIT_ATTEST_LOCK_RELEASED,"));
+        assert!(entry.contains("crate::kernel::boot::EXIT_ATTEST_LOCK_RELEASED,\n        crate::kernel::boot::EXIT_ATTEST_DRAINED,"));
+        assert!(entry.contains("drains=all"));
     }
 
     // ── identity validation (10–13) ─────────────────────────────────────────────────
@@ -90990,6 +91082,9 @@ mod stage200d0b1_x86_exit_prep {
         assert!(b.contains("current_asid == asid"));
         assert!(b.contains("EXIT_TASK_WRONG_IDENTITY"));
         assert!(b.contains("EXIT_TASK_EXITING_STILL_CURRENT"));
+        // Stage 200D-0B3 additionally proves absence from EVERY runqueue, so a reused TID
+        // cannot be satisfied by a task that is merely off this CPU's queue.
+        assert!(b.contains("kernel.task_present_in_any_runqueue(tid)"));
         // Reused TID with a different ASID is rejected by that comparison.
         let a = Asid(7);
         let reused = Asid(8);
@@ -91096,8 +91191,11 @@ mod stage200d0b1_x86_exit_prep {
             Some(51),
             "the exiting task must never remain current on the idle path"
         );
-        // The consumer names the idle owner explicitly.
-        assert!(consumer_block().contains("owner=idle"));
+        // The consumer names the PREPARED idle owner explicitly. "Prepared" is deliberate:
+        // selecting the owner is not restoring anything to userspace.
+        assert!(
+            consumer_block().contains("EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64 owner=idle")
+        );
     }
 
     // ── frame and epilogue (14–15) ──────────────────────────────────────────────────
@@ -91123,6 +91221,14 @@ mod stage200d0b1_x86_exit_prep {
         ] {
             assert!(!b.contains(forbidden), "consumer must not {forbidden}");
         }
+        // Stage 200D-0B3: "restore owner prepared" is not "user frame restored". The actual
+        // iret-frame commit is `flush_trap_context_to_iret_frame`, which the consumer never
+        // calls and which lives in the vector epilogue.
+        assert!(!b.contains("flush_trap_context_to_iret_frame"));
+        assert!(!b.contains("write_task_gprs_to_saved_regs"));
+        assert!(DESC_SRC.contains(
+            "unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };"
+        ));
     }
 
     // ── WouldBlock preservation (16–17) ─────────────────────────────────────────────
@@ -91177,8 +91283,60 @@ mod stage200d0b1_x86_exit_prep {
         // No exit-specific cleanup helper was introduced anywhere.
         assert!(!DESC_SRC.contains("exit_clear_trap_depth"));
         assert!(!X86_TRAP_SRC.contains("exit_clear_trap_depth"));
-        // The consumer documents the ownership rather than duplicating it.
-        assert!(consumer_block().contains("owner=common_epilogue"));
+        // Stage 200D-0B3: the ownership attestation moved OUT of the consumer and into the
+        // epilogue that actually owns the clear. Stage 200D-0B1 emitted it from inside the
+        // broad lock, describing work that had not happened yet.
+        assert!(
+            !consumer_block().contains("EXIT_TASK_TRAP_DEPTH_OWNER"),
+            "the in-lock depth-ownership claim must be gone"
+        );
+        assert!(
+            !X86_TRAP_SRC.contains("EXIT_TASK_COMMON_EPILOGUE_OWNER"),
+            "epilogue ownership is not attested from the arch handler"
+        );
+        assert!(DESC_SRC.contains("EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64"));
+        // It is emitted only AFTER the single depth clear on that return path, so `clears=1`
+        // describes a store that already executed.
+        let helper = DESC_SRC
+            .split("fn maybe_attest_exit_common_epilogue")
+            .nth(1)
+            .expect("epilogue attestation helper");
+        let helper = helper.split("\n}\n").next().unwrap();
+        assert!(
+            !helper.contains("TRAP_DISPATCH_DEPTH"),
+            "the attestation helper must make no depth write of its own"
+        );
+        // Both call sites (replacement return and idle divergence) sit AFTER a depth clear,
+        // with nothing but comments between, so `clears=1` describes a store that already ran.
+        let calls: alloc::vec::Vec<&str> = DESC_SRC
+            .match_indices("maybe_attest_exit_common_epilogue(cpu, ")
+            .map(|(i, _)| &DESC_SRC[..i])
+            .collect();
+        assert_eq!(calls.len(), 2, "exactly two epilogue attestation sites");
+        for head in calls {
+            let preceding_code = head
+                .lines()
+                .rev()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty() && !l.starts_with("//"))
+                .expect("a preceding statement");
+            assert_eq!(
+                preceding_code, "TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);",
+                "the attestation must immediately follow the depth clear it describes"
+            );
+        }
+        assert_eq!(
+            DESC_SRC
+                .matches("maybe_attest_exit_common_epilogue(cpu, \"replacement\")")
+                .count(),
+            1
+        );
+        assert_eq!(
+            DESC_SRC
+                .matches("maybe_attest_exit_common_epilogue(cpu, \"idle\")")
+                .count(),
+            1
+        );
     }
 
     // ── oracle preparation (20–21) ──────────────────────────────────────────────────
@@ -91223,7 +91381,8 @@ mod stage200d0b1_x86_exit_prep {
         assert!(b.contains("kernel.current_tid() == Some(tid)"));
         assert!(b.contains("kernel.task_asid(tid)"));
         assert!(b.contains("EXIT_TASK_EXITING_NOT_CURRENT"));
-        assert!(b.contains("EXIT_TASK_RESTORE_OWNER"));
+        assert!(b.contains("EXIT_TASK_RESTORE_OWNER_PREPARED"));
+        assert!(b.contains("EXIT_TASK_ABSENCE_VALIDATED arch=x86_64"));
         // No new task-inspection syscall was added for the oracle.
         assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
     }
@@ -91308,10 +91467,243 @@ mod stage200d0b1_x86_exit_prep {
         assert!(RUNNER.contains("reason=dirty_tree"));
         assert!(RUNNER.contains("recheck_exact_commit"));
         assert!(RUNNER.contains("log reuse"));
-        // This stage runs NO live boot: the runner is prepared, not executed, and emits no
-        // live seal of its own without a completed run.
-        assert!(RUNNER.contains("STAGE_200D0B2_X86_EXIT_CURRENT_TASK_LIVE_SEAL"));
+        // Stage 200D-0B3: the runner emits the SUPERSEDING refreeze seal, and no longer the
+        // inaccurate Stage 200D-0B2 one.
+        assert!(RUNNER.contains("STAGE_200D0B3_X86_EXIT_CURRENT_TASK_REFREEZE_SEAL"));
+        assert!(!RUNNER.contains("STAGE_200D0B2_X86_EXIT_CURRENT_TASK_LIVE_SEAL"));
         assert!(!RUNNER.contains("STAGE_200D0B1"));
+    }
+
+    /// (§9) The corrected runner must REJECT the four shapes of the old false contract. Each
+    /// assertion below is about what the runner refuses, not merely about what it requires —
+    /// a runner that only added new markers would still accept the sealed-but-false log.
+    #[test]
+    fn p28_runner_rejects_the_old_false_marker_contract() {
+        // 1. `BROAD_LOCK_RELEASED` as emitted from inside `with_cpu` (Stage 200D-0B1's exact
+        //    line shape, which carried no lock-state field at all) is explicitly forbidden.
+        assert!(RUNNER.contains("\"EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64 cpu=0 result=ok\""));
+        // 2. `POST_LOCK_DRAIN_DONE` emitted before `with_cpu` returned — same, by its old shape.
+        assert!(RUNNER.contains(
+            "\"EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64 cpu=0 broad_lock=0 result=ok\""
+        ));
+        // 3. `broad_lock=0` on an in-lock marker fails the run.
+        assert!(RUNNER.contains("in-lock marker falsely claims broad_lock=0"));
+        assert!(RUNNER.contains("in-lock marker does not state broad_lock=1"));
+        // 4. A missing REAL post-lock drain completion fails the run: the marker must attest
+        //    `drains=all`, not merely exist.
+        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
+        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
+        // The superseded in-lock ownership marker must not be accepted either.
+        assert!(RUNNER.contains("\"EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64\""));
+        // Those four forbidden strings are checked by `need_absent`, i.e. presence = failure.
+        let absent_block = RUNNER
+            .split("The old FALSE markers must not appear at all")
+            .nth(1)
+            .expect("the negative block exists");
+        let absent_block = absent_block.split("need_once").next().unwrap();
+        for forbidden in [
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64 cpu=0 result=ok",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64 cpu=0 broad_lock=0 result=ok",
+            "EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64",
+        ] {
+            assert!(
+                absent_block.contains(forbidden),
+                "the old marker must be in the need_absent list: {forbidden}"
+            );
+        }
+        // And the corrected ordering is enforced across the lock boundary.
+        assert!(
+            RUNNER.contains("the post-lock drains run after the broad lock is actually released")
+        );
+        assert!(
+            RUNNER.contains("the epilogue commits the user frame only after every drain completed")
+        );
+    }
+
+    /// (§2) The six production side effects that must never occur under the broad lock, each
+    /// asserted at zero inside the consumer's CODE.
+    #[test]
+    fn p29_no_production_side_effects_under_broad_lock() {
+        let cb = consumer_code();
+        for (what, needles) in [
+            (
+                "PeerDeath terminal claim",
+                ["PeerDeath", "complete_server_death", "try_claim_peer_death"].as_slice(),
+            ),
+            (
+                "timeout terminal claim",
+                [
+                    "complete_reply_timeout",
+                    "TerminalClaimant::Timeout",
+                    "claim_timeout",
+                ]
+                .as_slice(),
+            ),
+            (
+                "caller result publication",
+                [
+                    "rt_commit_receiver_runnable",
+                    "publish_blocked_syscall_completion",
+                    "BlockedSyscallCompletion",
+                ]
+                .as_slice(),
+            ),
+            (
+                "scheduler enqueue",
+                ["enqueue", "dispatch_next", "make_runnable"].as_slice(),
+            ),
+            (
+                "userspace copy",
+                ["copy_to_user", "copy_from_user", "write_user"].as_slice(),
+            ),
+            (
+                "reply-record scan",
+                [
+                    "process_ipc_timeout_deadlines",
+                    "scan_reply",
+                    "reply_record_for",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            for n in needles {
+                assert!(
+                    !cb.contains(n),
+                    "consumer must perform no {what} under the broad lock (found `{n}`)"
+                );
+            }
+        }
+        // The server-death completion stays OUT of the broad lock, where Stage 200D-2A put it.
+        let entry = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        let released = entry
+            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .expect("release boundary");
+        let death_drain = entry
+            .find("shared.drain_server_death_post_work(cpu)")
+            .expect("server-death drain");
+        assert!(
+            released < death_drain,
+            "server-death completion must remain post-lock"
+        );
+    }
+
+    /// (§5) "Restore owner prepared" is not "user frame restored". The actual commit and the
+    /// ring-3 return both follow the post-lock drains.
+    #[test]
+    fn p30_actual_user_return_follows_the_post_lock_drains() {
+        // The vector calls the shared entry (which contains every drain) and only afterwards
+        // commits the hardware frame.
+        let stub = DESC_SRC
+            .split("crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(")
+            .nth(1)
+            .expect("shared dispatch call");
+        let commit = stub
+            .find("unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };")
+            .expect("the real iret-frame commit");
+        let attest = stub
+            .find("maybe_attest_exit_common_epilogue(cpu, \"replacement\")")
+            .expect("epilogue attestation");
+        assert!(
+            commit < attest,
+            "the frame is committed before it is attested"
+        );
+        // No frame commit or ring-3 return happens inside the shared entry or the arch handler.
+        // Comment lines are stripped first: both files legitimately DISCUSS the iretq return
+        // while performing none of it.
+        for (name, src) in [
+            ("trap_entry", TRAP_ENTRY_SRC),
+            ("x86_64 trap", X86_TRAP_SRC),
+        ] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("flush_trap_context_to_iret_frame"),
+                "{name} must not commit the hardware iret frame"
+            );
+            for ret in ["iretq", "sysretq"] {
+                assert!(
+                    !code.contains(ret),
+                    "{name} must not return to ring 3 ({ret})"
+                );
+            }
+        }
+        // The latch enforces it at runtime: the epilogue refuses to attest unless the drain
+        // stage was reached, and reports the failure rather than staying silent.
+        let helper = DESC_SRC
+            .split("fn maybe_attest_exit_common_epilogue")
+            .nth(1)
+            .expect("helper");
+        let helper = helper.split("\n}\n").next().unwrap();
+        assert!(helper.contains("if stage != crate::kernel::boot::EXIT_ATTEST_DRAINED {"));
+        assert!(helper.contains("EXIT_TASK_TRAP_DEPTH_ERROR"));
+    }
+
+    /// (§6) The attestation latch is bounded, monotonic and carries no authority.
+    #[test]
+    fn p31_attestation_latch_is_bounded_and_authority_free() {
+        use crate::kernel::boot as kb;
+        let cpu = 0usize;
+        kb::clear_exit_attestation(cpu);
+        assert_eq!(kb::exit_attestation_stage(cpu), kb::EXIT_ATTEST_IDLE);
+        // A stage cannot be skipped.
+        assert!(kb::arm_exit_attestation(cpu, 77, Asid(9)));
+        assert!(
+            kb::advance_exit_attestation(
+                cpu,
+                kb::EXIT_ATTEST_LOCK_RELEASED,
+                kb::EXIT_ATTEST_DRAINED
+            )
+            .is_none(),
+            "the drain stage cannot fire before the release stage"
+        );
+        let (t, a) = kb::advance_exit_attestation(
+            cpu,
+            kb::EXIT_ATTEST_CONSUMED,
+            kb::EXIT_ATTEST_LOCK_RELEASED,
+        )
+        .expect("release advance");
+        assert_eq!((t, a), (77, Asid(9)));
+        assert!(
+            kb::advance_exit_attestation(
+                cpu,
+                kb::EXIT_ATTEST_CONSUMED,
+                kb::EXIT_ATTEST_LOCK_RELEASED
+            )
+            .is_none(),
+            "a stage advances at most once"
+        );
+        kb::advance_exit_attestation(cpu, kb::EXIT_ATTEST_LOCK_RELEASED, kb::EXIT_ATTEST_DRAINED)
+            .expect("drain advance");
+        let (tid, asid, stage) = kb::take_exit_attestation(cpu).expect("armed");
+        assert_eq!((tid, asid, stage), (77, Asid(9), kb::EXIT_ATTEST_DRAINED));
+        assert!(
+            kb::take_exit_attestation(cpu).is_none(),
+            "the latch is one-shot"
+        );
+        // Double-arm within one trap is refused.
+        assert!(kb::arm_exit_attestation(cpu, 1, Asid(1)));
+        assert!(
+            !kb::arm_exit_attestation(cpu, 2, Asid(2)),
+            "a second accepted exit in one trap is a defect"
+        );
+        kb::clear_exit_attestation(cpu);
+        // Nothing outside the marker sites reads the latch: no scheduler, teardown or
+        // terminal-claim decision may depend on it.
+        for src in [
+            include_str!("../../runtime.rs"),
+            include_str!("../scheduler.rs"),
+            include_str!("ipc_state.rs"),
+            include_str!("restart_state.rs"),
+        ] {
+            assert!(!src.contains("exit_attestation"));
+            assert!(!src.contains("EXIT_ATTEST_"));
+        }
     }
 }
 
@@ -91788,7 +92180,14 @@ mod stage200d0c1_aarch64_exit_prep {
                 "AArch64 has no trap-dispatch depth counter"
             );
         }
-        assert!(X86_TRAP_SRC.contains("EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64"));
+        // x86_64 DOES have one, and Stage 200D-0B3 moved its ownership attestation out of the
+        // in-lock consumer and into the vector epilogue that performs the clear. The contrast
+        // is the point of this guard: the two ports have different cleanup mechanisms, so the
+        // AArch64 consumer must not borrow the x86 shape.
+        const X86_DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(X86_DESC_SRC.contains("TRAP_DISPATCH_DEPTH"));
+        assert!(X86_DESC_SRC.contains("EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64"));
+        assert!(!X86_TRAP_SRC.contains("EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64"));
         // The generic NR16 handler manipulates no depth state on any architecture.
         const SYSCALL_SRC: &str = include_str!("../syscall.rs");
         let h = SYSCALL_SRC

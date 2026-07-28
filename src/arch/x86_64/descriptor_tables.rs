@@ -263,6 +263,42 @@ pub(crate) fn clear_trap_dispatch_depth(cpu: crate::kernel::scheduler::CpuId) {
     let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
     TRAP_DISPATCH_DEPTH[idx].store(0, Ordering::Release);
 }
+/// Stage 200D-0B3: attest common-epilogue ownership for an accepted `ExitCurrentTask`.
+///
+/// Called from the trap epilogue immediately after the SINGLE `TRAP_DISPATCH_DEPTH` clear that
+/// this return path performs, so `clears=1` is a statement about the depth store that just
+/// executed rather than a prediction. A strict no-op on every trap that did not accept an exit.
+///
+/// It writes no depth state of its own — adding one would double-clear, which is the defect the
+/// `exit_specific_trap_depth_writes=0` guard exists to prevent.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn maybe_attest_exit_common_epilogue(cpu: crate::kernel::scheduler::CpuId, owner: &str) {
+    let Some((tid, asid, stage)) = crate::kernel::boot::take_exit_attestation(cpu.0 as usize)
+    else {
+        return;
+    };
+    if stage != crate::kernel::boot::EXIT_ATTEST_DRAINED {
+        // An accepted exit reached the epilogue without both post-lock attestations having
+        // fired. That means the lock-release or drain-completion step was skipped, so the
+        // ordering this stage exists to prove did not hold. Report it; do not smooth it over.
+        crate::yarm_log!(
+            "EXIT_TASK_TRAP_DEPTH_ERROR arch=x86_64 tid={} cpu={} stage={} expected={} result=fail",
+            tid,
+            cpu.0,
+            stage,
+            crate::kernel::boot::EXIT_ATTEST_DRAINED
+        );
+        return;
+    }
+    crate::yarm_log!(
+        "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64 tid={} asid={} cpu={} owner={} clears=1 frame_committed=1 broad_lock=0 result=ok",
+        tid,
+        asid.0,
+        cpu.0,
+        owner
+    );
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static FATAL_LOG_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -1293,6 +1329,10 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             }
             crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", cpu.0);
             TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
+            // Stage 200D-0B3: the idle outcome reaches the SAME single depth clear and the same
+            // ownership attestation. No iret frame is committed and ring 3 is never re-entered
+            // on this path, so the exiting frame cannot be restored here either.
+            maybe_attest_exit_common_epilogue(cpu, "idle");
             idle_halt_loop();
         }
         if task_switched {
@@ -1302,6 +1342,19 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         }
         unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
         TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
+        // Stage 200D-0B3: the common-epilogue ownership attestation, emitted from the epilogue
+        // that actually owns the cleanup rather than from inside the broad lock (where Stage
+        // 200D-0B1 emitted it). By this point the ACTUAL user-return state has been committed:
+        // `flush_trap_context_to_iret_frame` has patched the hardware iret frame, and the
+        // single depth clear above has run. Both happened after
+        // `dispatch_trap_entry_with_shared_kernel` returned, i.e. after the broad lock was
+        // released and after every shared post-lock drain — so a user return can never precede
+        // the drains. Ring 3 is reached by the `iretq`/`sysretq` that follows this `return`.
+        //
+        // The stage check is fail-closed: reaching the epilogue with a latch that never made it
+        // to `drained` means an attestation was skipped, which is reported as an error rather
+        // than papered over with a reassuring marker.
+        maybe_attest_exit_common_epilogue(cpu, "replacement");
         return;
     }
 
