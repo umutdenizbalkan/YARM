@@ -73917,10 +73917,34 @@ mod stage197_first_cohort_seal {
         // never idle sentinels: (1) the default-off NEGATIVE oracle's forced error, and (2) the
         // Stage 198A1 DEFENSIVE no-provenance path (terminal scheduler state without authoritative
         // blocking-syscall provenance → canonical error path, NOT silent idle).
+        // Stage 200D-0D1 raised this from 2 to 5. The three new uses are the exit consumer's
+        // FAIL-CLOSED validations, which are genuine errors on the error channel — exactly the
+        // property this guard protects — and never idle sentinels:
+        //   (3) the exiting incarnation is still `current`;
+        //   (4) wrong identity (ASID mismatch, non-terminal, or still in a runqueue);
+        //   (5) the scheduler re-selected the exiting task as the replacement.
+        // The accepted-exit IDLE outcome does NOT use Internal: it returns the typed
+        // `EnterKernelIdle { ExitCurrentTaskNoRunnable }`, which is what keeps the invariant
+        // "Internal is never an idle sentinel" true.
         assert_eq!(
             RISCV_TRAP_SRC.matches("SyscallError::Internal").count(),
-            2,
-            "Internal may only be the negative-oracle error + the defensive no-provenance error"
+            5,
+            "Internal may only be genuine errors: negative oracle, defensive no-provenance, and the three exit fail-closed validations"
+        );
+        // The exit consumer's idle arm must NOT be an Internal sentinel.
+        let exit_consumer = RISCV_TRAP_SRC
+            .split("// ── Stage 200D-0D1: the RISC-V `CurrentTaskExited` consumer")
+            .nth(1)
+            .expect("exit consumer");
+        let idle_arm = exit_consumer
+            .split("owner=idle")
+            .nth(1)
+            .expect("exit idle arm");
+        let idle_arm = idle_arm.split("\n        }").next().unwrap();
+        assert!(
+            idle_arm.contains("RiscvIdleReason::ExitCurrentTaskNoRunnable")
+                && !idle_arm.contains("SyscallError::Internal"),
+            "the accepted-exit idle outcome is typed, never an Err(Internal) sentinel"
         );
         assert!(
             RISCV_TRAP_SRC.contains("RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_BEGIN")
@@ -74394,10 +74418,13 @@ mod stage197b_riscv_typed_idle_outcome {
         );
         // Both switch success branches set `switched = true` (→ ReturnToIncoming), and the tail
         // return selects ReturnToIncoming/ReturnToCurrent — never idle.
+        // Stage 200D-0D1 raised this from 2 to 3: the exit consumer's REPLACEMENT arm also
+        // selects `ReturnToIncoming`, because the resumed task differs from the trap's entering
+        // task. Its idle arm returns typed idle instead and sets nothing.
         assert_eq!(
             RISCV_TRAP_SRC.matches("switched = true;").count(),
-            2,
-            "the FutexWait switch + Yield switch success branches must set switched=true"
+            3,
+            "the FutexWait switch, Yield switch and accepted-exit replacement branches set switched=true"
         );
         assert!(
             RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToIncoming")
@@ -74504,10 +74531,19 @@ mod stage197b_riscv_typed_idle_outcome {
                 && RISCV_TRAP_SRC.contains("riscv_typed_outcome_internal_error_oracle_enabled()"),
             "the default-off negative (genuine error) oracle must exist"
         );
+        // Stage 200D-0D1 raised this from 2 to 5. The three new uses are the exit consumer's
+        // FAIL-CLOSED validations, which are genuine errors on the error channel — exactly the
+        // property this guard protects — and never idle sentinels:
+        //   (3) the exiting incarnation is still `current`;
+        //   (4) wrong identity (ASID mismatch, non-terminal, or still in a runqueue);
+        //   (5) the scheduler re-selected the exiting task as the replacement.
+        // The accepted-exit IDLE outcome does NOT use Internal: it returns the typed
+        // `EnterKernelIdle { ExitCurrentTaskNoRunnable }`, which is what keeps the invariant
+        // "Internal is never an idle sentinel" true.
         assert_eq!(
             RISCV_TRAP_SRC.matches("SyscallError::Internal").count(),
-            2,
-            "SyscallError::Internal is only the negative-oracle error + defensive no-provenance error"
+            5,
+            "SyscallError::Internal is only genuine errors: negative oracle, defensive no-provenance, and the three exit fail-closed validations"
         );
         // Its knob is default-off (absent → None) and wired.
         use crate::kernel::boot_command_line::parse_yarm_boot_options;
@@ -90854,13 +90890,22 @@ mod stage200d0a_exit_foundation {
         const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
         const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
         const X86_TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
-        for (name, src) in [("riscv64", RISCV_TRAP_SRC), ("aarch64", AARCH64_TRAP_SRC)] {
-            assert!(
-                !src.contains("take_post_lock_trap_disposition"),
-                "{name} must not consume the disposition in its arch handler"
-            );
-        }
-        for (name, src) in [("trap_entry", TRAP_ENTRY_SRC), ("x86_64", X86_TRAP_SRC)] {
+        // Stage 200D-0D1 completed the third and final cell, so all three ports now consume —
+        // each exactly once, each at its own architecture's correct boundary:
+        //   x86_64  `arch/x86_64/trap.rs`   in-lock, before the epilogue commits the iret frame
+        //   AArch64 `arch/trap_entry.rs`    shared post-lock section (its idle diverges in-lock)
+        //   RISC-V  `arch/riscv64/trap.rs`  its own Phase 3 (it does not use the shared entry)
+        // What this guard still protects is that no port grows a SECOND consumer, and that the
+        // AArch64 arch handler in particular does not (its consumer is deliberately elsewhere).
+        assert!(
+            !AARCH64_TRAP_SRC.contains("take_post_lock_trap_disposition"),
+            "the AArch64 arch handler must not consume; its consumer is in the shared entry"
+        );
+        for (name, src) in [
+            ("trap_entry", TRAP_ENTRY_SRC),
+            ("x86_64", X86_TRAP_SRC),
+            ("riscv64", RISCV_TRAP_SRC),
+        ] {
             assert_eq!(
                 src.matches("take_post_lock_trap_disposition(").count(),
                 1,
@@ -90937,16 +90982,20 @@ mod stage200d0b3_x86_exit_corrected {
         );
         // The AArch64 consumer (Stage 200D-0C1) lives in the SHARED post-lock section of
         // `arch/trap_entry.rs`, not in the arch handler — AArch64's idle divergence never
-        // returns from inside `with_cpu`, so it cannot use the x86_64 shape. Neither arch
-        // handler consumes the disposition, and RISC-V has no cell at all.
+        // returns from inside `with_cpu`, so it cannot use the x86_64 shape. RISC-V (Stage
+        // 200D-0D1) consumes in its OWN Phase 3, because it does not flow through the shared
+        // entry at all. Each port therefore holds exactly one consumer, in a different place.
         const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
         const AARCH64: &str = include_str!("../../arch/aarch64/trap.rs");
-        for (n, s) in [("riscv64", RISCV), ("aarch64", AARCH64)] {
-            assert!(
-                !s.contains("take_post_lock_trap_disposition"),
-                "{n} must not consume the disposition in its arch handler"
-            );
-        }
+        assert!(
+            !AARCH64.contains("take_post_lock_trap_disposition"),
+            "the AArch64 arch handler must not consume; its consumer is in the shared entry"
+        );
+        assert_eq!(
+            RISCV.matches("take_post_lock_trap_disposition(").count(),
+            1,
+            "RISC-V holds exactly one consumer, in its own trap wrapper"
+        );
     }
 
     /// (2/3/4) CORRECTED ordering. Stage 200D-0B1 asserted the consumer ran after the broad
@@ -92507,5 +92556,733 @@ mod stage200d0c1_aarch64_exit_prep {
         // The in-lock bypass is production behaviour too — an accepted NR16 must be handled
         // correctly on a feature-off build, it simply never happens without the oracle.
         assert!(!a64_handler_body().contains("aarch64-exit-current-task-oracle"));
+    }
+}
+
+/// Stage 200D-0D1 — RISC-V `ExitCurrentTask` consumer and live-oracle preparation.
+///
+/// The RISC-V pipeline is not the x86_64 or AArch64 one, so these guards anchor on the RISC-V
+/// trap wrapper's own Phase 1/2/3 structure. Every wiring guard proves a production use site:
+/// none passes because a constant, feature, marker or function name exists.
+#[cfg(test)]
+mod stage200d0d1_riscv_exit_prep {
+    use crate::kernel::boot::PostLockTrapDisposition;
+    use crate::kernel::vm::Asid;
+
+    const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RUNNER: &str = include_str!("../../../scripts/qemu-riscv-exit-current-task-smoke.sh");
+    const ROOT_TOML: &str = include_str!("../../../Cargo.toml");
+    const CPS_TOML: &str = include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml");
+    const FS_TOML: &str = include_str!("../../../crates/yarm-fs-servers/Cargo.toml");
+    const DRV_TOML: &str = include_str!("../../../crates/yarm-driver-servers/Cargo.toml");
+
+    /// The Phase-3 consumer block, verbatim.
+    fn consumer_block() -> &'static str {
+        let b = RV_TRAP_SRC
+            .split("// ── Stage 200D-0D1: the RISC-V `CurrentTaskExited` consumer")
+            .nth(1)
+            .expect("riscv consumer block present");
+        b.split("// Stage 198A1: blocking-syscall TERMINAL-IDLE")
+            .next()
+            .unwrap()
+    }
+
+    /// Comment-stripped consumer body: these guards are about CODE, and the block's prose
+    /// legitimately names teardown, claims and `publish_riscv_user_return` while doing none.
+    fn consumer_code() -> alloc::string::String {
+        consumer_block()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The in-lock handler body that arms the bypass.
+    fn inlock_handler() -> &'static str {
+        RV_TRAP_SRC
+            .split("pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode")
+            .nth(1)
+            .expect("riscv in-lock handler")
+    }
+
+    /// The bypass block, comment-stripped.
+    fn bypass_code() -> alloc::string::String {
+        let b = inlock_handler()
+            .split("// ── Stage 200D-0D1 (EXITCURRENTTASK IN-LOCK BYPASS)")
+            .nth(1)
+            .expect("bypass block");
+        let b = b.split("// Stage 163L: restore FIRST").next().unwrap();
+        b.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The Phase-3 region of the wrapper, from the drain header to the consumer.
+    fn wrapper() -> &'static str {
+        RV_TRAP_SRC
+            .split("pub fn handle_riscv_trap_entry_shared")
+            .nth(1)
+            .expect("riscv shared wrapper")
+    }
+
+    // ── 1–6: consumer uniqueness, placement, ordering ───────────────────────────────
+
+    /// 1. Exactly one RISC-V production consumer.
+    #[test]
+    fn r01_exactly_one_riscv_production_consumer() {
+        assert_eq!(
+            RV_TRAP_SRC
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1,
+            "exactly one RISC-V call site"
+        );
+        assert_eq!(
+            consumer_code()
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1,
+            "that call site is the consumer itself"
+        );
+        // The RISC-V bridge does not consume it either — one authority per port.
+        assert!(!RV_BOOT_SRC.contains("take_post_lock_trap_disposition"));
+        // The sibling ports keep exactly one each, untouched.
+        const X86: &str = include_str!("../../arch/x86_64/trap.rs");
+        const SHARED: &str = include_str!("../../arch/trap_entry.rs");
+        assert_eq!(X86.matches("take_post_lock_trap_disposition(").count(), 1);
+        assert_eq!(
+            SHARED.matches("take_post_lock_trap_disposition(").count(),
+            1
+        );
+    }
+
+    /// 2. The consumer is in the real RISC-V trap wrapper, not a helper or the bridge.
+    #[test]
+    fn r02_consumer_is_in_the_real_riscv_trap_wrapper() {
+        assert!(
+            wrapper().contains("take_post_lock_trap_disposition("),
+            "the consumer is inside handle_riscv_trap_entry_shared"
+        );
+        // The bridge calls that wrapper, and applies the frame only after it returns.
+        assert!(RV_BOOT_SRC.contains(
+            "crate::arch::riscv64::trap::handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)"
+        ));
+        let at = RV_BOOT_SRC
+            .find("handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)")
+            .unwrap();
+        assert!(
+            RV_BOOT_SRC[at..].contains("frame.sepc = tframe.saved_pc() as u64;"),
+            "the hardware frame is written after the wrapper returns"
+        );
+    }
+
+    /// 3. The consumer occurs after the broad-lock release.
+    #[test]
+    fn r03_consumer_after_broad_lock_release() {
+        let w = wrapper();
+        let with_cpu = w
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("Phase 2 lock acquire");
+        let phase3 = w
+            .find("// ── Phase 3: post-lock drain (broad guard released) ──")
+            .expect("Phase 3 boundary");
+        let consumer = w
+            .find("take_post_lock_trap_disposition(")
+            .expect("consumer");
+        assert!(with_cpu < phase3, "Phase 2 precedes Phase 3");
+        assert!(phase3 < consumer, "the consumer is in Phase 3");
+        // The lock is genuinely the broad SpinLock<KernelState>.
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        assert!(RUNTIME.contains("let mut guard = self.state.lock();"));
+        // The marker states the condition and names the holder.
+        assert!(consumer_block().contains(
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=riscv64 tid={} asid={} cpu={} broad_lock=0 holder=with_cpu"
+        ));
+    }
+
+    /// 4. The consumer occurs after every required Phase-3 drain.
+    #[test]
+    fn r04_consumer_after_every_phase3_drain() {
+        let w = wrapper();
+        let consumer = w
+            .find("take_post_lock_trap_disposition(")
+            .expect("consumer");
+        for drain in [
+            "shared.drain_dispatch_post_work(cpu)?;",
+            "shared.drain_reply_timeout_post_work(cpu, now);",
+            "shared.drain_server_death_post_work(cpu)",
+            "RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN",
+            "RISCV_FUTEX_WAIT_DISPATCH_DRAIN_BEGIN",
+            "RISCV_YIELD_DISPATCH_DRAIN_BEGIN",
+        ] {
+            let at = w
+                .find(drain)
+                .unwrap_or_else(|| panic!("Phase-3 drain present: {drain}"));
+            assert!(at < consumer, "{drain} must precede the consumer");
+        }
+        assert!(consumer_block().contains(
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=riscv64 cpu={} broad_lock=0 drains=all"
+        ));
+    }
+
+    /// 5/6. The consumer precedes both the frame application and `sret`, and precedes the
+    /// Stage 198A1 terminal-idle check that would otherwise misread an accepted exit.
+    #[test]
+    fn r05_r06_consumer_precedes_frame_application_and_sret() {
+        let w = wrapper();
+        let consumer = w
+            .find("take_post_lock_trap_disposition(")
+            .expect("consumer");
+        let idle_check = w
+            .find("// Stage 198A1: blocking-syscall TERMINAL-IDLE")
+            .expect("198A1 block");
+        let tail = w
+            .find("// Stage 197B: the sole non-idle tail return.")
+            .expect("tail return");
+        assert!(
+            consumer < idle_check,
+            "the exit outcome is decided before the provenance-based idle check"
+        );
+        assert!(consumer < tail, "the consumer precedes the tail return");
+        // Neither the wrapper nor the in-lock handler writes the hardware frame or sret's.
+        let code: alloc::string::String = RV_TRAP_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in ["frame.sepc =", "sret"] {
+            assert!(
+                !code.contains(forbidden),
+                "the trap wrapper must not commit the frame or return to U-mode ({forbidden})"
+            );
+        }
+        // `write_satp` DOES appear in the wrapper — the pre-existing 196D/196E/196G switch
+        // drains activate the incoming task's address space, which is correct and untouched.
+        // What must hold is that the EXIT path performs no address-space or frame write of its
+        // own: the in-lock bypass reuses the canonical restore, and the consumer re-applies
+        // nothing.
+        assert!(
+            code.contains("write_satp"),
+            "the existing switch drains are preserved"
+        );
+        for src in [consumer_code(), bypass_code()] {
+            for forbidden in ["write_satp", "frame.sepc =", "sret"] {
+                assert!(
+                    !src.contains(forbidden),
+                    "the exit path must not perform its own {forbidden}"
+                );
+            }
+        }
+    }
+
+    // ── 7–10: saved context and sepc ────────────────────────────────────────────────
+
+    /// 7/8. The replacement is restored, and the exiting TCB context is never applied.
+    #[test]
+    fn r07_r08_replacement_only_exiting_context_never_applied() {
+        let b = bypass_code();
+        // The bypass restores only when a replacement exists; `current` is already the
+        // replacement, so the canonical restore sources the right task.
+        assert!(b.contains("let replacement = kernel.current_tid().filter(|t| *t != 0);"));
+        assert!(b.contains("if replacement.is_none() {"));
+        assert!(b.contains("restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())?;"));
+        // The consumer itself re-applies nothing — a second restore would be duplicate authority.
+        let c = consumer_code();
+        assert!(!c.contains("restore_arch_thread_state"));
+        assert!(!c.contains("apply_user_context"));
+        assert!(c.contains("frame_source=replacement_tcb"));
+    }
+
+    /// 9/20. The exiting task's `sepc` is never committed and `publish_riscv_user_return` is
+    /// never called for it.
+    #[test]
+    fn r09_r20_exiting_sepc_and_mirrors_never_published() {
+        let b = bypass_code();
+        let c = consumer_code();
+        for src in [&b, &c] {
+            assert!(!src.contains("publish_riscv_user_return"));
+            assert!(!src.contains("set_saved_pc"));
+            assert!(!src.contains("set_user_gpr"));
+        }
+        // The a0/a1 result export is what the bypass exists to suppress: it must sit AFTER the
+        // bypass's early return, so an accepted exit can never reach it.
+        let h = inlock_handler();
+        let bypass_at = h
+            .find("if crate::kernel::boot::post_lock_trap_disposition_pending(cpu_idx) {")
+            .expect("bypass gate");
+        let export_at = h
+            .find("f.set_user_gpr(10, f.ret0());")
+            .expect("ecall result export");
+        assert!(
+            bypass_at < export_at,
+            "the bypass returns before the exiting task's result export"
+        );
+        assert!(b.contains("return Ok(());"));
+        assert!(b.contains("inlock_result_export=0"));
+    }
+
+    /// 10/22. Ordinary `sepc` policy is untouched: the bridge still pre-advances exactly once
+    /// and the handler still applies no second `+4`.
+    #[test]
+    fn r10_r22_ordinary_sepc_policy_unchanged() {
+        assert!(RV_BOOT_SRC.contains("tframe.set_saved_pc(sepc + advance);"));
+        // No new sepc arithmetic was introduced anywhere in the trap path.
+        let code: alloc::string::String = RV_TRAP_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("+ 4"), "no new sepc advance in the wrapper");
+        assert!(!code.contains("wrapping_add(4)"));
+        // The bypass performs no `sepc` arithmetic of its own — it only decides whether the
+        // canonical restore runs. (A bare `contains("4")` would match "riscv64" in its marker,
+        // so the check is on the operations that could actually move `sepc`.)
+        let b = bypass_code();
+        for forbidden in ["+ 4", "wrapping_add", "set_saved_pc", "saved_pc("] {
+            assert!(
+                !b.contains(forbidden),
+                "the bypass must not move sepc ({forbidden})"
+            );
+        }
+    }
+
+    // ── 11–18: identity, replacement, idle ──────────────────────────────────────────
+
+    /// 11/12. The exiting task is neither current nor the restore owner — enforced, not assumed.
+    #[test]
+    fn r11_r12_exiting_task_is_not_current_nor_owner() {
+        let c = consumer_code();
+        assert!(c.contains("if current == Some(tid) {"));
+        assert!(c.contains("EXIT_TASK_EXITING_STILL_CURRENT"));
+        assert!(c.contains("EXIT_TASK_EXITING_NOT_CURRENT arch=riscv64"));
+        assert!(c.contains("if next == tid {"));
+        assert!(c.contains("EXIT_TASK_RESELECTED_EXITING_TASK"));
+        assert!(c.contains("return Err(TrapHandleError::Syscall("));
+    }
+
+    /// 13/14. The idle path clears current and reuses the ESTABLISHED typed idle terminal.
+    #[test]
+    fn r13_r14_idle_path_uses_established_terminal() {
+        let c = consumer_code();
+        assert!(c.contains("EXIT_TASK_RESTORE_OWNER arch=riscv64 owner=idle"));
+        assert!(c.contains(
+            "return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {\n                    reason: RiscvIdleReason::ExitCurrentTaskNoRunnable,"
+        ));
+        // The typed reason is mapped by the EXISTING bridge idle terminal — no second idle loop.
+        assert!(RV_BOOT_SRC.contains(
+            "RiscvIdleReason::ExitCurrentTaskNoRunnable => \"ExitCurrentTaskNoRunnable\""
+        ));
+        assert_eq!(
+            RV_BOOT_SRC
+                .matches("riscv_trap_halt(\"kernel_idle_awaiting_io\")")
+                .count(),
+            1,
+            "exactly one idle terminal serves every typed idle reason"
+        );
+        // The idle arm restores nothing.
+        let idle_arm = c.split("owner=idle").nth(1).unwrap();
+        assert!(!idle_arm.contains("restore_arch_thread_state"));
+    }
+
+    /// 15/16. Identity is `{tid, asid}`; a reused TID with a different ASID is rejected.
+    #[test]
+    fn r15_r16_identity_is_tid_and_asid() {
+        let c = consumer_code();
+        assert!(c.contains("let identity_ok = match kernel.task_asid(tid) {"));
+        assert!(c.contains("Some(bound) => bound == asid,"));
+        assert!(c.contains("if !identity_ok || !terminal || in_runqueue {"));
+        // Behavioural: the store round-trips the exact incarnation it was given.
+        let cpu = 0usize;
+        crate::kernel::boot::clear_post_lock_trap_disposition(cpu);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            cpu,
+            7171,
+            Asid(5)
+        ));
+        match crate::kernel::boot::take_post_lock_trap_disposition(cpu) {
+            PostLockTrapDisposition::CurrentTaskExited { tid, asid } => {
+                assert_eq!((tid, asid), (7171, Asid(5)));
+            }
+            other => panic!("expected CurrentTaskExited, got {other:?}"),
+        }
+        crate::kernel::boot::clear_post_lock_trap_disposition(cpu);
+    }
+
+    /// 17/18. A disposition is per-CPU and one-shot.
+    #[test]
+    fn r17_r18_wrong_cpu_and_duplicate_rejected() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        crate::kernel::boot::clear_post_lock_trap_disposition(1);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            0,
+            33,
+            Asid(4)
+        ));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(1),
+            PostLockTrapDisposition::ReturnNormally
+        ));
+        assert!(
+            !crate::kernel::boot::publish_current_task_exited(0, 34, Asid(9)),
+            "a second publication in one trap is refused"
+        );
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::CurrentTaskExited { tid: 33, .. }
+        ));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::ReturnNormally
+        ));
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+    }
+
+    /// 19. The consumer writes no result and performs no production side effect.
+    #[test]
+    fn r19_no_old_frame_result_and_no_side_effects() {
+        let c = consumer_code();
+        for (what, needles) in [
+            ("teardown", ["exit_task", "reap", "destroy"].as_slice()),
+            (
+                "enqueue",
+                ["enqueue", "dispatch_next", "make_runnable"].as_slice(),
+            ),
+            (
+                "terminal claim",
+                [
+                    "PeerDeath",
+                    "try_claim",
+                    "complete_server_death",
+                    "complete_reply_timeout",
+                ]
+                .as_slice(),
+            ),
+            (
+                "result publication",
+                [
+                    "set_ok",
+                    "set_err",
+                    "rt_commit_receiver_runnable",
+                    "publish_riscv_user_return",
+                ]
+                .as_slice(),
+            ),
+            (
+                "userspace copy",
+                ["copy_to_user", "copy_from_user"].as_slice(),
+            ),
+            (
+                "reply-record scan",
+                ["process_ipc_timeout_deadlines", "scan_reply"].as_slice(),
+            ),
+        ] {
+            for n in needles {
+                assert!(
+                    !c.contains(n),
+                    "consumer must perform no {what} (found `{n}`)"
+                );
+            }
+        }
+    }
+
+    // ── 21–22: WouldBlock ───────────────────────────────────────────────────────────
+
+    /// 21/22. A declined preflight publishes no disposition, so neither the bypass nor the
+    /// consumer can activate, and the ordinary RISC-V return path applies.
+    #[test]
+    fn r21_r22_would_block_never_activates_bypass_or_consumer() {
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("NR16 handler");
+        let h = h.split("\n}\n").next().unwrap();
+        let decline = h
+            .find("return Err(SyscallError::WouldBlock);")
+            .expect("preflight decline");
+        let publish = h
+            .find("publish_current_task_exited(")
+            .expect("publication site");
+        assert!(decline < publish, "the decline returns before publication");
+        assert!(!h[..decline].contains("kernel.exit_task("));
+        // Both the bypass and the consumer are gated on an ACTUAL pending/ present disposition.
+        assert!(
+            bypass_code()
+                .contains("if crate::kernel::boot::post_lock_trap_disposition_pending(cpu_idx) {")
+        );
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        assert!(!crate::kernel::boot::post_lock_trap_disposition_pending(0));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::ReturnNormally
+        ));
+    }
+
+    // ── 23: sret / trap-depth ownership ─────────────────────────────────────────────
+
+    /// 23. RISC-V has no software trap-depth counter on this path; the bridge owns one `sret`.
+    #[test]
+    fn r23_unique_sret_ownership_and_zero_depth_clears() {
+        // Comment lines are stripped first: the consumer's own prose names x86_64's
+        // `TRAP_DISPATCH_DEPTH` precisely to record that RISC-V has no analogue.
+        for (name, src) in [("riscv trap", RV_TRAP_SRC), ("riscv boot", RV_BOOT_SRC)] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("TRAP_DISPATCH_DEPTH"),
+                "{name}: RISC-V has no trap-dispatch depth counter"
+            );
+        }
+        // x86_64 does have one, and it stays there — the ports differ by design.
+        const X86_DESC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(X86_DESC.contains("TRAP_DISPATCH_DEPTH"));
+        let c = consumer_code();
+        assert!(c.contains(
+            "EXIT_TASK_SRET_OWNER arch=riscv64 cpu={} owner=trap_bridge software_depth_clears=0"
+        ));
+        assert!(
+            !c.contains(".store("),
+            "the consumer writes no per-CPU counter"
+        );
+        assert!(!bypass_code().contains(".store("));
+        // The generic NR16 handler manipulates no depth state on any architecture.
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("NR16 handler");
+        let h = h.split("\n}\n").next().unwrap();
+        assert!(!h.contains("DEPTH") && !h.contains("depth"));
+    }
+
+    // ── 24–26: wiring, not declarations ─────────────────────────────────────────────
+
+    /// 24. The feature is declared AND forwarded through the whole artifact chain.
+    #[test]
+    fn r24_feature_forwarded_through_artifact_chain() {
+        for (name, toml) in [
+            ("yarm", ROOT_TOML),
+            ("yarm-control-plane-servers", CPS_TOML),
+            ("yarm-fs-servers", FS_TOML),
+            ("yarm-driver-servers", DRV_TOML),
+        ] {
+            assert!(
+                toml.contains("riscv-exit-current-task-oracle = []"),
+                "{name} must declare the feature"
+            );
+        }
+        // Declaring is not enough: it must gate compiled code at both ends.
+        assert!(RV_BOOT_SRC.contains("#[cfg(feature = \"riscv-exit-current-task-oracle\")]"));
+        assert!(INIT_SRC.contains("feature = \"riscv-exit-current-task-oracle\""));
+        // …and the runner must build BOTH the kernel and the userspace image with it.
+        assert!(RUNNER.contains("FEATURE=riscv-exit-current-task-oracle"));
+        assert!(
+            RUNNER.contains("BOOTSTRAP_FEATURE_ARGS=\"--no-default-features --features $FEATURE\"")
+        );
+        assert!(RUNNER.contains("--features \"$FEATURE\" \\"));
+        assert!(RUNNER.contains("feature not forwarded to userspace"));
+    }
+
+    /// 25. Selector 22 is genuinely free, actually written at boot, and comes from the shared
+    ///     encoder rather than a literal.
+    #[test]
+    fn r25_selector_is_free_and_actually_written() {
+        // Free: the RISC-V slot-5 namespace occupies 1..=10 and nothing writes 22.
+        assert!(
+            RV_BOOT_SRC.contains(
+                "init_args[5] = crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR;"
+            )
+        );
+        assert!(MOD_SRC.contains("pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"));
+        assert!(MOD_SRC.contains("pub const RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 8;"));
+        assert!(
+            !RV_BOOT_SRC.contains("init_args[5] = 22"),
+            "the selector is never hand-written at the boot site"
+        );
+        // Actually written, gated on the knob AND on slot 5 still being free.
+        assert!(
+            RV_BOOT_SRC.contains(
+                "init_args[5] = crate::kernel::boot::riscv_exit_current_task_selector();"
+            )
+        );
+        assert!(RV_BOOT_SRC.contains("riscv_exit_oracle_enabled() && init_args[5] == 0"));
+        let at = RV_BOOT_SRC
+            .find("init_args[5] = crate::kernel::boot::riscv_exit_current_task_selector();")
+            .expect("provisioning site");
+        assert!(
+            RV_BOOT_SRC[..at]
+                .rfind("#[cfg(feature = \"riscv-exit-current-task-oracle\")]")
+                .is_some(),
+            "the provisioning must be feature-gated"
+        );
+        // From the SHARED encoder, and the ABI reserves 22 for RISC-V distinctly.
+        assert!(MOD_SRC.contains(
+            "yarm_ipc_abi::exit_current_task_abi::exit_current_task_selector_for_current_arch("
+        ));
+        use yarm_ipc_abi::exit_current_task_abi as abi;
+        assert_eq!(abi::RISCV64_EXIT_SELECTOR, 22);
+        for taken in 1..=10usize {
+            assert_ne!(abi::RISCV64_EXIT_SELECTOR, taken);
+        }
+        assert_ne!(abi::RISCV64_EXIT_SELECTOR, abi::X86_64_EXIT_SELECTOR);
+        assert_ne!(abi::RISCV64_EXIT_SELECTOR, abi::AARCH64_EXIT_SELECTOR);
+        assert_eq!(
+            abi::exit_current_task_scenario_for_selector(
+                abi::RISCV64_EXIT_SELECTOR,
+                abi::AARCH64_EXIT_SELECTOR
+            ),
+            None,
+            "AArch64's selector must not activate the RISC-V cell"
+        );
+        // Both knob sites are feature-gated so no string leaks into a feature-off `.rodata`.
+        assert!(CMDLINE_SRC.contains(
+            "#[cfg(feature = \"riscv-exit-current-task-oracle\")]\n        if key == b\"yarm.riscv_exit_current_task_oracle\" {"
+        ));
+        assert!(CMDLINE_SRC.contains(
+            "#[cfg(feature = \"riscv-exit-current-task-oracle\")]\n    if parsed.riscv_exit_current_task_oracle == Some(true) {"
+        ));
+    }
+
+    /// 26/27. The disposable entry actually reaches `spawn_thread`, and the hard-fail marker
+    ///        can only follow a returning wrapper.
+    #[test]
+    fn r26_r27_entry_is_actually_spawned_and_marker_follows() {
+        assert!(INIT_SRC.contains("let entry = riscv_exit_task_child_body as *const () as usize;"));
+        let at = INIT_SRC
+            .find("let entry = riscv_exit_task_child_body as *const () as usize;")
+            .unwrap();
+        let tail = &INIT_SRC[at..];
+        let spawn = tail
+            .find("yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry)")
+            .expect("the entry must reach the real spawn operation");
+        assert!(spawn < tail.find("EXIT_TASK_ORACLE_SPAWNED arch=riscv64").unwrap());
+        // Dispatch is via the SHARED decoder, never a bare literal.
+        assert!(INIT_SRC.contains(
+            "if riscv_exit_current_task_oracle::armed(ctx.supervisor_control_recv_ep) {"
+        ));
+        assert!(INIT_SRC.contains("run_riscv_exit_current_task_oracle(ctx.task_id);"));
+        let armed = INIT_SRC
+            .split("mod riscv_exit_current_task_oracle {")
+            .nth(1)
+            .expect("decoder module");
+        let armed = armed.split("\n}").next().unwrap();
+        assert!(armed.contains("exit_current_task_scenario_for_current_arch"));
+        assert!(!armed.contains("22"), "no bare-literal selector comparison");
+        // Post-call hard-fail marker.
+        let body = INIT_SRC
+            .split("extern \"C\" fn riscv_exit_task_child_body() -> ! {")
+            .nth(1)
+            .expect("child body");
+        let body = body.split("\n}").next().unwrap();
+        let entered = body
+            .find("EXIT_TASK_USER_ENTERED role=disposable arch=riscv64")
+            .unwrap();
+        let call = body
+            .find("yarm_user_rt::syscall::exit_current_task()")
+            .unwrap();
+        let returned = body
+            .find("EXIT_TASK_SYSCALL_RETURNED arch=riscv64")
+            .unwrap();
+        assert!(entered < call && call < returned);
+    }
+
+    /// 28. Absence uses the full incarnation and adds no inspection syscall.
+    #[test]
+    fn r28_absence_uses_full_identity() {
+        let c = consumer_code();
+        assert!(c.contains("kernel.task_present_in_any_runqueue(tid)"));
+        assert!(c.contains("kernel.task_asid(tid)"));
+        assert!(c.contains("kernel.current_tid()"));
+        assert!(c.contains("identity=tid_asid"));
+        assert!(c.contains("frame_source=0"));
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+    }
+
+    // ── 29–32: runner static contract and feature-off ───────────────────────────────
+
+    /// 29. The runner requires survivor progress and terminal health.
+    #[test]
+    fn r29_runner_requires_terminal_health() {
+        assert!(RUNNER.contains("\"EXIT_TASK_SURVIVOR_PROGRESS_OK arch=riscv64\""));
+        assert!(RUNNER.contains("\"EXIT_TASK_SYSTEM_HEALTH_OK arch=riscv64\""));
+        assert!(RUNNER.contains("qemu exited before terminal proof"));
+        assert!(RUNNER.contains("terminal health is the last thing proven"));
+    }
+
+    /// 30. The runner rejects false lock ordering, and every declared-but-unwired shape.
+    #[test]
+    fn r30_runner_rejects_false_ordering_and_unwired_declarations() {
+        // Per-line lock-state, both directions.
+        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
+        assert!(RUNNER.contains("the in-lock bypass marker does not state broad_lock=1"));
+        assert!(RUNNER.contains("the in-lock bypass marker falsely claims broad_lock=0"));
+        // Consumer strictly after the drains.
+        assert!(RUNNER.contains("the consumer runs after every Phase-3 drain"));
+        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
+        // Declared-but-unwritten selector / declared-but-unspawned entry.
+        assert!(RUNNER.contains("EXIT_TASK_ORACLE_SLOTS arch=riscv64 slot5=22"));
+        assert!(RUNNER.contains("the selector is provisioned before the task is spawned"));
+        assert!(RUNNER.contains("the task is spawned before it runs"));
+        assert!(RUNNER.contains("feature-on kernel missing the slot-5 provisioning literal"));
+        // Old-frame / sepc restoration.
+        assert!(RUNNER.contains("EXIT_TASK_OLD_FRAME_RESTORED"));
+        assert!(RUNNER.contains("EXIT_TASK_EXITING_SEPC_COMMITTED"));
+        assert!(
+            RUNNER.contains("the in-lock bypass did not suppress the exiting task's result export")
+        );
+        assert!(RUNNER.contains("frame_source=replacement_tcb"));
+    }
+
+    /// 31. The runner rejects multiple boots, reuse, dirty trees and SHA drift.
+    #[test]
+    fn r31_runner_rejects_multiple_boots_and_drift() {
+        assert!(RUNNER.contains("QEMU_SINGLE_BOOT=1"));
+        assert!(RUNNER.contains("die \"[$L] QEMU launches != 1 (got $launches)\""));
+        assert!(RUNNER.contains("die \"[$L] distinct boot nonces != 1 (got $nonces)\""));
+        assert!(RUNNER.contains("die \"[$L] boot nonce lines != 1 (got $noncelines)\""));
+        assert!(RUNNER.contains("die \"log reuse: $p already exists\""));
+        assert!(RUNNER.contains("die \"artifact reused from an earlier run: $p\""));
+        assert!(RUNNER.contains("result=fail reason=dirty_tree"));
+        assert!(RUNNER.contains("die \"[$what] SHA drifted\""));
+        assert!(RUNNER.contains("die \"[$what] tree hash drifted\""));
+        const CORE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+        assert!(CORE.contains("SINGLE_BOOT_ARGS=(-no-reboot -no-shutdown)"));
+        // Prepared, not executed: only the 0D2 live seal is emitted.
+        assert!(RUNNER.contains("STAGE_200D0D2_RISCV_EXIT_CURRENT_TASK_LIVE_SEAL"));
+        assert!(!RUNNER.contains("STAGE_200D0D1_RISCV_EXIT_CONSUMER_PREP_SEAL"));
+    }
+
+    /// 32. The feature-off audit covers every oracle literal, in the kernel AND the initramfs,
+    ///     while the production consumer and bypass stay compiled everywhere.
+    #[test]
+    fn r32_feature_off_audit_excludes_only_oracle_literals() {
+        for lit in [
+            "EXIT_TASK_USER_ENTERED role=disposable arch=riscv64",
+            "EXIT_TASK_SYSTEM_HEALTH_OK arch=riscv64",
+            "EXIT_TASK_ORACLE_SPAWNED arch=riscv64",
+            "EXIT_TASK_SURVIVOR_PROGRESS_OK arch=riscv64",
+            "EXIT_TASK_ORACLE_SLOTS arch=riscv64",
+            "yarm.riscv_exit_current_task_oracle",
+            "YARM_RISCV_EXIT_CURRENT_TASK_ORACLE_SET",
+            "STAGE_200D0D2_RISCV_EXIT_CURRENT_TASK_LIVE_SEAL",
+        ] {
+            assert!(
+                RUNNER.contains(lit),
+                "the feature-off audit must cover {lit}"
+            );
+        }
+        assert!(RUNNER.contains("feature-off initramfs contains"));
+        // Production paths are NOT oracle-gated.
+        assert!(!consumer_block().contains("riscv-exit-current-task-oracle"));
+        assert!(!bypass_code().contains("riscv-exit-current-task-oracle"));
     }
 }

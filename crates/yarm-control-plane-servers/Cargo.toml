@@ -16,6 +16,8 @@ x86-exit-current-task-oracle = []
 # Stage 200D-0C1: gates the disposable AArch64 ExitCurrentTask oracle task. Feature-off
 # builds carry none of its literals.
 aarch64-exit-current-task-oracle = []
+# Stage 200D-0D1: gates the disposable RISC-V ExitCurrentTask oracle task.
+riscv-exit-current-task-oracle = []
 
 [dependencies]
 yarm = { package = "yarm-server-runtime", path = "../yarm-server-runtime", default-features = false }

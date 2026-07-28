@@ -412,6 +412,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_aarch64_exit_oracle_enabled(true);
         crate::yarm_log!("YARM_AARCH64_EXIT_CURRENT_TASK_ORACLE_SET enabled=1");
     }
+    // Stage 200D-0D1: DEFAULT-OFF RISC-V ExitCurrentTask live-oracle knob.
+    #[cfg(feature = "riscv-exit-current-task-oracle")]
+    if parsed.riscv_exit_current_task_oracle == Some(true) {
+        crate::kernel::boot::set_riscv_exit_oracle_enabled(true);
+        crate::yarm_log!("YARM_RISCV_EXIT_CURRENT_TASK_ORACLE_SET enabled=1");
+    }
     if let Some(mode) = parsed.x86_64_ipc_reply_timeout_oracle {
         // Stage 200C2A: arm the reply-timeout oracle mode (1=timeout-wins, 2=reply-wins). The slot-5
         // provisioning + registration/scan wiring are additionally feature- and arch-gated.
@@ -816,6 +822,10 @@ pub struct YarmBootOptions<'a> {
     /// sibling of the knob above. Spawns one disposable, non-essential userspace task that
     /// invokes NR 16 and must never return to EL0.
     pub aarch64_exit_current_task_oracle: Option<bool>,
+    /// Stage 200D-0D1: `yarm.riscv_exit_current_task_oracle=1` DEFAULT-OFF knob — the RISC-V
+    /// sibling. Spawns one disposable, non-essential userspace task that invokes NR 16 and must
+    /// never return to U-mode.
+    pub riscv_exit_current_task_oracle: Option<bool>,
     /// Stage 200C2C1: `yarm.aarch64_ipc_reply_timeout_oracle=timeout-wins|reply-wins` DEFAULT-OFF
     /// knob — the AArch64 port of the reply-receive TIMEOUT retirement oracle. Same per-boot mode
     /// discriminator as the x86 knob (`Some(1)` = timeout-wins, `Some(2)` = reply-wins; `None` = off),
@@ -1072,6 +1082,12 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         #[cfg(feature = "aarch64-exit-current-task-oracle")]
         if key == b"yarm.aarch64_exit_current_task_oracle" {
             options.aarch64_exit_current_task_oracle = Some(matches!(value, b"1" | b"true"));
+        }
+        // Stage 200D-0D1: feature-gated for the same reason as the AArch64 arm above — an
+        // ungated parse arm keeps the key's byte literal in a feature-off image's `.rodata`.
+        #[cfg(feature = "riscv-exit-current-task-oracle")]
+        if key == b"yarm.riscv_exit_current_task_oracle" {
+            options.riscv_exit_current_task_oracle = Some(matches!(value, b"1" | b"true"));
         }
         if key == b"yarm.x86_64_ipc_reply_timeout_oracle" {
             // Stage 200C2A: two mutually-exclusive string modes. An unrecognized value leaves the

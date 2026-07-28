@@ -16,6 +16,9 @@ x86-exit-current-task-oracle = []
 # reason — `build-qemu-aarch64-artifacts.sh` applies one feature set to every server
 # package. This crate compiles no oracle code under it.
 aarch64-exit-current-task-oracle = []
+# Stage 200D-0D1: the RISC-V sibling, an UNUSED pass-through for the same reason — one
+# BOOTSTRAP_FEATURE_ARGS is applied to every server package. No oracle code compiles here.
+riscv-exit-current-task-oracle = []
 default = ["hosted-dev"]
 hosted-dev = []
 

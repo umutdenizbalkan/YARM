@@ -828,6 +828,8 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             let reason_str = match reason {
                 RiscvIdleReason::FutexWaitNoIncoming => "FutexWaitNoIncoming",
                 RiscvIdleReason::BlockedIpcNoRunnable => "BlockedIpcNoRunnable",
+                // Stage 200D-0D1: an accepted ExitCurrentTask left no runnable task.
+                RiscvIdleReason::ExitCurrentTaskNoRunnable => "ExitCurrentTaskNoRunnable",
             };
             crate::yarm_log!("RISCV_TYPED_IDLE_OUTCOME result=ok reason={}", reason_str);
             crate::yarm_log!(
@@ -1725,6 +1727,21 @@ pub fn bootstrap_first_user_task(
     } else if crate::kernel::boot::riscv_futex_wake_oracle_enabled() {
         init_args[5] = 1;
         crate::yarm_log!("RISCV_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1");
+    }
+    // Stage 200D-0D1: the RISC-V ExitCurrentTask live-oracle slot-5 write. This IS the
+    // production activation — without it the feature and the knob arm nothing and init never
+    // sees the scenario. The value is NOT written literally: it comes from the shared
+    // `yarm_ipc_abi::exit_current_task_abi` encoder via `riscv_exit_current_task_selector()`,
+    // and the init server decodes it through the inverse of that same helper. This oracle needs
+    // no capabilities, so it takes slot 5 only, and is mutually exclusive with every slot-5
+    // oracle above (guarded by `init_args[5] == 0`).
+    #[cfg(feature = "riscv-exit-current-task-oracle")]
+    if crate::kernel::boot::riscv_exit_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::riscv_exit_current_task_selector();
+        crate::yarm_log!(
+            "EXIT_TASK_ORACLE_SLOTS arch=riscv64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
     }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
