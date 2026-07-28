@@ -66,7 +66,14 @@ serverdies_stage_boot_artifacts() {
   cp "$KELF" "$BOOT_KERNEL" || return 1
   [[ -f "$BOOT_INITRD" ]] || { echo "[serverdies] missing initramfs: $BOOT_INITRD"; return 1; }
   # The booted image MUST be the oracle-on one.
-  strings -a "$BOOT_KERNEL" | grep -qF "IPC_REPLY_TIMEOUT_COLLECTOR_GATE" \
+  #
+  # Materialize the symbol dump first rather than piping into `grep -q`: under
+  # `set -o pipefail`, `grep -q` exits on the FIRST match, `strings` then takes SIGPIPE, and
+  # the pipeline reports failure precisely when the literal IS present. That inversion made
+  # a correctly-staged kernel look un-staged.
+  local syms
+  syms=$(strings -a "$BOOT_KERNEL")
+  grep -qF "IPC_REPLY_TIMEOUT_COLLECTOR_GATE" <<<"$syms" \
     || { echo "[serverdies] staged kernel is not oracle-on"; return 1; }
 }
 
