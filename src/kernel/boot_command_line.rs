@@ -809,7 +809,7 @@ pub struct YarmBootOptions<'a> {
     /// direct classes; queued calls, timeouts, notifications, server-death wake, and all non-x86
     /// architectures stay disabled.
     pub x86_64_ipccall_direct_oracle: Option<bool>,
-    /// Stage 200C2A: `yarm.x86_64_ipc_reply_timeout_oracle=timeout-wins|reply-wins` DEFAULT-OFF knob.
+    /// Stage 200C2A: `yarm.x86_64_ipc_reply_timeout_oracle=timeout-wins|reply-wins|server-dies` DEFAULT-OFF knob.
     /// Provisions init startup slot 5 (=10) so init runs the reply-receive TIMEOUT live oracle, and
     /// arms the production reply-timeout registration + scan wiring for the run. `Some(1)` =
     /// timeout-wins, `Some(2)` = reply-wins; `None` = off. Mutually exclusive with every other slot-5
@@ -826,14 +826,14 @@ pub struct YarmBootOptions<'a> {
     /// sibling. Spawns one disposable, non-essential userspace task that invokes NR 16 and must
     /// never return to U-mode.
     pub riscv_exit_current_task_oracle: Option<bool>,
-    /// Stage 200C2C1: `yarm.aarch64_ipc_reply_timeout_oracle=timeout-wins|reply-wins` DEFAULT-OFF
+    /// Stage 200C2C1: `yarm.aarch64_ipc_reply_timeout_oracle=timeout-wins|reply-wins|server-dies` DEFAULT-OFF
     /// knob — the AArch64 port of the reply-receive TIMEOUT retirement oracle. Same per-boot mode
     /// discriminator as the x86 knob (`Some(1)` = timeout-wins, `Some(2)` = reply-wins; `None` = off),
     /// arming the SAME arch-neutral registration + off-lock collector/drain wiring. Mutually exclusive
     /// with every other slot-5 oracle. Requires `target_arch = aarch64` + the
     /// `aarch64-ipc-reply-timeout-oracle` feature.
     pub aarch64_ipc_reply_timeout_oracle: Option<u8>,
-    /// Stage 200C2C2: `yarm.riscv_ipc_reply_timeout_oracle=timeout-wins|reply-wins` DEFAULT-OFF
+    /// Stage 200C2C2: `yarm.riscv_ipc_reply_timeout_oracle=timeout-wins|reply-wins|server-dies` DEFAULT-OFF
     /// knob — the RISC-V port of the reply-receive TIMEOUT retirement oracle. Same per-boot mode
     /// discriminator as the x86/AArch64 knobs, arming the SAME arch-neutral registration +
     /// off-lock collector/drain wiring. Mutually exclusive with every other slot-5 oracle.
@@ -1099,6 +1099,13 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
                 b"reply-wins" | b"2" => {
                     Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS)
                 }
+                // Stage 200D-2B1C: the third scenario. `IPC_REPLY_TIMEOUT_MODE_SERVER_DIES`
+                // existed and the whole ServerDies mechanism was wired behind it, but no
+                // selector value mapped to it — so the scenario was unreachable from a boot
+                // command line and could never run live.
+                b"server-dies" | b"3" => {
+                    Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES)
+                }
                 _ => None,
             };
         }
@@ -1112,6 +1119,13 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
                 b"reply-wins" | b"2" => {
                     Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS)
                 }
+                // Stage 200D-2B1C: the third scenario. `IPC_REPLY_TIMEOUT_MODE_SERVER_DIES`
+                // existed and the whole ServerDies mechanism was wired behind it, but no
+                // selector value mapped to it — so the scenario was unreachable from a boot
+                // command line and could never run live.
+                b"server-dies" | b"3" => {
+                    Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES)
+                }
                 _ => None,
             };
         }
@@ -1124,6 +1138,13 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
                 }
                 b"reply-wins" | b"2" => {
                     Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS)
+                }
+                // Stage 200D-2B1C: the third scenario. `IPC_REPLY_TIMEOUT_MODE_SERVER_DIES`
+                // existed and the whole ServerDies mechanism was wired behind it, but no
+                // selector value mapped to it — so the scenario was unreachable from a boot
+                // command line and could never run live.
+                b"server-dies" | b"3" => {
+                    Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES)
                 }
                 _ => None,
             };

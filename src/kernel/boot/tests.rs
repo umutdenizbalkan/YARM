@@ -95268,3 +95268,291 @@ mod stage200d2b1bii_races {
         }
     }
 }
+
+/// Stage 200D-2B1C — the three-architecture return contract and live-readiness wiring.
+///
+/// The `CurrentTaskExited` consumers themselves landed in Stages 200D-0B3 / 0C1 / 0D1 and were
+/// live-proven per architecture. What this module pins is the CONTRACT they jointly implement,
+/// as a contract: for every port, both outcomes (a replacement task, and no runnable task at
+/// all) are handled, the full `{tid, asid}` incarnation is validated, the exited task's old
+/// userspace frame is never written, and each port keeps its own epilogue ownership without
+/// adding a duplicate cleanup.
+#[cfg(test)]
+mod stage200d2b1c_arch_return {
+    const X86: &str = include_str!("../../arch/x86_64/trap.rs");
+    const SHARED: &str = include_str!("../../arch/trap_entry.rs");
+    const RV: &str = include_str!("../../arch/riscv64/trap.rs");
+    const CMDLINE: &str = include_str!("../boot_command_line.rs");
+    const INIT: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    /// Exactly one production consumer per port — the disposition is one-shot, so a second
+    /// `take_...` anywhere would silently swallow it for the other.
+    #[test]
+    fn a01_one_consumer_per_architecture() {
+        for (arch, src) in [("x86_64", X86), ("aarch64", SHARED), ("riscv64", RV)] {
+            assert_eq!(
+                src.matches("take_post_lock_trap_disposition(").count(),
+                1,
+                "{arch} must have exactly one disposition consumer"
+            );
+        }
+    }
+
+    /// Every port validates the FULL incarnation, not a bare numeric TID.
+    #[test]
+    fn a02_full_exiting_identity_is_validated() {
+        for (arch, src) in [("x86_64", X86), ("aarch64", SHARED), ("riscv64", RV)] {
+            assert!(
+                src.contains("CurrentTaskExited { tid, asid }"),
+                "{arch} must bind both halves of the incarnation"
+            );
+            // Semantic, not lexical: each port reads the live ASID bound to that TID and
+            // compares it with the published one, treating a fully reaped TCB as safe. The
+            // three ports bind the matched value under different names, so assert the
+            // property rather than one port's spelling.
+            let consumer = src
+                .split("CurrentTaskExited { tid, asid }")
+                .nth(1)
+                .expect("consumer");
+            assert!(
+                consumer.contains("kernel.task_asid(tid)") && consumer.contains("== asid"),
+                "{arch} must compare the published ASID against the live binding"
+            );
+            assert!(
+                consumer.contains("None => true"),
+                "{arch} must treat a fully reaped TCB as unimpersonatable"
+            );
+            assert!(
+                src.contains("EXIT_TASK_WRONG_IDENTITY"),
+                "{arch} must fail closed on a mismatched incarnation"
+            );
+        }
+    }
+
+    /// The exiting task must never be the restore owner, and must never be current.
+    #[test]
+    fn a03_exited_task_is_never_restored() {
+        for (arch, src) in [("x86_64", X86), ("aarch64", SHARED), ("riscv64", RV)] {
+            assert!(
+                src.contains("EXIT_TASK_EXITING_STILL_CURRENT"),
+                "{arch} must fail closed if the exiting task is still current"
+            );
+            assert!(
+                src.contains("EXIT_TASK_RESELECTED_EXITING_TASK"),
+                "{arch} must fail closed if the exiting task is reselected as replacement"
+            );
+            assert!(
+                src.contains("EXIT_TASK_ABSENCE_VALIDATED"),
+                "{arch} must attest the exiting task's absence before restoring anyone"
+            );
+        }
+    }
+
+    /// Both outcomes exist on every port: a replacement, and the established idle path.
+    #[test]
+    fn a04_replacement_and_idle_paths_exist_on_every_arch() {
+        for (arch, src, owner_marker) in [
+            ("x86_64", X86, "EXIT_TASK_RESTORE_OWNER_PREPARED"),
+            ("aarch64", SHARED, "EXIT_TASK_RESTORE_OWNER"),
+            ("riscv64", RV, "EXIT_TASK_RESTORE_OWNER"),
+        ] {
+            let replacement = alloc::format!("{owner_marker} arch={arch} owner=replacement");
+            let idle = alloc::format!("{owner_marker} arch={arch} owner=idle");
+            assert!(
+                src.contains(&replacement),
+                "{arch} must name a replacement restore owner"
+            );
+            assert!(
+                src.contains(&idle),
+                "{arch} must name the idle restore owner when nothing is runnable"
+            );
+        }
+    }
+
+    /// The idle branch enters each port's ESTABLISHED idle primitive rather than inventing a
+    /// second one — AArch64 the shared no-ERET loop, RISC-V its typed idle outcome.
+    #[test]
+    fn a05_idle_branch_uses_the_established_primitive() {
+        assert!(
+            SHARED.contains("idle_no_eret_loop()"),
+            "aarch64 must enter the established no-ERET idle loop"
+        );
+        assert!(
+            RV.contains("RiscvIdleReason::ExitCurrentTaskNoRunnable"),
+            "riscv64 must enter its typed idle terminal with a named reason"
+        );
+        // x86_64 selects the owner in-lock and lets the ordinary epilogue run; it must not
+        // grow an idle loop of its own inside the consumer.
+        let consumer = X86
+            .split("PostLockTrapDisposition::CurrentTaskExited { tid, asid }")
+            .nth(1)
+            .expect("x86_64 consumer");
+        let consumer = consumer.split("\n    }").next().unwrap_or(consumer);
+        assert!(
+            !consumer.contains("idle_halt_loop") && !consumer.contains("loop {"),
+            "the x86_64 consumer must not introduce its own idle loop"
+        );
+    }
+
+    /// Each port keeps its OWN epilogue/depth ownership, and adds no duplicate cleanup.
+    #[test]
+    fn a06_no_duplicate_epilogue_or_depth_cleanup() {
+        // AArch64: hardware ERET owns cleanup; the shared section states the ownership.
+        assert!(
+            SHARED.contains("EXIT_TASK_TRAP_DEPTH_OWNER"),
+            "aarch64 must state its trap-depth ownership"
+        );
+        // RISC-V: the trap bridge owns the single sret, and the consumer clears nothing.
+        assert!(
+            RV.contains("software_depth_clears=0"),
+            "riscv64 must record zero consumer-side depth clears"
+        );
+        // x86_64 owns a real software depth counter, but the consumer must not write it.
+        let consumer = X86
+            .split("PostLockTrapDisposition::CurrentTaskExited { tid, asid }")
+            .nth(1)
+            .expect("x86_64 consumer");
+        let consumer = consumer.split("\n    }").next().unwrap_or(consumer);
+        for forbidden in ["TRAP_DISPATCH_DEPTH.store", "TRAP_DISPATCH_DEPTH.fetch"] {
+            assert!(
+                !consumer.contains(forbidden),
+                "the x86_64 consumer must not write the trap depth ({forbidden})"
+            );
+        }
+    }
+
+    /// The two ports that consume post-lock say so where it is checkable, and the x86_64 port
+    /// — which consumes in-lock by design — defers every frame effect past the drains.
+    #[test]
+    fn a07_lock_and_drain_position_is_explicit_per_port() {
+        for (arch, src) in [("aarch64", SHARED), ("riscv64", RV)] {
+            let released = alloc::format!("EXIT_TASK_BROAD_LOCK_RELEASED arch={arch}");
+            let drained = alloc::format!("EXIT_TASK_POST_LOCK_DRAIN_DONE arch={arch}");
+            assert!(src.contains(&released), "{arch} must attest lock release");
+            assert!(
+                src.contains(&drained),
+                "{arch} must attest drain completion"
+            );
+            let consumed = alloc::format!("EXIT_TASK_DISPOSITION_CONSUMED arch={arch}");
+            let c = src.find(&consumed).expect("consumed marker");
+            assert!(
+                src[..c].contains(&released) && src[..c].contains(&drained),
+                "{arch} must release the lock and drain BEFORE consuming"
+            );
+            assert!(
+                src.contains(&alloc::format!(
+                    "{consumed} tid={{}} asid={{}} cpu={{}} broad_lock=0"
+                )),
+                "{arch} must consume with broad_lock=0"
+            );
+        }
+        // x86_64 consumes in-lock and says broad_lock=1 rather than claiming otherwise; the
+        // frame is committed later, in the vector epilogue.
+        assert!(
+            X86.contains(
+                "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64 tid={} asid={} cpu={} broad_lock=1"
+            ),
+            "the x86_64 consumer must state that it runs under the broad lock"
+        );
+        assert!(
+            X86.contains("flush_trap_context_to_iret_frame"),
+            "x86_64 must defer the hardware frame commit to the vector epilogue"
+        );
+    }
+
+    /// The consumer performs no production side effect: no teardown, enqueue, terminal claim
+    /// or user copy may ride along on the return path.
+    #[test]
+    fn a08_consumer_has_no_production_side_effects() {
+        for (arch, src, anchor) in [
+            (
+                "x86_64",
+                X86,
+                "PostLockTrapDisposition::CurrentTaskExited { tid, asid }",
+            ),
+            (
+                "aarch64",
+                SHARED,
+                "PostLockTrapDisposition::CurrentTaskExited { tid, asid }",
+            ),
+            (
+                "riscv64",
+                RV,
+                "PostLockTrapDisposition::CurrentTaskExited { tid, asid }",
+            ),
+        ] {
+            let consumer = src.split(anchor).nth(1).expect("consumer");
+            let consumer = consumer.split("\n    }").next().unwrap_or(consumer);
+            for forbidden in [
+                "copy_to_user",
+                "rtd_enqueue",
+                "try_claim_peer_death_terminal",
+                "complete_server_death_over",
+                "exit_task(",
+            ] {
+                assert!(
+                    !consumer.contains(forbidden),
+                    "the {arch} consumer must not perform `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    // ── Live-readiness wiring ───────────────────────────────────────────────────────────
+
+    /// Stage 200D-2B1C: the ServerDies scenario is REACHABLE from a boot command line on all
+    /// three ports. `IPC_REPLY_TIMEOUT_MODE_SERVER_DIES` existed and the whole mechanism was
+    /// wired behind it, but no selector value mapped to it, so it could never run live.
+    #[test]
+    fn a09_server_dies_selector_is_forwarded_on_every_port() {
+        assert_eq!(
+            CMDLINE.matches("b\"server-dies\" | b\"3\" => {").count(),
+            3,
+            "all three per-arch selectors must accept `server-dies`"
+        );
+        assert_eq!(
+            CMDLINE
+                .matches("Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES)")
+                .count(),
+            3,
+            "each `server-dies` arm must map to the ServerDies mode"
+        );
+        for knob in [
+            "yarm.x86_64_ipc_reply_timeout_oracle",
+            "yarm.aarch64_ipc_reply_timeout_oracle",
+            "yarm.riscv_ipc_reply_timeout_oracle",
+        ] {
+            assert!(
+                CMDLINE.contains(knob),
+                "missing per-arch selector knob: {knob}"
+            );
+        }
+        // An unrecognized value must still leave the oracle inert.
+        assert_eq!(
+            CMDLINE.matches("_ => None,").count() >= 3,
+            true,
+            "an unknown selector value must leave the oracle inert"
+        );
+    }
+
+    /// The ServerDies userspace task is DISPOSABLE: it exits through the ordinary NR16 and any
+    /// return from it is a hard failure, never a fallback.
+    #[test]
+    fn a10_server_dies_oracle_task_is_disposable() {
+        assert!(
+            INIT.contains("yarm_user_rt::syscall::exit_current_task()"),
+            "the ServerDies server must exit through the ordinary syscall"
+        );
+        assert!(
+            INIT.contains("IPC_SERVER_DEATH_EXIT_RETURNED err={:?} result=fail"),
+            "a returning NR16 must be a hard failure, not a fallback"
+        );
+        // The scenario is decoded through the shared ABI, not a private per-port table.
+        assert!(
+            INIT.contains("ipc_reply_liveness_scenario_for_current_arch"),
+            "scenario selection must go through the shared ABI decoder"
+        );
+    }
+}
