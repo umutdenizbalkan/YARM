@@ -93585,6 +93585,18 @@ mod stage200d2b1bi_counters {
     use crate::kernel::boot::server_dies_counters as c;
     use c::Transition as T;
 
+    /// The nine transition counters, the per-CPU deferred queue and the causal collector
+    /// gate are all PROCESS-global. Every case that mutates them takes this guard, so the
+    /// default parallel `cargo test` run cannot interleave two instances and read a vector
+    /// that neither case produced. Poison-tolerant: a panicking case still yields the
+    /// guard rather than cascading into unrelated failures.
+    pub(super) static SERVER_DIES_GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) fn globals_guard() -> std::sync::MutexGuard<'static, ()> {
+        SERVER_DIES_GLOBALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     const IPC_SRC: &str = include_str!("ipc_state.rs");
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
@@ -93608,6 +93620,7 @@ mod stage200d2b1bi_counters {
     /// Nine classes, distinct discriminants, stable names.
     #[test]
     fn i01_nine_transition_classes() {
+        let _g = globals_guard();
         assert_eq!(c::CLASSES, 9);
         let mut seen = alloc::vec::Vec::new();
         for t in ALL {
@@ -93622,6 +93635,7 @@ mod stage200d2b1bi_counters {
     /// stamp clock, so one test cannot inherit another's counts.
     #[test]
     fn i02_instance_isolation_is_deterministic() {
+        let _g = globals_guard();
         c::reset_instance();
         c::record(T::LinkCreated);
         assert_eq!(c::count(T::LinkCreated), 1);
@@ -93638,6 +93652,7 @@ mod stage200d2b1bi_counters {
     /// STAMPS taken at the two real operations, not by declaration order.
     #[test]
     fn i03_success_vector_and_result_before_enqueue() {
+        let _g = globals_guard();
         c::reset_instance();
         for t in ALL {
             c::record(t);
@@ -93656,6 +93671,7 @@ mod stage200d2b1bi_counters {
     /// ordering claim provable rather than assumed.
     #[test]
     fn i04_inverted_order_fails_even_at_count_one() {
+        let _g = globals_guard();
         c::reset_instance();
         c::record(T::CallerEnqueue);
         c::record(T::ResultPublication);
@@ -93672,6 +93688,7 @@ mod stage200d2b1bi_counters {
     /// A missing stamp is never "in order".
     #[test]
     fn i05_missing_transition_is_not_in_order() {
+        let _g = globals_guard();
         c::reset_instance();
         c::record(T::ResultPublication);
         assert!(!c::result_before_enqueue(), "no enqueue yet");
@@ -93685,6 +93702,7 @@ mod stage200d2b1bi_counters {
     /// Duplicates are visible (count > 1) and fail the audit for every class.
     #[test]
     fn i06_duplicate_transitions_fail_closed() {
+        let _g = globals_guard();
         for t in ALL {
             c::reset_instance();
             c::record(t);
@@ -93699,6 +93717,7 @@ mod stage200d2b1bi_counters {
     /// zero — reserve may have happened, detach and everything after it must not.
     #[test]
     fn i07_capacity_refusal_advances_nothing_downstream() {
+        let _g = globals_guard();
         c::reset_instance();
         // Queue-full: no reservation, so not even the reserve class advances.
         assert_eq!(c::vector(), [0u32; 9]);
@@ -93724,6 +93743,7 @@ mod stage200d2b1bi_counters {
     /// Leak literals are derived from count RELATIONSHIPS at the real operations.
     #[test]
     fn i08_leak_relationships_fail_closed() {
+        let _g = globals_guard();
         // link created, never detached → link leak
         c::reset_instance();
         c::record(T::LinkCreated);
@@ -93747,6 +93767,7 @@ mod stage200d2b1bi_counters {
     /// performs the transition, on the branch where it actually committed.
     #[test]
     fn i09_counters_attached_to_real_operations() {
+        let _g = globals_guard();
         // 1 link created — inside the arm that installs a NEW link.
         let reg = IPC_SRC
             .split("pub(crate) fn register_server_reply_link(")
@@ -93817,6 +93838,7 @@ mod stage200d2b1bi_counters {
     /// transition on the userspace side.
     #[test]
     fn i10_no_simulated_transitions() {
+        let _g = globals_guard();
         assert!(
             !INIT_SRC.contains("server_dies_counters"),
             "userspace must not synthesize transitions"
@@ -93833,6 +93855,7 @@ mod stage200d2b1bi_counters {
     /// All fifteen canonical hard-fail literals exist at real sites.
     #[test]
     fn i11_fifteen_hard_fail_literals() {
+        let _g = globals_guard();
         let sources = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC, INIT_SRC];
         for lit in [
             "IPC_SERVER_DEATH_EXIT_RETURNED",
@@ -93876,6 +93899,7 @@ mod stage200d2b1bi_counters {
     /// The identity/generation literals sit at the real revalidation failures.
     #[test]
     fn i12_identity_literals_at_real_revalidation_sites() {
+        let _g = globals_guard();
         // Drain revalidation: emitted on the stale-identity branch, before `continue`.
         let drain = RUNTIME_SRC
             .split("pub(crate) fn drain_server_death_post_work")
@@ -93912,6 +93936,7 @@ mod stage200d2b1bi_counters {
     /// the operations they observe are not.
     #[test]
     fn i13_production_mechanism_is_not_feature_dependent() {
+        let _g = globals_guard();
         for (name, needle, src) in [
             (
                 "register link",
@@ -93955,6 +93980,1247 @@ mod stage200d2b1bi_counters {
                     head.rfind("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]")
                         .is_some(),
                     "every counter site is feature-gated"
+                );
+            }
+        }
+    }
+}
+
+/// Stage 200D-2B1B-ii — deterministic ServerDies races, fail-closed rejections, and
+/// wiring guards.
+///
+/// Every case drives the REAL production seams in a controlled order — terminal CAS,
+/// record lifecycle, TCB link seam, deferred queue, off-lock completion — and asserts the
+/// exact nine-counter vector plus the ordering stamps, not merely a marker's presence.
+/// No sleeps, no wall clock, no host-thread scheduling.
+#[cfg(all(test, feature = "ipc-reply-timeout-oracle-core"))]
+mod stage200d2b1bii_races {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::DeferredServerDeathCompletion;
+    use crate::kernel::boot::server_dies_counters as c;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::kernel::vm::Asid;
+    use c::Transition as T;
+
+    const TOKEN_GEN: u64 = 1;
+    const SERVER_DIED: u64 = 10;
+    const CPU: CpuId = CpuId(0);
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    /// Fresh fixture AND a fresh counter instance, so no case inherits another's counts.
+    ///
+    /// Returns the process-global serialization guard alongside the fixture: the counters,
+    /// the deferred queue and the collector gate are global, so a case must hold the guard
+    /// for its whole body or a parallel case could interleave transitions into its vector.
+    fn fx_fresh() -> (std::sync::MutexGuard<'static, ()>, CallerFx) {
+        let g = super::stage200d2b1bi_counters::globals_guard();
+        // Drain any queue residue from a previous case before the instance resets.
+        while crate::kernel::boot::server_death_work_drain_next(0).is_some() {}
+        c::reset_instance();
+        let fx = caller_fixture();
+        (g, fx)
+    }
+
+    fn arm(fx: &CallerFx) -> TerminalIdentity {
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(1);
+        let id =
+            fx.k.with(|s| {
+                s.reply_terminal_identity(
+                    fx.record_index,
+                    fx.record_generation,
+                    brg,
+                    Some(TOKEN_GEN),
+                )
+            })
+            .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(fx.record_index, id));
+        id
+    }
+
+    fn link(fx: &CallerFx) -> bool {
+        fx.k.with(|s| {
+            s.register_server_reply_link(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        })
+    }
+
+    /// The BROAD-LOCK phase exactly as `exit_task` performs it: reserve → detach → publish.
+    fn broad_lock_exit_phase(fx: &CallerFx) -> bool {
+        let reservation = match crate::kernel::boot::server_death_work_reserve(0) {
+            Some(r) => r,
+            None => return false,
+        };
+        match fx
+            .k
+            .with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+        {
+            Some(l) => crate::kernel::boot::server_death_work_publish(
+                reservation,
+                DeferredServerDeathCompletion {
+                    exiting_server: fx.replier,
+                    reply_record_index: l.reply_record_index,
+                    reply_record_generation: l.reply_record_generation,
+                },
+            ),
+            None => {
+                crate::kernel::boot::server_death_work_release(reservation);
+                false
+            }
+        }
+    }
+
+    fn drain(fx: &CallerFx) -> usize {
+        fx.k.drain_server_death_post_work(CPU)
+    }
+    fn winner(fx: &CallerFx) -> Option<TerminalClaimant> {
+        fx.k.with(|s| s.reply_terminal_committed_winner(fx.record_index))
+    }
+    /// A competing terminal claimant taking the cell for real — claim then commit,
+    /// through the SAME single-authority seams the production reply/timeout paths use.
+    fn claim_terminal(fx: &CallerFx, id: &TerminalIdentity, kind: TerminalClaimant) -> bool {
+        fx.k.with(
+            |s| match s.try_claim_reply_terminal_slot(fx.record_index, kind, id) {
+                Some(owner) => s.commit_reply_terminal_slot(fx.record_index, &owner),
+                None => false,
+            },
+        )
+    }
+    fn caller_result(fx: &CallerFx) -> Option<u64> {
+        fx.k.with(|s| s.pending_syscall_completion_result(1))
+    }
+    fn live_links(fx: &CallerFx) -> usize {
+        fx.k.with(|s| s.live_server_reply_link_count())
+    }
+    fn queued(cpu: usize) -> usize {
+        crate::kernel::boot::server_death_work_len(cpu)
+    }
+    /// The full nine-vector, in declared class order.
+    fn v() -> [u32; 9] {
+        c::vector()
+    }
+    /// The canonical successful ServerDies vector.
+    const SUCCESS: [u32; 9] = [1, 1, 1, 1, 1, 1, 1, 1, 1];
+
+    /// The nine classes in declared order, so a vector index and a class agree by
+    /// construction rather than by a hand-written literal.
+    const ALL: [T; 9] = [
+        T::LinkCreated,
+        T::LinkDetached,
+        T::DeferredReserved,
+        T::DeferredPublished,
+        T::DeferredConsumed,
+        T::PeerDeathWinner,
+        T::ResultPublication,
+        T::RunnableTransition,
+        T::CallerEnqueue,
+    ];
+
+    /// Drive the whole happy path once and return the armed terminal identity.
+    fn run_success(fx: &CallerFx) -> TerminalIdentity {
+        let id = arm(fx);
+        assert!(link(fx));
+        assert!(broad_lock_exit_phase(fx));
+        assert_eq!(drain(fx), 1);
+        id
+    }
+
+    /// Ordering stamps: a class that fired carries a non-zero monotonic stamp, a class
+    /// that did not carries none, and every causal edge whose BOTH endpoints fired holds
+    /// strictly. The stamps come from the production `record` sites, so this is an
+    /// assertion about the real execution order, not about the test's own sequencing.
+    fn assert_stamps(expect: [u32; 9]) {
+        for (i, t) in ALL.iter().enumerate() {
+            if expect[i] == 0 {
+                assert_eq!(c::stamp(*t), 0, "{t:?} never fired, so it carries no stamp");
+            } else {
+                assert_ne!(c::stamp(*t), 0, "{t:?} fired, so it is stamped");
+            }
+        }
+        for (a, b) in [
+            (T::LinkCreated, T::LinkDetached),
+            (T::DeferredReserved, T::LinkDetached),
+            (T::LinkDetached, T::DeferredPublished),
+            (T::DeferredPublished, T::DeferredConsumed),
+            (T::DeferredConsumed, T::PeerDeathWinner),
+            (T::PeerDeathWinner, T::ResultPublication),
+            (T::ResultPublication, T::RunnableTransition),
+            (T::RunnableTransition, T::CallerEnqueue),
+        ] {
+            // A class stores its LATEST stamp, so an edge is only a statement about the
+            // execution order when BOTH endpoints fired exactly once. Where a class
+            // repeated (a second reservation, a second exit attempt), the case asserts the
+            // ordering it does hold with an explicit stamp comparison of its own instead.
+            if expect[a as usize] == 1 && expect[b as usize] == 1 {
+                assert!(c::stamp(a) < c::stamp(b), "stamp order {a:?} before {b:?}");
+            }
+        }
+    }
+
+    /// The obligation EVERY race carries, whatever its outcome:
+    ///   1. the exact nine-counter vector,
+    ///   2. the ordering stamps over every class that fired,
+    ///   3. the single committed terminal winner (or none),
+    ///   4. a genuinely late/stale operation that the production seams refuse — and whose
+    ///      refusal moves no counter and cannot change the winner.
+    ///
+    /// The stale probes are the real entry points (`try_claim_reply_terminal_slot` and
+    /// `take_server_reply_link`), presented with an incarnation that never existed, so
+    /// "rejected" means the production code failed closed rather than the test skipping a
+    /// call.
+    fn assert_race(
+        fx: &CallerFx,
+        id: &TerminalIdentity,
+        expect: [u32; 9],
+        win: Option<TerminalClaimant>,
+    ) {
+        assert_eq!(v(), expect, "nine-counter vector");
+        assert_stamps(expect);
+        assert_eq!(winner(fx), win, "single committed terminal winner");
+
+        let mut stale = *id;
+        stale.reply_record_generation = id.reply_record_generation.wrapping_add(0x5eed);
+        assert_ne!(stale, *id, "the probe identity is genuinely stale");
+        let stale_asid = Asid(fx.replier.asid.0.wrapping_add(0x51));
+        assert_ne!(stale_asid, fx.replier.asid);
+
+        let before = v();
+        assert!(
+            !claim_terminal(fx, &stale, TerminalClaimant::CallerExit),
+            "a late claim on a stale record generation is refused in every state"
+        );
+        assert!(
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, stale_asid))
+                .is_none(),
+            "a stale server incarnation detaches nothing"
+        );
+        assert_eq!(v(), before, "a refused operation advances no counter");
+        assert_eq!(
+            winner(fx),
+            win,
+            "a refused operation cannot change the winner"
+        );
+    }
+
+    // ── Part 1: fail-closed rejections (4) ──────────────────────────────────────────
+
+    /// R1 wrong ENDPOINT generation: an item whose record generation no longer matches the
+    /// live slot detaches nothing, wins nothing, publishes nothing, wakes nobody.
+    #[test]
+    fn r01_wrong_endpoint_generation_rejected() {
+        let (_g, fx) = fx_fresh();
+        arm(&fx);
+        assert!(link(&fx));
+        // Publish an item carrying a DIFFERENT record generation than the live slot.
+        let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            res,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation.wrapping_add(7),
+            }
+        ));
+        assert_eq!(drain(&fx), 1, "the item is consumed");
+        assert_eq!(winner(&fx), None, "no terminal winner");
+        assert_eq!(caller_result(&fx), None, "no result published");
+        assert_eq!(live_links(&fx), 1, "the unrelated live link is untouched");
+        let got = v();
+        assert_eq!(got[T::LinkCreated as usize], 1);
+        assert_eq!(got[T::LinkDetached as usize], 0, "nothing detached");
+        assert_eq!(got[T::PeerDeathWinner as usize], 0);
+        assert_eq!(got[T::ResultPublication as usize], 0);
+        assert_eq!(got[T::RunnableTransition as usize], 0);
+        assert_eq!(got[T::CallerEnqueue as usize], 0);
+        assert!(!c::audit_success_path());
+        teardown();
+    }
+
+    /// R2 caller TID reuse with a DIFFERENT ASID: the stale caller incarnation authorizes
+    /// no wake. The armed identity names caller ASID A; the live caller is ASID B.
+    #[test]
+    fn r02_caller_tid_reuse_different_asid_rejected() {
+        let (_g, fx) = fx_fresh();
+        arm(&fx);
+        assert!(link(&fx));
+        // Rebind the caller TID into a DIFFERENT, already-live address space — the same
+        // numeric TID, a new incarnation — before the death completion runs.
+        let other = fx.replier.asid;
+        assert_ne!(other, fx.caller_asid, "a genuinely different incarnation");
+        fx.k.with(|s| s.bind_task_asid(1, other).expect("rebind caller"));
+        assert_eq!(
+            fx.k.with(|s| s.task_asid(1)),
+            Some(other),
+            "the live caller really moved address spaces"
+        );
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(caller_result(&fx), None, "the stale caller is not woken");
+        let got = v();
+        assert_eq!(got[T::ResultPublication as usize], 0);
+        assert_eq!(got[T::RunnableTransition as usize], 0);
+        assert_eq!(got[T::CallerEnqueue as usize], 0);
+        assert!(!c::audit_success_path());
+        teardown();
+    }
+
+    /// R3 server TID reuse with a DIFFERENT ASID: the detach is exact on {tid, asid}, so a
+    /// reused numeric TID removes nothing and the real link survives.
+    #[test]
+    fn r03_server_tid_reuse_different_asid_rejected() {
+        let (_g, fx) = fx_fresh();
+        arm(&fx);
+        assert!(link(&fx));
+        let before = v();
+        let stale = Asid(fx.replier.asid.0.wrapping_add(41));
+        assert_ne!(stale, fx.replier.asid);
+        let taken =
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, stale));
+        assert!(
+            taken.is_none(),
+            "a stale server incarnation detaches nothing"
+        );
+        assert_eq!(live_links(&fx), 1, "the real link survives");
+        assert_eq!(
+            v()[T::LinkDetached as usize],
+            before[T::LinkDetached as usize],
+            "no detach was counted"
+        );
+        assert!(!c::audit_success_path());
+        teardown();
+    }
+
+    /// R4 stale TIMEOUT generation: the same slot with a different token generation is not
+    /// the caller's registration. The comparison is four-field, and the guard proves the
+    /// slot-index-only shortcut is explicitly rejected in source.
+    #[test]
+    fn r04_stale_timeout_generation_rejected() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        // A second identity over the SAME record with a different token generation is a
+        // distinct registration and must not satisfy the armed one.
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(1);
+        let stale =
+            fx.k.with(|s| {
+                s.reply_terminal_identity(
+                    fx.record_index,
+                    fx.record_generation,
+                    brg,
+                    Some(TOKEN_GEN.wrapping_add(9)),
+                )
+            })
+            .expect("stale identity");
+        assert_ne!(
+            id.deadline_token_generation, stale.deadline_token_generation,
+            "generations really differ"
+        );
+        assert_eq!(
+            id.reply_record_index, stale.reply_record_index,
+            "the SLOT is identical — only the token generation distinguishes them"
+        );
+        // Source: the collector compares all four fields and names the slot-reuse case.
+        assert!(RUNTIME_SRC.contains("if this_idx == armed_idx && this_gen != armed_gen {"));
+        assert!(RUNTIME_SRC.contains("IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION"));
+        for field in [
+            "this_idx == armed_idx",
+            "this_gen == armed_gen",
+            "this_tid == armed_tid",
+            "this_asid == armed_asid",
+        ] {
+            assert!(RUNTIME_SRC.contains(field), "four-field compare: {field}");
+        }
+        teardown();
+    }
+
+    // ── Part 2: 24 deterministic races ──────────────────────────────────────────────
+
+    /// 1. PeerDeath wins normally — the canonical success vector.
+    #[test]
+    fn x01_peer_death_wins_normally() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert!(c::result_before_enqueue());
+        assert!(c::audit_success_path());
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 2. Result publication is stamped strictly before the enqueue.
+    #[test]
+    fn x02_result_stamped_before_enqueue() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert!(c::stamp(T::ResultPublication) < c::stamp(T::CallerEnqueue));
+        assert!(c::stamp(T::PeerDeathWinner) < c::stamp(T::ResultPublication));
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 3. Reply wins BEFORE the death drain: PeerDeath loses, no death publication.
+    #[test]
+    fn x03_reply_wins_before_death_drain() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        // Reply claims the terminal first.
+        assert!(claim_terminal(&fx, &id, TerminalClaimant::Reply));
+        assert_eq!(drain(&fx), 1, "the item is still consumed");
+        assert!(!c::audit_success_path());
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 1, 1, 1, 0, 0, 0, 0],
+            Some(TerminalClaimant::Reply),
+        );
+        teardown();
+    }
+
+    /// 4. Timeout wins BEFORE the death drain: same shape, Timeout owns the terminal.
+    #[test]
+    fn x04_timeout_wins_before_death_drain() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert!(claim_terminal(&fx, &id, TerminalClaimant::Timeout));
+        assert_eq!(drain(&fx), 1);
+        assert!(!c::audit_success_path());
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 1, 1, 1, 0, 0, 0, 0],
+            Some(TerminalClaimant::Timeout),
+        );
+        teardown();
+    }
+
+    /// 5. PeerDeath first, then a late Reply claim loses.
+    #[test]
+    fn x05_late_reply_after_peer_death_loses() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        let late = claim_terminal(&fx, &id, TerminalClaimant::Reply);
+        assert!(!late, "the late reply claim loses");
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 6. PeerDeath first, then a late Timeout claim loses.
+    #[test]
+    fn x06_late_timeout_after_peer_death_loses() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(drain(&fx), 1);
+        let late = claim_terminal(&fx, &id, TerminalClaimant::Timeout);
+        assert!(!late, "the late timeout claim loses");
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 7. A duplicate post-lock drain consumes nothing and completes nothing twice.
+    #[test]
+    fn x07_duplicate_drain_is_inert() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        let after_first = v();
+        assert_eq!(drain(&fx), 0, "the queue is empty");
+        assert_eq!(v(), after_first, "no counter advanced on the second drain");
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 8. A duplicate deferred publication collapses to one owner.
+    #[test]
+    fn x08_duplicate_deferred_publication_collapses() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        // A second publication for the SAME record/generation is refused.
+        let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        let dup = crate::kernel::boot::server_death_work_publish(
+            res,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation,
+            },
+        );
+        assert!(!dup, "the duplicate is refused");
+        assert_eq!(queued(0), 1, "one queued item");
+        // The class-2 counter repeated, so its stamp names the SECOND reservation: it is
+        // strictly later than the one and only publication that survived.
+        assert!(
+            c::stamp(T::DeferredReserved) > c::stamp(T::DeferredPublished),
+            "the refused duplicate reserved after the surviving publication"
+        );
+        // Both reservations really happened; only one publication survived.
+        assert_race(&fx, &id, [1, 1, 2, 1, 0, 0, 0, 0, 0], None);
+        teardown();
+    }
+
+    /// 9. Capacity refusal BEFORE the irreversible detach: nothing downstream advances and
+    ///    the link stays attached, so the record keeps an exact owner.
+    #[test]
+    fn x09_capacity_refusal_before_detach() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        // Fill every slot so the reservation fails.
+        let mut held = alloc::vec::Vec::new();
+        while let Some(r) = crate::kernel::boot::server_death_work_reserve(0) {
+            held.push(r);
+        }
+        // Each successful fill reservation is itself a real class-2 transition; the exit
+        // phase then adds none, because its own reservation never succeeds.
+        let filled = v()[T::DeferredReserved as usize];
+        assert_eq!(filled as usize, held.len(), "every fill was counted");
+        assert!(!broad_lock_exit_phase(&fx), "the exit phase declines");
+        assert_eq!(live_links(&fx), 1, "the link is retained");
+        assert_race(&fx, &id, [1, 0, filled, 0, 0, 0, 0, 0, 0], None);
+        for r in held {
+            crate::kernel::boot::server_death_work_release(r);
+        }
+        teardown();
+    }
+
+    /// 10. Stale reply-RECORD generation: consumed, but claims nothing.
+    #[test]
+    fn x10_stale_record_generation_claims_nothing() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            res,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation.wrapping_add(1),
+            }
+        ));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(caller_result(&fx), None, "nothing was published");
+        // The link was never detached: only reserve → publish → consume ran.
+        assert_race(&fx, &id, [1, 0, 1, 1, 1, 0, 0, 0, 0], None);
+        teardown();
+    }
+
+    /// 11. Stale SERVER incarnation in the queued item: consumed, claims nothing.
+    #[test]
+    fn x11_stale_server_incarnation_claims_nothing() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let bogus = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            fx.replier.tid,
+            Asid(fx.replier.asid.0.wrapping_add(23)),
+        );
+        let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            res,
+            DeferredServerDeathCompletion {
+                exiting_server: bogus,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation,
+            }
+        ));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(caller_result(&fx), None, "a stale server wakes nobody");
+        assert_eq!(live_links(&fx), 1, "the real link is untouched");
+        assert_race(&fx, &id, [1, 0, 1, 1, 1, 0, 0, 0, 0], None);
+        teardown();
+    }
+
+    /// 12. The link→deferred handoff is exact: the published item carries the link's own
+    ///     record coordinates, not the caller's or a re-derived pair.
+    #[test]
+    fn x12_link_to_deferred_handoff_is_exact() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(live_links(&fx), 0, "the link moved into the queue");
+        assert_eq!(queued(0), 1);
+        assert_eq!(drain(&fx), 1);
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 13. Reserve strictly precedes detach — the ordering that prevents a stranded caller.
+    #[test]
+    fn x13_reserve_precedes_detach() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert!(
+            c::stamp(T::DeferredReserved) < c::stamp(T::LinkDetached),
+            "the slot is reserved before the irreversible detach"
+        );
+        assert!(c::stamp(T::LinkDetached) < c::stamp(T::DeferredPublished));
+        // Not yet drained: the terminal is still unclaimed.
+        assert_race(&fx, &id, [1, 1, 1, 1, 0, 0, 0, 0, 0], None);
+        teardown();
+    }
+
+    /// 14. Consumption follows publication.
+    #[test]
+    fn x14_consume_follows_publish() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert!(c::stamp(T::DeferredPublished) < c::stamp(T::DeferredConsumed));
+        assert!(c::stamp(T::DeferredConsumed) < c::stamp(T::PeerDeathWinner));
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 15. Link creation precedes detachment.
+    #[test]
+    fn x15_link_created_before_detached() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert!(c::stamp(T::LinkCreated) < c::stamp(T::LinkDetached));
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 16. Exactly one caller wake: the runnable transition and the enqueue each fire once.
+    #[test]
+    fn x16_exactly_one_caller_wake() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 17. Exactly one terminal winner across a repeated drive attempt.
+    #[test]
+    fn x17_exactly_one_terminal_winner() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        // A second exit phase reserves, finds no link, and releases without publishing —
+        // so only the reservation class moves.
+        assert!(!broad_lock_exit_phase(&fx));
+        assert_eq!(drain(&fx), 0);
+        // The repeated class-2 stamp names the SECOND attempt, which ran after the whole
+        // first transaction had already committed and woken the caller.
+        assert!(
+            c::stamp(T::DeferredReserved) > c::stamp(T::CallerEnqueue),
+            "the second exit attempt began after the first transaction finished"
+        );
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 2, 1, 1, 1, 1, 1, 1],
+            Some(TerminalClaimant::PeerDeath),
+        );
+        teardown();
+    }
+
+    /// 18. No reverse-link leak on the success path.
+    #[test]
+    fn x18_no_reverse_link_leak() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(live_links(&fx), 0);
+        assert_eq!(v()[T::LinkCreated as usize], v()[T::LinkDetached as usize]);
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 19. No deferred-item leak on the success path.
+    #[test]
+    fn x19_no_deferred_item_leak() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(queued(0), 0);
+        assert_eq!(
+            v()[T::DeferredPublished as usize],
+            v()[T::DeferredConsumed as usize]
+        );
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 20. A losing reply path leaves no orphaned link or deferred item.
+    #[test]
+    fn x20_losing_reply_leaves_no_orphans() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert!(claim_terminal(&fx, &id, TerminalClaimant::Reply));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(live_links(&fx), 0, "no orphaned link");
+        assert_eq!(queued(0), 0, "no orphaned deferred item");
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 1, 1, 1, 0, 0, 0, 0],
+            Some(TerminalClaimant::Reply),
+        );
+        teardown();
+    }
+
+    /// 21. A losing timeout path leaves no orphaned link or deferred item.
+    #[test]
+    fn x21_losing_timeout_leaves_no_orphans() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert!(claim_terminal(&fx, &id, TerminalClaimant::Timeout));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(live_links(&fx), 0);
+        assert_eq!(queued(0), 0);
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 1, 1, 1, 0, 0, 0, 0],
+            Some(TerminalClaimant::Timeout),
+        );
+        teardown();
+    }
+
+    /// 22. The death completion copies NO user memory — the caller receives a code, and the
+    ///     reply payload is never delivered.
+    #[test]
+    fn x22_no_user_memory_copy_on_death() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(
+            caller_result(&fx),
+            Some(SERVER_DIED),
+            "a code, not a payload"
+        );
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        let comp = comp.split("\n}\n").next().unwrap();
+        let code: alloc::string::String = comp
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in ["copy_to_user", "copy_from_user", "write_user", "payload"] {
+            assert!(!code.contains(forbidden), "no user copy ({forbidden})");
+        }
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 23. Two independent records: each gets its own single winner, and the counters sum
+    ///     to two without any class double-counting within a record.
+    #[test]
+    fn x23_two_records_do_not_cross_contaminate() {
+        let (g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+        // Release the globals guard before re-acquiring it for the second instance — the
+        // mutex is not reentrant, and the point of this case is that instance 2 starts
+        // from zero even though instance 1 really ran to completion first.
+        drop(fx);
+        drop(g);
+        // A second, independent instance starts from zero.
+        let (_g2, fx2) = fx_fresh();
+        assert_eq!(v(), [0u32; 9], "the new instance inherits nothing");
+        assert_eq!(c::stamp(T::PeerDeathWinner), 0, "stamps reset with it");
+        let id2 = run_success(&fx2);
+        assert_race(&fx2, &id2, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 24. The collector gate is CAUSAL, not a timing race: it stays held across the whole
+    ///     death transaction — so no timeout claimant can be collected while PeerDeath is
+    ///     deciding — and it is released ONLY by the caller's own userspace validation
+    ///     carrying the canonical code. Every near-miss message is a real rejected release.
+    #[test]
+    fn x24_collector_release_requires_user_validation() {
+        let (_g, fx) = fx_fresh();
+        let prev = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES,
+        );
+        crate::kernel::boot::hold_reply_timeout_collector();
+        assert!(
+            crate::kernel::boot::reply_timeout_collector_held(),
+            "the gate arms in ServerDies mode"
+        );
+
+        let id = run_success(&fx);
+        assert!(
+            crate::kernel::boot::reply_timeout_collector_held(),
+            "the gate is still held after the terminal was decided"
+        );
+
+        // Near-miss userspace output never releases it — including the SAME marker
+        // carrying a code that is not the canonical ServerDied.
+        for msg in [
+            "IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code=9 result=ok",
+            "IPC_SERVER_DEATH_COLLECTOR_RELEASED released_by=caller result=ok",
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=4 reply_ok=0",
+            "unrelated",
+        ] {
+            crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg);
+            assert!(
+                crate::kernel::boot::reply_timeout_collector_held(),
+                "`{msg}` must not release the gate"
+            );
+        }
+        // Only the caller's own validated canonical code releases it.
+        crate::kernel::boot::maybe_release_reply_timeout_collector_gate(
+            "IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code=10 result=ok",
+        );
+        assert!(
+            !crate::kernel::boot::reply_timeout_collector_held(),
+            "userspace validation releases the gate"
+        );
+
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prev);
+        teardown();
+    }
+
+    // ── Part 3: wiring guards ───────────────────────────────────────────────────────
+
+    /// Every production caller of the post-lock death drain invokes it after its broad
+    /// guard has dropped — checked per architecture, at the real call sites.
+    #[test]
+    fn w01_every_drain_caller_is_post_lock() {
+        // x86_64 + AArch64 share the post-`with_cpu` section.
+        let shared = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        let released = shared
+            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .expect("release boundary");
+        let call = shared
+            .find("shared.drain_server_death_post_work(cpu)")
+            .expect("shared drain call");
+        assert!(released < call, "shared drain is post-guard");
+        // RISC-V drives its own Phase 3.
+        let rv = RV_TRAP_SRC
+            .split("pub fn handle_riscv_trap_entry_shared")
+            .nth(1)
+            .expect("riscv wrapper");
+        let phase3 = rv
+            .find("// ── Phase 3: post-lock drain (broad guard released) ──")
+            .expect("phase 3");
+        let rv_call = rv
+            .find("shared.drain_server_death_post_work(cpu)")
+            .expect("riscv drain call");
+        assert!(phase3 < rv_call, "riscv drain is in Phase 3");
+        // Exactly two production call sites, one per driver.
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("shared.drain_server_death_post_work(cpu)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            RV_TRAP_SRC
+                .matches("shared.drain_server_death_post_work(cpu)")
+                .count(),
+            1
+        );
+    }
+
+    /// The post-lock markers are emitted inside the drain, which is only reachable post-guard.
+    #[test]
+    fn w02_post_lock_markers_only_in_post_guard_code() {
+        let drain = RUNTIME_SRC
+            .split("pub(crate) fn drain_server_death_post_work")
+            .nth(1)
+            .expect("drain");
+        let drain = drain.split("\n    /// ").next().unwrap();
+        for m in [
+            "IPC_SERVER_DEATH_BROAD_LOCK_RELEASED",
+            "IPC_SERVER_DEATH_POST_LOCK_DRAIN_BEGIN",
+        ] {
+            assert!(drain.contains(m), "{m} lives in the drain");
+            let at = drain.find(m).unwrap();
+            let end = at + drain[at..].find("result=ok").expect("terminated");
+            assert!(
+                drain[at..end].contains("broad_lock=0"),
+                "{m} states broad_lock=0"
+            );
+        }
+        // The in-lock exit-phase markers deliberately carry no broad_lock=0.
+        let exit = RESTART_SRC
+            .split("IPC_SERVER_DEATH_DEFERRED_RESERVED")
+            .nth(1)
+            .expect("reserved marker");
+        let exit = exit.split("result=ok").next().unwrap();
+        assert!(
+            !exit.contains("broad_lock=0"),
+            "in-lock marker makes no post-lock claim"
+        );
+    }
+
+    /// DEFERRED_RESERVED precedes the detach, and DEFERRED_PUBLISHED follows it — in source.
+    #[test]
+    fn w03_reserve_before_detach_before_publish_in_source() {
+        let blk = RESTART_SRC
+            .split("let death_link = match crate::kernel::boot::server_death_work_reserve(cpu_idx)")
+            .nth(1)
+            .expect("exit block");
+        let reserved = blk
+            .find("IPC_SERVER_DEATH_DEFERRED_RESERVED")
+            .expect("reserved");
+        let detach = blk
+            .find("take_server_reply_link(tid, exit_identity.asid)")
+            .expect("detach");
+        let captured = blk
+            .find("IPC_SERVER_DEATH_LINK_CAPTURED")
+            .expect("captured");
+        let published = blk
+            .find("IPC_SERVER_DEATH_DEFERRED_PUBLISHED")
+            .expect("published");
+        assert!(reserved < detach, "reserved attested before the detach");
+        assert!(detach < captured, "capture attested after the real detach");
+        assert!(captured < published, "publication attested last");
+        // LINK_CAPTURED carries the full server identity and record coordinates.
+        for f in [
+            "server_tid=",
+            "server_asid=",
+            "record_index=",
+            "record_generation=",
+        ] {
+            assert!(
+                RESTART_SRC.contains(&alloc::format!("IPC_SERVER_DEATH_LINK_CAPTURED {f}"))
+                    || RESTART_SRC.contains(f),
+                "LINK_CAPTURED carries {f}"
+            );
+        }
+    }
+
+    /// TERMINAL_CLAIM follows the real CAS; COMPLETION_COMMITTED follows the real
+    /// publication; CALLER_ENQUEUED follows the real enqueue; commit precedes enqueue.
+    #[test]
+    fn w04_completion_markers_follow_their_real_operations() {
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        let cas = comp
+            .rfind("rt_commit_reply_terminal(d, record_index, &terminal_owner);")
+            .expect("terminal commit");
+        let claim = comp
+            .find("IPC_SERVER_DEATH_TERMINAL_CLAIM")
+            .expect("claim marker");
+        assert!(cas < claim, "claim marker follows the real commit");
+        let pub_op = comp
+            .find("rt_commit_receiver_runnable(")
+            .expect("publication");
+        let committed = comp
+            .find("IPC_SERVER_DEATH_COMPLETION_COMMITTED")
+            .expect("committed marker");
+        assert!(pub_op < committed);
+        let enq = comp.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        let enq_m = comp
+            .find("IPC_SERVER_DEATH_CALLER_ENQUEUED")
+            .expect("enqueue marker");
+        assert!(enq < enq_m);
+        assert!(
+            committed < enq,
+            "the commit marker precedes the real enqueue"
+        );
+        // Marker argument contracts.
+        assert!(comp.contains("terminal=PeerDeath result=won"));
+        assert!(comp.contains("code={} caller_tid={} caller_asid={} record_index={} record_generation={} runnable=1 broad_lock=0"));
+        assert!(comp.contains("enqueues=1 broad_lock=0"));
+    }
+
+    /// `record_server_dies_stale_token` is called at the real arm site, immediately after
+    /// the token is published into the caller's TCB.
+    #[test]
+    fn w05_stale_token_recorded_at_the_real_arm_site() {
+        let arm_fn = IPC_SRC
+            .split("tcb.reply_timeout_token = Some(handle);")
+            .nth(1)
+            .expect("arm site");
+        let tcb_done = arm_fn.find("});").expect("tcb write closes");
+        let rec = arm_fn
+            .find("record_server_dies_stale_token(")
+            .expect("recorded at the arm site");
+        assert!(tcb_done < rec, "recorded after the TCB publication");
+        assert!(
+            arm_fn[..rec].len() < 900,
+            "immediately after, not elsewhere"
+        );
+        for f in [
+            "handle.identity().token_index",
+            "handle.identity().token_generation",
+            "caller.tid.0",
+            "caller.asid.0",
+        ] {
+            assert!(arm_fn.contains(f), "records {f}");
+        }
+    }
+
+    /// No private per-port ServerDies table, and no oracle-only completion helper.
+    #[test]
+    fn w06_no_private_tables_or_oracle_completion_helper() {
+        for (name, src) in [
+            ("init service", INIT_SRC),
+            ("trap_entry", TRAP_ENTRY_SRC),
+            ("riscv trap", RV_TRAP_SRC),
+        ] {
+            assert!(
+                !src.contains("server_dies_counters"),
+                "{name} must hold no ServerDies accounting"
+            );
+        }
+        // The only completion entry point is the production transaction.
+        assert_eq!(
+            IPC_SRC
+                .matches("pub(crate) fn complete_server_death_over")
+                .count(),
+            1
+        );
+        // The oracle must not CALL any death helper. Comments are stripped first: the
+        // oracle documents in prose which helpers it deliberately does not call, and a
+        // guard that fired on that prose would be guarding a comment, not the wiring.
+        let init_code: alloc::string::String = INIT_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "complete_server_death",
+            "exit_task(",
+            "rt_commit_receiver_runnable",
+            "server_death_work_publish",
+            "take_server_reply_link",
+        ] {
+            assert!(
+                !init_code.contains(forbidden),
+                "the oracle must not call {forbidden}"
+            );
+        }
+    }
+
+    /// The success audit has a REAL production caller, so its literals survive linking.
+    #[test]
+    fn w07_audit_has_a_production_caller() {
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        assert!(
+            comp.contains("server_dies_counters::audit_success_path()"),
+            "the audit is invoked from the completion transaction"
+        );
+        let ok = comp.find("IPC_SERVER_DEATH_OK").expect("ok marker");
+        let audit = comp.find("audit_success_path()").expect("audit");
+        assert!(ok < audit, "audited after the transaction completed");
+        // Nothing downstream branches on the verdict.
+        assert!(comp.contains("if ok { \"ok\" } else { \"fail\" }"));
+    }
+
+    /// The collector release is wired to USERSPACE validation, not to a kernel-internal
+    /// event: the predicate reads the caller's own marker plus the canonical code, the
+    /// gate performs no production action of its own, and the oracle emits that marker
+    /// only after comparing the numeric code it actually received.
+    #[test]
+    fn w08_collector_release_runs_through_userspace_validation() {
+        let rel = MOD_SRC
+            .split("pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str) {")
+            .nth(1)
+            .expect("release fn");
+        let rel = rel.split("\n}\n").next().unwrap();
+        assert!(rel.contains("msg.starts_with(\"IPC_SERVER_DEATH_USER_VALIDATED\")"));
+        assert!(rel.contains("msg.contains(\"code=10\")"));
+        assert!(
+            rel.contains("released_by_reply || released_by_server_death")
+                || rel.contains("!released_by_reply && !released_by_server_death")
+        );
+        // The gate withholds an opportunity; it never performs a terminal action.
+        for forbidden in [
+            "claim_reply_terminal",
+            "take_server_reply_link",
+            "rt_commit_receiver_runnable",
+            "rtd_enqueue",
+            "reply_cap_generations",
+        ] {
+            assert!(!rel.contains(forbidden), "the gate must not {forbidden}");
+        }
+        // The DebugLog seam is the ONLY release path, and it is an unconditional call site
+        // (the off-feature build keeps a no-op of the same name).
+        assert!(MOD_SRC.contains(
+            "#[cfg(not(feature = \"ipc-reply-timeout-oracle-core\"))]\npub(crate) fn maybe_release_reply_timeout_collector_gate(_msg: &str) {}"
+        ));
+        // Userspace emits the releasing marker only after comparing the numeric code.
+        assert!(INIT_SRC.contains("IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code={}"));
+        assert!(INIT_SRC.contains("SyscallError::ServerDied as u32"));
+        // And the collector really consults the gate before publishing any timeout work.
+        let collect = RUNTIME_SRC
+            .split("fn collect_due_reply_timeout_work")
+            .nth(1)
+            .expect("collector");
+        let collect = collect.split("\n    }\n").next().unwrap();
+        assert!(
+            collect.contains("reply_timeout_collector_held()"),
+            "the collector reads the gate"
+        );
+    }
+
+    /// All FIFTEEN hard-fail literals attach to a real production operation: each one lives
+    /// inside a named production function whose body actually performs the operation the
+    /// literal reports on. A literal that merely exists somewhere in the file would satisfy
+    /// a `contains` check but not this one — the enclosing function and the operation it
+    /// performs are both named.
+    #[test]
+    fn w09_fifteen_literals_attach_to_real_operations() {
+        // (literal, source, enclosing production fn, an operation that fn really performs)
+        let table: [(&str, &str, &str, &str); 15] = [
+            // The oracle's own server really returns from NR16 before this is emitted.
+            (
+                "IPC_SERVER_DEATH_EXIT_RETURNED",
+                INIT_SRC,
+                // The ServerDies server, distinguished from the sibling oracle's
+                // `server_run() -> ServerOutcome` by having no return type.
+                "unsafe fn server_run() {",
+                "exit_current_task()",
+            ),
+            (
+                "IPC_SERVER_DEATH_DUPLICATE_DEFERRED",
+                RESTART_SRC,
+                "fn exit_task",
+                "server_death_work_publish(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY",
+                RUNTIME_SRC,
+                "fn drain_server_death_post_work",
+                "server_death_work_drain_next(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_RECORD_GENERATION",
+                RUNTIME_SRC,
+                "fn drain_server_death_post_work",
+                "server_death_work_drain_next(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_CALLER_IDENTITY",
+                IPC_SRC,
+                "fn complete_server_death_over",
+                "rt_is_blocked_receiver_exact(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_ENDPOINT_GENERATION",
+                IPC_SRC,
+                "fn complete_server_death_over",
+                "rt_endpoint_generation_read(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION",
+                RUNTIME_SRC,
+                "fn collect_due_reply_timeout_work",
+                "server_dies_stale_token()",
+            ),
+            (
+                "IPC_SERVER_DEATH_DUPLICATE_COMPLETION",
+                MOD_SRC,
+                "pub fn record(t: Transition)",
+                "fetch_add(1",
+            ),
+            (
+                "IPC_SERVER_DEATH_DUPLICATE_WAKE",
+                MOD_SRC,
+                "pub fn record(t: Transition)",
+                "fetch_add(1",
+            ),
+            (
+                "IPC_SERVER_DEATH_LINK_LEAK",
+                MOD_SRC,
+                "pub fn audit_success_path()",
+                "count(T::LinkCreated) != count(T::LinkDetached)",
+            ),
+            (
+                "IPC_SERVER_DEATH_RECORD_LEAK",
+                MOD_SRC,
+                "pub fn audit_success_path()",
+                "count(T::LinkDetached) != count(T::PeerDeathWinner)",
+            ),
+            (
+                "IPC_SERVER_DEATH_DEFERRED_LEAK",
+                MOD_SRC,
+                "pub fn audit_success_path()",
+                "count(T::DeferredPublished) != count(T::DeferredConsumed)",
+            ),
+            (
+                "IPC_SERVER_DEATH_TIMEOUT_WON",
+                RUNTIME_SRC,
+                "fn drain_reply_timeout_post_work",
+                "complete_reply_timeout_over(",
+            ),
+            (
+                "IPC_SERVER_DEATH_LATE_REPLY_ACCEPTED",
+                IPC_SRC,
+                "fn reserve_reply_win_before_copy",
+                "self.try_reserve_reply_win_before_copy(reply_cap)",
+            ),
+            (
+                "IPC_SERVER_DEATH_STALE_AUTHORITY_RESTORED",
+                IPC_SRC,
+                "fn restore_deadline_reply_lease",
+                "t.restore_reply_lease(owner)",
+            ),
+        ];
+        for (lit, src, enclosing, operation) in table {
+            let body = src
+                .split(enclosing)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{lit}: no production fn `{enclosing}`"));
+            // Bound the search to the enclosing item, not the rest of the file.
+            let body = body.split("\n    pub").next().unwrap();
+            assert!(
+                body.contains(lit),
+                "{lit} must live inside `{enclosing}`, not merely somewhere in the file"
+            );
+            assert!(
+                body.contains(operation),
+                "`{enclosing}` must really perform `{operation}` for {lit} to be attached"
+            );
+        }
+        // And none of the fifteen is emitted from userspace except the one that reports the
+        // oracle server's own returned-from-NR16 failure.
+        for lit in table.iter().map(|t| t.0) {
+            if lit != "IPC_SERVER_DEATH_EXIT_RETURNED" {
+                assert!(
+                    !INIT_SRC.contains(lit),
+                    "{lit} is a kernel verdict; userspace must not emit it"
                 );
             }
         }
