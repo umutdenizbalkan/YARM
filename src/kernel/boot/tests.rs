@@ -79337,6 +79337,22 @@ mod stage199a2d1_races {
         let (record_index, record_generation) = k
             .resolve_reply_cap_split_read(2, reply_cap_t2)
             .expect("resolve replier reply cap");
+        // Stage 200D-2B1D1: the ordinary queued call this fixture makes now registers the
+        // reverse link in PRODUCTION, so the fixture no longer starts link-free. Assert that
+        // it really happened — the fixture is itself a proof of the new wiring — and then
+        // detach it, so each case below keeps controlling linkage explicitly the way it was
+        // written to. Hiding the auto-link instead of asserting it would let the wiring
+        // regress silently.
+        assert_eq!(
+            k.with(|s| s.live_server_reply_link_count()),
+            1,
+            "the ordinary call path must register the reverse link"
+        );
+        let auto = k
+            .with(|s| s.take_server_reply_link(2, replier_asid))
+            .expect("the bound replier owns the auto-registered link");
+        assert_eq!(auto.reply_record_index, record_index);
+        assert_eq!(auto.reply_record_generation, record_generation);
         CallerFx {
             k: Arc::new(k),
             caller: id(1, caller_asid),
@@ -94068,8 +94084,12 @@ mod stage200d2b1bii_races {
         let g = super::stage200d2b1bi_counters::globals_guard();
         // Drain any queue residue from a previous case before the instance resets.
         while crate::kernel::boot::server_death_work_drain_next(0).is_some() {}
-        c::reset_instance();
+        // Build the fixture FIRST, then zero the counters. Since Stage 200D-2B1D1 the
+        // ordinary call the fixture makes registers a reverse link in production, so the
+        // fixture performs real transitions of its own; resetting afterwards keeps a case's
+        // vector a measurement of the CASE rather than of its setup.
         let fx = caller_fixture();
+        c::reset_instance();
         (g, fx)
     }
 
@@ -95554,5 +95574,279 @@ mod stage200d2b1c_arch_return {
             INIT.contains("ipc_reply_liveness_scenario_for_current_arch"),
             "scenario selection must go through the shared ABI decoder"
         );
+    }
+}
+
+/// Stage 200D-2B1D1 — the ordinary queued `IpcCall` reply-cap path registers the bounded
+/// reverse `ServerReplyLink`.
+///
+/// Until this stage the only production creator of a link was the IpcCall-DIRECT transaction,
+/// so a bound server exiting after an ORDINARY call left `exit_task` with nothing to detach and
+/// the whole server-death chain could not begin. Stage 200D-2B1D-x86 caught that live. These
+/// cases pin the ordinary path's own registration, its rollback, and the identity/generation
+/// exactness that stops a stale incarnation from detaching a live record's authority.
+#[cfg(test)]
+mod stage200d2b1d1_ordinary_link {
+    use super::*;
+    use crate::kernel::ipc::ThreadId;
+    use crate::runtime::SharedKernel;
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+
+    /// Two tasks in distinct address spaces, plus a reply endpoint the caller can receive on.
+    fn fx() -> (SharedKernel, Asid, Asid, CapId) {
+        let mut k = Bootstrap::init().expect("init");
+        let (caller_asid, _) = k.create_user_address_space().expect("caller asid");
+        let (server_asid, _) = k.create_user_address_space().expect("server asid");
+        k.register_task(1).expect("caller");
+        k.register_task(2).expect("server");
+        k.bind_task_asid(1, caller_asid).expect("bind caller");
+        k.bind_task_asid(2, server_asid).expect("bind server");
+        // The reply endpoint is created in task 0's cnode; the CALLER must hold the receive
+        // cap in its own cnode for `create_reply_cap_for_caller` to resolve it.
+        let (_eid, _send, recv_global) = k.create_endpoint(4).expect("reply endpoint");
+        let recv = k
+            .grant_capability_task_to_task(0, recv_global, 1)
+            .expect("grant reply-recv to the caller");
+        (SharedKernel::new(k), caller_asid, server_asid, recv)
+    }
+
+    /// Ordinary success: a call with a BOUND responder creates exactly one link, carrying the
+    /// server's full incarnation and the record's own index+generation.
+    #[test]
+    fn d01_ordinary_call_registers_exactly_one_link() {
+        let (k, _caller_asid, server_asid, recv) = fx();
+        k.with(|s| {
+            assert_eq!(
+                s.live_server_reply_link_count(),
+                0,
+                "no link before the call"
+            );
+            let cap = s
+                .create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                .expect("ordinary reply cap");
+            assert_ne!(cap.0, 0);
+            assert_eq!(
+                s.live_server_reply_link_count(),
+                1,
+                "the ordinary path must create exactly one link"
+            );
+            // The link is detachable ONLY by the exact server incarnation.
+            let taken = s.take_server_reply_link(2, server_asid);
+            let link = taken.expect("the bound server owns the link");
+            assert_eq!(link.server_tid, 2);
+            assert_eq!(link.server_asid, server_asid);
+            assert_ne!(
+                link.reply_record_generation, 0,
+                "the link must carry the record's real generation"
+            );
+            assert_eq!(s.live_server_reply_link_count(), 0, "detach removes it");
+        });
+    }
+
+    /// A call with NO bound responder owns no server incarnation, so it registers nothing —
+    /// which is what keeps the boot provisioning seam and unbound reply caps link-free.
+    #[test]
+    fn d02_unbound_responder_registers_no_link() {
+        let (k, _c, _s, recv) = fx();
+        k.with(|s| {
+            s.create_reply_cap_for_caller(ThreadId(1), recv, None)
+                .expect("unbound reply cap");
+            assert_eq!(
+                s.live_server_reply_link_count(),
+                0,
+                "no bound server means no link"
+            );
+        });
+    }
+
+    /// Duplicate prevention: capacity is ONE outstanding record per server. The second call
+    /// fails rather than silently overwriting the first server's authority.
+    #[test]
+    fn d03_second_call_to_the_same_server_is_refused_not_overwritten() {
+        let (k, _c, server_asid, recv) = fx();
+        k.with(|s| {
+            let first = s
+                .create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                .expect("first call");
+            let before = s.take_server_reply_link(2, server_asid);
+            let first_link = before.expect("first link");
+            // Put it back so the second registration really contends with a live link.
+            assert!(s.register_server_reply_link(
+                2,
+                server_asid,
+                first_link.reply_record_index,
+                first_link.reply_record_generation
+            ));
+
+            let second = s.create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)));
+            assert!(
+                second.is_err(),
+                "a second outstanding record must be refused"
+            );
+
+            // The FIRST server's authority is intact and unchanged.
+            let still = s
+                .take_server_reply_link(2, server_asid)
+                .expect("first link survives");
+            assert_eq!(still.reply_record_index, first_link.reply_record_index);
+            assert_eq!(
+                still.reply_record_generation, first_link.reply_record_generation,
+                "the refused call must not overwrite the live link"
+            );
+            assert_ne!(first.0, 0);
+        });
+    }
+
+    /// Rollback: when registration is refused, the whole publication unwinds — no link is left
+    /// behind, and the record slot the refused call reserved is freed rather than leaked.
+    #[test]
+    fn d04_refused_registration_leaks_no_link_and_no_record() {
+        let (k, _c, server_asid, recv) = fx();
+        k.with(|s| {
+            let first = s
+                .create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                .expect("first call");
+            let live_before = live_records(s);
+            let links_before = s.live_server_reply_link_count();
+
+            assert!(
+                s.create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                    .is_err(),
+                "second registration is refused"
+            );
+
+            assert_eq!(
+                s.live_server_reply_link_count(),
+                links_before,
+                "a refused call must leave no extra link"
+            );
+            assert_eq!(
+                live_records(s),
+                live_before,
+                "a refused call must free the record slot it reserved"
+            );
+            // The surviving link still names the FIRST call's record.
+            let link = s
+                .take_server_reply_link(2, server_asid)
+                .expect("first link");
+            assert_ne!(first.0, 0);
+            assert!(link.reply_record_generation > 0);
+        });
+    }
+
+    /// Stale identity and stale generation both fail closed: neither a reused numeric TID in a
+    /// different address space, nor the right server against a different record generation, can
+    /// detach the live record's authority.
+    #[test]
+    fn d05_stale_identity_or_generation_cannot_detach_authority() {
+        let (k, _c, server_asid, recv) = fx();
+        k.with(|s| {
+            s.create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                .expect("ordinary call");
+
+            // Same numeric TID, different address space → detaches nothing.
+            let other = Asid(server_asid.0.wrapping_add(37));
+            assert_ne!(other, server_asid);
+            assert!(
+                s.take_server_reply_link(2, other).is_none(),
+                "a stale server incarnation must not detach the link"
+            );
+            assert_eq!(s.live_server_reply_link_count(), 1, "the link survives");
+
+            // A different numeric TID in the right address space → also nothing.
+            assert!(
+                s.take_server_reply_link(3, server_asid).is_none(),
+                "a different server must not detach this link"
+            );
+            assert_eq!(s.live_server_reply_link_count(), 1);
+
+            // Only the exact incarnation detaches, and the generation it carries is the
+            // record's own — a link bearing a different generation is a different authority.
+            let link = s
+                .take_server_reply_link(2, server_asid)
+                .expect("exact match");
+            let gen_now = s
+                .reply_cap_record_generation_for_test(link.reply_record_index)
+                .expect("record generation");
+            assert_eq!(
+                link.reply_record_generation, gen_now,
+                "the link must name the record's CURRENT generation"
+            );
+        });
+    }
+
+    /// The registration is ordinary production code: it is not gated on any oracle feature,
+    /// and it sits before the responder can be enqueued.
+    #[test]
+    fn d06_registration_is_production_and_precedes_any_wake() {
+        let body = IPC_SRC
+            .split("pub fn create_reply_cap_for_caller_in_cnode(")
+            .nth(1)
+            .expect("ordinary creation function")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded body");
+        let reg = body
+            .find("self.register_server_reply_link(")
+            .expect("the ordinary path must register the link");
+        // Not feature-gated.
+        assert!(
+            !body[..reg].contains("#[cfg(feature ="),
+            "the ordinary registration must not be gated on an oracle feature"
+        );
+        // After the record is authoritative (Phase 3 persisted the CapId)...
+        let phase3 = body
+            .find("record.caller_cap_id = cap_id;")
+            .expect("phase 3");
+        assert!(
+            phase3 < reg,
+            "the record must be authoritative before linking"
+        );
+        // ...and the function performs no enqueue/wake of its own, so the responder cannot
+        // have become runnable before the link exists.
+        for wake in [
+            "enqueue_on_cpu",
+            "rtd_enqueue",
+            "sr_enqueue_committed_receiver_split",
+        ] {
+            assert!(
+                !body.contains(wake),
+                "the creation path must not wake the responder ({wake})"
+            );
+        }
+        // Rollback unwinds both halves.
+        let after = &body[reg..];
+        assert!(
+            after.contains("fast_revoke_reply_cap_in_cnode")
+                && after.contains("ipc.reply_caps[slot] = None;"),
+            "a refused registration must revoke the cap AND free the record"
+        );
+    }
+
+    /// The DIRECT transaction still owns its own registration, and the two paths cannot both
+    /// fire for one record — they create records through disjoint functions.
+    #[test]
+    fn d07_direct_path_does_not_double_register() {
+        let direct = include_str!("../ipccall_direct_txn.rs");
+        assert!(
+            direct.contains("self.register_server_reply_link_split("),
+            "the direct transaction keeps its own registration"
+        );
+        assert!(
+            !direct.contains("create_reply_cap_for_caller"),
+            "the direct path must not also create records through the ordinary function"
+        );
+        assert_eq!(
+            IPC_SRC.matches("self.register_server_reply_link(").count(),
+            1,
+            "the ordinary path must register in exactly one place"
+        );
+    }
+
+    fn live_records(s: &mut KernelState) -> usize {
+        (0..crate::kernel::boot::MAX_REPLY_CAPS)
+            .filter(|i| s.reply_cap_record_reservation(*i).is_some())
+            .count()
     }
 }

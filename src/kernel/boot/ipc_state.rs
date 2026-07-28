@@ -2506,6 +2506,19 @@ impl KernelState {
         })
     }
 
+    /// The CURRENT generation of a reply-record slot (`None` when vacant). Stage 200D-2B1D1
+    /// uses it to prove the ordinary path's reverse link names the record's own generation
+    /// rather than a stale one.
+    #[cfg(test)]
+    pub(crate) fn reply_cap_record_generation_for_test(&self, index: usize) -> Option<u64> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(index)
+                .and_then(|slot| slot.as_ref())
+                .map(|_| ipc.reply_cap_generations[index])
+        })
+    }
+
     /// Whether a `CapObject::Reply { index, generation }` currently resolves for
     /// invocation (i.e. `ipc_reply` would accept it): present, generation-matched,
     /// and `Available`. A `Reserved` record is NOT invokable.
@@ -4274,6 +4287,65 @@ impl KernelState {
                 record.caller_cap_id = cap_id;
             }
         });
+
+        // Stage 200D-2B1D1 — register the BOUNDED reverse link on the ORDINARY queued path.
+        //
+        // Until now the only production creator of a `ServerReplyLink` was the IpcCall-DIRECT
+        // transaction (`ipccall_direct_txn.rs`). The ordinary queued path created reply
+        // records with no link at all, so when a bound server exited, `exit_task` reserved a
+        // deferred slot, found nothing to detach, and the entire server-death chain — PeerDeath
+        // claim, canonical `ServerDied`, caller wake — could never begin. Stage 200D-2B1D-x86
+        // caught this live: the boot reached `IPC_SERVER_DEATH_DEFERRED_RESERVED` and stopped,
+        // with `LINK_CAPTURED` absent.
+        //
+        // The contract mirrors the direct transaction exactly:
+        //
+        //   position   the record is already `Available` (Phase 1) and its minted CapId is
+        //              persisted (Phase 3), so it is fully authoritative here; and the
+        //              responder has NOT been enqueued — the ordinary path's wake happens
+        //              later, in the caller's `handle_ipc_call`. The link therefore cannot
+        //              miss a window in either direction.
+        //   identity   the FULL `{tid, asid}` server incarnation recorded with the record, so
+        //              a numeric TID reused by a replacement task cannot detach this record's
+        //              authority; and the record's own `{index, generation}`, so a stale
+        //              generation cannot either.
+        //   capacity   one outstanding record per server. A second registration FAILS rather
+        //              than silently overwriting.
+        //   rollback   on failure the whole publication is unwound — the minted Reply cap is
+        //              revoked and the record slot freed — BEFORE the reply cap is returned to
+        //              the caller, so userspace observes nothing and neither a link nor a
+        //              record leaks.
+        //
+        // Only a call with a BOUND responder registers: `responder_tid`/`replier_asid` are
+        // `None` for the boot provisioning seam and for unbound reply caps, which own no
+        // server incarnation to link. This is ordinary production code — it is not gated on
+        // any oracle feature, and server death is not an oracle behavior.
+        if let (Some(server), Some(server_asid)) = (responder_tid, replier_asid)
+            && !self.register_server_reply_link(server.0, server_asid, slot, generation)
+        {
+            crate::yarm_log!(
+                "IPC_SERVER_REPLY_LINK_REGISTER_FAIL server_tid={} server_asid={} record_index={} record_generation={} path=ordinary reason=capacity result=rolled_back",
+                server.0,
+                server_asid.0,
+                slot,
+                generation
+            );
+            let reply_object = CapObject::Reply {
+                index: slot,
+                generation,
+            };
+            // Revoke from exactly where Phase 2 minted: the explicit destination cnode when
+            // one was given, otherwise the ACTIVE cnode (`mint_capability_for_active_cnode`).
+            // Using the caller's cnode instead would miss the mint whenever the caller is not
+            // the current task, and leak the cap.
+            if let Some(dest) = dest_cnode.or_else(|| self.current_task_cnode()) {
+                let _ = self.fast_revoke_reply_cap_in_cnode(dest, cap_id, reply_object);
+            }
+            self.with_ipc_state_mut(|ipc| {
+                ipc.reply_caps[slot] = None;
+            });
+            return Err(KernelError::CapabilityFull);
+        }
 
         crate::yarm_log!(
             "IPC_CALL_REPLY_CAP_ALLOC_DONE caller_tid={} slot={} cap={}",
