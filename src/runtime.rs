@@ -2903,6 +2903,27 @@ impl SharedKernel {
         let mut drained = 0usize;
         while let Some(work) = crate::kernel::boot::server_death_work_drain_next(cpu_idx) {
             drained += 1;
+            // ── Stage 200D-2B1A (§2/§4): the post-lock boundary attestation ──────────────
+            //
+            // Every caller of this drain reaches it only after its architecture's broad
+            // `SpinLock<KernelState>` guard has been dropped — x86_64 and AArch64 through the
+            // post-`with_cpu` section of `handle_trap_entry_shared`, RISC-V through its own
+            // Phase 3. `broad_lock=0` is therefore a property of where this code runs, not a
+            // claim about where the marker was written, and the whole completion below
+            // (PeerDeath claim, caller result publication, scheduler enqueue) happens here —
+            // outside the broad lock — exactly as Stage 200D-2A relocated it.
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_BROAD_LOCK_RELEASED cpu={} record_index={} record_generation={} broad_lock=0 holder=with_cpu result=ok",
+                cpu_idx,
+                work.reply_record_index,
+                work.reply_record_generation
+            );
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_POST_LOCK_DRAIN_BEGIN cpu={} record_index={} record_generation={} items=1 broad_lock=0 result=ok",
+                cpu_idx,
+                work.reply_record_index,
+                work.reply_record_generation
+            );
             // Resolve the identity the terminal cell was ARMED with. A record slot that was
             // reclaimed and reused since publication yields no matching identity, so a
             // stale item claims nothing.
@@ -3604,6 +3625,40 @@ impl SharedKernel {
                     continue;
                 };
                 if now >= deadline {
+                    // ── Stage 200D-2B1A (§5): the REAL stale-token examination ────────────
+                    //
+                    // This is the point at which the collector genuinely looks at the token
+                    // the ServerDies caller armed. It fires only after the causal gate was
+                    // RELEASED (the early return above guarantees that), i.e. after PeerDeath
+                    // committed and the caller validated code 10 — so the attestation is
+                    // "the same token was examined and found stale", not "no wake happened".
+                    // The token identity is compared against the one recorded at arm time;
+                    // a different token cannot satisfy it.
+                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                    if let Some((armed_idx, armed_gen, armed_tid, armed_asid)) =
+                        crate::kernel::boot::server_dies_stale_token()
+                    {
+                        let this_idx = handle.identity().token_index;
+                        let this_gen = handle.identity().token_generation;
+                        let this_tid = tcb.tid.0;
+                        let this_asid = tcb.asid.map(|a| a.0).unwrap_or(0);
+                        if this_idx == armed_idx
+                            && this_gen == armed_gen
+                            && this_tid == armed_tid
+                            && this_asid == armed_asid
+                            && crate::kernel::boot::server_dies_stale_scan_once()
+                        {
+                            crate::yarm_log!(
+                                "IPC_SERVER_DEATH_LATE_TIMEOUT_SCANNED token_index={} token_generation={} caller_tid={} caller_asid={} deadline={} now={} matches_armed=1 broad_lock=0 result=ok",
+                                this_idx,
+                                this_gen,
+                                this_tid,
+                                this_asid,
+                                deadline,
+                                now
+                            );
+                        }
+                    }
                     due[n] = Some(crate::kernel::boot::ReplyTimeoutPostWork { handle, deadline });
                     n += 1;
                 }

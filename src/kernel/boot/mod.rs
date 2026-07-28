@@ -3882,7 +3882,18 @@ static IPC_REPLY_TIMEOUT_COLLECTOR_HOLD: core::sync::atomic::AtomicU32 =
 /// Arm the causal gate (reply-wins only). Idempotent; emits the `held` marker once.
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn hold_reply_timeout_collector() {
-    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_REPLY_WINS {
+    // Stage 200D-2B1A (§4): the gate now also serves ServerDies. Its job there is the same
+    // as in reply-wins — make the winner CAUSAL rather than a timing race — but the winner
+    // it protects is `PeerDeath` rather than `Reply`. While held the narrow oracle collector
+    // publishes nothing, so no timeout claimant can reach the terminal cell before the
+    // server's death has committed. The gate NEVER chooses the winner: it only withholds one
+    // claimant's opportunity, and it is released before the stale token is examined, so the
+    // late-timeout verdict is reached by the real claim path losing on a real invalidated
+    // record. Timeout-wins and every production deadline remain untouched.
+    if !matches!(
+        x86_ipc_reply_timeout_oracle_mode(),
+        IPC_REPLY_TIMEOUT_MODE_REPLY_WINS | IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+    ) {
         return;
     }
     if IPC_REPLY_TIMEOUT_COLLECTOR_HOLD
@@ -3908,17 +3919,79 @@ pub(crate) fn reply_timeout_collector_held() -> bool {
     IPC_REPLY_TIMEOUT_COLLECTOR_HOLD.load(core::sync::atomic::Ordering::Acquire) == 1
 }
 
+/// Stage 200D-2B1A (§5): the armed ServerDies timeout token, recorded so the later scan can
+/// prove it examined the SAME token rather than merely observing no wake.
+/// `(token_index, token_generation, caller_tid, caller_asid)`; a zero generation means
+/// nothing has been armed yet. The generation is what makes the later comparison exact —
+/// a slot index alone would be satisfied by a reused registration.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static SERVER_DIES_STALE_TOKEN: crate::kernel::lock::SpinLock<(usize, u64, u64, u16)> =
+    crate::kernel::lock::SpinLock::new((0, 0, 0, 0));
+
+/// Record the token the ServerDies caller armed. One-shot per boot.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn record_server_dies_stale_token(
+    token_index: usize,
+    token_generation: u64,
+    caller_tid: u64,
+    caller_asid: u16,
+) {
+    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_SERVER_DIES {
+        return;
+    }
+    let mut slot = SERVER_DIES_STALE_TOKEN.lock();
+    if slot.1 == 0 {
+        *slot = (token_index, token_generation, caller_tid, caller_asid);
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_TIMEOUT_ARMED token_index={} token_generation={} caller_tid={} caller_asid={} tokens=1 result=ok",
+            token_index,
+            token_generation,
+            caller_tid,
+            caller_asid
+        );
+    }
+}
+
+/// The armed ServerDies token, or `None`.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+#[must_use]
+pub(crate) fn server_dies_stale_token() -> Option<(usize, u64, u64, u16)> {
+    let slot = SERVER_DIES_STALE_TOKEN.lock();
+    (slot.1 != 0).then_some(*slot)
+}
+
+/// One-shot latch so the stale-token scan attests exactly once.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static SERVER_DIES_STALE_SCAN_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+#[must_use]
+pub(crate) fn server_dies_stale_scan_once() -> bool {
+    !SERVER_DIES_STALE_SCAN_DONE.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+
 /// The DebugLog-seam release: the oracle client logs this marker only AFTER comparing
 /// the delivered reply payload, so observing it here is proof that userspace validated
 /// the reply before any timeout claimant could run. Same idiom as the Stage 199A2D2C
 /// cross-CPU seals. One-shot.
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str) {
-    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_REPLY_WINS {
+    if !matches!(
+        x86_ipc_reply_timeout_oracle_mode(),
+        IPC_REPLY_TIMEOUT_MODE_REPLY_WINS | IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+    ) {
         return;
     }
-    if !msg.starts_with("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV") || !msg.contains("reply_ok=1")
-    {
+    // Stage 200D-2B1A (§4): each scenario is released by ITS OWN userspace post-validation
+    // marker, so the release always means "userspace has already validated the winner".
+    // ServerDies releases on the caller's `IPC_SERVER_DEATH_USER_VALIDATED ... code=10`,
+    // which the caller logs only after comparing the numeric canonical code.
+    let released_by_reply =
+        msg.starts_with("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV") && msg.contains("reply_ok=1");
+    let released_by_server_death =
+        msg.starts_with("IPC_SERVER_DEATH_USER_VALIDATED") && msg.contains("code=10");
+    if !released_by_reply && !released_by_server_death {
         return;
     }
     if IPC_REPLY_TIMEOUT_COLLECTOR_HOLD

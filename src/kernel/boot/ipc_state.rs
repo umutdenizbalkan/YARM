@@ -554,6 +554,16 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
     let _ = rt_invalidate_reply_record(d, record_index, record_generation);
     // (8) Complete the TerminalCell as PeerDeath — one-shot, terminal.
     let _ = rt_commit_reply_terminal(d, record_index, &terminal_owner);
+    // Stage 200D-2B1A (§2): PeerDeath has WON the single terminal cell. Post-lock by
+    // construction — the whole transaction runs from the deferred drain, which every port
+    // invokes after its broad guard has dropped.
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won record_index={} record_generation={} caller_tid={} caller_asid={} broad_lock=0",
+        record_index,
+        record_generation,
+        caller.tid.0,
+        caller.asid.0
+    );
     // (9) Publish the canonical ServerDied return into the caller's saved context and
     // make it Runnable — the SAME publication the timeout path uses.
     let Some(affinity) = rt_commit_receiver_runnable(
@@ -564,8 +574,24 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
     ) else {
         return ReplyTimeoutOutcome::CleanupNoWake;
     };
+    // Stage 200D-2B1A (§2): the canonical ServerDied is now in the caller's saved context
+    // and the caller is Runnable — publication strictly BEFORE the enqueue below, so no
+    // scheduler can select the caller before its result exists.
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_COMPLETION_COMMITTED code={} caller_tid={} caller_asid={} record_index={} record_generation={} runnable=1 broad_lock=0 result=ok",
+        crate::kernel::syscall::SyscallError::ServerDied as u64,
+        caller.tid.0,
+        caller.asid.0,
+        record_index,
+        record_generation
+    );
     // (10) Scheduler enqueue LAST — the sole externally visible action, exactly once.
     d.rtd_enqueue(caller.tid.0);
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_CALLER_ENQUEUED caller_tid={} caller_asid={} enqueues=1 broad_lock=0 result=ok",
+        caller.tid.0,
+        caller.asid.0
+    );
     let _ = affinity;
     crate::yarm_log!(
         "IPC_SERVER_DEATH_OK arch={} terminal=PeerDeath death_result=ServerDied caller_wakes=1 reply_aliases_invalid=1 reply_copies=0 result=ok",
@@ -1836,6 +1862,18 @@ impl KernelState {
                 tcb.blocked_recv_generation = blocked_recv_generation;
             }
         });
+        // Stage 200D-2B1A (§5): record the EXACT token this caller armed, so the later
+        // collector scan can prove it examined the same one. This is the real arm site —
+        // the token is already in the caller's TCB and in the deadline store above; nothing
+        // is fabricated here and nothing is removed. Strictly ServerDies-mode-only and
+        // behind the oracle-core feature; it records, it never claims.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        crate::kernel::boot::record_server_dies_stale_token(
+            handle.identity().token_index,
+            handle.identity().token_generation,
+            caller.tid.0,
+            caller.asid.0,
+        );
         Ok(handle)
     }
 

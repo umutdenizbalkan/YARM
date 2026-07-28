@@ -141,8 +141,29 @@ impl KernelState {
         let cpu_idx = self.current_cpu().0 as usize;
         let death_link = match crate::kernel::boot::server_death_work_reserve(cpu_idx) {
             Some(reservation) => {
+                // Stage 200D-2B1A (§2): the reservation succeeded — attest it BEFORE the
+                // detach, because the detach is the irreversible step and the order
+                // (reserve, then detach, then publish) is exactly what prevents a stranded
+                // caller. In-lock: `exit_task` runs under the broad guard, so these three
+                // markers deliberately carry no `broad_lock=0`.
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid={} server_asid={} cpu={} slots=1 result=ok",
+                    tid,
+                    exit_identity.asid.0,
+                    cpu_idx
+                );
                 match self.take_server_reply_link(tid, exit_identity.asid) {
                     Some(link) => {
+                        // The EXACT link this server owned, detached by full incarnation
+                        // (`take_server_reply_link` matches {tid, asid}), carrying the exact
+                        // reply-record coordinates it was attached to.
+                        crate::yarm_log!(
+                            "IPC_SERVER_DEATH_LINK_CAPTURED server_tid={} server_asid={} record_index={} record_generation={} detached=1 result=ok",
+                            tid,
+                            exit_identity.asid.0,
+                            link.reply_record_index,
+                            link.reply_record_generation
+                        );
                         let work = crate::kernel::boot::DeferredServerDeathCompletion {
                             exiting_server: exit_identity,
                             reply_record_index: link.reply_record_index,
@@ -160,6 +181,27 @@ impl KernelState {
                             link.reply_record_generation,
                             u32::from(published)
                         );
+                        // One published item per exiting server. A duplicate exit collapses
+                        // here: `server_death_work_publish` returns false and releases the
+                        // slot rather than queueing a second owner for the same record.
+                        if published {
+                            crate::yarm_log!(
+                                "IPC_SERVER_DEATH_DEFERRED_PUBLISHED server_tid={} server_asid={} record_index={} record_generation={} cpu={} items=1 result=ok",
+                                tid,
+                                exit_identity.asid.0,
+                                link.reply_record_index,
+                                link.reply_record_generation,
+                                cpu_idx
+                            );
+                        } else {
+                            crate::yarm_log!(
+                                "IPC_SERVER_DEATH_DUPLICATE_DEFERRED server_tid={} server_asid={} record_index={} record_generation={} result=fail",
+                                tid,
+                                exit_identity.asid.0,
+                                link.reply_record_index,
+                                link.reply_record_generation
+                            );
+                        }
                         Some(link)
                     }
                     None => {
