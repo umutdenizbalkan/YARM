@@ -141,16 +141,24 @@ be destroyed by NR16 and therefore belongs in userspace.
 | Check | Result |
 |-------|--------|
 | `cargo fmt --all --check`, `git diff --check` | clean |
-| hosted, default features | 3687 passed, 1 failed (the known Stage 190B failure, unchanged), 2 ignored |
-| hosted, `ipc-reply-timeout-oracle-core` | 3844 passed, 1 failed (same known failure), 2 ignored |
+| hosted, default features (lib) | 3688 passed, **0 failed**, 2 ignored |
+| hosted, `ipc-reply-timeout-oracle-core` (lib) | 3845 passed, **0 failed**, 2 ignored |
+| every other `cargo test` target, both feature sets | 0 failed |
 | `cargo build --workspace` | ok |
 | feature-off kernels: x86_64, AArch64, RISC-V | build |
 | oracle-on kernels: `x86-`/`aarch64-`/`riscv64-ipc-reply-timeout-oracle` | build |
 | freestanding `init_server`: x86_64, AArch64, RISC-V | build |
 
-The known Stage 190B failure is `stage190b_controlled_workload::repeated_dispatch_places_next_task_audited_one_at_a_time`
-("the scheduler loop must place the next workload task by index, one at a time"), identical
-at `6b5ace8`, `5488d8e`, `b620385` and `35a98f2`.
+The whole suite is green in both feature sets — there is no carried failure behind this
+seal. Earlier drafts of this stage recorded a known Stage 190B failure
+(`repeated_dispatch_places_next_task_audited_one_at_a_time`); it was a stale source-grep
+guard, not a scheduler defect, and it is repaired in this branch's history along with two
+other stale guards (the RISC-V artifact gate and the x86_64 AP per-CPU scope). The Stage
+190B invariant itself was never violated.
+
+The 2B1B-ii cases are also stable under the DEFAULT parallel `cargo test`, not only
+single-threaded: the counters, the deferred queue and the collector gate are process-global,
+so every case that mutates them holds a poison-tolerant serialization guard.
 
 ### Binary oracle-literal audit — all three feature-off architectures
 
