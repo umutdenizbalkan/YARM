@@ -9,6 +9,9 @@
 const BUILD_SCRIPT: &str = include_str!("../scripts/build-qemu-riscv64-artifacts.sh");
 const SMOKE_SCRIPT: &str = include_str!("../scripts/qemu-riscv64-core-smoke.sh");
 const MATRIX_SCRIPT: &str = include_str!("../scripts/qemu-riscv64-smoke-matrix.sh");
+/// Stage 198B1 Part A moved the fail-closed reporting the build script used to inline
+/// into this shared library, which every per-arch build script sources.
+const BUILD_COMMON: &str = include_str!("../scripts/lib/build-qemu-artifacts-common.sh");
 
 #[test]
 fn build_script_produces_canonical_artifacts() {
@@ -24,13 +27,40 @@ fn build_script_produces_canonical_artifacts() {
 
 #[test]
 fn build_script_fails_clearly_when_artifacts_missing() {
+    // The reporting itself now lives in the shared library (Stage 198B1 Part A), so the
+    // build script must actually source it and call its gates — otherwise the guarantees
+    // below would be about code this script never runs.
     assert!(
-        BUILD_SCRIPT.contains("[fail] build-qemu-riscv64-artifacts:"),
-        "build script must print an explicit failure summary line"
+        BUILD_SCRIPT.contains("source \"$(dirname \"$0\")/lib/build-qemu-artifacts-common.sh\""),
+        "build script must source the shared fail-closed artifact library"
+    );
+    for gate in [
+        "common_build_integrity_init",
+        "common_verify_artifact_fresh \"$KERNEL_IMAGE\" \"kernel image\"",
+        "common_verify_artifact_fresh \"$INITRAMFS_IMAGE_ABS\" \"initramfs image\"",
+        "common_write_manifest \"riscv64\"",
+    ] {
+        assert!(
+            BUILD_SCRIPT.contains(gate),
+            "build script must invoke the fail-closed gate `{gate}`"
+        );
+    }
+    // An explicit failure summary line, and a nonzero exit — a missing or stale artifact
+    // must never be published as if the build had succeeded.
+    assert!(
+        BUILD_COMMON.contains("[error][integrity] $label missing after build (fail closed): $path")
+            && BUILD_COMMON.contains("[error][integrity] $label is STALE"),
+        "the artifact gate must print an explicit failure summary line"
     );
     assert!(
-        BUILD_SCRIPT.contains("size="),
-        "build script must report artifact sizes for diagnostic transparency"
+        BUILD_COMMON.contains("echo \"[error] build/stage step failed — failing closed (no stale artifact will be published)\"")
+            && BUILD_COMMON.contains("exit 1"),
+        "a failed build/stage step must fail closed with a nonzero exit"
+    );
+    // Artifact sizes are still recorded for diagnostic transparency.
+    assert!(
+        BUILD_COMMON.contains("size=%s") && BUILD_COMMON.contains("stat -c '%s'"),
+        "the manifest must report artifact sizes for diagnostic transparency"
     );
 }
 
