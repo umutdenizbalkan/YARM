@@ -1182,7 +1182,7 @@ pub fn handle_trap_entry_shared(
         crate::kernel::boot::take_post_lock_trap_disposition(cpu_idx)
     {
         crate::yarm_log!(
-            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} holder=with_cpu result=ok",
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} broad_lock=0 holder=with_cpu result=ok",
             cpu.0
         );
         crate::yarm_log!(
@@ -1190,7 +1190,7 @@ pub fn handle_trap_entry_shared(
             cpu.0
         );
         crate::yarm_log!(
-            "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64 tid={} asid={} cpu={} result=ok",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64 tid={} asid={} cpu={} broad_lock=0 result=ok",
             tid,
             asid.0,
             cpu.0

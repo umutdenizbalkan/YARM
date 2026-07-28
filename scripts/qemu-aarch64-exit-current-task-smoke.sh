@@ -220,6 +220,30 @@ if (( ! fail )); then
     || die "[$L] NR16 dispatches != 1"
   [[ "$(count_of "$NORM" "EXIT_TASK_RESTORE_OWNER arch=aarch64")" == "1" ]] \
     || die "[$L] restore-owner attestations != 1"
+  # ── lock-state correctness, marker by marker (Stage 200D-0C2) ─────────────────────
+  # Every marker emitted from the post-lock section must STATE the lock condition that held
+  # where it was emitted, not merely be positioned after the boundary. Stage 200D-0B3 removed
+  # markers that named a lock state they did not have; this is the AArch64 sibling check, and
+  # it is a whole-line assertion so a marker cannot pass on its name alone.
+  for m in "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64" \
+           "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64" \
+           "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64"; do
+    rg -a -F "$m" "$NORM" | rg -a -q -F "broad_lock=0" \
+      || die "[$L] post-lock marker does not state broad_lock=0: $m"
+    rg -a -F "$m" "$NORM" | rg -a -q -F "broad_lock=1" \
+      && die "[$L] post-lock marker falsely claims broad_lock=1: $m"
+  done
+  # The in-lock bypass decision is the one AArch64 exit marker emitted UNDER the broad lock,
+  # and it must not claim otherwise.
+  rg -a -F "EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64" "$NORM" | rg -a -q -F "broad_lock=0" \
+    && die "[$L] the in-lock bypass marker falsely claims broad_lock=0"
+  # The release marker must name the guard it outlived.
+  rg -a -F "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64" "$NORM" | rg -a -q -F "holder=with_cpu" \
+    || die "[$L] release marker does not name the broad-lock holder"
+  # The drain marker must attest that ALL drains ran, not merely that a drain point exists.
+  rg -a -F "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64" "$NORM" | rg -a -q -F "drains=all" \
+    || die "[$L] post-lock drain marker does not attest drains=all"
+
   # Trap-depth ownership: AArch64 has no software depth counter, so the consumer must attest
   # exactly zero clears. A non-zero count would mean a second cleanup owner appeared.
   [[ "$(count_of "$NORM" "EXIT_TASK_TRAP_DEPTH_OWNER arch=aarch64 cpu=0 owner=hardware_eret clears=0")" == "1" ]] \

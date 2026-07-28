@@ -91855,11 +91855,43 @@ mod stage200d0c1_aarch64_exit_prep {
             released < consumer,
             "the consumer runs after the broad guard is dropped"
         );
-        // The attestation says exactly that, and names the holder it outlived.
-        assert!(
-            consumer_block()
-                .contains("EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} holder=with_cpu")
-        );
+        // The attestation says exactly that: it STATES the lock condition that held where it
+        // was emitted and names the guard it outlived. Stage 200D-0B3 removed x86 markers that
+        // named a lock state they did not have; Stage 200D-0C2 makes the AArch64 siblings carry
+        // theirs explicitly rather than relying on position alone.
+        let cb = consumer_block();
+        assert!(cb.contains(
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} broad_lock=0 holder=with_cpu"
+        ));
+        // Every marker the post-lock consumer emits says broad_lock=0, and none claims =1.
+        for m in [
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64",
+        ] {
+            let at = cb.find(m).unwrap_or_else(|| panic!("marker present: {m}"));
+            let end = at + cb[at..].find("result=ok").expect("terminated");
+            assert!(
+                cb[at..end].contains("broad_lock=0"),
+                "post-lock marker must state broad_lock=0: {m}"
+            );
+            assert!(
+                !cb[at..end].contains("broad_lock=1"),
+                "post-lock marker must not claim broad_lock=1: {m}"
+            );
+        }
+        // The one AArch64 exit marker emitted UNDER the broad lock must not claim otherwise.
+        let inlock = A64_TRAP_SRC
+            .split("EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64")
+            .nth(1)
+            .expect("bypass marker");
+        assert!(!inlock[..inlock.find("result=ok").expect("terminated")].contains("broad_lock=0"));
+        // The runner enforces all of this on the live log, per whole line.
+        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
+        assert!(RUNNER.contains("post-lock marker falsely claims broad_lock=1"));
+        assert!(RUNNER.contains("the in-lock bypass marker falsely claims broad_lock=0"));
+        assert!(RUNNER.contains("release marker does not name the broad-lock holder"));
+        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
     }
 
     /// 4. The consumer occurs after ALL shared post-lock drains.
