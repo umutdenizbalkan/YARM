@@ -2565,8 +2565,17 @@ fn run_riscv_exit_current_task_oracle(_init_tid: u64) {
             // Keep init alive and yielding so the disposable task is scheduled, then keep making
             // progress afterwards — that continued progress is the live evidence that the
             // exiting task's frame was never restored and the hart moved on.
+            //
+            // Stage 200D-0D2: the bound is 64 here, NOT the 4096 the x86_64 and AArch64 cells
+            // use. Every RISC-V Yield runs the full Stage 196G post-lock retirement drain and
+            // emits ~13 serial log lines, so 4096 yields is ~54k lines of console output and the
+            // first live run timed out at ~985 of them — with the exit itself already complete
+            // and correct. This is the same RISC-V-specific reduction Stage 200C2C2C-R2B applied
+            // to the reply-timeout oracle's spin for the identical reason. 64 yields is still 64
+            // full trap -> scheduler dispatch -> sret round trips AFTER the exit, which is what
+            // "the survivor keeps progressing" has to mean; the sibling ports are untouched.
             let mut spun = 0u32;
-            while spun < 4096 {
+            while spun < 64 {
                 let _ = yarm_user_rt::syscall::yield_now();
                 spun += 1;
             }

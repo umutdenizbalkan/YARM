@@ -93170,6 +93170,20 @@ mod stage200d0d1_riscv_exit_prep {
             "if riscv_exit_current_task_oracle::armed(ctx.supervisor_control_recv_ep) {"
         ));
         assert!(INIT_SRC.contains("run_riscv_exit_current_task_oracle(ctx.task_id);"));
+        // Stage 200D-0D2: the RISC-V survivor loop is deliberately 64, not the siblings' 4096 —
+        // every RISC-V Yield runs the full 196G retirement drain and emits ~13 serial lines, so
+        // 4096 exceeds the boot timeout. The sibling bounds must stay untouched.
+        let rv_fn = INIT_SRC
+            .split("fn run_riscv_exit_current_task_oracle(_init_tid: u64) {")
+            .nth(1)
+            .expect("riscv oracle fn");
+        assert!(rv_fn.contains("while spun < 64 {"));
+        assert!(!rv_fn.contains("while spun < 4096 {"));
+        assert_eq!(
+            INIT_SRC.matches("while spun < 4096 {").count(),
+            2,
+            "x86_64 and AArch64 keep their 4096-yield survivor loops"
+        );
         let armed = INIT_SRC
             .split("mod riscv_exit_current_task_oracle {")
             .nth(1)
@@ -93236,6 +93250,11 @@ mod stage200d0d1_riscv_exit_prep {
         // Old-frame / sepc restoration.
         assert!(RUNNER.contains("EXIT_TASK_OLD_FRAME_RESTORED"));
         assert!(RUNNER.contains("EXIT_TASK_EXITING_SEPC_COMMITTED"));
+        // Stage 200D-0D2: the result-export hard-fail marker completes the enumerated set.
+        // Like its two siblings above it is never emitted today — the positive proof is
+        // `inlock_result_export=0` on the bypass marker — so it exists to fail closed if a
+        // future change ever re-introduced an exiting-task result export.
+        assert!(RUNNER.contains("EXIT_TASK_EXITING_RESULT_EXPORTED"));
         assert!(
             RUNNER.contains("the in-lock bypass did not suppress the exiting task's result export")
         );
