@@ -1799,6 +1799,8 @@ mod ipc_reply_timeout_oracle {
     /// consumed the record and committed the terminal as `Reply`, so a duplicate can never
     /// deliver a second payload or wake the caller twice.
     pub(super) static SERVER_DUP_REPLY_REJECTED: AtomicU32 = AtomicU32::new(0);
+    /// Stage 200D-2B1: set once the caller has validated the canonical `ServerDied`.
+    pub(super) static CLIENT_SERVER_DIED: AtomicU32 = AtomicU32::new(0);
     pub(super) static CLIENT_CONTINUATIONS: AtomicU32 = AtomicU32::new(0);
 
     const REQUEST_OPCODE: u16 = 0x0C0A;
@@ -1884,6 +1886,10 @@ mod ipc_reply_timeout_oracle {
         /// Stage 200C2C2C-R2C: the server's duplicate NR7 through the consumed reply cap
         /// was rejected (reply-wins only).
         pub dup_reply_rejected: u32,
+        /// Stage 200D-2B1: the blocked receive completed with the canonical `ServerDied`.
+        pub server_died: bool,
+        /// The NUMERIC ABI code the caller actually observed; must be 10.
+        pub server_died_code: u32,
     }
 
     /// Server child (ARCH-NEUTRAL core): handshake, recv the request + reply cap, then reply per mode.
@@ -1908,6 +1914,45 @@ mod ipc_reply_timeout_oracle {
             }
         };
         let reply_cap = rm.reply_cap.unwrap_or(0);
+        // ── Stage 200D-2B1 (A2): the ServerDies branch ──────────────────────────────
+        //
+        // The authorized replier ceases to exist WITHOUT replying. Everything up to here is
+        // the same real exchange the other two scenarios use: a real `ipc_recv_v2` on the
+        // real request endpoint, delivering the real receiver-local reply cap. The only
+        // difference is what happens next — the server calls the real NR16 and never runs
+        // another instruction.
+        //
+        // The oracle calls NO death helper: not `exit_task`, not `complete_server_death_over`,
+        // not a terminal-claim or deferred-work helper. `exit_current_task()` is the ordinary
+        // syscall wrapper; every step after it — reverse-link capture, deferred publication,
+        // post-lock drain, `PeerDeath` claim, canonical `ServerDied` publication — is
+        // unconditional production code reached through the normal trap path.
+        if is_server_dies() {
+            // Attest the exact reply-cap identity BEFORE exiting: after NR16 there is no
+            // instruction left to attest from.
+            yarm_user_rt::user_log!(
+                "IPC_SERVER_DEATH_REQUEST_RECEIVED opcode=0x{:04x} len={} result=ok",
+                REQUEST_OPCODE,
+                rm.message.len
+            );
+            yarm_user_rt::user_log!(
+                "IPC_SERVER_DEATH_REPLY_CAP_RECEIVED reply_cap={} present={} result=ok",
+                reply_cap,
+                u32::from(rm.reply_cap.is_some())
+            );
+            yarm_user_rt::user_log!("IPC_SERVER_DEATH_EXIT_ENTERED nr=16 role=server result=ok");
+            // SAFETY: terminates this thread; nothing after it may run.
+            let outcome = unsafe { yarm_user_rt::syscall::exit_current_task() };
+            // HARD FAIL. Reaching this line means an accepted NR16 returned to userspace with
+            // a live reply record still owned by this server — the runner treats it as fatal.
+            yarm_user_rt::user_log!(
+                "IPC_SERVER_DEATH_EXIT_RETURNED err={:?} result=fail",
+                outcome.err()
+            );
+            loop {
+                let _ = yarm_user_rt::syscall::yield_now();
+            }
+        }
         let reply_msg =
             match yarm_user_rt::ipc::Message::with_header(0, REPLY_OPCODE, 0, None, &REPLY_DATA) {
                 Ok(m) => m,
@@ -2039,6 +2084,15 @@ mod ipc_reply_timeout_oracle {
         let reply = if is_timeout_wins() {
             // SAFETY: `reply_ep` carries RECEIVE.
             unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_ep, TIMEOUT_WINS_TICKS) }
+        } else if is_server_dies() {
+            // Stage 200D-2B1 (A2/A4): block with a REAL finite deadline, so a real
+            // token-bearing deadline is armed and the causal collector has a genuine stale
+            // token to examine after `PeerDeath` has already won. The deadline is the
+            // reply-wins (long) bound, not the timeout-wins (short) one: the server's death
+            // must be what ends the block, and the collector gate additionally holds the
+            // oracle collector until the caller has validated `ServerDied`.
+            // SAFETY: `reply_ep` carries RECEIVE.
+            unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_ep, REPLY_WINS_TICKS) }
         } else {
             // SAFETY: `reply_ep` carries RECEIVE.
             unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_ep) }.map(|o| o.map(|rm| rm.message))
@@ -2115,6 +2169,32 @@ mod ipc_reply_timeout_oracle {
                         spun += 1;
                     }
                 }
+            }
+            // Stage 200D-2B1 (A2/A5): the ServerDies outcome. The authorized replier ceased
+            // to exist while this caller was blocked, so the blocked receive completes with
+            // the canonical `ServerDied` published by the production post-lock drain — NOT
+            // with a payload and NOT with a timeout. The code is checked NUMERICALLY against
+            // the frozen ABI value 10, not just by variant name, because the value is the
+            // thing the three architectures' return lanes actually carry.
+            Err(yarm_user_rt::syscall::SyscallError::ServerDied) => {
+                CLIENT_CONTINUATIONS.fetch_add(1, Relaxed);
+                out.continuations = CLIENT_CONTINUATIONS.load(Relaxed);
+                out.server_died = true;
+                let code = yarm_user_rt::syscall::SyscallError::ServerDied as u32;
+                out.server_died_code = code;
+                CLIENT_SERVER_DIED.store(1, Relaxed);
+                yarm_user_rt::user_log!(
+                    "IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code={} continuations={} result=ok",
+                    code,
+                    out.continuations
+                );
+                // Releasing the causal collector gate is the LAST thing the caller does with
+                // the terminal: only now may the oracle collector examine the stale token, so
+                // the late-timeout verdict cannot be reached before `PeerDeath` has committed
+                // and the caller has already validated its result.
+                yarm_user_rt::user_log!(
+                    "IPC_SERVER_DEATH_COLLECTOR_RELEASED released_by=caller result=ok"
+                );
             }
             Err(e) => {
                 yarm_user_rt::user_log!("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_RECV_FAIL err={:?}", e);
