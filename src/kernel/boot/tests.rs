@@ -59937,11 +59937,53 @@ mod stage190b_controlled_workload {
     // rotate-to-unrun-task). Each placement is audited (enqueue_on_cpu wake-only guard).
     #[test]
     fn repeated_dispatch_places_next_task_audited_one_at_a_time() {
+        // Stage 199A2D2C1 moved the loop bound from the bare `AP_WORKLOAD_TASKS` constant
+        // to `ap_workload_task_count()`, so the SMP-oracle boot can run exactly one proof
+        // task. The Stage 190B invariant is unchanged — the loop still places by INDEX,
+        // one at a time, bounded by a fixed small count — so this guard follows the bound
+        // rather than the constant, and then pins the bound itself below.
         assert!(
             SMP_SRC.contains("fn ap_sched_next_or_idle(")
-                && SMP_SRC.contains("(n as u64) < AP_WORKLOAD_TASKS")
+                && SMP_SRC.contains("if (n as u64) < ap_workload_task_count() {")
                 && SMP_SRC.contains("let next_tid = ap_workload_base_tid(cpu) + n as u64;"),
             "the scheduler loop must place the next workload task by index, one at a time"
+        );
+        // The bound must stay a FIXED, deterministic count. A run-queue length or a
+        // balancing decision here would turn the controlled sequence into exactly the
+        // arbitrary load balancing Stage 190B exists to rule out.
+        let count_fn = SMP_SRC
+            .split("fn ap_workload_task_count() -> u64 {")
+            .nth(1)
+            .expect("the workload bound must be a named function")
+            .split("\n}\n")
+            .next()
+            .expect("bounded function body");
+        for forbidden in [
+            ".len()",
+            "run_queue",
+            "enqueue_balanced",
+            "fetch_add",
+            "AP_DISPATCH_COUNT",
+        ] {
+            assert!(
+                !count_fn.contains(forbidden),
+                "the workload bound must be deterministic, not derived from `{forbidden}`"
+            );
+        }
+        // Only the explicitly gated SMP oracle narrows the sequence; the DEFAULT boot
+        // still runs the full `AP_WORKLOAD_TASKS` sequence, which is what makes the
+        // dispatch REPEATED.
+        let default_arm = count_fn
+            .split("} else {")
+            .nth(1)
+            .expect("the bound must have a default arm");
+        assert!(
+            default_arm.contains("AP_WORKLOAD_TASKS"),
+            "the default boot must run the full controlled sequence (repeated dispatch)"
+        );
+        assert!(
+            count_fn.contains("x86_ipccall_direct_smp_oracle_enabled()"),
+            "only the SMP oracle selector may narrow the sequence to a single task"
         );
         // Placement is via the audited wake-only-guarded enqueue.
         assert!(
