@@ -1779,8 +1779,8 @@ fn run_x86_ipccall_direct_oracle(init_tid: u64) {
 ))]
 mod ipc_reply_timeout_oracle {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-    use yarm_ipc_abi::ipc_reply_timeout_abi::{
-        IpcReplyTimeoutScenario, ipc_reply_timeout_scenario_for_current_arch,
+    use yarm_ipc_abi::ipc_reply_liveness_abi::{
+        IpcReplyLivenessScenario, ipc_reply_liveness_scenario_for_current_arch,
     };
 
     pub(super) static HANDSHAKE: AtomicU32 = AtomicU32::new(0x00E0);
@@ -1835,7 +1835,7 @@ mod ipc_reply_timeout_oracle {
     }
 
     /// Stage 200C2C2C-R2C: decode through the SHARED, ARCHITECTURE-LOCAL decoder in
-    /// `yarm_ipc_abi::ipc_reply_timeout_abi` — the same module whose encoder the kernel
+    /// `yarm_ipc_abi::ipc_reply_liveness_abi` — the same module whose encoder the kernel
     /// used to publish the selector, so the two directions cannot drift.
     ///
     /// The per-arch pairs overlap (AArch64 8/9, RISC-V 9/10, x86_64 10/11), so a shared
@@ -1845,12 +1845,33 @@ mod ipc_reply_timeout_oracle {
     /// already timed out — the reply then lost the terminal for a genuine reason and
     /// reply-wins was unreachable on both ports. A selector belonging to another
     /// architecture now decodes to `None` here rather than to the wrong scenario.
-    pub(super) fn scenario() -> Option<IpcReplyTimeoutScenario> {
-        ipc_reply_timeout_scenario_for_current_arch(mode() as usize)
+    pub(super) fn scenario() -> Option<IpcReplyLivenessScenario> {
+        ipc_reply_liveness_scenario_for_current_arch(mode() as usize)
     }
 
     pub(super) fn is_timeout_wins() -> bool {
-        matches!(scenario(), Some(IpcReplyTimeoutScenario::TimeoutWins))
+        matches!(scenario(), Some(IpcReplyLivenessScenario::TimeoutWins))
+    }
+
+    /// Stage 200D-2B1: the third liveness scenario — the authorized replier exits without
+    /// replying, so the caller must regain liveness through `PeerDeath` and `ServerDied`.
+    pub(super) fn is_server_dies() -> bool {
+        matches!(scenario(), Some(IpcReplyLivenessScenario::ServerDies))
+    }
+
+    /// Stage 200D-2B1: the ONE place a slot-5 value is turned into "this oracle is armed".
+    ///
+    /// The three dispatch sites used to compare bare literals — `Some(8) || Some(9)` on
+    /// AArch64, `Some(9) || Some(10)` on RISC-V, `Some(10) || Some(11)` on x86_64. That was a
+    /// private per-port selector table duplicating the ABI's mapping, and it silently excluded
+    /// the new `ServerDies` selector on every port, so the third scenario could never have
+    /// dispatched. Routing all three through the shared decoder removes the duplicate mapping
+    /// and makes the run of three arm automatically.
+    pub(super) fn armed(slot5: Option<u32>) -> bool {
+        match slot5 {
+            Some(v) => ipc_reply_liveness_scenario_for_current_arch(v as usize).is_some(),
+            None => false,
+        }
     }
 
     #[derive(Clone, Copy, Default)]
@@ -4089,7 +4110,7 @@ pub fn run() {
     // 11 = reply-wins (mutually exclusive with every other slot-5 oracle). Arch-gated; activation
     // requires the kernel feature + `yarm.x86_64_ipc_reply_timeout_oracle=timeout-wins|reply-wins`.
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-    if ctx.supervisor_control_recv_ep == Some(10) || ctx.supervisor_control_recv_ep == Some(11) {
+    if ipc_reply_timeout_oracle::armed(ctx.supervisor_control_recv_ep) {
         run_x86_ipc_reply_timeout_oracle(ctx.task_id);
     }
 
@@ -4155,7 +4176,7 @@ pub fn run() {
     // Slot-5 selector 8 = timeout-wins, 9 = reply-wins (mutually exclusive with every other AArch64
     // slot-5 oracle). Requires the kernel feature + `yarm.aarch64_ipc_reply_timeout_oracle=...`.
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
-    if ctx.supervisor_control_recv_ep == Some(8) || ctx.supervisor_control_recv_ep == Some(9) {
+    if ipc_reply_timeout_oracle::armed(ctx.supervisor_control_recv_ep) {
         run_aarch64_ipc_reply_timeout_oracle(ctx.task_id);
     }
     // Stage 200D-0C1: default-off + feature-gated AArch64 LIVE ExitCurrentTask oracle. The slot-5
@@ -4176,7 +4197,7 @@ pub fn run() {
     // other RISC-V slot-5 oracle). Requires the kernel feature + `yarm.riscv_ipc_reply_timeout_
     // oracle=...`.
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-    if ctx.supervisor_control_recv_ep == Some(9) || ctx.supervisor_control_recv_ep == Some(10) {
+    if ipc_reply_timeout_oracle::armed(ctx.supervisor_control_recv_ep) {
         run_riscv_ipc_reply_timeout_oracle(ctx.task_id);
     }
     // Stage 200D-0D1: default-off + feature-gated RISC-V LIVE ExitCurrentTask oracle. The slot-5

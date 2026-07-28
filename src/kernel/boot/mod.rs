@@ -3514,21 +3514,21 @@ pub fn ipccall_direct_oracle_reply_endpoint_is(eidx: usize) -> bool {
 
 // Stage 200C2C2C-R2C: the three per-arch selector BASES are the registry — they are all
 // visible here because provisioning must name them — but their INTERPRETATION lives in
-// `yarm_ipc_abi::ipc_reply_timeout_abi`, which is compiled for the current architecture and
+// `yarm_ipc_abi::ipc_reply_liveness_abi`, which is compiled for the current architecture and
 // is the single decoder shared with userspace. These aliases exist so there is exactly one
 // numeric source of truth; they must never be decoded by a shared numeric match.
 
 /// Slot-5 selector for the x86_64 reply-timeout oracle. Next free value after the direct/SMP
 /// oracles (3/9), so it is mutually exclusive with every other slot-5 oracle.
 pub const X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
-    yarm_ipc_abi::ipc_reply_timeout_abi::X86_64_SELECTOR_BASE as u64;
+    yarm_ipc_abi::ipc_reply_liveness_abi::X86_64_SELECTOR_BASE as u64;
 
 /// Stage 200C2C1 — slot-5 selector base for the AArch64 reply-timeout oracle. AArch64 slot-5 values
 /// 1..=7 are taken (FutexWake=1, FutexWait switch=2, FutexWait idle=3, two-task Yield=4, lone
 /// Yield=5, shared-region direct=6, ipccall-direct=7), so this oracle uses the next free PAIR: `8`
 /// (timeout-wins) / `9` (reply-wins), mutually exclusive with every other AArch64 slot-5 oracle.
 pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
-    yarm_ipc_abi::ipc_reply_timeout_abi::AARCH64_SELECTOR_BASE as u64;
+    yarm_ipc_abi::ipc_reply_liveness_abi::AARCH64_SELECTOR_BASE as u64;
 
 /// Stage 200C2C2 — slot-5 selector base for the RISC-V reply-timeout oracle. RISC-V slot-5 values
 /// 1..=8 are taken (FutexWake=1, FutexWait=2, FutexWait-idle=3, two-task Yield=4, lone Yield=5,
@@ -3536,7 +3536,7 @@ pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
 /// PAIR: `9` (timeout-wins) / `10` (reply-wins), mutually exclusive with every other RISC-V slot-5
 /// oracle.
 pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
-    yarm_ipc_abi::ipc_reply_timeout_abi::RISCV64_SELECTOR_BASE as u64;
+    yarm_ipc_abi::ipc_reply_liveness_abi::RISCV64_SELECTOR_BASE as u64;
 
 /// Oracle mode discriminator (also written to init startup slot 15 for the userspace scenario):
 /// `1` = timeout-wins, `2` = reply-wins.
@@ -3652,6 +3652,8 @@ pub fn riscv_exit_current_task_selector() -> u64 {
 
 pub const IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS: u8 = 1;
 pub const IPC_REPLY_TIMEOUT_MODE_REPLY_WINS: u8 = 2;
+/// Stage 200D-2B1: the third liveness mode — the authorized replier exits without replying.
+pub const IPC_REPLY_TIMEOUT_MODE_SERVER_DIES: u8 = 3;
 
 /// Stage 200C2C2C-R2C — the armed scenario as the TYPED value both sides agree on, or
 /// `None` when the oracle is off. The per-boot mode knob is the only input; the numeric
@@ -3659,11 +3661,12 @@ pub const IPC_REPLY_TIMEOUT_MODE_REPLY_WINS: u8 = 2;
 /// so the kernel never hand-writes a selector number.
 #[must_use]
 pub fn ipc_reply_timeout_scenario()
--> Option<yarm_ipc_abi::ipc_reply_timeout_abi::IpcReplyTimeoutScenario> {
-    use yarm_ipc_abi::ipc_reply_timeout_abi::IpcReplyTimeoutScenario as S;
+-> Option<yarm_ipc_abi::ipc_reply_liveness_abi::IpcReplyLivenessScenario> {
+    use yarm_ipc_abi::ipc_reply_liveness_abi::IpcReplyLivenessScenario as S;
     match x86_ipc_reply_timeout_oracle_mode() {
         IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS => Some(S::TimeoutWins),
         IPC_REPLY_TIMEOUT_MODE_REPLY_WINS => Some(S::ReplyWins),
+        IPC_REPLY_TIMEOUT_MODE_SERVER_DIES => Some(S::ServerDies),
         _ => None,
     }
 }
@@ -3673,7 +3676,7 @@ pub fn ipc_reply_timeout_scenario()
 #[must_use]
 pub fn ipc_reply_timeout_selector() -> Option<u64> {
     ipc_reply_timeout_scenario().map(|s| {
-        yarm_ipc_abi::ipc_reply_timeout_abi::ipc_reply_timeout_selector_for_current_arch(s) as u64
+        yarm_ipc_abi::ipc_reply_liveness_abi::ipc_reply_liveness_selector_for_current_arch(s) as u64
     })
 }
 

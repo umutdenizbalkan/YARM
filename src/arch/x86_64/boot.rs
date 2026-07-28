@@ -1035,7 +1035,7 @@ pub fn bootstrap_first_user_task(
             // Encode the mode in the slot-5 value: 10 = timeout-wins, 11 = reply-wins
             // (both mutually exclusive with every other slot-5 oracle).
             // Stage 200C2C2C-R2C: the selector is produced by the ARCHITECTURE-LOCAL encoder
-            // in `yarm_ipc_abi::ipc_reply_timeout_abi` — the exact inverse of the decoder
+            // in `yarm_ipc_abi::ipc_reply_liveness_abi` — the exact inverse of the decoder
             // userspace applies — so the kernel never hand-writes a slot-5 number and the
             // two sides cannot drift apart.
             init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);

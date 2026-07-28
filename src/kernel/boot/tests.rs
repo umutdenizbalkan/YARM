@@ -85820,7 +85820,7 @@ mod stage200c2b_guards {
         // registry and the architecture-local decoder cannot drift. Assert the alias AND the
         // value it resolves to (8 = AArch64 timeout-wins, 9 = AArch64 reply-wins).
         assert!(MOD_SRC.contains(
-            "pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =\n    yarm_ipc_abi::ipc_reply_timeout_abi::AARCH64_SELECTOR_BASE as u64;"
+            "pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =\n    yarm_ipc_abi::ipc_reply_liveness_abi::AARCH64_SELECTOR_BASE as u64;"
         ));
         assert_eq!(
             crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
@@ -87009,7 +87009,7 @@ mod stage200c2c2_riscv_port {
         // Stage 200C2C2C-R2C: aliased to the shared ABI base (single numeric source of truth).
         assert!(
             MOD_SRC.contains(
-                "pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =\n    yarm_ipc_abi::ipc_reply_timeout_abi::RISCV64_SELECTOR_BASE as u64;"
+                "pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =\n    yarm_ipc_abi::ipc_reply_liveness_abi::RISCV64_SELECTOR_BASE as u64;"
             ),
             "next genuinely free RISC-V slot-5 pair is 9/10 (1..=8 are taken)"
         );
@@ -88016,11 +88016,11 @@ mod stage200c2c2c_r2b_reply_authority {
         // property this case guards — interpretation is architecture-local — is unchanged and
         // now stronger: the userspace copy of the base table no longer exists at all.
         assert!(
-            SERVICE_SRC.contains("ipc_reply_timeout_scenario_for_current_arch(mode() as usize)")
+            SERVICE_SRC.contains("ipc_reply_liveness_scenario_for_current_arch(mode() as usize)")
         );
         assert!(
             SERVICE_SRC
-                .contains("matches!(scenario(), Some(IpcReplyTimeoutScenario::TimeoutWins))")
+                .contains("matches!(scenario(), Some(IpcReplyLivenessScenario::TimeoutWins))")
         );
         assert!(!SERVICE_SRC.contains("pub(super) const SELECTOR_BASE: u64"));
     }
@@ -88163,13 +88163,14 @@ mod stage200c2c2c_r2b_reply_authority {
 /// These cases pin the architecture-local decoder, the encode/decode inverse, the
 /// registry constants, and the source-level absence of any shared ambiguous match.
 mod stage200c2c2c_r2c_selector_matrix {
-    use yarm_ipc_abi::ipc_reply_timeout_abi::{
-        AARCH64_SELECTOR_BASE, CURRENT_ARCH_SELECTOR_BASE, IpcReplyTimeoutScenario,
-        RISCV64_SELECTOR_BASE, X86_64_SELECTOR_BASE, ipc_reply_timeout_scenario_for_base,
-        ipc_reply_timeout_scenario_for_current_arch, ipc_reply_timeout_selector_for_current_arch,
+    use yarm_ipc_abi::ipc_reply_liveness_abi::{
+        AARCH64_SELECTOR_BASE, CURRENT_ARCH_SELECTOR_BASE, IpcReplyLivenessScenario,
+        RISCV64_SELECTOR_BASE, X86_64_SELECTOR_BASE, ipc_reply_liveness_scenario_for_base,
+        ipc_reply_liveness_scenario_for_current_arch, ipc_reply_liveness_selector_for_current_arch,
     };
 
-    const ABI_SRC: &str = include_str!("../../../crates/yarm-ipc-abi/src/ipc_reply_timeout_abi.rs");
+    const ABI_SRC: &str =
+        include_str!("../../../crates/yarm-ipc-abi/src/ipc_reply_liveness_abi.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const SERVICE_SRC: &str = include_str!(
@@ -88188,40 +88189,40 @@ mod stage200c2c2c_r2c_selector_matrix {
             (X86_64_SELECTOR_BASE, "x86_64"),
         ] {
             assert_eq!(
-                ipc_reply_timeout_scenario_for_base(base, base),
-                Some(IpcReplyTimeoutScenario::TimeoutWins),
+                ipc_reply_liveness_scenario_for_base(base, base),
+                Some(IpcReplyLivenessScenario::TimeoutWins),
                 "{name}: base must be TimeoutWins"
             );
             assert_eq!(
-                ipc_reply_timeout_scenario_for_base(base, base + 1),
-                Some(IpcReplyTimeoutScenario::ReplyWins),
+                ipc_reply_liveness_scenario_for_base(base, base + 1),
+                Some(IpcReplyLivenessScenario::ReplyWins),
                 "{name}: base+1 must be ReplyWins"
             );
         }
         // The exact table the stage requires.
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 8),
-            Some(IpcReplyTimeoutScenario::TimeoutWins)
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 8),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
         );
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 9),
-            Some(IpcReplyTimeoutScenario::ReplyWins)
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 9),
+            Some(IpcReplyLivenessScenario::ReplyWins)
         );
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 9),
-            Some(IpcReplyTimeoutScenario::TimeoutWins)
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 9),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
         );
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 10),
-            Some(IpcReplyTimeoutScenario::ReplyWins)
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::ReplyWins)
         );
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 10),
-            Some(IpcReplyTimeoutScenario::TimeoutWins)
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
         );
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 11),
-            Some(IpcReplyTimeoutScenario::ReplyWins)
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 11),
+            Some(IpcReplyLivenessScenario::ReplyWins)
         );
     }
 
@@ -88231,21 +88232,21 @@ mod stage200c2c2c_r2c_selector_matrix {
     fn s02_same_number_means_different_scenarios_per_arch() {
         // `9` is AArch64 ReplyWins but RISC-V TimeoutWins.
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 9),
-            Some(IpcReplyTimeoutScenario::ReplyWins)
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 9),
+            Some(IpcReplyLivenessScenario::ReplyWins)
         );
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 9),
-            Some(IpcReplyTimeoutScenario::TimeoutWins)
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 9),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
         );
         // `10` is RISC-V ReplyWins but x86_64 TimeoutWins.
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 10),
-            Some(IpcReplyTimeoutScenario::ReplyWins)
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::ReplyWins)
         );
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 10),
-            Some(IpcReplyTimeoutScenario::TimeoutWins)
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
         );
     }
 
@@ -88253,42 +88254,85 @@ mod stage200c2c2c_r2c_selector_matrix {
     /// in a given build.
     #[test]
     fn s03_foreign_only_selectors_activate_nothing() {
-        // AArch64 build: x86_64's pair (10/11) is foreign; 10 is also RISC-V ReplyWins.
+        // Stage 200D-2B1 widened each architecture's PAIR into a RUN of three
+        // (base, base+1, base+2) = (TimeoutWins, ReplyWins, ServerDies), so the runs overlap
+        // more than the pairs did. "Foreign" now means "outside THIS build's run of three",
+        // and the guard asserts exactly that — a selector inside the run must decode, and a
+        // selector outside it must not, even when it is valid for another architecture.
+        //
+        // AArch64 run is 8/9/10, so x86_64's ReplyWins (11) and ServerDies (12) are foreign.
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 11),
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 11),
             None
         );
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(AARCH64_SELECTOR_BASE, 10),
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 12),
             None
         );
-        // RISC-V build: AArch64's TimeoutWins (8) and x86_64's ReplyWins (11) are foreign.
+        // 10 IS in AArch64's run — it is AArch64 ServerDies — even though it is also
+        // RISC-V ReplyWins and x86_64 TimeoutWins. It must decode with THIS arch's meaning.
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 8),
-            None
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::ServerDies)
         );
+        // RISC-V run is 9/10/11: AArch64's TimeoutWins (8) and x86_64's ServerDies (12)
+        // are foreign; 11 is RISC-V's own ServerDies.
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(RISCV64_SELECTOR_BASE, 11),
-            None
-        );
-        // x86_64 build: AArch64's whole pair (8/9) is foreign.
-        assert_eq!(
-            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 8),
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 8),
             None
         );
         assert_eq!(
-            ipc_reply_timeout_scenario_for_base(X86_64_SELECTOR_BASE, 9),
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 12),
             None
         );
-        // Nothing outside a pair activates anything, including the off value 0.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 11),
+            Some(IpcReplyLivenessScenario::ServerDies)
+        );
+        // x86_64 run is 10/11/12: AArch64's whole TimeoutWins/ReplyWins pair (8/9) is foreign.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 8),
+            None
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 9),
+            None
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 12),
+            Some(IpcReplyLivenessScenario::ServerDies)
+        );
+        // Nothing outside a base's own RUN activates anything, including the off value 0.
+        // 12 is deliberately NOT in this list any more: it is x86_64's ServerDies, so it is
+        // only inert for the other two bases. The loop derives the off-run values from each
+        // base rather than hard-coding a set that silently became run-relative.
         for base in [
             AARCH64_SELECTOR_BASE,
             RISCV64_SELECTOR_BASE,
             X86_64_SELECTOR_BASE,
         ] {
-            for sel in [0usize, 1, 7, 12, 100, usize::MAX] {
-                assert_eq!(ipc_reply_timeout_scenario_for_base(base, sel), None);
+            for sel in [0usize, 1, base - 1, base + 3, base + 4, 100, usize::MAX] {
+                assert_eq!(
+                    ipc_reply_liveness_scenario_for_base(base, sel),
+                    None,
+                    "selector {sel} is outside the run based at {base}"
+                );
             }
+            // …and every value INSIDE the run decodes to exactly one distinct scenario.
+            let run = [
+                ipc_reply_liveness_scenario_for_base(base, base),
+                ipc_reply_liveness_scenario_for_base(base, base + 1),
+                ipc_reply_liveness_scenario_for_base(base, base + 2),
+            ];
+            assert_eq!(
+                run,
+                [
+                    Some(IpcReplyLivenessScenario::TimeoutWins),
+                    Some(IpcReplyLivenessScenario::ReplyWins),
+                    Some(IpcReplyLivenessScenario::ServerDies),
+                ],
+                "the run based at {base} must map to the three scenarios in order"
+            );
         }
     }
 
@@ -88297,23 +88341,29 @@ mod stage200c2c2c_r2c_selector_matrix {
     #[test]
     fn s04_current_arch_encode_decode_round_trip() {
         for scenario in [
-            IpcReplyTimeoutScenario::TimeoutWins,
-            IpcReplyTimeoutScenario::ReplyWins,
+            IpcReplyLivenessScenario::TimeoutWins,
+            IpcReplyLivenessScenario::ReplyWins,
+            IpcReplyLivenessScenario::ServerDies,
         ] {
-            let sel = ipc_reply_timeout_selector_for_current_arch(scenario);
+            let sel = ipc_reply_liveness_selector_for_current_arch(scenario);
             assert_eq!(
-                ipc_reply_timeout_scenario_for_current_arch(sel),
+                ipc_reply_liveness_scenario_for_current_arch(sel),
                 Some(scenario),
                 "encode/decode must round-trip for {scenario:?}"
             );
         }
         // Values just outside this build's own pair are inert.
         assert_eq!(
-            ipc_reply_timeout_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE - 1),
+            ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE - 1),
             None
         );
+        // base+2 is now this build's own ServerDies; base+3 is the first value past the run.
         assert_eq!(
-            ipc_reply_timeout_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE + 2),
+            ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE + 2),
+            Some(IpcReplyLivenessScenario::ServerDies)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE + 3),
             None
         );
     }
@@ -88335,13 +88385,13 @@ mod stage200c2c2c_r2c_selector_matrix {
             X86_64_SELECTOR_BASE as u64
         );
         assert!(
-            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_timeout_abi::X86_64_SELECTOR_BASE as u64")
+            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_liveness_abi::X86_64_SELECTOR_BASE as u64")
         );
         assert!(
-            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_timeout_abi::AARCH64_SELECTOR_BASE as u64")
+            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_liveness_abi::AARCH64_SELECTOR_BASE as u64")
         );
         assert!(
-            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_timeout_abi::RISCV64_SELECTOR_BASE as u64")
+            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_liveness_abi::RISCV64_SELECTOR_BASE as u64")
         );
     }
 
@@ -88359,7 +88409,7 @@ mod stage200c2c2c_r2c_selector_matrix {
         );
         assert_eq!(
             crate::kernel::boot::ipc_reply_timeout_scenario(),
-            Some(IpcReplyTimeoutScenario::TimeoutWins)
+            Some(IpcReplyLivenessScenario::TimeoutWins)
         );
         assert_eq!(
             crate::kernel::boot::ipc_reply_timeout_selector(),
@@ -88371,7 +88421,7 @@ mod stage200c2c2c_r2c_selector_matrix {
         );
         assert_eq!(
             crate::kernel::boot::ipc_reply_timeout_scenario(),
-            Some(IpcReplyTimeoutScenario::ReplyWins)
+            Some(IpcReplyLivenessScenario::ReplyWins)
         );
         assert_eq!(
             crate::kernel::boot::ipc_reply_timeout_selector(),
@@ -88445,13 +88495,13 @@ mod stage200c2c2c_r2c_selector_matrix {
     /// with, so the two directions cannot drift apart again.
     #[test]
     fn s09_userspace_uses_the_shared_decoder() {
-        assert!(SERVICE_SRC.contains("use yarm_ipc_abi::ipc_reply_timeout_abi::{"));
+        assert!(SERVICE_SRC.contains("use yarm_ipc_abi::ipc_reply_liveness_abi::{"));
         assert!(
-            SERVICE_SRC.contains("ipc_reply_timeout_scenario_for_current_arch(mode() as usize)")
+            SERVICE_SRC.contains("ipc_reply_liveness_scenario_for_current_arch(mode() as usize)")
         );
         assert!(
             SERVICE_SRC
-                .contains("matches!(scenario(), Some(IpcReplyTimeoutScenario::TimeoutWins))")
+                .contains("matches!(scenario(), Some(IpcReplyLivenessScenario::TimeoutWins))")
         );
         // The userspace copy of the per-arch base table is gone.
         assert!(!SERVICE_SRC.contains("pub(super) const SELECTOR_BASE: u64"));
@@ -93303,5 +93353,227 @@ mod stage200d0d1_riscv_exit_prep {
         // Production paths are NOT oracle-gated.
         assert!(!consumer_block().contains("riscv-exit-current-task-oracle"));
         assert!(!bypass_code().contains("riscv-exit-current-task-oracle"));
+    }
+}
+
+/// Stage 200D-2B1 (§1) — the shared three-scenario IPC reply-liveness ABI.
+///
+/// These guards are about the ABI being the SINGLE source of selector meaning. They are
+/// deliberately negative-heavy: the failure this module exists to prevent is a second,
+/// private mapping appearing somewhere and drifting from this one (Stage 200C2C2C-R2B).
+#[cfg(test)]
+mod stage200d2b1_liveness_abi {
+    use yarm_ipc_abi::ipc_reply_liveness_abi::{
+        AARCH64_SELECTOR_BASE, IpcReplyLivenessScenario, RISCV64_SELECTOR_BASE,
+        X86_64_SELECTOR_BASE, ipc_reply_liveness_scenario_for_base,
+    };
+
+    const ABI_SRC: &str =
+        include_str!("../../../crates/yarm-ipc-abi/src/ipc_reply_liveness_abi.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const X86_BOOT: &str = include_str!("../../arch/x86_64/boot.rs");
+    const A64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    /// The §1 selector table, asserted exactly.
+    #[test]
+    fn b01_selector_table_is_exactly_the_specified_runs() {
+        use IpcReplyLivenessScenario as S;
+        for (base, expect) in [
+            (AARCH64_SELECTOR_BASE, [8usize, 9, 10]),
+            (RISCV64_SELECTOR_BASE, [9, 10, 11]),
+            (X86_64_SELECTOR_BASE, [10, 11, 12]),
+        ] {
+            assert_eq!(base, expect[0], "base");
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, expect[0]),
+                Some(S::TimeoutWins)
+            );
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, expect[1]),
+                Some(S::ReplyWins)
+            );
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, expect[2]),
+                Some(S::ServerDies)
+            );
+        }
+    }
+
+    /// The pre-existing timeout/reply selectors keep the meanings Stage 200C sealed them with.
+    /// Widening the pair into a run must not have renumbered anything.
+    #[test]
+    fn b02_old_timeout_and_reply_selectors_retain_their_meanings() {
+        use IpcReplyLivenessScenario as S;
+        for (base, timeout, reply) in [
+            (AARCH64_SELECTOR_BASE, 8usize, 9usize),
+            (RISCV64_SELECTOR_BASE, 9, 10),
+            (X86_64_SELECTOR_BASE, 10, 11),
+        ] {
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, timeout),
+                Some(S::TimeoutWins)
+            );
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, reply),
+                Some(S::ReplyWins)
+            );
+        }
+        // The kernel's registry constants still equal the ABI bases.
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            AARCH64_SELECTOR_BASE as u64
+        );
+    }
+
+    /// Kernel and userspace decode through the SAME module — one shared ABI, not two copies.
+    #[test]
+    fn b03_kernel_and_userspace_share_one_abi() {
+        assert!(MOD_SRC.contains(
+            "yarm_ipc_abi::ipc_reply_liveness_abi::ipc_reply_liveness_selector_for_current_arch("
+        ));
+        assert!(INIT_SRC.contains("ipc_reply_liveness_scenario_for_current_arch(mode() as usize)"));
+        assert!(INIT_SRC.contains("use yarm_ipc_abi::ipc_reply_liveness_abi::{"));
+        // The superseded module is gone entirely — it cannot be imported by accident.
+        for (name, src) in [
+            ("kernel", MOD_SRC),
+            ("init server", INIT_SRC),
+            ("x86 boot", X86_BOOT),
+            ("aarch64 boot", A64_BOOT),
+            ("riscv boot", RV_BOOT),
+        ] {
+            assert!(
+                !src.contains("ipc_reply_timeout_abi"),
+                "{name} must not reference the superseded module"
+            );
+            assert!(!src.contains("IpcReplyTimeoutScenario"));
+        }
+    }
+
+    /// No private per-port selector table, and no hand-computed base+offset outside the ABI.
+    #[test]
+    fn b04_no_private_tables_or_hand_computed_offsets() {
+        for (name, src) in [
+            ("kernel", MOD_SRC),
+            ("init server", INIT_SRC),
+            ("x86 boot", X86_BOOT),
+            ("aarch64 boot", A64_BOOT),
+            ("riscv boot", RV_BOOT),
+        ] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            // A private LIVENESS mapping would have to compute the run locally. (A bare
+            // `== Some(8)` is NOT forbidden in general: slot-5 is a shared namespace and 8 is
+            // also the RISC-V IpcCall-direct selector, which is a different oracle with its
+            // own meaning. The check is about the liveness run specifically.)
+            for forbidden in [
+                "matches!(mode(), 8",
+                "SELECTOR_BASE + 1",
+                "SELECTOR_BASE + 2",
+            ] {
+                assert!(
+                    !code.contains(forbidden),
+                    "{name} must not compute liveness selector meaning locally ({forbidden})"
+                );
+            }
+        }
+        // Every reply-liveness dispatch site is guarded by the SHARED decoder, never by a
+        // literal comparison. This is the concrete defect the guard exists for: the three
+        // sites previously compared `Some(8)||Some(9)`, `Some(9)||Some(10)`,
+        // `Some(10)||Some(11)` — private per-port tables that also silently excluded the new
+        // ServerDies selector, so the third scenario could never have dispatched.
+        let mut dispatch_sites = 0usize;
+        for arch in ["x86", "aarch64", "riscv"] {
+            let needle = alloc::format!("run_{arch}_ipc_reply_timeout_oracle(ctx.task_id);");
+            let at = INIT_SRC
+                .find(&needle)
+                .unwrap_or_else(|| panic!("dispatch site for {arch}"));
+            let head = &INIT_SRC[..at];
+            let guard_line = head
+                .lines()
+                .rev()
+                .find(|l| l.trim_start().starts_with("if "))
+                .expect("guarding if");
+            assert!(
+                guard_line.contains("ipc_reply_timeout_oracle::armed("),
+                "{arch} dispatch must go through the shared decoder, got: {guard_line}"
+            );
+            dispatch_sites += 1;
+        }
+        assert_eq!(dispatch_sites, 3);
+        // The shared `armed` helper decodes; it does not enumerate.
+        let armed = INIT_SRC
+            .split("pub(super) fn armed(slot5: Option<u32>) -> bool {")
+            .nth(1)
+            .expect("armed helper");
+        let armed = armed.split("\n    }").next().unwrap();
+        assert!(
+            armed.contains("ipc_reply_liveness_scenario_for_current_arch(v as usize).is_some()")
+        );
+        for n in ["8", "9", "10", "11", "12"] {
+            assert!(
+                !armed.contains(n),
+                "armed must contain no selector literal ({n})"
+            );
+        }
+        // The only base+offset arithmetic lives in the ABI module itself.
+        assert!(ABI_SRC.contains("selector == base + 1"));
+        assert!(ABI_SRC.contains("selector == base + 2"));
+    }
+
+    /// The ExitCurrentTask ABI is a DIFFERENT namespace and must never select an IPC scenario.
+    #[test]
+    fn b05_exit_current_task_abi_is_not_used_for_ipc_scenarios() {
+        // The two ABIs share no selector value.
+        use yarm_ipc_abi::exit_current_task_abi as exit_abi;
+        for s in [
+            exit_abi::X86_64_EXIT_SELECTOR,
+            exit_abi::AARCH64_EXIT_SELECTOR,
+            exit_abi::RISCV64_EXIT_SELECTOR,
+        ] {
+            for base in [
+                AARCH64_SELECTOR_BASE,
+                RISCV64_SELECTOR_BASE,
+                X86_64_SELECTOR_BASE,
+            ] {
+                assert_eq!(
+                    ipc_reply_liveness_scenario_for_base(base, s),
+                    None,
+                    "exit selector {s} must not decode as an IPC liveness scenario"
+                );
+            }
+        }
+        // …and the IPC oracle never consults the exit ABI.
+        let oracle = INIT_SRC
+            .split("mod ipc_reply_timeout_oracle {")
+            .nth(1)
+            .expect("ipc oracle module");
+        let oracle = oracle.split("\n    }\n}").next().unwrap();
+        assert!(!oracle.contains("exit_current_task_abi"));
+        // The kernel's IPC selector helper likewise uses only the liveness ABI.
+        let helper = MOD_SRC
+            .split("pub fn ipc_reply_timeout_selector() -> Option<u64> {")
+            .nth(1)
+            .expect("selector helper");
+        let helper = helper.split("\n}").next().unwrap();
+        assert!(helper.contains("ipc_reply_liveness_abi"));
+        assert!(!helper.contains("exit_current_task_abi"));
+    }
+
+    /// The third scenario is wired end to end in the kernel: a mode constant, a typed
+    /// scenario arm and the shared encoder — not just an enum variant.
+    #[test]
+    fn b06_server_dies_mode_is_wired_in_the_kernel() {
+        assert!(MOD_SRC.contains("pub const IPC_REPLY_TIMEOUT_MODE_SERVER_DIES: u8 = 3;"));
+        assert!(MOD_SRC.contains("IPC_REPLY_TIMEOUT_MODE_SERVER_DIES => Some(S::ServerDies),"));
+        // Userspace has the matching predicate, decoded through the shared helper.
+        assert!(INIT_SRC.contains("pub(super) fn is_server_dies() -> bool {"));
+        assert!(INIT_SRC.contains("Some(IpcReplyLivenessScenario::ServerDies)"));
     }
 }
