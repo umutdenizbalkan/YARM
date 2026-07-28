@@ -3960,6 +3960,225 @@ pub(crate) fn server_dies_stale_token() -> Option<(usize, u64, u64, u16)> {
     (slot.1 != 0).then_some(*slot)
 }
 
+// ── Stage 200D-2B1B-i: exact ServerDies transition counters ─────────────────────────
+//
+// Nine counters, each incremented BY the real production operation rather than inferred
+// from a nearby marker. They observe; they never gate, order or decide anything, and no
+// production lock exists for their sake — each is a relaxed atomic add on a path that has
+// already committed its transition.
+//
+// A monotonic SEQ stamps every increment, which is what makes ordering PROVABLE rather
+// than assumed: `result_publications` must carry a strictly smaller stamp than
+// `caller_enqueues`, so a reordering shows up as a stamp inversion even if both counters
+// reach 1. Every class also fails closed on a second increment, because for one armed
+// ServerDies instance each transition happens exactly once.
+//
+// Feature-gated in full. With `ipc-reply-timeout-oracle-core` off, every entry point below
+// is absent and the production sites call nothing.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub mod server_dies_counters {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    /// The nine transition classes, in the order the successful path must visit them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Transition {
+        LinkCreated = 0,
+        LinkDetached = 1,
+        DeferredReserved = 2,
+        DeferredPublished = 3,
+        DeferredConsumed = 4,
+        PeerDeathWinner = 5,
+        ResultPublication = 6,
+        RunnableTransition = 7,
+        CallerEnqueue = 8,
+    }
+
+    pub const CLASSES: usize = 9;
+
+    impl Transition {
+        #[must_use]
+        pub const fn name(self) -> &'static str {
+            match self {
+                Self::LinkCreated => "links_created",
+                Self::LinkDetached => "links_detached",
+                Self::DeferredReserved => "deferred_reserved",
+                Self::DeferredPublished => "deferred_published",
+                Self::DeferredConsumed => "deferred_consumed",
+                Self::PeerDeathWinner => "peer_death_winners",
+                Self::ResultPublication => "result_publications",
+                Self::RunnableTransition => "runnable_transitions",
+                Self::CallerEnqueue => "caller_enqueues",
+            }
+        }
+    }
+
+    static COUNTS: [AtomicU32; CLASSES] = [const { AtomicU32::new(0) }; CLASSES];
+    static STAMPS: [AtomicU64; CLASSES] = [const { AtomicU64::new(0) }; CLASSES];
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    /// Instance id: bumped by `reset_instance`, so one armed oracle (or one hosted test)
+    /// can never inherit another's counts.
+    static INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+    /// Begin a fresh instance. Deterministic: every class returns to zero and the stamp
+    /// clock restarts, so a test observes only its own transitions.
+    pub fn reset_instance() -> u64 {
+        for i in 0..CLASSES {
+            COUNTS[i].store(0, Ordering::Release);
+            STAMPS[i].store(0, Ordering::Release);
+        }
+        SEQ.store(0, Ordering::Release);
+        INSTANCE.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    #[must_use]
+    pub fn instance() -> u64 {
+        INSTANCE.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn count(t: Transition) -> u32 {
+        COUNTS[t as usize].load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn stamp(t: Transition) -> u64 {
+        STAMPS[t as usize].load(Ordering::Acquire)
+    }
+
+    /// The full nine-element vector, for exact assertions.
+    #[must_use]
+    pub fn vector() -> [u32; CLASSES] {
+        let mut v = [0u32; CLASSES];
+        for i in 0..CLASSES {
+            v[i] = COUNTS[i].load(Ordering::Acquire);
+        }
+        v
+    }
+
+    /// Record one real transition. Called FROM the production operation that performed it.
+    ///
+    /// A second increment for the same class in one instance is a defect, not a tolerated
+    /// duplicate: it emits the class's canonical hard-fail literal and the count is left
+    /// visibly >1 so an assertion cannot miss it.
+    pub fn record(t: Transition) {
+        let idx = t as usize;
+        let seq = SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+        let prev = COUNTS[idx].fetch_add(1, Ordering::AcqRel);
+        STAMPS[idx].store(seq, Ordering::Release);
+        if prev != 0 {
+            match t {
+                Transition::DeferredPublished => crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DUPLICATE_DEFERRED class={} count={} result=fail",
+                    t.name(),
+                    prev + 1
+                ),
+                Transition::PeerDeathWinner | Transition::ResultPublication => {
+                    crate::yarm_log!(
+                        "IPC_SERVER_DEATH_DUPLICATE_COMPLETION class={} count={} result=fail",
+                        t.name(),
+                        prev + 1
+                    )
+                }
+                Transition::RunnableTransition | Transition::CallerEnqueue => crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DUPLICATE_WAKE class={} count={} result=fail",
+                    t.name(),
+                    prev + 1
+                ),
+                _ => crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DUPLICATE_TRANSITION class={} count={} result=fail",
+                    t.name(),
+                    prev + 1
+                ),
+            }
+        }
+    }
+
+    /// `true` when the result publication is stamped strictly before the caller enqueue.
+    /// Both must have happened; a missing stamp is never "in order".
+    #[must_use]
+    pub fn result_before_enqueue() -> bool {
+        let r = stamp(Transition::ResultPublication);
+        let e = stamp(Transition::CallerEnqueue);
+        r != 0 && e != 0 && r < e
+    }
+
+    /// Audit the instance against the successful-path contract and emit the canonical
+    /// hard-fail literal for whichever invariant broke. Returns `true` when every class is
+    /// exactly 1 and the publication/enqueue order holds.
+    ///
+    /// The leak literals are derived from COUNT RELATIONSHIPS, not from a separate scan:
+    /// a link created but never detached IS a link leak, and a deferred item published but
+    /// never consumed IS a deferred leak.
+    #[must_use]
+    pub fn audit_success_path() -> bool {
+        use Transition as T;
+        let mut ok = true;
+        if count(T::LinkCreated) != count(T::LinkDetached) {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_LINK_LEAK created={} detached={} result=fail",
+                count(T::LinkCreated),
+                count(T::LinkDetached)
+            );
+            ok = false;
+        }
+        if count(T::DeferredPublished) != count(T::DeferredConsumed) {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_DEFERRED_LEAK published={} consumed={} result=fail",
+                count(T::DeferredPublished),
+                count(T::DeferredConsumed)
+            );
+            ok = false;
+        }
+        if count(T::DeferredReserved) < count(T::DeferredPublished) {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_DEFERRED_LEAK reserved={} published={} reason=publish_without_reserve result=fail",
+                count(T::DeferredReserved),
+                count(T::DeferredPublished)
+            );
+            ok = false;
+        }
+        // A detached link whose record never reached a terminal winner leaves the reply
+        // record owner-less — that is the record leak this literal names.
+        if count(T::LinkDetached) != count(T::PeerDeathWinner) {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_RECORD_LEAK detached={} peer_death_winners={} result=fail",
+                count(T::LinkDetached),
+                count(T::PeerDeathWinner)
+            );
+            ok = false;
+        }
+        for t in [
+            T::LinkCreated,
+            T::LinkDetached,
+            T::DeferredReserved,
+            T::DeferredPublished,
+            T::DeferredConsumed,
+            T::PeerDeathWinner,
+            T::ResultPublication,
+            T::RunnableTransition,
+            T::CallerEnqueue,
+        ] {
+            if count(t) != 1 {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_TRANSITION_COUNT class={} count={} expected=1 result=fail",
+                    t.name(),
+                    count(t)
+                );
+                ok = false;
+            }
+        }
+        if !result_before_enqueue() {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_DUPLICATE_WAKE reason=result_not_before_enqueue result_stamp={} enqueue_stamp={} result=fail",
+                stamp(T::ResultPublication),
+                stamp(T::CallerEnqueue)
+            );
+            ok = false;
+        }
+        ok
+    }
+}
+
 /// One-shot latch so the stale-token scan attests exactly once.
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static SERVER_DIES_STALE_SCAN_DONE: core::sync::atomic::AtomicBool =
@@ -4097,6 +4316,10 @@ pub(crate) fn server_death_work_reserve(cpu_idx: usize) -> Option<ServerDeathWor
         reply_record_index: usize::MAX,
         reply_record_generation: 0,
     });
+    // Stage 200D-2B1B-i (class 3): a slot was really taken. Recorded here and NOT at the
+    // call site, so a reservation that fails (queue full) records nothing.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    server_dies_counters::record(server_dies_counters::Transition::DeferredReserved);
     Some(ServerDeathWorkReservation { cpu_idx, slot })
 }
 
@@ -4123,6 +4346,10 @@ pub(crate) fn server_death_work_publish(
     }
     q[reservation.slot] = Some(work);
     SERVER_DEATH_WORK_PUBLISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Stage 200D-2B1B-i (class 4): the item is now queued. The duplicate branch above
+    // returned early, so a collapsed duplicate never reaches this counter.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    server_dies_counters::record(server_dies_counters::Transition::DeferredPublished);
     true
 }
 
@@ -4146,6 +4373,10 @@ pub(crate) fn server_death_work_drain_next(
     let taken = q[idx].take();
     if taken.is_some() {
         SERVER_DEATH_WORK_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Stage 200D-2B1B-i (class 5): one item left the queue. A second drain of the same
+        // record finds nothing here, so consumption cannot be double-counted.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        server_dies_counters::record(server_dies_counters::Transition::DeferredConsumed);
     }
     taken
 }

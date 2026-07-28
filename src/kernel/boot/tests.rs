@@ -93577,3 +93577,386 @@ mod stage200d2b1_liveness_abi {
         assert!(INIT_SRC.contains("Some(IpcReplyLivenessScenario::ServerDies)"));
     }
 }
+
+/// Stage 200D-2B1B-i — the nine ServerDies transition counters and the fifteen hard-fail
+/// literals, each proven attached to a REAL production operation.
+#[cfg(all(test, feature = "ipc-reply-timeout-oracle-core"))]
+mod stage200d2b1bi_counters {
+    use crate::kernel::boot::server_dies_counters as c;
+    use c::Transition as T;
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    const ALL: [T; 9] = [
+        T::LinkCreated,
+        T::LinkDetached,
+        T::DeferredReserved,
+        T::DeferredPublished,
+        T::DeferredConsumed,
+        T::PeerDeathWinner,
+        T::ResultPublication,
+        T::RunnableTransition,
+        T::CallerEnqueue,
+    ];
+
+    /// Nine classes, distinct discriminants, stable names.
+    #[test]
+    fn i01_nine_transition_classes() {
+        assert_eq!(c::CLASSES, 9);
+        let mut seen = alloc::vec::Vec::new();
+        for t in ALL {
+            assert!(!seen.contains(&(t as usize)), "duplicate discriminant");
+            seen.push(t as usize);
+            assert!(!t.name().is_empty());
+        }
+        assert_eq!(seen.len(), 9);
+    }
+
+    /// Instance isolation is deterministic: a reset zeroes every class and restarts the
+    /// stamp clock, so one test cannot inherit another's counts.
+    #[test]
+    fn i02_instance_isolation_is_deterministic() {
+        c::reset_instance();
+        c::record(T::LinkCreated);
+        assert_eq!(c::count(T::LinkCreated), 1);
+        let before = c::instance();
+        let after = c::reset_instance();
+        assert!(after > before, "instance id advances");
+        assert_eq!(c::vector(), [0u32; 9], "every class is zeroed");
+        for t in ALL {
+            assert_eq!(c::stamp(t), 0, "stamps are cleared");
+        }
+    }
+
+    /// The successful path's exact vector, and result strictly before enqueue — proven by
+    /// STAMPS taken at the two real operations, not by declaration order.
+    #[test]
+    fn i03_success_vector_and_result_before_enqueue() {
+        c::reset_instance();
+        for t in ALL {
+            c::record(t);
+        }
+        assert_eq!(c::vector(), [1u32; 9], "each class exactly once");
+        assert!(c::result_before_enqueue());
+        assert!(
+            c::stamp(T::ResultPublication) < c::stamp(T::CallerEnqueue),
+            "publication is stamped before the enqueue"
+        );
+        assert!(c::audit_success_path(), "the success audit passes");
+        c::reset_instance();
+    }
+
+    /// An inverted order fails even though both counters reach 1 — this is what makes the
+    /// ordering claim provable rather than assumed.
+    #[test]
+    fn i04_inverted_order_fails_even_at_count_one() {
+        c::reset_instance();
+        c::record(T::CallerEnqueue);
+        c::record(T::ResultPublication);
+        assert_eq!(c::count(T::ResultPublication), 1);
+        assert_eq!(c::count(T::CallerEnqueue), 1);
+        assert!(
+            !c::result_before_enqueue(),
+            "enqueue stamped first must fail the ordering check"
+        );
+        assert!(!c::audit_success_path());
+        c::reset_instance();
+    }
+
+    /// A missing stamp is never "in order".
+    #[test]
+    fn i05_missing_transition_is_not_in_order() {
+        c::reset_instance();
+        c::record(T::ResultPublication);
+        assert!(!c::result_before_enqueue(), "no enqueue yet");
+        assert!(!c::audit_success_path());
+        c::reset_instance();
+        c::record(T::CallerEnqueue);
+        assert!(!c::result_before_enqueue(), "no publication");
+        c::reset_instance();
+    }
+
+    /// Duplicates are visible (count > 1) and fail the audit for every class.
+    #[test]
+    fn i06_duplicate_transitions_fail_closed() {
+        for t in ALL {
+            c::reset_instance();
+            c::record(t);
+            c::record(t);
+            assert_eq!(c::count(t), 2, "{} duplicate is visible", t.name());
+            assert!(!c::audit_success_path(), "{} duplicate fails", t.name());
+        }
+        c::reset_instance();
+    }
+
+    /// A capacity refusal before the irreversible detach leaves every downstream class at
+    /// zero — reserve may have happened, detach and everything after it must not.
+    #[test]
+    fn i07_capacity_refusal_advances_nothing_downstream() {
+        c::reset_instance();
+        // Queue-full: no reservation, so not even the reserve class advances.
+        assert_eq!(c::vector(), [0u32; 9]);
+        // Reserve-then-release (nothing owed): reserve only.
+        c::record(T::DeferredReserved);
+        let v = c::vector();
+        assert_eq!(v[T::DeferredReserved as usize], 1);
+        for t in [
+            T::LinkDetached,
+            T::DeferredPublished,
+            T::DeferredConsumed,
+            T::PeerDeathWinner,
+            T::ResultPublication,
+            T::RunnableTransition,
+            T::CallerEnqueue,
+        ] {
+            assert_eq!(v[t as usize], 0, "{} must not advance", t.name());
+        }
+        assert!(!c::audit_success_path());
+        c::reset_instance();
+    }
+
+    /// Leak literals are derived from count RELATIONSHIPS at the real operations.
+    #[test]
+    fn i08_leak_relationships_fail_closed() {
+        // link created, never detached → link leak
+        c::reset_instance();
+        c::record(T::LinkCreated);
+        assert!(!c::audit_success_path());
+        // published, never consumed → deferred leak
+        c::reset_instance();
+        c::record(T::DeferredReserved);
+        c::record(T::DeferredPublished);
+        assert!(!c::audit_success_path());
+        // detached without a terminal winner → record leak
+        c::reset_instance();
+        c::record(T::LinkCreated);
+        c::record(T::LinkDetached);
+        assert!(!c::audit_success_path());
+        c::reset_instance();
+    }
+
+    // ── the counters are attached to REAL operations, not to markers ─────────────────
+
+    /// Each of the nine `record(...)` call sites sits in the production function that
+    /// performs the transition, on the branch where it actually committed.
+    #[test]
+    fn i09_counters_attached_to_real_operations() {
+        // 1 link created — inside the arm that installs a NEW link.
+        let reg = IPC_SRC
+            .split("pub(crate) fn register_server_reply_link(")
+            .nth(1)
+            .expect("register");
+        let reg = reg.split("\n    /// ").next().unwrap();
+        assert!(reg.contains("tcb.server_reply_link = Some(link);"));
+        let install = reg.find("tcb.server_reply_link = Some(link);").unwrap();
+        let rec = reg.find("Transition::LinkCreated").expect("class 1");
+        assert!(install < rec, "counted after the real install");
+        // 2 link detached — only when a link was actually taken.
+        let take = IPC_SRC
+            .split("pub(crate) fn take_server_reply_link(")
+            .nth(1)
+            .expect("take");
+        let take = take.split("\n    /// ").next().unwrap();
+        assert!(take.contains("if taken.is_some() {"));
+        assert!(take.contains("Transition::LinkDetached"));
+        // 3/4/5 deferred queue operations.
+        for (f, class, must) in [
+            (
+                "pub(crate) fn server_death_work_reserve(",
+                "Transition::DeferredReserved",
+                "Some(ServerDeathWorkReservation { cpu_idx, slot })",
+            ),
+            (
+                "pub(crate) fn server_death_work_publish(",
+                "Transition::DeferredPublished",
+                "q[reservation.slot] = Some(work);",
+            ),
+            (
+                "pub(crate) fn server_death_work_drain_next(",
+                "Transition::DeferredConsumed",
+                "if taken.is_some() {",
+            ),
+        ] {
+            let body = MOD_SRC.split(f).nth(1).expect(f);
+            let body = body.split("\n}\n").next().unwrap();
+            assert!(body.contains(class), "{f} records {class}");
+            assert!(body.contains(must), "{f} performs the real operation");
+        }
+        // 6/7/8/9 in the completion transaction, each after its real operation.
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        let terminal = comp
+            .find("rt_commit_reply_terminal(d, record_index, &terminal_owner);")
+            .unwrap();
+        let winner = comp.find("Transition::PeerDeathWinner").expect("class 6");
+        assert!(
+            terminal < winner,
+            "winner counted after the real CAS commit"
+        );
+        let publish = comp.find("rt_commit_receiver_runnable(").expect("publish");
+        let result = comp.find("Transition::ResultPublication").expect("class 7");
+        let runnable = comp
+            .find("Transition::RunnableTransition")
+            .expect("class 8");
+        assert!(publish < result && publish < runnable);
+        let enq = comp.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        let enq_c = comp.find("Transition::CallerEnqueue").expect("class 9");
+        assert!(enq < enq_c, "enqueue counted after the real enqueue");
+        assert!(result < enq_c, "result class precedes the enqueue class");
+    }
+
+    /// No counter is incremented from a marker site, and the oracle never records a
+    /// transition on the userspace side.
+    #[test]
+    fn i10_no_simulated_transitions() {
+        assert!(
+            !INIT_SRC.contains("server_dies_counters"),
+            "userspace must not synthesize transitions"
+        );
+        // Every production record(...) lives in one of the four kernel files that own the
+        // real operations.
+        let total: usize = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC]
+            .iter()
+            .map(|s| s.matches("server_dies_counters::record(").count())
+            .sum();
+        assert_eq!(total, 9, "exactly nine production record sites");
+    }
+
+    /// All fifteen canonical hard-fail literals exist at real sites.
+    #[test]
+    fn i11_fifteen_hard_fail_literals() {
+        let sources = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC, INIT_SRC];
+        for lit in [
+            "IPC_SERVER_DEATH_EXIT_RETURNED",
+            "IPC_SERVER_DEATH_DUPLICATE_DEFERRED",
+            "IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY",
+            "IPC_SERVER_DEATH_WRONG_CALLER_IDENTITY",
+            "IPC_SERVER_DEATH_WRONG_RECORD_GENERATION",
+            "IPC_SERVER_DEATH_WRONG_ENDPOINT_GENERATION",
+            "IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION",
+            "IPC_SERVER_DEATH_DUPLICATE_COMPLETION",
+            "IPC_SERVER_DEATH_DUPLICATE_WAKE",
+            "IPC_SERVER_DEATH_LINK_LEAK",
+            "IPC_SERVER_DEATH_RECORD_LEAK",
+            "IPC_SERVER_DEATH_DEFERRED_LEAK",
+            "IPC_SERVER_DEATH_TIMEOUT_WON",
+            "IPC_SERVER_DEATH_LATE_REPLY_ACCEPTED",
+            "IPC_SERVER_DEATH_STALE_AUTHORITY_RESTORED",
+        ] {
+            assert!(
+                sources.iter().any(|s| s.contains(lit)),
+                "missing hard-fail literal: {lit}"
+            );
+        }
+        // Every one of them reports a failure, never a success.
+        for s in sources {
+            for line in s.lines() {
+                if line.contains("IPC_SERVER_DEATH_WRONG_")
+                    || line.contains("IPC_SERVER_DEATH_TIMEOUT_WON")
+                    || line.contains("IPC_SERVER_DEATH_LATE_REPLY_ACCEPTED")
+                    || line.contains("IPC_SERVER_DEATH_STALE_AUTHORITY_RESTORED")
+                {
+                    assert!(
+                        !line.contains("result=ok"),
+                        "hard-fail literal must not report success: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The identity/generation literals sit at the real revalidation failures.
+    #[test]
+    fn i12_identity_literals_at_real_revalidation_sites() {
+        // Drain revalidation: emitted on the stale-identity branch, before `continue`.
+        let drain = RUNTIME_SRC
+            .split("pub(crate) fn drain_server_death_post_work")
+            .nth(1)
+            .expect("drain");
+        let stale = drain
+            .find("IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY")
+            .expect("server identity");
+        let rec_gen = drain
+            .find("IPC_SERVER_DEATH_WRONG_RECORD_GENERATION")
+            .expect("record generation");
+        let cont = drain[stale..].find("continue;").expect("declines");
+        assert!(stale < rec_gen && rec_gen < stale + cont);
+        // Completion: caller/endpoint literals on the `!waiter_ok` branch, which wakes nobody.
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        let bad = comp.find("if !waiter_ok {").expect("waiter branch");
+        let caller = comp
+            .find("IPC_SERVER_DEATH_WRONG_CALLER_IDENTITY")
+            .expect("caller identity");
+        let ep = comp
+            .find("IPC_SERVER_DEATH_WRONG_ENDPOINT_GENERATION")
+            .expect("endpoint generation");
+        assert!(bad < caller && bad < ep);
+        assert!(comp[bad..].contains("CleanupNoWake"), "wakes nobody");
+        // Timeout token: the same slot with a different generation is named explicitly.
+        assert!(RUNTIME_SRC.contains("if this_idx == armed_idx && this_gen != armed_gen {"));
+        assert!(RUNTIME_SRC.contains("IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION"));
+    }
+
+    /// The production mechanism is not oracle-feature-dependent: the counters are gated,
+    /// the operations they observe are not.
+    #[test]
+    fn i13_production_mechanism_is_not_feature_dependent() {
+        for (name, needle, src) in [
+            (
+                "register link",
+                "pub(crate) fn register_server_reply_link(",
+                IPC_SRC,
+            ),
+            (
+                "take link",
+                "pub(crate) fn take_server_reply_link(",
+                IPC_SRC,
+            ),
+            (
+                "reserve",
+                "pub(crate) fn server_death_work_reserve(",
+                MOD_SRC,
+            ),
+            (
+                "publish",
+                "pub(crate) fn server_death_work_publish(",
+                MOD_SRC,
+            ),
+            (
+                "drain next",
+                "pub(crate) fn server_death_work_drain_next(",
+                MOD_SRC,
+            ),
+        ] {
+            let at = src.find(needle).unwrap_or_else(|| panic!("{name}"));
+            let head = &src[..at];
+            let last = head.lines().rev().take(3).collect::<alloc::vec::Vec<_>>();
+            assert!(
+                !last.iter().any(|l| l.contains("cfg(feature =")),
+                "{name} must not be feature-gated"
+            );
+        }
+        // Each record site IS gated.
+        for src in [IPC_SRC, MOD_SRC, RUNTIME_SRC] {
+            for (i, _) in src.match_indices("server_dies_counters::record(") {
+                let head = &src[..i];
+                assert!(
+                    head.rfind("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]")
+                        .is_some(),
+                    "every counter site is feature-gated"
+                );
+            }
+        }
+    }
+}

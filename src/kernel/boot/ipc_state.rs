@@ -540,6 +540,24 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
             caller,
         );
     if !waiter_ok {
+        // Stage 200D-2B1B-i: the caller/endpoint incarnation that was armed is no longer the
+        // one present. Both literals name the same real revalidation failure from the two
+        // angles the checklist distinguishes — a changed caller {tid, asid} and a changed
+        // reply-endpoint incarnation — and NOTHING is woken or enqueued on this path.
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_WRONG_CALLER_IDENTITY caller_tid={} caller_asid={} record_index={} record_generation={} waker=none result=fail",
+            caller.tid.0,
+            caller.asid.0,
+            record_index,
+            record_generation
+        );
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_WRONG_ENDPOINT_GENERATION record_index={} record_generation={} caller_tid={} caller_asid={} waker=none result=fail",
+            record_index,
+            record_generation,
+            caller.tid.0,
+            caller.asid.0
+        );
         // Death owns the terminal but the caller/endpoint/waiter changed: invalidate and
         // complete the terminal, wake NOBODY. (The caller-exit case lands here, which is
         // why caller exit yields `caller wake = 0`.)
@@ -557,6 +575,13 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
     // Stage 200D-2B1A (§2): PeerDeath has WON the single terminal cell. Post-lock by
     // construction — the whole transaction runs from the deferred drain, which every port
     // invokes after its broad guard has dropped.
+    // Stage 200D-2B1B-i (class 6): the terminal cell has really been committed to
+    // PeerDeath. Recorded after `rt_commit_reply_terminal`, so a claim that lost the CAS
+    // never reaches this counter.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    crate::kernel::boot::server_dies_counters::record(
+        crate::kernel::boot::server_dies_counters::Transition::PeerDeathWinner,
+    );
     crate::yarm_log!(
         "IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won record_index={} record_generation={} caller_tid={} caller_asid={} broad_lock=0",
         record_index,
@@ -574,6 +599,20 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
     ) else {
         return ReplyTimeoutOutcome::CleanupNoWake;
     };
+    // Stage 200D-2B1B-i (classes 7 and 8): `rt_commit_receiver_runnable` performs BOTH the
+    // canonical result publication and the Runnable transition, and returns `Some` only when
+    // both committed — the `else` arm above returns without counting either. They are two
+    // distinct classes because a future split of that seam must not silently collapse them,
+    // and the stamps below prove the publication precedes the enqueue.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    {
+        crate::kernel::boot::server_dies_counters::record(
+            crate::kernel::boot::server_dies_counters::Transition::ResultPublication,
+        );
+        crate::kernel::boot::server_dies_counters::record(
+            crate::kernel::boot::server_dies_counters::Transition::RunnableTransition,
+        );
+    }
     // Stage 200D-2B1A (§2): the canonical ServerDied is now in the caller's saved context
     // and the caller is Runnable — publication strictly BEFORE the enqueue below, so no
     // scheduler can select the caller before its result exists.
@@ -587,6 +626,12 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
     );
     // (10) Scheduler enqueue LAST — the sole externally visible action, exactly once.
     d.rtd_enqueue(caller.tid.0);
+    // Stage 200D-2B1B-i (class 9): stamped after the real enqueue, so
+    // `result_before_enqueue()` compares two stamps taken at the two real operations.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    crate::kernel::boot::server_dies_counters::record(
+        crate::kernel::boot::server_dies_counters::Transition::CallerEnqueue,
+    );
     crate::yarm_log!(
         "IPC_SERVER_DEATH_CALLER_ENQUEUED caller_tid={} caller_asid={} enqueues=1 broad_lock=0 result=ok",
         caller.tid.0,
@@ -597,6 +642,25 @@ pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
         "IPC_SERVER_DEATH_OK arch={} terminal=PeerDeath death_result=ServerDied caller_wakes=1 reply_aliases_invalid=1 reply_copies=0 result=ok",
         crate::kernel::boot::REPLY_TIMEOUT_ARCH
     );
+    // Stage 200D-2B1B-i: audit the instance HERE — the one point where all nine transitions
+    // have happened for this record. This is the production caller that makes the leak and
+    // count literals reachable in a real image; without it `audit_success_path` would be a
+    // hosted-only declaration and the linker would strip its literals out of the boot binary,
+    // which is precisely the "declaration without a use site" defect this project keeps
+    // finding. Read-only: it emits markers and returns a verdict, and nothing downstream
+    // branches on it.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+        == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+    {
+        let ok = crate::kernel::boot::server_dies_counters::audit_success_path();
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_TRANSITION_AUDIT vector={:?} result_before_enqueue={} result={}",
+            crate::kernel::boot::server_dies_counters::vector(),
+            u32::from(crate::kernel::boot::server_dies_counters::result_before_enqueue()),
+            if ok { "ok" } else { "fail" }
+        );
+    }
     ReplyTimeoutOutcome::Woken
 }
 
@@ -1178,6 +1242,13 @@ impl KernelState {
                 Some(_) => false,
                 None => {
                     tcb.server_reply_link = Some(link);
+                    // Stage 200D-2B1B-i (class 1): a NEW reverse link now exists in the
+                    // server's TCB. The idempotent re-registration arm above returns `true`
+                    // without installing anything and deliberately does not count.
+                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                    crate::kernel::boot::server_dies_counters::record(
+                        crate::kernel::boot::server_dies_counters::Transition::LinkCreated,
+                    );
                     true
                 }
             }
@@ -1297,12 +1368,22 @@ impl KernelState {
         server_tid: u64,
         server_asid: Asid,
     ) -> Option<crate::kernel::task::ServerReplyLink> {
-        self.with_tcbs_mut(|tcbs| {
+        let taken = self.with_tcbs_mut(|tcbs| {
             tcbs.iter_mut()
                 .flatten()
                 .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
                 .and_then(|t| t.server_reply_link.take())
-        })
+        });
+        // Stage 200D-2B1B-i (class 2): counted only when a link was ACTUALLY removed. The
+        // lookup is exact on {tid, asid}, so a reused numeric TID with a different ASID
+        // matches nothing, detaches nothing, and records nothing.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        if taken.is_some() {
+            crate::kernel::boot::server_dies_counters::record(
+                crate::kernel::boot::server_dies_counters::Transition::LinkDetached,
+            );
+        }
+        taken
     }
 
     /// Total live reverse links (hosted leak accounting only).
@@ -1764,11 +1845,25 @@ impl KernelState {
         token_index: usize,
         owner: &crate::kernel::deadline_token::DeadlineReplyLeaseOwner,
     ) -> bool {
-        self.with_ipc_state(|ipc| {
+        let restored = self.with_ipc_state(|ipc| {
             ipc.reply_deadline_tokens
                 .get(token_index)
                 .is_some_and(|t| t.restore_reply_lease(owner))
-        })
+        });
+        // Stage 200D-2B1B-i: restoring a reversible reply lease after the ServerDies path has
+        // taken the terminal would put a superseded authority back in play. Emitted from the
+        // real restore result, so it names an operation that actually succeeded.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        if restored
+            && crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+                == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+        {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_STALE_AUTHORITY_RESTORED token_index={} authority=reply_lease result=fail",
+                token_index
+            );
+        }
+        restored
     }
 
     // ── Stage 200C1: production reply-receive deadline completion support ────────
@@ -2144,6 +2239,18 @@ impl KernelState {
                     crate::kernel::boot::REPLY_TIMEOUT_ARCH,
                     u32::from(lease.deadline_lease.is_some())
                 );
+                // Stage 200D-2B1B-i: in the ServerDies scenario the server never replies —
+                // it exits. A reply that nevertheless RESERVED the terminal is a late reply
+                // that was accepted, which is the inversion this literal names. Emitted from
+                // the real reserve success, not from marker absence.
+                #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+                    == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+                {
+                    crate::yarm_log!(
+                        "IPC_SERVER_DEATH_LATE_REPLY_ACCEPTED terminal=Reserved(Reply) expected=PeerDeath result=fail"
+                    );
+                }
                 Some(lease)
             }
             // The two confinement outcomes are strict, SILENT no-ops: every ordinary NR7

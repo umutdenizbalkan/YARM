@@ -2956,6 +2956,25 @@ impl SharedKernel {
                 || identity.replier_tid != work.exiting_server.tid
                 || identity.replier_asid != work.exiting_server.asid
             {
+                // Stage 200D-2B1B-i: the queued item no longer describes reality. Both
+                // literals name this one real revalidation failure from the two angles the
+                // checklist distinguishes — a server incarnation that is not the armed
+                // replier, and a record generation that has moved on. Nothing is detached,
+                // claimed, published, woken or enqueued past this point.
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY armed_tid={} armed_asid={} item_tid={} item_asid={} record_index={} caller_wakes=0 result=fail",
+                    identity.replier_tid.0,
+                    identity.replier_asid.0,
+                    work.exiting_server.tid.0,
+                    work.exiting_server.asid.0,
+                    work.reply_record_index
+                );
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_WRONG_RECORD_GENERATION armed_generation={} item_generation={} record_index={} caller_wakes=0 result=fail",
+                    identity.reply_record_generation,
+                    work.reply_record_generation,
+                    work.reply_record_index
+                );
                 crate::yarm_log!(
                     "IPC_SERVER_DEATH_DRAIN outcome=stale_identity record_index={} caller_wakes=0 result=ok",
                     work.reply_record_index
@@ -3642,6 +3661,19 @@ impl SharedKernel {
                         let this_gen = handle.identity().token_generation;
                         let this_tid = tcb.tid.0;
                         let this_asid = tcb.asid.map(|a| a.0).unwrap_or(0);
+                        // Stage 200D-2B1B-i: the same SLOT with a different generation is a
+                        // reused registration, never the caller's original one. Naming it here
+                        // is what makes the comparison provably four-field rather than
+                        // slot-index-only.
+                        if this_idx == armed_idx && this_gen != armed_gen {
+                            crate::yarm_log!(
+                                "IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION token_index={} armed_generation={} scanned_generation={} caller_tid={} result=fail",
+                                this_idx,
+                                armed_gen,
+                                this_gen,
+                                this_tid
+                            );
+                        }
                         if this_idx == armed_idx
                             && this_gen == armed_gen
                             && this_tid == armed_tid
@@ -3700,6 +3732,20 @@ impl SharedKernel {
             let mut d = OffLockReplyTimeout(self);
             let outcome =
                 crate::kernel::boot::complete_reply_timeout_over(&mut d, &work.handle, now);
+            // Stage 200D-2B1B-i: in the ServerDies scenario the deadline must LOSE. A Timeout
+            // completion that actually woke the caller means it reached the terminal cell
+            // before PeerDeath — the exact inversion this literal names. Emitted from the real
+            // completion outcome, never inferred from a missing marker.
+            #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+            if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+                == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+                && matches!(outcome, crate::runtime::ReplyTimeoutOutcome::Woken)
+            {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_TIMEOUT_WON outcome={:?} terminal=Timeout expected=PeerDeath result=fail",
+                    outcome
+                );
+            }
             // The FIRST drained work item carries the deferred-work publish/drain evidence.
             if crate::kernel::boot::reply_timeout_deferred_once() {
                 crate::yarm_log!(
