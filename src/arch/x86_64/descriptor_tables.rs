@@ -1318,25 +1318,69 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // decision here, with the broad guard dropped and every drain complete, but BEFORE any
         // frame is committed. Only an `idle` owner is revalidated: a prepared replacement was
         // chosen from live state and the drains cannot invalidate it, so it is never displaced.
-        let revalidated_owner = if matches!(exiting_tid, None | Some(0)) {
+        let revalidation = if matches!(exiting_tid, None | Some(0)) {
             #[cfg(not(feature = "hosted-dev"))]
             {
                 shared.revalidate_idle_owner_after_drains(cpu, &mut trap_frame)
             }
             #[cfg(feature = "hosted-dev")]
             {
-                None
+                crate::runtime::OwnerRevalidation::Idle
             }
         } else {
-            None
+            crate::runtime::OwnerRevalidation::Idle
         };
-        if let Some(next) = revalidated_owner {
-            crate::yarm_log!(
-                "EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu={} prepared=idle committed=replacement next_tid={} advances=1 broad_lock=0 result=ok",
-                cpu.0,
-                next
-            );
-        }
+        // Stage 200D-2B1D5B: the restore-failure contract. The disposition is a pure function of
+        // the outcome (`OwnerRevalidation::disposition`), so the fail-closed rule is one testable
+        // rule rather than the incidental shape of this match.
+        let revalidated_owner = match revalidation.disposition() {
+            crate::runtime::OwnerCommit::Replacement(next) => {
+                crate::yarm_log!(
+                    "EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu={} prepared=idle committed=replacement next_tid={} advances=1 broad_lock=0 result=ok",
+                    cpu.0,
+                    next
+                );
+                Some(next)
+            }
+            crate::runtime::OwnerCommit::Idle => {
+                if let crate::runtime::OwnerRevalidation::RestoreFailed { tid, .. } = revalidation {
+                    // The advance was undone: nothing is current on this CPU and `tid` is back
+                    // on its run queue (or gone with its TCB), so the idle path below is safe.
+                    crate::yarm_log!(
+                        "EXIT_TASK_OWNER_REVALIDATE_ROLLBACK arch=x86_64 cpu={} tid={} advances=0 committed=idle broad_lock=0 result=ok",
+                        cpu.0,
+                        tid
+                    );
+                }
+                None
+            }
+            crate::runtime::OwnerCommit::FailClosed(tid) => {
+                // A replacement is still this CPU's `current` with no restorable context and the
+                // rollback did not complete. Halting here through the idle path would strand it
+                // exactly as Stage 200D-2B1D4 stranded its caller, and committing the frame would
+                // iret into the PREVIOUS task's context. Fail closed through the SAME fatal path
+                // the trap-dispatch error above uses — no new policy, no silent continue.
+                crate::pr_err!(
+                    "x86 owner revalidation rollback failed: cpu={} tid={} vector={}",
+                    cpu.0,
+                    tid,
+                    vector
+                );
+                crate::yarm_log!(
+                    "EXIT_TASK_OWNER_REVALIDATE_ROLLBACK arch=x86_64 cpu={} tid={} advances=1 committed=stranded broad_lock=0 result=fail",
+                    cpu.0,
+                    tid
+                );
+                let snapshot = shared.fatal_trap_read_snapshot(cpu);
+                log_decoded_fatal_trap_from_snapshot(
+                    snapshot, vector, error_code, frame, fault_addr,
+                );
+                debug_uart_trap_breadcrumb(
+                    b'T', vector, error_code, fault_addr, fault_rip, cpu_apic,
+                );
+                halt_forever();
+            }
+        };
         if matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none() {
             // The scheduler uses TID 0 as its idle/supervisor sentinel.  It has
             // no user context to iretq back to; returning through the current

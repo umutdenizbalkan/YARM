@@ -261,6 +261,66 @@ impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout<'_> {
     }
 }
 
+/// Stage 200D-2B1D5B — the typed outcome of the x86_64 post-drain owner revalidation.
+///
+/// The seam's hazard is that `dispatch_next_on_cpu` COMMITS its selection as the CPU's
+/// `current` before the arch restore is attempted. A plain `Option<u64>` could not say whether
+/// a `None` meant "nothing was ever committed" (safe to idle) or "a replacement was committed
+/// and then failed to restore" (idling strands it). These three cases are now distinct.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerRevalidation {
+    /// Nothing was committed: the drains produced no CPU-local work, or the queue yielded the
+    /// scheduler's idle/supervisor sentinel (TID 0), which owns no user context.
+    Idle,
+    /// `tid` was committed as this CPU's `current` AND its arch state was restored into the
+    /// caller's `TrapFrame`. The frame is populated and safe to commit.
+    Replacement(u64),
+    /// `tid` was committed as this CPU's `current` and the arch restore did NOT succeed, so the
+    /// frame is not populated with `tid`'s context. `rolled_back` records whether the seam
+    /// managed to undo the advance (clear `current`, and return `tid` to this CPU's run queue
+    /// unless its TCB is gone). Only `rolled_back == true` leaves state consistent enough for
+    /// the ordinary idle path.
+    RestoreFailed { tid: u64, rolled_back: bool },
+}
+
+/// What the x86_64 trap epilogue must do with an [`OwnerRevalidation`].
+///
+/// Kept as a pure function of the outcome so the fail-closed rule is directly testable rather
+/// than implied by the shape of a `match` inside the trap handler.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerCommit {
+    /// Take the ordinary idle path: nothing is current on this CPU.
+    Idle,
+    /// Commit `tid` as the new owner through the existing replacement path.
+    Replacement(u64),
+    /// `tid` is still this CPU's `current` with no restorable context and the advance could not
+    /// be undone. Idling would halt a CPU the scheduler believes is running a task, so the
+    /// caller must fail closed through the architecture's existing fatal path.
+    FailClosed(u64),
+}
+
+#[cfg(target_arch = "x86_64")]
+impl OwnerRevalidation {
+    /// The fail-closed rule. A rolled-back restore failure is idle-safe precisely because the
+    /// rollback restored the invariant "nothing is current on this CPU"; an un-rolled-back one
+    /// never is.
+    pub(crate) fn disposition(self) -> OwnerCommit {
+        match self {
+            OwnerRevalidation::Idle => OwnerCommit::Idle,
+            OwnerRevalidation::Replacement(tid) => OwnerCommit::Replacement(tid),
+            OwnerRevalidation::RestoreFailed {
+                rolled_back: true, ..
+            } => OwnerCommit::Idle,
+            OwnerRevalidation::RestoreFailed {
+                tid,
+                rolled_back: false,
+            } => OwnerCommit::FailClosed(tid),
+        }
+    }
+}
+
 impl SharedKernel {
     /// Stage 114 fix: this used to also cache `scheduler_state` /
     /// `boot_config_state_lock` / `boot_config` raw pointers computed from
@@ -588,34 +648,61 @@ impl SharedKernel {
     /// uses the EXISTING `dispatch_next_on_cpu`, so the run queue advances through the same
     /// authority the in-lock path uses and never through a second queue:
     ///
-    ///   * exactly one advance — one `dispatch_next_on_cpu` call, whose result is returned;
+    ///   * exactly one advance — one `dispatch_next_on_cpu` call, whose result is reported;
     ///   * CPU-local only — `dispatch_next_on_cpu(cpu)` pops from THIS cpu's run queue, so a
     ///     task runnable elsewhere is never stolen;
-    ///   * the idle sentinel (TID 0) is not a user task and is reported as "still idle", so the
-    ///     caller keeps its existing idle path rather than trying to return to ring 3;
-    ///   * on a restore failure the selection is reported as none, so the caller idles rather
-    ///     than committing a frame that was never populated.
+    ///   * the idle sentinel (TID 0) is not a user task and is reported as `Idle`, so the
+    ///     caller keeps its existing idle path rather than trying to return to ring 3.
     ///
-    /// Returns the TID committed as the new owner, or `None` to keep idling.
+    /// Stage 200D-2B1D5B — the restore-failure contract. `dispatch_next_on_cpu` has ALREADY
+    /// committed the selected task as this CPU's `current` by the time the restore is attempted,
+    /// so a failure cannot simply be reported as "no owner": entering the ordinary idle path
+    /// with that task still current halts the CPU while the scheduler believes the task is
+    /// running on it — on no run queue and on no CPU, stranded exactly as the Stage 200D-2B1D4
+    /// caller was. The failure is therefore rolled back here, and reported distinctly from
+    /// genuine idle so the caller can fail closed if the rollback itself could not complete.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn revalidate_idle_owner_after_drains(
         &self,
         cpu: CpuId,
         frame: &mut crate::kernel::trapframe::TrapFrame,
-    ) -> Option<u64> {
+    ) -> OwnerRevalidation {
         self.with_cpu(cpu, |kernel| {
-            let next = kernel.dispatch_next_on_cpu(cpu)?;
+            let Some(next) = kernel.dispatch_next_on_cpu(cpu) else {
+                return OwnerRevalidation::Idle;
+            };
             if next == 0 {
-                // The scheduler's idle/supervisor sentinel owns no user context.
-                return None;
+                // The scheduler's idle/supervisor sentinel owns no user context. Nothing was
+                // committed — `dispatch_next` returns the sentinel it was already holding.
+                return OwnerRevalidation::Idle;
             }
-            match crate::arch::x86_64::trap::restore_arch_thread_state(kernel, cpu, Some(frame)) {
-                Ok(()) => Some(next),
-                Err(_) => None,
+            // `restore_arch_thread_state` maps `KernelError::TaskMissing` to `Ok(())` so early
+            // boot (no user task scheduled yet) restores nothing and still returns cleanly.
+            // That is correct for its other callers and WRONG here: a task that is still in a
+            // run queue but whose TCB has been reaped would report success with the frame left
+            // holding the PREVIOUS task's context, and the epilogue would iret into ring 3 on
+            // the exited task's frame. Establish restorability first, so a missing TCB is a
+            // restore failure rather than a silent bad user return.
+            let restorable = kernel.thread_user_context(next).is_some();
+            if restorable
+                && crate::arch::x86_64::trap::restore_arch_thread_state(kernel, cpu, Some(frame))
+                    .is_ok()
+            {
+                return OwnerRevalidation::Replacement(next);
+            }
+            // Undo the queue advance. Clearing `current` is mandatory; re-enqueueing is only
+            // meaningful for a task that still exists — a reaped one has nothing to run and
+            // must not be resurrected into a run queue.
+            let cleared = kernel.block_current_on_cpu(cpu) == Some(next);
+            let requeued = !restorable || kernel.enqueue_on_cpu(cpu, next).is_ok();
+            OwnerRevalidation::RestoreFailed {
+                tid: next,
+                rolled_back: cleared && requeued,
             }
         })
-        .ok()
-        .flatten()
+        // A failed guard acquisition means `dispatch_next_on_cpu` never ran, so nothing was
+        // committed and idling is consistent.
+        .unwrap_or(OwnerRevalidation::Idle)
     }
 
     /// Stage 168 (D6-GENUINE-B): the authoritative **mutating** dispatch step,

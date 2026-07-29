@@ -96218,7 +96218,7 @@ mod stage200d2b1d5a_owner_revalidation {
     fn g01_seam_uses_the_existing_dispatch_and_advances_once() {
         let body = seam();
         assert!(
-            body.contains("kernel.dispatch_next_on_cpu(cpu)?"),
+            body.contains("let Some(next) = kernel.dispatch_next_on_cpu(cpu) else {"),
             "the seam must use the existing dispatch_next_on_cpu"
         );
         assert_eq!(
@@ -96226,12 +96226,9 @@ mod stage200d2b1d5a_owner_revalidation {
             1,
             "exactly one queue advance per revalidation"
         );
-        // No second queue, no hand-rolled selection.
-        for forbidden in [
-            "enqueue_on_cpu",
-            "runnable_count_on",
-            "block_current_on_cpu",
-        ] {
+        // No second queue, no hand-rolled selection. (`block_current_on_cpu`/`enqueue_on_cpu`
+        // ARE used, but only to UNDO this advance — see the Stage 200D-2B1D5B guards.)
+        for forbidden in ["runnable_count_on", "dispatch_next_current_cpu"] {
             assert!(
                 !body.contains(forbidden),
                 "the seam must not reach for `{forbidden}`"
@@ -96246,6 +96243,13 @@ mod stage200d2b1d5a_owner_revalidation {
         assert!(
             body.contains("dispatch_next_on_cpu(cpu)"),
             "the seam must pop from this CPU's own run queue"
+        );
+        // The Stage 200D-2B1D5B rollback is CPU-local too: it must undo the advance on the very
+        // CPU that made it, never park the task somewhere else.
+        assert!(
+            body.contains("block_current_on_cpu(cpu)")
+                && body.contains("enqueue_on_cpu(cpu, next)"),
+            "the rollback must clear and requeue on the caller's own CPU"
         );
         assert!(
             !body.contains("CpuId(0)") && !body.contains("current_cpu"),
@@ -96267,12 +96271,12 @@ mod stage200d2b1d5a_owner_revalidation {
     fn g03_seam_fails_closed_to_idle() {
         let body = seam();
         assert!(
-            body.contains("if next == 0 {") && body.contains("return None;"),
-            "the idle/supervisor sentinel must report `still idle`"
+            body.contains("if next == 0 {") && body.contains("return OwnerRevalidation::Idle;"),
+            "the idle/supervisor sentinel must report `Idle`"
         );
         assert!(
-            body.contains("Ok(()) => Some(next),") && body.contains("Err(_) => None,"),
-            "a restore failure must report `still idle` rather than commit an unpopulated frame"
+            body.contains("return OwnerRevalidation::Replacement(next);"),
+            "only a restored task may be reported as a committed replacement"
         );
         assert!(
             body.contains("restore_arch_thread_state(kernel, cpu, Some(frame))"),
@@ -96285,13 +96289,16 @@ mod stage200d2b1d5a_owner_revalidation {
     #[test]
     fn g04_prepared_replacement_owner_is_preserved() {
         let gate = DESC_SRC
-            .split("let revalidated_owner = if matches!(exiting_tid, None | Some(0)) {")
+            .split("let revalidation = if matches!(exiting_tid, None | Some(0)) {")
             .nth(1)
             .expect("the revalidation gate must exist");
-        let gate = gate.split("\n        if ").next().expect("bounded gate");
+        let gate = gate
+            .split("\n        // Stage 200D-2B1D5B")
+            .next()
+            .expect("bounded gate");
         assert!(
-            gate.contains("} else {") && gate.contains("None"),
-            "a non-idle prepared owner must yield `None` — no revalidation, no displacement"
+            gate.contains("} else {") && gate.contains("crate::runtime::OwnerRevalidation::Idle"),
+            "a non-idle prepared owner must yield `Idle` — no revalidation, no displacement"
         );
         // The seam is only ever called from that gated arm.
         assert_eq!(
@@ -96497,5 +96504,416 @@ mod stage200d2b1d5a_owner_revalidation {
             "the CPU is still unowned"
         );
         assert_eq!(k.runnable_count_on_cpu(cpu), 0, "no queue was advanced");
+    }
+}
+
+/// Stage 200D-2B1D5B — the owner-revalidation RESTORE-FAILURE contract.
+///
+/// `dispatch_next_on_cpu` commits its selection as the CPU's `current` BEFORE the arch restore
+/// is attempted. Stage 200D-2B1D5A reported a restore failure as `None`, which the epilogue
+/// could not distinguish from genuine idle — so the CPU would halt through the ordinary idle
+/// path while the scheduler still believed the committed task was running on it. That is the
+/// same strand Stage 200D-2B1D4 diagnosed, one level down.
+///
+/// These cases run the real seam on a real `SharedKernel`: the seam is `#[cfg(target_arch =
+/// "x86_64")]` and the hosted suite is an x86_64 host, so the production code path is exercised
+/// directly rather than through source inspection.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod stage200d2b1d5b_restore_contract {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::{OwnerCommit, OwnerRevalidation, SharedKernel};
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    fn seam() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn revalidate_idle_owner_after_drains(")
+            .nth(1)
+            .expect("the revalidation seam must exist")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded body")
+    }
+
+    /// Register `tid`, give it a distinguishable user context, and make it runnable on `cpu`.
+    fn woken_task(k: &mut crate::kernel::boot::KernelState, tid: u64, cpu: CpuId, pc: u64) {
+        k.register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        let mut ctx = crate::kernel::task::UserRegisterContext::default();
+        ctx.instruction_ptr = crate::kernel::vm::VirtAddr(pc);
+        ctx.stack_ptr = crate::kernel::vm::VirtAddr(pc + 0x1000);
+        k.set_thread_user_context(tid, ctx).expect("ctx");
+        k.enqueue_on_cpu(cpu, tid).expect("wake");
+    }
+
+    /// Drop `tid`'s TCB while it is still queued — the reaped-server shape that makes the arch
+    /// restore unable to produce a context.
+    fn reap_tcb(k: &mut crate::kernel::boot::KernelState, tid: u64) {
+        k.with_tcbs_mut(|tcbs| {
+            for slot in tcbs.iter_mut() {
+                if slot.as_ref().is_some_and(|t| t.tid.0 == tid) {
+                    *slot = None;
+                }
+            }
+        });
+    }
+
+    // ── the fail-closed rule, as a pure function ──────────────────────────────────────────
+
+    /// Every outcome maps to exactly one disposition, and ONLY an un-rolled-back restore
+    /// failure is allowed to reach the fatal path — never genuine idle, never a replacement.
+    #[test]
+    fn h01_disposition_is_the_fail_closed_rule() {
+        assert_eq!(OwnerRevalidation::Idle.disposition(), OwnerCommit::Idle);
+        assert_eq!(
+            OwnerRevalidation::Replacement(7).disposition(),
+            OwnerCommit::Replacement(7)
+        );
+        // Rolled back: `current` was cleared, so the ordinary idle path is safe.
+        assert_eq!(
+            OwnerRevalidation::RestoreFailed {
+                tid: 7,
+                rolled_back: true
+            }
+            .disposition(),
+            OwnerCommit::Idle
+        );
+        // NOT rolled back: a committed replacement is still current. Idling would strand it.
+        assert_eq!(
+            OwnerRevalidation::RestoreFailed {
+                tid: 7,
+                rolled_back: false
+            }
+            .disposition(),
+            OwnerCommit::FailClosed(7)
+        );
+    }
+
+    /// The three outcomes are genuinely distinct — a restore failure can never be confused with
+    /// genuine idle at the type level, which is the whole point of replacing `Option<u64>`.
+    #[test]
+    fn h02_restore_failure_is_distinguishable_from_genuine_idle() {
+        let idle = OwnerRevalidation::Idle;
+        let failed_ok = OwnerRevalidation::RestoreFailed {
+            tid: 7,
+            rolled_back: true,
+        };
+        let failed_bad = OwnerRevalidation::RestoreFailed {
+            tid: 7,
+            rolled_back: false,
+        };
+        assert_ne!(idle, failed_ok, "genuine idle is not a rolled-back failure");
+        assert_ne!(idle, failed_bad, "genuine idle is not a stranded failure");
+        assert_ne!(failed_ok, failed_bad, "rollback success is recorded");
+        // Only genuine idle and a rolled-back failure may take the idle path.
+        for (outcome, expected) in [
+            (idle, OwnerCommit::Idle),
+            (failed_ok, OwnerCommit::Idle),
+            (failed_bad, OwnerCommit::FailClosed(7)),
+        ] {
+            assert_eq!(outcome.disposition(), expected);
+        }
+    }
+
+    // ── the seam, run for real ────────────────────────────────────────────────────────────
+
+    /// A drain-woken task with a live TCB restores: the outcome is `Replacement`, the frame is
+    /// populated with THAT task's context, and it is this CPU's current.
+    #[test]
+    fn h03_successful_restore_reports_replacement_and_populates_the_frame() {
+        let cpu = CpuId(0);
+        let mut state = Bootstrap::init().expect("init");
+        woken_task(&mut state, 40201, cpu, 0x4000_0000);
+        let shared = SharedKernel::new(state);
+
+        let mut frame = TrapFrame::zeroed();
+        let outcome = shared.revalidate_idle_owner_after_drains(cpu, &mut frame);
+
+        assert_eq!(outcome, OwnerRevalidation::Replacement(40201));
+        assert_eq!(outcome.disposition(), OwnerCommit::Replacement(40201));
+        assert_eq!(
+            frame.saved_pc, 0x4000_0000,
+            "the committed owner's context reached the caller's frame"
+        );
+        shared.with(|k| {
+            assert_eq!(
+                k.current_tid_on_cpu(cpu),
+                Some(40201),
+                "committed as current"
+            );
+            assert_eq!(k.runnable_count_on_cpu(cpu), 0, "exactly one queue advance");
+        });
+    }
+
+    /// Genuine idle: nothing was committed, nothing was written to the frame.
+    #[test]
+    fn h04_genuine_idle_reports_idle_and_leaves_the_frame_alone() {
+        let cpu = CpuId(0);
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+
+        let mut frame = TrapFrame::zeroed();
+        let outcome = shared.revalidate_idle_owner_after_drains(cpu, &mut frame);
+
+        assert_eq!(outcome, OwnerRevalidation::Idle);
+        assert_eq!(outcome.disposition(), OwnerCommit::Idle);
+        assert_eq!(frame, TrapFrame::zeroed(), "no frame was populated");
+        shared.with(|k| {
+            assert!(
+                matches!(k.current_tid_on_cpu(cpu), None | Some(0)),
+                "nothing became current"
+            );
+        });
+    }
+
+    /// THE STAGE: a queued task whose TCB has been reaped cannot be restored. The seam must
+    /// report a restore FAILURE (not `Idle`, not `Replacement`), must leave the frame holding
+    /// no bogus context, and must undo the advance so the CPU can idle consistently.
+    #[test]
+    fn h05_unrestorable_task_is_reported_as_failure_and_rolled_back() {
+        let cpu = CpuId(0);
+        let mut state = Bootstrap::init().expect("init");
+        woken_task(&mut state, 40202, cpu, 0x5000_0000);
+        reap_tcb(&mut state, 40202);
+        let shared = SharedKernel::new(state);
+
+        let mut frame = TrapFrame::zeroed();
+        let outcome = shared.revalidate_idle_owner_after_drains(cpu, &mut frame);
+
+        assert_eq!(
+            outcome,
+            OwnerRevalidation::RestoreFailed {
+                tid: 40202,
+                rolled_back: true
+            },
+            "an unrestorable committed task is a rolled-back restore failure"
+        );
+        // It is emphatically NOT reported as a replacement: committing this frame would iret
+        // into the PREVIOUS task's context.
+        assert_ne!(outcome, OwnerRevalidation::Replacement(40202));
+        assert_eq!(
+            frame,
+            TrapFrame::zeroed(),
+            "a failed restore must not leave a partially written frame"
+        );
+        // The rollback restored the invariant the idle path depends on.
+        assert_eq!(outcome.disposition(), OwnerCommit::Idle);
+        shared.with(|k| {
+            assert!(
+                matches!(k.current_tid_on_cpu(cpu), None | Some(0)),
+                "the committed replacement was taken back off `current`"
+            );
+            assert_eq!(
+                k.runnable_count_on_cpu(cpu),
+                0,
+                "a reaped task is not resurrected into the run queue"
+            );
+        });
+    }
+
+    /// State consistency, stated as the invariant it protects: after ANY outcome, the CPU is
+    /// never left with a `current` task that the caller is about to idle past.
+    #[test]
+    fn h06_no_outcome_leaves_a_stranded_current_task() {
+        let cpu = CpuId(0);
+
+        // (a) genuine idle, (b) successful replacement, (c) unrestorable task.
+        let a = Bootstrap::init().expect("init");
+        let mut b = Bootstrap::init().expect("init");
+        woken_task(&mut b, 40203, cpu, 0x6000_0000);
+        let mut c = Bootstrap::init().expect("init");
+        woken_task(&mut c, 40204, cpu, 0x7000_0000);
+        reap_tcb(&mut c, 40204);
+
+        for state in [a, b, c] {
+            let shared = SharedKernel::new(state);
+            let mut frame = TrapFrame::zeroed();
+            let outcome = shared.revalidate_idle_owner_after_drains(cpu, &mut frame);
+            let current = shared.with(|k| k.current_tid_on_cpu(cpu));
+            match outcome.disposition() {
+                // The caller idles: nothing may be current.
+                OwnerCommit::Idle => assert!(
+                    matches!(current, None | Some(0)),
+                    "idling with {current:?} still current would strand it ({outcome:?})"
+                ),
+                // The caller commits `tid`: it MUST be current.
+                OwnerCommit::Replacement(tid) => {
+                    assert_eq!(current, Some(tid), "the committed owner must be current")
+                }
+                // The caller halts: state is inconsistent by definition, and it does not idle.
+                OwnerCommit::FailClosed(_) => {}
+            }
+        }
+    }
+
+    /// A rolled-back failure leaves the CPU idle-equivalent to genuine idle, judged by the
+    /// EPILOGUE'S OWN predicate — the `None | Some(0)` unowned test the idle gate uses.
+    ///
+    /// The two are not byte-identical and must not be asserted to be: genuine idle leaves the
+    /// scheduler's idle sentinel current (`Some(0)`), while the rollback's `block_current_on_cpu`
+    /// clears the slot outright (`None`) — the same primitive Stage 190A uses to return an AP to
+    /// idle. What matters is that both satisfy the predicate the caller actually branches on.
+    #[test]
+    fn h07_rollback_is_idle_equivalent_by_the_epilogues_own_predicate() {
+        let cpu = CpuId(0);
+        let idle = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut failed_state = Bootstrap::init().expect("init");
+        woken_task(&mut failed_state, 40205, cpu, 0x8000_0000);
+        reap_tcb(&mut failed_state, 40205);
+        let failed = SharedKernel::new(failed_state);
+
+        let mut f1 = TrapFrame::zeroed();
+        let mut f2 = TrapFrame::zeroed();
+        let o1 = idle.revalidate_idle_owner_after_drains(cpu, &mut f1);
+        let o2 = failed.revalidate_idle_owner_after_drains(cpu, &mut f2);
+
+        assert_eq!(
+            o1.disposition(),
+            o2.disposition(),
+            "both take the idle path"
+        );
+        assert_eq!(o1.disposition(), OwnerCommit::Idle);
+        assert_eq!(f1, f2, "neither committed a frame");
+        assert_eq!(f1, TrapFrame::zeroed(), "neither wrote a context");
+
+        for (label, shared) in [("genuine idle", &idle), ("rolled back", &failed)] {
+            let (current, runnable) =
+                shared.with(|k| (k.current_tid_on_cpu(cpu), k.runnable_count_on_cpu(cpu)));
+            // This is verbatim the predicate the x86 epilogue's idle gate applies.
+            assert!(
+                matches!(current, None | Some(0)),
+                "{label}: the CPU must be unowned by the epilogue's own test, got {current:?}"
+            );
+            assert_eq!(runnable, 0, "{label}: no runnable work is left behind");
+        }
+        // The gate really is that predicate.
+        assert!(
+            DESC_SRC
+                .contains("matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none()"),
+            "the idle gate must be the `None | Some(0)` predicate these outcomes satisfy"
+        );
+    }
+
+    // ── wiring guards ─────────────────────────────────────────────────────────────────────
+
+    /// The seam detects unrestorability BEFORE trusting `restore_arch_thread_state`, whose
+    /// `TaskMissing -> Ok(())` swallow would otherwise report a bogus success.
+    #[test]
+    fn h08_seam_establishes_restorability_before_reporting_success() {
+        let body = seam();
+        let check = body
+            .find("let restorable = kernel.thread_user_context(next).is_some();")
+            .expect("the seam must establish restorability");
+        let ok = body
+            .find("return OwnerRevalidation::Replacement(next);")
+            .expect("the success return");
+        assert!(
+            check < ok,
+            "restorability must be established before success"
+        );
+        assert!(
+            body.contains("if restorable\n") || body.contains("if restorable "),
+            "the success path must be gated on restorability"
+        );
+        // And the swallow it defends against is really there.
+        let restore = include_str!("../../arch/x86_64/trap.rs")
+            .split("pub(crate) fn restore_arch_thread_state(")
+            .nth(1)
+            .expect("the restore helper");
+        assert!(
+            restore.contains("Err(crate::kernel::boot::KernelError::TaskMissing) => {"),
+            "restore_arch_thread_state still maps TaskMissing to Ok(()) for its other callers"
+        );
+    }
+
+    /// The rollback undoes the advance: clear `current`, and requeue only a task that still
+    /// exists. Both results are folded into `rolled_back`.
+    #[test]
+    fn h09_rollback_clears_current_and_requeues_only_live_tasks() {
+        let body = seam();
+        assert!(
+            body.contains("let cleared = kernel.block_current_on_cpu(cpu) == Some(next);"),
+            "the rollback must take the committed task back off `current`"
+        );
+        assert!(
+            body.contains(
+                "let requeued = !restorable || kernel.enqueue_on_cpu(cpu, next).is_ok();"
+            ),
+            "a live task is returned to its run queue; a reaped one is not resurrected"
+        );
+        assert!(
+            body.contains("rolled_back: cleared && requeued,"),
+            "`rolled_back` must require BOTH halves of the undo"
+        );
+    }
+
+    /// The epilogue fails closed: the `FailClosed` arm reaches the existing fatal architecture
+    /// path and never falls through to the idle path or a frame commit.
+    #[test]
+    fn h10_epilogue_fails_closed_on_an_unrecoverable_rollback() {
+        let arm = DESC_SRC
+            .split("crate::runtime::OwnerCommit::FailClosed(tid) => {")
+            .nth(1)
+            .expect("the fail-closed arm must exist");
+        let arm = arm.split("\n        };").next().expect("bounded arm");
+        for required in [
+            "shared.fatal_trap_read_snapshot(cpu)",
+            "log_decoded_fatal_trap_from_snapshot(",
+            "debug_uart_trap_breadcrumb(",
+            "halt_forever();",
+        ] {
+            assert!(
+                arm.contains(required),
+                "the fail-closed arm must use the existing fatal path: `{required}`"
+            );
+        }
+        for forbidden in [
+            "idle_halt_loop",
+            "flush_trap_context_to_iret_frame",
+            "Some(tid)",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "the fail-closed arm must not reach `{forbidden}`"
+            );
+        }
+        // `halt_forever` diverges, so the arm cannot fall through to the frame commit.
+        assert!(
+            DESC_SRC.contains("fn halt_forever() -> ! {"),
+            "the fatal path must be divergent — a returning one would commit the frame anyway"
+        );
+    }
+
+    /// The disposition is consulted exactly once, and the epilogue branches on it rather than
+    /// re-deriving the rule inline.
+    #[test]
+    fn h11_epilogue_branches_on_the_typed_disposition() {
+        assert!(
+            DESC_SRC.contains("match revalidation.disposition() {"),
+            "the epilogue must branch on the typed disposition"
+        );
+        assert_eq!(
+            DESC_SRC.matches(".disposition()").count(),
+            1,
+            "one disposition decision per trap return"
+        );
+        for arm in [
+            "crate::runtime::OwnerCommit::Replacement(next) => {",
+            "crate::runtime::OwnerCommit::Idle => {",
+            "crate::runtime::OwnerCommit::FailClosed(tid) => {",
+        ] {
+            assert!(DESC_SRC.contains(arm), "the epilogue must handle `{arm}`");
+        }
+        // The seam no longer returns a bare Option — the whole point of the stage.
+        assert!(
+            RUNTIME_SRC.contains(") -> OwnerRevalidation {"),
+            "the seam must return the typed outcome"
+        );
+        assert!(
+            !seam().contains("-> Option<u64>") && !seam().contains(".ok()\n        .flatten()"),
+            "the seam must not collapse its outcome back into an Option"
+        );
     }
 }
