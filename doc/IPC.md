@@ -599,6 +599,17 @@ rollback (`stage199d_multi_pair_races`).
 the off-lock NR6/NR7 path: the proof gate and the oracle endpoint confinement are
 unchanged, and no production default was flipped.
 
+**The direct NR6 delivery is NOT yet contract-conforming.** A subsequent audit of the
+production-default flip found that the direct transaction implements the *oracle's* message
+contract, not the recv-v2 contract every legacy path implements: it does not strip the
+2-byte inline opcode prefix that `ipc_call` prepends, it reports `OPCODE_INLINE` instead of
+the application opcode, and it reports the unstripped length. It also discards the
+transaction result and reports success unconditionally, and returns `ret2 = 0` where the
+legacy path returns `SYSCALL_NO_TRANSFER_CAP`. The NR7 reply direction is unaffected (reply
+messages carry no opcode prefix, so its `OPCODE_INLINE`/verbatim encoding already matches
+`Message::new`). Until the NR6 direction conforms, the endpoint confinement is load-bearing
+for correctness, not merely for scope. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.
+
 **Retirement-seal isolation model — Model 1, serialized master.**
 `scripts/qemu-combined-retirement-seal.sh` runs the first-cohort (12), plain (6) and
 ordinary-cap (6) seals **strictly sequentially** — one QEMU at a time — each with a unique
