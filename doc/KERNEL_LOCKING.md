@@ -56,6 +56,22 @@ lines excluded.
 | Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
 | **Total broad-lock acquisition sites** | **51** |
 
+Canonical Stage **204A** additionally requires each site classified. That classification is
+complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
+
+| Class | Count | Note |
+|-------|-------|------|
+| boot-only | **0** | — |
+| test-only | **3** | `runtime.rs:1244`, `1248` (`ipc_recv_with_deadline_split_bridge`), `runtime.rs:2654` |
+| obsolete | **2** | `runtime.rs:2644` (`handle_trap_with_cpu`, **no in-tree caller at all**); `runtime.rs:3725` (`run_reply_timeout_completion`, superseded by `OffLockReplyTimeout`) |
+| runtime-required | **46** | the real retirement surface |
+| undocumented | **0** | every site enumerated with file, line and enclosing function |
+
+> **Naming hazard.** `runtime.rs:3696` sits inside `smp_request_wake_target_split_read` — a
+> function whose name ends in `_split_read` but which takes the **broad** lock
+> (`self.with(|k| k.task_home_cpu(tid))`). It is the only such case in the tree. Do not
+> treat the `_split_*` naming convention as a guarantee.
+
 #### `with_cpu` — 41 sites
 
 | File | Count | Lines |

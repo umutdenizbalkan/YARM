@@ -34,7 +34,7 @@ fragment files unless the canonical owner explicitly does not exist.
 | Phase gates (Phase 2/3/4 contracts, server roadmap, kernel-status milestones, phase readiness matrix) | **`doc/PHASE_GATES.md`** |
 | Service manifest format | `doc/SERVICE_MANIFEST.md` |
 | Project history (closed phases / milestones / checklists) | **`doc/PROJECT_HISTORY.md`** |
-| Roadmap (current direction) | `doc/ROADMAP.md` |
+| Roadmap (current direction) | `doc/KERNEL_UNLOCKING.md` §0 |
 | Project status / maturity | **`doc/STATUS.md`** |
 | Agent rules (capability/spawn/zero-copy/smoke policy + source-licensing header + server-runtime boundary) | **`doc/AI_AGENT_RULES.md`** |
 | Agent-facing entry point (short pointer for tools that look for `AGENTS.md` by convention) | `doc/AGENTS.md` (points at `doc/AI_AGENT_RULES.md`) |
@@ -110,14 +110,15 @@ documentation describes the current system and the roadmap.
 | `doc/FIRST_COHORT_RETIREMENT_SEAL.md`, `doc/SECOND_COHORT_RETIREMENT_SEAL.md`, `doc/SECOND_COHORT_PLAIN_SEAL.md`, `doc/SECOND_COHORT_ORDINARY_CAP_SEAL.md` | **Accepted seals**, not stage narratives. Each carries an authoritative 3×N implementation matrix and is pinned by many `include_str!` assertions in the hosted corpus. |
 | `doc/supervisor-*.md`, `doc/process-manager-restart-contract.md`, `doc/driver-*.md`, `doc/pm-restart-live-*.md` | **Deferred deletion.** These are pinned by `include_str!` from *production crate sources* (`crates/yarm-control-plane-servers/src/control_plane/mod.rs`, `crates/yarm-driver-servers/src/lib.rs`). Retiring them requires editing production files, which the Pass 6 change explicitly did not do. Their unique content has **not** yet been proven redundant, so they must not be deleted on name alone. |
 
-### Known-broken references pre-dating Pass 6 (not introduced here)
+### Broken references found in Pass 6 — all repaired
 
-* `scripts/check-contract-doc-enforcement.sh` greps `doc/ABI_CONTRACT_FREEZE.md`, which
-  does not exist — that gate cannot pass.
-* `scripts/qemu-ipc-recv-v2-oracle-smoke.sh` names `doc/IPC_RECV_V2_ORACLE.md` in a
-  comment; the file does not exist.
-* `doc/ROADMAP.md` was referenced by `DOCUMENTATION_MAP.md` and `STATUS.md` but has never
-  existed in this tree. The kernel-unlock roadmap is `doc/KERNEL_UNLOCKING.md` §0.
+All three pre-dated Pass 6 and are now fixed; none remain.
+
+| Missing file | Referenced by | Repair |
+|--------------|---------------|--------|
+| `doc/ABI_CONTRACT_FREEZE.md` | `scripts/check-contract-doc-enforcement.sh` (grepped it, so the gate could **not** pass), plus prose in several docs | Deleted in `3c86f362` with no migration. Its content is recovered, **re-verified against the tree**, and folded into `doc/SYSCALL_ABI.md` → "Mechanism-layer contract freeze". The gate now reads that section. Four of the five frozen contracts had moved file since the doc was written and are corrected; the fifth (`LinuxCompatSyscall::DISPATCH_TABLE` in `src/linux_compat/mod.rs`) no longer exists anywhere in the tree, so that freeze is documented as **retired** rather than restated. |
+| `doc/IPC_RECV_V2_ORACLE.md` | comment in `scripts/qemu-ipc-recv-v2-oracle-smoke.sh` | Never existed in any commit. The comment now names the real canonical owners (`doc/IPC.md`, `doc/KERNEL_TEST_RULES.md` Rule L1) and states plainly that the fault/contention workload has not been written. |
+| `doc/ROADMAP.md` | ownership rows in `DOCUMENTATION_MAP.md` and `STATUS.md` | Never existed in any commit. Both rows now point at `doc/KERNEL_UNLOCKING.md` §0, the actual roadmap. |
 
 Filenames appearing in the historical Pass 1–5 logs below are records of *already deleted*
 documents, not live links.

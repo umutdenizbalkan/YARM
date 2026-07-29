@@ -676,7 +676,8 @@ counterpart and needs none.
   (`EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu=0 holder=with_cpu result=ok`).
 * Direct IPC NR 6 / NR 7 — admitted under the proof gate only (Stage 199A2C1).
 * **ServerDies — no live cell**; runner `scripts/qemu-aarch64-server-dies-smoke.sh`
-  exists and is blocked behind canonical Stage 202D.
+  exists and is blocked behind the ServerDies link-accounting repair (a canonical **199D**
+  increment; the same defect is 202D's reply-object-cleanup element).
 * SMP / PSCI — deferred.
 
 ---

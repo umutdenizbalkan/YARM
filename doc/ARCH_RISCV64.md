@@ -1014,7 +1014,8 @@ x86_64 and AArch64 bounds are untouched and a guard pins all three. See
   The deadline **scan** is still `scan_broad_lock=1`.
 * `ExitCurrentTask` NR 16 — **not earned** (see above).
 * **ServerDies — no live cell**; runner `scripts/qemu-riscv64-server-dies-smoke.sh`
-  exists and is blocked behind canonical Stage 202D.
+  exists and is blocked behind the ServerDies link-accounting repair (a canonical **199D**
+  increment; the same defect is 202D's reply-object-cleanup element).
 
 ---
 

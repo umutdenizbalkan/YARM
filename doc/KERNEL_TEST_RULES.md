@@ -199,28 +199,52 @@ setups that consume a few mapping slots before the exhaustion loop.
 
 ## Rule H1 — Hosted runs must be single-threaded
 
-**`cargo test --lib` ABORTS under the default parallel harness.** Verified at commit
-`757993b`: `double free or corruption`, SIGABRT, **3 of 3** attempts, after ~35 tests.
-The same binary passes **3725 / 3725** with `-- --test-threads=1`. The kernel test
-corpus shares process-global mutable state (per-CPU statics, one-shot latches, proof
-knobs, `server_dies_counters`), so it is not safe to run concurrently.
+`cargo test --lib` **no longer aborts** under the default parallel harness. Three
+cross-test aliasing bugs that caused `double free or corruption` / `free(): invalid
+pointer` / SIGSEGV were fixed (transplanted from `889026f3`); all three had the same shape,
+one test publishing something into PROCESS-global state that a later, unrelated test then
+dereferenced:
+
+1. **The owned `KernelState` construction path.** `Bootstrap::init` built every owned state
+   through the single process-global `static mut BOOTSTRAP_KERNEL_STATE` scratch buffer and
+   bitwise-copied it out, so two concurrent constructions produced two owners of one
+   allocation. The owned path now builds into caller-supplied storage via `init_state_into`.
+2. **The process-global LAPIC MMIO base.** Tests published a pointer to their own stack
+   buffer and never restored it, so every later acknowledged IRQ or timer tick wrote into a
+   dead frame. `LapicTestConfig` now serializes those tests, hands out a process-static
+   simulated MMIO page, and restores the previous configuration on drop including on panic.
+3. **The boot IRQ-description staging slot.** A parser test left `LAPIC_BASE=0xfee04000`
+   staged; the next `run_kernel_boot` anywhere in the process consumed it and stored to that
+   unmapped absolute address. That case now drains the slot and asserts it empty on exit.
+
+Guarded by `kernel::boot::tests::parallel_state_isolation` (3 tests).
+
+**Single-threaded is still required, for a different reason.** A parallel run now completes
+but produces **58–71 logical assertion failures**, varying per run. The kernel test corpus
+shares process-global mutable state — per-CPU statics, one-shot latches, proof knobs,
+`server_dies_counters`, reply-timeout stores, deferred-death slots, shared-region
+transaction tables, ack slots — so concurrent tests observe each other's machine.
 
 **Canonical hosted invocations:**
 
 ```
-cargo test --lib   -- --test-threads=1     # 3725 passed
-cargo test --tests -- --test-threads=1     # 3864 passed (3725 lib + 139 integration)
+cargo test --lib   -- --test-threads=1     # 3729 passed, 0 failed
+cargo test --tests -- --test-threads=1     # 3729 lib + 146 integration, 0 failed
 ```
 
 Consequences that must be respected:
 
 * Any claim of the form "hosted-proven" means *single-threaded* hosted-proven. Say so.
-* The CI step `cargo test -q` in `.github/workflows/compat-gates.yml` inherits the
-  default parallel harness and is therefore **not currently a reliable gate**. Treat a
-  green `cargo test -q` as unproven until it is pinned to `--test-threads=1` or the
-  shared-state hazard is removed.
+* The CI step `cargo test -q` in `.github/workflows/compat-gates.yml` inherits the default
+  parallel harness. It no longer crashes, but it will report logical failures until the
+  shared-state contention is removed. Pin it to `--test-threads=1` or fix the contention.
+* Removing that contention is canonical Stage **205C** (long-running concurrency torture),
+  which cannot use the hosted suite as its harness until then.
 * A test that latches a one-shot static must reset it, or be written so a second
   observation is harmless — otherwise it passes alone and fails in a full run.
+* A test that publishes a pointer into process-global state must restore the previous value
+  on drop, including on panic, and must publish storage that outlives every possible later
+  reader. `LapicTestConfig` is the reference pattern.
 
 ## Rule H2 — Hosted-dev disables the off-lock user copy
 
@@ -269,7 +293,7 @@ this failure mode as a runner/oracle defect, not a kernel defect.**
 
 | Rule | Key point |
 |------|-----------|
-| H1. Single-threaded hosted | `cargo test` **must** use `--test-threads=1`; the parallel harness aborts |
+| H1. Single-threaded hosted | `cargo test` **must** use `--test-threads=1`. The parallel memory corruption is fixed; 58–71 logical shared-state failures remain (Stage 205C) |
 | H2. No hosted off-lock copy | `hosted-dev` disables the split user-copy; off-lock payload claims are unprovable hosted |
 | L1. Live cells | clean boot + full ordered sequence + distinct boot nonce; never a green seal for unachieved work |
 | L2. Arch-specific bounds | live-oracle loop bounds must be sized per architecture |

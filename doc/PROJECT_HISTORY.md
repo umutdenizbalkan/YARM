@@ -311,7 +311,7 @@ permanent record. Current live state is `doc/STATUS.md` §0; the roadmap is
 | Reply-timeout x86_64 functional + retirement | `IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok`; `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout result=ok`; `IPC_REPLY_BEATS_TIMEOUT_OK arch=x86_64 terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok` | 2 |
 | **Reply-timeout three-architecture matrix (Stage 200C)** | **`STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`** — timeout-wins + reply-wins on x86_64, AArch64 and RISC-V, serially from one clean exact commit `72a4ebf` | **6** |
 | `ExitCurrentTask` NR 16 | `STAGE_200D0B3_X86_EXIT_CURRENT_TASK_REFREEZE_SEAL` (x86_64, `0b5e98f`); `EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu=0 holder=with_cpu result=ok` | 2 of 3 — RISC-V **not earned** |
-| ServerDies liveness foundation (Stage 202A) | foundation seal `result=ok`, explicitly `live_cells=0` | 0 by design |
+| ServerDies liveness foundation (historical Stage 200D-2B1B) | foundation seal `result=ok`, explicitly `live_cells=0` | 0 by design |
 | ServerDies three-arch return contract / live readiness (Stage 202B) | readiness seal `qemu_boots=0 live_cells=0 result=ok` | 0 by design |
 | **ServerDies live** | **none — four attempts, none sealed** | **0** |
 
@@ -322,7 +322,7 @@ These were **not** granted, and the refusal is the record:
 * `STAGE_199_IPCCALL_REPLY_OFFLOCK_SEAL … result=deferred reason=broad_lock_payload_copy_needs_pre_global_lock_split_seam_which_is_hosted_disabled_and_block_dispatch_switch_required` — preserved in full in `doc/IPC.md` §8.3.
 * `GLOBAL_LOCK_RETIRE_CLASS_DEFERRED class=FutexWait reason=block_dispatch_switch_required_needs_global_lock` — the Stage 191D deferral discipline; seams landed helper-only.
 * `STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL … cross_cpu=0 result=blocked reason=ap_dispatch_on_wake_and_context_restore_not_wired` — later superseded by the earned `cross_cpu=1` seal.
-* `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail` — **still open**; see `doc/IPC.md` §8.5 and canonical Stage 202D.
+* `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail` — **still open**; see `doc/IPC.md` §8.5. It is canonical **199D**'s server-crash cleanup and canonical **202D**'s reply-object cleanup.
 
 ### Historical x86_64 D6 switch-proof bring-up (Stages 120–132)
 

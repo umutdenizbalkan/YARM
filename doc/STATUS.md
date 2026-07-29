@@ -33,47 +33,77 @@ Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 
 | Command | Result |
 |---------|--------|
-| `cargo test --lib -- --test-threads=1` | ✅ 3725 passed, 0 failed, 2 ignored |
-| `cargo test --tests -- --test-threads=1` | ✅ 3864 passed (3725 lib + 139 integration), 0 failed |
-| `cargo test --lib` (default parallel harness) | ❌ **aborts** — `double free or corruption`, SIGABRT, 3 of 3 runs |
+| `cargo test --lib -- --test-threads=1` | ✅ 3729 passed, 0 failed, 2 ignored |
+| `cargo test --tests -- --test-threads=1` | ✅ 3729 lib + 146 integration, 0 failed |
+| `cargo test --lib` (default parallel harness) | ⚠️ **completes, 0 aborts in 5 runs** — 58–71 logical shared-state assertion failures remain |
+| `bash scripts/check-contract-doc-enforcement.sh` | ✅ passes |
+| `cargo check` — x86_64 / AArch64 / RISC-V bare-metal `kernel_boot` | ✅ clean |
+
+The parallel memory corruption (three cross-test aliasing bugs) is **fixed**; see
+`doc/KERNEL_TEST_RULES.md` Rule H1. What remains is process-global test contention, which
+is canonical Stage 205C work.
+
+### Canonical stage position
+
+Stage definitions are owner-supplied and authoritative
+(`doc/KERNEL_UNLOCKING.md` §0). **A historical stage carrying the same number does not
+complete the canonical stage.**
+
+| Phase | Complete | Partial foundation | Open |
+|-------|----------|--------------------|------|
+| 2 — IPC (199C–199G) | 0 of 5 | 199D, 199E | 199C, 199F, 199G |
+| 3 — Capability (200A–200D) | 0 of 4 | 200A, 200C | 200B, 200D |
+| 4 — VM (201A–201G) | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
+| 5 — Lifecycle (202A–202F) | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |
+| 6 — Timer/IRQ/sched (203A–203D) | 0 of 4 | 203A, 203C, 203D | 203B |
+| 7 — Monolith removal (204A–204E) | **204A** | 204B | 204C, 204D, 204E |
+| 8 — Seal (205A–205D) | 0 of 4 | 205A | 205B, 205C, 205D |
+| **Total** | **1 of 34** | 11 | 22 |
+
+**No canonical stage in Phases 2–6 or 8 is complete.** The one complete stage, 204A
+(broad-lock callsite census), is documentation rather than lock retirement: 51 callsites
+classified as 0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.
+
+The historical stages labelled 200A/200B/200C (terminal ownership, deadline token,
+reply-timeout transaction) are IPC timeout work belonging to canonical **199E**. They
+contribute nothing to canonical 200A–200C, which are the **capability** stages and have
+essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ONLY`.
 
 ### Live cells earned
 
-| Programme | Cells | Seal |
-|-----------|-------|------|
-| First cohort (`DebugLog`, `FutexWake`, `FutexWait`, `Yield`) | 12 (3 arch × 4) | `FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok` |
-| Second cohort — plain `IpcSend` | 6 | `SECOND_COHORT_PLAIN_SEAL arches=3 classes=2 live_cells=6 result=ok` |
-| Second cohort — ordinary-cap `IpcSend` | 6 | `SECOND_COHORT_ORDINARY_CAP` 3×2 matrix |
-| Second cohort — shared-region direct | 3 | `SECOND_COHORT_SHARED_REGION_DIRECT_MATRIX_SEAL arches=3 classes=1 live_cells=3 fuse_trips=0 result=ok` |
-| Reply-timeout matrix (Stage 200C) | **6** | `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf` |
-| `ExitCurrentTask` NR 16 | **2 of 3** | x86_64 sealed `0b5e98f`; AArch64 sealed; **RISC-V not earned** |
-| Direct IPC NR 6 / NR 7 (x86_64 SMP=2) | proof-gated only | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok` |
-| **Server death (`ServerDies`)** | **0** | none — four live attempts, none sealed |
+| Programme | Cells | Canonical stage it serves |
+|-----------|-------|---------------------------|
+| First cohort (`DebugLog`, `FutexWake`, `FutexWait`, `Yield`) | 12 | pre-199C retirement groundwork |
+| Second cohort — plain / ordinary-cap `IpcSend` | 12 | 199C **delivery** only, not blocking-sender retirement |
+| Second cohort — shared-region direct | 3 | 200C (1 of 7 object classes) |
+| Reply-timeout matrix | **6** | 199E (one quarter of the stage) |
+| `ExitCurrentTask` NR 16 | **2 of 3** | 202D (one sub-path; RISC-V unearned) |
+| Direct IPC NR 6 / NR 7 (x86_64 SMP=2) | knob-gated | 199D mechanism, **not** the production path |
+| **Server death (`ServerDies`)** | **0** | 199D server-crash cleanup — blocked |
 
 ### Immediate blockers
 
 1. **`IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`** — the only hard
-   failure in the tree. `LinkCreated` counts every bound `IpcCall` system-wide while
-   `LinkDetached` counts only the exit path, and `audit_success_path` additionally demands
-   every class `== 1`; `reset_instance()` has no live caller. Blocks every ServerDies live
-   cell. **This is the recommended next implementation stage (canonical 202D).**
-2. **`revalidate_idle_owner_after_drains` has never run in QEMU** — the fix for the live
-   hang found in the fourth ServerDies attempt is hosted-proven only.
-3. **NR 6 / NR 7 off-lock direct IPC is default-OFF** — the entire Stage 199 programme
-   delivers no production benefit until the gate is flipped.
-4. **Off-lock dispatch is x86_64-only** — AArch64 and RISC-V cannot retire any
-   queue-advancing class.
-5. **AArch64 split classes re-acquire the broad lock on return**
-   (`src/arch/trap_entry.rs:1432`), so AArch64 has no genuinely broad-lock-free syscall.
-6. **`FutexWait` off-lock seams landed helper-only** and were never wired live.
-7. **Reply-timeout scan is off-lock on x86_64 only**; the broad-lock completion fallback
-   `run_reply_timeout_completion_locked` (`src/runtime.rs:3725`) survives.
+   failure in the tree. Blocks 199D server-crash cleanup and 202D reply-object cleanup.
+   **The smallest next production stage is the repair for this** (a 199D increment; see
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6).
+2. **`revalidate_idle_owner_after_drains` has never run in QEMU** (`src/runtime.rs:665`).
+3. **NR 6 / NR 7 off-lock direct IPC is default-OFF**, so 199D's landed transaction
+   delivers no production benefit.
+4. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
+   RISC-V cannot retire any queue-advancing class.
+5. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
+   wiring.
+6. **`FutexWait` off-lock seams landed helper-only** and were never wired.
+7. **Reply-timeout scan is off-lock on x86_64 only**; `IpcSend` and `IpcCall` timeouts are
+   untouched; the broad fallback `run_reply_timeout_completion` survives (199E).
 8. **RISC-V `ExitCurrentTask` live cell** — kernel chain proven correct, runner bound
-   corrected at `5488d8e`, re-run never executed.
-9. **`cargo test --lib` aborts under the default parallel harness**, so the CI step
-   `cargo test -q` is not a reliable gate.
-10. **`scripts/check-contract-doc-enforcement.sh` greps `doc/ABI_CONTRACT_FREEZE.md`,
-    which does not exist** — the ABI freeze gate cannot pass.
+   corrected at `5488d8e`, re-run never executed (202D).
+9. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures** — blocks
+   205C and keeps every hosted claim single-threaded-only.
+10. **AArch64 re-acquires the broad lock on its split return path**
+    (`src/arch/trap_entry.rs:1432`) — 204B/204E must localize it. 205A reports the cell; it
+    is not where it gets retired.
 
 ---
 

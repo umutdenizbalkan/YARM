@@ -442,7 +442,10 @@ none sealed. Two defects were found live:
    accumulate from boot.
    **Resolution is a design decision** — scope the counters to the audited death, or count
    both close sites and drop the `== 1` expectation. Both change what the nine-counter
-   vector means. Tracked as canonical Stage **202D**, the recommended next stage.
+   vector means. This is the **server-crash cleanup** element of canonical Stage **199D**
+   and simultaneously the **reply-object cleanup** element of canonical Stage **202D**; the
+   repair is the smallest next production stage (`doc/KERNEL_UNLOCK_AUDIT.md` §6). It is an
+   increment, **not** a complete canonical stage.
 
 ### 8.6 Preserved contracts from the deleted stage reports
 

@@ -8,9 +8,22 @@ canonical roadmap to full kernel unlocking.**
 
 This document is generated from the source tree, not from prior stage reports. Where a
 prior report and the source disagree, the source wins and the disagreement is recorded.
-Historical stage numbering (`199A2D2C2B3`, `200D-2B1D5B`, …) is **not** used as a
-progress measure; it is retained only as commit-evidence. The canonical stage ladder is
-§4 (`199C` … `205D`).
+
+**The canonical stage definitions for 199C–205D are owner-supplied and authoritative.**
+They live in `doc/KERNEL_UNLOCKING.md` §0 and are reproduced in status form in §3 here.
+Historical stage numbering (`199A2D2C2B3`, `200D-2B1D5B`, and the historical `200A`/`200B`/
+`200C`) is **not** a progress measure and is retained only as commit-evidence. **A
+historical stage carrying the same number does not complete the canonical stage unless it
+satisfies the canonical definition.**
+
+> **Correction notice.** The first revision of this document (Pass 6, commit `f8a3c04`)
+> invented a stage ladder by grouping recent branch history under the 199C–205D numbers.
+> That was wrong in a specific and consequential way: it mapped the historical
+> reply-timeout stages onto canonical `200A`/`200B`/`200C` and reported them **COMPLETE**,
+> when canonical 200A–200C are the **capability** subsystem stages and have essentially no
+> production wiring. It also placed defect retirement in `205A`, which is a reporting
+> stage. Every status in §3 has been recalculated from source against the owner-supplied
+> definitions.
 
 ---
 
@@ -40,14 +53,26 @@ progress measure; it is retained only as commit-evidence. The canonical stage la
 
 | Command | Result |
 |---------|--------|
-| `cargo test --lib -- --test-threads=1` | **ok — 3725 passed, 0 failed, 2 ignored** |
-| `cargo test --tests -- --test-threads=1` | **ok — 3725 lib + 139 integration = 3864 passed, 0 failed** |
-| `cargo test --lib` (default parallel harness) | **ABORTS — `double free or corruption`, SIGABRT, 3 of 3 attempts** |
+| `cargo test --lib -- --test-threads=1` | **ok — 3729 passed, 0 failed, 2 ignored** |
+| `cargo test --tests -- --test-threads=1` | **ok — 3729 lib + 146 integration, 0 failed** |
+| `cargo test --lib` (default parallel harness) | **completes — no abort in 5 of 5 runs**; 58–71 logical assertion failures remain, count varying per run |
+| `bash scripts/check-contract-doc-enforcement.sh` | **ok — gate passes** |
+| `cargo check` for x86_64 / AArch64 / RISC-V bare-metal `kernel_boot` | **clean** |
 
-The parallel abort is reproducible and is recorded as blocker **B9** (§5). It means the
-CI step `cargo test -q` in `.github/workflows/compat-gates.yml` is not currently a
-reliable gate. Every "hosted evidence" claim in this document is a **single-threaded**
-claim.
+**The parallel abort is fixed.** The first revision of this audit recorded
+`cargo test --lib` aborting with `double free or corruption` / SIGABRT on 3 of 3 attempts
+and listed it as a blocker. That was a real memory-safety bug with three independent
+cross-test aliasing causes; the fixes were transplanted from `889026f3` and every parallel
+run now reaches a normal test-result line. See `doc/KERNEL_TEST_RULES.md` Rule H1 for the
+three causes and the surviving constraint.
+
+What remains under a parallel harness is **logical** shared-machine contention, not memory
+unsafety: modules that share process-global counters and one-shot latches
+(`stage200d1_server_death` 11, `stage200c_reply_timeout_transaction` 8,
+`stage198e3b2b_drain_switch` 8, `stage200d2a_deferred_death` 7, and ~15 more) fail
+non-deterministically when run concurrently. Every "hosted evidence" claim in this document
+is therefore still a **single-threaded** claim, and removing that contention is part of
+canonical Stage **205C**.
 
 ---
 
@@ -148,6 +173,57 @@ global-lock fallback handler** of the reply-timeout path. Its off-lock replaceme
 `with_ipc_split_mut` / `with_task_tcbs_split_mut` / `enqueue_reply_timeout_wake_split` —
 is the production path on x86_64. The broad-lock variant is retained as the fallback and
 has not been deleted.
+
+### 1.4a Per-callsite classification — the Stage 204A deliverable
+
+Canonical Stage 204A requires every runtime callsite classified **boot-only / test-only /
+runtime-required / obsolete fallback**, with no undocumented runtime callsite remaining.
+Enclosing functions were resolved mechanically from source.
+
+| Class | Count |
+|-------|-------|
+| boot-only | **0** |
+| test-only | **3** |
+| obsolete | **2** |
+| runtime-required | **46** |
+| undocumented | **0** |
+
+#### test-only (3)
+
+| Site | Enclosing fn | Why |
+|------|--------------|-----|
+| `runtime.rs:1244` | `ipc_recv_with_deadline_split_bridge` | only callers are in `src/kernel/boot/tests.rs`; the helper's own doc says "falls back to global lock for recv; **not a standalone trap-seam path**" |
+| `runtime.rs:1248` | `ipc_recv_with_deadline_split_bridge` | same helper, deadline arm |
+| `runtime.rs:2654` | `control_plane_set_process_cnode_slots_via_syscall` | the `SharedKernel` wrapper's only callers are in the `runtime.rs` test module (lines 4962, 4986, 5495, 5682); production NR 8 goes through `control_plane_set_process_cnode_slots_split_mut` |
+
+#### obsolete (2)
+
+| Site | Enclosing fn | Why |
+|------|--------------|-----|
+| `runtime.rs:2644` | `SharedKernel::handle_trap_with_cpu` | **no in-tree caller at all** — production, tests or otherwise. Only source-grep guards reference the name. Deletable. |
+| `runtime.rs:3725` | `run_reply_timeout_completion` | no production caller; superseded by the `OffLockReplyTimeout` composition (`runtime.rs:247`). Retained only until the AArch64/RISC-V reply-timeout scans are ported (canonical 199E). |
+
+#### runtime-required (46)
+
+| Group | Sites | Enclosing fn |
+|-------|-------|--------------|
+| Authoritative trap dispatch | `trap_entry.rs:299`; `riscv64/trap.rs:563` | `handle_trap_entry_shared`, `handle_riscv_trap_entry_shared` |
+| Post-lock drain re-acquisitions | `trap_entry.rs:423, 499, 558, 644, 674, 747, 805`; `riscv64/trap.rs:659, 727, 825, 870, 958, 1063, 1194` | same two functions |
+| First-resume trampoline | `trap_entry.rs:1055, 1202, 1295` | `yarm_kernel_thread_switch_trampoline` |
+| AArch64 split return path | `trap_entry.rs:1432` | `finalize_split_handled_syscall` |
+| Identity snapshots | `descriptor_tables.rs:1249, 1305` | `yarm_x86_dispatch_trap_from_stub` |
+| x86_64 AP paths (knob-gated at runtime, still compiled in) | `smp.rs:2179, 2442, 2455, 2571, 2582, 2664` | `ap_seal_return_to_idle`, `c2c_bsp_saved_frame_resume`, `ap_saved_frame_resume`, `ap_sched_next_or_idle` |
+| RISC-V resume | `riscv64/boot.rs:1048` | `yarm_riscv64_trap_bridge` |
+| Thread creation | `thread_state.rs:232` | `yarm_kernel_thread_switch_trampoline_rust_real` |
+| Recv / delivery boundary | `runtime.rs:1350, 1450, 1484, 1533, 1701, 1714, 1846, 2190, 2368, 2402` | `try_split_ipc_recv_queued_plain_into_frame`, `complete_recv_boundary_user_copy`, `complete_recv_boundary_ordinary_cap`, `execute_dispatch_post_work`, `execute_blocked_waiter_reply_cap_delivery`, `execute_blocked_waiter_ordinary_cap_delivery` |
+| Identity / SMP / deadline helpers | `runtime.rs:389, 670, 3696, 4013, 4017, 4025` | `current_tid_authoritative`, `revalidate_idle_owner_after_drains`, `smp_request_wake_target_split_read`, `disarm_reply_deadline_on_reply_win`, `smp_assign_task_home_cpu` |
+
+> **Naming hazard found during classification.** `runtime.rs:3696` sits inside
+> `smp_request_wake_target_split_read` — a function whose name ends in `_split_read` but
+> which takes the **broad** lock via `self.with(|k| k.task_home_cpu(tid))`. It is the only
+> `*_split_read`-named function in the tree that does so. Do not treat the naming
+> convention as a guarantee; canonical 204B should either rename it or give it a real
+> task-domain seam.
 
 ### 1.5 Raw / global `KernelState` mutation
 
@@ -289,152 +365,253 @@ flow through step 8 above (noted explicitly at `trap_entry.rs:1109`).
 
 ## 3. Canonical stage status — 199C … 205D
 
-Stage identities below are **canonical**, defined by this audit against the source at
-`757993b`. The "historical" column records which legacy stage labels contributed, purely
-as commit-evidence.
+**The definitions below are owner-supplied and authoritative.** Full definition text lives
+in `doc/KERNEL_UNLOCKING.md` §0.3; this section carries the recalculated status and the
+source evidence for each verdict. Three levels are distinguished, and only the third
+counts as done:
 
-Status values: **COMPLETE** = production path landed and evidenced; **PARTIAL** =
-mechanism landed but an architecture, a gate, or a live cell is missing; **OPEN** = not
-implemented.
+* **hosted foundation** — seams exist and are hosted-tested. May be `HELPER_ONLY`, i.e.
+  wired into nothing.
+* **live proof** — proven on a clean QEMU boot. May be knob-gated, in which case it proves
+  the mechanism and **not** the production path.
+* **stage complete** — the definition's full scope is retired on the production path, on
+  every required architecture, with no broad-lock fallback.
 
-| Canonical | Scope | Status | Source / test evidence | Missing production work | Missing live cells | Depends on |
-|-----------|-------|--------|------------------------|-------------------------|--------------------|------------|
-| **199C** | Off-lock direct `IpcCall`/`IpcReply` transaction (x86_64), incarnation-safe reply records, reserve→commit→cancel | **PARTIAL** | `syscall_split.rs:295/307`; `ipccall_direct_txn.rs`; hosted suite; `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok` (`STAGE_199A2D3`) | gate `ipccall_direct_proof_enabled()` is **default-OFF** — NR6/NR7 never take the off-lock path in a normal boot | 0 (all NR6/NR7 cells are proof-gated) | — |
-| **199D** | Cross-arch NR6/NR7 admission (AArch64 `199A2C1`, RISC-V `199A2C2`) | **PARTIAL** | `trap_entry.rs:1384`; `riscv64/trap.rs:442`; `qemu-ipccall-reply-direct-matrix-seal.sh` | same default-OFF gate | proof-gated only | 199C |
-| **200A** | Reply / timeout / peer-death terminal ownership model | **COMPLETE** | `doc/STAGE_200A…` §10 hosted seal `result=ok`; `terminal_ownership.rs` | — | n/a (hosted-only stage) | — |
-| **200B** | Generation-bearing deadline token store | **COMPLETE** | `deadline_token.rs`; hosted seal `result=ok` | — | n/a | 200A |
-| **200C** | Reply-receive deadline completion transaction + three-arch live matrix | **COMPLETE** | `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`; `scripts/qemu-ipc-reply-timeout-matrix-smoke.sh` | — | **6/6 earned** (timeout-wins + reply-wins × x86_64/AArch64/RISC-V) | 200B |
-| **200D** | Off-lock reply-timeout retirement (scan off the broad lock) | **PARTIAL** | `IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 … result=ok`; `OffLockReplyTimeout` (`runtime.rs:247`) | AArch64 + RISC-V scans still `scan_broad_lock=1`; `run_reply_timeout_completion_locked` (`runtime.rs:3725`) not deleted | x86_64 only | 200C |
-| **201A** | `ExitCurrentTask` NR 16 ABI + non-returning disposition | **COMPLETE** | `SYSCALL_EXIT_CURRENT_TASK_NR = 16` (`syscall.rs:37`); hosted suite | — | n/a | — |
-| **201B** | `ExitCurrentTask` live cells — x86_64, AArch64 | **COMPLETE** | sealed at `0b5e98f`; `EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 … result=ok` | — | **2/3 earned** | 201A |
-| **201C** | `ExitCurrentTask` live cell — RISC-V | **OPEN** | runner bound corrected at `5488d8e` (4096→64 yields) | none — kernel chain proven correct at `fb5f040` | **0/1** — re-run never executed | 201B |
-| **201D** | Server-death terminal mechanism + deferred post-lock completion | **COMPLETE** | `2bba07f` (hosted mechanism), `a1eb8cb` (deferred completion); `drain_server_death_post_work` | — | n/a | 200A |
-| **202A** | ServerDies liveness foundation — 9 transition classes, 15 hard-fail literals, 24 races, 9 wiring guards | **COMPLETE** | `mod.rs:3985`–`4152`; `35a98f2`, `dc5f5c5`; foundation seal `result=ok` | — | 0 by design (`live_cells=0` is part of the seal) | 201D |
-| **202B** | Three-architecture return contract + ServerDies live readiness | **COMPLETE** | `7e811cc`; readiness seal `qemu_boots=0 live_cells=0 result=ok` | — | 0 by design | 202A |
-| **202C** | x86 post-drain restore-owner revalidation + typed restore-failure contract | **COMPLETE (hosted)** | `OwnerRevalidation`/`OwnerCommit` (`runtime.rs:272`–`322`); `revalidate_idle_owner_after_drains` (`runtime.rs:665`, wired `x86_64/descriptor_tables.rs:1324`); 9 + 11 hosted cases, 7 + 10 mutation guards killed | AArch64/RISC-V equivalents not needed (they consume post-drain — A4) | **0** — never exercised in QEMU | 202B |
-| **202D** | ServerDies link accounting repair — `LINK_LEAK created=54 detached=1 result=fail` | **OPEN** | defect proven live (Stage 200D-2B1D4); counters at `mod.rs:4116`; creation `ipc_state.rs:1250`, detach `ipc_state.rs:1383` | scope the counters to the audited death, or count `unregister_server_reply_link` too and drop the `== 1` expectation | **blocks all of 203** | 202C |
-| **203A** | x86_64 ServerDies live cell | **OPEN** | 4 attempts, none sealed (`200D-2B1D`, `D2`, `D4`, `D5`) | none known beyond 202D | 0/1 | 202D |
-| **203B** | AArch64 ServerDies live cell | **OPEN** | runner `scripts/qemu-aarch64-server-dies-smoke.sh` exists | — | 0/1 | 203A |
-| **203C** | RISC-V ServerDies live cell | **OPEN** | runner `scripts/qemu-riscv64-server-dies-smoke.sh` exists | — | 0/1 | 203A |
-| **203D** | ServerDies three-architecture matrix seal | **OPEN** | — | combined exact-commit runner | 0/3 | 203A–C |
-| **204A** | Retire blocking `IpcRecv` (NR 2) off the broad lock | **OPEN** | today only the kernel-task queued-plain case is split | off-lock block-publish + queue-advancing dispatch for the general receiver | 0/3 | 203D |
-| **204B** | Retire `IpcSend` (NR 1) off the broad lock | **OPEN** | plain / ordinary-cap / shared-region all enter broad | off-lock send transaction | 0/3 | 204A |
-| **204C** | Retire `FutexWait` (NR 9) block+dispatch off the broad lock | **OPEN** | seams landed **helper-only** at Stage 191D — `futex_wait_would_block_split_read`, `futex_wait_publish_block_split_mut` (`syscall_split.rs:786`) | wire the seams live; needs the multi-stage dispatch rewrite the comment disclaims | 0/3 | 204A |
-| **204D** | Retire the non-syscall trap path (timer / external IRQ / page fault) | **OPEN** | whole handler is inside `with_cpu` | per-domain IRQ + fault handling | 0/3 | 204A–C |
-| **205A** | Remove the AArch64 split return-path broad re-acquisition (A1) | **OPEN** | `trap_entry.rs:1432` | off-lock arch return export | 0/1 | 204D |
-| **205B** | Collapse `trap_entry.rs` / `riscv64/trap.rs` to a single bounded broad seam | **OPEN** | 12 + 8 callsites today | drain re-acquisitions replaced by split restores | 0/3 | 205A |
-| **205C** | Retire the residual non-trap `with_cpu` sites (`smp.rs` ×4, `descriptor_tables.rs` ×2, `riscv64/boot.rs`, `thread_state.rs`) and the 10 broad `with` sites | **OPEN** | §1.3, §1.4 | split seams for AP bring-up, identity snapshot, resume, thread creation | 0/3 | 205B |
-| **205D** | Delete `SharedKernel::with` / `with_cpu` and the `SpinLock<KernelState>` field — **full unlock** | **OPEN** | `runtime.rs:232` | the field itself | 0/3 | 205C |
+### 3.1 Phase 2 — IPC subsystem unlocking
 
-### 3.1 Documentation defects found during the stage mapping
+| Stage | Scope (abbreviated) | Status | Evidence and gap |
+|-------|--------------------|--------|------------------|
+| **199C** | Blocking `IpcSend` — sender-waiter publication retired, sparse-queue + timeout parity | **OPEN** | `handle_ipc_send` and its waiter publication run inside the broad `with_cpu`. The only off-lock element is the x86_64 D2-send drain (`trap_entry.rs:388`), which relocates the queue-advancing **dispatch**, not the publication, and is compile-time absent on the other two architectures. The 15 `IpcSend` live cells prove **delivery**, not blocking-sender retirement. |
+| **199D** | `IpcCall` + reply-object lifecycle as one transaction, incl. **server crash cleanup** | **OPEN** — hosted foundation + knob-gated live proof | Off-lock transaction exists (`ipccall_direct_txn.rs`; `syscall_split.rs:295/307`), reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) but **default-OFF** (`mod.rs:3095`), so no production boot takes it. **Server-crash cleanup unproven: 0 ServerDies live cells and `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`.** |
+| **199E** | IPC timeout + cancellation: recv, **send**, **call**, reply | **OPEN** — one quarter retired | Reply timeout only: narrow completion on 3 arches, scan off-lock **x86_64 only**, 6 live cells (`STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, `72a4ebf`). `IpcRecvTimeout` pre-reads its deadline off-lock; the receive is broad. **`IpcSend` timeout and `IpcCall` timeout are not retired at all.** Broad fallback `runtime.rs:3725` present. |
+| **199F** | Notification signal / wait / wait-timeout / multi-signal; no global lock in IRQ-originated delivery | **OPEN** | Only `notification_waiter_count_split_read` exists, and it is a read helper. `signal_notification` (`ipc_state.rs:5196`) takes `&mut self` under the broad lock. IRQ-originated delivery runs inside the broad trap closure. |
+| **199G** | Full IPC seal — zero IPC broad-lock acquisitions | **OPEN** | Blocked on 199C–199F. |
 
-* **Stage 200C2C is entirely undocumented.** The three-architecture reply-timeout matrix —
-  arguably the most significant landed result in the audited range, 6 live cells — exists
-  only in commit messages (`1ef1dcc`…`72a4ebf`). No `doc/` file mentions it and
-  `KERNEL_UNLOCKING.md` contains **zero** occurrences of any stage identifier at or above
-  199C. Migrated into `doc/KERNEL_UNLOCKING.md` and `doc/IPC.md` by this pass.
+### 3.2 Phase 3 — Capability subsystem unlocking
+
+| Stage | Scope | Status | Evidence and gap |
+|-------|-------|--------|------------------|
+| **200A** | CNode slot lookup / reservation / generation / install-remove / rollback | **OPEN** — narrow foundation | `control_plane_set_process_cnode_slots_split_mut` retires one control-plane op (NR 8); read helpers `cnode_slot_capacity_split_read`, `cnode_registered_split_read`, `process_cnode_for_identity_split_read`. The five-part decomposition does not exist. |
+| **200B** | Cap copy / mint / move / release / revoke, identity+refcount separated from slot mutation | **OPEN** — hosted foundation, **zero production wiring** | `cap_transfer_split.rs`, `cap_memory_mint_split.rs`, `cap_transfer_materialize_split.rs`, `cap_transfer_delegation_split.rs` are each marked **`M2_SEAM_HELPER_ONLY`** and documented as **"NOT wired into"** `ipc_reply` / `ipc_send` / `recv` / `call` / `materialize_received_message_cap_routed`. |
+| **200C** | Object lifetime + transfer-envelope cleanup for Endpoint, Notification, Reply, MemoryObject, AddressSpace, Task, IRQ | **OPEN** — 1 of 7 object classes | Shared-region transaction cleanup is real and 3-arch live for the direct class (executor-owned protocol A, generation-bearing teardown, cancellation fuse; `orphan_pages=0`, `duplicate_unmaps=0`, `leaked_transactions=0`). `with_capability_state_split_mut` has exactly **one** production caller (`capability_lifecycle_state.rs:864`). |
+| **200D** | Capability subsystem seal + failure injection | **OPEN** | Blocked on 200A–200C. |
+
+> The historical stages labelled `200A` / `200B` / `200C` (terminal ownership, deadline
+> token store, reply-timeout transaction) are **IPC timeout work and belong to canonical
+> 199E**. They contribute nothing to canonical 200A–200C.
+
+### 3.3 Phase 4 — VM and memory-object unlocking
+
+| Stage | Scope | Status | Evidence and gap |
+|-------|-------|--------|------------------|
+| **201A** | Anon map + MemoryObject creation, initial page ownership, AS reservation | **OPEN** | `VmAnonMap` (NR 13) broad-lock only. |
+| **201B** | `VM_MAP` / `VM_UNMAP` transactional model | **OPEN** — narrow foundation | Only `VmBrk` (NR 14) page-crossing shrink is split, x86_64 only, single-CPU-online gated. `with_vm_user_spaces_split_mut` / `with_memory_split_mut` exist. |
+| **201C** | ZC grant + file-slice MemoryObjects (`FILE_GRANT_RO`, NR 28) with complete explicit failure handling | **OPEN** | NR 28 / NR 29 broad-lock only. NR 27 confirmed removed (Stage 197A), so the no-fallback premise holds. |
+| **201D** | Page fault + demand mapping off the broad lock | **OPEN** | Only diagnostic bookkeeping is off-lock (`record_fault_split_mut`). Classification, AS lookup, MO lookup, page allocation, mapping commit and disposition all run in `handle_trap_event` (`fault_state.rs:1127`) under `with_cpu`. |
+| **201E** | COW + fork memory lifetime | **OPEN** | `Fork` (NR 12) broad-lock only. |
+| **201F** | Cross-arch TLB seal | **OPEN** — x86_64 mechanism landed | x86_64 has a real cross-CPU shootdown ACK coordinator (`tlb_shootdown.rs`, Stage 189A); the ack is produced by the target AP's mailbox handler and never fabricated. The **AArch64/RISC-V wake-only-AP rationale the stage explicitly requires is not written.** |
+| **201G** | VM subsystem seal | **OPEN** | Blocked on 201A–201F. |
+
+### 3.4 Phase 5 — Task and process lifecycle unlocking
+
+| Stage | Scope | Status | Evidence and gap |
+|-------|-------|--------|------------------|
+| **202A** | Thread creation + admission; x86 naked-trampoline fix generalized as an explicit **entry ABI contract** | **OPEN** | `thread_state.rs:232` still takes `with_cpu`. The trampoline fix exists but has not been generalized into a stated contract. |
+| **202B** | Process spawn with rollback; no partially visible process | **OPEN** | NR 23 / 24 / 26 / 29 broad-lock only. |
+| **202C** | Fork/COW transaction; child published only after commit | **OPEN** | Blocked on 201E and 202B. |
+| **202D** | Exit + normal reap: thread/process exit, scheduler removal, IPC waiter cancellation, **reply-object cleanup**, VM teardown, cap teardown, parent notification | **OPEN** — partial foundation, 2/3 live cells for one sub-path | `ExitCurrentTask` (NR 16) ABI + non-returning disposition landed; live cells x86_64 (`0b5e98f`) and AArch64; **RISC-V unearned** (runner bound corrected `5488d8e`, re-run never executed). NR 16 still runs **inside** the broad lock with post-lock drains; the other seven elements are not retired. The ServerDies link-accounting defect is this stage's **reply-object-cleanup** element, overlapping 199D's server-crash cleanup. |
+| **202E** | `ReapFaultedTask` (NR 31) out of the broad-lock-only path | **OPEN** | `handle_reap_faulted_task` (`syscall/process.rs:933`) dispatches under the broad lock; `reap_faulted_task_noalloc_cleanup` (`restart_state.rs:361`) takes `&mut self`. |
+| **202F** | Lifecycle subsystem seal | **OPEN** | Blocked on 202A–202E. |
+
+### 3.5 Phase 6 — Timer, IRQ, and scheduler hot paths
+
+| Stage | Scope | Status | Evidence and gap |
+|-------|-------|--------|------------------|
+| **203A** | Timer tick + deadline processing; **no broad lock from timer interrupt context** | **OPEN** — partial foundation | The tick is handled inside `handle_trap_entry_with_fault_bookkeeping_mode`, i.e. inside `with_cpu`. `scheduler_tick_now_split_read` and the post-lock reply-timeout drain are partial foundations. |
+| **203B** | IRQ delivery — ack, notification delivery, waiter wake, mask/unmask; fast paths never take the broad lock | **OPEN** | External IRQs enter the same broad trap closure. |
+| **203C** | Scheduler core; rank-1/rank-2 seams become **authoritative, not compatibility helpers** | **OPEN** — partial | The rank-1 seam is authoritative for queue-advancing dispatch on **x86_64 only**: `d6_genuine_enabled()` (`mod.rs:766`) is compile-time **false** on AArch64 and RISC-V. ~20 of the 46 runtime-required callsites are drain re-acquisitions that exist precisely because the seams are not authoritative end to end. |
+| **203D** | Cross-CPU work; AArch64/RISC-V may stay BSP-only **provided APs are explicitly wake-only and no runnable task can be stranded** | **OPEN** — x86_64 live-proven, knob-gated | x86_64: shootdown mailboxes, reschedule IPIs both directions, remote wake, cross-CPU placement, per-CPU current — all live at SMP=2 under default-off knobs; production scheduler still BSP-only. The AArch64/RISC-V wake-only + no-stranding argument the stage requires is **not documented**. |
+
+### 3.6 Phase 7 — Remove the monolithic runtime path
+
+| Stage | Scope | Status | Evidence and gap |
+|-------|-------|--------|------------------|
+| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 51 callsites enumerated with file, line and enclosing function. **0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). |
+| **204B** | Decompose `KernelState` ownership; `SharedKernel` may remain a container but must not serialize the kernel | **OPEN** — partial foundation | 11 ranked domain locks and a full seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`. |
+| **204C** | Remove fallback-to-global handlers | **OPEN** | Five families live: default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
+| **204D** | Remove retirement scaffolding | **OPEN** | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, one-shot class logging and the foundation oracles are all live. |
+| **204E** | Delete the runtime `SpinLock` + anti-reintroduction guard | **OPEN** | `state: SpinLock<KernelState>` (`runtime.rs:232`) present; no guard exists. |
+
+### 3.7 Phase 8 — Full unlocking seal
+
+| Stage | Scope | Status | Evidence and gap |
+|-------|-------|--------|------------------|
+| **205A** | Complete syscall matrix — arch, class, locks, blocking, post-lock work, rollback, **address-space restore**, live proof. **Every runtime cell localized.** | **OPEN** — matrix drafted, localization false | §2 supplies the matrix across all three architectures with locks / blocking / post-lock / rollback / hosted / live columns. Two gaps: the **address-space restore** column is not populated per cell, and the exit condition (every runtime cell localized) is false while 46 runtime-required broad callsites remain. **205A reports cells; it is not where defects are retired.** |
+| **205B** | Fault-injection matrix at every transactional boundary | **OPEN** — isolated precedents | Shared-region 12-case race seal, reply-cap 18-case negative seal, 24 deterministic ServerDies races. No unified matrix; no coverage of allocation failure, slot exhaustion, queue full, or shootdown failure. |
+| **205C** | Long-running concurrency torture with all anomaly counters zero | **OPEN** | No sustained harness exists. The hosted suite cannot currently serve as one: under a parallel harness it produces 58–71 shared-state assertion failures (§0). |
+| **205D** | Cross-arch full-unlock seal — `KERNEL_RUNTIME_GLOBAL_LOCK_CALLS … count=0` ×3, `KERNEL_FULL_UNLOCK_SEAL … result=ok` ×3, `KERNEL_FULL_UNLOCK_CROSS_ARCH_SEAL arches=3 result=ok` | **OPEN** | **None of the three marker families exists anywhere in the tree** (grep over `src`, `crates`, `tests`, `scripts`). |
+
+### 3.8 Summary
+
+| Phase | Complete | Partial foundation | Open |
+|-------|----------|--------------------|------|
+| 2 — IPC | 0 of 5 | 199D, 199E | 199C, 199F, 199G |
+| 3 — Capability | 0 of 4 | 200A, 200C | 200B, 200D |
+| 4 — VM | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
+| 5 — Lifecycle | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |
+| 6 — Timer/IRQ/sched | 0 of 4 | 203A, 203C, 203D | 203B |
+| 7 — Monolith removal | **204A** | 204B | 204C, 204D, 204E |
+| 8 — Seal | 0 of 4 | 205A | 205B, 205C, 205D |
+| **Total** | **1 of 34** | 11 | 22 |
+
+**No canonical stage in Phases 2–6 or 8 is complete.** The one completed stage, 204A, is
+documentation rather than lock retirement.
+
+### 3.9 Documentation defects found during the stage mapping
+
+* **Stage 200C2C was entirely undocumented.** The three-architecture reply-timeout matrix
+  (6 live cells, canonical 199E evidence) existed only in commit messages. Migrated into
+  `doc/IPC.md` §8.4 and `doc/PROJECT_HISTORY.md`.
 * **`doc/SYSCALL_ABI.md` was stale**: it declared "Public syscall count: 16 (`0..=15`)"
-  while NR 16 `ExitCurrentTask` had landed. Corrected by this pass.
-* **`doc/STATUS.md` was ~70 stages stale**, describing Stage 129–132 as the frontier.
-* Three doc references were already broken before this pass:
-  `doc/ABI_CONTRACT_FREEZE.md` (**actively grepped** by
-  `scripts/check-contract-doc-enforcement.sh` — that gate cannot pass),
-  `doc/IPC_RECV_V2_ORACLE.md` (comment in `scripts/qemu-ipc-recv-v2-oracle-smoke.sh`), and
-  `doc/ROADMAP.md` (referenced by `DOCUMENTATION_MAP.md` and `STATUS.md`).
+  while NR 16 `ExitCurrentTask` had landed, and its slot matrix still listed `16..=22` as a
+  reserved gap. Both corrected.
+* **`doc/STATUS.md` was roughly seventy stages stale**, describing Stage 129–132 as the
+  frontier.
+* **Three doc references were broken and all are now repaired** — see
+  `doc/DOCUMENTATION_MAP.md` "Broken references found in Pass 6 — all repaired".
+  `doc/ABI_CONTRACT_FREEZE.md` was deleted in `3c86f362` with no migration while
+  `scripts/check-contract-doc-enforcement.sh` still grepped it, so that gate could not
+  pass; its content is recovered, re-verified and folded into `doc/SYSCALL_ABI.md`.
+
+### 3.10 Gate status
+
+All nine documentation / contract gates pass:
+
+| Gate | Result |
+|------|--------|
+| `check-contract-doc-enforcement` | ✅ (was failing — repaired, see §3.9) |
+| `check-current-contracts` | ✅ |
+| `check-roadmap-readiness` | ✅ |
+| `check-boundary-milestone-freeze` | ✅ |
+| `check-proc-vfs-codec-freeze` | ✅ |
+| `check-service-domain-ownership` | ✅ |
+| `check-tid-allocation-policy` | ✅ |
+| `check-ci-workflow-enforcement` | ✅ |
+| `check-hal-conformance-targets` | ✅ |
+| `check-crate-graph-boundary` | ✅ |
+| `check-pr-scope-and-message` | ✅ |
+
+**Two source-boundary gates fail, and both pre-date this work.** Verified failing at
+`origin/main` (`757993b`) and at the Pass 6 commit (`f8a3c04`), i.e. not introduced here.
+They are production-source violations, not documentation, and repairing them is unrelated
+production work that this audit deliberately did not perform:
+
+| Gate | Failure |
+|------|---------|
+| `check-kernel-arch-boundary` | `architecture boundary violation pattern 'target_arch = "x86_64"' in src/bin/kernel_boot.rs` — lines 91 and 93 carry `#[cfg(target_arch = "x86_64")]` / `#[cfg(not(target_arch = "x86_64"))]` |
+| `check-service-arch-boundary` | `crates/yarm-control-plane-servers/src/bin/crash_test_srv.rs:1: missing delegation to service/runtime entrypoint` |
+
+Because these two are red, **the branch is not gate-clean overall** even though every
+documentation gate passes. That distinction is stated rather than papered over.
 
 ---
 
-## 4. Dependency-ordered roadmap to full unlock
+## 4. Roadmap to full unlock
 
-Each stage below is scoped to **one production path**, small enough for a single
-implementation turn. "Broad-lock reduction" is the expected change to the §1.2 count of
-**51**.
+The ordering is the canonical phase order (`doc/KERNEL_UNLOCKING.md` §0). Phases 2–6
+retire subsystems; Phase 7 removes the monolith; Phase 8 seals. Within a phase, a seal
+stage cannot precede the stages it seals.
 
-| # | Stage | One production path | Exit criteria | Hosted tests | Live cells | Broad-lock callsite Δ |
-|---|-------|---------------------|---------------|--------------|------------|----------------------|
-| 1 | **202D** | `server_dies_counters` accounting (`mod.rs:4116`, `ipc_state.rs:1250/1383`) | `IPC_SERVER_DEATH_LINK_LEAK` cannot fire on a boot with ≥1 ordinary `IpcCall`; `audit_success_path` scopes to the audited death; the nine-counter vector's meaning is restated in `doc/IPC.md` | ≥8 cases: multi-call boot, reply-closed link, exit-closed link, both, counter scoping, reset semantics; ≥4 mutation guards | **0** (explicitly none) | **0** |
-| 2 | **203A** | x86_64 ServerDies runner (`scripts/qemu-x86_64-server-dies-smoke.sh`) | one clean boot: caller enqueued → dispatched → resumed with `code=10`; zero hard-fail literals; `202C` revalidation observed live | runner scope guards | **1** (x86_64) | 0 |
-| 3 | **201C** | RISC-V `ExitCurrentTask` runner re-run | `EXIT_TASK_SURVIVOR_PROGRESS_OK` + `EXIT_TASK_SYSTEM_HEALTH_OK` within the boot timeout | bound guard already landed | **1** (RISC-V) | 0 |
-| 4 | **203B/203C** | AArch64 + RISC-V ServerDies runners | per-arch clean boot, same literals | runner scope guards | **2** | 0 |
-| 5 | **203D** | Combined exact-commit ServerDies matrix runner | one commit, three arches, `live_cells=3 result=ok` | matrix parser guards | **3 (seal)** | 0 |
-| 6 | **200D′** | AArch64 + RISC-V reply-timeout scan → off-lock | `IPC_REPLY_TIMEOUT_LOCK_STATUS scan_broad_lock=0` on all three arches; delete `run_reply_timeout_completion_locked` | ≥10 cases | **2** | **−1** (`runtime.rs:3725`) |
-| 7 | **199C′** | Flip `ipccall_direct_proof_enabled()` from proof-gate to production default on x86_64 | normal boot takes the off-lock NR6/NR7 path; all Stage 199 seals re-run green ungated | ≥12 cases incl. gate-removal guards | **2** | 0 |
-| 8 | **199D′** | Same flip for AArch64 + RISC-V | three-arch ungated matrix seal | ≥8 cases | **4** | 0 |
-| 9 | **205A** | AArch64 `finalize_split_handled_syscall` (`trap_entry.rs:1412`) | AArch64 `DebugLog`/`FutexWake` complete with **zero** broad acquisitions; export + ELR advance via a split seam | ≥8 cases + 4 mutation guards | **2** (AArch64 DebugLog, FutexWake) | **−1** |
-| 10 | **204A** | Blocking `IpcRecv` (NR 2) off-lock block-publish + dispatch | general receiver blocks and resumes with no broad acquisition on the fast path | ≥15 cases | **3** | **−2** to **−4** |
-| 11 | **204C** | Wire the Stage 191D `FutexWait` seams live | `FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK` on the production path; 192A/195E drains become the only dispatch | ≥12 cases | **3** | **−2** |
-| 12 | **204B** | `IpcSend` (NR 1) off-lock send transaction | plain + ordinary-cap classes complete off-lock | ≥15 cases | **6** | **−2** |
-| 13 | **204D** | Non-syscall trap path (timer / IRQ / page fault) | timer tick and page fault handled without `with_cpu` | ≥12 cases | **3** | **−2** |
-| 14 | **205B** | Collapse drain re-acquisitions in `trap_entry.rs` / `riscv64/trap.rs` | ≤1 broad seam per arch trap entry | ≥15 cases | **3** | **−16** |
-| 15 | **205C** | Residual sites: `smp.rs`, `descriptor_tables.rs`, `riscv64/boot.rs`, `thread_state.rs`, the 10 broad `with` sites | zero production `with`/`with_cpu` outside `runtime.rs` | ≥20 cases | **3** | **−17** |
-| 16 | **205D** | Delete `SharedKernel::with`, `with_cpu`, and `state: SpinLock<KernelState>` | the type does not compile with a broad lock present; a source guard asserts its absence | full suite | **3** | **−3 → 0 total** |
+Because **no** Phase 2–6 stage is complete, the useful near-term sequencing is:
 
-Cumulative: **51 → 0** production broad-lock acquisition sites.
+| # | Work | Canonical stage | Why now |
+|---|------|-----------------|---------|
+| 1 | ServerDies reply-link accounting repair | **199D** increment (+ 202D cleanup) | the only `result=fail` in the tree; gates every ServerDies live cell — see §6 |
+| 2 | x86_64 ServerDies live cell | 199D | first exercise of `revalidate_idle_owner_after_drains`, which has never run in QEMU |
+| 3 | RISC-V `ExitCurrentTask` runner re-run | 202D | pure execution debt; the kernel chain is already proven correct |
+| 4 | AArch64 + RISC-V ServerDies live cells | 199D | completes server-crash cleanup proof across architectures |
+| 5 | Flip `ipccall_direct_proof_enabled()` to production default | 199D | until this lands, the entire off-lock direct-IPC transaction benefits nothing |
+| 6 | AArch64 + RISC-V reply-timeout scan off-lock; delete `run_reply_timeout_completion` | 199E | removes one obsolete broad callsite (51 → 50) |
+| 7 | `IpcSend` timeout + `IpcCall` timeout retirement | 199E | the two untouched quarters of 199E |
+| 8 | Blocking `IpcSend` sender-waiter publication | 199C | largest remaining Phase-2 item |
+| 9 | Notification signal/wait/timeout seams | 199F | last Phase-2 subsystem before the 199G seal |
+| 10 | Wire the `HELPER_ONLY` capability seams into production | 200A–200C | Phase 3 currently has zero production wiring |
+
+Phases 4–6 follow. Phase 7 (204B–204E) is the actual broad-lock removal and cannot start
+meaningfully until Phases 2–6 have localized their paths; 204A is already complete and its
+census is the input to 204B.
 
 ---
 
 ## 5. Ten highest-priority blockers
 
-| # | Blocker | Where | Why it blocks | Blocks |
-|---|---------|-------|---------------|--------|
-| **B1** | `LINK_LEAK created=54 detached=1 result=fail` — `LinkCreated` counts every bound `IpcCall` system-wide, `LinkDetached` only the exit path; `audit_success_path` also demands every class `== 1`, and `reset_instance()` has no live caller | `mod.rs:4116`; `ipc_state.rs:1250` vs `1383` | the ServerDies audit hard-fails on **any** real boot, so no ServerDies live cell can ever be earned | 202D, 203A–D |
-| **B2** | `revalidate_idle_owner_after_drains` — the fix for the Stage 200D-2B1D4 live hang — has **never run in QEMU** | defined `runtime.rs:665`, wired `x86_64/descriptor_tables.rs:1324` | the entire ServerDies live programme rests on an unexercised repair | 203A |
-| **B3** | NR6/NR7 off-lock direct IPC is **default-OFF** (`ipccall_direct_proof_enabled()`) | `mod.rs:3095` | every Stage 199 seal describes a path a normal boot never takes; the off-lock IPC work delivers **zero** production benefit today | 199C′, 199D′ |
-| **B4** | Off-lock authoritative dispatch is compile-time x86_64-only | `mod.rs:766` | AArch64 and RISC-V cannot retire any queue-advancing class; two thirds of the matrix is structurally frozen | 204A, 204C, 205B |
-| **B5** | AArch64 split classes re-acquire the broad lock on return | `trap_entry.rs:1432` | AArch64 has **no** genuinely broad-lock-free syscall; the first-cohort seal overstates it | 205A |
-| **B6** | `FutexWait` block+dispatch seams landed **helper-only** and were never wired | `syscall_split.rs:786`–`803` | the largest single blocking class stays broad-lock-only; the comment itself disclaims the required dispatch rewrite | 204C |
-| **B7** | Reply-timeout scan is off-lock on x86_64 only; the broad-lock completion fallback survives | `runtime.rs:3725`; `IPC_REPLY_TIMEOUT_LOCK_STATUS scan_broad_lock=1` on AArch64/RISC-V | Stage 200D cannot close; a broad callsite cannot be deleted | 200D′ |
-| **B8** | RISC-V `ExitCurrentTask` live cell never earned — kernel chain proven correct, runner bound corrected, **re-run not executed** | `5488d8e` | 201 stays at 2/3 with no technical obstacle — pure execution debt | 201C |
-| **B9** | `cargo test --lib` **aborts** under the default parallel harness (`double free or corruption`, SIGABRT, 3/3) while passing 3725/3725 single-threaded | hosted suite; CI `cargo test -q` | the project's own hosted gate is unreliable; every hosted claim is implicitly single-threaded and unstated | all hosted evidence |
-| **B10** | `scripts/check-contract-doc-enforcement.sh` greps `doc/ABI_CONTRACT_FREEZE.md`, which **does not exist** | script lines 14, 26, 27 | a contract gate that cannot pass; ABI freeze is unenforced | ABI contract enforcement |
+| # | Blocker | Where | Blocks |
+|---|---------|-------|--------|
+| **B1** | `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail` — `LinkCreated` counts every bound `IpcCall` system-wide while `LinkDetached` counts only the exit path; `audit_success_path` also demands every class `== 1`, and `reset_instance()` has no live caller | `mod.rs:4116`; `ipc_state.rs:1250` vs `1383` | 199D server-crash cleanup, 202D reply-object cleanup, all ServerDies live cells |
+| **B2** | `revalidate_idle_owner_after_drains` has never run in QEMU | `runtime.rs:665`, wired `descriptor_tables.rs:1324` | the ServerDies live programme rests on an unexercised repair |
+| **B3** | NR 6 / NR 7 off-lock direct IPC is default-OFF | `mod.rs:3095` | 199D — the landed transaction delivers no production benefit |
+| **B4** | `d6_genuine_enabled()` is compile-time x86_64-only | `mod.rs:766` | 203C; AArch64/RISC-V cannot retire any queue-advancing class |
+| **B5** | Every capability seam is `M2_SEAM_HELPER_ONLY` | `cap_transfer_split.rs`, `cap_memory_mint_split.rs`, `cap_transfer_materialize_split.rs`, `cap_transfer_delegation_split.rs` | all of Phase 3 (200A–200D) |
+| **B6** | `FutexWait` off-lock seams landed helper-only and were never wired | `syscall_split.rs:786`–`803` | 203C; the largest blocking class stays broad-lock-only |
+| **B7** | Reply-timeout scan off-lock on x86_64 only; `IpcSend`/`IpcCall` timeouts untouched; broad fallback survives | `runtime.rs:3725`; `IPC_REPLY_TIMEOUT_LOCK_STATUS scan_broad_lock=1` on AArch64/RISC-V | 199E |
+| **B8** | RISC-V `ExitCurrentTask` live cell never earned — kernel chain proven correct, runner bound corrected, re-run not executed | `5488d8e` | 202D |
+| **B9** | Parallel `cargo test --lib` produces 58–71 shared-state assertion failures from process-global counters and one-shot latches | `stage200d1_server_death`, `stage200c_reply_timeout_transaction`, `stage198e3b2b_drain_switch`, `stage200d2a_deferred_death`, ~15 more | 205C; and every hosted claim remains single-threaded-only |
+| **B10** | AArch64 re-acquires the broad lock on its split return path | `trap_entry.rs:1432` | 204B/204E must localize it; **205A reports the cell, it does not retire it** |
+
+The memory-corruption blocker recorded in the first revision of this document is
+**resolved** — see §0 and `doc/KERNEL_TEST_RULES.md` Rule H1.
 
 ---
 
-## 6. Recommended immediate next stage
+## 6. Smallest next production stage
 
-### **Stage 202D — ServerDies link accounting repair**
+### ServerDies reply-link accounting repair — a **199D** increment that also cleans up state **202D** will own
 
-**One production path:** `src/kernel/boot/mod.rs::audit_success_path` and the two
-`ServerReplyLink` accounting sites (`ipc_state.rs:1250` create, `ipc_state.rs:1383`
-detach).
+**One production path:** `server_dies_counters::audit_success_path`
+(`src/kernel/boot/mod.rs:4116`), the `LinkCreated` record at
+`src/kernel/boot/ipc_state.rs:1250`, and the `LinkDetached` record at
+`src/kernel/boot/ipc_state.rs:1383`.
 
-**Why this one, ahead of everything else:**
+**This is not a complete canonical stage and must not be reported as one.** 199D
+additionally requires the NR 6 / NR 7 gate flipped to production default and the whole
+call/reply transaction proven with no broad-lock fallback. This increment removes the one
+hard failure standing in front of that work.
 
-1. It is the **only** hard `result=fail` currently in the tree. Blockers B2–B8 are
-   incompleteness; B1 is a live failing assertion.
-2. It is the sole gate on four canonical stages (203A–203D) and, transitively, on the
-   whole of 204–205.
+**Why this one:**
+
+1. It is the only `result=fail` in the tree. B2–B8 are incompleteness; B1 is a live
+   failing assertion.
+2. It gates every ServerDies live cell, and therefore both 199D's server-crash cleanup and
+   202D's reply-object cleanup.
 3. It is genuinely one turn: a counter-scoping decision plus hosted tests. **No QEMU, no
    live cell, no scheduler change.**
-4. It cannot regress anything — the counters are diagnostic, and Stage 200D-2B1D4 already
-   proved the underlying link lifecycle is correct (`ipc_reply` does close links via
+4. It cannot regress anything — the counters are diagnostic, and the underlying link
+   lifecycle is already correct (`ipc_reply` closes links via
    `finalize_server_reply_link_for_record`). The bug is in the *audit*, not the mechanism.
 
 **Recommended resolution:** scope the nine-counter vector to the death currently being
-audited, rather than counting `unregister_server_reply_link` as a second close site.
-Per-death scoping preserves the "every class == 1" expectation that Stage 200D-2B1B's
-fifteen hard-fail literals were written against, so the foundation seal keeps its meaning;
-counting both close sites would force that seal to be re-specified.
+audited rather than adding `unregister_server_reply_link` as a second close site. Per-death
+scoping preserves the "every class == 1" expectation the fifteen hard-fail literals were
+written against; counting both close sites would force those literals to be re-specified.
 
 **Exit criteria:**
 * `IPC_SERVER_DEATH_LINK_LEAK` cannot fire on a boot containing ≥1 unrelated bound `IpcCall`.
 * `IPC_SERVER_DEATH_TRANSITION_AUDIT` reports the audited death only.
 * `reset_instance()` either gains a live caller or is removed with its rationale recorded.
-* The Stage 202A fifteen hard-fail literals and nine wiring guards still hold.
+* The fifteen hard-fail literals and nine wiring guards still hold.
 
-**Hosted tests (≥8):** multi-call boot with one death; reply-closed link; exit-closed
-link; both in one boot; counter scoping across two deaths; reset semantics; the nine-class
-vector shape; a negative case where a genuine leak *must* still be reported.
+**Hosted tests (≥8):** multi-call boot with one death; reply-closed link; exit-closed link;
+both in one boot; counter scoping across two deaths; reset semantics; the nine-class vector
+shape; a negative case where a genuine leak **must** still be reported.
 
 **Mutation guards (≥4):** counters revert to global scope; the genuine-leak detector is
 weakened to always-pass; the audited-death filter is dropped; `== 1` is removed without
 per-death scoping.
 
-**Live cells:** **none.** State this explicitly in the stage report — 202D is a hosted
-stage, and the first live cell belongs to 203A.
+**Live cells: none.** State this explicitly in the stage report.
 
-**Expected broad-lock callsite reduction: 0.** 202D unblocks the reduction; it does not
-itself perform one. Claiming otherwise would be false.
+**Expected broad-lock callsite reduction: 0.** It unblocks reduction; it does not perform
+one. Claiming otherwise would be false.
 
 ---
 
