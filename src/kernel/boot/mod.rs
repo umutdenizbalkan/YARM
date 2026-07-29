@@ -4019,15 +4019,151 @@ pub mod server_dies_counters {
     /// can never inherit another's counts.
     static INSTANCE: AtomicU64 = AtomicU64::new(0);
 
-    /// Begin a fresh instance. Deterministic: every class returns to zero and the stamp
-    /// clock restarts, so a test observes only its own transitions.
+    // ── Stage 199D: the two tiers the original single pair was conflating ─────────────
+    //
+    // `LinkCreated` used to be incremented by EVERY bound `IpcCall` in the system while
+    // `LinkDetached` was incremented only by the one dying server's teardown, and
+    // `audit_success_path` compared the two. On a real boot that is `created=54
+    // detached=1` — the `IPC_SERVER_DEATH_LINK_LEAK` failure. It was never a leak: the
+    // ordinary reply path does close its links, through `detach_server_reply_link_exact`,
+    // which counted nothing at all. One pair of counters was being asked to answer two
+    // different questions, and could answer neither.
+    //
+    // They are now separate:
+    //
+    //   TIER 1 — `LINKS_CREATED_TOTAL` / `LINKS_CLOSED_TOTAL`, unscoped, incremented by
+    //   EVERY genuine installation and by EVERY genuine removal at BOTH closing edges.
+    //   This is the real reverse-link leak invariant and it is what `LINK_LEAK` now
+    //   compares. A link created anywhere and never closed still fails the audit.
+    //
+    //   TIER 2 — the nine-vector, scoped to the ONE armed ServerDies transaction by the
+    //   reply record `{index, generation}` it owns. Unrelated earlier or later calls
+    //   cannot contaminate it, because they carry a different record identity.
+
+    /// The reply record the armed ServerDies transaction owns: `(index, generation)`.
+    /// A zero generation means unarmed — reply-record generations start at 1, so zero is
+    /// unambiguous. Bounded, no allocation, no lock: the arm is one-shot per instance.
+    static ARMED_RECORD_INDEX: AtomicU64 = AtomicU64::new(0);
+    static ARMED_RECORD_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    /// Tier-1 unscoped link-lifecycle totals.
+    static LINKS_CREATED_TOTAL: AtomicU32 = AtomicU32::new(0);
+    static LINKS_CLOSED_TOTAL: AtomicU32 = AtomicU32::new(0);
+
+    /// Begin a fresh instance. Deterministic: every class returns to zero, the stamp
+    /// clock restarts, the armed record is cleared and both link totals reset, so a test
+    /// observes only its own transitions.
     pub fn reset_instance() -> u64 {
         for i in 0..CLASSES {
             COUNTS[i].store(0, Ordering::Release);
             STAMPS[i].store(0, Ordering::Release);
         }
         SEQ.store(0, Ordering::Release);
+        ARMED_RECORD_INDEX.store(0, Ordering::Release);
+        ARMED_RECORD_GENERATION.store(0, Ordering::Release);
+        LINKS_CREATED_TOTAL.store(0, Ordering::Release);
+        LINKS_CLOSED_TOTAL.store(0, Ordering::Release);
         INSTANCE.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Arm this instance to the reply record the ServerDies transaction owns. One-shot:
+    /// a second arm with a DIFFERENT record is refused and reported, so two overlapping
+    /// scenarios can never share a vector. Re-arming the identical record is idempotent.
+    ///
+    /// Returns `true` when the instance is armed to `{index, generation}` afterwards.
+    pub fn arm_record(index: usize, generation: u64) -> bool {
+        if generation == 0 {
+            return false;
+        }
+        match armed_record() {
+            None => {
+                ARMED_RECORD_INDEX.store(index as u64, Ordering::Release);
+                ARMED_RECORD_GENERATION.store(generation, Ordering::Release);
+                true
+            }
+            Some((i, g)) if i == index && g == generation => true,
+            Some((i, g)) => {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_SCOPE_CONFLICT armed_index={} armed_generation={} offered_index={} offered_generation={} result=fail",
+                    i,
+                    g,
+                    index,
+                    generation
+                );
+                false
+            }
+        }
+    }
+
+    /// The armed reply record, or `None` while unarmed.
+    #[must_use]
+    pub fn armed_record() -> Option<(usize, u64)> {
+        let g = ARMED_RECORD_GENERATION.load(Ordering::Acquire);
+        (g != 0).then(|| (ARMED_RECORD_INDEX.load(Ordering::Acquire) as usize, g))
+    }
+
+    /// Whether `{index, generation}` is the armed transaction's record.
+    #[must_use]
+    pub fn matches_armed(index: usize, generation: u64) -> bool {
+        armed_record() == Some((index, generation))
+    }
+
+    /// Tier-1 totals: `(created, closed)` across every reverse link in the system.
+    #[must_use]
+    pub fn link_totals() -> (u32, u32) {
+        (
+            LINKS_CREATED_TOTAL.load(Ordering::Acquire),
+            LINKS_CLOSED_TOTAL.load(Ordering::Acquire),
+        )
+    }
+
+    /// A reverse link was genuinely installed for `{index, generation}`.
+    ///
+    /// Always tier-1. Tier-2 only when it is the armed record's link — which, in the
+    /// production ordering, it is not: the link is installed while the reply record is
+    /// created, and the transaction only arms later, when the caller blocks. The scoped
+    /// arm therefore attributes the creation edge itself (see `note_armed_link_present`).
+    /// This branch is the safety net if that ordering ever changes, and it is what keeps
+    /// the two paths from double-counting.
+    pub fn note_link_created(index: usize, generation: u64) {
+        LINKS_CREATED_TOTAL.fetch_add(1, Ordering::AcqRel);
+        if matches_armed(index, generation) {
+            record(Transition::LinkCreated);
+        }
+    }
+
+    /// The armed record's link was observed present at arm time.
+    ///
+    /// This is the scoped creation edge. It is a genuine observation of live kernel state
+    /// — teardown has not run, and the link is read back from the bound replier's TCB —
+    /// not an inference from the detach. If the link is absent the caller does not call
+    /// this, `LinkCreated` stays 0 and the audit fails, which is exactly the "armed a
+    /// record that owns no reverse link" defect.
+    pub fn note_armed_link_present(index: usize, generation: u64) {
+        if matches_armed(index, generation) {
+            record(Transition::LinkCreated);
+        }
+    }
+
+    /// A reverse link was genuinely removed for `{index, generation}`, at either closing
+    /// edge — the ordinary terminal detach or the exit-path teardown.
+    ///
+    /// Always tier-1. Tier-2 only for the armed record. A close for a DIFFERENT record
+    /// while armed is reported and deliberately not counted: it belongs to another
+    /// transaction and must not move this vector.
+    pub fn note_link_closed(index: usize, generation: u64) {
+        LINKS_CLOSED_TOTAL.fetch_add(1, Ordering::AcqRel);
+        if matches_armed(index, generation) {
+            record(Transition::LinkDetached);
+        } else if let Some((ai, ag)) = armed_record() {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_FOREIGN_LINK_CLOSE armed_index={} armed_generation={} closed_index={} closed_generation={} counted=0 result=ok",
+                ai,
+                ag,
+                index,
+                generation
+            );
+        }
     }
 
     #[must_use]
@@ -4107,18 +4243,29 @@ pub mod server_dies_counters {
     /// exactly 1 and the publication/enqueue order holds.
     ///
     /// The leak literals are derived from COUNT RELATIONSHIPS, not from a separate scan:
-    /// a link created but never detached IS a link leak, and a deferred item published but
+    /// a link created but never closed IS a link leak, and a deferred item published but
     /// never consumed IS a deferred leak.
+    ///
+    /// The link-leak literal reads the TIER-1 totals — every reverse link in the system,
+    /// closed at either edge — because that, and not the armed transaction's pair, is the
+    /// question "did a reverse link leak?" actually asks. The armed transaction's own
+    /// `LinkCreated` / `LinkDetached` are checked by the exact-1 loop below like every
+    /// other class.
     #[must_use]
     pub fn audit_success_path() -> bool {
         use Transition as T;
         let mut ok = true;
-        if count(T::LinkCreated) != count(T::LinkDetached) {
+        let (links_created, links_closed) = link_totals();
+        if links_created != links_closed {
             crate::yarm_log!(
-                "IPC_SERVER_DEATH_LINK_LEAK created={} detached={} result=fail",
-                count(T::LinkCreated),
-                count(T::LinkDetached)
+                "IPC_SERVER_DEATH_LINK_LEAK created={} closed={} scope=system result=fail",
+                links_created,
+                links_closed
             );
+            ok = false;
+        }
+        if armed_record().is_none() {
+            crate::yarm_log!("IPC_SERVER_DEATH_SCOPE_UNARMED result=fail");
             ok = false;
         }
         if count(T::DeferredPublished) != count(T::DeferredConsumed) {

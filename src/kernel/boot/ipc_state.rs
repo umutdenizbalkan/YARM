@@ -1242,12 +1242,20 @@ impl KernelState {
                 Some(_) => false,
                 None => {
                     tcb.server_reply_link = Some(link);
-                    // Stage 200D-2B1B-i (class 1): a NEW reverse link now exists in the
-                    // server's TCB. The idempotent re-registration arm above returns `true`
-                    // without installing anything and deliberately does not count.
+                    // Stage 199D: a NEW reverse link now exists in the server's TCB. The
+                    // idempotent re-registration arm above returns `true` without installing
+                    // anything and deliberately does not count.
+                    //
+                    // This is the SYSTEM-WIDE creation edge — it fires for every bound
+                    // `IpcCall`, not just the armed ServerDies one — so it feeds the
+                    // unscoped leak totals. `note_link_created` adds it to the armed
+                    // transaction's vector only when the record identities match, which is
+                    // what stopped the 54 unrelated calls from being compared against one
+                    // death's single detach.
                     #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-                    crate::kernel::boot::server_dies_counters::record(
-                        crate::kernel::boot::server_dies_counters::Transition::LinkCreated,
+                    crate::kernel::boot::server_dies_counters::note_link_created(
+                        record_index,
+                        record_generation,
                     );
                     true
                 }
@@ -1285,6 +1293,18 @@ impl KernelState {
                 None => DetachOutcome::AlreadyAbsent,
                 Some(link) if link.matches_record(record_index, record_generation) => {
                     tcb.server_reply_link = None;
+                    // Stage 199D: the ORDINARY terminal close — reply, timeout, caller exit,
+                    // endpoint destruction, cancellation, rollback. It used to count nothing
+                    // at all, which is why the created/detached pair was not even a valid
+                    // leak invariant. It is a genuine removal, so it closes a link for the
+                    // system totals; it moves the armed vector only if it is the armed
+                    // record's link (the reply-wins case, which the audit then correctly
+                    // fails on `PeerDeathWinner == 0`).
+                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                    crate::kernel::boot::server_dies_counters::note_link_closed(
+                        record_index,
+                        record_generation,
+                    );
                     DetachOutcome::Detached
                 }
                 // Same slot, different generation: the slot was reclaimed and reused, so
@@ -1374,13 +1394,16 @@ impl KernelState {
                 .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
                 .and_then(|t| t.server_reply_link.take())
         });
-        // Stage 200D-2B1B-i (class 2): counted only when a link was ACTUALLY removed. The
-        // lookup is exact on {tid, asid}, so a reused numeric TID with a different ASID
-        // matches nothing, detaches nothing, and records nothing.
+        // Stage 199D: the EXIT-PATH close. Counted only when a link was ACTUALLY removed —
+        // the lookup is exact on {tid, asid}, so a reused numeric TID with a different ASID
+        // matches nothing, detaches nothing and records nothing. The removed link carries
+        // the record identity, so the close is attributed to the transaction that owns it
+        // rather than to whichever transaction happens to be armed.
         #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-        if taken.is_some() {
-            crate::kernel::boot::server_dies_counters::record(
-                crate::kernel::boot::server_dies_counters::Transition::LinkDetached,
+        if let Some(link) = taken {
+            crate::kernel::boot::server_dies_counters::note_link_closed(
+                link.reply_record_index,
+                link.reply_record_generation,
             );
         }
         taken
@@ -1969,7 +1992,75 @@ impl KernelState {
             caller.tid.0,
             caller.asid.0,
         );
+        // Stage 199D: this is also where the ServerDies transaction first becomes
+        // IDENTIFIABLE, and therefore where the transition counters can be scoped to it.
+        // The reverse link was installed earlier, when the reply record was created, so the
+        // creation edge cannot scope itself; here the record `{index, generation}` is known
+        // and the server has not exited yet.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        self.arm_server_dies_link_scope(record_index, record_generation);
         Ok(handle)
+    }
+
+    /// Stage 199D — arm the ServerDies transition counters to exactly one reply record and
+    /// attribute that record's reverse-link creation edge.
+    ///
+    /// Runs only in ServerDies oracle mode and only behind the oracle-core feature. It
+    /// observes; it never installs, removes or repairs a link.
+    ///
+    /// The creation edge is attributed by READING LIVE STATE — the record's bound replier
+    /// is resolved and its TCB link is read back and required to name this exact record.
+    /// That is a real observation, not an inference from the later detach: if the armed
+    /// record owns no reverse link, nothing is counted, `LinkCreated` stays 0 and
+    /// `audit_success_path` fails on the exact-1 check. That is the honest report for
+    /// "armed a record with no link", which is precisely the defect Stage 200D-2B1D-x86
+    /// hit live (`DEFERRED_RESERVED` reached, `LINK_CAPTURED` absent).
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn arm_server_dies_link_scope(
+        &mut self,
+        record_index: usize,
+        record_generation: u64,
+    ) {
+        use crate::kernel::boot::server_dies_counters as c;
+        if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            != crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+        {
+            return;
+        }
+        if !c::arm_record(record_index, record_generation) {
+            return;
+        }
+        let bound = self.with_ipc_state(|ipc| {
+            if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+                return None;
+            }
+            ipc.reply_caps
+                .get(record_index)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.responder_tid.zip(r.replier_asid))
+        });
+        let Some((server_tid, server_asid)) = bound else {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} link_present=0 reason=unbound_record result=ok",
+                record_index,
+                record_generation
+            );
+            return;
+        };
+        let present = self
+            .server_reply_link_for(server_tid.0, server_asid)
+            .is_some_and(|link| link.matches_record(record_index, record_generation));
+        if present {
+            c::note_armed_link_present(record_index, record_generation);
+        }
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_SCOPE_ARMED record_index={} record_generation={} server_tid={} server_asid={} link_present={} result=ok",
+            record_index,
+            record_generation,
+            server_tid.0,
+            server_asid.0,
+            u32::from(present)
+        );
     }
 
     /// The reply-timeout token handle referenced by a blocked caller's TCB (the NR7

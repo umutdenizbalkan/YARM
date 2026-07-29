@@ -99,28 +99,28 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 
 ### Immediate blockers
 
-1. **`IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`** — the only hard
-   failure in the tree. Blocks 199D server-crash cleanup and 202D reply-object cleanup.
-   **The smallest next production stage is the repair for this** (a 199D increment; see
-   `doc/KERNEL_UNLOCK_AUDIT.md` §6).
-2. **`revalidate_idle_owner_after_drains` has never run in QEMU** (`src/runtime.rs:665`).
-3. **NR 6 / NR 7 off-lock direct IPC is default-OFF**, so 199D's landed transaction
+1. **`revalidate_idle_owner_after_drains` has never run in QEMU** (`src/runtime.rs:665`) —
+   now the leading blocker. The `IPC_SERVER_DEATH_LINK_LEAK` accounting failure that used
+   to head this list is **resolved** (Stage 199D increment, `doc/IPC.md` §8.5); there is no
+   longer a hard `result=fail` in the tree, and the next ServerDies live attempt is
+   unblocked.
+2. **NR 6 / NR 7 off-lock direct IPC is default-OFF**, so 199D's landed transaction
    delivers no production benefit.
-4. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
+3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
-5. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
+4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
    wiring.
-6. **`FutexWait` off-lock seams landed helper-only** and were never wired.
-7. **Reply-timeout scan is off-lock on x86_64 only**; `IpcSend` and `IpcCall` timeouts are
+5. **`FutexWait` off-lock seams landed helper-only** and were never wired.
+6. **Reply-timeout scan is off-lock on x86_64 only**; `IpcSend` and `IpcCall` timeouts are
    untouched; the broad fallback `run_reply_timeout_completion` survives (199E).
-8. **RISC-V `ExitCurrentTask` live cell** — kernel chain proven correct, runner bound
+7. **RISC-V `ExitCurrentTask` live cell** — kernel chain proven correct, runner bound
    corrected at `5488d8e`, re-run never executed (202D).
-9. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures** — keeps
+8. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures** — keeps
    every hosted claim single-threaded-only. Test-infrastructure debt; a prerequisite for
    using the hosted suite as a 205C harness, not 205C completion work.
-10. **AArch64 re-acquires the broad lock on its split return path**
-    (`src/arch/trap_entry.rs:1432`) — 204B/204E must localize it. 205A reports the cell; it
-    is not where it gets retired.
+9. **AArch64 re-acquires the broad lock on its split return path**
+   (`src/arch/trap_entry.rs:1432`) — 204B/204E must localize it. 205A reports the cell; it
+   is not where it gets retired.
 
 ---
 
@@ -341,16 +341,18 @@ The four highest-impact items, in order of unlock value:
    kernel-unlocking smoke policy and unblock RISC-V SMP scheduling so
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
-2. **Kernel unlocking — canonical Stage 202D (ServerDies link accounting).**
-   The broad `SpinLock<KernelState>` still has **51** production acquisition sites
-   (§0). The single hard failure blocking forward progress is
-   `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`: the nine-counter
-   ServerDies audit compares a system-wide `LinkCreated` count against one death's
-   `LinkDetached` count. Scope the counters to the audited death, keep the Stage 202A
-   fifteen hard-fail literals meaningful, and land it as a hosted-only stage (no QEMU,
-   no live cell, zero broad-lock reduction). That unblocks the three ServerDies live
-   cells and, transitively, the whole 204/205 retirement ladder. See
-   `doc/KERNEL_UNLOCKING.md` §0 and `doc/KERNEL_UNLOCK_AUDIT.md` §6.
+2. **Kernel unlocking — canonical Stage 199D.**
+   The broad `SpinLock<KernelState>` still has **51** production acquisition sites (§0).
+   The ServerDies reverse-link accounting failure that used to head this list is
+   **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
+   ServerDies transaction and the leak invariant moved to system-wide link totals, so there
+   is no hard `result=fail` left in the tree. Two follow-ons, of different kinds: the
+   **x86_64 ServerDies live cell** (a runner act — one clean boot earns the first cell and
+   finally exercises `revalidate_idle_owner_after_drains`, which has never run in QEMU), and
+   the **smallest production change**, flipping `ipccall_direct_proof_enabled()` to the
+   production default on x86_64 so the landed off-lock NR 6 / NR 7 transaction is actually
+   taken by a normal boot. Neither completes 199D. See `doc/KERNEL_UNLOCKING.md` §0 and
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

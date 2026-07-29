@@ -93717,7 +93717,15 @@ mod stage200d2b1bi_counters {
     fn i03_success_vector_and_result_before_enqueue() {
         let _g = globals_guard();
         c::reset_instance();
+        // Stage 199D: the audit requires an armed scope, and the link-leak literal now
+        // reads the system-wide totals, so this synthetic vector must balance them too.
+        assert!(c::arm_record(7, 3));
+        c::note_link_created(7, 3);
+        c::note_link_closed(7, 3);
         for t in ALL {
+            if matches!(t, T::LinkCreated | T::LinkDetached) {
+                continue;
+            }
             c::record(t);
         }
         assert_eq!(c::vector(), [1u32; 9], "each class exactly once");
@@ -93839,7 +93847,9 @@ mod stage200d2b1bi_counters {
         let reg = reg.split("\n    /// ").next().unwrap();
         assert!(reg.contains("tcb.server_reply_link = Some(link);"));
         let install = reg.find("tcb.server_reply_link = Some(link);").unwrap();
-        let rec = reg.find("Transition::LinkCreated").expect("class 1");
+        // Stage 199D: the creation edge now reports its RECORD IDENTITY, so the count can
+        // be attributed to the armed transaction instead of to every call in the system.
+        let rec = reg.find("note_link_created(").expect("class 1");
         assert!(install < rec, "counted after the real install");
         // 2 link detached — only when a link was actually taken.
         let take = IPC_SRC
@@ -93847,8 +93857,22 @@ mod stage200d2b1bi_counters {
             .nth(1)
             .expect("take");
         let take = take.split("\n    /// ").next().unwrap();
-        assert!(take.contains("if taken.is_some() {"));
-        assert!(take.contains("Transition::LinkDetached"));
+        // Stage 199D: the exit-path close reports the identity of the link it removed.
+        assert!(take.contains("if let Some(link) = taken {"));
+        assert!(take.contains("note_link_closed("));
+        assert!(take.contains("link.reply_record_index"));
+        // The ORDINARY terminal close is the second real closing edge and must also report.
+        let detach = IPC_SRC
+            .split("pub(crate) fn detach_server_reply_link_exact(")
+            .nth(1)
+            .expect("detach");
+        let detach = detach.split("\n    /// ").next().unwrap();
+        assert!(detach.contains("tcb.server_reply_link = None;"));
+        assert!(
+            detach.contains("note_link_closed("),
+            "the ordinary terminal close counts too — it used to count nothing, which is \
+             why created/closed was not a valid leak invariant"
+        );
         // 3/4/5 deferred queue operations.
         for (f, class, must) in [
             (
@@ -93906,13 +93930,52 @@ mod stage200d2b1bi_counters {
             !INIT_SRC.contains("server_dies_counters"),
             "userspace must not synthesize transitions"
         );
-        // Every production record(...) lives in one of the four kernel files that own the
-        // real operations.
-        let total: usize = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC]
+        // Every production transition entry point lives in one of the four kernel files
+        // that own the real operations.
+        //
+        // Stage 199D: seven classes are still recorded by a direct qualified
+        // `server_dies_counters::record(...)` at their real operation. The two LINK classes
+        // go through the scoped helpers instead — `note_link_created` / `note_link_closed`
+        // (which also feed the system-wide leak totals) and `note_armed_link_present` — so
+        // a transition can be attributed to the ONE armed transaction rather than counted
+        // for every call in the system. Nine classes, nine real operations, still no
+        // synthesized transition.
+        let files = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC];
+        let direct: usize = files
             .iter()
             .map(|s| s.matches("server_dies_counters::record(").count())
             .sum();
-        assert_eq!(total, 9, "exactly nine production record sites");
+        assert_eq!(direct, 7, "seven directly-recorded classes");
+        let created: usize = files
+            .iter()
+            .map(|s| {
+                s.matches("server_dies_counters::note_link_created(")
+                    .count()
+            })
+            .sum();
+        let closed: usize = files
+            .iter()
+            .map(|s| s.matches("server_dies_counters::note_link_closed(").count())
+            .sum();
+        assert_eq!(created, 1, "one reverse-link creation edge");
+        assert_eq!(
+            closed, 2,
+            "two reverse-link closing edges: ordinary terminal + exit"
+        );
+        // The scoped helpers are the ONLY way the link classes are reached, so an unscoped
+        // link count cannot reappear by accident.
+        let link_records = MOD_SRC.matches("record(Transition::LinkCreated)").count()
+            + MOD_SRC.matches("record(Transition::LinkDetached)").count();
+        assert_eq!(
+            link_records, 3,
+            "created (scoped + armed-present) and detached"
+        );
+        for f in [IPC_SRC, RUNTIME_SRC, RESTART_SRC] {
+            assert!(
+                !f.contains("Transition::LinkCreated") && !f.contains("Transition::LinkDetached"),
+                "link classes are recorded only through the scoped helpers"
+            );
+        }
     }
 
     /// All fifteen canonical hard-fail literals exist at real sites.
@@ -94095,6 +94158,13 @@ mod stage200d2b1bii_races {
         // vector a measurement of the CASE rather than of its setup.
         let fx = caller_fixture();
         c::reset_instance();
+        // Stage 199D: the nine-vector describes exactly ONE armed ServerDies transaction,
+        // identified by the reply record it owns. Arm the instance to this fixture's record
+        // so the case's transitions are attributed and unrelated records are not.
+        assert!(
+            c::arm_record(fx.record_index, fx.record_generation),
+            "the fixture's record arms the counter scope"
+        );
         (g, fx)
     }
 
@@ -94826,6 +94896,252 @@ mod stage200d2b1bii_races {
         teardown();
     }
 
+    // ── Stage 199D: reverse-link accounting ────────────────────────────────────────
+    //
+    // These pin the defect that made `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1`
+    // fire on every real boot: `LinkCreated` was counted for EVERY bound `IpcCall` in the
+    // system, `LinkDetached` only for the one dying server, and `audit_success_path`
+    // compared the two. It was never a leak — the ordinary reply path does close its
+    // links, through a seam that counted nothing at all.
+
+    /// d01. THE REPRODUCTION. Links created by unrelated calls before and after the armed
+    ///      transaction do not move its vector, and the success audit passes.
+    #[test]
+    fn d01_unrelated_links_do_not_contaminate_the_armed_vector() {
+        let (_g, fx) = fx_fresh();
+        // Two unrelated records, one before the armed transaction runs and one after.
+        // They are genuine creations: they move the system totals, never the vector.
+        c::note_link_created(fx.record_index + 41, 7);
+        let id = run_success(&fx);
+        c::note_link_created(fx.record_index + 42, 9);
+        assert_eq!(
+            v()[T::LinkCreated as usize],
+            1,
+            "the armed transaction created exactly one link"
+        );
+        assert_eq!(v()[T::LinkDetached as usize], 1, "and closed exactly one");
+        let (created, closed) = c::link_totals();
+        assert_eq!(created, 3, "all three creations reach the system totals");
+        assert_eq!(closed, 1, "only the armed one has been closed so far");
+        // Close the two unrelated links so the system totals balance, exactly as the
+        // ordinary reply path would.
+        c::note_link_closed(fx.record_index + 41, 7);
+        c::note_link_closed(fx.record_index + 42, 9);
+        assert_eq!(c::link_totals(), (3, 3));
+        assert_eq!(
+            v()[T::LinkDetached as usize],
+            1,
+            "foreign closes never move the armed vector"
+        );
+        assert!(
+            c::audit_success_path(),
+            "the audit passes with 52 unrelated links either side"
+        );
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// d02. A REAL leak is still reported: a link created and never closed fails the audit
+    ///      through the system-wide totals, even though the armed pair is a clean 1/1.
+    #[test]
+    fn d02_real_reverse_link_leak_is_not_hidden() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(v()[T::LinkCreated as usize], 1);
+        assert_eq!(v()[T::LinkDetached as usize], 1);
+        assert!(c::audit_success_path(), "clean before the leak");
+        // An unrelated link that is never closed.
+        c::note_link_created(fx.record_index + 77, 5);
+        assert_eq!(c::link_totals(), (2, 1));
+        assert!(
+            !c::audit_success_path(),
+            "a leaked reverse link anywhere fails the audit"
+        );
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// d03. Both closing edges count. The ORDINARY terminal close used to count nothing,
+    ///      which is why created/closed was not a valid invariant in the first place.
+    #[test]
+    fn d03_both_closing_edges_count() {
+        let (_g, fx) = fx_fresh();
+        assert!(link(&fx));
+        assert_eq!(c::link_totals(), (1, 0));
+        // The ordinary terminal close, through the exact-detach seam.
+        let outcome = fx.k.with(|s| {
+            s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        });
+        assert!(outcome.detached(), "the ordinary close removes the link");
+        assert_eq!(
+            c::link_totals(),
+            (1, 1),
+            "the ordinary terminal close is a real closing edge"
+        );
+        assert_eq!(live_links(&fx), 0);
+        teardown();
+    }
+
+    /// d04. Duplicate close of the ARMED record stays fail-closed: the second close leaves
+    ///      the class visibly >1 and the audit refuses.
+    #[test]
+    fn d04_duplicate_armed_close_is_fail_closed() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(v()[T::LinkDetached as usize], 1);
+        c::note_link_closed(fx.record_index, fx.record_generation);
+        assert_eq!(
+            v()[T::LinkDetached as usize],
+            2,
+            "a duplicate is left visible, not swallowed"
+        );
+        assert!(!c::audit_success_path(), "duplicate detach fails the audit");
+        // The terminal claim itself is untouched by the duplicate accounting event — only
+        // the vector records the defect, which is the point of counting rather than gating.
+        assert_eq!(
+            winner(&fx),
+            Some(TerminalClaimant::PeerDeath),
+            "the terminal claim is untouched by the duplicate accounting event"
+        );
+        let _ = id;
+        teardown();
+    }
+
+    /// d05. A stale RECORD GENERATION detaches nothing and therefore counts nothing, on
+    ///      either tier.
+    #[test]
+    fn d05_stale_generation_counts_nothing() {
+        let (_g, fx) = fx_fresh();
+        assert!(link(&fx));
+        let before = c::link_totals();
+        let outcome = fx.k.with(|s| {
+            s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation.wrapping_add(1),
+            )
+        });
+        assert!(!outcome.detached(), "a stale generation detaches nothing");
+        assert_eq!(c::link_totals(), before, "and counts nothing");
+        assert_eq!(v()[T::LinkDetached as usize], 0);
+        assert_eq!(live_links(&fx), 1, "the real link survives");
+        teardown();
+    }
+
+    /// d06. A LOSING terminal path stays fail-closed: the armed record's link is closed by
+    ///      the ordinary reply, so `LinkDetached` is 1 while `PeerDeathWinner` is 0 and the
+    ///      record-leak literal fires.
+    #[test]
+    fn d06_losing_terminal_path_is_fail_closed() {
+        let (_g, fx) = fx_fresh();
+        let _id = arm(&fx);
+        assert!(link(&fx));
+        // The reply wins: the ordinary terminal close removes the armed record's link.
+        let outcome = fx.k.with(|s| {
+            s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        });
+        assert!(outcome.detached());
+        assert_eq!(v()[T::LinkDetached as usize], 1, "the armed link did close");
+        assert_eq!(
+            v()[T::PeerDeathWinner as usize],
+            0,
+            "but no peer-death claim was made"
+        );
+        assert!(
+            !c::audit_success_path(),
+            "a losing terminal path never passes the ServerDies success audit"
+        );
+        teardown();
+    }
+
+    /// d07. An UNARMED instance cannot pass the audit — the vector would describe nothing
+    ///      in particular.
+    #[test]
+    fn d07_unarmed_instance_fails_the_audit() {
+        let _g = super::stage200d2b1bi_counters::globals_guard();
+        c::reset_instance();
+        assert_eq!(c::armed_record(), None);
+        for t in ALL {
+            if !matches!(t, T::LinkCreated | T::LinkDetached) {
+                c::record(t);
+            }
+        }
+        assert!(
+            !c::audit_success_path(),
+            "no armed transaction, no success audit"
+        );
+        c::reset_instance();
+    }
+
+    /// d08. The scope is one-shot: a second, DIFFERENT record is refused, so two
+    ///      overlapping scenarios can never share a vector. Re-arming the same record is
+    ///      idempotent.
+    #[test]
+    fn d08_scope_is_one_shot_and_idempotent() {
+        let _g = super::stage200d2b1bi_counters::globals_guard();
+        c::reset_instance();
+        assert!(c::arm_record(3, 11));
+        assert!(c::matches_armed(3, 11));
+        assert!(
+            c::arm_record(3, 11),
+            "re-arming the same record is idempotent"
+        );
+        assert!(!c::arm_record(4, 12), "a different record is refused");
+        assert_eq!(c::armed_record(), Some((3, 11)), "the first arm stands");
+        // A generation of zero is never a valid identity.
+        assert!(!c::arm_record(5, 0));
+        c::reset_instance();
+        assert_eq!(c::armed_record(), None, "reset clears the scope");
+    }
+
+    /// d09. Arming a record that owns NO reverse link leaves `LinkCreated` at zero and
+    ///      fails the audit. This is the defect Stage 200D-2B1D-x86 hit live, where the
+    ///      boot reached `DEFERRED_RESERVED` with `LINK_CAPTURED` absent; it must be
+    ///      reported, not derived away.
+    #[test]
+    fn d09_armed_record_without_a_link_fails() {
+        let (_g, fx) = fx_fresh();
+        // No `link(&fx)` — the armed record owns no reverse link.
+        assert_eq!(live_links(&fx), 0);
+        assert_eq!(
+            v()[T::LinkCreated as usize],
+            0,
+            "nothing observed, nothing counted"
+        );
+        assert!(!c::audit_success_path());
+        teardown();
+    }
+
+    /// d10. The production creation edge reports its record identity, so the armed vector
+    ///      counts it only when it belongs to the armed transaction.
+    #[test]
+    fn d10_creation_edge_is_attributed_by_record_identity() {
+        let (_g, fx) = fx_fresh();
+        assert!(link(&fx), "the real production registration");
+        assert_eq!(
+            v()[T::LinkCreated as usize],
+            1,
+            "the armed record's creation is counted once"
+        );
+        assert_eq!(c::link_totals().0, 1);
+        // A creation for a different record moves only the system total.
+        c::note_link_created(fx.record_index + 13, 3);
+        assert_eq!(v()[T::LinkCreated as usize], 1);
+        assert_eq!(c::link_totals().0, 2);
+        teardown();
+    }
+
     /// 24. The collector gate is CAUSAL, not a timing race: it stays held across the whole
     ///     death transaction — so no timeout claimant can be collected while PeerDeath is
     ///     deciding — and it is released ONLY by the caller's own userspace validation
@@ -95232,7 +95548,10 @@ mod stage200d2b1bii_races {
                 "IPC_SERVER_DEATH_LINK_LEAK",
                 MOD_SRC,
                 "pub fn audit_success_path()",
-                "count(T::LinkCreated) != count(T::LinkDetached)",
+                // Stage 199D: the leak literal reads the SYSTEM-WIDE link totals. The armed
+                // transaction's own pair is checked by the exact-1 loop like every other
+                // class; comparing the two was the created=54 detached=1 defect.
+                "links_created != links_closed",
             ),
             (
                 "IPC_SERVER_DEATH_RECORD_LEAK",

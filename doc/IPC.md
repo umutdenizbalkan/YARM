@@ -427,25 +427,58 @@ none sealed. Two defects were found live:
    existing fatal architecture path rather than a second policy. **This fix has never run
    in QEMU.** The `FailClosed` arm is a currently-unreachable backstop.
 
-2. **`LINK_LEAK created=54 detached=1 result=fail` — OPEN.** This is **not** a resource
-   leak: the ordinary reply path does close its links (`ipc_reply` calls
-   `finalize_server_reply_link_for_record`). The mismatch is in what the counters count.
-   `LinkCreated` is recorded by `register_server_reply_link`
-   (`src/kernel/boot/ipc_state.rs:1250`), which runs for **every** bound ordinary
-   `IpcCall` in the system. `LinkDetached` is recorded only by `take_server_reply_link`
-   (`ipc_state.rs:1383`), the exit path; normal reply completions close through
-   `unregister_server_reply_link`, which records nothing. `audit_success_path`
-   (`mod.rs:4116`) therefore compares a system-wide creation count against a single
-   death's detach count, and additionally expects every class to equal exactly 1 — true
-   only when the direct transaction was the sole link creator and counters were reset per
-   hosted case. `reset_instance()` has no live caller, so in a real boot the counters
-   accumulate from boot.
-   **Resolution is a design decision** — scope the counters to the audited death, or count
-   both close sites and drop the `== 1` expectation. Both change what the nine-counter
-   vector means. This is the **server-crash cleanup** element of canonical Stage **199D**
-   and simultaneously the **reply-object cleanup** element of canonical Stage **202D**; the
-   repair is the smallest next production stage (`doc/KERNEL_UNLOCK_AUDIT.md` §6). It is an
-   increment, **not** a complete canonical stage.
+2. **`LINK_LEAK created=54 detached=1 result=fail` — RESOLVED (Stage 199D increment).**
+   It was never a resource leak: the ordinary reply path does close its links, through
+   `finalize_server_reply_link_for_record`. One pair of counters was being asked to answer
+   two different questions and could answer neither. `LinkCreated` was recorded by
+   `register_server_reply_link` for **every** bound `IpcCall` in the system; `LinkDetached`
+   only by `take_server_reply_link`, the exit path; and the ordinary terminal close
+   (`detach_server_reply_link_exact`) recorded **nothing at all**, so the pair was not even
+   a valid global leak invariant. `audit_success_path` then compared a system-wide creation
+   count against one death's detach count and additionally demanded every class equal 1 —
+   true only when the direct transaction was the sole link creator and the counters were
+   reset per hosted case. `reset_instance()` had no live caller, so a real boot accumulated
+   from boot.
+
+   The two questions are now separated.
+
+   **Tier 1 — system-wide link-lifecycle totals** (`links_created` / `links_closed`).
+   Incremented by every genuine installation and by every genuine removal at **both**
+   closing edges. This is the real reverse-link leak invariant, and it is what the
+   `IPC_SERVER_DEATH_LINK_LEAK` literal now compares:
+   `IPC_SERVER_DEATH_LINK_LEAK created=<n> closed=<m> scope=system result=fail`. A link
+   created anywhere and never closed still fails the audit.
+
+   **Tier 2 — the nine-vector, scoped to exactly one armed ServerDies transaction**,
+   identified by the reply record `{index, generation}` it owns. Unrelated earlier or later
+   calls carry a different record identity and cannot move it, so the expectation is
+   `LinkCreated = 1` and `LinkDetached = 1` regardless of how much unrelated IPC the boot
+   performs.
+
+   The scope is armed at `register_reply_receive_deadline` — the point at which the
+   transaction first becomes identifiable, and the same site that already records the
+   ServerDies stale token. The reverse link is installed earlier, when the reply record is
+   created, so the creation edge cannot scope itself; instead the arm **observes live
+   state**, resolving the record's bound replier and reading its TCB link back
+   (`IPC_SERVER_DEATH_SCOPE_ARMED … link_present=<0|1>`). That keeps `LinkCreated` a
+   genuine observation rather than an inference from the later detach: an armed record that
+   owns no reverse link leaves it at 0 and fails the audit, which is exactly the defect
+   Stage 200D-2B1D-x86 hit live (`DEFERRED_RESERVED` reached, `LINK_CAPTURED` absent).
+
+   Fail-closed behaviour is preserved throughout: a second close of the armed record leaves
+   the class visibly `>1`; a close for a different record while armed is reported
+   (`IPC_SERVER_DEATH_FOREIGN_LINK_CLOSE … counted=0`) and not counted; a stale record
+   generation or stale server incarnation detaches nothing and counts nothing; a **losing**
+   terminal path (reply wins) closes the armed link so `LinkDetached = 1` while
+   `PeerDeathWinner = 0`, and the existing record-leak literal fires; and an unarmed
+   instance fails outright (`IPC_SERVER_DEATH_SCOPE_UNARMED`). A second, different arm is
+   refused (`IPC_SERVER_DEATH_SCOPE_CONFLICT`), so two overlapping scenarios can never
+   share a vector.
+
+   Ten focused hosted cases pin this (`d01`–`d10`), including the original reproduction
+   with unrelated links created on both sides of the armed transaction. **No live cell is
+   claimed** — this is a hosted accounting repair, and the ServerDies live cells remain
+   unearned on all three architectures.
 
 ### 8.6 Preserved contracts from the deleted stage reports
 

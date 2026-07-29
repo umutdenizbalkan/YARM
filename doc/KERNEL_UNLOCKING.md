@@ -71,7 +71,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 | Stage | Definition (owner-supplied) | Status | Evidence / what is missing |
 |-------|------------------------------|--------|----------------------------|
 | **199C** | **Blocking IpcSend.** Retire sender-waiter publication where endpoint policy blocks a sender: sender → `Blocked(IpcSend)`, waiter enqueued once, receiver later consumes sender, sender wakes once. Full sparse-queue and timeout parity. | **OPEN** | `handle_ipc_send` and its waiter publication run entirely inside the broad `with_cpu`. The only off-lock element is the x86_64 D2-send drain (`src/arch/trap_entry.rs:388`), which relocates the *queue-advancing dispatch* — **not** the waiter publication — and is compile-time absent on AArch64/RISC-V. Sparse-queue and send-timeout parity untouched. The 15 `IpcSend` live cells (plain / ordinary-cap / shared-region) prove **delivery**, not blocking-sender retirement. |
-| **199D** | **IpcCall and reply-object lifecycle** as one transaction: delivery → caller reply-blocked → reply object created → reply cap transferred → server replies → caller wakes → reply object destroyed. Required: no orphan reply object, no duplicate reply, no lost caller, no reply-cap rematerialization, timeout/cancellation cleanup, **server crash cleanup**. | **OPEN** (hosted foundation + knob-gated live proof) | Transaction exists off-lock: `src/kernel/ipccall_direct_txn.rs`, `syscall_split.rs:295/307`, reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 in both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) — but **default-OFF** (`ipccall_direct_proof_enabled()`, `src/kernel/boot/mod.rs:3095`), so **no production boot takes it**. **Server crash cleanup is unproven**: zero ServerDies live cells on any architecture and a hard failing audit, `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`. Timeout/cancellation cleanup depends on 199E. |
+| **199D** | **IpcCall and reply-object lifecycle** as one transaction: delivery → caller reply-blocked → reply object created → reply cap transferred → server replies → caller wakes → reply object destroyed. Required: no orphan reply object, no duplicate reply, no lost caller, no reply-cap rematerialization, timeout/cancellation cleanup, **server crash cleanup**. | **OPEN** (hosted foundation + knob-gated live proof) | Transaction exists off-lock: `src/kernel/ipccall_direct_txn.rs`, `syscall_split.rs:295/307`, reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 in both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) — but **default-OFF** (`ipccall_direct_proof_enabled()`, `src/kernel/boot/mod.rs:3095`), so **no production boot takes it**. Server-crash cleanup: the reverse-link accounting is **repaired** — the transition counters now describe exactly one armed ServerDies transaction, and the leak invariant moved to system-wide link totals (`doc/IPC.md` §8.5, 10 hosted cases). Still unproven live: **zero ServerDies live cells on any architecture**. Timeout/cancellation cleanup depends on 199E. |
 | **199E** | **IPC timeout and cancellation** off the broad lock: `IpcRecvTimeout`, **IpcSend timeout**, **IpcCall timeout**, reply timeout/cancellation. Bounded timer/deadline structures, subsystem-local cleanup. Known sparse sender-waiter behavior must remain fixed. | **OPEN** (partial) | Reply timeout is the only retired quarter: narrow completion transaction on all three arches, scan off-lock **x86_64 only** (`IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0`), 6 live cells (timeout-wins + reply-wins × 3 arches, `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`). `IpcRecvTimeout` pre-reads its deadline off-lock but the receive itself is broad. **IpcSend timeout and IpcCall timeout are not retired at all.** Broad fallback `run_reply_timeout_completion` (`src/runtime.rs:3725`) still present. |
 | **199F** | **Notification wait/signal parity**: signal, wait, wait-with-timeout, multi-signal accumulation, wake exactly once. No global lock in IRQ-originated notification delivery. | **OPEN** | Only `notification_waiter_count_split_read` (`src/runtime.rs:4341`) exists, and it is a read helper. `signal_notification` (`src/kernel/boot/ipc_state.rs:5196`) takes `&mut self` under the broad lock. IRQ-originated delivery runs inside `handle_trap_entry_shared`'s `with_cpu`. No seams for wait, wait-with-timeout, or multi-signal accumulation. |
 | **199G** | **Full IPC subsystem seal** — send, recv, call, reply, notifications, timeouts, capability transfer, shared-region transfer all operate with **zero** runtime broad-lock acquisitions. Major exit gate. | **OPEN** | Blocked on 199C–199F. The authoritative trap dispatch (`src/arch/trap_entry.rs:299`, `src/arch/riscv64/trap.rs:563`) still serves every non-split IPC syscall. |
@@ -175,57 +175,44 @@ census (204A), which is documentation, not lock retirement.
 
 ### 0.6 Structural blockers
 
-1. **`IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`** — the only hard
-   failure in the tree. Blocks 199D's server-crash cleanup and 202D's reply-object cleanup.
-2. **`revalidate_idle_owner_after_drains`** (`src/runtime.rs:665`) has never run in QEMU.
-3. **NR 6 / NR 7 off-lock direct IPC is default-OFF**, so 199D's landed transaction
+1. **`revalidate_idle_owner_after_drains`** (`src/runtime.rs:665`) has never run in QEMU —
+   now the leading blocker. The `IPC_SERVER_DEATH_LINK_LEAK` accounting failure that used to
+   head this list is **resolved** (`doc/IPC.md` §8.5); no hard `result=fail` remains.
+2. **NR 6 / NR 7 off-lock direct IPC is default-OFF**, so 199D's landed transaction
    delivers no production benefit.
-4. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C cannot be completed, and
+3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C cannot be completed, and
    AArch64/RISC-V cannot retire any queue-advancing class.
-5. **All capability seams are `HELPER_ONLY`** — Phase 3 has zero production wiring.
-6. **`FutexWait` off-lock seams landed helper-only** (`syscall_split.rs:786`).
-7. **Reply-timeout scan is off-lock on x86_64 only**; three quarters of 199E untouched.
-8. **RISC-V `ExitCurrentTask` live cell** is pure execution debt (202D).
-9. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures.** The
+4. **All capability seams are `HELPER_ONLY`** — Phase 3 has zero production wiring.
+5. **`FutexWait` off-lock seams landed helper-only** (`syscall_split.rs:786`).
+6. **Reply-timeout scan is off-lock on x86_64 only**; three quarters of 199E untouched.
+7. **RISC-V `ExitCurrentTask` live cell** is pure execution debt (202D).
+8. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures.** The
    memory corruption is fixed (see `doc/KERNEL_TEST_RULES.md` Rule H1); what remains is
-   process-global test contention, which also blocks 205C.
-10. **AArch64 re-acquires the broad lock on its split return path**
-    (`src/arch/trap_entry.rs:1432`) — a runtime-required site that 204B/204E must localize.
-    205A will *report* this cell; it is not where it gets retired.
+   process-global test contention — test-infrastructure debt, a prerequisite for using the
+   hosted suite as a 205C harness rather than 205C completion work.
+9. **AArch64 re-acquires the broad lock on its split return path**
+   (`src/arch/trap_entry.rs:1432`) — a runtime-required site that 204B/204E must localize.
+   205A will *report* this cell; it is not where it gets retired.
 
 ### 0.7 Smallest next production stage
 
-**ServerDies reply-link accounting repair — a 199D increment (server-crash cleanup) that
-also cleans up state 202D will own.**
+**The previous recommendation — the ServerDies reply-link accounting repair — has landed**
+as a canonical **199D** increment (server-crash cleanup) that also cleans up state canonical
+**202D** owns (reply-object cleanup). See `doc/IPC.md` §8.5. There is no longer a hard
+`result=fail` in the tree.
 
-One production path: `server_dies_counters::audit_success_path`
-(`src/kernel/boot/mod.rs:4116`), the `LinkCreated` record at
-`src/kernel/boot/ipc_state.rs:1250`, and the `LinkDetached` record at
-`src/kernel/boot/ipc_state.rs:1383`.
+Two follow-ons, of different kinds:
 
-This is the smallest production change that removes a hard failure. It is **not** a
-complete canonical stage and must not be reported as one — 199D additionally requires the
-NR 6/NR 7 gate flipped to production and the full transaction proven without a broad-lock
-fallback.
+* **Live proof, no production code:** the x86_64 ServerDies live cell. One clean boot earns
+  the first ServerDies cell **and** finally exercises `revalidate_idle_owner_after_drains`,
+  which has never run in QEMU (blocker 1 in §0.6).
+* **Smallest production change:** flip `ipccall_direct_proof_enabled()`
+  (`src/kernel/boot/mod.rs:3095`) from a default-OFF proof knob to the production default on
+  x86_64, so the landed, live-proven off-lock NR 6 / NR 7 transaction is actually taken by a
+  normal boot. One production path; expected broad-lock callsite reduction **0**.
 
-*Why this one:* it is the only `result=fail` in the tree; it gates every ServerDies live
-cell; it is genuinely one turn (a counter-scoping decision plus hosted tests, no QEMU, no
-live cell, zero broad-lock reduction); and it cannot regress anything, because the counters
-are diagnostic and the underlying link lifecycle is already correct — `ipc_reply` closes
-links through `finalize_server_reply_link_for_record`.
-
-*Recommended resolution:* scope the nine-counter vector to the death being audited rather
-than adding `unregister_server_reply_link` as a second close site. Per-death scoping
-preserves the "every class == 1" expectation the fifteen hard-fail literals were written
-against; counting both close sites would force those literals to be re-specified.
-
-*Exit criteria:* `IPC_SERVER_DEATH_LINK_LEAK` cannot fire on a boot containing ≥1 unrelated
-bound `IpcCall`; the transition audit reports only the audited death; `reset_instance()`
-either gains a live caller or is removed with its rationale recorded; the fifteen hard-fail
-literals and nine wiring guards still hold. ≥8 hosted cases, ≥4 mutation guards, and a
-negative case where a genuine leak **must** still be reported.
-
-*Expected broad-lock callsite reduction: 0.* It unblocks reduction; it does not perform one.
+Neither completes canonical 199D, which additionally requires the transaction proven with no
+broad-lock fallback and server-crash cleanup proven live on all three architectures.
 
 ---
 

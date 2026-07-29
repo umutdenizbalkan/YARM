@@ -322,7 +322,7 @@ These were **not** granted, and the refusal is the record:
 * `STAGE_199_IPCCALL_REPLY_OFFLOCK_SEAL … result=deferred reason=broad_lock_payload_copy_needs_pre_global_lock_split_seam_which_is_hosted_disabled_and_block_dispatch_switch_required` — preserved in full in `doc/IPC.md` §8.3.
 * `GLOBAL_LOCK_RETIRE_CLASS_DEFERRED class=FutexWait reason=block_dispatch_switch_required_needs_global_lock` — the Stage 191D deferral discipline; seams landed helper-only.
 * `STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL … cross_cpu=0 result=blocked reason=ap_dispatch_on_wake_and_context_restore_not_wired` — later superseded by the earned `cross_cpu=1` seal.
-* `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail` — **still open**; see `doc/IPC.md` §8.5. It is canonical **199D**'s server-crash cleanup and canonical **202D**'s reply-object cleanup.
+* `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail` — **resolved** by the canonical **199D** reverse-link accounting increment (which also cleans up state canonical **202D** owns). It was never a resource leak: one pair of counters was answering two different questions. See `doc/IPC.md` §8.5.
 
 ### Historical x86_64 D6 switch-proof bring-up (Stages 120–132)
 
