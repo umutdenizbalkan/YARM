@@ -96817,6 +96817,20 @@ mod stage200d2b1d5b_restore_contract {
             body.contains("if restorable\n") || body.contains("if restorable "),
             "the success path must be gated on restorability"
         );
+        // Restorability alone is not success: the restore must actually be ATTEMPTED, and its
+        // result must gate the replacement commit. Without this, dropping the call would leave
+        // the frame holding the PREVIOUS task's context while reporting `Replacement`.
+        let restore_call = body
+            .find("restore_arch_thread_state(kernel, cpu, Some(frame))")
+            .expect("the seam must attempt the arch restore");
+        assert!(
+            check < restore_call && restore_call < ok,
+            "order must be: establish restorability -> attempt restore -> report success"
+        );
+        assert!(
+            body[restore_call..ok].contains(".is_ok()"),
+            "the replacement commit must require the restore to have SUCCEEDED"
+        );
         // And the swallow it defends against is really there.
         let restore = include_str!("../../arch/x86_64/trap.rs")
             .split("pub(crate) fn restore_arch_thread_state(")
