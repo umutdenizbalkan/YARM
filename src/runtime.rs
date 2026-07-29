@@ -573,6 +573,51 @@ impl SharedKernel {
         })
     }
 
+    /// Stage 200D-2B1D5A — re-validate an `idle` restore-owner decision AFTER the post-lock
+    /// drains, and commit exactly one CPU-local task if the drains produced work.
+    ///
+    /// The x86_64 consumer picks the restore owner IN-LOCK (Stage 200D-0B3), which is correct
+    /// for identity coherence but happens strictly BEFORE the post-lock drains — and the drains
+    /// are exactly where wakes are published. Stage 200D-2B1D4 caught the consequence live: the
+    /// server-death drain made a caller runnable and enqueued it (`enqueues=1`), the epilogue
+    /// committed the earlier `owner=idle` decision anyway, and the CPU halted holding an idle
+    /// frame while a runnable task existed — re-idling on every tick until the boot timed out.
+    ///
+    /// This runs with the broad guard already dropped, so the brief `with_cpu` re-acquire below
+    /// is sound (and is itself the lock-dropped proof — a still-held guard would deadlock). It
+    /// uses the EXISTING `dispatch_next_on_cpu`, so the run queue advances through the same
+    /// authority the in-lock path uses and never through a second queue:
+    ///
+    ///   * exactly one advance — one `dispatch_next_on_cpu` call, whose result is returned;
+    ///   * CPU-local only — `dispatch_next_on_cpu(cpu)` pops from THIS cpu's run queue, so a
+    ///     task runnable elsewhere is never stolen;
+    ///   * the idle sentinel (TID 0) is not a user task and is reported as "still idle", so the
+    ///     caller keeps its existing idle path rather than trying to return to ring 3;
+    ///   * on a restore failure the selection is reported as none, so the caller idles rather
+    ///     than committing a frame that was never populated.
+    ///
+    /// Returns the TID committed as the new owner, or `None` to keep idling.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn revalidate_idle_owner_after_drains(
+        &self,
+        cpu: CpuId,
+        frame: &mut crate::kernel::trapframe::TrapFrame,
+    ) -> Option<u64> {
+        self.with_cpu(cpu, |kernel| {
+            let next = kernel.dispatch_next_on_cpu(cpu)?;
+            if next == 0 {
+                // The scheduler's idle/supervisor sentinel owns no user context.
+                return None;
+            }
+            match crate::arch::x86_64::trap::restore_arch_thread_state(kernel, cpu, Some(frame)) {
+                Ok(()) => Some(next),
+                Err(_) => None,
+            }
+        })
+        .ok()
+        .flatten()
+    }
+
     /// Stage 168 (D6-GENUINE-B): the authoritative **mutating** dispatch step,
     /// run through the rank-1 scheduler seam with the global
     /// `SpinLock<KernelState>` already dropped by the trap-entry drain. This

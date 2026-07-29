@@ -1313,7 +1313,31 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // interrupt handler. A strict no-op off the reply path / before the reply is delivered / once done.
         #[cfg(not(feature = "hosted-dev"))]
         crate::arch::x86_64::smp::c2c_bsp_saved_frame_resume(shared, cpu);
-        if matches!(exiting_tid, None | Some(0)) {
+        // Stage 200D-2B1D5A: the restore owner was prepared IN-LOCK, before the post-lock
+        // drains ran — and the drains are exactly where wakes are published. Re-validate the
+        // decision here, with the broad guard dropped and every drain complete, but BEFORE any
+        // frame is committed. Only an `idle` owner is revalidated: a prepared replacement was
+        // chosen from live state and the drains cannot invalidate it, so it is never displaced.
+        let revalidated_owner = if matches!(exiting_tid, None | Some(0)) {
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                shared.revalidate_idle_owner_after_drains(cpu, &mut trap_frame)
+            }
+            #[cfg(feature = "hosted-dev")]
+            {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(next) = revalidated_owner {
+            crate::yarm_log!(
+                "EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu={} prepared=idle committed=replacement next_tid={} advances=1 broad_lock=0 result=ok",
+                cpu.0,
+                next
+            );
+        }
+        if matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none() {
             // The scheduler uses TID 0 as its idle/supervisor sentinel.  It has
             // no user context to iretq back to; returning through the current
             // user trap frame would resume the task that just blocked and form
@@ -1335,7 +1359,9 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             maybe_attest_exit_common_epilogue(cpu, "idle");
             idle_halt_loop();
         }
-        if task_switched {
+        // A revalidated owner is a genuine task switch: its GPRs must reach the saved regs the
+        // epilogue flushes, exactly as a normally-prepared replacement's would.
+        if task_switched || revalidated_owner.is_some() {
             write_task_gprs_to_saved_regs(regs, &trap_frame);
         } else if vector as usize == VEC_SYSCALL {
             write_trap_returns_to_saved_regs(regs, &trap_frame);

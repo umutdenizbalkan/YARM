@@ -96184,3 +96184,318 @@ mod stage200d2b1d3_terminal_arming {
         });
     }
 }
+
+/// Stage 200D-2B1D5A — the x86_64 post-drain restore-owner revalidation.
+///
+/// The x86_64 consumer picks the restore owner IN-LOCK, strictly before the post-lock drains,
+/// and the drains are exactly where wakes are published. Stage 200D-2B1D4 caught the
+/// consequence live: a drain enqueued a runnable caller, the epilogue committed the earlier
+/// `owner=idle` decision anyway, and the CPU halted while a runnable task existed.
+///
+/// The seam is `#[cfg(target_arch = "x86_64")]` production code reached from the freestanding
+/// trap epilogue, so these are source-level guards over the wiring plus behavioural cases for
+/// the scheduler primitive it delegates to.
+#[cfg(test)]
+mod stage200d2b1d5a_owner_revalidation {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    fn seam() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn revalidate_idle_owner_after_drains(")
+            .nth(1)
+            .expect("the revalidation seam must exist")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded body")
+    }
+
+    /// The seam advances the run queue through the EXISTING authority, exactly once.
+    #[test]
+    fn g01_seam_uses_the_existing_dispatch_and_advances_once() {
+        let body = seam();
+        assert!(
+            body.contains("kernel.dispatch_next_on_cpu(cpu)?"),
+            "the seam must use the existing dispatch_next_on_cpu"
+        );
+        assert_eq!(
+            body.matches("dispatch_next_on_cpu(").count(),
+            1,
+            "exactly one queue advance per revalidation"
+        );
+        // No second queue, no hand-rolled selection.
+        for forbidden in [
+            "enqueue_on_cpu",
+            "runnable_count_on",
+            "block_current_on_cpu",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the seam must not reach for `{forbidden}`"
+            );
+        }
+    }
+
+    /// CPU affinity: the pop is from THIS cpu's queue, and no other CPU is named.
+    #[test]
+    fn g02_seam_is_cpu_local() {
+        let body = seam();
+        assert!(
+            body.contains("dispatch_next_on_cpu(cpu)"),
+            "the seam must pop from this CPU's own run queue"
+        );
+        assert!(
+            !body.contains("CpuId(0)") && !body.contains("current_cpu"),
+            "the seam must not substitute another CPU for the caller's"
+        );
+        // `dispatch_next_on_cpu` itself is per-CPU by construction.
+        let prim = include_str!("scheduler_state.rs")
+            .split("pub fn dispatch_next_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {")
+            .nth(1)
+            .expect("the primitive");
+        assert!(
+            prim.contains("dispatch_next_on(cpu)"),
+            "the primitive must dispatch on the requested CPU"
+        );
+    }
+
+    /// The idle sentinel is not a user task, and a failed restore must not commit a frame.
+    #[test]
+    fn g03_seam_fails_closed_to_idle() {
+        let body = seam();
+        assert!(
+            body.contains("if next == 0 {") && body.contains("return None;"),
+            "the idle/supervisor sentinel must report `still idle`"
+        );
+        assert!(
+            body.contains("Ok(()) => Some(next),") && body.contains("Err(_) => None,"),
+            "a restore failure must report `still idle` rather than commit an unpopulated frame"
+        );
+        assert!(
+            body.contains("restore_arch_thread_state(kernel, cpu, Some(frame))"),
+            "the seam must restore the selected task's arch state into the caller's frame"
+        );
+    }
+
+    /// A prepared REPLACEMENT owner is never displaced: revalidation is gated on the prepared
+    /// owner being idle.
+    #[test]
+    fn g04_prepared_replacement_owner_is_preserved() {
+        let gate = DESC_SRC
+            .split("let revalidated_owner = if matches!(exiting_tid, None | Some(0)) {")
+            .nth(1)
+            .expect("the revalidation gate must exist");
+        let gate = gate.split("\n        if ").next().expect("bounded gate");
+        assert!(
+            gate.contains("} else {") && gate.contains("None"),
+            "a non-idle prepared owner must yield `None` — no revalidation, no displacement"
+        );
+        // The seam is only ever called from that gated arm.
+        assert_eq!(
+            DESC_SRC
+                .matches("revalidate_idle_owner_after_drains(")
+                .count(),
+            1,
+            "the seam must have exactly one call site"
+        );
+    }
+
+    /// Genuine idle is unchanged: with no revalidated owner the existing idle body still runs.
+    #[test]
+    fn g05_genuine_idle_path_is_unchanged() {
+        assert!(
+            DESC_SRC.contains(
+                "if matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none() {"
+            ),
+            "the idle body must still run when revalidation produced nothing"
+        );
+        let idle = DESC_SRC
+            .split("if matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none() {")
+            .nth(1)
+            .expect("idle body");
+        let idle = idle
+            .split("\n        if task_switched")
+            .next()
+            .unwrap_or(idle);
+        for kept in [
+            "SCHED_ENTER_IDLE_HLT cpu={}",
+            "maybe_attest_exit_common_epilogue(cpu, \"idle\")",
+            "idle_halt_loop()",
+        ] {
+            assert!(idle.contains(kept), "the idle path must still `{kept}`");
+        }
+    }
+
+    /// A revalidated owner joins the REPLACEMENT path: its GPRs are written, the frame is
+    /// flushed, depth is cleared once, and the attestation names `replacement`.
+    #[test]
+    fn g06_revalidated_owner_joins_the_replacement_path() {
+        assert!(
+            DESC_SRC.contains("if task_switched || revalidated_owner.is_some() {"),
+            "a revalidated owner must have its GPRs written like any task switch"
+        );
+        let after = DESC_SRC
+            .split("if task_switched || revalidated_owner.is_some() {")
+            .nth(1)
+            .expect("replacement path");
+        let flush = after
+            .find("flush_trap_context_to_iret_frame")
+            .expect("frame flush");
+        let clear = after
+            .find("TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);")
+            .expect("depth clear");
+        let attest = after
+            .find("maybe_attest_exit_common_epilogue(cpu, \"replacement\")")
+            .expect("attestation");
+        assert!(
+            flush < clear && clear < attest,
+            "flush -> single depth clear -> attest(replacement), in that order"
+        );
+        // Exactly one depth clear on this path.
+        let bounded = &after[..attest];
+        assert_eq!(
+            bounded
+                .matches("TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);")
+                .count(),
+            1,
+            "exactly one depth clear before the attestation"
+        );
+        // And the commit is attested distinctly from the prepared decision.
+        assert!(
+            DESC_SRC.contains(
+                "EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu={} prepared=idle committed=replacement"
+            ),
+            "a revalidated commit must be attested as such"
+        );
+    }
+
+    /// Behavioural: a task made runnable AFTER the owner would have been decided is selectable
+    /// by the very primitive the seam delegates to, and the selection advances the run queue
+    /// exactly once.
+    ///
+    /// The precondition is the state the IN-LOCK decision actually saw at Stage 200D-2B1D4:
+    /// nothing runnable on this CPU, so `owner=idle` was prepared. The enqueues below are what
+    /// the post-lock server-death drain then published.
+    #[test]
+    fn g07_drain_woken_task_is_selectable_one_at_a_time() {
+        let cpu = CpuId(0);
+        let mut k = Bootstrap::init().expect("init");
+        k.register_task_with_class(40101, TaskClass::App)
+            .expect("t1");
+        k.register_task_with_class(40102, TaskClass::App)
+            .expect("t2");
+        assert_eq!(
+            k.runnable_count_on_cpu(cpu),
+            0,
+            "precondition: no runnable work on this CPU when the owner is prepared"
+        );
+        assert!(
+            matches!(k.current_tid_on_cpu(cpu), None | Some(0)),
+            "precondition: the prepared owner is idle"
+        );
+        assert!(
+            matches!(k.dispatch_next_on_cpu(cpu), None | Some(0)),
+            "with nothing runnable the seam reports `still idle`"
+        );
+
+        // The post-lock drain publishes two wakes — invisible to the in-lock decision.
+        k.enqueue_on_cpu(cpu, 40101).expect("wake 1");
+        k.enqueue_on_cpu(cpu, 40102).expect("wake 2");
+        assert_eq!(
+            k.runnable_count_on_cpu(cpu),
+            2,
+            "the drain made two tasks runnable on this CPU"
+        );
+
+        // Revalidation: a drain-woken task is selected instead of idling past it.
+        let first = k
+            .dispatch_next_on_cpu(cpu)
+            .expect("a drain-woken task must be selectable");
+        assert!(
+            first == 40101 || first == 40102,
+            "the committed owner must be one of the drain-woken tasks, got {first}"
+        );
+        assert_eq!(
+            k.current_tid_on_cpu(cpu),
+            Some(first),
+            "the selected task becomes this CPU's current"
+        );
+        // One advance, not a drain of the queue.
+        assert_eq!(
+            k.runnable_count_on_cpu(cpu),
+            1,
+            "exactly one queue advance per revalidation"
+        );
+        // The seam runs once per trap return; a CPU that already owns a task must not advance
+        // the queue a second time.
+        assert_eq!(
+            k.dispatch_next_on_cpu(cpu),
+            Some(first),
+            "a CPU that already owns a task keeps that owner"
+        );
+        assert_eq!(
+            k.runnable_count_on_cpu(cpu),
+            1,
+            "no second advance while an owner is committed"
+        );
+    }
+
+    /// Behavioural CPU affinity: work published on ANOTHER CPU's run queue is never stolen.
+    #[test]
+    fn g08_revalidation_never_steals_another_cpus_work() {
+        let mut k = Bootstrap::init().expect("init");
+        k.bring_up_cpu(CpuId(1)).expect("cpu1 online");
+        k.register_task_with_class(40103, TaskClass::App)
+            .expect("t3");
+        k.enqueue_on_cpu(CpuId(1), 40103).expect("wake on cpu1");
+        assert_eq!(k.runnable_count_on_cpu(CpuId(1)), 1, "queued on cpu1");
+        assert_eq!(k.runnable_count_on_cpu(CpuId(0)), 0, "nothing on cpu0");
+
+        // CPU 0's revalidation sees none of its own work and keeps idling.
+        assert!(
+            matches!(k.dispatch_next_on_cpu(CpuId(0)), None | Some(0)),
+            "cpu0 must stay idle rather than steal cpu1's runnable task"
+        );
+        assert_ne!(
+            k.current_tid_on_cpu(CpuId(0)),
+            Some(40103),
+            "cpu0 never becomes the owner of a task queued on cpu1"
+        );
+        assert_eq!(
+            k.runnable_count_on_cpu(CpuId(1)),
+            1,
+            "cpu1's run queue is untouched by cpu0's revalidation"
+        );
+
+        // The owning CPU's own revalidation does select it.
+        assert_eq!(
+            k.dispatch_next_on_cpu(CpuId(1)),
+            Some(40103),
+            "cpu1's revalidation selects its own drain-woken task"
+        );
+        assert_eq!(k.runnable_count_on_cpu(CpuId(1)), 0, "one advance on cpu1");
+    }
+
+    /// Behavioural genuine idle: with no runnable work the primitive reports "still idle" and
+    /// leaves the CPU unowned, so the existing idle body still runs.
+    #[test]
+    fn g09_genuine_idle_selects_nothing() {
+        let cpu = CpuId(0);
+        let mut k = Bootstrap::init().expect("init");
+        assert_eq!(k.runnable_count_on_cpu(cpu), 0, "nothing runnable");
+        for _ in 0..3 {
+            assert!(
+                matches!(k.dispatch_next_on_cpu(cpu), None | Some(0)),
+                "a genuinely idle CPU must not manufacture an owner"
+            );
+        }
+        assert!(
+            matches!(k.current_tid_on_cpu(cpu), None | Some(0)),
+            "the CPU is still unowned"
+        );
+        assert_eq!(k.runnable_count_on_cpu(cpu), 0, "no queue was advanced");
+    }
+}
