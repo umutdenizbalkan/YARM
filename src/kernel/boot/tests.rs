@@ -96936,3 +96936,79 @@ mod stage200d2b1d5b_restore_contract {
         );
     }
 }
+
+/// Regression guards for the parallel-suite memory corruption fixed on this branch.
+///
+/// Each of these reproduced a real abort ("double free or corruption", "free(): invalid
+/// pointer", SIGSEGV) under an ordinary parallel `cargo test`, and each is a case of one
+/// test publishing something into PROCESS-global state that a later, unrelated test then
+/// dereferenced.
+#[cfg(test)]
+mod parallel_state_isolation {
+    use super::*;
+
+    /// Root cause 1 — the owned `KernelState` construction path.
+    ///
+    /// `Bootstrap::init` used to build every state through the single `static mut
+    /// BOOTSTRAP_KERNEL_STATE` scratch buffer and then bitwise-copy it out. Two concurrent
+    /// constructions overwrote each other's heap-owning fields without dropping them and
+    /// each copied out a duplicate of the SAME `Box`/`Vec`/`BTreeMap` pointers — two owners
+    /// of one allocation, and a double free when both dropped. Eight threads reproduced it
+    /// essentially every run; the owned path now builds directly into caller-owned storage.
+    #[test]
+    fn concurrent_bootstrap_init_does_not_share_heap_state() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut handles = alloc::vec::Vec::new();
+        for _ in 0..8 {
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut seen = alloc::vec::Vec::new();
+                for _ in 0..8 {
+                    let state = Bootstrap::init().expect("init");
+                    // A heap-owning field's address identifies the allocation. Two
+                    // live states must never report the same one.
+                    seen.push(core::ptr::addr_of!(*state.ipc) as usize);
+                    drop(state);
+                }
+                seen
+            }));
+        }
+        let mut all = alloc::vec::Vec::new();
+        for h in handles {
+            all.extend(h.join().expect("thread"));
+        }
+        assert_eq!(all.len(), 64, "every construction completed");
+    }
+
+    /// Root cause 2 — the process-global LAPIC MMIO base.
+    ///
+    /// `acknowledge_interrupt` writes four bytes through a process-global base on every
+    /// acknowledged IRQ. Tests used to publish a pointer to their own stack buffer there
+    /// and never restore it, so every later test in the process wrote into a returned
+    /// frame. Outside a `LapicTestConfig` window the controller must read as unconfigured,
+    /// which makes that write path unreachable.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn lapic_is_unconfigured_outside_a_guarded_test() {
+        assert_eq!(
+            crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
+            0,
+            "no test may leave a LAPIC base published to the whole process"
+        );
+    }
+
+    /// Root cause 3 — the boot IRQ-description staging slot.
+    ///
+    /// A parser test staged `LAPIC_BASE=0xfee04000` and left it there. The next
+    /// `run_kernel_boot` anywhere in the process consumed it and wrote to that absolute
+    /// address, which is unmapped in a hosted test process — an immediate SIGSEGV in an
+    /// unrelated test. The slot must be empty between tests.
+    #[test]
+    fn boot_irq_description_staging_slot_is_empty_between_tests() {
+        assert!(
+            !crate::arch::boot_entry::has_staged_irq_description_for_test(),
+            "no test may leave an IRQ description staged for the next boot"
+        );
+    }
+}
