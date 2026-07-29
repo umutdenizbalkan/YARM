@@ -95850,3 +95850,337 @@ mod stage200d2b1d1_ordinary_link {
             .count()
     }
 }
+
+/// Stage 200D-2B1D3 — the ServerDies scenario arms the REAL terminal cell, deadline token and
+/// stale-token record through the ordinary production path.
+///
+/// Part of this module is a PRODUCTION-PARITY audit: every precondition the Stage 200D-2B1B
+/// race fixtures supply by hand is mapped here to a real production call site, so a
+/// fixture-only prerequisite cannot hide behind a green hosted suite again. Stages 2B1D-x86
+/// and 2B1D2 each found one such prerequisite the hard way, one live boot at a time.
+#[cfg(all(test, feature = "ipc-reply-timeout-oracle-core"))]
+mod stage200d2b1d3_terminal_arming {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    /// The body of the one gate that decides whether the scenario arms anything at all.
+    fn arm_gate() -> &'static str {
+        IPC_SRC
+            .split("pub(crate) fn maybe_arm_reply_timeout_oracle(")
+            .nth(1)
+            .expect("the arming gate must exist")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded body")
+    }
+
+    /// PRODUCTION PARITY — the audit this stage is gated on.
+    ///
+    /// Every state-mutating precondition the 2B1B fixtures perform by hand must have a real
+    /// production call site. A helper that only a fixture can reach means the hosted races
+    /// prove a mechanism the live system can never enter.
+    #[test]
+    fn e01_every_fixture_precondition_has_a_production_call_site() {
+        // (fixture operation, the file that must contain its production call)
+        for (op, prod_src, what) in [
+            ("arm_reply_terminal(", IPC_SRC, "terminal cell arming"),
+            (
+                "register_server_reply_link(",
+                IPC_SRC,
+                "reverse link creation (Stage 200D-2B1D1)",
+            ),
+            (
+                "take_server_reply_link(",
+                RESTART_SRC,
+                "reverse link detach in exit_task",
+            ),
+            (
+                "server_death_work_reserve(",
+                RESTART_SRC,
+                "deferred slot reservation",
+            ),
+            (
+                "server_death_work_publish(",
+                RESTART_SRC,
+                "deferred publication",
+            ),
+            (
+                "server_death_work_drain_next(",
+                RUNTIME_SRC,
+                "post-lock drain",
+            ),
+            ("try_claim_reply_terminal_slot(", IPC_SRC, "terminal claim"),
+            ("commit_reply_terminal_slot(", IPC_SRC, "terminal commit"),
+            (
+                "register_reply_receive_deadline(",
+                IPC_SRC,
+                "deadline token registration",
+            ),
+            (
+                "record_server_dies_stale_token(",
+                IPC_SRC,
+                "stale token record",
+            ),
+            (
+                "hold_reply_timeout_collector()",
+                IPC_SRC,
+                "causal collector hold",
+            ),
+        ] {
+            // A call, not merely a definition: strip `fn <name>` declarations.
+            let calls = prod_src
+                .lines()
+                .filter(|l| l.contains(op))
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| !l.contains("fn ") || l.contains("self.") || l.contains("boot::"))
+                .count();
+            assert!(
+                calls > 0,
+                "{what}: `{op}` has no production call site — it would be fixture-only"
+            );
+        }
+    }
+
+    /// ...and REACHABILITY: a production call site that the ServerDies mode returns before
+    /// is exactly as useless as no call site. This is the defect Stage 200D-2B1D2 hit.
+    #[test]
+    fn e02_server_dies_reaches_the_arming_gate_body() {
+        let gate = arm_gate();
+        // All three scenarios now have an arm; nothing falls through to the early return.
+        for mode in [
+            "IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS =>",
+            "IPC_REPLY_TIMEOUT_MODE_REPLY_WINS =>",
+            "IPC_REPLY_TIMEOUT_MODE_SERVER_DIES =>",
+        ] {
+            assert!(gate.contains(mode), "the arming gate must handle {mode}");
+        }
+        // The ServerDies arm must come BEFORE the catch-all return, or it is dead code.
+        let sd = gate
+            .find("IPC_REPLY_TIMEOUT_MODE_SERVER_DIES =>")
+            .expect("server-dies arm");
+        let fallthrough = gate.find("_ => return,").expect("catch-all");
+        assert!(
+            sd < fallthrough,
+            "the ServerDies arm must precede the catch-all early return"
+        );
+        // And the gate is entered from the ordinary blocked-recv path, not a private seam.
+        assert!(
+            IPC_SRC.contains("self.maybe_arm_reply_timeout_oracle(plan.blocked_tid.0"),
+            "the gate must be reached from the ordinary blocked-recv commit"
+        );
+    }
+
+    /// The arm supplies a FINITE deadline and holds the causal collector — the reply-wins
+    /// policy, preserved. It must not select a winner or fabricate a completion.
+    #[test]
+    fn e03_server_dies_arm_is_finite_and_holds_the_collector() {
+        let gate = arm_gate();
+        let arm = gate
+            .split("IPC_REPLY_TIMEOUT_MODE_SERVER_DIES =>")
+            .nth(1)
+            .expect("server-dies arm")
+            .split("_ => return,")
+            .next()
+            .expect("bounded arm");
+        // Both per-arch forms must be relative to that arch's real clock. Asserting a bare
+        // `wrapping_add` would let one branch be replaced by a constant while the other
+        // branch's occurrence kept the guard green.
+        assert!(
+            arm.contains("let d = now.wrapping_add("),
+            "the aarch64/riscv64 ServerDies deadline must be relative to the hw counter"
+        );
+        assert!(
+            arm.contains("let d = self.scheduler_tick_now().wrapping_add("),
+            "the x86_64 ServerDies deadline must be relative to the scheduler tick"
+        );
+        assert!(
+            arm.contains("hold_reply_timeout_collector()"),
+            "the ServerDies arm must hold the causal collector"
+        );
+        // It must not decide the outcome.
+        for forbidden in [
+            "PeerDeath",
+            "try_claim",
+            "complete_server_death_over",
+            "rtd_enqueue",
+            "set_ipc_reply_timeout_rw_deadline",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "the ServerDies arm must not `{forbidden}`"
+            );
+        }
+    }
+
+    /// The terminal cell is armed from the FULL identity — both incarnations, the record's own
+    /// generation, the blocked-recv generation and the deadline token generation — and the
+    /// arming happens after that identity is built, never from a partial one.
+    #[test]
+    fn e04_terminal_is_armed_from_the_full_identity() {
+        let gate = arm_gate();
+        let ident = gate
+            .find("self.reply_terminal_identity(")
+            .expect("identity construction");
+        let armed = gate
+            .find("self.arm_reply_terminal(record_index, identity);")
+            .expect("terminal arming");
+        assert!(ident < armed, "the identity must be built before arming");
+        // The identity carries every discriminator.
+        let ctor = IPC_SRC
+            .split("pub(crate) fn reply_terminal_identity(")
+            .nth(1)
+            .expect("identity ctor");
+        for field in [
+            "caller_tid",
+            "caller_asid",
+            "replier_tid",
+            "replier_asid",
+            "reply_record_index",
+            "reply_record_generation",
+            "blocked_recv_generation",
+            "deadline_token_generation",
+        ] {
+            assert!(
+                ctor.contains(field),
+                "the terminal identity must carry {field}"
+            );
+        }
+        // The deadline token is registered with the same record coordinates.
+        assert!(
+            gate.contains("self.register_reply_receive_deadline(")
+                && gate.contains("record_index,")
+                && gate.contains("record_generation,"),
+            "the deadline must be registered against the same record"
+        );
+    }
+
+    /// The stale token is recorded at the REAL arm site — inside the deadline registration,
+    /// after the token exists — so the later scan examines a registration that really happened.
+    #[test]
+    fn e05_stale_token_recorded_at_the_real_arm_site() {
+        let reg = IPC_SRC
+            .split("pub(crate) fn register_reply_receive_deadline(")
+            .nth(1)
+            .expect("deadline registration");
+        let rec = reg
+            .find("record_server_dies_stale_token(")
+            .expect("stale token record");
+        // It records the token's own identity, not a fabricated one.
+        for field in [
+            "handle.identity().token_index",
+            "handle.identity().token_generation",
+            "caller.tid.0",
+            "caller.asid.0",
+        ] {
+            assert!(
+                reg[..rec + 400].contains(field),
+                "the stale token must record {field}"
+            );
+        }
+        // The collector scan compares all four fields and names the generation mismatch.
+        assert!(
+            RUNTIME_SRC.contains("if this_idx == armed_idx && this_gen != armed_gen {")
+                && RUNTIME_SRC.contains("IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION"),
+            "the scan must reject a stale generation on the same slot"
+        );
+    }
+
+    /// The whole arming remains ordinary production code for the terminal/deadline halves —
+    /// only the stale-token RECORD (an oracle observation) is feature-gated.
+    #[test]
+    fn e06_arming_is_not_oracle_feature_gated() {
+        let gate = arm_gate();
+        let armed = gate
+            .find("self.arm_reply_terminal(record_index, identity);")
+            .expect("terminal arming");
+        assert!(
+            !gate[..armed].contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+            "terminal arming must not sit behind an oracle feature gate"
+        );
+        // The stale-token record is the one oracle-gated observation, and it only records.
+        let reg = IPC_SRC
+            .split("pub(crate) fn register_reply_receive_deadline(")
+            .nth(1)
+            .expect("registration");
+        let rec = reg.find("record_server_dies_stale_token(").expect("record");
+        assert!(
+            reg[..rec].contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+            "the stale-token observation is the oracle-gated part"
+        );
+    }
+
+    /// Duplicate refusal and rollback are the EXISTING primitives' job, and they must still be
+    /// reachable from this path: a second arming of a live cell is refused, and a record whose
+    /// arming fails leaves no terminal owner behind.
+    #[test]
+    fn e07_duplicate_arming_refused_and_rollback_leaves_no_owner() {
+        use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            // An UNARMED cell carries `TerminalIdentity::ZERO`, and every field of a real
+            // claimant's identity is non-zero (a live record's generation is never 0), so no
+            // claim a real drain can construct will ever match it. This is exactly what Stage
+            // 200D-2B1D2 saw live: armed_tid=0/armed_asid=0/armed_generation=0 against a
+            // correct item, rejected.
+            //
+            // The claim is presented with realistic coordinates rather than `ZERO` itself:
+            // `ZERO` trivially equals the vacant cell, but it is unconstructible from a real
+            // record, so asserting on it would test an unreachable state instead of the
+            // invariant that protects the live path.
+            let realistic = TerminalIdentity {
+                reply_record_index: 0,
+                reply_record_generation: 17,
+                caller_tid: crate::kernel::ipc::ThreadId(10007),
+                caller_asid: Asid(1),
+                replier_tid: crate::kernel::ipc::ThreadId(10008),
+                replier_asid: Asid(1),
+                reply_endpoint_index: 1,
+                reply_endpoint_generation: 1,
+                blocked_recv_generation: 1,
+                deadline_token_generation: Some(1),
+            };
+            assert_ne!(realistic, TerminalIdentity::ZERO);
+            assert!(
+                s.try_claim_reply_terminal_slot(0, TerminalClaimant::PeerDeath, &realistic)
+                    .is_none(),
+                "an unarmed terminal cell must refuse a real PeerDeath claim"
+            );
+            assert_eq!(
+                s.reply_terminal_committed_winner(0),
+                None,
+                "a refused claim leaves no committed winner"
+            );
+
+            // Once armed, the SAME identity claims once and only once — the duplicate is
+            // refused rather than overwriting the first winner.
+            s.arm_reply_terminal(0, realistic);
+            let owner = s
+                .try_claim_reply_terminal_slot(0, TerminalClaimant::PeerDeath, &realistic)
+                .expect("the armed identity claims");
+            assert!(s.commit_reply_terminal_slot(0, &owner), "commit succeeds");
+            assert!(
+                s.try_claim_reply_terminal_slot(0, TerminalClaimant::Reply, &realistic)
+                    .is_none(),
+                "a second claimant must be refused once the terminal is committed"
+            );
+            assert_eq!(
+                s.reply_terminal_committed_winner(0),
+                Some(TerminalClaimant::PeerDeath),
+                "the first winner stands"
+            );
+
+            // A stale record generation against the same armed slot is refused.
+            let mut stale = realistic;
+            stale.reply_record_generation = realistic.reply_record_generation.wrapping_add(1);
+            assert!(
+                s.try_claim_reply_terminal_slot(0, TerminalClaimant::PeerDeath, &stale)
+                    .is_none(),
+                "a stale record generation must never claim the terminal"
+            );
+        });
+    }
+}

@@ -2153,6 +2153,46 @@ impl KernelState {
                 crate::kernel::boot::hold_reply_timeout_collector();
                 d
             }
+            // Stage 200D-2B1D3 — the ServerDies arm.
+            //
+            // Everything downstream of this `match` is already the production path the other
+            // two scenarios use: it arms the REAL terminal cell from
+            // `reply_terminal_identity` (full caller AND replier incarnations, the record's
+            // own index+generation, the blocked-recv generation and the deadline token
+            // generation), registers the REAL deadline token, and — inside
+            // `register_reply_receive_deadline` — records the stale token at its existing arm
+            // site so the later scan can prove it examined the SAME registration.
+            //
+            // Until now `SERVER_DIES` fell into the `_ => return` below, so none of that ran:
+            // the terminal cell stayed `TerminalIdentity::ZERO`, and Stage 200D-2B1D2's live
+            // boot saw the death drain correctly reject a correct item against a vacant cell
+            // (`armed_tid=0 armed_asid=0 armed_generation=0`).
+            //
+            // The deadline is FINITE and deliberately later than the request round-trip, for
+            // the same reason reply-wins' is: the scenario's winner must be decided by the
+            // real claim path, never by the deadline firing first. This arm therefore only
+            // supplies a registration for the late scan to find already-invalidated — it does
+            // NOT select PeerDeath, fabricate a completion, or touch the ordinary IPC path.
+            //
+            // The collector hold/release policy is preserved exactly: the gate is armed here,
+            // strictly before the terminal cell, and released only by the caller's own
+            // userspace validation (`IPC_SERVER_DEATH_USER_VALIDATED ... code=10`). While held
+            // no timeout claimant can reach the terminal, which is what makes the PeerDeath
+            // win CAUSAL rather than a timing race. `hold_reply_timeout_collector` already
+            // admits this mode.
+            //
+            // `set_ipc_reply_timeout_rw_deadline` is deliberately NOT called: that record
+            // drives the reply-wins-only late-scan attestation, which is gated on
+            // `mode == REPLY_WINS`. ServerDies' analogue is the stale token recorded below,
+            // scanned by `server_dies_stale_scan_once`.
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES => {
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                let d = now.wrapping_add(20);
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+                let d = self.scheduler_tick_now().wrapping_add(8);
+                crate::kernel::boot::hold_reply_timeout_collector();
+                d
+            }
             _ => return,
         };
         let Some(caller_asid) = self.task_asid(caller_tid) else {
