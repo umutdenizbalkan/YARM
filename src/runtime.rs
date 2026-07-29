@@ -3372,19 +3372,25 @@ impl SharedKernel {
         self.consume_reply_record_split(index, generation)
     }
 
-    /// rank 3 — read the reply endpoint SLOT INDEX bound in a present, generation-matched
-    /// reply record. Used ONLY by the Stage 199A2B4 NR7 gate to confine the off-lock reply
-    /// path to the oracle's reply endpoint (every other reply stays on the legacy path).
+    /// rank 3 — read the reply endpoint SLOT INDEX **and GENERATION** bound in a present,
+    /// generation-matched reply record. Used by the Stage 199A2B4 NR7 gate to confine the
+    /// off-lock reply path to the oracle's reply endpoint (every other reply stays on the
+    /// legacy path), and by the Stage 199D endpoint-keyed acknowledgement store, which
+    /// requires the exact endpoint INCARNATION — index alone cannot distinguish a recycled
+    /// endpoint slot from the one the acknowledgement was published for.
     /// `None` when absent or generation-mismatched.
-    pub(crate) fn reply_record_endpoint_index_split_read(
+    pub(crate) fn reply_record_endpoint_ref_split_read(
         &self,
         index: usize,
         generation: u64,
-    ) -> Option<usize> {
+    ) -> Option<(usize, u64)> {
         self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get(index) {
             Some(Some(record)) if ipc.reply_cap_generations[index] == generation => {
                 match record.reply_endpoint {
-                    CapObject::Endpoint { index: eidx, .. } => Some(eidx),
+                    CapObject::Endpoint {
+                        index: eidx,
+                        generation: egen,
+                    } => Some((eidx, egen)),
                     _ => None,
                 }
             }
@@ -4302,6 +4308,22 @@ impl SharedKernel {
         // Lock order: task (rank 2). Forbidden caller-held locks: none with rank ≤ 2.
         // SAFETY: same as `task_class_split_read`.
         unsafe { KernelState::task_exists_from_raw(self.state.data_ptr() as *const _, tid) }
+    }
+
+    /// Stage 199D — live reverse-link count, through the rank-2 task seam only.
+    ///
+    /// Observational, for the ServerDies quiescent link-balance attestation. It reads the
+    /// same field `KernelState::live_server_reply_link_count` reads, but it must NOT take the
+    /// broad lock: the caller is the off-lock DebugLog split path, and adding a broad
+    /// acquisition there would both re-enter the lock this programme is retiring and break
+    /// the Stage 204A census (`tests/broad_lock_census_guard.rs` would fail).
+    pub(crate) fn live_server_reply_link_count_split_read(&self) -> usize {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .filter(|t| t.server_reply_link.is_some())
+                .count()
+        })
     }
 
     pub fn cnode_slot_capacity_split_read(&self, pid: u64) -> Option<usize> {

@@ -427,25 +427,98 @@ none sealed. Two defects were found live:
    existing fatal architecture path rather than a second policy. **This fix has never run
    in QEMU.** The `FailClosed` arm is a currently-unreachable backstop.
 
-2. **`LINK_LEAK created=54 detached=1 result=fail` — OPEN.** This is **not** a resource
-   leak: the ordinary reply path does close its links (`ipc_reply` calls
-   `finalize_server_reply_link_for_record`). The mismatch is in what the counters count.
-   `LinkCreated` is recorded by `register_server_reply_link`
-   (`src/kernel/boot/ipc_state.rs:1250`), which runs for **every** bound ordinary
-   `IpcCall` in the system. `LinkDetached` is recorded only by `take_server_reply_link`
-   (`ipc_state.rs:1383`), the exit path; normal reply completions close through
-   `unregister_server_reply_link`, which records nothing. `audit_success_path`
-   (`mod.rs:4116`) therefore compares a system-wide creation count against a single
-   death's detach count, and additionally expects every class to equal exactly 1 — true
-   only when the direct transaction was the sole link creator and counters were reset per
-   hosted case. `reset_instance()` has no live caller, so in a real boot the counters
-   accumulate from boot.
-   **Resolution is a design decision** — scope the counters to the audited death, or count
-   both close sites and drop the `== 1` expectation. Both change what the nine-counter
-   vector means. This is the **server-crash cleanup** element of canonical Stage **199D**
-   and simultaneously the **reply-object cleanup** element of canonical Stage **202D**; the
-   repair is the smallest next production stage (`doc/KERNEL_UNLOCK_AUDIT.md` §6). It is an
-   increment, **not** a complete canonical stage.
+2. **`LINK_LEAK created=54 detached=1 result=fail` — RESOLVED (Stage 199D increment).**
+   It was never a resource leak: the ordinary reply path does close its links, through
+   `finalize_server_reply_link_for_record`. One pair of counters was being asked to answer
+   two different questions and could answer neither. `LinkCreated` was recorded by
+   `register_server_reply_link` for **every** bound `IpcCall` in the system; `LinkDetached`
+   only by `take_server_reply_link`, the exit path; and the ordinary terminal close
+   (`detach_server_reply_link_exact`) recorded **nothing at all**, so the pair was not even
+   a valid global leak invariant. `audit_success_path` then compared a system-wide creation
+   count against one death's detach count and additionally demanded every class equal 1 —
+   true only when the direct transaction was the sole link creator and the counters were
+   reset per hosted case. `reset_instance()` had no live caller, so a real boot accumulated
+   from boot.
+
+   The two questions are now separated.
+
+   **Tier 1 — system-wide link-lifecycle totals** (`links_created` / `links_closed`).
+   Incremented by every genuine installation and by every genuine removal at **both**
+   closing edges. This is the real reverse-link leak invariant, and it is what the
+   `IPC_SERVER_DEATH_LINK_LEAK` literal now compares:
+   `IPC_SERVER_DEATH_LINK_LEAK created=<n> closed=<m> scope=system result=fail`. A link
+   created anywhere and never closed still fails the audit.
+
+   **Tier 2 — the nine-vector, scoped to exactly one armed ServerDies transaction**,
+   identified by the reply record `{index, generation}` it owns. Unrelated earlier or later
+   calls carry a different record identity and cannot move it, so the expectation is
+   `LinkCreated = 1` and `LinkDetached = 1` regardless of how much unrelated IPC the boot
+   performs.
+
+   The scope is armed at `register_reply_receive_deadline` — the point at which the
+   transaction first becomes identifiable, and the same site that already records the
+   ServerDies stale token. The reverse link is installed earlier, when the reply record is
+   created, so the creation edge cannot scope itself; instead the arm **observes live
+   state**, resolving the record's bound replier and reading its TCB link back
+   (`IPC_SERVER_DEATH_SCOPE_ARMED … link_present=<0|1>`). That keeps `LinkCreated` a
+   genuine observation rather than an inference from the later detach: an armed record that
+   owns no reverse link leaves it at 0 and fails the audit, which is exactly the defect
+   Stage 200D-2B1D-x86 hit live (`DEFERRED_RESERVED` reached, `LINK_CAPTURED` absent).
+
+   Fail-closed behaviour is preserved throughout: a second close of the armed record leaves
+   the class visibly `>1`; a close for a different record while armed is reported
+   (`IPC_SERVER_DEATH_FOREIGN_LINK_CLOSE … counted=0`) and not counted; a stale record
+   generation or stale server incarnation detaches nothing and counts nothing; a **losing**
+   terminal path (reply wins) closes the armed link so `LinkDetached = 1` while
+   `PeerDeathWinner = 0`, and the existing record-leak literal fires; and an unarmed
+   instance fails outright (`IPC_SERVER_DEATH_SCOPE_UNARMED`). A second, different arm is
+   refused (`IPC_SERVER_DEATH_SCOPE_CONFLICT`), so two overlapping scenarios can never
+   share a vector.
+
+   Ten focused hosted cases pin this (`d01`–`d10`), including the original reproduction
+   with unrelated links created on both sides of the armed transaction.
+
+3. **First ServerDies live cell — x86_64, EARNED.** Historical seal name
+   `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`; canonically a **Stage 199D server-crash-cleanup
+   increment** (it also exercises the reply-object-cleanup element canonical 202D owns).
+   Exact commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
+   `e2fd0b5c7a82dc6c8c422d5c6db242473533a9a6`, one fresh boot, clean tree frozen and
+   re-checked after every phase.
+
+   ```
+   STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64
+     sha=f5669cb55325ac58aba6a15207a89c95ad8cad3d
+     tree=e2fd0b5c7a82dc6c8c422d5c6db242473533a9a6
+     live_cells=1 caller_wakes=1 peer_death_winners=1
+     exit_returns=0 feature_off_oracle_literals=0 result=ok
+   ```
+
+   Live evidence for the accounting model, both tiers:
+
+   * **Scoped vector `[1, 1, 1, 1, 1, 1, 1, 1, 1]`** with `result_before_enqueue=1` —
+     `IPC_SERVER_DEATH_TRANSITION_AUDIT`. All nine transitions once, in order.
+   * **Quiescent system balance `created=54 closed=54 live_links=0`** —
+     `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT … scope=system result=ok`. **54 is the exact
+     count that used to be reported as the leak** (`created=54 detached=1 result=fail`): the
+     links were always being closed, the ordinary terminal path simply never counted its
+     closes.
+   * Scope armed by observation, not inference — `IPC_SERVER_DEATH_SCOPE_ARMED
+     record_index=1 record_generation=17 server_tid=10008 server_asid=1 link_present=1`.
+   * **Owner revalidation executed for the first time in QEMU** —
+     `EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu=0 prepared=idle committed=replacement
+     next_tid=1 advances=1 broad_lock=0 result=ok`, and the **replacement return** is
+     correct: `EXIT_TASK_COMMON_EPILOGUE_OWNER … owner=replacement clears=1
+     frame_committed=1`. This closed the Stage 200D-2B1D4 hang, in which the epilogue
+     committed a stale `owner=idle` decision taken before the drains published the wake.
+   * `IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won` →
+     `IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code=10 continuations=1`;
+     `reply_aliases_invalid=1 reply_copies=0`; survivor and health attested
+     (`SURVIVOR_PROGRESS_OK … yields=64`, `SYSTEM_HEALTH_OK`).
+   * Zero `result=fail` in the whole 14215-line log; all eighteen forbidden markers absent;
+     one boot banner; `caller_wakes=1`, `peer_death_winners=1`.
+
+   **This is one cell on one architecture.** AArch64 and RISC-V ServerDies cells remain
+   unearned, and canonical 199D is not sealed.
 
 ### 8.6 Preserved contracts from the deleted stage reports
 
@@ -475,22 +548,56 @@ Only the reservation **owner** may consume or release; an alias fails closed. Th
 cannot dispatch before **both** the reply bytes and the `Consumed` barrier are visible;
 the enqueue publishes the completed wake state to whichever CPU dispatches.
 
-**The direct-IPC acknowledgement slot is single-outstanding-pair, by design.** The two ack
-modules are classified ORACLE-ONLY / SINGLE-OUTSTANDING-PAIR proof infrastructure. On a
-**real** build each `publish` carries a fail-closed **overwrite fuse**: it refuses to
-overwrite an active (`VALID && !CLAIMED`) acknowledgement — the second-simultaneous-pair
-condition — preserving the active ack and marking
-`IPCCALL_DIRECT_ACK_OVERWRITE_FUSE` / `IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE`. Endpoint
-confinement plus the single provisioning slot already hold the system to one pair; the
-fuse is defence in depth and never trips in the sealed flow (`overwrite_fuse_trips=0`).
-**Hosted builds keep last-writer-wins**, because the wiring fixtures share the
-process-global statics.
-The memory-ordering audit confirmed one outstanding pair is handed across CPUs correctly
-(Release → Acquire; a monotone `SEQ` defeats stale restore), so no single pair can lose an
-ack under valid cross-CPU sequencing. Replacing the slot with an **endpoint-indexed,
-generation-bearing bounded store** is required only to support genuine **multi-pair**
-production concurrency — it is a prerequisite for concurrent direct IPC, not for the
-current sealed flow.
+**The direct-IPC acknowledgement store is bounded, endpoint-indexed, generation-bearing
+and multi-pair** (Stage 199D; `src/kernel/direct_ack_store.rs`). It replaces the former
+single-outstanding-pair slot with the store the Stage 199A2D1 race model specified.
+`ipccall_direct_ack` and `ipcreply_direct_ack` are now endpoint-keyed views over one
+`DirectAckStore` instance each; neither holds any synchronisation of its own.
+
+*Model.* A fixed array of `DIRECT_ACK_STORE_CAPACITY` slots — no allocation, no unbounded
+growth. Each slot runs `Vacant → Reserved → Committed → Consumed`, with `cancel`
+(`Reserved → Vacant`) and `restore` (`Consumed → Committed`, same publication only).
+
+* **reserve** binds one slot to one `(endpoint_index, endpoint_generation)` pair and one
+  waiter incarnation `{tid, asid}`. It publishes nothing an observer can consume, and it
+  is the ONLY refusal point — capacity is refused here, **before** any irreversible
+  publication, so a refusal costs nothing to unwind.
+* **commit** is the single irreversible publication. It consumes the reservation token by
+  value (so one reservation commits at most once) and requires the committed fields to
+  name exactly the endpoint and waiter incarnation the reservation was taken for.
+* **consume** is the exactly-once ownership transfer, keyed by the EXACT endpoint
+  incarnation and optionally by the exact waiter incarnation. Absent, stale-generation,
+  foreign-waiter, not-yet-committed and already-consumed attempts are each refused
+  fail-closed, counted separately, and mutate nothing.
+* **cancel** returns an uncommitted reservation to `Vacant` with every identity wiped —
+  a rollback that leaks neither a slot nor a waiter.
+
+*Identity and staleness.* Each slot carries a per-slot generation bumped on every entry
+into `Reserved`, so a reservation token that outlived its slot can neither commit nor
+cancel someone else's pair. A recycled endpoint slot (same index, newer generation) and a
+recycled thread id in another address space are both DIFFERENT incarnations and are
+refused.
+
+*Fail-closed refusals.* The former overwrite fuse survives as the refusal of a SECOND LIVE
+pair on the SAME endpoint: the already-published acknowledgement is preserved untouched and
+`IPCCALL_DIRECT_ACK_OVERWRITE_FUSE` / `IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE` is marked
+(`overwrite_fuse_count()`, still 0 in the sealed flow). Capacity exhaustion marks
+`IPCCALL_DIRECT_ACK_CAPACITY_REFUSED` / `IPCREPLY_DIRECT_ACK_CAPACITY_REFUSED`. **Hosted
+builds keep last-writer-wins** in the `publish` convenience wrapper, because the wiring
+fixtures share the process-global stores.
+
+*Concurrency.* Commit publishes the slot state with `Release` after the fields; consume is
+an `AcqRel`/`Acquire` compare-exchange; readers `Acquire` the state first. The endpoint
+uniqueness decision and the slot allocation are taken together under a leaf admission
+guard, because they touch different words and no CAS ordering alone can make them one
+decision; every other operation is lock-free. Deterministic hosted races cover two and
+`DIRECT_ACK_STORE_CAPACITY` simultaneous pairs, contended consumption, capacity
+exhaustion, same-endpoint reservation, stale/foreign consumption, and reserve→cancel
+rollback (`stage199d_multi_pair_races`).
+
+**Scope.** This lifts the ack store's own one-pair limit. It does NOT widen who may use
+the off-lock NR6/NR7 path: the proof gate and the oracle endpoint confinement are
+unchanged, and no production default was flipped.
 
 **Retirement-seal isolation model — Model 1, serialized master.**
 `scripts/qemu-combined-retirement-seal.sh` runs the first-cohort (12), plain (6) and

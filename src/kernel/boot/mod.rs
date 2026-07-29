@@ -4019,15 +4019,151 @@ pub mod server_dies_counters {
     /// can never inherit another's counts.
     static INSTANCE: AtomicU64 = AtomicU64::new(0);
 
-    /// Begin a fresh instance. Deterministic: every class returns to zero and the stamp
-    /// clock restarts, so a test observes only its own transitions.
+    // ── Stage 199D: the two tiers the original single pair was conflating ─────────────
+    //
+    // `LinkCreated` used to be incremented by EVERY bound `IpcCall` in the system while
+    // `LinkDetached` was incremented only by the one dying server's teardown, and
+    // `audit_success_path` compared the two. On a real boot that is `created=54
+    // detached=1` — the `IPC_SERVER_DEATH_LINK_LEAK` failure. It was never a leak: the
+    // ordinary reply path does close its links, through `detach_server_reply_link_exact`,
+    // which counted nothing at all. One pair of counters was being asked to answer two
+    // different questions, and could answer neither.
+    //
+    // They are now separate:
+    //
+    //   TIER 1 — `LINKS_CREATED_TOTAL` / `LINKS_CLOSED_TOTAL`, unscoped, incremented by
+    //   EVERY genuine installation and by EVERY genuine removal at BOTH closing edges.
+    //   This is the real reverse-link leak invariant and it is what `LINK_LEAK` now
+    //   compares. A link created anywhere and never closed still fails the audit.
+    //
+    //   TIER 2 — the nine-vector, scoped to the ONE armed ServerDies transaction by the
+    //   reply record `{index, generation}` it owns. Unrelated earlier or later calls
+    //   cannot contaminate it, because they carry a different record identity.
+
+    /// The reply record the armed ServerDies transaction owns: `(index, generation)`.
+    /// A zero generation means unarmed — reply-record generations start at 1, so zero is
+    /// unambiguous. Bounded, no allocation, no lock: the arm is one-shot per instance.
+    static ARMED_RECORD_INDEX: AtomicU64 = AtomicU64::new(0);
+    static ARMED_RECORD_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    /// Tier-1 unscoped link-lifecycle totals.
+    static LINKS_CREATED_TOTAL: AtomicU32 = AtomicU32::new(0);
+    static LINKS_CLOSED_TOTAL: AtomicU32 = AtomicU32::new(0);
+
+    /// Begin a fresh instance. Deterministic: every class returns to zero, the stamp
+    /// clock restarts, the armed record is cleared and both link totals reset, so a test
+    /// observes only its own transitions.
     pub fn reset_instance() -> u64 {
         for i in 0..CLASSES {
             COUNTS[i].store(0, Ordering::Release);
             STAMPS[i].store(0, Ordering::Release);
         }
         SEQ.store(0, Ordering::Release);
+        ARMED_RECORD_INDEX.store(0, Ordering::Release);
+        ARMED_RECORD_GENERATION.store(0, Ordering::Release);
+        LINKS_CREATED_TOTAL.store(0, Ordering::Release);
+        LINKS_CLOSED_TOTAL.store(0, Ordering::Release);
         INSTANCE.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Arm this instance to the reply record the ServerDies transaction owns. One-shot:
+    /// a second arm with a DIFFERENT record is refused and reported, so two overlapping
+    /// scenarios can never share a vector. Re-arming the identical record is idempotent.
+    ///
+    /// Returns `true` when the instance is armed to `{index, generation}` afterwards.
+    pub fn arm_record(index: usize, generation: u64) -> bool {
+        if generation == 0 {
+            return false;
+        }
+        match armed_record() {
+            None => {
+                ARMED_RECORD_INDEX.store(index as u64, Ordering::Release);
+                ARMED_RECORD_GENERATION.store(generation, Ordering::Release);
+                true
+            }
+            Some((i, g)) if i == index && g == generation => true,
+            Some((i, g)) => {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_SCOPE_CONFLICT armed_index={} armed_generation={} offered_index={} offered_generation={} result=fail",
+                    i,
+                    g,
+                    index,
+                    generation
+                );
+                false
+            }
+        }
+    }
+
+    /// The armed reply record, or `None` while unarmed.
+    #[must_use]
+    pub fn armed_record() -> Option<(usize, u64)> {
+        let g = ARMED_RECORD_GENERATION.load(Ordering::Acquire);
+        (g != 0).then(|| (ARMED_RECORD_INDEX.load(Ordering::Acquire) as usize, g))
+    }
+
+    /// Whether `{index, generation}` is the armed transaction's record.
+    #[must_use]
+    pub fn matches_armed(index: usize, generation: u64) -> bool {
+        armed_record() == Some((index, generation))
+    }
+
+    /// Tier-1 totals: `(created, closed)` across every reverse link in the system.
+    #[must_use]
+    pub fn link_totals() -> (u32, u32) {
+        (
+            LINKS_CREATED_TOTAL.load(Ordering::Acquire),
+            LINKS_CLOSED_TOTAL.load(Ordering::Acquire),
+        )
+    }
+
+    /// A reverse link was genuinely installed for `{index, generation}`.
+    ///
+    /// Always tier-1. Tier-2 only when it is the armed record's link — which, in the
+    /// production ordering, it is not: the link is installed while the reply record is
+    /// created, and the transaction only arms later, when the caller blocks. The scoped
+    /// arm therefore attributes the creation edge itself (see `note_armed_link_present`).
+    /// This branch is the safety net if that ordering ever changes, and it is what keeps
+    /// the two paths from double-counting.
+    pub fn note_link_created(index: usize, generation: u64) {
+        LINKS_CREATED_TOTAL.fetch_add(1, Ordering::AcqRel);
+        if matches_armed(index, generation) {
+            record(Transition::LinkCreated);
+        }
+    }
+
+    /// The armed record's link was observed present at arm time.
+    ///
+    /// This is the scoped creation edge. It is a genuine observation of live kernel state
+    /// — teardown has not run, and the link is read back from the bound replier's TCB —
+    /// not an inference from the detach. If the link is absent the caller does not call
+    /// this, `LinkCreated` stays 0 and the audit fails, which is exactly the "armed a
+    /// record that owns no reverse link" defect.
+    pub fn note_armed_link_present(index: usize, generation: u64) {
+        if matches_armed(index, generation) {
+            record(Transition::LinkCreated);
+        }
+    }
+
+    /// A reverse link was genuinely removed for `{index, generation}`, at either closing
+    /// edge — the ordinary terminal detach or the exit-path teardown.
+    ///
+    /// Always tier-1. Tier-2 only for the armed record. A close for a DIFFERENT record
+    /// while armed is reported and deliberately not counted: it belongs to another
+    /// transaction and must not move this vector.
+    pub fn note_link_closed(index: usize, generation: u64) {
+        LINKS_CLOSED_TOTAL.fetch_add(1, Ordering::AcqRel);
+        if matches_armed(index, generation) {
+            record(Transition::LinkDetached);
+        } else if let Some((ai, ag)) = armed_record() {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_FOREIGN_LINK_CLOSE armed_index={} armed_generation={} closed_index={} closed_generation={} counted=0 result=ok",
+                ai,
+                ag,
+                index,
+                generation
+            );
+        }
     }
 
     #[must_use]
@@ -4107,18 +4243,29 @@ pub mod server_dies_counters {
     /// exactly 1 and the publication/enqueue order holds.
     ///
     /// The leak literals are derived from COUNT RELATIONSHIPS, not from a separate scan:
-    /// a link created but never detached IS a link leak, and a deferred item published but
+    /// a link created but never closed IS a link leak, and a deferred item published but
     /// never consumed IS a deferred leak.
+    ///
+    /// The link-leak literal reads the TIER-1 totals — every reverse link in the system,
+    /// closed at either edge — because that, and not the armed transaction's pair, is the
+    /// question "did a reverse link leak?" actually asks. The armed transaction's own
+    /// `LinkCreated` / `LinkDetached` are checked by the exact-1 loop below like every
+    /// other class.
     #[must_use]
     pub fn audit_success_path() -> bool {
         use Transition as T;
         let mut ok = true;
-        if count(T::LinkCreated) != count(T::LinkDetached) {
+        let (links_created, links_closed) = link_totals();
+        if links_created != links_closed {
             crate::yarm_log!(
-                "IPC_SERVER_DEATH_LINK_LEAK created={} detached={} result=fail",
-                count(T::LinkCreated),
-                count(T::LinkDetached)
+                "IPC_SERVER_DEATH_LINK_LEAK created={} closed={} scope=system result=fail",
+                links_created,
+                links_closed
             );
+            ok = false;
+        }
+        if armed_record().is_none() {
+            crate::yarm_log!("IPC_SERVER_DEATH_SCOPE_UNARMED result=fail");
             ok = false;
         }
         if count(T::DeferredPublished) != count(T::DeferredConsumed) {
@@ -4232,6 +4379,62 @@ pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str) {
 /// Off-feature no-op so the DebugLog seams stay unconditional call sites.
 #[cfg(not(feature = "ipc-reply-timeout-oracle-core"))]
 pub(crate) fn maybe_release_reply_timeout_collector_gate(_msg: &str) {}
+
+/// One-shot latch for the quiescent link-balance attestation.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static SERVER_DIES_LINK_BALANCE_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 199D — the ServerDies scenario's QUIESCENT reverse-link balance attestation.
+///
+/// Read-only and one-shot. It reports; it repairs nothing, claims nothing and mutates no
+/// accounting state. The completion-time `IPC_SERVER_DEATH_TRANSITION_AUDIT` already proves
+/// the armed transaction's own 1/1 pair; this answers the separate, system-wide question at
+/// a point where the scenario is finished.
+///
+/// **"After no audited call remains open" is enforced, not assumed.** The trigger is the
+/// surviving caller's own final marker, which it logs only after validating `ServerDied` and
+/// completing its survivor loop; and the reading is additionally gated on
+/// `live_server_reply_link_count() == 0`, so a still-outstanding reverse link defers the
+/// attestation rather than reporting a balance that a later close would change. If links are
+/// still live the latch is NOT consumed, so a later trigger can still produce the reading.
+///
+/// Emitted from the off-lock DebugLog split path, alongside the existing collector-gate
+/// release, so it costs an ordinary boot nothing.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn maybe_emit_server_dies_link_balance(msg: &str, live_links: usize) {
+    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_SERVER_DIES {
+        return;
+    }
+    if !(msg.starts_with("IPC_SERVER_DEATH_SCENARIO_DONE") && msg.contains("server_died=1")) {
+        return;
+    }
+    if SERVER_DIES_LINK_BALANCE_DONE.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if live_links != 0 {
+        // Not quiescent yet: an audited call is still open. Report the deferral rather than
+        // publishing a balance that is not final, and leave the latch unconsumed.
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_LINK_BALANCE_DEFERRED live_links={} reason=audited_call_open result=ok",
+            live_links
+        );
+        return;
+    }
+    if SERVER_DIES_LINK_BALANCE_DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let (created, closed) = server_dies_counters::link_totals();
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT created={} closed={} live_links=0 scope=system result={}",
+        created,
+        closed,
+        if created == closed { "ok" } else { "fail" }
+    );
+}
+
+#[cfg(not(feature = "ipc-reply-timeout-oracle-core"))]
+pub(crate) fn maybe_emit_server_dies_link_balance(_msg: &str, _live_links: usize) {}
 
 // ── Stage 200D-2A: per-CPU bounded DEFERRED SERVER-DEATH work queue ─────────────────
 //
@@ -4992,147 +5195,255 @@ pub(crate) fn emit_ipccall_direct_request_live_markers() {}
 )))]
 pub(crate) fn emit_ipcreply_direct_live_markers() {}
 
-/// Authoritative committed blocked-server acknowledgement for the NR6 direct request
-/// transaction, published ONLY from the fully-committed recv-v2 path. A single-slot
-/// store with a monotonic `commit_seq` and an atomic CLAIMED guard so a duplicate
-/// trap/drain cannot claim the same acknowledgement twice; `restore` re-arms it only
-/// for a retryable rollback of the exact same publication.
+/// Authoritative committed blocked-server acknowledgements for the NR6 direct request
+/// transaction, published ONLY from the fully-committed recv-v2 path.
 ///
-/// # Concurrency classification (Stage 199A2D1)
-/// This is ORACLE-ONLY, SINGLE-OUTSTANDING-PAIR proof infrastructure — NOT a general
-/// production concurrency store. It correctly hands ONE committed acknowledgement across
-/// CPUs (Release publication → Acquire/AcqRel claim), but it holds exactly ONE slot: a
-/// SECOND simultaneous oracle pair would overwrite (or steal) the active unclaimed
-/// acknowledgement. Endpoint confinement + the single provisioning slot already keep the
-/// system to one pair; on a REAL boot the fail-closed overwrite fuse below additionally
-/// REFUSES to overwrite an active (VALID && !CLAIMED) acknowledgement and marks the fuse.
-/// Multi-pair production concurrency would require replacing this slot with an
-/// endpoint-indexed, generation-bearing bounded store (see the Stage 199A2D1 report).
+/// # Concurrency classification (Stage 199D)
+/// This is the endpoint-keyed view of a bounded, generation-bearing MULTI-PAIR
+/// [`crate::kernel::direct_ack_store::DirectAckStore`] — the replacement the Stage 199A2D1
+/// race model specified for the former single-outstanding-pair slot. Independent
+/// `(endpoint_index, endpoint_generation)` pairs now coexist up to
+/// [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`], each published and
+/// consumed exactly once, with capacity refused at reservation time — before any
+/// irreversible publication. The former overwrite fuse survives as the fail-closed
+/// [`overwrite_fuse_count`]: a SECOND live pair on the SAME endpoint is refused and the
+/// already-published acknowledgement is preserved untouched.
+///
+/// Endpoint confinement and the NR6/NR7 proof gate are unchanged and still decide WHICH
+/// endpoints may use the off-lock path at all; this store no longer constrains how many
+/// pairs may be outstanding while they do.
 pub mod ipccall_direct_ack {
     use crate::kernel::boot::ReceiverWaiterIdentity;
+    use crate::kernel::direct_ack_store::{
+        AckConsume, AckEndpoint, AckFields, AckReservation, AckReserveError, AckWaiter,
+        DirectAckStore,
+    };
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::ipccall_direct::BlockedServerAck;
     use crate::kernel::vm::Asid;
-    use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
-    static VALID: AtomicBool = AtomicBool::new(false);
-    static CLAIMED: AtomicBool = AtomicBool::new(false);
-    /// Fail-closed fuse: counts refused overwrites of an ACTIVE (VALID && !CLAIMED) ack — a
-    /// second-simultaneous-pair condition. Must be 0 in the sealed single-pair oracle boot.
-    static OVERWRITE_FUSE: AtomicU64 = AtomicU64::new(0);
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    static SERVER_TID: AtomicU64 = AtomicU64::new(0);
-    static SERVER_ASID: AtomicU16 = AtomicU16::new(0);
-    static EP_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static EP_GEN: AtomicU64 = AtomicU64::new(0);
-    static PAYLOAD_PTR: AtomicUsize = AtomicUsize::new(0);
-    static PAYLOAD_LEN: AtomicUsize = AtomicUsize::new(0);
-    static META_PTR: AtomicUsize = AtomicUsize::new(0);
-    static META_LEN: AtomicUsize = AtomicUsize::new(0);
+    static STORE: DirectAckStore = DirectAckStore::new();
 
-    /// Reset (test setup / between boots).
-    pub fn reset() {
-        VALID.store(false, Ordering::Release);
-        CLAIMED.store(false, Ordering::Release);
-        OVERWRITE_FUSE.store(0, Ordering::Release);
+    /// The shared multi-pair store backing the blocked-SERVER acknowledgements.
+    pub(crate) fn store() -> &'static DirectAckStore {
+        &STORE
     }
 
-    /// Count of refused overwrites of an active acknowledgement (a second-pair fuse trip).
-    /// Must be 0 in the sealed single-pair oracle boot.
-    pub fn overwrite_fuse_count() -> u64 {
-        OVERWRITE_FUSE.load(Ordering::Acquire)
+    fn endpoint_of(ack: &BlockedServerAck) -> AckEndpoint {
+        AckEndpoint::new(ack.endpoint_index, ack.endpoint_generation)
     }
 
-    fn next_seq() -> u64 {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        NEXT.fetch_add(1, Ordering::Relaxed)
+    fn waiter_of(ack: &BlockedServerAck) -> AckWaiter {
+        AckWaiter::new(ack.server.tid.0, ack.server.asid.0)
     }
 
-    /// Publish the ack (fields first, `VALID` released last). Clears the claim so a
-    /// fresh publication is independently claimable exactly once. Returns the seq.
-    ///
-    /// Stage 199A2D1 fail-closed overwrite fuse (REAL builds only): refuse to overwrite an
-    /// ACTIVE (VALID && !CLAIMED) acknowledgement — that is a second-simultaneous-pair
-    /// condition this single-slot store does not support. The active ack is preserved and the
-    /// fuse is marked. Never trips in the sealed one-pair flow (the slot is published exactly
-    /// once, from VALID=false, then claimed). Hosted builds keep last-writer-wins so the
-    /// wiring-test fixtures (which share these process-global statics) are unaffected.
-    pub(crate) fn publish(ack: BlockedServerAck) -> u64 {
-        #[cfg(not(feature = "hosted-dev"))]
-        if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {
-            OVERWRITE_FUSE.fetch_add(1, Ordering::Relaxed);
-            crate::yarm_log!("IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server");
-            return SEQ.load(Ordering::Relaxed);
+    fn fields_of(ack: &BlockedServerAck) -> AckFields {
+        AckFields {
+            endpoint: endpoint_of(ack),
+            waiter: waiter_of(ack),
+            payload_user_ptr: ack.payload_user_ptr,
+            payload_user_len: ack.payload_user_len,
+            meta_user_ptr: ack.meta_user_ptr,
+            meta_user_len: ack.meta_user_len,
         }
-        let seq = next_seq();
-        SERVER_TID.store(ack.server.tid.0, Ordering::Relaxed);
-        SERVER_ASID.store(ack.server.asid.0, Ordering::Relaxed);
-        EP_IDX.store(ack.endpoint_index, Ordering::Relaxed);
-        EP_GEN.store(ack.endpoint_generation, Ordering::Relaxed);
-        PAYLOAD_PTR.store(ack.payload_user_ptr, Ordering::Relaxed);
-        PAYLOAD_LEN.store(ack.payload_user_len, Ordering::Relaxed);
-        META_PTR.store(ack.meta_user_ptr, Ordering::Relaxed);
-        META_LEN.store(ack.meta_user_len, Ordering::Relaxed);
-        SEQ.store(seq, Ordering::Relaxed);
-        CLAIMED.store(false, Ordering::Relaxed);
-        VALID.store(true, Ordering::Release);
-        seq
     }
 
-    /// The current committed acknowledgement, or `None` if nothing is published.
-    pub fn snapshot() -> Option<BlockedServerAck> {
-        if !VALID.load(Ordering::Acquire) {
-            return None;
-        }
-        Some(BlockedServerAck {
+    fn ack_of(fields: AckFields) -> BlockedServerAck {
+        BlockedServerAck {
             server: ReceiverWaiterIdentity::new(
-                ThreadId(SERVER_TID.load(Ordering::Relaxed)),
-                Asid(SERVER_ASID.load(Ordering::Relaxed)),
+                ThreadId(fields.waiter.tid),
+                Asid(fields.waiter.asid),
             ),
-            endpoint_index: EP_IDX.load(Ordering::Relaxed),
-            endpoint_generation: EP_GEN.load(Ordering::Relaxed),
+            endpoint_index: fields.endpoint.index,
+            endpoint_generation: fields.endpoint.generation,
             recv_v2_committed: true,
-            payload_user_ptr: PAYLOAD_PTR.load(Ordering::Relaxed),
-            payload_user_len: PAYLOAD_LEN.load(Ordering::Relaxed),
-            meta_user_ptr: META_PTR.load(Ordering::Relaxed),
-            meta_user_len: META_LEN.load(Ordering::Relaxed),
-        })
-    }
-
-    /// The published commit sequence (for the claimer).
-    pub fn commit_seq() -> u64 {
-        SEQ.load(Ordering::Relaxed)
-    }
-
-    /// Atomically CLAIM the current ack exactly once. Returns `Some((ack, seq))` on a
-    /// fresh claim; `None` if there is no ack or it is already claimed (a duplicate
-    /// trap/drain). The claim is the single ownership transfer of the acknowledgement.
-    pub fn claim() -> Option<(BlockedServerAck, u64)> {
-        let ack = snapshot()?;
-        if CLAIMED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return None; // already claimed — duplicate cannot claim twice
+            payload_user_ptr: fields.payload_user_ptr,
+            payload_user_len: fields.payload_user_len,
+            meta_user_ptr: fields.meta_user_ptr,
+            meta_user_len: fields.meta_user_len,
         }
-        Some((ack, SEQ.load(Ordering::Relaxed)))
     }
 
-    /// Re-arm (restore) a claimed ack for a retryable rollback of the SAME publication
-    /// (matching seq). Returns `true` if restored. A stale/changed publication (seq
-    /// advanced) cannot be restored — the stale ack stays claimed (discarded).
+    /// Reset every pair and counter (test setup / between boots).
+    pub fn reset() {
+        STORE.reset();
+    }
+
+    /// Reserve the pair slot for one blocked server BEFORE anything is published, so
+    /// capacity (or a still-live pair on the same endpoint) is refused while the caller can
+    /// still abandon the pair with nothing to unwind.
+    pub(crate) fn reserve(
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        server: ReceiverWaiterIdentity,
+    ) -> Result<AckReservation, AckReserveError> {
+        STORE.reserve(
+            AckEndpoint::new(endpoint_index, endpoint_generation),
+            AckWaiter::new(server.tid.0, server.asid.0),
+        )
+    }
+
+    /// Publish the reserved acknowledgement — the single irreversible step. Returns the
+    /// publication sequence, or hands the reservation back so the caller can cancel it.
+    pub(crate) fn commit(
+        reservation: AckReservation,
+        ack: BlockedServerAck,
+    ) -> Result<u64, AckReservation> {
+        let fields = fields_of(&ack);
+        STORE
+            .commit(reservation, fields)
+            .map_err(|err| err.into_reservation())
+    }
+
+    /// Abandon an uncommitted reservation, leaving no slot occupied and no server identity
+    /// readable.
+    pub(crate) fn cancel(reservation: AckReservation) -> bool {
+        STORE.cancel(reservation)
+    }
+
+    /// Reserve + commit in one step. Used by the hosted wiring fixtures and by tests; the
+    /// production publish site drives the explicit reserve → commit lifecycle so a rollback
+    /// between the two is expressible. Returns 0 when the store refuses (capacity or a
+    /// still-live pair on the same endpoint) — nothing is published in that case.
+    ///
+    /// Hosted builds first release any spent-or-live pair on the endpoint so the wiring
+    /// fixtures, which share this process-global store across cases, keep the
+    /// last-writer-wins behaviour they were written against. Real builds are fail-closed:
+    /// a live pair is preserved and the refusal is counted.
+    pub(crate) fn publish(ack: BlockedServerAck) -> u64 {
+        #[cfg(feature = "hosted-dev")]
+        STORE.release_endpoint_index(ack.endpoint_index);
+        let reservation = match reserve(ack.endpoint_index, ack.endpoint_generation, ack.server) {
+            Ok(reservation) => reservation,
+            Err(AckReserveError::EndpointAlreadyLive) => {
+                crate::yarm_log!("IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server");
+                return 0;
+            }
+            Err(AckReserveError::CapacityExhausted) => {
+                crate::yarm_log!("IPCCALL_DIRECT_ACK_CAPACITY_REFUSED slot=server");
+                return 0;
+            }
+        };
+        match commit(reservation, ack) {
+            Ok(seq) => seq,
+            Err(reservation) => {
+                cancel(reservation);
+                0
+            }
+        }
+    }
+
+    /// The acknowledgement published for EXACTLY this endpoint incarnation, or `None`.
+    pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedServerAck> {
+        STORE
+            .snapshot(AckEndpoint::new(endpoint_index, endpoint_generation))
+            .map(ack_of)
+    }
+
+    /// The publication sequence held for this endpoint incarnation, or 0.
+    pub fn commit_seq(endpoint_index: usize, endpoint_generation: u64) -> u64 {
+        STORE.commit_seq(AckEndpoint::new(endpoint_index, endpoint_generation))
+    }
+
+    /// Consume the acknowledgement published for EXACTLY this endpoint incarnation, at most
+    /// once. `None` on an absent, stale, still-reserved or already-consumed pair — a
+    /// duplicate trap/drain can never consume the same acknowledgement twice.
+    pub fn claim(
+        endpoint_index: usize,
+        endpoint_generation: u64,
+    ) -> Option<(BlockedServerAck, u64)> {
+        claim_exact(endpoint_index, endpoint_generation, None)
+    }
+
+    /// Endpoint-keyed consume that additionally pins the SERVER incarnation: an
+    /// acknowledgement belonging to a different `{tid, asid}` is foreign and refused.
+    pub fn claim_exact(
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        expect_server: Option<ReceiverWaiterIdentity>,
+    ) -> Option<(BlockedServerAck, u64)> {
+        match STORE.consume(
+            AckEndpoint::new(endpoint_index, endpoint_generation),
+            expect_server.map(|id| AckWaiter::new(id.tid.0, id.asid.0)),
+        ) {
+            AckConsume::Consumed(fields, seq) => Some((ack_of(fields), seq)),
+            _ => None,
+        }
+    }
+
+    /// Re-arm (restore) a consumed ack for a retryable rollback of the SAME publication
+    /// (matching seq). A superseded publication cannot be restored — it stays consumed.
     pub fn restore(seq: u64) -> bool {
-        if SEQ.load(Ordering::Relaxed) == seq && VALID.load(Ordering::Acquire) {
-            CLAIMED.store(false, Ordering::Release);
-            true
-        } else {
-            false
+        STORE.restore(seq)
+    }
+
+    /// True iff an unconsumed published ack is present for this endpoint incarnation.
+    pub fn is_claimable(endpoint_index: usize, endpoint_generation: u64) -> bool {
+        STORE.is_claimable(AckEndpoint::new(endpoint_index, endpoint_generation))
+    }
+
+    /// Reservations refused because the endpoint already owned a LIVE pair — the
+    /// fail-closed successor of the single-slot overwrite fuse. Must be 0 in the sealed
+    /// oracle boot.
+    pub fn overwrite_fuse_count() -> u64 {
+        STORE.endpoint_live_refusal_count()
+    }
+
+    /// Reservations refused because every slot held a live pair. Must be 0 in the sealed
+    /// oracle boot.
+    pub fn capacity_refusal_count() -> u64 {
+        STORE.capacity_refusal_count()
+    }
+
+    /// Simultaneously outstanding (reserved or committed) blocked-server pairs.
+    pub fn live_pair_count() -> usize {
+        STORE.live_pair_count()
+    }
+
+    /// Test support: the endpoint incarnation of the store's SINGLE pair, when exactly one
+    /// exists. Lets a wiring fixture that publishes one acknowledgement address it through
+    /// the ordinary endpoint-keyed API. `None` for zero or more than one pair.
+    pub fn sole_pair_endpoint() -> Option<(usize, u64)> {
+        STORE
+            .sole_pair_endpoint()
+            .map(|endpoint| (endpoint.index, endpoint.generation))
+    }
+
+    // ── Test-support wrappers ────────────────────────────────────────────────────────
+    //
+    // The recv-v2 publication / claim / restore WIRING fixtures publish exactly one
+    // acknowledgement each; these address that single pair through the ordinary
+    // endpoint-keyed API above so the wiring assertions stay readable. They are NOT a
+    // production affordance: every production consumer names the endpoint incarnation it
+    // is entitled to, and the endpoint-keying itself is proven by the store's own tests
+    // and by the multi-pair hosted races.
+
+    #[cfg(test)]
+    pub fn sole_snapshot() -> Option<BlockedServerAck> {
+        let (index, generation) = sole_pair_endpoint()?;
+        snapshot(index, generation)
+    }
+
+    #[cfg(test)]
+    pub fn sole_claim() -> Option<(BlockedServerAck, u64)> {
+        let (index, generation) = sole_pair_endpoint()?;
+        claim(index, generation)
+    }
+
+    #[cfg(test)]
+    pub fn sole_is_claimable() -> bool {
+        match sole_pair_endpoint() {
+            Some((index, generation)) => is_claimable(index, generation),
+            None => false,
         }
     }
 
-    /// True iff an unclaimed committed ack is present.
-    pub fn is_claimable() -> bool {
-        VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire)
+    #[cfg(test)]
+    pub fn sole_commit_seq() -> u64 {
+        match sole_pair_endpoint() {
+            Some((index, generation)) => commit_seq(index, generation),
+            None => 0,
+        }
     }
 }
 
@@ -5172,11 +5483,27 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
         return;
     };
     let server = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
+    // Stage 199D reserve → commit → cancel. RESERVE first: capacity (and a still-live pair
+    // on this endpoint) is refused here, before ANY irreversible publication, so a refusal
+    // costs nothing to unwind. A reservation is invisible to every consumer until commit.
+    let reservation = match ipccall_direct_ack::reserve(index, generation, server) {
+        Ok(reservation) => reservation,
+        Err(crate::kernel::direct_ack_store::AckReserveError::EndpointAlreadyLive) => {
+            crate::yarm_log!("IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server");
+            return;
+        }
+        Err(crate::kernel::direct_ack_store::AckReserveError::CapacityExhausted) => {
+            crate::yarm_log!("IPCCALL_DIRECT_ACK_CAPACITY_REFUSED slot=server");
+            return;
+        }
+    };
     // Re-read the endpoint waiter identity under the IPC lock immediately before
     // publication and require an EXACT match (else the record is not fully committed
-    // for this endpoint — publish nothing).
+    // for this endpoint — publish nothing). CANCEL returns the reserved slot to vacant
+    // with no server identity readable: a rollback with no slot or waiter leak.
     let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
     if waiter != Some(server) {
+        ipccall_direct_ack::cancel(reservation);
         return;
     }
     let ack = crate::kernel::ipccall_direct::BlockedServerAck {
@@ -5189,7 +5516,13 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
         meta_user_ptr: state.meta_user_ptr,
         meta_user_len: state.meta_user_len,
     };
-    let seq = ipccall_direct_ack::publish(ack);
+    let seq = match ipccall_direct_ack::commit(reservation, ack) {
+        Ok(seq) => seq,
+        Err(reservation) => {
+            ipccall_direct_ack::cancel(reservation);
+            return;
+        }
+    };
     // Stage 199A2D2C2B1: emit the AUTHORITATIVE cross-CPU blocked-server marker EXACTLY ONCE, only
     // for the x86_64 SMP oracle's CPU-1 recv-v2 server, and ONLY once every authoritative
     // blocking-order condition has committed: the saved continuation is captured, the exact endpoint
@@ -5230,7 +5563,9 @@ fn maybe_emit_ipccall_direct_smp_server_blocked(
     let server = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
     let waiter_exact =
         kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(endpoint_index)) == Some(server);
-    let ack_published = ipccall_direct_ack::commit_seq() == ack_seq && ack_seq != 0;
+    let ack_published = ipccall_direct_ack::commit_seq(endpoint_index, endpoint_generation)
+        == ack_seq
+        && ack_seq != 0;
     if !(saved_frame && absent_from_runqueue && home_cpu_1 && waiter_exact && ack_published) {
         return;
     }
@@ -5246,132 +5581,221 @@ fn maybe_emit_ipccall_direct_smp_server_blocked(
     );
 }
 
-/// Stage 199A2B3: single-slot committed blocked-CALLER acknowledgement for the NR7
-/// direct reply transaction. Mirrors [`ipccall_direct_ack`] with the same claim/restore
-/// lifecycle (an atomic CLAIMED guard so a duplicate reply drain cannot claim twice).
+/// Committed blocked-CALLER acknowledgements for the NR7 direct reply transaction.
+/// Mirrors [`ipccall_direct_ack`] with the same reserve → commit → consume/cancel
+/// lifecycle over its own bounded multi-pair store.
 ///
-/// # Concurrency classification (Stage 199A2D1)
-/// This is ORACLE-ONLY, SINGLE-OUTSTANDING-PAIR proof infrastructure — NOT a general
-/// production concurrency store. It correctly hands ONE committed acknowledgement across
-/// CPUs (Release publication → Acquire/AcqRel claim), but it holds exactly ONE slot: a
-/// SECOND simultaneous oracle pair would overwrite (or steal) the active unclaimed
-/// acknowledgement. Endpoint confinement + the single provisioning slot already keep the
-/// system to one pair; on a REAL boot the fail-closed overwrite fuse below additionally
-/// REFUSES to overwrite an active (VALID && !CLAIMED) acknowledgement and marks the fuse.
-/// Multi-pair production concurrency would require replacing this slot with an
-/// endpoint-indexed, generation-bearing bounded store (see the Stage 199A2D1 report).
+/// # Concurrency classification (Stage 199D)
+/// The endpoint-keyed view of a second, independent bounded
+/// [`crate::kernel::direct_ack_store::DirectAckStore`]. Independent
+/// `(endpoint_index, endpoint_generation)` reply pairs coexist, each consumed exactly
+/// once; capacity is refused at reservation time, before any irreversible publication.
+/// The former overwrite fuse survives as the fail-closed [`overwrite_fuse_count`]: a
+/// second LIVE pair on the SAME reply endpoint is refused and the already-published
+/// acknowledgement is preserved untouched.
 pub mod ipcreply_direct_ack {
     use crate::kernel::boot::ReceiverWaiterIdentity;
+    use crate::kernel::direct_ack_store::{
+        AckConsume, AckEndpoint, AckFields, AckReservation, AckReserveError, AckWaiter,
+        DirectAckStore,
+    };
     use crate::kernel::ipc::ThreadId;
     use crate::kernel::ipccall_direct::BlockedCallerAck;
     use crate::kernel::vm::Asid;
-    use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
-    static VALID: AtomicBool = AtomicBool::new(false);
-    static CLAIMED: AtomicBool = AtomicBool::new(false);
-    /// Fail-closed fuse: counts refused overwrites of an ACTIVE (VALID && !CLAIMED) ack — a
-    /// second-simultaneous-pair condition. Must be 0 in the sealed single-pair oracle boot.
-    static OVERWRITE_FUSE: AtomicU64 = AtomicU64::new(0);
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    static CALLER_TID: AtomicU64 = AtomicU64::new(0);
-    static CALLER_ASID: AtomicU16 = AtomicU16::new(0);
-    static EP_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
-    static EP_GEN: AtomicU64 = AtomicU64::new(0);
-    static PAYLOAD_PTR: AtomicUsize = AtomicUsize::new(0);
-    static PAYLOAD_LEN: AtomicUsize = AtomicUsize::new(0);
-    static META_PTR: AtomicUsize = AtomicUsize::new(0);
-    static META_LEN: AtomicUsize = AtomicUsize::new(0);
+    static STORE: DirectAckStore = DirectAckStore::new();
 
-    pub fn reset() {
-        VALID.store(false, Ordering::Release);
-        CLAIMED.store(false, Ordering::Release);
-        OVERWRITE_FUSE.store(0, Ordering::Release);
+    /// The shared multi-pair store backing the blocked-CALLER acknowledgements.
+    pub(crate) fn store() -> &'static DirectAckStore {
+        &STORE
     }
 
-    /// Count of refused overwrites of an active acknowledgement (a second-pair fuse trip).
-    /// Must be 0 in the sealed single-pair oracle boot.
-    pub fn overwrite_fuse_count() -> u64 {
-        OVERWRITE_FUSE.load(Ordering::Acquire)
-    }
-
-    fn next_seq() -> u64 {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Publish the ack (fields first, `VALID` released last). Stage 199A2D1 fail-closed
-    /// overwrite fuse (REAL builds only): refuse to overwrite an ACTIVE (VALID && !CLAIMED)
-    /// acknowledgement — a second-simultaneous-pair condition this single-slot store does not
-    /// support. The active ack is preserved and the fuse is marked. Never trips in the sealed
-    /// one-pair flow. Hosted builds keep last-writer-wins for the wiring-test fixtures.
-    pub(crate) fn publish(ack: BlockedCallerAck) -> u64 {
-        #[cfg(not(feature = "hosted-dev"))]
-        if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {
-            OVERWRITE_FUSE.fetch_add(1, Ordering::Relaxed);
-            crate::yarm_log!("IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE slot=caller");
-            return SEQ.load(Ordering::Relaxed);
+    fn fields_of(ack: &BlockedCallerAck) -> AckFields {
+        AckFields {
+            endpoint: AckEndpoint::new(ack.endpoint_index, ack.endpoint_generation),
+            waiter: AckWaiter::new(ack.caller.tid.0, ack.caller.asid.0),
+            payload_user_ptr: ack.payload_user_ptr,
+            payload_user_len: ack.payload_user_len,
+            meta_user_ptr: ack.meta_user_ptr,
+            meta_user_len: ack.meta_user_len,
         }
-        let seq = next_seq();
-        CALLER_TID.store(ack.caller.tid.0, Ordering::Relaxed);
-        CALLER_ASID.store(ack.caller.asid.0, Ordering::Relaxed);
-        EP_IDX.store(ack.endpoint_index, Ordering::Relaxed);
-        EP_GEN.store(ack.endpoint_generation, Ordering::Relaxed);
-        PAYLOAD_PTR.store(ack.payload_user_ptr, Ordering::Relaxed);
-        PAYLOAD_LEN.store(ack.payload_user_len, Ordering::Relaxed);
-        META_PTR.store(ack.meta_user_ptr, Ordering::Relaxed);
-        META_LEN.store(ack.meta_user_len, Ordering::Relaxed);
-        SEQ.store(seq, Ordering::Relaxed);
-        CLAIMED.store(false, Ordering::Relaxed);
-        VALID.store(true, Ordering::Release);
-        seq
     }
 
-    pub fn snapshot() -> Option<BlockedCallerAck> {
-        if !VALID.load(Ordering::Acquire) {
-            return None;
-        }
-        Some(BlockedCallerAck {
+    fn ack_of(fields: AckFields) -> BlockedCallerAck {
+        BlockedCallerAck {
             caller: ReceiverWaiterIdentity::new(
-                ThreadId(CALLER_TID.load(Ordering::Relaxed)),
-                Asid(CALLER_ASID.load(Ordering::Relaxed)),
+                ThreadId(fields.waiter.tid),
+                Asid(fields.waiter.asid),
             ),
-            endpoint_index: EP_IDX.load(Ordering::Relaxed),
-            endpoint_generation: EP_GEN.load(Ordering::Relaxed),
+            endpoint_index: fields.endpoint.index,
+            endpoint_generation: fields.endpoint.generation,
             recv_v2_committed: true,
-            payload_user_ptr: PAYLOAD_PTR.load(Ordering::Relaxed),
-            payload_user_len: PAYLOAD_LEN.load(Ordering::Relaxed),
-            meta_user_ptr: META_PTR.load(Ordering::Relaxed),
-            meta_user_len: META_LEN.load(Ordering::Relaxed),
-        })
-    }
-
-    pub fn claim() -> Option<(BlockedCallerAck, u64)> {
-        let ack = snapshot()?;
-        if CLAIMED
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return None;
+            payload_user_ptr: fields.payload_user_ptr,
+            payload_user_len: fields.payload_user_len,
+            meta_user_ptr: fields.meta_user_ptr,
+            meta_user_len: fields.meta_user_len,
         }
-        Some((ack, SEQ.load(Ordering::Relaxed)))
     }
 
+    /// Reset every pair and counter (test setup / between boots).
+    pub fn reset() {
+        STORE.reset();
+    }
+
+    /// Reserve the pair slot for one blocked caller BEFORE anything is published.
+    pub(crate) fn reserve(
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        caller: ReceiverWaiterIdentity,
+    ) -> Result<AckReservation, AckReserveError> {
+        STORE.reserve(
+            AckEndpoint::new(endpoint_index, endpoint_generation),
+            AckWaiter::new(caller.tid.0, caller.asid.0),
+        )
+    }
+
+    /// Publish the reserved acknowledgement — the single irreversible step.
+    pub(crate) fn commit(
+        reservation: AckReservation,
+        ack: BlockedCallerAck,
+    ) -> Result<u64, AckReservation> {
+        let fields = fields_of(&ack);
+        STORE
+            .commit(reservation, fields)
+            .map_err(|err| err.into_reservation())
+    }
+
+    /// Abandon an uncommitted reservation, leaving no slot occupied and no caller identity
+    /// readable.
+    pub(crate) fn cancel(reservation: AckReservation) -> bool {
+        STORE.cancel(reservation)
+    }
+
+    /// Reserve + commit in one step (hosted wiring fixtures and tests). Returns 0 when the
+    /// store refuses — nothing is published in that case. See
+    /// [`super::ipccall_direct_ack::publish`] for the hosted last-writer-wins note.
+    pub(crate) fn publish(ack: BlockedCallerAck) -> u64 {
+        #[cfg(feature = "hosted-dev")]
+        STORE.release_endpoint_index(ack.endpoint_index);
+        let reservation = match reserve(ack.endpoint_index, ack.endpoint_generation, ack.caller) {
+            Ok(reservation) => reservation,
+            Err(AckReserveError::EndpointAlreadyLive) => {
+                crate::yarm_log!("IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE slot=caller");
+                return 0;
+            }
+            Err(AckReserveError::CapacityExhausted) => {
+                crate::yarm_log!("IPCREPLY_DIRECT_ACK_CAPACITY_REFUSED slot=caller");
+                return 0;
+            }
+        };
+        match commit(reservation, ack) {
+            Ok(seq) => seq,
+            Err(reservation) => {
+                cancel(reservation);
+                0
+            }
+        }
+    }
+
+    /// The acknowledgement published for EXACTLY this reply-endpoint incarnation.
+    pub fn snapshot(endpoint_index: usize, endpoint_generation: u64) -> Option<BlockedCallerAck> {
+        STORE
+            .snapshot(AckEndpoint::new(endpoint_index, endpoint_generation))
+            .map(ack_of)
+    }
+
+    /// Consume the acknowledgement for EXACTLY this reply-endpoint incarnation, at most
+    /// once.
+    pub fn claim(
+        endpoint_index: usize,
+        endpoint_generation: u64,
+    ) -> Option<(BlockedCallerAck, u64)> {
+        claim_exact(endpoint_index, endpoint_generation, None)
+    }
+
+    /// Endpoint-keyed consume that additionally pins the CALLER incarnation.
+    pub fn claim_exact(
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        expect_caller: Option<ReceiverWaiterIdentity>,
+    ) -> Option<(BlockedCallerAck, u64)> {
+        match STORE.consume(
+            AckEndpoint::new(endpoint_index, endpoint_generation),
+            expect_caller.map(|id| AckWaiter::new(id.tid.0, id.asid.0)),
+        ) {
+            AckConsume::Consumed(fields, seq) => Some((ack_of(fields), seq)),
+            _ => None,
+        }
+    }
+
+    /// Re-arm a consumed ack for a retryable rollback of the SAME publication.
     pub fn restore(seq: u64) -> bool {
-        if SEQ.load(Ordering::Relaxed) == seq && VALID.load(Ordering::Acquire) {
-            CLAIMED.store(false, Ordering::Release);
-            true
-        } else {
-            false
+        STORE.restore(seq)
+    }
+
+    /// True iff an unconsumed published ack is present for this endpoint incarnation.
+    pub fn is_claimable(endpoint_index: usize, endpoint_generation: u64) -> bool {
+        STORE.is_claimable(AckEndpoint::new(endpoint_index, endpoint_generation))
+    }
+
+    /// Reservations refused because the reply endpoint already owned a LIVE pair. Must be 0
+    /// in the sealed oracle boot.
+    pub fn overwrite_fuse_count() -> u64 {
+        STORE.endpoint_live_refusal_count()
+    }
+
+    /// Reservations refused because every slot held a live pair. Must be 0 in the sealed
+    /// oracle boot.
+    pub fn capacity_refusal_count() -> u64 {
+        STORE.capacity_refusal_count()
+    }
+
+    /// Simultaneously outstanding (reserved or committed) blocked-caller pairs.
+    pub fn live_pair_count() -> usize {
+        STORE.live_pair_count()
+    }
+
+    /// Test support: the endpoint incarnation of the store's SINGLE pair, when exactly one
+    /// exists. `None` for zero or more than one pair.
+    pub fn sole_pair_endpoint() -> Option<(usize, u64)> {
+        STORE
+            .sole_pair_endpoint()
+            .map(|endpoint| (endpoint.index, endpoint.generation))
+    }
+
+    // Test-support wrappers for the single-pair reply wiring fixtures; see the NR6 twin.
+
+    #[cfg(test)]
+    pub fn sole_snapshot() -> Option<BlockedCallerAck> {
+        let (index, generation) = sole_pair_endpoint()?;
+        snapshot(index, generation)
+    }
+
+    #[cfg(test)]
+    pub fn sole_claim() -> Option<(BlockedCallerAck, u64)> {
+        let (index, generation) = sole_pair_endpoint()?;
+        claim(index, generation)
+    }
+
+    #[cfg(test)]
+    pub fn sole_is_claimable() -> bool {
+        match sole_pair_endpoint() {
+            Some((index, generation)) => is_claimable(index, generation),
+            None => false,
         }
     }
 
-    pub fn is_claimable() -> bool {
-        VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire)
+    #[cfg(test)]
+    pub fn sole_commit_seq() -> u64 {
+        match sole_pair_endpoint() {
+            Some((index, generation)) => commit_seq(index, generation),
+            None => 0,
+        }
     }
 
-    /// The published commit sequence (for the caller-blocked attestation).
-    pub fn commit_seq() -> u64 {
-        SEQ.load(Ordering::Relaxed)
+    /// The publication sequence held for this reply-endpoint incarnation, or 0.
+    pub fn commit_seq(endpoint_index: usize, endpoint_generation: u64) -> u64 {
+        STORE.commit_seq(AckEndpoint::new(endpoint_index, endpoint_generation))
     }
 }
 
@@ -5409,9 +5833,23 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
         return;
     };
     let caller = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
+    // Stage 199D reserve → commit → cancel: capacity is refused here, before any
+    // irreversible publication (see the NR6 twin).
+    let reservation = match ipcreply_direct_ack::reserve(index, generation, caller) {
+        Ok(reservation) => reservation,
+        Err(crate::kernel::direct_ack_store::AckReserveError::EndpointAlreadyLive) => {
+            crate::yarm_log!("IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE slot=caller");
+            return;
+        }
+        Err(crate::kernel::direct_ack_store::AckReserveError::CapacityExhausted) => {
+            crate::yarm_log!("IPCREPLY_DIRECT_ACK_CAPACITY_REFUSED slot=caller");
+            return;
+        }
+    };
     // Re-read the endpoint waiter identity under the IPC lock immediately before publish.
     let waiter = kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(index));
     if waiter != Some(caller) {
+        ipcreply_direct_ack::cancel(reservation);
         return;
     }
     let ack = crate::kernel::ipccall_direct::BlockedCallerAck {
@@ -5424,7 +5862,13 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
         meta_user_ptr: state.meta_user_ptr,
         meta_user_len: state.meta_user_len,
     };
-    let seq = ipcreply_direct_ack::publish(ack);
+    let seq = match ipcreply_direct_ack::commit(reservation, ack) {
+        Ok(seq) => seq,
+        Err(reservation) => {
+            ipcreply_direct_ack::cancel(reservation);
+            return;
+        }
+    };
     // Stage 199A2D2C2C: emit the AUTHORITATIVE cross-CPU blocked-CALLER marker EXACTLY ONCE, only for
     // the x86_64 SMP oracle's CPU-0 client blocking on its reply endpoint, and ONLY once every
     // authoritative blocking-order condition has committed (saved continuation captured, the exact
@@ -5463,7 +5907,9 @@ fn maybe_emit_ipcreply_direct_smp_caller_blocked(
     let caller = ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(receiver_tid), asid);
     let waiter_exact =
         kernel.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(endpoint_index)) == Some(caller);
-    let ack_published = ipcreply_direct_ack::commit_seq() == ack_seq && ack_seq != 0;
+    let ack_published = ipcreply_direct_ack::commit_seq(endpoint_index, endpoint_generation)
+        == ack_seq
+        && ack_seq != 0;
     if !(saved_frame && absent_from_runqueue && home_cpu_0 && waiter_exact && ack_published) {
         return;
     }

@@ -313,7 +313,8 @@ permanent record. Current live state is `doc/STATUS.md` §0; the roadmap is
 | `ExitCurrentTask` NR 16 | `STAGE_200D0B3_X86_EXIT_CURRENT_TASK_REFREEZE_SEAL` (x86_64, `0b5e98f`); `EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu=0 holder=with_cpu result=ok` | 2 of 3 — RISC-V **not earned** |
 | ServerDies liveness foundation (historical Stage 200D-2B1B) | foundation seal `result=ok`, explicitly `live_cells=0` | 0 by design |
 | ServerDies three-arch return contract / live readiness (Stage 202B) | readiness seal `qemu_boots=0 live_cells=0 result=ok` | 0 by design |
-| **ServerDies live** | **none — four attempts, none sealed** | **0** |
+| **ServerDies live — x86_64** | **`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 sha=f5669cb55325ac58aba6a15207a89c95ad8cad3d tree=e2fd0b5c7a82dc6c8c422d5c6db242473533a9a6 live_cells=1 caller_wakes=1 peer_death_winners=1 exit_returns=0 feature_off_oracle_literals=0 result=ok`** — canonically a **Stage 199D server-crash-cleanup increment**, also exercising canonical 202D's reply-object cleanup. Scoped vector `[1, 1, 1, 1, 1, 1, 1, 1, 1]`; quiescent system balance `created=54 closed=54 live_links=0`; `EXIT_TASK_OWNER_REVALIDATED … committed=replacement next_tid=1 advances=1` with a correct replacement return. Earned on the sixth attempt; the preceding five refusals are recorded in `doc/IPC.md` §8.5. | **1 of 3** |
+| ServerDies live — AArch64, RISC-V | not attempted | **0 of 2** |
 
 ### Deferred / refused seals preserved deliberately
 
@@ -322,7 +323,7 @@ These were **not** granted, and the refusal is the record:
 * `STAGE_199_IPCCALL_REPLY_OFFLOCK_SEAL … result=deferred reason=broad_lock_payload_copy_needs_pre_global_lock_split_seam_which_is_hosted_disabled_and_block_dispatch_switch_required` — preserved in full in `doc/IPC.md` §8.3.
 * `GLOBAL_LOCK_RETIRE_CLASS_DEFERRED class=FutexWait reason=block_dispatch_switch_required_needs_global_lock` — the Stage 191D deferral discipline; seams landed helper-only.
 * `STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL … cross_cpu=0 result=blocked reason=ap_dispatch_on_wake_and_context_restore_not_wired` — later superseded by the earned `cross_cpu=1` seal.
-* `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail` — **still open**; see `doc/IPC.md` §8.5. It is canonical **199D**'s server-crash cleanup and canonical **202D**'s reply-object cleanup.
+* `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail` — **resolved** by the canonical **199D** reverse-link accounting increment (which also cleans up state canonical **202D** owns). It was never a resource leak: one pair of counters was answering two different questions. See `doc/IPC.md` §8.5.
 
 ### Historical x86_64 D6 switch-proof bring-up (Stages 120–132)
 

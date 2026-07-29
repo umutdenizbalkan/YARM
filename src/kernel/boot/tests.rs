@@ -77062,13 +77062,13 @@ mod stage199a2b2f_wiring {
     #[test]
     fn ack_published_from_recv_commit() {
         let fx = fixture();
-        let ack = ipccall_direct_ack::snapshot().expect("recv-v2 commit published an ack");
+        let ack = ipccall_direct_ack::sole_snapshot().expect("recv-v2 commit published an ack");
         assert_eq!(ack.server.tid.0, 2);
         assert_eq!(ack.server.asid, fx.server_asid);
         assert!(ack.recv_v2_committed);
         assert_eq!(ack.payload_user_ptr, PAYLOAD_VA);
         assert_eq!(ack.meta_user_ptr, META_VA);
-        assert!(ipccall_direct_ack::is_claimable());
+        assert!(ipccall_direct_ack::sole_is_claimable());
         teardown();
     }
 
@@ -77109,7 +77109,7 @@ mod stage199a2b2f_wiring {
             let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
         });
         assert!(
-            ipccall_direct_ack::snapshot().is_none(),
+            ipccall_direct_ack::sole_snapshot().is_none(),
             "gate off: no ack published"
         );
         teardown();
@@ -77120,7 +77120,7 @@ mod stage199a2b2f_wiring {
     #[test]
     fn drain_delivers_once_and_wakes_server() {
         let fx = fixture();
-        let (ack, seq) = ipccall_direct_ack::claim().expect("claim published ack");
+        let (ack, seq) = ipccall_direct_ack::sole_claim().expect("claim published ack");
         let work = DirectRequestPostWork {
             snapshot: snapshot(&fx, b"request!"),
             ack,
@@ -77155,9 +77155,9 @@ mod stage199a2b2f_wiring {
     #[test]
     fn duplicate_claim_returns_none() {
         let _fx = fixture();
-        assert!(ipccall_direct_ack::claim().is_some(), "first claim");
+        assert!(ipccall_direct_ack::sole_claim().is_some(), "first claim");
         assert!(
-            ipccall_direct_ack::claim().is_none(),
+            ipccall_direct_ack::sole_claim().is_none(),
             "duplicate claim rejected"
         );
         teardown();
@@ -77168,7 +77168,7 @@ mod stage199a2b2f_wiring {
     #[test]
     fn server_exit_after_ack_claim_discards() {
         let fx = fixture();
-        let (ack, seq) = ipccall_direct_ack::claim().expect("claim");
+        let (ack, seq) = ipccall_direct_ack::sole_claim().expect("claim");
         // Server exits before the drain runs the transaction.
         fx.k.with(|s| {
             let _ = s.exit_task(2, 0);
@@ -77192,7 +77192,7 @@ mod stage199a2b2f_wiring {
         // remains claimed and is therefore not claimable by another drain.
         let _ = seq;
         assert!(
-            !ipccall_direct_ack::is_claimable(),
+            !ipccall_direct_ack::sole_is_claimable(),
             "stale server ack not restored after discard"
         );
         teardown();
@@ -77203,7 +77203,7 @@ mod stage199a2b2f_wiring {
     #[test]
     fn cnode_full_mint_failure_rolls_back() {
         let fx = fixture();
-        let (ack, seq) = ipccall_direct_ack::claim().expect("claim");
+        let (ack, seq) = ipccall_direct_ack::sole_claim().expect("claim");
         // Fill task2's cnode to capacity so sr_mint_split cannot mint (reuse a global
         // cap — create_endpoint needs a current task, and the server is blocked).
         fx.k.with(|s| {
@@ -77444,7 +77444,7 @@ mod stage199a2b3_direct_reply_txn {
             (asid1, asid2, reply_cap_t2)
         });
         let published_ack =
-            ipcreply_direct_ack::snapshot().expect("recv-v2 commit published a caller ack");
+            ipcreply_direct_ack::sole_snapshot().expect("recv-v2 commit published a caller ack");
         // Recover the reply record index+generation the replier's Reply cap names.
         let (record_index, record_generation) = k
             .resolve_reply_cap_split_read(2, reply_cap_t2)
@@ -78074,13 +78074,14 @@ mod stage199a2b3_wiring {
     #[test]
     fn caller_ack_published_from_recv_commit() {
         let fx = fixture();
-        let ack = ipcreply_direct_ack::snapshot().expect("recv-v2 commit published a caller ack");
+        let ack =
+            ipcreply_direct_ack::sole_snapshot().expect("recv-v2 commit published a caller ack");
         assert_eq!(ack.caller.tid.0, 1);
         assert_eq!(ack.caller.asid, fx.caller_asid);
         assert!(ack.recv_v2_committed);
         assert_eq!(ack.payload_user_ptr, CALLER_PAYLOAD_VA);
         assert_eq!(ack.meta_user_ptr, CALLER_META_VA);
-        assert!(ipcreply_direct_ack::is_claimable());
+        assert!(ipcreply_direct_ack::sole_is_claimable());
         teardown();
     }
 
@@ -78127,7 +78128,7 @@ mod stage199a2b3_wiring {
             let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
         });
         assert!(
-            ipcreply_direct_ack::snapshot().is_none(),
+            ipcreply_direct_ack::sole_snapshot().is_none(),
             "gate off: no caller ack published"
         );
         teardown();
@@ -78138,7 +78139,7 @@ mod stage199a2b3_wiring {
     #[test]
     fn drain_delivers_once_and_wakes_caller() {
         let fx = fixture();
-        let (ack, seq) = ipcreply_direct_ack::claim().expect("claim published caller ack");
+        let (ack, seq) = ipcreply_direct_ack::sole_claim().expect("claim published caller ack");
         let work = DirectReplyPostWork {
             snapshot: snapshot(&fx, b"replyOK!"),
             ack,
@@ -78174,9 +78175,9 @@ mod stage199a2b3_wiring {
     #[test]
     fn duplicate_claim_returns_none() {
         let _fx = fixture();
-        assert!(ipcreply_direct_ack::claim().is_some(), "first claim");
+        assert!(ipcreply_direct_ack::sole_claim().is_some(), "first claim");
         assert!(
-            ipcreply_direct_ack::claim().is_none(),
+            ipcreply_direct_ack::sole_claim().is_none(),
             "duplicate claim rejected"
         );
         teardown();
@@ -78187,7 +78188,7 @@ mod stage199a2b3_wiring {
     #[test]
     fn caller_exit_after_ack_claim_discards() {
         let fx = fixture();
-        let (ack, seq) = ipcreply_direct_ack::claim().expect("claim");
+        let (ack, seq) = ipcreply_direct_ack::sole_claim().expect("claim");
         fx.k.with(|s| {
             let _ = s.exit_task(1, 0);
         });
@@ -78211,7 +78212,7 @@ mod stage199a2b3_wiring {
         assert_ne!(fx.k.with(|s| s.current_tid()), Some(1), "zero wake");
         // The stale ack is NOT re-armed by the drain (caller gone → discarded).
         assert!(
-            !ipcreply_direct_ack::is_claimable(),
+            !ipcreply_direct_ack::sole_is_claimable(),
             "stale caller ack not restored after discard"
         );
         teardown();
@@ -78249,8 +78250,8 @@ mod stage199a2b3_wiring {
             .find("copy_from_user_asid_split_read")
             .expect("copy present");
         let claim_at = gate
-            .find("ipcreply_direct_ack::claim()")
-            .expect("claim present");
+            .find("ipcreply_direct_ack::claim(reply_eidx, reply_egen)")
+            .expect("endpoint-keyed claim present");
         assert!(
             copy_at < claim_at,
             "the reply source copy must precede the ack claim"
@@ -79336,7 +79337,7 @@ mod stage199a2d1_races {
             (asid1, asid2, reply_cap_t2)
         });
         let published_ack =
-            ipcreply_direct_ack::snapshot().expect("recv-v2 commit published a caller ack");
+            ipcreply_direct_ack::sole_snapshot().expect("recv-v2 commit published a caller ack");
         let reply_eidx = published_ack.endpoint_index;
         let reply_egen = published_ack.endpoint_generation;
         let (record_index, record_generation) = k
@@ -79526,12 +79527,12 @@ mod stage199a2d1_races {
                     .stack_size(8 * 1024 * 1024)
                     .spawn(move || {
                         b.wait();
-                        match ipccall_direct_ack::claim() {
+                        match ipccall_direct_ack::sole_claim() {
                             Some((claimed, seq)) => {
                                 ok.fetch_add(1, O::Relaxed);
                                 // Only the claim WINNER does work + publishes.
                                 assert_eq!(claimed.endpoint_index, 3);
-                                assert_eq!(seq, ipccall_direct_ack::commit_seq());
+                                assert_eq!(seq, ipccall_direct_ack::sole_commit_seq());
                                 work.fetch_add(1, O::Relaxed);
                                 pubs.fetch_add(1, O::Relaxed);
                             }
@@ -79586,7 +79587,7 @@ mod stage199a2d1_races {
                     .stack_size(8 * 1024 * 1024)
                     .spawn(move || {
                         b.wait();
-                        match ipcreply_direct_ack::claim() {
+                        match ipcreply_direct_ack::sole_claim() {
                             Some((claimed, _seq)) => {
                                 ok.fetch_add(1, O::Relaxed);
                                 assert_eq!(claimed.endpoint_index, 9);
@@ -79801,7 +79802,7 @@ mod stage199a2d1_races {
         let (eidx, old_egen) = (fx.reply_eidx, fx.reply_egen);
 
         // Claim the published caller ack (the reply work item owns it).
-        let (ack, ack_seq) = ipcreply_direct_ack::claim().expect("claim caller ack");
+        let (ack, ack_seq) = ipcreply_direct_ack::sole_claim().expect("claim caller ack");
         assert_eq!(ack.endpoint_generation, old_egen);
 
         // Force an endpoint replacement: bump the generation and install a DIFFERENT
@@ -80065,108 +80066,109 @@ mod stage199a2d1_memory_ordering {
         ReceiverWaiterIdentity::new(ThreadId(tid), Asid(asid))
     }
 
-    // Isolate each single-slot ack module's SOURCE body for the ordering guards.
-    fn ipccall_ack_src() -> &'static str {
-        let s = include_str!("mod.rs");
-        let after = s
-            .split("pub mod ipccall_direct_ack {")
-            .nth(1)
-            .expect("ipccall_direct_ack module present");
-        after
-            .split("pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack")
-            .next()
-            .expect("module body bounded")
+    // The synchronisation now lives in the shared bounded multi-pair store; the ordering
+    // guards below pin ITS source, and additionally pin that both ack modules delegate to
+    // it rather than re-implementing publication.
+    fn store_src() -> &'static str {
+        include_str!("../direct_ack_store.rs")
     }
 
-    fn ipcreply_ack_src() -> &'static str {
-        let s = include_str!("mod.rs");
-        let after = s
-            .split("pub mod ipcreply_direct_ack {")
-            .nth(1)
-            .expect("ipcreply_direct_ack module present");
-        after
-            .split("pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack")
-            .next()
-            .expect("module body bounded")
-    }
-
-    // ── Source guards: the ack publish/claim/restore orderings are the exact strong ones ──
+    // ── Source guards: the store's publish/consume/restore orderings are the strong ones ──
     #[test]
-    fn ack_publish_releases_valid_last_after_relaxed_fields() {
-        for (name, body) in [
-            ("ipccall_direct_ack", ipccall_ack_src()),
-            ("ipcreply_direct_ack", ipcreply_ack_src()),
+    fn ack_commit_releases_state_last_after_relaxed_fields() {
+        let body = store_src()
+            .split("    pub(crate) fn commit(")
+            .nth(1)
+            .expect("commit present")
+            .split("\n    /// ")
+            .next()
+            .expect("commit body bounded");
+        // Fields are stored Relaxed, then the COMMITTED state is published with Release.
+        assert!(
+            body.contains("slot.seq.store(seq, Ordering::Relaxed);"),
+            "the publication sequence is stored Relaxed before the Release"
+        );
+        assert!(
+            body.contains("slot.state.store(SLOT_COMMITTED, Ordering::Release);"),
+            "the COMMITTED state must be published with Release"
+        );
+        assert!(
+            !body.contains("slot.state.store(SLOT_COMMITTED, Ordering::Relaxed)"),
+            "the publication must not be Relaxed"
+        );
+        // The Release is the LAST slot store in commit — only the counter and the Ok follow.
+        let tail = body
+            .split("slot.state.store(SLOT_COMMITTED, Ordering::Release);")
+            .nth(1)
+            .expect("commit publishes the state");
+        assert!(
+            !tail.contains("slot."),
+            "no slot field is written after the Release publication (tail={tail:?})"
+        );
+    }
+
+    #[test]
+    fn ack_readers_acquire_the_state_first() {
+        let body = store_src();
+        for reader in [
+            "    pub(crate) fn snapshot(",
+            "    pub(crate) fn is_claimable(",
+            "    pub(crate) fn commit_seq(",
         ] {
-            // VALID published with Release, LAST.
-            assert!(
-                body.contains("VALID.store(true, Ordering::Release);"),
-                "{name}: VALID must be published with Release"
-            );
-            // No weakened publication of the VALID gate.
-            assert!(
-                !body.contains("VALID.store(true, Ordering::Relaxed)"),
-                "{name}: VALID publication must not be Relaxed"
-            );
-            // Fields are stored Relaxed (ordered by the trailing VALID Release).
-            assert!(
-                body.contains("SEQ.store(seq, Ordering::Relaxed);"),
-                "{name}: SEQ stored Relaxed before the VALID Release"
-            );
-            // The VALID Release is the LAST store in publish (nothing after it before the
-            // `seq` return): the substring immediately following is the return.
-            let pubslice = body
-                .split("VALID.store(true, Ordering::Release);")
+            let f = body
+                .split(reader)
                 .nth(1)
-                .expect("publish releases VALID");
-            let tail: String = pubslice.chars().take(40).collect();
+                .expect("reader present")
+                .split("\n    /// ")
+                .next()
+                .expect("reader body bounded");
             assert!(
-                tail.trim_start().starts_with("seq"),
-                "{name}: nothing is stored after the VALID Release in publish (tail={tail:?})"
+                f.contains("state.load(Ordering::Acquire)"),
+                "{reader}: the state gate must be an Acquire load"
+            );
+            assert!(
+                !f.contains("state.load(Ordering::Relaxed)"),
+                "{reader}: the state gate must never be a Relaxed load"
             );
         }
     }
 
     #[test]
-    fn ack_snapshot_acquires_valid_first() {
-        for (name, body) in [
-            ("ipccall_direct_ack", ipccall_ack_src()),
-            ("ipcreply_direct_ack", ipcreply_ack_src()),
-        ] {
-            assert!(
-                body.contains("if !VALID.load(Ordering::Acquire) {"),
-                "{name}: snapshot must Acquire-gate on VALID first"
-            );
-            assert!(
-                !body.contains("VALID.load(Ordering::Relaxed)"),
-                "{name}: the VALID gate must never be a Relaxed load"
-            );
-        }
-    }
-
-    #[test]
-    fn ack_claim_is_acqrel_acquire_cas() {
-        for (name, body) in [
-            ("ipccall_direct_ack", ipccall_ack_src()),
-            ("ipcreply_direct_ack", ipcreply_ack_src()),
-        ] {
-            assert!(
-                body.contains(
-                    ".compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)"
-                ),
-                "{name}: the claim CAS must be AcqRel success / Acquire failure"
-            );
-            // Restore re-arms with Release and only on an exact SEQ match of a still-VALID slot.
-            assert!(
-                body.contains(
-                    "SEQ.load(Ordering::Relaxed) == seq && VALID.load(Ordering::Acquire)"
-                ),
-                "{name}: restore must gate on exact SEQ match of a still-VALID publication"
-            );
-            assert!(
-                body.contains("CLAIMED.store(false, Ordering::Release);"),
-                "{name}: restore/reset must clear CLAIMED with Release"
-            );
-        }
+    fn ack_reserve_and_consume_are_acqrel_acquire_cas() {
+        let body = store_src();
+        // Reserving a slot is the CAS that makes two racing CPUs resolve to one winner.
+        assert!(
+            body.contains(
+                "                    SLOT_VACANT,\n                    SLOT_RESERVED,\n                    Ordering::AcqRel,\n                    Ordering::Acquire,"
+            ),
+            "the reserve CAS must be AcqRel success / Acquire failure"
+        );
+        // Consuming is the exactly-once ownership transfer.
+        assert!(
+            body.contains(
+                "                SLOT_COMMITTED,\n                SLOT_CONSUMED,\n                Ordering::AcqRel,\n                Ordering::Acquire,"
+            ),
+            "the consume CAS must be AcqRel success / Acquire failure"
+        );
+        // Restore re-arms only a CONSUMED slot whose publication sequence matches exactly.
+        let restore = body
+            .split("    pub(crate) fn restore(")
+            .nth(1)
+            .expect("restore present")
+            .split("\n    /// ")
+            .next()
+            .expect("restore body bounded");
+        assert!(
+            restore.contains("slot.state.load(Ordering::Acquire) == SLOT_CONSUMED")
+                && restore.contains("slot.seq.load(Ordering::Relaxed) == seq"),
+            "restore must gate on a CONSUMED slot with an exact sequence match"
+        );
+        assert!(
+            restore.contains(
+                "                        SLOT_CONSUMED,\n                        SLOT_COMMITTED,\n                        Ordering::AcqRel,\n                        Ordering::Acquire,"
+            ),
+            "restore must re-arm through an AcqRel CAS, not a blind store"
+        );
     }
 
     // ── Functional: a claimant sees the COMPLETE ack (all-or-nothing publication) ──
@@ -80174,7 +80176,7 @@ mod stage199a2d1_memory_ordering {
     fn snapshot_is_all_or_nothing_never_partial() {
         ipccall_direct_ack::reset();
         assert!(
-            ipccall_direct_ack::snapshot().is_none(),
+            ipccall_direct_ack::sole_snapshot().is_none(),
             "no VALID slot → snapshot observes nothing (never a partial default)"
         );
         let ack = BlockedServerAck {
@@ -80188,7 +80190,7 @@ mod stage199a2d1_memory_ordering {
             meta_user_len: 40,
         };
         let _ = ipccall_direct_ack::publish(ack);
-        let seen = ipccall_direct_ack::snapshot().expect("published slot is visible");
+        let seen = ipccall_direct_ack::sole_snapshot().expect("published slot is visible");
         // Every field is the published one — never a half-written / zero field.
         assert_eq!(seen.server, ack.server);
         assert_eq!(seen.endpoint_index, ack.endpoint_index);
@@ -80215,7 +80217,7 @@ mod stage199a2d1_memory_ordering {
             meta_user_len: 40,
         };
         let seq1 = ipcreply_direct_ack::publish(ack);
-        let (_a, claimed_seq) = ipcreply_direct_ack::claim().expect("claim first publication");
+        let (_a, claimed_seq) = ipcreply_direct_ack::sole_claim().expect("claim first publication");
         assert_eq!(claimed_seq, seq1);
         // A retryable rollback of the SAME publication re-arms it.
         assert!(
@@ -80223,7 +80225,7 @@ mod stage199a2d1_memory_ordering {
             "restore re-arms the exact same publication"
         );
         // Re-claim, then a NEWER publication advances SEQ (hosted last-writer-wins).
-        let (_a2, _s2) = ipcreply_direct_ack::claim().expect("re-claim");
+        let (_a2, _s2) = ipcreply_direct_ack::sole_claim().expect("re-claim");
         let seq2 = ipcreply_direct_ack::publish(ack);
         assert!(
             seq2 > seq1,
@@ -80235,7 +80237,7 @@ mod stage199a2d1_memory_ordering {
             "an older sequence cannot restore over a newer publication"
         );
         // The current (newer) publication is still claimable exactly once.
-        assert!(ipcreply_direct_ack::is_claimable());
+        assert!(ipcreply_direct_ack::sole_is_claimable());
         ipcreply_direct_ack::reset();
     }
 
@@ -80316,15 +80318,24 @@ mod stage199a2d1_memory_ordering {
     }
 }
 
-/// Stage 199A2D1 — Part 3 single-slot acknowledgement boundary guards.
+/// Stage 199D — bounded multi-pair acknowledgement boundary guards.
 ///
-/// The single-slot ack modules are classified ORACLE-ONLY / SINGLE-OUTSTANDING-PAIR.
-/// One outstanding request+reply pair is sufficient; a SECOND simultaneous oracle pair is
-/// refused fail-closed (the active unclaimed ack is preserved, never overwritten/stolen).
+/// The former single-slot ack modules are now endpoint-keyed views of the bounded,
+/// generation-bearing [`crate::kernel::direct_ack_store::DirectAckStore`] the Stage
+/// 199A2D1 race model specified. These guards pin the replacement: no single-slot
+/// atomics survive, the fail-closed refusals (a second LIVE pair on one endpoint, and
+/// capacity) are preserved and exposed, the production publish sites drive
+/// reserve → commit → cancel, and every split-dispatch consumer names the exact endpoint
+/// incarnation it is entitled to.
 #[cfg(test)]
-mod stage199a2d1_single_slot_boundary {
+mod stage199d_multi_pair_boundary {
+    use crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY;
+    use alloc::format;
+
+    /// Both acknowledgement modules are now endpoint-keyed views of the shared bounded
+    /// multi-pair store — no local single-slot atomics survive in either of them.
     #[test]
-    fn ack_modules_are_classified_and_fused_fail_closed() {
+    fn ack_modules_delegate_to_the_bounded_multi_pair_store() {
         let src = include_str!("mod.rs");
         for module in [
             "pub mod ipccall_direct_ack {",
@@ -80332,49 +80343,177 @@ mod stage199a2d1_single_slot_boundary {
         ] {
             assert!(src.contains(module), "module {module} present");
         }
-        // Both modules carry the Stage 199A2D1 concurrency classification.
+        // Both modules carry the Stage 199D multi-pair classification, replacing the
+        // Stage 199A2D1 single-outstanding-pair classification.
         assert_eq!(
-            src.matches("# Concurrency classification (Stage 199A2D1)")
+            src.matches("# Concurrency classification (Stage 199D)")
                 .count(),
             2,
-            "both ack modules classified as single-outstanding-pair oracle infra"
+            "both ack modules classified as bounded multi-pair stores"
         );
-        // Both modules carry the fail-closed overwrite fuse (real builds refuse to
-        // overwrite an active VALID && !CLAIMED ack) and expose its count.
+        assert!(
+            !src.contains("# Concurrency classification (Stage 199A2D1)"),
+            "the single-outstanding-pair classification is retired"
+        );
+        // Each module owns its own instance of the shared store.
         assert_eq!(
-            src.matches("static OVERWRITE_FUSE: AtomicU64 = AtomicU64::new(0);")
+            src.matches("static STORE: DirectAckStore = DirectAckStore::new();")
                 .count(),
             2,
-            "both ack modules declare the overwrite fuse"
+            "each ack module owns one bounded multi-pair store"
         );
+        // The retired single-slot atomics are gone from BOTH ack module bodies.
+        for module in [
+            "pub mod ipccall_direct_ack {",
+            "pub mod ipcreply_direct_ack {",
+        ] {
+            let body = src
+                .split(module)
+                .nth(1)
+                .expect("module present")
+                .split("\n/// ")
+                .next()
+                .expect("module body bounded");
+            for retired in [
+                "static VALID: AtomicBool",
+                "static CLAIMED: AtomicBool",
+                "static OVERWRITE_FUSE: AtomicU64",
+                "static EP_IDX: AtomicUsize",
+                "static SEQ: AtomicU64",
+                "VALID.store(true, Ordering::Release);",
+                "CLAIMED\n            .compare_exchange(false, true",
+            ] {
+                assert!(
+                    !body.contains(retired),
+                    "{module}: the single-slot construct {retired:?} must not survive"
+                );
+            }
+            // The module holds NO atomics of its own — all synchronisation is the store's.
+            assert!(
+                !body.contains("core::sync::atomic"),
+                "{module}: must not re-implement synchronisation"
+            );
+        }
+    }
+
+    /// The fail-closed overwrite fuse survives the replacement as the refusal of a SECOND
+    /// LIVE pair on the SAME endpoint, and capacity is refused at reservation time.
+    #[test]
+    fn fail_closed_refusals_are_preserved_and_exposed() {
+        let src = include_str!("mod.rs");
         assert_eq!(
             src.matches("pub fn overwrite_fuse_count() -> u64 {")
                 .count(),
             2,
-            "both ack modules expose overwrite_fuse_count()"
-        );
-        // The real-build guard is present in both publish paths, and returns WITHOUT
-        // overwriting when an active ack is already published.
-        assert!(
-            src.contains("IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server"),
-            "server ack publish marks the overwrite fuse"
-        );
-        assert!(
-            src.contains("IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE slot=caller"),
-            "caller ack publish marks the overwrite fuse"
+            "both ack modules still expose overwrite_fuse_count()"
         );
         assert_eq!(
-            src.matches("if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {")
-                .count(),
+            src.matches("STORE.endpoint_live_refusal_count()").count(),
             2,
-            "both publish paths fail-closed on an active (VALID && !CLAIMED) slot"
+            "the fuse is now the endpoint-already-live refusal count"
         );
-        // The guard is confined to REAL builds (hosted fixtures keep last-writer-wins).
         assert_eq!(
-            src.matches("#[cfg(not(feature = \"hosted-dev\"))]\n        if VALID.load(Ordering::Acquire) && !CLAIMED.load(Ordering::Acquire) {")
+            src.matches("pub fn capacity_refusal_count() -> u64 {")
                 .count(),
             2,
-            "the overwrite guard is real-build-only in both modules"
+            "both ack modules expose the capacity refusal count"
+        );
+        for marker in [
+            "IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server",
+            "IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE slot=caller",
+            "IPCCALL_DIRECT_ACK_CAPACITY_REFUSED slot=server",
+            "IPCREPLY_DIRECT_ACK_CAPACITY_REFUSED slot=caller",
+        ] {
+            assert!(src.contains(marker), "refusal marker {marker:?} present");
+        }
+    }
+
+    /// The two PRODUCTION publish sites drive the reserve → commit → cancel lifecycle, so
+    /// capacity is refused before any irreversible publication and a failed waiter
+    /// re-validation rolls the reservation back instead of leaking a slot.
+    #[test]
+    fn production_publish_sites_reserve_before_they_commit() {
+        let src = include_str!("mod.rs");
+        for (publisher, module) in [
+            (
+                "pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack",
+                "ipccall_direct_ack",
+            ),
+            (
+                "pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack",
+                "ipcreply_direct_ack",
+            ),
+        ] {
+            let body = src
+                .split(publisher)
+                .nth(1)
+                .expect("publisher present")
+                .split("\n/// ")
+                .next()
+                .expect("body bounded");
+            let reserve = body
+                .find(&format!("{module}::reserve("))
+                .unwrap_or_else(|| panic!("{module}: publish site reserves"));
+            let commit = body
+                .find(&format!("{module}::commit("))
+                .unwrap_or_else(|| panic!("{module}: publish site commits"));
+            let cancel = body
+                .find(&format!("{module}::cancel("))
+                .unwrap_or_else(|| panic!("{module}: publish site cancels on rollback"));
+            assert!(
+                reserve < cancel && cancel < commit,
+                "{module}: reserve must precede the rollback cancel, which precedes commit"
+            );
+            assert!(
+                body.contains("AckReserveError::CapacityExhausted"),
+                "{module}: capacity is refused at the publish site"
+            );
+            assert!(
+                body.contains("AckReserveError::EndpointAlreadyLive"),
+                "{module}: a second live pair on the endpoint is refused"
+            );
+        }
+    }
+
+    /// The NR6/NR7 consumers name the EXACT endpoint incarnation they are entitled to.
+    #[test]
+    fn split_dispatch_consumers_are_endpoint_keyed() {
+        let split = include_str!("../syscall_split.rs");
+        for call in [
+            "ipccall_direct_ack::is_claimable(send_eidx, send_egen)",
+            "ipccall_direct_ack::claim(send_eidx, send_egen)",
+            "ipcreply_direct_ack::snapshot(reply_eidx, reply_egen)",
+            "ipcreply_direct_ack::is_claimable(reply_eidx, reply_egen)",
+            "ipcreply_direct_ack::claim(reply_eidx, reply_egen)",
+        ] {
+            assert!(
+                split.contains(call),
+                "the split-dispatch consumer must be endpoint-keyed: {call}"
+            );
+        }
+        // The endpoint GENERATION reaches the NR7 consumer through the reply record.
+        assert!(
+            split.contains("reply_record_endpoint_ref_split_read(rec_idx, rec_gen)"),
+            "NR7 reads the reply endpoint index AND generation"
+        );
+        // Endpoint confinement and the proof gate are unchanged.
+        assert!(
+            split.contains("ipccall_direct_oracle_request_endpoint_is(send_eidx)")
+                && split.contains("ipccall_direct_oracle_reply_endpoint_is(reply_eidx)"),
+            "endpoint confinement is unchanged"
+        );
+    }
+
+    /// The store is bounded and holds strictly more than one pair.
+    #[test]
+    fn store_capacity_is_bounded_and_multi_pair() {
+        assert!(
+            DIRECT_ACK_STORE_CAPACITY > 1,
+            "a multi-pair store holds more than one pair"
+        );
+        assert!(
+            DIRECT_ACK_STORE_CAPACITY <= 64,
+            "the store stays bounded (no allocation, fixed footprint)"
         );
     }
 
@@ -80392,6 +80531,481 @@ mod stage199a2d1_single_slot_boundary {
             crate::kernel::boot::ipcreply_direct_ack::overwrite_fuse_count(),
             0
         );
+    }
+}
+
+/// Stage 199D — deterministic hosted RACES against the bounded, endpoint-indexed,
+/// generation-bearing multi-pair acknowledgement store.
+///
+/// Every case is barrier-aligned and repeated many times: the asserted outcome must hold on
+/// EVERY run, not merely usually. Each test builds its own [`DirectAckStore`] instance, so
+/// the races are independent of the process-global stores the wiring fixtures share.
+///
+/// Covered: two (and eight) simultaneous independent pairs; contended consumption of one
+/// pair while another is live; capacity exhaustion under a simultaneous reservation storm;
+/// stale/foreign/duplicate consumption under contention; and reserve→cancel rollback with
+/// no slot or waiter leak.
+#[cfg(test)]
+mod stage199d_multi_pair_races {
+    use crate::kernel::direct_ack_store::{
+        AckConsume, AckEndpoint, AckFields, AckReserveError, AckWaiter, DIRECT_ACK_STORE_CAPACITY,
+        DirectAckStore,
+    };
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering as O};
+    use std::sync::{Arc, Barrier};
+
+    const RUNS: usize = 200;
+
+    fn ep(index: usize, generation: u64) -> AckEndpoint {
+        AckEndpoint::new(index, generation)
+    }
+
+    fn waiter(tid: u64, asid: u16) -> AckWaiter {
+        AckWaiter::new(tid, asid)
+    }
+
+    fn fields(e: AckEndpoint, w: AckWaiter) -> AckFields {
+        AckFields {
+            endpoint: e,
+            waiter: w,
+            payload_user_ptr: 0x4000 + e.index,
+            payload_user_len: 8,
+            meta_user_ptr: 0x8000 + e.index,
+            meta_user_len: 40,
+        }
+    }
+
+    /// Publish one pair on a fresh store (reserve → commit), returning the sequence.
+    fn publish(store: &DirectAckStore, e: AckEndpoint, w: AckWaiter) -> u64 {
+        let reservation = store.reserve(e, w).expect("reserve");
+        store.commit(reservation, fields(e, w)).expect("commit")
+    }
+
+    fn spawn_all<F>(threads: usize, barrier: Arc<Barrier>, body: F)
+    where
+        F: Fn(usize) + Send + Sync + 'static,
+    {
+        let body = Arc::new(body);
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let b = Arc::clone(&barrier);
+            let f = Arc::clone(&body);
+            handles.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        b.wait();
+                        f(t);
+                    })
+                    .expect("spawn"),
+            );
+        }
+        for h in handles {
+            h.join().expect("join");
+        }
+    }
+
+    // ── (a) TWO SIMULTANEOUS PAIRS — the property the single-slot store could not provide ──
+    //
+    // Two threads publish and consume their OWN endpoint pair at the same instant. Both must
+    // succeed, each must receive its own acknowledgement, and neither may overwrite, steal or
+    // observe the other's. The single-slot predecessor failed this by construction.
+    #[test]
+    fn a_two_simultaneous_pairs_both_publish_and_consume() {
+        for _ in 0..RUNS {
+            let store = Arc::new(DirectAckStore::new());
+            let ok = Arc::new(AtomicUsize::new(0));
+            let crossed = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(2));
+            {
+                let (store, ok, crossed) =
+                    (Arc::clone(&store), Arc::clone(&ok), Arc::clone(&crossed));
+                spawn_all(2, Arc::clone(&barrier), move |t| {
+                    let e = ep(3 + t, 11 + t as u64);
+                    let w = waiter(20 + t as u64, 1 + t as u16);
+                    let seq = publish(&store, e, w);
+                    match store.consume(e, Some(w)) {
+                        AckConsume::Consumed(got, got_seq) => {
+                            // Exactly this thread's pair — never the sibling's.
+                            if got.endpoint != e || got.waiter != w || got_seq != seq {
+                                crossed.fetch_add(1, O::Relaxed);
+                            } else {
+                                ok.fetch_add(1, O::Relaxed);
+                            }
+                        }
+                        _ => {
+                            crossed.fetch_add(1, O::Relaxed);
+                        }
+                    }
+                });
+            }
+            assert_eq!(ok.load(O::Relaxed), 2, "both pairs completed independently");
+            assert_eq!(crossed.load(O::Relaxed), 0, "no cross-pair contamination");
+            assert_eq!(store.consume_count(), 2);
+            assert_eq!(store.commit_count(), 2);
+            assert_eq!(
+                store.endpoint_live_refusal_count(),
+                0,
+                "no overwrite fuse trip"
+            );
+            assert_eq!(store.capacity_refusal_count(), 0);
+            assert_eq!(store.live_pair_count(), 0);
+        }
+    }
+
+    // ── (b) FULL-CAPACITY SIMULTANEOUS PAIRS — every slot in flight at once ──
+    //
+    // CAPACITY threads publish and hold distinct pairs simultaneously, then each consumes its
+    // own. All CAPACITY pairs coexist; none is refused, lost or crossed.
+    #[test]
+    fn b_capacity_many_simultaneous_pairs_all_coexist() {
+        for _ in 0..RUNS {
+            let store = Arc::new(DirectAckStore::new());
+            let ok = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(DIRECT_ACK_STORE_CAPACITY));
+            let publish_barrier = Arc::new(Barrier::new(DIRECT_ACK_STORE_CAPACITY));
+            {
+                let (store, ok, publish_barrier) = (
+                    Arc::clone(&store),
+                    Arc::clone(&ok),
+                    Arc::clone(&publish_barrier),
+                );
+                spawn_all(DIRECT_ACK_STORE_CAPACITY, Arc::clone(&barrier), move |t| {
+                    let e = ep(t, 100 + t as u64);
+                    let w = waiter(200 + t as u64, 1);
+                    let seq = publish(&store, e, w);
+                    // Every pair is published and unconsumed at this instant.
+                    publish_barrier.wait();
+                    if let AckConsume::Consumed(got, got_seq) = store.consume(e, Some(w))
+                        && got.endpoint == e
+                        && got.waiter == w
+                        && got_seq == seq
+                    {
+                        ok.fetch_add(1, O::Relaxed);
+                    }
+                });
+            }
+            assert_eq!(
+                ok.load(O::Relaxed),
+                DIRECT_ACK_STORE_CAPACITY,
+                "every simultaneous pair published and consumed its own acknowledgement"
+            );
+            assert_eq!(store.capacity_refusal_count(), 0);
+            assert_eq!(store.endpoint_live_refusal_count(), 0);
+        }
+    }
+
+    // ── (c) CONTENDED CONSUMPTION — exactly one winner, siblings untouched ──
+    //
+    // Two threads consume the SAME pair while a second, independent pair is live. Exactly one
+    // consumer wins; the loser gets `AlreadyConsumed` and mutates nothing; the sibling pair is
+    // still claimable afterwards.
+    #[test]
+    fn c_contended_consumption_has_exactly_one_winner() {
+        for _ in 0..RUNS {
+            let store = Arc::new(DirectAckStore::new());
+            let contested = ep(3, 11);
+            let contested_waiter = waiter(20, 1);
+            let sibling = ep(4, 12);
+            let sibling_waiter = waiter(21, 2);
+            let contested_seq = publish(&store, contested, contested_waiter);
+            publish(&store, sibling, sibling_waiter);
+
+            let won = Arc::new(AtomicUsize::new(0));
+            let duplicate = Arc::new(AtomicUsize::new(0));
+            let other = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(2));
+            {
+                let (store, won, duplicate, other) = (
+                    Arc::clone(&store),
+                    Arc::clone(&won),
+                    Arc::clone(&duplicate),
+                    Arc::clone(&other),
+                );
+                spawn_all(2, Arc::clone(&barrier), move |_| {
+                    match store.consume(contested, Some(contested_waiter)) {
+                        AckConsume::Consumed(got, seq) => {
+                            assert_eq!(got.endpoint, contested);
+                            assert_eq!(seq, contested_seq);
+                            won.fetch_add(1, O::Relaxed);
+                        }
+                        AckConsume::AlreadyConsumed => {
+                            duplicate.fetch_add(1, O::Relaxed);
+                        }
+                        _ => {
+                            other.fetch_add(1, O::Relaxed);
+                        }
+                    }
+                });
+            }
+            assert_eq!(won.load(O::Relaxed), 1, "exactly one ownership transfer");
+            assert_eq!(duplicate.load(O::Relaxed), 1, "the loser is a duplicate");
+            assert_eq!(other.load(O::Relaxed), 0);
+            assert_eq!(store.consume_count(), 1);
+            assert!(
+                store.is_claimable(sibling),
+                "the independent pair survives the contested consume"
+            );
+            assert!(store.consume(sibling, Some(sibling_waiter)).ok().is_some());
+        }
+    }
+
+    // ── (d) CAPACITY EXHAUSTION RACE — refusal before any irreversible publication ──
+    //
+    // CAPACITY + 4 threads race to reserve DISTINCT endpoints at the same instant. Exactly
+    // CAPACITY reservations win and publish; every other thread is refused with
+    // `CapacityExhausted` BEFORE publishing anything, and leaves no waiter identity behind.
+    #[test]
+    fn d_capacity_exhaustion_race_refuses_before_publication() {
+        const OVERSUBSCRIBE: usize = 4;
+        const THREADS: usize = DIRECT_ACK_STORE_CAPACITY + OVERSUBSCRIBE;
+        for _ in 0..RUNS {
+            let store = Arc::new(DirectAckStore::new());
+            let admitted = Arc::new(AtomicUsize::new(0));
+            let refused = Arc::new(AtomicUsize::new(0));
+            let wrong_error = Arc::new(AtomicUsize::new(0));
+            // Which threads were admitted is decided by the race, not by thread index.
+            let was_admitted: Arc<Vec<AtomicUsize>> =
+                Arc::new((0..THREADS).map(|_| AtomicUsize::new(0)).collect());
+            let barrier = Arc::new(Barrier::new(THREADS));
+            {
+                let (store, admitted, refused, wrong_error, was_admitted) = (
+                    Arc::clone(&store),
+                    Arc::clone(&admitted),
+                    Arc::clone(&refused),
+                    Arc::clone(&wrong_error),
+                    Arc::clone(&was_admitted),
+                );
+                spawn_all(THREADS, Arc::clone(&barrier), move |t| {
+                    let e = ep(t, 500 + t as u64);
+                    let w = waiter(600 + t as u64, 1);
+                    match store.reserve(e, w) {
+                        Ok(reservation) => {
+                            store.commit(reservation, fields(e, w)).expect("commit");
+                            was_admitted[t].store(1, O::Relaxed);
+                            admitted.fetch_add(1, O::Relaxed);
+                        }
+                        Err(AckReserveError::CapacityExhausted) => {
+                            // Refused BEFORE publication: nothing to unwind, and the pair is
+                            // invisible to every consumer.
+                            assert_eq!(store.consume(e, Some(w)), AckConsume::Absent);
+                            refused.fetch_add(1, O::Relaxed);
+                        }
+                        Err(AckReserveError::EndpointAlreadyLive) => {
+                            wrong_error.fetch_add(1, O::Relaxed);
+                        }
+                    }
+                });
+            }
+            assert_eq!(
+                admitted.load(O::Relaxed),
+                DIRECT_ACK_STORE_CAPACITY,
+                "exactly the bounded capacity is admitted"
+            );
+            assert_eq!(
+                refused.load(O::Relaxed),
+                OVERSUBSCRIBE,
+                "every oversubscribed reservation is refused"
+            );
+            assert_eq!(
+                wrong_error.load(O::Relaxed),
+                0,
+                "distinct endpoints never trip the endpoint-already-live refusal"
+            );
+            assert_eq!(
+                store.commit_count(),
+                DIRECT_ACK_STORE_CAPACITY as u64,
+                "a refused reservation publishes nothing"
+            );
+            assert_eq!(
+                store.capacity_refusal_count(),
+                OVERSUBSCRIBE as u64,
+                "every refusal is counted"
+            );
+            assert_eq!(store.live_pair_count(), DIRECT_ACK_STORE_CAPACITY);
+            // No REFUSED waiter identity or endpoint is readable anywhere in the store, and
+            // every admitted pair is intact.
+            for t in 0..THREADS {
+                let e = ep(t, 500 + t as u64);
+                let w = waiter(600 + t as u64, 1);
+                if was_admitted[t].load(O::Relaxed) == 1 {
+                    assert!(store.is_claimable(e), "an admitted pair is claimable");
+                } else {
+                    assert!(
+                        store.waiter_is_absent(w),
+                        "a refused reservation leaves no waiter behind"
+                    );
+                    assert!(
+                        store.snapshot(e).is_none(),
+                        "a refused reservation publishes no acknowledgement"
+                    );
+                }
+            }
+        }
+    }
+
+    // ── (e) SAME-ENDPOINT RESERVATION RACE — one live pair per endpoint, fail-closed ──
+    //
+    // Several threads race to reserve the SAME endpoint. Exactly one wins; the rest are
+    // refused with `EndpointAlreadyLive` (the fail-closed successor of the overwrite fuse) or
+    // lose the vacancy CAS, and the winner's published acknowledgement is never overwritten.
+    #[test]
+    fn e_same_endpoint_reservation_race_admits_one_live_pair() {
+        const THREADS: usize = 4;
+        for _ in 0..RUNS {
+            let store = Arc::new(DirectAckStore::new());
+            let e = ep(3, 11);
+            let admitted = Arc::new(AtomicUsize::new(0));
+            let refused = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(THREADS));
+            {
+                let (store, admitted, refused) = (
+                    Arc::clone(&store),
+                    Arc::clone(&admitted),
+                    Arc::clone(&refused),
+                );
+                spawn_all(THREADS, Arc::clone(&barrier), move |t| {
+                    let w = waiter(700 + t as u64, 1);
+                    match store.reserve(e, w) {
+                        Ok(reservation) => {
+                            store.commit(reservation, fields(e, w)).expect("commit");
+                            admitted.fetch_add(1, O::Relaxed);
+                        }
+                        Err(AckReserveError::EndpointAlreadyLive) => {
+                            refused.fetch_add(1, O::Relaxed);
+                        }
+                        Err(AckReserveError::CapacityExhausted) => {
+                            panic!("capacity cannot be exhausted by one endpoint");
+                        }
+                    }
+                });
+            }
+            assert_eq!(
+                admitted.load(O::Relaxed),
+                1,
+                "exactly one live pair per endpoint"
+            );
+            assert_eq!(refused.load(O::Relaxed), THREADS - 1);
+            assert_eq!(
+                store.commit_count(),
+                1,
+                "the published ack is never overwritten"
+            );
+            assert_eq!(store.live_pair_count(), 1);
+            assert_eq!(store.endpoint_live_refusal_count(), (THREADS - 1) as u64);
+        }
+    }
+
+    // ── (f) STALE / FOREIGN CONSUMPTION RACE — the entitled consumer still wins exactly once ──
+    //
+    // While one pair is live, threads consume it with a stale endpoint generation, a foreign
+    // waiter incarnation, and the correct identity, all at the same instant. Every wrong-identity
+    // attempt is refused and mutates nothing; the entitled consumer wins exactly once.
+    #[test]
+    fn f_stale_and_foreign_consumers_never_take_the_pair() {
+        for _ in 0..RUNS {
+            let store = Arc::new(DirectAckStore::new());
+            let e = ep(3, 11);
+            let w = waiter(20, 1);
+            let seq = publish(&store, e, w);
+            let won = Arc::new(AtomicUsize::new(0));
+            let stale = Arc::new(AtomicUsize::new(0));
+            let foreign = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(3));
+            {
+                let (store, won, stale, foreign) = (
+                    Arc::clone(&store),
+                    Arc::clone(&won),
+                    Arc::clone(&stale),
+                    Arc::clone(&foreign),
+                );
+                spawn_all(3, Arc::clone(&barrier), move |t| match t {
+                    // Stale endpoint incarnation (recycled endpoint slot).
+                    0 => {
+                        if store.consume(ep(3, 12), Some(w)) == AckConsume::StaleGeneration {
+                            stale.fetch_add(1, O::Relaxed);
+                        }
+                    }
+                    // Foreign waiter incarnation (recycled tid in another address space).
+                    1 => {
+                        if store.consume(e, Some(waiter(20, 2))) == AckConsume::ForeignWaiter {
+                            foreign.fetch_add(1, O::Relaxed);
+                        }
+                    }
+                    // The entitled consumer.
+                    _ => {
+                        if let AckConsume::Consumed(got, got_seq) = store.consume(e, Some(w))
+                            && got.endpoint == e
+                            && got.waiter == w
+                            && got_seq == seq
+                        {
+                            won.fetch_add(1, O::Relaxed);
+                        }
+                    }
+                });
+            }
+            assert_eq!(
+                won.load(O::Relaxed),
+                1,
+                "the entitled consumer wins exactly once"
+            );
+            assert_eq!(
+                stale.load(O::Relaxed),
+                1,
+                "the stale incarnation is refused"
+            );
+            assert_eq!(
+                foreign.load(O::Relaxed),
+                1,
+                "the foreign incarnation is refused"
+            );
+            assert_eq!(store.consume_count(), 1);
+            assert_eq!(store.stale_generation_rejection_count(), 1);
+            assert_eq!(store.foreign_waiter_rejection_count(), 1);
+        }
+    }
+
+    // ── (g) ROLLBACK RACE — cancelled reservations leave no slot or waiter leak ──
+    //
+    // Threads reserve and then cancel simultaneously. Afterwards the store is completely empty,
+    // no cancelled waiter identity is readable, and the FULL capacity is available again — a
+    // rollback that leaked a slot would show up as a capacity refusal on the refill.
+    #[test]
+    fn g_reserve_then_cancel_race_leaks_no_slot_or_waiter() {
+        for _ in 0..RUNS {
+            let store = Arc::new(DirectAckStore::new());
+            let cancelled = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(Barrier::new(DIRECT_ACK_STORE_CAPACITY));
+            {
+                let (store, cancelled) = (Arc::clone(&store), Arc::clone(&cancelled));
+                spawn_all(DIRECT_ACK_STORE_CAPACITY, Arc::clone(&barrier), move |t| {
+                    let e = ep(t, 900 + t as u64);
+                    let w = waiter(800 + t as u64, 1);
+                    let reservation = store.reserve(e, w).expect("reserve");
+                    // A reservation is invisible: nobody can consume it.
+                    assert_eq!(store.consume(e, Some(w)), AckConsume::NotCommitted);
+                    if store.cancel(reservation) {
+                        cancelled.fetch_add(1, O::Relaxed);
+                    }
+                });
+            }
+            assert_eq!(cancelled.load(O::Relaxed), DIRECT_ACK_STORE_CAPACITY);
+            assert_eq!(store.occupied_count(), 0, "no slot leak");
+            assert_eq!(store.commit_count(), 0, "a rollback publishes nothing");
+            for t in 0..DIRECT_ACK_STORE_CAPACITY {
+                assert!(
+                    store.waiter_is_absent(waiter(800 + t as u64, 1)),
+                    "no waiter leak"
+                );
+            }
+            // The full capacity is available again.
+            for t in 0..DIRECT_ACK_STORE_CAPACITY {
+                store
+                    .reserve(ep(t, 1), waiter(t as u64, 1))
+                    .expect("full capacity restored after rollback");
+            }
+        }
     }
 }
 
@@ -80664,7 +81278,7 @@ mod stage199a2d2a_smp_request {
     #[test]
     fn ack_carries_cpu1_server_identity() {
         let fx = smp_server_fixture();
-        let ack = ipccall_direct_ack::snapshot().expect("ack published");
+        let ack = ipccall_direct_ack::sole_snapshot().expect("ack published");
         assert_eq!(ack.server, fx.server, "ack names the exact server tid+asid");
         assert_eq!(ack.endpoint_index, fx.endpoint_index);
         assert_eq!(fx.k.with(|s| s.task_home_cpu(ack.server.tid.0)), Some(CPU1));
@@ -80772,7 +81386,7 @@ mod stage199a2d2a_smp_request {
                         lease.claim(30 + t as u64).expect("claim lease");
                         b.wait();
                         // Only the ack-claim WINNER runs the transaction.
-                        if let Some((claimed_ack, seq)) = ipccall_direct_ack::claim() {
+                        if let Some((claimed_ack, seq)) = ipccall_direct_ack::sole_claim() {
                             let _ = seq;
                             if k.ipc_call_direct_request_txn(
                                 &snap,
@@ -81402,7 +82016,10 @@ mod stage199a2d2c2b1_guards {
         assert!(MODRS.contains("== Some(crate::kernel::scheduler::CpuId(1));"));
         assert!(MODRS.contains("let waiter_exact ="));
         assert!(MODRS.contains("endpoint_waiter_identity(endpoint_index)) == Some(server)"));
-        assert!(MODRS.contains("let ack_published = ipccall_direct_ack::commit_seq() == ack_seq"));
+        assert!(MODRS.contains(
+            "let ack_published = ipccall_direct_ack::commit_seq(endpoint_index, endpoint_generation)"
+        ));
+        assert!(MODRS.contains("        == ack_seq\n        && ack_seq != 0;"));
         assert!(MODRS.contains(
             "if !(saved_frame && absent_from_runqueue && home_cpu_1 && waiter_exact && ack_published)"
         ));
@@ -81424,7 +82041,12 @@ mod stage199a2d2c2b1_guards {
         let start = MODRS
             .find("fn maybe_emit_ipccall_direct_smp_server_blocked")
             .unwrap();
-        let body = &MODRS[start..start + 1800];
+        // Bound the slice on the function's closing brace, not a byte count: a fixed byte
+        // window can land inside a multi-byte character when the source is reflowed.
+        let body = MODRS[start..]
+            .split("\n}\n")
+            .next()
+            .expect("marker function body is brace-bounded");
         assert!(!body.contains("IPCCALL_DIRECT_SMP_REQUEST_OK"));
         assert!(!EXEC.contains("IPCCALL_DIRECT_SMP_REQUEST_OK"));
         assert!(
@@ -81560,11 +82182,15 @@ mod stage199a2d2c2b2_guards {
     #[test]
     fn early_wouldblock_is_non_mutating() {
         assert!(SPLIT.contains("x86_ipccall_direct_smp_request_enabled()"));
-        assert!(SPLIT.contains("!crate::kernel::boot::ipccall_direct_ack::is_claimable()"));
+        assert!(SPLIT.contains(
+            "!crate::kernel::boot::ipccall_direct_ack::is_claimable(send_eidx, send_egen)"
+        ));
         assert!(SPLIT.contains("ipccall_direct_smp_request_note_early_wouldblock()"));
         assert!(SPLIT.contains("SyscallError::WouldBlock.code()"));
         let wb = SPLIT.find("note_early_wouldblock").unwrap();
-        let claim = SPLIT.find("ipccall_direct_ack::claim()").unwrap();
+        let claim = SPLIT
+            .find("ipccall_direct_ack::claim(send_eidx, send_egen)")
+            .unwrap();
         assert!(wb < claim, "early WouldBlock precedes any ack claim");
     }
 
@@ -82083,7 +82709,7 @@ mod stage199a2d2c2c_reply_guards {
             .nth(1)
             .unwrap();
         assert!(f.contains("x86_ipccall_direct_smp_reply_enabled()"));
-        assert!(f.contains("ipcreply_direct_ack::snapshot().is_none()"));
+        assert!(f.contains("ipcreply_direct_ack::snapshot(reply_eidx, reply_egen).is_none()"));
         assert!(f.contains("ipcreply_direct_smp_reply_note_early_wouldblock()"));
         assert!(f.contains("SyscallError::WouldBlock.code()"));
     }
@@ -82096,7 +82722,9 @@ mod stage199a2d2c2c_reply_guards {
             .split("fn try_split_ipcreply_direct_into_frame")
             .nth(1)
             .unwrap();
-        assert!(f.contains("!crate::kernel::boot::ipcreply_direct_ack::is_claimable()"));
+        assert!(f.contains(
+            "!crate::kernel::boot::ipcreply_direct_ack::is_claimable(reply_eidx, reply_egen)"
+        ));
         assert!(f.contains("ipcreply_direct_smp_note_duplicate_refused()"));
         assert!(
             f.contains("IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED arch=x86_64 reason=consumed_barrier")
@@ -93717,7 +94345,15 @@ mod stage200d2b1bi_counters {
     fn i03_success_vector_and_result_before_enqueue() {
         let _g = globals_guard();
         c::reset_instance();
+        // Stage 199D: the audit requires an armed scope, and the link-leak literal now
+        // reads the system-wide totals, so this synthetic vector must balance them too.
+        assert!(c::arm_record(7, 3));
+        c::note_link_created(7, 3);
+        c::note_link_closed(7, 3);
         for t in ALL {
+            if matches!(t, T::LinkCreated | T::LinkDetached) {
+                continue;
+            }
             c::record(t);
         }
         assert_eq!(c::vector(), [1u32; 9], "each class exactly once");
@@ -93839,7 +94475,9 @@ mod stage200d2b1bi_counters {
         let reg = reg.split("\n    /// ").next().unwrap();
         assert!(reg.contains("tcb.server_reply_link = Some(link);"));
         let install = reg.find("tcb.server_reply_link = Some(link);").unwrap();
-        let rec = reg.find("Transition::LinkCreated").expect("class 1");
+        // Stage 199D: the creation edge now reports its RECORD IDENTITY, so the count can
+        // be attributed to the armed transaction instead of to every call in the system.
+        let rec = reg.find("note_link_created(").expect("class 1");
         assert!(install < rec, "counted after the real install");
         // 2 link detached — only when a link was actually taken.
         let take = IPC_SRC
@@ -93847,8 +94485,22 @@ mod stage200d2b1bi_counters {
             .nth(1)
             .expect("take");
         let take = take.split("\n    /// ").next().unwrap();
-        assert!(take.contains("if taken.is_some() {"));
-        assert!(take.contains("Transition::LinkDetached"));
+        // Stage 199D: the exit-path close reports the identity of the link it removed.
+        assert!(take.contains("if let Some(link) = taken {"));
+        assert!(take.contains("note_link_closed("));
+        assert!(take.contains("link.reply_record_index"));
+        // The ORDINARY terminal close is the second real closing edge and must also report.
+        let detach = IPC_SRC
+            .split("pub(crate) fn detach_server_reply_link_exact(")
+            .nth(1)
+            .expect("detach");
+        let detach = detach.split("\n    /// ").next().unwrap();
+        assert!(detach.contains("tcb.server_reply_link = None;"));
+        assert!(
+            detach.contains("note_link_closed("),
+            "the ordinary terminal close counts too — it used to count nothing, which is \
+             why created/closed was not a valid leak invariant"
+        );
         // 3/4/5 deferred queue operations.
         for (f, class, must) in [
             (
@@ -93906,13 +94558,52 @@ mod stage200d2b1bi_counters {
             !INIT_SRC.contains("server_dies_counters"),
             "userspace must not synthesize transitions"
         );
-        // Every production record(...) lives in one of the four kernel files that own the
-        // real operations.
-        let total: usize = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC]
+        // Every production transition entry point lives in one of the four kernel files
+        // that own the real operations.
+        //
+        // Stage 199D: seven classes are still recorded by a direct qualified
+        // `server_dies_counters::record(...)` at their real operation. The two LINK classes
+        // go through the scoped helpers instead — `note_link_created` / `note_link_closed`
+        // (which also feed the system-wide leak totals) and `note_armed_link_present` — so
+        // a transition can be attributed to the ONE armed transaction rather than counted
+        // for every call in the system. Nine classes, nine real operations, still no
+        // synthesized transition.
+        let files = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC];
+        let direct: usize = files
             .iter()
             .map(|s| s.matches("server_dies_counters::record(").count())
             .sum();
-        assert_eq!(total, 9, "exactly nine production record sites");
+        assert_eq!(direct, 7, "seven directly-recorded classes");
+        let created: usize = files
+            .iter()
+            .map(|s| {
+                s.matches("server_dies_counters::note_link_created(")
+                    .count()
+            })
+            .sum();
+        let closed: usize = files
+            .iter()
+            .map(|s| s.matches("server_dies_counters::note_link_closed(").count())
+            .sum();
+        assert_eq!(created, 1, "one reverse-link creation edge");
+        assert_eq!(
+            closed, 2,
+            "two reverse-link closing edges: ordinary terminal + exit"
+        );
+        // The scoped helpers are the ONLY way the link classes are reached, so an unscoped
+        // link count cannot reappear by accident.
+        let link_records = MOD_SRC.matches("record(Transition::LinkCreated)").count()
+            + MOD_SRC.matches("record(Transition::LinkDetached)").count();
+        assert_eq!(
+            link_records, 3,
+            "created (scoped + armed-present) and detached"
+        );
+        for f in [IPC_SRC, RUNTIME_SRC, RESTART_SRC] {
+            assert!(
+                !f.contains("Transition::LinkCreated") && !f.contains("Transition::LinkDetached"),
+                "link classes are recorded only through the scoped helpers"
+            );
+        }
     }
 
     /// All fifteen canonical hard-fail literals exist at real sites.
@@ -94095,6 +94786,13 @@ mod stage200d2b1bii_races {
         // vector a measurement of the CASE rather than of its setup.
         let fx = caller_fixture();
         c::reset_instance();
+        // Stage 199D: the nine-vector describes exactly ONE armed ServerDies transaction,
+        // identified by the reply record it owns. Arm the instance to this fixture's record
+        // so the case's transitions are attributed and unrelated records are not.
+        assert!(
+            c::arm_record(fx.record_index, fx.record_generation),
+            "the fixture's record arms the counter scope"
+        );
         (g, fx)
     }
 
@@ -94826,6 +95524,252 @@ mod stage200d2b1bii_races {
         teardown();
     }
 
+    // ── Stage 199D: reverse-link accounting ────────────────────────────────────────
+    //
+    // These pin the defect that made `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1`
+    // fire on every real boot: `LinkCreated` was counted for EVERY bound `IpcCall` in the
+    // system, `LinkDetached` only for the one dying server, and `audit_success_path`
+    // compared the two. It was never a leak — the ordinary reply path does close its
+    // links, through a seam that counted nothing at all.
+
+    /// d01. THE REPRODUCTION. Links created by unrelated calls before and after the armed
+    ///      transaction do not move its vector, and the success audit passes.
+    #[test]
+    fn d01_unrelated_links_do_not_contaminate_the_armed_vector() {
+        let (_g, fx) = fx_fresh();
+        // Two unrelated records, one before the armed transaction runs and one after.
+        // They are genuine creations: they move the system totals, never the vector.
+        c::note_link_created(fx.record_index + 41, 7);
+        let id = run_success(&fx);
+        c::note_link_created(fx.record_index + 42, 9);
+        assert_eq!(
+            v()[T::LinkCreated as usize],
+            1,
+            "the armed transaction created exactly one link"
+        );
+        assert_eq!(v()[T::LinkDetached as usize], 1, "and closed exactly one");
+        let (created, closed) = c::link_totals();
+        assert_eq!(created, 3, "all three creations reach the system totals");
+        assert_eq!(closed, 1, "only the armed one has been closed so far");
+        // Close the two unrelated links so the system totals balance, exactly as the
+        // ordinary reply path would.
+        c::note_link_closed(fx.record_index + 41, 7);
+        c::note_link_closed(fx.record_index + 42, 9);
+        assert_eq!(c::link_totals(), (3, 3));
+        assert_eq!(
+            v()[T::LinkDetached as usize],
+            1,
+            "foreign closes never move the armed vector"
+        );
+        assert!(
+            c::audit_success_path(),
+            "the audit passes with 52 unrelated links either side"
+        );
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// d02. A REAL leak is still reported: a link created and never closed fails the audit
+    ///      through the system-wide totals, even though the armed pair is a clean 1/1.
+    #[test]
+    fn d02_real_reverse_link_leak_is_not_hidden() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(v()[T::LinkCreated as usize], 1);
+        assert_eq!(v()[T::LinkDetached as usize], 1);
+        assert!(c::audit_success_path(), "clean before the leak");
+        // An unrelated link that is never closed.
+        c::note_link_created(fx.record_index + 77, 5);
+        assert_eq!(c::link_totals(), (2, 1));
+        assert!(
+            !c::audit_success_path(),
+            "a leaked reverse link anywhere fails the audit"
+        );
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// d03. Both closing edges count. The ORDINARY terminal close used to count nothing,
+    ///      which is why created/closed was not a valid invariant in the first place.
+    #[test]
+    fn d03_both_closing_edges_count() {
+        let (_g, fx) = fx_fresh();
+        assert!(link(&fx));
+        assert_eq!(c::link_totals(), (1, 0));
+        // The ordinary terminal close, through the exact-detach seam.
+        let outcome = fx.k.with(|s| {
+            s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        });
+        assert!(outcome.detached(), "the ordinary close removes the link");
+        assert_eq!(
+            c::link_totals(),
+            (1, 1),
+            "the ordinary terminal close is a real closing edge"
+        );
+        assert_eq!(live_links(&fx), 0);
+        teardown();
+    }
+
+    /// d04. Duplicate close of the ARMED record stays fail-closed: the second close leaves
+    ///      the class visibly >1 and the audit refuses.
+    #[test]
+    fn d04_duplicate_armed_close_is_fail_closed() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(v()[T::LinkDetached as usize], 1);
+        c::note_link_closed(fx.record_index, fx.record_generation);
+        assert_eq!(
+            v()[T::LinkDetached as usize],
+            2,
+            "a duplicate is left visible, not swallowed"
+        );
+        assert!(!c::audit_success_path(), "duplicate detach fails the audit");
+        // The terminal claim itself is untouched by the duplicate accounting event — only
+        // the vector records the defect, which is the point of counting rather than gating.
+        assert_eq!(
+            winner(&fx),
+            Some(TerminalClaimant::PeerDeath),
+            "the terminal claim is untouched by the duplicate accounting event"
+        );
+        let _ = id;
+        teardown();
+    }
+
+    /// d05. A stale RECORD GENERATION detaches nothing and therefore counts nothing, on
+    ///      either tier.
+    #[test]
+    fn d05_stale_generation_counts_nothing() {
+        let (_g, fx) = fx_fresh();
+        assert!(link(&fx));
+        let before = c::link_totals();
+        let outcome = fx.k.with(|s| {
+            s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation.wrapping_add(1),
+            )
+        });
+        assert!(!outcome.detached(), "a stale generation detaches nothing");
+        assert_eq!(c::link_totals(), before, "and counts nothing");
+        assert_eq!(v()[T::LinkDetached as usize], 0);
+        assert_eq!(live_links(&fx), 1, "the real link survives");
+        teardown();
+    }
+
+    /// d06. A LOSING terminal path stays fail-closed: the armed record's link is closed by
+    ///      the ordinary reply, so `LinkDetached` is 1 while `PeerDeathWinner` is 0 and the
+    ///      record-leak literal fires.
+    #[test]
+    fn d06_losing_terminal_path_is_fail_closed() {
+        let (_g, fx) = fx_fresh();
+        let _id = arm(&fx);
+        assert!(link(&fx));
+        // The reply wins: the ordinary terminal close removes the armed record's link.
+        let outcome = fx.k.with(|s| {
+            s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        });
+        assert!(outcome.detached());
+        assert_eq!(v()[T::LinkDetached as usize], 1, "the armed link did close");
+        assert_eq!(
+            v()[T::PeerDeathWinner as usize],
+            0,
+            "but no peer-death claim was made"
+        );
+        assert!(
+            !c::audit_success_path(),
+            "a losing terminal path never passes the ServerDies success audit"
+        );
+        teardown();
+    }
+
+    /// d07. An UNARMED instance cannot pass the audit — the vector would describe nothing
+    ///      in particular.
+    #[test]
+    fn d07_unarmed_instance_fails_the_audit() {
+        let _g = super::stage200d2b1bi_counters::globals_guard();
+        c::reset_instance();
+        assert_eq!(c::armed_record(), None);
+        for t in ALL {
+            if !matches!(t, T::LinkCreated | T::LinkDetached) {
+                c::record(t);
+            }
+        }
+        assert!(
+            !c::audit_success_path(),
+            "no armed transaction, no success audit"
+        );
+        c::reset_instance();
+    }
+
+    /// d08. The scope is one-shot: a second, DIFFERENT record is refused, so two
+    ///      overlapping scenarios can never share a vector. Re-arming the same record is
+    ///      idempotent.
+    #[test]
+    fn d08_scope_is_one_shot_and_idempotent() {
+        let _g = super::stage200d2b1bi_counters::globals_guard();
+        c::reset_instance();
+        assert!(c::arm_record(3, 11));
+        assert!(c::matches_armed(3, 11));
+        assert!(
+            c::arm_record(3, 11),
+            "re-arming the same record is idempotent"
+        );
+        assert!(!c::arm_record(4, 12), "a different record is refused");
+        assert_eq!(c::armed_record(), Some((3, 11)), "the first arm stands");
+        // A generation of zero is never a valid identity.
+        assert!(!c::arm_record(5, 0));
+        c::reset_instance();
+        assert_eq!(c::armed_record(), None, "reset clears the scope");
+    }
+
+    /// d09. Arming a record that owns NO reverse link leaves `LinkCreated` at zero and
+    ///      fails the audit. This is the defect Stage 200D-2B1D-x86 hit live, where the
+    ///      boot reached `DEFERRED_RESERVED` with `LINK_CAPTURED` absent; it must be
+    ///      reported, not derived away.
+    #[test]
+    fn d09_armed_record_without_a_link_fails() {
+        let (_g, fx) = fx_fresh();
+        // No `link(&fx)` — the armed record owns no reverse link.
+        assert_eq!(live_links(&fx), 0);
+        assert_eq!(
+            v()[T::LinkCreated as usize],
+            0,
+            "nothing observed, nothing counted"
+        );
+        assert!(!c::audit_success_path());
+        teardown();
+    }
+
+    /// d10. The production creation edge reports its record identity, so the armed vector
+    ///      counts it only when it belongs to the armed transaction.
+    #[test]
+    fn d10_creation_edge_is_attributed_by_record_identity() {
+        let (_g, fx) = fx_fresh();
+        assert!(link(&fx), "the real production registration");
+        assert_eq!(
+            v()[T::LinkCreated as usize],
+            1,
+            "the armed record's creation is counted once"
+        );
+        assert_eq!(c::link_totals().0, 1);
+        // A creation for a different record moves only the system total.
+        c::note_link_created(fx.record_index + 13, 3);
+        assert_eq!(v()[T::LinkCreated as usize], 1);
+        assert_eq!(c::link_totals().0, 2);
+        teardown();
+    }
+
     /// 24. The collector gate is CAUSAL, not a timing race: it stays held across the whole
     ///     death transaction — so no timeout claimant can be collected while PeerDeath is
     ///     deciding — and it is released ONLY by the caller's own userspace validation
@@ -95232,7 +96176,10 @@ mod stage200d2b1bii_races {
                 "IPC_SERVER_DEATH_LINK_LEAK",
                 MOD_SRC,
                 "pub fn audit_success_path()",
-                "count(T::LinkCreated) != count(T::LinkDetached)",
+                // Stage 199D: the leak literal reads the SYSTEM-WIDE link totals. The armed
+                // transaction's own pair is checked by the exact-1 loop like every other
+                // class; comparing the two was the created=54 detached=1 defect.
+                "links_created != links_closed",
             ),
             (
                 "IPC_SERVER_DEATH_RECORD_LEAK",

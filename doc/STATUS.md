@@ -13,8 +13,9 @@
 
 ## 0. Kernel-unlock frontier — current verified state
 
-**Verified at commit `757993b699b309dafdb3d17c428380c08d7fc9f7`, tree
-`1118b61b74588e73b0dc235dc96086ec7488257c` (`main == origin/main`).**
+**Broad-lock census verified at commit `757993b6`, tree `1118b61b`. Live-cell evidence at
+commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
+`e2fd0b5c7a82dc6c8c422d5c6db242473533a9a6`.**
 Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 `doc/KERNEL_UNLOCKING.md` §0.
 
@@ -87,40 +88,72 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 
 ### Live cells earned
 
-| Programme | Cells | Canonical stage it serves |
-|-----------|-------|---------------------------|
-| First cohort (`DebugLog`, `FutexWake`, `FutexWait`, `Yield`) | 12 | pre-199C retirement groundwork |
-| Second cohort — plain / ordinary-cap `IpcSend` | 12 | 199C **delivery** only, not blocking-sender retirement |
-| Second cohort — shared-region direct | 3 | 200C (1 of 7 object classes) |
-| Reply-timeout matrix | **6** | 199E (one quarter of the stage) |
-| `ExitCurrentTask` NR 16 | **2 of 3** | 202D (one sub-path; RISC-V unearned) |
-| Direct IPC NR 6 / NR 7 (x86_64 SMP=2) | knob-gated | 199D mechanism, **not** the production path |
-| **Server death (`ServerDies`)** | **0** | 199D server-crash cleanup — blocked |
+| Programme | Cells | Seal / canonical stage served |
+|-----------|-------|-------------------------------|
+| Stage 198F combined retirement (first cohort 12 + supported `IpcSend` 18) | **30** | `STAGE_198F_COMPLETE_RETIREMENT_SEAL … total_live_cells=30 result=ok`; pre-199C groundwork, 199C delivery, 200C shared-region |
+| Reply-timeout matrix | **6** | `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`; 199E (one quarter of the stage) |
+| `ExitCurrentTask` NR 16 | **2 of 3** | x86_64 `0b5e98f`, AArch64; 202D (one sub-path; RISC-V unearned) |
+| **Server death (`ServerDies`) — x86_64** | **1 of 3** | **`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`; canonical 199D server-crash-cleanup increment** |
+| **Accepted total (production-path)** | **39** | 30 + 6 + 2 + 1 |
+| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D mechanism, **not** the production path |
+
+> **On the total.** There is no aggregate live-cell counter anywhere in the tree; the only
+> in-tree aggregate is Stage 198F's `total_live_cells=30`. The figure above is computed from
+> the seals listed and counts only **production-path** cells. Including the six knob-gated
+> Stage 199 functional cells gives **45**. A previously-quoted figure of **43** matches
+> neither: it requires counting the six knob-gated Stage 199 cells *and* excluding the two
+> `ExitCurrentTask` cells. Recorded here as **39** with the arithmetic visible rather than
+> asserting an unverifiable total — if the intended policy is to count knob-gated cells, the
+> number is 45 and this row should say so.
+
+### x86_64 ServerDies cell — evidence
+
+Exact commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
+`e2fd0b5c7a82dc6c8c422d5c6db242473533a9a6`. One fresh boot, 14215 lines, **zero
+`result=fail`**, all eighteen forbidden markers absent, one boot banner.
+
+* Scoped vector `[1, 1, 1, 1, 1, 1, 1, 1, 1]`, `result_before_enqueue=1`.
+* Quiescent system balance `created=54 closed=54 live_links=0` — the same 54 that was
+  previously reported as a leak.
+* `EXIT_TASK_OWNER_REVALIDATED … prepared=idle committed=replacement next_tid=1 advances=1`
+  — `revalidate_idle_owner_after_drains` executed in QEMU for the first time — and
+  `EXIT_TASK_COMMON_EPILOGUE_OWNER … owner=replacement frame_committed=1`.
+* `TERMINAL_CLAIM terminal=PeerDeath result=won` → `USER_VALIDATED result=ServerDied code=10`;
+  survivor and health attested.
+
+Full detail: `doc/IPC.md` §8.5.
 
 ### Immediate blockers
 
-1. **`IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`** — the only hard
-   failure in the tree. Blocks 199D server-crash cleanup and 202D reply-object cleanup.
-   **The smallest next production stage is the repair for this** (a 199D increment; see
-   `doc/KERNEL_UNLOCK_AUDIT.md` §6).
-2. **`revalidate_idle_owner_after_drains` has never run in QEMU** (`src/runtime.rs:665`).
-3. **NR 6 / NR 7 off-lock direct IPC is default-OFF**, so 199D's landed transaction
-   delivers no production benefit.
-4. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
+1. **AArch64 and RISC-V ServerDies live cells are unearned** — 1 of 3. The x86_64 cell is
+   earned (`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, `f5669cb5`), which also **cleared the
+   two blockers that used to head this list**: the `IPC_SERVER_DEATH_LINK_LEAK` accounting
+   failure is resolved, and `revalidate_idle_owner_after_drains` has now executed in QEMU
+   (`EXIT_TASK_OWNER_REVALIDATED … committed=replacement`).
+2. **NR 6 / NR 7 off-lock direct IPC cannot be made production-default yet.** It is gated
+   twice: the proof gate *and* an oracle-endpoint confinement that services only the
+   oracle's endpoints. The **acknowledgement-store prerequisite is now met** — the
+   single-slot, one-outstanding-pair ack has been replaced by the bounded, endpoint-indexed,
+   generation-bearing multi-pair store (`src/kernel/direct_ack_store.rs`, Stage 199D), so a
+   real service chain's many concurrent bound `IpcCall`s (54 reverse links in one boot) no
+   longer collide in a one-pair slot. Both gates are still in place and unchanged; removing
+   the endpoint confinement is its own increment. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1 and
+   `doc/IPC.md` §8.6.
+3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
-5. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
+4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
    wiring.
-6. **`FutexWait` off-lock seams landed helper-only** and were never wired.
-7. **Reply-timeout scan is off-lock on x86_64 only**; `IpcSend` and `IpcCall` timeouts are
+5. **`FutexWait` off-lock seams landed helper-only** and were never wired.
+6. **Reply-timeout scan is off-lock on x86_64 only**; `IpcSend` and `IpcCall` timeouts are
    untouched; the broad fallback `run_reply_timeout_completion` survives (199E).
-8. **RISC-V `ExitCurrentTask` live cell** — kernel chain proven correct, runner bound
+7. **RISC-V `ExitCurrentTask` live cell** — kernel chain proven correct, runner bound
    corrected at `5488d8e`, re-run never executed (202D).
-9. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures** — keeps
+8. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures** — keeps
    every hosted claim single-threaded-only. Test-infrastructure debt; a prerequisite for
    using the hosted suite as a 205C harness, not 205C completion work.
-10. **AArch64 re-acquires the broad lock on its split return path**
-    (`src/arch/trap_entry.rs:1432`) — 204B/204E must localize it. 205A reports the cell; it
-    is not where it gets retired.
+9. **AArch64 re-acquires the broad lock on its split return path**
+   (`src/arch/trap_entry.rs:1432`) — 204B/204E must localize it. 205A reports the cell; it
+   is not where it gets retired.
 
 ---
 
@@ -341,16 +374,18 @@ The four highest-impact items, in order of unlock value:
    kernel-unlocking smoke policy and unblock RISC-V SMP scheduling so
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
-2. **Kernel unlocking — canonical Stage 202D (ServerDies link accounting).**
-   The broad `SpinLock<KernelState>` still has **51** production acquisition sites
-   (§0). The single hard failure blocking forward progress is
-   `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`: the nine-counter
-   ServerDies audit compares a system-wide `LinkCreated` count against one death's
-   `LinkDetached` count. Scope the counters to the audited death, keep the Stage 202A
-   fifteen hard-fail literals meaningful, and land it as a hosted-only stage (no QEMU,
-   no live cell, zero broad-lock reduction). That unblocks the three ServerDies live
-   cells and, transitively, the whole 204/205 retirement ladder. See
-   `doc/KERNEL_UNLOCKING.md` §0 and `doc/KERNEL_UNLOCK_AUDIT.md` §6.
+2. **Kernel unlocking — canonical Stage 199D.**
+   The broad `SpinLock<KernelState>` still has **51** production acquisition sites (§0).
+   The ServerDies reverse-link accounting failure that used to head this list is
+   **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
+   ServerDies transaction and the leak invariant moved to system-wide link totals, so there
+   is no hard `result=fail` left in the tree. Two follow-ons, of different kinds: the
+   **x86_64 ServerDies live cell** (a runner act — one clean boot earns the first cell and
+   finally exercises `revalidate_idle_owner_after_drains`, which has never run in QEMU), and
+   the **smallest production change**, flipping `ipccall_direct_proof_enabled()` to the
+   production default on x86_64 so the landed off-lock NR 6 / NR 7 transaction is actually
+   taken by a normal boot. Neither completes 199D. See `doc/KERNEL_UNLOCKING.md` §0 and
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating
