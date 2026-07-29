@@ -213,6 +213,107 @@ See `doc/BOOT.md` §4.1 for the full marker contract and
 
 ---
 
+## 6.1 Return contract, scheduling and live proof (kernel unlocking)
+
+Census and cross-architecture matrix: `doc/KERNEL_UNLOCK_AUDIT.md` §2. Roadmap:
+`doc/KERNEL_UNLOCKING.md` §0.
+
+### Off-lock position
+
+x86_64 is the **only** architecture with off-lock authoritative dispatch.
+`d6_genuine_enabled()` (`src/kernel/boot/mod.rs:766`) is
+`cfg!(target_arch = "x86_64") && !d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()`
+— compile-time true in production, with **no opt-out back to the old global-lock path**.
+
+Ungated off-lock syscall classes: **5** — NR 15 `DebugLog`, NR 10 `FutexWake`,
+NR 8 `ControlPlaneSetCnodeSlots`, NR 2 `IpcRecv` (kernel-task queued-plain only),
+NR 14 `VmBrk` (page-crossing shrink only). NR 6 / NR 7 direct IPC are implemented and
+live-proven but **proof-gated, default-OFF**.
+
+### Post-lock drain chain
+
+After `with_cpu` returns in `handle_trap_entry_shared`:
+`drain_dispatch_post_work` → D2-send → D2-recv → FutexWait (192A) → Yield (192B) →
+D6-genuine mutating dispatch → Stage 117 switch-plan stash →
+`drain_reply_timeout_post_work` → `drain_server_death_post_work`.
+
+Each drain re-verifies its subject before acting and falls back to the broad path with
+`reason=state_changed` if the state moved while the guard was down.
+
+### Restore-owner contract — the x86_64-specific hazard
+
+x86_64 resolves the restore owner **in-lock** (Stage 200D-0B3), which is correct for
+identity coherence but happens strictly **before** the post-lock drains — and the drains
+are exactly where wakes are published. AArch64 and RISC-V consume the disposition
+**after** the drains, so they never had this gap.
+
+The live consequence (fourth ServerDies attempt): the server-death drain made a caller
+runnable and enqueued it, the epilogue committed the earlier `owner=idle` decision
+anyway, and the CPU halted holding an idle frame while a runnable task existed —
+re-idling on every timer tick, 220 times, until the boot timed out.
+
+**Invariant:** *a restore-owner decision taken before the post-lock drains must be
+re-validated after them.* Any drain that makes a task runnable hits this; the
+reply-timeout collector and the server-death drain both can.
+
+The repair is `SharedKernel::revalidate_idle_owner_after_drains` (`src/runtime.rs:665`),
+wired in the trap epilogue at `src/arch/x86_64/descriptor_tables.rs:1324`. It runs with
+the broad guard dropped and every drain complete, but before any frame is committed. It
+uses the existing `dispatch_next_on_cpu` (exactly one queue advance, through the same
+authority), is CPU-local, and is gated on the prepared owner being idle so a prepared
+replacement is never displaced.
+
+Because `dispatch_next_on_cpu` **commits** its selection as the CPU's `current` before
+the arch restore is attempted, the outcome is typed rather than `Option<u64>`:
+
+```rust
+pub(crate) enum OwnerRevalidation {
+    Idle,                                          // nothing committed
+    Replacement(u64),                              // committed AND restored
+    RestoreFailed { tid: u64, rolled_back: bool }, // committed, NOT restored
+}
+pub(crate) enum OwnerCommit { Idle, Replacement(u64), FailClosed(u64) }
+```
+
+`OwnerRevalidation::disposition()` is a pure function, so the fail-closed rule is one
+testable rule rather than the incidental shape of a `match`. Only
+`RestoreFailed { rolled_back: false }` maps to `FailClosed`, which takes the **existing**
+fatal path (`fatal_trap_read_snapshot` → `log_decoded_fatal_trap_from_snapshot` →
+`debug_uart_trap_breadcrumb` → `halt_forever`), not a second policy; `halt_forever`
+diverges, so that arm cannot fall through to the frame commit.
+
+Rollback undoes the seam's own advance, CPU-locally: `block_current_on_cpu` clears
+`current` (and scheduler membership, so the re-enqueue cannot hit `AlreadyQueued`), and
+the task is re-enqueued **only if it is still live** — a task whose TCB is gone is not
+resurrected into a run queue, but `current` is still cleared, which is what the idle path
+depends on. `rolled_back` requires **both** halves.
+
+A silent-success hole was closed along the way: `restore_arch_thread_state` maps
+`KernelError::TaskMissing` to `Ok(())` so early boot restores nothing and still returns
+cleanly. That is correct for its other callers and **wrong** at this call site — a task
+still in a run queue whose TCB has been reaped would be reported as a successful
+replacement.
+
+> ⚠️ **`revalidate_idle_owner_after_drains` has never run in QEMU.** It is
+> hosted-proven only (9 + 11 cases, 7 + 10 mutation guards killed). The `FailClosed` arm
+> is a currently-unreachable backstop: with today's code `block_current_on_cpu` always
+> returns the task just dispatched and the only restore failure is the unrestorable one,
+> which is not requeued, so `rolled_back` is always `true`.
+
+### Live-proof status
+
+* `ExitCurrentTask` NR 16 — live cell sealed at `0b5e98f`
+  (`STAGE_200D0B3_X86_EXIT_CURRENT_TASK_REFREEZE_SEAL`).
+* Reply timeout — `scan_broad_lock=0`, `completion_transaction_narrow=1`; two matrix cells.
+* Direct IPC NR 6 / NR 7 at SMP=2 — full cross-CPU request **and** reply proven live,
+  frozen by `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; all knob-gated.
+* AP scheduling — proof-gated live (generic fresh entry, saved-frame resume, recv-v2
+  block, cross-CPU IPI both directions). The **production** scheduler remains BSP-only.
+* **ServerDies — no live cell.** Blocked on the link-accounting defect (canonical Stage
+  202D); see `doc/IPC.md` §8.5.
+
+---
+
 ## 7. Authoring rule
 
 Future x86_64 docs update **this file**. Cross-arch / generic boot docs

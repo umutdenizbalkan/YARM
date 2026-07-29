@@ -11,6 +11,119 @@
 
 ---
 
+## 0. Kernel-unlock frontier — current verified state
+
+**Verified at commit `757993b699b309dafdb3d17c428380c08d7fc9f7`, tree
+`1118b61b74588e73b0dc235dc96086ec7488257c` (`main == origin/main`).**
+Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
+`doc/KERNEL_UNLOCKING.md` §0.
+
+### Broad-lock position
+
+| Metric | Value |
+|--------|-------|
+| Production `SharedKernel::with_cpu` callsites | **41** |
+| Production broad `SharedKernel::with` callsites | **10** |
+| **Total production broad-lock acquisition sites** | **51** |
+| Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
+| Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
+| Off-lock authoritative dispatch | **x86_64 only** (`d6_genuine_enabled()` is compile-time false elsewhere) |
+
+### Hosted validation (re-executed, not inherited)
+
+| Command | Result |
+|---------|--------|
+| `cargo test --lib -- --test-threads=1` | ✅ 3729 passed, 0 failed, 2 ignored |
+| `cargo test --tests -- --test-threads=1` | ✅ 3881 passed (3729 lib + 152 integration), 0 failed |
+| `cargo test --tests --features ipc-reply-timeout-oracle-core -- --test-threads=1` | ✅ 4045 passed, 0 failed |
+| `cargo test --lib` (default parallel harness) | ⚠️ **completes, 0 aborts** — 58–71 logical shared-state assertion failures remain |
+| all 13 repository gate scripts | ✅ **13 of 13 pass** |
+| `cargo check` — x86_64 / AArch64 / RISC-V bare-metal `kernel_boot` | ✅ clean |
+| `cargo check` — x86_64 / AArch64 / RISC-V freestanding `crash_test_srv` | ✅ clean |
+| `cargo fmt --check`, `git diff --check` | ✅ clean |
+
+The parallel memory corruption (three cross-test aliasing bugs) is **fixed**; see
+`doc/KERNEL_TEST_RULES.md` Rule H1. What remains is process-global test contention in the
+hosted corpus: **test-infrastructure debt, not canonical Stage 205C work.** It may precede
+or support 205C (which is a long-running torture of the running kernel) but closes no part
+of it.
+
+### Canonical stage position
+
+Stage definitions are owner-supplied and authoritative
+(`doc/KERNEL_UNLOCKING.md` §0). **A historical stage carrying the same number does not
+complete the canonical stage.**
+
+| Phase | Complete | Partial foundation | Open |
+|-------|----------|--------------------|------|
+| 2 — IPC (199C–199G) | 0 of 5 | 199D, 199E | 199C, 199F, 199G |
+| 3 — Capability (200A–200D) | 0 of 4 | 200A, 200C | 200B, 200D |
+| 4 — VM (201A–201G) | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
+| 5 — Lifecycle (202A–202F) | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |
+| 6 — Timer/IRQ/sched (203A–203D) | 0 of 4 | 203A, 203C, 203D | 203B |
+| 7 — Monolith removal (204A–204E) | **1 of 5** (204A) | 204B | 204C, 204D, 204E |
+| 8 — Seal (205A–205D) | 0 of 4 | 205A | 205B, 205C, 205D |
+| **Total** | **1 of 35** | 12 | 22 |
+
+**No canonical stage in Phases 2–6 or 8 is complete.** The one complete stage, 204A
+(broad-lock callsite census), is documentation rather than lock retirement: 51 callsites
+classified as 0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.
+
+> **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
+> was the only row written without an `N of M` denominator, and the totals silently counted it
+> as four stages. **The dropped stage was `204B` (decompose `KernelState` ownership), the sole
+> Phase-7 partial**, which is why both the total (34 → **35**) and the partial count
+> (11 → **12**) were low by exactly one. All 35 stages were, and remain, individually
+> documented and classified; only the summary arithmetic was wrong. `204B` is classified
+> **partial foundation**: the eleven ranked domain locks and the `*_split_mut` / `*_split_read`
+> seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`, so the
+> container still serializes the kernel.
+
+
+The historical stages labelled 200A/200B/200C (terminal ownership, deadline token,
+reply-timeout transaction) are IPC timeout work belonging to canonical **199E**. They
+contribute nothing to canonical 200A–200C, which are the **capability** stages and have
+essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ONLY`.
+
+### Live cells earned
+
+| Programme | Cells | Canonical stage it serves |
+|-----------|-------|---------------------------|
+| First cohort (`DebugLog`, `FutexWake`, `FutexWait`, `Yield`) | 12 | pre-199C retirement groundwork |
+| Second cohort — plain / ordinary-cap `IpcSend` | 12 | 199C **delivery** only, not blocking-sender retirement |
+| Second cohort — shared-region direct | 3 | 200C (1 of 7 object classes) |
+| Reply-timeout matrix | **6** | 199E (one quarter of the stage) |
+| `ExitCurrentTask` NR 16 | **2 of 3** | 202D (one sub-path; RISC-V unearned) |
+| Direct IPC NR 6 / NR 7 (x86_64 SMP=2) | knob-gated | 199D mechanism, **not** the production path |
+| **Server death (`ServerDies`)** | **0** | 199D server-crash cleanup — blocked |
+
+### Immediate blockers
+
+1. **`IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`** — the only hard
+   failure in the tree. Blocks 199D server-crash cleanup and 202D reply-object cleanup.
+   **The smallest next production stage is the repair for this** (a 199D increment; see
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6).
+2. **`revalidate_idle_owner_after_drains` has never run in QEMU** (`src/runtime.rs:665`).
+3. **NR 6 / NR 7 off-lock direct IPC is default-OFF**, so 199D's landed transaction
+   delivers no production benefit.
+4. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
+   RISC-V cannot retire any queue-advancing class.
+5. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
+   wiring.
+6. **`FutexWait` off-lock seams landed helper-only** and were never wired.
+7. **Reply-timeout scan is off-lock on x86_64 only**; `IpcSend` and `IpcCall` timeouts are
+   untouched; the broad fallback `run_reply_timeout_completion` survives (199E).
+8. **RISC-V `ExitCurrentTask` live cell** — kernel chain proven correct, runner bound
+   corrected at `5488d8e`, re-run never executed (202D).
+9. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures** — keeps
+   every hosted claim single-threaded-only. Test-infrastructure debt; a prerequisite for
+   using the hosted suite as a 205C harness, not 205C completion work.
+10. **AArch64 re-acquires the broad lock on its split return path**
+    (`src/arch/trap_entry.rs:1432`) — 204B/204E must localize it. 205A reports the cell; it
+    is not where it gets retired.
+
+---
+
 ## 1. Per-architecture status
 
 ### 1.1 AArch64 (QEMU virt — primary)
@@ -35,9 +148,11 @@ exec-load policy, and capability-materialization rules.
 | Optional FS strict | ✅ RAMFS + ext4 live; FAT skipped |
 | AP Rust online (`yarm.x86_ap_rust=1`) | ✅ Stage 109 outcome A — AP enters Rust and parks |
 | Production scheduler | BSP only; `online_cpu_count()` stays at 1; AP `started_secondary` reported separately |
-| D6 switch proof | 🧪 default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`; Stage 128 maps/checks switch-stack pages; Stage 129 adds on-demand active-root repair; Stage 130 fixes TSS RSP0 mismatch after proof switch-back (trampoline now passes `ctx.outgoing_stack_top`) and adds post-`DONE` cleanup markers (`CLEANUP_BEGIN` → `STASH_CLEAR_OK` → `STATE_CLEAR_OK` → `CURRENT_OK` / `CR3_OK` / `TSS_OK` → `CLEANUP_DONE`); Stage 131 audits `ArchSwitchContext` layout / `switch_frames` ABI (all offsets correct), fixes post-proof crash caused by `fxrstor` from all-zero fxsave area setting MXCSR=0 (all SSE exceptions unmasked) — fix calls `initialize_frame_fpu_state` in `initialize_thread_kernel_switch_frame` on x86_64, adds audit markers (`AUDIT_BEGIN` → `LAYOUT_OK` → `R14_RESTORE_CHECK` → `AUDIT_DONE`), 22 new hosted-dev tests; Stage 132 corrects #XF theory → actual crash is `#PF` (vector 0xe, error 0x2) on unmapped kernel stack (only top page was mapped; trap handler descends ~9 KB deep), fixes by mapping all stack pages via `d6_ensure_full_proof_switch_stack_mapped` for both proof tasks before the switch, adds one-shot `D6_POST_CLEANUP_DIAG_PENDING` flag + `d6_emit_post_cleanup_first_trap_diag` capturing vector/error/CR2/RSP/TSS_RSP0/stack_class, adds `read_boot_tss_rsp0` accessor, 20 new hosted-dev tests; QEMU proof validation pending local run |
-| AP scheduler participation | ❌ deferred — blocked on the AP per-CPU environment (GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu`) |
-| Timer interrupts on APs | ❌ APs have no IDT; `cli` stays set; no AP scheduler ticks |
+| Off-lock authoritative dispatch (D6-genuine) | ✅ **production, no opt-out** — `d6_genuine_enabled()` is compile-time true on x86_64 unless a D6 switch diagnostic owns the switch path; the D2-send / D2-recv / FutexWait / Yield / D6 drains all run with the broad guard dropped |
+| D6 switch proof harness | 🧪 default-off diagnostic only (`yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`); mutually exclusive with the production D6-genuine path. Historical bring-up detail (Stages 120–132) is in `doc/PROJECT_HISTORY.md` |
+| AP scheduler participation | 🧪 **proof-gated live** — `X86_AP_GENERIC_RETURN_SEAL`, `X86_AP_SAVED_RETURN_SEAL`, `X86_AP_RECV_V2_BLOCK_SEAL` and the cross-CPU NR6/NR7 seals all earned live at SMP=2 under default-off knobs; the **production** scheduler is still BSP-only (`online_cpu_count()` == 1) |
+| Timer interrupts on APs | ❌ not enabled on the production path |
+| Restore-owner selection | ⚠️ resolved **in-lock** (identity-coherent) and revalidated after the drains by `revalidate_idle_owner_after_drains`; that revalidation is **hosted-proven only, never run in QEMU** |
 
 See `doc/ARCH_X86_64.md` for the safety fences, AP marker sequence, BT2
 LAPIC timer discipline, and the ordered next-target list before AP
@@ -201,7 +316,8 @@ scripts/phase5-boundary-gates.sh --ui-runtime-entrypoint
 | Process / spawn | `doc/PROCESS_AND_SPAWN.md` | ✅ Pass 4 (canonical) |
 | Phase gates (Phase 2/3/4 contracts, roadmap, kernel-status milestones) | `doc/PHASE_GATES.md` | ✅ Pass 4 (canonical) |
 | Service manifest | `doc/SERVICE_MANIFEST.md` | ✅ (existing canonical) |
-| Roadmap (current direction) | `doc/ROADMAP.md` | ✅ (existing canonical) |
+| Kernel-unlock audit (census / matrix / stage table / roadmap) | `doc/KERNEL_UNLOCK_AUDIT.md` | ✅ Pass 6 (canonical) |
+| Roadmap (current direction) | `doc/KERNEL_UNLOCKING.md` §0 | ✅ Pass 6 — the former `doc/ROADMAP.md` never existed in this tree; the kernel-unlock roadmap is canonical |
 | Agent rules (capability/spawn/zero-copy/smoke + source-licensing header §15 + server-runtime boundary §16) | `doc/AI_AGENT_RULES.md` | ✅ Pass 5 (canonical; absorbed `AGENTS.md` body 2026-06-16) |
 | libc / Linux / musl POSIX compatibility | `doc/LIBC_AND_LINUX_COMPAT.md` | ✅ Pass 5 (canonical; merged `LIBC_ABI_X86_64_NONE.md` + `LINUX_COMPAT.md` + `MUSL_POSIX_IPC_MAPPING.md` 2026-06-16) |
 | Global unlocking readiness audit | `doc/KERNEL_UNLOCKING.md` §7.1 | ✅ Pass 5 (single source of truth) |
@@ -225,42 +341,16 @@ The four highest-impact items, in order of unlock value:
    kernel-unlocking smoke policy and unblock RISC-V SMP scheduling so
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
-2. **Kernel-unlocking D2 + D6 genuine seam live-wire, then x86_64
-   AP per-CPU environment (D-NEXT-2).** Stage 114 live-wired D3's VmBrk
-   shrink path (Outcome A). Stages 115–116 addressed the D2/D6 blocker
-   iteratively: Stage 115 added the rank-3 IPC seam; Stage 116 removed the
-   `task_state_lock` (rank-2 sub-lock) from crossing `switch_frames` via
-   `DispatchSwitchPlan`. Stage 117 (Outcome B) adds the global-lock-drop stash
-   infrastructure (`PerCpuSwitchPlanStash`, `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`)
-   but cannot prove the unlocked path in smoke: no production task has
-   `kernel_context.initialized = true`, so `switch_frames` is never called.
-   Stage 118 (Outcome B) adds the second half: `BOOTSTRAP_FIRST_USER_TID` (tid=1)
-   now gets `initialized = true` on x86_64 (via `initialize_thread_kernel_switch_frame`
-   in `spawn_user_task_from_image`); the spin-loop trampoline is replaced with a
-   real first-resume handler that re-acquires the global lock and calls
-   `post_switch_restore_arch_thread_state`; `FIRST_RESUME_STASH` and
-   `FirstResumeContext` infrastructure is added; `DispatchSwitchPlan` gains
-   `outgoing_stack_top` and `incoming_frame_ptr` is widened to `*mut`. Stage 119
-   (Outcome B) extends initialization to tid=2 (supervisor) via new
-   `BOOTSTRAP_SUPERVISOR_TID = 2` constant, and fixes the TSS RSP0 bug in the
-   trampoline switch-back (was passing `ctx.outgoing_stack_top`, now passes `None`
-   to preserve B's kernel stack top set by the stash-drain). Both tid=1 and tid=2
-   now show `D6_KERNEL_SWITCH_FRAME_INIT_DONE` in x86_64 core smoke. Stage 120
-   adds a default-off x86_64/single-CPU/one-shot proof harness gated by
-   `yarm.d6_switch_proof=1` (script opt-in: `D6_SWITCH_PROOF=1`) to force the
-   tid=1 → tid=2 initialized pair through the existing unlocked `switch_frames`
-   path. Stage 121 audits and fixes the x86_64 first-resume ABI boundary: the
-   initialized switch frame now uses SysV callee stack shape (`rsp % 16 == 8`)
-   and a tiny x86_64 shim now stays raw-COM1-only before tail-jumping to the
-   Rust first-resume handler. Stage 122 added raw first-instruction breadcrumbs;
-   Stage 123 removes the pre-Rust marker bridge call and adds `!RM` at that boundary. Stage 124
-   removes the obsolete shim stack adjustment and adds `!RJ`. Stage 125 replaces
-   the direct Rust jump with an x86_64 ABI bridge that emits `!RB`, aligns for a
-   normal `call`, and calls `yarm_kernel_thread_switch_trampoline_rust_real`.
-   QEMU proof validation is pending the local user run. This is a proof harness, not
-   scheduler policy; AArch64/RISC-V remain unchanged/fallback-safe. See
-   `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage 118 / Stage 119 / Stage 120 /
-   Stage 121 / Stage 122 / Stage 123 / Stage 124 / Stage 125 / §7.1.5.
+2. **Kernel unlocking — canonical Stage 202D (ServerDies link accounting).**
+   The broad `SpinLock<KernelState>` still has **51** production acquisition sites
+   (§0). The single hard failure blocking forward progress is
+   `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail`: the nine-counter
+   ServerDies audit compares a system-wide `LinkCreated` count against one death's
+   `LinkDetached` count. Scope the counters to the audited death, keep the Stage 202A
+   fifteen hard-fail literals meaningful, and land it as a hosted-only stage (no QEMU,
+   no live cell, zero broad-lock reduction). That unblocks the three ServerDies live
+   cells and, transitively, the whole 204/205 retirement ladder. See
+   `doc/KERNEL_UNLOCKING.md` §0 and `doc/KERNEL_UNLOCK_AUDIT.md` §6.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating
@@ -284,7 +374,9 @@ The full invariant list lives in `doc/KERNEL_UNLOCKING.md` §3. Headlines:
 
 - SpawnV5 ABI (16-byte reply, argument layout) — frozen.
 - Image IDs 7–12 — frozen.
-- `SYSCALL_COUNT = 31`; `STARTUP_SLOT_COUNT = 18`.
+- `SYSCALL_COUNT = 32` (dispatch-table size); public ABI surface is `0..=16`
+  after `ExitCurrentTask` (NR 16) landed — see `doc/SYSCALL_ABI.md`.
+- `STARTUP_SLOT_COUNT = 18`.
 - `RecvSharedV3` ABI offsets — frozen.
 - Optional-FS smoke markers (`INIT_RAMFS_SPAWN_OK`, `RAMFS_MOUNT_READY`,
   `VFS_MOUNT_REGISTER_RAMFS_OK`, `INIT_EXT4_SPAWN_OK`, `EXT4_SRV_ENTRY`,

@@ -13,8 +13,13 @@ fragment files unless the canonical owner explicitly does not exist.
 
 | Topic | Canonical doc(s) |
 |-------|------------------|
-| Kernel unlocking (decomposition, milestones, status, audits) | **`doc/KERNEL_UNLOCKING.md`** |
-| Kernel locking architecture (lock-rank design, domains, invariants) | `doc/KERNEL_LOCKING.md` |
+| Kernel unlocking (canonical stages 199C–205D, roadmap, status) | **`doc/KERNEL_UNLOCKING.md`** §0 |
+| Kernel-unlock audit (broad-lock census, per-arch syscall/path matrix, stage evidence, blockers) | **`doc/KERNEL_UNLOCK_AUDIT.md`** |
+| Kernel locking architecture (lock-rank design, domains, invariants) + current broad-lock census | `doc/KERNEL_LOCKING.md` (§0 census) |
+| IPC reply caps, shared regions, direct IPC, reply timeout, server death | `doc/IPC.md` §8 |
+| Accepted global-lock retirement seals | `doc/PROJECT_HISTORY.md` |
+| Supervisor runtime state / audit / PM-restart contracts | `doc/supervisor-runtime-state.md`, `doc/supervisor-audit.md`, `doc/supervisor-pm-restart-contract.md`, `doc/process-manager-restart-contract.md` |
+| Driver layering / driver-manager PM spawn contract | `doc/driver-layering-audit.md`, `doc/driver-manager-pm-spawn-contract.md` |
 | Boot (boot flow, command line, memory layout, QEMU runbook) | **`doc/BOOT.md`** |
 | Architecture — AArch64 | **`doc/ARCH_AARCH64.md`** |
 | Architecture — x86_64 | **`doc/ARCH_X86_64.md`** |
@@ -29,7 +34,7 @@ fragment files unless the canonical owner explicitly does not exist.
 | Phase gates (Phase 2/3/4 contracts, server roadmap, kernel-status milestones, phase readiness matrix) | **`doc/PHASE_GATES.md`** |
 | Service manifest format | `doc/SERVICE_MANIFEST.md` |
 | Project history (closed phases / milestones / checklists) | **`doc/PROJECT_HISTORY.md`** |
-| Roadmap (current direction) | `doc/ROADMAP.md` |
+| Roadmap (current direction) | `doc/KERNEL_UNLOCKING.md` §0 |
 | Project status / maturity | **`doc/STATUS.md`** |
 | Agent rules (capability/spawn/zero-copy/smoke policy + source-licensing header + server-runtime boundary) | **`doc/AI_AGENT_RULES.md`** |
 | Agent-facing entry point (short pointer for tools that look for `AGENTS.md` by convention) | `doc/AGENTS.md` (points at `doc/AI_AGENT_RULES.md`) |
@@ -62,7 +67,79 @@ be deleted before merge), it must:
    **not** in `doc/`.
 2. Carry an explicit "delete-by" stage and PR number at the top.
 
+## Consolidation Pass 6 (kernel-unlock audit + de-fragmentation)
+
+Pass 6 deleted **39** per-stage report files (`doc/STAGE_*.md`) after migrating every
+unique contract, accepted seal, known defect, commit evidence and unresolved item into a
+retained canonical document. Git history holds the full narrative; the active
+documentation describes the current system and the roadmap.
+
+### Deleted-fragment inventory and destination mapping
+
+| Deleted fragment | Unique content preserved in |
+|------------------|------------------------------|
+| `STAGE_198B1_REPORT.md` | `doc/IPC.md` §8.6 (ordinary-cap copy/delegation semantics; retirement-seal isolation model); `doc/PROJECT_HISTORY.md` (build-integrity seal) |
+| `STAGE_198C_REPLY_CAP_AUDIT.md` | `doc/IPC.md` §8.1 (reply-cap semantics, one-shot, aliases); `doc/PROJECT_HISTORY.md` (reply-cap direct negative seal) |
+| `STAGE_198D1_QUEUED_REPLY_CAP_AUDIT.md` | `doc/IPC.md` §8.1 (queued envelope redesign; queued reply-cap enqueue unsupported) |
+| `STAGE_198E1_SHARED_REGION_AUDIT.md` | `doc/IPC.md` §8.2; `doc/PROJECT_HISTORY.md` (hosted audit seal) |
+| `STAGE_198E2A_SHARED_REGION_DIRECT.md` | `doc/IPC.md` §8.2 (transaction states, rollback order); `doc/PROJECT_HISTORY.md` |
+| `STAGE_198E2A1_SHARED_REGION_TXN_RACE.md` | `doc/IPC.md` §8.2 (protocol A executor-owned cleanup, generation-bearing teardown); `doc/PROJECT_HISTORY.md` |
+| `STAGE_198E2B_SHARED_REGION_ENQUEUE.md` | `doc/IPC.md` §8.2 (enqueue class hosted-only, zero live cells); `doc/PROJECT_HISTORY.md` |
+| `STAGE_198E3_SHARED_REGION_LIVE.md` | `doc/IPC.md` §8.2; `doc/PROJECT_HISTORY.md` |
+| `STAGE_198E3C1_SHARED_REGION_USERSPACE_CONTRACT.md` | `doc/IPC.md` §8.2 — **verbatim**: large-transfer `IpcSend` ABI table, `ENCODED_LEN` = 16 bytes, `Message::MAX_PAYLOAD` = 128 selector. `include_str!` pin repointed to `doc/IPC.md` |
+| `STAGE_199A1_IPCCALL_DIRECT_AUDIT.md` | `doc/IPC.md` §8.3. `include_str!` pin repointed to `doc/IPC.md` |
+| `STAGE_199A2A_OFFLOCK_INCARNATION.md` | `doc/IPC.md` §8.3 — **verbatim**: achieved incarnation seal and the `result=deferred` off-lock seal with its full reason. `include_str!` pin repointed to `doc/IPC.md` |
+| `STAGE_199A2B1_OFFLOCK_FOUNDATIONS.md`, `STAGE_199A2B2_REQUEST_SUBSTRATE.md`, `STAGE_199A2B2C_OFFLOCK_SEAMS.md` | `doc/IPC.md` §8.3 (reserve → commit → cancel transaction shape); `doc/KERNEL_UNLOCKING.md` §0 (canonical 199C) |
+| `STAGE_199A2D1_DIRECT_IPC_RACE_MODEL.md` | `doc/IPC.md` §8.3 (race outcomes) and §8.6 (reply-delivery ordering, single-slot ack boundary, overwrite fuse, multi-pair prerequisite) |
+| `STAGE_199A2D2A_SMP_REQUEST.md`, `…2B_AP_DISPATCH.md`, `…2C1_AP_GENERIC_RETURN.md`, `…2C2A_AP_SAVED_RETURN.md`, `…2C2B_CROSS_CPU_NR6.md`, `…2C2B1_RECV_V2_SERVER_BLOCK.md`, `…2C2B2_CROSS_CPU_REQUEST.md`, `…2C2B3_AP_USER_CONSUME.md`, `…2C2C_CROSS_CPU_REPLY.md`, `…2C2_RECV_V2_CONTINUATION.md` | `doc/PROJECT_HISTORY.md` (earned AP / cross-CPU seals, and the superseded `result=blocked` refusals); `doc/ARCH_X86_64.md` §6.1 (live-proof status) |
+| `STAGE_199A2D3_X86_DIRECT_IPC_FREEZE.md` | `doc/PROJECT_HISTORY.md` (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` verbatim); `doc/ARCH_X86_64.md` §6.1 |
+| `STAGE_200A_REPLY_TERMINAL_OWNERSHIP.md` | `doc/IPC.md` §8.4 (terminal ownership); `doc/PROJECT_HISTORY.md` |
+| `STAGE_200B_DEADLINE_TOKEN.md` | `doc/IPC.md` §8.4 (deadline tokens, arm/fire/cancel, reuse safety); `doc/PROJECT_HISTORY.md` |
+| `STAGE_200C1_REPLY_TIMEOUT_TRANSACTION.md` | `doc/IPC.md` §8.4 (completion transaction) |
+| `STAGE_200C2A_REPLY_TIMEOUT_X86_LIVE.md`, `STAGE_200C2B_REPLY_TIMEOUT_X86_RETIREMENT.md` | `doc/IPC.md` §8.4; `doc/PROJECT_HISTORY.md` (`scan_broad_lock=0`, class retirement) |
+| `STAGE_200D2B1B_SERVER_DEATH_LIVENESS_FOUNDATION.md` | `doc/IPC.md` §8.5 (nine transitions, fifteen literals, 24 races, nine guards); `doc/PROJECT_HISTORY.md` (`live_cells=0` by design) |
+| `STAGE_200D2B1C_ARCH_RETURN_LIVE_READINESS.md` | `doc/ARCH_AARCH64.md` §6.1 and `doc/ARCH_RISCV64.md` §11.1 (post-drain disposition consumption); `doc/PROJECT_HISTORY.md` (readiness seal) |
+| `STAGE_200D2B1D_X86_SERVER_DIES_LIVE_ATTEMPT.md`, `…D2_…`, `…D4_…` | `doc/IPC.md` §8.5 (both live defects, including `LINK_LEAK` in full); `doc/STATUS.md` §0 |
+| `STAGE_200D2B1D5_DISPATCH_INVARIANT_DIAGNOSIS.md` | `doc/ARCH_X86_64.md` §6.1 (the violated invariant and why it is x86_64-specific) |
+| `STAGE_200D2B1D5A_X86_POST_DRAIN_OWNER_REVALIDATION.md`, `STAGE_200D2B1D5B_OWNER_REVALIDATION_RESTORE_CONTRACT.md` | `doc/ARCH_X86_64.md` §6.1 (`OwnerRevalidation` / `OwnerCommit`, rollback, `TaskMissing` silent-success hole, unreachable `FailClosed` backstop) |
+
+### Retained despite matching a fragment shape
+
+| Retained | Reason |
+|----------|--------|
+| `doc/FIRST_COHORT_RETIREMENT_SEAL.md`, `doc/SECOND_COHORT_RETIREMENT_SEAL.md`, `doc/SECOND_COHORT_PLAIN_SEAL.md`, `doc/SECOND_COHORT_ORDINARY_CAP_SEAL.md` | **Accepted seals**, not stage narratives. Each carries an authoritative 3×N implementation matrix and is pinned by many `include_str!` assertions in the hosted corpus. |
+| `doc/supervisor-*.md`, `doc/process-manager-restart-contract.md`, `doc/driver-*.md`, `doc/pm-restart-live-*.md` | **Deferred deletion.** These are pinned by `include_str!` from *production crate sources* (`crates/yarm-control-plane-servers/src/control_plane/mod.rs`, `crates/yarm-driver-servers/src/lib.rs`). Retiring them requires editing production files, which the Pass 6 change explicitly did not do. Their unique content has **not** yet been proven redundant, so they must not be deleted on name alone. |
+
+### Broken references found in Pass 6 — all repaired
+
+All three pre-dated Pass 6 and are now fixed; none remain.
+
+| Missing file | Referenced by | Repair |
+|--------------|---------------|--------|
+| `doc/ABI_CONTRACT_FREEZE.md` | `scripts/check-contract-doc-enforcement.sh` (grepped it, so the gate could **not** pass), plus prose in several docs | Deleted in `3c86f362` with no migration. Its content is recovered, **re-verified against the tree**, and folded into `doc/SYSCALL_ABI.md` → "Mechanism-layer contract freeze". The gate now reads that section. Four of the five frozen contracts had moved file since the doc was written and are corrected; the fifth (`LinuxCompatSyscall::DISPATCH_TABLE` in `src/linux_compat/mod.rs`) no longer exists anywhere in the tree, so that freeze is documented as **retired** rather than restated. |
+| `doc/IPC_RECV_V2_ORACLE.md` | comment in `scripts/qemu-ipc-recv-v2-oracle-smoke.sh` | Never existed in any commit. The comment now names the real canonical owners (`doc/IPC.md`, `doc/KERNEL_TEST_RULES.md` Rule L1) and states plainly that the fault/contention workload has not been written. |
+| `doc/ROADMAP.md` | ownership rows in `DOCUMENTATION_MAP.md` and `STATUS.md` | Never existed in any commit. Both rows now point at `doc/KERNEL_UNLOCKING.md` §0, the actual roadmap. |
+
+Filenames appearing in the historical Pass 1–5 logs below are records of *already deleted*
+documents, not live links.
+
 ## Validation
+
+**Two guards enforce the rules in this file.**
+
+`tests/broad_lock_census_guard.rs` (6 tests) recomputes the Stage 204A broad-lock census
+from source and fails if a production `SharedKernel::with` / `with_cpu` callsite is added
+or removed without re-classifying it in `doc/KERNEL_UNLOCK_AUDIT.md` §1,
+`doc/KERNEL_LOCKING.md` §0.2 and `doc/STATUS.md` §0. Stage 204A is the one canonical stage
+recorded COMPLETE, and a census is only complete while it matches the tree.
+
+**`tests/doc_fragmentation_guard.rs` enforces this file's rules.** It fails the build when
+a new `doc/STAGE_*.md` (or other per-stage / duplicate-status / readiness / checklist /
+PR-plan shape) appears without explicit approval. Approval requires **both** an entry in
+`APPROVED_FRAGMENTS` in that test **and** a row in this file — so a new fragment cannot
+merge by accident, and cannot merge without recording who owns the topic. The guard also
+asserts the canonical owner docs exist and that `doc/KERNEL_UNLOCK_AUDIT.md` states the
+exact commit and tree it was taken against.
 
 The canonical-owner expectations above are pinned by source-grep tests:
 

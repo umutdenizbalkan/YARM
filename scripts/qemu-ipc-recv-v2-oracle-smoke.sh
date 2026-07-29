@@ -211,7 +211,10 @@ REQUIRED_ANY=(
 # and is correctly absent on a healthy boot; IPC_RECV_V2_SENDER_WAKE_ORDER_OK is
 # contention-dependent. Both stay recorded-only here and are covered by the
 # hosted seam tests; deterministic QEMU triggering is left to a fault/contention
-# workload (see doc/IPC_RECV_V2_ORACLE.md).
+# workload that has not been written yet. Canonical owners: doc/IPC.md for the
+# recv-v2 / reply-cap contract, doc/KERNEL_TEST_RULES.md Rule L1 for what such a
+# workload must prove before it may claim a live cell. (This previously named
+# doc/IPC_RECV_V2_ORACLE.md, which has never existed in this tree.)
 EXTENDED_REQUIRED=(
   "IPC_REPLY_CAP_ONESHOT_OK"
   "IPC_TRANSFER_CAP_MATERIALIZE_OK"

@@ -197,10 +197,109 @@ setups that consume a few mapping slots before the exhaustion loop.
 
 ---
 
+## Rule H1 — Hosted runs must be single-threaded
+
+`cargo test --lib` **no longer aborts** under the default parallel harness. Three
+cross-test aliasing bugs that caused `double free or corruption` / `free(): invalid
+pointer` / SIGSEGV were fixed (transplanted from `889026f3`); all three had the same shape,
+one test publishing something into PROCESS-global state that a later, unrelated test then
+dereferenced:
+
+1. **The owned `KernelState` construction path.** `Bootstrap::init` built every owned state
+   through the single process-global `static mut BOOTSTRAP_KERNEL_STATE` scratch buffer and
+   bitwise-copied it out, so two concurrent constructions produced two owners of one
+   allocation. The owned path now builds into caller-supplied storage via `init_state_into`.
+2. **The process-global LAPIC MMIO base.** Tests published a pointer to their own stack
+   buffer and never restored it, so every later acknowledged IRQ or timer tick wrote into a
+   dead frame. `LapicTestConfig` now serializes those tests, hands out a process-static
+   simulated MMIO page, and restores the previous configuration on drop including on panic.
+3. **The boot IRQ-description staging slot.** A parser test left `LAPIC_BASE=0xfee04000`
+   staged; the next `run_kernel_boot` anywhere in the process consumed it and stored to that
+   unmapped absolute address. That case now drains the slot and asserts it empty on exit.
+
+Guarded by `kernel::boot::tests::parallel_state_isolation` (3 tests).
+
+**Single-threaded is still required, for a different reason.** A parallel run now completes
+but produces **58–71 logical assertion failures**, varying per run. The kernel test corpus
+shares process-global mutable state — per-CPU statics, one-shot latches, proof knobs,
+`server_dies_counters`, reply-timeout stores, deferred-death slots, shared-region
+transaction tables, ack slots — so concurrent tests observe each other's machine.
+
+**Canonical hosted invocations:**
+
+```
+cargo test --lib   -- --test-threads=1     # 3729 passed, 0 failed
+cargo test --tests -- --test-threads=1     # 3729 lib + 146 integration, 0 failed
+```
+
+Consequences that must be respected:
+
+* Any claim of the form "hosted-proven" means *single-threaded* hosted-proven. Say so.
+* The CI step `cargo test -q` in `.github/workflows/compat-gates.yml` inherits the default
+  parallel harness. It no longer crashes, but it will report logical failures until the
+  shared-state contention is removed. Pin it to `--test-threads=1` or fix the contention.
+* This contention is **test-infrastructure debt, not canonical Stage 205C work.** 205C is a
+  long-running torture of the *running kernel*; what fails here is the hosted corpus sharing
+  process-global fixtures with itself. Removing it is a prerequisite for using the hosted
+  suite as a 205C harness and may precede or support that stage, but it proves nothing about
+  the kernel and closes no part of the stage.
+* A test that latches a one-shot static must reset it, or be written so a second
+  observation is harmless — otherwise it passes alone and fails in a full run.
+* A test that publishes a pointer into process-global state must restore the previous value
+  on drop, including on panic, and must publish storage that outlives every possible later
+  reader. `LapicTestConfig` is the reference pattern.
+
+## Rule H2 — Hosted-dev disables the off-lock user copy
+
+`copy_from_user_asid_split_read` is `#[cfg(not(feature = "hosted-dev"))]`-only, and the
+hosted stubs of `try_split_debug_log_into_frame` / `try_split_futex_wake_into_frame`
+return `None`. **No off-lock user-memory copy can be exercised, let alone proven, in a
+hosted test.** Every hosted execution of NR 6 / NR 7 receives `&mut KernelState` and is
+by construction under the broad lock. Do not write a hosted test that claims to prove a
+payload copy happened off the broad lock; it cannot.
+
+## Rule L1 — A live cell requires a clean boot, not a marker
+
+A **live cell** is claimed only from a genuine clean QEMU boot in which the full ordered
+marker sequence appears. Rules that the existing runners already enforce and that new
+runners must keep:
+
+* A `result=blocked` / `result=fail` diagnostic must **never** be able to satisfy a
+  success gate. Success is gated behind the complete ordered sequence, not behind the
+  absence of failure.
+* Cross-CPU claims require markers carrying **distinct** CPU IDs. A same-CPU sequence
+  must never be presented as cross-CPU.
+* Exact-commit runners must refuse a dirty tree, capture SHA **and** tracked tree hash,
+  re-check both after every child, register every child log once, and fail on log reuse.
+* **One-boot proof:** a per-boot nonce (`YARM_BOOT_INSTANCE`, read from the
+  architecture's free-running counter) must appear exactly once and be **distinct** —
+  that is what separates one boot from two that produced identical-looking lines.
+* A feature-off image must be validated marker-clean.
+* If the seal is not genuinely earned, report the exact remaining blocker. **Do not emit
+  a green seal for something not achieved.** Stage 199A2A's `result=deferred` seal and
+  Stage 191D's `GLOBAL_LOCK_RETIRE_CLASS_DEFERRED class=FutexWait` are the reference
+  precedents for this discipline.
+
+## Rule L2 — Live-oracle loop bounds are architecture-specific
+
+A loop bound copied across architectures will time the boot out. RISC-V `Yield` runs the
+full Stage 196G post-lock retirement drain and emits ~13 serial console lines per call,
+so a 4096-iteration survivor loop is ~54k lines — it exceeded the 180 s boot timeout at
+`fb5f040` even though the kernel chain was complete and correct. The RISC-V bound was
+reduced to 64 (`5488d8e`), matching the earlier reduction Stage 200C2C2C-R2B applied to
+the reply-timeout oracle's spin. x86_64 and AArch64 bounds are unaffected. **Classify
+this failure mode as a runner/oracle defect, not a kernel defect.**
+
+---
+
 ## Summary Table
 
 | Rule | Key point |
 |------|-----------|
+| H1. Single-threaded hosted | `cargo test` **must** use `--test-threads=1`. The parallel memory corruption is fixed; 58–71 logical shared-state failures remain — test-infrastructure debt, not Stage 205C |
+| H2. No hosted off-lock copy | `hosted-dev` disables the split user-copy; off-lock payload claims are unprovable hosted |
+| L1. Live cells | clean boot + full ordered sequence + distinct boot nonce; never a green seal for unachieved work |
+| L2. Arch-specific bounds | live-oracle loop bounds must be sized per architecture |
 | 1. Cspace-at-mint | Mint caps **before** `dispatch_next_task` |
 | 2. Idle re-enqueue | After every `dispatch_next_task`, call `idle_re_enqueue_for_test()` |
 | 3. HashMap init | Write user memory **before** any syscall reads it; write per-ASID |

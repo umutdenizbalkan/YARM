@@ -4,14 +4,14 @@
 set -euo pipefail
 
 # Contract-doc enforcement gate:
-# - doc/ABI_CONTRACT_FREEZE.md
-# - doc/SYSCALL_ABI.md
+# - doc/SYSCALL_ABI.md (after Pass 6 — absorbed the mechanism-layer contract freeze,
+#   formerly doc/ABI_CONTRACT_FREEZE.md, which was deleted in 3c86f362 without
+#   updating this gate; the gate could not pass while it grepped a missing file)
 # - doc/VFS.md (after Pass 4 — consolidated from PROC_VFS_CODEC_FREEZE.md)
 #
 # Verifies required freeze markers and runs targeted frozen-contract tests.
 
 required_docs=(
-  "doc/ABI_CONTRACT_FREEZE.md"
   "doc/SYSCALL_ABI.md"
   "doc/VFS.md"
 )
@@ -23,8 +23,15 @@ for doc in "${required_docs[@]}"; do
   fi
 done
 
-rg -q "src/arch/trap.rs" doc/ABI_CONTRACT_FREEZE.md
-rg -q "LinuxCompatSyscall::DISPATCH_TABLE" doc/ABI_CONTRACT_FREEZE.md
+# Mechanism-layer freeze markers (doc/SYSCALL_ABI.md "Mechanism-layer contract freeze").
+rg -q "src/arch/trap.rs" doc/SYSCALL_ABI.md
+rg -q "src/kernel/trapframe.rs" doc/SYSCALL_ABI.md
+rg -q "src/kernel/scheduler_timer.rs" doc/SYSCALL_ABI.md
+rg -q "Mechanism-layer contract freeze" doc/SYSCALL_ABI.md
+# The Linux-compat dispatch-table freeze is RETIRED: `LinuxCompatSyscall::DISPATCH_TABLE`
+# and `src/linux_compat/mod.rs` no longer exist in the tree. Assert the retirement is
+# documented rather than re-asserting a symbol that is gone.
+rg -q "Retired freeze — Linux-compat syscall dispatch table" doc/SYSCALL_ABI.md
 rg -q 'ABI Version: `10`' doc/SYSCALL_ABI.md
 rg -q "TransferRelease" doc/SYSCALL_ABI.md
 rg -q "PROC_CODEC_V2_VERSION = 2" doc/VFS.md

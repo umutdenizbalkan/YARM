@@ -429,14 +429,40 @@ impl Bootstrap {
     ) -> Result<alloc::boxed::Box<KernelState>, KernelError> {
         let (boot_map, boot_map_len) = Self::default_boot_memory_map();
         let reserved = Self::default_reserved_ranges();
-        let state = Self::init_static_with_boot_memory_map(
+        Self::init_boxed_with_boot_memory_map(
             capacity_profile,
             &boot_map[..boot_map_len],
             &reserved,
-        )?;
+        )
+    }
+
+    /// Construct an OWNED `KernelState` directly into freshly allocated storage.
+    ///
+    /// This deliberately does NOT route through `BOOTSTRAP_KERNEL_STATE`. That static is a
+    /// single process-global buffer, so building an owned state through it made every
+    /// caller share one scratch area: two concurrent constructions would overwrite each
+    /// other's heap-owning fields without dropping them, and each would then copy out a
+    /// bitwise duplicate of the same `Box`/`Vec`/`BTreeMap` pointers — two owners of one
+    /// allocation, and a double free when both were dropped. The owned path has no reason
+    /// to touch the boot singleton, so it no longer does.
+    #[inline(never)]
+    pub fn init_boxed_with_boot_memory_map(
+        capacity_profile: KernelCapacityProfile,
+        boot_regions: &[MemoryRegion],
+        reserved_ranges: &[(u64, u64)],
+    ) -> Result<alloc::boxed::Box<KernelState>, KernelError> {
         let mut boxed = alloc::boxed::Box::new(core::mem::MaybeUninit::<KernelState>::uninit());
+        // SAFETY: `boxed` is uniquely owned, correctly aligned storage for one
+        // `KernelState`. `init_state_into` either fully initializes it (returning `Ok`) or
+        // leaves it uninitialized (returning `Err`), so `assume_init` runs only on the
+        // success path.
         unsafe {
-            core::ptr::copy_nonoverlapping(state as *mut KernelState, boxed.as_mut_ptr(), 1);
+            Self::init_state_into(
+                boxed.as_mut_ptr(),
+                capacity_profile,
+                boot_regions,
+                reserved_ranges,
+            )?;
             Ok(boxed.assume_init())
         }
     }
@@ -447,6 +473,32 @@ impl Bootstrap {
         boot_regions: &[MemoryRegion],
         reserved_ranges: &[(u64, u64)],
     ) -> Result<&'static mut KernelState, KernelError> {
+        // SAFETY: `BOOTSTRAP_KERNEL_STATE` is the boot singleton's storage — correctly
+        // aligned and large enough for one `KernelState`. On `Ok` it is fully initialized,
+        // so handing out a `&'static mut` to it is sound; on `Err` it is left
+        // uninitialized and no reference is produced.
+        unsafe {
+            let state_ptr = core::ptr::addr_of_mut!(BOOTSTRAP_KERNEL_STATE).cast::<KernelState>();
+            Self::init_state_into(state_ptr, capacity_profile, boot_regions, reserved_ranges)?;
+            Ok(&mut *state_ptr)
+        }
+    }
+
+    /// Initialize one `KernelState` into caller-supplied storage.
+    ///
+    /// # Safety
+    /// `state_ptr` must point to writable, correctly aligned, uninitialized storage for one
+    /// `KernelState`, uniquely owned by the caller for the duration of the call. On `Ok`
+    /// the storage is fully initialized; on `Err` it is left uninitialized (any fields
+    /// written before the failure are dropped in place first), so the caller must not
+    /// `assume_init` after an error.
+    #[inline(never)]
+    unsafe fn init_state_into(
+        state_ptr: *mut KernelState,
+        capacity_profile: KernelCapacityProfile,
+        boot_regions: &[MemoryRegion],
+        reserved_ranges: &[(u64, u64)],
+    ) -> Result<(), KernelError> {
         crate::arch::boot_entry::bootstrap_step("enter");
         // Register all reserved ranges in the global frame allocator guard and emit
         // PMEM_RESERVE_* diagnostics so boot logs show the full reserved map.
@@ -551,7 +603,6 @@ impl Bootstrap {
 
         crate::arch::boot_entry::bootstrap_step("kernel_state_write");
         unsafe {
-            let state_ptr = core::ptr::addr_of_mut!(BOOTSTRAP_KERNEL_STATE).cast::<KernelState>();
             core::ptr::addr_of_mut!((*state_ptr).kernel_aspace).write(kernel_aspace);
             core::ptr::addr_of_mut!((*state_ptr).hal)
                 .write(crate::arch::hal::SelectedIsaHal::default());
@@ -684,12 +735,21 @@ impl Bootstrap {
                     .next_dynamic_tid(state.tid_allocation_policy)
             );
 
+            // Every field is written by this point, so a failure from here on has a fully
+            // constructed state to clean up: drop it in place and report the storage as
+            // uninitialized, rather than leaking the heap-owning fields.
             crate::arch::boot_entry::bootstrap_step("register_task_0");
-            state.register_task(0)?;
+            if let Err(err) = state.register_task(0) {
+                core::ptr::drop_in_place(state_ptr);
+                return Err(err);
+            }
             crate::arch::boot_entry::bootstrap_step("dispatch_next_task");
-            state.dispatch_next_task()?;
+            if let Err(err) = state.dispatch_next_task() {
+                core::ptr::drop_in_place(state_ptr);
+                return Err(err);
+            }
             crate::arch::boot_entry::bootstrap_step("done");
-            Ok(state)
+            Ok(())
         }
     }
 

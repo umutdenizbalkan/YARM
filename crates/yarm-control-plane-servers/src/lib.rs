@@ -27,6 +27,13 @@ pub fn run_vfs_server() {
     control_plane::vfs::run();
 }
 
+/// Crash-test service body (SUP-L5B). Never returns: it faults deterministically so the
+/// supervisor's crash-restart path can be exercised.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn run_crash_test_srv() -> ! {
+    control_plane::crash_test::run()
+}
+
 #[cfg(any(not(test), feature = "legacy-tests"))]
 pub fn run_supervisor_server() {
     control_plane::supervisor::run();

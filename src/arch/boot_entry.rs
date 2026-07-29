@@ -145,6 +145,14 @@ pub fn stage_irq_controller_description_for_boot(description: &[u8]) -> bool {
     true
 }
 
+/// `true` while an IRQ description is staged for the next boot. Tests use this to assert
+/// that no case leaves one behind: the next `run_kernel_boot` in the process consumes it
+/// and writes to the MMIO base it names.
+#[cfg(test)]
+pub fn has_staged_irq_description_for_test() -> bool {
+    IRQ_DESCRIPTION_LEN.load(Ordering::Acquire) != 0
+}
+
 pub fn stage_irq_controller_description_from_firmware_blob(blob: &[u8]) -> bool {
     let mut canonical = [0u8; MAX_IRQ_DESCRIPTION_BYTES];
     let Some(canonical_len) =
@@ -340,6 +348,27 @@ pub fn run_kernel_boot(run: fn()) {
     run_kernel_boot_with_irq_description(run, None);
 }
 
+/// Enter the kernel run loop from the freestanding entry point, after
+/// [`prepare_arch_boot`] has returned.
+///
+/// This owns the one architecture-dependent decision the boot **binary** used to make for
+/// itself: on x86_64 the IRQ-controller description has already been consumed by
+/// `prepare_arch_boot`, so the entry point calls `run` directly; every other architecture
+/// still needs the [`run_kernel_boot`] staging pass first. That `cfg` belongs in the arch
+/// layer, not in `src/bin/kernel_boot.rs` — the bin must route ISA details through
+/// `src/arch/*`, which `scripts/check-kernel-arch-boundary.sh` enforces by rejecting any
+/// `target_arch` predicate in the bin.
+///
+/// Behaviour is byte-identical to the two-arm `cfg` this replaces; only the location of the
+/// predicate changed.
+#[inline]
+pub fn enter_kernel_run_loop(run: fn()) {
+    #[cfg(target_arch = "x86_64")]
+    run();
+    #[cfg(not(target_arch = "x86_64"))]
+    run_kernel_boot(run);
+}
+
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
@@ -352,80 +381,98 @@ mod tests {
         crate::std::format!("lapic_mmio_base=0x{base:x}")
     }
 
+    // These cases publish a LAPIC base into a PROCESS-global that every later test writes
+    // through on every timer tick. They must therefore name the process-static simulated
+    // page (`LapicTestConfig::base`) rather than a buffer of their own, and the guard
+    // restores the previous configuration when the case ends — see the ownership rules on
+    // `LapicTestConfig`. Publishing a local buffer here left the global pointing into a
+    // returned stack frame, and unrelated tests then corrupted whatever reused it.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn boot_entry_accepts_explicit_irq_description() {
-        let mut regs = [0u32; 512];
-        let desc = crate::std::format!(
-            "{},ignored=1",
-            lapic_description_for_test(regs.as_mut_ptr() as usize)
-        );
-        crate::arch::x86_64::irq::reset_lapic_config_for_test();
+        let lapic = crate::arch::x86_64::irq::LapicTestConfig::acquire();
+        let desc = crate::std::format!("{},ignored=1", lapic_description_for_test(lapic.base()));
         run_kernel_boot_with_irq_description(|| {}, Some(desc.as_bytes()));
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
-            regs.as_mut_ptr() as usize
+            lapic.base()
         );
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn staged_description_is_consumed_once() {
-        let mut regs = [0u32; 512];
-        let desc = lapic_description_for_test(regs.as_mut_ptr() as usize);
-        crate::arch::x86_64::irq::reset_lapic_config_for_test();
+        let lapic = crate::arch::x86_64::irq::LapicTestConfig::acquire();
+        let desc = lapic_description_for_test(lapic.base());
         assert!(stage_irq_controller_description_for_boot(desc.as_bytes()));
         run_kernel_boot(|| {});
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
-            regs.as_mut_ptr() as usize
+            lapic.base()
         );
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn firmware_blob_staging_validates_required_fields() {
+        // This case only exercises the PARSER, but staging writes into a process-global
+        // slot that the next `run_kernel_boot` anywhere in the process consumes — and
+        // consuming it makes the kernel write four bytes to the address it names. A real
+        // LAPIC address like 0xfee04000 is not mapped in a hosted test process, so leaving
+        // one staged made an unrelated test segfault. Hold the LAPIC guard (serializing
+        // against the boot cases) and drain the slot before returning.
+        let _lapic = crate::arch::x86_64::irq::LapicTestConfig::acquire();
+        let mut scratch = [0u8; MAX_IRQ_DESCRIPTION_BYTES];
+
         assert!(!stage_irq_controller_description_from_firmware_blob(
             b"cpu@0 enabled=1"
         ));
+        assert!(take_staged_irq_description(&mut scratch).is_none());
+
         assert!(stage_irq_controller_description_from_firmware_blob(
             b"lapic_mmio_base=0xfee03000"
         ));
+        assert!(take_staged_irq_description(&mut scratch).is_some());
+
         assert!(stage_irq_controller_description_from_firmware_blob(
             b"LAPIC_BASE=0xfee04000"
         ));
+        assert!(take_staged_irq_description(&mut scratch).is_some());
+
+        assert!(
+            take_staged_irq_description(&mut scratch).is_none(),
+            "the staging slot must be empty when this case returns"
+        );
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn boot_entry_accepts_firmware_blob_path() {
-        let mut regs = [0u32; 512];
-        let blob = crate::std::format!("LAPIC_BASE=0x{:x}", regs.as_mut_ptr() as usize);
-        crate::arch::x86_64::irq::reset_lapic_config_for_test();
+        let lapic = crate::arch::x86_64::irq::LapicTestConfig::acquire();
+        let blob = crate::std::format!("LAPIC_BASE=0x{:x}", lapic.base());
         run_kernel_boot_with_firmware_blob(|| {}, Some(blob.as_bytes()));
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
-            regs.as_mut_ptr() as usize
+            lapic.base()
         );
     }
 
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn boot_entry_uses_registered_firmware_blob_provider() {
-        static mut TEST_LAPIC_REGS: [u32; 512] = [0; 512];
+        let lapic = crate::arch::x86_64::irq::LapicTestConfig::acquire();
 
         fn provider(buf: &mut [u8]) -> usize {
-            let base = core::ptr::addr_of_mut!(TEST_LAPIC_REGS) as usize;
+            let base = crate::arch::x86_64::irq::test_lapic_page_base();
             let blob = crate::std::format!("LAPIC_BASE=0x{base:x}");
             buf[..blob.len()].copy_from_slice(blob.as_bytes());
             blob.len()
         }
-        crate::arch::x86_64::irq::reset_lapic_config_for_test();
         set_firmware_blob_provider_for_boot(provider);
         run_kernel_boot(|| {});
         assert_eq!(
             crate::arch::x86_64::irq::lapic_mmio_base_for_test(),
-            core::ptr::addr_of_mut!(TEST_LAPIC_REGS) as usize
+            lapic.base()
         );
     }
 

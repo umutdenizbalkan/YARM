@@ -288,10 +288,64 @@ chronology:
 
 ---
 
+## Accepted seals — global-lock retirement programme
+
+Migrated from the per-stage report files during Consolidation Pass 6, which deleted
+them. These are the **accepted** seals: each was earned from a genuine clean QEMU boot
+(or, where marked *hosted*, from the hosted corpus) and is preserved here as the
+permanent record. Current live state is `doc/STATUS.md` §0; the roadmap is
+`doc/KERNEL_UNLOCKING.md` §0; the full evidence base is `doc/KERNEL_UNLOCK_AUDIT.md`.
+
+| Programme | Seal | Cells |
+|-----------|------|-------|
+| First cohort — `DebugLog`, `FutexWake`, `FutexWait`, `Yield` | `FIRST_COHORT_LIVE_MATRIX arches=3 classes=4 live_cells=12 result=ok`; `FIRST_COHORT_CROSS_ARCH_SEAL arches=3 classes=4 result=ok` | 12 |
+| Second cohort — plain `IpcSend` | `SECOND_COHORT_PLAIN_SEAL arches=3 classes=2 live_cells=6 result=ok` | 6 |
+| Second cohort — ordinary-cap `IpcSend` | `GLOBAL_LOCK_RETIRE_CLASS_DONE class=IpcSendOrdinaryCap result=ok` per arch; `IPCSEND_ORDINARY_CAP_BLOCKED_RECEIVER_ORACLE_DONE … payload_len=8 receiver_resumes=1 fresh_cap=1 object_identity_ok=1` | 6 |
+| Second cohort — shared-region direct | `SECOND_COHORT_SHARED_REGION_DIRECT_MATRIX_SEAL arches=3 classes=1 live_cells=3 fuse_trips=0 duplicate_wakes=0 result=ok` | 3 |
+| Shared-region — hosted audit / direct / race / enqueue | `SECOND_COHORT_SHARED_REGION_HOSTED_SEAL … result=ok`; `…_DIRECT_HOSTED_SEAL cases=18 … result=ok`; `…_TXN_RACE_SEAL cases=12 orphan_pages=0 duplicate_unmaps=0 duplicate_revokes=0 duplicate_pin_releases=0 stale_publications=0 result=ok`; `…_ENQUEUE_HOSTED_SEAL cases=23 … result=ok` | hosted |
+| Reply-cap direct negative | `SECOND_COHORT_REPLY_CAP_DIRECT_NEGATIVE_SEAL cases=18 leaked_reply_caps=0 leaked_reply_objects=0 duplicate_wakes=0 duplicate_replies=0 result=ok` | hosted |
+| Build integrity | `ARTIFACT_BUILD_INTEGRITY_SEAL arches=3 stale_artifact_acceptance=0 failed_build_rejected=1 result=ok` | hosted |
+| Direct IPC NR 6 / NR 7 (x86_64, SMP=2, knob-gated) | `STAGE_199_X86_AP_GENERIC_RETURN_SEAL … result=ok`; `STAGE_199_X86_AP_SAVED_RETURN_SEAL … result=ok`; `STAGE_199_X86_AP_RECV_V2_BLOCK_SEAL … result=ok`; `STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_USER_SEAL … cross_cpu=1 … result=ok`; `IPCREPLY_DIRECT_SMP_REPLY_OK … cross_cpu=1 … result=ok`; freeze: `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL functional_smp1=1 ap_dispatch_smp2=1 cross_cpu_request_smp2=1 cross_cpu_reply_smp2=1 request_user_consumed=1 reply_user_consumed=1 trap_depth_errors=0 wrong_current_task=0 duplicate_replies=0 duplicate_wakes=0 overwrite_fuse_trips=0 result=ok` | proof-gated |
+| Reply / timeout / peer-death terminal ownership (Stage 200A) | hosted seal `result=ok` | hosted |
+| Deadline token store (Stage 200B) | hosted seal `result=ok` | hosted |
+| Reply-timeout x86_64 functional + retirement | `IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok`; `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout result=ok`; `IPC_REPLY_BEATS_TIMEOUT_OK arch=x86_64 terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok` | 2 |
+| **Reply-timeout three-architecture matrix (Stage 200C)** | **`STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`** — timeout-wins + reply-wins on x86_64, AArch64 and RISC-V, serially from one clean exact commit `72a4ebf` | **6** |
+| `ExitCurrentTask` NR 16 | `STAGE_200D0B3_X86_EXIT_CURRENT_TASK_REFREEZE_SEAL` (x86_64, `0b5e98f`); `EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu=0 holder=with_cpu result=ok` | 2 of 3 — RISC-V **not earned** |
+| ServerDies liveness foundation (historical Stage 200D-2B1B) | foundation seal `result=ok`, explicitly `live_cells=0` | 0 by design |
+| ServerDies three-arch return contract / live readiness (Stage 202B) | readiness seal `qemu_boots=0 live_cells=0 result=ok` | 0 by design |
+| **ServerDies live** | **none — four attempts, none sealed** | **0** |
+
+### Deferred / refused seals preserved deliberately
+
+These were **not** granted, and the refusal is the record:
+
+* `STAGE_199_IPCCALL_REPLY_OFFLOCK_SEAL … result=deferred reason=broad_lock_payload_copy_needs_pre_global_lock_split_seam_which_is_hosted_disabled_and_block_dispatch_switch_required` — preserved in full in `doc/IPC.md` §8.3.
+* `GLOBAL_LOCK_RETIRE_CLASS_DEFERRED class=FutexWait reason=block_dispatch_switch_required_needs_global_lock` — the Stage 191D deferral discipline; seams landed helper-only.
+* `STAGE_199_IPCCALL_DIRECT_SMP_REQUEST_SEAL … cross_cpu=0 result=blocked reason=ap_dispatch_on_wake_and_context_restore_not_wired` — later superseded by the earned `cross_cpu=1` seal.
+* `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail` — **still open**; see `doc/IPC.md` §8.5. It is canonical **199D**'s server-crash cleanup and canonical **202D**'s reply-object cleanup.
+
+### Historical x86_64 D6 switch-proof bring-up (Stages 120–132)
+
+Retained as a one-paragraph summary; the blow-by-blow was deleted with the fragments.
+The default-off `yarm.d6_switch_proof=1` harness forced an initialized task pair through
+the unlocked `switch_frames` path. Stage 128 mapped and checked the switch-stack pages;
+129 added on-demand active-root repair; 130 fixed a TSS RSP0 mismatch after switch-back
+and added the post-`DONE` cleanup marker chain; 131 audited the `ArchSwitchContext`
+layout (all offsets correct) and fixed a post-proof crash caused by `fxrstor` from an
+all-zero fxsave area setting `MXCSR=0` (all SSE exceptions unmasked), by calling
+`initialize_frame_fpu_state` in `initialize_thread_kernel_switch_frame`; 132 corrected
+the `#XF` theory — the real fault was `#PF` (vector `0xe`, error `0x2`) on an unmapped
+kernel stack, because only the top page was mapped while the trap handler descends
+~9 KB — fixed by mapping all stack pages for both proof tasks before the switch. The
+harness is a diagnostic and is mutually exclusive with the production D6-genuine path.
+
+---
+
 ## Authoring rule
 
 Do not add new design / ABI / status content here. Add new live content
 to the canonical owner doc (see `doc/DOCUMENTATION_MAP.md`). Append a
 new row to the chronological table above only when a milestone is
 genuinely closed and you have already updated the canonical owner doc to
-reflect the new live state.
+reflect the new live state. Accepted seals belong in the seal table above,
+**not** in a new per-stage file — `tests/doc_fragmentation_guard.rs` enforces this.

@@ -602,6 +602,86 @@ See `doc/BOOT.md` §4.2 for default `-append` policy and
 
 ---
 
+## 6.1 Return contract, scheduling and live proof (kernel unlocking)
+
+Census and cross-architecture matrix: `doc/KERNEL_UNLOCK_AUDIT.md` §2. Roadmap:
+`doc/KERNEL_UNLOCKING.md` §0.
+
+### Off-lock position — 2 ungated classes, and neither is broad-lock-free
+
+AArch64 reaches the pre-broad-lock split seam only through a **selective ABI import**.
+`pre_split_import_syscall_abi` (`src/arch/trap_entry.rs:1384`) peeks the raw syscall
+number from `x8` and imports the decoded ABI (`x8` → `nr`, `x0..x5` → `args[]`) **only**
+for NR 15 `DebugLog` and NR 10 `FutexWake` — plus NR 6 / NR 7 when the direct proof gate
+is armed, and everything when the recv oracle knob is on. Every other syscall keeps
+`nr = 0` in the frame, so the split dispatcher declines it at the NR gate and it falls
+back to the unchanged broad-lock path. This selectivity is what keeps `DebugLog` and
+`FutexWake` the only newly-eligible pre-lock classes.
+
+Without that import the split dispatcher saw `nr=0` and always fell back — the Stage 160B
+defect. The import reuses the exact helper the global path uses, so the split path cannot
+drift from it.
+
+> ⚠️ **AArch64 has no genuinely broad-lock-free syscall.**
+> `finalize_split_handled_syscall` (`src/arch/trap_entry.rs:1412`) re-acquires the broad
+> lock via `with_cpu` at line **1432** for every *handled* split syscall, to export
+> results to `x0..x5` and advance `ELR` past the `SVC`. That re-acquisition is the arch
+> **return-path restore**, not the split seam — but it is still a broad acquisition, and
+> it means the AArch64 cells in the first-cohort seal describe a path that touches the
+> broad lock once on the way out. Removing it is canonical Stage **205A**.
+
+The pre-export re-save is retained deliberately for every return-consuming split class
+(for example `FutexWake`'s count): a multi-return-lane split class would otherwise lose
+lanes that the earlier single-lane classes tolerated skipping.
+
+### Scheduling
+
+`d6_genuine_enabled()` (`src/kernel/boot/mod.rs:766`) is **compile-time `false`** on
+AArch64. Every queue-advancing dispatch is taken **in-lock**; AArch64 cannot retire any
+queue-advancing class until that changes (canonical blocker 4 in
+`doc/KERNEL_UNLOCKING.md` §0.5).
+
+AArch64 does have its own post-lock drains, ported from the x86_64 originals:
+
+* **Stage 195E** — FutexWait queue-advancing dispatch drain (`src/arch/trap_entry.rs:612`).
+  The idle outcome is a **success**, not an error: no runnable incoming task yields
+  `enter_post_lock_idle` with the broad guard already dropped.
+* **Stage 195G** — Yield queue-advancing dispatch drain (`src/arch/trap_entry.rs:717`),
+  the preempt sibling of the above.
+* A split `FutexWake` that flipped the outgoing task to `Runnable` before the drain ran
+  is detected and handled rather than double-dispatched.
+
+Two AArch64-specific in-lock constraints are load-bearing and must not be "tidied":
+the idle divergence calls `idle_no_eret_loop()` **inside** `with_cpu` and never returns,
+and `restore_arch_thread_state` also runs **inside** `with_cpu` — so a post-lock drain
+cannot be assumed to run after either.
+
+### Restore-owner ordering — AArch64 is not exposed to the x86_64 hazard
+
+AArch64 consumes the trap disposition **after** the post-lock drains (Stage 202B guard
+`a07`), so its owner selection already observes any wakes the drains published. The
+x86_64-only revalidation seam described in `doc/ARCH_X86_64.md` §6.1 has no AArch64
+counterpart and needs none.
+
+### Live-proof status
+
+* First cohort — 4 live cells (`DebugLog`, `FutexWake`, `FutexWait`, `Yield`), including
+  `AARCH64_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok`.
+* Second cohort — plain, ordinary-cap and shared-region-direct cells all earned;
+  `SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=aarch64 classes=1 live_cells=1
+  fuse_trips=0 result=ok`.
+* Reply timeout — both matrix cells earned (Stage 200C2C1B fixed AArch64 blocked-recv
+  timeout delivery to earn them). The deadline **scan** is still `scan_broad_lock=1`.
+* `ExitCurrentTask` NR 16 — live cell earned
+  (`EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu=0 holder=with_cpu result=ok`).
+* Direct IPC NR 6 / NR 7 — admitted under the proof gate only (Stage 199A2C1).
+* **ServerDies — no live cell**; runner `scripts/qemu-aarch64-server-dies-smoke.sh`
+  exists and is blocked behind the ServerDies link-accounting repair (a canonical **199D**
+  increment; the same defect is 202D's reply-object-cleanup element).
+* SMP / PSCI — deferred.
+
+---
+
 ## 7. Authoring rule
 
 Future AArch64 docs update **this file**. Cross-arch / generic boot docs

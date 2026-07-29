@@ -3,14 +3,14 @@
 # YARM Syscall ABI v10 (Frozen Contract)
 
 - ABI Version: `10`
-- Public syscall count: `16` (`0..=15`)
+- Public syscall count: `17` (`0..=16`)
 - Kernel dispatch table count: `32` (`SYSCALL_COUNT`, slots `0..=31`)
 
 ## Public ABI v10 syscall numbers
 
 `SYSCALL_COUNT` in the kernel is the dispatch-table size, not the public ABI
 count. The current public ABI v10 surface is the contiguous user-callable range
-`0..=15` (**16 slots**). Some public slots still enforce capability or control
+`0..=16` (**17 slots**). Some public slots still enforce capability or control
 plane policy and can return `MissingRight`; that does not make them private
 kernel-extension slots.
 
@@ -32,6 +32,7 @@ kernel-extension slots.
 | `13` | `VmAnonMap` | public, wired anonymous page mapping syscall |
 | `14` | `VmBrk` | public staged syscall; query, grow, and page-granular shrink are supported |
 | `15` | `DebugLog` | public debug logging syscall |
+| `16` | `ExitCurrentTask` | public; terminates the **calling** task. Never returns on success — the trap disposition is non-returning, so there is no return-register contract for the success case. `16` was audited unused before assignment: the `0..=31` space held `0..=15`, `23`, `24`, `26`, `28..=31`, leaving `16..=22`, `25` and `27` free. |
 
 ## ABI slot status matrix
 
@@ -67,7 +68,8 @@ Status terms used by this matrix:
 | `13` | `VmAnonMap` | public v10 | any user task | Wired anonymous mapping syscall; not reserved or deprecated. |
 | `14` | `VmBrk` | public v10 | thread-group leader | Staged per-task brk contract. |
 | `15` | `DebugLog` | public v10 | any user task | Debug logging aid; semantics are best-effort. |
-| `16..=22` | — | reserved gap | none | `Syscall::decode` rejects these with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
+| `16` | `ExitCurrentTask` | public v10 | any user task | Terminates the calling task; non-returning trap disposition, so no success return-register contract. |
+| `17..=22` | — | reserved gap | none | `Syscall::decode` rejects these with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
 | `23` | `SpawnProcess` | privileged extension | privileged/bootstrap control-plane use | Implemented kernel dispatch slot; not part of public v10 count. |
 | `24` | `SpawnProcessFromUserBuf` | privileged extension | privileged/control-plane staging use | Implemented kernel dispatch slot; not part of public v10 count. |
 | `25` | — | reserved gap | none | `Syscall::decode` rejects this with `InvalidNumber`; unavailable until explicitly assigned in a future ABI. |
@@ -90,7 +92,7 @@ Changes that require an ABI v11 bump include:
 - renumbering any public syscall;
 - changing public syscall argument layout, return layout, error behavior, or
   side effects incompatibly;
-- assigning a reserved public gap (`16..=22` or `25`) to a user-visible public
+- assigning a reserved public gap (`17..=22` or `25`) to a user-visible public
   syscall;
 - changing public struct layout, encoded metadata bytes, flag bits, sentinel
   values, or existing flag meanings incompatibly;
@@ -120,10 +122,37 @@ The public tail slots `13..=15` are assigned and dispatched in v10:
 `13` is `VmAnonMap`, `14` is `VmBrk`, and `15` is `DebugLog`.
 They are not reserved gaps and are covered by the public ABI v10 matrix above.
 
+## Per-architecture broad-lock dispatch matrix
+
+Which syscalls are serviced **without** the broad `SpinLock<KernelState>`. Everything
+absent from this table enters the broad lock via `SharedKernel::with_cpu`. Census and
+evidence: `doc/KERNEL_UNLOCK_AUDIT.md` §2.
+
+| Nr | Class | x86_64 | AArch64 | RISC-V | Gate |
+|----|-------|--------|---------|--------|------|
+| `15` | `DebugLog` | off-lock | off-lock, **broad re-acquire on return**¹ | off-lock | ungated |
+| `10` | `FutexWake` | off-lock | off-lock, **broad re-acquire on return**¹ | off-lock | ungated |
+| `8` | `ControlPlaneSetCnodeSlots` | off-lock | broad | broad | ungated |
+| `2` | `IpcRecv` — kernel-task queued-plain case only | off-lock | broad | broad | ungated |
+| `14` | `VmBrk` — page-crossing shrink case only | off-lock | broad | broad | ungated |
+| `6` | `IpcCall` direct | off-lock | off-lock | off-lock | `ipccall_direct_proof_enabled()` — **default OFF** |
+| `7` | `IpcReply` direct | off-lock | off-lock | off-lock | `ipccall_direct_proof_enabled()` — **default OFF** |
+
+¹ AArch64 `finalize_split_handled_syscall` (`src/arch/trap_entry.rs:1432`) re-takes
+`with_cpu` to export results and advance past the SVC, so AArch64 split classes are not
+broad-lock-free end to end. It is a **runtime-required** broad callsite that canonical
+**204B**/**204E** must localize. Canonical **205A** (complete syscall matrix) *reports* this
+cell; it is not where the defect is retired.
+
+AArch64 admits a syscall to the split seam only through its selective ABI import
+(`src/arch/trap_entry.rs:1384`), so NR 8 / NR 2 / NR 14 never reach it. RISC-V uses a
+purpose-built bridge (`src/arch/riscv64/trap.rs:417`) whose gate admits only NR 15,
+NR 10, and gated NR 6 / NR 7.
+
 ## Reserved and gap slots
 
-- `16..=22`: reserved/unassigned in ABI v10. `Syscall::decode` rejects these
-  numbers with `InvalidNumber`.
+- `17..=22`: reserved/unassigned in ABI v10. `Syscall::decode` rejects these
+  numbers with `InvalidNumber`. (`16` is now `ExitCurrentTask` — see above.)
 - `25`: reserved/unassigned in ABI v10. `Syscall::decode` rejects this number
   with `InvalidNumber`.
 - `30`: `RecvSharedV3` — Stage 42+43 live non-blocking recv_shared_v3 extension (NR 30).
@@ -525,3 +554,50 @@ IDs ≥ 13 remain `None` (returns `InvalidArgs` from Phase 2B / Phase 3A spawn p
 
 `INIT_SPAWN_OPTIONAL_FS_SERVERS` remains `false` in all core profiles — no live spawning added.
 CPIO staging of optional-FS binaries is unchanged from Stage 80.
+
+---
+
+## Mechanism-layer contract freeze
+
+> **Canonical home for the ABI / contract freeze.** This section absorbs the former
+> `doc/ABI_CONTRACT_FREEZE.md`, which was deleted in `3c86f362` **without** updating
+> `scripts/check-contract-doc-enforcement.sh` — leaving that gate grepping a file that no
+> longer existed, so it could not pass. The gate now reads this file. Every source path
+> below was re-verified against the tree; the stale paths the old document carried are
+> corrected here rather than restored.
+
+These in-kernel mechanism contracts are intentionally stable for the next implementation
+phase. Changing one requires updating this section, the corresponding module docs, and the
+test that asserts it.
+
+### Frozen contracts
+
+| # | Contract | Source of truth (verified) | Guarantee |
+|---|----------|----------------------------|-----------|
+| 1 | **Trap routing surface** | `TrapEvent` (`src/arch/trap.rs:44`), `TrapAction` (`src/arch/trap.rs:35`), `route_trap(&TrapEvent) -> TrapAction` (`src/arch/trap.rs:87`) | one canonical entry event, explicit `fault` / `irq` payload, deterministic routing. Guarded by `trap_router_maps_syscall`. |
+| 2 | **Trap frame ABI encoding** | `#[repr(C)] pub struct TrapFrame` (`src/kernel/trapframe.rs:12`) | success iff `error == 0`; errors clear the return registers. |
+| 3 | **Timer preemption semantics** | `tick_and_check(&mut self) -> (Tick, bool)` (`src/kernel/scheduler_timer.rs:38`) | at most one preempt decision per quantum-boundary tick. |
+| 4 | **Restart / fault contracts at the bootstrap boundary** | `restart_task` (`src/kernel/boot/restart_state.rs:270`), `exit_task` (`src/kernel/boot/restart_state.rs:84`), `handle_trap_event` (`src/kernel/boot/fault_state.rs:1127`) | restart backoff / budget / token checks are enforced **before** the task is made runnable. |
+| 5 | **Typed wire codecs** | `proc_v2_golden_vector_is_stable`, `vfs_v1_golden_vector_is_stable` (`crates/yarm-ipc-abi/src/{process_abi,vfs_abi}.rs`); versions pinned in `doc/VFS.md` §6 | golden vectors are source-level constants; no binary fixtures in-tree. |
+
+### Retired freeze — Linux-compat syscall dispatch table
+
+The old document froze "`LinuxCompatSyscall::DISPATCH_TABLE` in `src/linux_compat/mod.rs`,
+guarded by `linux_dispatch_table_is_frozen_contract`". **That symbol, that module and that
+test no longer exist anywhere in the tree** — the `linux_compat` module was removed and only
+`crates/yarm-compat-servers/src/posix_compat` remains. The `linux-compat` Cargo feature
+still exists (`linux-compat = ["posix-compat"]`) but gates no dispatch table.
+
+This freeze is therefore **retired, not restated**. Re-adding a grep for that symbol would
+assert a source of truth that is not in the tree. Current libc / Linux / musl surface:
+`doc/LIBC_AND_LINUX_COMPAT.md`.
+
+### CI gate semantics
+
+- Mechanism / core profile must pass: `cargo test -- --test-threads=1`
+  (see `doc/KERNEL_TEST_RULES.md` Rule H1).
+- POSIX personality profile must pass: `cargo test --features posix-compat`.
+- CI workflow source: `.github/workflows/compat-gates.yml`.
+- Gate script: `scripts/check-contract-doc-enforcement.sh`.
+- Typed-codec golden vectors and truncation-rejection tests are required gates for any
+  wire-compatibility change.
