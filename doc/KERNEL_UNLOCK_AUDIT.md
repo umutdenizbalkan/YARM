@@ -662,20 +662,34 @@ declining every ordinary `IpcCall`. The two proof obligations — "normal featur
 use the off-lock NR6/NR7 path" and "no broad-lock fallback for eligible x86 NR6/NR7" — are
 **unachievable** by that change alone.
 
-Removing layer 2 as well is not a small increment, and it collides with a documented
-constraint (`doc/IPC.md` §8.6). The blocked-server / blocked-caller acknowledgement is a
-**single slot** classified ORACLE-ONLY / SINGLE-OUTSTANDING-PAIR, whose real-build `publish`
-carries a fail-closed overwrite fuse that **refuses** a second simultaneous pair
-(`mod.rs:5223`, `5265`, `5512`). The off-lock request path requires a committed ack before it
-will service a call. A production service chain runs many concurrent bound `IpcCall`s — the
-x86_64 ServerDies cell measured **54 reverse links in a single boot** — so unconfining the
-path would drive multiple outstanding pairs through a one-pair slot.
+Removing layer 2 as well is not a small increment. It used to collide with a second
+constraint as well: the blocked-server / blocked-caller acknowledgement was a **single
+slot** classified ORACLE-ONLY / SINGLE-OUTSTANDING-PAIR, whose real-build `publish` refused
+a second simultaneous pair. The off-lock request path requires a committed ack before it
+will service a call, and a production service chain runs many concurrent bound `IpcCall`s —
+the x86_64 ServerDies cell measured **54 reverse links in a single boot** — so unconfining
+the path would have driven multiple outstanding pairs through a one-pair slot.
 
-**Prerequisite:** replace the single-slot ack with the endpoint-indexed, generation-bearing
-bounded store the Stage 199A2D1 race model already names as required for genuine multi-pair
-concurrency. That is its own increment, and it must land before any production-default flip.
-Until then the correct statement is that the off-lock NR 6 / NR 7 transaction is
-**live-proven for one outstanding pair on the oracle's endpoints**, not production-ready.
+**That prerequisite is now met.** `src/kernel/direct_ack_store.rs` implements the bounded,
+endpoint-indexed, generation-bearing multi-pair store the Stage 199A2D1 race model named:
+`DIRECT_ACK_STORE_CAPACITY` independent `(endpoint_index, endpoint_generation)` pairs
+coexist under a reserve → commit → consume/cancel lifecycle, with exactly-once
+acknowledgement, incarnation-exact identity, fail-closed rejection of stale/duplicate/
+foreign consumption, capacity refused *before* any irreversible publication, and
+leak-free rollback. Both ack modules are now endpoint-keyed views over it, and both
+split-dispatch consumers name the exact endpoint incarnation they are entitled to. Proved
+by `stage199d_multi_pair_races` (deterministic barrier-aligned races over 2 and
+`DIRECT_ACK_STORE_CAPACITY` simultaneous pairs, contended consumption, capacity
+exhaustion, same-endpoint reservation, stale/foreign consumption, reserve→cancel rollback),
+`stage199d_multi_pair_boundary`, and the store's own unit tests. See `doc/IPC.md` §8.6.
+
+**Still blocking the flip:** the ack store no longer limits the system to one pair, but
+layer 2 (oracle endpoint confinement) and the layer-1 proof gate are **unchanged** — this
+increment deliberately did not widen who may use the off-lock path, flip any production
+default, or seal a stage. Unconfining still requires its own increment, and the correct
+statement today is that the off-lock NR 6 / NR 7 transaction is **live-proven for one
+outstanding pair on the oracle's endpoints**, with the multi-pair acknowledgement
+prerequisite now satisfied in hosted proof but not yet exercised live.
 
 ---
 

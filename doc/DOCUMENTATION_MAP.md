@@ -90,7 +90,7 @@ documentation describes the current system and the roadmap.
 | `STAGE_199A1_IPCCALL_DIRECT_AUDIT.md` | `doc/IPC.md` §8.3. `include_str!` pin repointed to `doc/IPC.md` |
 | `STAGE_199A2A_OFFLOCK_INCARNATION.md` | `doc/IPC.md` §8.3 — **verbatim**: achieved incarnation seal and the `result=deferred` off-lock seal with its full reason. `include_str!` pin repointed to `doc/IPC.md` |
 | `STAGE_199A2B1_OFFLOCK_FOUNDATIONS.md`, `STAGE_199A2B2_REQUEST_SUBSTRATE.md`, `STAGE_199A2B2C_OFFLOCK_SEAMS.md` | `doc/IPC.md` §8.3 (reserve → commit → cancel transaction shape); `doc/KERNEL_UNLOCKING.md` §0 (canonical 199C) |
-| `STAGE_199A2D1_DIRECT_IPC_RACE_MODEL.md` | `doc/IPC.md` §8.3 (race outcomes) and §8.6 (reply-delivery ordering, single-slot ack boundary, overwrite fuse, multi-pair prerequisite) |
+| `STAGE_199A2D1_DIRECT_IPC_RACE_MODEL.md` | `doc/IPC.md` §8.3 (race outcomes) and §8.6 (reply-delivery ordering, the bounded endpoint-indexed multi-pair ack store that replaced the single-slot boundary, overwrite fuse, capacity refusal) |
 | `STAGE_199A2D2A_SMP_REQUEST.md`, `…2B_AP_DISPATCH.md`, `…2C1_AP_GENERIC_RETURN.md`, `…2C2A_AP_SAVED_RETURN.md`, `…2C2B_CROSS_CPU_NR6.md`, `…2C2B1_RECV_V2_SERVER_BLOCK.md`, `…2C2B2_CROSS_CPU_REQUEST.md`, `…2C2B3_AP_USER_CONSUME.md`, `…2C2C_CROSS_CPU_REPLY.md`, `…2C2_RECV_V2_CONTINUATION.md` | `doc/PROJECT_HISTORY.md` (earned AP / cross-CPU seals, and the superseded `result=blocked` refusals); `doc/ARCH_X86_64.md` §6.1 (live-proof status) |
 | `STAGE_199A2D3_X86_DIRECT_IPC_FREEZE.md` | `doc/PROJECT_HISTORY.md` (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` verbatim); `doc/ARCH_X86_64.md` §6.1 |
 | `STAGE_200A_REPLY_TERMINAL_OWNERSHIP.md` | `doc/IPC.md` §8.4 (terminal ownership); `doc/PROJECT_HISTORY.md` |

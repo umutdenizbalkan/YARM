@@ -132,10 +132,13 @@ Full detail: `doc/IPC.md` §8.5.
    (`EXIT_TASK_OWNER_REVALIDATED … committed=replacement`).
 2. **NR 6 / NR 7 off-lock direct IPC cannot be made production-default yet.** It is gated
    twice: the proof gate *and* an oracle-endpoint confinement that services only the
-   oracle's endpoints. Unconfining it requires replacing the single-slot, one-outstanding-pair
-   acknowledgement with an endpoint-indexed generation-bearing bounded store — a real service
-   chain runs many concurrent bound `IpcCall`s (54 reverse links in one boot). See
-   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.
+   oracle's endpoints. The **acknowledgement-store prerequisite is now met** — the
+   single-slot, one-outstanding-pair ack has been replaced by the bounded, endpoint-indexed,
+   generation-bearing multi-pair store (`src/kernel/direct_ack_store.rs`, Stage 199D), so a
+   real service chain's many concurrent bound `IpcCall`s (54 reverse links in one boot) no
+   longer collide in a one-pair slot. Both gates are still in place and unchanged; removing
+   the endpoint confinement is its own increment. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1 and
+   `doc/IPC.md` §8.6.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

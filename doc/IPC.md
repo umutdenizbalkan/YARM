@@ -548,22 +548,56 @@ Only the reservation **owner** may consume or release; an alias fails closed. Th
 cannot dispatch before **both** the reply bytes and the `Consumed` barrier are visible;
 the enqueue publishes the completed wake state to whichever CPU dispatches.
 
-**The direct-IPC acknowledgement slot is single-outstanding-pair, by design.** The two ack
-modules are classified ORACLE-ONLY / SINGLE-OUTSTANDING-PAIR proof infrastructure. On a
-**real** build each `publish` carries a fail-closed **overwrite fuse**: it refuses to
-overwrite an active (`VALID && !CLAIMED`) acknowledgement — the second-simultaneous-pair
-condition — preserving the active ack and marking
-`IPCCALL_DIRECT_ACK_OVERWRITE_FUSE` / `IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE`. Endpoint
-confinement plus the single provisioning slot already hold the system to one pair; the
-fuse is defence in depth and never trips in the sealed flow (`overwrite_fuse_trips=0`).
-**Hosted builds keep last-writer-wins**, because the wiring fixtures share the
-process-global statics.
-The memory-ordering audit confirmed one outstanding pair is handed across CPUs correctly
-(Release → Acquire; a monotone `SEQ` defeats stale restore), so no single pair can lose an
-ack under valid cross-CPU sequencing. Replacing the slot with an **endpoint-indexed,
-generation-bearing bounded store** is required only to support genuine **multi-pair**
-production concurrency — it is a prerequisite for concurrent direct IPC, not for the
-current sealed flow.
+**The direct-IPC acknowledgement store is bounded, endpoint-indexed, generation-bearing
+and multi-pair** (Stage 199D; `src/kernel/direct_ack_store.rs`). It replaces the former
+single-outstanding-pair slot with the store the Stage 199A2D1 race model specified.
+`ipccall_direct_ack` and `ipcreply_direct_ack` are now endpoint-keyed views over one
+`DirectAckStore` instance each; neither holds any synchronisation of its own.
+
+*Model.* A fixed array of `DIRECT_ACK_STORE_CAPACITY` slots — no allocation, no unbounded
+growth. Each slot runs `Vacant → Reserved → Committed → Consumed`, with `cancel`
+(`Reserved → Vacant`) and `restore` (`Consumed → Committed`, same publication only).
+
+* **reserve** binds one slot to one `(endpoint_index, endpoint_generation)` pair and one
+  waiter incarnation `{tid, asid}`. It publishes nothing an observer can consume, and it
+  is the ONLY refusal point — capacity is refused here, **before** any irreversible
+  publication, so a refusal costs nothing to unwind.
+* **commit** is the single irreversible publication. It consumes the reservation token by
+  value (so one reservation commits at most once) and requires the committed fields to
+  name exactly the endpoint and waiter incarnation the reservation was taken for.
+* **consume** is the exactly-once ownership transfer, keyed by the EXACT endpoint
+  incarnation and optionally by the exact waiter incarnation. Absent, stale-generation,
+  foreign-waiter, not-yet-committed and already-consumed attempts are each refused
+  fail-closed, counted separately, and mutate nothing.
+* **cancel** returns an uncommitted reservation to `Vacant` with every identity wiped —
+  a rollback that leaks neither a slot nor a waiter.
+
+*Identity and staleness.* Each slot carries a per-slot generation bumped on every entry
+into `Reserved`, so a reservation token that outlived its slot can neither commit nor
+cancel someone else's pair. A recycled endpoint slot (same index, newer generation) and a
+recycled thread id in another address space are both DIFFERENT incarnations and are
+refused.
+
+*Fail-closed refusals.* The former overwrite fuse survives as the refusal of a SECOND LIVE
+pair on the SAME endpoint: the already-published acknowledgement is preserved untouched and
+`IPCCALL_DIRECT_ACK_OVERWRITE_FUSE` / `IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE` is marked
+(`overwrite_fuse_count()`, still 0 in the sealed flow). Capacity exhaustion marks
+`IPCCALL_DIRECT_ACK_CAPACITY_REFUSED` / `IPCREPLY_DIRECT_ACK_CAPACITY_REFUSED`. **Hosted
+builds keep last-writer-wins** in the `publish` convenience wrapper, because the wiring
+fixtures share the process-global stores.
+
+*Concurrency.* Commit publishes the slot state with `Release` after the fields; consume is
+an `AcqRel`/`Acquire` compare-exchange; readers `Acquire` the state first. The endpoint
+uniqueness decision and the slot allocation are taken together under a leaf admission
+guard, because they touch different words and no CAS ordering alone can make them one
+decision; every other operation is lock-free. Deterministic hosted races cover two and
+`DIRECT_ACK_STORE_CAPACITY` simultaneous pairs, contended consumption, capacity
+exhaustion, same-endpoint reservation, stale/foreign consumption, and reserve→cancel
+rollback (`stage199d_multi_pair_races`).
+
+**Scope.** This lifts the ack store's own one-pair limit. It does NOT widen who may use
+the off-lock NR6/NR7 path: the proof gate and the oracle endpoint confinement are
+unchanged, and no production default was flipped.
 
 **Retirement-seal isolation model — Model 1, serialized master.**
 `scripts/qemu-combined-retirement-seal.sh` runs the first-cohort (12), plain (6) and

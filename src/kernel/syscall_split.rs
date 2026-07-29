@@ -640,8 +640,14 @@ fn try_split_ipccall_direct_into_frame(
     let send_endpoint = shared
         .resolve_endpoint_send_cap_split_read(tid, send_cap)
         .ok()?;
-    let send_eidx = match send_endpoint {
-        crate::kernel::capabilities::CapObject::Endpoint { index, .. } => index,
+    // Stage 199D: the acknowledgement store is endpoint-INDEXED and generation-BEARING, so
+    // the consumer names the EXACT endpoint incarnation it is entitled to. A recycled
+    // endpoint slot (same index, newer generation) can no longer consume the older
+    // incarnation's acknowledgement.
+    let (send_eidx, send_egen) = match send_endpoint {
+        crate::kernel::capabilities::CapObject::Endpoint { index, generation } => {
+            (index, generation)
+        }
         _ => return None,
     };
     if !crate::kernel::boot::ipccall_direct_oracle_request_endpoint_is(send_eidx) {
@@ -653,7 +659,7 @@ fn try_split_ipccall_direct_into_frame(
     // record reservation / Reply-cap mint / destination copy / waiter claim / enqueue / IPI. Counts
     // the early retry. Confined to the C2B2 selector so the SMP=1 oracle is unaffected.
     if crate::kernel::boot::x86_ipccall_direct_smp_request_enabled()
-        && !crate::kernel::boot::ipccall_direct_ack::is_claimable()
+        && !crate::kernel::boot::ipccall_direct_ack::is_claimable(send_eidx, send_egen)
     {
         crate::kernel::boot::ipccall_direct_smp_request_note_early_wouldblock();
         frame.set_err(crate::kernel::syscall::SyscallError::WouldBlock.code());
@@ -667,8 +673,11 @@ fn try_split_ipccall_direct_into_frame(
     // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing.
     let payload = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len)?;
     let snapshot = IpcCallDirectSnapshot::build(caller, send_cap, reply_cap, &payload[..len])?;
-    // Claim the exact published blocked-server acknowledgement (atomic single claim).
-    let (ack, ack_seq) = crate::kernel::boot::ipccall_direct_ack::claim()?;
+    // Consume the acknowledgement published for EXACTLY this endpoint incarnation, at most
+    // once (Stage 199D endpoint-keyed, generation-bearing store). A pair belonging to any
+    // other endpoint, any other endpoint generation, or already consumed by a duplicate
+    // trap yields `None` — no copy result is used, nothing is mutated, NR6 stays legacy.
+    let (ack, ack_seq) = crate::kernel::boot::ipccall_direct_ack::claim(send_eidx, send_egen)?;
     let work = crate::kernel::ipccall_direct_txn::DirectRequestPostWork {
         snapshot,
         ack,
@@ -724,7 +733,9 @@ fn try_split_ipcreply_direct_into_frame(
     // the proof gate is armed. Resolve the reply cap → record → its bound reply endpoint index; any
     // other reply endpoint → None (legacy). No ack claim, no copy, no mutation.
     let (rec_idx, rec_gen) = shared.resolve_reply_cap_split_read(tid, reply_cap).ok()?;
-    let reply_eidx = shared.reply_record_endpoint_index_split_read(rec_idx, rec_gen)?;
+    // Stage 199D: carry the reply endpoint GENERATION too — the acknowledgement store is
+    // keyed by the exact endpoint incarnation, not by index alone.
+    let (reply_eidx, reply_egen) = shared.reply_record_endpoint_ref_split_read(rec_idx, rec_gen)?;
     if !crate::kernel::boot::ipccall_direct_oracle_reply_endpoint_is(reply_eidx) {
         return None;
     }
@@ -742,12 +753,12 @@ fn try_split_ipcreply_direct_into_frame(
     #[cfg(not(feature = "hosted-dev"))]
     if crate::kernel::boot::x86_ipccall_direct_smp_reply_enabled() {
         use crate::kernel::syscall::SyscallError;
-        if crate::kernel::boot::ipcreply_direct_ack::snapshot().is_none() {
+        if crate::kernel::boot::ipcreply_direct_ack::snapshot(reply_eidx, reply_egen).is_none() {
             crate::kernel::boot::ipcreply_direct_smp_reply_note_early_wouldblock();
             frame.set_err(SyscallError::WouldBlock.code());
             return Some(Ok(()));
         }
-        if !crate::kernel::boot::ipcreply_direct_ack::is_claimable() {
+        if !crate::kernel::boot::ipcreply_direct_ack::is_claimable(reply_eidx, reply_egen) {
             crate::kernel::boot::ipcreply_direct_smp_note_duplicate_refused();
             crate::yarm_log!(
                 "IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED arch=x86_64 reason=consumed_barrier reply_copies=1 caller_wakes=1 ipis=1 result=ok"
@@ -764,8 +775,9 @@ fn try_split_ipcreply_direct_into_frame(
     // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing.
     let payload = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len)?;
     let snapshot = IpcReplyDirectSnapshot::build(replier, reply_cap, &payload[..len])?;
-    // Claim the exact published blocked-caller acknowledgement (atomic single claim).
-    let (ack, ack_seq) = crate::kernel::boot::ipcreply_direct_ack::claim()?;
+    // Consume the acknowledgement published for EXACTLY this reply-endpoint incarnation,
+    // at most once (Stage 199D endpoint-keyed, generation-bearing store).
+    let (ack, ack_seq) = crate::kernel::boot::ipcreply_direct_ack::claim(reply_eidx, reply_egen)?;
     let work = crate::kernel::ipccall_direct_txn::DirectReplyPostWork {
         snapshot,
         ack,
