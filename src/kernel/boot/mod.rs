@@ -4380,6 +4380,62 @@ pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str) {
 #[cfg(not(feature = "ipc-reply-timeout-oracle-core"))]
 pub(crate) fn maybe_release_reply_timeout_collector_gate(_msg: &str) {}
 
+/// One-shot latch for the quiescent link-balance attestation.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static SERVER_DIES_LINK_BALANCE_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 199D — the ServerDies scenario's QUIESCENT reverse-link balance attestation.
+///
+/// Read-only and one-shot. It reports; it repairs nothing, claims nothing and mutates no
+/// accounting state. The completion-time `IPC_SERVER_DEATH_TRANSITION_AUDIT` already proves
+/// the armed transaction's own 1/1 pair; this answers the separate, system-wide question at
+/// a point where the scenario is finished.
+///
+/// **"After no audited call remains open" is enforced, not assumed.** The trigger is the
+/// surviving caller's own final marker, which it logs only after validating `ServerDied` and
+/// completing its survivor loop; and the reading is additionally gated on
+/// `live_server_reply_link_count() == 0`, so a still-outstanding reverse link defers the
+/// attestation rather than reporting a balance that a later close would change. If links are
+/// still live the latch is NOT consumed, so a later trigger can still produce the reading.
+///
+/// Emitted from the off-lock DebugLog split path, alongside the existing collector-gate
+/// release, so it costs an ordinary boot nothing.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn maybe_emit_server_dies_link_balance(msg: &str, live_links: usize) {
+    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_SERVER_DIES {
+        return;
+    }
+    if !(msg.starts_with("IPC_SERVER_DEATH_SCENARIO_DONE") && msg.contains("server_died=1")) {
+        return;
+    }
+    if SERVER_DIES_LINK_BALANCE_DONE.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if live_links != 0 {
+        // Not quiescent yet: an audited call is still open. Report the deferral rather than
+        // publishing a balance that is not final, and leave the latch unconsumed.
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_LINK_BALANCE_DEFERRED live_links={} reason=audited_call_open result=ok",
+            live_links
+        );
+        return;
+    }
+    if SERVER_DIES_LINK_BALANCE_DONE.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let (created, closed) = server_dies_counters::link_totals();
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT created={} closed={} live_links=0 scope=system result={}",
+        created,
+        closed,
+        if created == closed { "ok" } else { "fail" }
+    );
+}
+
+#[cfg(not(feature = "ipc-reply-timeout-oracle-core"))]
+pub(crate) fn maybe_emit_server_dies_link_balance(_msg: &str, _live_links: usize) {}
+
 // ── Stage 200D-2A: per-CPU bounded DEFERRED SERVER-DEATH work queue ─────────────────
 //
 // The sibling of the Stage 200C2B reply-timeout queue below, with the SAME ownership

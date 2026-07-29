@@ -1861,6 +1861,16 @@ mod ipc_reply_timeout_oracle {
         matches!(scenario(), Some(IpcReplyLivenessScenario::ServerDies))
     }
 
+    /// The reply-wins scenario, stated POSITIVELY.
+    ///
+    /// The reporting tail used to be an `else` on `is_timeout_wins()`, so every scenario that
+    /// was not timeout-wins fell into it — including `ServerDies`, which then reported the
+    /// reply-wins verdict with `reply_ok=0` and `result=fail` even though the ServerDies path
+    /// had just completed correctly. A scenario must only ever emit its OWN verdict.
+    pub(super) fn is_reply_wins() -> bool {
+        matches!(scenario(), Some(IpcReplyLivenessScenario::ReplyWins))
+    }
+
     /// Stage 200D-2B1: the ONE place a slot-5 value is turned into "this oracle is armed".
     ///
     /// The three dispatch sites used to compare bare literals — `Some(8) || Some(9)` on
@@ -2203,6 +2213,61 @@ mod ipc_reply_timeout_oracle {
         out
     }
 
+    /// Yields the surviving caller performs after the death, to prove it kept being
+    /// scheduled rather than merely returning once.
+    ///
+    /// Deliberately small. Every yield is a full trap -> scheduler dispatch -> return round
+    /// trip inside the same boot budget as the rest of the proof; the RISC-V
+    /// `ExitCurrentTask` cell was lost to a bound copied from a cheaper port
+    /// (`doc/KERNEL_TEST_RULES.md` Rule L2). 64 round trips after the death is progress.
+    const SERVER_DIES_SURVIVOR_YIELDS: u64 = 64;
+
+    /// The ServerDies scenario's own final attestations, emitted by the SURVIVING caller
+    /// after it has validated `ServerDied`.
+    ///
+    /// Purely observational: it yields, reports, and lets the kernel answer with a quiescent
+    /// link-balance reading. It claims no terminal, touches no accounting and changes no
+    /// kernel state.
+    ///
+    /// Ordering is the point. The survivor loop runs FIRST, so by the time the health marker
+    /// is logged the caller has demonstrably been re-scheduled many times since the death;
+    /// the kernel's quiescent balance attestation is then triggered by the final marker, so
+    /// it is read at a point where this scenario's audited call is provably finished.
+    pub(super) fn server_dies_final_attestations(out: &ClientOutcome) {
+        let died_ok = out.server_died
+            && out.server_died_code == yarm_user_rt::syscall::SyscallError::ServerDied as u32
+            && out.continuations == 1;
+        if !died_ok {
+            yarm_user_rt::user_log!(
+                "IPC_SERVER_DEATH_SCENARIO_DONE server_died={} code={} continuations={} result=fail",
+                out.server_died as u32,
+                out.server_died_code,
+                out.continuations
+            );
+            return;
+        }
+        let mut spun = 0u64;
+        while spun < SERVER_DIES_SURVIVOR_YIELDS {
+            let _ = yarm_user_rt::syscall::yield_now();
+            spun += 1;
+        }
+        yarm_user_rt::user_log!(
+            "IPC_SERVER_DEATH_SURVIVOR_PROGRESS_OK survivor=init yields={} continuations={} result=ok",
+            spun,
+            out.continuations
+        );
+        yarm_user_rt::user_log!(
+            "IPC_SERVER_DEATH_SYSTEM_HEALTH_OK arch=x86_64 survivor=init death_result=ServerDied code={} result=ok",
+            out.server_died_code
+        );
+        // The kernel observes this marker and answers with the quiescent link balance; see
+        // `maybe_emit_server_dies_link_balance` on the off-lock DebugLog path.
+        yarm_user_rt::user_log!(
+            "IPC_SERVER_DEATH_SCENARIO_DONE server_died=1 code={} continuations=1 result=ok",
+            out.server_died_code
+        );
+    }
+
     pub(super) static mut CHILD_STACK: [u8; 16384] = [0u8; 16384];
     pub(super) static mut CHILD_TLS: [u8; 512] = [0u8; 512];
 
@@ -2370,21 +2435,32 @@ fn run_x86_ipc_reply_timeout_oracle(init_tid: u64) {
                 out.late_reply_rejected
             );
         }
-    } else if out.reply_ok
-        && out.continuations == 1
-        && out.server_replied_ok == 1
-        && out.dup_reply_rejected == 1
-    {
-        yarm_user_rt::user_log!(
-            "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok"
-        );
-    } else {
-        yarm_user_rt::user_log!(
-            "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 duplicate_reply={} result=fail",
-            out.reply_ok as u32,
-            out.continuations,
-            out.dup_reply_rejected
-        );
+    } else if oracle::is_server_dies() {
+        // The ServerDies verdict, and ONLY it. This branch used to be absent, so the
+        // scenario fell into the reply-wins tail below and reported `reply_ok=0 result=fail`
+        // after the ServerDies path had completed correctly — a verdict for a scenario it
+        // never ran.
+        oracle::server_dies_final_attestations(&out);
+    } else if oracle::is_reply_wins() {
+        // Positively gated: see `oracle::is_reply_wins`. A scenario that is neither
+        // timeout-wins, ServerDies nor reply-wins emits no verdict at all rather than
+        // borrowing another scenario's.
+        if out.reply_ok
+            && out.continuations == 1
+            && out.server_replied_ok == 1
+            && out.dup_reply_rejected == 1
+        {
+            yarm_user_rt::user_log!(
+                "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok=1 caller_continuations=1 late_timeout_wakes=0 duplicate_reply=rejected result=ok"
+            );
+        } else {
+            yarm_user_rt::user_log!(
+                "X86_IPC_REPLY_BEATS_TIMEOUT_DONE reply_ok={} caller_continuations={} late_timeout_wakes=0 duplicate_reply={} result=fail",
+                out.reply_ok as u32,
+                out.continuations,
+                out.dup_reply_rejected
+            );
+        }
     }
 }
 

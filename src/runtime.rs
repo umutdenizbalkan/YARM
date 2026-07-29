@@ -4304,6 +4304,22 @@ impl SharedKernel {
         unsafe { KernelState::task_exists_from_raw(self.state.data_ptr() as *const _, tid) }
     }
 
+    /// Stage 199D — live reverse-link count, through the rank-2 task seam only.
+    ///
+    /// Observational, for the ServerDies quiescent link-balance attestation. It reads the
+    /// same field `KernelState::live_server_reply_link_count` reads, but it must NOT take the
+    /// broad lock: the caller is the off-lock DebugLog split path, and adding a broad
+    /// acquisition there would both re-enter the lock this programme is retiring and break
+    /// the Stage 204A census (`tests/broad_lock_census_guard.rs` would fail).
+    pub(crate) fn live_server_reply_link_count_split_read(&self) -> usize {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .filter(|t| t.server_reply_link.is_some())
+                .count()
+        })
+    }
+
     pub fn cnode_slot_capacity_split_read(&self, pid: u64) -> Option<usize> {
         // Stage 5A split-read: read CNode slot capacity under capability lock (rank 4) only.
         // Does not acquire the outer SharedKernel lock. Does not mutate any state.

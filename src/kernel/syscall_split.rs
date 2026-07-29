@@ -410,6 +410,13 @@ fn try_split_debug_log_into_frame(
             // Stage 200C2C2C-R2B: same causal reply-wins gate release on the off-lock DebugLog
             // path, so the seam the oracle actually takes is never the one that misses it.
             crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg);
+            // Stage 199D: the ServerDies quiescent link-balance attestation. Read-only and
+            // one-shot; the live-link count is read through the task-domain split seam, not
+            // the broad lock, because this runs on the off-lock DebugLog path.
+            crate::kernel::boot::maybe_emit_server_dies_link_balance(
+                msg,
+                shared.live_server_reply_link_count_split_read(),
+            );
         }
         // Copy failed (no mapping / not user-readable) — same as the global handler's
         // `DEBUG_LOG_COPY_FAIL` path: OK, no log.

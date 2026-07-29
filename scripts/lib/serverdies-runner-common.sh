@@ -40,7 +40,18 @@ serverdies_recheck_commit() {
 
 # ── the marker contract ────────────────────────────────────────────────────────────────
 # Ordered: each must appear, and after the one before it. This is the causal chain from the
-# server's own exit through the post-lock drain to the caller's validated ServerDied.
+# server's own exit through the post-lock drain to the caller's validated ServerDied, and on
+# to quiescence.
+#
+# ORDER CORRECTION (first real run of this prepared runner): `IPC_SERVER_DEATH_OK` was
+# listed AFTER `IPC_SERVER_DEATH_USER_VALIDATED`, which is causally impossible. `_OK` is the
+# KERNEL's completion attestation, emitted inside `complete_server_death_over` immediately
+# after the caller enqueue; `USER_VALIDATED` is a ring-3 `USER_LOG` the caller can only emit
+# BECAUSE that completion enqueued and the scheduler then dispatched it. The already-sealed
+# reply-timeout runner uses the same shape — kernel `IPC_REPLY_TIMEOUT_OK` first, userspace
+# `..._DONE` after. The earlier attempts never reached the caller wake, so the inversion was
+# never exposed. Nothing about the SET of required markers was weakened by the correction;
+# the tail below adds the quiescent attestations rather than removing anything.
 serverdies_required_markers() {
   cat <<MARKERS
 IPC_SERVER_DEATH_REQUEST_RECEIVED
@@ -55,8 +66,12 @@ IPC_SERVER_DEATH_POST_LOCK_DRAIN_BEGIN
 IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won
 IPC_SERVER_DEATH_COMPLETION_COMMITTED
 IPC_SERVER_DEATH_CALLER_ENQUEUED
-IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code=10
 IPC_SERVER_DEATH_OK
+IPC_SERVER_DEATH_TRANSITION_AUDIT
+IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code=10
+IPC_SERVER_DEATH_SURVIVOR_PROGRESS_OK
+IPC_SERVER_DEATH_SYSTEM_HEALTH_OK
+IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT
 MARKERS
 }
 
@@ -102,6 +117,8 @@ IPC_SERVER_DEATH_LATE_REPLY_ACCEPTED
 IPC_SERVER_DEATH_STALE_AUTHORITY_RESTORED
 IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION
 IPC_SERVER_DEATH_LATE_TIMEOUT_SCANNED
+IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT
+IPC_SERVER_DEATH_LINK_BALANCE_DEFERRED
 ORACLE
 }
 
