@@ -185,15 +185,155 @@ pub struct ThreadControlBlock {
     /// which keep their existing plain-deadline behavior unchanged. Dormant in
     /// production this stage (no live path registers it yet).
     pub reply_timeout_token: Option<crate::kernel::deadline_token::DeadlineTokenHandle>,
+    /// Stage 200D — the BOUNDED, generation-bearing REVERSE link from this task (as the
+    /// authorized replier) to the reply record it must answer.
+    ///
+    /// Teardown needs to find the records a dying server owed a reply to. Scanning every
+    /// reply record on every task exit is O(MAX_REPLY_CAPS) of unrelated work and would
+    /// make the death path's cost depend on unrelated IPC traffic, so the link is stored
+    /// HERE — directly on the exact server TCB — and read by index at exit.
+    ///
+    /// Capacity is deliberately ONE. That is the honest current contract: this kernel
+    /// does not support queued `IpcCall` or multiple simultaneous call/reply pairs, so a
+    /// live server incarnation owes at most one outstanding reply. A second registration
+    /// while one is live FAILS (it never silently overwrites), and the caller rolls the
+    /// whole reply-record publication back before the request becomes externally visible.
+    /// It is a fixed-size `Option`, so registration allocates nothing and is safe to run
+    /// under the ranked lifecycle/IPC locks.
+    pub server_reply_link: Option<ServerReplyLink>,
     /// Stage 200C1 — a monotonic per-task blocked-receive generation. Captured into
     /// the reply-timeout token identity at registration and revalidated at timeout
     /// completion, so a caller that unblocked and re-blocked (a new recv) advances
     /// this and a stale timeout completion is refused. Bumped when a fresh blocked
     /// recv is published.
     pub blocked_recv_generation: u64,
+    /// Stage 200C2C1B — a generation-bearing PENDING COMPLETION for a blocked syscall that
+    /// was completed remotely (off-lock) while its caller was descheduled.
+    ///
+    /// On architectures whose blocked syscalls resume by SAVED-FRAME return (the AArch64
+    /// port: the SVC's `ELR_EL1` already points past the instruction, so the handler is
+    /// NEVER re-entered), a remote completion cannot deliver its result by "returning" from
+    /// the handler — there is no second handler entry. It instead parks the outcome HERE,
+    /// and the resume boundary consumes it exactly once while encoding the canonical
+    /// syscall result into the resumed frame. One producer (the completion transaction),
+    /// one consumer (the resume boundary); a stale generation or a replacement `{tid, asid}`
+    /// incarnation is refused, so a NEW receive can never observe an OLD result and no
+    /// completion is observed twice.
+    pub pending_syscall_completion: Option<BlockedSyscallCompletion>,
+}
+
+/// Stage 200D — a generation-bearing reverse link from an authorized replier to the reply
+/// record it owes. Stored on the replier's own TCB (see `ThreadControlBlock::server_reply_link`).
+///
+/// Both the SERVER identity and the RECORD identity are generation-bearing, and both are
+/// re-checked at use. A restarted task that reuses the numeric TID always carries a different
+/// ASID, so it can neither inherit an old link's authority nor have its own link cancelled by a
+/// stale numeric-TID sweep; a reply-record slot that was reclaimed and reused advances its
+/// generation, so a link left behind by an earlier occupant refers to nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerReplyLink {
+    /// The authorized replier's numeric thread id. Never authorizes on its own.
+    pub server_tid: u64,
+    /// The replier INCARNATION. Together with `server_tid` this is the authority key.
+    pub server_asid: crate::kernel::vm::Asid,
+    /// Slot index in the single reply-record store.
+    pub reply_record_index: usize,
+    /// The slot's generation at registration — what makes a reused slot detectable.
+    pub reply_record_generation: u64,
+}
+
+impl ServerReplyLink {
+    /// `true` when this link still describes the given server incarnation.
+    #[must_use]
+    pub fn matches_server(&self, tid: u64, asid: crate::kernel::vm::Asid) -> bool {
+        self.server_tid == tid && self.server_asid == asid
+    }
+
+    /// `true` when this link still describes the given record incarnation.
+    #[must_use]
+    pub fn matches_record(&self, index: usize, generation: u64) -> bool {
+        self.reply_record_index == index && self.reply_record_generation == generation
+    }
+}
+
+/// Stage 200C2C1B — which blocked syscall class a [`BlockedSyscallCompletion`] completes.
+/// Arch-neutral: RISC-V (whose port shares the saved-frame resume shape) can consume the
+/// same mechanism later; only AArch64 is wired in this stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedSyscallClass {
+    /// A blocked `ipc_recv` / `ipc_recv_with_deadline` (recv-v2) receive.
+    IpcRecv,
+}
+
+/// Stage 200C2C1B — the exact, generation-bearing outcome of a remotely completed blocked
+/// syscall. Carries full identity so consumption is unambiguous: the consumer must match
+/// the EXACT `{tid, asid}` incarnation AND the `blocked_generation` captured when the
+/// caller blocked. Purely internal — this is NOT a public ABI type and adds no syscall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockedSyscallCompletion {
+    /// Which blocked syscall class this completes.
+    pub syscall_class: BlockedSyscallClass,
+    /// The canonical syscall error code to encode on resume (e.g. `TimedOut`).
+    pub result: u64,
+    /// The exact caller thread id.
+    pub tid: u64,
+    /// The exact caller address-space id (a replacement incarnation differs).
+    pub asid: Asid,
+    /// The blocked-receive generation captured when the caller blocked; a caller that
+    /// unblocked and re-blocked advances this, so a stale completion is refused.
+    pub blocked_generation: u64,
 }
 
 impl ThreadControlBlock {
+    /// Stage 200C2C2C-R2A — the CANONICAL publication of a completed blocked syscall's user-visible
+    /// return registers into this task's saved continuation (RISC-V).
+    ///
+    /// ## Why two stores exist
+    ///
+    /// [`UserRegisterContext`] keeps two mirrors of the same userspace state: `user_gprs` (the raw
+    /// register file) and `arg0..arg5` (the decoded syscall-argument lanes). They are populated
+    /// together by `TrapFrame::capture_user_context` (frame → TCB) and restored together by
+    /// `TrapFrame::apply_user_context` (TCB → frame), so on entry they agree. They are NOT
+    /// redundant: the argument lanes are what the RISC-V syscall ABI import/restore path treats as
+    /// authoritative for a resumed continuation, which is why publishing a completed result into
+    /// only ONE of them lets the resume reconstruct `a0` from the other, stale mirror. That is
+    /// exactly the proven defect: a timed-out receive published `a0 = 9` into the register mirror
+    /// while the argument mirror still held the original endpoint capability, and userspace
+    /// observed `a0 = 65540` — its own stale argument — instead of the result.
+    ///
+    /// This helper owns that mirror synchronization so no completion path has to know about it.
+    /// It performs no user-memory copy, takes no lock, and must be called BEFORE the task is
+    /// enqueued (the result must already be visible when the scheduler can dispatch it).
+    ///
+    /// `error` is the canonical `SyscallError` code (`0` = success). Only the RISC-V result lanes
+    /// (`a0`/`a1` and their argument mirrors) are touched; every other saved register, `sepc`,
+    /// `sstatus`, `satp`, `sp` and `tp` are left exactly as the continuation saved them.
+    #[cfg(target_arch = "riscv64")]
+    pub fn publish_riscv_user_return(&mut self, ret0: usize, ret1: usize, error: usize) {
+        // RISC-V syscall ABI: a0 carries the error code when non-zero, otherwise ret0; a1 carries
+        // ret1. `a0` is `user_gprs[10]`, `a1` is `user_gprs[11]`.
+        let a0 = if error != 0 { error } else { ret0 };
+        let a1 = if error != 0 { 0 } else { ret1 };
+        self.user_context.user_gprs[10] = a0;
+        self.user_context.user_gprs[11] = a1;
+        // The argument-lane mirror MUST be published in the same operation, or the resume can
+        // reconstruct a stale `a0` from it (the proven defect above).
+        self.user_context.arg0 = a0;
+        self.user_context.arg1 = a1;
+    }
+
+    /// Hosted mirror of [`Self::publish_riscv_user_return`] so the publication contract is
+    /// testable on any host. Same lane semantics; compiled when not targeting RISC-V.
+    #[cfg(not(target_arch = "riscv64"))]
+    pub fn publish_riscv_user_return(&mut self, ret0: usize, ret1: usize, error: usize) {
+        let a0 = if error != 0 { error } else { ret0 };
+        let a1 = if error != 0 { 0 } else { ret1 };
+        self.user_context.user_gprs[10] = a0;
+        self.user_context.user_gprs[11] = a1;
+        self.user_context.arg0 = a0;
+        self.user_context.arg1 = a1;
+    }
+
     pub fn new(tid: ThreadId, asid: Option<Asid>) -> Self {
         Self {
             tid,
@@ -213,7 +353,9 @@ impl ThreadControlBlock {
             ipc_timeout_fired: false,
             blocked_recv_state: None,
             reply_timeout_token: None,
+            server_reply_link: None,
             blocked_recv_generation: 0,
+            pending_syscall_completion: None,
         }
     }
 }

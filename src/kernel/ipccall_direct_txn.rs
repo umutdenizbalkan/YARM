@@ -222,6 +222,21 @@ impl SharedKernel {
             return Err(IpcCallDirectError::WouldBlock);
         }
 
+        // (4b) Stage 200D-1: RESERVE reverse-link capacity BEFORE anything becomes
+        // externally visible. The record slot below is `Reserved` (not invokable), but
+        // failing the link registration only at step (11b) would mean the record had
+        // already been published `Available` in the failing window. Probing here keeps the
+        // externally atomic order: both resources are known-available before either is
+        // published, so every failure from this point leaves zero live records, zero live
+        // links, no visible request and no enqueued server.
+        //
+        // The probe also rejects a server incarnation that has already committed to exit,
+        // so an exiting server can never have a request exposed to it.
+        if !self.can_reserve_server_reply_link_split(ack.server.tid.0, ack.server.asid) {
+            self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
+            return Err(IpcCallDirectError::RecordFull);
+        }
+
         // (5) reserve one ReplyCapRecord slot (Reserved → NOT externally invokable).
         let (idx, rgen) = match self.reserve_direct_reply_record_split(
             snapshot.caller,
@@ -325,6 +340,35 @@ impl SharedKernel {
                     self.sr_revoke_split(server_cnode, server_cap, reply_object);
                     let _ = self.cancel_direct_reply_record_split(idx, rgen);
                     lease.discard();
+                    return Err(IpcCallDirectError::RecordCommitFailed);
+                }
+                // Stage 200D (11b) — register the BOUNDED reverse link from the exact
+                // server incarnation to the record it now owes, so teardown can find it
+                // by index instead of scanning every reply record.
+                //
+                // Ordering is deliberate: the record is already `Available` (fully
+                // initialized and authoritative), and the server is Runnable but NOT yet
+                // enqueued, so it cannot have dispatched and no NR7 can be in flight. The
+                // link therefore cannot miss a window.
+                //
+                // Capacity is one outstanding record. A second registration FAILS rather
+                // than silently overwriting, and we then roll the whole publication back
+                // BEFORE the request becomes externally visible — the server is never
+                // enqueued, so userspace observes nothing.
+                if !self.register_server_reply_link_split(
+                    ack.server.tid.0,
+                    ack.server.asid,
+                    idx,
+                    rgen,
+                ) {
+                    self.sr_revoke_split(server_cnode, server_cap, reply_object);
+                    let _ = self.cancel_direct_reply_record_split(idx, rgen);
+                    lease.discard();
+                    crate::yarm_log!(
+                        "IPC_SERVER_REPLY_LINK_REGISTER_FAIL server_tid={} record_index={} reason=capacity result=rolled_back",
+                        ack.server.tid.0,
+                        idx
+                    );
                     return Err(IpcCallDirectError::RecordCommitFailed);
                 }
                 // (12) scheduler enqueue LAST — the single, non-fallible wake.

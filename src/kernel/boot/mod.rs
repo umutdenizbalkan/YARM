@@ -20,7 +20,9 @@ mod ipc_state;
 // Stage 200C2B: the reply-timeout completion transaction abstraction + single generic
 // body are re-exported so the OFF-LOCK drain in `crate::runtime` can run the SAME body
 // through the `SharedKernel` split-mut seams (no duplicated transaction).
-pub(crate) use ipc_state::{ReplyTimeoutDomains, complete_reply_timeout_over};
+pub(crate) use ipc_state::{
+    DetachOutcome, ReplyTimeoutDomains, complete_reply_timeout_over, complete_server_death_over,
+};
 mod memory_lifecycle_state;
 mod memory_state;
 mod orchestrator_state;
@@ -3510,14 +3512,305 @@ pub fn ipccall_direct_oracle_reply_endpoint_is(eidx: usize) -> bool {
 // slot-5 oracle, plus the oracle's confined reply endpoint index (the ONLY recv-v2 timeout that
 // registers a reply-terminal deadline — every ordinary receive stays on its unchanged path).
 
+// Stage 200C2C2C-R2C: the three per-arch selector BASES are the registry — they are all
+// visible here because provisioning must name them — but their INTERPRETATION lives in
+// `yarm_ipc_abi::ipc_reply_liveness_abi`, which is compiled for the current architecture and
+// is the single decoder shared with userspace. These aliases exist so there is exactly one
+// numeric source of truth; they must never be decoded by a shared numeric match.
+
 /// Slot-5 selector for the x86_64 reply-timeout oracle. Next free value after the direct/SMP
 /// oracles (3/9), so it is mutually exclusive with every other slot-5 oracle.
-pub const X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 = 10;
+pub const X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::ipc_reply_liveness_abi::X86_64_SELECTOR_BASE as u64;
+
+/// Stage 200C2C1 — slot-5 selector base for the AArch64 reply-timeout oracle. AArch64 slot-5 values
+/// 1..=7 are taken (FutexWake=1, FutexWait switch=2, FutexWait idle=3, two-task Yield=4, lone
+/// Yield=5, shared-region direct=6, ipccall-direct=7), so this oracle uses the next free PAIR: `8`
+/// (timeout-wins) / `9` (reply-wins), mutually exclusive with every other AArch64 slot-5 oracle.
+pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::ipc_reply_liveness_abi::AARCH64_SELECTOR_BASE as u64;
+
+/// Stage 200C2C2 — slot-5 selector base for the RISC-V reply-timeout oracle. RISC-V slot-5 values
+/// 1..=8 are taken (FutexWake=1, FutexWait=2, FutexWait-idle=3, two-task Yield=4, lone Yield=5,
+/// queue-switch=6, shared-region direct=7, ipccall-direct=8), so this oracle uses the next free
+/// PAIR: `9` (timeout-wins) / `10` (reply-wins), mutually exclusive with every other RISC-V slot-5
+/// oracle.
+pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =
+    yarm_ipc_abi::ipc_reply_liveness_abi::RISCV64_SELECTOR_BASE as u64;
 
 /// Oracle mode discriminator (also written to init startup slot 15 for the userspace scenario):
 /// `1` = timeout-wins, `2` = reply-wins.
+// ── Stage 200D-0B1: the x86_64 ExitCurrentTask live-oracle activation ───────────────
+//
+// DEFAULT-OFF and feature-gated. When armed, init spawns ONE disposable, non-essential
+// userspace task that calls NR 16 and must never execute another instruction. Every
+// literal below lives behind `x86-exit-current-task-oracle`, so a feature-off binary
+// contains none of it — while the production syscall, decoder and disposition consumer
+// remain compiled unconditionally.
+#[cfg(feature = "x86-exit-current-task-oracle")]
+static X86_EXIT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "x86-exit-current-task-oracle")]
+pub(crate) fn set_x86_exit_oracle_enabled(on: bool) {
+    X86_EXIT_ORACLE_ENABLED.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// `true` only when the feature is built AND the boot knob armed it.
+#[must_use]
+pub fn x86_exit_oracle_enabled() -> bool {
+    #[cfg(feature = "x86-exit-current-task-oracle")]
+    {
+        X86_EXIT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(feature = "x86-exit-current-task-oracle"))]
+    {
+        false
+    }
+}
+
+/// Startup slot-5 selector for the disposable exit task. Distinct from every
+/// reply-liveness selector, so the two oracles remain mutually exclusive.
+#[cfg(feature = "x86-exit-current-task-oracle")]
+pub const X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR: u64 = 20;
+
+// ── Stage 200D-0C1: the AArch64 ExitCurrentTask live-oracle activation ──────────────
+//
+// The AArch64 sibling of the block above, with one deliberate difference: the selector
+// is NOT hand-written here. It comes from the shared
+// `yarm_ipc_abi::exit_current_task_abi` encoder — the exact inverse of the decoder the
+// init server applies — so the kernel and userspace ends cannot drift apart the way the
+// reply-timeout selectors did in Stage 200C2C2C-R2B.
+#[cfg(feature = "aarch64-exit-current-task-oracle")]
+static AARCH64_EXIT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "aarch64-exit-current-task-oracle")]
+pub(crate) fn set_aarch64_exit_oracle_enabled(on: bool) {
+    AARCH64_EXIT_ORACLE_ENABLED.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// `true` only when the feature is built AND the boot knob armed it.
+#[must_use]
+pub fn aarch64_exit_oracle_enabled() -> bool {
+    #[cfg(feature = "aarch64-exit-current-task-oracle")]
+    {
+        AARCH64_EXIT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(feature = "aarch64-exit-current-task-oracle"))]
+    {
+        false
+    }
+}
+
+/// The startup slot-5 selector this build's kernel must publish for the disposable exit
+/// task, produced by the SHARED ABI encoder rather than a local literal.
+#[cfg(feature = "aarch64-exit-current-task-oracle")]
+#[must_use]
+pub fn aarch64_exit_current_task_selector() -> u64 {
+    yarm_ipc_abi::exit_current_task_abi::exit_current_task_selector_for_current_arch(
+        yarm_ipc_abi::exit_current_task_abi::ExitCurrentTaskScenario::SelfExit,
+    ) as u64
+}
+
+// ── Stage 200D-0D1: the RISC-V ExitCurrentTask live-oracle activation ───────────────
+//
+// The third arch cell, identical in shape to the AArch64 one: the selector is NOT written
+// literally here but comes from the shared `yarm_ipc_abi::exit_current_task_abi` encoder,
+// the exact inverse of the decoder the init server applies.
+#[cfg(feature = "riscv-exit-current-task-oracle")]
+static RISCV_EXIT_ORACLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "riscv-exit-current-task-oracle")]
+pub(crate) fn set_riscv_exit_oracle_enabled(on: bool) {
+    RISCV_EXIT_ORACLE_ENABLED.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// `true` only when the feature is built AND the boot knob armed it.
+#[must_use]
+pub fn riscv_exit_oracle_enabled() -> bool {
+    #[cfg(feature = "riscv-exit-current-task-oracle")]
+    {
+        RISCV_EXIT_ORACLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(feature = "riscv-exit-current-task-oracle"))]
+    {
+        false
+    }
+}
+
+/// The startup slot-5 selector this build's kernel must publish for the disposable exit
+/// task, produced by the SHARED ABI encoder rather than a local literal.
+#[cfg(feature = "riscv-exit-current-task-oracle")]
+#[must_use]
+pub fn riscv_exit_current_task_selector() -> u64 {
+    yarm_ipc_abi::exit_current_task_abi::exit_current_task_selector_for_current_arch(
+        yarm_ipc_abi::exit_current_task_abi::ExitCurrentTaskScenario::SelfExit,
+    ) as u64
+}
+
 pub const IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS: u8 = 1;
 pub const IPC_REPLY_TIMEOUT_MODE_REPLY_WINS: u8 = 2;
+/// Stage 200D-2B1: the third liveness mode — the authorized replier exits without replying.
+pub const IPC_REPLY_TIMEOUT_MODE_SERVER_DIES: u8 = 3;
+
+/// Stage 200C2C2C-R2C — the armed scenario as the TYPED value both sides agree on, or
+/// `None` when the oracle is off. The per-boot mode knob is the only input; the numeric
+/// slot-5 selector is derived from this by `ipc_reply_timeout_selector_for_current_arch`,
+/// so the kernel never hand-writes a selector number.
+#[must_use]
+pub fn ipc_reply_timeout_scenario()
+-> Option<yarm_ipc_abi::ipc_reply_liveness_abi::IpcReplyLivenessScenario> {
+    use yarm_ipc_abi::ipc_reply_liveness_abi::IpcReplyLivenessScenario as S;
+    match x86_ipc_reply_timeout_oracle_mode() {
+        IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS => Some(S::TimeoutWins),
+        IPC_REPLY_TIMEOUT_MODE_REPLY_WINS => Some(S::ReplyWins),
+        IPC_REPLY_TIMEOUT_MODE_SERVER_DIES => Some(S::ServerDies),
+        _ => None,
+    }
+}
+
+/// The slot-5 selector to publish for the armed scenario, decided by the ARCHITECTURE-LOCAL
+/// encoder. `None` when the oracle is off.
+#[must_use]
+pub fn ipc_reply_timeout_selector() -> Option<u64> {
+    ipc_reply_timeout_scenario().map(|s| {
+        yarm_ipc_abi::ipc_reply_liveness_abi::ipc_reply_liveness_selector_for_current_arch(s) as u64
+    })
+}
+
+/// Stage 200C2C1 — the monotonic "now" that drives reply-timeout deadlines, per arch.
+///
+/// x86_64: the periodic LAPIC timer advances the scheduler tick, so the scheduler tick IS the
+/// monotonic source (the caller passes it — see `reply_timeout_now_split_read`). AArch64: the port
+/// is COOPERATIVE — there is no periodic timer preemption, so the scheduler tick never advances
+/// under a user workload. Instead read the always-advancing generic-timer PHYSICAL COUNTER
+/// (`CNTPCT_EL0`), scaled down by `REPLY_TIMEOUT_AARCH64_TICK_SHIFT` to a coarse tick. It advances in
+/// hardware regardless of IRQ delivery, so the off-lock collector (which runs on EVERY trap, e.g. the
+/// oracle's yield loop) observes it advance and finds a DUE deadline. The deadline is armed in the
+/// SAME units (`reply_timeout_hw_now() + delta`), so arm and scan share one clock.
+#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
+pub(crate) const REPLY_TIMEOUT_AARCH64_TICK_SHIFT: u64 = 16;
+
+/// Stage 200C2C2 — the RISC-V monotonic reply-timeout tick. Like AArch64, the RISC-V port has no
+/// reliable periodic scheduler tick under a user workload, so deadlines use the architectural
+/// monotonic counter: the `time` CSR (the SBI/`mtime`-backed real-time counter, which is
+/// monotonic, never moves backwards, is available before userspace, and is readable from S-mode).
+/// It is scaled down by the same shift so the arm and the scan share ONE clock domain. `time` is
+/// 64-bit on RV64, so wrap is not reachable in any realistic uptime; the comparison is a plain
+/// `now >= deadline` in the scaled domain.
+#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "riscv64"))]
+pub(crate) const REPLY_TIMEOUT_RISCV_TICK_SHIFT: u64 = 13;
+
+#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "riscv64"))]
+pub(crate) fn reply_timeout_hw_now() -> u64 {
+    let t: u64;
+    // SAFETY: `time` is a read-only architectural CSR; the read has no side effects.
+    unsafe {
+        core::arch::asm!("csrr {0}, time", out(reg) t, options(nostack, nomem, preserves_flags));
+    }
+    t >> REPLY_TIMEOUT_RISCV_TICK_SHIFT
+}
+
+/// Read the AArch64 generic-timer physical counter scaled to a coarse reply-timeout tick.
+#[cfg(all(feature = "ipc-reply-timeout-oracle-core", target_arch = "aarch64"))]
+pub(crate) fn reply_timeout_hw_now() -> u64 {
+    let cnt: u64;
+    // SAFETY: `CNTPCT_EL0` is a read-only architectural counter register; the read has no side
+    // effects and needs no memory/stack clobber.
+    unsafe {
+        core::arch::asm!("mrs {0}, cntpct_el0", out(reg) cnt, options(nostack, nomem, preserves_flags));
+    }
+    cnt >> REPLY_TIMEOUT_AARCH64_TICK_SHIFT
+}
+
+/// Stage 200C2C1 — the compile-time arch tag stamped into arch-neutral IPC terminal
+/// markers (`arch={REPLY_TIMEOUT_ARCH}`), so the SAME emit sites report `x86_64` on the x86
+/// build and `aarch64` on the AArch64 build. Only the current architecture's tag is ever
+/// linked, so no foreign arch literal leaks into an artifact.
+///
+/// CLASSIFICATION (Stage 200D-F0): **production mechanism**, not an oracle literal. It is
+/// consumed by the ungated server-death completion path, which exists on every build, so
+/// gating it on `ipc-reply-timeout-oracle-core` made the feature-off kernel fail to
+/// compile on all three architectures. The per-arch `cfg`s are retained; only the feature
+/// condition is removed. This widens no oracle marker: the marker STRINGS that embed the
+/// tag remain wherever they were already gated.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const REPLY_TIMEOUT_ARCH: &str = "x86_64";
+#[cfg(target_arch = "aarch64")]
+pub(crate) const REPLY_TIMEOUT_ARCH: &str = "aarch64";
+#[cfg(target_arch = "riscv64")]
+pub(crate) const REPLY_TIMEOUT_ARCH: &str = "riscv64";
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+)))]
+pub(crate) const REPLY_TIMEOUT_ARCH: &str = "unknown";
+
+// ── Stage 200C2C2C-R2C: the BOOT-INSTANCE identifier ────────────────────────────────
+//
+// Every "this marker appears exactly once" assertion in the live runners is only sound if
+// the captured log holds exactly ONE boot instance. Banner and kernel-entry counts catch a
+// firmware or payload re-entry, but a runner that concatenated two logs, or a guest that
+// reset and re-ran an identical boot, would produce identical counts of identical lines.
+//
+// The nonce closes that: it is read ONCE per boot from the architecture's free-running
+// hardware counter and never stored across a reset, so two boot instances cannot produce
+// the same value. A runner asserts BOTH that the marker appears once AND that exactly one
+// DISTINCT nonce value is present — the second check is what distinguishes "one boot" from
+// "two boots that happened to look alike".
+static BOOT_INSTANCE_NONCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BOOT_INSTANCE_NONCE_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// The architecture's free-running counter, used only as a boot-instance discriminator.
+#[must_use]
+fn boot_instance_counter() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: `rdtsc` is unprivileged and has no memory or state effects.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let v: u64;
+        // SAFETY: `CNTPCT_EL0` is a readable EL1 system register on every supported core.
+        unsafe { core::arch::asm!("mrs {0}, CNTPCT_EL0", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let v: u64;
+        // SAFETY: `time` is an unprivileged read-only CSR.
+        unsafe { core::arch::asm!("csrr {0}, time", out(reg) v, options(nomem, nostack)) };
+        v
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )))]
+    {
+        0
+    }
+}
+
+/// Emit this boot instance's identifier exactly once. Idempotent: later calls are no-ops,
+/// so it can be placed on any path that every boot reaches.
+pub fn emit_boot_instance_nonce(arch: &str) {
+    if BOOT_INSTANCE_NONCE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let nonce = boot_instance_counter();
+    BOOT_INSTANCE_NONCE.store(nonce, core::sync::atomic::Ordering::Release);
+    crate::yarm_log!(
+        "YARM_BOOT_INSTANCE arch={} nonce=0x{:016x} result=ok",
+        arch,
+        nonce
+    );
+}
 
 static X86_IPC_REPLY_TIMEOUT_ORACLE_MODE: core::sync::atomic::AtomicU8 =
     core::sync::atomic::AtomicU8::new(0);
@@ -3560,6 +3853,766 @@ pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
     !IPC_REPLY_TIMEOUT_RW_LATE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
 }
 
+// ── Stage 200C2C2C-R2B: the CAUSAL reply-wins collector gate ────────────────────────
+//
+// The reply-wins scenario must prove that a REPLY wins terminal ownership over a
+// TIMEOUT. Before this gate that outcome depended on wall-clock luck: the deadline was
+// armed at `now + N` hardware ticks and the server merely had to issue its NR7 "fast
+// enough". On the ports without a periodic scheduler tick the collector advances only on
+// TRAPS, so the elapsed time between the caller's block and the server's reply is a
+// property of QEMU host load, not of the kernel's ownership model — exactly the
+// non-determinism Stage 200C2C2C-R1 measured.
+//
+// The gate replaces that timing dependence with a CAUSAL one. While HELD, the narrow
+// collector publishes NO work, so no timeout claimant can reach the terminal cell at
+// all. It is armed at reply-wins ARM time — strictly BEFORE any terminal claim is
+// possible — and released only when the DebugLog seam observes the oracle client's own
+// post-validation marker, i.e. after userspace has compared the delivered reply payload.
+// The reply therefore wins because it is the ONLY claimant that could run, and the
+// subsequent scan genuinely executes past the (long-since passed) deadline.
+//
+// STRICTLY TEST-ONLY and doubly confined: the whole mechanism is behind
+// `ipc-reply-timeout-oracle-core`, and every entry point additionally requires the
+// oracle to be in REPLY-WINS mode. Timeout-wins and every production deadline are
+// untouched — the gate is never armed for them.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static IPC_REPLY_TIMEOUT_COLLECTOR_HOLD: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Arm the causal gate (reply-wins only). Idempotent; emits the `held` marker once.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn hold_reply_timeout_collector() {
+    // Stage 200D-2B1A (§4): the gate now also serves ServerDies. Its job there is the same
+    // as in reply-wins — make the winner CAUSAL rather than a timing race — but the winner
+    // it protects is `PeerDeath` rather than `Reply`. While held the narrow oracle collector
+    // publishes nothing, so no timeout claimant can reach the terminal cell before the
+    // server's death has committed. The gate NEVER chooses the winner: it only withholds one
+    // claimant's opportunity, and it is released before the stale token is examined, so the
+    // late-timeout verdict is reached by the real claim path losing on a real invalidated
+    // record. Timeout-wins and every production deadline remain untouched.
+    if !matches!(
+        x86_ipc_reply_timeout_oracle_mode(),
+        IPC_REPLY_TIMEOUT_MODE_REPLY_WINS | IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+    ) {
+        return;
+    }
+    if IPC_REPLY_TIMEOUT_COLLECTOR_HOLD
+        .compare_exchange(
+            0,
+            1,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!(
+            "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch={} outcome=held phase=before_terminal_claim result=ok",
+            REPLY_TIMEOUT_ARCH
+        );
+    }
+}
+
+/// `true` while the causal gate suppresses collection. Always `false` outside
+/// reply-wins, so it can never suppress a production or timeout-wins deadline.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn reply_timeout_collector_held() -> bool {
+    IPC_REPLY_TIMEOUT_COLLECTOR_HOLD.load(core::sync::atomic::Ordering::Acquire) == 1
+}
+
+/// Stage 200D-2B1A (§5): the armed ServerDies timeout token, recorded so the later scan can
+/// prove it examined the SAME token rather than merely observing no wake.
+/// `(token_index, token_generation, caller_tid, caller_asid)`; a zero generation means
+/// nothing has been armed yet. The generation is what makes the later comparison exact —
+/// a slot index alone would be satisfied by a reused registration.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static SERVER_DIES_STALE_TOKEN: crate::kernel::lock::SpinLock<(usize, u64, u64, u16)> =
+    crate::kernel::lock::SpinLock::new((0, 0, 0, 0));
+
+/// Record the token the ServerDies caller armed. One-shot per boot.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn record_server_dies_stale_token(
+    token_index: usize,
+    token_generation: u64,
+    caller_tid: u64,
+    caller_asid: u16,
+) {
+    if x86_ipc_reply_timeout_oracle_mode() != IPC_REPLY_TIMEOUT_MODE_SERVER_DIES {
+        return;
+    }
+    let mut slot = SERVER_DIES_STALE_TOKEN.lock();
+    if slot.1 == 0 {
+        *slot = (token_index, token_generation, caller_tid, caller_asid);
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_TIMEOUT_ARMED token_index={} token_generation={} caller_tid={} caller_asid={} tokens=1 result=ok",
+            token_index,
+            token_generation,
+            caller_tid,
+            caller_asid
+        );
+    }
+}
+
+/// The armed ServerDies token, or `None`.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+#[must_use]
+pub(crate) fn server_dies_stale_token() -> Option<(usize, u64, u64, u16)> {
+    let slot = SERVER_DIES_STALE_TOKEN.lock();
+    (slot.1 != 0).then_some(*slot)
+}
+
+// ── Stage 200D-2B1B-i: exact ServerDies transition counters ─────────────────────────
+//
+// Nine counters, each incremented BY the real production operation rather than inferred
+// from a nearby marker. They observe; they never gate, order or decide anything, and no
+// production lock exists for their sake — each is a relaxed atomic add on a path that has
+// already committed its transition.
+//
+// A monotonic SEQ stamps every increment, which is what makes ordering PROVABLE rather
+// than assumed: `result_publications` must carry a strictly smaller stamp than
+// `caller_enqueues`, so a reordering shows up as a stamp inversion even if both counters
+// reach 1. Every class also fails closed on a second increment, because for one armed
+// ServerDies instance each transition happens exactly once.
+//
+// Feature-gated in full. With `ipc-reply-timeout-oracle-core` off, every entry point below
+// is absent and the production sites call nothing.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub mod server_dies_counters {
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    /// The nine transition classes, in the order the successful path must visit them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Transition {
+        LinkCreated = 0,
+        LinkDetached = 1,
+        DeferredReserved = 2,
+        DeferredPublished = 3,
+        DeferredConsumed = 4,
+        PeerDeathWinner = 5,
+        ResultPublication = 6,
+        RunnableTransition = 7,
+        CallerEnqueue = 8,
+    }
+
+    pub const CLASSES: usize = 9;
+
+    impl Transition {
+        #[must_use]
+        pub const fn name(self) -> &'static str {
+            match self {
+                Self::LinkCreated => "links_created",
+                Self::LinkDetached => "links_detached",
+                Self::DeferredReserved => "deferred_reserved",
+                Self::DeferredPublished => "deferred_published",
+                Self::DeferredConsumed => "deferred_consumed",
+                Self::PeerDeathWinner => "peer_death_winners",
+                Self::ResultPublication => "result_publications",
+                Self::RunnableTransition => "runnable_transitions",
+                Self::CallerEnqueue => "caller_enqueues",
+            }
+        }
+    }
+
+    static COUNTS: [AtomicU32; CLASSES] = [const { AtomicU32::new(0) }; CLASSES];
+    static STAMPS: [AtomicU64; CLASSES] = [const { AtomicU64::new(0) }; CLASSES];
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    /// Instance id: bumped by `reset_instance`, so one armed oracle (or one hosted test)
+    /// can never inherit another's counts.
+    static INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+    /// Begin a fresh instance. Deterministic: every class returns to zero and the stamp
+    /// clock restarts, so a test observes only its own transitions.
+    pub fn reset_instance() -> u64 {
+        for i in 0..CLASSES {
+            COUNTS[i].store(0, Ordering::Release);
+            STAMPS[i].store(0, Ordering::Release);
+        }
+        SEQ.store(0, Ordering::Release);
+        INSTANCE.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    #[must_use]
+    pub fn instance() -> u64 {
+        INSTANCE.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn count(t: Transition) -> u32 {
+        COUNTS[t as usize].load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn stamp(t: Transition) -> u64 {
+        STAMPS[t as usize].load(Ordering::Acquire)
+    }
+
+    /// The full nine-element vector, for exact assertions.
+    #[must_use]
+    pub fn vector() -> [u32; CLASSES] {
+        let mut v = [0u32; CLASSES];
+        for i in 0..CLASSES {
+            v[i] = COUNTS[i].load(Ordering::Acquire);
+        }
+        v
+    }
+
+    /// Record one real transition. Called FROM the production operation that performed it.
+    ///
+    /// A second increment for the same class in one instance is a defect, not a tolerated
+    /// duplicate: it emits the class's canonical hard-fail literal and the count is left
+    /// visibly >1 so an assertion cannot miss it.
+    pub fn record(t: Transition) {
+        let idx = t as usize;
+        let seq = SEQ.fetch_add(1, Ordering::AcqRel) + 1;
+        let prev = COUNTS[idx].fetch_add(1, Ordering::AcqRel);
+        STAMPS[idx].store(seq, Ordering::Release);
+        if prev != 0 {
+            match t {
+                Transition::DeferredPublished => crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DUPLICATE_DEFERRED class={} count={} result=fail",
+                    t.name(),
+                    prev + 1
+                ),
+                Transition::PeerDeathWinner | Transition::ResultPublication => {
+                    crate::yarm_log!(
+                        "IPC_SERVER_DEATH_DUPLICATE_COMPLETION class={} count={} result=fail",
+                        t.name(),
+                        prev + 1
+                    )
+                }
+                Transition::RunnableTransition | Transition::CallerEnqueue => crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DUPLICATE_WAKE class={} count={} result=fail",
+                    t.name(),
+                    prev + 1
+                ),
+                _ => crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DUPLICATE_TRANSITION class={} count={} result=fail",
+                    t.name(),
+                    prev + 1
+                ),
+            }
+        }
+    }
+
+    /// `true` when the result publication is stamped strictly before the caller enqueue.
+    /// Both must have happened; a missing stamp is never "in order".
+    #[must_use]
+    pub fn result_before_enqueue() -> bool {
+        let r = stamp(Transition::ResultPublication);
+        let e = stamp(Transition::CallerEnqueue);
+        r != 0 && e != 0 && r < e
+    }
+
+    /// Audit the instance against the successful-path contract and emit the canonical
+    /// hard-fail literal for whichever invariant broke. Returns `true` when every class is
+    /// exactly 1 and the publication/enqueue order holds.
+    ///
+    /// The leak literals are derived from COUNT RELATIONSHIPS, not from a separate scan:
+    /// a link created but never detached IS a link leak, and a deferred item published but
+    /// never consumed IS a deferred leak.
+    #[must_use]
+    pub fn audit_success_path() -> bool {
+        use Transition as T;
+        let mut ok = true;
+        if count(T::LinkCreated) != count(T::LinkDetached) {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_LINK_LEAK created={} detached={} result=fail",
+                count(T::LinkCreated),
+                count(T::LinkDetached)
+            );
+            ok = false;
+        }
+        if count(T::DeferredPublished) != count(T::DeferredConsumed) {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_DEFERRED_LEAK published={} consumed={} result=fail",
+                count(T::DeferredPublished),
+                count(T::DeferredConsumed)
+            );
+            ok = false;
+        }
+        if count(T::DeferredReserved) < count(T::DeferredPublished) {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_DEFERRED_LEAK reserved={} published={} reason=publish_without_reserve result=fail",
+                count(T::DeferredReserved),
+                count(T::DeferredPublished)
+            );
+            ok = false;
+        }
+        // A detached link whose record never reached a terminal winner leaves the reply
+        // record owner-less — that is the record leak this literal names.
+        if count(T::LinkDetached) != count(T::PeerDeathWinner) {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_RECORD_LEAK detached={} peer_death_winners={} result=fail",
+                count(T::LinkDetached),
+                count(T::PeerDeathWinner)
+            );
+            ok = false;
+        }
+        for t in [
+            T::LinkCreated,
+            T::LinkDetached,
+            T::DeferredReserved,
+            T::DeferredPublished,
+            T::DeferredConsumed,
+            T::PeerDeathWinner,
+            T::ResultPublication,
+            T::RunnableTransition,
+            T::CallerEnqueue,
+        ] {
+            if count(t) != 1 {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_TRANSITION_COUNT class={} count={} expected=1 result=fail",
+                    t.name(),
+                    count(t)
+                );
+                ok = false;
+            }
+        }
+        if !result_before_enqueue() {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_DUPLICATE_WAKE reason=result_not_before_enqueue result_stamp={} enqueue_stamp={} result=fail",
+                stamp(T::ResultPublication),
+                stamp(T::CallerEnqueue)
+            );
+            ok = false;
+        }
+        ok
+    }
+}
+
+/// One-shot latch so the stale-token scan attests exactly once.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static SERVER_DIES_STALE_SCAN_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+#[must_use]
+pub(crate) fn server_dies_stale_scan_once() -> bool {
+    !SERVER_DIES_STALE_SCAN_DONE.swap(true, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// The DebugLog-seam release: the oracle client logs this marker only AFTER comparing
+/// the delivered reply payload, so observing it here is proof that userspace validated
+/// the reply before any timeout claimant could run. Same idiom as the Stage 199A2D2C
+/// cross-CPU seals. One-shot.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str) {
+    if !matches!(
+        x86_ipc_reply_timeout_oracle_mode(),
+        IPC_REPLY_TIMEOUT_MODE_REPLY_WINS | IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+    ) {
+        return;
+    }
+    // Stage 200D-2B1A (§4): each scenario is released by ITS OWN userspace post-validation
+    // marker, so the release always means "userspace has already validated the winner".
+    // ServerDies releases on the caller's `IPC_SERVER_DEATH_USER_VALIDATED ... code=10`,
+    // which the caller logs only after comparing the numeric canonical code.
+    let released_by_reply =
+        msg.starts_with("IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV") && msg.contains("reply_ok=1");
+    let released_by_server_death =
+        msg.starts_with("IPC_SERVER_DEATH_USER_VALIDATED") && msg.contains("code=10");
+    if !released_by_reply && !released_by_server_death {
+        return;
+    }
+    if IPC_REPLY_TIMEOUT_COLLECTOR_HOLD
+        .compare_exchange(
+            1,
+            0,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        crate::yarm_log!(
+            "IPC_REPLY_TIMEOUT_COLLECTOR_GATE arch={} outcome=released trigger=userspace_reply_validated result=ok",
+            REPLY_TIMEOUT_ARCH
+        );
+    }
+}
+
+/// Off-feature no-op so the DebugLog seams stay unconditional call sites.
+#[cfg(not(feature = "ipc-reply-timeout-oracle-core"))]
+pub(crate) fn maybe_release_reply_timeout_collector_gate(_msg: &str) {}
+
+// ── Stage 200D-2A: per-CPU bounded DEFERRED SERVER-DEATH work queue ─────────────────
+//
+// The sibling of the Stage 200C2B reply-timeout queue below, with the SAME ownership
+// model — a per-CPU bounded array under its own IRQ-safe lock, never the broad
+// `SpinLock<KernelState>` — but deliberately NOT behind the oracle feature: server death
+// is production behaviour on every build, whereas the reply-timeout collector is an
+// oracle-gated proof path.
+//
+// Why a deferred queue at all: `exit_task` runs under the broad lock. Claiming PeerDeath,
+// publishing the caller's result and enqueueing it there is correct but keeps the whole
+// completion inside the broad lock, which is exactly the unlocking this stage removes.
+// Teardown now only RESERVES a slot, detaches the exact link and publishes an immutable
+// generation-bearing item; the post-lock drain does all the authority work.
+//
+// Reservation precedes the irreversible link detach on purpose: a detached link with no
+// deferred owner would strand the caller blocked forever, so capacity is proven available
+// before the link stops being the owner.
+
+/// One owned unit of deferred server-death completion work.
+///
+/// Everything here is immutable and generation-bearing: no raw pointer, no borrowed TCB
+/// reference, no userspace pointer, and no second authoritative completion state — the
+/// terminal cell remains the only authority. `exiting_server` is a full `{tid, asid}`
+/// identity, so a replacement incarnation reusing the numeric TID can never inherit this
+/// item's authority, and `reply_record_generation` makes a reclaimed-and-reused record
+/// slot detectable at drain time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeferredServerDeathCompletion {
+    /// The exact exiting replier incarnation, captured while its TCB was still stable.
+    pub exiting_server: ReceiverWaiterIdentity,
+    /// The reply record it owed, by slot.
+    pub reply_record_index: usize,
+    /// …and by generation, so a reused slot is a stale item rather than a wrong target.
+    pub reply_record_generation: u64,
+}
+
+/// Per-CPU deferred server-death slots, bounded by the reply-record store itself: there
+/// cannot be more outstanding records than slots, so the queue cannot overflow through
+/// legitimate use. No allocation happens on the teardown path.
+pub(crate) const SD_POST_WORK_SLOTS: usize = MAX_REPLY_CAPS;
+
+static SERVER_DEATH_POST_WORK: [crate::kernel::lock::SpinLockIrq<
+    [Option<DeferredServerDeathCompletion>; SD_POST_WORK_SLOTS],
+>; crate::kernel::scheduler::MAX_CPUS] =
+    [const { crate::kernel::lock::SpinLockIrq::new([None; SD_POST_WORK_SLOTS]) };
+        crate::kernel::scheduler::MAX_CPUS];
+
+static SERVER_DEATH_WORK_PUBLISHED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static SERVER_DEATH_WORK_DRAINED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// A proof that one queue slot is available for `cpu_idx`. Held across the link detach so
+/// the handoff can never lose the work; consuming it publishes, dropping it releases.
+#[derive(Debug)]
+#[must_use = "a reservation must be published or explicitly released"]
+pub(crate) struct ServerDeathWorkReservation {
+    cpu_idx: usize,
+    slot: usize,
+}
+
+impl ServerDeathWorkReservation {
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
+}
+
+/// Reserve one slot BEFORE the reverse link is detached. `None` when the queue is full —
+/// teardown then leaves the link attached and does not detach, so the record keeps an
+/// exact owner rather than being stranded.
+pub(crate) fn server_death_work_reserve(cpu_idx: usize) -> Option<ServerDeathWorkReservation> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let mut q = SERVER_DEATH_POST_WORK[cpu_idx].lock();
+    let slot = q.iter().position(|s| s.is_none())?;
+    // Mark the slot taken with a placeholder the drain skips: a reserved-but-unpublished
+    // slot must not be drainable, and must not be handed out twice.
+    q[slot] = Some(DeferredServerDeathCompletion {
+        exiting_server: ReceiverWaiterIdentity::new(crate::kernel::ipc::ThreadId(0), Asid(0)),
+        reply_record_index: usize::MAX,
+        reply_record_generation: 0,
+    });
+    // Stage 200D-2B1B-i (class 3): a slot was really taken. Recorded here and NOT at the
+    // call site, so a reservation that fails (queue full) records nothing.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    server_dies_counters::record(server_dies_counters::Transition::DeferredReserved);
+    Some(ServerDeathWorkReservation { cpu_idx, slot })
+}
+
+/// Publish into a held reservation. A DUPLICATE (an item for the same record slot and
+/// generation already queued and not yet drained) collapses to ONE owner: the reservation
+/// is released and `false` is returned, so a repeated task-exit notification cannot
+/// produce two deferred items. A different record can never overwrite a pending item
+/// because each reservation owns its own slot.
+pub(crate) fn server_death_work_publish(
+    reservation: ServerDeathWorkReservation,
+    work: DeferredServerDeathCompletion,
+) -> bool {
+    let mut q = SERVER_DEATH_POST_WORK[reservation.cpu_idx].lock();
+    let duplicate = q.iter().enumerate().any(|(i, s)| {
+        i != reservation.slot
+            && s.is_some_and(|w| {
+                w.reply_record_index == work.reply_record_index
+                    && w.reply_record_generation == work.reply_record_generation
+            })
+    });
+    if duplicate {
+        q[reservation.slot] = None;
+        return false;
+    }
+    q[reservation.slot] = Some(work);
+    SERVER_DEATH_WORK_PUBLISHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Stage 200D-2B1B-i (class 4): the item is now queued. The duplicate branch above
+    // returned early, so a collapsed duplicate never reaches this counter.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    server_dies_counters::record(server_dies_counters::Transition::DeferredPublished);
+    true
+}
+
+/// Release a reservation without publishing (a failpoint or an aborted handoff).
+pub(crate) fn server_death_work_release(reservation: ServerDeathWorkReservation) {
+    SERVER_DEATH_POST_WORK[reservation.cpu_idx].lock()[reservation.slot] = None;
+}
+
+/// Drain the next PUBLISHED item for `cpu_idx`. Reserved-but-unpublished placeholders are
+/// skipped, so a reservation in flight is never drained as if it were work.
+pub(crate) fn server_death_work_drain_next(
+    cpu_idx: usize,
+) -> Option<DeferredServerDeathCompletion> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let mut q = SERVER_DEATH_POST_WORK[cpu_idx].lock();
+    let idx = q
+        .iter()
+        .position(|s| s.is_some_and(|w| w.reply_record_index != usize::MAX))?;
+    let taken = q[idx].take();
+    if taken.is_some() {
+        SERVER_DEATH_WORK_DRAINED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        // Stage 200D-2B1B-i (class 5): one item left the queue. A second drain of the same
+        // record finds nothing here, so consumption cannot be double-counted.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        server_dies_counters::record(server_dies_counters::Transition::DeferredConsumed);
+    }
+    taken
+}
+
+/// Number of PUBLISHED (drainable) items queued for `cpu_idx`.
+pub(crate) fn server_death_work_len(cpu_idx: usize) -> usize {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return 0;
+    }
+    SERVER_DEATH_POST_WORK[cpu_idx]
+        .lock()
+        .iter()
+        .filter(|s| s.is_some_and(|w| w.reply_record_index != usize::MAX))
+        .count()
+}
+
+/// Clear every slot for `cpu_idx` (hosted test isolation only).
+pub(crate) fn server_death_work_clear(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        for slot in SERVER_DEATH_POST_WORK[cpu_idx].lock().iter_mut() {
+            *slot = None;
+        }
+    }
+}
+
+/// Stage 200D-0 — is at least one deferred server-death slot free for `cpu_idx`?
+///
+/// A non-mutating probe used by `ExitCurrentTask` BEFORE anything irreversible happens: a
+/// task that still owes a reply must not be allowed to reach the point of no return unless
+/// its deferred completion can be handed off, or the blocked caller would be stranded.
+pub fn server_death_work_capacity_available(cpu_idx: usize) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    SERVER_DEATH_POST_WORK[cpu_idx]
+        .lock()
+        .iter()
+        .any(|s| s.is_none())
+}
+
+// ── Stage 200D-0A: the TYPED non-returning trap disposition ─────────────────────────
+//
+// A successful `ExitCurrentTask` abandons its own syscall frame. Rather than have each
+// architecture infer that from missing scheduler state — which is how divergent,
+// duplicated lifecycle logic creeps into trap paths — the syscall publishes an explicit
+// per-CPU typed disposition and every arch return path will consume it the same way:
+//
+//   do not restore the exiting frame
+//   drain post-lock work
+//   dispatch the audited replacement, or enter idle
+//
+// This is CONTROL-FLOW OWNERSHIP, not a second lifecycle authority: `exit_task` remains
+// the only teardown authority, and nothing here mutates task, record or terminal state.
+//
+// It is generation-bearing (`{tid, asid}`, not a bare TID or a global boolean), per-CPU,
+// and single-shot. A duplicate publication is REJECTED rather than overwriting, so a
+// second exit on the same CPU cannot silently displace a pending one.
+
+/// What the post-lock trap path must do with the frame that just trapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostLockTrapDisposition {
+    /// The ordinary case: finalize the syscall result and restore the same frame.
+    ReturnNormally,
+    /// The task that trapped has exited. Its frame must never be restored; the post-lock
+    /// path drains deferred work and dispatches a replacement or idles.
+    CurrentTaskExited { tid: u64, asid: Asid },
+}
+
+/// Per-CPU slot. `None` means `ReturnNormally` — the overwhelmingly common case costs a
+/// single relaxed load and no allocation.
+static POST_LOCK_TRAP_DISPOSITION: [crate::kernel::lock::SpinLockIrq<Option<(u64, Asid)>>;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { crate::kernel::lock::SpinLockIrq::new(None) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Publish `CurrentTaskExited` for `cpu_idx`. Returns `false` WITHOUT overwriting when a
+/// disposition is already pending — a duplicate publication is a bug, not a last-writer-wins
+/// race, and the caller must be able to see that it lost.
+#[must_use]
+pub fn publish_current_task_exited(cpu_idx: usize, tid: u64, asid: Asid) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    let mut slot = POST_LOCK_TRAP_DISPOSITION[cpu_idx].lock();
+    if slot.is_some() {
+        return false;
+    }
+    *slot = Some((tid, asid));
+    true
+}
+
+/// Consume the disposition for `cpu_idx`. One-shot: the second caller sees
+/// `ReturnNormally`, so a normally returning syscall can never act on a stale exit.
+#[must_use]
+pub fn take_post_lock_trap_disposition(cpu_idx: usize) -> PostLockTrapDisposition {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return PostLockTrapDisposition::ReturnNormally;
+    }
+    match POST_LOCK_TRAP_DISPOSITION[cpu_idx].lock().take() {
+        Some((tid, asid)) => PostLockTrapDisposition::CurrentTaskExited { tid, asid },
+        None => PostLockTrapDisposition::ReturnNormally,
+    }
+}
+
+/// Non-consuming peek (assertions/telemetry only).
+#[must_use]
+pub fn post_lock_trap_disposition_pending(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && POST_LOCK_TRAP_DISPOSITION[cpu_idx].lock().is_some()
+}
+
+/// Clear the slot (hosted test isolation only).
+#[cfg(any(test, feature = "hosted-dev"))]
+pub fn clear_post_lock_trap_disposition(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        *POST_LOCK_TRAP_DISPOSITION[cpu_idx].lock() = None;
+    }
+}
+
+// ── Stage 200D-0B3: the bounded exit-attestation latch ──────────────────────────────
+//
+// Stage 200D-0B1 attested "broad lock released" and "post-lock drain done" from INSIDE
+// `SharedKernel::with_cpu`, where neither was true, and Stage 200D-0B2 sealed a live boot
+// against those claims. The correction is not a rewording: each of the three claims now has
+// to be emitted from the place that actually performs it, and those places are three
+// different stack frames spanning the lock boundary.
+//
+// This latch is what lets a later frame know that THIS trap accepted an exit. It carries no
+// authority whatsoever: no scheduling, teardown, frame selection or terminal-claim decision
+// reads it. Its only consumers are markers and one fail-closed stage check, so an
+// attestation can never run ahead of the operation it describes.
+//
+// `stage` is monotonic within one trap:
+//   0 = idle           no accepted exit on this CPU
+//   1 = consumed       the in-lock consumer validated the identity and prepared the owner
+//   2 = lock_released  `with_cpu` has returned; the broad guard is dropped
+//   3 = drained        every shared post-lock drain has completed
+// The vector epilogue consumes the latch back to 0. A frame that finds an unexpected stage
+// emits `EXIT_TASK_TRAP_DEPTH_ERROR` rather than a reassuring marker.
+pub const EXIT_ATTEST_IDLE: u8 = 0;
+pub const EXIT_ATTEST_CONSUMED: u8 = 1;
+pub const EXIT_ATTEST_LOCK_RELEASED: u8 = 2;
+pub const EXIT_ATTEST_DRAINED: u8 = 3;
+
+static EXIT_ATTEST_STAGE: [core::sync::atomic::AtomicU8; crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU8::new(EXIT_ATTEST_IDLE) };
+        crate::kernel::scheduler::MAX_CPUS];
+static EXIT_ATTEST_TID: [core::sync::atomic::AtomicU64; crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+static EXIT_ATTEST_ASID: [core::sync::atomic::AtomicU16; crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU16::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Arm the latch from the in-lock consumer. Returns `false` if one is already armed for this
+/// CPU — a second accepted exit in one trap is a defect, not a last-writer-wins race.
+#[must_use]
+pub fn arm_exit_attestation(cpu_idx: usize, tid: u64, asid: Asid) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    use core::sync::atomic::Ordering;
+    if EXIT_ATTEST_STAGE[cpu_idx]
+        .compare_exchange(
+            EXIT_ATTEST_IDLE,
+            EXIT_ATTEST_CONSUMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    EXIT_ATTEST_TID[cpu_idx].store(tid, Ordering::Release);
+    EXIT_ATTEST_ASID[cpu_idx].store(asid.0, Ordering::Release);
+    true
+}
+
+/// Advance the latch exactly one stage. Returns the armed `{tid, asid}` on success, or `None`
+/// when this CPU has no armed attestation at `expected` — which is the ordinary case for every
+/// trap that is not an accepted exit, and makes the marker sites strict no-ops there.
+#[must_use]
+pub fn advance_exit_attestation(cpu_idx: usize, expected: u8, next: u8) -> Option<(u64, Asid)> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    use core::sync::atomic::Ordering;
+    EXIT_ATTEST_STAGE[cpu_idx]
+        .compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    Some((
+        EXIT_ATTEST_TID[cpu_idx].load(Ordering::Acquire),
+        Asid(EXIT_ATTEST_ASID[cpu_idx].load(Ordering::Acquire)),
+    ))
+}
+
+/// Read the current stage without changing it.
+#[must_use]
+pub fn exit_attestation_stage(cpu_idx: usize) -> u8 {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return EXIT_ATTEST_IDLE;
+    }
+    EXIT_ATTEST_STAGE[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Consume the latch in the vector epilogue, returning the armed identity and the stage it
+/// had reached. `None` when nothing was armed.
+#[must_use]
+pub fn take_exit_attestation(cpu_idx: usize) -> Option<(u64, Asid, u8)> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    use core::sync::atomic::Ordering;
+    let stage = EXIT_ATTEST_STAGE[cpu_idx].swap(EXIT_ATTEST_IDLE, Ordering::AcqRel);
+    if stage == EXIT_ATTEST_IDLE {
+        return None;
+    }
+    Some((
+        EXIT_ATTEST_TID[cpu_idx].load(Ordering::Acquire),
+        Asid(EXIT_ATTEST_ASID[cpu_idx].load(Ordering::Acquire)),
+        stage,
+    ))
+}
+
+/// Clear the latch (hosted test isolation only).
+#[cfg(any(test, feature = "hosted-dev"))]
+pub fn clear_exit_attestation(cpu_idx: usize) {
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        EXIT_ATTEST_STAGE[cpu_idx].store(EXIT_ATTEST_IDLE, core::sync::atomic::Ordering::Release);
+    }
+}
+
+pub(crate) fn server_death_work_published_count() -> u64 {
+    SERVER_DEATH_WORK_PUBLISHED.load(core::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn server_death_work_drained_count() -> u64 {
+    SERVER_DEATH_WORK_DRAINED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 // ── Stage 200C2B: per-CPU bounded DEFERRED reply-timeout work queue ─────────────────
 //
 // The narrow collector (`SharedKernel::collect_due_reply_timeout_work`) publishes one
@@ -3575,7 +4628,7 @@ pub(crate) fn ipc_reply_timeout_rw_late_scan_once() -> bool {
 /// full generation-bearing identity (token slot+generation, terminal epoch, caller
 /// `{tid,asid}`, reply record index+generation, reply endpoint index+generation, and
 /// blocked-recv generation); `deadline` is the DUE tick that selected it.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReplyTimeoutPostWork {
     pub handle: crate::kernel::deadline_token::DeadlineTokenHandle,
@@ -3584,10 +4637,10 @@ pub(crate) struct ReplyTimeoutPostWork {
 
 /// Per-CPU deferred-work slots — bounded by the whole deadline-token store, so a
 /// full store cannot overflow it.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) const RT_POST_WORK_SLOTS: usize = MAX_DEADLINE_TOKENS;
 
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_POST_WORK: [crate::kernel::lock::SpinLockIrq<
     [Option<ReplyTimeoutPostWork>; RT_POST_WORK_SLOTS],
 >; crate::kernel::scheduler::MAX_CPUS] =
@@ -3596,10 +4649,10 @@ static REPLY_TIMEOUT_POST_WORK: [crate::kernel::lock::SpinLockIrq<
 
 /// Live counters (retirement-seal evidence): total deferred-work items published by the
 /// collector and total drained by the off-lock drain.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_WORK_PUBLISHED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_WORK_DRAINED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
@@ -3609,7 +4662,7 @@ static REPLY_TIMEOUT_WORK_DRAINED: core::sync::atomic::AtomicU64 =
 /// FULL queue returns `false`; the collector then leaves the DUE deadline armed to be
 /// retried on a later scan. Returns `true` iff the item is now published (or already
 /// present).
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_work_publish(cpu_idx: usize, work: ReplyTimeoutPostWork) -> bool {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return false;
@@ -3634,7 +4687,7 @@ pub(crate) fn reply_timeout_work_publish(cpu_idx: usize, work: ReplyTimeoutPostW
 
 /// Drain (remove + return) the next published work item for `cpu_idx`, or `None` when
 /// the queue is empty.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_work_drain_next(cpu_idx: usize) -> Option<ReplyTimeoutPostWork> {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return None;
@@ -3648,7 +4701,7 @@ pub(crate) fn reply_timeout_work_drain_next(cpu_idx: usize) -> Option<ReplyTimeo
 }
 
 /// `true` iff the per-CPU deferred-work queue for `cpu_idx` holds no items (assertions).
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_work_is_empty(cpu_idx: usize) -> bool {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return true;
@@ -3660,12 +4713,12 @@ pub(crate) fn reply_timeout_work_is_empty(cpu_idx: usize) -> bool {
 }
 
 /// Total deferred-work items published by the collector (retirement-seal evidence).
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_work_published_count() -> u64 {
     REPLY_TIMEOUT_WORK_PUBLISHED.load(core::sync::atomic::Ordering::Relaxed)
 }
 /// Total deferred-work items drained by the off-lock drain (retirement-seal evidence).
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_work_drained_count() -> u64 {
     REPLY_TIMEOUT_WORK_DRAINED.load(core::sync::atomic::Ordering::Relaxed)
 }
@@ -3673,40 +4726,87 @@ pub(crate) fn reply_timeout_work_drained_count() -> u64 {
 /// One-shot latch guarding the retired lock-status + class retirement seal: `true` on
 /// the FIRST off-lock completion (proving the class scan runs with the broad lock
 /// retired), `false` afterwards.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_LOCK_STATUS_EMITTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_lock_status_once() -> bool {
-    !REPLY_TIMEOUT_LOCK_STATUS_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
+    // Stage 200C2C2B: an explicit compare-exchange is the single authority for this attestation.
+    // Exactly one caller can observe the false -> true transition, so the marker is emitted once
+    // per boot even if several trap paths race the drain. The latch is a `static` with no reset
+    // path anywhere (asserted by a guard), so it cannot be re-armed mid-boot.
+    REPLY_TIMEOUT_LOCK_STATUS_EMITTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Stage 200C2C1B — the class RETIREMENT marker is authorized only AFTER a resumed caller has
+/// consumed its exact pending completion and had the canonical result encoded. On x86_64 the
+/// completion transaction itself IS the delivery point (saved-frame return), so the drain arms
+/// this immediately; on AArch64 the drain only ARMS it and the resume boundary fires it, so a
+/// committed-but-never-delivered completion can never claim the class retired.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static REPLY_TIMEOUT_RETIRE_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+static REPLY_TIMEOUT_RETIRE_EMITTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Arm the class-retirement marker (called by the off-lock completion transaction once it has
+/// COMMITTED a timeout terminal). Arming alone never emits.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn arm_reply_timeout_class_retired() {
+    REPLY_TIMEOUT_RETIRE_ARMED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Emit `GLOBAL_LOCK_RETIRE_CLASS_DONE` exactly once, and ONLY if a committed completion armed
+/// it. Called from the delivery point (the resume boundary), so the marker attests an
+/// end-to-end retirement: collected off-lock, completed off-lock, and actually delivered.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+pub(crate) fn maybe_emit_reply_timeout_class_retired() {
+    if !REPLY_TIMEOUT_RETIRE_ARMED.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if REPLY_TIMEOUT_RETIRE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::yarm_log!(
+        "GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout result=ok",
+        REPLY_TIMEOUT_ARCH
+    );
 }
 
 /// `true` once at least one reply-timeout deadline has been armed this boot — the gate
 /// for attesting the retired off-lock scan (the scan is meaningful only after an arm).
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_ARMED_ANY: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn set_reply_timeout_armed_any() {
     REPLY_TIMEOUT_ARMED_ANY.store(true, core::sync::atomic::Ordering::Release);
 }
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_armed_any() -> bool {
     REPLY_TIMEOUT_ARMED_ANY.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// One-shot latch for the deferred-work publish/drain evidence marker.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 static REPLY_TIMEOUT_DEFERRED_EMITTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub(crate) fn reply_timeout_deferred_once() -> bool {
     !REPLY_TIMEOUT_DEFERRED_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel)
 }
 
 /// Test-only: empty a CPU's deferred-work queue WITHOUT running completions, so a test
 /// starts from a known-clean per-CPU queue (the queue statics are process-global).
-#[cfg(all(test, feature = "x86-ipc-reply-timeout-oracle"))]
+#[cfg(all(test, feature = "ipc-reply-timeout-oracle-core"))]
 pub(crate) fn reply_timeout_work_clear(cpu_idx: usize) {
     if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
         for slot in REPLY_TIMEOUT_POST_WORK[cpu_idx].lock().iter_mut() {
@@ -3716,7 +4816,7 @@ pub(crate) fn reply_timeout_work_clear(cpu_idx: usize) {
 }
 
 /// Test-only: count queued (not-yet-drained) work items for `cpu_idx`.
-#[cfg(all(test, feature = "x86-ipc-reply-timeout-oracle"))]
+#[cfg(all(test, feature = "ipc-reply-timeout-oracle-core"))]
 pub(crate) fn reply_timeout_work_len(cpu_idx: usize) -> usize {
     if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
         return 0;
@@ -3734,7 +4834,7 @@ pub fn ipc_reply_timeout_oracle_reply_endpoint_is(eidx: usize) -> bool {
 }
 
 /// The init-local caps a provisioned reply-timeout oracle hands to init (mirrors the direct oracle).
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub struct IpcReplyTimeoutOracleCaps {
     /// init-local request endpoint cap (`SEND | RECEIVE`) → startup slot 13.
     pub request_ep_cap: u32,
@@ -3749,7 +4849,7 @@ pub struct IpcReplyTimeoutOracleCaps {
 /// the ONLY registration endpoint. Fail-closed: on any step failure it emits a precise marker and
 /// returns `None` (the oracle stays un-armed). Provisions NO MemoryObject, NO queued/notification
 /// authority, and NO second deadline queue.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub fn provision_init_ipc_reply_timeout_oracle(
     kernel: &mut KernelState,
     init_tid: u64,

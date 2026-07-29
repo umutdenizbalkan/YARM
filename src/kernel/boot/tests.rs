@@ -26906,7 +26906,7 @@ mod stage42 {
     fn stage42_variant_count_is_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 42+43 adds RecvSharedV3 variant"
         );
     }
@@ -34044,7 +34044,7 @@ mod stage116_solution1_lock_drop_before_switch {
         );
         // The VARIANT_COUNT must be exactly 23 (Stage 115 baseline).
         assert!(
-            syscall_src.contains("pub const VARIANT_COUNT: usize = 22"),
+            syscall_src.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "Syscall::VARIANT_COUNT must still equal 23 (Stage 115 baseline; no new syscalls)"
         );
     }
@@ -34328,7 +34328,7 @@ mod stage117_global_lock_drop_before_switch {
     fn stage117_syscall_count_unchanged() {
         let syscall_src = include_str!("../syscall.rs");
         assert!(
-            syscall_src.contains("pub const VARIANT_COUNT: usize = 22"),
+            syscall_src.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "Syscall::VARIANT_COUNT must still equal 23 (Stage 115 baseline)"
         );
     }
@@ -34937,7 +34937,8 @@ mod stage120_controlled_switch_proof {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35077,7 +35078,8 @@ mod stage121_first_resume_abi_diagnostics {
                 && SYSCALL_SRC.contains("mod sched;")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "D4 module split and syscall counts must remain intact"
         );
     }
@@ -35229,7 +35231,8 @@ mod stage122_first_instruction_proof {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35307,7 +35310,8 @@ mod stage123_no_pre_rust_marker_bridge_call {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35407,7 +35411,8 @@ mod stage124_rust_tail_jump_stack_shape {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35522,7 +35527,8 @@ mod stage125_first_resume_rust_entry_bridge {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "syscall count and variant count must remain unchanged"
         );
     }
@@ -35675,7 +35681,8 @@ mod stage126_kernel_switch_stack_mapping_backing {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -35828,7 +35835,8 @@ mod stage127_target_asid_switch_stack_mapping {
     fn stage127_d4_and_syscall_counts_remain_intact() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -35968,11 +35976,11 @@ mod scheduler_correctness {
     fn syscall_variant_count_unchanged_at_23() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "VARIANT_COUNT source must remain 23"
         );
     }
@@ -36235,7 +36243,8 @@ mod stage129_active_root_repair {
     fn stage129_d4_modules_and_syscall_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -36420,7 +36429,8 @@ mod stage128_active_cr3_switch_stack_mapping {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -36714,7 +36724,8 @@ mod stage130_d6_proof_cleanup {
     fn stage130_d4_modules_and_syscall_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22")
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
                 && SYSCALL_SRC.contains("mod cap;")
                 && SYSCALL_SRC.contains("mod process;")
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
@@ -37976,7 +37987,7 @@ mod stage135_pt_allocator_no_stack_scratch {
     fn stage135_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 135 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38103,7 +38114,7 @@ mod stage136_pfa_no_method_stack_frames {
     fn stage136_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 136 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38278,7 +38289,7 @@ mod stage137_demand_pf_loop_fix {
     fn stage137_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 137 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38435,7 +38446,7 @@ mod stage138_pf_frame_and_hw_pte_proof {
     fn stage138_syscall_variant_count_unchanged() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 138 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38568,7 +38579,7 @@ mod stage139_d6_proof_cr3_cleanup {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 139 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 139 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38731,7 +38742,7 @@ mod stage140_user_return_cr3 {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 140 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 140 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -38913,7 +38924,7 @@ mod stage141_kernel_return_ctx_repair {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 141 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39137,7 +39148,7 @@ mod stage142_stack_window_mapping {
         assert_eq!(SYSCALL_COUNT, 32, "Stage 142 must not change SYSCALL_COUNT");
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39347,7 +39358,7 @@ mod stage143_live_stack_selection {
     fn stage143_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39464,7 +39475,7 @@ mod stage144_arch_safe_trampoline_ip {
     fn stage144_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 144 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39599,7 +39610,7 @@ mod stage145_vm_module_extraction {
     fn stage145_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 145 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -39795,7 +39806,7 @@ mod stage146_ipc_module_extraction {
     fn stage146_syscall_variant_count() {
         assert_eq!(
             Syscall::VARIANT_COUNT,
-            22,
+            24,
             "Stage 146 must not change Syscall::VARIANT_COUNT"
         );
     }
@@ -40114,7 +40125,7 @@ mod stage147_ipc_boundary_audit {
 // - All 8 submodules declared in syscall.rs
 // - No submodule defines a competing dispatch function
 // - Shared cross-boundary helpers remain in syscall.rs
-// - SYSCALL_COUNT==32 and VARIANT_COUNT==23 assertions present
+// - SYSCALL_COUNT==32 and VARIANT_COUNT==24 assertions present
 // - No ABI constants duplicated in submodules
 // - D6/CR3/PF diagnostic markers still present
 mod stage148_decomposition_map {
@@ -40224,12 +40235,15 @@ mod stage148_decomposition_map {
         );
     }
 
-    // 5. VARIANT_COUNT == 22 compile-time declaration is present in syscall.rs.
+    // 5. VARIANT_COUNT is DERIVED from ALL_SYSCALL_VARIANTS and equals 24.
     #[test]
     fn stage148_variant_count_declaration() {
         assert!(
-            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 22"),
-            "VARIANT_COUNT must be 23 in syscall.rs"
+            // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
+            // guard targets the derivation rather than a literal that could drift again.
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 24,
+            "VARIANT_COUNT must be derived and equal 24"
         );
     }
 
@@ -40669,8 +40683,11 @@ mod stage150_ipc_abi_extraction {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 22"),
-            "VARIANT_COUNT must remain 23"
+            // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
+            // guard targets the derivation rather than a literal that could drift again.
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 24,
+            "VARIANT_COUNT must be derived and equal 24"
         );
     }
 
@@ -40897,8 +40914,11 @@ mod stage151_ipc_abi_boundary_audit {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 22"),
-            "VARIANT_COUNT must remain 23"
+            // Stage 200D-0A: the count is DERIVED from the canonical variant list, so the
+            // guard targets the derivation rather than a literal that could drift again.
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
+                && crate::kernel::syscall::Syscall::VARIANT_COUNT == 24,
+            "VARIANT_COUNT must be derived and equal 24"
         );
     }
 
@@ -41033,11 +41053,11 @@ mod stage152_syscall_decomposition_completeness_audit {
         );
     }
 
-    // 5. Syscall::VARIANT_COUNT == 22 preserved.
+    // 5. Syscall::VARIANT_COUNT == 24 preserved.
     #[test]
     fn stage152_variant_count_is_23() {
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -41533,7 +41553,7 @@ mod stage153_ipc_cap_boundary_audit {
             "compile-time SYSCALL_COUNT==32 assertion must remain"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -41680,7 +41700,7 @@ mod stage154_ipc_recv_core_boundary {
             "compile-time SYSCALL_COUNT==32 assertion must remain"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42044,7 +42064,7 @@ mod stage155_recv_v2_codec_convergence {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42293,7 +42313,7 @@ mod stage156_ipc_smoke_oracle {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42776,7 +42796,7 @@ mod stage159bcd_ipc_recv_proof_workload {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -42910,7 +42930,8 @@ mod stage160_aarch64_split_recv_routing {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -42993,7 +43014,8 @@ mod stage160b_aarch64_recv_split_dispatch_audit {
     fn stage160b_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -43127,7 +43149,8 @@ mod stage160c_aarch64_trap_abi_bracketing {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts must be unchanged"
         );
         // The x86_64 D6 proof hook lives in the same trap-entry file I edited; it
@@ -43262,7 +43285,8 @@ mod stage160d_aarch64_split_error_export_parity {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts must be unchanged"
         );
         assert!(
@@ -43414,7 +43438,8 @@ mod stage161_sender_wake_deferred {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -43538,7 +43563,8 @@ mod stage162_sender_wake_infra_deferred {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts must be unchanged"
         );
     }
@@ -43783,7 +43809,8 @@ mod stage163_sender_wake_proven {
     fn stage163_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts must be unchanged"
         );
         assert!(
@@ -44247,7 +44274,8 @@ mod stage163_sender_wake_proven {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;")
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
                 && USER_RT_SRC.contains("const SYSCALL_FORK_NR: usize = 12;"),
             "counts unchanged and fork still NR 12"
         );
@@ -44339,7 +44367,8 @@ mod stage163_sender_wake_proven {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts unchanged"
         );
         // The vm_layout bump touches only the address-space bound — not RPi5 boot
@@ -44455,7 +44484,8 @@ mod stage163_sender_wake_proven {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts unchanged"
         );
         // The COW clone change is confined to VM state — it must not reference RPi5
@@ -44577,7 +44607,8 @@ mod stage163g_cow_pagefault {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -44711,7 +44742,8 @@ mod stage163h_fork_child_pte_mismatch {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -44919,7 +44951,8 @@ mod stage163i_stale_tlb_recovery {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -45121,7 +45154,8 @@ mod stage163j_fork_return_lane {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -45258,7 +45292,8 @@ mod stage163k_no_smoke_interference {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -45502,7 +45537,8 @@ mod stage163l_nonx86_fork_return {
         }
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();"),
             "syscall/IPC counts unchanged"
         );
         assert!(
@@ -52666,7 +52702,7 @@ mod stage166_d6_switch_a {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -52892,7 +52928,7 @@ mod stage167_d6_genuine {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
     }
@@ -53249,7 +53285,7 @@ mod stage168_d6_genuine_b_and_d2_recv {
             "SYSCALL_COUNT must remain 32"
         );
         assert!(
-            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "Syscall::VARIANT_COUNT must remain 23"
         );
         assert!(
@@ -53499,7 +53535,8 @@ mod stage168b_d2_recv_genuine_completion {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -53854,7 +53891,8 @@ mod stage169_d2_send_genuine {
     fn stage169_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -54093,7 +54131,8 @@ mod stage170_ipc_final {
     fn stage170_invariants_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -54410,7 +54449,8 @@ mod stage171_sched_timeout {
     fn stage171_invariants_and_no_scope_creep() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 and VARIANT_COUNT=23 must be unchanged"
         );
         assert!(
@@ -54788,7 +54828,8 @@ mod stage172_vm_cow {
     fn stage172_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55071,7 +55112,8 @@ mod stage173_cap_cnode {
     fn stage173_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55441,7 +55483,8 @@ mod stage174_fault_delivery {
     fn stage174_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55663,7 +55706,8 @@ mod stage175_spawn_lifecycle {
     fn stage175_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -55785,7 +55829,8 @@ mod stage175b_duplicate_tid_gate {
     fn stage175b_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
     }
@@ -55999,7 +56044,8 @@ mod stage176_global_state {
     fn stage176_invariants_and_fallbacks_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56279,7 +56325,8 @@ mod stage177_smp_ready {
     fn stage177_invariants_and_regressions_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56562,7 +56609,8 @@ mod stage178_cross_arch_d6 {
     fn stage178_invariants_and_x86_d6_untouched() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56711,7 +56759,8 @@ mod stage178b_cross_arch_d6_hook {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -56936,7 +56985,8 @@ mod stage179_d3_full {
     fn stage179_invariants_preserved() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57144,7 +57194,8 @@ mod stage180_ci_profiles {
     fn stage180_counts_and_docs() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57402,7 +57453,8 @@ mod stage181_graduate_knobs {
     fn stage181_counts_and_docs() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57521,7 +57573,8 @@ mod stage181b_sender_wake_plumbing {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -57882,7 +57935,8 @@ mod stage181c_fork_internal {
     fn stage181c_counts_and_graduation_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -58025,7 +58079,8 @@ mod stage182_remove_fallbacks {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -58200,7 +58255,8 @@ mod stage183_smp_live {
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -59152,7 +59208,8 @@ mod stage183_ap_idle_admit {
     fn stage183_inc2_counts_unchanged() {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32")
-                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22"),
+                && SYSCALL_SRC
+                    .contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()"),
             "SYSCALL_COUNT=32 / VARIANT_COUNT=23 unchanged"
         );
         assert!(
@@ -59880,11 +59937,53 @@ mod stage190b_controlled_workload {
     // rotate-to-unrun-task). Each placement is audited (enqueue_on_cpu wake-only guard).
     #[test]
     fn repeated_dispatch_places_next_task_audited_one_at_a_time() {
+        // Stage 199A2D2C1 moved the loop bound from the bare `AP_WORKLOAD_TASKS` constant
+        // to `ap_workload_task_count()`, so the SMP-oracle boot can run exactly one proof
+        // task. The Stage 190B invariant is unchanged — the loop still places by INDEX,
+        // one at a time, bounded by a fixed small count — so this guard follows the bound
+        // rather than the constant, and then pins the bound itself below.
         assert!(
             SMP_SRC.contains("fn ap_sched_next_or_idle(")
-                && SMP_SRC.contains("(n as u64) < AP_WORKLOAD_TASKS")
+                && SMP_SRC.contains("if (n as u64) < ap_workload_task_count() {")
                 && SMP_SRC.contains("let next_tid = ap_workload_base_tid(cpu) + n as u64;"),
             "the scheduler loop must place the next workload task by index, one at a time"
+        );
+        // The bound must stay a FIXED, deterministic count. A run-queue length or a
+        // balancing decision here would turn the controlled sequence into exactly the
+        // arbitrary load balancing Stage 190B exists to rule out.
+        let count_fn = SMP_SRC
+            .split("fn ap_workload_task_count() -> u64 {")
+            .nth(1)
+            .expect("the workload bound must be a named function")
+            .split("\n}\n")
+            .next()
+            .expect("bounded function body");
+        for forbidden in [
+            ".len()",
+            "run_queue",
+            "enqueue_balanced",
+            "fetch_add",
+            "AP_DISPATCH_COUNT",
+        ] {
+            assert!(
+                !count_fn.contains(forbidden),
+                "the workload bound must be deterministic, not derived from `{forbidden}`"
+            );
+        }
+        // Only the explicitly gated SMP oracle narrows the sequence; the DEFAULT boot
+        // still runs the full `AP_WORKLOAD_TASKS` sequence, which is what makes the
+        // dispatch REPEATED.
+        let default_arm = count_fn
+            .split("} else {")
+            .nth(1)
+            .expect("the bound must have a default arm");
+        assert!(
+            default_arm.contains("AP_WORKLOAD_TASKS"),
+            "the default boot must run the full controlled sequence (repeated dispatch)"
+        );
+        assert!(
+            count_fn.contains("x86_ipccall_direct_smp_oracle_enabled()"),
+            "only the SMP oracle selector may narrow the sequence to a single task"
         );
         // Placement is via the audited wake-only-guarded enqueue.
         assert!(
@@ -70628,7 +70727,9 @@ mod stage199a1_ipccall_direct_audit {
     #[test]
     fn stage198f_policy_constants_unchanged() {
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         // Supported = 10 classes / 30 cells; enqueue classes excluded (per the seal doc).
         const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
@@ -71709,9 +71810,14 @@ mod stage195g_aarch64_yield_dispatch {
             body.contains("futex_wait_bypass") && body.contains("idle_no_eret_loop();"),
             "the FutexWait bypass and normal idle must remain intact"
         );
+        // Stage 200D-0C1 added a THIRD member of this family (the accepted-NR16 exit
+        // bypass). The invariant this guard protects is unchanged: the restore-skip must
+        // cover EVERY bypass, and the Yield term must still be one of them.
         assert!(
-            body.contains("let post_lock_bypass = futex_wait_bypass || yield_bypass;"),
-            "the restore-skip must cover both bypasses"
+            body.contains(
+                "let post_lock_bypass = futex_wait_bypass || yield_bypass || exit_disposition_bypass;"
+            ),
+            "the restore-skip must cover every bypass, including Yield"
         );
     }
 
@@ -72037,7 +72143,7 @@ mod stage196a_riscv_shared_trap_foundation {
     #[test]
     fn syscall_and_variant_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
     }
 
     // The bridge must route through the shared wrapper and no longer hold a persistent raw
@@ -72386,7 +72492,7 @@ mod stage196b_riscv_debuglog_split {
     #[test]
     fn other_classes_and_reap_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
         // Smoke rejects the non-retired classes + the queue-advancing drains (FutexWake is now
         // retired in 196C, so it is NOT rejected).
         for bad in [
@@ -72544,7 +72650,7 @@ mod stage196c_riscv_futex_wake_split {
     #[test]
     fn debuglog_live_others_excluded_counts_unchanged() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog"),
             "DebugLog must stay a live riscv64 split class"
@@ -72613,7 +72719,7 @@ mod stage196d_riscv_queue_switch_foundation {
     #[test]
     fn zero_new_retirement_classes() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
         // DebugLog + FutexWake remain live (unchanged from 196B/196C).
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
@@ -73144,7 +73250,7 @@ mod stage196e_riscv_futex_wait_retirement {
     #[test]
     fn preserved_classes_and_counts() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -73354,7 +73460,7 @@ mod stage196f_riscv_futex_wait_default_on_idle {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
         // NR 27 stays excluded on the RISC-V path (Yield IS retired as of 196G).
         assert!(
             !RISCV_TRAP_SRC.contains("class=InitramfsReadChunk"),
@@ -73597,7 +73703,7 @@ mod stage196g_riscv_yield_default_on {
     #[test]
     fn invariants_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
         assert!(
             SPLIT_SRC.contains("arch=riscv64 class=DebugLog")
                 && SPLIT_SRC.contains("arch=riscv64 class=FutexWake"),
@@ -73650,7 +73756,7 @@ mod stage197_first_cohort_seal {
     fn cohort_identity_and_counts() {
         assert_eq!(COHORT.len(), 4);
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
         // The doc pins the cohort + explicit exclusions.
         assert!(
             SEAL_DOC.contains("FirstCohort = { DebugLog, FutexWake, FutexWait, Yield }"),
@@ -73853,10 +73959,34 @@ mod stage197_first_cohort_seal {
         // never idle sentinels: (1) the default-off NEGATIVE oracle's forced error, and (2) the
         // Stage 198A1 DEFENSIVE no-provenance path (terminal scheduler state without authoritative
         // blocking-syscall provenance → canonical error path, NOT silent idle).
+        // Stage 200D-0D1 raised this from 2 to 5. The three new uses are the exit consumer's
+        // FAIL-CLOSED validations, which are genuine errors on the error channel — exactly the
+        // property this guard protects — and never idle sentinels:
+        //   (3) the exiting incarnation is still `current`;
+        //   (4) wrong identity (ASID mismatch, non-terminal, or still in a runqueue);
+        //   (5) the scheduler re-selected the exiting task as the replacement.
+        // The accepted-exit IDLE outcome does NOT use Internal: it returns the typed
+        // `EnterKernelIdle { ExitCurrentTaskNoRunnable }`, which is what keeps the invariant
+        // "Internal is never an idle sentinel" true.
         assert_eq!(
             RISCV_TRAP_SRC.matches("SyscallError::Internal").count(),
-            2,
-            "Internal may only be the negative-oracle error + the defensive no-provenance error"
+            5,
+            "Internal may only be genuine errors: negative oracle, defensive no-provenance, and the three exit fail-closed validations"
+        );
+        // The exit consumer's idle arm must NOT be an Internal sentinel.
+        let exit_consumer = RISCV_TRAP_SRC
+            .split("// ── Stage 200D-0D1: the RISC-V `CurrentTaskExited` consumer")
+            .nth(1)
+            .expect("exit consumer");
+        let idle_arm = exit_consumer
+            .split("owner=idle")
+            .nth(1)
+            .expect("exit idle arm");
+        let idle_arm = idle_arm.split("\n        }").next().unwrap();
+        assert!(
+            idle_arm.contains("RiscvIdleReason::ExitCurrentTaskNoRunnable")
+                && !idle_arm.contains("SyscallError::Internal"),
+            "the accepted-exit idle outcome is typed, never an Err(Internal) sentinel"
         );
         assert!(
             RISCV_TRAP_SRC.contains("RISCV_TYPED_OUTCOME_INTERNAL_ERROR_ORACLE_BEGIN")
@@ -74084,7 +74214,7 @@ mod stage197b_nr27_removed_zc_mandatory {
             Err(SyscallError::InvalidNumber)
         ));
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(Syscall::VARIANT_COUNT, 22);
+        assert_eq!(Syscall::VARIANT_COUNT, 24);
         // Needles are split so these assertions do not match themselves via include_str!.
         let variant_decl = concat!("InitramfsRead", "Chunk = ");
         let split_arm = concat!("Syscall::InitramfsRead", "Chunk");
@@ -74330,10 +74460,13 @@ mod stage197b_riscv_typed_idle_outcome {
         );
         // Both switch success branches set `switched = true` (→ ReturnToIncoming), and the tail
         // return selects ReturnToIncoming/ReturnToCurrent — never idle.
+        // Stage 200D-0D1 raised this from 2 to 3: the exit consumer's REPLACEMENT arm also
+        // selects `ReturnToIncoming`, because the resumed task differs from the trap's entering
+        // task. Its idle arm returns typed idle instead and sets nothing.
         assert_eq!(
             RISCV_TRAP_SRC.matches("switched = true;").count(),
-            2,
-            "the FutexWait switch + Yield switch success branches must set switched=true"
+            3,
+            "the FutexWait switch, Yield switch and accepted-exit replacement branches set switched=true"
         );
         assert!(
             RISCV_TRAP_SRC.contains("RiscvTrapEntryOutcome::ReturnToIncoming")
@@ -74440,10 +74573,19 @@ mod stage197b_riscv_typed_idle_outcome {
                 && RISCV_TRAP_SRC.contains("riscv_typed_outcome_internal_error_oracle_enabled()"),
             "the default-off negative (genuine error) oracle must exist"
         );
+        // Stage 200D-0D1 raised this from 2 to 5. The three new uses are the exit consumer's
+        // FAIL-CLOSED validations, which are genuine errors on the error channel — exactly the
+        // property this guard protects — and never idle sentinels:
+        //   (3) the exiting incarnation is still `current`;
+        //   (4) wrong identity (ASID mismatch, non-terminal, or still in a runqueue);
+        //   (5) the scheduler re-selected the exiting task as the replacement.
+        // The accepted-exit IDLE outcome does NOT use Internal: it returns the typed
+        // `EnterKernelIdle { ExitCurrentTaskNoRunnable }`, which is what keeps the invariant
+        // "Internal is never an idle sentinel" true.
         assert_eq!(
             RISCV_TRAP_SRC.matches("SyscallError::Internal").count(),
-            2,
-            "SyscallError::Internal is only the negative-oracle error + defensive no-provenance error"
+            5,
+            "SyscallError::Internal is only genuine errors: negative oracle, defensive no-provenance, and the three exit fail-closed validations"
         );
         // Its knob is default-off (absent → None) and wired.
         use crate::kernel::boot_command_line::parse_yarm_boot_options;
@@ -74474,7 +74616,7 @@ mod stage197b_riscv_typed_idle_outcome {
     #[test]
     fn baseline_and_cohort_preserved() {
         assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
-        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 22);
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
         assert!(matches!(
             crate::kernel::syscall::Syscall::decode(27),
             Err(crate::kernel::syscall::SyscallError::InvalidNumber)
@@ -75727,7 +75869,9 @@ duplicate_replies=0 duplicate_wakes=0 result=ok";
     #[test]
     fn abi_and_policy_unchanged() {
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         // Stage 199A2B1: restart/exit cleanup now calls the AUTHORITATIVE
         // identity-typed entry points with the captured exiting `{tid, asid}`.
         assert!(RESTART_SRC.contains("revoke_reply_caps_for_caller_identity"));
@@ -75935,7 +76079,9 @@ mod stage199a2b1_offlock_foundations {
     #[test]
     fn abi_and_policy_preserved() {
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
@@ -76119,7 +76265,9 @@ mod stage199a2b2_request_substrate {
             "no live NR6 direct split-dispatch arm this increment"
         );
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
         assert!(SEAL_DOC.contains("total_live_cells=30"));
     }
@@ -76280,7 +76428,9 @@ mod stage199a2b2c_offlock_seams {
             "no live NR6 direct split-dispatch arm this increment"
         );
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
         assert!(SEAL_DOC.contains("total_live_cells=30"));
     }
@@ -76669,7 +76819,9 @@ mod stage199a2b2d_direct_request_txn {
         const SEAL_DOC: &str = include_str!("../../../doc/SECOND_COHORT_RETIREMENT_SEAL.md");
         assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
         assert!(SEAL_DOC.contains("total_live_cells=30"));
     }
@@ -78145,7 +78297,9 @@ mod stage199a2b3_wiring {
         // Single reservation authority field on the record.
         assert!(DEFS_SRC.contains("pub(crate) reservation: ReplyRecordReservation,"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         // NR6 request seal remains present (unchanged accepted transaction).
@@ -78434,7 +78588,9 @@ mod stage199a2b4_live_oracle_guards {
         const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
@@ -78586,7 +78742,9 @@ mod stage199a2c1_aarch64_guards {
             "the parent round-trip logic must exist exactly once (arch-neutral core)"
         );
         assert_eq!(
-            INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(),
+            INIT_SRC
+                .matches("const REQUEST_DATA: [u8; 8] = *b\"NR6call!")
+                .count(),
             1,
             "the request payload contract must not be duplicated per arch"
         );
@@ -78620,7 +78778,9 @@ mod stage199a2c1_aarch64_guards {
         const SYSCALL_SRC: &str = include_str!("../syscall.rs");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
     }
 }
 
@@ -78766,7 +78926,12 @@ mod stage199a2c2_riscv_guards {
                 .count(),
             1
         );
-        assert_eq!(INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(), 1);
+        assert_eq!(
+            INIT_SRC
+                .matches("const REQUEST_DATA: [u8; 8] = *b\"NR6call!")
+                .count(),
+            1
+        );
         assert!(INIT_SRC.contains("fn run_riscv_ipccall_direct_oracle"));
         assert!(INIT_SRC.contains("RISCV_IPCREPLY_DIRECT_SEND"));
         assert!(INIT_SRC.contains("RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE"));
@@ -78811,7 +78976,9 @@ mod stage199a2c2_riscv_guards {
         const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
@@ -79008,12 +79175,16 @@ mod stage199a2c3_matrix_guards {
             "one arch-neutral oracle core"
         );
         assert_eq!(
-            INIT_SRC.matches("const REQUEST_DATA: [u8; 8]").count(),
+            INIT_SRC
+                .matches("const REQUEST_DATA: [u8; 8] = *b\"NR6call!")
+                .count(),
             1,
             "one request payload definition"
         );
         assert_eq!(
-            INIT_SRC.matches("const REPLY_DATA: [u8; 8]").count(),
+            INIT_SRC
+                .matches("const REPLY_DATA: [u8; 8] = *b\"NR7repl!")
+                .count(),
             1,
             "one reply payload definition"
         );
@@ -79043,7 +79214,9 @@ mod stage199a2c3_matrix_guards {
         const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
         assert!(SEAL_DOC.contains("total_live_cells=30"));
         assert!(SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         assert!(IPC_SRC.contains("pub(crate) const REPLY_CAP_QUEUEING_SUPPORTED: bool = false;"));
     }
 }
@@ -79164,6 +79337,22 @@ mod stage199a2d1_races {
         let (record_index, record_generation) = k
             .resolve_reply_cap_split_read(2, reply_cap_t2)
             .expect("resolve replier reply cap");
+        // Stage 200D-2B1D1: the ordinary queued call this fixture makes now registers the
+        // reverse link in PRODUCTION, so the fixture no longer starts link-free. Assert that
+        // it really happened — the fixture is itself a proof of the new wiring — and then
+        // detach it, so each case below keeps controlling linkage explicitly the way it was
+        // written to. Hiding the auto-link instead of asserting it would let the wiring
+        // regress silently.
+        assert_eq!(
+            k.with(|s| s.live_server_reply_link_count()),
+            1,
+            "the ordinary call path must register the reverse link"
+        );
+        let auto = k
+            .with(|s| s.take_server_reply_link(2, replier_asid))
+            .expect("the bound replier owns the auto-registered link");
+        assert_eq!(auto.reply_record_index, record_index);
+        assert_eq!(auto.reply_record_generation, record_generation);
         CallerFx {
             k: Arc::new(k),
             caller: id(1, caller_asid),
@@ -80759,16 +80948,35 @@ mod stage199a2d2a_smp_request {
         assert!(!ipccall_direct_smp_oracle_active(1), "inert on smp<2");
     }
 
-    // (9.11) No NR7 cross-CPU reply SMP marker exists in kernel source this stage.
+    // (9.11) The cross-CPU NR7 reply marker is a properly GATED ONE-SHOT emit.
+    //
+    // Stage 200C2C1 (stale-guard correction): the request-only Stage 199A2D2A RESERVED the
+    // `IPCREPLY_DIRECT_SMP_REPLY_OK` name for the LIVE emitter (D2B), which a later stage
+    // legitimately wired. This guard no longer asserts the marker's ABSENCE (true only at
+    // 199A2D2A); it inspects the CURRENT canonical definition — the marker is emitted ONLY behind
+    // the BSP-validated gate + delivered-count + one-shot `EMITTED` latch, never ad-hoc.
     #[test]
-    fn no_nr7_smp_reply_marker_in_kernel_source() {
+    fn nr7_smp_reply_marker_is_gated_one_shot() {
         let modrs = include_str!("mod.rs");
+        assert!(modrs.contains("fn maybe_emit_ipcreply_direct_smp_reply_ok"));
+        let body = modrs
+            .split("fn maybe_emit_ipcreply_direct_smp_reply_ok")
+            .nth(1)
+            .expect("emit helper body");
+        let emit = body
+            .find("IPCREPLY_DIRECT_SMP_REPLY_OK")
+            .expect("marker emit");
+        let latch = body.find("EMITTED.swap(true").expect("one-shot latch");
+        let delivered = body
+            .find("ipcreply_direct_smp_reply_delivered_count() < 1")
+            .expect("delivered-count gate");
+        let validated = body
+            .find("X86_BSP_REPLY_USER_VALIDATED")
+            .expect("bsp-validated gate");
         assert!(
-            !modrs.contains("IPCREPLY_DIRECT_SMP_REPLY_OK"),
-            "this request-only stage emits NO cross-CPU NR7 reply marker in kernel source"
+            latch < emit && delivered < emit && validated < emit,
+            "the cross-CPU NR7 reply marker is emitted only through the gated one-shot path"
         );
-        // The request-only success + seal marker names ARE reserved for the LIVE emitter (D2A/B).
-        // Their absence-from-emission this stage is enforced by the LIVE path being blocked (see doc).
     }
 
     // (9.12) Stage 199 functional invariants preserved.
@@ -80776,7 +80984,9 @@ mod stage199a2d2a_smp_request {
     fn stage199_functional_invariants_preserved() {
         let syscall_src = include_str!("../syscall.rs");
         assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"));
-        assert!(syscall_src.contains("pub const VARIANT_COUNT: usize = 22;"));
+        assert!(
+            syscall_src.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len();")
+        );
         // The SMP=1 functional selector is unchanged and distinct from the SMP selector.
         assert_eq!(crate::kernel::boot::IPCCALL_DIRECT_ORACLE_SELECTOR, 3);
         assert_eq!(X86_IPCCALL_DIRECT_SMP_ORACLE_SELECTOR, 9);
@@ -81668,11 +81878,20 @@ mod stage199a2d2c2b3_guards {
         assert!(EXEC.contains("0x83, 0xF8, 0x08")); // cmp eax,8 (length compare)
     }
 
-    // (12) The cross-CPU NR7 REPLY path remains disabled (no SMP reply delivery / IPI-to-CPU-0 wired).
+    // (12) The cross-CPU NR7 reply is admitted ONLY behind its explicit gate; the unrelated IPI +
+    // exec-stub sub-paths remain absent.
+    //
+    // Stage 200C2C1 (stale-guard correction): the NR7 reply direction — absent at the request-only
+    // Stage 199A2D2C2B3 — was legitimately wired by a later stage behind
+    // `x86_ipccall_direct_smp_reply_enabled()`. This guard no longer asserts its blanket absence; it
+    // verifies the reply admission is GATED (never unconditional in the split whitelist) and that the
+    // c2b2 reschedule IPI + the exec-stub direct-reply remain absent (unchanged since the request stage).
     #[test]
-    fn cross_cpu_nr7_remains_disabled() {
+    fn cross_cpu_nr7_reply_is_gated() {
+        // The NR7 reply is admitted through the split whitelist ONLY while its gate is armed.
+        assert!(SPLIT.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        // The unrelated sub-paths remain absent (unchanged since the request-only stage).
         assert!(!SMP.contains("c2b2_send_reschedule_ipi_to_cpu0"));
-        assert!(!SPLIT.contains("x86_ipccall_direct_smp_reply"));
         assert!(!EXEC.contains("ipc_reply_direct"));
     }
 }
@@ -85272,6 +85491,7 @@ mod stage200c_terminal_reuse_sync_guard {
 /// These prove the WIRING is correct + correctly gated, without a live boot (the
 /// two live boots are proven by `scripts/qemu-ipc-reply-timeout-x86_64-smoke.sh`).
 #[cfg(test)]
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 mod stage200c2b_guards {
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const MOD_SRC: &str = include_str!("mod.rs");
@@ -85284,21 +85504,34 @@ mod stage200c2b_guards {
     const INIT_SRC: &str = include_str!(
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
-    const SMOKE_SRC: &str =
+    const X86_SMOKE_SRC: &str =
         include_str!("../../../scripts/qemu-ipc-reply-timeout-x86_64-retirement-smoke.sh");
+    const AARCH64_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-aarch64-retirement-smoke.sh");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
 
-    // (1) feature AND a valid selector are both required.
+    // (1) each per-arch feature AND a valid selector are both required.
     #[test]
     fn g01_feature_and_valid_selector_required() {
-        // The provisioning + boot wiring are feature-gated.
-        assert!(MOD_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]"));
+        // The arch-neutral provisioning is gated on the shared umbrella; each arch's boot wiring is
+        // gated on its own per-arch feature (which enables the umbrella).
+        assert!(MOD_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"));
         assert!(X86_BOOT_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]"));
-        // The boot provisioning additionally requires the runtime selector armed.
+        assert!(
+            AARCH64_BOOT_SRC.contains("#[cfg(feature = \"aarch64-ipc-reply-timeout-oracle\")]")
+        );
+        // Each boot provisioning additionally requires the runtime selector armed (shared mode read).
         assert!(X86_BOOT_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
-        // Feature-on without a VALID selector is inert: unrecognized values → None.
-        assert!(CMDLINE_SRC.contains("b\"timeout-wins\" | b\"1\""));
-        assert!(CMDLINE_SRC.contains("b\"reply-wins\" | b\"2\""));
-        assert!(CMDLINE_SRC.contains("_ => None,"));
+        assert!(AARCH64_BOOT_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
+        // Feature-on without a VALID selector is inert: unrecognized values → None, for BOTH knobs.
+        assert!(CMDLINE_SRC.contains("yarm.x86_64_ipc_reply_timeout_oracle"));
+        assert!(CMDLINE_SRC.contains("yarm.aarch64_ipc_reply_timeout_oracle"));
+        assert_eq!(
+            CMDLINE_SRC.matches("b\"timeout-wins\" | b\"1\"").count(),
+            3,
+            "all three arch knobs parse timeout-wins"
+        );
+        assert_eq!(CMDLINE_SRC.matches("b\"reply-wins\" | b\"2\"").count(), 3);
     }
 
     // (2) the two selector modes are mutually exclusive (single mode discriminator).
@@ -85310,7 +85543,15 @@ mod stage200c2b_guards {
         assert!(
             MOD_SRC.contains("X86_IPC_REPLY_TIMEOUT_ORACLE_MODE: core::sync::atomic::AtomicU8")
         );
-        assert!(X86_BOOT_SRC.contains("X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR"));
+        // Stage 200C2C2C-R2C: x86 boot no longer names the selector constant — it publishes
+        // slot 5 through the ARCHITECTURE-LOCAL encoder, whose x86 pair is still 10/11.
+        assert!(X86_BOOT_SRC.contains(
+            "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);"
+        ));
+        assert_eq!(
+            crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            10
+        );
         // Mutually exclusive with every other slot-5 oracle (fires only when 5/13/14 = 0).
         assert!(
             X86_BOOT_SRC.contains("init_args[5] == 0")
@@ -85444,52 +85685,80 @@ mod stage200c2b_guards {
     fn g11_live_literals_are_feature_gated() {
         // The ARM marker + the reply-win reserve are feature-gated in ipc_state.rs.
         assert!(IPC_STATE_SRC.contains("IPC_REPLY_TIMEOUT_ARMED"));
-        // The OFF-LOCK completion markers (Stage 200C2B) live in the feature-gated drain
-        // in runtime.rs — the completion no longer runs under the broad lock.
+        // The OFF-LOCK completion markers (Stage 200C2B/200C2C1) live in the feature-gated
+        // drain in runtime.rs — the completion no longer runs under the broad lock. The
+        // arch tag is stamped at runtime via `REPLY_TIMEOUT_ARCH` (`arch={}`), so the SAME
+        // emit sites report x86_64 or aarch64 without duplicating the marker per arch.
         for lit in [
-            "IPC_REPLY_TIMEOUT_OK arch=x86_64",
-            "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0",
-            "IPC_REPLY_TIMEOUT_LATE_SCAN",
-            "IPC_REPLY_TIMEOUT_DEFERRED",
-            "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout",
+            "IPC_REPLY_TIMEOUT_OK arch={} terminal=Timeout",
+            "IPC_REPLY_TIMEOUT_LOCK_STATUS arch={} scan_broad_lock=0",
+            "IPC_REPLY_TIMEOUT_LATE_SCAN arch={}",
+            "IPC_REPLY_TIMEOUT_DEFERRED arch={}",
+            "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch={}",
         ] {
             assert!(RUNTIME_SRC.contains(lit), "literal {lit} present (drain)");
         }
-        // The emitting fns are all `#[cfg(feature = "x86-ipc-reply-timeout-oracle")]`.
-        assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn maybe_arm_reply_timeout_oracle"));
-        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn collect_due_reply_timeout_work"));
-        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"x86-ipc-reply-timeout-oracle\")]\n    pub(crate) fn drain_reply_timeout_post_work"));
+        // Stage 200C2C1B: the class-retirement emit moved OUT of the drain into the gated
+        // one-shot helper, so it can fire only from a genuine delivery point.
+        assert!(
+            MOD_SRC
+                .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout result=ok")
+        );
+        assert!(!RUNTIME_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={}"));
+        assert!(RUNTIME_SRC.contains("REPLY_TIMEOUT_ARCH"));
+        // The emitting fns are all `#[cfg(feature = "ipc-reply-timeout-oracle-core")]`.
+        assert!(IPC_STATE_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn maybe_arm_reply_timeout_oracle"));
+        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn collect_due_reply_timeout_work"));
+        assert!(RUNTIME_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]\n    pub(crate) fn drain_reply_timeout_post_work"));
     }
 
     // (12) the reply-timeout CLASS is honestly retired: scan_broad_lock=0 + the class
     // retirement seal are emitted, and no scan_broad_lock=1 claim remains.
     #[test]
     fn g12_class_retirement_present_and_honest() {
-        assert!(RUNTIME_SRC.contains("IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok"));
+        assert!(RUNTIME_SRC.contains("IPC_REPLY_TIMEOUT_LOCK_STATUS arch={} scan_broad_lock=0 completion_transaction_narrow=1 result=ok"));
+        // The retirement marker lives in the ARMED one-shot helper: the transaction only arms it,
+        // and it fires from the delivery point — a committed-but-undelivered completion can never
+        // claim the class retired.
         assert!(
-            RUNTIME_SRC.contains(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout result=ok"
-            )
+            MOD_SRC
+                .contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={} class=IpcReplyTimeout result=ok")
         );
+        assert!(MOD_SRC.contains("fn arm_reply_timeout_class_retired"));
+        assert!(MOD_SRC.contains("REPLY_TIMEOUT_RETIRE_ARMED.load"));
         // No lingering honest-broad-lock (scan_broad_lock=1) claim for this class.
         assert!(!IPC_STATE_SRC.contains("scan_broad_lock=1"));
         assert!(!RUNTIME_SRC.contains("scan_broad_lock=1"));
         assert!(!INIT_SRC.contains("class=IpcReplyTimeout"));
-        // The retirement seal is emitted ONLY by the runner script, gated behind both boots.
-        assert!(SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL"));
-        assert!(SMOKE_SRC.contains("scan_broad_lock=0"));
+        // The retirement seal is emitted ONLY by a runner script, gated behind both boots.
+        assert!(X86_SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL"));
+        assert!(X86_SMOKE_SRC.contains("scan_broad_lock=0"));
+        assert!(AARCH64_SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_AARCH64_RETIREMENT_SEAL"));
+        assert!(AARCH64_SMOKE_SRC.contains("scan_broad_lock=0"));
     }
 
-    // (13) the retirement smoke runner requires BOTH fresh boots + emits the seal only then.
+    // (13) each retirement smoke runner requires BOTH fresh boots + emits its seal only then.
     #[test]
     fn g13_runner_requires_two_fresh_boots() {
-        assert!(SMOKE_SRC.contains("yarm.x86_64_ipc_reply_timeout_oracle=${mode}"));
-        assert!(SMOKE_SRC.contains("boot_mode timeout-wins"));
-        assert!(SMOKE_SRC.contains("boot_mode reply-wins"));
-        assert!(SMOKE_SRC.contains("recheck_sha_clean"));
-        assert!(SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL"));
-        // The seal is gated behind BOTH scenarios passing.
-        assert!(SMOKE_SRC.contains("\"$TW_OK\" != \"1\" || \"$RW_OK\" != \"1\""));
+        for (src, sel, seal) in [
+            (
+                X86_SMOKE_SRC,
+                "yarm.x86_64_ipc_reply_timeout_oracle=${mode}",
+                "STAGE_200C_REPLY_TIMEOUT_X86_RETIREMENT_SEAL",
+            ),
+            (
+                AARCH64_SMOKE_SRC,
+                "yarm.aarch64_ipc_reply_timeout_oracle=${mode}",
+                "STAGE_200C_REPLY_TIMEOUT_AARCH64_RETIREMENT_SEAL",
+            ),
+        ] {
+            assert!(src.contains(sel));
+            assert!(src.contains("boot_mode timeout-wins"));
+            assert!(src.contains("boot_mode reply-wins"));
+            assert!(src.contains("recheck_sha_clean"));
+            assert!(src.contains(seal));
+            assert!(src.contains("\"$TW_OK\" != \"1\" || \"$RW_OK\" != \"1\""));
+        }
     }
 
     // ── Stage 200C2B source hard-stops (item 6) ─────────────────────────────────────
@@ -85598,6 +85867,143 @@ mod stage200c2b_guards {
         assert!(!scan.contains("complete_reply_timeout_over"));
         assert!(!scan.contains("run_reply_timeout_completion"));
     }
+
+    // ── Stage 200C2C1 AArch64 port guards ───────────────────────────────────────────
+
+    // (a1) AArch64 boot provisions the SAME arch-neutral oracle behind its OWN slot-5 pair (8/9),
+    // reusing `provision_init_ipc_reply_timeout_oracle`, mutually exclusive with the other slot-5s.
+    #[test]
+    fn a1_aarch64_provisioning_reuses_neutral_core() {
+        // Stage 200C2C2C-R2C: the constant is now an ALIAS of the shared ABI base, so the
+        // registry and the architecture-local decoder cannot drift. Assert the alias AND the
+        // value it resolves to (8 = AArch64 timeout-wins, 9 = AArch64 reply-wins).
+        assert!(MOD_SRC.contains(
+            "pub const AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =\n    yarm_ipc_abi::ipc_reply_liveness_abi::AARCH64_SELECTOR_BASE as u64;"
+        ));
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            8
+        );
+        assert!(AARCH64_BOOT_SRC.contains("provision_init_ipc_reply_timeout_oracle"));
+        // Stage 200C2C2C-R2C: slot 5 is published by the architecture-local encoder.
+        assert!(AARCH64_BOOT_SRC.contains(
+            "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);"
+        ));
+        assert!(
+            AARCH64_BOOT_SRC.contains("init_args[5] == 0")
+                && AARCH64_BOOT_SRC.contains("init_args[13] == 0")
+                && AARCH64_BOOT_SRC.contains("init_args[14] == 0")
+        );
+    }
+
+    // (a2) the collector + drain are wired into the SHARED trap-entry post-lock area behind the
+    // umbrella feature, so BOTH arches reach them after the broad guard drops (reachability, no DCE).
+    #[test]
+    fn a2_shared_postlock_reachability() {
+        // Stage 200C2C2B: the shared entry drives x86_64 + AArch64; RISC-V is excluded because it
+        // wires the identical collector/drain into its OWN trap wrapper (single-driver invariant
+        // for the one-shot lock-status attestation).
+        assert!(
+            TRAP_SRC.contains("feature = \"ipc-reply-timeout-oracle-core\"")
+                && TRAP_SRC.contains("not(target_arch = \"riscv64\")"),
+            "the collector/drain call is gated on the umbrella, excluding RISC-V"
+        );
+        // The call sits in the shared entry AFTER `with_cpu` returns (broad lock dropped).
+        let idx_call = TRAP_SRC
+            .find("shared.collect_due_reply_timeout_work")
+            .expect("collect call");
+        let idx_ret = TRAP_SRC
+            .find("// `with_cpu` has returned")
+            .expect("post-lock marker");
+        assert!(
+            idx_ret < idx_call,
+            "collector runs after the broad guard drops"
+        );
+    }
+
+    // (a3) single-source: the terminal + completion + reserve/commit/rollback logic exists EXACTLY
+    // once (the arch wrappers duplicate NONE of it).
+    #[test]
+    fn a3_single_source_no_arch_duplication() {
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("fn collect_due_reply_timeout_work")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn complete_reply_timeout_over")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn reserve_reply_win_before_copy")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn commit_reply_win_after_delivery")
+                .count(),
+            1
+        );
+        assert_eq!(IPC_STATE_SRC.matches("fn rollback_reply_win").count(), 1);
+        // The AArch64 userspace wrapper reuses the shared oracle core (no duplicated round-trip).
+        assert!(INIT_SRC.contains("fn run_aarch64_ipc_reply_timeout_oracle"));
+        assert!(INIT_SRC.contains("AARCH64_IPC_REPLY_TIMEOUT_DONE"));
+        assert!(INIT_SRC.contains("AARCH64_IPC_REPLY_BEATS_TIMEOUT_DONE"));
+        // The client/server core (server_run/client_run) is defined once, shared by both arch runners.
+        assert_eq!(
+            INIT_SRC.matches("pub(super) unsafe fn client_run").count(),
+            1
+        );
+    }
+
+    // (a4) the AArch64 timeout return uses NO x86 error-register assumption: the saved-frame register
+    // write is x86_64-ONLY (saved-frame return). AArch64 RE-RUNS the recv syscall on resume, so the
+    // completion must NOT touch the saved GPRs (that would corrupt the re-run's x0..x5 args); it
+    // relies on the `ipc_timeout_fired` flag to drive the canonical TimedOut, like the ordinary path.
+    #[test]
+    fn a4_aarch64_timeout_return_frame() {
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        // The saved-frame register write is x86_64-ONLY (that arch resumes via saved-frame return,
+        // RCX = error). AArch64 RE-RUNS the recv handler, re-importing its args from x0..x5, so any
+        // result-register write there would corrupt the re-run's endpoint-cap/pointer arguments.
+        assert!(body.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(
+            body.contains("tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error")
+        );
+        // There is exactly ONE saved-frame mutation block, and it is x86_64-gated: no non-x86
+        // branch writes any saved register (the recv handler re-runs and re-imports x0..x5).
+        //
+        // Stage 200C2C2C-R2C: count ASSIGNMENTS, not mentions. The RISC-V stored-lane
+        // attestation added by this stage READS `tcb.user_context` to report the published
+        // values; reads cannot clobber a resumed register, and the guard's subject is writes.
+        let saved_frame_writes = |t: &str| {
+            t.lines()
+                .filter(|l| {
+                    let l = l.trim_start();
+                    l.starts_with("tcb.user_context") && l.contains(" = ")
+                })
+                .count()
+        };
+        assert_eq!(
+            saved_frame_writes(body),
+            5,
+            "the only saved-frame writes are the five x86_64-gated result-register writes"
+        );
+        assert!(!body.contains("#[cfg(not(target_arch = \"x86_64\"))]"));
+        // The TimedOut result is driven by the `ipc_timeout_fired` flag (the prepare step).
+        assert!(IPC_STATE_SRC.contains("tcb.ipc_timeout_fired = true;"));
+        // No ELR mutation in the completion.
+        assert!(!body.contains("elr =") && !body.contains("set_elr") && !body.contains(".elr"));
+    }
 }
 
 /// Stage 200C2B — deterministic OFF-LOCK reply-timeout collection + completion proofs.
@@ -85606,6 +86012,7 @@ mod stage200c2b_guards {
 /// with the broad lock retired — plus the reversible reply lease that governs the
 /// reply-copy-fault race. Run single-threaded (the per-CPU deferred queue is a
 /// process-global static; each test clears CPU 0's queue first).
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 mod stage200c2b_offlock {
     use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
     use crate::kernel::boot::Bootstrap;
@@ -86031,7 +86438,7 @@ mod stage200c2b_offlock {
     fn t19_frozen_nr7_without_deadline() {
         let fx = caller_fixture();
         // No deadline registered, oracle inert (hosted) → reserve is a strict no-op.
-        #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
         {
             let cap = crate::kernel::capabilities::CapId(0);
             assert!(
@@ -86070,5 +86477,10457 @@ mod stage200c2b_offlock {
         k.drain_reply_timeout_post_work(CPU, NOW);
         assert_eq!(queue_len(), 0, "empty after a stale (rollback) drain");
         clear_queue();
+    }
+}
+
+/// Stage 200C2C1B — AArch64 blocked-recv TIMEOUT RE-ENTRY proofs.
+///
+/// The AArch64 port resumes a blocked syscall by SAVED-FRAME return (its `SVC` `ELR_EL1`
+/// already points past the instruction), so the handler is never re-entered and the resume
+/// boundary MIRRORS `arg0..arg5` into `x0..x5`. A remotely completed caller therefore parks a
+/// generation-bearing [`BlockedSyscallCompletion`] that the resume boundary consumes exactly
+/// once while encoding the canonical result. These tests pin that contract.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage200c2c1b_aarch64_reentry {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::kernel::deadline_token::DeadlineTokenHandle;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{BlockedSyscallClass, TaskStatus};
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+
+    const TOKEN_GEN: u64 = 1;
+    const BRG: u64 = 1;
+    const DEADLINE: u64 = 100;
+    const NOW: u64 = 200;
+    const CPU: CpuId = CpuId(0);
+    /// `SyscallError::TimedOut as u64` — the canonical timeout result code.
+    const TIMED_OUT: u64 = 9;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const AARCH64_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-aarch64-retirement-smoke.sh");
+
+    fn clear_queue() {
+        crate::kernel::boot::reply_timeout_work_clear(0);
+    }
+
+    fn setup(fx: &CallerFx) -> (usize, u64, TerminalIdentity, DeadlineTokenHandle) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let identity =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, identity));
+        let handle =
+            fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, DEADLINE))
+                .expect("register");
+        (idx, rgen, identity, handle)
+    }
+
+    /// Drive a full off-lock timeout completion for the fixture's caller.
+    fn complete_timeout(fx: &CallerFx) {
+        clear_queue();
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        clear_queue();
+    }
+
+    /// Snapshot the caller's saved `arg0..arg5` (the AArch64 resume lanes).
+    fn saved_args(fx: &CallerFx) -> [usize; 6] {
+        fx.k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                let t = tcbs
+                    .iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("caller");
+                let c = &t.user_context;
+                [c.arg0, c.arg1, c.arg2, c.arg3, c.arg4, c.arg5]
+            })
+        })
+    }
+
+    /// Seed distinct saved arguments so a clobber is detectable.
+    fn seed_args(fx: &CallerFx) {
+        fx.k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("caller");
+                let c = &mut t.user_context;
+                c.arg0 = 0x1111;
+                c.arg1 = 0x2222;
+                c.arg2 = 0x3333;
+                c.arg3 = 0x4444;
+                c.arg4 = 0x5555;
+                c.arg5 = 0x6666;
+                c.instruction_ptr = crate::kernel::vm::VirtAddr(0xDEAD_0000);
+            });
+        });
+    }
+
+    fn saved_pc(fx: &CallerFx) -> u64 {
+        fx.k.with(|s| {
+            s.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("caller")
+                    .user_context
+                    .instruction_ptr
+                    .0
+            })
+        })
+    }
+
+    // (1) the initial blocked entry retains x0–x5 (the completion must not disturb them).
+    #[test]
+    fn t01_initial_blocked_entry_retains_args() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        seed_args(&fx);
+        let before = saved_args(&fx);
+        assert_eq!(before, [0x1111, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666]);
+        // Still blocked, args untouched while blocked.
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(1)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        assert_eq!(saved_args(&fx), before);
+        teardown();
+    }
+
+    // (2) the timeout completion writes NO AArch64 argument register.
+    //
+    // The hosted suite runs on x86_64, so the AArch64 half is source-proven: the ONLY saved-frame
+    // write in the transaction is x86_64-gated (that arch delivers by saved-frame return), and no
+    // `arg`/`user_gprs` write exists outside it. The behavioural half — that a generation-bearing
+    // completion is parked instead — is exercised directly.
+    #[test]
+    fn t02_completion_writes_no_arg_register() {
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        let x86_blk = body
+            .split("#[cfg(target_arch = \"x86_64\")]")
+            .nth(1)
+            .expect("x86 block")
+            .split("\n        }")
+            .next()
+            .unwrap();
+        assert!(x86_blk.contains("user_gprs[2] = timed_out"));
+        // Every saved-frame write lives inside that x86_64-gated block. Stage 200C2C2C-R2C:
+        // compare ASSIGNMENTS — the RISC-V stored-lane attestation only reads the context.
+        let writes = |t: &str| {
+            t.lines()
+                .filter(|l| {
+                    let l = l.trim_start();
+                    l.starts_with("tcb.user_context") && l.contains(" = ")
+                })
+                .count()
+        };
+        assert_eq!(
+            writes(body),
+            writes(x86_blk),
+            "no saved-frame write outside the x86_64-gated block (AArch64 lanes untouched)"
+        );
+        // The AArch64 delivery mechanism is the parked, generation-bearing completion.
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        assert!(fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (3) the completion is detected BEFORE the endpoint-cap/argument decoding at the boundary.
+    #[test]
+    fn t03_completion_detected_before_arg_decoding() {
+        // Source contract: in the AArch64 resume boundary the consume call precedes the
+        // arg0..arg5 -> x0..x5 mirror (which is what would re-expose the stale endpoint cap).
+        let blk = AARCH64_TRAP_SRC
+            .split("if !syscall_return {")
+            .nth(1)
+            .expect("resume mirror block");
+        let consume = blk
+            .find("take_blocked_syscall_completion")
+            .expect("consume call");
+        let mirror = blk.find("REG_X0, frame.arg(0)").expect("arg mirror");
+        assert!(
+            consume < mirror,
+            "the pending completion must be consumed BEFORE the argument mirror"
+        );
+    }
+
+    // (4) the exact canonical TimedOut is encoded on the completion (resume) boundary.
+    #[test]
+    fn t04_exact_timedout_encoded() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        let done =
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .expect("pending completion");
+        assert_eq!(done.result, TIMED_OUT, "canonical SyscallError::TimedOut");
+        assert_eq!(done.syscall_class, BlockedSyscallClass::IpcRecv);
+        assert_eq!(done.tid, 1);
+        assert_eq!(done.blocked_generation, BRG);
+        teardown();
+    }
+
+    // (5) the saved ELR is unchanged while blocked (advanced once, at block time).
+    #[test]
+    fn t05_elr_unchanged_while_blocked() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        seed_args(&fx);
+        let pc = saved_pc(&fx);
+        complete_timeout(&fx);
+        assert_eq!(
+            saved_pc(&fx),
+            pc,
+            "the completion must not move the saved ELR"
+        );
+    }
+
+    // (6) the resume boundary advances the ELR exactly once — i.e. it never re-advances it.
+    #[test]
+    fn t06_elr_single_advance() {
+        // Source contract: the consume block performs NO ELR/PC mutation; the SVC return address
+        // was established once at block time (`syscall_resume_pc`).
+        let blk = AARCH64_TRAP_SRC
+            .split("take_blocked_syscall_completion")
+            .nth(1)
+            .expect("consume block");
+        let blk = blk.split("REG_X0, frame.arg(0)").next().unwrap();
+        assert!(
+            !blk.contains("set_saved_pc"),
+            "no ELR mutation on the completion path"
+        );
+        assert!(!blk.contains("instruction_ptr ="));
+        assert!(!blk.contains("+ 4"));
+    }
+
+    // (7) the completion is consumed exactly ONCE.
+    #[test]
+    fn t07_completion_consumed_once() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_some()
+        );
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none(),
+            "a completion must never be observable twice"
+        );
+        teardown();
+    }
+
+    // (8) a third boundary entry cannot observe a stale TimedOut.
+    #[test]
+    fn t08_third_entry_sees_no_stale_result() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        let _ = fx.k.with(|s| s.take_blocked_syscall_completion(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (9) a blocked-recv GENERATION mismatch rejects the stale completion.
+    #[test]
+    fn t09_generation_mismatch_rejected() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        assert!(fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        // The caller re-blocked with a NEW receive (generation advances).
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none(),
+            "a stale-generation completion must be refused"
+        );
+        // ...and dropped, so it cannot linger for a later receive.
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (10) a replacement TID incarnation with a DIFFERENT ASID is untouched.
+    #[test]
+    fn t10_replacement_asid_untouched() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        // Replace the caller incarnation (same numeric TID, different ASID).
+        fx.k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == 1)
+                    .expect("caller");
+                t.asid = Some(crate::kernel::vm::Asid(0xBEEF));
+            });
+        });
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none(),
+            "a replacement ASID incarnation must not consume the old completion"
+        );
+        teardown();
+    }
+
+    // (11) a NEW receive cannot consume an OLD timeout result.
+    #[test]
+    fn t11_new_receive_cannot_consume_old_result() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        // The caller starts a fresh receive: generation advances BEFORE the boundary runs.
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        // The fresh receive therefore sees NO parked result at all.
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (12) no endpoint waiter is reinstalled by the completion.
+    #[test]
+    fn t12_no_waiter_reinstalled() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, id, _h) = setup(&fx);
+        complete_timeout(&fx);
+        let waiter = fx.k.with(|s| {
+            s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(id.reply_endpoint_index))
+        });
+        assert!(
+            waiter.is_none(),
+            "the exact waiter is claimed, never reinstalled"
+        );
+        teardown();
+    }
+
+    // (13) no deadline is re-armed by the completion.
+    #[test]
+    fn t13_no_deadline_rearmed() {
+        let fx = caller_fixture();
+        let (_idx, _rgen, _id, handle) = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(|s| s.deadline_token_is_completed(handle.token_index())),
+            "the token is COMPLETED, not re-armed"
+        );
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 0);
+        assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 0);
+        teardown();
+    }
+
+    // (14) the reply-wins path still delivers the EXACT payload (no completion interception).
+    #[test]
+    fn t14_reply_wins_payload_preserved() {
+        let fx = caller_fixture();
+        let (idx, _rgen, id, handle) = setup(&fx);
+        // Reply wins: lease + terminal, then commit.
+        let lease =
+            fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
+                .expect("reply lease");
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("reply terminal");
+        assert!(fx.k.with(|s| s.complete_deadline_reply_lease(handle.token_index(), &lease)));
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        // NO pending completion is parked for a reply win, so the resume boundary cannot
+        // intercept the successful reply continuation.
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Reply)
+        );
+        teardown();
+    }
+
+    // (15) ordinary receive-timeout behavior is unchanged (still fires on the in-lock scan).
+    #[test]
+    fn t15_ordinary_recv_timeout_unchanged() {
+        use crate::kernel::boot::Bootstrap;
+        use crate::kernel::capabilities::CapId;
+        use crate::kernel::task::WaitReason;
+        use crate::runtime::SharedKernel;
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(70).expect("t70");
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 70).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
+                tcb.ipc_timeout_deadline = Some(5);
+            });
+            let expired = s.process_ipc_timeout_deadlines(10).expect("scan");
+            assert_eq!(expired, 1, "ordinary deadline still fires in-lock");
+            assert_eq!(s.task_status(70), Some(TaskStatus::Runnable));
+            // The ordinary path parks NO pending completion (it is unretired + unchanged).
+            assert!(!s.has_pending_syscall_completion(70));
+        });
+    }
+
+    // (16) the retirement marker is emitted only AFTER the result is encoded at the boundary.
+    #[test]
+    fn t16_retirement_marker_follows_result_encoding() {
+        // The class-retirement emit is ARMED by the transaction and FIRED at the boundary,
+        // strictly after the result is written into the resume lane.
+        assert!(MOD_SRC.contains("fn arm_reply_timeout_class_retired"));
+        assert!(MOD_SRC.contains("fn maybe_emit_reply_timeout_class_retired"));
+        assert!(RUNTIME_SRC.contains("arm_reply_timeout_class_retired()"));
+        let blk = AARCH64_TRAP_SRC
+            .split("take_blocked_syscall_completion")
+            .nth(1)
+            .expect("consume block");
+        let encode = blk.find("frame.set_arg(0, done.result").expect("encode");
+        let emit = blk
+            .find("maybe_emit_reply_timeout_class_retired")
+            .expect("retire emit");
+        assert!(
+            encode < emit,
+            "encode the canonical result BEFORE claiming retirement"
+        );
+    }
+
+    // (17) the COMMITTED marker alone cannot satisfy the smoke — the runner additionally
+    // requires the boundary consumption, the retirement marker and the userspace completion,
+    // in order.
+    #[test]
+    fn t17_committed_marker_alone_insufficient() {
+        assert!(AARCH64_SMOKE_SRC.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=aarch64"));
+        assert!(AARCH64_SMOKE_SRC.contains("AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED"));
+        assert!(AARCH64_SMOKE_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=aarch64"));
+        assert!(
+            AARCH64_SMOKE_SRC.contains("AARCH64_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut")
+        );
+        // The ordering assertions are present (committed -> consumed -> retired -> userspace).
+        assert!(AARCH64_SMOKE_SRC.contains("must precede the resume-boundary consumption"));
+        assert!(AARCH64_SMOKE_SRC.contains("must follow the completion consumption"));
+        assert!(AARCH64_SMOKE_SRC.contains("must precede the userspace completion"));
+    }
+
+    // (18) the AArch64 cell claims no RISC-V behavior OF ITS OWN.
+    //
+    // Stage 200C2C2 correction: Stage 200C2C1 asserted the blanket ABSENCE of RISC-V wiring, which
+    // was true only while RISC-V was unported. The RISC-V cell now legitimately exists, so this
+    // guard instead pins that the AArch64 cell's own surfaces stay AArch64-attributed and that the
+    // arch cells remain separately gated (no cell silently activates another arch).
+    #[test]
+    fn t18_no_riscv_claimed() {
+        assert!(AARCH64_SMOKE_SRC.contains("FEATURE=aarch64-ipc-reply-timeout-oracle"));
+        assert!(!AARCH64_SMOKE_SRC.contains("FEATURE=riscv64-ipc-reply-timeout-oracle"));
+        assert!(INIT_SRC.contains("RISCV_IPC_REPLY_TIMEOUT_DONE"));
+        // The AArch64 runner mentions riscv ONLY to FORBID a cross-arch attribution leaking into
+        // the AArch64 artifact — it never asserts or claims any RISC-V behavior.
+        assert!(!AARCH64_SMOKE_SRC.contains("STAGE_200C_REPLY_TIMEOUT_RISCV"));
+        assert!(!AARCH64_SMOKE_SRC.contains("yarm.riscv_ipc_reply_timeout_oracle"));
+        // The completion mechanism is arch-neutral but wired for AArch64 only this stage.
+        assert!(IPC_STATE_SRC.contains("BlockedSyscallCompletion"));
+    }
+
+    // (extra) after consumption the exact post-state holds: no pending completion, no deadline,
+    // token completed, waiter absent, task runnable, terminal Completed(Timeout), record Cancelled.
+    #[test]
+    fn t19_post_consumption_state_exact() {
+        let fx = caller_fixture();
+        let (idx, _rgen, id, handle) = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_some()
+        );
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 0);
+        assert!(fx.k.with(|s| s.deadline_token_is_completed(handle.token_index())));
+        assert!(
+            fx.k.with(
+                |s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(id.reply_endpoint_index))
+            )
+            .is_none()
+        );
+        assert_eq!(fx.k.with(|s| s.task_status(1)), Some(TaskStatus::Runnable));
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(idx)),
+            Some(ReplyRecordReservation::Cancelled)
+        );
+        teardown();
+    }
+}
+
+/// Stage 200C2C2 — RISC-V reply-timeout retirement port proofs.
+///
+/// The RISC-V cell REUSES the arch-neutral machinery verbatim; only the feature/selector, the
+/// monotonic clock source (`time` CSR), the Phase-3 post-lock wiring, the saved-context completion
+/// consumer, the userspace wrapper and the live proof differ. These tests pin exactly that.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage200c2c2_riscv_port {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::ReplyRecordReservation;
+    use crate::kernel::deadline_token::DeadlineTokenHandle;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::task::{BlockedSyscallClass, TaskStatus};
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+
+    const TOKEN_GEN: u64 = 1;
+    const BRG: u64 = 1;
+    const DEADLINE: u64 = 100;
+    const NOW: u64 = 200;
+    const CPU: CpuId = CpuId(0);
+    const TIMED_OUT: u64 = 9;
+
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RISCV_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh");
+
+    fn clear_queue() {
+        crate::kernel::boot::reply_timeout_work_clear(0);
+    }
+
+    fn setup(fx: &CallerFx) -> (usize, u64, TerminalIdentity, DeadlineTokenHandle) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let identity =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, identity));
+        let handle =
+            fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, DEADLINE))
+                .expect("register");
+        (idx, rgen, identity, handle)
+    }
+
+    fn complete_timeout(fx: &CallerFx) {
+        clear_queue();
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        clear_queue();
+    }
+
+    // (1) feature AND a valid selector are both required.
+    #[test]
+    fn r01_feature_and_selector_required() {
+        assert!(RISCV_BOOT_SRC.contains("#[cfg(feature = \"riscv64-ipc-reply-timeout-oracle\")]"));
+        assert!(RISCV_BOOT_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
+        assert!(CMDLINE_SRC.contains("yarm.riscv_ipc_reply_timeout_oracle"));
+        // Unrecognized selector values leave the oracle inert.
+        assert_eq!(
+            CMDLINE_SRC.matches("b\"timeout-wins\" | b\"1\"").count(),
+            3,
+            "all three arch knobs parse timeout-wins"
+        );
+        assert_eq!(CMDLINE_SRC.matches("b\"reply-wins\" | b\"2\"").count(), 3);
+    }
+
+    // (2) a slot collision fails closed (the oracle stands down, never overwrites).
+    #[test]
+    fn r02_slot_collision_fails_closed() {
+        // Stage 200C2C2C-R2C: aliased to the shared ABI base (single numeric source of truth).
+        assert!(
+            MOD_SRC.contains(
+                "pub const RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR: u64 =\n    yarm_ipc_abi::ipc_reply_liveness_abi::RISCV64_SELECTOR_BASE as u64;"
+            ),
+            "next genuinely free RISC-V slot-5 pair is 9/10 (1..=8 are taken)"
+        );
+        assert_eq!(
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            9
+        );
+        // Stage 200C2C2C-R2C: the provisioning site now calls the architecture-local encoder,
+        // so anchor the guard on that call rather than on the constant's name.
+        let blk = RISCV_BOOT_SRC
+            .split("init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector()")
+            .next()
+            .expect("provisioning guard");
+        assert!(
+            blk.len() < RISCV_BOOT_SRC.len(),
+            "riscv64 boot must publish slot 5 through the shared encoder"
+        );
+        // The guard immediately preceding the selector assignment requires all three slots empty.
+        let tail = &blk[blk.len().saturating_sub(1200)..];
+        assert!(tail.contains("init_args[5] == 0"));
+        assert!(tail.contains("init_args[13] == 0"));
+        assert!(tail.contains("init_args[14] == 0"));
+    }
+
+    // (3) the deadline is armed and evaluated in the SAME monotonic clock domain.
+    #[test]
+    fn r03_monotonic_source_consistency() {
+        // RISC-V arms from `reply_timeout_hw_now` (the `time` CSR) ...
+        assert!(MOD_SRC.contains("csrr {0}, time"));
+        assert!(MOD_SRC.contains("REPLY_TIMEOUT_RISCV_TICK_SHIFT"));
+        assert!(IPC_STATE_SRC.contains(
+            "#[cfg(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))]\n        let now = crate::kernel::boot::reply_timeout_hw_now();"
+        ));
+        // ... and the collector reads the SAME source through one seam.
+        let seam = RUNTIME_SRC
+            .split("fn reply_timeout_now_split_read")
+            .nth(1)
+            .expect("clock seam");
+        let seam = seam.split("\n    ///").next().unwrap();
+        assert!(seam.contains("target_arch = \"riscv64\""));
+        assert!(seam.contains("reply_timeout_hw_now()"));
+        // The scheduler-tick fallback is excluded for RISC-V (it does not advance reliably).
+        assert!(seam.contains("not(any(target_arch = \"aarch64\", target_arch = \"riscv64\"))"));
+    }
+
+    // (4) a token-bearing deadline reaches the RISC-V post-lock collector + drain.
+    #[test]
+    fn r04_reaches_postlock_collector() {
+        assert!(RISCV_TRAP_SRC.contains("shared.collect_due_reply_timeout_work(now, cpu)"));
+        assert!(RISCV_TRAP_SRC.contains("shared.drain_reply_timeout_post_work(cpu, now)"));
+        // It sits in Phase 3, AFTER the broad guard is released.
+        let p3 = RISCV_TRAP_SRC
+            .find("Phase 3: post-lock drain (broad guard released)")
+            .expect("phase 3 marker");
+        let call = RISCV_TRAP_SRC
+            .find("shared.collect_due_reply_timeout_work")
+            .expect("collector call");
+        assert!(p3 < call, "the collector runs in the post-lock phase");
+        // Reachability: gated only on the umbrella feature + the runtime selector (never dead).
+        assert!(RISCV_TRAP_SRC.contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"));
+        assert!(RISCV_TRAP_SRC.contains("x86_ipc_reply_timeout_oracle_enabled()"));
+    }
+
+    // (5) the ordinary receive timeout remains on the old broad path, unretired.
+    #[test]
+    fn r05_ordinary_timeout_unchanged() {
+        use crate::kernel::boot::Bootstrap;
+        use crate::kernel::capabilities::CapId;
+        use crate::kernel::task::WaitReason;
+        use crate::runtime::SharedKernel;
+        assert!(IPC_STATE_SRC.contains("if tcb.reply_timeout_token.is_some() {"));
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            s.register_task(80).expect("t80");
+            s.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 80).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)));
+                tcb.ipc_timeout_deadline = Some(5);
+            });
+            assert_eq!(s.process_ipc_timeout_deadlines(10).expect("scan"), 1);
+            assert_eq!(s.task_status(80), Some(TaskStatus::Runnable));
+            assert!(!s.has_pending_syscall_completion(80));
+        });
+    }
+
+    // (6) the completion is consumed at the RISC-V saved-context resume boundary.
+    #[test]
+    fn r06_consumed_at_saved_context_resume() {
+        assert!(RISCV_TRAP_SRC.contains("take_blocked_syscall_completion"));
+        let restore = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .expect("restore body");
+        let restore = restore.split("\npub fn ").next().unwrap();
+        assert!(restore.contains("take_blocked_syscall_completion"));
+        // Both the same-task and post-switch restores funnel through this ONE function.
+        assert!(RISCV_TRAP_SRC.contains("restore_arch_thread_state(kernel, cpu, frame)"));
+    }
+
+    // (7) stale saved arguments cannot overwrite the encoded TimedOut: the completion write
+    // happens AFTER the saved-context restore that reloads the pre-block snapshot.
+    #[test]
+    fn r07_stale_args_cannot_overwrite_result() {
+        let restore = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .expect("restore body");
+        let restore = restore.split("\npub fn ").next().unwrap();
+        let apply = restore
+            .find("resume_current_thread_with_frame")
+            .expect("context restore");
+        let consume = restore
+            .find("take_blocked_syscall_completion")
+            .expect("completion consume");
+        assert!(
+            apply < consume,
+            "the canonical result must be written AFTER the saved-context restore"
+        );
+    }
+
+    // (8) the completion is detected before the result frame is published to userspace.
+    #[test]
+    fn r08_completion_before_result_publication() {
+        let restore = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .expect("restore body");
+        let restore = restore.split("\npub fn ").next().unwrap();
+        let consume = restore.find("take_blocked_syscall_completion").unwrap();
+        let encode = restore
+            .find("frame.set_user_gpr(10, done.result as usize)")
+            .expect("a0 encode");
+        assert!(consume < encode);
+    }
+
+    // (9) the exact RISC-V TimedOut ABI encoding (a0 = error lane, a1 cleared).
+    #[test]
+    fn r09_exact_timedout_abi() {
+        // The consumer uses the SAME lane the RISC-V ecall error export uses (`set_user_gpr(10)`).
+        assert!(RISCV_TRAP_SRC.contains("f.set_user_gpr(10, err);"));
+        assert!(RISCV_TRAP_SRC.contains("frame.set_user_gpr(10, done.result as usize);"));
+        assert!(RISCV_TRAP_SRC.contains("frame.set_user_gpr(11, 0);"));
+        // It is NOT the AArch64 convention (which zeroes x1..x5 as args).
+        let restore = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .unwrap()
+            .split("\npub fn ")
+            .next()
+            .unwrap();
+        assert!(!restore.contains("set_arg(0, done.result"));
+        // The parked result is the canonical TimedOut code.
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        let done =
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .expect("pending");
+        assert_eq!(done.result, TIMED_OUT);
+        assert_eq!(done.syscall_class, BlockedSyscallClass::IpcRecv);
+        teardown();
+    }
+
+    // (10) `sepc` advances exactly once — the consumer performs no PC mutation.
+    #[test]
+    fn r10_sepc_single_advance() {
+        let blk = RISCV_TRAP_SRC
+            .split("take_blocked_syscall_completion")
+            .nth(1)
+            .expect("consume block");
+        let blk = blk.split("let idx = cpu.0").next().unwrap();
+        assert!(!blk.contains("set_saved_pc"));
+        assert!(!blk.contains("+ 4"));
+        assert!(!blk.contains("sepc +="));
+        // The single advance is the bridge's documented pre-advance.
+        assert!(RISCV_TRAP_SRC.contains("pre-advances tframe.saved_pc by +4"));
+    }
+
+    // (11) the completion is consumed exactly once.
+    #[test]
+    fn r11_consumed_once() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_some()
+        );
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        teardown();
+    }
+
+    // (12) a stale blocked-recv generation is rejected.
+    #[test]
+    fn r12_stale_generation_rejected() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (13) a replacement TID/ASID incarnation is unaffected.
+    #[test]
+    fn r13_replacement_incarnation_unaffected() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        fx.k.with(|s| {
+            s.with_tcbs_mut(|tcbs| {
+                let t = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 1).unwrap();
+                t.asid = Some(crate::kernel::vm::Asid(0xFACE));
+            });
+        });
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        teardown();
+    }
+
+    // (14) a NEW receive cannot consume an old timeout result.
+    #[test]
+    fn r14_new_receive_cannot_consume_old_result() {
+        let fx = caller_fixture();
+        let _ = setup(&fx);
+        complete_timeout(&fx);
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        teardown();
+    }
+
+    // (15) no endpoint waiter is reinstalled by the completion.
+    #[test]
+    fn r15_no_waiter_reinstall() {
+        let fx = caller_fixture();
+        let (_i, _g, id, _h) = setup(&fx);
+        complete_timeout(&fx);
+        assert!(
+            fx.k.with(
+                |s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(id.reply_endpoint_index))
+            )
+            .is_none()
+        );
+        teardown();
+    }
+
+    // (16) no deadline is re-armed by the completion.
+    #[test]
+    fn r16_no_deadline_rearm() {
+        let fx = caller_fixture();
+        let (_i, _g, _id, handle) = setup(&fx);
+        complete_timeout(&fx);
+        assert!(fx.k.with(|s| s.deadline_token_is_completed(handle.token_index())));
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 0);
+        assert_eq!(fx.k.with(|s| s.ipc_deadline_count_for_tid(1)), 0);
+        teardown();
+    }
+
+    // (17) the reply-wins path bypasses the completion consumer entirely.
+    #[test]
+    fn r17_reply_wins_bypasses_consumer() {
+        let fx = caller_fixture();
+        let (idx, _g, id, handle) = setup(&fx);
+        let lease =
+            fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
+                .expect("lease");
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("terminal");
+        assert!(fx.k.with(|s| s.complete_deadline_reply_lease(handle.token_index(), &lease)));
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        assert!(
+            fx.k.with(|s| s.take_blocked_syscall_completion(1))
+                .is_none()
+        );
+        teardown();
+    }
+
+    // (18) the timeout result precedes the scheduler dispatch (enqueue is last).
+    #[test]
+    fn r18_result_precedes_dispatch() {
+        let body = IPC_STATE_SRC
+            .split("fn complete_reply_timeout_over")
+            .nth(1)
+            .expect("body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        let prep = body.find("rt_prepare_timeout_result(d").expect("prepare");
+        let commit = body.find("rt_commit_receiver_runnable(").expect("commit");
+        let enqueue = body.find("d.rtd_enqueue(caller.tid.0)").expect("enqueue");
+        assert!(prep < enqueue && commit < enqueue);
+    }
+
+    // (19) the retirement marker follows the completion DELIVERY (never the kernel commit alone).
+    #[test]
+    fn r19_retirement_follows_delivery() {
+        // The transaction only ARMS; the delivery point fires.
+        assert!(RUNTIME_SRC.contains("arm_reply_timeout_class_retired()"));
+        assert!(RUNTIME_SRC.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch={}"));
+        assert!(!RUNTIME_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch={}"));
+        let blk = RISCV_TRAP_SRC
+            .split("take_blocked_syscall_completion")
+            .nth(1)
+            .expect("consume block");
+        let encode = blk
+            .find("frame.set_user_gpr(10, done.result as usize)")
+            .expect("encode");
+        let emit = blk
+            .find("maybe_emit_reply_timeout_class_retired")
+            .expect("retire emit");
+        assert!(
+            encode < emit,
+            "encode the canonical result BEFORE claiming retirement"
+        );
+        // The runner additionally enforces the ordered live sequence.
+        assert!(RISCV_SMOKE_SRC.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED"));
+        assert!(RISCV_SMOKE_SRC.contains("must follow the completion consumption"));
+    }
+
+    // (20) the x86_64 + AArch64 sealed source paths remain intact, and the shared implementations
+    // are single-source (the RISC-V wrapper duplicates no terminal/deadline/completion logic).
+    #[test]
+    fn r20_sealed_paths_and_single_source() {
+        // Sealed arch cells still present. Stage 200C2C2C-R2C routes slot-5 publication
+        // through the shared architecture-local encoder on every arch.
+        assert!(X86_BOOT_SRC.contains(
+            "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);"
+        ));
+        assert!(AARCH64_TRAP_SRC.contains("take_blocked_syscall_completion"));
+        assert!(INIT_SRC.contains("X86_IPC_REPLY_TIMEOUT_DONE"));
+        assert!(INIT_SRC.contains("AARCH64_IPC_REPLY_TIMEOUT_DONE"));
+        assert!(INIT_SRC.contains("RISCV_IPC_REPLY_TIMEOUT_DONE"));
+        // Exactly ONE implementation of each shared piece.
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("fn collect_due_reply_timeout_work")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn complete_reply_timeout_over")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn reserve_reply_win_before_copy")
+                .count(),
+            1
+        );
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("fn commit_reply_win_after_delivery")
+                .count(),
+            1
+        );
+        assert_eq!(IPC_STATE_SRC.matches("fn rollback_reply_win").count(), 1);
+        assert_eq!(
+            include_str!("../task.rs")
+                .matches("pub struct BlockedSyscallCompletion")
+                .count(),
+            1
+        );
+        // One shared userspace client core across all three arch wrappers.
+        assert_eq!(
+            INIT_SRC.matches("pub(super) unsafe fn client_run").count(),
+            1
+        );
+    }
+
+    // (21) reversible reply-copy failure preserves the common contract on the RISC-V route.
+    #[test]
+    fn r21_reply_copy_fault_rollback() {
+        let fx = caller_fixture();
+        let (idx, rgen, id, handle) = setup(&fx);
+        let lease =
+            fx.k.with(|s| s.claim_deadline_reply_lease(&handle))
+                .expect("lease");
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("terminal");
+        // Copy fault → restore both holds.
+        assert!(fx.k.with(|s| s.restore_deadline_reply_lease(handle.token_index(), &lease)));
+        assert!(fx.k.with(|s| s.release_reply_terminal_slot_if_retryable(idx, &owner)));
+        assert!(fx.k.with(|s| s.deadline_token_is_armed(handle.token_index())));
+        assert!(fx.k.with(|s| s.reply_terminal_is_open(idx)));
+        assert!(fx.k.with(|s| s.direct_reply_record_is_invokable(idx, rgen)));
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(1)),
+            Some(TaskStatus::Blocked(_))
+        ));
+        assert!(!fx.k.with(|s| s.has_pending_syscall_completion(1)));
+        // A due timeout after the rollback yields EXACTLY ONE terminal outcome.
+        complete_timeout(&fx);
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        assert_eq!(
+            fx.k.with(|s| s.reply_cap_record_reservation(idx)),
+            Some(ReplyRecordReservation::Cancelled)
+        );
+        teardown();
+    }
+}
+
+/// Stage 200C2C2B — RISC-V FINAL-FRAME completion delivery + one-shot lock-status authority.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage200c2c2b_riscv_final_frame {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const RISCV_SMOKE_SRC: &str =
+        include_str!("../../../scripts/qemu-ipc-reply-timeout-riscv64-retirement-smoke.sh");
+
+    /// The single restore function both return routes funnel through.
+    fn restore_body() -> &'static str {
+        let b = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state")
+            .nth(1)
+            .expect("restore body");
+        b.split("\npub fn ").next().unwrap()
+    }
+
+    // (1)+(2) the completion is applied to the ACTUAL outgoing frame, AFTER the generic
+    // context restoration that would otherwise overwrite it.
+    #[test]
+    fn f01_applied_to_final_frame_after_restore() {
+        let b = restore_body();
+        let restore = b
+            .find("resume_current_thread_with_frame")
+            .expect("generic restore");
+        let consume = b.find("take_blocked_syscall_completion").expect("consume");
+        let encode = b
+            .find("frame.set_user_gpr(10, done.result as usize)")
+            .expect("encode");
+        assert!(restore < consume, "generic restoration precedes delivery");
+        assert!(consume < encode, "identity validated before encoding");
+    }
+
+    // (3) the same-task result export cannot overwrite the completion: the export re-derives a0
+    // from the frame ERROR lane, which the delivery sets.
+    #[test]
+    fn f03_same_task_export_cannot_overwrite() {
+        assert!(RISCV_TRAP_SRC.contains("f.set_user_gpr(10, err);"));
+        assert!(restore_body().contains("frame.set_err(done.result as usize);"));
+    }
+
+    // (4) post-switch synchronization cannot overwrite it — that route calls the SAME restore.
+    #[test]
+    fn f04_post_switch_uses_same_helper() {
+        let ps = RISCV_TRAP_SRC
+            .split("fn restore_arch_thread_state_post_switch")
+            .nth(1)
+            .expect("post-switch");
+        assert!(ps.contains("restore_arch_thread_state(kernel, cpu, frame)"));
+    }
+
+    // (5)+(6) the established RISC-V error encoding is reused; the userspace-visible code is
+    // exactly TimedOut (9).
+    #[test]
+    fn f05_reuses_riscv_error_abi() {
+        let b = restore_body();
+        assert!(b.contains("frame.set_err(done.result as usize);"));
+        assert!(b.contains("frame.set_user_gpr(10, done.result as usize);"));
+        assert!(b.contains("frame.set_user_gpr(11, 0);"));
+        assert_eq!(crate::kernel::syscall::SyscallError::TimedOut as u64, 9);
+    }
+
+    // (13)+(14) delivery changes NO architectural state: no sepc/sstatus/satp/sp/tp writes.
+    #[test]
+    fn f13_no_arch_state_mutation() {
+        let b = restore_body();
+        let blk = b.split("take_blocked_syscall_completion").nth(1).unwrap();
+        let blk = blk.split("let idx = cpu.0").next().unwrap();
+        for forbidden in [
+            "set_saved_pc",
+            "saved_sp",
+            "sstatus",
+            "satp",
+            "set_user_gpr(2,",
+            "set_user_gpr(4,",
+            "+ 4",
+        ] {
+            assert!(
+                !blk.contains(forbidden),
+                "delivery must not touch {forbidden}"
+            );
+        }
+    }
+
+    // (16) the retirement marker follows final-frame encoding.
+    #[test]
+    fn f16_retirement_follows_final_encoding() {
+        let b = restore_body();
+        let encode = b
+            .find("frame.set_user_gpr(10, done.result as usize)")
+            .unwrap();
+        let emit = b.find("maybe_emit_reply_timeout_class_retired").unwrap();
+        assert!(encode < emit);
+    }
+
+    // (17) the transaction-commit marker alone cannot satisfy the smoke.
+    #[test]
+    fn f17_commit_marker_alone_insufficient() {
+        assert!(RISCV_SMOKE_SRC.contains("IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch=riscv64"));
+        assert!(RISCV_SMOKE_SRC.contains("RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED"));
+        assert!(RISCV_SMOKE_SRC.contains("GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64"));
+        assert!(RISCV_SMOKE_SRC.contains("RISCV_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut"));
+    }
+
+    // (18) the lock-status marker has ONE authoritative emit site.
+    #[test]
+    fn f18_lock_status_single_emit_site() {
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("IPC_REPLY_TIMEOUT_LOCK_STATUS arch={}")
+                .count(),
+            1,
+            "exactly one lock-status emit site"
+        );
+        assert_eq!(MOD_SRC.matches("IPC_REPLY_TIMEOUT_LOCK_STATUS").count(), 0);
+        // RISC-V drives the drain from its OWN wrapper only — the shared entry excludes it, so the
+        // one-shot attestation can never be driven by two wrappers.
+        assert!(TRAP_ENTRY_SRC.contains("not(target_arch = \"riscv64\")"));
+        assert!(RISCV_TRAP_SRC.contains("shared.drain_reply_timeout_post_work(cpu, now)"));
+    }
+
+    // (19) the latch is a compare-exchange authority with NO reset path anywhere.
+    #[test]
+    fn f19_latch_cannot_reset() {
+        let f = MOD_SRC
+            .split("fn reply_timeout_lock_status_once")
+            .nth(1)
+            .expect("latch fn");
+        let f = f.split("\n#[cfg").next().unwrap();
+        assert!(f.contains("compare_exchange"), "compare-exchange authority");
+        // The only writes to the latch are that compare_exchange — no `store(false)` reset.
+        assert_eq!(
+            MOD_SRC.matches("REPLY_TIMEOUT_LOCK_STATUS_EMITTED").count(),
+            2,
+            "one definition + one compare_exchange use; no reset path"
+        );
+        assert!(!MOD_SRC.contains("REPLY_TIMEOUT_LOCK_STATUS_EMITTED.store(false"));
+    }
+
+    // (20) both return routes use ONE final delivery helper (no duplicated implementation).
+    #[test]
+    fn f20_single_delivery_implementation() {
+        assert_eq!(
+            RISCV_TRAP_SRC
+                .matches("take_blocked_syscall_completion")
+                .count(),
+            1,
+            "exactly one delivery site, shared by both return routes"
+        );
+    }
+}
+
+/// Stage 200C2C2C-R2A — RISC-V blocked-syscall RESULT PUBLICATION into the saved continuation.
+///
+/// `UserRegisterContext` carries two mirrors of the same userspace state — the raw `user_gprs`
+/// register file and the decoded `arg0..arg5` syscall-argument lanes. They are captured and
+/// restored together, so publishing a completed result into only ONE lets the resume reconstruct
+/// a stale value from the other. That was the proven defect (userspace saw its own endpoint-cap
+/// argument, 65540, instead of the timeout code 9). One canonical helper now owns the mirroring.
+mod stage200c2c2c_r2a_riscv_publication {
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::task::ThreadControlBlock;
+    use crate::kernel::vm::Asid;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+
+    /// `SyscallError::TimedOut as usize` — the canonical timeout code.
+    const TIMED_OUT: usize = 9;
+    /// The exact stale argument userspace observed before the repair (a reply-endpoint cap).
+    const STALE_ARG: usize = 65540;
+
+    fn tcb_blocked_on_recv() -> ThreadControlBlock {
+        let mut t = ThreadControlBlock::new(ThreadId(1), Some(Asid(1)));
+        // Model the saved continuation of a blocked recv: BOTH mirrors hold the original
+        // syscall arguments (a0 = the endpoint capability).
+        t.user_context.user_gprs[10] = STALE_ARG;
+        t.user_context.arg0 = STALE_ARG;
+        t.user_context.user_gprs[11] = 0x1111;
+        t.user_context.arg1 = 0x1111;
+        // A distinct unrelated saved register that must survive untouched.
+        t.user_context.user_gprs[20] = 0xDEAD;
+        t
+    }
+
+    // (1) the stale argument a0 is replaced by the timeout result in BOTH mirrors.
+    #[test]
+    fn p01_stale_argument_replaced_by_timeout_result() {
+        let mut t = tcb_blocked_on_recv();
+        assert_eq!(t.user_context.user_gprs[10], STALE_ARG);
+        t.publish_riscv_user_return(0, 0, TIMED_OUT);
+        assert_eq!(t.user_context.user_gprs[10], TIMED_OUT, "register mirror");
+        assert_eq!(t.user_context.arg0, TIMED_OUT, "argument-lane mirror");
+    }
+
+    // (2) a success result (0) replaces a nonzero original argument.
+    #[test]
+    fn p02_success_replaces_nonzero_argument() {
+        let mut t = tcb_blocked_on_recv();
+        t.publish_riscv_user_return(0, 0, 0);
+        assert_eq!(t.user_context.user_gprs[10], 0);
+        assert_eq!(t.user_context.arg0, 0);
+    }
+
+    // (3) the two stored mirrors cannot diverge after publication (any result shape).
+    #[test]
+    fn p03_mirrors_cannot_diverge() {
+        for (ret0, ret1, err) in [(0, 0, TIMED_OUT), (0, 0, 0), (42, 7, 0), (0, 0, 2)] {
+            let mut t = tcb_blocked_on_recv();
+            t.publish_riscv_user_return(ret0, ret1, err);
+            assert_eq!(
+                t.user_context.user_gprs[10], t.user_context.arg0,
+                "a0 mirrors agree"
+            );
+            assert_eq!(
+                t.user_context.user_gprs[11], t.user_context.arg1,
+                "a1 mirrors agree"
+            );
+        }
+    }
+
+    // (4) an error result clears the secondary lane, so a stale success value cannot be read
+    // alongside a canonical error.
+    #[test]
+    fn p04_error_clears_secondary_lane() {
+        let mut t = tcb_blocked_on_recv();
+        t.publish_riscv_user_return(0, 0, TIMED_OUT);
+        assert_eq!(t.user_context.user_gprs[11], 0);
+        assert_eq!(t.user_context.arg1, 0);
+    }
+
+    // (5) unrelated saved registers are untouched.
+    #[test]
+    fn p05_other_registers_unchanged() {
+        let mut t = tcb_blocked_on_recv();
+        let pc = t.user_context.instruction_ptr;
+        let sp = t.user_context.stack_ptr;
+        t.publish_riscv_user_return(0, 0, TIMED_OUT);
+        assert_eq!(t.user_context.user_gprs[20], 0xDEAD);
+        assert_eq!(t.user_context.instruction_ptr, pc, "sepc untouched");
+        assert_eq!(t.user_context.stack_ptr, sp, "sp untouched");
+    }
+
+    // (6) publication happens BEFORE the task is made Runnable / enqueued, so the scheduler can
+    // never dispatch a task whose stored result is still stale.
+    #[test]
+    fn p06_publication_precedes_runnable_and_enqueue() {
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        let publish = body
+            .find("publish_riscv_user_return")
+            .expect("publication call");
+        let runnable = body
+            .find("tcb.status = TaskStatus::Runnable")
+            .expect("runnable");
+        assert!(publish < runnable, "publish before Runnable");
+        // The enqueue is the transaction's last step, strictly after this helper returns.
+        let txn = IPC_STATE_SRC
+            .split("fn complete_reply_timeout_over")
+            .nth(1)
+            .expect("txn");
+        let txn = txn.split("\npub(crate) fn ").next().unwrap();
+        let commit = txn
+            .find("rt_commit_receiver_runnable(")
+            .expect("commit call");
+        let enqueue = txn.find("d.rtd_enqueue(caller.tid.0)").expect("enqueue");
+        assert!(commit < enqueue, "publication precedes scheduler enqueue");
+    }
+
+    // (7) SOURCE GUARD: no completion path writes only one mirror — every RISC-V result
+    // publication goes through the canonical helper.
+    #[test]
+    fn p07_no_unmirrored_a0_writes_outside_helper() {
+        // The helper is the single definition owning the mirror pair.
+        assert_eq!(
+            TASK_SRC.matches("pub fn publish_riscv_user_return").count(),
+            2,
+            "one riscv64 definition + one hosted mirror, no third"
+        );
+        // The completion boundary uses the helper, not paired ad-hoc writes.
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("commit body");
+        let body = body.split("\npub(crate) fn ").next().unwrap();
+        assert!(body.contains("tcb.publish_riscv_user_return(0, 0, timed_out as usize);"));
+        // No RISC-V a0/a1 lane is written directly at this boundary. Stage 200C2C2C-R2C:
+        // the stored-lane attestation READS both lanes to report them, so the guard targets
+        // assignment specifically — a read can never clobber the published result.
+        let riscv_direct = body.matches("user_gprs[10] =").count()
+            + body.matches("user_gprs[11] =").count()
+            + body.matches("set_user_gpr(10").count()
+            + body.matches("set_user_gpr(11").count();
+        assert_eq!(
+            riscv_direct, 0,
+            "no direct RISC-V lane writes outside the helper"
+        );
+    }
+
+    // (8) the timeout completion still performs NO user-memory copy.
+    #[test]
+    fn p08_no_user_memory_copy_in_completion() {
+        let txn = IPC_STATE_SRC
+            .split("fn complete_reply_timeout_over")
+            .nth(1)
+            .expect("txn");
+        let txn = txn.split("\npub(crate) fn ").next().unwrap();
+        for c in ["copy_to_user", "copy_from_user", "copy_to_current_user"] {
+            assert!(!txn.contains(c), "timeout completion must not {c}");
+        }
+    }
+}
+
+/// Stage 200C2C2C-R2B — reply-win reservation is governed by TERMINAL OWNERSHIP ONLY.
+///
+/// Deadline registration is subordinate bookkeeping: its presence, absence, numeric value or
+/// leasability must never decide whether a reply may win. These tests pin that separation and the
+/// reply-versus-timeout races around it.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage200c2c2c_r2b_reply_authority {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::deadline_token::DeadlineTokenHandle;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+
+    const TOKEN_GEN: u64 = 1;
+    const BRG: u64 = 1;
+    const NOW: u64 = 200;
+    const CPU: CpuId = CpuId(0);
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+
+    fn arm_terminal(fx: &CallerFx) -> (usize, u64, TerminalIdentity) {
+        let (idx, rgen) = (fx.record_index, fx.record_generation);
+        let id =
+            fx.k.with(|s| s.reply_terminal_identity(idx, rgen, BRG, Some(TOKEN_GEN)))
+                .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(idx, id));
+        (idx, rgen, id)
+    }
+
+    fn register_deadline(
+        fx: &CallerFx,
+        idx: usize,
+        rgen: u64,
+        deadline: u64,
+    ) -> DeadlineTokenHandle {
+        fx.k.with(|s| s.register_reply_receive_deadline(idx, rgen, BRG, TOKEN_GEN, deadline))
+            .expect("register")
+    }
+
+    /// The reply's terminal claim — the SINGLE authority the reservation depends on.
+    fn reply_claims_terminal(fx: &CallerFx, idx: usize, id: &TerminalIdentity) -> bool {
+        fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, id))
+            .is_some()
+    }
+
+    // (1) live record, NO deadline token → reply may win.
+    #[test]
+    fn a01_no_deadline_token_reply_wins() {
+        let fx = caller_fixture();
+        let (idx, _g, id) = arm_terminal(&fx);
+        assert_eq!(fx.k.with(|s| s.active_deadline_registrations()), 0);
+        assert!(
+            reply_claims_terminal(&fx, idx, &id),
+            "no token must not block a reply"
+        );
+        teardown();
+    }
+
+    // (2) FINITE armed token → reply may win, and the token is not an authority.
+    #[test]
+    fn a02_finite_token_reply_wins() {
+        let fx = caller_fixture();
+        let (idx, rgen, id) = arm_terminal(&fx);
+        let h = register_deadline(&fx, idx, rgen, 100);
+        assert!(fx.k.with(|s| s.deadline_token_is_armed(h.token_index())));
+        assert!(reply_claims_terminal(&fx, idx, &id));
+        teardown();
+    }
+
+    // (3) FAR / effectively unreachable token → reply may still win. This is the case that
+    // previously declined, because an unleasable token vetoed the reply.
+    #[test]
+    fn a03_far_token_reply_wins() {
+        let fx = caller_fixture();
+        let (idx, rgen, id) = arm_terminal(&fx);
+        let _h = register_deadline(&fx, idx, rgen, u64::MAX / 2);
+        assert!(
+            reply_claims_terminal(&fx, idx, &id),
+            "a far deadline value must not gate reply eligibility"
+        );
+        teardown();
+    }
+
+    // (4) reply wins, THEN the collector sees the old token → the timeout is rejected because the
+    // terminal is already owned; no caller is woken by the timeout.
+    #[test]
+    fn a04_reply_then_late_collector_rejected() {
+        let fx = caller_fixture();
+        let (idx, rgen, id) = arm_terminal(&fx);
+        let _h = register_deadline(&fx, idx, rgen, 100);
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id))
+                .expect("reply terminal");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &owner)));
+        // The collector now runs on the still-registered token.
+        crate::kernel::boot::reply_timeout_work_clear(0);
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        fx.k.drain_reply_timeout_post_work(CPU, NOW);
+        crate::kernel::boot::reply_timeout_work_clear(0);
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Reply),
+            "exactly one terminal winner — the reply"
+        );
+        assert!(
+            !fx.k.with(|s| s.ipc_timeout_fired_read(1)),
+            "no timeout wake"
+        );
+        teardown();
+    }
+
+    // (5) timeout reserves FIRST → the reply is rejected by the terminal authority.
+    #[test]
+    fn a05_timeout_first_reply_rejected() {
+        let fx = caller_fixture();
+        let (idx, _g, id) = arm_terminal(&fx);
+        let t =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Timeout, &id))
+                .expect("timeout terminal");
+        assert!(
+            !reply_claims_terminal(&fx, idx, &id),
+            "a committed/reserved timeout must defeat the reply"
+        );
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(idx, &t)));
+        assert_eq!(
+            fx.k.with(|s| s.reply_terminal_committed_winner(idx)),
+            Some(TerminalClaimant::Timeout)
+        );
+        teardown();
+    }
+
+    // (6) a duplicate reply alias race yields exactly ONE winner.
+    #[test]
+    fn a06_duplicate_reply_one_winner() {
+        let fx = caller_fixture();
+        let (idx, _g, id) = arm_terminal(&fx);
+        let first =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id));
+        let second =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &id));
+        assert!(first.is_some());
+        assert!(second.is_none(), "duplicate reply alias must lose");
+        teardown();
+    }
+
+    // (7) a restarted caller with a REUSED numeric TID (different generation) is rejected — the
+    // reply cannot win against a replacement incarnation.
+    #[test]
+    fn a07_restarted_caller_rejected() {
+        let fx = caller_fixture();
+        let (idx, _g, id) = arm_terminal(&fx);
+        // The caller re-blocked with a NEW receive: its blocked generation advances, so the
+        // terminal identity built for the OLD receive no longer matches.
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        let stale = fx.k.with(|s| {
+            s.reply_terminal_identity(idx, fx.record_generation, BRG + 1, Some(TOKEN_GEN))
+        });
+        if let Some(fresh_id) = stale {
+            assert_ne!(
+                fresh_id.blocked_recv_generation, id.blocked_recv_generation,
+                "generation must differ after restart"
+            );
+            // The OLD identity must not claim against the NEW incarnation's cell identity.
+            assert!(
+                fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                    idx,
+                    TerminalClaimant::Reply,
+                    &fresh_id
+                ))
+                .is_none()
+            );
+        }
+        teardown();
+    }
+
+    // (8) SOURCE: deadline bookkeeping can never decline the reservation, and a failed lease
+    // never releases the terminal the reply already owns.
+    #[test]
+    fn a08_deadline_is_not_terminal_authority() {
+        let body = IPC_STATE_SRC
+            .split("fn try_reserve_reply_win_before_copy")
+            .nth(1)
+            .expect("reserve body");
+        let body = body.split("\n    /// Stage").next().unwrap();
+        // The terminal claim is the LAST fallible step of the reservation.
+        assert!(body.contains(
+            ".try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity)\n            .ok_or(ReplyReserveDecline::TimeoutAlreadyClaimed)?"
+        ));
+        // A failed lease must NOT release the terminal nor early-return.
+        let after_claim = body.split("try_claim_reply_terminal_slot").nth(1).unwrap();
+        assert!(
+            !after_claim.contains("release_reply_terminal_slot_if_retryable"),
+            "a failed deadline lease must never release the won terminal"
+        );
+        assert!(
+            !after_claim.contains("return Err"),
+            "deadline bookkeeping must never decline the reservation"
+        );
+        // The lease is optional cleanup.
+        assert!(body.contains(".and_then(|handle|"));
+        // The typed decline classification exists and excludes any deadline-bookkeeping reason.
+        assert!(IPC_STATE_SRC.contains("enum ReplyReserveDecline"));
+        assert!(!IPC_STATE_SRC.contains("DeadlineTokenMismatch,"));
+        assert!(!IPC_STATE_SRC.contains("DeadlineLeaseUnavailable"));
+        assert!(!IPC_STATE_SRC.contains("DeadlineNotRegistered"));
+    }
+
+    // ── Stage 200C2C2C-R2B: the live blocker — the userspace slot-5 SCENARIO DECODER ──
+    //
+    // Each arch owns a distinct free PAIR (base, base+1) = (timeout-wins, reply-wins), and the
+    // pairs OVERLAP: AArch64 8/9, RISC-V 9/10, x86_64 10/11. Commit 998589f widened the
+    // userspace decoder from `matches!(mode(), 8 | 10)` to `matches!(mode(), 8 | 9 | 10)` to add
+    // RISC-V's timeout-wins `9` — but `9` was already AArch64's REPLY-wins and `10` was already
+    // RISC-V's REPLY-wins. Both non-x86 ports therefore ran the TIMEOUT-wins userspace scenario
+    // (server withholds NR7 until the client times out) under their reply-wins selector, so the
+    // reply genuinely lost the terminal (`TimeoutAlreadyClaimed`) no matter what deadline value
+    // the kernel armed. The decoder must be relative to THIS arch's own base.
+
+    // (9) the three per-arch selector bases are exactly the kernel-side constants, and the three
+    // (base, base+1) pairs are pairwise OVERLAPPING — which is precisely why an absolute value
+    // set cannot decode the scenario.
+    #[test]
+    fn a09_selector_pairs_overlap_across_arches() {
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            8
+        );
+        assert_eq!(
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            9
+        );
+        assert_eq!(
+            crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            10
+        );
+        // AArch64 reply-wins == RISC-V timeout-wins; RISC-V reply-wins == x86_64 timeout-wins.
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR + 1,
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR
+        );
+        assert_eq!(
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR + 1,
+            crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR
+        );
+    }
+
+    // (10) SOURCE: the userspace decoder is arch-relative, the collapsed absolute set is gone,
+    // and every arch's declared base matches the kernel constant it must mirror.
+    #[test]
+    fn a10_userspace_decoder_is_arch_relative() {
+        const SERVICE_SRC: &str = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        // Search CODE only — the fix's own comment names the defective expression verbatim.
+        let code: alloc::string::String = SERVICE_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("matches!(mode(), 8 | 9 | 10)"),
+            "the collapsed absolute selector set decodes AArch64/RISC-V reply-wins as timeout-wins"
+        );
+        assert!(!code.contains("matches!(mode(), 8 | 10)"));
+        // Stage 200C2C2C-R2C superseded R2B's per-file base copy with the SHARED typed
+        // decoder in `yarm_ipc_abi`, which the kernel's encoder is the exact inverse of. The
+        // property this case guards — interpretation is architecture-local — is unchanged and
+        // now stronger: the userspace copy of the base table no longer exists at all.
+        assert!(
+            SERVICE_SRC.contains("ipc_reply_liveness_scenario_for_current_arch(mode() as usize)")
+        );
+        assert!(
+            SERVICE_SRC
+                .contains("matches!(scenario(), Some(IpcReplyLivenessScenario::TimeoutWins))")
+        );
+        assert!(!SERVICE_SRC.contains("pub(super) const SELECTOR_BASE: u64"));
+    }
+
+    // ── Stage 200C2C2C-R2B: the CAUSAL collector gate ────────────────────────────────
+
+    // (11) while HELD the narrow collector publishes NOTHING — so no timeout claimant can reach
+    // the terminal cell at all. Releasing it restores collection of the very same due deadline.
+    // This is what makes reply-wins causal rather than a wall-clock race.
+    #[test]
+    fn a11_held_gate_suppresses_collection() {
+        crate::kernel::boot::reply_timeout_work_clear(0);
+        let prior = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS,
+        );
+        let fx = caller_fixture();
+        let (idx, rgen, _id) = arm_terminal(&fx);
+        let _h = register_deadline(&fx, idx, rgen, 100);
+
+        crate::kernel::boot::hold_reply_timeout_collector();
+        assert!(crate::kernel::boot::reply_timeout_collector_held());
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(
+            crate::kernel::boot::reply_timeout_work_len(0),
+            0,
+            "a held gate must publish no timeout work for a DUE deadline"
+        );
+
+        // The exact userspace validation marker is the release trigger.
+        crate::kernel::boot::maybe_release_reply_timeout_collector_gate(
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=8 reply_ok=1",
+        );
+        assert!(!crate::kernel::boot::reply_timeout_collector_held());
+        fx.k.collect_due_reply_timeout_work(NOW, CPU);
+        assert_eq!(
+            crate::kernel::boot::reply_timeout_work_len(0),
+            1,
+            "after release the same due deadline is collected normally"
+        );
+        crate::kernel::boot::reply_timeout_work_clear(0);
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prior);
+        teardown();
+    }
+
+    // (12) the gate is REPLY-WINS ONLY: it can never be armed in timeout-wins mode or with the
+    // oracle off, so no production or timeout-wins deadline is ever suppressed.
+    #[test]
+    fn a12_gate_never_arms_outside_reply_wins() {
+        let prior = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        for mode in [
+            0u8,
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS,
+        ] {
+            crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(mode);
+            crate::kernel::boot::hold_reply_timeout_collector();
+            assert!(
+                !crate::kernel::boot::reply_timeout_collector_held(),
+                "the causal gate must never arm outside reply-wins (mode={mode})"
+            );
+        }
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prior);
+    }
+
+    // (13) release requires the EXACT post-validation marker: a failed validation
+    // (`reply_ok=0`), an unrelated userspace line, or the wrong mode all leave it held.
+    #[test]
+    fn a13_gate_release_requires_validated_reply() {
+        let prior = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS,
+        );
+        crate::kernel::boot::hold_reply_timeout_collector();
+        assert!(crate::kernel::boot::reply_timeout_collector_held());
+        for msg in [
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=0 reply_ok=0",
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_TIMED_OUT",
+            "reply_ok=1",
+            "",
+        ] {
+            crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg);
+            assert!(
+                crate::kernel::boot::reply_timeout_collector_held(),
+                "gate must stay held for {msg:?}"
+            );
+        }
+        crate::kernel::boot::maybe_release_reply_timeout_collector_gate(
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=8 reply_ok=1",
+        );
+        assert!(!crate::kernel::boot::reply_timeout_collector_held());
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prior);
+    }
+
+    // (14) SOURCE: the gate is armed BEFORE the terminal is armed (so no claimant can ever race
+    // it), the collector honours it, both DebugLog seams release it, and the reply-wins
+    // late-scan attestation is only allowed once the gate is RELEASED (a "scan claimed nothing"
+    // claim made while collection is suppressed would be vacuous).
+    #[test]
+    fn a14_gate_wiring_is_ordered_and_non_vacuous() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        const DEBUG_SRC: &str = include_str!("../syscall/debug.rs");
+        const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+        // Armed strictly before `arm_reply_terminal`.
+        let arm = IPC_STATE_SRC
+            .split("fn maybe_arm_reply_timeout_oracle")
+            .nth(1)
+            .expect("arm body");
+        let hold_at = arm
+            .find("hold_reply_timeout_collector()")
+            .expect("gate armed");
+        let terminal_at = arm
+            .find("self.arm_reply_terminal(")
+            .expect("terminal armed");
+        assert!(
+            hold_at < terminal_at,
+            "the causal gate must be armed BEFORE the terminal cell"
+        );
+        // The collector honours the gate as its FIRST action.
+        let collect = RUNTIME_SRC
+            .split("pub(crate) fn collect_due_reply_timeout_work")
+            .nth(1)
+            .expect("collector body");
+        assert!(collect.contains("if crate::kernel::boot::reply_timeout_collector_held() {\n            return;\n        }"));
+        assert!(
+            collect.find("reply_timeout_collector_held").unwrap()
+                < collect.find("with_task_tcbs_split_mut").unwrap()
+        );
+        // Both DebugLog seams release it.
+        assert!(DEBUG_SRC.contains("maybe_release_reply_timeout_collector_gate(msg_str)"));
+        assert!(SPLIT_SRC.contains("maybe_release_reply_timeout_collector_gate(msg)"));
+        // The reply-wins late-scan attestation requires the gate released.
+        assert!(RUNTIME_SRC.contains("&& !crate::kernel::boot::reply_timeout_collector_held()"));
+    }
+}
+
+/// Stage 200C2C2C-R2C — the THREE-ARCHITECTURE selector/matrix guards.
+///
+/// The direct-reply timeout oracle's slot-5 selector pairs OVERLAP across architectures
+/// (AArch64 8/9, RISC-V 9/10, x86_64 10/11), so a number alone never identifies a scenario.
+/// These cases pin the architecture-local decoder, the encode/decode inverse, the
+/// registry constants, and the source-level absence of any shared ambiguous match.
+mod stage200c2c2c_r2c_selector_matrix {
+    use yarm_ipc_abi::ipc_reply_liveness_abi::{
+        AARCH64_SELECTOR_BASE, CURRENT_ARCH_SELECTOR_BASE, IpcReplyLivenessScenario,
+        RISCV64_SELECTOR_BASE, X86_64_SELECTOR_BASE, ipc_reply_liveness_scenario_for_base,
+        ipc_reply_liveness_scenario_for_current_arch, ipc_reply_liveness_selector_for_current_arch,
+    };
+
+    const ABI_SRC: &str =
+        include_str!("../../../crates/yarm-ipc-abi/src/ipc_reply_liveness_abi.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    /// (1) each architecture's own pair decodes to its own two scenarios.
+    #[test]
+    fn s01_each_arch_pair_decodes_to_its_own_scenarios() {
+        for (base, name) in [
+            (AARCH64_SELECTOR_BASE, "aarch64"),
+            (RISCV64_SELECTOR_BASE, "riscv64"),
+            (X86_64_SELECTOR_BASE, "x86_64"),
+        ] {
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, base),
+                Some(IpcReplyLivenessScenario::TimeoutWins),
+                "{name}: base must be TimeoutWins"
+            );
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, base + 1),
+                Some(IpcReplyLivenessScenario::ReplyWins),
+                "{name}: base+1 must be ReplyWins"
+            );
+        }
+        // The exact table the stage requires.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 8),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 9),
+            Some(IpcReplyLivenessScenario::ReplyWins)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 9),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::ReplyWins)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 11),
+            Some(IpcReplyLivenessScenario::ReplyWins)
+        );
+    }
+
+    /// (2) THE regression this stage freezes: the same number means different things on
+    /// different architectures, so a decoder must never be shared numerically.
+    #[test]
+    fn s02_same_number_means_different_scenarios_per_arch() {
+        // `9` is AArch64 ReplyWins but RISC-V TimeoutWins.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 9),
+            Some(IpcReplyLivenessScenario::ReplyWins)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 9),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
+        );
+        // `10` is RISC-V ReplyWins but x86_64 TimeoutWins.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::ReplyWins)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
+        );
+    }
+
+    /// (3) a selector belonging ONLY to another architecture cannot activate any scenario
+    /// in a given build.
+    #[test]
+    fn s03_foreign_only_selectors_activate_nothing() {
+        // Stage 200D-2B1 widened each architecture's PAIR into a RUN of three
+        // (base, base+1, base+2) = (TimeoutWins, ReplyWins, ServerDies), so the runs overlap
+        // more than the pairs did. "Foreign" now means "outside THIS build's run of three",
+        // and the guard asserts exactly that — a selector inside the run must decode, and a
+        // selector outside it must not, even when it is valid for another architecture.
+        //
+        // AArch64 run is 8/9/10, so x86_64's ReplyWins (11) and ServerDies (12) are foreign.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 11),
+            None
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 12),
+            None
+        );
+        // 10 IS in AArch64's run — it is AArch64 ServerDies — even though it is also
+        // RISC-V ReplyWins and x86_64 TimeoutWins. It must decode with THIS arch's meaning.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(AARCH64_SELECTOR_BASE, 10),
+            Some(IpcReplyLivenessScenario::ServerDies)
+        );
+        // RISC-V run is 9/10/11: AArch64's TimeoutWins (8) and x86_64's ServerDies (12)
+        // are foreign; 11 is RISC-V's own ServerDies.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 8),
+            None
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 12),
+            None
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(RISCV64_SELECTOR_BASE, 11),
+            Some(IpcReplyLivenessScenario::ServerDies)
+        );
+        // x86_64 run is 10/11/12: AArch64's whole TimeoutWins/ReplyWins pair (8/9) is foreign.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 8),
+            None
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 9),
+            None
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_base(X86_64_SELECTOR_BASE, 12),
+            Some(IpcReplyLivenessScenario::ServerDies)
+        );
+        // Nothing outside a base's own RUN activates anything, including the off value 0.
+        // 12 is deliberately NOT in this list any more: it is x86_64's ServerDies, so it is
+        // only inert for the other two bases. The loop derives the off-run values from each
+        // base rather than hard-coding a set that silently became run-relative.
+        for base in [
+            AARCH64_SELECTOR_BASE,
+            RISCV64_SELECTOR_BASE,
+            X86_64_SELECTOR_BASE,
+        ] {
+            for sel in [0usize, 1, base - 1, base + 3, base + 4, 100, usize::MAX] {
+                assert_eq!(
+                    ipc_reply_liveness_scenario_for_base(base, sel),
+                    None,
+                    "selector {sel} is outside the run based at {base}"
+                );
+            }
+            // …and every value INSIDE the run decodes to exactly one distinct scenario.
+            let run = [
+                ipc_reply_liveness_scenario_for_base(base, base),
+                ipc_reply_liveness_scenario_for_base(base, base + 1),
+                ipc_reply_liveness_scenario_for_base(base, base + 2),
+            ];
+            assert_eq!(
+                run,
+                [
+                    Some(IpcReplyLivenessScenario::TimeoutWins),
+                    Some(IpcReplyLivenessScenario::ReplyWins),
+                    Some(IpcReplyLivenessScenario::ServerDies),
+                ],
+                "the run based at {base} must map to the three scenarios in order"
+            );
+        }
+    }
+
+    /// (4) the CURRENT build decodes only its own pair, and encode/decode are exact
+    /// inverses — so the kernel cannot publish a selector userspace would misread.
+    #[test]
+    fn s04_current_arch_encode_decode_round_trip() {
+        for scenario in [
+            IpcReplyLivenessScenario::TimeoutWins,
+            IpcReplyLivenessScenario::ReplyWins,
+            IpcReplyLivenessScenario::ServerDies,
+        ] {
+            let sel = ipc_reply_liveness_selector_for_current_arch(scenario);
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_current_arch(sel),
+                Some(scenario),
+                "encode/decode must round-trip for {scenario:?}"
+            );
+        }
+        // Values just outside this build's own pair are inert.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE - 1),
+            None
+        );
+        // base+2 is now this build's own ServerDies; base+3 is the first value past the run.
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE + 2),
+            Some(IpcReplyLivenessScenario::ServerDies)
+        );
+        assert_eq!(
+            ipc_reply_liveness_scenario_for_current_arch(CURRENT_ARCH_SELECTOR_BASE + 3),
+            None
+        );
+    }
+
+    /// (5) the kernel's selector registry constants ARE the ABI bases — one numeric source
+    /// of truth, so the registry cannot drift from the decoder.
+    #[test]
+    fn s05_kernel_registry_constants_are_the_abi_bases() {
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            AARCH64_SELECTOR_BASE as u64
+        );
+        assert_eq!(
+            crate::kernel::boot::RISCV_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            RISCV64_SELECTOR_BASE as u64
+        );
+        assert_eq!(
+            crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            X86_64_SELECTOR_BASE as u64
+        );
+        assert!(
+            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_liveness_abi::X86_64_SELECTOR_BASE as u64")
+        );
+        assert!(
+            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_liveness_abi::AARCH64_SELECTOR_BASE as u64")
+        );
+        assert!(
+            MOD_SRC.contains("yarm_ipc_abi::ipc_reply_liveness_abi::RISCV64_SELECTOR_BASE as u64")
+        );
+    }
+
+    /// (6) the per-boot mode maps to the typed scenario, and the published selector is
+    /// produced by the architecture-local encoder.
+    #[test]
+    fn s06_mode_maps_to_typed_scenario() {
+        let prior = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(0);
+        assert_eq!(crate::kernel::boot::ipc_reply_timeout_scenario(), None);
+        assert_eq!(crate::kernel::boot::ipc_reply_timeout_selector(), None);
+
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS,
+        );
+        assert_eq!(
+            crate::kernel::boot::ipc_reply_timeout_scenario(),
+            Some(IpcReplyLivenessScenario::TimeoutWins)
+        );
+        assert_eq!(
+            crate::kernel::boot::ipc_reply_timeout_selector(),
+            Some(CURRENT_ARCH_SELECTOR_BASE as u64)
+        );
+
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS,
+        );
+        assert_eq!(
+            crate::kernel::boot::ipc_reply_timeout_scenario(),
+            Some(IpcReplyLivenessScenario::ReplyWins)
+        );
+        assert_eq!(
+            crate::kernel::boot::ipc_reply_timeout_selector(),
+            Some(CURRENT_ARCH_SELECTOR_BASE as u64 + 1)
+        );
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prior);
+    }
+
+    /// (7) SOURCE: NO shared ambiguous numeric selector match survives anywhere, and the
+    /// current-arch base is chosen by `cfg` rather than by a runtime value.
+    #[test]
+    fn s07_no_shared_ambiguous_selector_match() {
+        let code_of = |src: &str| -> alloc::string::String {
+            src.lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n")
+        };
+        for (name, src) in [
+            ("service.rs", SERVICE_SRC),
+            ("boot/mod.rs", MOD_SRC),
+            ("ipc_state.rs", IPC_STATE_SRC),
+        ] {
+            let code = code_of(src);
+            for bad in [
+                "matches!(mode(), 8 | 9 | 10)",
+                "matches!(mode(), 8 | 10)",
+                "matches!(selector, 8 | 9 | 10)",
+            ] {
+                assert!(
+                    !code.contains(bad),
+                    "{name} still decodes selectors with the ambiguous shared match {bad}"
+                );
+            }
+        }
+        // The ABI selects the current base by `cfg`, never at runtime.
+        assert!(
+            ABI_SRC.contains("#[cfg(target_arch = \"aarch64\")]\npub const CURRENT_ARCH_SELECTOR_BASE: usize = AARCH64_SELECTOR_BASE;")
+        );
+        assert!(
+            ABI_SRC.contains("#[cfg(target_arch = \"riscv64\")]\npub const CURRENT_ARCH_SELECTOR_BASE: usize = RISCV64_SELECTOR_BASE;")
+        );
+        assert!(
+            ABI_SRC.contains("#[cfg(target_arch = \"x86_64\")]\npub const CURRENT_ARCH_SELECTOR_BASE: usize = X86_64_SELECTOR_BASE;")
+        );
+    }
+
+    /// (8) SOURCE: all three architectures publish slot 5 through the shared encoder, and
+    /// none hand-writes `base + (mode - 1)` any more.
+    #[test]
+    fn s08_provisioning_uses_the_shared_encoder() {
+        for (name, src) in [
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains(
+                    "init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);"
+                ),
+                "{name} must publish slot 5 via the architecture-local encoder"
+            );
+            assert!(
+                !src.contains("x86_ipc_reply_timeout_oracle_mode() as u64 - 1"),
+                "{name} must not hand-compute the selector from the mode"
+            );
+        }
+    }
+
+    /// (9) SOURCE: userspace decodes through the SAME shared module the kernel encodes
+    /// with, so the two directions cannot drift apart again.
+    #[test]
+    fn s09_userspace_uses_the_shared_decoder() {
+        assert!(SERVICE_SRC.contains("use yarm_ipc_abi::ipc_reply_liveness_abi::{"));
+        assert!(
+            SERVICE_SRC.contains("ipc_reply_liveness_scenario_for_current_arch(mode() as usize)")
+        );
+        assert!(
+            SERVICE_SRC
+                .contains("matches!(scenario(), Some(IpcReplyLivenessScenario::TimeoutWins))")
+        );
+        // The userspace copy of the per-arch base table is gone.
+        assert!(!SERVICE_SRC.contains("pub(super) const SELECTOR_BASE: u64"));
+    }
+
+    /// (10) SOURCE: the reply-wins scenario proves a DUPLICATE NR7 through the consumed
+    /// reply cap is rejected, and all three arch wrappers require that verdict.
+    #[test]
+    fn s10_duplicate_reply_is_proven_rejected() {
+        assert!(SERVICE_SRC.contains("SERVER_DUP_REPLY_REJECTED"));
+        assert!(SERVICE_SRC.contains("IPC_REPLY_TIMEOUT_ORACLE_SERVER_DUP_REPLY rejected={}"));
+        assert_eq!(
+            SERVICE_SRC
+                .matches("duplicate_reply=rejected result=ok")
+                .count(),
+            3,
+            "each arch wrapper must require the duplicate-reply rejection"
+        );
+        assert_eq!(
+            SERVICE_SRC
+                .matches("&& out.dup_reply_rejected == 1")
+                .count(),
+            3
+        );
+    }
+
+    /// (11) SOURCE: the RISC-V return chain publishes the STORED TCB lanes, so all three
+    /// observations of a0 (stored, final, first-userspace) are independently attestable.
+    #[test]
+    fn s11_riscv_stored_return_lanes_are_attested() {
+        // Stage 200D: the marker also reports the canonical code it published, because the
+        // same publication now serves TimedOut and ServerDied.
+        assert!(
+            IPC_STATE_SRC.contains("RISCV_BLOCKED_RETURN_PUBLISHED tid={} code={} stored_a0={}")
+        );
+        // Emitted AFTER the canonical publication helper, never before it.
+        let block = IPC_STATE_SRC
+            .split("tcb.publish_riscv_user_return(0, 0, timed_out as usize);")
+            .nth(1)
+            .expect("publication site");
+        assert!(
+            block
+                .split("\n        }")
+                .next()
+                .unwrap()
+                .contains("RISCV_BLOCKED_RETURN_PUBLISHED"),
+            "the stored-lane attestation must follow the publication"
+        );
+    }
+
+    /// (12) SOURCE: the boot-instance identifier is one-shot and emitted by every
+    /// architecture, so a runner can assert exactly one DISTINCT boot per log.
+    #[test]
+    fn s12_boot_instance_nonce_is_one_shot_per_arch() {
+        assert!(MOD_SRC.contains(
+            "if BOOT_INSTANCE_NONCE_EMITTED.swap(true, core::sync::atomic::Ordering::AcqRel) {\n        return;\n    }"
+        ));
+        assert!(MOD_SRC.contains("YARM_BOOT_INSTANCE arch={} nonce=0x{:016x} result=ok"));
+        assert!(X86_BOOT_SRC.contains("emit_boot_instance_nonce(\"x86_64\")"));
+        assert!(AARCH64_BOOT_SRC.contains("emit_boot_instance_nonce(\"aarch64\")"));
+        assert!(RISCV_BOOT_SRC.contains("emit_boot_instance_nonce(\"riscv64\")"));
+        // No reset path anywhere: a re-armable latch could fake a single boot.
+        assert!(!MOD_SRC.contains("BOOT_INSTANCE_NONCE_EMITTED.store(false"));
+    }
+
+    /// (13) SOURCE: the matrix runner enforces the exact-commit, log-freshness and
+    /// single-boot contracts, and seals only on six cells.
+    #[test]
+    fn s13_matrix_runner_contract() {
+        const RUNNER: &str =
+            include_str!("../../../scripts/qemu-ipc-reply-timeout-matrix-smoke.sh");
+        // Clean tree required; SHA + tree hash re-checked after every child.
+        assert!(RUNNER.contains("reason=dirty_tree"));
+        assert!(RUNNER.contains("recheck_exact_commit"));
+        assert!(RUNNER.contains("git rev-parse HEAD^{tree}"));
+        // Fresh logs only.
+        assert!(RUNNER.contains("log reuse: $path was already used by another cell"));
+        assert!(RUNNER.contains("log reuse: $path already exists before its cell ran"));
+        // Five single-boot witnesses, including DISTINCT nonces.
+        assert!(RUNNER.contains("DISTINCT boot instances != 1"));
+        assert!(RUNNER.contains("QEMU_SINGLE_BOOT=1"));
+        // Six cells or no seal.
+        assert!(RUNNER.contains("(( TW_PASS != 3 )) || (( RW_PASS != 3 ))"));
+        assert!(RUNNER.contains("STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL"));
+        assert!(RUNNER.contains("total_live_cells=6"));
+    }
+}
+
+/// Stage 200D-1 — the SERVER-DEATH terminal mechanism: lifecycle closure, exactly-once
+/// terminal ownership, reverse-registration integrity and teardown safety.
+///
+/// Every case drives real state transitions through the production seams (terminal
+/// compare-exchange, record reservation lifecycle, TCB link seam) in a controlled ORDER
+/// rather than by racing threads, so each interleaving is exercised deterministically.
+///
+/// Hosted only: this module proves the ARCHITECTURE-NEUTRAL mechanism. It claims no live
+/// retirement cell, no scenario-selector generalization and no multi-pair support.
+mod stage200d1_server_death {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::DetachOutcome;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::kernel::vm::Asid;
+
+    const BRG: u64 = 1;
+    const TOKEN_GEN: u64 = 1;
+    /// The canonical server-death code, as the ABI defines it.
+    const SERVER_DIED: u64 = 10;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+
+    fn arm(fx: &CallerFx) -> TerminalIdentity {
+        // Arm with the caller's LIVE blocked-receive generation — the same value the
+        // production block path captures — so the transaction's revalidation compares like
+        // with like instead of against a hand-picked constant.
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(BRG);
+        let id =
+            fx.k.with(|s| {
+                s.reply_terminal_identity(
+                    fx.record_index,
+                    fx.record_generation,
+                    brg,
+                    Some(TOKEN_GEN),
+                )
+            })
+            .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(fx.record_index, id));
+        id
+    }
+
+    /// Register the reverse link the way the NR6 transaction does.
+    fn link(fx: &CallerFx) -> bool {
+        fx.k.with(|s| {
+            s.register_server_reply_link(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        })
+    }
+
+    fn live_links(fx: &CallerFx) -> usize {
+        fx.k.with(|s| s.live_server_reply_link_count())
+    }
+
+    fn link_present(fx: &CallerFx) -> bool {
+        fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+            .is_some()
+    }
+
+    fn record_live(fx: &CallerFx) -> bool {
+        fx.k.with(|s| {
+            s.reply_cap_record_caller_asid(fx.record_index).is_some()
+                && s.reply_record_slot_generation(fx.record_index) == Some(fx.record_generation)
+        })
+    }
+
+    fn winner(fx: &CallerFx) -> Option<TerminalClaimant> {
+        fx.k.with(|s| s.reply_terminal_committed_winner(fx.record_index))
+    }
+
+    fn caller_result(fx: &CallerFx) -> Option<u64> {
+        fx.k.with(|s| s.pending_syscall_completion_result(1))
+    }
+
+    /// Run the production death transaction for the registered link.
+    fn kill_server(fx: &CallerFx) -> crate::runtime::ReplyTimeoutOutcome {
+        let l =
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+                .expect("link registered");
+        fx.k.with(|s| s.complete_server_death_for_link(l))
+    }
+
+    // ── (1) the base case ────────────────────────────────────────────────────────────
+    #[test]
+    fn d01_server_death_claims_available_record() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx), "registration must succeed on a live server");
+        assert_eq!(live_links(&fx), 1);
+        let outcome = kill_server(&fx);
+        assert!(matches!(
+            outcome,
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert_eq!(live_links(&fx), 0, "links leaked");
+        teardown();
+    }
+
+    // ── (2)(3) reply versus server death, both orders ────────────────────────────────
+    #[test]
+    fn d02_reply_wins_before_server_death() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        // Reply claims first.
+        let reply_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Reply, &id)
+            })
+            .expect("reply claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &reply_owner)));
+        // Death now loses at the single authority; no caller result is published.
+        let outcome = kill_server(&fx);
+        assert!(matches!(
+            outcome,
+            crate::runtime::ReplyTimeoutOutcome::LostToTerminal
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::Reply));
+        assert_eq!(
+            caller_result(&fx),
+            None,
+            "no death result may overwrite a reply"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn d03_server_death_wins_before_reply() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        // A late reply can no longer claim the terminal.
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::Reply,
+                &id
+            ))
+            .is_none(),
+            "late reply must not claim a completed terminal"
+        );
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert_eq!(live_links(&fx), 0);
+        teardown();
+    }
+
+    // ── (4)(5) timeout versus server death, both orders ──────────────────────────────
+    #[test]
+    fn d04_timeout_wins_before_server_death() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let t_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Timeout, &id)
+            })
+            .expect("timeout claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &t_owner)));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::LostToTerminal
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::Timeout));
+        teardown();
+    }
+
+    #[test]
+    fn d05_server_death_wins_before_timeout() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::Timeout,
+                &id
+            ))
+            .is_none(),
+            "a later deadline is subordinate stale work once death won"
+        );
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        teardown();
+    }
+
+    // ── (6)(7) caller exit versus server death ───────────────────────────────────────
+    #[test]
+    fn d06_caller_exit_wins_before_server_death() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let c_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::CallerExit, &id)
+            })
+            .expect("caller exit claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &c_owner)));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::LostToTerminal
+        ));
+        assert_eq!(
+            caller_result(&fx),
+            None,
+            "caller exit ⇒ server-death cleanup with caller wake = 0"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn d07_server_death_wins_before_caller_exit() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::CallerExit,
+                &id
+            ))
+            .is_none()
+        );
+        teardown();
+    }
+
+    // ── (8) endpoint destruction versus server death ─────────────────────────────────
+    #[test]
+    fn d08_endpoint_gone_versus_server_death() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let e_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(
+                    fx.record_index,
+                    TerminalClaimant::EndpointGone,
+                    &id,
+                )
+            })
+            .expect("endpoint gone claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &e_owner)));
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::LostToTerminal
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::EndpointGone));
+        teardown();
+    }
+
+    // ── (9) duplicate server-exit notifications ──────────────────────────────────────
+    #[test]
+    fn d09_duplicate_server_exit_wakes_once() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        let l =
+            fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+                .expect("link");
+        let first = fx.k.with(|s| s.complete_server_death_for_link(l));
+        let second = fx.k.with(|s| s.complete_server_death_for_link(l));
+        assert!(matches!(first, crate::runtime::ReplyTimeoutOutcome::Woken));
+        assert!(
+            !matches!(second, crate::runtime::ReplyTimeoutOutcome::Woken),
+            "a duplicate teardown notification must not wake the caller twice"
+        );
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    // ── (10)(11) restarted incarnations with reused numeric TIDs ─────────────────────
+    #[test]
+    fn d10_restarted_server_reused_tid_different_asid() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // A replacement server carries the SAME numeric TID but a different ASID.
+        let other = Asid(fx.replier.asid.0.wrapping_add(77));
+        assert!(
+            !fx.k.with(|s| s.register_server_reply_link(
+                fx.replier.tid.0,
+                other,
+                fx.record_index,
+                fx.record_generation
+            )),
+            "a different incarnation must not inherit reply authority"
+        );
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                other,
+                fx.record_index,
+                fx.record_generation
+            )),
+            DetachOutcome::StaleServerIdentity,
+            "a replacement incarnation must not cancel the old link"
+        );
+        assert!(link_present(&fx), "the original link survives untouched");
+        teardown();
+    }
+
+    #[test]
+    fn d11_restarted_caller_reused_tid_different_asid() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // Rebind the caller's blocked-receive generation: the caller re-blocked, so the
+        // identity captured at registration is stale.
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        let outcome = kill_server(&fx);
+        assert!(
+            !matches!(outcome, crate::runtime::ReplyTimeoutOutcome::Woken),
+            "death must not wake a caller whose blocked receive advanced"
+        );
+        assert_eq!(caller_result(&fx), None);
+        teardown();
+    }
+
+    // ── (12) reply-record slot reuse with a stale reverse link ───────────────────────
+    #[test]
+    fn d12_slot_reuse_makes_link_stale() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        let stale_gen = fx.record_generation.wrapping_add(1);
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                stale_gen
+            )),
+            DetachOutcome::StaleRecordGeneration,
+            "an unlink for a reused slot must mutate nothing"
+        );
+        assert!(link_present(&fx));
+        teardown();
+    }
+
+    // ── (13) reply copy fault while the server begins exit ───────────────────────────
+    #[test]
+    fn d13_retryable_copy_fault_retains_link_then_death_claims() {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        // Reply reserves, then its caller copy faults retryably and releases the terminal.
+        let reply_owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Reply, &id)
+            })
+            .expect("reply reserves");
+        assert!(
+            fx.k.with(|s| s
+                .release_reply_terminal_slot_if_retryable(fx.record_index, &reply_owner))
+        );
+        // A retryable release keeps the record available for the SAME server, so the link
+        // is deliberately retained — the server still owes that reply.
+        assert!(
+            link_present(&fx),
+            "a retryable rollback must retain the link"
+        );
+        // The server then dies: death can now claim the released terminal.
+        assert!(matches!(
+            kill_server(&fx),
+            crate::runtime::ReplyTimeoutOutcome::Woken
+        ));
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        teardown();
+    }
+
+    // ── (14) NR6 registration versus the server entering Exiting ─────────────────────
+    #[test]
+    fn d14_registration_refused_once_server_is_exiting() {
+        let fx = caller_fixture();
+        arm(&fx);
+        // The server commits to exit BEFORE registration is attempted.
+        fx.k.with(|s| s.set_task_status_for_test(2, crate::kernel::task::TaskStatus::Exited(0)));
+        assert!(
+            !link(&fx),
+            "an exiting incarnation must never be published as an authorized replier"
+        );
+        assert_eq!(live_links(&fx), 0);
+        assert!(
+            !fx.k
+                .can_reserve_server_reply_link_split(fx.replier.tid.0, fx.replier.asid),
+            "the capacity probe must also refuse an exiting incarnation"
+        );
+        teardown();
+    }
+
+    // ── (15) reverse-link capacity failure ───────────────────────────────────────────
+    #[test]
+    fn d15_capacity_one_second_link_fails_without_overwrite() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // A SECOND, different record on the same live server must be refused.
+        let other_index = fx.record_index.wrapping_add(1);
+        assert!(
+            !fx.k.with(|s| s.register_server_reply_link(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                other_index,
+                fx.record_generation
+            )),
+            "capacity is one; a second live link must fail"
+        );
+        let held =
+            fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+                .expect("link");
+        assert_eq!(
+            held.reply_record_index, fx.record_index,
+            "the original link must not be silently overwritten"
+        );
+        // Re-registering the IDENTICAL link is idempotent.
+        assert!(link(&fx));
+        assert_eq!(live_links(&fx), 1);
+        // Detaching a different live link is refused, not silently applied.
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                other_index,
+                fx.record_generation
+            )),
+            DetachOutcome::DifferentLiveLink
+        );
+        assert!(link_present(&fx));
+        teardown();
+    }
+
+    // ── (16)(17) publication failpoints ──────────────────────────────────────────────
+    #[test]
+    fn d16_failure_after_record_reservation_before_link_leaves_nothing() {
+        let fx = caller_fixture();
+        // Reserve a fresh record, then fail before publishing any link.
+        let (idx, gen_) =
+            fx.k.with(|s| {
+                s.reserve_direct_reply_record(
+                    fx.caller,
+                    fx.replier,
+                    crate::kernel::boot::CapObject::Endpoint {
+                        index: fx.reply_eidx,
+                        generation: fx.reply_egen,
+                    },
+                )
+            })
+            .expect("reserve");
+        assert_eq!(live_links(&fx), 0, "no link is published yet");
+        assert!(fx.k.with(|s| s.cancel_direct_reply_record(idx, gen_)));
+        assert_eq!(live_links(&fx), 0, "rollback leaves zero links");
+        assert!(
+            fx.k.with(|s| s.reply_record_slot_generation(idx)) != Some(gen_)
+                || fx.k.with(|s| s.reply_cap_record_caller_asid(idx)).is_none(),
+            "rollback leaves zero live records"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn d17_failure_after_link_before_exposure_rolls_both_back() {
+        let fx = caller_fixture();
+        let (idx, gen_) =
+            fx.k.with(|s| {
+                s.reserve_direct_reply_record(
+                    fx.caller,
+                    fx.replier,
+                    crate::kernel::boot::CapObject::Endpoint {
+                        index: fx.reply_eidx,
+                        generation: fx.reply_egen,
+                    },
+                )
+            })
+            .expect("reserve");
+        assert!(fx.k.with(|s| s.register_server_reply_link(
+            fx.replier.tid.0,
+            fx.replier.asid,
+            idx,
+            gen_
+        )));
+        assert_eq!(live_links(&fx), 1);
+        // Roll back: cancellation closes the link on the same edge.
+        assert!(fx.k.with(|s| s.cancel_direct_reply_record(idx, gen_)));
+        assert_eq!(live_links(&fx), 0, "cancellation must close the link");
+        teardown();
+    }
+
+    // ── (18–21) terminal unregistration table ────────────────────────────────────────
+    fn terminal_unlink_case(kind: TerminalClaimant) {
+        let fx = caller_fixture();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(fx.record_index, kind, &id))
+                .expect("claim");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &owner)));
+        // Every terminal path funnels through the SAME finalization seam.
+        assert_eq!(
+            fx.k.with(
+                |s| s.finalize_server_reply_link_for_record(fx.record_index, fx.record_generation)
+            ),
+            DetachOutcome::Detached,
+            "{kind:?} terminal must close the reverse link exactly once"
+        );
+        assert_eq!(live_links(&fx), 0);
+        // Repeating it is idempotent and mutates nothing.
+        assert_eq!(
+            fx.k.with(
+                |s| s.finalize_server_reply_link_for_record(fx.record_index, fx.record_generation)
+            ),
+            DetachOutcome::AlreadyAbsent
+        );
+        teardown();
+    }
+
+    #[test]
+    fn d18_reply_terminal_unlinks() {
+        terminal_unlink_case(TerminalClaimant::Reply);
+    }
+
+    #[test]
+    fn d19_timeout_terminal_unlinks() {
+        terminal_unlink_case(TerminalClaimant::Timeout);
+    }
+
+    #[test]
+    fn d20_caller_exit_terminal_unlinks() {
+        terminal_unlink_case(TerminalClaimant::CallerExit);
+    }
+
+    #[test]
+    fn d21_endpoint_gone_terminal_unlinks() {
+        terminal_unlink_case(TerminalClaimant::EndpointGone);
+    }
+
+    // ── (22) stale duplicate unregistration after record reuse ───────────────────────
+    #[test]
+    fn d22_stale_duplicate_unregistration_after_reuse() {
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        assert!(fx.k.with(|s| s.unregister_server_reply_link(
+            fx.replier.tid.0,
+            fx.replier.asid,
+            fx.record_index,
+            fx.record_generation
+        )));
+        assert_eq!(live_links(&fx), 0);
+        // A repeat, and a repeat at a reused generation, both mutate nothing.
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation
+            )),
+            DetachOutcome::AlreadyAbsent
+        );
+        assert_eq!(
+            fx.k.with(|s| s.detach_server_reply_link_exact(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation.wrapping_add(9)
+            )),
+            DetachOutcome::AlreadyAbsent
+        );
+        assert_eq!(live_links(&fx), 0, "links leaked");
+        teardown();
+    }
+}
+
+/// Stage 200D-1 — architecture result-publication contracts and mechanism source guards.
+///
+/// These prove that `ServerDied` rides the EXISTING blocked-completion machinery on all
+/// three ports rather than introducing a fourth resume path, and that the mechanism's
+/// hard-stops hold at the source level. Hosted contracts only — no live retirement cell.
+mod stage200d1_publication_and_guards {
+    use crate::kernel::task::ThreadControlBlock;
+
+    const SERVER_DIED: usize = 10;
+
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+    const KSYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+
+    // ── 1. Error ABI ────────────────────────────────────────────────────────────────
+
+    /// Both enums agree on 10, both decoders map it, and the unknown-code fallback is
+    /// untouched. `10` is unused elsewhere in the SYSCALL-error namespace; the other
+    /// enums that happen to use 10 (`netmgr`, `process`, `socket`, `irqmux`) are
+    /// service-local ABIs in separate namespaces and are not conflicts.
+    #[test]
+    fn g01_error_abi_agrees_on_both_sides() {
+        assert_eq!(
+            crate::kernel::syscall::SyscallError::ServerDied as usize,
+            10
+        );
+        assert_eq!(
+            crate::kernel::syscall::SyscallError::from_code(10),
+            crate::kernel::syscall::SyscallError::ServerDied
+        );
+        // Unknown codes still fall back to Internal — unchanged by this stage.
+        for code in [0usize, 11, 12, 99, 254, 255, 4096] {
+            assert_eq!(
+                crate::kernel::syscall::SyscallError::from_code(code),
+                crate::kernel::syscall::SyscallError::Internal,
+                "code {code} must keep the existing Internal fallback"
+            );
+        }
+        // Source-level agreement with the userspace enum + decoder.
+        assert!(KSYSCALL_SRC.contains("ServerDied = 10,"));
+        assert!(KSYSCALL_SRC.contains("10 => Self::ServerDied,"));
+        assert!(USER_RT_SRC.contains("ServerDied = 10,"));
+        assert!(USER_RT_SRC.contains("10 => SyscallError::ServerDied,"));
+        assert!(USER_RT_SRC.contains("_ => SyscallError::Internal,"));
+    }
+
+    /// No oracle-specific translation layer: the death path publishes the canonical
+    /// `SyscallError::ServerDied` discriminant directly.
+    #[test]
+    fn g02_no_oracle_specific_error_translation() {
+        assert!(
+            IPC_STATE_SRC.contains("crate::kernel::syscall::SyscallError::ServerDied as u64"),
+            "death must publish the canonical discriminant"
+        );
+        assert!(!IPC_STATE_SRC.contains("SERVER_DEATH_ERROR_CODE"));
+        assert!(!IPC_STATE_SRC.contains("fn map_server_death_error"));
+    }
+
+    // ── 9. Architecture result-publication contracts ────────────────────────────────
+
+    /// RISC-V: BOTH saved-context mirrors carry code 10 and the secondary lane is 0,
+    /// published through the canonical helper.
+    #[test]
+    fn g03_riscv_publication_contract() {
+        let mut tcb = ThreadControlBlock::new(
+            crate::kernel::ipc::ThreadId(7),
+            Some(crate::kernel::vm::Asid(3)),
+        );
+        tcb.publish_riscv_user_return(0, 0, SERVER_DIED);
+        assert_eq!(tcb.user_context.user_gprs[10], SERVER_DIED, "a0 lane");
+        assert_eq!(tcb.user_context.arg0, SERVER_DIED, "arg0 mirror");
+        assert_eq!(tcb.user_context.user_gprs[11], 0, "secondary result lane");
+        assert_eq!(tcb.user_context.arg1, 0, "secondary mirror");
+        // The completion helper publishes RISC-V lanes ONLY through the canonical helper.
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("body");
+        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        assert!(body.contains("tcb.publish_riscv_user_return(0, 0, timed_out as usize);"));
+        let direct =
+            body.matches("user_gprs[10] =").count() + body.matches("user_gprs[11] =").count();
+        assert_eq!(
+            direct, 0,
+            "no direct single-mirror RISC-V write is permitted"
+        );
+        // Publication happens BEFORE the task becomes Runnable and before any enqueue.
+        let pub_at = body.find("publish_riscv_user_return").expect("publish");
+        let runnable_at = body
+            .find("tcb.status = TaskStatus::Runnable")
+            .expect("runnable");
+        assert!(pub_at < runnable_at, "publication precedes Runnable");
+    }
+
+    /// AArch64: the death result rides the EXISTING parked blocked completion, which the
+    /// normal resume boundary consumes — no new resume path.
+    #[test]
+    fn g04_aarch64_parked_completion_contract() {
+        const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("body");
+        // The parked completion carries the parameterized code, so ServerDied uses it too.
+        assert!(body.contains("result: timed_out,"));
+        assert!(body.contains("pending_syscall_completion = Some("));
+        // The resume boundary consumes it through the existing single consumer.
+        assert!(AARCH64_TRAP_SRC.contains("take_blocked_syscall_completion"));
+        // Death does not add a second consumer anywhere.
+        assert_eq!(
+            AARCH64_TRAP_SRC
+                .matches("take_blocked_syscall_completion")
+                .count(),
+            1,
+            "exactly one consumer at the AArch64 resume boundary"
+        );
+    }
+
+    /// x86_64: the saved-frame error lane carries the code, and no metadata field is
+    /// written by the completion that could override it.
+    #[test]
+    fn g05_x86_saved_frame_contract() {
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("body");
+        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        assert!(body.contains("#[cfg(target_arch = \"x86_64\")]"));
+        assert!(
+            body.contains("tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error")
+        );
+        // The error lane is the LAST word on the result: the completion writes no recv
+        // metadata at all, so nothing can override the raw error. Comments are stripped
+        // first — prose about the mechanism is not a metadata write.
+        let code: alloc::string::String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in ["recv_meta", "IpcRecvMeta", "meta.status", "meta_ptr"] {
+            assert!(
+                !code.contains(forbidden),
+                "no metadata write in the completion ({forbidden})"
+            );
+        }
+    }
+
+    // ── 10. Mechanism source guards ─────────────────────────────────────────────────
+
+    /// Teardown resolves the record BY INDEX from the exact TCB link — it never scans the
+    /// reply-record store to find death authority. (The pre-existing capability-revoke
+    /// sweeps still iterate, but they revoke caps; they are not the authority path, and
+    /// the death claim strictly precedes them.)
+    #[test]
+    fn g06_no_global_scan_for_death_authority() {
+        let body = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let body = body.split("\n    pub fn ").next().unwrap();
+        assert!(body.contains("take_server_reply_link(tid, exit_identity.asid)"));
+        // Stage 200D-2A: teardown no longer claims in place — it publishes a deferred item
+        // the post-lock drain claims from. The no-scan property this case guards is
+        // unchanged, and is now stronger: teardown touches no record at all.
+        assert!(body.contains("server_death_work_publish("));
+        assert!(
+            !body.contains("for slot in") && !body.contains("reply_caps.iter"),
+            "teardown must not scan the reply-record store for death authority"
+        );
+        // The link handoff runs BEFORE the revoke sweep, which would otherwise destroy the
+        // record the deferred item needs.
+        let death_at = body.find("take_server_reply_link").expect("handoff");
+        let sweep_at = body
+            .find("revoke_reply_caps_for_replier_identity_except")
+            .expect("sweep");
+        assert!(
+            death_at < sweep_at,
+            "the death claim must precede the revoke sweep"
+        );
+    }
+
+    /// Numeric TID alone never authorizes: every link operation and the death claim carry
+    /// the ASID incarnation too.
+    #[test]
+    fn g07_no_numeric_tid_only_authority() {
+        for needle in [
+            "fn register_server_reply_link(\n        &mut self,\n        server_tid: u64,\n        server_asid: Asid,",
+            "fn detach_server_reply_link_exact(\n        &mut self,\n        server_tid: u64,\n        server_asid: Asid,",
+            "fn take_server_reply_link(\n        &mut self,\n        server_tid: u64,\n        server_asid: Asid,",
+        ] {
+            assert!(
+                IPC_STATE_SRC.contains(needle),
+                "missing identity-keyed seam: {needle}"
+            );
+        }
+        // The link type itself binds both halves and exposes exact matchers.
+        assert!(TASK_SRC.contains("pub server_asid: crate::kernel::vm::Asid,"));
+        assert!(
+            TASK_SRC.contains(
+                "fn matches_server(&self, tid: u64, asid: crate::kernel::vm::Asid) -> bool"
+            )
+        );
+        assert!(
+            TASK_SRC.contains("fn matches_record(&self, index: usize, generation: u64) -> bool")
+        );
+    }
+
+    /// The death completion performs NO user-memory copy.
+    #[test]
+    fn g08_no_user_copy_in_death_completion() {
+        let body = IPC_STATE_SRC
+            .split("fn complete_server_death_over")
+            .nth(1)
+            .expect("death txn");
+        let body = body.split("\nimpl IpcSubsystem").next().unwrap();
+        for forbidden in [
+            "copy_to_user",
+            "copy_from_user",
+            "copy_from_current_user",
+            "write_user",
+            "user_slice",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "server-death completion must not touch user memory ({forbidden})"
+            );
+        }
+    }
+
+    /// There is ONE terminal authority store; death claims through the same cell.
+    #[test]
+    fn g09_single_terminal_authority_store() {
+        let body = IPC_STATE_SRC
+            .split("fn complete_server_death_over")
+            .nth(1)
+            .expect("death txn");
+        assert!(body.contains("ipc.reply_terminal_ownership"));
+        assert!(body.contains("try_claim_peer_death_terminal(identity)"));
+        // No parallel death table or flag anywhere.
+        for forbidden in [
+            "death_claimed",
+            "peer_death_table",
+            "server_death_flags",
+            "death_authority",
+        ] {
+            assert!(
+                !IPC_STATE_SRC.contains(forbidden),
+                "second authority store: {forbidden}"
+            );
+        }
+    }
+
+    /// A reverse link is never silently overwritten, and registration refuses an exiting
+    /// incarnation on BOTH the broad and the split seam.
+    #[test]
+    fn g10_no_silent_link_overwrite_and_exiting_gate() {
+        for src in [IPC_STATE_SRC, RUNTIME_SRC] {
+            assert!(
+                src.contains(
+                    "Some(existing) if existing == link => true,\n                Some(_) => false,"
+                ),
+                "a different live link must fail, never overwrite"
+            );
+        }
+        assert!(
+            IPC_STATE_SRC
+                .contains("TaskStatus::Runnable | TaskStatus::Running | TaskStatus::Blocked(_)")
+        );
+        assert!(RUNTIME_SRC.contains("crate::kernel::task::TaskStatus::Runnable"));
+    }
+
+    /// The NR6 transaction reserves link capacity BEFORE publishing the record, so no
+    /// failure window can expose a request whose link is missing.
+    #[test]
+    fn g11_capacity_reserved_before_publication() {
+        let probe = TXN_SRC
+            .find("can_reserve_server_reply_link_split")
+            .expect("capacity probe");
+        let reserve = TXN_SRC
+            .find("reserve_direct_reply_record_split")
+            .expect("record reservation");
+        let register = TXN_SRC
+            .find("register_server_reply_link_split")
+            .expect("registration");
+        // Anchor on the actual CALL: the module doc comment names the helper too.
+        let enqueue = TXN_SRC
+            .find("self.sr_enqueue_committed_receiver_split(ack.server.tid.0")
+            .expect("enqueue");
+        assert!(
+            probe < reserve,
+            "link capacity is probed before the record is reserved"
+        );
+        assert!(
+            register < enqueue,
+            "the link is published before the server is enqueued"
+        );
+        // Registration failure rolls the publication back.
+        let after = &TXN_SRC[register..];
+        assert!(after.contains("cancel_direct_reply_record_split(idx, rgen)"));
+    }
+
+    /// Every terminal finalization path funnels through the single unlink seam.
+    #[test]
+    fn g12_all_terminal_paths_use_the_finalization_seam() {
+        // Narrow transactions (timeout + death) close it inside record invalidation.
+        assert!(IPC_STATE_SRC.contains("let _ = rt_detach_server_link(d, index, generation);"));
+        // Broad paths.
+        assert!(IPC_STATE_SRC.contains("fn finalize_server_reply_link_for_record"));
+        assert!(
+            IPC_STATE_SRC
+                .split("fn cancel_direct_reply_record")
+                .nth(1)
+                .unwrap()
+                .contains("finalize_server_reply_link_for_record(index, generation)")
+        );
+        assert!(
+            IPC_STATE_SRC
+                .split("pub fn ipc_reply(")
+                .nth(1)
+                .unwrap()
+                .contains("finalize_server_reply_link_for_record(slot, record_generation)")
+        );
+        // Direct NR7 consumption.
+        assert!(
+            RUNTIME_SRC.contains("finalize_server_reply_link_for_record_split(index, generation)")
+        );
+        // A RETRYABLE copy-fault rollback deliberately does NOT detach.
+        let release = RUNTIME_SRC
+            .split("fn release_reply_record_split")
+            .nth(1)
+            .expect("release");
+        let release = release.split("\n    pub(crate) fn ").next().unwrap();
+        assert!(
+            !release.contains("finalize_server_reply_link"),
+            "a retryable rollback must retain the link — the server still owes the reply"
+        );
+    }
+
+    /// The reply-record claim and the caller enqueue do not happen inside a TCB claim.
+    #[test]
+    fn g13_no_enqueue_inside_tcb_claim() {
+        let body = IPC_STATE_SRC
+            .split("fn complete_server_death_over")
+            .nth(1)
+            .expect("death txn");
+        let body = body.split("\nimpl IpcSubsystem").next().unwrap();
+        // The enqueue is the last statement and is not nested in any domain closure.
+        let enqueue = body.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        let commit = body.find("rt_commit_receiver_runnable(").expect("commit");
+        assert!(commit < enqueue, "publication precedes the enqueue");
+        // `rtd_enqueue` is the scheduler seam; no tcb closure wraps it.
+        let tail = &body[enqueue..];
+        assert!(!tail.contains("rtd_tcbs"), "no TCB claim spans the enqueue");
+    }
+
+    /// Authority is captured before any capability/CNode reclamation in teardown.
+    #[test]
+    fn g14_authority_captured_before_cnode_reclamation() {
+        let body = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let body = body.split("\n    pub fn ").next().unwrap();
+        let capture = body.find("take_server_reply_link").expect("capture");
+        let identity = body.find("let exit_identity").expect("identity");
+        assert!(
+            identity < capture,
+            "the exact exiting identity precedes link capture"
+        );
+        // Waiter/CNode cleanup and reporting all follow the deferred handoff (Stage
+        // 200D-2A: authority is captured into the deferred item, not claimed here).
+        let handoff = body.find("server_death_work_publish(").expect("handoff");
+        for later in [
+            "clear_ipc_waiters_for_tid",
+            "report_task_exit_to_supervisor",
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("missing {later}"));
+            assert!(handoff < at, "{later} must follow the deferred handoff");
+        }
+    }
+}
+
+/// Stage 200D-2A — DEFERRED post-lock server-death completion.
+///
+/// The Stage 200D-1 mechanism was lifecycle-correct but did all of its authority work
+/// inside the broad `SpinLock<KernelState>`. These cases prove the new split: the
+/// broad-lock phase only reserves a slot, detaches the exact link and publishes an
+/// immutable generation-bearing item; the post-lock drain does the PeerDeath claim, the
+/// result publication and the single enqueue.
+///
+/// Hosted and source-guarded — no live retirement cell is claimed.
+mod stage200d2a_deferred_death {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::DeferredServerDeathCompletion;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::kernel::vm::Asid;
+
+    const TOKEN_GEN: u64 = 1;
+    const SERVER_DIED: u64 = 10;
+    const CPU: CpuId = CpuId(0);
+
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+
+    fn clear_queue() {
+        crate::kernel::boot::server_death_work_clear(0);
+    }
+    fn queued() -> usize {
+        crate::kernel::boot::server_death_work_len(0)
+    }
+
+    fn arm(fx: &CallerFx) -> TerminalIdentity {
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(1);
+        let id =
+            fx.k.with(|s| {
+                s.reply_terminal_identity(
+                    fx.record_index,
+                    fx.record_generation,
+                    brg,
+                    Some(TOKEN_GEN),
+                )
+            })
+            .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(fx.record_index, id));
+        id
+    }
+
+    fn link(fx: &CallerFx) -> bool {
+        fx.k.with(|s| {
+            s.register_server_reply_link(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        })
+    }
+
+    /// The BROAD-LOCK phase exactly as `exit_task` performs it: reserve → detach → publish.
+    fn broad_lock_exit_phase(fx: &CallerFx) -> bool {
+        let reservation = match crate::kernel::boot::server_death_work_reserve(0) {
+            Some(r) => r,
+            None => return false,
+        };
+        match fx
+            .k
+            .with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+        {
+            Some(l) => crate::kernel::boot::server_death_work_publish(
+                reservation,
+                DeferredServerDeathCompletion {
+                    exiting_server: fx.replier,
+                    reply_record_index: l.reply_record_index,
+                    reply_record_generation: l.reply_record_generation,
+                },
+            ),
+            None => {
+                crate::kernel::boot::server_death_work_release(reservation);
+                false
+            }
+        }
+    }
+
+    fn drain(fx: &CallerFx) -> usize {
+        fx.k.drain_server_death_post_work(CPU)
+    }
+
+    fn winner(fx: &CallerFx) -> Option<TerminalClaimant> {
+        fx.k.with(|s| s.reply_terminal_committed_winner(fx.record_index))
+    }
+    fn caller_result(fx: &CallerFx) -> Option<u64> {
+        fx.k.with(|s| s.pending_syscall_completion_result(1))
+    }
+    fn live_links(fx: &CallerFx) -> usize {
+        fx.k.with(|s| s.live_server_reply_link_count())
+    }
+
+    /// Set up armed terminal + registered link, then run the broad-lock phase.
+    fn armed_and_deferred(fx: &CallerFx) -> TerminalIdentity {
+        let id = arm(fx);
+        assert!(link(fx));
+        assert!(broad_lock_exit_phase(fx));
+        id
+    }
+
+    // ── (1)(2) publication integrity ────────────────────────────────────────────────
+    #[test]
+    fn f01_exit_publishes_exactly_one_item() {
+        clear_queue();
+        let fx = caller_fixture();
+        armed_and_deferred(&fx);
+        assert_eq!(queued(), 1, "one detached link ⇒ exactly one deferred item");
+        assert_eq!(live_links(&fx), 0, "the link is no longer the owner");
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f02_duplicate_exit_publishes_no_duplicate() {
+        clear_queue();
+        let fx = caller_fixture();
+        armed_and_deferred(&fx);
+        // A second exit notification finds no link, so it publishes nothing.
+        assert!(!broad_lock_exit_phase(&fx));
+        assert_eq!(queued(), 1, "no duplicate deferred item");
+        // Even a forced duplicate publication collapses to one owner.
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert!(!crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation,
+            }
+        ));
+        assert_eq!(queued(), 1);
+        clear_queue();
+        teardown();
+    }
+
+    // ── (3)(4) another claimant wins BEFORE the drain ───────────────────────────────
+    fn losing_race(kind: TerminalClaimant, expect_result: Option<u64>) {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        let owner =
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(fx.record_index, kind, &id))
+                .expect("rival claims");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &owner)));
+        // The deferred item still runs, loses, and is CONSUMED exactly once.
+        assert_eq!(drain(&fx), 1, "the losing item must be consumed");
+        assert_eq!(queued(), 0, "a losing item must never remain queued");
+        assert_eq!(winner(&fx), Some(kind), "no result overwrite");
+        assert_eq!(caller_result(&fx), expect_result, "death added no wake");
+        assert_eq!(drain(&fx), 0, "nothing left to drain");
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f03_reply_wins_before_drain() {
+        losing_race(TerminalClaimant::Reply, None);
+    }
+
+    #[test]
+    fn f04_timeout_wins_before_drain() {
+        losing_race(TerminalClaimant::Timeout, None);
+    }
+
+    // ── (5)(6) deferred PeerDeath wins ──────────────────────────────────────────────
+    #[test]
+    fn f05_deferred_peer_death_wins_before_reply() {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::Reply,
+                &id
+            ))
+            .is_none(),
+            "a late reply cannot claim a completed terminal"
+        );
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f06_deferred_peer_death_wins_before_timeout() {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        assert!(
+            fx.k.with(|s| s.try_claim_reply_terminal_slot(
+                fx.record_index,
+                TerminalClaimant::Timeout,
+                &id
+            ))
+            .is_none()
+        );
+        clear_queue();
+        teardown();
+    }
+
+    // ── (7)(8) caller exit / endpoint destruction before the drain ──────────────────
+    #[test]
+    fn f07_caller_exit_before_drain() {
+        losing_race(TerminalClaimant::CallerExit, None);
+    }
+
+    #[test]
+    fn f08_endpoint_gone_before_drain() {
+        losing_race(TerminalClaimant::EndpointGone, None);
+    }
+
+    // ── (9) record slot reused before the stale drain runs ──────────────────────────
+    #[test]
+    fn f09_record_slot_reuse_makes_item_stale() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // Publish an item that names a generation the record no longer has.
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation.wrapping_add(1),
+            }
+        ));
+        assert_eq!(drain(&fx), 1, "the stale item is consumed");
+        assert_eq!(winner(&fx), None, "a stale item must claim nothing");
+        assert_eq!(caller_result(&fx), None);
+        clear_queue();
+        teardown();
+    }
+
+    // ── (10)(11) reused numeric TIDs with different ASIDs ───────────────────────────
+    #[test]
+    fn f10_server_tid_reused_with_different_asid() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // An item naming the SAME numeric server TID but a different incarnation.
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: crate::kernel::boot::ReceiverWaiterIdentity::new(
+                    fx.replier.tid,
+                    Asid(fx.replier.asid.0.wrapping_add(64)),
+                ),
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation,
+            }
+        ));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(
+            winner(&fx),
+            None,
+            "numeric TID alone must never authorize a deferred claim"
+        );
+        assert_eq!(caller_result(&fx), None);
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f11_caller_tid_reused_with_different_asid() {
+        clear_queue();
+        let fx = caller_fixture();
+        armed_and_deferred(&fx);
+        // The caller re-blocked: its blocked-receive generation advanced.
+        fx.k.with(|s| s.bump_blocked_recv_generation(1));
+        assert_eq!(drain(&fx), 1, "the item is still consumed");
+        assert_eq!(
+            caller_result(&fx),
+            None,
+            "no replacement incarnation is woken"
+        );
+        clear_queue();
+        teardown();
+    }
+
+    // ── (12) capacity failure ───────────────────────────────────────────────────────
+    #[test]
+    fn f12_capacity_failure_retains_the_link() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // Exhaust every slot.
+        let mut held = alloc::vec::Vec::new();
+        while let Some(r) = crate::kernel::boot::server_death_work_reserve(0) {
+            held.push(r);
+        }
+        // The broad-lock phase must NOT detach the link when it cannot reserve.
+        assert!(!broad_lock_exit_phase(&fx));
+        assert_eq!(
+            live_links(&fx),
+            1,
+            "a full queue must leave the link attached — never strand the caller"
+        );
+        for r in held {
+            crate::kernel::boot::server_death_work_release(r);
+        }
+        clear_queue();
+        teardown();
+    }
+
+    // ── (13)(14) handoff failpoints ─────────────────────────────────────────────────
+    #[test]
+    fn f13_failpoint_before_link_detach_restores_nothing() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        // Reserve, then abort before detaching: the link remains the exact owner.
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        crate::kernel::boot::server_death_work_release(r);
+        assert_eq!(live_links(&fx), 1, "the exact link is still the owner");
+        assert_eq!(queued(), 0, "no deferred item leaked");
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f14_failpoint_after_detach_publishes_exactly_one() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx));
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        let l =
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+                .expect("link");
+        // Detached: from here the ONLY permitted end states are one published item.
+        assert!(crate::kernel::boot::server_death_work_publish(
+            r,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: l.reply_record_index,
+                reply_record_generation: l.reply_record_generation,
+            }
+        ));
+        assert_eq!(live_links(&fx), 0);
+        assert_eq!(queued(), 1, "exactly one deferred owner after detach");
+        clear_queue();
+        teardown();
+    }
+
+    // ── (15)(16) exactly-once execution ─────────────────────────────────────────────
+    #[test]
+    fn f15_deferred_work_executes_exactly_once() {
+        clear_queue();
+        let fx = caller_fixture();
+        armed_and_deferred(&fx);
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(drain(&fx), 0, "a drained item must not run twice");
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f16_losing_item_consumed_exactly_once() {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        let owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Reply, &id)
+            })
+            .expect("reply");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &owner)));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(drain(&fx), 0);
+        assert_eq!(queued(), 0, "deferred items leaked");
+        clear_queue();
+        teardown();
+    }
+
+    // ── (17)(18) registration versus Exiting ────────────────────────────────────────
+    #[test]
+    fn f17_registration_then_immediate_exit_yields_one_item() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        assert!(link(&fx), "registration completes first");
+        fx.k.with(|s| s.set_task_status_for_test(2, crate::kernel::task::TaskStatus::Exited(0)));
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(queued(), 1, "exactly one deferred item");
+        assert_eq!(live_links(&fx), 0);
+        clear_queue();
+        teardown();
+    }
+
+    #[test]
+    fn f18_registration_loses_to_exiting() {
+        clear_queue();
+        let fx = caller_fixture();
+        arm(&fx);
+        fx.k.with(|s| s.set_task_status_for_test(2, crate::kernel::task::TaskStatus::Exited(0)));
+        assert!(!link(&fx), "registration must fail once Exiting won");
+        assert!(!broad_lock_exit_phase(&fx), "nothing to defer");
+        assert_eq!(queued(), 0);
+        clear_queue();
+        teardown();
+    }
+
+    // ── (19)(20)(21)(22) publication ordering + no late overwrite ───────────────────
+    #[test]
+    fn f19_result_publication_precedes_runnable() {
+        // Source contract: the publication write happens before the status flip, inside
+        // the single completion helper both timeout and death share.
+        let body = IPC_STATE_SRC
+            .split("fn rt_commit_receiver_runnable")
+            .nth(1)
+            .expect("body");
+        let body = body.split("\n/// Stage 200C1").next().unwrap_or(body);
+        let publish = body
+            .find("tcb.pending_syscall_completion = Some(")
+            .expect("publish");
+        let runnable = body
+            .find("tcb.status = TaskStatus::Runnable")
+            .expect("runnable");
+        assert!(publish < runnable, "result publication precedes Runnable");
+    }
+
+    #[test]
+    fn f20_runnable_precedes_enqueue() {
+        let txn = IPC_STATE_SRC
+            .split("fn complete_server_death_over")
+            .nth(1)
+            .expect("txn");
+        let txn = txn.split("\nimpl IpcSubsystem").next().unwrap();
+        let commit = txn.find("rt_commit_receiver_runnable(").expect("commit");
+        let enqueue = txn.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        assert!(commit < enqueue, "Runnable precedes the enqueue");
+    }
+
+    #[test]
+    fn f21_enqueue_happens_after_broad_lock_release() {
+        // The broad-lock phase in exit_task performs no claim, publication or enqueue.
+        let body = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let body = body.split("\n    pub fn ").next().unwrap();
+        for forbidden in [
+            "complete_server_death_for_link",
+            "complete_server_death_over",
+            "rt_commit_receiver_runnable",
+            "rtd_enqueue",
+            "enqueue_woken_task",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the broad-lock phase must not {forbidden}"
+            );
+        }
+        // It only reserves, detaches and publishes.
+        assert!(body.contains("server_death_work_reserve(cpu_idx)"));
+        assert!(body.contains("take_server_reply_link(tid, exit_identity.asid)"));
+        assert!(body.contains("server_death_work_publish("));
+        // And the drain is wired into every port's POST-LOCK area.
+        assert!(TRAP_ENTRY_SRC.contains("shared.drain_server_death_post_work(cpu)"));
+        assert!(RISCV_TRAP_SRC.contains("shared.drain_server_death_post_work(cpu)"));
+        // The drain itself uses only the split seams, never `with(`.
+        let drain = RUNTIME_SRC
+            .split("pub(crate) fn drain_server_death_post_work")
+            .nth(1)
+            .expect("drain");
+        let drain = drain.split("\n    /// Stage 200D —").next().unwrap();
+        assert!(
+            !drain.contains("self.with(|"),
+            "the drain must never take the broad lock"
+        );
+        assert!(drain.contains("with_ipc_split_mut"));
+        assert!(drain.contains("OffLockReplyTimeout(self)"));
+    }
+
+    // ── 8. Lock-rank and structural guards ─────────────────────────────────────────
+    //
+    // Documented lock sequence after this stage:
+    //
+    //   broad `SpinLock<KernelState>` (exit_task)
+    //     └─ scoped `with_tcbs_mut`  — mark Exited, then RELEASED
+    //     └─ scoped task claim       — take the exact link, then RELEASED
+    //     └─ per-CPU work queue lock — reserve/publish (rank-independent, own IrqSpinLock)
+    //   ── broad lock RELEASED ──
+    //   post-lock drain
+    //     └─ rank 3 ipc  — read armed identity, claim PeerDeath, invalidate record
+    //     └─ rank 2 task — revalidate caller, publish result, mark Runnable
+    //     └─ rank 1 sched— enqueue (LAST, non-fallible)
+    //
+    // No claim spans a release boundary, and no domain claim is held across the enqueue.
+
+    /// The deferred item carries only immutable, generation-bearing identity — no raw
+    /// pointer, no borrowed reference, no userspace pointer, no second completion state.
+    #[test]
+    fn f23_deferred_item_representation() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let def = MOD_SRC
+            .split("pub(crate) struct DeferredServerDeathCompletion {")
+            .nth(1)
+            .expect("item");
+        let def = def.split("\n}").next().unwrap();
+        assert!(def.contains("pub exiting_server: ReceiverWaiterIdentity,"));
+        assert!(def.contains("pub reply_record_index: usize,"));
+        assert!(def.contains("pub reply_record_generation: u64,"));
+        for forbidden in ["*mut", "*const", "&'", "&mut", "user_ptr", "TerminalOwner"] {
+            assert!(
+                !def.contains(forbidden),
+                "deferred item must not carry {forbidden}"
+            );
+        }
+    }
+
+    /// No PeerDeath claim, result publication or enqueue happens under the broad lock,
+    /// anywhere in the kernel.
+    #[test]
+    fn f24_no_broad_lock_death_authority_anywhere() {
+        // `complete_server_death_over` has exactly one production call site, and it is the
+        // post-lock drain.
+        // The only PRODUCTION caller is the post-lock drain. The one remaining broad-lock
+        // entry (`complete_server_death_for_link`) is `cfg`-gated to hosted builds, so it
+        // cannot be linked into a freestanding kernel at all.
+        assert_eq!(
+            RUNTIME_SRC.matches("complete_server_death_over(").count(),
+            1
+        );
+        assert_eq!(RESTART_SRC.matches("complete_server_death_over").count(), 0);
+        assert!(IPC_STATE_SRC.contains(
+            "#[cfg(any(test, feature = \"hosted-dev\"))]\n    pub(crate) fn complete_server_death_for_link("
+        ));
+        assert!(
+            RUNTIME_SRC
+                .contains("crate::kernel::boot::complete_server_death_over(&mut d, &identity)")
+        );
+        // The in-lock helper that used to claim from exit_task is gone from that path.
+        let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit");
+        let exit = exit.split("\n    pub fn ").next().unwrap();
+        assert!(!exit.contains("complete_server_death"));
+        // Teardown holds no reply-record guard: it touches no ipc state at all beyond the
+        // sweep that follows the handoff.
+        let handoff = exit.find("server_death_work_publish(").expect("handoff");
+        let before = &exit[..handoff];
+        assert!(
+            !before.contains("with_ipc_state") && !before.contains("reply_terminal"),
+            "the broad-lock phase must not hold a reply-record guard"
+        );
+    }
+
+    /// The drain reuses the accepted publication machinery — no second resume path — and
+    /// the per-arch contracts still hold with code 10.
+    #[test]
+    fn f25_arch_return_contracts_survive_deferral() {
+        use crate::kernel::task::ThreadControlBlock;
+        // RISC-V: both mirrors, secondary lanes zero, canonical helper only.
+        let mut tcb = ThreadControlBlock::new(crate::kernel::ipc::ThreadId(9), Some(Asid(4)));
+        tcb.publish_riscv_user_return(0, 0, SERVER_DIED as usize);
+        assert_eq!(tcb.user_context.user_gprs[10], SERVER_DIED as usize);
+        assert_eq!(tcb.user_context.arg0, SERVER_DIED as usize);
+        assert_eq!(tcb.user_context.user_gprs[11], 0);
+        assert_eq!(tcb.user_context.arg1, 0);
+        // The drain publishes through the shared completion helper, not a new path.
+        let drain = RUNTIME_SRC
+            .split("pub(crate) fn drain_server_death_post_work")
+            .nth(1)
+            .expect("drain");
+        let drain = drain.split("\n    /// Stage 200D —").next().unwrap();
+        for forbidden in [
+            "publish_riscv_user_return",
+            "user_gprs[",
+            "pending_syscall_completion =",
+            "TaskStatus::Runnable",
+        ] {
+            assert!(
+                !drain.contains(forbidden),
+                "the drain must delegate publication, not perform it ({forbidden})"
+            );
+        }
+    }
+
+    /// Bounded queue: no allocation on the teardown path, capacity tied to the record
+    /// store, and reserved-but-unpublished slots are never drained.
+    #[test]
+    fn f26_queue_is_bounded_and_allocation_free() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        assert!(MOD_SRC.contains("pub(crate) const SD_POST_WORK_SLOTS: usize = MAX_REPLY_CAPS;"));
+        assert!(
+            MOD_SRC.contains("static SERVER_DEATH_POST_WORK: [crate::kernel::lock::SpinLockIrq<")
+        );
+        let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit");
+        let exit = exit.split("\n    pub fn ").next().unwrap();
+        for forbidden in ["Vec::", "Box::", "alloc::", "to_vec()"] {
+            assert!(
+                !exit.contains(forbidden),
+                "no allocation in teardown ({forbidden})"
+            );
+        }
+        // A reserved placeholder is not drainable.
+        clear_queue();
+        let r = crate::kernel::boot::server_death_work_reserve(0).expect("slot");
+        assert_eq!(queued(), 0, "a reservation is not drainable work");
+        assert!(crate::kernel::boot::server_death_work_drain_next(0).is_none());
+        crate::kernel::boot::server_death_work_release(r);
+        clear_queue();
+    }
+
+    #[test]
+    fn f22_late_drain_never_overwrites_a_result() {
+        clear_queue();
+        let fx = caller_fixture();
+        let id = armed_and_deferred(&fx);
+        // Timeout wins and publishes ITS result first.
+        let owner =
+            fx.k.with(|s| {
+                s.try_claim_reply_terminal_slot(fx.record_index, TerminalClaimant::Timeout, &id)
+            })
+            .expect("timeout");
+        assert!(fx.k.with(|s| s.commit_reply_terminal_slot(fx.record_index, &owner)));
+        fx.k.with(|s| {
+            s.set_pending_syscall_completion_for_test(
+                1,
+                crate::kernel::syscall::SyscallError::TimedOut as u64,
+            )
+        });
+        assert_eq!(caller_result(&fx), Some(9));
+        assert_eq!(drain(&fx), 1, "the losing item is consumed");
+        assert_eq!(
+            caller_result(&fx),
+            Some(9),
+            "a late death drain must not overwrite the committed result"
+        );
+        clear_queue();
+        teardown();
+    }
+}
+
+/// Stage 200D-F0 — PRODUCTION-versus-ORACLE feature gating.
+///
+/// The server-death mechanism is production behaviour on every build; the reply-timeout
+/// oracle's selectors, markers, causal gates and seals are proof scaffolding that must
+/// vanish without the feature. Stage 200D-2A conflated the two: ungated production code
+/// referenced oracle-gated items, so NO feature-off kernel compiled on ANY architecture,
+/// and that stage's validation never caught it because it only ever built feature-on.
+///
+/// These guards pin the classification so the mistake cannot recur silently.
+mod stage200df0_feature_gating {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+
+    /// Extract the `#[cfg(...)]` attributes immediately preceding `needle` in `src`.
+    fn preceding_cfgs<'a>(src: &'a str, needle: &str) -> alloc::string::String {
+        let at = src
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing: {needle}"));
+        let head = &src[..at];
+        head.lines()
+            .rev()
+            .take_while(|l| {
+                let t = l.trim();
+                t.starts_with("#[") || t.starts_with("//") || t.starts_with("///") || t.is_empty()
+            })
+            .filter(|l| l.trim().starts_with("#["))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    const ORACLE_FEATURE: &str = "ipc-reply-timeout-oracle-core";
+
+    /// (1) the PRODUCTION server-death mechanism is never gated on the oracle feature.
+    #[test]
+    fn f01_production_server_death_is_not_oracle_gated() {
+        for (what, src, needle) in [
+            (
+                "deferred item type",
+                MOD_SRC,
+                "pub(crate) struct DeferredServerDeathCompletion {",
+            ),
+            (
+                "per-CPU work queue",
+                MOD_SRC,
+                "static SERVER_DEATH_POST_WORK:",
+            ),
+            (
+                "work reserve",
+                MOD_SRC,
+                "pub(crate) fn server_death_work_reserve(",
+            ),
+            (
+                "work publish",
+                MOD_SRC,
+                "pub(crate) fn server_death_work_publish(",
+            ),
+            (
+                "post-lock drain",
+                RUNTIME_SRC,
+                "pub(crate) fn drain_server_death_post_work(",
+            ),
+            (
+                "completion domain",
+                RUNTIME_SRC,
+                "pub(crate) struct OffLockReplyTimeout<",
+            ),
+            (
+                "caller-enqueue helper",
+                RUNTIME_SRC,
+                "fn enqueue_reply_timeout_wake_split(",
+            ),
+            (
+                "peer-death completion transaction",
+                IPC_STATE_SRC,
+                "pub(crate) fn complete_server_death_over<",
+            ),
+            (
+                "arch tag",
+                MOD_SRC,
+                "pub(crate) const REPLY_TIMEOUT_ARCH: &str = \"x86_64\";",
+            ),
+        ] {
+            let cfgs = preceding_cfgs(src, needle);
+            assert!(
+                !cfgs.contains(ORACLE_FEATURE),
+                "{what} is production mechanism and must not be gated on {ORACLE_FEATURE}: {cfgs}"
+            );
+        }
+        // Teardown's handoff is likewise ungated.
+        let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let exit = exit.split("\n    pub fn ").next().unwrap();
+        assert!(exit.contains("server_death_work_reserve(cpu_idx)"));
+        assert!(
+            !exit.contains(ORACLE_FEATURE),
+            "the teardown handoff must not be oracle-gated"
+        );
+    }
+
+    /// (2) the ORACLE's own scaffolding stays gated — the repair widened nothing.
+    #[test]
+    fn f02_oracle_scaffolding_remains_gated() {
+        for (what, src, needle) in [
+            (
+                "causal collector gate hold",
+                MOD_SRC,
+                "pub(crate) fn hold_reply_timeout_collector()",
+            ),
+            (
+                "causal gate release",
+                MOD_SRC,
+                "pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str)",
+            ),
+            (
+                "collector hold flag",
+                MOD_SRC,
+                "static IPC_REPLY_TIMEOUT_COLLECTOR_HOLD:",
+            ),
+            (
+                "reply-timeout work queue",
+                MOD_SRC,
+                "static REPLY_TIMEOUT_POST_WORK:",
+            ),
+            (
+                "narrow collector",
+                RUNTIME_SRC,
+                "pub(crate) fn collect_due_reply_timeout_work(",
+            ),
+            (
+                "reply-timeout drain",
+                RUNTIME_SRC,
+                "pub(crate) fn drain_reply_timeout_post_work(",
+            ),
+            (
+                "reply-win reserve",
+                IPC_STATE_SRC,
+                "pub(crate) fn reserve_reply_win_before_copy(",
+            ),
+        ] {
+            let cfgs = preceding_cfgs(src, needle);
+            assert!(
+                cfgs.contains(ORACLE_FEATURE),
+                "{what} is oracle scaffolding and must stay gated on {ORACLE_FEATURE}: {cfgs}"
+            );
+        }
+    }
+
+    /// (3) the repair removed ONLY the feature condition from the arch tag — the per-arch
+    /// `cfg`s remain, so a foreign arch literal still cannot be linked.
+    #[test]
+    fn f03_arch_tag_keeps_its_per_arch_cfgs() {
+        for arch in ["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                MOD_SRC.contains(&alloc::format!(
+                    "#[cfg(target_arch = \"{arch}\")]\npub(crate) const REPLY_TIMEOUT_ARCH: &str = \"{arch}\";"
+                )),
+                "{arch} tag must keep its per-arch cfg"
+            );
+        }
+        // Exactly one tag is linked per build.
+        assert!(MOD_SRC.contains("pub(crate) const REPLY_TIMEOUT_ARCH: &str = \"unknown\";"));
+    }
+
+    /// (4) the classification is documented at each repaired site, so the next person
+    /// reaching for a `cfg` there sees why it is absent.
+    #[test]
+    fn f04_classification_is_documented() {
+        assert!(MOD_SRC.contains("CLASSIFICATION (Stage 200D-F0): **production mechanism**"));
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("CLASSIFICATION (Stage 200D-F0): **production mechanism**")
+                .count(),
+            2,
+            "both repaired runtime.rs items carry the classification"
+        );
+    }
+}
+
+/// Stage 200D-0A — `ExitCurrentTask` (NR 16): ABI, lifecycle entry and the non-returning
+/// trap-disposition contract.
+///
+/// Hosted only. This module proves the ARCHITECTURE-NEUTRAL foundation; it deliberately
+/// claims no live cell, and `d24` asserts that no architecture consumes the disposition yet.
+mod stage200d0a_exit_foundation {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::PostLockTrapDisposition;
+    use crate::kernel::syscall::{
+        ALL_SYSCALL_VARIANTS, EXIT_STATUS_SELF_REQUESTED, SYSCALL_EXIT_CURRENT_TASK_NR, Syscall,
+    };
+    use crate::kernel::vm::Asid;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const CPU: usize = 0;
+
+    fn handler_body() -> &'static str {
+        let b = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("handler");
+        b.split("\nfn handle_reap_faulted_task").next().unwrap()
+    }
+
+    // ── 1/2. Syscall-number space and variant invariant ─────────────────────────────
+
+    /// (1) NR16 decodes to `ExitCurrentTask` and to nothing else.
+    #[test]
+    fn d01_nr16_maps_only_to_exit_current_task() {
+        assert_eq!(SYSCALL_EXIT_CURRENT_TASK_NR, 16);
+        assert_eq!(Syscall::decode(16), Ok(Syscall::ExitCurrentTask));
+        assert_eq!(Syscall::ExitCurrentTask.number(), 16);
+        // No other variant claims 16.
+        assert_eq!(
+            ALL_SYSCALL_VARIANTS
+                .iter()
+                .filter(|v| v.number() == 16)
+                .count(),
+            1
+        );
+    }
+
+    /// (2) every previously assigned number is unchanged.
+    #[test]
+    fn d02_no_existing_syscall_number_moved() {
+        for (nr, expect) in [
+            (0usize, Syscall::Yield),
+            (1, Syscall::IpcSend),
+            (2, Syscall::IpcRecv),
+            (3, Syscall::VmMap),
+            (4, Syscall::TransferRelease),
+            (5, Syscall::IpcRecvTimeout),
+            (6, Syscall::IpcCall),
+            (7, Syscall::IpcReply),
+            (8, Syscall::ControlPlaneSetCnodeSlots),
+            (9, Syscall::FutexWait),
+            (10, Syscall::FutexWake),
+            (11, Syscall::SpawnThread),
+            (12, Syscall::Fork),
+            (13, Syscall::VmAnonMap),
+            (14, Syscall::VmBrk),
+            (15, Syscall::DebugLog),
+            (23, Syscall::SpawnProcess),
+            (24, Syscall::SpawnProcessFromUserBuf),
+            (26, Syscall::SpawnFromInitramfsFile),
+            (28, Syscall::CreateInitramfsFileSliceMo),
+            (29, Syscall::SpawnFromMemoryObject),
+            (30, Syscall::RecvSharedV3),
+            (31, Syscall::ReapFaultedTask),
+        ] {
+            assert_eq!(Syscall::decode(nr), Ok(expect), "number {nr} must not move");
+        }
+    }
+
+    /// (3) NR27 stays absent, the other free numbers stay unassigned, and unknown-number
+    /// behaviour is unchanged.
+    #[test]
+    fn d03_nr27_and_free_numbers_remain_unassigned() {
+        for free in [17usize, 18, 19, 20, 21, 22, 25, 27] {
+            assert!(
+                Syscall::decode(free).is_err(),
+                "number {free} must remain unassigned"
+            );
+            assert!(
+                !ALL_SYSCALL_VARIANTS.iter().any(|v| v.number() == free),
+                "no variant may claim {free}"
+            );
+        }
+        assert!(
+            !SYSCALL_SRC.contains("_NR: usize = 27;"),
+            "NR27 must stay absent"
+        );
+        assert!(Syscall::decode(32).is_err());
+        assert!(Syscall::decode(usize::MAX).is_err());
+        assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 32);
+    }
+
+    /// (4) the variant count is DERIVED, equals 24, and cannot drift: every listed variant
+    /// round-trips through `decode`, the list has no duplicates, and its length matches the
+    /// enum's own declaration count parsed from source.
+    #[test]
+    fn d04_variant_list_is_exhaustive_and_derived() {
+        assert_eq!(Syscall::VARIANT_COUNT, 24);
+        assert_eq!(ALL_SYSCALL_VARIANTS.len(), 24);
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = ALL_SYSCALL_VARIANTS.len()")
+        );
+        // Every listed variant decodes back to itself.
+        for v in ALL_SYSCALL_VARIANTS {
+            assert_eq!(Syscall::decode(v.number()), Ok(*v));
+        }
+        // No duplicates.
+        for (i, a) in ALL_SYSCALL_VARIANTS.iter().enumerate() {
+            for b in &ALL_SYSCALL_VARIANTS[i + 1..] {
+                assert_ne!(
+                    a.number(),
+                    b.number(),
+                    "duplicate syscall number in the list"
+                );
+            }
+        }
+        // Drift detection: the enum's declared variants, counted from source, must equal
+        // the list length. Adding a variant without listing it fails HERE.
+        let declared = SYSCALL_SRC
+            .split("pub enum Syscall {")
+            .nth(1)
+            .expect("enum")
+            .split("\n}")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                t.contains(" = SYSCALL_") && !t.starts_with("//")
+            })
+            .count();
+        assert_eq!(
+            declared,
+            ALL_SYSCALL_VARIANTS.len(),
+            "ALL_SYSCALL_VARIANTS must list every enum variant exactly once"
+        );
+    }
+
+    // ── 2. Mechanism-only: current identity, no user target ─────────────────────────
+
+    /// (5)(6)(7) identity comes from scheduler state; no user argument, no capability.
+    #[test]
+    fn d05_d06_d07_current_identity_only() {
+        let b = handler_body();
+        assert!(b.contains("kernel.current_tid()"));
+        assert!(b.contains("kernel.task_asid(tid)"));
+        for forbidden in ["frame.arg(", "_frame.arg(", "copy_from_user", "user_ptr"] {
+            assert!(!b.contains(forbidden), "must not read {forbidden}");
+        }
+        for cap in ["resolve_send_cap", "has_right", "capability_for", "CapId"] {
+            assert!(!b.contains(cap), "self-exit needs no capability ({cap})");
+        }
+    }
+
+    // ── 5. Capacity before irreversibility ──────────────────────────────────────────
+
+    /// (8) no reply link ⇒ a full death queue is irrelevant; exit is still accepted.
+    #[test]
+    fn d08_no_link_means_capacity_irrelevant() {
+        crate::kernel::boot::server_death_work_clear(CPU);
+        let fx = caller_fixture();
+        // Task 2 owns no reverse link.
+        assert!(
+            fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+                .is_none()
+        );
+        // Exhaust the queue anyway.
+        let mut held = alloc::vec::Vec::new();
+        while let Some(r) = crate::kernel::boot::server_death_work_reserve(CPU) {
+            held.push(r);
+        }
+        // The handler's precondition is `link.is_some() && !capacity`, so with no link the
+        // capacity term is never even consulted.
+        let would_refuse =
+            fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+                .is_some()
+                && !crate::kernel::boot::server_death_work_capacity_available(CPU);
+        assert!(!would_refuse, "no link ⇒ no capacity requirement");
+        for r in held {
+            crate::kernel::boot::server_death_work_release(r);
+        }
+        crate::kernel::boot::server_death_work_clear(CPU);
+        teardown();
+    }
+
+    fn link(fx: &CallerFx) -> bool {
+        fx.k.with(|s| {
+            s.register_server_reply_link(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        })
+    }
+
+    /// (9)(24) live link + capacity ⇒ accepted, and exactly one deferred item is published.
+    #[test]
+    fn d09_d24_live_link_with_capacity_publishes_one_item() {
+        crate::kernel::boot::server_death_work_clear(CPU);
+        crate::kernel::boot::clear_post_lock_trap_disposition(CPU);
+        let fx = caller_fixture();
+        assert!(link(&fx));
+        assert!(crate::kernel::boot::server_death_work_capacity_available(
+            CPU
+        ));
+        let _ = fx.k.with(|s| s.exit_task(2, EXIT_STATUS_SELF_REQUESTED));
+        assert_eq!(
+            crate::kernel::boot::server_death_work_len(CPU),
+            1,
+            "a task with an outstanding reply publishes exactly one death item"
+        );
+        assert_eq!(
+            fx.k.with(|s| s.live_server_reply_link_count()),
+            0,
+            "reverse-link leak"
+        );
+        crate::kernel::boot::server_death_work_clear(CPU);
+        teardown();
+    }
+
+    /// (10)(11)(12) live link + NO capacity ⇒ refusal leaves everything untouched.
+    #[test]
+    fn d10_d11_d12_capacity_refusal_changes_nothing() {
+        crate::kernel::boot::server_death_work_clear(CPU);
+        crate::kernel::boot::clear_post_lock_trap_disposition(CPU);
+        let fx = caller_fixture();
+        assert!(link(&fx));
+        let mut held = alloc::vec::Vec::new();
+        while let Some(r) = crate::kernel::boot::server_death_work_reserve(CPU) {
+            held.push(r);
+        }
+        // The handler's preflight predicate refuses.
+        let refuse =
+            fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+                .is_some()
+                && !crate::kernel::boot::server_death_work_capacity_available(CPU);
+        assert!(refuse, "a live link with no capacity must refuse");
+        // Refusal is a PREFLIGHT decision: no lifecycle call was made, so the task is still
+        // alive, the link is still attached, and no deferred item exists.
+        assert!(!matches!(
+            fx.k.with(|s| s.task_status(2)),
+            Some(crate::kernel::task::TaskStatus::Exited(_))
+        ));
+        assert!(
+            fx.k.with(|s| s.server_reply_link_for(fx.replier.tid.0, fx.replier.asid))
+                .is_some()
+        );
+        assert_eq!(crate::kernel::boot::server_death_work_len(CPU), 0);
+        assert!(!crate::kernel::boot::post_lock_trap_disposition_pending(
+            CPU
+        ));
+        for r in held {
+            crate::kernel::boot::server_death_work_release(r);
+        }
+        crate::kernel::boot::server_death_work_clear(CPU);
+        teardown();
+    }
+
+    /// The capacity probe mutates nothing.
+    #[test]
+    fn d13_capacity_probe_is_non_mutating() {
+        crate::kernel::boot::server_death_work_clear(CPU);
+        let fx = caller_fixture();
+        assert!(link(&fx));
+        let before = fx.k.with(|s| s.live_server_reply_link_count());
+        for _ in 0..3 {
+            let _ = crate::kernel::boot::server_death_work_capacity_available(CPU);
+        }
+        assert_eq!(fx.k.with(|s| s.live_server_reply_link_count()), before);
+        assert_eq!(crate::kernel::boot::server_death_work_len(CPU), 0);
+        assert!(!crate::kernel::boot::post_lock_trap_disposition_pending(
+            CPU
+        ));
+        crate::kernel::boot::server_death_work_clear(CPU);
+        teardown();
+    }
+
+    // ── 4. Typed disposition ────────────────────────────────────────────────────────
+
+    /// (14)(15) exactly one disposition; a duplicate is REJECTED, never overwriting.
+    #[test]
+    fn d14_d15_single_shot_disposition_rejects_duplicates() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(CPU);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            CPU,
+            7,
+            Asid(3)
+        ));
+        // A second publication LOSES and does not displace the first.
+        assert!(!crate::kernel::boot::publish_current_task_exited(
+            CPU,
+            9,
+            Asid(4)
+        ));
+        assert_eq!(
+            crate::kernel::boot::take_post_lock_trap_disposition(CPU),
+            PostLockTrapDisposition::CurrentTaskExited {
+                tid: 7,
+                asid: Asid(3)
+            },
+            "the first publisher must win"
+        );
+        // One-shot.
+        assert_eq!(
+            crate::kernel::boot::take_post_lock_trap_disposition(CPU),
+            PostLockTrapDisposition::ReturnNormally
+        );
+    }
+
+    /// (20) the disposition is generation-bearing: a restarted numeric TID does not match.
+    #[test]
+    fn d20_restarted_tid_cannot_consume_old_disposition() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(CPU);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            CPU,
+            5,
+            Asid(11)
+        ));
+        let taken = crate::kernel::boot::take_post_lock_trap_disposition(CPU);
+        let PostLockTrapDisposition::CurrentTaskExited { tid, asid } = taken else {
+            panic!("expected an exit disposition");
+        };
+        assert_eq!(tid, 5);
+        // A replacement incarnation reuses the numeric TID but carries a different ASID, so
+        // an identity comparison rejects it — numeric TID alone is never authority.
+        assert_ne!(asid, Asid(12));
+        assert!(!(tid == 5 && asid == Asid(12)));
+    }
+
+    /// (21)(22) the slot is per-CPU, and an unrelated syscall on another CPU sees nothing.
+    #[test]
+    fn d21_d22_per_cpu_and_unrelated_paths_see_nothing() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        crate::kernel::boot::clear_post_lock_trap_disposition(1);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            0,
+            3,
+            Asid(1)
+        ));
+        // A different CPU must NOT consume CPU 0's disposition.
+        assert_eq!(
+            crate::kernel::boot::take_post_lock_trap_disposition(1),
+            PostLockTrapDisposition::ReturnNormally,
+            "a per-CPU disposition must not be consumable from another CPU"
+        );
+        // CPU 0 still has it.
+        assert!(crate::kernel::boot::post_lock_trap_disposition_pending(0));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::CurrentTaskExited { .. }
+        ));
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+    }
+
+    // ── 3/7. Return contract and epilogue eligibility ───────────────────────────────
+
+    /// (16)(17)(18) accepted exit writes no result and is ineligible for the normal
+    /// epilogue; a preflight `WouldBlock` uses the ordinary returning epilogue.
+    #[test]
+    fn d16_d17_d18_epilogue_eligibility() {
+        let b = handler_body();
+        // No frame result write on ANY path through the handler.
+        for w in [
+            "frame.set_ok",
+            "frame.set_err",
+            "frame.set_user_gpr",
+            "set_ret",
+            "encode_transfer_cap_ret",
+        ] {
+            assert!(
+                !b.contains(w),
+                "no result may be written into an abandoned frame ({w})"
+            );
+        }
+        assert!(
+            b.contains("_frame: &mut TrapFrame"),
+            "the frame is deliberately unused"
+        );
+        // Accepted exit publishes the disposition; refusal does not.
+        let publish = b.find("publish_current_task_exited").expect("publish");
+        let refuse = b.find("Err(SyscallError::WouldBlock)").expect("refusal");
+        assert!(
+            refuse < publish,
+            "the refusal path returns before any publication"
+        );
+        // Modelled eligibility: only a pending disposition makes the normal epilogue
+        // ineligible, and a refusal leaves none pending.
+        crate::kernel::boot::clear_post_lock_trap_disposition(CPU);
+        assert!(
+            !crate::kernel::boot::post_lock_trap_disposition_pending(CPU),
+            "WouldBlock ⇒ normal epilogue eligible"
+        );
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            CPU,
+            1,
+            Asid(1)
+        ));
+        assert!(
+            crate::kernel::boot::post_lock_trap_disposition_pending(CPU),
+            "accepted exit ⇒ normal epilogue INELIGIBLE"
+        );
+        crate::kernel::boot::clear_post_lock_trap_disposition(CPU);
+    }
+
+    /// (19) deferred work is published BEFORE any consumer could observe the disposition:
+    /// teardown publishes inside the broad lock, the disposition afterwards.
+    #[test]
+    fn d19_deferred_work_precedes_disposition() {
+        let b = handler_body();
+        let commit = b.find("kernel.exit_task(tid,").expect("lifecycle");
+        let publish = b.find("publish_current_task_exited").expect("disposition");
+        assert!(
+            commit < publish,
+            "teardown (which publishes deferred work) must precede the disposition"
+        );
+    }
+
+    /// (13)(23) accepted exit transitions once; a task with no outstanding reply creates
+    /// no death item.
+    #[test]
+    fn d13b_d23_single_transition_no_spurious_item() {
+        crate::kernel::boot::server_death_work_clear(CPU);
+        let fx = caller_fixture();
+        // No link registered.
+        let _ = fx.k.with(|s| s.exit_task(2, EXIT_STATUS_SELF_REQUESTED));
+        assert!(matches!(
+            fx.k.with(|s| s.task_status(2)),
+            Some(crate::kernel::task::TaskStatus::Exited(_))
+        ));
+        assert_eq!(
+            crate::kernel::boot::server_death_work_len(CPU),
+            0,
+            "no outstanding reply ⇒ no deferred death item"
+        );
+        crate::kernel::boot::server_death_work_clear(CPU);
+        teardown();
+    }
+
+    // ── 6/8/11. Source guards ───────────────────────────────────────────────────────
+
+    /// The handler converges on the ONE authoritative lifecycle and duplicates nothing.
+    #[test]
+    fn d25_one_authoritative_lifecycle() {
+        let b = handler_body();
+        assert!(b.contains("kernel.exit_task(tid, EXIT_STATUS_SELF_REQUESTED)"));
+        assert_eq!(
+            SYSCALL_SRC.matches("kernel.exit_task(").count(),
+            1,
+            "exactly one production exit_task call site"
+        );
+        for dup in [
+            "revoke_reply_caps_for",
+            "take_server_reply_link",
+            "clear_ipc_waiters_for_tid",
+            "report_task_exit_to",
+            "TaskStatus::Exited",
+            "server_death_work_publish",
+            "dispatch_next_task",
+        ] {
+            assert!(
+                !b.contains(dup),
+                "teardown step {dup} must live only in exit_task"
+            );
+        }
+    }
+
+    /// The generic handler performs no trap-depth manipulation — that is the future
+    /// architecture consumer's job, and doing it here would be per-arch logic in the
+    /// wrong place.
+    #[test]
+    fn d26_no_trap_depth_manipulation_in_generic_handler() {
+        let b = handler_body();
+        for d in [
+            "trap_depth",
+            "TRAP_DEPTH",
+            "nested_trap",
+            "depth -=",
+            "depth +=",
+        ] {
+            assert!(
+                !b.contains(d),
+                "trap-depth ownership is not the handler's ({d})"
+            );
+        }
+    }
+
+    /// Stage 200D-1 / 200D-2A lock invariants are untouched by this stage.
+    #[test]
+    fn d27_stage200d_lock_invariants_preserved() {
+        let exit = RESTART_SRC.split("fn exit_task").nth(1).expect("exit_task");
+        let exit = exit.split("\n    pub fn ").next().unwrap();
+        for forbidden in [
+            "complete_server_death",
+            "rt_commit_receiver_runnable",
+            "rtd_enqueue",
+            "for slot in",
+            "reply_caps.iter",
+        ] {
+            assert!(
+                !exit.contains(forbidden),
+                "broad-lock phase must not {forbidden}"
+            );
+        }
+        assert!(exit.contains("server_death_work_reserve(cpu_idx)"));
+        assert!(exit.contains("server_death_work_publish("));
+    }
+
+    /// The userspace wrapper states the asymmetric contract honestly.
+    #[test]
+    fn d28_userspace_contract_is_honest() {
+        assert!(USER_RT_SRC.contains("pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;"));
+        // rustfmt reflows the signature across lines; assert the pieces, not the layout.
+        assert!(USER_RT_SRC.contains("pub unsafe fn exit_current_task()"));
+        assert!(
+            USER_RT_SRC.contains("core::result::Result<core::convert::Infallible, SyscallError>")
+        );
+        // No unconditional `-> !`, because preflight can legitimately return.
+        assert!(!USER_RT_SRC.contains("pub unsafe fn exit_current_task() -> !"));
+    }
+
+    /// (24) Each architecture consumes the disposition only from its OWN live stage, and
+    /// never more than once.
+    ///
+    /// Stage 200D-0A required zero consumers anywhere. That bound has since been reached
+    /// twice, by design: x86_64 in `arch/x86_64/trap.rs` (Stage 200D-0B2) and AArch64 in the
+    /// shared post-lock section of `arch/trap_entry.rs` (Stage 200D-0C1). What this guard
+    /// still protects — and what actually matters — is that no architecture grows a SECOND
+    /// consumer and that RISC-V, which has no cell, grows none at all.
+    #[test]
+    fn d29_no_live_arch_consumer_is_claimed() {
+        const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+        const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+        const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+        const X86_TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+        // Stage 200D-0D1 completed the third and final cell, so all three ports now consume —
+        // each exactly once, each at its own architecture's correct boundary:
+        //   x86_64  `arch/x86_64/trap.rs`   in-lock, before the epilogue commits the iret frame
+        //   AArch64 `arch/trap_entry.rs`    shared post-lock section (its idle diverges in-lock)
+        //   RISC-V  `arch/riscv64/trap.rs`  its own Phase 3 (it does not use the shared entry)
+        // What this guard still protects is that no port grows a SECOND consumer, and that the
+        // AArch64 arch handler in particular does not (its consumer is deliberately elsewhere).
+        assert!(
+            !AARCH64_TRAP_SRC.contains("take_post_lock_trap_disposition"),
+            "the AArch64 arch handler must not consume; its consumer is in the shared entry"
+        );
+        for (name, src) in [
+            ("trap_entry", TRAP_ENTRY_SRC),
+            ("x86_64", X86_TRAP_SRC),
+            ("riscv64", RISCV_TRAP_SRC),
+        ] {
+            assert_eq!(
+                src.matches("take_post_lock_trap_disposition(").count(),
+                1,
+                "{name} must hold exactly one consumer"
+            );
+        }
+        // The AArch64 consumer is arch-gated, so it cannot alter the sealed x86_64 path.
+        assert!(TRAP_ENTRY_SRC.contains(
+            "#[cfg(target_arch = \"aarch64\")]\n    if let crate::kernel::boot::PostLockTrapDisposition::CurrentTaskExited"
+        ));
+        // The typed disposition and its single publisher exist, ready for that stage.
+        assert!(MOD_SRC.contains("pub enum PostLockTrapDisposition"));
+        assert_eq!(
+            SYSCALL_SRC.matches("publish_current_task_exited(").count(),
+            1
+        );
+    }
+}
+
+/// Stage 200D-0B3 — the x86_64 `CurrentTaskExited` consumer contract, CORRECTED.
+///
+/// Supersedes the Stage 200D-0B1 module of the same shape. Stage 200D-0B1 asserted that the
+/// consumer ran after the broad lock was released and after the post-lock drains; both were
+/// false, because the consumer runs inside `SharedKernel::with_cpu`. Those guards are replaced
+/// here by ones that assert the REAL pipeline, and the properties that were always true
+/// (identity, `WouldBlock`, feature gating, the oracle wiring) are retained unchanged.
+mod stage200d0b3_x86_exit_corrected {
+    use crate::kernel::boot::PostLockTrapDisposition;
+    use crate::kernel::vm::Asid;
+
+    const X86_TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RUNNER: &str = include_str!("../../../scripts/qemu-x86-exit-current-task-smoke.sh");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    /// Comment-stripped consumer body: these guards are about CODE, and the block's own
+    /// prose legitimately names `exit_task`, frames and depth while explaining why it
+    /// touches none of them.
+    fn consumer_code() -> alloc::string::String {
+        consumer_block()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    fn consumer_block() -> &'static str {
+        let b = X86_TRAP_SRC
+            .split(
+                "// ── Stage 200D-0B3: the x86_64 CurrentTaskExited consumer (in-lock, corrected)",
+            )
+            .nth(1)
+            .expect("consumer");
+        b.split("// Stage 117: skip restore_arch_thread_state")
+            .next()
+            .unwrap()
+    }
+
+    // ── consumer uniqueness and ordering (1–4) ──────────────────────────────────────
+    #[test]
+    fn p01_exactly_one_production_consumer() {
+        assert_eq!(
+            X86_TRAP_SRC
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1,
+            "exactly one x86_64 consumer call site"
+        );
+        // The AArch64 consumer (Stage 200D-0C1) lives in the SHARED post-lock section of
+        // `arch/trap_entry.rs`, not in the arch handler — AArch64's idle divergence never
+        // returns from inside `with_cpu`, so it cannot use the x86_64 shape. RISC-V (Stage
+        // 200D-0D1) consumes in its OWN Phase 3, because it does not flow through the shared
+        // entry at all. Each port therefore holds exactly one consumer, in a different place.
+        const RISCV: &str = include_str!("../../arch/riscv64/trap.rs");
+        const AARCH64: &str = include_str!("../../arch/aarch64/trap.rs");
+        assert!(
+            !AARCH64.contains("take_post_lock_trap_disposition"),
+            "the AArch64 arch handler must not consume; its consumer is in the shared entry"
+        );
+        assert_eq!(
+            RISCV.matches("take_post_lock_trap_disposition(").count(),
+            1,
+            "RISC-V holds exactly one consumer, in its own trap wrapper"
+        );
+    }
+
+    /// (2/3/4) CORRECTED ordering. Stage 200D-0B1 asserted the consumer ran after the broad
+    /// lock was released and after the post-lock drains. Neither was true: the consumer is
+    /// inside `SharedKernel::with_cpu`, and the drains do not run until it returns. The real
+    /// order — and the one now asserted — is: syscall dispatch, consumer, owner preparation,
+    /// in-lock restore preparation, `with_cpu` returns, drains, epilogue.
+    #[test]
+    fn p02_p03_p04_consumer_ordering() {
+        let body = X86_TRAP_SRC
+            .split("fn handle_trap_entry_with_fault_bookkeeping_mode")
+            .nth(1)
+            .expect("entry");
+        let inlock = body.find("handle_trap_event").expect("in-lock phase");
+        let consumer = body
+            .find("take_post_lock_trap_disposition")
+            .expect("consumer");
+        let restore = body
+            .find("restore_arch_thread_state(kernel, cpu, frame)")
+            .expect("restore");
+        assert!(
+            inlock < consumer,
+            "the consumer follows the syscall dispatch"
+        );
+        assert!(
+            consumer < restore,
+            "the consumer precedes the in-lock restore PREPARATION"
+        );
+        // The whole handler body runs inside `with_cpu`, so the consumer is in-lock. This is
+        // the fact Stage 200D-0B1 got wrong, so it is asserted against the source of the lock
+        // rather than against any comment.
+        assert!(RUNTIME_SRC.contains(
+            "pub fn with_cpu<R>(\n        &self,\n        cpu: CpuId,\n        f: impl FnOnce(&mut KernelState) -> R,\n    ) -> Result<R, KernelError> {\n        let mut guard = self.state.lock();"
+        ));
+        let entry = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        let with_cpu = entry
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("lock acquire");
+        let inner_call = entry
+            .find("handle_trap_entry_with_fault_bookkeeping_mode(")
+            .expect("arch handler call");
+        let released = entry
+            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .expect("release boundary");
+        assert!(
+            with_cpu < inner_call && inner_call < released,
+            "the arch handler — and therefore the consumer — runs between lock acquire and release"
+        );
+        // The consumer itself must NOT claim the lock was released or that drains ran.
+        let cb = consumer_block();
+        assert!(
+            !cb.contains("EXIT_TASK_BROAD_LOCK_RELEASED"),
+            "the false release attestation must not be emitted from inside the broad lock"
+        );
+        assert!(
+            !cb.contains("EXIT_TASK_POST_LOCK_DRAIN_DONE"),
+            "the false drain attestation must not be emitted from inside the broad lock"
+        );
+        assert!(
+            !cb.contains("broad_lock=0"),
+            "no in-lock marker may claim broad_lock=0"
+        );
+        // Every marker the consumer does emit states broad_lock=1.
+        for m in [
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64",
+            "EXIT_TASK_EXITING_NOT_CURRENT arch=x86_64",
+            "EXIT_TASK_ABSENCE_VALIDATED arch=x86_64",
+            "EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64",
+        ] {
+            let at = cb.find(m).unwrap_or_else(|| panic!("marker present: {m}"));
+            let line_end = cb[at..]
+                .find("result=ok")
+                .unwrap_or_else(|| panic!("terminated: {m}"));
+            assert!(
+                cb[at..at + line_end].contains("broad_lock=1"),
+                "in-lock marker must state broad_lock=1: {m}"
+            );
+        }
+    }
+
+    /// (2b) The two post-lock markers are emitted from the shared entry, on the correct side
+    /// of the boundary, and the drain marker only after every drain has completed.
+    #[test]
+    fn p02b_post_lock_markers_sit_after_the_real_boundary() {
+        let entry = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        let released_boundary = entry
+            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .expect("release boundary");
+        let release_marker = entry
+            .find("EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64")
+            .expect("release marker");
+        let drain_marker = entry
+            .find("EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64")
+            .expect("drain marker");
+        assert!(
+            released_boundary < release_marker,
+            "the release marker is emitted after with_cpu returned"
+        );
+        assert!(
+            release_marker < drain_marker,
+            "the drain marker follows the release marker"
+        );
+        // EVERY shared post-lock drain precedes the drain marker.
+        for drain in [
+            "shared.drain_dispatch_post_work(cpu)?;",
+            "shared.drain_reply_timeout_post_work(cpu, now);",
+            "shared.drain_server_death_post_work(cpu)",
+            "DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()",
+        ] {
+            let at = entry
+                .find(drain)
+                .unwrap_or_else(|| panic!("drain present: {drain}"));
+            assert!(at < drain_marker, "{drain} must complete before drains=all");
+        }
+        // The stage CAS makes the ordering enforceable at runtime, not merely by layout: the
+        // drain marker cannot fire unless the release marker already advanced the latch.
+        assert!(entry.contains("crate::kernel::boot::EXIT_ATTEST_CONSUMED,\n        crate::kernel::boot::EXIT_ATTEST_LOCK_RELEASED,"));
+        assert!(entry.contains("crate::kernel::boot::EXIT_ATTEST_LOCK_RELEASED,\n        crate::kernel::boot::EXIT_ATTEST_DRAINED,"));
+        assert!(entry.contains("drains=all"));
+    }
+
+    // ── identity validation (10–13) ─────────────────────────────────────────────────
+    #[test]
+    fn p10_p11_exact_identity_not_numeric_tid() {
+        let b = consumer_block();
+        // ASID participates in the check; a numeric-TID-only comparison would not mention it.
+        assert!(b.contains("current_asid == asid"));
+        assert!(b.contains("EXIT_TASK_WRONG_IDENTITY"));
+        assert!(b.contains("EXIT_TASK_EXITING_STILL_CURRENT"));
+        // Stage 200D-0B3 additionally proves absence from EVERY runqueue, so a reused TID
+        // cannot be satisfied by a task that is merely off this CPU's queue.
+        assert!(b.contains("kernel.task_present_in_any_runqueue(tid)"));
+        // Reused TID with a different ASID is rejected by that comparison.
+        let a = Asid(7);
+        let reused = Asid(8);
+        assert!(
+            !(a == reused),
+            "different incarnations must not compare equal"
+        );
+    }
+
+    #[test]
+    fn p12_wrong_cpu_disposition_not_consumable() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        crate::kernel::boot::clear_post_lock_trap_disposition(1);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            0,
+            4,
+            Asid(2)
+        ));
+        assert_eq!(
+            crate::kernel::boot::take_post_lock_trap_disposition(1),
+            PostLockTrapDisposition::ReturnNormally,
+            "another CPU must not consume it"
+        );
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::CurrentTaskExited { tid: 4, .. }
+        ));
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+    }
+
+    #[test]
+    fn p13_duplicate_consumption_rejected() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            0,
+            6,
+            Asid(5)
+        ));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::CurrentTaskExited { .. }
+        ));
+        assert_eq!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::ReturnNormally,
+            "a second consumer sees nothing"
+        );
+    }
+
+    // ── replacement and idle models (5–9) ───────────────────────────────────────────
+    #[test]
+    fn p05_p06_p07_replacement_path_restores_replacement_only() {
+        let k = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        let (a, b) = k.with(|s| {
+            s.register_task(41).expect("A");
+            s.register_task(42).expect("B");
+            let (aa, _) = s.create_user_address_space().expect("asid a");
+            let (ab, _) = s.create_user_address_space().expect("asid b");
+            s.bind_task_asid(41, aa).expect("bind a");
+            s.bind_task_asid(42, ab).expect("bind b");
+            s.enqueue_current_cpu(41).expect("enq a");
+            s.enqueue_current_cpu(42).expect("enq b");
+            s.dispatch_next_task().expect("dispatch");
+            (aa, ab)
+        });
+        let _ = (a, b);
+        let owner = k.with(|s| s.current_tid()).expect("current");
+        // The current task exits; exit_task removes it and dispatches the other.
+        let _ = k.with(|s| s.exit_task(owner, 0));
+        let restore_owner = k.with(|s| s.current_tid());
+        assert_ne!(
+            restore_owner,
+            Some(owner),
+            "the exiting task must not remain the restore owner"
+        );
+        assert!(restore_owner.is_some(), "the replacement is published");
+        assert!(matches!(
+            k.with(|s| s.task_status(owner)),
+            Some(crate::kernel::task::TaskStatus::Exited(_))
+        ));
+    }
+
+    #[test]
+    fn p08_p09_idle_path_clears_current() {
+        let k = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        let lone = k.with(|s| {
+            s.register_task(51).expect("lone");
+            let (asid, _) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(51, asid).expect("bind");
+            s.enqueue_current_cpu(51).expect("enq");
+            s.dispatch_next_task().expect("dispatch");
+            s.current_tid()
+        });
+        assert_eq!(lone, Some(51));
+        let _ = k.with(|s| s.exit_task(51, 0));
+        // With no replacement the exiting task must not stay current; the established idle
+        // outcome is whatever `dispatch_next_task` selected, never task 51.
+        assert_ne!(
+            k.with(|s| s.current_tid()),
+            Some(51),
+            "the exiting task must never remain current on the idle path"
+        );
+        // The consumer names the PREPARED idle owner explicitly. "Prepared" is deliberate:
+        // selecting the owner is not restoring anything to userspace.
+        assert!(
+            consumer_block().contains("EXIT_TASK_RESTORE_OWNER_PREPARED arch=x86_64 owner=idle")
+        );
+    }
+
+    // ── frame and epilogue (14–15) ──────────────────────────────────────────────────
+    #[test]
+    fn p14_p15_no_old_frame_write_or_restore() {
+        let b = consumer_code();
+        for w in [
+            "frame.set_ok",
+            "frame.set_err",
+            "frame.set_user_gpr",
+            "apply_user_context",
+            "resume_current_thread_with_frame",
+        ] {
+            assert!(!b.contains(w), "the consumer must not touch a frame ({w})");
+        }
+        // It performs no teardown, enqueue or terminal claim either.
+        for forbidden in [
+            "exit_task",
+            "enqueue",
+            "try_claim",
+            "complete_server_death",
+            "copy_to_user",
+        ] {
+            assert!(!b.contains(forbidden), "consumer must not {forbidden}");
+        }
+        // Stage 200D-0B3: "restore owner prepared" is not "user frame restored". The actual
+        // iret-frame commit is `flush_trap_context_to_iret_frame`, which the consumer never
+        // calls and which lives in the vector epilogue.
+        assert!(!b.contains("flush_trap_context_to_iret_frame"));
+        assert!(!b.contains("write_task_gprs_to_saved_regs"));
+        assert!(DESC_SRC.contains(
+            "unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };"
+        ));
+    }
+
+    // ── WouldBlock preservation (16–17) ─────────────────────────────────────────────
+    #[test]
+    fn p16_p17_wouldblock_uses_the_normal_return() {
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("handler");
+        let h = h.split("\nfn handle_reap_faulted_task").next().unwrap();
+        let refuse = h.find("Err(SyscallError::WouldBlock)").expect("refusal");
+        let publish = h.find("publish_current_task_exited").expect("publish");
+        assert!(
+            refuse < publish,
+            "the refusal returns before any disposition is published"
+        );
+        // A refusal leaves no disposition, so the normal epilogue is the only outcome.
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        assert!(!crate::kernel::boot::post_lock_trap_disposition_pending(0));
+        assert_eq!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::ReturnNormally
+        );
+    }
+
+    // ── trap-depth ownership (18–19) ────────────────────────────────────────────────
+    #[test]
+    fn p18_p19_common_epilogue_owns_trap_depth() {
+        // The consumer makes no depth write of its own.
+        let b = consumer_code();
+        for d in ["TRAP_DISPATCH_DEPTH", "trap_depth", "depth -=", "depth +="] {
+            assert!(
+                !b.contains(d),
+                "the consumer must not touch trap depth ({d})"
+            );
+        }
+        // The generic NR16 handler makes none either.
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("handler");
+        let h = h.split("\nfn handle_reap_faulted_task").next().unwrap();
+        assert!(!h.contains("TRAP_DISPATCH_DEPTH"));
+        // The common epilogue still owns the cleanup, unchanged.
+        assert!(
+            DESC_SRC
+                .matches("TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release)")
+                .count()
+                >= 1,
+            "the common epilogue retains its depth cleanup"
+        );
+        // No exit-specific cleanup helper was introduced anywhere.
+        assert!(!DESC_SRC.contains("exit_clear_trap_depth"));
+        assert!(!X86_TRAP_SRC.contains("exit_clear_trap_depth"));
+        // Stage 200D-0B3: the ownership attestation moved OUT of the consumer and into the
+        // epilogue that actually owns the clear. Stage 200D-0B1 emitted it from inside the
+        // broad lock, describing work that had not happened yet.
+        assert!(
+            !consumer_block().contains("EXIT_TASK_TRAP_DEPTH_OWNER"),
+            "the in-lock depth-ownership claim must be gone"
+        );
+        assert!(
+            !X86_TRAP_SRC.contains("EXIT_TASK_COMMON_EPILOGUE_OWNER"),
+            "epilogue ownership is not attested from the arch handler"
+        );
+        assert!(DESC_SRC.contains("EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64"));
+        // It is emitted only AFTER the single depth clear on that return path, so `clears=1`
+        // describes a store that already executed.
+        let helper = DESC_SRC
+            .split("fn maybe_attest_exit_common_epilogue")
+            .nth(1)
+            .expect("epilogue attestation helper");
+        let helper = helper.split("\n}\n").next().unwrap();
+        assert!(
+            !helper.contains("TRAP_DISPATCH_DEPTH"),
+            "the attestation helper must make no depth write of its own"
+        );
+        // Both call sites (replacement return and idle divergence) sit AFTER a depth clear,
+        // with nothing but comments between, so `clears=1` describes a store that already ran.
+        let calls: alloc::vec::Vec<&str> = DESC_SRC
+            .match_indices("maybe_attest_exit_common_epilogue(cpu, ")
+            .map(|(i, _)| &DESC_SRC[..i])
+            .collect();
+        assert_eq!(calls.len(), 2, "exactly two epilogue attestation sites");
+        for head in calls {
+            let preceding_code = head
+                .lines()
+                .rev()
+                .map(|l| l.trim())
+                .find(|l| !l.is_empty() && !l.starts_with("//"))
+                .expect("a preceding statement");
+            assert_eq!(
+                preceding_code, "TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);",
+                "the attestation must immediately follow the depth clear it describes"
+            );
+        }
+        assert_eq!(
+            DESC_SRC
+                .matches("maybe_attest_exit_common_epilogue(cpu, \"replacement\")")
+                .count(),
+            1
+        );
+        assert_eq!(
+            DESC_SRC
+                .matches("maybe_attest_exit_common_epilogue(cpu, \"idle\")")
+                .count(),
+            1
+        );
+    }
+
+    // ── oracle preparation (20–21) ──────────────────────────────────────────────────
+    #[test]
+    fn p20_oracle_task_has_hard_fail_marker_after_the_call() {
+        let m_raw = INIT_SRC
+            .split("mod x86_exit_current_task_oracle")
+            .nth(1)
+            .expect("oracle module");
+        // Compare CODE positions: the module's prose explains the hard-fail marker before
+        // the call site, which is documentation rather than an emission.
+        let m: alloc::string::String = m_raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(m.contains("EXIT_TASK_USER_ENTERED"));
+        let call = m.find("exit_current_task()").expect("the NR16 call");
+        let fail = m
+            .find("EXIT_TASK_SYSCALL_RETURNED")
+            .expect("hard-fail marker");
+        assert!(
+            call < fail,
+            "the hard-fail marker must sit AFTER the call, so it can only print on a return"
+        );
+        // Stage 200D-0B2: x86_64 spawned threads need a NAKED trampoline — the initial SP
+        // is not call-aligned, so a plain `extern "C"` entry faults before its first line.
+        // The first live attempt used one and the child spawned but never logged.
+        assert!(INIT_SRC.contains("pub(super) extern \"C\" fn child_entry() -> !"));
+        assert!(INIT_SRC.contains("let entry = oracle::child_entry as *const () as usize;"));
+        // The disposable task is spawned, not init/PM/supervisor.
+        assert!(INIT_SRC.contains("EXIT_TASK_ORACLE_SPAWNED disposable_tid="));
+        assert!(INIT_SRC.contains("spawn_thread(tls_base, stack_top, entry)"));
+        // A surviving task proves continued progress afterwards.
+        assert!(INIT_SRC.contains("EXIT_TASK_SURVIVOR_PROGRESS_OK"));
+    }
+
+    #[test]
+    fn p21_absence_validation_uses_full_identity() {
+        let b = consumer_block();
+        // Absence is validated on {tid, asid}: not current, correct ASID, terminal.
+        assert!(b.contains("kernel.current_tid() == Some(tid)"));
+        assert!(b.contains("kernel.task_asid(tid)"));
+        assert!(b.contains("EXIT_TASK_EXITING_NOT_CURRENT"));
+        assert!(b.contains("EXIT_TASK_RESTORE_OWNER_PREPARED"));
+        assert!(b.contains("EXIT_TASK_ABSENCE_VALIDATED arch=x86_64"));
+        // No new task-inspection syscall was added for the oracle.
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+    }
+
+    // ── feature gating (22) ─────────────────────────────────────────────────────────
+    #[test]
+    fn p22_oracle_literals_are_feature_gated() {
+        // The whole oracle module and its dispatch are behind the feature.
+        assert!(INIT_SRC.contains("feature = \"x86-exit-current-task-oracle\""));
+        let m = INIT_SRC
+            .split("mod x86_exit_current_task_oracle")
+            .nth(1)
+            .expect("module");
+        let head = &INIT_SRC[..INIT_SRC.find("mod x86_exit_current_task_oracle").unwrap()];
+        assert!(
+            head.rfind("feature = \"x86-exit-current-task-oracle\"")
+                .is_some(),
+            "the oracle module is feature-gated"
+        );
+        let _ = m;
+        // The kernel-side selector and knob are gated too; the production consumer is not.
+        assert!(MOD_SRC.contains(
+            "#[cfg(feature = \"x86-exit-current-task-oracle\")]\npub const X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR: u64 = 20;"
+        ));
+        assert!(
+            !consumer_block().contains("x86-exit-current-task-oracle"),
+            "the production consumer must NOT be oracle-gated"
+        );
+    }
+
+    /// Stage 200D-0B2: the boot knob must actually PROVISION the selector into init's
+    /// slot 5. Declaring the constant and parsing the knob is not enough — Stage 200D-0B1
+    /// did both and still produced a boot with zero exit markers, because nothing ever
+    /// wrote `init_args[5]`. This guard closes that gap.
+    #[test]
+    fn p27_selector_is_actually_provisioned() {
+        const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+        assert!(
+            X86_BOOT_SRC.contains(
+                "init_args[5] = crate::kernel::boot::X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR;"
+            ),
+            "the exit-oracle selector must be written into init's startup slot 5"
+        );
+        // Gated on the knob AND on slot 5 still being free, so it stays mutually exclusive
+        // with every other slot-5 oracle.
+        assert!(X86_BOOT_SRC.contains("x86_exit_oracle_enabled() && init_args[5] == 0"));
+        // Feature-gated, so a feature-off image provisions nothing.
+        let at = X86_BOOT_SRC
+            .find("init_args[5] = crate::kernel::boot::X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR;")
+            .expect("provisioning site");
+        let head = &X86_BOOT_SRC[..at];
+        assert!(
+            head.rfind("#[cfg(feature = \"x86-exit-current-task-oracle\")]")
+                .is_some(),
+            "the provisioning must be feature-gated"
+        );
+        // Userspace decodes the SAME number.
+        assert!(INIT_SRC.contains("ctx.supervisor_control_recv_ep == Some(20)"));
+        // Assert the declared value from SOURCE rather than the constant itself: the
+        // constant is feature-gated, and this guard must hold in every configuration.
+        assert!(MOD_SRC.contains("pub const X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR: u64 = 20;"));
+    }
+
+    // ── runner static contract (23–26) ──────────────────────────────────────────────
+    #[test]
+    fn p23_p24_p25_p26_runner_contract() {
+        // Terminal health required.
+        assert!(RUNNER.contains("EXIT_TASK_SYSTEM_HEALTH_OK"));
+        // Early QEMU exit and fatal markers fail closed.
+        assert!(RUNNER.contains("qemu exited before terminal proof"));
+        assert!(RUNNER.contains("EXIT_TASK_SYSCALL_RETURNED"));
+        // Single boot instance.
+        assert!(RUNNER.contains("DISTINCT boot instances != 1"));
+        // `-no-reboot -no-shutdown` are supplied by the core runner's QEMU_SINGLE_BOOT
+        // passthrough, which this runner sets; asserting the passthrough is the accurate
+        // check, since duplicating the flags here would not reach QEMU.
+        assert!(RUNNER.contains("QEMU_SINGLE_BOOT=1"));
+        const CORE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+        assert!(CORE.contains("-no-reboot"));
+        assert!(CORE.contains("-no-shutdown"));
+        // Exact-commit discipline.
+        assert!(RUNNER.contains("reason=dirty_tree"));
+        assert!(RUNNER.contains("recheck_exact_commit"));
+        assert!(RUNNER.contains("log reuse"));
+        // Stage 200D-0B3: the runner emits the SUPERSEDING refreeze seal, and no longer the
+        // inaccurate Stage 200D-0B2 one.
+        assert!(RUNNER.contains("STAGE_200D0B3_X86_EXIT_CURRENT_TASK_REFREEZE_SEAL"));
+        assert!(!RUNNER.contains("STAGE_200D0B2_X86_EXIT_CURRENT_TASK_LIVE_SEAL"));
+        assert!(!RUNNER.contains("STAGE_200D0B1"));
+    }
+
+    /// (§9) The corrected runner must REJECT the four shapes of the old false contract. Each
+    /// assertion below is about what the runner refuses, not merely about what it requires —
+    /// a runner that only added new markers would still accept the sealed-but-false log.
+    #[test]
+    fn p28_runner_rejects_the_old_false_marker_contract() {
+        // 1. `BROAD_LOCK_RELEASED` as emitted from inside `with_cpu` (Stage 200D-0B1's exact
+        //    line shape, which carried no lock-state field at all) is explicitly forbidden.
+        assert!(RUNNER.contains("\"EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64 cpu=0 result=ok\""));
+        // 2. `POST_LOCK_DRAIN_DONE` emitted before `with_cpu` returned — same, by its old shape.
+        assert!(RUNNER.contains(
+            "\"EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64 cpu=0 broad_lock=0 result=ok\""
+        ));
+        // 3. `broad_lock=0` on an in-lock marker fails the run.
+        assert!(RUNNER.contains("in-lock marker falsely claims broad_lock=0"));
+        assert!(RUNNER.contains("in-lock marker does not state broad_lock=1"));
+        // 4. A missing REAL post-lock drain completion fails the run: the marker must attest
+        //    `drains=all`, not merely exist.
+        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
+        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
+        // The superseded in-lock ownership marker must not be accepted either.
+        assert!(RUNNER.contains("\"EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64\""));
+        // Those four forbidden strings are checked by `need_absent`, i.e. presence = failure.
+        let absent_block = RUNNER
+            .split("The old FALSE markers must not appear at all")
+            .nth(1)
+            .expect("the negative block exists");
+        let absent_block = absent_block.split("need_once").next().unwrap();
+        for forbidden in [
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=x86_64 cpu=0 result=ok",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=x86_64 cpu=0 broad_lock=0 result=ok",
+            "EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64",
+        ] {
+            assert!(
+                absent_block.contains(forbidden),
+                "the old marker must be in the need_absent list: {forbidden}"
+            );
+        }
+        // And the corrected ordering is enforced across the lock boundary.
+        assert!(
+            RUNNER.contains("the post-lock drains run after the broad lock is actually released")
+        );
+        assert!(
+            RUNNER.contains("the epilogue commits the user frame only after every drain completed")
+        );
+    }
+
+    /// (§2) The six production side effects that must never occur under the broad lock, each
+    /// asserted at zero inside the consumer's CODE.
+    #[test]
+    fn p29_no_production_side_effects_under_broad_lock() {
+        let cb = consumer_code();
+        for (what, needles) in [
+            (
+                "PeerDeath terminal claim",
+                ["PeerDeath", "complete_server_death", "try_claim_peer_death"].as_slice(),
+            ),
+            (
+                "timeout terminal claim",
+                [
+                    "complete_reply_timeout",
+                    "TerminalClaimant::Timeout",
+                    "claim_timeout",
+                ]
+                .as_slice(),
+            ),
+            (
+                "caller result publication",
+                [
+                    "rt_commit_receiver_runnable",
+                    "publish_blocked_syscall_completion",
+                    "BlockedSyscallCompletion",
+                ]
+                .as_slice(),
+            ),
+            (
+                "scheduler enqueue",
+                ["enqueue", "dispatch_next", "make_runnable"].as_slice(),
+            ),
+            (
+                "userspace copy",
+                ["copy_to_user", "copy_from_user", "write_user"].as_slice(),
+            ),
+            (
+                "reply-record scan",
+                [
+                    "process_ipc_timeout_deadlines",
+                    "scan_reply",
+                    "reply_record_for",
+                ]
+                .as_slice(),
+            ),
+        ] {
+            for n in needles {
+                assert!(
+                    !cb.contains(n),
+                    "consumer must perform no {what} under the broad lock (found `{n}`)"
+                );
+            }
+        }
+        // The server-death completion stays OUT of the broad lock, where Stage 200D-2A put it.
+        let entry = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        let released = entry
+            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .expect("release boundary");
+        let death_drain = entry
+            .find("shared.drain_server_death_post_work(cpu)")
+            .expect("server-death drain");
+        assert!(
+            released < death_drain,
+            "server-death completion must remain post-lock"
+        );
+    }
+
+    /// (§5) "Restore owner prepared" is not "user frame restored". The actual commit and the
+    /// ring-3 return both follow the post-lock drains.
+    #[test]
+    fn p30_actual_user_return_follows_the_post_lock_drains() {
+        // The vector calls the shared entry (which contains every drain) and only afterwards
+        // commits the hardware frame.
+        let stub = DESC_SRC
+            .split("crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(")
+            .nth(1)
+            .expect("shared dispatch call");
+        let commit = stub
+            .find("unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };")
+            .expect("the real iret-frame commit");
+        let attest = stub
+            .find("maybe_attest_exit_common_epilogue(cpu, \"replacement\")")
+            .expect("epilogue attestation");
+        assert!(
+            commit < attest,
+            "the frame is committed before it is attested"
+        );
+        // No frame commit or ring-3 return happens inside the shared entry or the arch handler.
+        // Comment lines are stripped first: both files legitimately DISCUSS the iretq return
+        // while performing none of it.
+        for (name, src) in [
+            ("trap_entry", TRAP_ENTRY_SRC),
+            ("x86_64 trap", X86_TRAP_SRC),
+        ] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("flush_trap_context_to_iret_frame"),
+                "{name} must not commit the hardware iret frame"
+            );
+            for ret in ["iretq", "sysretq"] {
+                assert!(
+                    !code.contains(ret),
+                    "{name} must not return to ring 3 ({ret})"
+                );
+            }
+        }
+        // The latch enforces it at runtime: the epilogue refuses to attest unless the drain
+        // stage was reached, and reports the failure rather than staying silent.
+        let helper = DESC_SRC
+            .split("fn maybe_attest_exit_common_epilogue")
+            .nth(1)
+            .expect("helper");
+        let helper = helper.split("\n}\n").next().unwrap();
+        assert!(helper.contains("if stage != crate::kernel::boot::EXIT_ATTEST_DRAINED {"));
+        assert!(helper.contains("EXIT_TASK_TRAP_DEPTH_ERROR"));
+    }
+
+    /// (§6) The attestation latch is bounded, monotonic and carries no authority.
+    #[test]
+    fn p31_attestation_latch_is_bounded_and_authority_free() {
+        use crate::kernel::boot as kb;
+        let cpu = 0usize;
+        kb::clear_exit_attestation(cpu);
+        assert_eq!(kb::exit_attestation_stage(cpu), kb::EXIT_ATTEST_IDLE);
+        // A stage cannot be skipped.
+        assert!(kb::arm_exit_attestation(cpu, 77, Asid(9)));
+        assert!(
+            kb::advance_exit_attestation(
+                cpu,
+                kb::EXIT_ATTEST_LOCK_RELEASED,
+                kb::EXIT_ATTEST_DRAINED
+            )
+            .is_none(),
+            "the drain stage cannot fire before the release stage"
+        );
+        let (t, a) = kb::advance_exit_attestation(
+            cpu,
+            kb::EXIT_ATTEST_CONSUMED,
+            kb::EXIT_ATTEST_LOCK_RELEASED,
+        )
+        .expect("release advance");
+        assert_eq!((t, a), (77, Asid(9)));
+        assert!(
+            kb::advance_exit_attestation(
+                cpu,
+                kb::EXIT_ATTEST_CONSUMED,
+                kb::EXIT_ATTEST_LOCK_RELEASED
+            )
+            .is_none(),
+            "a stage advances at most once"
+        );
+        kb::advance_exit_attestation(cpu, kb::EXIT_ATTEST_LOCK_RELEASED, kb::EXIT_ATTEST_DRAINED)
+            .expect("drain advance");
+        let (tid, asid, stage) = kb::take_exit_attestation(cpu).expect("armed");
+        assert_eq!((tid, asid, stage), (77, Asid(9), kb::EXIT_ATTEST_DRAINED));
+        assert!(
+            kb::take_exit_attestation(cpu).is_none(),
+            "the latch is one-shot"
+        );
+        // Double-arm within one trap is refused.
+        assert!(kb::arm_exit_attestation(cpu, 1, Asid(1)));
+        assert!(
+            !kb::arm_exit_attestation(cpu, 2, Asid(2)),
+            "a second accepted exit in one trap is a defect"
+        );
+        kb::clear_exit_attestation(cpu);
+        // Nothing outside the marker sites reads the latch: no scheduler, teardown or
+        // terminal-claim decision may depend on it.
+        for src in [
+            include_str!("../../runtime.rs"),
+            include_str!("../scheduler.rs"),
+            include_str!("ipc_state.rs"),
+            include_str!("restart_state.rs"),
+        ] {
+            assert!(!src.contains("exit_attestation"));
+            assert!(!src.contains("EXIT_ATTEST_"));
+        }
+    }
+}
+
+/// Stage 200D-0C1 — AArch64 `ExitCurrentTask` consumer and live-oracle preparation.
+///
+/// Every guard here proves a PRODUCTION USE SITE. None of them passes merely because a
+/// constant, marker or function name exists somewhere: the wiring guards anchor on the
+/// actual call, the actual `init_args[5]` assignment and the actual `spawn_thread` argument.
+#[cfg(test)]
+mod stage200d0c1_aarch64_exit_prep {
+    use crate::kernel::boot::PostLockTrapDisposition;
+    use crate::kernel::vm::Asid;
+
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const A64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const A64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const X86_TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const ABI_SRC: &str = include_str!("../../../crates/yarm-ipc-abi/src/exit_current_task_abi.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RUNNER: &str = include_str!("../../../scripts/qemu-aarch64-exit-current-task-smoke.sh");
+    const ROOT_TOML: &str = include_str!("../../../Cargo.toml");
+    const CPS_TOML: &str = include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml");
+    const FS_TOML: &str = include_str!("../../../crates/yarm-fs-servers/Cargo.toml");
+    const DRV_TOML: &str = include_str!("../../../crates/yarm-driver-servers/Cargo.toml");
+
+    /// The AArch64 consumer block, verbatim from the shared post-lock section.
+    fn consumer_block() -> &'static str {
+        let b = TRAP_ENTRY_SRC
+            .split("// ── Stage 200D-0C1: the AArch64 `CurrentTaskExited` consumer")
+            .nth(1)
+            .expect("aarch64 consumer block present");
+        b.split("    inner_result\n}").next().unwrap()
+    }
+
+    /// Comment-stripped consumer body: these guards are about CODE, and the block's own
+    /// prose legitimately names frames, depth and teardown while explaining why it touches
+    /// none of them.
+    fn consumer_code() -> alloc::string::String {
+        consumer_block()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The AArch64 in-lock handler body that arms the bypass.
+    fn a64_handler_body() -> &'static str {
+        A64_TRAP_SRC
+            .split("pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode")
+            .nth(1)
+            .expect("aarch64 in-lock handler")
+    }
+
+    // ── 1–5: consumer uniqueness, placement and ordering ────────────────────────────
+
+    /// 1. Exactly one AArch64 production consumer.
+    #[test]
+    fn c01_exactly_one_aarch64_production_consumer() {
+        // One call in the shared post-lock section, gated to AArch64.
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1,
+            "exactly one call site in the shared trap entry"
+        );
+        assert_eq!(
+            consumer_code()
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1,
+            "that call site is the AArch64 consumer itself"
+        );
+        // The AArch64 arch handler must NOT also consume it — that would be two authorities.
+        assert!(!A64_TRAP_SRC.contains("take_post_lock_trap_disposition"));
+        // The x86_64 consumer (Stage 200D-0B2) is untouched and still the only x86 one.
+        assert_eq!(
+            X86_TRAP_SRC
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1
+        );
+    }
+
+    /// 2. The consumer is in the REAL AArch64 trap-return path, not a helper.
+    #[test]
+    fn c02_consumer_is_in_the_real_trap_return_path() {
+        // It is inside `handle_trap_entry_shared` — the function the AArch64 vector calls.
+        let entry = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        assert!(
+            entry.contains("take_post_lock_trap_disposition("),
+            "the consumer is inside handle_trap_entry_shared"
+        );
+        // The AArch64 vector reaches that entry through the shared dispatch wrapper, and
+        // commits the exception-return frame only AFTER it returns.
+        assert!(
+            A64_BOOT_SRC
+                .contains("crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(")
+        );
+        let at = A64_BOOT_SRC
+            .find("crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(")
+            .unwrap();
+        assert!(
+            A64_BOOT_SRC[at..]
+                .contains("write_trapframe_back_to_vector_frame(frame, &trap_frame);"),
+            "the vector frame is committed after the shared entry returns"
+        );
+        // It is AArch64-gated, so it cannot alter the sealed x86_64 path.
+        let head = &TRAP_ENTRY_SRC[..TRAP_ENTRY_SRC
+            .find("// ── Stage 200D-0C1: the AArch64 `CurrentTaskExited` consumer")
+            .unwrap()];
+        assert!(
+            head.rfind("#[cfg(not(target_arch = \"riscv64\"))]")
+                .is_some(),
+            "the surrounding post-lock section exists"
+        );
+        assert!(consumer_block().contains("#[cfg(target_arch = \"aarch64\")]"));
+    }
+
+    /// 3. The consumer occurs after the broad-lock release.
+    #[test]
+    fn c03_consumer_occurs_after_broad_lock_release() {
+        let entry = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        // `with_cpu` is where the broad SpinLock<KernelState> is taken and dropped.
+        let with_cpu = entry
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("in-lock phase");
+        let released = entry
+            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .expect("release comment marks the boundary");
+        let consumer = entry
+            .find("take_post_lock_trap_disposition(")
+            .expect("consumer");
+        assert!(
+            with_cpu < released,
+            "the lock is taken before it is dropped"
+        );
+        assert!(
+            released < consumer,
+            "the consumer runs after the broad guard is dropped"
+        );
+        // The attestation says exactly that: it STATES the lock condition that held where it
+        // was emitted and names the guard it outlived. Stage 200D-0B3 removed x86 markers that
+        // named a lock state they did not have; Stage 200D-0C2 makes the AArch64 siblings carry
+        // theirs explicitly rather than relying on position alone.
+        let cb = consumer_block();
+        assert!(cb.contains(
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64 cpu={} broad_lock=0 holder=with_cpu"
+        ));
+        // Every marker the post-lock consumer emits says broad_lock=0, and none claims =1.
+        for m in [
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=aarch64",
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64",
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=aarch64",
+        ] {
+            let at = cb.find(m).unwrap_or_else(|| panic!("marker present: {m}"));
+            let end = at + cb[at..].find("result=ok").expect("terminated");
+            assert!(
+                cb[at..end].contains("broad_lock=0"),
+                "post-lock marker must state broad_lock=0: {m}"
+            );
+            assert!(
+                !cb[at..end].contains("broad_lock=1"),
+                "post-lock marker must not claim broad_lock=1: {m}"
+            );
+        }
+        // The one AArch64 exit marker emitted UNDER the broad lock must not claim otherwise.
+        let inlock = A64_TRAP_SRC
+            .split("EXIT_TASK_INLOCK_BYPASS_ARMED arch=aarch64")
+            .nth(1)
+            .expect("bypass marker");
+        assert!(!inlock[..inlock.find("result=ok").expect("terminated")].contains("broad_lock=0"));
+        // The runner enforces all of this on the live log, per whole line.
+        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
+        assert!(RUNNER.contains("post-lock marker falsely claims broad_lock=1"));
+        assert!(RUNNER.contains("the in-lock bypass marker falsely claims broad_lock=0"));
+        assert!(RUNNER.contains("release marker does not name the broad-lock holder"));
+        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
+    }
+
+    /// 4. The consumer occurs after ALL shared post-lock drains.
+    #[test]
+    fn c04_consumer_occurs_after_every_post_lock_drain() {
+        let entry = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        let consumer = entry
+            .find("take_post_lock_trap_disposition(")
+            .expect("consumer");
+        for drain in [
+            "shared.drain_dispatch_post_work(cpu)?;",
+            "shared.drain_server_death_post_work(cpu)",
+            "shared.drain_reply_timeout_post_work(cpu, now);",
+            "super::aarch64::trap::enter_post_lock_idle(cpu);",
+            "DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take()",
+        ] {
+            let at = entry
+                .find(drain)
+                .unwrap_or_else(|| panic!("post-lock drain present: {drain}"));
+            assert!(at < consumer, "{drain} must precede the consumer");
+        }
+        assert!(consumer_block().contains(
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=aarch64 cpu={} broad_lock=0 drains=all"
+        ));
+    }
+
+    /// 5. The consumer occurs BEFORE any outgoing frame restoration — because the in-lock
+    ///    restore is bypassed for exactly this case.
+    #[test]
+    fn c05_consumer_precedes_outgoing_frame_restoration() {
+        let body = a64_handler_body();
+        // The bypass is computed from the pending disposition and folded into post_lock_bypass.
+        assert!(body.contains(
+            "let exit_disposition_bypass = {\n        let idx = cpu.0 as usize;\n        idx < crate::kernel::scheduler::MAX_CPUS\n            && crate::kernel::boot::post_lock_trap_disposition_pending(idx)\n    };"
+        ));
+        assert!(body.contains(
+            "let post_lock_bypass = futex_wait_bypass || yield_bypass || exit_disposition_bypass;"
+        ));
+        // …and `post_lock_bypass` is what suppresses the in-lock restore.
+        assert!(body.contains("if !switch_pending && !post_lock_bypass {"));
+        let gate = body
+            .find("if !switch_pending && !post_lock_bypass {")
+            .unwrap();
+        assert!(
+            body[gate..].contains(
+                "restore_arch_thread_state(kernel, cpu, frame.as_deref_mut(), syscall_return)"
+            ),
+            "the suppressed call is the real in-lock arch restore"
+        );
+        // The consumer performs the restore itself, after validating.
+        let cb = consumer_code();
+        let validated = cb.find("EXIT_TASK_ABSENCE_VALIDATED").expect("absence");
+        let restore = cb
+            .find("post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())")
+            .expect("consumer-side restore");
+        assert!(validated < restore, "validation precedes any restore");
+    }
+
+    // ── 6–10: replacement and idle paths ────────────────────────────────────────────
+
+    /// 6/8. The replacement path restores the replacement, and only the replacement.
+    #[test]
+    fn c06_c08_replacement_is_the_only_restore_owner() {
+        let cb = consumer_code();
+        assert!(cb.contains("Some(next) if next != 0 => {"));
+        assert!(cb.contains("kernel.d2_recv_switch_incoming_asid(next);"));
+        assert!(cb.contains(
+            "EXIT_TASK_RESTORE_OWNER arch=aarch64 owner=replacement exiting_tid={} next_tid={}"
+        ));
+        // The exiting tid is never an argument to a restore or an address-space switch.
+        assert!(!cb.contains("d2_recv_switch_incoming_asid(tid)"));
+        // A replacement that IS the exiting task is a hard failure, not a restore.
+        assert!(cb.contains("if next == tid {"));
+        assert!(cb.contains("EXIT_TASK_RESELECTED_EXITING_TASK"));
+    }
+
+    /// 7. The exiting task is not current — enforced, not assumed.
+    #[test]
+    fn c07_exiting_task_is_not_current() {
+        let cb = consumer_code();
+        assert!(cb.contains("if current == Some(tid) {"));
+        assert!(cb.contains("EXIT_TASK_EXITING_STILL_CURRENT"));
+        assert!(cb.contains("EXIT_TASK_EXITING_NOT_CURRENT arch=aarch64"));
+        // Fails closed through the existing fatal trap path.
+        assert!(cb.contains("return Err(TrapHandleError::Syscall("));
+    }
+
+    /// 9/10. The idle path clears current and reuses the ESTABLISHED idle primitive.
+    #[test]
+    fn c09_c10_idle_path_uses_the_established_primitive() {
+        let cb = consumer_code();
+        assert!(cb.contains("EXIT_TASK_RESTORE_OWNER arch=aarch64 owner=idle"));
+        assert!(cb.contains("super::aarch64::trap::enter_post_lock_idle_after_exit(cpu, tid);"));
+        // No frame restore on the idle arm.
+        let idle_arm = cb.split("owner=idle").nth(1).unwrap();
+        assert!(
+            !idle_arm.contains("post_switch_restore_arch_thread_state"),
+            "the idle outcome restores nothing"
+        );
+        // The helper delegates to the SAME wfi primitive — not a second idle policy.
+        let helper = A64_TRAP_SRC
+            .split("pub(crate) fn enter_post_lock_idle_after_exit")
+            .nth(1)
+            .expect("idle helper");
+        let helper = helper.split("\n}").next().unwrap();
+        assert!(helper.contains("idle_no_eret_loop();"));
+        assert!(
+            !helper.contains("asm!(\"wfi\")"),
+            "no second wfi loop is introduced"
+        );
+        assert_eq!(
+            A64_TRAP_SRC
+                .matches("unsafe { core::arch::asm!(\"wfi\") };")
+                .count(),
+            1,
+            "exactly one wfi idle primitive exists in the AArch64 trap module"
+        );
+        // The in-lock idle divergence is skipped for the exit case, so the consumer is
+        // reachable at all when there is no replacement.
+        assert!(a64_handler_body().contains("EXIT_TASK_INLOCK_IDLE_DEFERRED arch=aarch64"));
+    }
+
+    // ── 11–14: exact identity ───────────────────────────────────────────────────────
+
+    /// 11/12. Identity is `{tid, asid}`; a reused TID with a different ASID is rejected.
+    #[test]
+    fn c11_c12_identity_is_tid_and_asid() {
+        let cb = consumer_code();
+        assert!(cb.contains("let identity_ok = match kernel.task_asid(tid) {"));
+        assert!(cb.contains("Some(bound) => bound == asid,"));
+        assert!(cb.contains("if !identity_ok || !terminal || in_runqueue {"));
+        assert!(cb.contains("EXIT_TASK_WRONG_IDENTITY arch=aarch64"));
+        // Behavioural: the publication carries the ASID, and a mismatched ASID cannot be
+        // produced by the store itself (it round-trips exactly what was published).
+        let cpu = 0usize;
+        crate::kernel::boot::clear_post_lock_trap_disposition(cpu);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            cpu,
+            4242,
+            Asid(7)
+        ));
+        match crate::kernel::boot::take_post_lock_trap_disposition(cpu) {
+            PostLockTrapDisposition::CurrentTaskExited { tid, asid } => {
+                assert_eq!(tid, 4242);
+                assert_eq!(asid, Asid(7), "the ASID is carried, not re-derived");
+            }
+            other => panic!("expected CurrentTaskExited, got {other:?}"),
+        }
+        crate::kernel::boot::clear_post_lock_trap_disposition(cpu);
+    }
+
+    /// 13. A disposition published for one CPU is not visible to another.
+    #[test]
+    fn c13_wrong_cpu_is_rejected() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        crate::kernel::boot::clear_post_lock_trap_disposition(1);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            0,
+            9001,
+            Asid(3)
+        ));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(1),
+            PostLockTrapDisposition::ReturnNormally
+        ));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::CurrentTaskExited { tid: 9001, .. }
+        ));
+        // Out-of-range CPUs never fabricate a disposition.
+        assert!(!crate::kernel::boot::publish_current_task_exited(
+            crate::kernel::scheduler::MAX_CPUS,
+            1,
+            Asid(1)
+        ));
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+    }
+
+    /// 14. A second publication is rejected, and a second take yields nothing.
+    #[test]
+    fn c14_duplicate_disposition_is_rejected() {
+        let cpu = 0usize;
+        crate::kernel::boot::clear_post_lock_trap_disposition(cpu);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            cpu,
+            5,
+            Asid(2)
+        ));
+        assert!(
+            !crate::kernel::boot::publish_current_task_exited(cpu, 6, Asid(3)),
+            "exactly one disposition per exiting trap"
+        );
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(cpu),
+            PostLockTrapDisposition::CurrentTaskExited { tid: 5, .. }
+        ));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(cpu),
+            PostLockTrapDisposition::ReturnNormally
+        ));
+        // The consumer is an `if let` on a single take, so it cannot consume twice.
+        assert_eq!(
+            consumer_code()
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1
+        );
+    }
+
+    // ── 15–16: the old frame is neither written nor restored ────────────────────────
+
+    /// 15. An accepted exit writes no result into the old frame.
+    #[test]
+    fn c15_accepted_exit_writes_no_old_frame_result() {
+        let cb = consumer_code();
+        for forbidden in [
+            "set_err(",
+            "set_ok(",
+            "set_ret0(",
+            "set_user_gpr(",
+            "set_arg(",
+            "export_syscall_result_to_user_gprs",
+        ] {
+            assert!(
+                !cb.contains(forbidden),
+                "the consumer must not write syscall results: {forbidden}"
+            );
+        }
+        // The in-lock export path is `!task_switched`, and an accepted exit always switches.
+        let body = a64_handler_body();
+        let export = body
+            .find("export_syscall_result_to_user_gprs(trapframe);")
+            .expect("export site");
+        let head = &body[..export];
+        assert!(
+            head.rfind("if !task_switched && matches!(event, TrapEvent::Syscall) {")
+                .is_some(),
+            "the result export is confined to the non-switching path"
+        );
+    }
+
+    /// 16. An accepted exit neither saves nor restores the exiting ELR/SP_EL0.
+    #[test]
+    fn c16_accepted_exit_does_not_touch_old_elr_or_sp() {
+        let body = a64_handler_body();
+        // The outgoing-context save is suppressed for the exit case: the exiting TCB is dead.
+        assert!(body.contains("if task_switched && !exit_disposition_bypass {"));
+        let save = body
+            .find("let _ = kernel.set_thread_user_context(orig_tid, ctx);")
+            .expect("outgoing save site");
+        let gate = body
+            .find("if task_switched && !exit_disposition_bypass {")
+            .unwrap();
+        assert!(gate < save, "the save is inside the bypassed block");
+        // The consumer never sets a saved PC/SP and never reads the exiting task's context.
+        let cb = consumer_code();
+        for forbidden in [
+            "set_saved_pc(",
+            "set_saved_sp(",
+            "capture_user_context(",
+            "set_thread_user_context(",
+        ] {
+            assert!(
+                !cb.contains(forbidden),
+                "consumer must not touch frames: {forbidden}"
+            );
+        }
+    }
+
+    // ── 17–18: WouldBlock stays on the ordinary return ──────────────────────────────
+
+    /// 17/18. A declined preflight publishes no disposition and returns normally.
+    #[test]
+    fn c17_c18_would_block_never_reaches_the_consumer() {
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("NR16 handler");
+        let h = h.split("\n}\n").next().unwrap();
+        let decline = h
+            .find("return Err(SyscallError::WouldBlock);")
+            .expect("preflight decline");
+        let publish = h
+            .find("publish_current_task_exited(")
+            .expect("publication site");
+        assert!(
+            decline < publish,
+            "the decline returns before anything is published"
+        );
+        // The decline is a plain early return: no lifecycle transition, no publication.
+        let declined_arm = &h[..decline];
+        assert!(!declined_arm.contains("kernel.exit_task("));
+        assert!(!declined_arm.contains("publish_current_task_exited("));
+        assert!(h.contains("link_retained=1 result=would_block"));
+        // Behavioural: with nothing published, the consumer's `take` yields ReturnNormally,
+        // so the accepted-exit branch cannot run.
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::ReturnNormally
+        ));
+    }
+
+    // ── 19–20: trap-depth ownership ─────────────────────────────────────────────────
+
+    /// 19/20. AArch64 has no software trap-depth counter, so there is exactly one cleanup
+    ///        owner (the hardware exception return) and zero consumer-side clears.
+    #[test]
+    fn c19_c20_trap_depth_owner_is_unique_and_unwritten() {
+        // The x86_64 depth counter has no AArch64 analogue anywhere in the AArch64 port.
+        for src in [A64_TRAP_SRC, A64_BOOT_SRC] {
+            assert!(
+                !src.contains("TRAP_DISPATCH_DEPTH"),
+                "AArch64 has no trap-dispatch depth counter"
+            );
+        }
+        // x86_64 DOES have one, and Stage 200D-0B3 moved its ownership attestation out of the
+        // in-lock consumer and into the vector epilogue that performs the clear. The contrast
+        // is the point of this guard: the two ports have different cleanup mechanisms, so the
+        // AArch64 consumer must not borrow the x86 shape.
+        const X86_DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(X86_DESC_SRC.contains("TRAP_DISPATCH_DEPTH"));
+        assert!(X86_DESC_SRC.contains("EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64"));
+        assert!(!X86_TRAP_SRC.contains("EXIT_TASK_TRAP_DEPTH_OWNER arch=x86_64"));
+        // The generic NR16 handler manipulates no depth state on any architecture.
+        const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("NR16 handler");
+        let h = h.split("\n}\n").next().unwrap();
+        assert!(!h.contains("DEPTH"));
+        assert!(!h.contains("depth"));
+        // The consumer attests the owner and makes zero clears.
+        let cb = consumer_code();
+        assert!(cb.contains(
+            "EXIT_TASK_TRAP_DEPTH_OWNER arch=aarch64 cpu={} owner=hardware_eret clears=0"
+        ));
+        assert!(
+            !cb.contains(".store("),
+            "the consumer writes no per-CPU counter"
+        );
+    }
+
+    // ── 21–23: wiring, not declarations ─────────────────────────────────────────────
+
+    /// 21. The feature is declared AND forwarded through the whole build chain.
+    #[test]
+    fn c21_feature_is_forwarded_through_the_build_chain() {
+        for (name, toml) in [
+            ("yarm", ROOT_TOML),
+            ("yarm-control-plane-servers", CPS_TOML),
+            ("yarm-fs-servers", FS_TOML),
+            ("yarm-driver-servers", DRV_TOML),
+        ] {
+            assert!(
+                toml.contains("aarch64-exit-current-task-oracle = []"),
+                "{name} must declare the feature so one BOOTSTRAP_FEATURE_ARGS resolves"
+            );
+        }
+        // Declaring is not enough — the feature must actually gate compiled code at both
+        // ends of the chain.
+        assert!(A64_BOOT_SRC.contains("#[cfg(feature = \"aarch64-exit-current-task-oracle\")]"));
+        assert!(INIT_SRC.contains("feature = \"aarch64-exit-current-task-oracle\""));
+        // …and the runner must build BOTH the kernel and the userspace image with it.
+        assert!(RUNNER.contains("FEATURE=aarch64-exit-current-task-oracle"));
+        assert!(
+            RUNNER.contains("BOOTSTRAP_FEATURE_ARGS=\"--no-default-features --features $FEATURE\"")
+        );
+        assert!(RUNNER.contains("--features \"$FEATURE\" \\"));
+        assert!(RUNNER.contains("feature not forwarded to userspace"));
+    }
+
+    /// 22. The slot-5 selector is ACTUALLY written at boot, from the SHARED encoder.
+    #[test]
+    fn c22_slot5_assignment_is_actually_written() {
+        // The production assignment exists…
+        assert!(
+            A64_BOOT_SRC.contains(
+                "init_args[5] = crate::kernel::boot::aarch64_exit_current_task_selector();"
+            ),
+            "the AArch64 boot must write the exit selector into init's startup slot 5"
+        );
+        // …is gated on the knob AND on slot 5 still being free (mutual exclusion)…
+        assert!(A64_BOOT_SRC.contains("aarch64_exit_oracle_enabled() && init_args[5] == 0"));
+        // …and is feature-gated, so a feature-off image provisions nothing.
+        let at = A64_BOOT_SRC
+            .find("init_args[5] = crate::kernel::boot::aarch64_exit_current_task_selector();")
+            .expect("provisioning site");
+        assert!(
+            A64_BOOT_SRC[..at]
+                .rfind("#[cfg(feature = \"aarch64-exit-current-task-oracle\")]")
+                .is_some(),
+            "the provisioning must be feature-gated"
+        );
+        // The value comes from the SHARED ABI encoder, never a hand-written literal.
+        assert!(MOD_SRC.contains(
+            "yarm_ipc_abi::exit_current_task_abi::exit_current_task_selector_for_current_arch("
+        ));
+        assert!(
+            !A64_BOOT_SRC.contains("init_args[5] = 21"),
+            "the selector is never hand-computed at the boot site"
+        );
+        // The encoder/decoder pair round-trips, and does not accept another arch's value.
+        use yarm_ipc_abi::exit_current_task_abi as abi;
+        let s = abi::exit_current_task_selector_for_current_arch(
+            abi::ExitCurrentTaskScenario::SelfExit,
+        );
+        assert_eq!(
+            abi::exit_current_task_scenario_for_current_arch(s),
+            Some(abi::ExitCurrentTaskScenario::SelfExit)
+        );
+        assert_eq!(abi::AARCH64_EXIT_SELECTOR, 21);
+        assert_eq!(abi::X86_64_EXIT_SELECTOR, 20);
+        assert_eq!(
+            abi::exit_current_task_scenario_for_selector(
+                abi::AARCH64_EXIT_SELECTOR,
+                abi::X86_64_EXIT_SELECTOR
+            ),
+            None,
+            "x86_64's selector must not activate the AArch64 cell"
+        );
+        // The selector is honestly free: it collides with no existing slot-5 oracle.
+        for taken in 1..=11u64 {
+            assert_ne!(abi::AARCH64_EXIT_SELECTOR as u64, taken);
+        }
+        assert_ne!(abi::AARCH64_EXIT_SELECTOR, abi::X86_64_EXIT_SELECTOR);
+        // The boot knob is parsed and armed — and BOTH sites are feature-gated. Gating only
+        // the arming site leaves the key's byte literal in a feature-off image's `.rodata`,
+        // which is a literal-cleanliness failure even though the code is unreachable. This
+        // was a real defect caught by auditing the built AArch64 binary, not the source.
+        assert!(CMDLINE_SRC.contains(
+            "#[cfg(feature = \"aarch64-exit-current-task-oracle\")]\n        if key == b\"yarm.aarch64_exit_current_task_oracle\" {"
+        ));
+        assert!(CMDLINE_SRC.contains(
+            "#[cfg(feature = \"aarch64-exit-current-task-oracle\")]\n    if parsed.aarch64_exit_current_task_oracle == Some(true) {"
+        ));
+        assert!(
+            CMDLINE_SRC.contains("crate::kernel::boot::set_aarch64_exit_oracle_enabled(true);")
+        );
+    }
+
+    /// 23. The disposable entry is actually PASSED TO the spawn operation, and userspace
+    ///     decodes the selector through the shared helper rather than a literal.
+    #[test]
+    fn c23_userspace_entry_is_actually_spawned() {
+        // The entry is taken as a pointer and handed to the real spawn syscall.
+        assert!(
+            INIT_SRC.contains("let entry = aarch64_exit_task_child_body as *const () as usize;")
+        );
+        let at = INIT_SRC
+            .find("let entry = aarch64_exit_task_child_body as *const () as usize;")
+            .unwrap();
+        let tail = &INIT_SRC[at..];
+        let spawn = tail
+            .find("yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry)")
+            .expect("the entry must reach the real spawn operation");
+        assert!(
+            spawn < tail.find("EXIT_TASK_ORACLE_SPAWNED").unwrap(),
+            "the spawn happens before it is attested"
+        );
+        // The oracle runs only when the SHARED decoder says this build's selector is armed.
+        assert!(INIT_SRC.contains(
+            "if aarch64_exit_current_task_oracle::armed(ctx.supervisor_control_recv_ep) {"
+        ));
+        assert!(INIT_SRC.contains("run_aarch64_exit_current_task_oracle(ctx.task_id);"));
+        assert!(INIT_SRC.contains(
+            "yarm_ipc_abi::exit_current_task_abi::exit_current_task_scenario_for_current_arch("
+        ));
+        // No bare-literal comparison for this cell (the x86 shape this stage must not repeat).
+        let armed = INIT_SRC
+            .split("pub(super) fn armed(slot5: Option<u32>) -> bool {")
+            .nth(1)
+            .expect("decoder");
+        let armed = armed.split("\n    }").next().unwrap();
+        assert!(!armed.contains("== Some(21)"));
+        assert!(!armed.contains("21"));
+    }
+
+    /// 24. The post-call hard-fail marker follows the wrapper, and only there.
+    #[test]
+    fn c24_post_call_hard_fail_marker_follows_the_wrapper() {
+        let body = INIT_SRC
+            .split("extern \"C\" fn aarch64_exit_task_child_body() -> ! {")
+            .nth(1)
+            .expect("child body");
+        let body = body.split("\n}").next().unwrap();
+        let entered = body
+            .find("EXIT_TASK_USER_ENTERED role=disposable arch=aarch64")
+            .unwrap();
+        let call = body
+            .find("yarm_user_rt::syscall::exit_current_task()")
+            .unwrap();
+        let returned = body
+            .find("EXIT_TASK_SYSCALL_RETURNED arch=aarch64")
+            .unwrap();
+        assert!(entered < call, "the entry marker precedes the syscall");
+        assert!(
+            call < returned,
+            "the hard-fail marker can only follow a return"
+        );
+        assert!(body.contains("result=fail"));
+        // The runner treats it as fatal.
+        assert!(RUNNER.contains("\"EXIT_TASK_SYSCALL_RETURNED\" \\"));
+    }
+
+    /// 25. Absence validation uses the FULL incarnation and no new inspection syscall.
+    #[test]
+    fn c25_absence_validation_uses_full_identity() {
+        let cb = consumer_code();
+        assert!(cb.contains("kernel.task_present_in_any_runqueue(tid)"));
+        assert!(cb.contains("kernel.task_asid(tid)"));
+        assert!(cb.contains("kernel.current_tid()"));
+        assert!(cb.contains(
+            "EXIT_TASK_ABSENCE_VALIDATED arch=aarch64 tid={} asid={} current=0 runqueue=0 restore_owner=0 identity=tid_asid"
+        ));
+        // No general-purpose task-inspection syscall was added for the oracle.
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+    }
+
+    // ── 26–30: runner static contract and feature-off preservation ──────────────────
+
+    /// 26. The runner requires terminal system health.
+    #[test]
+    fn c26_runner_requires_terminal_health() {
+        assert!(RUNNER.contains("\"EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64\""));
+        assert!(RUNNER.contains(
+            "need_order \"$NORM\" \"$L\" \"EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64\" \"EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64\""
+        ));
+    }
+
+    /// 27. The runner rejects an early QEMU exit and every fatal marker.
+    #[test]
+    fn c27_runner_rejects_early_exit() {
+        assert!(RUNNER.contains("die \"RUN_B produced no boot log\""));
+        for fatal in [
+            "KERNEL PANIC",
+            "RUST PANIC",
+            "panicked at",
+            "SYNCHRONOUS EXCEPTION",
+            "FATAL",
+            "EXIT_TASK_OLD_FRAME_RESTORED",
+            "EXIT_TASK_EXITING_STILL_CURRENT",
+            "EXIT_TASK_WRONG_IDENTITY",
+            "EXIT_TASK_DUPLICATE_DISPOSITION",
+            "EXIT_TASK_TRAP_DEPTH_ERROR",
+            "EXIT_TASK_RESELECTED_EXITING_TASK",
+        ] {
+            assert!(RUNNER.contains(fatal), "runner must fail closed on {fatal}");
+        }
+        // A boot completion count of 1 is required, so a truncated boot cannot pass.
+        assert!(RUNNER.contains("die \"[$L] boot completions != 1 (got $bootok)\""));
+    }
+
+    /// 28. The runner rejects multiple boots and reused logs/artifacts.
+    #[test]
+    fn c28_runner_rejects_multiple_boots_and_reuse() {
+        assert!(RUNNER.contains("QEMU_SINGLE_BOOT=1"));
+        assert!(RUNNER.contains("die \"[$L] QEMU launches != 1 (got $launches)\""));
+        assert!(RUNNER.contains("die \"[$L] distinct boot nonces != 1 (got $nonces)\""));
+        assert!(RUNNER.contains("die \"[$L] kernel entries != 1 (got $entry)\""));
+        assert!(RUNNER.contains("die \"log reuse: $p already exists\""));
+        assert!(RUNNER.contains("die \"artifact reused from an earlier run: $p\""));
+        // The single-boot flags are what QEMU_SINGLE_BOOT turns on.
+        const CORE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+        assert!(CORE.contains("QEMU_ARGS+=(-no-reboot -no-shutdown)"));
+    }
+
+    /// 29. The runner refuses a dirty tree and any SHA/tree drift.
+    #[test]
+    fn c29_runner_rejects_dirty_tree_or_drift() {
+        assert!(RUNNER.contains("result=fail reason=dirty_tree"));
+        assert!(RUNNER.contains("die \"[$what] SHA drifted\""));
+        assert!(RUNNER.contains("die \"[$what] tree hash drifted\""));
+        assert!(RUNNER.contains("die \"[$what] tree became dirty\""));
+        assert!(RUNNER.contains("recheck_exact_commit RUN_A"));
+        assert!(RUNNER.contains("recheck_exact_commit RUN_B"));
+        // The runner is PREPARED here, not executed: it emits only the 0C2 live seal.
+        assert!(RUNNER.contains("STAGE_200D0C2_AARCH64_EXIT_CURRENT_TASK_LIVE_SEAL"));
+        assert!(!RUNNER.contains("STAGE_200D0C1_AARCH64_EXIT_CONSUMER_PREP_SEAL"));
+    }
+
+    /// 30. The feature-off audit covers every oracle literal, and the production
+    ///     infrastructure is deliberately NOT feature-gated.
+    #[test]
+    fn c30_feature_off_audit_excludes_only_oracle_literals() {
+        for lit in [
+            "EXIT_TASK_USER_ENTERED role=disposable arch=aarch64",
+            "EXIT_TASK_SYSTEM_HEALTH_OK arch=aarch64",
+            "EXIT_TASK_ORACLE_SPAWNED arch=aarch64",
+            "EXIT_TASK_SURVIVOR_PROGRESS_OK arch=aarch64",
+            "EXIT_TASK_ORACLE_SLOTS arch=aarch64",
+            "yarm.aarch64_exit_current_task_oracle",
+            "STAGE_200D0C2_AARCH64_EXIT_CURRENT_TASK_LIVE_SEAL",
+        ] {
+            assert!(
+                RUNNER.contains(lit),
+                "the feature-off audit must cover {lit}"
+            );
+        }
+        // The production consumer, the disposition store and NR16 stay compiled everywhere.
+        assert!(
+            !consumer_block().contains("aarch64-exit-current-task-oracle"),
+            "the production consumer must NOT be oracle-gated"
+        );
+        assert!(!MOD_SRC.contains(
+            "#[cfg(feature = \"aarch64-exit-current-task-oracle\")]\npub fn take_post_lock_trap_disposition"
+        ));
+        // The in-lock bypass is production behaviour too — an accepted NR16 must be handled
+        // correctly on a feature-off build, it simply never happens without the oracle.
+        assert!(!a64_handler_body().contains("aarch64-exit-current-task-oracle"));
+    }
+}
+
+/// Stage 200D-0D1 — RISC-V `ExitCurrentTask` consumer and live-oracle preparation.
+///
+/// The RISC-V pipeline is not the x86_64 or AArch64 one, so these guards anchor on the RISC-V
+/// trap wrapper's own Phase 1/2/3 structure. Every wiring guard proves a production use site:
+/// none passes because a constant, feature, marker or function name exists.
+#[cfg(test)]
+mod stage200d0d1_riscv_exit_prep {
+    use crate::kernel::boot::PostLockTrapDisposition;
+    use crate::kernel::vm::Asid;
+
+    const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RUNNER: &str = include_str!("../../../scripts/qemu-riscv-exit-current-task-smoke.sh");
+    const ROOT_TOML: &str = include_str!("../../../Cargo.toml");
+    const CPS_TOML: &str = include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml");
+    const FS_TOML: &str = include_str!("../../../crates/yarm-fs-servers/Cargo.toml");
+    const DRV_TOML: &str = include_str!("../../../crates/yarm-driver-servers/Cargo.toml");
+
+    /// The Phase-3 consumer block, verbatim.
+    fn consumer_block() -> &'static str {
+        let b = RV_TRAP_SRC
+            .split("// ── Stage 200D-0D1: the RISC-V `CurrentTaskExited` consumer")
+            .nth(1)
+            .expect("riscv consumer block present");
+        b.split("// Stage 198A1: blocking-syscall TERMINAL-IDLE")
+            .next()
+            .unwrap()
+    }
+
+    /// Comment-stripped consumer body: these guards are about CODE, and the block's prose
+    /// legitimately names teardown, claims and `publish_riscv_user_return` while doing none.
+    fn consumer_code() -> alloc::string::String {
+        consumer_block()
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The in-lock handler body that arms the bypass.
+    fn inlock_handler() -> &'static str {
+        RV_TRAP_SRC
+            .split("pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode")
+            .nth(1)
+            .expect("riscv in-lock handler")
+    }
+
+    /// The bypass block, comment-stripped.
+    fn bypass_code() -> alloc::string::String {
+        let b = inlock_handler()
+            .split("// ── Stage 200D-0D1 (EXITCURRENTTASK IN-LOCK BYPASS)")
+            .nth(1)
+            .expect("bypass block");
+        let b = b.split("// Stage 163L: restore FIRST").next().unwrap();
+        b.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// The Phase-3 region of the wrapper, from the drain header to the consumer.
+    fn wrapper() -> &'static str {
+        RV_TRAP_SRC
+            .split("pub fn handle_riscv_trap_entry_shared")
+            .nth(1)
+            .expect("riscv shared wrapper")
+    }
+
+    // ── 1–6: consumer uniqueness, placement, ordering ───────────────────────────────
+
+    /// 1. Exactly one RISC-V production consumer.
+    #[test]
+    fn r01_exactly_one_riscv_production_consumer() {
+        assert_eq!(
+            RV_TRAP_SRC
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1,
+            "exactly one RISC-V call site"
+        );
+        assert_eq!(
+            consumer_code()
+                .matches("take_post_lock_trap_disposition(")
+                .count(),
+            1,
+            "that call site is the consumer itself"
+        );
+        // The RISC-V bridge does not consume it either — one authority per port.
+        assert!(!RV_BOOT_SRC.contains("take_post_lock_trap_disposition"));
+        // The sibling ports keep exactly one each, untouched.
+        const X86: &str = include_str!("../../arch/x86_64/trap.rs");
+        const SHARED: &str = include_str!("../../arch/trap_entry.rs");
+        assert_eq!(X86.matches("take_post_lock_trap_disposition(").count(), 1);
+        assert_eq!(
+            SHARED.matches("take_post_lock_trap_disposition(").count(),
+            1
+        );
+    }
+
+    /// 2. The consumer is in the real RISC-V trap wrapper, not a helper or the bridge.
+    #[test]
+    fn r02_consumer_is_in_the_real_riscv_trap_wrapper() {
+        assert!(
+            wrapper().contains("take_post_lock_trap_disposition("),
+            "the consumer is inside handle_riscv_trap_entry_shared"
+        );
+        // The bridge calls that wrapper, and applies the frame only after it returns.
+        assert!(RV_BOOT_SRC.contains(
+            "crate::arch::riscv64::trap::handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)"
+        ));
+        let at = RV_BOOT_SRC
+            .find("handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)")
+            .unwrap();
+        assert!(
+            RV_BOOT_SRC[at..].contains("frame.sepc = tframe.saved_pc() as u64;"),
+            "the hardware frame is written after the wrapper returns"
+        );
+    }
+
+    /// 3. The consumer occurs after the broad-lock release.
+    #[test]
+    fn r03_consumer_after_broad_lock_release() {
+        let w = wrapper();
+        let with_cpu = w
+            .find(".with_cpu(cpu, |kernel| {")
+            .expect("Phase 2 lock acquire");
+        let phase3 = w
+            .find("// ── Phase 3: post-lock drain (broad guard released) ──")
+            .expect("Phase 3 boundary");
+        let consumer = w
+            .find("take_post_lock_trap_disposition(")
+            .expect("consumer");
+        assert!(with_cpu < phase3, "Phase 2 precedes Phase 3");
+        assert!(phase3 < consumer, "the consumer is in Phase 3");
+        // The lock is genuinely the broad SpinLock<KernelState>.
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        assert!(RUNTIME.contains("let mut guard = self.state.lock();"));
+        // The marker states the condition and names the holder.
+        assert!(consumer_block().contains(
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=riscv64 tid={} asid={} cpu={} broad_lock=0 holder=with_cpu"
+        ));
+    }
+
+    /// 4. The consumer occurs after every required Phase-3 drain.
+    #[test]
+    fn r04_consumer_after_every_phase3_drain() {
+        let w = wrapper();
+        let consumer = w
+            .find("take_post_lock_trap_disposition(")
+            .expect("consumer");
+        for drain in [
+            "shared.drain_dispatch_post_work(cpu)?;",
+            "shared.drain_reply_timeout_post_work(cpu, now);",
+            "shared.drain_server_death_post_work(cpu)",
+            "RISCV_QUEUE_SWITCH_FOUNDATION_DRAIN_BEGIN",
+            "RISCV_FUTEX_WAIT_DISPATCH_DRAIN_BEGIN",
+            "RISCV_YIELD_DISPATCH_DRAIN_BEGIN",
+        ] {
+            let at = w
+                .find(drain)
+                .unwrap_or_else(|| panic!("Phase-3 drain present: {drain}"));
+            assert!(at < consumer, "{drain} must precede the consumer");
+        }
+        assert!(consumer_block().contains(
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=riscv64 cpu={} broad_lock=0 drains=all"
+        ));
+    }
+
+    /// 5/6. The consumer precedes both the frame application and `sret`, and precedes the
+    /// Stage 198A1 terminal-idle check that would otherwise misread an accepted exit.
+    #[test]
+    fn r05_r06_consumer_precedes_frame_application_and_sret() {
+        let w = wrapper();
+        let consumer = w
+            .find("take_post_lock_trap_disposition(")
+            .expect("consumer");
+        let idle_check = w
+            .find("// Stage 198A1: blocking-syscall TERMINAL-IDLE")
+            .expect("198A1 block");
+        let tail = w
+            .find("// Stage 197B: the sole non-idle tail return.")
+            .expect("tail return");
+        assert!(
+            consumer < idle_check,
+            "the exit outcome is decided before the provenance-based idle check"
+        );
+        assert!(consumer < tail, "the consumer precedes the tail return");
+        // Neither the wrapper nor the in-lock handler writes the hardware frame or sret's.
+        let code: alloc::string::String = RV_TRAP_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in ["frame.sepc =", "sret"] {
+            assert!(
+                !code.contains(forbidden),
+                "the trap wrapper must not commit the frame or return to U-mode ({forbidden})"
+            );
+        }
+        // `write_satp` DOES appear in the wrapper — the pre-existing 196D/196E/196G switch
+        // drains activate the incoming task's address space, which is correct and untouched.
+        // What must hold is that the EXIT path performs no address-space or frame write of its
+        // own: the in-lock bypass reuses the canonical restore, and the consumer re-applies
+        // nothing.
+        assert!(
+            code.contains("write_satp"),
+            "the existing switch drains are preserved"
+        );
+        for src in [consumer_code(), bypass_code()] {
+            for forbidden in ["write_satp", "frame.sepc =", "sret"] {
+                assert!(
+                    !src.contains(forbidden),
+                    "the exit path must not perform its own {forbidden}"
+                );
+            }
+        }
+    }
+
+    // ── 7–10: saved context and sepc ────────────────────────────────────────────────
+
+    /// 7/8. The replacement is restored, and the exiting TCB context is never applied.
+    #[test]
+    fn r07_r08_replacement_only_exiting_context_never_applied() {
+        let b = bypass_code();
+        // The bypass restores only when a replacement exists; `current` is already the
+        // replacement, so the canonical restore sources the right task.
+        assert!(b.contains("let replacement = kernel.current_tid().filter(|t| *t != 0);"));
+        assert!(b.contains("if replacement.is_none() {"));
+        assert!(b.contains("restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())?;"));
+        // The consumer itself re-applies nothing — a second restore would be duplicate authority.
+        let c = consumer_code();
+        assert!(!c.contains("restore_arch_thread_state"));
+        assert!(!c.contains("apply_user_context"));
+        assert!(c.contains("frame_source=replacement_tcb"));
+    }
+
+    /// 9/20. The exiting task's `sepc` is never committed and `publish_riscv_user_return` is
+    /// never called for it.
+    #[test]
+    fn r09_r20_exiting_sepc_and_mirrors_never_published() {
+        let b = bypass_code();
+        let c = consumer_code();
+        for src in [&b, &c] {
+            assert!(!src.contains("publish_riscv_user_return"));
+            assert!(!src.contains("set_saved_pc"));
+            assert!(!src.contains("set_user_gpr"));
+        }
+        // The a0/a1 result export is what the bypass exists to suppress: it must sit AFTER the
+        // bypass's early return, so an accepted exit can never reach it.
+        let h = inlock_handler();
+        let bypass_at = h
+            .find("if crate::kernel::boot::post_lock_trap_disposition_pending(cpu_idx) {")
+            .expect("bypass gate");
+        let export_at = h
+            .find("f.set_user_gpr(10, f.ret0());")
+            .expect("ecall result export");
+        assert!(
+            bypass_at < export_at,
+            "the bypass returns before the exiting task's result export"
+        );
+        assert!(b.contains("return Ok(());"));
+        assert!(b.contains("inlock_result_export=0"));
+    }
+
+    /// 10/22. Ordinary `sepc` policy is untouched: the bridge still pre-advances exactly once
+    /// and the handler still applies no second `+4`.
+    #[test]
+    fn r10_r22_ordinary_sepc_policy_unchanged() {
+        assert!(RV_BOOT_SRC.contains("tframe.set_saved_pc(sepc + advance);"));
+        // No new sepc arithmetic was introduced anywhere in the trap path.
+        let code: alloc::string::String = RV_TRAP_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("+ 4"), "no new sepc advance in the wrapper");
+        assert!(!code.contains("wrapping_add(4)"));
+        // The bypass performs no `sepc` arithmetic of its own — it only decides whether the
+        // canonical restore runs. (A bare `contains("4")` would match "riscv64" in its marker,
+        // so the check is on the operations that could actually move `sepc`.)
+        let b = bypass_code();
+        for forbidden in ["+ 4", "wrapping_add", "set_saved_pc", "saved_pc("] {
+            assert!(
+                !b.contains(forbidden),
+                "the bypass must not move sepc ({forbidden})"
+            );
+        }
+    }
+
+    // ── 11–18: identity, replacement, idle ──────────────────────────────────────────
+
+    /// 11/12. The exiting task is neither current nor the restore owner — enforced, not assumed.
+    #[test]
+    fn r11_r12_exiting_task_is_not_current_nor_owner() {
+        let c = consumer_code();
+        assert!(c.contains("if current == Some(tid) {"));
+        assert!(c.contains("EXIT_TASK_EXITING_STILL_CURRENT"));
+        assert!(c.contains("EXIT_TASK_EXITING_NOT_CURRENT arch=riscv64"));
+        assert!(c.contains("if next == tid {"));
+        assert!(c.contains("EXIT_TASK_RESELECTED_EXITING_TASK"));
+        assert!(c.contains("return Err(TrapHandleError::Syscall("));
+    }
+
+    /// 13/14. The idle path clears current and reuses the ESTABLISHED typed idle terminal.
+    #[test]
+    fn r13_r14_idle_path_uses_established_terminal() {
+        let c = consumer_code();
+        assert!(c.contains("EXIT_TASK_RESTORE_OWNER arch=riscv64 owner=idle"));
+        assert!(c.contains(
+            "return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {\n                    reason: RiscvIdleReason::ExitCurrentTaskNoRunnable,"
+        ));
+        // The typed reason is mapped by the EXISTING bridge idle terminal — no second idle loop.
+        assert!(RV_BOOT_SRC.contains(
+            "RiscvIdleReason::ExitCurrentTaskNoRunnable => \"ExitCurrentTaskNoRunnable\""
+        ));
+        assert_eq!(
+            RV_BOOT_SRC
+                .matches("riscv_trap_halt(\"kernel_idle_awaiting_io\")")
+                .count(),
+            1,
+            "exactly one idle terminal serves every typed idle reason"
+        );
+        // The idle arm restores nothing.
+        let idle_arm = c.split("owner=idle").nth(1).unwrap();
+        assert!(!idle_arm.contains("restore_arch_thread_state"));
+    }
+
+    /// 15/16. Identity is `{tid, asid}`; a reused TID with a different ASID is rejected.
+    #[test]
+    fn r15_r16_identity_is_tid_and_asid() {
+        let c = consumer_code();
+        assert!(c.contains("let identity_ok = match kernel.task_asid(tid) {"));
+        assert!(c.contains("Some(bound) => bound == asid,"));
+        assert!(c.contains("if !identity_ok || !terminal || in_runqueue {"));
+        // Behavioural: the store round-trips the exact incarnation it was given.
+        let cpu = 0usize;
+        crate::kernel::boot::clear_post_lock_trap_disposition(cpu);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            cpu,
+            7171,
+            Asid(5)
+        ));
+        match crate::kernel::boot::take_post_lock_trap_disposition(cpu) {
+            PostLockTrapDisposition::CurrentTaskExited { tid, asid } => {
+                assert_eq!((tid, asid), (7171, Asid(5)));
+            }
+            other => panic!("expected CurrentTaskExited, got {other:?}"),
+        }
+        crate::kernel::boot::clear_post_lock_trap_disposition(cpu);
+    }
+
+    /// 17/18. A disposition is per-CPU and one-shot.
+    #[test]
+    fn r17_r18_wrong_cpu_and_duplicate_rejected() {
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        crate::kernel::boot::clear_post_lock_trap_disposition(1);
+        assert!(crate::kernel::boot::publish_current_task_exited(
+            0,
+            33,
+            Asid(4)
+        ));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(1),
+            PostLockTrapDisposition::ReturnNormally
+        ));
+        assert!(
+            !crate::kernel::boot::publish_current_task_exited(0, 34, Asid(9)),
+            "a second publication in one trap is refused"
+        );
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::CurrentTaskExited { tid: 33, .. }
+        ));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::ReturnNormally
+        ));
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+    }
+
+    /// 19. The consumer writes no result and performs no production side effect.
+    #[test]
+    fn r19_no_old_frame_result_and_no_side_effects() {
+        let c = consumer_code();
+        for (what, needles) in [
+            ("teardown", ["exit_task", "reap", "destroy"].as_slice()),
+            (
+                "enqueue",
+                ["enqueue", "dispatch_next", "make_runnable"].as_slice(),
+            ),
+            (
+                "terminal claim",
+                [
+                    "PeerDeath",
+                    "try_claim",
+                    "complete_server_death",
+                    "complete_reply_timeout",
+                ]
+                .as_slice(),
+            ),
+            (
+                "result publication",
+                [
+                    "set_ok",
+                    "set_err",
+                    "rt_commit_receiver_runnable",
+                    "publish_riscv_user_return",
+                ]
+                .as_slice(),
+            ),
+            (
+                "userspace copy",
+                ["copy_to_user", "copy_from_user"].as_slice(),
+            ),
+            (
+                "reply-record scan",
+                ["process_ipc_timeout_deadlines", "scan_reply"].as_slice(),
+            ),
+        ] {
+            for n in needles {
+                assert!(
+                    !c.contains(n),
+                    "consumer must perform no {what} (found `{n}`)"
+                );
+            }
+        }
+    }
+
+    // ── 21–22: WouldBlock ───────────────────────────────────────────────────────────
+
+    /// 21/22. A declined preflight publishes no disposition, so neither the bypass nor the
+    /// consumer can activate, and the ordinary RISC-V return path applies.
+    #[test]
+    fn r21_r22_would_block_never_activates_bypass_or_consumer() {
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("NR16 handler");
+        let h = h.split("\n}\n").next().unwrap();
+        let decline = h
+            .find("return Err(SyscallError::WouldBlock);")
+            .expect("preflight decline");
+        let publish = h
+            .find("publish_current_task_exited(")
+            .expect("publication site");
+        assert!(decline < publish, "the decline returns before publication");
+        assert!(!h[..decline].contains("kernel.exit_task("));
+        // Both the bypass and the consumer are gated on an ACTUAL pending/ present disposition.
+        assert!(
+            bypass_code()
+                .contains("if crate::kernel::boot::post_lock_trap_disposition_pending(cpu_idx) {")
+        );
+        crate::kernel::boot::clear_post_lock_trap_disposition(0);
+        assert!(!crate::kernel::boot::post_lock_trap_disposition_pending(0));
+        assert!(matches!(
+            crate::kernel::boot::take_post_lock_trap_disposition(0),
+            PostLockTrapDisposition::ReturnNormally
+        ));
+    }
+
+    // ── 23: sret / trap-depth ownership ─────────────────────────────────────────────
+
+    /// 23. RISC-V has no software trap-depth counter on this path; the bridge owns one `sret`.
+    #[test]
+    fn r23_unique_sret_ownership_and_zero_depth_clears() {
+        // Comment lines are stripped first: the consumer's own prose names x86_64's
+        // `TRAP_DISPATCH_DEPTH` precisely to record that RISC-V has no analogue.
+        for (name, src) in [("riscv trap", RV_TRAP_SRC), ("riscv boot", RV_BOOT_SRC)] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("TRAP_DISPATCH_DEPTH"),
+                "{name}: RISC-V has no trap-dispatch depth counter"
+            );
+        }
+        // x86_64 does have one, and it stays there — the ports differ by design.
+        const X86_DESC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        assert!(X86_DESC.contains("TRAP_DISPATCH_DEPTH"));
+        let c = consumer_code();
+        assert!(c.contains(
+            "EXIT_TASK_SRET_OWNER arch=riscv64 cpu={} owner=trap_bridge software_depth_clears=0"
+        ));
+        assert!(
+            !c.contains(".store("),
+            "the consumer writes no per-CPU counter"
+        );
+        assert!(!bypass_code().contains(".store("));
+        // The generic NR16 handler manipulates no depth state on any architecture.
+        let h = SYSCALL_SRC
+            .split("fn handle_exit_current_task")
+            .nth(1)
+            .expect("NR16 handler");
+        let h = h.split("\n}\n").next().unwrap();
+        assert!(!h.contains("DEPTH") && !h.contains("depth"));
+    }
+
+    // ── 24–26: wiring, not declarations ─────────────────────────────────────────────
+
+    /// 24. The feature is declared AND forwarded through the whole artifact chain.
+    #[test]
+    fn r24_feature_forwarded_through_artifact_chain() {
+        for (name, toml) in [
+            ("yarm", ROOT_TOML),
+            ("yarm-control-plane-servers", CPS_TOML),
+            ("yarm-fs-servers", FS_TOML),
+            ("yarm-driver-servers", DRV_TOML),
+        ] {
+            assert!(
+                toml.contains("riscv-exit-current-task-oracle = []"),
+                "{name} must declare the feature"
+            );
+        }
+        // Declaring is not enough: it must gate compiled code at both ends.
+        assert!(RV_BOOT_SRC.contains("#[cfg(feature = \"riscv-exit-current-task-oracle\")]"));
+        assert!(INIT_SRC.contains("feature = \"riscv-exit-current-task-oracle\""));
+        // …and the runner must build BOTH the kernel and the userspace image with it.
+        assert!(RUNNER.contains("FEATURE=riscv-exit-current-task-oracle"));
+        assert!(
+            RUNNER.contains("BOOTSTRAP_FEATURE_ARGS=\"--no-default-features --features $FEATURE\"")
+        );
+        assert!(RUNNER.contains("--features \"$FEATURE\" \\"));
+        assert!(RUNNER.contains("feature not forwarded to userspace"));
+    }
+
+    /// 25. Selector 22 is genuinely free, actually written at boot, and comes from the shared
+    ///     encoder rather than a literal.
+    #[test]
+    fn r25_selector_is_free_and_actually_written() {
+        // Free: the RISC-V slot-5 namespace occupies 1..=10 and nothing writes 22.
+        assert!(
+            RV_BOOT_SRC.contains(
+                "init_args[5] = crate::kernel::boot::RISCV_SHARED_REGION_ORACLE_SELECTOR;"
+            )
+        );
+        assert!(MOD_SRC.contains("pub const RISCV_SHARED_REGION_ORACLE_SELECTOR: u64 = 7;"));
+        assert!(MOD_SRC.contains("pub const RISCV_IPCCALL_DIRECT_ORACLE_SELECTOR: u64 = 8;"));
+        assert!(
+            !RV_BOOT_SRC.contains("init_args[5] = 22"),
+            "the selector is never hand-written at the boot site"
+        );
+        // Actually written, gated on the knob AND on slot 5 still being free.
+        assert!(
+            RV_BOOT_SRC.contains(
+                "init_args[5] = crate::kernel::boot::riscv_exit_current_task_selector();"
+            )
+        );
+        assert!(RV_BOOT_SRC.contains("riscv_exit_oracle_enabled() && init_args[5] == 0"));
+        let at = RV_BOOT_SRC
+            .find("init_args[5] = crate::kernel::boot::riscv_exit_current_task_selector();")
+            .expect("provisioning site");
+        assert!(
+            RV_BOOT_SRC[..at]
+                .rfind("#[cfg(feature = \"riscv-exit-current-task-oracle\")]")
+                .is_some(),
+            "the provisioning must be feature-gated"
+        );
+        // From the SHARED encoder, and the ABI reserves 22 for RISC-V distinctly.
+        assert!(MOD_SRC.contains(
+            "yarm_ipc_abi::exit_current_task_abi::exit_current_task_selector_for_current_arch("
+        ));
+        use yarm_ipc_abi::exit_current_task_abi as abi;
+        assert_eq!(abi::RISCV64_EXIT_SELECTOR, 22);
+        for taken in 1..=10usize {
+            assert_ne!(abi::RISCV64_EXIT_SELECTOR, taken);
+        }
+        assert_ne!(abi::RISCV64_EXIT_SELECTOR, abi::X86_64_EXIT_SELECTOR);
+        assert_ne!(abi::RISCV64_EXIT_SELECTOR, abi::AARCH64_EXIT_SELECTOR);
+        assert_eq!(
+            abi::exit_current_task_scenario_for_selector(
+                abi::RISCV64_EXIT_SELECTOR,
+                abi::AARCH64_EXIT_SELECTOR
+            ),
+            None,
+            "AArch64's selector must not activate the RISC-V cell"
+        );
+        // Both knob sites are feature-gated so no string leaks into a feature-off `.rodata`.
+        assert!(CMDLINE_SRC.contains(
+            "#[cfg(feature = \"riscv-exit-current-task-oracle\")]\n        if key == b\"yarm.riscv_exit_current_task_oracle\" {"
+        ));
+        assert!(CMDLINE_SRC.contains(
+            "#[cfg(feature = \"riscv-exit-current-task-oracle\")]\n    if parsed.riscv_exit_current_task_oracle == Some(true) {"
+        ));
+    }
+
+    /// 26/27. The disposable entry actually reaches `spawn_thread`, and the hard-fail marker
+    ///        can only follow a returning wrapper.
+    #[test]
+    fn r26_r27_entry_is_actually_spawned_and_marker_follows() {
+        assert!(INIT_SRC.contains("let entry = riscv_exit_task_child_body as *const () as usize;"));
+        let at = INIT_SRC
+            .find("let entry = riscv_exit_task_child_body as *const () as usize;")
+            .unwrap();
+        let tail = &INIT_SRC[at..];
+        let spawn = tail
+            .find("yarm_user_rt::syscall::spawn_thread(tls_base, stack_top, entry)")
+            .expect("the entry must reach the real spawn operation");
+        assert!(spawn < tail.find("EXIT_TASK_ORACLE_SPAWNED arch=riscv64").unwrap());
+        // Dispatch is via the SHARED decoder, never a bare literal.
+        assert!(INIT_SRC.contains(
+            "if riscv_exit_current_task_oracle::armed(ctx.supervisor_control_recv_ep) {"
+        ));
+        assert!(INIT_SRC.contains("run_riscv_exit_current_task_oracle(ctx.task_id);"));
+        // Stage 200D-0D2: the RISC-V survivor loop is deliberately 64, not the siblings' 4096 —
+        // every RISC-V Yield runs the full 196G retirement drain and emits ~13 serial lines, so
+        // 4096 exceeds the boot timeout. The sibling bounds must stay untouched.
+        let rv_fn = INIT_SRC
+            .split("fn run_riscv_exit_current_task_oracle(_init_tid: u64) {")
+            .nth(1)
+            .expect("riscv oracle fn");
+        assert!(rv_fn.contains("while spun < 64 {"));
+        assert!(!rv_fn.contains("while spun < 4096 {"));
+        assert_eq!(
+            INIT_SRC.matches("while spun < 4096 {").count(),
+            2,
+            "x86_64 and AArch64 keep their 4096-yield survivor loops"
+        );
+        let armed = INIT_SRC
+            .split("mod riscv_exit_current_task_oracle {")
+            .nth(1)
+            .expect("decoder module");
+        let armed = armed.split("\n}").next().unwrap();
+        assert!(armed.contains("exit_current_task_scenario_for_current_arch"));
+        assert!(!armed.contains("22"), "no bare-literal selector comparison");
+        // Post-call hard-fail marker.
+        let body = INIT_SRC
+            .split("extern \"C\" fn riscv_exit_task_child_body() -> ! {")
+            .nth(1)
+            .expect("child body");
+        let body = body.split("\n}").next().unwrap();
+        let entered = body
+            .find("EXIT_TASK_USER_ENTERED role=disposable arch=riscv64")
+            .unwrap();
+        let call = body
+            .find("yarm_user_rt::syscall::exit_current_task()")
+            .unwrap();
+        let returned = body
+            .find("EXIT_TASK_SYSCALL_RETURNED arch=riscv64")
+            .unwrap();
+        assert!(entered < call && call < returned);
+    }
+
+    /// 28. Absence uses the full incarnation and adds no inspection syscall.
+    #[test]
+    fn r28_absence_uses_full_identity() {
+        let c = consumer_code();
+        assert!(c.contains("kernel.task_present_in_any_runqueue(tid)"));
+        assert!(c.contains("kernel.task_asid(tid)"));
+        assert!(c.contains("kernel.current_tid()"));
+        assert!(c.contains("identity=tid_asid"));
+        assert!(c.contains("frame_source=0"));
+        assert_eq!(crate::kernel::syscall::Syscall::VARIANT_COUNT, 24);
+    }
+
+    // ── 29–32: runner static contract and feature-off ───────────────────────────────
+
+    /// 29. The runner requires survivor progress and terminal health.
+    #[test]
+    fn r29_runner_requires_terminal_health() {
+        assert!(RUNNER.contains("\"EXIT_TASK_SURVIVOR_PROGRESS_OK arch=riscv64\""));
+        assert!(RUNNER.contains("\"EXIT_TASK_SYSTEM_HEALTH_OK arch=riscv64\""));
+        assert!(RUNNER.contains("qemu exited before terminal proof"));
+        assert!(RUNNER.contains("terminal health is the last thing proven"));
+    }
+
+    /// 30. The runner rejects false lock ordering, and every declared-but-unwired shape.
+    #[test]
+    fn r30_runner_rejects_false_ordering_and_unwired_declarations() {
+        // Per-line lock-state, both directions.
+        assert!(RUNNER.contains("post-lock marker does not state broad_lock=0"));
+        assert!(RUNNER.contains("the in-lock bypass marker does not state broad_lock=1"));
+        assert!(RUNNER.contains("the in-lock bypass marker falsely claims broad_lock=0"));
+        // Consumer strictly after the drains.
+        assert!(RUNNER.contains("the consumer runs after every Phase-3 drain"));
+        assert!(RUNNER.contains("post-lock drain marker does not attest drains=all"));
+        // Declared-but-unwritten selector / declared-but-unspawned entry.
+        assert!(RUNNER.contains("EXIT_TASK_ORACLE_SLOTS arch=riscv64 slot5=22"));
+        assert!(RUNNER.contains("the selector is provisioned before the task is spawned"));
+        assert!(RUNNER.contains("the task is spawned before it runs"));
+        assert!(RUNNER.contains("feature-on kernel missing the slot-5 provisioning literal"));
+        // Old-frame / sepc restoration.
+        assert!(RUNNER.contains("EXIT_TASK_OLD_FRAME_RESTORED"));
+        assert!(RUNNER.contains("EXIT_TASK_EXITING_SEPC_COMMITTED"));
+        // Stage 200D-0D2: the result-export hard-fail marker completes the enumerated set.
+        // Like its two siblings above it is never emitted today — the positive proof is
+        // `inlock_result_export=0` on the bypass marker — so it exists to fail closed if a
+        // future change ever re-introduced an exiting-task result export.
+        assert!(RUNNER.contains("EXIT_TASK_EXITING_RESULT_EXPORTED"));
+        assert!(
+            RUNNER.contains("the in-lock bypass did not suppress the exiting task's result export")
+        );
+        assert!(RUNNER.contains("frame_source=replacement_tcb"));
+    }
+
+    /// 31. The runner rejects multiple boots, reuse, dirty trees and SHA drift.
+    #[test]
+    fn r31_runner_rejects_multiple_boots_and_drift() {
+        assert!(RUNNER.contains("QEMU_SINGLE_BOOT=1"));
+        assert!(RUNNER.contains("die \"[$L] QEMU launches != 1 (got $launches)\""));
+        assert!(RUNNER.contains("die \"[$L] distinct boot nonces != 1 (got $nonces)\""));
+        assert!(RUNNER.contains("die \"[$L] boot nonce lines != 1 (got $noncelines)\""));
+        assert!(RUNNER.contains("die \"log reuse: $p already exists\""));
+        assert!(RUNNER.contains("die \"artifact reused from an earlier run: $p\""));
+        assert!(RUNNER.contains("result=fail reason=dirty_tree"));
+        assert!(RUNNER.contains("die \"[$what] SHA drifted\""));
+        assert!(RUNNER.contains("die \"[$what] tree hash drifted\""));
+        const CORE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+        assert!(CORE.contains("SINGLE_BOOT_ARGS=(-no-reboot -no-shutdown)"));
+        // Prepared, not executed: only the 0D2 live seal is emitted.
+        assert!(RUNNER.contains("STAGE_200D0D2_RISCV_EXIT_CURRENT_TASK_LIVE_SEAL"));
+        assert!(!RUNNER.contains("STAGE_200D0D1_RISCV_EXIT_CONSUMER_PREP_SEAL"));
+    }
+
+    /// 32. The feature-off audit covers every oracle literal, in the kernel AND the initramfs,
+    ///     while the production consumer and bypass stay compiled everywhere.
+    #[test]
+    fn r32_feature_off_audit_excludes_only_oracle_literals() {
+        for lit in [
+            "EXIT_TASK_USER_ENTERED role=disposable arch=riscv64",
+            "EXIT_TASK_SYSTEM_HEALTH_OK arch=riscv64",
+            "EXIT_TASK_ORACLE_SPAWNED arch=riscv64",
+            "EXIT_TASK_SURVIVOR_PROGRESS_OK arch=riscv64",
+            "EXIT_TASK_ORACLE_SLOTS arch=riscv64",
+            "yarm.riscv_exit_current_task_oracle",
+            "YARM_RISCV_EXIT_CURRENT_TASK_ORACLE_SET",
+            "STAGE_200D0D2_RISCV_EXIT_CURRENT_TASK_LIVE_SEAL",
+        ] {
+            assert!(
+                RUNNER.contains(lit),
+                "the feature-off audit must cover {lit}"
+            );
+        }
+        assert!(RUNNER.contains("feature-off initramfs contains"));
+        // Production paths are NOT oracle-gated.
+        assert!(!consumer_block().contains("riscv-exit-current-task-oracle"));
+        assert!(!bypass_code().contains("riscv-exit-current-task-oracle"));
+    }
+}
+
+/// Stage 200D-2B1 (§1) — the shared three-scenario IPC reply-liveness ABI.
+///
+/// These guards are about the ABI being the SINGLE source of selector meaning. They are
+/// deliberately negative-heavy: the failure this module exists to prevent is a second,
+/// private mapping appearing somewhere and drifting from this one (Stage 200C2C2C-R2B).
+#[cfg(test)]
+mod stage200d2b1_liveness_abi {
+    use yarm_ipc_abi::ipc_reply_liveness_abi::{
+        AARCH64_SELECTOR_BASE, IpcReplyLivenessScenario, RISCV64_SELECTOR_BASE,
+        X86_64_SELECTOR_BASE, ipc_reply_liveness_scenario_for_base,
+    };
+
+    const ABI_SRC: &str =
+        include_str!("../../../crates/yarm-ipc-abi/src/ipc_reply_liveness_abi.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const X86_BOOT: &str = include_str!("../../arch/x86_64/boot.rs");
+    const A64_BOOT: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    /// The §1 selector table, asserted exactly.
+    #[test]
+    fn b01_selector_table_is_exactly_the_specified_runs() {
+        use IpcReplyLivenessScenario as S;
+        for (base, expect) in [
+            (AARCH64_SELECTOR_BASE, [8usize, 9, 10]),
+            (RISCV64_SELECTOR_BASE, [9, 10, 11]),
+            (X86_64_SELECTOR_BASE, [10, 11, 12]),
+        ] {
+            assert_eq!(base, expect[0], "base");
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, expect[0]),
+                Some(S::TimeoutWins)
+            );
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, expect[1]),
+                Some(S::ReplyWins)
+            );
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, expect[2]),
+                Some(S::ServerDies)
+            );
+        }
+    }
+
+    /// The pre-existing timeout/reply selectors keep the meanings Stage 200C sealed them with.
+    /// Widening the pair into a run must not have renumbered anything.
+    #[test]
+    fn b02_old_timeout_and_reply_selectors_retain_their_meanings() {
+        use IpcReplyLivenessScenario as S;
+        for (base, timeout, reply) in [
+            (AARCH64_SELECTOR_BASE, 8usize, 9usize),
+            (RISCV64_SELECTOR_BASE, 9, 10),
+            (X86_64_SELECTOR_BASE, 10, 11),
+        ] {
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, timeout),
+                Some(S::TimeoutWins)
+            );
+            assert_eq!(
+                ipc_reply_liveness_scenario_for_base(base, reply),
+                Some(S::ReplyWins)
+            );
+        }
+        // The kernel's registry constants still equal the ABI bases.
+        assert_eq!(
+            crate::kernel::boot::AARCH64_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR,
+            AARCH64_SELECTOR_BASE as u64
+        );
+    }
+
+    /// Kernel and userspace decode through the SAME module — one shared ABI, not two copies.
+    #[test]
+    fn b03_kernel_and_userspace_share_one_abi() {
+        assert!(MOD_SRC.contains(
+            "yarm_ipc_abi::ipc_reply_liveness_abi::ipc_reply_liveness_selector_for_current_arch("
+        ));
+        assert!(INIT_SRC.contains("ipc_reply_liveness_scenario_for_current_arch(mode() as usize)"));
+        assert!(INIT_SRC.contains("use yarm_ipc_abi::ipc_reply_liveness_abi::{"));
+        // The superseded module is gone entirely — it cannot be imported by accident.
+        for (name, src) in [
+            ("kernel", MOD_SRC),
+            ("init server", INIT_SRC),
+            ("x86 boot", X86_BOOT),
+            ("aarch64 boot", A64_BOOT),
+            ("riscv boot", RV_BOOT),
+        ] {
+            assert!(
+                !src.contains("ipc_reply_timeout_abi"),
+                "{name} must not reference the superseded module"
+            );
+            assert!(!src.contains("IpcReplyTimeoutScenario"));
+        }
+    }
+
+    /// No private per-port selector table, and no hand-computed base+offset outside the ABI.
+    #[test]
+    fn b04_no_private_tables_or_hand_computed_offsets() {
+        for (name, src) in [
+            ("kernel", MOD_SRC),
+            ("init server", INIT_SRC),
+            ("x86 boot", X86_BOOT),
+            ("aarch64 boot", A64_BOOT),
+            ("riscv boot", RV_BOOT),
+        ] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            // A private LIVENESS mapping would have to compute the run locally. (A bare
+            // `== Some(8)` is NOT forbidden in general: slot-5 is a shared namespace and 8 is
+            // also the RISC-V IpcCall-direct selector, which is a different oracle with its
+            // own meaning. The check is about the liveness run specifically.)
+            for forbidden in [
+                "matches!(mode(), 8",
+                "SELECTOR_BASE + 1",
+                "SELECTOR_BASE + 2",
+            ] {
+                assert!(
+                    !code.contains(forbidden),
+                    "{name} must not compute liveness selector meaning locally ({forbidden})"
+                );
+            }
+        }
+        // Every reply-liveness dispatch site is guarded by the SHARED decoder, never by a
+        // literal comparison. This is the concrete defect the guard exists for: the three
+        // sites previously compared `Some(8)||Some(9)`, `Some(9)||Some(10)`,
+        // `Some(10)||Some(11)` — private per-port tables that also silently excluded the new
+        // ServerDies selector, so the third scenario could never have dispatched.
+        let mut dispatch_sites = 0usize;
+        for arch in ["x86", "aarch64", "riscv"] {
+            let needle = alloc::format!("run_{arch}_ipc_reply_timeout_oracle(ctx.task_id);");
+            let at = INIT_SRC
+                .find(&needle)
+                .unwrap_or_else(|| panic!("dispatch site for {arch}"));
+            let head = &INIT_SRC[..at];
+            let guard_line = head
+                .lines()
+                .rev()
+                .find(|l| l.trim_start().starts_with("if "))
+                .expect("guarding if");
+            assert!(
+                guard_line.contains("ipc_reply_timeout_oracle::armed("),
+                "{arch} dispatch must go through the shared decoder, got: {guard_line}"
+            );
+            dispatch_sites += 1;
+        }
+        assert_eq!(dispatch_sites, 3);
+        // The shared `armed` helper decodes; it does not enumerate.
+        let armed = INIT_SRC
+            .split("pub(super) fn armed(slot5: Option<u32>) -> bool {")
+            .nth(1)
+            .expect("armed helper");
+        let armed = armed.split("\n    }").next().unwrap();
+        assert!(
+            armed.contains("ipc_reply_liveness_scenario_for_current_arch(v as usize).is_some()")
+        );
+        for n in ["8", "9", "10", "11", "12"] {
+            assert!(
+                !armed.contains(n),
+                "armed must contain no selector literal ({n})"
+            );
+        }
+        // The only base+offset arithmetic lives in the ABI module itself.
+        assert!(ABI_SRC.contains("selector == base + 1"));
+        assert!(ABI_SRC.contains("selector == base + 2"));
+    }
+
+    /// The ExitCurrentTask ABI is a DIFFERENT namespace and must never select an IPC scenario.
+    #[test]
+    fn b05_exit_current_task_abi_is_not_used_for_ipc_scenarios() {
+        // The two ABIs share no selector value.
+        use yarm_ipc_abi::exit_current_task_abi as exit_abi;
+        for s in [
+            exit_abi::X86_64_EXIT_SELECTOR,
+            exit_abi::AARCH64_EXIT_SELECTOR,
+            exit_abi::RISCV64_EXIT_SELECTOR,
+        ] {
+            for base in [
+                AARCH64_SELECTOR_BASE,
+                RISCV64_SELECTOR_BASE,
+                X86_64_SELECTOR_BASE,
+            ] {
+                assert_eq!(
+                    ipc_reply_liveness_scenario_for_base(base, s),
+                    None,
+                    "exit selector {s} must not decode as an IPC liveness scenario"
+                );
+            }
+        }
+        // …and the IPC oracle never consults the exit ABI.
+        let oracle = INIT_SRC
+            .split("mod ipc_reply_timeout_oracle {")
+            .nth(1)
+            .expect("ipc oracle module");
+        let oracle = oracle.split("\n    }\n}").next().unwrap();
+        assert!(!oracle.contains("exit_current_task_abi"));
+        // The kernel's IPC selector helper likewise uses only the liveness ABI.
+        let helper = MOD_SRC
+            .split("pub fn ipc_reply_timeout_selector() -> Option<u64> {")
+            .nth(1)
+            .expect("selector helper");
+        let helper = helper.split("\n}").next().unwrap();
+        assert!(helper.contains("ipc_reply_liveness_abi"));
+        assert!(!helper.contains("exit_current_task_abi"));
+    }
+
+    /// The third scenario is wired end to end in the kernel: a mode constant, a typed
+    /// scenario arm and the shared encoder — not just an enum variant.
+    #[test]
+    fn b06_server_dies_mode_is_wired_in_the_kernel() {
+        assert!(MOD_SRC.contains("pub const IPC_REPLY_TIMEOUT_MODE_SERVER_DIES: u8 = 3;"));
+        assert!(MOD_SRC.contains("IPC_REPLY_TIMEOUT_MODE_SERVER_DIES => Some(S::ServerDies),"));
+        // Userspace has the matching predicate, decoded through the shared helper.
+        assert!(INIT_SRC.contains("pub(super) fn is_server_dies() -> bool {"));
+        assert!(INIT_SRC.contains("Some(IpcReplyLivenessScenario::ServerDies)"));
+    }
+}
+
+/// Stage 200D-2B1B-i — the nine ServerDies transition counters and the fifteen hard-fail
+/// literals, each proven attached to a REAL production operation.
+#[cfg(all(test, feature = "ipc-reply-timeout-oracle-core"))]
+mod stage200d2b1bi_counters {
+    use crate::kernel::boot::server_dies_counters as c;
+    use c::Transition as T;
+
+    /// The nine transition counters, the per-CPU deferred queue and the causal collector
+    /// gate are all PROCESS-global. Every case that mutates them takes this guard, so the
+    /// default parallel `cargo test` run cannot interleave two instances and read a vector
+    /// that neither case produced. Poison-tolerant: a panicking case still yields the
+    /// guard rather than cascading into unrelated failures.
+    pub(super) static SERVER_DIES_GLOBALS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) fn globals_guard() -> std::sync::MutexGuard<'static, ()> {
+        SERVER_DIES_GLOBALS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    const ALL: [T; 9] = [
+        T::LinkCreated,
+        T::LinkDetached,
+        T::DeferredReserved,
+        T::DeferredPublished,
+        T::DeferredConsumed,
+        T::PeerDeathWinner,
+        T::ResultPublication,
+        T::RunnableTransition,
+        T::CallerEnqueue,
+    ];
+
+    /// Nine classes, distinct discriminants, stable names.
+    #[test]
+    fn i01_nine_transition_classes() {
+        let _g = globals_guard();
+        assert_eq!(c::CLASSES, 9);
+        let mut seen = alloc::vec::Vec::new();
+        for t in ALL {
+            assert!(!seen.contains(&(t as usize)), "duplicate discriminant");
+            seen.push(t as usize);
+            assert!(!t.name().is_empty());
+        }
+        assert_eq!(seen.len(), 9);
+    }
+
+    /// Instance isolation is deterministic: a reset zeroes every class and restarts the
+    /// stamp clock, so one test cannot inherit another's counts.
+    #[test]
+    fn i02_instance_isolation_is_deterministic() {
+        let _g = globals_guard();
+        c::reset_instance();
+        c::record(T::LinkCreated);
+        assert_eq!(c::count(T::LinkCreated), 1);
+        let before = c::instance();
+        let after = c::reset_instance();
+        assert!(after > before, "instance id advances");
+        assert_eq!(c::vector(), [0u32; 9], "every class is zeroed");
+        for t in ALL {
+            assert_eq!(c::stamp(t), 0, "stamps are cleared");
+        }
+    }
+
+    /// The successful path's exact vector, and result strictly before enqueue — proven by
+    /// STAMPS taken at the two real operations, not by declaration order.
+    #[test]
+    fn i03_success_vector_and_result_before_enqueue() {
+        let _g = globals_guard();
+        c::reset_instance();
+        for t in ALL {
+            c::record(t);
+        }
+        assert_eq!(c::vector(), [1u32; 9], "each class exactly once");
+        assert!(c::result_before_enqueue());
+        assert!(
+            c::stamp(T::ResultPublication) < c::stamp(T::CallerEnqueue),
+            "publication is stamped before the enqueue"
+        );
+        assert!(c::audit_success_path(), "the success audit passes");
+        c::reset_instance();
+    }
+
+    /// An inverted order fails even though both counters reach 1 — this is what makes the
+    /// ordering claim provable rather than assumed.
+    #[test]
+    fn i04_inverted_order_fails_even_at_count_one() {
+        let _g = globals_guard();
+        c::reset_instance();
+        c::record(T::CallerEnqueue);
+        c::record(T::ResultPublication);
+        assert_eq!(c::count(T::ResultPublication), 1);
+        assert_eq!(c::count(T::CallerEnqueue), 1);
+        assert!(
+            !c::result_before_enqueue(),
+            "enqueue stamped first must fail the ordering check"
+        );
+        assert!(!c::audit_success_path());
+        c::reset_instance();
+    }
+
+    /// A missing stamp is never "in order".
+    #[test]
+    fn i05_missing_transition_is_not_in_order() {
+        let _g = globals_guard();
+        c::reset_instance();
+        c::record(T::ResultPublication);
+        assert!(!c::result_before_enqueue(), "no enqueue yet");
+        assert!(!c::audit_success_path());
+        c::reset_instance();
+        c::record(T::CallerEnqueue);
+        assert!(!c::result_before_enqueue(), "no publication");
+        c::reset_instance();
+    }
+
+    /// Duplicates are visible (count > 1) and fail the audit for every class.
+    #[test]
+    fn i06_duplicate_transitions_fail_closed() {
+        let _g = globals_guard();
+        for t in ALL {
+            c::reset_instance();
+            c::record(t);
+            c::record(t);
+            assert_eq!(c::count(t), 2, "{} duplicate is visible", t.name());
+            assert!(!c::audit_success_path(), "{} duplicate fails", t.name());
+        }
+        c::reset_instance();
+    }
+
+    /// A capacity refusal before the irreversible detach leaves every downstream class at
+    /// zero — reserve may have happened, detach and everything after it must not.
+    #[test]
+    fn i07_capacity_refusal_advances_nothing_downstream() {
+        let _g = globals_guard();
+        c::reset_instance();
+        // Queue-full: no reservation, so not even the reserve class advances.
+        assert_eq!(c::vector(), [0u32; 9]);
+        // Reserve-then-release (nothing owed): reserve only.
+        c::record(T::DeferredReserved);
+        let v = c::vector();
+        assert_eq!(v[T::DeferredReserved as usize], 1);
+        for t in [
+            T::LinkDetached,
+            T::DeferredPublished,
+            T::DeferredConsumed,
+            T::PeerDeathWinner,
+            T::ResultPublication,
+            T::RunnableTransition,
+            T::CallerEnqueue,
+        ] {
+            assert_eq!(v[t as usize], 0, "{} must not advance", t.name());
+        }
+        assert!(!c::audit_success_path());
+        c::reset_instance();
+    }
+
+    /// Leak literals are derived from count RELATIONSHIPS at the real operations.
+    #[test]
+    fn i08_leak_relationships_fail_closed() {
+        let _g = globals_guard();
+        // link created, never detached → link leak
+        c::reset_instance();
+        c::record(T::LinkCreated);
+        assert!(!c::audit_success_path());
+        // published, never consumed → deferred leak
+        c::reset_instance();
+        c::record(T::DeferredReserved);
+        c::record(T::DeferredPublished);
+        assert!(!c::audit_success_path());
+        // detached without a terminal winner → record leak
+        c::reset_instance();
+        c::record(T::LinkCreated);
+        c::record(T::LinkDetached);
+        assert!(!c::audit_success_path());
+        c::reset_instance();
+    }
+
+    // ── the counters are attached to REAL operations, not to markers ─────────────────
+
+    /// Each of the nine `record(...)` call sites sits in the production function that
+    /// performs the transition, on the branch where it actually committed.
+    #[test]
+    fn i09_counters_attached_to_real_operations() {
+        let _g = globals_guard();
+        // 1 link created — inside the arm that installs a NEW link.
+        let reg = IPC_SRC
+            .split("pub(crate) fn register_server_reply_link(")
+            .nth(1)
+            .expect("register");
+        let reg = reg.split("\n    /// ").next().unwrap();
+        assert!(reg.contains("tcb.server_reply_link = Some(link);"));
+        let install = reg.find("tcb.server_reply_link = Some(link);").unwrap();
+        let rec = reg.find("Transition::LinkCreated").expect("class 1");
+        assert!(install < rec, "counted after the real install");
+        // 2 link detached — only when a link was actually taken.
+        let take = IPC_SRC
+            .split("pub(crate) fn take_server_reply_link(")
+            .nth(1)
+            .expect("take");
+        let take = take.split("\n    /// ").next().unwrap();
+        assert!(take.contains("if taken.is_some() {"));
+        assert!(take.contains("Transition::LinkDetached"));
+        // 3/4/5 deferred queue operations.
+        for (f, class, must) in [
+            (
+                "pub(crate) fn server_death_work_reserve(",
+                "Transition::DeferredReserved",
+                "Some(ServerDeathWorkReservation { cpu_idx, slot })",
+            ),
+            (
+                "pub(crate) fn server_death_work_publish(",
+                "Transition::DeferredPublished",
+                "q[reservation.slot] = Some(work);",
+            ),
+            (
+                "pub(crate) fn server_death_work_drain_next(",
+                "Transition::DeferredConsumed",
+                "if taken.is_some() {",
+            ),
+        ] {
+            let body = MOD_SRC.split(f).nth(1).expect(f);
+            let body = body.split("\n}\n").next().unwrap();
+            assert!(body.contains(class), "{f} records {class}");
+            assert!(body.contains(must), "{f} performs the real operation");
+        }
+        // 6/7/8/9 in the completion transaction, each after its real operation.
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        let terminal = comp
+            .find("rt_commit_reply_terminal(d, record_index, &terminal_owner);")
+            .unwrap();
+        let winner = comp.find("Transition::PeerDeathWinner").expect("class 6");
+        assert!(
+            terminal < winner,
+            "winner counted after the real CAS commit"
+        );
+        let publish = comp.find("rt_commit_receiver_runnable(").expect("publish");
+        let result = comp.find("Transition::ResultPublication").expect("class 7");
+        let runnable = comp
+            .find("Transition::RunnableTransition")
+            .expect("class 8");
+        assert!(publish < result && publish < runnable);
+        let enq = comp.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        let enq_c = comp.find("Transition::CallerEnqueue").expect("class 9");
+        assert!(enq < enq_c, "enqueue counted after the real enqueue");
+        assert!(result < enq_c, "result class precedes the enqueue class");
+    }
+
+    /// No counter is incremented from a marker site, and the oracle never records a
+    /// transition on the userspace side.
+    #[test]
+    fn i10_no_simulated_transitions() {
+        let _g = globals_guard();
+        assert!(
+            !INIT_SRC.contains("server_dies_counters"),
+            "userspace must not synthesize transitions"
+        );
+        // Every production record(...) lives in one of the four kernel files that own the
+        // real operations.
+        let total: usize = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC]
+            .iter()
+            .map(|s| s.matches("server_dies_counters::record(").count())
+            .sum();
+        assert_eq!(total, 9, "exactly nine production record sites");
+    }
+
+    /// All fifteen canonical hard-fail literals exist at real sites.
+    #[test]
+    fn i11_fifteen_hard_fail_literals() {
+        let _g = globals_guard();
+        let sources = [IPC_SRC, MOD_SRC, RUNTIME_SRC, RESTART_SRC, INIT_SRC];
+        for lit in [
+            "IPC_SERVER_DEATH_EXIT_RETURNED",
+            "IPC_SERVER_DEATH_DUPLICATE_DEFERRED",
+            "IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY",
+            "IPC_SERVER_DEATH_WRONG_CALLER_IDENTITY",
+            "IPC_SERVER_DEATH_WRONG_RECORD_GENERATION",
+            "IPC_SERVER_DEATH_WRONG_ENDPOINT_GENERATION",
+            "IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION",
+            "IPC_SERVER_DEATH_DUPLICATE_COMPLETION",
+            "IPC_SERVER_DEATH_DUPLICATE_WAKE",
+            "IPC_SERVER_DEATH_LINK_LEAK",
+            "IPC_SERVER_DEATH_RECORD_LEAK",
+            "IPC_SERVER_DEATH_DEFERRED_LEAK",
+            "IPC_SERVER_DEATH_TIMEOUT_WON",
+            "IPC_SERVER_DEATH_LATE_REPLY_ACCEPTED",
+            "IPC_SERVER_DEATH_STALE_AUTHORITY_RESTORED",
+        ] {
+            assert!(
+                sources.iter().any(|s| s.contains(lit)),
+                "missing hard-fail literal: {lit}"
+            );
+        }
+        // Every one of them reports a failure, never a success.
+        for s in sources {
+            for line in s.lines() {
+                if line.contains("IPC_SERVER_DEATH_WRONG_")
+                    || line.contains("IPC_SERVER_DEATH_TIMEOUT_WON")
+                    || line.contains("IPC_SERVER_DEATH_LATE_REPLY_ACCEPTED")
+                    || line.contains("IPC_SERVER_DEATH_STALE_AUTHORITY_RESTORED")
+                {
+                    assert!(
+                        !line.contains("result=ok"),
+                        "hard-fail literal must not report success: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The identity/generation literals sit at the real revalidation failures.
+    #[test]
+    fn i12_identity_literals_at_real_revalidation_sites() {
+        let _g = globals_guard();
+        // Drain revalidation: emitted on the stale-identity branch, before `continue`.
+        let drain = RUNTIME_SRC
+            .split("pub(crate) fn drain_server_death_post_work")
+            .nth(1)
+            .expect("drain");
+        let stale = drain
+            .find("IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY")
+            .expect("server identity");
+        let rec_gen = drain
+            .find("IPC_SERVER_DEATH_WRONG_RECORD_GENERATION")
+            .expect("record generation");
+        let cont = drain[stale..].find("continue;").expect("declines");
+        assert!(stale < rec_gen && rec_gen < stale + cont);
+        // Completion: caller/endpoint literals on the `!waiter_ok` branch, which wakes nobody.
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        let bad = comp.find("if !waiter_ok {").expect("waiter branch");
+        let caller = comp
+            .find("IPC_SERVER_DEATH_WRONG_CALLER_IDENTITY")
+            .expect("caller identity");
+        let ep = comp
+            .find("IPC_SERVER_DEATH_WRONG_ENDPOINT_GENERATION")
+            .expect("endpoint generation");
+        assert!(bad < caller && bad < ep);
+        assert!(comp[bad..].contains("CleanupNoWake"), "wakes nobody");
+        // Timeout token: the same slot with a different generation is named explicitly.
+        assert!(RUNTIME_SRC.contains("if this_idx == armed_idx && this_gen != armed_gen {"));
+        assert!(RUNTIME_SRC.contains("IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION"));
+    }
+
+    /// The production mechanism is not oracle-feature-dependent: the counters are gated,
+    /// the operations they observe are not.
+    #[test]
+    fn i13_production_mechanism_is_not_feature_dependent() {
+        let _g = globals_guard();
+        for (name, needle, src) in [
+            (
+                "register link",
+                "pub(crate) fn register_server_reply_link(",
+                IPC_SRC,
+            ),
+            (
+                "take link",
+                "pub(crate) fn take_server_reply_link(",
+                IPC_SRC,
+            ),
+            (
+                "reserve",
+                "pub(crate) fn server_death_work_reserve(",
+                MOD_SRC,
+            ),
+            (
+                "publish",
+                "pub(crate) fn server_death_work_publish(",
+                MOD_SRC,
+            ),
+            (
+                "drain next",
+                "pub(crate) fn server_death_work_drain_next(",
+                MOD_SRC,
+            ),
+        ] {
+            let at = src.find(needle).unwrap_or_else(|| panic!("{name}"));
+            let head = &src[..at];
+            let last = head.lines().rev().take(3).collect::<alloc::vec::Vec<_>>();
+            assert!(
+                !last.iter().any(|l| l.contains("cfg(feature =")),
+                "{name} must not be feature-gated"
+            );
+        }
+        // Each record site IS gated.
+        for src in [IPC_SRC, MOD_SRC, RUNTIME_SRC] {
+            for (i, _) in src.match_indices("server_dies_counters::record(") {
+                let head = &src[..i];
+                assert!(
+                    head.rfind("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]")
+                        .is_some(),
+                    "every counter site is feature-gated"
+                );
+            }
+        }
+    }
+}
+
+/// Stage 200D-2B1B-ii — deterministic ServerDies races, fail-closed rejections, and
+/// wiring guards.
+///
+/// Every case drives the REAL production seams in a controlled order — terminal CAS,
+/// record lifecycle, TCB link seam, deferred queue, off-lock completion — and asserts the
+/// exact nine-counter vector plus the ordering stamps, not merely a marker's presence.
+/// No sleeps, no wall clock, no host-thread scheduling.
+#[cfg(all(test, feature = "ipc-reply-timeout-oracle-core"))]
+mod stage200d2b1bii_races {
+    use super::stage199a2d1_races::{CallerFx, caller_fixture, teardown};
+    use crate::kernel::boot::DeferredServerDeathCompletion;
+    use crate::kernel::boot::server_dies_counters as c;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+    use crate::kernel::vm::Asid;
+    use c::Transition as T;
+
+    const TOKEN_GEN: u64 = 1;
+    const SERVER_DIED: u64 = 10;
+    const CPU: CpuId = CpuId(0);
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const RV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    /// Fresh fixture AND a fresh counter instance, so no case inherits another's counts.
+    ///
+    /// Returns the process-global serialization guard alongside the fixture: the counters,
+    /// the deferred queue and the collector gate are global, so a case must hold the guard
+    /// for its whole body or a parallel case could interleave transitions into its vector.
+    fn fx_fresh() -> (std::sync::MutexGuard<'static, ()>, CallerFx) {
+        let g = super::stage200d2b1bi_counters::globals_guard();
+        // Drain any queue residue from a previous case before the instance resets.
+        while crate::kernel::boot::server_death_work_drain_next(0).is_some() {}
+        // Build the fixture FIRST, then zero the counters. Since Stage 200D-2B1D1 the
+        // ordinary call the fixture makes registers a reverse link in production, so the
+        // fixture performs real transitions of its own; resetting afterwards keeps a case's
+        // vector a measurement of the CASE rather than of its setup.
+        let fx = caller_fixture();
+        c::reset_instance();
+        (g, fx)
+    }
+
+    fn arm(fx: &CallerFx) -> TerminalIdentity {
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(1);
+        let id =
+            fx.k.with(|s| {
+                s.reply_terminal_identity(
+                    fx.record_index,
+                    fx.record_generation,
+                    brg,
+                    Some(TOKEN_GEN),
+                )
+            })
+            .expect("identity");
+        fx.k.with(|s| s.arm_reply_terminal(fx.record_index, id));
+        id
+    }
+
+    fn link(fx: &CallerFx) -> bool {
+        fx.k.with(|s| {
+            s.register_server_reply_link(
+                fx.replier.tid.0,
+                fx.replier.asid,
+                fx.record_index,
+                fx.record_generation,
+            )
+        })
+    }
+
+    /// The BROAD-LOCK phase exactly as `exit_task` performs it: reserve → detach → publish.
+    fn broad_lock_exit_phase(fx: &CallerFx) -> bool {
+        let reservation = match crate::kernel::boot::server_death_work_reserve(0) {
+            Some(r) => r,
+            None => return false,
+        };
+        match fx
+            .k
+            .with(|s| s.take_server_reply_link(fx.replier.tid.0, fx.replier.asid))
+        {
+            Some(l) => crate::kernel::boot::server_death_work_publish(
+                reservation,
+                DeferredServerDeathCompletion {
+                    exiting_server: fx.replier,
+                    reply_record_index: l.reply_record_index,
+                    reply_record_generation: l.reply_record_generation,
+                },
+            ),
+            None => {
+                crate::kernel::boot::server_death_work_release(reservation);
+                false
+            }
+        }
+    }
+
+    fn drain(fx: &CallerFx) -> usize {
+        fx.k.drain_server_death_post_work(CPU)
+    }
+    fn winner(fx: &CallerFx) -> Option<TerminalClaimant> {
+        fx.k.with(|s| s.reply_terminal_committed_winner(fx.record_index))
+    }
+    /// A competing terminal claimant taking the cell for real — claim then commit,
+    /// through the SAME single-authority seams the production reply/timeout paths use.
+    fn claim_terminal(fx: &CallerFx, id: &TerminalIdentity, kind: TerminalClaimant) -> bool {
+        fx.k.with(
+            |s| match s.try_claim_reply_terminal_slot(fx.record_index, kind, id) {
+                Some(owner) => s.commit_reply_terminal_slot(fx.record_index, &owner),
+                None => false,
+            },
+        )
+    }
+    fn caller_result(fx: &CallerFx) -> Option<u64> {
+        fx.k.with(|s| s.pending_syscall_completion_result(1))
+    }
+    fn live_links(fx: &CallerFx) -> usize {
+        fx.k.with(|s| s.live_server_reply_link_count())
+    }
+    fn queued(cpu: usize) -> usize {
+        crate::kernel::boot::server_death_work_len(cpu)
+    }
+    /// The full nine-vector, in declared class order.
+    fn v() -> [u32; 9] {
+        c::vector()
+    }
+    /// The canonical successful ServerDies vector.
+    const SUCCESS: [u32; 9] = [1, 1, 1, 1, 1, 1, 1, 1, 1];
+
+    /// The nine classes in declared order, so a vector index and a class agree by
+    /// construction rather than by a hand-written literal.
+    const ALL: [T; 9] = [
+        T::LinkCreated,
+        T::LinkDetached,
+        T::DeferredReserved,
+        T::DeferredPublished,
+        T::DeferredConsumed,
+        T::PeerDeathWinner,
+        T::ResultPublication,
+        T::RunnableTransition,
+        T::CallerEnqueue,
+    ];
+
+    /// Drive the whole happy path once and return the armed terminal identity.
+    fn run_success(fx: &CallerFx) -> TerminalIdentity {
+        let id = arm(fx);
+        assert!(link(fx));
+        assert!(broad_lock_exit_phase(fx));
+        assert_eq!(drain(fx), 1);
+        id
+    }
+
+    /// Ordering stamps: a class that fired carries a non-zero monotonic stamp, a class
+    /// that did not carries none, and every causal edge whose BOTH endpoints fired holds
+    /// strictly. The stamps come from the production `record` sites, so this is an
+    /// assertion about the real execution order, not about the test's own sequencing.
+    fn assert_stamps(expect: [u32; 9]) {
+        for (i, t) in ALL.iter().enumerate() {
+            if expect[i] == 0 {
+                assert_eq!(c::stamp(*t), 0, "{t:?} never fired, so it carries no stamp");
+            } else {
+                assert_ne!(c::stamp(*t), 0, "{t:?} fired, so it is stamped");
+            }
+        }
+        for (a, b) in [
+            (T::LinkCreated, T::LinkDetached),
+            (T::DeferredReserved, T::LinkDetached),
+            (T::LinkDetached, T::DeferredPublished),
+            (T::DeferredPublished, T::DeferredConsumed),
+            (T::DeferredConsumed, T::PeerDeathWinner),
+            (T::PeerDeathWinner, T::ResultPublication),
+            (T::ResultPublication, T::RunnableTransition),
+            (T::RunnableTransition, T::CallerEnqueue),
+        ] {
+            // A class stores its LATEST stamp, so an edge is only a statement about the
+            // execution order when BOTH endpoints fired exactly once. Where a class
+            // repeated (a second reservation, a second exit attempt), the case asserts the
+            // ordering it does hold with an explicit stamp comparison of its own instead.
+            if expect[a as usize] == 1 && expect[b as usize] == 1 {
+                assert!(c::stamp(a) < c::stamp(b), "stamp order {a:?} before {b:?}");
+            }
+        }
+    }
+
+    /// The obligation EVERY race carries, whatever its outcome:
+    ///   1. the exact nine-counter vector,
+    ///   2. the ordering stamps over every class that fired,
+    ///   3. the single committed terminal winner (or none),
+    ///   4. a genuinely late/stale operation that the production seams refuse — and whose
+    ///      refusal moves no counter and cannot change the winner.
+    ///
+    /// The stale probes are the real entry points (`try_claim_reply_terminal_slot` and
+    /// `take_server_reply_link`), presented with an incarnation that never existed, so
+    /// "rejected" means the production code failed closed rather than the test skipping a
+    /// call.
+    fn assert_race(
+        fx: &CallerFx,
+        id: &TerminalIdentity,
+        expect: [u32; 9],
+        win: Option<TerminalClaimant>,
+    ) {
+        assert_eq!(v(), expect, "nine-counter vector");
+        assert_stamps(expect);
+        assert_eq!(winner(fx), win, "single committed terminal winner");
+
+        let mut stale = *id;
+        stale.reply_record_generation = id.reply_record_generation.wrapping_add(0x5eed);
+        assert_ne!(stale, *id, "the probe identity is genuinely stale");
+        let stale_asid = Asid(fx.replier.asid.0.wrapping_add(0x51));
+        assert_ne!(stale_asid, fx.replier.asid);
+
+        let before = v();
+        assert!(
+            !claim_terminal(fx, &stale, TerminalClaimant::CallerExit),
+            "a late claim on a stale record generation is refused in every state"
+        );
+        assert!(
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, stale_asid))
+                .is_none(),
+            "a stale server incarnation detaches nothing"
+        );
+        assert_eq!(v(), before, "a refused operation advances no counter");
+        assert_eq!(
+            winner(fx),
+            win,
+            "a refused operation cannot change the winner"
+        );
+    }
+
+    // ── Part 1: fail-closed rejections (4) ──────────────────────────────────────────
+
+    /// R1 wrong ENDPOINT generation: an item whose record generation no longer matches the
+    /// live slot detaches nothing, wins nothing, publishes nothing, wakes nobody.
+    #[test]
+    fn r01_wrong_endpoint_generation_rejected() {
+        let (_g, fx) = fx_fresh();
+        arm(&fx);
+        assert!(link(&fx));
+        // Publish an item carrying a DIFFERENT record generation than the live slot.
+        let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            res,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation.wrapping_add(7),
+            }
+        ));
+        assert_eq!(drain(&fx), 1, "the item is consumed");
+        assert_eq!(winner(&fx), None, "no terminal winner");
+        assert_eq!(caller_result(&fx), None, "no result published");
+        assert_eq!(live_links(&fx), 1, "the unrelated live link is untouched");
+        let got = v();
+        assert_eq!(got[T::LinkCreated as usize], 1);
+        assert_eq!(got[T::LinkDetached as usize], 0, "nothing detached");
+        assert_eq!(got[T::PeerDeathWinner as usize], 0);
+        assert_eq!(got[T::ResultPublication as usize], 0);
+        assert_eq!(got[T::RunnableTransition as usize], 0);
+        assert_eq!(got[T::CallerEnqueue as usize], 0);
+        assert!(!c::audit_success_path());
+        teardown();
+    }
+
+    /// R2 caller TID reuse with a DIFFERENT ASID: the stale caller incarnation authorizes
+    /// no wake. The armed identity names caller ASID A; the live caller is ASID B.
+    #[test]
+    fn r02_caller_tid_reuse_different_asid_rejected() {
+        let (_g, fx) = fx_fresh();
+        arm(&fx);
+        assert!(link(&fx));
+        // Rebind the caller TID into a DIFFERENT, already-live address space — the same
+        // numeric TID, a new incarnation — before the death completion runs.
+        let other = fx.replier.asid;
+        assert_ne!(other, fx.caller_asid, "a genuinely different incarnation");
+        fx.k.with(|s| s.bind_task_asid(1, other).expect("rebind caller"));
+        assert_eq!(
+            fx.k.with(|s| s.task_asid(1)),
+            Some(other),
+            "the live caller really moved address spaces"
+        );
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(caller_result(&fx), None, "the stale caller is not woken");
+        let got = v();
+        assert_eq!(got[T::ResultPublication as usize], 0);
+        assert_eq!(got[T::RunnableTransition as usize], 0);
+        assert_eq!(got[T::CallerEnqueue as usize], 0);
+        assert!(!c::audit_success_path());
+        teardown();
+    }
+
+    /// R3 server TID reuse with a DIFFERENT ASID: the detach is exact on {tid, asid}, so a
+    /// reused numeric TID removes nothing and the real link survives.
+    #[test]
+    fn r03_server_tid_reuse_different_asid_rejected() {
+        let (_g, fx) = fx_fresh();
+        arm(&fx);
+        assert!(link(&fx));
+        let before = v();
+        let stale = Asid(fx.replier.asid.0.wrapping_add(41));
+        assert_ne!(stale, fx.replier.asid);
+        let taken =
+            fx.k.with(|s| s.take_server_reply_link(fx.replier.tid.0, stale));
+        assert!(
+            taken.is_none(),
+            "a stale server incarnation detaches nothing"
+        );
+        assert_eq!(live_links(&fx), 1, "the real link survives");
+        assert_eq!(
+            v()[T::LinkDetached as usize],
+            before[T::LinkDetached as usize],
+            "no detach was counted"
+        );
+        assert!(!c::audit_success_path());
+        teardown();
+    }
+
+    /// R4 stale TIMEOUT generation: the same slot with a different token generation is not
+    /// the caller's registration. The comparison is four-field, and the guard proves the
+    /// slot-index-only shortcut is explicitly rejected in source.
+    #[test]
+    fn r04_stale_timeout_generation_rejected() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        // A second identity over the SAME record with a different token generation is a
+        // distinct registration and must not satisfy the armed one.
+        let brg =
+            fx.k.with(|s| s.blocked_recv_generation_for(1, fx.caller_asid))
+                .unwrap_or(1);
+        let stale =
+            fx.k.with(|s| {
+                s.reply_terminal_identity(
+                    fx.record_index,
+                    fx.record_generation,
+                    brg,
+                    Some(TOKEN_GEN.wrapping_add(9)),
+                )
+            })
+            .expect("stale identity");
+        assert_ne!(
+            id.deadline_token_generation, stale.deadline_token_generation,
+            "generations really differ"
+        );
+        assert_eq!(
+            id.reply_record_index, stale.reply_record_index,
+            "the SLOT is identical — only the token generation distinguishes them"
+        );
+        // Source: the collector compares all four fields and names the slot-reuse case.
+        assert!(RUNTIME_SRC.contains("if this_idx == armed_idx && this_gen != armed_gen {"));
+        assert!(RUNTIME_SRC.contains("IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION"));
+        for field in [
+            "this_idx == armed_idx",
+            "this_gen == armed_gen",
+            "this_tid == armed_tid",
+            "this_asid == armed_asid",
+        ] {
+            assert!(RUNTIME_SRC.contains(field), "four-field compare: {field}");
+        }
+        teardown();
+    }
+
+    // ── Part 2: 24 deterministic races ──────────────────────────────────────────────
+
+    /// 1. PeerDeath wins normally — the canonical success vector.
+    #[test]
+    fn x01_peer_death_wins_normally() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert!(c::result_before_enqueue());
+        assert!(c::audit_success_path());
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 2. Result publication is stamped strictly before the enqueue.
+    #[test]
+    fn x02_result_stamped_before_enqueue() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert!(c::stamp(T::ResultPublication) < c::stamp(T::CallerEnqueue));
+        assert!(c::stamp(T::PeerDeathWinner) < c::stamp(T::ResultPublication));
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 3. Reply wins BEFORE the death drain: PeerDeath loses, no death publication.
+    #[test]
+    fn x03_reply_wins_before_death_drain() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        // Reply claims the terminal first.
+        assert!(claim_terminal(&fx, &id, TerminalClaimant::Reply));
+        assert_eq!(drain(&fx), 1, "the item is still consumed");
+        assert!(!c::audit_success_path());
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 1, 1, 1, 0, 0, 0, 0],
+            Some(TerminalClaimant::Reply),
+        );
+        teardown();
+    }
+
+    /// 4. Timeout wins BEFORE the death drain: same shape, Timeout owns the terminal.
+    #[test]
+    fn x04_timeout_wins_before_death_drain() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert!(claim_terminal(&fx, &id, TerminalClaimant::Timeout));
+        assert_eq!(drain(&fx), 1);
+        assert!(!c::audit_success_path());
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 1, 1, 1, 0, 0, 0, 0],
+            Some(TerminalClaimant::Timeout),
+        );
+        teardown();
+    }
+
+    /// 5. PeerDeath first, then a late Reply claim loses.
+    #[test]
+    fn x05_late_reply_after_peer_death_loses() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(winner(&fx), Some(TerminalClaimant::PeerDeath));
+        let late = claim_terminal(&fx, &id, TerminalClaimant::Reply);
+        assert!(!late, "the late reply claim loses");
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 6. PeerDeath first, then a late Timeout claim loses.
+    #[test]
+    fn x06_late_timeout_after_peer_death_loses() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(drain(&fx), 1);
+        let late = claim_terminal(&fx, &id, TerminalClaimant::Timeout);
+        assert!(!late, "the late timeout claim loses");
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 7. A duplicate post-lock drain consumes nothing and completes nothing twice.
+    #[test]
+    fn x07_duplicate_drain_is_inert() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        let after_first = v();
+        assert_eq!(drain(&fx), 0, "the queue is empty");
+        assert_eq!(v(), after_first, "no counter advanced on the second drain");
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 8. A duplicate deferred publication collapses to one owner.
+    #[test]
+    fn x08_duplicate_deferred_publication_collapses() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        // A second publication for the SAME record/generation is refused.
+        let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        let dup = crate::kernel::boot::server_death_work_publish(
+            res,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation,
+            },
+        );
+        assert!(!dup, "the duplicate is refused");
+        assert_eq!(queued(0), 1, "one queued item");
+        // The class-2 counter repeated, so its stamp names the SECOND reservation: it is
+        // strictly later than the one and only publication that survived.
+        assert!(
+            c::stamp(T::DeferredReserved) > c::stamp(T::DeferredPublished),
+            "the refused duplicate reserved after the surviving publication"
+        );
+        // Both reservations really happened; only one publication survived.
+        assert_race(&fx, &id, [1, 1, 2, 1, 0, 0, 0, 0, 0], None);
+        teardown();
+    }
+
+    /// 9. Capacity refusal BEFORE the irreversible detach: nothing downstream advances and
+    ///    the link stays attached, so the record keeps an exact owner.
+    #[test]
+    fn x09_capacity_refusal_before_detach() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        // Fill every slot so the reservation fails.
+        let mut held = alloc::vec::Vec::new();
+        while let Some(r) = crate::kernel::boot::server_death_work_reserve(0) {
+            held.push(r);
+        }
+        // Each successful fill reservation is itself a real class-2 transition; the exit
+        // phase then adds none, because its own reservation never succeeds.
+        let filled = v()[T::DeferredReserved as usize];
+        assert_eq!(filled as usize, held.len(), "every fill was counted");
+        assert!(!broad_lock_exit_phase(&fx), "the exit phase declines");
+        assert_eq!(live_links(&fx), 1, "the link is retained");
+        assert_race(&fx, &id, [1, 0, filled, 0, 0, 0, 0, 0, 0], None);
+        for r in held {
+            crate::kernel::boot::server_death_work_release(r);
+        }
+        teardown();
+    }
+
+    /// 10. Stale reply-RECORD generation: consumed, but claims nothing.
+    #[test]
+    fn x10_stale_record_generation_claims_nothing() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            res,
+            DeferredServerDeathCompletion {
+                exiting_server: fx.replier,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation.wrapping_add(1),
+            }
+        ));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(caller_result(&fx), None, "nothing was published");
+        // The link was never detached: only reserve → publish → consume ran.
+        assert_race(&fx, &id, [1, 0, 1, 1, 1, 0, 0, 0, 0], None);
+        teardown();
+    }
+
+    /// 11. Stale SERVER incarnation in the queued item: consumed, claims nothing.
+    #[test]
+    fn x11_stale_server_incarnation_claims_nothing() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        let bogus = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            fx.replier.tid,
+            Asid(fx.replier.asid.0.wrapping_add(23)),
+        );
+        let res = crate::kernel::boot::server_death_work_reserve(0).expect("reserve");
+        assert!(crate::kernel::boot::server_death_work_publish(
+            res,
+            DeferredServerDeathCompletion {
+                exiting_server: bogus,
+                reply_record_index: fx.record_index,
+                reply_record_generation: fx.record_generation,
+            }
+        ));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(caller_result(&fx), None, "a stale server wakes nobody");
+        assert_eq!(live_links(&fx), 1, "the real link is untouched");
+        assert_race(&fx, &id, [1, 0, 1, 1, 1, 0, 0, 0, 0], None);
+        teardown();
+    }
+
+    /// 12. The link→deferred handoff is exact: the published item carries the link's own
+    ///     record coordinates, not the caller's or a re-derived pair.
+    #[test]
+    fn x12_link_to_deferred_handoff_is_exact() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert_eq!(live_links(&fx), 0, "the link moved into the queue");
+        assert_eq!(queued(0), 1);
+        assert_eq!(drain(&fx), 1);
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 13. Reserve strictly precedes detach — the ordering that prevents a stranded caller.
+    #[test]
+    fn x13_reserve_precedes_detach() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert!(
+            c::stamp(T::DeferredReserved) < c::stamp(T::LinkDetached),
+            "the slot is reserved before the irreversible detach"
+        );
+        assert!(c::stamp(T::LinkDetached) < c::stamp(T::DeferredPublished));
+        // Not yet drained: the terminal is still unclaimed.
+        assert_race(&fx, &id, [1, 1, 1, 1, 0, 0, 0, 0, 0], None);
+        teardown();
+    }
+
+    /// 14. Consumption follows publication.
+    #[test]
+    fn x14_consume_follows_publish() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert!(c::stamp(T::DeferredPublished) < c::stamp(T::DeferredConsumed));
+        assert!(c::stamp(T::DeferredConsumed) < c::stamp(T::PeerDeathWinner));
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 15. Link creation precedes detachment.
+    #[test]
+    fn x15_link_created_before_detached() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert!(c::stamp(T::LinkCreated) < c::stamp(T::LinkDetached));
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 16. Exactly one caller wake: the runnable transition and the enqueue each fire once.
+    #[test]
+    fn x16_exactly_one_caller_wake() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(caller_result(&fx), Some(SERVER_DIED));
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 17. Exactly one terminal winner across a repeated drive attempt.
+    #[test]
+    fn x17_exactly_one_terminal_winner() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        // A second exit phase reserves, finds no link, and releases without publishing —
+        // so only the reservation class moves.
+        assert!(!broad_lock_exit_phase(&fx));
+        assert_eq!(drain(&fx), 0);
+        // The repeated class-2 stamp names the SECOND attempt, which ran after the whole
+        // first transaction had already committed and woken the caller.
+        assert!(
+            c::stamp(T::DeferredReserved) > c::stamp(T::CallerEnqueue),
+            "the second exit attempt began after the first transaction finished"
+        );
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 2, 1, 1, 1, 1, 1, 1],
+            Some(TerminalClaimant::PeerDeath),
+        );
+        teardown();
+    }
+
+    /// 18. No reverse-link leak on the success path.
+    #[test]
+    fn x18_no_reverse_link_leak() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(live_links(&fx), 0);
+        assert_eq!(v()[T::LinkCreated as usize], v()[T::LinkDetached as usize]);
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 19. No deferred-item leak on the success path.
+    #[test]
+    fn x19_no_deferred_item_leak() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(queued(0), 0);
+        assert_eq!(
+            v()[T::DeferredPublished as usize],
+            v()[T::DeferredConsumed as usize]
+        );
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 20. A losing reply path leaves no orphaned link or deferred item.
+    #[test]
+    fn x20_losing_reply_leaves_no_orphans() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert!(claim_terminal(&fx, &id, TerminalClaimant::Reply));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(live_links(&fx), 0, "no orphaned link");
+        assert_eq!(queued(0), 0, "no orphaned deferred item");
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 1, 1, 1, 0, 0, 0, 0],
+            Some(TerminalClaimant::Reply),
+        );
+        teardown();
+    }
+
+    /// 21. A losing timeout path leaves no orphaned link or deferred item.
+    #[test]
+    fn x21_losing_timeout_leaves_no_orphans() {
+        let (_g, fx) = fx_fresh();
+        let id = arm(&fx);
+        assert!(link(&fx));
+        assert!(broad_lock_exit_phase(&fx));
+        assert!(claim_terminal(&fx, &id, TerminalClaimant::Timeout));
+        assert_eq!(drain(&fx), 1);
+        assert_eq!(live_links(&fx), 0);
+        assert_eq!(queued(0), 0);
+        assert_race(
+            &fx,
+            &id,
+            [1, 1, 1, 1, 1, 0, 0, 0, 0],
+            Some(TerminalClaimant::Timeout),
+        );
+        teardown();
+    }
+
+    /// 22. The death completion copies NO user memory — the caller receives a code, and the
+    ///     reply payload is never delivered.
+    #[test]
+    fn x22_no_user_memory_copy_on_death() {
+        let (_g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_eq!(
+            caller_result(&fx),
+            Some(SERVER_DIED),
+            "a code, not a payload"
+        );
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        let comp = comp.split("\n}\n").next().unwrap();
+        let code: alloc::string::String = comp
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in ["copy_to_user", "copy_from_user", "write_user", "payload"] {
+            assert!(!code.contains(forbidden), "no user copy ({forbidden})");
+        }
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 23. Two independent records: each gets its own single winner, and the counters sum
+    ///     to two without any class double-counting within a record.
+    #[test]
+    fn x23_two_records_do_not_cross_contaminate() {
+        let (g, fx) = fx_fresh();
+        let id = run_success(&fx);
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+        // Release the globals guard before re-acquiring it for the second instance — the
+        // mutex is not reentrant, and the point of this case is that instance 2 starts
+        // from zero even though instance 1 really ran to completion first.
+        drop(fx);
+        drop(g);
+        // A second, independent instance starts from zero.
+        let (_g2, fx2) = fx_fresh();
+        assert_eq!(v(), [0u32; 9], "the new instance inherits nothing");
+        assert_eq!(c::stamp(T::PeerDeathWinner), 0, "stamps reset with it");
+        let id2 = run_success(&fx2);
+        assert_race(&fx2, &id2, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        teardown();
+    }
+
+    /// 24. The collector gate is CAUSAL, not a timing race: it stays held across the whole
+    ///     death transaction — so no timeout claimant can be collected while PeerDeath is
+    ///     deciding — and it is released ONLY by the caller's own userspace validation
+    ///     carrying the canonical code. Every near-miss message is a real rejected release.
+    #[test]
+    fn x24_collector_release_requires_user_validation() {
+        let (_g, fx) = fx_fresh();
+        let prev = crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode();
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES,
+        );
+        crate::kernel::boot::hold_reply_timeout_collector();
+        assert!(
+            crate::kernel::boot::reply_timeout_collector_held(),
+            "the gate arms in ServerDies mode"
+        );
+
+        let id = run_success(&fx);
+        assert!(
+            crate::kernel::boot::reply_timeout_collector_held(),
+            "the gate is still held after the terminal was decided"
+        );
+
+        // Near-miss userspace output never releases it — including the SAME marker
+        // carrying a code that is not the canonical ServerDied.
+        for msg in [
+            "IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code=9 result=ok",
+            "IPC_SERVER_DEATH_COLLECTOR_RELEASED released_by=caller result=ok",
+            "IPC_REPLY_TIMEOUT_ORACLE_CLIENT_REPLY_RECV plen=4 reply_ok=0",
+            "unrelated",
+        ] {
+            crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg);
+            assert!(
+                crate::kernel::boot::reply_timeout_collector_held(),
+                "`{msg}` must not release the gate"
+            );
+        }
+        // Only the caller's own validated canonical code releases it.
+        crate::kernel::boot::maybe_release_reply_timeout_collector_gate(
+            "IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code=10 result=ok",
+        );
+        assert!(
+            !crate::kernel::boot::reply_timeout_collector_held(),
+            "userspace validation releases the gate"
+        );
+
+        assert_race(&fx, &id, SUCCESS, Some(TerminalClaimant::PeerDeath));
+        crate::kernel::boot::set_x86_ipc_reply_timeout_oracle_mode(prev);
+        teardown();
+    }
+
+    // ── Part 3: wiring guards ───────────────────────────────────────────────────────
+
+    /// Every production caller of the post-lock death drain invokes it after its broad
+    /// guard has dropped — checked per architecture, at the real call sites.
+    #[test]
+    fn w01_every_drain_caller_is_post_lock() {
+        // x86_64 + AArch64 share the post-`with_cpu` section.
+        let shared = TRAP_ENTRY_SRC
+            .split("pub fn handle_trap_entry_shared")
+            .nth(1)
+            .expect("shared entry");
+        let released = shared
+            .find("// `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.")
+            .expect("release boundary");
+        let call = shared
+            .find("shared.drain_server_death_post_work(cpu)")
+            .expect("shared drain call");
+        assert!(released < call, "shared drain is post-guard");
+        // RISC-V drives its own Phase 3.
+        let rv = RV_TRAP_SRC
+            .split("pub fn handle_riscv_trap_entry_shared")
+            .nth(1)
+            .expect("riscv wrapper");
+        let phase3 = rv
+            .find("// ── Phase 3: post-lock drain (broad guard released) ──")
+            .expect("phase 3");
+        let rv_call = rv
+            .find("shared.drain_server_death_post_work(cpu)")
+            .expect("riscv drain call");
+        assert!(phase3 < rv_call, "riscv drain is in Phase 3");
+        // Exactly two production call sites, one per driver.
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("shared.drain_server_death_post_work(cpu)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            RV_TRAP_SRC
+                .matches("shared.drain_server_death_post_work(cpu)")
+                .count(),
+            1
+        );
+    }
+
+    /// The post-lock markers are emitted inside the drain, which is only reachable post-guard.
+    #[test]
+    fn w02_post_lock_markers_only_in_post_guard_code() {
+        let drain = RUNTIME_SRC
+            .split("pub(crate) fn drain_server_death_post_work")
+            .nth(1)
+            .expect("drain");
+        let drain = drain.split("\n    /// ").next().unwrap();
+        for m in [
+            "IPC_SERVER_DEATH_BROAD_LOCK_RELEASED",
+            "IPC_SERVER_DEATH_POST_LOCK_DRAIN_BEGIN",
+        ] {
+            assert!(drain.contains(m), "{m} lives in the drain");
+            let at = drain.find(m).unwrap();
+            let end = at + drain[at..].find("result=ok").expect("terminated");
+            assert!(
+                drain[at..end].contains("broad_lock=0"),
+                "{m} states broad_lock=0"
+            );
+        }
+        // The in-lock exit-phase markers deliberately carry no broad_lock=0.
+        let exit = RESTART_SRC
+            .split("IPC_SERVER_DEATH_DEFERRED_RESERVED")
+            .nth(1)
+            .expect("reserved marker");
+        let exit = exit.split("result=ok").next().unwrap();
+        assert!(
+            !exit.contains("broad_lock=0"),
+            "in-lock marker makes no post-lock claim"
+        );
+    }
+
+    /// DEFERRED_RESERVED precedes the detach, and DEFERRED_PUBLISHED follows it — in source.
+    #[test]
+    fn w03_reserve_before_detach_before_publish_in_source() {
+        let blk = RESTART_SRC
+            .split("let death_link = match crate::kernel::boot::server_death_work_reserve(cpu_idx)")
+            .nth(1)
+            .expect("exit block");
+        let reserved = blk
+            .find("IPC_SERVER_DEATH_DEFERRED_RESERVED")
+            .expect("reserved");
+        let detach = blk
+            .find("take_server_reply_link(tid, exit_identity.asid)")
+            .expect("detach");
+        let captured = blk
+            .find("IPC_SERVER_DEATH_LINK_CAPTURED")
+            .expect("captured");
+        let published = blk
+            .find("IPC_SERVER_DEATH_DEFERRED_PUBLISHED")
+            .expect("published");
+        assert!(reserved < detach, "reserved attested before the detach");
+        assert!(detach < captured, "capture attested after the real detach");
+        assert!(captured < published, "publication attested last");
+        // LINK_CAPTURED carries the full server identity and record coordinates.
+        for f in [
+            "server_tid=",
+            "server_asid=",
+            "record_index=",
+            "record_generation=",
+        ] {
+            assert!(
+                RESTART_SRC.contains(&alloc::format!("IPC_SERVER_DEATH_LINK_CAPTURED {f}"))
+                    || RESTART_SRC.contains(f),
+                "LINK_CAPTURED carries {f}"
+            );
+        }
+    }
+
+    /// TERMINAL_CLAIM follows the real CAS; COMPLETION_COMMITTED follows the real
+    /// publication; CALLER_ENQUEUED follows the real enqueue; commit precedes enqueue.
+    #[test]
+    fn w04_completion_markers_follow_their_real_operations() {
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        let cas = comp
+            .rfind("rt_commit_reply_terminal(d, record_index, &terminal_owner);")
+            .expect("terminal commit");
+        let claim = comp
+            .find("IPC_SERVER_DEATH_TERMINAL_CLAIM")
+            .expect("claim marker");
+        assert!(cas < claim, "claim marker follows the real commit");
+        let pub_op = comp
+            .find("rt_commit_receiver_runnable(")
+            .expect("publication");
+        let committed = comp
+            .find("IPC_SERVER_DEATH_COMPLETION_COMMITTED")
+            .expect("committed marker");
+        assert!(pub_op < committed);
+        let enq = comp.find("d.rtd_enqueue(caller.tid.0);").expect("enqueue");
+        let enq_m = comp
+            .find("IPC_SERVER_DEATH_CALLER_ENQUEUED")
+            .expect("enqueue marker");
+        assert!(enq < enq_m);
+        assert!(
+            committed < enq,
+            "the commit marker precedes the real enqueue"
+        );
+        // Marker argument contracts.
+        assert!(comp.contains("terminal=PeerDeath result=won"));
+        assert!(comp.contains("code={} caller_tid={} caller_asid={} record_index={} record_generation={} runnable=1 broad_lock=0"));
+        assert!(comp.contains("enqueues=1 broad_lock=0"));
+    }
+
+    /// `record_server_dies_stale_token` is called at the real arm site, immediately after
+    /// the token is published into the caller's TCB.
+    #[test]
+    fn w05_stale_token_recorded_at_the_real_arm_site() {
+        let arm_fn = IPC_SRC
+            .split("tcb.reply_timeout_token = Some(handle);")
+            .nth(1)
+            .expect("arm site");
+        let tcb_done = arm_fn.find("});").expect("tcb write closes");
+        let rec = arm_fn
+            .find("record_server_dies_stale_token(")
+            .expect("recorded at the arm site");
+        assert!(tcb_done < rec, "recorded after the TCB publication");
+        assert!(
+            arm_fn[..rec].len() < 900,
+            "immediately after, not elsewhere"
+        );
+        for f in [
+            "handle.identity().token_index",
+            "handle.identity().token_generation",
+            "caller.tid.0",
+            "caller.asid.0",
+        ] {
+            assert!(arm_fn.contains(f), "records {f}");
+        }
+    }
+
+    /// No private per-port ServerDies table, and no oracle-only completion helper.
+    #[test]
+    fn w06_no_private_tables_or_oracle_completion_helper() {
+        for (name, src) in [
+            ("init service", INIT_SRC),
+            ("trap_entry", TRAP_ENTRY_SRC),
+            ("riscv trap", RV_TRAP_SRC),
+        ] {
+            assert!(
+                !src.contains("server_dies_counters"),
+                "{name} must hold no ServerDies accounting"
+            );
+        }
+        // The only completion entry point is the production transaction.
+        assert_eq!(
+            IPC_SRC
+                .matches("pub(crate) fn complete_server_death_over")
+                .count(),
+            1
+        );
+        // The oracle must not CALL any death helper. Comments are stripped first: the
+        // oracle documents in prose which helpers it deliberately does not call, and a
+        // guard that fired on that prose would be guarding a comment, not the wiring.
+        let init_code: alloc::string::String = INIT_SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "complete_server_death",
+            "exit_task(",
+            "rt_commit_receiver_runnable",
+            "server_death_work_publish",
+            "take_server_reply_link",
+        ] {
+            assert!(
+                !init_code.contains(forbidden),
+                "the oracle must not call {forbidden}"
+            );
+        }
+    }
+
+    /// The success audit has a REAL production caller, so its literals survive linking.
+    #[test]
+    fn w07_audit_has_a_production_caller() {
+        let comp = IPC_SRC
+            .split("pub(crate) fn complete_server_death_over")
+            .nth(1)
+            .expect("completion");
+        assert!(
+            comp.contains("server_dies_counters::audit_success_path()"),
+            "the audit is invoked from the completion transaction"
+        );
+        let ok = comp.find("IPC_SERVER_DEATH_OK").expect("ok marker");
+        let audit = comp.find("audit_success_path()").expect("audit");
+        assert!(ok < audit, "audited after the transaction completed");
+        // Nothing downstream branches on the verdict.
+        assert!(comp.contains("if ok { \"ok\" } else { \"fail\" }"));
+    }
+
+    /// The collector release is wired to USERSPACE validation, not to a kernel-internal
+    /// event: the predicate reads the caller's own marker plus the canonical code, the
+    /// gate performs no production action of its own, and the oracle emits that marker
+    /// only after comparing the numeric code it actually received.
+    #[test]
+    fn w08_collector_release_runs_through_userspace_validation() {
+        let rel = MOD_SRC
+            .split("pub(crate) fn maybe_release_reply_timeout_collector_gate(msg: &str) {")
+            .nth(1)
+            .expect("release fn");
+        let rel = rel.split("\n}\n").next().unwrap();
+        assert!(rel.contains("msg.starts_with(\"IPC_SERVER_DEATH_USER_VALIDATED\")"));
+        assert!(rel.contains("msg.contains(\"code=10\")"));
+        assert!(
+            rel.contains("released_by_reply || released_by_server_death")
+                || rel.contains("!released_by_reply && !released_by_server_death")
+        );
+        // The gate withholds an opportunity; it never performs a terminal action.
+        for forbidden in [
+            "claim_reply_terminal",
+            "take_server_reply_link",
+            "rt_commit_receiver_runnable",
+            "rtd_enqueue",
+            "reply_cap_generations",
+        ] {
+            assert!(!rel.contains(forbidden), "the gate must not {forbidden}");
+        }
+        // The DebugLog seam is the ONLY release path, and it is an unconditional call site
+        // (the off-feature build keeps a no-op of the same name).
+        assert!(MOD_SRC.contains(
+            "#[cfg(not(feature = \"ipc-reply-timeout-oracle-core\"))]\npub(crate) fn maybe_release_reply_timeout_collector_gate(_msg: &str) {}"
+        ));
+        // Userspace emits the releasing marker only after comparing the numeric code.
+        assert!(INIT_SRC.contains("IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code={}"));
+        assert!(INIT_SRC.contains("SyscallError::ServerDied as u32"));
+        // And the collector really consults the gate before publishing any timeout work.
+        let collect = RUNTIME_SRC
+            .split("fn collect_due_reply_timeout_work")
+            .nth(1)
+            .expect("collector");
+        let collect = collect.split("\n    }\n").next().unwrap();
+        assert!(
+            collect.contains("reply_timeout_collector_held()"),
+            "the collector reads the gate"
+        );
+    }
+
+    /// All FIFTEEN hard-fail literals attach to a real production operation: each one lives
+    /// inside a named production function whose body actually performs the operation the
+    /// literal reports on. A literal that merely exists somewhere in the file would satisfy
+    /// a `contains` check but not this one — the enclosing function and the operation it
+    /// performs are both named.
+    #[test]
+    fn w09_fifteen_literals_attach_to_real_operations() {
+        // (literal, source, enclosing production fn, an operation that fn really performs)
+        let table: [(&str, &str, &str, &str); 15] = [
+            // The oracle's own server really returns from NR16 before this is emitted.
+            (
+                "IPC_SERVER_DEATH_EXIT_RETURNED",
+                INIT_SRC,
+                // The ServerDies server, distinguished from the sibling oracle's
+                // `server_run() -> ServerOutcome` by having no return type.
+                "unsafe fn server_run() {",
+                "exit_current_task()",
+            ),
+            (
+                "IPC_SERVER_DEATH_DUPLICATE_DEFERRED",
+                RESTART_SRC,
+                "fn exit_task",
+                "server_death_work_publish(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY",
+                RUNTIME_SRC,
+                "fn drain_server_death_post_work",
+                "server_death_work_drain_next(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_RECORD_GENERATION",
+                RUNTIME_SRC,
+                "fn drain_server_death_post_work",
+                "server_death_work_drain_next(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_CALLER_IDENTITY",
+                IPC_SRC,
+                "fn complete_server_death_over",
+                "rt_is_blocked_receiver_exact(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_ENDPOINT_GENERATION",
+                IPC_SRC,
+                "fn complete_server_death_over",
+                "rt_endpoint_generation_read(",
+            ),
+            (
+                "IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION",
+                RUNTIME_SRC,
+                "fn collect_due_reply_timeout_work",
+                "server_dies_stale_token()",
+            ),
+            (
+                "IPC_SERVER_DEATH_DUPLICATE_COMPLETION",
+                MOD_SRC,
+                "pub fn record(t: Transition)",
+                "fetch_add(1",
+            ),
+            (
+                "IPC_SERVER_DEATH_DUPLICATE_WAKE",
+                MOD_SRC,
+                "pub fn record(t: Transition)",
+                "fetch_add(1",
+            ),
+            (
+                "IPC_SERVER_DEATH_LINK_LEAK",
+                MOD_SRC,
+                "pub fn audit_success_path()",
+                "count(T::LinkCreated) != count(T::LinkDetached)",
+            ),
+            (
+                "IPC_SERVER_DEATH_RECORD_LEAK",
+                MOD_SRC,
+                "pub fn audit_success_path()",
+                "count(T::LinkDetached) != count(T::PeerDeathWinner)",
+            ),
+            (
+                "IPC_SERVER_DEATH_DEFERRED_LEAK",
+                MOD_SRC,
+                "pub fn audit_success_path()",
+                "count(T::DeferredPublished) != count(T::DeferredConsumed)",
+            ),
+            (
+                "IPC_SERVER_DEATH_TIMEOUT_WON",
+                RUNTIME_SRC,
+                "fn drain_reply_timeout_post_work",
+                "complete_reply_timeout_over(",
+            ),
+            (
+                "IPC_SERVER_DEATH_LATE_REPLY_ACCEPTED",
+                IPC_SRC,
+                "fn reserve_reply_win_before_copy",
+                "self.try_reserve_reply_win_before_copy(reply_cap)",
+            ),
+            (
+                "IPC_SERVER_DEATH_STALE_AUTHORITY_RESTORED",
+                IPC_SRC,
+                "fn restore_deadline_reply_lease",
+                "t.restore_reply_lease(owner)",
+            ),
+        ];
+        for (lit, src, enclosing, operation) in table {
+            let body = src
+                .split(enclosing)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{lit}: no production fn `{enclosing}`"));
+            // Bound the search to the enclosing item, not the rest of the file.
+            let body = body.split("\n    pub").next().unwrap();
+            assert!(
+                body.contains(lit),
+                "{lit} must live inside `{enclosing}`, not merely somewhere in the file"
+            );
+            assert!(
+                body.contains(operation),
+                "`{enclosing}` must really perform `{operation}` for {lit} to be attached"
+            );
+        }
+        // And none of the fifteen is emitted from userspace except the one that reports the
+        // oracle server's own returned-from-NR16 failure.
+        for lit in table.iter().map(|t| t.0) {
+            if lit != "IPC_SERVER_DEATH_EXIT_RETURNED" {
+                assert!(
+                    !INIT_SRC.contains(lit),
+                    "{lit} is a kernel verdict; userspace must not emit it"
+                );
+            }
+        }
+    }
+}
+
+/// Stage 200D-2B1C — the three-architecture return contract and live-readiness wiring.
+///
+/// The `CurrentTaskExited` consumers themselves landed in Stages 200D-0B3 / 0C1 / 0D1 and were
+/// live-proven per architecture. What this module pins is the CONTRACT they jointly implement,
+/// as a contract: for every port, both outcomes (a replacement task, and no runnable task at
+/// all) are handled, the full `{tid, asid}` incarnation is validated, the exited task's old
+/// userspace frame is never written, and each port keeps its own epilogue ownership without
+/// adding a duplicate cleanup.
+#[cfg(test)]
+mod stage200d2b1c_arch_return {
+    const X86: &str = include_str!("../../arch/x86_64/trap.rs");
+    const SHARED: &str = include_str!("../../arch/trap_entry.rs");
+    const RV: &str = include_str!("../../arch/riscv64/trap.rs");
+    const CMDLINE: &str = include_str!("../boot_command_line.rs");
+    const INIT: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    /// Exactly one production consumer per port — the disposition is one-shot, so a second
+    /// `take_...` anywhere would silently swallow it for the other.
+    #[test]
+    fn a01_one_consumer_per_architecture() {
+        for (arch, src) in [("x86_64", X86), ("aarch64", SHARED), ("riscv64", RV)] {
+            assert_eq!(
+                src.matches("take_post_lock_trap_disposition(").count(),
+                1,
+                "{arch} must have exactly one disposition consumer"
+            );
+        }
+    }
+
+    /// Every port validates the FULL incarnation, not a bare numeric TID.
+    #[test]
+    fn a02_full_exiting_identity_is_validated() {
+        for (arch, src) in [("x86_64", X86), ("aarch64", SHARED), ("riscv64", RV)] {
+            assert!(
+                src.contains("CurrentTaskExited { tid, asid }"),
+                "{arch} must bind both halves of the incarnation"
+            );
+            // Semantic, not lexical: each port reads the live ASID bound to that TID and
+            // compares it with the published one, treating a fully reaped TCB as safe. The
+            // three ports bind the matched value under different names, so assert the
+            // property rather than one port's spelling.
+            let consumer = src
+                .split("CurrentTaskExited { tid, asid }")
+                .nth(1)
+                .expect("consumer");
+            assert!(
+                consumer.contains("kernel.task_asid(tid)") && consumer.contains("== asid"),
+                "{arch} must compare the published ASID against the live binding"
+            );
+            assert!(
+                consumer.contains("None => true"),
+                "{arch} must treat a fully reaped TCB as unimpersonatable"
+            );
+            assert!(
+                src.contains("EXIT_TASK_WRONG_IDENTITY"),
+                "{arch} must fail closed on a mismatched incarnation"
+            );
+        }
+    }
+
+    /// The exiting task must never be the restore owner, and must never be current.
+    #[test]
+    fn a03_exited_task_is_never_restored() {
+        for (arch, src) in [("x86_64", X86), ("aarch64", SHARED), ("riscv64", RV)] {
+            assert!(
+                src.contains("EXIT_TASK_EXITING_STILL_CURRENT"),
+                "{arch} must fail closed if the exiting task is still current"
+            );
+            assert!(
+                src.contains("EXIT_TASK_RESELECTED_EXITING_TASK"),
+                "{arch} must fail closed if the exiting task is reselected as replacement"
+            );
+            assert!(
+                src.contains("EXIT_TASK_ABSENCE_VALIDATED"),
+                "{arch} must attest the exiting task's absence before restoring anyone"
+            );
+        }
+    }
+
+    /// Both outcomes exist on every port: a replacement, and the established idle path.
+    #[test]
+    fn a04_replacement_and_idle_paths_exist_on_every_arch() {
+        for (arch, src, owner_marker) in [
+            ("x86_64", X86, "EXIT_TASK_RESTORE_OWNER_PREPARED"),
+            ("aarch64", SHARED, "EXIT_TASK_RESTORE_OWNER"),
+            ("riscv64", RV, "EXIT_TASK_RESTORE_OWNER"),
+        ] {
+            let replacement = alloc::format!("{owner_marker} arch={arch} owner=replacement");
+            let idle = alloc::format!("{owner_marker} arch={arch} owner=idle");
+            assert!(
+                src.contains(&replacement),
+                "{arch} must name a replacement restore owner"
+            );
+            assert!(
+                src.contains(&idle),
+                "{arch} must name the idle restore owner when nothing is runnable"
+            );
+        }
+    }
+
+    /// The idle branch enters each port's ESTABLISHED idle primitive rather than inventing a
+    /// second one — AArch64 the shared no-ERET loop, RISC-V its typed idle outcome.
+    #[test]
+    fn a05_idle_branch_uses_the_established_primitive() {
+        assert!(
+            SHARED.contains("idle_no_eret_loop()"),
+            "aarch64 must enter the established no-ERET idle loop"
+        );
+        assert!(
+            RV.contains("RiscvIdleReason::ExitCurrentTaskNoRunnable"),
+            "riscv64 must enter its typed idle terminal with a named reason"
+        );
+        // x86_64 selects the owner in-lock and lets the ordinary epilogue run; it must not
+        // grow an idle loop of its own inside the consumer.
+        let consumer = X86
+            .split("PostLockTrapDisposition::CurrentTaskExited { tid, asid }")
+            .nth(1)
+            .expect("x86_64 consumer");
+        let consumer = consumer.split("\n    }").next().unwrap_or(consumer);
+        assert!(
+            !consumer.contains("idle_halt_loop") && !consumer.contains("loop {"),
+            "the x86_64 consumer must not introduce its own idle loop"
+        );
+    }
+
+    /// Each port keeps its OWN epilogue/depth ownership, and adds no duplicate cleanup.
+    #[test]
+    fn a06_no_duplicate_epilogue_or_depth_cleanup() {
+        // AArch64: hardware ERET owns cleanup; the shared section states the ownership.
+        assert!(
+            SHARED.contains("EXIT_TASK_TRAP_DEPTH_OWNER"),
+            "aarch64 must state its trap-depth ownership"
+        );
+        // RISC-V: the trap bridge owns the single sret, and the consumer clears nothing.
+        assert!(
+            RV.contains("software_depth_clears=0"),
+            "riscv64 must record zero consumer-side depth clears"
+        );
+        // x86_64 owns a real software depth counter, but the consumer must not write it.
+        let consumer = X86
+            .split("PostLockTrapDisposition::CurrentTaskExited { tid, asid }")
+            .nth(1)
+            .expect("x86_64 consumer");
+        let consumer = consumer.split("\n    }").next().unwrap_or(consumer);
+        for forbidden in ["TRAP_DISPATCH_DEPTH.store", "TRAP_DISPATCH_DEPTH.fetch"] {
+            assert!(
+                !consumer.contains(forbidden),
+                "the x86_64 consumer must not write the trap depth ({forbidden})"
+            );
+        }
+    }
+
+    /// The two ports that consume post-lock say so where it is checkable, and the x86_64 port
+    /// — which consumes in-lock by design — defers every frame effect past the drains.
+    #[test]
+    fn a07_lock_and_drain_position_is_explicit_per_port() {
+        for (arch, src) in [("aarch64", SHARED), ("riscv64", RV)] {
+            let released = alloc::format!("EXIT_TASK_BROAD_LOCK_RELEASED arch={arch}");
+            let drained = alloc::format!("EXIT_TASK_POST_LOCK_DRAIN_DONE arch={arch}");
+            assert!(src.contains(&released), "{arch} must attest lock release");
+            assert!(
+                src.contains(&drained),
+                "{arch} must attest drain completion"
+            );
+            let consumed = alloc::format!("EXIT_TASK_DISPOSITION_CONSUMED arch={arch}");
+            let c = src.find(&consumed).expect("consumed marker");
+            assert!(
+                src[..c].contains(&released) && src[..c].contains(&drained),
+                "{arch} must release the lock and drain BEFORE consuming"
+            );
+            assert!(
+                src.contains(&alloc::format!(
+                    "{consumed} tid={{}} asid={{}} cpu={{}} broad_lock=0"
+                )),
+                "{arch} must consume with broad_lock=0"
+            );
+        }
+        // x86_64 consumes in-lock and says broad_lock=1 rather than claiming otherwise; the
+        // frame is committed later, in the vector epilogue.
+        assert!(
+            X86.contains(
+                "EXIT_TASK_DISPOSITION_CONSUMED arch=x86_64 tid={} asid={} cpu={} broad_lock=1"
+            ),
+            "the x86_64 consumer must state that it runs under the broad lock"
+        );
+        assert!(
+            X86.contains("flush_trap_context_to_iret_frame"),
+            "x86_64 must defer the hardware frame commit to the vector epilogue"
+        );
+    }
+
+    /// The consumer performs no production side effect: no teardown, enqueue, terminal claim
+    /// or user copy may ride along on the return path.
+    #[test]
+    fn a08_consumer_has_no_production_side_effects() {
+        for (arch, src, anchor) in [
+            (
+                "x86_64",
+                X86,
+                "PostLockTrapDisposition::CurrentTaskExited { tid, asid }",
+            ),
+            (
+                "aarch64",
+                SHARED,
+                "PostLockTrapDisposition::CurrentTaskExited { tid, asid }",
+            ),
+            (
+                "riscv64",
+                RV,
+                "PostLockTrapDisposition::CurrentTaskExited { tid, asid }",
+            ),
+        ] {
+            let consumer = src.split(anchor).nth(1).expect("consumer");
+            let consumer = consumer.split("\n    }").next().unwrap_or(consumer);
+            for forbidden in [
+                "copy_to_user",
+                "rtd_enqueue",
+                "try_claim_peer_death_terminal",
+                "complete_server_death_over",
+                "exit_task(",
+            ] {
+                assert!(
+                    !consumer.contains(forbidden),
+                    "the {arch} consumer must not perform `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    // ── Live-readiness wiring ───────────────────────────────────────────────────────────
+
+    /// Stage 200D-2B1C: the ServerDies scenario is REACHABLE from a boot command line on all
+    /// three ports. `IPC_REPLY_TIMEOUT_MODE_SERVER_DIES` existed and the whole mechanism was
+    /// wired behind it, but no selector value mapped to it, so it could never run live.
+    #[test]
+    fn a09_server_dies_selector_is_forwarded_on_every_port() {
+        assert_eq!(
+            CMDLINE.matches("b\"server-dies\" | b\"3\" => {").count(),
+            3,
+            "all three per-arch selectors must accept `server-dies`"
+        );
+        assert_eq!(
+            CMDLINE
+                .matches("Some(crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES)")
+                .count(),
+            3,
+            "each `server-dies` arm must map to the ServerDies mode"
+        );
+        for knob in [
+            "yarm.x86_64_ipc_reply_timeout_oracle",
+            "yarm.aarch64_ipc_reply_timeout_oracle",
+            "yarm.riscv_ipc_reply_timeout_oracle",
+        ] {
+            assert!(
+                CMDLINE.contains(knob),
+                "missing per-arch selector knob: {knob}"
+            );
+        }
+        // An unrecognized value must still leave the oracle inert.
+        assert_eq!(
+            CMDLINE.matches("_ => None,").count() >= 3,
+            true,
+            "an unknown selector value must leave the oracle inert"
+        );
+    }
+
+    /// The ServerDies userspace task is DISPOSABLE: it exits through the ordinary NR16 and any
+    /// return from it is a hard failure, never a fallback.
+    #[test]
+    fn a10_server_dies_oracle_task_is_disposable() {
+        assert!(
+            INIT.contains("yarm_user_rt::syscall::exit_current_task()"),
+            "the ServerDies server must exit through the ordinary syscall"
+        );
+        assert!(
+            INIT.contains("IPC_SERVER_DEATH_EXIT_RETURNED err={:?} result=fail"),
+            "a returning NR16 must be a hard failure, not a fallback"
+        );
+        // The scenario is decoded through the shared ABI, not a private per-port table.
+        assert!(
+            INIT.contains("ipc_reply_liveness_scenario_for_current_arch"),
+            "scenario selection must go through the shared ABI decoder"
+        );
+    }
+}
+
+/// Stage 200D-2B1D1 — the ordinary queued `IpcCall` reply-cap path registers the bounded
+/// reverse `ServerReplyLink`.
+///
+/// Until this stage the only production creator of a link was the IpcCall-DIRECT transaction,
+/// so a bound server exiting after an ORDINARY call left `exit_task` with nothing to detach and
+/// the whole server-death chain could not begin. Stage 200D-2B1D-x86 caught that live. These
+/// cases pin the ordinary path's own registration, its rollback, and the identity/generation
+/// exactness that stops a stale incarnation from detaching a live record's authority.
+#[cfg(test)]
+mod stage200d2b1d1_ordinary_link {
+    use super::*;
+    use crate::kernel::ipc::ThreadId;
+    use crate::runtime::SharedKernel;
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+
+    /// Two tasks in distinct address spaces, plus a reply endpoint the caller can receive on.
+    fn fx() -> (SharedKernel, Asid, Asid, CapId) {
+        let mut k = Bootstrap::init().expect("init");
+        let (caller_asid, _) = k.create_user_address_space().expect("caller asid");
+        let (server_asid, _) = k.create_user_address_space().expect("server asid");
+        k.register_task(1).expect("caller");
+        k.register_task(2).expect("server");
+        k.bind_task_asid(1, caller_asid).expect("bind caller");
+        k.bind_task_asid(2, server_asid).expect("bind server");
+        // The reply endpoint is created in task 0's cnode; the CALLER must hold the receive
+        // cap in its own cnode for `create_reply_cap_for_caller` to resolve it.
+        let (_eid, _send, recv_global) = k.create_endpoint(4).expect("reply endpoint");
+        let recv = k
+            .grant_capability_task_to_task(0, recv_global, 1)
+            .expect("grant reply-recv to the caller");
+        (SharedKernel::new(k), caller_asid, server_asid, recv)
+    }
+
+    /// Ordinary success: a call with a BOUND responder creates exactly one link, carrying the
+    /// server's full incarnation and the record's own index+generation.
+    #[test]
+    fn d01_ordinary_call_registers_exactly_one_link() {
+        let (k, _caller_asid, server_asid, recv) = fx();
+        k.with(|s| {
+            assert_eq!(
+                s.live_server_reply_link_count(),
+                0,
+                "no link before the call"
+            );
+            let cap = s
+                .create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                .expect("ordinary reply cap");
+            assert_ne!(cap.0, 0);
+            assert_eq!(
+                s.live_server_reply_link_count(),
+                1,
+                "the ordinary path must create exactly one link"
+            );
+            // The link is detachable ONLY by the exact server incarnation.
+            let taken = s.take_server_reply_link(2, server_asid);
+            let link = taken.expect("the bound server owns the link");
+            assert_eq!(link.server_tid, 2);
+            assert_eq!(link.server_asid, server_asid);
+            assert_ne!(
+                link.reply_record_generation, 0,
+                "the link must carry the record's real generation"
+            );
+            assert_eq!(s.live_server_reply_link_count(), 0, "detach removes it");
+        });
+    }
+
+    /// A call with NO bound responder owns no server incarnation, so it registers nothing —
+    /// which is what keeps the boot provisioning seam and unbound reply caps link-free.
+    #[test]
+    fn d02_unbound_responder_registers_no_link() {
+        let (k, _c, _s, recv) = fx();
+        k.with(|s| {
+            s.create_reply_cap_for_caller(ThreadId(1), recv, None)
+                .expect("unbound reply cap");
+            assert_eq!(
+                s.live_server_reply_link_count(),
+                0,
+                "no bound server means no link"
+            );
+        });
+    }
+
+    /// Duplicate prevention: capacity is ONE outstanding record per server. The second call
+    /// fails rather than silently overwriting the first server's authority.
+    #[test]
+    fn d03_second_call_to_the_same_server_is_refused_not_overwritten() {
+        let (k, _c, server_asid, recv) = fx();
+        k.with(|s| {
+            let first = s
+                .create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                .expect("first call");
+            let before = s.take_server_reply_link(2, server_asid);
+            let first_link = before.expect("first link");
+            // Put it back so the second registration really contends with a live link.
+            assert!(s.register_server_reply_link(
+                2,
+                server_asid,
+                first_link.reply_record_index,
+                first_link.reply_record_generation
+            ));
+
+            let second = s.create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)));
+            assert!(
+                second.is_err(),
+                "a second outstanding record must be refused"
+            );
+
+            // The FIRST server's authority is intact and unchanged.
+            let still = s
+                .take_server_reply_link(2, server_asid)
+                .expect("first link survives");
+            assert_eq!(still.reply_record_index, first_link.reply_record_index);
+            assert_eq!(
+                still.reply_record_generation, first_link.reply_record_generation,
+                "the refused call must not overwrite the live link"
+            );
+            assert_ne!(first.0, 0);
+        });
+    }
+
+    /// Rollback: when registration is refused, the whole publication unwinds — no link is left
+    /// behind, and the record slot the refused call reserved is freed rather than leaked.
+    #[test]
+    fn d04_refused_registration_leaks_no_link_and_no_record() {
+        let (k, _c, server_asid, recv) = fx();
+        k.with(|s| {
+            let first = s
+                .create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                .expect("first call");
+            let live_before = live_records(s);
+            let links_before = s.live_server_reply_link_count();
+
+            assert!(
+                s.create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                    .is_err(),
+                "second registration is refused"
+            );
+
+            assert_eq!(
+                s.live_server_reply_link_count(),
+                links_before,
+                "a refused call must leave no extra link"
+            );
+            assert_eq!(
+                live_records(s),
+                live_before,
+                "a refused call must free the record slot it reserved"
+            );
+            // The surviving link still names the FIRST call's record.
+            let link = s
+                .take_server_reply_link(2, server_asid)
+                .expect("first link");
+            assert_ne!(first.0, 0);
+            assert!(link.reply_record_generation > 0);
+        });
+    }
+
+    /// Stale identity and stale generation both fail closed: neither a reused numeric TID in a
+    /// different address space, nor the right server against a different record generation, can
+    /// detach the live record's authority.
+    #[test]
+    fn d05_stale_identity_or_generation_cannot_detach_authority() {
+        let (k, _c, server_asid, recv) = fx();
+        k.with(|s| {
+            s.create_reply_cap_for_caller(ThreadId(1), recv, Some(ThreadId(2)))
+                .expect("ordinary call");
+
+            // Same numeric TID, different address space → detaches nothing.
+            let other = Asid(server_asid.0.wrapping_add(37));
+            assert_ne!(other, server_asid);
+            assert!(
+                s.take_server_reply_link(2, other).is_none(),
+                "a stale server incarnation must not detach the link"
+            );
+            assert_eq!(s.live_server_reply_link_count(), 1, "the link survives");
+
+            // A different numeric TID in the right address space → also nothing.
+            assert!(
+                s.take_server_reply_link(3, server_asid).is_none(),
+                "a different server must not detach this link"
+            );
+            assert_eq!(s.live_server_reply_link_count(), 1);
+
+            // Only the exact incarnation detaches, and the generation it carries is the
+            // record's own — a link bearing a different generation is a different authority.
+            let link = s
+                .take_server_reply_link(2, server_asid)
+                .expect("exact match");
+            let gen_now = s
+                .reply_cap_record_generation_for_test(link.reply_record_index)
+                .expect("record generation");
+            assert_eq!(
+                link.reply_record_generation, gen_now,
+                "the link must name the record's CURRENT generation"
+            );
+        });
+    }
+
+    /// The registration is ordinary production code: it is not gated on any oracle feature,
+    /// and it sits before the responder can be enqueued.
+    #[test]
+    fn d06_registration_is_production_and_precedes_any_wake() {
+        let body = IPC_SRC
+            .split("pub fn create_reply_cap_for_caller_in_cnode(")
+            .nth(1)
+            .expect("ordinary creation function")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded body");
+        let reg = body
+            .find("self.register_server_reply_link(")
+            .expect("the ordinary path must register the link");
+        // Not feature-gated.
+        assert!(
+            !body[..reg].contains("#[cfg(feature ="),
+            "the ordinary registration must not be gated on an oracle feature"
+        );
+        // After the record is authoritative (Phase 3 persisted the CapId)...
+        let phase3 = body
+            .find("record.caller_cap_id = cap_id;")
+            .expect("phase 3");
+        assert!(
+            phase3 < reg,
+            "the record must be authoritative before linking"
+        );
+        // ...and the function performs no enqueue/wake of its own, so the responder cannot
+        // have become runnable before the link exists.
+        for wake in [
+            "enqueue_on_cpu",
+            "rtd_enqueue",
+            "sr_enqueue_committed_receiver_split",
+        ] {
+            assert!(
+                !body.contains(wake),
+                "the creation path must not wake the responder ({wake})"
+            );
+        }
+        // Rollback unwinds both halves.
+        let after = &body[reg..];
+        assert!(
+            after.contains("fast_revoke_reply_cap_in_cnode")
+                && after.contains("ipc.reply_caps[slot] = None;"),
+            "a refused registration must revoke the cap AND free the record"
+        );
+    }
+
+    /// The DIRECT transaction still owns its own registration, and the two paths cannot both
+    /// fire for one record — they create records through disjoint functions.
+    #[test]
+    fn d07_direct_path_does_not_double_register() {
+        let direct = include_str!("../ipccall_direct_txn.rs");
+        assert!(
+            direct.contains("self.register_server_reply_link_split("),
+            "the direct transaction keeps its own registration"
+        );
+        assert!(
+            !direct.contains("create_reply_cap_for_caller"),
+            "the direct path must not also create records through the ordinary function"
+        );
+        assert_eq!(
+            IPC_SRC.matches("self.register_server_reply_link(").count(),
+            1,
+            "the ordinary path must register in exactly one place"
+        );
+    }
+
+    fn live_records(s: &mut KernelState) -> usize {
+        (0..crate::kernel::boot::MAX_REPLY_CAPS)
+            .filter(|i| s.reply_cap_record_reservation(*i).is_some())
+            .count()
+    }
+}
+
+/// Stage 200D-2B1D3 — the ServerDies scenario arms the REAL terminal cell, deadline token and
+/// stale-token record through the ordinary production path.
+///
+/// Part of this module is a PRODUCTION-PARITY audit: every precondition the Stage 200D-2B1B
+/// race fixtures supply by hand is mapped here to a real production call site, so a
+/// fixture-only prerequisite cannot hide behind a green hosted suite again. Stages 2B1D-x86
+/// and 2B1D2 each found one such prerequisite the hard way, one live boot at a time.
+#[cfg(all(test, feature = "ipc-reply-timeout-oracle-core"))]
+mod stage200d2b1d3_terminal_arming {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    const IPC_SRC: &str = include_str!("ipc_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    /// The body of the one gate that decides whether the scenario arms anything at all.
+    fn arm_gate() -> &'static str {
+        IPC_SRC
+            .split("pub(crate) fn maybe_arm_reply_timeout_oracle(")
+            .nth(1)
+            .expect("the arming gate must exist")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded body")
+    }
+
+    /// PRODUCTION PARITY — the audit this stage is gated on.
+    ///
+    /// Every state-mutating precondition the 2B1B fixtures perform by hand must have a real
+    /// production call site. A helper that only a fixture can reach means the hosted races
+    /// prove a mechanism the live system can never enter.
+    #[test]
+    fn e01_every_fixture_precondition_has_a_production_call_site() {
+        // (fixture operation, the file that must contain its production call)
+        for (op, prod_src, what) in [
+            ("arm_reply_terminal(", IPC_SRC, "terminal cell arming"),
+            (
+                "register_server_reply_link(",
+                IPC_SRC,
+                "reverse link creation (Stage 200D-2B1D1)",
+            ),
+            (
+                "take_server_reply_link(",
+                RESTART_SRC,
+                "reverse link detach in exit_task",
+            ),
+            (
+                "server_death_work_reserve(",
+                RESTART_SRC,
+                "deferred slot reservation",
+            ),
+            (
+                "server_death_work_publish(",
+                RESTART_SRC,
+                "deferred publication",
+            ),
+            (
+                "server_death_work_drain_next(",
+                RUNTIME_SRC,
+                "post-lock drain",
+            ),
+            ("try_claim_reply_terminal_slot(", IPC_SRC, "terminal claim"),
+            ("commit_reply_terminal_slot(", IPC_SRC, "terminal commit"),
+            (
+                "register_reply_receive_deadline(",
+                IPC_SRC,
+                "deadline token registration",
+            ),
+            (
+                "record_server_dies_stale_token(",
+                IPC_SRC,
+                "stale token record",
+            ),
+            (
+                "hold_reply_timeout_collector()",
+                IPC_SRC,
+                "causal collector hold",
+            ),
+        ] {
+            // A call, not merely a definition: strip `fn <name>` declarations.
+            let calls = prod_src
+                .lines()
+                .filter(|l| l.contains(op))
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .filter(|l| !l.contains("fn ") || l.contains("self.") || l.contains("boot::"))
+                .count();
+            assert!(
+                calls > 0,
+                "{what}: `{op}` has no production call site — it would be fixture-only"
+            );
+        }
+    }
+
+    /// ...and REACHABILITY: a production call site that the ServerDies mode returns before
+    /// is exactly as useless as no call site. This is the defect Stage 200D-2B1D2 hit.
+    #[test]
+    fn e02_server_dies_reaches_the_arming_gate_body() {
+        let gate = arm_gate();
+        // All three scenarios now have an arm; nothing falls through to the early return.
+        for mode in [
+            "IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS =>",
+            "IPC_REPLY_TIMEOUT_MODE_REPLY_WINS =>",
+            "IPC_REPLY_TIMEOUT_MODE_SERVER_DIES =>",
+        ] {
+            assert!(gate.contains(mode), "the arming gate must handle {mode}");
+        }
+        // The ServerDies arm must come BEFORE the catch-all return, or it is dead code.
+        let sd = gate
+            .find("IPC_REPLY_TIMEOUT_MODE_SERVER_DIES =>")
+            .expect("server-dies arm");
+        let fallthrough = gate.find("_ => return,").expect("catch-all");
+        assert!(
+            sd < fallthrough,
+            "the ServerDies arm must precede the catch-all early return"
+        );
+        // And the gate is entered from the ordinary blocked-recv path, not a private seam.
+        assert!(
+            IPC_SRC.contains("self.maybe_arm_reply_timeout_oracle(plan.blocked_tid.0"),
+            "the gate must be reached from the ordinary blocked-recv commit"
+        );
+    }
+
+    /// The arm supplies a FINITE deadline and holds the causal collector — the reply-wins
+    /// policy, preserved. It must not select a winner or fabricate a completion.
+    #[test]
+    fn e03_server_dies_arm_is_finite_and_holds_the_collector() {
+        let gate = arm_gate();
+        let arm = gate
+            .split("IPC_REPLY_TIMEOUT_MODE_SERVER_DIES =>")
+            .nth(1)
+            .expect("server-dies arm")
+            .split("_ => return,")
+            .next()
+            .expect("bounded arm");
+        // Both per-arch forms must be relative to that arch's real clock. Asserting a bare
+        // `wrapping_add` would let one branch be replaced by a constant while the other
+        // branch's occurrence kept the guard green.
+        assert!(
+            arm.contains("let d = now.wrapping_add("),
+            "the aarch64/riscv64 ServerDies deadline must be relative to the hw counter"
+        );
+        assert!(
+            arm.contains("let d = self.scheduler_tick_now().wrapping_add("),
+            "the x86_64 ServerDies deadline must be relative to the scheduler tick"
+        );
+        assert!(
+            arm.contains("hold_reply_timeout_collector()"),
+            "the ServerDies arm must hold the causal collector"
+        );
+        // It must not decide the outcome.
+        for forbidden in [
+            "PeerDeath",
+            "try_claim",
+            "complete_server_death_over",
+            "rtd_enqueue",
+            "set_ipc_reply_timeout_rw_deadline",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "the ServerDies arm must not `{forbidden}`"
+            );
+        }
+    }
+
+    /// The terminal cell is armed from the FULL identity — both incarnations, the record's own
+    /// generation, the blocked-recv generation and the deadline token generation — and the
+    /// arming happens after that identity is built, never from a partial one.
+    #[test]
+    fn e04_terminal_is_armed_from_the_full_identity() {
+        let gate = arm_gate();
+        let ident = gate
+            .find("self.reply_terminal_identity(")
+            .expect("identity construction");
+        let armed = gate
+            .find("self.arm_reply_terminal(record_index, identity);")
+            .expect("terminal arming");
+        assert!(ident < armed, "the identity must be built before arming");
+        // The identity carries every discriminator.
+        let ctor = IPC_SRC
+            .split("pub(crate) fn reply_terminal_identity(")
+            .nth(1)
+            .expect("identity ctor");
+        for field in [
+            "caller_tid",
+            "caller_asid",
+            "replier_tid",
+            "replier_asid",
+            "reply_record_index",
+            "reply_record_generation",
+            "blocked_recv_generation",
+            "deadline_token_generation",
+        ] {
+            assert!(
+                ctor.contains(field),
+                "the terminal identity must carry {field}"
+            );
+        }
+        // The deadline token is registered with the same record coordinates.
+        assert!(
+            gate.contains("self.register_reply_receive_deadline(")
+                && gate.contains("record_index,")
+                && gate.contains("record_generation,"),
+            "the deadline must be registered against the same record"
+        );
+    }
+
+    /// The stale token is recorded at the REAL arm site — inside the deadline registration,
+    /// after the token exists — so the later scan examines a registration that really happened.
+    #[test]
+    fn e05_stale_token_recorded_at_the_real_arm_site() {
+        let reg = IPC_SRC
+            .split("pub(crate) fn register_reply_receive_deadline(")
+            .nth(1)
+            .expect("deadline registration");
+        let rec = reg
+            .find("record_server_dies_stale_token(")
+            .expect("stale token record");
+        // It records the token's own identity, not a fabricated one.
+        for field in [
+            "handle.identity().token_index",
+            "handle.identity().token_generation",
+            "caller.tid.0",
+            "caller.asid.0",
+        ] {
+            assert!(
+                reg[..rec + 400].contains(field),
+                "the stale token must record {field}"
+            );
+        }
+        // The collector scan compares all four fields and names the generation mismatch.
+        assert!(
+            RUNTIME_SRC.contains("if this_idx == armed_idx && this_gen != armed_gen {")
+                && RUNTIME_SRC.contains("IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION"),
+            "the scan must reject a stale generation on the same slot"
+        );
+    }
+
+    /// The whole arming remains ordinary production code for the terminal/deadline halves —
+    /// only the stale-token RECORD (an oracle observation) is feature-gated.
+    #[test]
+    fn e06_arming_is_not_oracle_feature_gated() {
+        let gate = arm_gate();
+        let armed = gate
+            .find("self.arm_reply_terminal(record_index, identity);")
+            .expect("terminal arming");
+        assert!(
+            !gate[..armed].contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+            "terminal arming must not sit behind an oracle feature gate"
+        );
+        // The stale-token record is the one oracle-gated observation, and it only records.
+        let reg = IPC_SRC
+            .split("pub(crate) fn register_reply_receive_deadline(")
+            .nth(1)
+            .expect("registration");
+        let rec = reg.find("record_server_dies_stale_token(").expect("record");
+        assert!(
+            reg[..rec].contains("#[cfg(feature = \"ipc-reply-timeout-oracle-core\")]"),
+            "the stale-token observation is the oracle-gated part"
+        );
+    }
+
+    /// Duplicate refusal and rollback are the EXISTING primitives' job, and they must still be
+    /// reachable from this path: a second arming of a live cell is refused, and a record whose
+    /// arming fails leaves no terminal owner behind.
+    #[test]
+    fn e07_duplicate_arming_refused_and_rollback_leaves_no_owner() {
+        use crate::kernel::terminal_ownership::{TerminalClaimant, TerminalIdentity};
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            // An UNARMED cell carries `TerminalIdentity::ZERO`, and every field of a real
+            // claimant's identity is non-zero (a live record's generation is never 0), so no
+            // claim a real drain can construct will ever match it. This is exactly what Stage
+            // 200D-2B1D2 saw live: armed_tid=0/armed_asid=0/armed_generation=0 against a
+            // correct item, rejected.
+            //
+            // The claim is presented with realistic coordinates rather than `ZERO` itself:
+            // `ZERO` trivially equals the vacant cell, but it is unconstructible from a real
+            // record, so asserting on it would test an unreachable state instead of the
+            // invariant that protects the live path.
+            let realistic = TerminalIdentity {
+                reply_record_index: 0,
+                reply_record_generation: 17,
+                caller_tid: crate::kernel::ipc::ThreadId(10007),
+                caller_asid: Asid(1),
+                replier_tid: crate::kernel::ipc::ThreadId(10008),
+                replier_asid: Asid(1),
+                reply_endpoint_index: 1,
+                reply_endpoint_generation: 1,
+                blocked_recv_generation: 1,
+                deadline_token_generation: Some(1),
+            };
+            assert_ne!(realistic, TerminalIdentity::ZERO);
+            assert!(
+                s.try_claim_reply_terminal_slot(0, TerminalClaimant::PeerDeath, &realistic)
+                    .is_none(),
+                "an unarmed terminal cell must refuse a real PeerDeath claim"
+            );
+            assert_eq!(
+                s.reply_terminal_committed_winner(0),
+                None,
+                "a refused claim leaves no committed winner"
+            );
+
+            // Once armed, the SAME identity claims once and only once — the duplicate is
+            // refused rather than overwriting the first winner.
+            s.arm_reply_terminal(0, realistic);
+            let owner = s
+                .try_claim_reply_terminal_slot(0, TerminalClaimant::PeerDeath, &realistic)
+                .expect("the armed identity claims");
+            assert!(s.commit_reply_terminal_slot(0, &owner), "commit succeeds");
+            assert!(
+                s.try_claim_reply_terminal_slot(0, TerminalClaimant::Reply, &realistic)
+                    .is_none(),
+                "a second claimant must be refused once the terminal is committed"
+            );
+            assert_eq!(
+                s.reply_terminal_committed_winner(0),
+                Some(TerminalClaimant::PeerDeath),
+                "the first winner stands"
+            );
+
+            // A stale record generation against the same armed slot is refused.
+            let mut stale = realistic;
+            stale.reply_record_generation = realistic.reply_record_generation.wrapping_add(1);
+            assert!(
+                s.try_claim_reply_terminal_slot(0, TerminalClaimant::PeerDeath, &stale)
+                    .is_none(),
+                "a stale record generation must never claim the terminal"
+            );
+        });
+    }
+}
+
+/// Stage 200D-2B1D5A — the x86_64 post-drain restore-owner revalidation.
+///
+/// The x86_64 consumer picks the restore owner IN-LOCK, strictly before the post-lock drains,
+/// and the drains are exactly where wakes are published. Stage 200D-2B1D4 caught the
+/// consequence live: a drain enqueued a runnable caller, the epilogue committed the earlier
+/// `owner=idle` decision anyway, and the CPU halted while a runnable task existed.
+///
+/// The seam is `#[cfg(target_arch = "x86_64")]` production code reached from the freestanding
+/// trap epilogue, so these are source-level guards over the wiring plus behavioural cases for
+/// the scheduler primitive it delegates to.
+#[cfg(test)]
+mod stage200d2b1d5a_owner_revalidation {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    fn seam() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn revalidate_idle_owner_after_drains(")
+            .nth(1)
+            .expect("the revalidation seam must exist")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded body")
+    }
+
+    /// The seam advances the run queue through the EXISTING authority, exactly once.
+    #[test]
+    fn g01_seam_uses_the_existing_dispatch_and_advances_once() {
+        let body = seam();
+        assert!(
+            body.contains("let Some(next) = kernel.dispatch_next_on_cpu(cpu) else {"),
+            "the seam must use the existing dispatch_next_on_cpu"
+        );
+        assert_eq!(
+            body.matches("dispatch_next_on_cpu(").count(),
+            1,
+            "exactly one queue advance per revalidation"
+        );
+        // No second queue, no hand-rolled selection. (`block_current_on_cpu`/`enqueue_on_cpu`
+        // ARE used, but only to UNDO this advance — see the Stage 200D-2B1D5B guards.)
+        for forbidden in ["runnable_count_on", "dispatch_next_current_cpu"] {
+            assert!(
+                !body.contains(forbidden),
+                "the seam must not reach for `{forbidden}`"
+            );
+        }
+    }
+
+    /// CPU affinity: the pop is from THIS cpu's queue, and no other CPU is named.
+    #[test]
+    fn g02_seam_is_cpu_local() {
+        let body = seam();
+        assert!(
+            body.contains("dispatch_next_on_cpu(cpu)"),
+            "the seam must pop from this CPU's own run queue"
+        );
+        // The Stage 200D-2B1D5B rollback is CPU-local too: it must undo the advance on the very
+        // CPU that made it, never park the task somewhere else.
+        assert!(
+            body.contains("block_current_on_cpu(cpu)")
+                && body.contains("enqueue_on_cpu(cpu, next)"),
+            "the rollback must clear and requeue on the caller's own CPU"
+        );
+        assert!(
+            !body.contains("CpuId(0)") && !body.contains("current_cpu"),
+            "the seam must not substitute another CPU for the caller's"
+        );
+        // `dispatch_next_on_cpu` itself is per-CPU by construction.
+        let prim = include_str!("scheduler_state.rs")
+            .split("pub fn dispatch_next_on_cpu(&mut self, cpu: CpuId) -> Option<u64> {")
+            .nth(1)
+            .expect("the primitive");
+        assert!(
+            prim.contains("dispatch_next_on(cpu)"),
+            "the primitive must dispatch on the requested CPU"
+        );
+    }
+
+    /// The idle sentinel is not a user task, and a failed restore must not commit a frame.
+    #[test]
+    fn g03_seam_fails_closed_to_idle() {
+        let body = seam();
+        assert!(
+            body.contains("if next == 0 {") && body.contains("return OwnerRevalidation::Idle;"),
+            "the idle/supervisor sentinel must report `Idle`"
+        );
+        assert!(
+            body.contains("return OwnerRevalidation::Replacement(next);"),
+            "only a restored task may be reported as a committed replacement"
+        );
+        assert!(
+            body.contains("restore_arch_thread_state(kernel, cpu, Some(frame))"),
+            "the seam must restore the selected task's arch state into the caller's frame"
+        );
+    }
+
+    /// A prepared REPLACEMENT owner is never displaced: revalidation is gated on the prepared
+    /// owner being idle.
+    #[test]
+    fn g04_prepared_replacement_owner_is_preserved() {
+        let gate = DESC_SRC
+            .split("let revalidation = if matches!(exiting_tid, None | Some(0)) {")
+            .nth(1)
+            .expect("the revalidation gate must exist");
+        let gate = gate
+            .split("\n        // Stage 200D-2B1D5B")
+            .next()
+            .expect("bounded gate");
+        assert!(
+            gate.contains("} else {") && gate.contains("crate::runtime::OwnerRevalidation::Idle"),
+            "a non-idle prepared owner must yield `Idle` — no revalidation, no displacement"
+        );
+        // The seam is only ever called from that gated arm.
+        assert_eq!(
+            DESC_SRC
+                .matches("revalidate_idle_owner_after_drains(")
+                .count(),
+            1,
+            "the seam must have exactly one call site"
+        );
+    }
+
+    /// Genuine idle is unchanged: with no revalidated owner the existing idle body still runs.
+    #[test]
+    fn g05_genuine_idle_path_is_unchanged() {
+        assert!(
+            DESC_SRC.contains(
+                "if matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none() {"
+            ),
+            "the idle body must still run when revalidation produced nothing"
+        );
+        let idle = DESC_SRC
+            .split("if matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none() {")
+            .nth(1)
+            .expect("idle body");
+        let idle = idle
+            .split("\n        if task_switched")
+            .next()
+            .unwrap_or(idle);
+        for kept in [
+            "SCHED_ENTER_IDLE_HLT cpu={}",
+            "maybe_attest_exit_common_epilogue(cpu, \"idle\")",
+            "idle_halt_loop()",
+        ] {
+            assert!(idle.contains(kept), "the idle path must still `{kept}`");
+        }
+    }
+
+    /// A revalidated owner joins the REPLACEMENT path: its GPRs are written, the frame is
+    /// flushed, depth is cleared once, and the attestation names `replacement`.
+    #[test]
+    fn g06_revalidated_owner_joins_the_replacement_path() {
+        assert!(
+            DESC_SRC.contains("if task_switched || revalidated_owner.is_some() {"),
+            "a revalidated owner must have its GPRs written like any task switch"
+        );
+        let after = DESC_SRC
+            .split("if task_switched || revalidated_owner.is_some() {")
+            .nth(1)
+            .expect("replacement path");
+        let flush = after
+            .find("flush_trap_context_to_iret_frame")
+            .expect("frame flush");
+        let clear = after
+            .find("TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);")
+            .expect("depth clear");
+        let attest = after
+            .find("maybe_attest_exit_common_epilogue(cpu, \"replacement\")")
+            .expect("attestation");
+        assert!(
+            flush < clear && clear < attest,
+            "flush -> single depth clear -> attest(replacement), in that order"
+        );
+        // Exactly one depth clear on this path.
+        let bounded = &after[..attest];
+        assert_eq!(
+            bounded
+                .matches("TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);")
+                .count(),
+            1,
+            "exactly one depth clear before the attestation"
+        );
+        // And the commit is attested distinctly from the prepared decision.
+        assert!(
+            DESC_SRC.contains(
+                "EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu={} prepared=idle committed=replacement"
+            ),
+            "a revalidated commit must be attested as such"
+        );
+    }
+
+    /// Behavioural: a task made runnable AFTER the owner would have been decided is selectable
+    /// by the very primitive the seam delegates to, and the selection advances the run queue
+    /// exactly once.
+    ///
+    /// The precondition is the state the IN-LOCK decision actually saw at Stage 200D-2B1D4:
+    /// nothing runnable on this CPU, so `owner=idle` was prepared. The enqueues below are what
+    /// the post-lock server-death drain then published.
+    #[test]
+    fn g07_drain_woken_task_is_selectable_one_at_a_time() {
+        let cpu = CpuId(0);
+        let mut k = Bootstrap::init().expect("init");
+        k.register_task_with_class(40101, TaskClass::App)
+            .expect("t1");
+        k.register_task_with_class(40102, TaskClass::App)
+            .expect("t2");
+        assert_eq!(
+            k.runnable_count_on_cpu(cpu),
+            0,
+            "precondition: no runnable work on this CPU when the owner is prepared"
+        );
+        assert!(
+            matches!(k.current_tid_on_cpu(cpu), None | Some(0)),
+            "precondition: the prepared owner is idle"
+        );
+        assert!(
+            matches!(k.dispatch_next_on_cpu(cpu), None | Some(0)),
+            "with nothing runnable the seam reports `still idle`"
+        );
+
+        // The post-lock drain publishes two wakes — invisible to the in-lock decision.
+        k.enqueue_on_cpu(cpu, 40101).expect("wake 1");
+        k.enqueue_on_cpu(cpu, 40102).expect("wake 2");
+        assert_eq!(
+            k.runnable_count_on_cpu(cpu),
+            2,
+            "the drain made two tasks runnable on this CPU"
+        );
+
+        // Revalidation: a drain-woken task is selected instead of idling past it.
+        let first = k
+            .dispatch_next_on_cpu(cpu)
+            .expect("a drain-woken task must be selectable");
+        assert!(
+            first == 40101 || first == 40102,
+            "the committed owner must be one of the drain-woken tasks, got {first}"
+        );
+        assert_eq!(
+            k.current_tid_on_cpu(cpu),
+            Some(first),
+            "the selected task becomes this CPU's current"
+        );
+        // One advance, not a drain of the queue.
+        assert_eq!(
+            k.runnable_count_on_cpu(cpu),
+            1,
+            "exactly one queue advance per revalidation"
+        );
+        // The seam runs once per trap return; a CPU that already owns a task must not advance
+        // the queue a second time.
+        assert_eq!(
+            k.dispatch_next_on_cpu(cpu),
+            Some(first),
+            "a CPU that already owns a task keeps that owner"
+        );
+        assert_eq!(
+            k.runnable_count_on_cpu(cpu),
+            1,
+            "no second advance while an owner is committed"
+        );
+    }
+
+    /// Behavioural CPU affinity: work published on ANOTHER CPU's run queue is never stolen.
+    #[test]
+    fn g08_revalidation_never_steals_another_cpus_work() {
+        let mut k = Bootstrap::init().expect("init");
+        k.bring_up_cpu(CpuId(1)).expect("cpu1 online");
+        k.register_task_with_class(40103, TaskClass::App)
+            .expect("t3");
+        k.enqueue_on_cpu(CpuId(1), 40103).expect("wake on cpu1");
+        assert_eq!(k.runnable_count_on_cpu(CpuId(1)), 1, "queued on cpu1");
+        assert_eq!(k.runnable_count_on_cpu(CpuId(0)), 0, "nothing on cpu0");
+
+        // CPU 0's revalidation sees none of its own work and keeps idling.
+        assert!(
+            matches!(k.dispatch_next_on_cpu(CpuId(0)), None | Some(0)),
+            "cpu0 must stay idle rather than steal cpu1's runnable task"
+        );
+        assert_ne!(
+            k.current_tid_on_cpu(CpuId(0)),
+            Some(40103),
+            "cpu0 never becomes the owner of a task queued on cpu1"
+        );
+        assert_eq!(
+            k.runnable_count_on_cpu(CpuId(1)),
+            1,
+            "cpu1's run queue is untouched by cpu0's revalidation"
+        );
+
+        // The owning CPU's own revalidation does select it.
+        assert_eq!(
+            k.dispatch_next_on_cpu(CpuId(1)),
+            Some(40103),
+            "cpu1's revalidation selects its own drain-woken task"
+        );
+        assert_eq!(k.runnable_count_on_cpu(CpuId(1)), 0, "one advance on cpu1");
+    }
+
+    /// Behavioural genuine idle: with no runnable work the primitive reports "still idle" and
+    /// leaves the CPU unowned, so the existing idle body still runs.
+    #[test]
+    fn g09_genuine_idle_selects_nothing() {
+        let cpu = CpuId(0);
+        let mut k = Bootstrap::init().expect("init");
+        assert_eq!(k.runnable_count_on_cpu(cpu), 0, "nothing runnable");
+        for _ in 0..3 {
+            assert!(
+                matches!(k.dispatch_next_on_cpu(cpu), None | Some(0)),
+                "a genuinely idle CPU must not manufacture an owner"
+            );
+        }
+        assert!(
+            matches!(k.current_tid_on_cpu(cpu), None | Some(0)),
+            "the CPU is still unowned"
+        );
+        assert_eq!(k.runnable_count_on_cpu(cpu), 0, "no queue was advanced");
+    }
+}
+
+/// Stage 200D-2B1D5B — the owner-revalidation RESTORE-FAILURE contract.
+///
+/// `dispatch_next_on_cpu` commits its selection as the CPU's `current` BEFORE the arch restore
+/// is attempted. Stage 200D-2B1D5A reported a restore failure as `None`, which the epilogue
+/// could not distinguish from genuine idle — so the CPU would halt through the ordinary idle
+/// path while the scheduler still believed the committed task was running on it. That is the
+/// same strand Stage 200D-2B1D4 diagnosed, one level down.
+///
+/// These cases run the real seam on a real `SharedKernel`: the seam is `#[cfg(target_arch =
+/// "x86_64")]` and the hosted suite is an x86_64 host, so the production code path is exercised
+/// directly rather than through source inspection.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod stage200d2b1d5b_restore_contract {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::{OwnerCommit, OwnerRevalidation, SharedKernel};
+
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+    fn seam() -> &'static str {
+        RUNTIME_SRC
+            .split("pub(crate) fn revalidate_idle_owner_after_drains(")
+            .nth(1)
+            .expect("the revalidation seam must exist")
+            .split("\n    /// ")
+            .next()
+            .expect("bounded body")
+    }
+
+    /// Register `tid`, give it a distinguishable user context, and make it runnable on `cpu`.
+    fn woken_task(k: &mut crate::kernel::boot::KernelState, tid: u64, cpu: CpuId, pc: u64) {
+        k.register_task_with_class(tid, TaskClass::App)
+            .expect("reg");
+        let mut ctx = crate::kernel::task::UserRegisterContext::default();
+        ctx.instruction_ptr = crate::kernel::vm::VirtAddr(pc);
+        ctx.stack_ptr = crate::kernel::vm::VirtAddr(pc + 0x1000);
+        k.set_thread_user_context(tid, ctx).expect("ctx");
+        k.enqueue_on_cpu(cpu, tid).expect("wake");
+    }
+
+    /// Drop `tid`'s TCB while it is still queued — the reaped-server shape that makes the arch
+    /// restore unable to produce a context.
+    fn reap_tcb(k: &mut crate::kernel::boot::KernelState, tid: u64) {
+        k.with_tcbs_mut(|tcbs| {
+            for slot in tcbs.iter_mut() {
+                if slot.as_ref().is_some_and(|t| t.tid.0 == tid) {
+                    *slot = None;
+                }
+            }
+        });
+    }
+
+    // ── the fail-closed rule, as a pure function ──────────────────────────────────────────
+
+    /// Every outcome maps to exactly one disposition, and ONLY an un-rolled-back restore
+    /// failure is allowed to reach the fatal path — never genuine idle, never a replacement.
+    #[test]
+    fn h01_disposition_is_the_fail_closed_rule() {
+        assert_eq!(OwnerRevalidation::Idle.disposition(), OwnerCommit::Idle);
+        assert_eq!(
+            OwnerRevalidation::Replacement(7).disposition(),
+            OwnerCommit::Replacement(7)
+        );
+        // Rolled back: `current` was cleared, so the ordinary idle path is safe.
+        assert_eq!(
+            OwnerRevalidation::RestoreFailed {
+                tid: 7,
+                rolled_back: true
+            }
+            .disposition(),
+            OwnerCommit::Idle
+        );
+        // NOT rolled back: a committed replacement is still current. Idling would strand it.
+        assert_eq!(
+            OwnerRevalidation::RestoreFailed {
+                tid: 7,
+                rolled_back: false
+            }
+            .disposition(),
+            OwnerCommit::FailClosed(7)
+        );
+    }
+
+    /// The three outcomes are genuinely distinct — a restore failure can never be confused with
+    /// genuine idle at the type level, which is the whole point of replacing `Option<u64>`.
+    #[test]
+    fn h02_restore_failure_is_distinguishable_from_genuine_idle() {
+        let idle = OwnerRevalidation::Idle;
+        let failed_ok = OwnerRevalidation::RestoreFailed {
+            tid: 7,
+            rolled_back: true,
+        };
+        let failed_bad = OwnerRevalidation::RestoreFailed {
+            tid: 7,
+            rolled_back: false,
+        };
+        assert_ne!(idle, failed_ok, "genuine idle is not a rolled-back failure");
+        assert_ne!(idle, failed_bad, "genuine idle is not a stranded failure");
+        assert_ne!(failed_ok, failed_bad, "rollback success is recorded");
+        // Only genuine idle and a rolled-back failure may take the idle path.
+        for (outcome, expected) in [
+            (idle, OwnerCommit::Idle),
+            (failed_ok, OwnerCommit::Idle),
+            (failed_bad, OwnerCommit::FailClosed(7)),
+        ] {
+            assert_eq!(outcome.disposition(), expected);
+        }
+    }
+
+    // ── the seam, run for real ────────────────────────────────────────────────────────────
+
+    /// A drain-woken task with a live TCB restores: the outcome is `Replacement`, the frame is
+    /// populated with THAT task's context, and it is this CPU's current.
+    #[test]
+    fn h03_successful_restore_reports_replacement_and_populates_the_frame() {
+        let cpu = CpuId(0);
+        let mut state = Bootstrap::init().expect("init");
+        woken_task(&mut state, 40201, cpu, 0x4000_0000);
+        let shared = SharedKernel::new(state);
+
+        let mut frame = TrapFrame::zeroed();
+        let outcome = shared.revalidate_idle_owner_after_drains(cpu, &mut frame);
+
+        assert_eq!(outcome, OwnerRevalidation::Replacement(40201));
+        assert_eq!(outcome.disposition(), OwnerCommit::Replacement(40201));
+        assert_eq!(
+            frame.saved_pc, 0x4000_0000,
+            "the committed owner's context reached the caller's frame"
+        );
+        shared.with(|k| {
+            assert_eq!(
+                k.current_tid_on_cpu(cpu),
+                Some(40201),
+                "committed as current"
+            );
+            assert_eq!(k.runnable_count_on_cpu(cpu), 0, "exactly one queue advance");
+        });
+    }
+
+    /// Genuine idle: nothing was committed, nothing was written to the frame.
+    #[test]
+    fn h04_genuine_idle_reports_idle_and_leaves_the_frame_alone() {
+        let cpu = CpuId(0);
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+
+        let mut frame = TrapFrame::zeroed();
+        let outcome = shared.revalidate_idle_owner_after_drains(cpu, &mut frame);
+
+        assert_eq!(outcome, OwnerRevalidation::Idle);
+        assert_eq!(outcome.disposition(), OwnerCommit::Idle);
+        assert_eq!(frame, TrapFrame::zeroed(), "no frame was populated");
+        shared.with(|k| {
+            assert!(
+                matches!(k.current_tid_on_cpu(cpu), None | Some(0)),
+                "nothing became current"
+            );
+        });
+    }
+
+    /// THE STAGE: a queued task whose TCB has been reaped cannot be restored. The seam must
+    /// report a restore FAILURE (not `Idle`, not `Replacement`), must leave the frame holding
+    /// no bogus context, and must undo the advance so the CPU can idle consistently.
+    #[test]
+    fn h05_unrestorable_task_is_reported_as_failure_and_rolled_back() {
+        let cpu = CpuId(0);
+        let mut state = Bootstrap::init().expect("init");
+        woken_task(&mut state, 40202, cpu, 0x5000_0000);
+        reap_tcb(&mut state, 40202);
+        let shared = SharedKernel::new(state);
+
+        let mut frame = TrapFrame::zeroed();
+        let outcome = shared.revalidate_idle_owner_after_drains(cpu, &mut frame);
+
+        assert_eq!(
+            outcome,
+            OwnerRevalidation::RestoreFailed {
+                tid: 40202,
+                rolled_back: true
+            },
+            "an unrestorable committed task is a rolled-back restore failure"
+        );
+        // It is emphatically NOT reported as a replacement: committing this frame would iret
+        // into the PREVIOUS task's context.
+        assert_ne!(outcome, OwnerRevalidation::Replacement(40202));
+        assert_eq!(
+            frame,
+            TrapFrame::zeroed(),
+            "a failed restore must not leave a partially written frame"
+        );
+        // The rollback restored the invariant the idle path depends on.
+        assert_eq!(outcome.disposition(), OwnerCommit::Idle);
+        shared.with(|k| {
+            assert!(
+                matches!(k.current_tid_on_cpu(cpu), None | Some(0)),
+                "the committed replacement was taken back off `current`"
+            );
+            assert_eq!(
+                k.runnable_count_on_cpu(cpu),
+                0,
+                "a reaped task is not resurrected into the run queue"
+            );
+        });
+    }
+
+    /// State consistency, stated as the invariant it protects: after ANY outcome, the CPU is
+    /// never left with a `current` task that the caller is about to idle past.
+    #[test]
+    fn h06_no_outcome_leaves_a_stranded_current_task() {
+        let cpu = CpuId(0);
+
+        // (a) genuine idle, (b) successful replacement, (c) unrestorable task.
+        let a = Bootstrap::init().expect("init");
+        let mut b = Bootstrap::init().expect("init");
+        woken_task(&mut b, 40203, cpu, 0x6000_0000);
+        let mut c = Bootstrap::init().expect("init");
+        woken_task(&mut c, 40204, cpu, 0x7000_0000);
+        reap_tcb(&mut c, 40204);
+
+        for state in [a, b, c] {
+            let shared = SharedKernel::new(state);
+            let mut frame = TrapFrame::zeroed();
+            let outcome = shared.revalidate_idle_owner_after_drains(cpu, &mut frame);
+            let current = shared.with(|k| k.current_tid_on_cpu(cpu));
+            match outcome.disposition() {
+                // The caller idles: nothing may be current.
+                OwnerCommit::Idle => assert!(
+                    matches!(current, None | Some(0)),
+                    "idling with {current:?} still current would strand it ({outcome:?})"
+                ),
+                // The caller commits `tid`: it MUST be current.
+                OwnerCommit::Replacement(tid) => {
+                    assert_eq!(current, Some(tid), "the committed owner must be current")
+                }
+                // The caller halts: state is inconsistent by definition, and it does not idle.
+                OwnerCommit::FailClosed(_) => {}
+            }
+        }
+    }
+
+    /// A rolled-back failure leaves the CPU idle-equivalent to genuine idle, judged by the
+    /// EPILOGUE'S OWN predicate — the `None | Some(0)` unowned test the idle gate uses.
+    ///
+    /// The two are not byte-identical and must not be asserted to be: genuine idle leaves the
+    /// scheduler's idle sentinel current (`Some(0)`), while the rollback's `block_current_on_cpu`
+    /// clears the slot outright (`None`) — the same primitive Stage 190A uses to return an AP to
+    /// idle. What matters is that both satisfy the predicate the caller actually branches on.
+    #[test]
+    fn h07_rollback_is_idle_equivalent_by_the_epilogues_own_predicate() {
+        let cpu = CpuId(0);
+        let idle = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut failed_state = Bootstrap::init().expect("init");
+        woken_task(&mut failed_state, 40205, cpu, 0x8000_0000);
+        reap_tcb(&mut failed_state, 40205);
+        let failed = SharedKernel::new(failed_state);
+
+        let mut f1 = TrapFrame::zeroed();
+        let mut f2 = TrapFrame::zeroed();
+        let o1 = idle.revalidate_idle_owner_after_drains(cpu, &mut f1);
+        let o2 = failed.revalidate_idle_owner_after_drains(cpu, &mut f2);
+
+        assert_eq!(
+            o1.disposition(),
+            o2.disposition(),
+            "both take the idle path"
+        );
+        assert_eq!(o1.disposition(), OwnerCommit::Idle);
+        assert_eq!(f1, f2, "neither committed a frame");
+        assert_eq!(f1, TrapFrame::zeroed(), "neither wrote a context");
+
+        for (label, shared) in [("genuine idle", &idle), ("rolled back", &failed)] {
+            let (current, runnable) =
+                shared.with(|k| (k.current_tid_on_cpu(cpu), k.runnable_count_on_cpu(cpu)));
+            // This is verbatim the predicate the x86 epilogue's idle gate applies.
+            assert!(
+                matches!(current, None | Some(0)),
+                "{label}: the CPU must be unowned by the epilogue's own test, got {current:?}"
+            );
+            assert_eq!(runnable, 0, "{label}: no runnable work is left behind");
+        }
+        // The gate really is that predicate.
+        assert!(
+            DESC_SRC
+                .contains("matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none()"),
+            "the idle gate must be the `None | Some(0)` predicate these outcomes satisfy"
+        );
+    }
+
+    // ── wiring guards ─────────────────────────────────────────────────────────────────────
+
+    /// The seam detects unrestorability BEFORE trusting `restore_arch_thread_state`, whose
+    /// `TaskMissing -> Ok(())` swallow would otherwise report a bogus success.
+    #[test]
+    fn h08_seam_establishes_restorability_before_reporting_success() {
+        let body = seam();
+        let check = body
+            .find("let restorable = kernel.thread_user_context(next).is_some();")
+            .expect("the seam must establish restorability");
+        let ok = body
+            .find("return OwnerRevalidation::Replacement(next);")
+            .expect("the success return");
+        assert!(
+            check < ok,
+            "restorability must be established before success"
+        );
+        assert!(
+            body.contains("if restorable\n") || body.contains("if restorable "),
+            "the success path must be gated on restorability"
+        );
+        // Restorability alone is not success: the restore must actually be ATTEMPTED, and its
+        // result must gate the replacement commit. Without this, dropping the call would leave
+        // the frame holding the PREVIOUS task's context while reporting `Replacement`.
+        let restore_call = body
+            .find("restore_arch_thread_state(kernel, cpu, Some(frame))")
+            .expect("the seam must attempt the arch restore");
+        assert!(
+            check < restore_call && restore_call < ok,
+            "order must be: establish restorability -> attempt restore -> report success"
+        );
+        assert!(
+            body[restore_call..ok].contains(".is_ok()"),
+            "the replacement commit must require the restore to have SUCCEEDED"
+        );
+        // And the swallow it defends against is really there.
+        let restore = include_str!("../../arch/x86_64/trap.rs")
+            .split("pub(crate) fn restore_arch_thread_state(")
+            .nth(1)
+            .expect("the restore helper");
+        assert!(
+            restore.contains("Err(crate::kernel::boot::KernelError::TaskMissing) => {"),
+            "restore_arch_thread_state still maps TaskMissing to Ok(()) for its other callers"
+        );
+    }
+
+    /// The rollback undoes the advance: clear `current`, and requeue only a task that still
+    /// exists. Both results are folded into `rolled_back`.
+    #[test]
+    fn h09_rollback_clears_current_and_requeues_only_live_tasks() {
+        let body = seam();
+        assert!(
+            body.contains("let cleared = kernel.block_current_on_cpu(cpu) == Some(next);"),
+            "the rollback must take the committed task back off `current`"
+        );
+        assert!(
+            body.contains(
+                "let requeued = !restorable || kernel.enqueue_on_cpu(cpu, next).is_ok();"
+            ),
+            "a live task is returned to its run queue; a reaped one is not resurrected"
+        );
+        assert!(
+            body.contains("rolled_back: cleared && requeued,"),
+            "`rolled_back` must require BOTH halves of the undo"
+        );
+    }
+
+    /// The epilogue fails closed: the `FailClosed` arm reaches the existing fatal architecture
+    /// path and never falls through to the idle path or a frame commit.
+    #[test]
+    fn h10_epilogue_fails_closed_on_an_unrecoverable_rollback() {
+        let arm = DESC_SRC
+            .split("crate::runtime::OwnerCommit::FailClosed(tid) => {")
+            .nth(1)
+            .expect("the fail-closed arm must exist");
+        let arm = arm.split("\n        };").next().expect("bounded arm");
+        for required in [
+            "shared.fatal_trap_read_snapshot(cpu)",
+            "log_decoded_fatal_trap_from_snapshot(",
+            "debug_uart_trap_breadcrumb(",
+            "halt_forever();",
+        ] {
+            assert!(
+                arm.contains(required),
+                "the fail-closed arm must use the existing fatal path: `{required}`"
+            );
+        }
+        for forbidden in [
+            "idle_halt_loop",
+            "flush_trap_context_to_iret_frame",
+            "Some(tid)",
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "the fail-closed arm must not reach `{forbidden}`"
+            );
+        }
+        // `halt_forever` diverges, so the arm cannot fall through to the frame commit.
+        assert!(
+            DESC_SRC.contains("fn halt_forever() -> ! {"),
+            "the fatal path must be divergent — a returning one would commit the frame anyway"
+        );
+    }
+
+    /// The disposition is consulted exactly once, and the epilogue branches on it rather than
+    /// re-deriving the rule inline.
+    #[test]
+    fn h11_epilogue_branches_on_the_typed_disposition() {
+        assert!(
+            DESC_SRC.contains("match revalidation.disposition() {"),
+            "the epilogue must branch on the typed disposition"
+        );
+        assert_eq!(
+            DESC_SRC.matches(".disposition()").count(),
+            1,
+            "one disposition decision per trap return"
+        );
+        for arm in [
+            "crate::runtime::OwnerCommit::Replacement(next) => {",
+            "crate::runtime::OwnerCommit::Idle => {",
+            "crate::runtime::OwnerCommit::FailClosed(tid) => {",
+        ] {
+            assert!(DESC_SRC.contains(arm), "the epilogue must handle `{arm}`");
+        }
+        // The seam no longer returns a bare Option — the whole point of the stage.
+        assert!(
+            RUNTIME_SRC.contains(") -> OwnerRevalidation {"),
+            "the seam must return the typed outcome"
+        );
+        assert!(
+            !seam().contains("-> Option<u64>") && !seam().contains(".ok()\n        .flatten()"),
+            "the seam must not collapse its outcome back into an Option"
+        );
     }
 }

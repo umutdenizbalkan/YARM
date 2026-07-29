@@ -122,7 +122,109 @@ impl KernelState {
             self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0)),
         );
         let _ = self.revoke_reply_caps_for_caller_identity(exit_identity);
-        let _ = self.revoke_reply_caps_for_replier_identity(exit_identity);
+        // ── Stage 200D-2A: SERVER-DEATH caller liveness, DEFERRED ────────────────────
+        //
+        // This is the BROAD-LOCK phase and it deliberately does very little. It captures
+        // the exact exiting incarnation, reserves one bounded deferred slot, detaches the
+        // exact reverse link and publishes an immutable generation-bearing work item.
+        //
+        // It does NOT claim PeerDeath, publish any caller result, make the caller Runnable
+        // or enqueue anything — all of that moves to the post-lock drain, which is the
+        // whole point of this stage. The task's status was already set to `Exited` above
+        // (inside its own scoped `with_tcbs_mut`), which is what blocks any new reverse-link
+        // registration targeting this incarnation, so the snapshot cannot race a fresh one.
+        //
+        // ORDER MATTERS: the queue slot is reserved BEFORE the link is detached. A detached
+        // link with no deferred owner would strand the blocked caller forever, so if no
+        // capacity exists we leave the link attached and detach nothing — the record keeps
+        // an exact owner and a later exit path can still find it.
+        let cpu_idx = self.current_cpu().0 as usize;
+        let death_link = match crate::kernel::boot::server_death_work_reserve(cpu_idx) {
+            Some(reservation) => {
+                // Stage 200D-2B1A (§2): the reservation succeeded — attest it BEFORE the
+                // detach, because the detach is the irreversible step and the order
+                // (reserve, then detach, then publish) is exactly what prevents a stranded
+                // caller. In-lock: `exit_task` runs under the broad guard, so these three
+                // markers deliberately carry no `broad_lock=0`.
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DEFERRED_RESERVED server_tid={} server_asid={} cpu={} slots=1 result=ok",
+                    tid,
+                    exit_identity.asid.0,
+                    cpu_idx
+                );
+                match self.take_server_reply_link(tid, exit_identity.asid) {
+                    Some(link) => {
+                        // The EXACT link this server owned, detached by full incarnation
+                        // (`take_server_reply_link` matches {tid, asid}), carrying the exact
+                        // reply-record coordinates it was attached to.
+                        crate::yarm_log!(
+                            "IPC_SERVER_DEATH_LINK_CAPTURED server_tid={} server_asid={} record_index={} record_generation={} detached=1 result=ok",
+                            tid,
+                            exit_identity.asid.0,
+                            link.reply_record_index,
+                            link.reply_record_generation
+                        );
+                        let work = crate::kernel::boot::DeferredServerDeathCompletion {
+                            exiting_server: exit_identity,
+                            reply_record_index: link.reply_record_index,
+                            reply_record_generation: link.reply_record_generation,
+                        };
+                        // A duplicate exit notification collapses to ONE owner: publish
+                        // returns false and releases the slot rather than queueing twice.
+                        let published =
+                            crate::kernel::boot::server_death_work_publish(reservation, work);
+                        crate::yarm_log!(
+                            "IPC_SERVER_DEATH_DEFERRED server_tid={} server_asid={} record_index={} record_generation={} published={} result=ok",
+                            tid,
+                            exit_identity.asid.0,
+                            link.reply_record_index,
+                            link.reply_record_generation,
+                            u32::from(published)
+                        );
+                        // One published item per exiting server. A duplicate exit collapses
+                        // here: `server_death_work_publish` returns false and releases the
+                        // slot rather than queueing a second owner for the same record.
+                        if published {
+                            crate::yarm_log!(
+                                "IPC_SERVER_DEATH_DEFERRED_PUBLISHED server_tid={} server_asid={} record_index={} record_generation={} cpu={} items=1 result=ok",
+                                tid,
+                                exit_identity.asid.0,
+                                link.reply_record_index,
+                                link.reply_record_generation,
+                                cpu_idx
+                            );
+                        } else {
+                            crate::yarm_log!(
+                                "IPC_SERVER_DEATH_DUPLICATE_DEFERRED server_tid={} server_asid={} record_index={} record_generation={} result=fail",
+                                tid,
+                                exit_identity.asid.0,
+                                link.reply_record_index,
+                                link.reply_record_generation
+                            );
+                        }
+                        Some(link)
+                    }
+                    None => {
+                        // Nothing owed: release the reservation so the slot is not held.
+                        crate::kernel::boot::server_death_work_release(reservation);
+                        None
+                    }
+                }
+            }
+            None => {
+                // Queue full: keep the link attached (no irreversible detach) so the
+                // record still has an exact owner. Never silently drop the work.
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DEFER_FULL server_tid={} link_retained=1 result=degraded",
+                    tid
+                );
+                None
+            }
+        };
+        // The replier revoke sweep must still exclude ONLY the exact detached record
+        // generation — the deferred drain invalidates that record itself as part of its
+        // terminal commit, and a reused slot (different generation) is swept normally.
+        let _ = self.revoke_reply_caps_for_replier_identity_except(exit_identity, death_link);
         if cap_cnode {
             crate::yarm_log!("CAP_CNODE_REVOKE_ON_EXIT_OK tid={}", tid);
         }

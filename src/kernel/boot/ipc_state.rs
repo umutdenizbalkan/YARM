@@ -38,7 +38,25 @@ struct RecvBlockPhasePlan {
 /// `commit_reply_win_after_delivery` (copy succeeded) or `rollback_reply_win` (copy
 /// faulted) consumes it, so an irreversible terminal completion never precedes a
 /// fallible caller copy and the deadline is never permanently lost by a faulting copy.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+/// Stage 200C2C2C-R2B — why a reply-win reservation declined. TERMINAL OWNERSHIP is the single
+/// authority; deadline registration is subordinate bookkeeping and can NEVER appear here as a
+/// decline reason (a token that cannot be leased leaves the reply's terminal claim intact).
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplyReserveDecline {
+    /// The reply capability did not resolve to a present reply record.
+    RecordMissing,
+    /// The record is not the oracle's confined reply endpoint (a strict no-op for this hook).
+    RecordNotLive,
+    /// The reply record's caller `{tid, asid}` no longer resolves.
+    CallerIdentityMismatch,
+    /// The terminal identity could not be constructed (endpoint/record generation drift).
+    EndpointGenerationMismatch,
+    /// A timeout (or other) terminal claimant already owns the terminal cell.
+    TimeoutAlreadyClaimed,
+}
+
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
 #[derive(Debug)]
 pub(crate) struct ReplyWinLease {
     record_index: usize,
@@ -180,11 +198,53 @@ fn rt_claim_endpoint_waiter_exact<D: ReplyTimeoutDomains>(
 
 /// Invalidate a reply record because Timeout won the terminal cell: `Available` /
 /// `Reserved` → `Cancelled` (non-invokable), so a late `ipc_reply` alias fails closed.
+/// Stage 200D-1 — detach the reverse link for a record that is being finalized, through
+/// the narrow per-domain seams (rank-3 ipc read for the bound replier, then rank-2 task
+/// write). Exact on both identities, so a stale or different link is never touched.
+///
+/// This is the narrow-transaction counterpart of
+/// `KernelState::finalize_server_reply_link_for_record`; both close the SAME single
+/// lifecycle edge, so no terminal path can complete a record and leave its link live.
+fn rt_detach_server_link<D: ReplyTimeoutDomains>(d: &mut D, index: usize, generation: u64) -> bool {
+    let bound = d.rtd_ipc(|ipc| {
+        if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
+            return None;
+        }
+        ipc.reply_caps
+            .get(index)
+            .and_then(|s| s.as_ref())
+            .and_then(|r| r.responder_tid.zip(r.replier_asid))
+    });
+    let Some((tid, asid)) = bound else {
+        return false;
+    };
+    d.rtd_tcbs(|tcbs| {
+        let Some(tcb) = tcbs
+            .iter_mut()
+            .flatten()
+            .find(|t| t.tid.0 == tid.0 && t.asid == Some(asid))
+        else {
+            return false;
+        };
+        match tcb.server_reply_link {
+            Some(link) if link.matches_record(index, generation) => {
+                tcb.server_reply_link = None;
+                true
+            }
+            _ => false,
+        }
+    })
+}
+
 fn rt_invalidate_reply_record<D: ReplyTimeoutDomains>(
     d: &mut D,
     index: usize,
     generation: u64,
 ) -> bool {
+    // Stage 200D-1: close the reverse link on the SAME edge that retires the record's
+    // reply authority. Done FIRST, while the record is still readable — the bound replier
+    // identity is read off the record itself.
+    let _ = rt_detach_server_link(d, index, generation);
     d.rtd_ipc(|ipc| match ipc.reply_caps.get_mut(index) {
         Some(Some(record))
             if ipc.reply_cap_generations[index] == generation
@@ -255,16 +315,22 @@ fn rt_prepare_timeout_result<D: ReplyTimeoutDomains>(d: &mut D, tid: u64, asid: 
     })
 }
 
-/// Commit a still-blocked exact receiver to `Runnable`, installing the canonical
-/// recv-v2 TIMEOUT return into the saved frame. Returns the captured CPU affinity, or
-/// `None` if the task is no longer the exact blocked receiver. This is a TIMEOUT wake,
-/// not a reply delivery.
-fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
+/// Commit a still-blocked exact receiver to `Runnable`, installing a canonical recv-v2
+/// ERROR return into the saved frame. Returns the captured CPU affinity, or `None` if the
+/// task is no longer the exact blocked receiver. This is a completion WAKE, not a reply
+/// delivery: no user memory is copied on any path through this function.
+///
+/// Stage 200D parameterizes the result code so SERVER DEATH publishes through this exact
+/// function rather than introducing a second resume path. `error_code` is the canonical
+/// `SyscallError` discriminant to deliver — `TimedOut` for a fired deadline, `ServerDied`
+/// for a dead replier — and it is the ONLY thing that differs between the two outcomes.
+pub(crate) fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
     d: &mut D,
     tid: u64,
     asid: Asid,
+    error_code: u64,
 ) -> Option<Option<crate::kernel::scheduler::CpuId>> {
-    let timed_out = crate::kernel::syscall::SyscallError::TimedOut as u64;
+    let timed_out = error_code;
     d.rtd_tcbs(|tcbs| {
         let tcb = tcbs.iter_mut().flatten().find(|t| {
             t.tid.0 == tid
@@ -274,21 +340,66 @@ fn rt_commit_receiver_runnable<D: ReplyTimeoutDomains>(
                     TaskStatus::Blocked(WaitReason::EndpointReceive(_))
                 )
         })?;
-        // Install the canonical recv-v2 TIMEOUT return into the saved frame: the
-        // blocked recv-v2 resumes via saved-frame return, so the error register must
-        // carry `SyscallError::TimedOut` (the userspace wrapper maps it to Ok(None)).
-        tcb.user_context.arg0 = 0;
-        tcb.user_context.user_gprs[0] = 0; // ret0
+        // x86_64: the blocked recv-v2 resumes via SAVED-FRAME return (NO syscall re-run),
+        // so install the canonical recv-v2 TIMEOUT into the saved result registers directly
+        // — RAX=ret0 (user_gprs[0]) = 0, RCX=error (user_gprs[2]) = `TimedOut`. The userspace
+        // wrapper reads RCX and maps `TimedOut` to `Ok(None)`.
         #[cfg(target_arch = "x86_64")]
         {
+            tcb.user_context.arg0 = 0;
+            tcb.user_context.user_gprs[0] = 0; // RAX = ret0
             tcb.user_context.user_gprs[2] = timed_out as usize; // RCX = error
             tcb.user_context.user_gprs[3] = 0; // RDX
             tcb.user_context.user_gprs[7] = 0; // R8
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        // RISC-V: publish the completed result through the CANONICAL helper, which owns the
+        // saved-continuation mirror synchronization (`user_gprs` a0/a1 AND their argument lanes).
+        // Publishing here — before the task is made Runnable, and long before the scheduler
+        // enqueue — guarantees the result is already visible when the resume path reconstructs the
+        // outgoing frame. No user-memory copy, no lock; the enclosing lookup already matched the
+        // exact `{tid, asid}` incarnation and blocked state, so this is never a numeric-TID-only
+        // publication.
+        #[cfg(target_arch = "riscv64")]
         {
-            tcb.user_context.user_gprs[0] = timed_out as usize;
+            tcb.publish_riscv_user_return(0, 0, timed_out as usize);
+            // Stage 200C2C2C-R2C: attest the STORED TCB lanes — the middle link of the RISC-V
+            // return chain (kernel final a0 at the resume boundary, stored TCB a0 here, first
+            // userspace a0 in the caller). Reporting them from the TCB *after* publication is
+            // what makes the three independently observed values comparable; a metadata lane
+            // can never override the raw error this way.
+            crate::yarm_log!(
+                "RISCV_BLOCKED_RETURN_PUBLISHED tid={} code={} stored_a0={} stored_a1={} stored_arg0={} stored_arg1={} result=ok",
+                tid,
+                error_code,
+                tcb.user_context.user_gprs[10],
+                tcb.user_context.user_gprs[11],
+                tcb.user_context.arg0,
+                tcb.user_context.arg1
+            );
         }
+        // AArch64 (and other non-x86 saved-frame-resume ports): the blocked recv is NEVER
+        // re-entered — its SVC `ELR_EL1` already points past the instruction, so the caller
+        // resumes straight to userspace from its saved context. A remote completion therefore
+        // cannot deliver its result by "returning" from the handler, and it must NOT write a
+        // result register here: the AArch64 resume boundary MIRRORS `arg0..arg5` into `x0..x5`,
+        // so any `user_gprs` write is overwritten (that is precisely the defect this stage
+        // fixes — the caller observed its own stale endpoint-cap argument as a bogus result).
+        //
+        // Instead PARK a generation-bearing pending completion. The resume boundary consumes it
+        // exactly once, validates the exact `{tid, asid}` + blocked generation, and encodes the
+        // canonical result into the resumed frame. No register write, no ELR mutation here.
+        // Parked UNCONDITIONALLY: it is the arch-neutral record of "this blocked caller was
+        // completed remotely, with this exact outcome and identity". AArch64 consumes it at its
+        // resume boundary (its only delivery mechanism); x86_64 has already installed the
+        // equivalent saved-frame result above and simply never consumes the record — a later
+        // receive on that caller bumps `blocked_recv_generation`, which invalidates it.
+        tcb.pending_syscall_completion = Some(crate::kernel::task::BlockedSyscallCompletion {
+            syscall_class: crate::kernel::task::BlockedSyscallClass::IpcRecv,
+            result: timed_out,
+            tid,
+            asid,
+            blocked_generation: tcb.blocked_recv_generation,
+        });
         let _ = timed_out;
         tcb.status = TaskStatus::Runnable;
         Some(tcb.cpu_affinity)
@@ -356,12 +467,200 @@ pub(crate) fn complete_reply_timeout_over<D: ReplyTimeoutDomains>(
     let _ = rt_commit_reply_terminal(d, record_index, &terminal_owner);
     let _ = rt_complete_deadline_fire(d, token_index, &fire_owner);
     // (10–11) Commit the caller → Runnable.
-    let Some(affinity) = rt_commit_receiver_runnable(d, caller.tid.0, caller.asid) else {
+    let Some(affinity) = rt_commit_receiver_runnable(
+        d,
+        caller.tid.0,
+        caller.asid,
+        crate::kernel::syscall::SyscallError::TimedOut as u64,
+    ) else {
         return ReplyTimeoutOutcome::CleanupNoWake;
     };
     // (12) Scheduler enqueue LAST — the sole externally visible action, no lock held.
     d.rtd_enqueue(caller.tid.0);
     let _ = affinity;
+    ReplyTimeoutOutcome::Woken
+}
+
+/// Stage 200D — the SINGLE server-death completion transaction, generic over the same
+/// per-domain access `D` the reply-timeout transaction uses.
+///
+/// This is deliberately the timeout transaction's sibling, not a new mechanism: it claims
+/// the SAME terminal cell through the SAME compare-exchange, revalidates the SAME caller /
+/// endpoint / blocked-receive generations, and publishes its result through the SAME
+/// `rt_commit_receiver_runnable` — differing only in the claimant (`PeerDeath`) and the
+/// canonical code (`ServerDied`). There is no second authority store and no second resume
+/// path.
+///
+/// The deadline is SUBORDINATE here. Death does not need a token to win: if one is armed
+/// it simply becomes stale work, and a later scan loses at its own terminal claim. That is
+/// the correct direction — deadline bookkeeping must never gate terminal ownership.
+///
+/// Ordering (each a short bounded domain claim, released before the next; enqueue LAST and
+/// non-fallible; NO user-memory copy anywhere):
+/// (1) claim `PeerDeath` terminal — Reply/Timeout/CallerExit/EndpointGone may have won;
+/// (2–4) revalidate exact caller / endpoint generation / blocked-recv generation;
+/// (5) claim the exact endpoint waiter; (6) prepare the canonical result;
+/// (7) invalidate reply authority so late reply aliases are non-invokable;
+/// (8) commit the terminal; (9) publish the caller's return state + `Runnable`;
+/// (10) enqueue exactly once.
+pub(crate) fn complete_server_death_over<D: ReplyTimeoutDomains>(
+    d: &mut D,
+    identity: &crate::kernel::terminal_ownership::TerminalIdentity,
+) -> crate::runtime::ReplyTimeoutOutcome {
+    use crate::runtime::ReplyTimeoutOutcome;
+    let record_index = identity.reply_record_index;
+    let record_generation = identity.reply_record_generation;
+
+    // (1) The SINGLE authority. A reply that already reserved, a timeout that already
+    // claimed, or a caller that already exited all make this fail — death then loses,
+    // exactly as the accepted one-winner model requires.
+    let Some(terminal_owner) = d.rtd_ipc(|ipc| {
+        ipc.reply_terminal_ownership
+            .get(record_index)
+            .and_then(|cell| cell.try_claim_peer_death_terminal(identity))
+    }) else {
+        return ReplyTimeoutOutcome::LostToTerminal;
+    };
+    // (2–5) Revalidate the exact caller incarnation, endpoint generation and blocked
+    // receive generation, then claim the exact waiter. A restarted caller reusing the
+    // numeric TID fails here, so death can never wake a replacement incarnation.
+    let caller = ReceiverWaiterIdentity::new(identity.caller_tid, identity.caller_asid);
+    let caller_ok = rt_is_blocked_receiver_exact(d, caller.tid.0, caller.asid);
+    let endpoint_ok = rt_endpoint_generation_read(d, identity.reply_endpoint_index)
+        == Some(identity.reply_endpoint_generation);
+    let brg_ok = rt_blocked_recv_generation_for(d, caller.tid.0, caller.asid)
+        == Some(identity.blocked_recv_generation);
+    let waiter_ok = caller_ok
+        && endpoint_ok
+        && brg_ok
+        && rt_claim_endpoint_waiter_exact(
+            d,
+            identity.reply_endpoint_index,
+            identity.reply_endpoint_generation,
+            caller,
+        );
+    if !waiter_ok {
+        // Stage 200D-2B1B-i: the caller/endpoint incarnation that was armed is no longer the
+        // one present. Both literals name the same real revalidation failure from the two
+        // angles the checklist distinguishes — a changed caller {tid, asid} and a changed
+        // reply-endpoint incarnation — and NOTHING is woken or enqueued on this path.
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_WRONG_CALLER_IDENTITY caller_tid={} caller_asid={} record_index={} record_generation={} waker=none result=fail",
+            caller.tid.0,
+            caller.asid.0,
+            record_index,
+            record_generation
+        );
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_WRONG_ENDPOINT_GENERATION record_index={} record_generation={} caller_tid={} caller_asid={} waker=none result=fail",
+            record_index,
+            record_generation,
+            caller.tid.0,
+            caller.asid.0
+        );
+        // Death owns the terminal but the caller/endpoint/waiter changed: invalidate and
+        // complete the terminal, wake NOBODY. (The caller-exit case lands here, which is
+        // why caller exit yields `caller wake = 0`.)
+        let _ = rt_invalidate_reply_record(d, record_index, record_generation);
+        let _ = rt_commit_reply_terminal(d, record_index, &terminal_owner);
+        return ReplyTimeoutOutcome::CleanupNoWake;
+    }
+    // (6) Mark the blocked receive as completed-by-error, reusing the timeout path's
+    // preparation step (it sets no result register of its own).
+    let _ = rt_prepare_timeout_result(d, caller.tid.0, caller.asid);
+    // (7) Late reply aliases become non-invokable.
+    let _ = rt_invalidate_reply_record(d, record_index, record_generation);
+    // (8) Complete the TerminalCell as PeerDeath — one-shot, terminal.
+    let _ = rt_commit_reply_terminal(d, record_index, &terminal_owner);
+    // Stage 200D-2B1A (§2): PeerDeath has WON the single terminal cell. Post-lock by
+    // construction — the whole transaction runs from the deferred drain, which every port
+    // invokes after its broad guard has dropped.
+    // Stage 200D-2B1B-i (class 6): the terminal cell has really been committed to
+    // PeerDeath. Recorded after `rt_commit_reply_terminal`, so a claim that lost the CAS
+    // never reaches this counter.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    crate::kernel::boot::server_dies_counters::record(
+        crate::kernel::boot::server_dies_counters::Transition::PeerDeathWinner,
+    );
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won record_index={} record_generation={} caller_tid={} caller_asid={} broad_lock=0",
+        record_index,
+        record_generation,
+        caller.tid.0,
+        caller.asid.0
+    );
+    // (9) Publish the canonical ServerDied return into the caller's saved context and
+    // make it Runnable — the SAME publication the timeout path uses.
+    let Some(affinity) = rt_commit_receiver_runnable(
+        d,
+        caller.tid.0,
+        caller.asid,
+        crate::kernel::syscall::SyscallError::ServerDied as u64,
+    ) else {
+        return ReplyTimeoutOutcome::CleanupNoWake;
+    };
+    // Stage 200D-2B1B-i (classes 7 and 8): `rt_commit_receiver_runnable` performs BOTH the
+    // canonical result publication and the Runnable transition, and returns `Some` only when
+    // both committed — the `else` arm above returns without counting either. They are two
+    // distinct classes because a future split of that seam must not silently collapse them,
+    // and the stamps below prove the publication precedes the enqueue.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    {
+        crate::kernel::boot::server_dies_counters::record(
+            crate::kernel::boot::server_dies_counters::Transition::ResultPublication,
+        );
+        crate::kernel::boot::server_dies_counters::record(
+            crate::kernel::boot::server_dies_counters::Transition::RunnableTransition,
+        );
+    }
+    // Stage 200D-2B1A (§2): the canonical ServerDied is now in the caller's saved context
+    // and the caller is Runnable — publication strictly BEFORE the enqueue below, so no
+    // scheduler can select the caller before its result exists.
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_COMPLETION_COMMITTED code={} caller_tid={} caller_asid={} record_index={} record_generation={} runnable=1 broad_lock=0 result=ok",
+        crate::kernel::syscall::SyscallError::ServerDied as u64,
+        caller.tid.0,
+        caller.asid.0,
+        record_index,
+        record_generation
+    );
+    // (10) Scheduler enqueue LAST — the sole externally visible action, exactly once.
+    d.rtd_enqueue(caller.tid.0);
+    // Stage 200D-2B1B-i (class 9): stamped after the real enqueue, so
+    // `result_before_enqueue()` compares two stamps taken at the two real operations.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    crate::kernel::boot::server_dies_counters::record(
+        crate::kernel::boot::server_dies_counters::Transition::CallerEnqueue,
+    );
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_CALLER_ENQUEUED caller_tid={} caller_asid={} enqueues=1 broad_lock=0 result=ok",
+        caller.tid.0,
+        caller.asid.0
+    );
+    let _ = affinity;
+    crate::yarm_log!(
+        "IPC_SERVER_DEATH_OK arch={} terminal=PeerDeath death_result=ServerDied caller_wakes=1 reply_aliases_invalid=1 reply_copies=0 result=ok",
+        crate::kernel::boot::REPLY_TIMEOUT_ARCH
+    );
+    // Stage 200D-2B1B-i: audit the instance HERE — the one point where all nine transitions
+    // have happened for this record. This is the production caller that makes the leak and
+    // count literals reachable in a real image; without it `audit_success_path` would be a
+    // hosted-only declaration and the linker would strip its literals out of the boot binary,
+    // which is precisely the "declaration without a use site" defect this project keeps
+    // finding. Read-only: it emits markers and returns a verdict, and nothing downstream
+    // branches on it.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+        == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+    {
+        let ok = crate::kernel::boot::server_dies_counters::audit_success_path();
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_TRANSITION_AUDIT vector={:?} result_before_enqueue={} result={}",
+            crate::kernel::boot::server_dies_counters::vector(),
+            u32::from(crate::kernel::boot::server_dies_counters::result_before_enqueue()),
+            if ok { "ok" } else { "fail" }
+        );
+    }
     ReplyTimeoutOutcome::Woken
 }
 
@@ -433,6 +732,34 @@ impl IpcSubsystem {
     /// Whether any endpoint receive-waiter slot still holds the complete `identity`.
     pub(crate) fn any_endpoint_waiter_is(&self, identity: ReceiverWaiterIdentity) -> bool {
         self.endpoint_waiters.iter().any(|w| *w == Some(identity))
+    }
+}
+
+/// Stage 200D-1 — the outcome of an exact reverse-link detach. Production callers
+/// collapse every non-`Detached` value to "nothing to do"; the distinction exists so the
+/// hosted lifecycle tests can tell "the link was never there" apart from "a DIFFERENT link
+/// is live", which are very different bugs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DetachOutcome {
+    /// The exact link was present and has been removed. This is the only mutating result.
+    Detached,
+    /// No link is registered on that server incarnation — the idempotent repeat case.
+    AlreadyAbsent,
+    /// The server `{tid, asid}` does not resolve to a live task incarnation.
+    StaleServerIdentity,
+    /// A link is present for this record SLOT, but at a different record generation:
+    /// the slot was reclaimed and reused since registration.
+    StaleRecordGeneration,
+    /// A link is present and live, but for a DIFFERENT record. Never removed — removing
+    /// it would silently strip a valid outstanding authority.
+    DifferentLiveLink,
+}
+
+impl DetachOutcome {
+    /// `true` only when this call actually removed the link.
+    #[must_use]
+    pub(crate) fn detached(self) -> bool {
+        matches!(self, Self::Detached)
     }
 }
 
@@ -594,18 +921,35 @@ impl KernelState {
         &mut self,
         caller: ReceiverWaiterIdentity,
     ) -> usize {
-        self.with_ipc_state_mut(|ipc| {
+        // Stage 200D-1: caller exit is a terminal outcome for every record the caller
+        // owns, so each retired record's reverse link closes on the same edge. The bound
+        // replier identities are SNAPSHOT under the ipc claim (bounded, allocation-free)
+        // and the TCB writes happen after it is released — the two ranks never nest.
+        let mut closing: [Option<(u64, Asid, usize, u64)>; super::MAX_REPLY_CAPS] =
+            [None; super::MAX_REPLY_CAPS];
+        let revoked = self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
-            for slot in ipc.reply_caps.iter_mut() {
+            for (idx, slot) in ipc.reply_caps.iter_mut().enumerate() {
                 if slot.is_some_and(|record| {
                     record.caller_tid == caller.tid && record.caller_asid == caller.asid
                 }) {
+                    if let Some((stid, sasid)) = slot
+                        .as_ref()
+                        .and_then(|r| r.responder_tid.zip(r.replier_asid))
+                    {
+                        closing[idx] = Some((stid.0, sasid, idx, ipc.reply_cap_generations[idx]));
+                    }
                     *slot = None;
                     revoked += 1;
                 }
             }
             revoked
-        })
+        });
+        for entry in closing.iter().flatten() {
+            let (stid, sasid, idx, gen_) = *entry;
+            let _ = self.detach_server_reply_link_exact(stid, sasid, idx, gen_);
+        }
+        revoked
     }
 
     /// Numeric-TID convenience wrapper (tests / non-authoritative callers). Resolves
@@ -653,21 +997,121 @@ impl KernelState {
         &mut self,
         replier: ReceiverWaiterIdentity,
     ) -> usize {
-        self.with_ipc_state_mut(|ipc| {
+        self.revoke_reply_caps_for_replier_identity_except(replier, None)
+    }
+
+    /// Stage 200D — the replier-side revoke sweep, with an EXCLUSION for the record whose
+    /// server-death terminal has just been completed.
+    ///
+    /// Teardown completes the linked record through the terminal authority (which
+    /// invalidates it as part of the commit). Clearing the slot here as well would either
+    /// destroy the authority before the claim, or drop a record whose outcome another
+    /// claimant legitimately won. The exclusion is generation-bearing: a slot that was
+    /// reclaimed and reused since the link was taken does NOT match, so a reused slot is
+    /// still swept normally.
+    pub(crate) fn revoke_reply_caps_for_replier_identity_except(
+        &mut self,
+        replier: ReceiverWaiterIdentity,
+        except: Option<crate::kernel::task::ServerReplyLink>,
+    ) -> usize {
+        // Stage 200D-1: same lifecycle edge as the caller sweep — each record this
+        // removes is terminal, so its reverse link closes with it. Snapshot under the ipc
+        // claim, detach after it is released.
+        let mut closing: [Option<(u64, Asid, usize, u64)>; super::MAX_REPLY_CAPS] =
+            [None; super::MAX_REPLY_CAPS];
+        let revoked = self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
-            for slot in ipc.reply_caps.iter_mut() {
+            for (idx, slot) in ipc.reply_caps.iter_mut().enumerate() {
+                if except
+                    .is_some_and(|link| link.matches_record(idx, ipc.reply_cap_generations[idx]))
+                {
+                    continue;
+                }
                 if slot.is_some_and(|record| {
                     record.responder_tid == Some(replier.tid)
                         && record
                             .replier_asid
                             .is_none_or(|stored| stored == replier.asid)
                 }) {
+                    if let Some((stid, sasid)) = slot
+                        .as_ref()
+                        .and_then(|r| r.responder_tid.zip(r.replier_asid))
+                    {
+                        closing[idx] = Some((stid.0, sasid, idx, ipc.reply_cap_generations[idx]));
+                    }
                     *slot = None;
                     revoked += 1;
                 }
             }
             revoked
-        })
+        });
+        for entry in closing.iter().flatten() {
+            let (stid, sasid, idx, gen_) = *entry;
+            let _ = self.detach_server_reply_link_exact(stid, sasid, idx, gen_);
+        }
+        revoked
+    }
+
+    /// Stage 200D — complete the blocked caller of `link` with the canonical server-death
+    /// result, through the single terminal authority.
+    ///
+    /// Builds the generation-bearing terminal identity from the LIVE record (so a slot
+    /// that was reclaimed since registration yields no identity and nothing happens), then
+    /// runs the shared `complete_server_death_over` transaction. Returns the outcome.
+    ///
+    /// **HOSTED-ONLY as of Stage 200D-2A.** This takes `&mut KernelState`, i.e. it runs
+    /// under the broad lock — exactly what that stage removed from the production path.
+    /// `exit_task` now only reserves a slot, detaches the exact link and publishes a
+    /// deferred item; `SharedKernel::drain_server_death_post_work` does all authority work
+    /// after the broad lock is released. This entry is retained, `cfg`-gated out of
+    /// freestanding builds, as the SINGLE-STEP entry the Stage 200D-1 lifecycle proofs
+    /// drive. Because it cannot be linked into a production kernel, no production path can
+    /// claim PeerDeath under the broad lock.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn complete_server_death_for_link(
+        &mut self,
+        link: crate::kernel::task::ServerReplyLink,
+    ) -> crate::runtime::ReplyTimeoutOutcome {
+        use crate::runtime::ReplyTimeoutOutcome;
+        let idx = link.reply_record_index;
+        let gen_ = link.reply_record_generation;
+        // The slot must still be THIS record incarnation; a reused slot is a stale link.
+        if self.with_ipc_state(|ipc| ipc.reply_cap_generations.get(idx).copied()) != Some(gen_) {
+            return ReplyTimeoutOutcome::StaleToken;
+        }
+        let Some((caller_tid, caller_asid)) = self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(idx)
+                .and_then(|s| s.as_ref())
+                .map(|r| (r.caller_tid.0, r.caller_asid))
+        }) else {
+            return ReplyTimeoutOutcome::StaleToken;
+        };
+        // Claim against the identity the cell was ARMED with (see
+        // `reply_terminal_armed_identity`). Falling back to a reconstruction only covers
+        // the un-armed case, where no other claimant can exist either.
+        let identity = match self.reply_terminal_armed_identity(idx) {
+            Some(id) if id.reply_record_index == idx && id.reply_record_generation == gen_ => id,
+            _ => {
+                let brg = self
+                    .blocked_recv_generation_for(caller_tid, caller_asid)
+                    .unwrap_or(0);
+                match self.reply_terminal_identity(idx, gen_, brg, None) {
+                    Some(id) => id,
+                    None => return ReplyTimeoutOutcome::StaleToken,
+                }
+            }
+        };
+        crate::yarm_log!(
+            "IPC_SERVER_DEATH_CLAIM server_tid={} server_asid={} record_index={} record_generation={} caller_tid={} caller_asid={} result=ok",
+            link.server_tid,
+            link.server_asid.0,
+            idx,
+            gen_,
+            caller_tid,
+            caller_asid.0
+        );
+        complete_server_death_over(self, &identity)
     }
 
     /// Numeric-TID convenience wrapper (tests / non-authoritative callers). Resolves
@@ -745,10 +1189,221 @@ impl KernelState {
         })
     }
 
+    // ── Stage 200D: bounded, generation-bearing REVERSE registration ─────────────
+    //
+    // Teardown must find the reply records a dying server owed a reply to WITHOUT
+    // scanning the whole reply-record store: the cost of a task exit must not depend on
+    // unrelated IPC traffic. The link therefore lives on the exact server TCB and is read
+    // by index. It is NOT a second authority — the terminal cell still decides every
+    // outcome; the link only says *which cell to look at*.
+
+    /// Register the reverse link on the exact server incarnation. Returns `false` — with
+    /// NO mutation — when the server TCB is absent, its incarnation does not match, or a
+    /// DIFFERENT live link is already registered. Capacity is one outstanding record (the
+    /// honest single-pair contract): a second registration never silently overwrites the
+    /// first, so the caller must roll the reply-record publication back.
+    ///
+    /// Re-registering the IDENTICAL link is idempotent and succeeds, so a retried commit
+    /// cannot fail spuriously.
+    pub(crate) fn register_server_reply_link(
+        &mut self,
+        server_tid: u64,
+        server_asid: Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> bool {
+        let link = crate::kernel::task::ServerReplyLink {
+            server_tid,
+            server_asid,
+            reply_record_index: record_index,
+            reply_record_generation: record_generation,
+        };
+        self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+            else {
+                return false;
+            };
+            // Stage 200D-1: an incarnation that has already committed to exit must never be
+            // published as an authorized replier. Teardown snapshots the link AFTER the
+            // status flips, so a link installed now would never be looked at and the caller
+            // would block forever with no death claim. Refusing forces the NR6 publication
+            // to roll back, which is the only other permitted outcome of that race.
+            if !matches!(
+                tcb.status,
+                TaskStatus::Runnable | TaskStatus::Running | TaskStatus::Blocked(_)
+            ) {
+                return false;
+            }
+            match tcb.server_reply_link {
+                Some(existing) if existing == link => true,
+                Some(_) => false,
+                None => {
+                    tcb.server_reply_link = Some(link);
+                    // Stage 200D-2B1B-i (class 1): a NEW reverse link now exists in the
+                    // server's TCB. The idempotent re-registration arm above returns `true`
+                    // without installing anything and deliberately does not count.
+                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                    crate::kernel::boot::server_dies_counters::record(
+                        crate::kernel::boot::server_dies_counters::Transition::LinkCreated,
+                    );
+                    true
+                }
+            }
+        })
+    }
+
+    /// Stage 200D-1 — THE single reverse-link finalization seam.
+    ///
+    /// Every terminal outcome (reply, timeout, server death, caller exit, endpoint
+    /// destruction, explicit record cancellation, NR6 publication rollback, and a
+    /// permanently-cancelling reply-copy rollback) funnels through here, so the link's
+    /// lifecycle has exactly one closing edge rather than scattered TCB field writes.
+    ///
+    /// The detach is EXACT on both identities. A link is removed only when it still
+    /// names this server incarnation AND this record incarnation; anything else is
+    /// reported and left untouched. That is what makes the call safe to make
+    /// unconditionally from every terminal path, including the ones that lose a race.
+    pub(crate) fn detach_server_reply_link_exact(
+        &mut self,
+        server_tid: u64,
+        server_asid: Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> DetachOutcome {
+        self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+            else {
+                return DetachOutcome::StaleServerIdentity;
+            };
+            match tcb.server_reply_link {
+                None => DetachOutcome::AlreadyAbsent,
+                Some(link) if link.matches_record(record_index, record_generation) => {
+                    tcb.server_reply_link = None;
+                    DetachOutcome::Detached
+                }
+                // Same slot, different generation: the slot was reclaimed and reused, so
+                // this unlink belongs to a previous occupant and must mutate nothing.
+                Some(link) if link.reply_record_index == record_index => {
+                    DetachOutcome::StaleRecordGeneration
+                }
+                // A different outstanding record is live on this server. Removing it
+                // would silently strip a valid authority, so it is refused.
+                Some(_) => DetachOutcome::DifferentLiveLink,
+            }
+        })
+    }
+
+    /// Backwards-compatible boolean wrapper: `true` iff the exact link was removed.
+    pub(crate) fn unregister_server_reply_link(
+        &mut self,
+        server_tid: u64,
+        server_asid: Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> bool {
+        self.detach_server_reply_link_exact(
+            server_tid,
+            server_asid,
+            record_index,
+            record_generation,
+        )
+        .detached()
+    }
+
+    /// Stage 200D-1 — finalize the reverse link for a record whose terminal outcome just
+    /// became irrevocable, WITHOUT the caller having to know the server identity.
+    ///
+    /// The bound replier `{tid, asid}` is read from the record itself (the same identity
+    /// registration used), so a terminal path only needs the record it just completed.
+    /// Returns the detach outcome; `StaleServerIdentity` when the record is gone or was
+    /// never bound to a replier, which is the normal, harmless repeat case.
+    pub(crate) fn finalize_server_reply_link_for_record(
+        &mut self,
+        record_index: usize,
+        record_generation: u64,
+    ) -> DetachOutcome {
+        let bound = self.with_ipc_state(|ipc| {
+            if ipc.reply_cap_generations.get(record_index).copied() != Some(record_generation) {
+                return None;
+            }
+            ipc.reply_caps
+                .get(record_index)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.responder_tid.zip(r.replier_asid))
+        });
+        match bound {
+            Some((tid, asid)) => {
+                self.detach_server_reply_link_exact(tid.0, asid, record_index, record_generation)
+            }
+            None => DetachOutcome::StaleServerIdentity,
+        }
+    }
+
+    /// Read the link registered on the exact server incarnation (no mutation).
+    pub(crate) fn server_reply_link_for(
+        &self,
+        server_tid: u64,
+        server_asid: Asid,
+    ) -> Option<crate::kernel::task::ServerReplyLink> {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+                .and_then(|t| t.server_reply_link)
+        })
+    }
+
+    /// Drop whatever link the exact server incarnation holds, whatever it points at.
+    /// Used ONLY by teardown after it has already snapshot the link — so a TCB that is
+    /// about to be reclaimed cannot leave a dangling reference behind. Returns the link
+    /// that was removed.
+    pub(crate) fn take_server_reply_link(
+        &mut self,
+        server_tid: u64,
+        server_asid: Asid,
+    ) -> Option<crate::kernel::task::ServerReplyLink> {
+        let taken = self.with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+                .and_then(|t| t.server_reply_link.take())
+        });
+        // Stage 200D-2B1B-i (class 2): counted only when a link was ACTUALLY removed. The
+        // lookup is exact on {tid, asid}, so a reused numeric TID with a different ASID
+        // matches nothing, detaches nothing, and records nothing.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        if taken.is_some() {
+            crate::kernel::boot::server_dies_counters::record(
+                crate::kernel::boot::server_dies_counters::Transition::LinkDetached,
+            );
+        }
+        taken
+    }
+
+    /// Total live reverse links (hosted leak accounting only).
+    pub(crate) fn live_server_reply_link_count(&self) -> usize {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .filter(|t| t.server_reply_link.is_some())
+                .count()
+        })
+    }
+
     /// Cancel a `Reserved` direct record (rollback): mark `Cancelled` then clear the
     /// slot to `Vacant`, so the reserved authority is reclaimed atomically and a
     /// partially-built record can never be resolved. Returns `false` on mismatch.
     pub(crate) fn cancel_direct_reply_record(&mut self, index: usize, generation: u64) -> bool {
+        // Stage 200D-1: cancellation is a terminal outcome for the record, so it closes the
+        // reverse link on the same edge. Done FIRST, while the record still resolves its
+        // bound replier. Exact on both identities, so a reused slot is untouched.
+        let _ = self.finalize_server_reply_link_for_record(index, generation);
         self.with_ipc_state_mut(|ipc| {
             let matches = matches!(
                 ipc.reply_caps.get(index),
@@ -805,6 +1460,25 @@ impl KernelState {
     /// slot, tying it to the record's caller/replier incarnations, reply endpoint,
     /// and the given blocked-recv / deadline-token generations. `None` when the
     /// slot is vacant or generation-mismatched.
+    /// Stage 200D-1 — the identity the terminal cell for `index` was ARMED with.
+    ///
+    /// Server death must claim against exactly that identity, not a reconstructed one: the
+    /// armed identity carries the blocked-receive generation and deadline-token generation
+    /// captured when the caller blocked, and reconstructing them at teardown time would
+    /// produce a different key and fail the compare-exchange for the wrong reason. The
+    /// death transaction still revalidates caller / endpoint / blocked-receive generation
+    /// against LIVE state afterwards, so using the armed identity widens nothing.
+    pub(crate) fn reply_terminal_armed_identity(
+        &self,
+        index: usize,
+    ) -> Option<crate::kernel::terminal_ownership::TerminalIdentity> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_terminal_ownership
+                .get(index)
+                .map(|cell| *cell.identity())
+        })
+    }
+
     pub(crate) fn reply_terminal_identity(
         &self,
         index: usize,
@@ -1171,11 +1845,25 @@ impl KernelState {
         token_index: usize,
         owner: &crate::kernel::deadline_token::DeadlineReplyLeaseOwner,
     ) -> bool {
-        self.with_ipc_state(|ipc| {
+        let restored = self.with_ipc_state(|ipc| {
             ipc.reply_deadline_tokens
                 .get(token_index)
                 .is_some_and(|t| t.restore_reply_lease(owner))
-        })
+        });
+        // Stage 200D-2B1B-i: restoring a reversible reply lease after the ServerDies path has
+        // taken the terminal would put a superseded authority back in play. Emitted from the
+        // real restore result, so it names an operation that actually succeeded.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        if restored
+            && crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+                == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+        {
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_STALE_AUTHORITY_RESTORED token_index={} authority=reply_lease result=fail",
+                token_index
+            );
+        }
+        restored
     }
 
     // ── Stage 200C1: production reply-receive deadline completion support ────────
@@ -1269,6 +1957,18 @@ impl KernelState {
                 tcb.blocked_recv_generation = blocked_recv_generation;
             }
         });
+        // Stage 200D-2B1A (§5): record the EXACT token this caller armed, so the later
+        // collector scan can prove it examined the same one. This is the real arm site —
+        // the token is already in the caller's TCB and in the deadline store above; nothing
+        // is fabricated here and nothing is removed. Strictly ServerDies-mode-only and
+        // behind the oracle-core feature; it records, it never claims.
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+        crate::kernel::boot::record_server_dies_stale_token(
+            handle.identity().token_index,
+            handle.identity().token_generation,
+            caller.tid.0,
+            caller.asid.0,
+        );
         Ok(handle)
     }
 
@@ -1300,6 +2000,97 @@ impl KernelState {
         })
     }
 
+    /// Stage 200C2C1B — CONSUME the exact pending blocked-syscall completion for `tid`, if one
+    /// is parked and still valid. This is the SINGLE consumer (the resume boundary): it matches
+    /// the EXACT `{tid, asid}` incarnation and the `blocked_generation` captured when the caller
+    /// blocked, then takes the completion (so it can never be observed twice) and clears the
+    /// exact residue that belongs to it. A stale generation, a replacement ASID, or a caller that
+    /// re-blocked with a NEW receive is refused and the parked entry is dropped without effect.
+    ///
+    /// Returns the canonical syscall result to encode, or `None` when nothing applies. The caller
+    /// encodes the result FIRST and only then observes the cleared state — this function performs
+    /// no register or ELR mutation of its own.
+    pub(crate) fn take_blocked_syscall_completion(
+        &mut self,
+        tid: u64,
+    ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid)?;
+            let pending = tcb.pending_syscall_completion?;
+            // Exact identity: same incarnation AND the generation captured at block time.
+            let exact = pending.tid == tid
+                && tcb.asid == Some(pending.asid)
+                && tcb.blocked_recv_generation == pending.blocked_generation;
+            // Take it either way — a stale entry must not linger to be seen by a later receive.
+            tcb.pending_syscall_completion = None;
+            if !exact {
+                return None;
+            }
+            // Clear the residue that belongs to THIS completion only (the deadline + token were
+            // already retired by the completion transaction; this drops the consumed flag).
+            tcb.ipc_timeout_fired = false;
+            tcb.blocked_recv_state = None;
+            Some(pending)
+        })
+    }
+
+    /// `true` iff a pending blocked-syscall completion is parked for `tid` (assertions).
+    #[cfg(test)]
+    /// Stage 200D-1 — the parked completion's canonical result code for `tid`, if any.
+    /// Read-only; used by the hosted lifecycle proofs to assert exactly-once publication.
+    pub(crate) fn pending_syscall_completion_result(&self, tid: u64) -> Option<u64> {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .and_then(|t| t.pending_syscall_completion.map(|c| c.result))
+        })
+    }
+
+    /// Stage 200D-1 — the live generation of reply-record slot `index`.
+    pub(crate) fn reply_record_slot_generation(&self, index: usize) -> Option<u64> {
+        self.with_ipc_state(|ipc| ipc.reply_cap_generations.get(index).copied())
+    }
+
+    /// Stage 200D-2A — hosted-only: install a parked completion result directly, so the
+    /// "a late drain must not overwrite a committed result" case can be stepped.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn set_pending_syscall_completion_for_test(&mut self, tid: u64, result: u64) {
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                let asid = tcb.asid.unwrap_or(Asid(0));
+                tcb.pending_syscall_completion =
+                    Some(crate::kernel::task::BlockedSyscallCompletion {
+                        syscall_class: crate::kernel::task::BlockedSyscallClass::IpcRecv,
+                        result,
+                        tid,
+                        asid,
+                        blocked_generation: tcb.blocked_recv_generation,
+                    });
+            }
+        });
+    }
+
+    /// Stage 200D-1 — hosted-only: drive a task's status directly, so the
+    /// registration-versus-exit race can be stepped deterministically instead of raced.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn set_task_status_for_test(&mut self, tid: u64, status: TaskStatus) {
+        self.with_tcbs_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid) {
+                tcb.status = status;
+            }
+        });
+    }
+
+    pub(crate) fn has_pending_syscall_completion(&self, tid: u64) -> bool {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .is_some_and(|t| t.pending_syscall_completion.is_some())
+        })
+    }
+
     /// Publish a fresh blocked-receive generation on a task (registration/test
     /// driver): bumps the monotonic per-task counter and returns the new value.
     pub(crate) fn bump_blocked_recv_generation(&mut self, tid: u64) -> Option<u64> {
@@ -1314,7 +2105,7 @@ impl KernelState {
     /// the terminal cell for the caller's reply record and register a reply-timeout
     /// deadline referencing the exact token. Fires ONLY for the oracle's confined
     /// reply endpoint with a finite deadline; every ordinary receive is untouched.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn maybe_arm_reply_timeout_oracle(
         &mut self,
         caller_tid: u64,
@@ -1326,20 +2117,80 @@ impl KernelState {
         {
             return;
         }
-        // timeout-wins arrives via recv-timeout (a finite user deadline is supplied);
-        // reply-wins arrives via infinite recv-v2 (deadline is `None`), so the kernel
-        // injects a fixed later deadline — the prompt reply wins well before it, and a
-        // subsequent scan passes it harmlessly.
+        // The deadline is armed in the SAME monotonic units the off-lock collector scans in
+        // (`reply_timeout_now`): x86_64 uses the LAPIC-advanced scheduler tick; AArch64 uses the
+        // generic-timer physical counter (no periodic scheduler tick on the cooperative port). On
+        // x86_64, timeout-wins arrives via recv-timeout (a finite user deadline is supplied) and
+        // reply-wins via infinite recv-v2 (deadline `None`), so the kernel injects a fixed later
+        // deadline. On AArch64 BOTH scenarios inject a hw-counter-relative deadline (the supplied
+        // recv-timeout deadline is in the stuck scheduler-tick base and is not comparable).
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        let now = crate::kernel::boot::reply_timeout_hw_now();
         let deadline_tick = match mode {
-            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS => match deadline {
-                Some(d) => d,
-                None => return,
-            },
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_TIMEOUT_WINS => {
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                {
+                    let _ = deadline;
+                    now.wrapping_add(4)
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+                match deadline {
+                    Some(d) => d,
+                    None => return,
+                }
+            }
             crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS => {
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                let d = now.wrapping_add(20);
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
                 let d = self.scheduler_tick_now().wrapping_add(8);
                 // Record it so the scan can prove it later ran PAST this deadline
                 // harmlessly (the reply disarms the token before it is reached).
                 crate::kernel::boot::set_ipc_reply_timeout_rw_deadline(d);
+                // Stage 200C2C2C-R2B: arm the CAUSAL collector gate HERE — strictly before the
+                // terminal cell is armed below, so no timeout claimant can ever reach it while
+                // the reply is in flight. Reply-wins only; released by userspace validation.
+                crate::kernel::boot::hold_reply_timeout_collector();
+                d
+            }
+            // Stage 200D-2B1D3 — the ServerDies arm.
+            //
+            // Everything downstream of this `match` is already the production path the other
+            // two scenarios use: it arms the REAL terminal cell from
+            // `reply_terminal_identity` (full caller AND replier incarnations, the record's
+            // own index+generation, the blocked-recv generation and the deadline token
+            // generation), registers the REAL deadline token, and — inside
+            // `register_reply_receive_deadline` — records the stale token at its existing arm
+            // site so the later scan can prove it examined the SAME registration.
+            //
+            // Until now `SERVER_DIES` fell into the `_ => return` below, so none of that ran:
+            // the terminal cell stayed `TerminalIdentity::ZERO`, and Stage 200D-2B1D2's live
+            // boot saw the death drain correctly reject a correct item against a vacant cell
+            // (`armed_tid=0 armed_asid=0 armed_generation=0`).
+            //
+            // The deadline is FINITE and deliberately later than the request round-trip, for
+            // the same reason reply-wins' is: the scenario's winner must be decided by the
+            // real claim path, never by the deadline firing first. This arm therefore only
+            // supplies a registration for the late scan to find already-invalidated — it does
+            // NOT select PeerDeath, fabricate a completion, or touch the ordinary IPC path.
+            //
+            // The collector hold/release policy is preserved exactly: the gate is armed here,
+            // strictly before the terminal cell, and released only by the caller's own
+            // userspace validation (`IPC_SERVER_DEATH_USER_VALIDATED ... code=10`). While held
+            // no timeout claimant can reach the terminal, which is what makes the PeerDeath
+            // win CAUSAL rather than a timing race. `hold_reply_timeout_collector` already
+            // admits this mode.
+            //
+            // `set_ipc_reply_timeout_rw_deadline` is deliberately NOT called: that record
+            // drives the reply-wins-only late-scan attestation, which is gated on
+            // `mode == REPLY_WINS`. ServerDies' analogue is the stale token recorded below,
+            // scanned by `server_dies_stale_scan_once`.
+            crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES => {
+                #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                let d = now.wrapping_add(20);
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+                let d = self.scheduler_tick_now().wrapping_add(8);
+                crate::kernel::boot::hold_reply_timeout_collector();
                 d
             }
             _ => return,
@@ -1377,7 +2228,8 @@ impl KernelState {
                 // Gate the retired off-lock scan attestation: a deadline is now live.
                 crate::kernel::boot::set_reply_timeout_armed_any();
                 crate::yarm_log!(
-                    "IPC_REPLY_TIMEOUT_ARMED arch=x86_64 caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
+                    "IPC_REPLY_TIMEOUT_ARMED arch={} caller_tid={} caller_asid={} record_index={} record_generation={} terminal_epoch={} token_slot={} token_generation={} deadline={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
                     caller_tid,
                     caller_asid.0,
                     record_index,
@@ -1409,16 +2261,68 @@ impl KernelState {
     /// reply-authority check rejects the late reply). This is the ONLY NR7
     /// integration. `commit_reply_win_after_delivery` / `rollback_reply_win`
     /// resolve the reservation.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn reserve_reply_win_before_copy(
         &mut self,
         reply_cap: CapId,
     ) -> Option<ReplyWinLease> {
-        use crate::kernel::terminal_ownership::TerminalClaimant;
         if !crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
             return None;
         }
-        let (idx, generation) = self.reply_cap_record_index_generation(reply_cap)?;
+        match self.try_reserve_reply_win_before_copy(reply_cap) {
+            Ok(lease) => {
+                // Stage 200C2C2C-R2B: the reply won the terminal. `token_lease` is the
+                // SUBORDINATE deadline bookkeeping result and is deliberately reported
+                // separately from the outcome — 0 is a normal, non-declining value.
+                crate::yarm_log!(
+                    "IPC_REPLY_WIN_RESERVE arch={} outcome=ok terminal=Reserved(Reply) token_lease={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                    u32::from(lease.deadline_lease.is_some())
+                );
+                // Stage 200D-2B1B-i: in the ServerDies scenario the server never replies —
+                // it exits. A reply that nevertheless RESERVED the terminal is a late reply
+                // that was accepted, which is the inversion this literal names. Emitted from
+                // the real reserve success, not from marker absence.
+                #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+                    == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+                {
+                    crate::yarm_log!(
+                        "IPC_SERVER_DEATH_LATE_REPLY_ACCEPTED terminal=Reserved(Reply) expected=PeerDeath result=fail"
+                    );
+                }
+                Some(lease)
+            }
+            // The two confinement outcomes are strict, SILENT no-ops: every ordinary NR7
+            // in the system takes them, and they are not oracle events.
+            Err(ReplyReserveDecline::RecordMissing) | Err(ReplyReserveDecline::RecordNotLive) => {
+                None
+            }
+            Err(reason) => {
+                crate::yarm_log!(
+                    "IPC_REPLY_WIN_RESERVE arch={} outcome=decline reason={:?} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
+                    reason
+                );
+                None
+            }
+        }
+    }
+
+    /// Stage 200C2C2C-R2B — the reservation body, with the decline reason made EXPLICIT
+    /// and typed. `ReplyReserveDecline` has no deadline-bookkeeping variant by
+    /// construction: once the terminal claim succeeds this function cannot fail, so a
+    /// deadline registration (present, absent, far, unreachable, re-armed, or already
+    /// detached) can never decide reply eligibility.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn try_reserve_reply_win_before_copy(
+        &mut self,
+        reply_cap: CapId,
+    ) -> Result<ReplyWinLease, ReplyReserveDecline> {
+        use crate::kernel::terminal_ownership::TerminalClaimant;
+        let (idx, generation) = self
+            .reply_cap_record_index_generation(reply_cap)
+            .ok_or(ReplyReserveDecline::RecordMissing)?;
         let reply_eidx = self.with_ipc_state(|ipc| match ipc.reply_caps.get(idx) {
             Some(Some(record)) => match record.reply_endpoint {
                 CapObject::Endpoint { index, .. } => Some(index),
@@ -1429,39 +2333,49 @@ impl KernelState {
         if reply_eidx.map(crate::kernel::boot::ipc_reply_timeout_oracle_reply_endpoint_is)
             != Some(true)
         {
-            return None;
+            return Err(ReplyReserveDecline::RecordNotLive);
         }
-        let (caller_tid, caller_asid) = self.with_ipc_state(|ipc| {
-            ipc.reply_caps
-                .get(idx)
-                .and_then(|s| s.as_ref())
-                .map(|r| (r.caller_tid.0, r.caller_asid))
-        })?;
+        let (caller_tid, caller_asid) = self
+            .with_ipc_state(|ipc| {
+                ipc.reply_caps
+                    .get(idx)
+                    .and_then(|s| s.as_ref())
+                    .map(|r| (r.caller_tid.0, r.caller_asid))
+            })
+            .ok_or(ReplyReserveDecline::CallerIdentityMismatch)?;
         let brg = self
             .blocked_recv_generation_for(caller_tid, caller_asid)
             .unwrap_or(1);
-        let identity = self.reply_terminal_identity(idx, generation, brg, Some(1))?;
+        let identity = self
+            .reply_terminal_identity(idx, generation, brg, Some(1))
+            .ok_or(ReplyReserveDecline::EndpointGenerationMismatch)?;
         // (1) Owned reply source snapshot is the caller of this hook (handle_ipc_reply
         // has already snapshot the server payload). (2) Claim the terminal REVERSIBLY.
-        let terminal_owner =
-            self.try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity)?;
-        // (3) Obtain REVERSIBLE ownership of the exact deadline registration — a lease,
+        // This is the SINGLE authority deciding reply eligibility — the LAST fallible
+        // step of the reservation.
+        let terminal_owner = self
+            .try_claim_reply_terminal_slot(idx, TerminalClaimant::Reply, &identity)
+            .ok_or(ReplyReserveDecline::TimeoutAlreadyClaimed)?;
+        // (3) OPTIONALLY obtain REVERSIBLE ownership of the exact deadline registration — a lease,
         // NOT a permanent disarm — so a subsequent copy fault can restore it exactly.
-        let lease = match self.reply_timeout_token_for_caller(caller_tid, caller_asid) {
-            Some(handle) => match self.claim_deadline_reply_lease(&handle) {
-                Some(owner) => Some((handle.token_index(), owner)),
-                None => {
-                    // The deadline token exists but could not be leased (already
-                    // fired/completed by a due timeout) — timeout is winning. Release
-                    // the terminal reservation and decline; the frozen reply flow will
-                    // reject the late reply through normal authority.
-                    let _ = self.release_reply_terminal_slot_if_retryable(idx, &terminal_owner);
-                    return None;
-                }
-            },
-            None => None,
-        };
-        Some(ReplyWinLease {
+        //
+        // Stage 200C2C2C-R2B: this is SUBORDINATE BOOKKEEPING, never terminal authority. Reaching
+        // this point means the reply already WON the terminal cell above, which is the single
+        // authority: a competing timeout/cancellation claimant could only have won by making that
+        // claim fail. Previously a token that could not be leased (missing, re-armed, far, or
+        // already detached) caused this hook to RELEASE the terminal it legitimately owned and
+        // decline — letting deadline-queue bookkeeping veto a valid reply. It no longer can.
+        //
+        // When the token cannot be leased we simply take no lease: we mutate no token (so a stale
+        // or re-armed generation is never touched), and the reply keeps terminal ownership. Any
+        // later timeout fire then loses at its own terminal claim, which is the correct authority.
+        let lease = self
+            .reply_timeout_token_for_caller(caller_tid, caller_asid)
+            .and_then(|handle| {
+                self.claim_deadline_reply_lease(&handle)
+                    .map(|owner| (handle.token_index(), owner))
+            });
+        Ok(ReplyWinLease {
             record_index: idx,
             terminal_owner,
             deadline_lease: lease,
@@ -1474,14 +2388,15 @@ impl KernelState {
     /// (`Reserved(Reply) → Completed(Reply)`). Both are non-fallible bookkeeping by
     /// the exact owner; the caller has already been delivered + enqueued by the
     /// frozen reply flow. Emits the reply-win marker.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn commit_reply_win_after_delivery(&mut self, lease: ReplyWinLease) {
         if let Some((token_index, owner)) = lease.deadline_lease {
             let _ = self.complete_deadline_reply_lease(token_index, &owner);
         }
         let _ = self.commit_reply_terminal_slot(lease.record_index, &lease.terminal_owner);
         crate::yarm_log!(
-            "IPC_REPLY_BEATS_TIMEOUT_OK arch=x86_64 terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok"
+            "IPC_REPLY_BEATS_TIMEOUT_OK arch={} terminal=Reply reply_copies=1 deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok",
+            crate::kernel::boot::REPLY_TIMEOUT_ARCH
         );
     }
 
@@ -1491,7 +2406,7 @@ impl KernelState {
     /// (`Reserved(Reply) → Open`). The reply record was never consumed and the caller
     /// never woken, so a later timeout scan (or a retried reply) still sees a clean,
     /// claimable state.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn rollback_reply_win(&mut self, lease: ReplyWinLease) {
         if let Some((token_index, owner)) = lease.deadline_lease {
             let _ = self.restore_deadline_reply_lease(token_index, &owner);
@@ -1499,13 +2414,14 @@ impl KernelState {
         let _ = self
             .release_reply_terminal_slot_if_retryable(lease.record_index, &lease.terminal_owner);
         crate::yarm_log!(
-            "IPC_REPLY_WIN_ROLLBACK arch=x86_64 terminal=Open deadline=Armed reply_copies=0 caller_wakes=0 result=ok"
+            "IPC_REPLY_WIN_ROLLBACK arch={} terminal=Open deadline=Armed reply_copies=0 caller_wakes=0 result=ok",
+            crate::kernel::boot::REPLY_TIMEOUT_ARCH
         );
     }
 
     /// Resolve a reply cap in the current task's CNode to its `(record index,
     /// generation)`. `None` if the cap is absent or not a `Reply` object.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn reply_cap_record_index_generation(
         &self,
         reply_cap: CapId,
@@ -1627,6 +2543,19 @@ impl KernelState {
                 .get(index)
                 .and_then(|slot| slot.as_ref())
                 .map(|record| record.reservation)
+        })
+    }
+
+    /// The CURRENT generation of a reply-record slot (`None` when vacant). Stage 200D-2B1D1
+    /// uses it to prove the ordinary path's reverse link names the record's own generation
+    /// rather than a stale one.
+    #[cfg(test)]
+    pub(crate) fn reply_cap_record_generation_for_test(&self, index: usize) -> Option<u64> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(index)
+                .and_then(|slot| slot.as_ref())
+                .map(|_| ipc.reply_cap_generations[index])
         })
     }
 
@@ -2175,7 +3104,7 @@ impl KernelState {
         // TCB + deadline + waiter). Oracle-gated, this arms the terminal + registers
         // the reply-timeout token; a strict no-op off the oracle / off the confined
         // reply endpoint / with no finite deadline, so ordinary receives are unchanged.
-        #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
         self.maybe_arm_reply_timeout_oracle(plan.blocked_tid.0, plan.endpoint_idx, deadline);
         if crate::kernel::boot::d2_recv_genuine_enabled() {
             // Stage 168 (D2-GENUINE-RECV): ipc publish done; enter dispatch.
@@ -2423,7 +3352,7 @@ impl KernelState {
                     // by the reply-timeout pre-pass above (the shared terminal
                     // transaction), never by this ordinary loop — so an ordinary and a
                     // reply-receive deadline are cleanly distinguished.
-                    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
                     if tcb.reply_timeout_token.is_some() {
                         continue;
                     }
@@ -3399,6 +4328,65 @@ impl KernelState {
             }
         });
 
+        // Stage 200D-2B1D1 — register the BOUNDED reverse link on the ORDINARY queued path.
+        //
+        // Until now the only production creator of a `ServerReplyLink` was the IpcCall-DIRECT
+        // transaction (`ipccall_direct_txn.rs`). The ordinary queued path created reply
+        // records with no link at all, so when a bound server exited, `exit_task` reserved a
+        // deferred slot, found nothing to detach, and the entire server-death chain — PeerDeath
+        // claim, canonical `ServerDied`, caller wake — could never begin. Stage 200D-2B1D-x86
+        // caught this live: the boot reached `IPC_SERVER_DEATH_DEFERRED_RESERVED` and stopped,
+        // with `LINK_CAPTURED` absent.
+        //
+        // The contract mirrors the direct transaction exactly:
+        //
+        //   position   the record is already `Available` (Phase 1) and its minted CapId is
+        //              persisted (Phase 3), so it is fully authoritative here; and the
+        //              responder has NOT been enqueued — the ordinary path's wake happens
+        //              later, in the caller's `handle_ipc_call`. The link therefore cannot
+        //              miss a window in either direction.
+        //   identity   the FULL `{tid, asid}` server incarnation recorded with the record, so
+        //              a numeric TID reused by a replacement task cannot detach this record's
+        //              authority; and the record's own `{index, generation}`, so a stale
+        //              generation cannot either.
+        //   capacity   one outstanding record per server. A second registration FAILS rather
+        //              than silently overwriting.
+        //   rollback   on failure the whole publication is unwound — the minted Reply cap is
+        //              revoked and the record slot freed — BEFORE the reply cap is returned to
+        //              the caller, so userspace observes nothing and neither a link nor a
+        //              record leaks.
+        //
+        // Only a call with a BOUND responder registers: `responder_tid`/`replier_asid` are
+        // `None` for the boot provisioning seam and for unbound reply caps, which own no
+        // server incarnation to link. This is ordinary production code — it is not gated on
+        // any oracle feature, and server death is not an oracle behavior.
+        if let (Some(server), Some(server_asid)) = (responder_tid, replier_asid)
+            && !self.register_server_reply_link(server.0, server_asid, slot, generation)
+        {
+            crate::yarm_log!(
+                "IPC_SERVER_REPLY_LINK_REGISTER_FAIL server_tid={} server_asid={} record_index={} record_generation={} path=ordinary reason=capacity result=rolled_back",
+                server.0,
+                server_asid.0,
+                slot,
+                generation
+            );
+            let reply_object = CapObject::Reply {
+                index: slot,
+                generation,
+            };
+            // Revoke from exactly where Phase 2 minted: the explicit destination cnode when
+            // one was given, otherwise the ACTIVE cnode (`mint_capability_for_active_cnode`).
+            // Using the caller's cnode instead would miss the mint whenever the caller is not
+            // the current task, and leak the cap.
+            if let Some(dest) = dest_cnode.or_else(|| self.current_task_cnode()) {
+                let _ = self.fast_revoke_reply_cap_in_cnode(dest, cap_id, reply_object);
+            }
+            self.with_ipc_state_mut(|ipc| {
+                ipc.reply_caps[slot] = None;
+            });
+            return Err(KernelError::CapabilityFull);
+        }
+
         crate::yarm_log!(
             "IPC_CALL_REPLY_CAP_ALLOC_DONE caller_tid={} slot={} cap={}",
             caller_tid.0,
@@ -3826,6 +4814,12 @@ impl KernelState {
             );
             return Err(KernelError::MissingRight);
         }
+        // Stage 200D-1: the REPLY terminal outcome becomes irrevocable here (the record is
+        // consumed). Close the reverse link on the same edge, using the bound replier
+        // identity read off the record itself — exact on both identities, so a reused slot
+        // or a replaced server incarnation is never touched.
+        let record_generation = self.with_ipc_state(|ipc| ipc.reply_cap_generations[slot]);
+        let _ = self.finalize_server_reply_link_for_record(slot, record_generation);
         let record = self.with_ipc_state_mut(|ipc| {
             let rec = ipc.reply_caps[slot].ok_or(KernelError::StaleCapability)?;
             ipc.reply_caps[slot] = None;

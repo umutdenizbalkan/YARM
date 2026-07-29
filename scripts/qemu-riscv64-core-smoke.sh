@@ -169,7 +169,16 @@ require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 LOGFILE=${LOGFILE:-qemu-riscv64-core.log}
 rm -f "$LOGFILE"
 
-echo "[info] qemu command: $QEMU_BIN -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -nographic -monitor none -serial stdio -bios $QEMU_BIOS -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
+# Stage 200C2C2C-R2B: opt-in SINGLE-BOOT-INSTANCE enforcement. With `QEMU_SINGLE_BOOT=1`,
+# QEMU is told never to restart the guest, so a reset can never silently produce a second
+# boot inside one log. Default-off: every existing caller keeps its exact prior invocation.
+QEMU_SINGLE_BOOT=${QEMU_SINGLE_BOOT:-0}
+SINGLE_BOOT_ARGS=()
+if [[ "$QEMU_SINGLE_BOOT" == "1" ]]; then
+  SINGLE_BOOT_ARGS=(-no-reboot -no-shutdown)
+fi
+
+echo "[info] qemu command: $QEMU_BIN -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -nographic -monitor none -serial stdio -bios $QEMU_BIOS -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE ${SINGLE_BOOT_ARGS[*]-} -append '$KERNEL_CMDLINE'"
 
 if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
   -machine "$QEMU_MACHINE" \
@@ -182,6 +191,7 @@ if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
   -bios "$QEMU_BIOS" \
   -kernel "$KERNEL_IMAGE" \
   -initrd "$INITRAMFS_IMAGE" \
+  ${SINGLE_BOOT_ARGS[@]+"${SINGLE_BOOT_ARGS[@]}"} \
   -append "$KERNEL_CMDLINE" \
 ; then
   QEMU_STATUS=0

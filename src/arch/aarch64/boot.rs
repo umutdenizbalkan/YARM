@@ -7838,6 +7838,39 @@ pub fn bootstrap_first_user_task(
             );
         }
     }
+    // Stage 200C2C1: default-off AArch64 reply-receive TIMEOUT retirement oracle. Provisions a
+    // request + a confined reply endpoint into init's CNode (the SAME arch-neutral
+    // `provision_init_ipc_reply_timeout_oracle`), and encodes the mode in the slot-5 value: 8 =
+    // timeout-wins, 9 = reply-wins — mutually exclusive with every other AArch64 slot-5 oracle
+    // (only fires when slots 5/13/14 are all still zero). Transactional + fail-closed.
+    #[cfg(feature = "aarch64-ipc-reply-timeout-oracle")]
+    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled()
+        && init_args[5] == 0
+        && init_args[13] == 0
+        && init_args[14] == 0
+    {
+        if let Some(caps) = crate::kernel::boot::provision_init_ipc_reply_timeout_oracle(
+            kernel,
+            RING3_INIT_SERVER_TID,
+        ) {
+            // Stage 200C2C2C-R2C: the selector is produced by the ARCHITECTURE-LOCAL encoder
+            // in `yarm_ipc_abi::ipc_reply_liveness_abi` — the exact inverse of the decoder
+            // userspace applies — so the kernel never hand-writes a slot-5 number and the
+            // two sides cannot drift apart.
+            init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);
+            init_args[13] = caps.request_ep_cap as u64;
+            init_args[14] = caps.reply_ep_cap as u64;
+            crate::yarm_log!(
+                "IPC_REPLY_TIMEOUT_ORACLE_SLOTS slot5={} slot13={} slot14={} req_eidx={} rep_eidx={} mode={}",
+                init_args[5],
+                init_args[13],
+                init_args[14],
+                caps.request_endpoint_idx,
+                caps.reply_endpoint_idx,
+                crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            );
+        }
+    }
     // Stage 195C: default-off AArch64 FutexWake live oracle. Slot 5
     // (supervisor_control_recv_ep) is unused by init, so under
     // `yarm.aarch64_futex_wake_oracle=1` we reuse it as a sentinel (=1) that tells init to
@@ -7862,6 +7895,24 @@ pub fn bootstrap_first_user_task(
     } else if crate::kernel::boot::aarch64_futex_wake_oracle_enabled() {
         init_args[5] = 1;
         crate::yarm_log!("AARCH64_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1");
+    }
+    // Stage 200D-0C1: the AArch64 ExitCurrentTask live-oracle slot-5 write. This IS the
+    // production activation — without it the feature and the knob arm nothing and init never
+    // sees the scenario (the exact defect that produced two dead x86 runs in Stage 200D-0B2,
+    // where the selector constant existed but nothing assigned it).
+    //
+    // The value is NOT written literally: it comes from the shared
+    // `yarm_ipc_abi::exit_current_task_abi` encoder via `aarch64_exit_current_task_selector()`,
+    // and the init server decodes it through the inverse of that same helper. This oracle needs
+    // no capabilities, so it takes slot 5 only, and is mutually exclusive with every slot-5
+    // oracle above (guarded by `init_args[5] == 0`).
+    #[cfg(feature = "aarch64-exit-current-task-oracle")]
+    if crate::kernel::boot::aarch64_exit_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::aarch64_exit_current_task_selector();
+        crate::yarm_log!(
+            "EXIT_TASK_ORACLE_SLOTS arch=aarch64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
     }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
@@ -8083,6 +8134,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
         kernel.online_cpu_count(),
         kernel.present_cpu_count()
     );
+    // Stage 200C2C2C-R2C: one-shot boot-instance identifier (see `emit_boot_instance_nonce`).
+    crate::kernel::boot::emit_boot_instance_nonce("aarch64");
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),

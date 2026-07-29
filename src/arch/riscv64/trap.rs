@@ -40,6 +40,10 @@ pub enum RiscvIdleReason {
     /// alone. (Generalized from the recv-only `BlockedRecvNoRunnable`, since the producer covers all
     /// three blocking IPC syscalls, not recv alone.)
     BlockedIpcNoRunnable,
+    /// Stage 200D-0D1: an accepted `ExitCurrentTask` removed the last runnable task. Distinct
+    /// from `BlockedIpcNoRunnable` because nothing is blocked — the task is gone — so the
+    /// blocking-seam provenance token that branch requires is legitimately absent.
+    ExitCurrentTaskNoRunnable,
 }
 
 /// Stage 197B: the explicit, typed result of the RISC-V shared trap-entry wrapper. It replaces the
@@ -81,6 +85,51 @@ fn restore_arch_thread_state(
         .resume_current_thread_with_frame(frame)
         .map_err(crate::kernel::syscall::SyscallError::from)
         .map_err(TrapHandleError::Syscall)?;
+    // Stage 200C2C2 — BLOCKED-SYSCALL COMPLETION boundary (RISC-V).
+    //
+    // Like AArch64, a blocked recv on this port is NEVER re-entered: the boot bridge
+    // pre-advances `sepc` by +4 before `handle_trap_entry`, so the TCB captures `sepc+4` and a
+    // resumed caller `sret`s to the instruction after its `ecall`. A remotely completed caller
+    // therefore cannot receive its result by "returning" from the handler — it consumes the
+    // exact parked completion HERE.
+    //
+    // Placement is deliberate: this runs AFTER `resume_current_thread_with_frame` (whose
+    // `apply_user_context` reloads the saved `user_gprs` — the very write that would otherwise
+    // clobber a result lane, cf. the Stage 163L a0-zeroing note below), so the canonical result
+    // is written LAST and cannot be overwritten by the restored pre-block snapshot. `sepc`,
+    // `sstatus`, `satp`/ASID, `sp` and `tp`/TLS are all left exactly as restored — the ecall
+    // return address was advanced once, at block time.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    if let Some(current_tid) = kernel.current_tid() {
+        if let Some(done) = kernel.take_blocked_syscall_completion(current_tid) {
+            // RISC-V syscall-error convention. The result is written to BOTH lanes so it survives
+            // either resume route:
+            //   * post-switch resume — nothing runs after this, so a0 (`user_gprs[10]`) is what
+            //     userspace sees; a1 is cleared so a stale success lane cannot be read as payload;
+            //   * same-task return — the `EXC_USER_ECALL` export below re-derives a0 from the
+            //     frame's ERROR lane (`if let Some(err) = f.error_code()`), which would otherwise
+            //     overwrite the GPR write. Setting `set_err` makes that export carry the canonical
+            //     code instead of clobbering it.
+            frame.set_err(done.result as usize);
+            frame.set_user_gpr(10, done.result as usize);
+            frame.set_user_gpr(11, 0);
+            // Delivery-authoritative: emitted only AFTER the canonical result is encoded into the
+            // outgoing frame's established error lanes, and reporting those FINAL lane values.
+            crate::yarm_log!(
+                "RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED tid={} class={:?} result=TimedOut code={} blocked_generation={} sepc=0x{:016x} final_a0={} final_a1={} result=ok",
+                current_tid,
+                done.syscall_class,
+                done.result,
+                done.blocked_generation,
+                frame.saved_pc() as u64,
+                frame.user_gpr(10),
+                frame.user_gpr(11)
+            );
+            // Retirement is authorized ONLY here — after the exact completion was consumed and
+            // the canonical result encoded into a valid `sret` frame.
+            crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
+        }
+    }
     let idx = cpu.0 as usize;
     if idx < MAX_CPUS {
         LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
@@ -207,6 +256,45 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
             outgoing
         );
         crate::yarm_log!("RISCV_YIELD_HANDLER_BYPASS_DONE cpu={}", cpu.0);
+        return Ok(());
+    }
+    // ── Stage 200D-0D1 (EXITCURRENTTASK IN-LOCK BYPASS) ────────────────────────────────
+    //
+    // The fourth member of the 196D/196E/196G bypass family, and deliberately the NARROWEST.
+    // The source audit showed RISC-V does NOT need what AArch64 needed: there is no in-lock
+    // idle divergence here (idle is a typed `EnterKernelIdle` produced in Phase 3), and the
+    // canonical restore below reads the CURRENT task — which `exit_task` has already switched
+    // to the replacement — so it restores the RIGHT task's context, not the exiting one's.
+    //
+    // What must be suppressed is the block AFTER the restore: for `EXC_USER_ECALL` it writes
+    // `ret0`/`ret1` into `user_gpr(10)`/`(11)`. Those are the accepted NR16's own return values,
+    // and NR16 must never publish a result. Letting it run would write a result on behalf of a
+    // task that no longer exists into the frame the replacement is about to be resumed from.
+    // (The bridge's `task_switched` write-back happens to overwrite a0..a5 from `arg[]`
+    // afterwards, so this is latent rather than observed — which is exactly why it is fixed
+    // here rather than left to depend on a downstream overwrite.)
+    //
+    // The no-replacement case additionally skips the restore: with `current == None` the
+    // canonical restore would fail and propagate `Err`, turning an ordinary idle outcome into a
+    // fatal trap. Phase 3 produces the typed idle instead.
+    //
+    // Requires an ACTUAL pending disposition (no generic skip flag) and is inert for every
+    // other syscall on every other path.
+    if crate::kernel::boot::post_lock_trap_disposition_pending(cpu_idx) {
+        let replacement = kernel.current_tid().filter(|t| *t != 0);
+        crate::yarm_log!(
+            "EXIT_TASK_INLOCK_BYPASS_ARMED arch=riscv64 cpu={} replacement={} inlock_result_export=0 broad_lock=1 result=ok",
+            cpu.0,
+            replacement.unwrap_or(0)
+        );
+        if replacement.is_none() {
+            // Idle outcome: restore NOTHING. Phase 3 names the outcome and returns typed idle.
+            return Ok(());
+        }
+        // Replacement outcome: apply the REPLACEMENT's saved context (the canonical restore
+        // sources `current`, which is already the replacement), then return WITHOUT the ecall
+        // result export.
+        restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())?;
         return Ok(());
     }
     // Stage 163L: restore FIRST so apply_user_context (called inside
@@ -535,6 +623,28 @@ pub fn handle_riscv_trap_entry_shared(
     // nothing (the common case). This is the mechanism that makes the RISC-V
     // deferred-snapshot wake path complete AFTER the broad borrow drops.
     shared.drain_dispatch_post_work(cpu)?;
+
+    // Stage 200C2C2 (IpcReplyTimeout OFF-LOCK RETIREMENT, RISC-V cell): with the broad
+    // `SpinLock<KernelState>` from Phase 2's `with_cpu` genuinely released, collect DUE
+    // token-bearing reply-receive deadlines through the NARROW collector (rank-2 task split seam)
+    // and drain the per-CPU deferred work through the OFF-LOCK completion transaction (per-domain
+    // split-mut seams). This is the arch-neutral machinery accepted for x86_64 and AArch64 — only
+    // the call site and the monotonic clock differ. `now` comes from the RISC-V `time` CSR (the
+    // scheduler tick does not advance reliably under a user workload on this port), the SAME clock
+    // domain the deadline is armed in. Ordinary receive-timeout deadlines stay on the in-lock scan
+    // (the collector's token-bearing filter skips them). Default-off: a strict no-op unless the
+    // RISC-V oracle feature is built AND its selector is active.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled() {
+        let now = shared.reply_timeout_now_split_read();
+        shared.collect_due_reply_timeout_work(now, cpu);
+        shared.drain_reply_timeout_post_work(cpu, now);
+    }
+
+    // Stage 200D-2A: the SERVER-DEATH post-lock drain, ungated (production behaviour on
+    // every build). RISC-V drives its own post-lock area, so the drain is wired here for
+    // the same reason the collector above is — one driver per port.
+    let _ = shared.drain_server_death_post_work(cpu);
 
     // Foundation-oracle DRAIN — consume the token published in-lock, proving the
     // outer guard is genuinely dropped by RE-ACQUIRING `with_cpu` here (a held
@@ -900,6 +1010,167 @@ pub fn handle_riscv_trap_entry_shared(
     if log_structural {
         crate::yarm_log!("RISCV_POST_LOCK_DRAIN_DONE cpu={} result=ok", cpu.0);
         crate::yarm_log!("RISCV_SHARED_TRAP_ENTRY_DONE cpu={}", cpu.0);
+    }
+
+    // ── Stage 200D-0D1: the RISC-V `CurrentTaskExited` consumer ─────────────────────────
+    //
+    // THE single RISC-V production call to `take_post_lock_trap_disposition`. Its position is
+    // the contract, and every clause is a property of THIS line rather than of a comment:
+    //
+    //   after broad-lock release — Phase 2's `with_cpu` returned far above; the brief
+    //                              re-acquire below is only possible BECAUSE the guard dropped
+    //                              (a still-held guard would deadlock), so reaching the
+    //                              validation at all is the proof.
+    //   after every drain        — `drain_dispatch_post_work`, the reply-timeout collector +
+    //                              drain, `drain_server_death_post_work`, the foundation
+    //                              oracle, and the 196D/196E/196G switch drains have all run.
+    //   before frame application — the bridge applies `tframe` to the hardware frame only
+    //                              after this wrapper returns.
+    //   before `sret`            — likewise; `sret` is the bridge's, several statements later.
+    //
+    // It must also precede the Stage 198A1 terminal-idle block below: that block treats
+    // `current == None` WITHOUT blocking-seam provenance as a defect and takes the fatal `Err`
+    // path. An accepted exit legitimately produces `current == None` with no provenance (nothing
+    // blocked — the task is gone), so the exit outcome is decided here, before that check can
+    // misread it.
+    //
+    // The consumer performs NO teardown, NO enqueue, NO PeerDeath or Timeout claim, NO result
+    // publication, NO `publish_riscv_user_return`, NO userspace copy and NO second scheduler
+    // path. It validates the exact `{tid, asid, cpu}` incarnation, attests the outcome, and
+    // selects between the replacement the in-lock bypass already restored and the established
+    // typed idle terminal.
+    if let crate::kernel::boot::PostLockTrapDisposition::CurrentTaskExited { tid, asid } =
+        crate::kernel::boot::take_post_lock_trap_disposition(cpu_idx)
+    {
+        crate::yarm_log!(
+            "EXIT_TASK_BROAD_LOCK_RELEASED arch=riscv64 tid={} asid={} cpu={} broad_lock=0 holder=with_cpu result=ok",
+            tid,
+            asid.0,
+            cpu.0
+        );
+        crate::yarm_log!(
+            "EXIT_TASK_POST_LOCK_DRAIN_DONE arch=riscv64 cpu={} broad_lock=0 drains=all result=ok",
+            cpu.0
+        );
+        crate::yarm_log!(
+            "EXIT_TASK_DISPOSITION_CONSUMED arch=riscv64 tid={} asid={} cpu={} broad_lock=0 result=ok",
+            tid,
+            asid.0,
+            cpu.0
+        );
+        // Lock-dropped proof + identity read in one brief re-acquire. Reads only.
+        let (current, identity_ok, terminal, in_runqueue) = shared
+            .with_cpu(cpu, |kernel| {
+                let current = kernel.current_tid();
+                // FULL incarnation: a numeric TID match alone would let a restarted task satisfy
+                // a stale disposition, so the ASID recorded at publication must still be bound to
+                // that TID — or the TCB must be gone entirely.
+                let identity_ok = match kernel.task_asid(tid) {
+                    Some(bound) => bound == asid,
+                    None => true,
+                };
+                let terminal = matches!(
+                    kernel.task_status(tid),
+                    Some(crate::kernel::task::TaskStatus::Exited(_))
+                        | Some(crate::kernel::task::TaskStatus::Dead)
+                        | None
+                );
+                (
+                    current,
+                    identity_ok,
+                    terminal,
+                    kernel.task_present_in_any_runqueue(tid),
+                )
+            })
+            .map_err(|err| TrapHandleError::Syscall(err.into()))?;
+        if current == Some(tid) {
+            crate::yarm_log!(
+                "EXIT_TASK_EXITING_STILL_CURRENT arch=riscv64 tid={} cpu={} result=fail",
+                tid,
+                cpu.0
+            );
+            return Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            ));
+        }
+        if !identity_ok || !terminal || in_runqueue {
+            crate::yarm_log!(
+                "EXIT_TASK_WRONG_IDENTITY arch=riscv64 tid={} asid={} identity_ok={} terminal={} in_runqueue={} result=fail",
+                tid,
+                asid.0,
+                u32::from(identity_ok),
+                u32::from(terminal),
+                u32::from(in_runqueue)
+            );
+            return Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::Internal,
+            ));
+        }
+        crate::yarm_log!(
+            "EXIT_TASK_EXITING_NOT_CURRENT arch=riscv64 tid={} asid={} cpu={} broad_lock=0 result=ok",
+            tid,
+            asid.0,
+            cpu.0
+        );
+        crate::yarm_log!(
+            "EXIT_TASK_ABSENCE_VALIDATED arch=riscv64 tid={} asid={} current=0 runqueue=0 restore_owner=0 frame_source=0 identity=tid_asid broad_lock=0 result=ok",
+            tid,
+            asid.0
+        );
+        // sret / trap-depth ownership (Stage 200D-0D1 audit): RISC-V has NO software
+        // trap-dispatch depth counter on this path — x86_64's `TRAP_DISPATCH_DEPTH` has no
+        // RISC-V analogue, and the bridge owns the single `sret`. The correct number of
+        // consumer-side clears is therefore ZERO, and none is made here.
+        crate::yarm_log!(
+            "EXIT_TASK_SRET_OWNER arch=riscv64 cpu={} owner=trap_bridge software_depth_clears=0 broad_lock=0 result=ok",
+            cpu.0
+        );
+        match current {
+            Some(next) if next != 0 => {
+                if next == tid {
+                    crate::yarm_log!(
+                        "EXIT_TASK_RESELECTED_EXITING_TASK arch=riscv64 tid={} cpu={} result=fail",
+                        tid,
+                        cpu.0
+                    );
+                    return Err(TrapHandleError::Syscall(
+                        crate::kernel::syscall::SyscallError::Internal,
+                    ));
+                }
+                crate::yarm_log!(
+                    "EXIT_TASK_RESTORE_OWNER arch=riscv64 owner=replacement exiting_tid={} next_tid={} cpu={} broad_lock=0 result=ok",
+                    tid,
+                    next,
+                    cpu.0
+                );
+                // The replacement's saved sepc/sstatus/GPRs were applied to `tframe` by the
+                // in-lock bypass (which sourced `current`, already the replacement). Nothing is
+                // re-applied here: a second restore would be a duplicate frame authority.
+                crate::yarm_log!(
+                    "EXIT_TASK_RESTORE_DONE arch=riscv64 owner=replacement next_tid={} cpu={} frame_source=replacement_tcb result=ok",
+                    next,
+                    cpu.0
+                );
+                // Typed outcome: the resumed task differs from the trap's entering task, so the
+                // bridge's `task_switched` write-back sources the replacement's saved context.
+                switched = true;
+            }
+            _ => {
+                crate::yarm_log!(
+                    "EXIT_TASK_RESTORE_OWNER arch=riscv64 owner=idle exiting_tid={} cpu={} broad_lock=0 result=ok",
+                    tid,
+                    cpu.0
+                );
+                // No replacement: no frame was restored by the bypass and none is armed here.
+                // Return the ESTABLISHED typed idle terminal — the same `riscv_trap_halt` (wfi)
+                // path FutexWait-no-incoming and the terminal all-blocked case already use, with
+                // its own provenance so a live log can tell which class idled. No second idle
+                // loop is introduced, and no `sret` is attempted.
+                return Ok(RiscvTrapEntryOutcome::EnterKernelIdle {
+                    reason: RiscvIdleReason::ExitCurrentTaskNoRunnable,
+                });
+            }
+        }
     }
 
     // Stage 198A1: blocking-syscall TERMINAL-IDLE on the Ok path, from AUTHORITATIVE PROVENANCE —

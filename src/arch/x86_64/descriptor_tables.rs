@@ -263,6 +263,42 @@ pub(crate) fn clear_trap_dispatch_depth(cpu: crate::kernel::scheduler::CpuId) {
     let idx = (cpu.0 as usize).min(crate::arch::platform_constants::MAX_CPUS - 1);
     TRAP_DISPATCH_DEPTH[idx].store(0, Ordering::Release);
 }
+/// Stage 200D-0B3: attest common-epilogue ownership for an accepted `ExitCurrentTask`.
+///
+/// Called from the trap epilogue immediately after the SINGLE `TRAP_DISPATCH_DEPTH` clear that
+/// this return path performs, so `clears=1` is a statement about the depth store that just
+/// executed rather than a prediction. A strict no-op on every trap that did not accept an exit.
+///
+/// It writes no depth state of its own — adding one would double-clear, which is the defect the
+/// `exit_specific_trap_depth_writes=0` guard exists to prevent.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn maybe_attest_exit_common_epilogue(cpu: crate::kernel::scheduler::CpuId, owner: &str) {
+    let Some((tid, asid, stage)) = crate::kernel::boot::take_exit_attestation(cpu.0 as usize)
+    else {
+        return;
+    };
+    if stage != crate::kernel::boot::EXIT_ATTEST_DRAINED {
+        // An accepted exit reached the epilogue without both post-lock attestations having
+        // fired. That means the lock-release or drain-completion step was skipped, so the
+        // ordering this stage exists to prove did not hold. Report it; do not smooth it over.
+        crate::yarm_log!(
+            "EXIT_TASK_TRAP_DEPTH_ERROR arch=x86_64 tid={} cpu={} stage={} expected={} result=fail",
+            tid,
+            cpu.0,
+            stage,
+            crate::kernel::boot::EXIT_ATTEST_DRAINED
+        );
+        return;
+    }
+    crate::yarm_log!(
+        "EXIT_TASK_COMMON_EPILOGUE_OWNER arch=x86_64 tid={} asid={} cpu={} owner={} clears=1 frame_committed=1 broad_lock=0 result=ok",
+        tid,
+        asid.0,
+        cpu.0,
+        owner
+    );
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 static FATAL_LOG_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -1277,7 +1313,75 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // interrupt handler. A strict no-op off the reply path / before the reply is delivered / once done.
         #[cfg(not(feature = "hosted-dev"))]
         crate::arch::x86_64::smp::c2c_bsp_saved_frame_resume(shared, cpu);
-        if matches!(exiting_tid, None | Some(0)) {
+        // Stage 200D-2B1D5A: the restore owner was prepared IN-LOCK, before the post-lock
+        // drains ran — and the drains are exactly where wakes are published. Re-validate the
+        // decision here, with the broad guard dropped and every drain complete, but BEFORE any
+        // frame is committed. Only an `idle` owner is revalidated: a prepared replacement was
+        // chosen from live state and the drains cannot invalidate it, so it is never displaced.
+        let revalidation = if matches!(exiting_tid, None | Some(0)) {
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                shared.revalidate_idle_owner_after_drains(cpu, &mut trap_frame)
+            }
+            #[cfg(feature = "hosted-dev")]
+            {
+                crate::runtime::OwnerRevalidation::Idle
+            }
+        } else {
+            crate::runtime::OwnerRevalidation::Idle
+        };
+        // Stage 200D-2B1D5B: the restore-failure contract. The disposition is a pure function of
+        // the outcome (`OwnerRevalidation::disposition`), so the fail-closed rule is one testable
+        // rule rather than the incidental shape of this match.
+        let revalidated_owner = match revalidation.disposition() {
+            crate::runtime::OwnerCommit::Replacement(next) => {
+                crate::yarm_log!(
+                    "EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu={} prepared=idle committed=replacement next_tid={} advances=1 broad_lock=0 result=ok",
+                    cpu.0,
+                    next
+                );
+                Some(next)
+            }
+            crate::runtime::OwnerCommit::Idle => {
+                if let crate::runtime::OwnerRevalidation::RestoreFailed { tid, .. } = revalidation {
+                    // The advance was undone: nothing is current on this CPU and `tid` is back
+                    // on its run queue (or gone with its TCB), so the idle path below is safe.
+                    crate::yarm_log!(
+                        "EXIT_TASK_OWNER_REVALIDATE_ROLLBACK arch=x86_64 cpu={} tid={} advances=0 committed=idle broad_lock=0 result=ok",
+                        cpu.0,
+                        tid
+                    );
+                }
+                None
+            }
+            crate::runtime::OwnerCommit::FailClosed(tid) => {
+                // A replacement is still this CPU's `current` with no restorable context and the
+                // rollback did not complete. Halting here through the idle path would strand it
+                // exactly as Stage 200D-2B1D4 stranded its caller, and committing the frame would
+                // iret into the PREVIOUS task's context. Fail closed through the SAME fatal path
+                // the trap-dispatch error above uses — no new policy, no silent continue.
+                crate::pr_err!(
+                    "x86 owner revalidation rollback failed: cpu={} tid={} vector={}",
+                    cpu.0,
+                    tid,
+                    vector
+                );
+                crate::yarm_log!(
+                    "EXIT_TASK_OWNER_REVALIDATE_ROLLBACK arch=x86_64 cpu={} tid={} advances=1 committed=stranded broad_lock=0 result=fail",
+                    cpu.0,
+                    tid
+                );
+                let snapshot = shared.fatal_trap_read_snapshot(cpu);
+                log_decoded_fatal_trap_from_snapshot(
+                    snapshot, vector, error_code, frame, fault_addr,
+                );
+                debug_uart_trap_breadcrumb(
+                    b'T', vector, error_code, fault_addr, fault_rip, cpu_apic,
+                );
+                halt_forever();
+            }
+        };
+        if matches!(exiting_tid, None | Some(0)) && revalidated_owner.is_none() {
             // The scheduler uses TID 0 as its idle/supervisor sentinel.  It has
             // no user context to iretq back to; returning through the current
             // user trap frame would resume the task that just blocked and form
@@ -1293,15 +1397,34 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
             }
             crate::yarm_log!("SCHED_ENTER_IDLE_HLT cpu={}", cpu.0);
             TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
+            // Stage 200D-0B3: the idle outcome reaches the SAME single depth clear and the same
+            // ownership attestation. No iret frame is committed and ring 3 is never re-entered
+            // on this path, so the exiting frame cannot be restored here either.
+            maybe_attest_exit_common_epilogue(cpu, "idle");
             idle_halt_loop();
         }
-        if task_switched {
+        // A revalidated owner is a genuine task switch: its GPRs must reach the saved regs the
+        // epilogue flushes, exactly as a normally-prepared replacement's would.
+        if task_switched || revalidated_owner.is_some() {
             write_task_gprs_to_saved_regs(regs, &trap_frame);
         } else if vector as usize == VEC_SYSCALL {
             write_trap_returns_to_saved_regs(regs, &trap_frame);
         }
         unsafe { flush_trap_context_to_iret_frame(interrupt_frame, &trap_frame) };
         TRAP_DISPATCH_DEPTH[depth_idx].store(0, Ordering::Release);
+        // Stage 200D-0B3: the common-epilogue ownership attestation, emitted from the epilogue
+        // that actually owns the cleanup rather than from inside the broad lock (where Stage
+        // 200D-0B1 emitted it). By this point the ACTUAL user-return state has been committed:
+        // `flush_trap_context_to_iret_frame` has patched the hardware iret frame, and the
+        // single depth clear above has run. Both happened after
+        // `dispatch_trap_entry_with_shared_kernel` returned, i.e. after the broad lock was
+        // released and after every shared post-lock drain — so a user return can never precede
+        // the drains. Ring 3 is reached by the `iretq`/`sysretq` that follows this `return`.
+        //
+        // The stage check is fail-closed: reaching the epilogue with a latch that never made it
+        // to `drained` means an attestation was skipped, which is reported as an error rather
+        // than papered over with a reassuring marker.
+        maybe_attest_exit_common_epilogue(cpu, "replacement");
         return;
     }
 

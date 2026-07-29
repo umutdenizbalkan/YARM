@@ -828,6 +828,8 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             let reason_str = match reason {
                 RiscvIdleReason::FutexWaitNoIncoming => "FutexWaitNoIncoming",
                 RiscvIdleReason::BlockedIpcNoRunnable => "BlockedIpcNoRunnable",
+                // Stage 200D-0D1: an accepted ExitCurrentTask left no runnable task.
+                RiscvIdleReason::ExitCurrentTaskNoRunnable => "ExitCurrentTaskNoRunnable",
             };
             crate::yarm_log!("RISCV_TYPED_IDLE_OUTCOME result=ok reason={}", reason_str);
             crate::yarm_log!(
@@ -1672,6 +1674,41 @@ pub fn bootstrap_first_user_task(
     // and init skips all. NB: these are WORKLOAD selectors only — the FutexWait retirement mechanism
     // itself is DEFAULT-ON (no knob) as of 196F. The chain never overwrites a selector the
     // shared-region oracle already set (guarded by `init_args[5] == 0`).
+    // Stage 200C2C2: default-off RISC-V reply-receive TIMEOUT retirement oracle. Provisions a
+    // request + a confined reply endpoint into init's CNode (the SAME arch-neutral
+    // `provision_init_ipc_reply_timeout_oracle` used by the x86_64 and AArch64 cells) and encodes
+    // the mode in the slot-5 value: 9 = timeout-wins, 10 = reply-wins. Mutually exclusive with
+    // every other RISC-V slot-5 oracle: it fires only when slots 5/13/14 are ALL still zero, so a
+    // selector collision fails closed (this oracle simply stands down). Transactional +
+    // fail-closed inside the provisioning helper.
+    #[cfg(feature = "riscv64-ipc-reply-timeout-oracle")]
+    if crate::kernel::boot::x86_ipc_reply_timeout_oracle_enabled()
+        && init_args[5] == 0
+        && init_args[13] == 0
+        && init_args[14] == 0
+    {
+        if let Some(caps) = crate::kernel::boot::provision_init_ipc_reply_timeout_oracle(
+            kernel,
+            RING3_INIT_SERVER_TID,
+        ) {
+            // Stage 200C2C2C-R2C: the selector is produced by the ARCHITECTURE-LOCAL encoder
+            // in `yarm_ipc_abi::ipc_reply_liveness_abi` — the exact inverse of the decoder
+            // userspace applies — so the kernel never hand-writes a slot-5 number and the
+            // two sides cannot drift apart.
+            init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);
+            init_args[13] = caps.request_ep_cap as u64;
+            init_args[14] = caps.reply_ep_cap as u64;
+            crate::yarm_log!(
+                "IPC_REPLY_TIMEOUT_ORACLE_SLOTS slot5={} slot13={} slot14={} req_eidx={} rep_eidx={} mode={}",
+                init_args[5],
+                init_args[13],
+                init_args[14],
+                caps.request_endpoint_idx,
+                caps.reply_endpoint_idx,
+                crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+            );
+        }
+    }
     if init_args[5] == 0 && crate::kernel::boot::riscv_yield_lone_task_oracle_enabled() {
         init_args[5] = 6;
         crate::yarm_log!("RISCV_YIELD_LONE_TASK_ORACLE_PROVISION_OK slot5=6");
@@ -1690,6 +1727,21 @@ pub fn bootstrap_first_user_task(
     } else if crate::kernel::boot::riscv_futex_wake_oracle_enabled() {
         init_args[5] = 1;
         crate::yarm_log!("RISCV_FUTEX_WAKE_ORACLE_PROVISION_OK slot5=1");
+    }
+    // Stage 200D-0D1: the RISC-V ExitCurrentTask live-oracle slot-5 write. This IS the
+    // production activation — without it the feature and the knob arm nothing and init never
+    // sees the scenario. The value is NOT written literally: it comes from the shared
+    // `yarm_ipc_abi::exit_current_task_abi` encoder via `riscv_exit_current_task_selector()`,
+    // and the init server decodes it through the inverse of that same helper. This oracle needs
+    // no capabilities, so it takes slot 5 only, and is mutually exclusive with every slot-5
+    // oracle above (guarded by `init_args[5] == 0`).
+    #[cfg(feature = "riscv-exit-current-task-oracle")]
+    if crate::kernel::boot::riscv_exit_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::riscv_exit_current_task_selector();
+        crate::yarm_log!(
+            "EXIT_TASK_ORACLE_SLOTS arch=riscv64 slot5={} caps=none result=ok",
+            init_args[5]
+        );
     }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
@@ -2077,6 +2129,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     // remains valid for the life of the kernel.
     install_riscv_trap_shared_kernel(shared);
     crate::yarm_log!("YARM_LOCK_SPLIT_STAGE196A_INSTALLED arch=riscv64 shared=1 raw=0");
+    // Stage 200C2C2C-R2C: one-shot boot-instance identifier (see `emit_boot_instance_nonce`).
+    crate::kernel::boot::emit_boot_instance_nonce("riscv64");
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),

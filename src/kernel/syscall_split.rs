@@ -407,6 +407,9 @@ fn try_split_debug_log_into_frame(
             // Stage 199A2D2C2C: terminal cross-CPU reply-OK marker, gated on observing the resumed
             // CPU-0 client's X86_BSP_REPLY_USER_VALIDATED marker here (the off-lock DebugLog path).
             crate::kernel::boot::maybe_emit_ipcreply_direct_smp_reply_ok(msg);
+            // Stage 200C2C2C-R2B: same causal reply-wins gate release on the off-lock DebugLog
+            // path, so the seam the oracle actually takes is never the one that misses it.
+            crate::kernel::boot::maybe_release_reply_timeout_collector_gate(msg);
         }
         // Copy failed (no mapping / not user-readable) — same as the global handler's
         // `DEBUG_LOG_COPY_FAIL` path: OK, no log.

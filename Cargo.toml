@@ -79,17 +79,52 @@ riscv-ipccall-direct-oracle = ["ipccall-direct-oracle"]
 # direct-transaction logic + class literals compile.
 x86-ipccall-direct-smp-oracle = ["ipccall-direct-oracle"]
 
-# Stage 200C2A/200C2B: default-off x86_64 LIVE reply-receive TIMEOUT oracle. COMPILES the Stage
-# 200C live reply-timeout marker paths (registration hook at the recv-v2 reply block, the reversible
-# NR7 reply-win reserve/commit/rollback, the NARROW off-lock collector + per-CPU deferred-work drain,
-# and the class retirement seal). Activation additionally requires `target_arch = x86_64` and the
-# runtime selector `yarm.x86_64_ipc_reply_timeout_oracle=timeout-wins|reply-wins`. Feature-OFF
-# artifacts contain none of the Stage 200C live marker literals. Stage 200C2B retires the
-# `IpcReplyTimeout` class: token-bearing reply deadlines are collected + completed OFF the broad
-# `SpinLock<KernelState>` at the trap-entry post-lock area (scan_broad_lock=0), while ordinary
-# receive timeouts stay on their existing in-lock path. Adds NO server-death/notification/multi-pair/
-# second-queue support and no non-x86 live cell.
-x86-ipc-reply-timeout-oracle = []
+# Stage 200C2B core: the ARCH-NEUTRAL reply-timeout retirement machinery (the reversible NR7
+# reply-win reserve/commit/rollback, the `ClaimedByReply` deadline lease, the NARROW off-lock
+# collector + per-CPU deferred-work drain, the single `complete_reply_timeout_over` transaction, and
+# the class retirement markers). Enabled by each per-arch oracle feature below; never selected
+# directly. Compiles the same body for every arch — only the trap-entry wire, feature/selector,
+# userspace wrapper and live proof are arch-specific.
+ipc-reply-timeout-oracle-core = []
+
+# Stage 200C2A/200C2B: default-off x86_64 LIVE reply-receive TIMEOUT retirement oracle. Activation
+# requires `target_arch = x86_64`, this feature, and the selector
+# `yarm.x86_64_ipc_reply_timeout_oracle=timeout-wins|reply-wins`. Retires the `IpcReplyTimeout`
+# class off the broad `SpinLock<KernelState>` (scan_broad_lock=0); ordinary receive timeouts stay
+# in-lock. Feature-OFF x86_64 artifacts contain none of the Stage 200C live marker literals.
+x86-ipc-reply-timeout-oracle = ["ipc-reply-timeout-oracle-core"]
+# Stage 200D-0B1: the x86_64 disposable-task ExitCurrentTask live oracle. Selector, marker
+# and gate literals compile ONLY with this feature; the production NR16 syscall, its
+# decoder and the disposition consumer are unconditional.
+x86-exit-current-task-oracle = []
+# Stage 200D-0C1: the AArch64 disposable-task ExitCurrentTask live oracle — the AArch64 sibling
+# of the cell above. Selector, marker and gate literals compile ONLY with this feature; the
+# production NR16 syscall, its decoder, the disposition publication and the AArch64 post-lock
+# disposition consumer are unconditional. Feature-OFF AArch64 artifacts contain none of the
+# Stage 200D-0C oracle literals.
+aarch64-exit-current-task-oracle = []
+# Stage 200D-0D1: the RISC-V disposable-task ExitCurrentTask live oracle — the third and final
+# arch cell. Selector, marker and gate literals compile ONLY with this feature; the production
+# NR16 syscall, the disposition publication and the RISC-V post-lock consumer are
+# unconditional. Feature-OFF RISC-V artifacts contain none of the Stage 200D-0D oracle literals.
+riscv-exit-current-task-oracle = []
+
+# Stage 200C2C1: default-off AArch64 LIVE reply-receive TIMEOUT retirement oracle. The AArch64 port
+# of the accepted x86_64 cell — it REUSES the arch-neutral core verbatim and only adds the AArch64
+# trap-entry wire, selector, userspace wrapper and live proof. Activation requires
+# `target_arch = aarch64`, this feature, and the selector
+# `yarm.aarch64_ipc_reply_timeout_oracle=timeout-wins|reply-wins`. Feature-OFF AArch64 artifacts
+# contain none of the Stage 200C live/retirement marker literals.
+aarch64-ipc-reply-timeout-oracle = ["ipc-reply-timeout-oracle-core"]
+
+# Stage 200C2C2: default-off RISC-V LIVE reply-receive TIMEOUT retirement oracle — the third and
+# final arch cell. REUSES the arch-neutral core verbatim (collector, deferred work, completion
+# transaction, reversible reply lease, BlockedSyscallCompletion); only the selector, monotonic
+# clock source, trap wiring, saved-context consumer, userspace wrapper and live proof differ.
+# Activation requires `target_arch = riscv64`, this feature, and the selector
+# `yarm.riscv_ipc_reply_timeout_oracle=timeout-wins|reply-wins`. Feature-OFF RISC-V artifacts
+# contain none of the Stage 200C retirement marker literals.
+riscv64-ipc-reply-timeout-oracle = ["ipc-reply-timeout-oracle-core"]
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }

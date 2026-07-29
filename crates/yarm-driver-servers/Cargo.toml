@@ -7,6 +7,18 @@ edition = "2024"
 autobins = false
 
 [features]
+# Stage 200D-0B2: accepted as an UNUSED pass-through. `build-qemu-x86_64-artifacts.sh`
+# applies one `BOOTSTRAP_FEATURE_ARGS` to every server package, so a feature that only
+# `yarm` and `yarm-control-plane-servers` implement must still resolve here. This crate
+# compiles no oracle code under it — the real gating stays where the oracle lives.
+x86-exit-current-task-oracle = []
+# Stage 200D-0C1: the AArch64 sibling, accepted as an UNUSED pass-through for the same
+# reason — `build-qemu-aarch64-artifacts.sh` applies one feature set to every server
+# package. This crate compiles no oracle code under it.
+aarch64-exit-current-task-oracle = []
+# Stage 200D-0D1: the RISC-V sibling, an UNUSED pass-through for the same reason — one
+# BOOTSTRAP_FEATURE_ARGS is applied to every server package. No oracle code compiles here.
+riscv-exit-current-task-oracle = []
 default = ["hosted-dev"]
 hosted-dev = []
 

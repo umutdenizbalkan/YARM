@@ -238,10 +238,14 @@ pub struct SharedKernel {
 /// the rank-1 scheduler enqueue seam). It NEVER forms a broad `&mut KernelState` and
 /// NEVER takes the broad `SpinLock<KernelState>` — each primitive is a SHORT bounded
 /// claim of exactly one domain, so the composed transaction holds no broad lock.
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+// CLASSIFICATION (Stage 200D-F0): **production mechanism**. Despite the historical
+// `ReplyTimeout` name this is the generic OFF-LOCK IPC TERMINAL-COMPLETION domain: the
+// ungated server-death path composes its transaction through exactly these seams on every
+// build. Gating it on `ipc-reply-timeout-oracle-core` made the feature-off kernel fail to
+// compile. It is deliberately NOT renamed here — this stage's first commit is the minimal
+// repair, and a rename would spread an unrelated diff across every call site.
 pub(crate) struct OffLockReplyTimeout<'a>(pub(crate) &'a SharedKernel);
 
-#[cfg(feature = "x86-ipc-reply-timeout-oracle")]
 impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout<'_> {
     fn rtd_ipc<R>(&mut self, f: impl FnOnce(&mut crate::kernel::boot::IpcSubsystem) -> R) -> R {
         self.0.with_ipc_split_mut(f)
@@ -254,6 +258,66 @@ impl crate::kernel::boot::ReplyTimeoutDomains for OffLockReplyTimeout<'_> {
     }
     fn rtd_enqueue(&mut self, tid: u64) {
         self.0.enqueue_reply_timeout_wake_split(tid);
+    }
+}
+
+/// Stage 200D-2B1D5B — the typed outcome of the x86_64 post-drain owner revalidation.
+///
+/// The seam's hazard is that `dispatch_next_on_cpu` COMMITS its selection as the CPU's
+/// `current` before the arch restore is attempted. A plain `Option<u64>` could not say whether
+/// a `None` meant "nothing was ever committed" (safe to idle) or "a replacement was committed
+/// and then failed to restore" (idling strands it). These three cases are now distinct.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerRevalidation {
+    /// Nothing was committed: the drains produced no CPU-local work, or the queue yielded the
+    /// scheduler's idle/supervisor sentinel (TID 0), which owns no user context.
+    Idle,
+    /// `tid` was committed as this CPU's `current` AND its arch state was restored into the
+    /// caller's `TrapFrame`. The frame is populated and safe to commit.
+    Replacement(u64),
+    /// `tid` was committed as this CPU's `current` and the arch restore did NOT succeed, so the
+    /// frame is not populated with `tid`'s context. `rolled_back` records whether the seam
+    /// managed to undo the advance (clear `current`, and return `tid` to this CPU's run queue
+    /// unless its TCB is gone). Only `rolled_back == true` leaves state consistent enough for
+    /// the ordinary idle path.
+    RestoreFailed { tid: u64, rolled_back: bool },
+}
+
+/// What the x86_64 trap epilogue must do with an [`OwnerRevalidation`].
+///
+/// Kept as a pure function of the outcome so the fail-closed rule is directly testable rather
+/// than implied by the shape of a `match` inside the trap handler.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerCommit {
+    /// Take the ordinary idle path: nothing is current on this CPU.
+    Idle,
+    /// Commit `tid` as the new owner through the existing replacement path.
+    Replacement(u64),
+    /// `tid` is still this CPU's `current` with no restorable context and the advance could not
+    /// be undone. Idling would halt a CPU the scheduler believes is running a task, so the
+    /// caller must fail closed through the architecture's existing fatal path.
+    FailClosed(u64),
+}
+
+#[cfg(target_arch = "x86_64")]
+impl OwnerRevalidation {
+    /// The fail-closed rule. A rolled-back restore failure is idle-safe precisely because the
+    /// rollback restored the invariant "nothing is current on this CPU"; an un-rolled-back one
+    /// never is.
+    pub(crate) fn disposition(self) -> OwnerCommit {
+        match self {
+            OwnerRevalidation::Idle => OwnerCommit::Idle,
+            OwnerRevalidation::Replacement(tid) => OwnerCommit::Replacement(tid),
+            OwnerRevalidation::RestoreFailed {
+                rolled_back: true, ..
+            } => OwnerCommit::Idle,
+            OwnerRevalidation::RestoreFailed {
+                tid,
+                rolled_back: false,
+            } => OwnerCommit::FailClosed(tid),
+        }
     }
 }
 
@@ -567,6 +631,78 @@ impl SharedKernel {
             );
             current
         })
+    }
+
+    /// Stage 200D-2B1D5A — re-validate an `idle` restore-owner decision AFTER the post-lock
+    /// drains, and commit exactly one CPU-local task if the drains produced work.
+    ///
+    /// The x86_64 consumer picks the restore owner IN-LOCK (Stage 200D-0B3), which is correct
+    /// for identity coherence but happens strictly BEFORE the post-lock drains — and the drains
+    /// are exactly where wakes are published. Stage 200D-2B1D4 caught the consequence live: the
+    /// server-death drain made a caller runnable and enqueued it (`enqueues=1`), the epilogue
+    /// committed the earlier `owner=idle` decision anyway, and the CPU halted holding an idle
+    /// frame while a runnable task existed — re-idling on every tick until the boot timed out.
+    ///
+    /// This runs with the broad guard already dropped, so the brief `with_cpu` re-acquire below
+    /// is sound (and is itself the lock-dropped proof — a still-held guard would deadlock). It
+    /// uses the EXISTING `dispatch_next_on_cpu`, so the run queue advances through the same
+    /// authority the in-lock path uses and never through a second queue:
+    ///
+    ///   * exactly one advance — one `dispatch_next_on_cpu` call, whose result is reported;
+    ///   * CPU-local only — `dispatch_next_on_cpu(cpu)` pops from THIS cpu's run queue, so a
+    ///     task runnable elsewhere is never stolen;
+    ///   * the idle sentinel (TID 0) is not a user task and is reported as `Idle`, so the
+    ///     caller keeps its existing idle path rather than trying to return to ring 3.
+    ///
+    /// Stage 200D-2B1D5B — the restore-failure contract. `dispatch_next_on_cpu` has ALREADY
+    /// committed the selected task as this CPU's `current` by the time the restore is attempted,
+    /// so a failure cannot simply be reported as "no owner": entering the ordinary idle path
+    /// with that task still current halts the CPU while the scheduler believes the task is
+    /// running on it — on no run queue and on no CPU, stranded exactly as the Stage 200D-2B1D4
+    /// caller was. The failure is therefore rolled back here, and reported distinctly from
+    /// genuine idle so the caller can fail closed if the rollback itself could not complete.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn revalidate_idle_owner_after_drains(
+        &self,
+        cpu: CpuId,
+        frame: &mut crate::kernel::trapframe::TrapFrame,
+    ) -> OwnerRevalidation {
+        self.with_cpu(cpu, |kernel| {
+            let Some(next) = kernel.dispatch_next_on_cpu(cpu) else {
+                return OwnerRevalidation::Idle;
+            };
+            if next == 0 {
+                // The scheduler's idle/supervisor sentinel owns no user context. Nothing was
+                // committed — `dispatch_next` returns the sentinel it was already holding.
+                return OwnerRevalidation::Idle;
+            }
+            // `restore_arch_thread_state` maps `KernelError::TaskMissing` to `Ok(())` so early
+            // boot (no user task scheduled yet) restores nothing and still returns cleanly.
+            // That is correct for its other callers and WRONG here: a task that is still in a
+            // run queue but whose TCB has been reaped would report success with the frame left
+            // holding the PREVIOUS task's context, and the epilogue would iret into ring 3 on
+            // the exited task's frame. Establish restorability first, so a missing TCB is a
+            // restore failure rather than a silent bad user return.
+            let restorable = kernel.thread_user_context(next).is_some();
+            if restorable
+                && crate::arch::x86_64::trap::restore_arch_thread_state(kernel, cpu, Some(frame))
+                    .is_ok()
+            {
+                return OwnerRevalidation::Replacement(next);
+            }
+            // Undo the queue advance. Clearing `current` is mandatory; re-enqueueing is only
+            // meaningful for a task that still exists — a reaped one has nothing to run and
+            // must not be resurrected into a run queue.
+            let cleared = kernel.block_current_on_cpu(cpu) == Some(next);
+            let requeued = !restorable || kernel.enqueue_on_cpu(cpu, next).is_ok();
+            OwnerRevalidation::RestoreFailed {
+                tid: next,
+                rolled_back: cleared && requeued,
+            }
+        })
+        // A failed guard acquisition means `dispatch_next_on_cpu` never ran, so nothing was
+        // committed and idling is consistent.
+        .unwrap_or(OwnerRevalidation::Idle)
     }
 
     /// Stage 168 (D6-GENUINE-B): the authoritative **mutating** dispatch step,
@@ -2878,6 +3014,232 @@ impl SharedKernel {
     /// rank 3 — cancel a `Reserved` record (rollback): `Reserved → Cancelled → Vacant`
     /// as a single atomic ipc-state mutation, reclaiming the reserved authority so a
     /// partially-built record can never resolve. `false` on mismatch.
+    /// Stage 200D-2A — the POST-LOCK server-death drain.
+    ///
+    /// Runs after the broad `SpinLock<KernelState>` has been released. Every remaining
+    /// piece of authority work happens here: the PeerDeath terminal claim, all identity
+    /// and generation revalidation, the canonical `ServerDied` publication, and the single
+    /// scheduler enqueue. The broad-lock phase in `exit_task` only reserved a slot,
+    /// detached the exact link and published this item.
+    ///
+    /// It reuses the accepted machinery verbatim — `OffLockReplyTimeout`'s per-domain
+    /// split-mut seams and `complete_server_death_over`, which publishes through
+    /// `rt_commit_receiver_runnable(error_code)` and therefore through the SAME arch return
+    /// paths as timeout completion. No second completion or resume path is created.
+    ///
+    /// A LOSING item (reply, timeout, caller exit or endpoint destruction already won) is
+    /// still consumed exactly once: it is removed from the queue before the transaction
+    /// runs, so it can never loop or remain queued.
+    pub(crate) fn drain_server_death_post_work(&self, cpu: CpuId) -> usize {
+        let cpu_idx = cpu.0 as usize;
+        let mut drained = 0usize;
+        while let Some(work) = crate::kernel::boot::server_death_work_drain_next(cpu_idx) {
+            drained += 1;
+            // ── Stage 200D-2B1A (§2/§4): the post-lock boundary attestation ──────────────
+            //
+            // Every caller of this drain reaches it only after its architecture's broad
+            // `SpinLock<KernelState>` guard has been dropped — x86_64 and AArch64 through the
+            // post-`with_cpu` section of `handle_trap_entry_shared`, RISC-V through its own
+            // Phase 3. `broad_lock=0` is therefore a property of where this code runs, not a
+            // claim about where the marker was written, and the whole completion below
+            // (PeerDeath claim, caller result publication, scheduler enqueue) happens here —
+            // outside the broad lock — exactly as Stage 200D-2A relocated it.
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_BROAD_LOCK_RELEASED cpu={} record_index={} record_generation={} broad_lock=0 holder=with_cpu result=ok",
+                cpu_idx,
+                work.reply_record_index,
+                work.reply_record_generation
+            );
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_POST_LOCK_DRAIN_BEGIN cpu={} record_index={} record_generation={} items=1 broad_lock=0 result=ok",
+                cpu_idx,
+                work.reply_record_index,
+                work.reply_record_generation
+            );
+            // Resolve the identity the terminal cell was ARMED with. A record slot that was
+            // reclaimed and reused since publication yields no matching identity, so a
+            // stale item claims nothing.
+            let armed = self.with_ipc_split_mut(|ipc| {
+                if ipc
+                    .reply_cap_generations
+                    .get(work.reply_record_index)
+                    .copied()
+                    != Some(work.reply_record_generation)
+                {
+                    return None;
+                }
+                ipc.reply_terminal_ownership
+                    .get(work.reply_record_index)
+                    .map(|cell| *cell.identity())
+            });
+            let Some(identity) = armed else {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DRAIN outcome=stale_record record_index={} record_generation={} caller_wakes=0 result=ok",
+                    work.reply_record_index,
+                    work.reply_record_generation
+                );
+                continue;
+            };
+            // The item must still describe the record it was published for, and that record
+            // must still name the exact exiting incarnation — numeric TID alone never
+            // authorizes, so a replacement server cannot inherit this item's authority.
+            if identity.reply_record_index != work.reply_record_index
+                || identity.reply_record_generation != work.reply_record_generation
+                || identity.replier_tid != work.exiting_server.tid
+                || identity.replier_asid != work.exiting_server.asid
+            {
+                // Stage 200D-2B1B-i: the queued item no longer describes reality. Both
+                // literals name this one real revalidation failure from the two angles the
+                // checklist distinguishes — a server incarnation that is not the armed
+                // replier, and a record generation that has moved on. Nothing is detached,
+                // claimed, published, woken or enqueued past this point.
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_WRONG_SERVER_IDENTITY armed_tid={} armed_asid={} item_tid={} item_asid={} record_index={} caller_wakes=0 result=fail",
+                    identity.replier_tid.0,
+                    identity.replier_asid.0,
+                    work.exiting_server.tid.0,
+                    work.exiting_server.asid.0,
+                    work.reply_record_index
+                );
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_WRONG_RECORD_GENERATION armed_generation={} item_generation={} record_index={} caller_wakes=0 result=fail",
+                    identity.reply_record_generation,
+                    work.reply_record_generation,
+                    work.reply_record_index
+                );
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_DRAIN outcome=stale_identity record_index={} caller_wakes=0 result=ok",
+                    work.reply_record_index
+                );
+                continue;
+            }
+            let mut d = OffLockReplyTimeout(self);
+            let outcome = crate::kernel::boot::complete_server_death_over(&mut d, &identity);
+            crate::yarm_log!(
+                "IPC_SERVER_DEATH_DRAIN outcome={:?} record_index={} record_generation={} broad_lock=0 result=ok",
+                outcome,
+                work.reply_record_index,
+                work.reply_record_generation
+            );
+        }
+        drained
+    }
+
+    /// Stage 200D — register the bounded reverse link through the rank-2 TASK seam (never
+    /// the broad lock). Returns `false` with no mutation when the server incarnation is
+    /// absent or already holds a DIFFERENT live link; re-registering the identical link is
+    /// idempotent. Allocation-free: the link is a fixed `Option` field on the TCB.
+    pub(crate) fn register_server_reply_link_split(
+        &self,
+        server_tid: u64,
+        server_asid: crate::kernel::vm::Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> bool {
+        let link = crate::kernel::task::ServerReplyLink {
+            server_tid,
+            server_asid,
+            reply_record_index: record_index,
+            reply_record_generation: record_generation,
+        };
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+            else {
+                return false;
+            };
+            // Stage 200D-1: an incarnation that has already committed to exit must never
+            // be published as an authorized replier. Teardown snapshots the link AFTER the
+            // status flips, so registering here would install an authority nobody will
+            // ever look at — the caller would block forever with no death claim. Refusing
+            // makes the NR6 publication roll back instead, which is the only other
+            // permitted outcome of this race.
+            if !matches!(
+                tcb.status,
+                crate::kernel::task::TaskStatus::Runnable
+                    | crate::kernel::task::TaskStatus::Running
+                    | crate::kernel::task::TaskStatus::Blocked(_)
+            ) {
+                return false;
+            }
+            match tcb.server_reply_link {
+                Some(existing) if existing == link => true,
+                Some(_) => false,
+                None => {
+                    tcb.server_reply_link = Some(link);
+                    true
+                }
+            }
+        })
+    }
+
+    /// Stage 200D-1 — RESERVE reverse-link capacity BEFORE the reply record becomes
+    /// externally visible.
+    ///
+    /// The NR6 transaction must not expose a request whose link it then fails to install:
+    /// that would be a live record with no teardown-visible link, which is a hard-stop.
+    /// This probe answers "would `register_server_reply_link_split` succeed for this exact
+    /// server right now" without mutating anything, so the transaction can decline early
+    /// — before the record is published and long before the server is enqueued.
+    ///
+    /// It is a reservation in the single-pair sense only: capacity is one, the server is
+    /// not yet Runnable-and-enqueued at the call site, and the real registration re-checks
+    /// every condition, so a probe that passes cannot be invalidated by the server itself.
+    pub(crate) fn can_reserve_server_reply_link_split(
+        &self,
+        server_tid: u64,
+        server_asid: crate::kernel::vm::Asid,
+    ) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+                .is_some_and(|t| {
+                    t.server_reply_link.is_none()
+                        && matches!(
+                            t.status,
+                            crate::kernel::task::TaskStatus::Runnable
+                                | crate::kernel::task::TaskStatus::Running
+                                | crate::kernel::task::TaskStatus::Blocked(_)
+                        )
+                })
+        })
+    }
+
+    /// Stage 200D — remove the reverse link, but ONLY when it still describes this exact
+    /// record incarnation. A stale removal (reused slot, replaced server incarnation,
+    /// already removed) mutates nothing. Idempotent by construction, so every terminal
+    /// outcome can call it unconditionally.
+    pub(crate) fn unregister_server_reply_link_split(
+        &self,
+        server_tid: u64,
+        server_asid: crate::kernel::vm::Asid,
+        record_index: usize,
+        record_generation: u64,
+    ) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
+            else {
+                return false;
+            };
+            match tcb.server_reply_link {
+                Some(link)
+                    if link.matches_server(server_tid, server_asid)
+                        && link.matches_record(record_index, record_generation) =>
+                {
+                    tcb.server_reply_link = None;
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+
     pub(crate) fn cancel_direct_reply_record_split(&self, index: usize, generation: u64) -> bool {
         use crate::kernel::boot::ReplyRecordReservation;
         self.with_ipc_split_mut(|ipc| {
@@ -2941,7 +3303,7 @@ impl SharedKernel {
     /// non-`Reserved` state (never for our exact owned reservation).
     pub(crate) fn consume_reply_record_split(&self, index: usize, generation: u64) -> bool {
         use crate::kernel::boot::ReplyRecordReservation;
-        self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+        let consumed = self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
             Some(Some(record))
                 if ipc.reply_cap_generations[index] == generation
                     && record.reservation == ReplyRecordReservation::Reserved =>
@@ -2950,7 +3312,39 @@ impl SharedKernel {
                 true
             }
             _ => false,
-        })
+        });
+        // Stage 200D-1: consumption is the REPLY terminal becoming irrevocable, so the
+        // reverse link closes on the same edge. Note the contrast with
+        // `release_reply_record_split` below: a RETRYABLE copy-fault rollback returns the
+        // record to `Available` for the same exact server, so it deliberately does NOT
+        // detach — the server still owes that reply.
+        if consumed {
+            let _ = self.finalize_server_reply_link_for_record_split(index, generation);
+        }
+        consumed
+    }
+
+    /// Stage 200D-1 — close the reverse link for a record finalized on a narrow path.
+    /// Reads the bound replier under the rank-3 ipc claim, then writes the TCB under the
+    /// rank-2 task claim; the claims never nest. Exact on both identities.
+    pub(crate) fn finalize_server_reply_link_for_record_split(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> bool {
+        let bound = self.with_ipc_split_mut(|ipc| {
+            if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
+                return None;
+            }
+            ipc.reply_caps
+                .get(index)
+                .and_then(|s| s.as_ref())
+                .and_then(|r| r.responder_tid.zip(r.replier_asid))
+        });
+        let Some((tid, asid)) = bound else {
+            return false;
+        };
+        self.unregister_server_reply_link_split(tid.0, asid, index, generation)
     }
 
     /// rank 3 — `Reserved → Available`: caller-destination-copy-fault rollback for an
@@ -3333,6 +3727,22 @@ impl SharedKernel {
 
     // ── Stage 200C2B: OFF-LOCK reply-timeout collection + completion ────────────────
 
+    /// Stage 200C2C1 — the monotonic "now" that the off-lock collector scans in. x86_64: the
+    /// LAPIC-advanced scheduler tick (read off-lock). AArch64: the generic-timer physical counter,
+    /// since the cooperative port has no periodic scheduler tick. Matches the units the deadline is
+    /// armed in (`maybe_arm_reply_timeout_oracle`).
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn reply_timeout_now_split_read(&self) -> u64 {
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        {
+            crate::kernel::boot::reply_timeout_hw_now()
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "riscv64")))]
+        {
+            self.scheduler_tick_now_split_read()
+        }
+    }
+
     /// Stage 200C2B — the NARROW collector. Scans ONLY token-bearing reply-receive
     /// deadlines through the rank-2 task split-mut seam (NO broad `&mut KernelState`,
     /// NO `with` / `with_cpu`, NO broad runtime lock) and publishes one owned
@@ -3340,8 +3750,15 @@ impl SharedKernel {
     /// makes NO timeout decision, mutates NO waiter and wakes NO task. A full queue
     /// leaves the DUE deadline armed (the TCB entry is NOT cleared here) for a later
     /// scan — no due registration is ever silently dropped.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn collect_due_reply_timeout_work(&self, now: u64, cpu: CpuId) {
+        // Stage 200C2C2C-R2B — the CAUSAL reply-wins gate. While held, publish NOTHING, so
+        // no timeout claimant can reach the terminal cell while a reply is in flight. It is
+        // armed ONLY in reply-wins mode (never for a production or timeout-wins deadline)
+        // and released by the oracle client's own post-validation DebugLog marker.
+        if crate::kernel::boot::reply_timeout_collector_held() {
+            return;
+        }
         // Snapshot due (handle, deadline) pairs under ONLY the task lock; publish after
         // the task lock is dropped so the queue lock never nests inside the task lock.
         let mut due: [Option<crate::kernel::boot::ReplyTimeoutPostWork>;
@@ -3359,6 +3776,53 @@ impl SharedKernel {
                     continue;
                 };
                 if now >= deadline {
+                    // ── Stage 200D-2B1A (§5): the REAL stale-token examination ────────────
+                    //
+                    // This is the point at which the collector genuinely looks at the token
+                    // the ServerDies caller armed. It fires only after the causal gate was
+                    // RELEASED (the early return above guarantees that), i.e. after PeerDeath
+                    // committed and the caller validated code 10 — so the attestation is
+                    // "the same token was examined and found stale", not "no wake happened".
+                    // The token identity is compared against the one recorded at arm time;
+                    // a different token cannot satisfy it.
+                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+                    if let Some((armed_idx, armed_gen, armed_tid, armed_asid)) =
+                        crate::kernel::boot::server_dies_stale_token()
+                    {
+                        let this_idx = handle.identity().token_index;
+                        let this_gen = handle.identity().token_generation;
+                        let this_tid = tcb.tid.0;
+                        let this_asid = tcb.asid.map(|a| a.0).unwrap_or(0);
+                        // Stage 200D-2B1B-i: the same SLOT with a different generation is a
+                        // reused registration, never the caller's original one. Naming it here
+                        // is what makes the comparison provably four-field rather than
+                        // slot-index-only.
+                        if this_idx == armed_idx && this_gen != armed_gen {
+                            crate::yarm_log!(
+                                "IPC_SERVER_DEATH_WRONG_TIMEOUT_GENERATION token_index={} armed_generation={} scanned_generation={} caller_tid={} result=fail",
+                                this_idx,
+                                armed_gen,
+                                this_gen,
+                                this_tid
+                            );
+                        }
+                        if this_idx == armed_idx
+                            && this_gen == armed_gen
+                            && this_tid == armed_tid
+                            && this_asid == armed_asid
+                            && crate::kernel::boot::server_dies_stale_scan_once()
+                        {
+                            crate::yarm_log!(
+                                "IPC_SERVER_DEATH_LATE_TIMEOUT_SCANNED token_index={} token_generation={} caller_tid={} caller_asid={} deadline={} now={} matches_armed=1 broad_lock=0 result=ok",
+                                this_idx,
+                                this_gen,
+                                this_tid,
+                                this_asid,
+                                deadline,
+                                now
+                            );
+                        }
+                    }
                     due[n] = Some(crate::kernel::boot::ReplyTimeoutPostWork { handle, deadline });
                     n += 1;
                 }
@@ -3380,7 +3844,7 @@ impl SharedKernel {
     /// (`scan_broad_lock=0`) and emits the reply-timeout class retirement seal exactly
     /// once. On a non-`Woken` outcome it clears the caller's stale TCB registration so it
     /// is not re-collected.
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
     pub(crate) fn drain_reply_timeout_post_work(&self, cpu: CpuId, now: u64) {
         // Once ANY reply-timeout deadline has been armed this boot, the class's deadline
         // scan runs HERE — off the broad `SpinLock<KernelState>` — whether or not a
@@ -3391,10 +3855,8 @@ impl SharedKernel {
             && crate::kernel::boot::reply_timeout_lock_status_once()
         {
             crate::yarm_log!(
-                "IPC_REPLY_TIMEOUT_LOCK_STATUS arch=x86_64 scan_broad_lock=0 completion_transaction_narrow=1 result=ok"
-            );
-            crate::yarm_log!(
-                "GLOBAL_LOCK_RETIRE_CLASS_DONE arch=x86_64 class=IpcReplyTimeout result=ok"
+                "IPC_REPLY_TIMEOUT_LOCK_STATUS arch={} scan_broad_lock=0 completion_transaction_narrow=1 result=ok",
+                crate::kernel::boot::REPLY_TIMEOUT_ARCH
             );
         }
         let cpu_idx = cpu.0 as usize;
@@ -3402,10 +3864,25 @@ impl SharedKernel {
             let mut d = OffLockReplyTimeout(self);
             let outcome =
                 crate::kernel::boot::complete_reply_timeout_over(&mut d, &work.handle, now);
+            // Stage 200D-2B1B-i: in the ServerDies scenario the deadline must LOSE. A Timeout
+            // completion that actually woke the caller means it reached the terminal cell
+            // before PeerDeath — the exact inversion this literal names. Emitted from the real
+            // completion outcome, never inferred from a missing marker.
+            #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+            if crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
+                == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_SERVER_DIES
+                && matches!(outcome, crate::runtime::ReplyTimeoutOutcome::Woken)
+            {
+                crate::yarm_log!(
+                    "IPC_SERVER_DEATH_TIMEOUT_WON outcome={:?} terminal=Timeout expected=PeerDeath result=fail",
+                    outcome
+                );
+            }
             // The FIRST drained work item carries the deferred-work publish/drain evidence.
             if crate::kernel::boot::reply_timeout_deferred_once() {
                 crate::yarm_log!(
-                    "IPC_REPLY_TIMEOUT_DEFERRED arch=x86_64 published={} drained={} result=ok",
+                    "IPC_REPLY_TIMEOUT_DEFERRED arch={} published={} drained={} result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH,
                     crate::kernel::boot::reply_timeout_work_published_count(),
                     crate::kernel::boot::reply_timeout_work_drained_count()
                 );
@@ -3413,14 +3890,29 @@ impl SharedKernel {
             match outcome {
                 ReplyTimeoutOutcome::Woken => {
                     crate::yarm_log!(
-                        "IPC_REPLY_TIMEOUT_OK arch=x86_64 terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok"
+                        "IPC_REPLY_TIMEOUT_OK arch={} terminal=Timeout timeout_result=TimedOut caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok",
+                        crate::kernel::boot::REPLY_TIMEOUT_ARCH
                     );
+                    // The terminal is COMMITTED off-lock — but the caller has not yet been
+                    // delivered its result. Attest the commit here and ARM the class-retirement
+                    // marker; it fires only from the delivery point.
+                    crate::yarm_log!(
+                        "IPC_REPLY_TIMEOUT_COMPLETION_COMMITTED arch={} terminal=Timeout result=ok",
+                        crate::kernel::boot::REPLY_TIMEOUT_ARCH
+                    );
+                    crate::kernel::boot::arm_reply_timeout_class_retired();
+                    // x86_64 delivers via SAVED-FRAME return installed by the transaction itself,
+                    // so the completion IS the delivery point and the marker fires now. AArch64
+                    // defers it to its resume boundary (which consumes the parked completion).
+                    #[cfg(target_arch = "x86_64")]
+                    crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
                 }
                 other => {
                     // Harmless late expiry (the reply disarmed/completed the token, or the
                     // caller already resumed): no timeout claim, no wake.
                     crate::yarm_log!(
-                        "IPC_REPLY_TIMEOUT_LATE_SCAN arch=x86_64 outcome={:?} late_timeout_claims=0 result=ok",
+                        "IPC_REPLY_TIMEOUT_LATE_SCAN arch={} outcome={:?} late_timeout_claims=0 result=ok",
+                        crate::kernel::boot::REPLY_TIMEOUT_ARCH,
                         other
                     );
                     // Clear the caller's stale TCB registration so a later scan does not
@@ -3456,9 +3948,18 @@ impl SharedKernel {
             == crate::kernel::boot::IPC_REPLY_TIMEOUT_MODE_REPLY_WINS
         {
             let rw = crate::kernel::boot::ipc_reply_timeout_rw_deadline();
-            if rw != 0 && now >= rw && crate::kernel::boot::ipc_reply_timeout_rw_late_scan_once() {
+            // Stage 200C2C2C-R2B: require the causal gate to be RELEASED first, so this
+            // attestation can only be made by a drain whose collector was genuinely free to
+            // publish timeout work — and still claimed none. While held the collector is
+            // suppressed, and a "late scan claimed nothing" claim would be vacuous.
+            if rw != 0
+                && now >= rw
+                && !crate::kernel::boot::reply_timeout_collector_held()
+                && crate::kernel::boot::ipc_reply_timeout_rw_late_scan_once()
+            {
                 crate::yarm_log!(
-                    "IPC_REPLY_TIMEOUT_LATE_SCAN arch=x86_64 outcome=reply_won late_timeout_claims=0 result=ok"
+                    "IPC_REPLY_TIMEOUT_LATE_SCAN arch={} outcome=reply_won late_timeout_claims=0 result=ok",
+                    crate::kernel::boot::REPLY_TIMEOUT_ARCH
                 );
             }
         }
@@ -3469,7 +3970,8 @@ impl SharedKernel {
     /// released BEFORE the rank-1 scheduler claim performs the enqueue — so no task lock
     /// is held while enqueuing, and no broad lock is ever taken. Mirrors
     /// `KernelState::enqueue_task`'s placement (pinned → its CPU; unpinned → balanced).
-    #[cfg(feature = "x86-ipc-reply-timeout-oracle")]
+    // CLASSIFICATION (Stage 200D-F0): **production mechanism**. The server-death
+    // completion enqueues its woken caller through this seam on every build.
     fn enqueue_reply_timeout_wake_split(&self, tid: u64) {
         use crate::kernel::ipc::ThreadId;
         use crate::kernel::scheduler::TaskPriority;

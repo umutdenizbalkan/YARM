@@ -47,6 +47,10 @@ pub mod syscall {
         WouldBlock = 7,
         PageFault = 8,
         TimedOut = 9,
+        /// Stage 200D — the authorized IPC replier ceased to exist before completing
+        /// the reply. Must stay numerically identical to `kernel::syscall::SyscallError`
+        /// (both are `10`); the Stage 200D ABI guards assert the two enums agree.
+        ServerDied = 10,
         Internal = 255,
     }
 
@@ -77,6 +81,9 @@ pub mod syscall {
     pub const SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR: usize = 29;
     /// SUP-L7K-A: PM-only reap of a terminal faulted/exited task after restart.
     pub const SYSCALL_REAP_FAULTED_TASK_NR: usize = 31;
+    /// Stage 200D-0: terminate the CALLING task (NR 16). Must match
+    /// `kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR`.
+    pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
     const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
@@ -223,8 +230,45 @@ pub mod syscall {
             7 => SyscallError::WouldBlock,
             8 => SyscallError::PageFault,
             9 => SyscallError::TimedOut,
+            10 => SyscallError::ServerDied,
+            // Unknown codes still fall back to `Internal` — unchanged by Stage 200D.
             _ => SyscallError::Internal,
         }
+    }
+
+    /// Stage 200D-0A — terminate the CALLING task (NR 16).
+    ///
+    /// Takes no arguments: the kernel derives the exact `{tid, asid}` from scheduler
+    /// state, so a task can only ever end itself and no capability is involved.
+    ///
+    /// # Return contract
+    ///
+    /// There are exactly two outcomes, and the signature makes the asymmetry explicit
+    /// rather than promising a `!` the kernel cannot always deliver:
+    ///
+    /// * **Accepted** — the call does not return. The task transitions to `Exiting`,
+    ///   teardown takes ownership, and the instruction after the trap never executes. The
+    ///   `Infallible` in the success position encodes that: there is no success value to
+    ///   observe, because observing one would mean the task resumed.
+    /// * **Preflight refusal** — `Err(SyscallError::WouldBlock)`. This is the ONLY
+    ///   returning outcome, and it happens strictly BEFORE anything irreversible: the
+    ///   kernel could not reserve the bounded deferred capacity needed to hand off a reply
+    ///   this task still owes. Nothing changed; the task is still runnable and retrying
+    ///   later is valid. A partially-exited task is never returned to.
+    ///
+    /// # Safety
+    /// On acceptance this ends the current thread of execution; nothing after it runs.
+    #[inline]
+    pub unsafe fn exit_current_task()
+    -> core::result::Result<core::convert::Infallible, SyscallError> {
+        // SAFETY: no pointer arguments; the kernel reads no user memory for this call.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_EXIT_CURRENT_TASK_NR, [0; 6]) };
+        // Only reached when the kernel DECLINED the exit before mutating anything.
+        #[cfg(target_arch = "x86_64")]
+        let code = ret.error;
+        #[cfg(not(target_arch = "x86_64"))]
+        let code = ret.ret0;
+        Err(decode_syscall_error(code))
     }
 
     #[inline]

@@ -1034,8 +1034,11 @@ pub fn bootstrap_first_user_task(
         ) {
             // Encode the mode in the slot-5 value: 10 = timeout-wins, 11 = reply-wins
             // (both mutually exclusive with every other slot-5 oracle).
-            init_args[5] = crate::kernel::boot::X86_IPC_REPLY_TIMEOUT_ORACLE_SELECTOR
-                + (crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode() as u64 - 1);
+            // Stage 200C2C2C-R2C: the selector is produced by the ARCHITECTURE-LOCAL encoder
+            // in `yarm_ipc_abi::ipc_reply_liveness_abi` — the exact inverse of the decoder
+            // userspace applies — so the kernel never hand-writes a slot-5 number and the
+            // two sides cannot drift apart.
+            init_args[5] = crate::kernel::boot::ipc_reply_timeout_selector().unwrap_or(0);
             init_args[13] = caps.request_ep_cap as u64;
             init_args[14] = caps.reply_ep_cap as u64;
             crate::yarm_log!(
@@ -1048,6 +1051,22 @@ pub fn bootstrap_first_user_task(
                 crate::kernel::boot::x86_ipc_reply_timeout_oracle_mode()
             );
         }
+    }
+    // Stage 200D-0B2: provision the x86_64 ExitCurrentTask oracle's slot-5 selector (20).
+    //
+    // Stage 200D-0B1 declared the selector constant and the boot knob but never wired this
+    // step, so the knob armed and init's slot 5 stayed 0 — the disposable task was never
+    // reached and the first live run produced zero exit markers. Feature-gated, and taken
+    // only when slot 5 is still free, so it stays mutually exclusive with every other
+    // slot-5 oracle. This oracle needs no provisioned caps: the disposable task performs
+    // no IPC, it only calls NR 16.
+    #[cfg(feature = "x86-exit-current-task-oracle")]
+    if crate::kernel::boot::x86_exit_oracle_enabled() && init_args[5] == 0 {
+        init_args[5] = crate::kernel::boot::X86_EXIT_CURRENT_TASK_ORACLE_SELECTOR;
+        crate::yarm_log!(
+            "EXIT_TASK_ORACLE_SLOTS slot5={} caps=none result=ok",
+            init_args[5]
+        );
     }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
@@ -1642,6 +1661,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     crate::arch::x86_64::irq::enable_interrupts_for_boot();
     debug_uart_marker(b'J');
     crate::yarm_log!("YARM_BOOT_STAGE pre_boot_ok");
+    // Stage 200C2C2C-R2C: one-shot boot-instance identifier (see `emit_boot_instance_nonce`).
+    crate::kernel::boot::emit_boot_instance_nonce("x86_64");
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
@@ -1656,6 +1677,8 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
 pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
     use crate::kernel::boot::Bootstrap;
     let mut kernel = Bootstrap::init().expect("kernel init");
+    // Stage 200C2C2C-R2C: one-shot boot-instance identifier (see `emit_boot_instance_nonce`).
+    crate::kernel::boot::emit_boot_instance_nonce("x86_64");
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
