@@ -10,7 +10,7 @@
 # its own invariant, so leaked_caps / leaked_mappings / leaked_envelopes / stale_releases are 0 by
 # construction (the seal fails unless every case passes).
 #
-# Verdict (from doc/STAGE_198E1_SHARED_REGION_AUDIT.md):
+# Verdict (from doc/IPC.md §8.2):
 #   IpcSendSharedRegionDirect  = NEEDS_BOUNDED_FIX  -> direct=blocked
 #   IpcSendSharedRegionEnqueue = NEEDS_BOUNDED_FIX  -> enqueue=blocked
 # (the map + TLB shootdown + user-copy still run under the broad lock; the post-lock map/copy

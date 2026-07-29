@@ -260,10 +260,10 @@ production semantics.
 5. **Thread / time sync**: `clone` / TLS / futex / `clock_gettime` /
    `nanosleep` over existing hooks.
 
-Milestone 3 in `doc/X86_64_NONE_MUSL_PORT_TODO.md` is partially
-implemented: startup / memory / thread / futex hooks and timer-backed
-clock hooks exist; full musl crt / `__libc_start_main` integration is
-still pending.
+Milestone 3 (from the former `doc/X86_64_NONE_MUSL_PORT_TODO.md`, folded
+into this document in Pass 5) is partially implemented: startup / memory /
+thread / futex hooks and timer-backed clock hooks exist; full musl crt /
+`__libc_start_main` integration is still pending.
 
 ---
 

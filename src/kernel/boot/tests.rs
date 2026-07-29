@@ -50690,7 +50690,7 @@ mod stage188d_reply_cap_rank_inversion_seam {
 
     // ── Stage 198C1 — reply-cap direct-delivery classifier + semantics hardening ──
     //
-    // These lock in the audit (doc/STAGE_198C_REPLY_CAP_AUDIT.md) findings in hosted
+    // These lock in the audit (doc/IPC.md §8.1) findings in hosted
     // code with NO architecture wiring and NO new lock/ABI/marker: reply-cap
     // classification is authoritative from the resolved `CapObject::Reply` (never a
     // user flag), and the source-cap disposition is delegation with a one-shot
@@ -63090,7 +63090,7 @@ mod stage193g_remaining_shapes_audit {
 // These tests do NOT enable or retire the queued reply-cap class. They pin the lifetime facts
 // that the chosen redesign (design A — typed queued envelope carrying kernel-derived object
 // identity) depends on, using existing kernel primitives only. See
-// doc/STAGE_198D1_QUEUED_REPLY_CAP_AUDIT.md.
+// doc/IPC.md §8.1.
 mod stage198d1_queued_reply_cap_lifetime {
     use super::*;
 
@@ -63569,7 +63569,7 @@ mod stage198ds_direct_only_reply_caps {
 // the shared path, the transfer is a one-shot delegation, and the envelope/active-mapping/cleanup
 // lifecycle reclaims cleanly on teardown. The mapping-plan WRITE gate and cleanup-token
 // generation/stale/duplicate semantics are additionally covered by the existing stage54_* /
-// stage56_* tests (composed into the hosted audit seal). See doc/STAGE_198E1_SHARED_REGION_AUDIT.md.
+// stage56_* tests (composed into the hosted audit seal). See doc/IPC.md §8.2.
 //
 // VERDICT: IpcSendSharedRegionDirect = NEEDS_BOUNDED_FIX; IpcSendSharedRegionEnqueue =
 // NEEDS_BOUNDED_FIX (the map + TLB shootdown + user-copy still run under the broad lock; the
@@ -63939,7 +63939,7 @@ mod stage198e1_shared_region_audit {
 //
 // Drives the real Phase-A snapshot producer + post-lock executor + idempotent rollback
 // (src/kernel/boot/shared_region_txn.rs) through hosted production-path tests. No QEMU, no live
-// architecture class, no arch retirement gate. See doc/STAGE_198E2A_SHARED_REGION_DIRECT.md.
+// architecture class, no arch retirement gate. See doc/IPC.md §8.2.
 mod stage198e2a_shared_region_direct {
     use super::*;
     use crate::kernel::boot::shared_region_txn::{
@@ -64546,7 +64546,7 @@ mod stage198e2a_shared_region_direct {
 // ALL cleanup, unmapping EXACTLY the successfully-mapped page prefix. No page is mapped, no writeback
 // and no wake occur after cancellation; nothing is unmapped/revoked/pin-released twice; a delayed
 // old-TID teardown cannot touch a replacement-ASID transaction. See
-// doc/STAGE_198E2A1_SHARED_REGION_TXN_RACE.md.
+// doc/IPC.md §8.2.
 mod stage198e2a1_shared_region_txn_race {
     use super::*;
     use crate::kernel::boot::shared_region_txn::{
@@ -64939,7 +64939,7 @@ mod stage198e2a1_shared_region_txn_race {
 // only the `origin_direct=false` proof marker differs. Also proves the cancellation-request table is
 // FAIL-CLOSED (proof C): a cancellation that cannot be recorded latches an overflow that every
 // executor checkpoint treats as authoritative, so silent cancellation loss is impossible. No QEMU, no
-// live architecture class. See doc/STAGE_198E2B_SHARED_REGION_ENQUEUE.md.
+// live architecture class. See doc/IPC.md §8.2.
 mod stage198e2b_shared_region_enqueue {
     use super::*;
     use crate::kernel::boot::shared_region_txn::{
@@ -65992,7 +65992,7 @@ mod stage198e2b_shared_region_enqueue {
 // retirement markers are origin-gated; the fail-closed cancellation fuse diagnostic fires exactly
 // once; and the RISC-V sender/receiver typed-outcome contract is preserved. The live 6-cell QEMU
 // seal (userspace oracle) is proven by scripts/qemu-shared-region-live-seal.sh (live-wiring
-// continuation). See doc/STAGE_198E3_SHARED_REGION_LIVE.md.
+// continuation). See doc/IPC.md §8.2.
 mod stage198e3_shared_region_live {
     use super::*;
     use crate::kernel::boot::{SharedRegionLiveOrigin, shared_region_live_origin_take};
@@ -69239,8 +69239,9 @@ mod stage198e3c1_direct_live_policy {
 
     // ── Stage 198E3C2A: authoritative large-length send ABI + portable oracle core ───────────────
     const KERNEL_IPC_SRC: &str = include_str!("../../../crates/yarm-kernel/src/ipc.rs");
-    const CONTRACT_DOC: &str =
-        include_str!("../../../doc/STAGE_198E3C1_SHARED_REGION_USERSPACE_CONTRACT.md");
+    // Stage 198E3C2A contract migrated into `doc/IPC.md` §8.2 (Consolidation Pass 6);
+    // the per-stage fragment was deleted after every pinned phrase below was preserved.
+    const CONTRACT_DOC: &str = include_str!("../../../doc/IPC.md");
 
     // Slice the canonical `send_shared_region_large` helper body.
     fn large_send_helper() -> &'static str {
@@ -70429,7 +70430,8 @@ mod stage199a1_ipccall_direct_audit {
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const GUARD_SRC: &str = include_str!("../../../scripts/lib/build-qemu-artifacts-common.sh");
-    const AUDIT_DOC: &str = include_str!("../../../doc/STAGE_199A1_IPCCALL_DIRECT_AUDIT.md");
+    // Stage 199A1 direct-IpcCall audit migrated into `doc/IPC.md` §8.3 (Consolidation Pass 6).
+    const AUDIT_DOC: &str = include_str!("../../../doc/IPC.md");
 
     // (3/6/8) Direct call delivers the request once, the first reply succeeds, and the reply routes to
     // the bound reply endpoint (a live caller resumes exactly once). Reference-impl behavioral.
@@ -75427,7 +75429,7 @@ mod stage198b_second_cohort_ordinary_cap_parity {
 // global-lock `switch_required` case the codebase already defers for FutexWait
 // (see `syscall_split.rs` MARK_FUTEX_WAIT_DEFERRED_REASON). This module therefore
 // emits the honest incarnation-safety seal below and records the deferral in
-// doc/STAGE_199A2A_OFFLOCK_INCARNATION.md, mirroring the Stage 191D FutexWait
+// doc/IPC.md §8.3, mirroring the Stage 191D FutexWait
 // deferral discipline — it does NOT emit a green off-lock seal.
 mod stage199a2a_offlock_incarnation {
     use super::*;
@@ -75439,7 +75441,10 @@ mod stage199a2a_offlock_incarnation {
     const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const RESTART_SRC: &str = include_str!("restart_state.rs");
-    const OFFLOCK_DOC: &str = include_str!("../../../doc/STAGE_199A2A_OFFLOCK_INCARNATION.md");
+    // Stage 199A2A off-lock/incarnation contract migrated into `doc/IPC.md` §8.3
+    // (Consolidation Pass 6); the achieved seal and the honestly-deferred seal are
+    // preserved verbatim there.
+    const OFFLOCK_DOC: &str = include_str!("../../../doc/IPC.md");
 
     /// The honest achieved-invariant seal for this increment.
     const INCARNATION_SEAL: &str = "STAGE_199A2A_INCARNATION_SAFE_REPLY_RECORD_SEAL \
@@ -76286,7 +76291,7 @@ mod stage199a2b2_request_substrate {
 // split-reads → require-ack → mint → off-lock copy_slice_to_user → claim/commit/
 // enqueue → commit, with the 12-case rollback), the x86 trap-entry snapshot publish,
 // and the recv-v2 ack publication point. Precise seam-level plan in
-// doc/STAGE_199A2B2C_OFFLOCK_SEAMS.md. No live NR6 split arm; behavior unchanged.
+// doc/IPC.md §8.3. No live NR6 split arm; behavior unchanged.
 mod stage199a2b2c_offlock_seams {
     use super::*;
     use crate::kernel::boot::ReplyRecordReservation;
@@ -80456,7 +80461,7 @@ mod stage199a2d1_smp_readiness {
 /// client runs the ACCEPTED `ipc_call_direct_request_txn` (never a fork), whose captured-affinity
 /// enqueue places the woken server on CPU 1's run queue — never the BSP. The LIVE AP
 /// dispatch-on-wake + context-restore path that would let CPU 1 actually resume the enqueued
-/// server is a separate prerequisite (see doc/STAGE_199A2D2A_SMP_REQUEST.md); this module proves
+/// server is a separate prerequisite (see doc/PROJECT_HISTORY.md); this module proves
 /// the kernel mechanism that path will drive.
 #[cfg(test)]
 mod stage199a2d2a_smp_request {

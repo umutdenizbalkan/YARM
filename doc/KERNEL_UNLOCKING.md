@@ -33,6 +33,121 @@ Directive labels are stable across stages:
 
 ---
 
+## 0. Canonical stages 199C–205D and the roadmap to full unlock
+
+> **This section supersedes every stage narrative below it.** §1–§7 are retained as
+> historical design record and remain accurate about *mechanisms*; they are **not**
+> accurate about *current progress* and must not be read as a status page. Detailed
+> evidence for everything in this section is in `doc/KERNEL_UNLOCK_AUDIT.md`.
+
+**Baseline:** commit `757993b699b309dafdb3d17c428380c08d7fc9f7`, tree
+`1118b61b74588e73b0dc235dc96086ec7488257c`, `main == origin/main`.
+
+### 0.1 The one measurable definition of "unlocked"
+
+`SharedKernel` (`src/runtime.rs:231`) owns exactly one broad lock,
+`state: SpinLock<KernelState>`. Exactly three methods acquire it — `lock` (test-only),
+`with`, `with_cpu`. Everything else reaches kernel state through the per-domain
+split seams. **Full unlock = zero production callsites of `with`/`with_cpu`, after
+which the `SpinLock<KernelState>` field is deleted.**
+
+Current count: **51** production acquisition sites (41 `with_cpu` + 10 `with`).
+
+### 0.2 Stage numbering rule
+
+Historical stage labels (`199A2D2C2B3`, `200D-2B1D5B`, …) encode the order in which
+work was attempted, not the order in which it must be completed, and several of them
+name stages that landed *no* production path. They are retained as commit-evidence only.
+
+**The canonical ladder is `199C` … `205D` below.** Each canonical stage is scoped to
+**one production path** and sized for a single implementation turn. When a new stage is
+started, it takes the next canonical identifier — not a new sub-branch of an old one.
+
+### 0.3 Canonical stage status
+
+| Canonical | Scope | Status | Missing |
+|-----------|-------|--------|---------|
+| **199C** | Off-lock direct `IpcCall`/`IpcReply` transaction (x86_64) | PARTIAL | gate `ipccall_direct_proof_enabled()` default-OFF |
+| **199D** | Cross-arch NR6/NR7 admission (AArch64, RISC-V) | PARTIAL | same gate |
+| **200A** | Reply / timeout / peer-death terminal ownership model | COMPLETE | — |
+| **200B** | Generation-bearing deadline token store | COMPLETE | — |
+| **200C** | Reply-receive deadline completion transaction + 3-arch live matrix | COMPLETE | — (**6/6 live cells**, `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`) |
+| **200D** | Off-lock reply-timeout retirement (scan off the broad lock) | PARTIAL | AArch64 + RISC-V scans still broad; `run_reply_timeout_completion_locked` not deleted |
+| **201A** | `ExitCurrentTask` NR 16 ABI + non-returning disposition | COMPLETE | — |
+| **201B** | `ExitCurrentTask` live cells — x86_64, AArch64 | COMPLETE | — (2/3) |
+| **201C** | `ExitCurrentTask` live cell — RISC-V | OPEN | re-run only; runner bound fixed at `5488d8e` |
+| **201D** | Server-death terminal mechanism + deferred post-lock completion | COMPLETE | — |
+| **202A** | ServerDies liveness foundation (9 transitions, 15 literals, 24 races) | COMPLETE | — |
+| **202B** | Three-architecture return contract + live readiness | COMPLETE | — |
+| **202C** | x86 post-drain restore-owner revalidation + typed restore-failure contract | COMPLETE (hosted) | never exercised in QEMU |
+| **202D** | **ServerDies link accounting repair** (`LINK_LEAK created=54 detached=1 result=fail`) | **OPEN — next stage** | counter scoping decision |
+| **203A/B/C** | ServerDies live cells — x86_64 / AArch64 / RISC-V | OPEN | blocked by 202D |
+| **203D** | ServerDies three-architecture matrix seal | OPEN | blocked by 203A–C |
+| **204A** | Retire blocking `IpcRecv` (NR 2) off the broad lock | OPEN | |
+| **204B** | Retire `IpcSend` (NR 1) off the broad lock | OPEN | |
+| **204C** | Retire `FutexWait` (NR 9) block+dispatch off the broad lock | OPEN | seams landed helper-only at Stage 191D |
+| **204D** | Retire the non-syscall trap path (timer / IRQ / page fault) | OPEN | |
+| **205A** | Remove the AArch64 split return-path broad re-acquisition | OPEN | `src/arch/trap_entry.rs:1432` |
+| **205B** | Collapse trap entry to a single bounded broad seam per arch | OPEN | |
+| **205C** | Retire residual non-trap `with_cpu` sites and the 10 broad `with` sites | OPEN | |
+| **205D** | Delete `SharedKernel::with` / `with_cpu` and the `SpinLock<KernelState>` field | OPEN | **full unlock** |
+
+### 0.4 Dependency-ordered roadmap
+
+Each row is one production path, one turn. "Δ" is the expected change to the count of
+51 broad-lock acquisition sites.
+
+| # | Stage | Production path | Exit criteria | Live cells | Δ |
+|---|-------|-----------------|---------------|------------|---|
+| 1 | 202D | `server_dies_counters::audit_success_path` + the two `ServerReplyLink` accounting sites | `LINK_LEAK` cannot fire on a boot with ≥1 unrelated bound `IpcCall`; audit scoped to the audited death; Stage 202A literals still hold | **0** | 0 |
+| 2 | 203A | x86_64 ServerDies runner | one clean boot, caller enqueued → dispatched → resumed `code=10`, zero hard-fail literals | 1 | 0 |
+| 3 | 201C | RISC-V `ExitCurrentTask` runner re-run | `EXIT_TASK_SURVIVOR_PROGRESS_OK` + `EXIT_TASK_SYSTEM_HEALTH_OK` inside the boot timeout | 1 | 0 |
+| 4 | 203B/C | AArch64 + RISC-V ServerDies runners | per-arch clean boot | 2 | 0 |
+| 5 | 203D | Combined exact-commit matrix runner | one commit, three arches, `live_cells=3 result=ok` | 3 | 0 |
+| 6 | 200D′ | AArch64 + RISC-V reply-timeout scan → off-lock | `scan_broad_lock=0` on all three; delete the broad-lock completion fallback | 2 | **−1** |
+| 7 | 199C′ | Flip the NR6/NR7 gate to production default on x86_64 | normal boot takes the off-lock path; Stage 199 seals re-run green **ungated** | 2 | 0 |
+| 8 | 199D′ | Same flip for AArch64 + RISC-V | three-arch ungated matrix seal | 4 | 0 |
+| 9 | 205A | AArch64 `finalize_split_handled_syscall` | AArch64 NR 15 / NR 10 complete with zero broad acquisitions | 2 | **−1** |
+| 10 | 204A | Blocking `IpcRecv` off-lock block-publish + dispatch | general receiver blocks and resumes with no broad acquisition | 3 | −2…−4 |
+| 11 | 204C | Wire the Stage 191D `FutexWait` seams live | `FUTEX_WAIT_SPLIT_BLOCK_PUBLISH_OK` on the production path | 3 | −2 |
+| 12 | 204B | `IpcSend` off-lock send transaction | plain + ordinary-cap complete off-lock | 6 | −2 |
+| 13 | 204D | Non-syscall trap path | timer tick and page fault handled without `with_cpu` | 3 | −2 |
+| 14 | 205B | Collapse drain re-acquisitions | ≤1 broad seam per arch trap entry | 3 | **−16** |
+| 15 | 205C | Residual sites | zero production `with`/`with_cpu` outside `runtime.rs` | 3 | **−17** |
+| 16 | 205D | Delete the broad lock | the type does not compile with a broad lock present | 3 | −3 → **0** |
+
+### 0.5 Structural blockers
+
+1. `IPC_SERVER_DEATH_LINK_LEAK created=54 detached=1 result=fail` — the only hard
+   failure in the tree; blocks every ServerDies live cell.
+2. `revalidate_idle_owner_after_drains` (`src/runtime.rs:665`) has never run in QEMU.
+3. NR6/NR7 off-lock direct IPC is default-OFF, so Stage 199 delivers no production benefit.
+4. `d6_genuine_enabled()` (`src/kernel/boot/mod.rs:766`) is compile-time **x86_64-only** —
+   AArch64 and RISC-V cannot retire any queue-advancing class.
+5. AArch64 split classes re-acquire the broad lock on return (`src/arch/trap_entry.rs:1432`).
+6. `FutexWait` off-lock seams landed helper-only (`src/kernel/syscall_split.rs:786`).
+7. Reply-timeout scan is off-lock on x86_64 only; the broad-lock fallback survives.
+8. RISC-V `ExitCurrentTask` live cell is pure execution debt.
+9. `cargo test --lib` aborts under the default parallel harness (see
+   `doc/KERNEL_TEST_RULES.md` Rule 8).
+10. `scripts/check-contract-doc-enforcement.sh` greps a non-existent
+    `doc/ABI_CONTRACT_FREEZE.md`.
+
+### 0.6 Recommended immediate next stage — **202D**
+
+One production path: `server_dies_counters::audit_success_path`
+(`src/kernel/boot/mod.rs:4116`) plus the `LinkCreated` record at
+`src/kernel/boot/ipc_state.rs:1250` and the `LinkDetached` record at
+`src/kernel/boot/ipc_state.rs:1383`.
+
+Scope the nine-counter vector to the death currently being audited rather than adding
+`unregister_server_reply_link` as a second close site — per-death scoping preserves the
+"every class == 1" expectation the Stage 202A fifteen hard-fail literals were written
+against. Hosted-only: **no QEMU, no live cell, zero broad-lock reduction.** ≥8 hosted
+cases and ≥4 mutation guards; the genuine-leak detector must still fire on a real leak.
+
+---
+
 ## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call, Stage 124 Rust tail-jump stack-shape fix, Stage 125 Rust entry bridge, Stage 126 kernel switch-stack mapping/backing gate, Stage 127 target-ASID stack mapping retry, Stage 128 active-CR3 shared switch-stack coverage, Stage 129 active-root VmFull on-demand repair, Stage 163P cross-arch accepted sender-wake regression oracle)
 
 | Item | Status | Live since | Notes |

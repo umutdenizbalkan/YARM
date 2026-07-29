@@ -3,14 +3,14 @@
 # YARM Syscall ABI v10 (Frozen Contract)
 
 - ABI Version: `10`
-- Public syscall count: `16` (`0..=15`)
+- Public syscall count: `17` (`0..=16`)
 - Kernel dispatch table count: `32` (`SYSCALL_COUNT`, slots `0..=31`)
 
 ## Public ABI v10 syscall numbers
 
 `SYSCALL_COUNT` in the kernel is the dispatch-table size, not the public ABI
 count. The current public ABI v10 surface is the contiguous user-callable range
-`0..=15` (**16 slots**). Some public slots still enforce capability or control
+`0..=16` (**17 slots**). Some public slots still enforce capability or control
 plane policy and can return `MissingRight`; that does not make them private
 kernel-extension slots.
 
@@ -32,6 +32,7 @@ kernel-extension slots.
 | `13` | `VmAnonMap` | public, wired anonymous page mapping syscall |
 | `14` | `VmBrk` | public staged syscall; query, grow, and page-granular shrink are supported |
 | `15` | `DebugLog` | public debug logging syscall |
+| `16` | `ExitCurrentTask` | public; terminates the **calling** task. Never returns on success — the trap disposition is non-returning, so there is no return-register contract for the success case. `16` was audited unused before assignment: the `0..=31` space held `0..=15`, `23`, `24`, `26`, `28..=31`, leaving `16..=22`, `25` and `27` free. |
 
 ## ABI slot status matrix
 
@@ -120,10 +121,35 @@ The public tail slots `13..=15` are assigned and dispatched in v10:
 `13` is `VmAnonMap`, `14` is `VmBrk`, and `15` is `DebugLog`.
 They are not reserved gaps and are covered by the public ABI v10 matrix above.
 
+## Per-architecture broad-lock dispatch matrix
+
+Which syscalls are serviced **without** the broad `SpinLock<KernelState>`. Everything
+absent from this table enters the broad lock via `SharedKernel::with_cpu`. Census and
+evidence: `doc/KERNEL_UNLOCK_AUDIT.md` §2.
+
+| Nr | Class | x86_64 | AArch64 | RISC-V | Gate |
+|----|-------|--------|---------|--------|------|
+| `15` | `DebugLog` | off-lock | off-lock, **broad re-acquire on return**¹ | off-lock | ungated |
+| `10` | `FutexWake` | off-lock | off-lock, **broad re-acquire on return**¹ | off-lock | ungated |
+| `8` | `ControlPlaneSetCnodeSlots` | off-lock | broad | broad | ungated |
+| `2` | `IpcRecv` — kernel-task queued-plain case only | off-lock | broad | broad | ungated |
+| `14` | `VmBrk` — page-crossing shrink case only | off-lock | broad | broad | ungated |
+| `6` | `IpcCall` direct | off-lock | off-lock | off-lock | `ipccall_direct_proof_enabled()` — **default OFF** |
+| `7` | `IpcReply` direct | off-lock | off-lock | off-lock | `ipccall_direct_proof_enabled()` — **default OFF** |
+
+¹ AArch64 `finalize_split_handled_syscall` (`src/arch/trap_entry.rs:1432`) re-takes
+`with_cpu` to export results and advance past the SVC, so AArch64 split classes are not
+broad-lock-free end to end. Tracked as canonical Stage 205A.
+
+AArch64 admits a syscall to the split seam only through its selective ABI import
+(`src/arch/trap_entry.rs:1384`), so NR 8 / NR 2 / NR 14 never reach it. RISC-V uses a
+purpose-built bridge (`src/arch/riscv64/trap.rs:417`) whose gate admits only NR 15,
+NR 10, and gated NR 6 / NR 7.
+
 ## Reserved and gap slots
 
-- `16..=22`: reserved/unassigned in ABI v10. `Syscall::decode` rejects these
-  numbers with `InvalidNumber`.
+- `17..=22`: reserved/unassigned in ABI v10. `Syscall::decode` rejects these
+  numbers with `InvalidNumber`. (`16` is now `ExitCurrentTask` — see above.)
 - `25`: reserved/unassigned in ABI v10. `Syscall::decode` rejects this number
   with `InvalidNumber`.
 - `30`: `RecvSharedV3` — Stage 42+43 live non-blocking recv_shared_v3 extension (NR 30).

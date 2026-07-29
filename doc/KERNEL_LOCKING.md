@@ -5,6 +5,119 @@
 This document records the current kernel locking shape and a staged plan to
 remove implicit global-lock coupling from syscall/trap paths.
 
+---
+
+## 0. Current lock architecture and broad-lock census (authoritative)
+
+> **This section supersedes the status statements below it.** Everything after §0 remains
+> accurate about lock *design* (ranks, ordering, domain semantics) and is retained as the
+> canonical architecture reference; it is **not** a current census. Evidence:
+> `doc/KERNEL_UNLOCK_AUDIT.md` §1. Roadmap: `doc/KERNEL_UNLOCKING.md` §0.
+
+**Baseline:** commit `757993b699b309dafdb3d17c428380c08d7fc9f7`, tree
+`1118b61b74588e73b0dc235dc96086ec7488257c`.
+
+### 0.1 The two-tier architecture
+
+```
+SharedKernel                       src/runtime.rs:231
+└── state: SpinLock<KernelState>   ← the BROAD lock ("global lock")
+        │
+        ├── tier 1: broad acquisition — with() / with_cpu() / lock()
+        │            takes SpinLock<KernelState>, yields &mut KernelState
+        │
+        └── tier 2: per-domain split seams — *_split_mut / *_split_read
+                     derive raw field pointers from state.data_ptr(),
+                     take exactly ONE ranked domain lock, never form
+                     a broad &mut KernelState
+```
+
+`KernelState` (`src/kernel/boot/mod.rs:6791`) carries eleven domain locks:
+`scheduler_state` (`SpinLockIrq<SchedulerState>`) plus the ten unit-guard domains
+`ipc_state_lock`, `driver_state_lock`, `fault_state_lock`, `restart_state_lock`,
+`capability_state_lock`, `telemetry_state_lock`, `boot_config_state_lock`,
+`vm_state_lock`, `task_state_lock`, `memory_state_lock`.
+
+Split seams recompute their raw pointers from `self.state.data_ptr()` on **every** call.
+Caching them is a known-bad pattern: the Stage 114 fix (documented at
+`src/runtime.rs:325`) removed cached pointers that went stale because `SpinLock::new`
+moved the state, reproduced as a SIGSEGV through a dangling `scheduler_state`.
+
+### 0.2 Production broad-lock census
+
+Method: all `.rs` under `src/` and `crates/`, excluding whole-file test modules
+(`tests.rs`) and everything after a `#[cfg(test)] mod tests {` boundary; comment-only
+lines excluded.
+
+| Category | Production callsites |
+|----------|---------------------|
+| `SharedKernel::with_cpu` | **41** |
+| `SharedKernel::with` (broad `&mut KernelState`) | **10** |
+| Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
+| **Total broad-lock acquisition sites** | **51** |
+
+#### `with_cpu` — 41 sites
+
+| File | Count | Lines |
+|------|-------|-------|
+| `src/runtime.rs` | 13 | 389, 670, 1350, 1450, 1484, 1533, 1701, 1714, 1846, 2190, 2368, 2402, 2644 |
+| `src/arch/trap_entry.rs` | 12 | 299, 423, 499, 558, 644, 674, 747, 805, 1055, 1202, 1295, 1432 |
+| `src/arch/riscv64/trap.rs` | 8 | 563, 659, 727, 825, 870, 958, 1063, 1194 |
+| `src/arch/x86_64/smp.rs` | 4 | 2179, 2455, 2571, 2664 |
+| `src/arch/x86_64/descriptor_tables.rs` | 2 | 1249, 1305 |
+| `src/arch/riscv64/boot.rs` | 1 | 1048 |
+| `src/kernel/boot/thread_state.rs` | 1 | 232 |
+
+Of those 41: **1** is the authoritative trap dispatch (`trap_entry.rs:299`, with its
+RISC-V twin at `riscv64/trap.rs:563`) inside which every non-split syscall, every timer
+and external IRQ and every page fault runs its complete handler; **~20** are short
+post-lock re-acquisitions performed by the D2 / D6 / FutexWait / Yield drains purely to
+restore arch thread state after the authoritative dispatch already ran off-lock; **2** are
+identity snapshots (`descriptor_tables.rs:1249/1305`); **1** is the AArch64 split return
+path (`trap_entry.rs:1432`); the rest are SMP bring-up, RISC-V resume and thread creation.
+
+#### Broad `.with(|state| …)` — 10 sites
+
+`src/runtime.rs:1244, 1248, 2654, 3696, 3725, 4013, 4017, 4025`;
+`src/arch/x86_64/smp.rs:2442, 2582`.
+
+`src/kernel/boot/orchestrator_state.rs:47` matches the same text but is
+`LOCK_ORDER_LAST_RANK.with(…)`, a `thread_local!` accessor — **not** a broad-lock
+acquisition, and excluded from the count.
+
+### 0.3 Raw / global `KernelState` mutation
+
+There is **none** outside the three `SharedKernel` methods. No `static mut KernelState`
+and no global `KernelState` handle exists; the only kernel-wide static of that shape is
+`KERNEL_GLOBAL_ALLOCATOR` (`src/kernel/global_allocator.rs:679/685`), which is an
+allocator. The residual correctness risk is therefore lock-domain **ordering** and the
+**size of the remaining broad closures**, not uncontrolled mutation.
+
+### 0.4 Legacy global-lock fallback handlers still live
+
+| Fallback | Site | Trigger |
+|----------|------|---------|
+| Default-deny split dispatch | `src/kernel/syscall_split.rs:885` (`_ => None`) | every non-whitelisted syscall |
+| In-helper decline → broad lock | the four `try_split_*_into_frame` helpers return `None` for cases they cannot service | narrow-case miss |
+| Reply-timeout broad completion | `src/runtime.rs:3725` `run_reply_timeout_completion_locked` | non-x86_64, or off the off-lock collector |
+| Drain `reason=state_changed` | `src/arch/trap_entry.rs:445, 521, 876` | post-drain re-verify failed |
+| `d6_genuine_enabled()` compile-time false | `src/kernel/boot/mod.rs:766` | **AArch64 and RISC-V, always** |
+
+`d6_genuine_enabled()` is `cfg!(target_arch = "x86_64") && !d6_controlled_switch_proof_enabled()
+&& !d6_switch_a_enabled()` — there is no production opt-out on x86_64 and no opt-in
+elsewhere. **Off-lock authoritative dispatch is an x86_64-only mechanism.**
+
+### 0.5 Post-lock drain chain (order is load-bearing)
+
+After `with_cpu` returns in `handle_trap_entry_shared`: `drain_dispatch_post_work` →
+D2-send *(x86)* → D2-recv *(x86)* → FutexWait (192A x86 / 195E AArch64) → Yield
+(192B x86 / 195G AArch64) → D6-genuine mutating dispatch *(x86)* → Stage 117 switch-plan
+stash → `drain_reply_timeout_post_work` → `drain_server_death_post_work`. RISC-V runs an
+equivalent chain inside `handle_riscv_trap_entry_shared`, including its own reply-timeout
+collector, and does **not** flow through the shared reply-timeout drain.
+
+---
+
 ## Current status
 
 - `SharedKernel` global lock (`SpinLock<KernelState>`) still exists and remains

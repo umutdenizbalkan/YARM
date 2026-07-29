@@ -907,6 +907,117 @@ gate to live-only is the next pass, not this one.
 
 ---
 
+## 11.1 Return contract, scheduling and live proof (kernel unlocking)
+
+Census and cross-architecture matrix: `doc/KERNEL_UNLOCK_AUDIT.md` §2. Roadmap:
+`doc/KERNEL_UNLOCKING.md` §0.
+
+### RISC-V does not use the shared trap entry
+
+x86_64 and AArch64 both enter `arch::trap_entry::handle_trap_entry_shared`. RISC-V has a
+**purpose-built** bridge, `handle_riscv_trap_entry_shared` (`src/arch/riscv64/trap.rs:417`),
+structured on the same three phases but written for the RISC-V trap bridge:
+
+1. **Pre-lock phase** — split dispatch for an explicitly enumerated NR set.
+2. **Broad-lock phase** — one bounded `shared.with_cpu` callback; no raw
+   `&mut KernelState` escapes it.
+3. **Post-lock drains** — including a **RISC-V-local** reply-timeout collector. RISC-V
+   does **not** flow through the shared `drain_reply_timeout_post_work` (noted at
+   `src/arch/trap_entry.rs:1109`).
+
+### Off-lock position — exactly 2 ungated classes, enumerated at the bridge
+
+The RISC-V trap bridge has **already** imported the syscall ABI into the portable frame
+(`a7` → `nr`, `a0..a5` → `args`), so unlike AArch64 the ABI is always present. The gate is
+therefore explicit rather than import-driven (`src/arch/riscv64/trap.rs:452`):
+
+```rust
+let split_eligible = is_syscall
+    && (nr == SYSCALL_DEBUG_LOG_NR || nr == SYSCALL_FUTEX_WAKE_NR || is_ipc_direct);
+```
+
+This is deliberate: the shared `try_split_dispatch_into_frame` also knows NR 8, NR 2 and
+NR 14, and the RISC-V gate exists so that it can **never** service any of them here.
+
+Both ungated classes return **early**, skipping the broad-lock phase and the
+`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag entirely — so no drain is owed and nothing is
+left true across the `sret`. `DebugLog` is a pure read; `FutexWake` mutates only
+waiter/run-queue state and the caller stays `current`. Both finalize through the bridge's
+same-task ecall write-back: `sepc+4` exactly once, `sstatus` preserved, `a0` from
+`set_ok`. RISC-V therefore does **not** pay AArch64's return-path broad re-acquisition.
+
+NR 6 / NR 7 are admitted only while the common direct proof gate is armed (Stage
+199A2C2); with the gate off they fall through **unchanged** to the broad-lock handler and
+a normal boot is byte-identical.
+
+### Typed outcomes — errors are never inferred as idle
+
+The bridge returns a typed `RiscvTrapEntryOutcome`, not an `Err` sentinel. Stage 197B made
+FutexWait's no-incoming case a typed **success** — `EnterKernelIdle { reason:
+FutexWaitNoIncoming }` → `RISCV_TYPED_IDLE_OUTCOME result=ok` +
+`RISCV_KERNEL_IDLE_WAITING_FOR_IO` — rather than an `Err(Internal)` the bridge would have
+to guess about. A default-off negative oracle
+(`riscv_typed_outcome_internal_error_oracle_enabled`) forces a genuine internal error on
+the first syscall from a provably-live current task and requires the bridge to take the
+fatal `RISCV_TRAP_HANDLE_FAILED` path — proving the error/idle separation directly rather
+than asserting it.
+
+### Scheduling
+
+`d6_genuine_enabled()` is **compile-time `false`** on RISC-V; every queue-advancing
+dispatch is taken in-lock. RISC-V has no AP scheduler
+(`RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled`).
+
+RISC-V consumes the trap disposition **after** the post-lock drains (Stage 202B guard
+`a07`), so it is not exposed to the x86_64 restore-owner hazard.
+
+### Cost model — `Yield` is expensive, and live oracles must be sized for it
+
+Every RISC-V `Yield` runs the full Stage 196G post-lock retirement drain and emits
+**~13 serial console lines**. A 4096-iteration survivor loop is therefore ~54k lines. At
+`fb5f040` the `ExitCurrentTask` live run produced a **complete and correct** exit chain —
+selector provisioned, disposable task entered, NR 16 dispatched once, preflight ok,
+lifecycle transition, disposition published, in-lock bypass armed with
+`inlock_result_export=0`, broad lock released, all Phase-3 drains done, disposition
+consumed, identity and absence validated, `sret` owner attested, replacement restored —
+with **zero** hard-fail markers and zero fatals. What failed was the survivor-progress
+proof afterwards: init's loop had completed only ~985 of 4096 iterations when the 180 s
+boot timeout fired, so `EXIT_TASK_SURVIVOR_PROGRESS_OK` and `EXIT_TASK_SYSTEM_HEALTH_OK`
+never appeared.
+
+**Classification: runner/oracle defect, not a kernel defect.** init was demonstrably
+alive and dispatching at the end of the log (`RISCV_YIELD_DISPATCH_* incoming=1`). The
+bound was reduced to **64** at `5488d8e` — the same RISC-V-specific reduction Stage
+200C2C2C-R2B applied to the reply-timeout oracle's spin, for the identical reason. 64
+yields is still 64 full trap → scheduler dispatch → `sret` round trips **after** the exit.
+x86_64 and AArch64 bounds are untouched and a guard pins all three. See
+`doc/KERNEL_TEST_RULES.md` Rule L2.
+
+> ⚠️ **The corrected RISC-V `ExitCurrentTask` runner has not been re-run.** The live cell
+> is unearned purely as execution debt — canonical Stage **201C**.
+
+### Live-proof status
+
+* First cohort — 4 live cells, including `RISCV_DEBUGLOG_SPLIT_USER_RETURN_OK`,
+  `RISCV_FUTEX_WAKE_LIVE_ORACLE_DONE result=ok first_wake=1 second_wake=0`,
+  `RISCV_FUTEX_WAIT_IDLE_ORACLE_DONE result=ok lock_dropped=1 current_none=1
+  outgoing_blocked=1`, `RISCV_FUTEX_WAIT_LIVE_ORACLE_DONE result=ok wake_count=1`.
+* Second cohort — plain, ordinary-cap and shared-region-direct cells earned;
+  `SECOND_COHORT_SHARED_REGION_DIRECT_LIVE_SEAL arch=riscv64 classes=1 live_cells=1
+  fuse_trips=0 result=ok`.
+* Reply timeout — both matrix cells earned. Timeout-wins proves its return chain end to
+  end with **three independently observed values of `a0`**, all required to be `9`, in
+  order: `RISCV_BLOCKED_RETURN_PUBLISHED` (stored TCB lanes) →
+  `RISCV_BLOCKED_SYSCALL_COMPLETION_DELIVERED` (final `sret` frame) →
+  `USER_RT_RECV_AFTER_SYSCALL` (first userspace observation). Reply-wins adds a causal
+  reservation so the winning reply is observed before the timeout can claim.
+  The deadline **scan** is still `scan_broad_lock=1`.
+* `ExitCurrentTask` NR 16 — **not earned** (see above).
+* **ServerDies — no live cell**; runner `scripts/qemu-riscv64-server-dies-smoke.sh`
+  exists and is blocked behind canonical Stage 202D.
+
+---
+
 ## 12. Authoring rule
 
 Future RISC-V64 docs update **this file**. Cross-arch / generic boot

@@ -45,7 +45,7 @@ inline `OPCODE_SHARED_MEM` message (that value is produced by the kernel on this
 Args: `arg0 = ep_cap`, `arg1 = offset`, `arg2 = region_len (> 128)`, `arg5 = source
 shared-region cap`. The kernel builds a 16-byte `SharedMemoryRegion { offset:u64@0,
 len:u64@8 }` descriptor; the source cap is delegated/duplicated (not moved). See
-`doc/STAGE_198E3C1_SHARED_REGION_USERSPACE_CONTRACT.md`.
+`doc/IPC.md §8.2`.
 
 ## 4. Target-specific transfer VAs (must NOT be unified)
 
