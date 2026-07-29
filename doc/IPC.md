@@ -476,9 +476,49 @@ none sealed. Two defects were found live:
    share a vector.
 
    Ten focused hosted cases pin this (`d01`–`d10`), including the original reproduction
-   with unrelated links created on both sides of the armed transaction. **No live cell is
-   claimed** — this is a hosted accounting repair, and the ServerDies live cells remain
-   unearned on all three architectures.
+   with unrelated links created on both sides of the armed transaction.
+
+3. **First ServerDies live cell — x86_64, EARNED.** Historical seal name
+   `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`; canonically a **Stage 199D server-crash-cleanup
+   increment** (it also exercises the reply-object-cleanup element canonical 202D owns).
+   Exact commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
+   `e2fd0b5c7a82dc6c8c422d5c6db242473533a9a6`, one fresh boot, clean tree frozen and
+   re-checked after every phase.
+
+   ```
+   STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64
+     sha=f5669cb55325ac58aba6a15207a89c95ad8cad3d
+     tree=e2fd0b5c7a82dc6c8c422d5c6db242473533a9a6
+     live_cells=1 caller_wakes=1 peer_death_winners=1
+     exit_returns=0 feature_off_oracle_literals=0 result=ok
+   ```
+
+   Live evidence for the accounting model, both tiers:
+
+   * **Scoped vector `[1, 1, 1, 1, 1, 1, 1, 1, 1]`** with `result_before_enqueue=1` —
+     `IPC_SERVER_DEATH_TRANSITION_AUDIT`. All nine transitions once, in order.
+   * **Quiescent system balance `created=54 closed=54 live_links=0`** —
+     `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT … scope=system result=ok`. **54 is the exact
+     count that used to be reported as the leak** (`created=54 detached=1 result=fail`): the
+     links were always being closed, the ordinary terminal path simply never counted its
+     closes.
+   * Scope armed by observation, not inference — `IPC_SERVER_DEATH_SCOPE_ARMED
+     record_index=1 record_generation=17 server_tid=10008 server_asid=1 link_present=1`.
+   * **Owner revalidation executed for the first time in QEMU** —
+     `EXIT_TASK_OWNER_REVALIDATED arch=x86_64 cpu=0 prepared=idle committed=replacement
+     next_tid=1 advances=1 broad_lock=0 result=ok`, and the **replacement return** is
+     correct: `EXIT_TASK_COMMON_EPILOGUE_OWNER … owner=replacement clears=1
+     frame_committed=1`. This closed the Stage 200D-2B1D4 hang, in which the epilogue
+     committed a stale `owner=idle` decision taken before the drains published the wake.
+   * `IPC_SERVER_DEATH_TERMINAL_CLAIM terminal=PeerDeath result=won` →
+     `IPC_SERVER_DEATH_USER_VALIDATED result=ServerDied code=10 continuations=1`;
+     `reply_aliases_invalid=1 reply_copies=0`; survivor and health attested
+     (`SURVIVOR_PROGRESS_OK … yields=64`, `SYSTEM_HEALTH_OK`).
+   * Zero `result=fail` in the whole 14215-line log; all eighteen forbidden markers absent;
+     one boot banner; `caller_wakes=1`, `peer_death_winners=1`.
+
+   **This is one cell on one architecture.** AArch64 and RISC-V ServerDies cells remain
+   unearned, and canonical 199D is not sealed.
 
 ### 8.6 Preserved contracts from the deleted stage reports
 

@@ -394,7 +394,7 @@ counts as done:
 | Stage | Scope (abbreviated) | Status | Evidence and gap |
 |-------|--------------------|--------|------------------|
 | **199C** | Blocking `IpcSend` — sender-waiter publication retired, sparse-queue + timeout parity | **OPEN** | `handle_ipc_send` and its waiter publication run inside the broad `with_cpu`. The only off-lock element is the x86_64 D2-send drain (`trap_entry.rs:388`), which relocates the queue-advancing **dispatch**, not the publication, and is compile-time absent on the other two architectures. The 15 `IpcSend` live cells prove **delivery**, not blocking-sender retirement. |
-| **199D** | `IpcCall` + reply-object lifecycle as one transaction, incl. **server crash cleanup** | **OPEN** — hosted foundation + knob-gated live proof | Off-lock transaction exists (`ipccall_direct_txn.rs`; `syscall_split.rs:295/307`), reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) but **default-OFF** (`mod.rs:3095`), so no production boot takes it. Server-crash cleanup: the reverse-link accounting is **repaired** — the counters now describe exactly one armed ServerDies transaction, with system-wide totals carrying the leak invariant (`doc/IPC.md` §8.5, 10 hosted cases). **Still open as a stage: 0 ServerDies live cells on any architecture, and the NR6/NR7 gate is default-OFF.** |
+| **199D** | `IpcCall` + reply-object lifecycle as one transaction, incl. **server crash cleanup** | **OPEN** — hosted foundation + knob-gated live proof | Off-lock transaction exists (`ipccall_direct_txn.rs`; `syscall_split.rs:295/307`), reserve→commit→cancel, incarnation-safe records, one-shot consumed barrier. Live-proven x86_64 SMP=2 both directions (`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`) but **default-OFF** (`mod.rs:3095`), so no production boot takes it. Server-crash cleanup: accounting **repaired** and the **first live cell EARNED on x86_64** — `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL` at `f5669cb5`/`e2fd0b5c`, scoped vector `[1;9]`, quiescent `created=54 closed=54 live_links=0`, `EXIT_TASK_OWNER_REVALIDATED … committed=replacement`, zero `result=fail` (`doc/IPC.md` §8.5). **Still open as a stage: 1 of 3 architectures, and the NR6/NR7 gate is default-OFF.** |
 | **199E** | IPC timeout + cancellation: recv, **send**, **call**, reply | **OPEN** — one quarter retired | Reply timeout only: narrow completion on 3 arches, scan off-lock **x86_64 only**, 6 live cells (`STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, `72a4ebf`). `IpcRecvTimeout` pre-reads its deadline off-lock; the receive is broad. **`IpcSend` timeout and `IpcCall` timeout are not retired at all.** Broad fallback `runtime.rs:3725` present. |
 | **199F** | Notification signal / wait / wait-timeout / multi-signal; no global lock in IRQ-originated delivery | **OPEN** | Only `notification_waiter_count_split_read` exists, and it is a read helper. `signal_notification` (`ipc_state.rs:5196`) takes `&mut self` under the broad lock. IRQ-originated delivery runs inside the broad trap closure. |
 | **199G** | Full IPC seal — zero IPC broad-lock acquisitions | **OPEN** | Blocked on 199C–199F. |
@@ -636,6 +636,46 @@ callsite reduction: 0** — the off-lock path already exists; this makes it reac
 Neither act completes canonical 199D. The stage additionally requires the full call/reply
 transaction proven with no broad-lock fallback, and server-crash cleanup proven live on all
 three architectures.
+
+---
+
+## 6.1 Why the NR6/NR7 production-default flip is NOT the smallest next increment
+
+Recorded because the flip was attempted and stopped, and the reason is a design constraint
+rather than an oversight.
+
+Making the off-lock NR 6 / NR 7 path production-default on x86_64 was expected to be a
+one-predicate change to `ipccall_direct_proof_enabled()`. It is not: **enablement is
+two-layered**, and the proof gate is only the outer layer.
+
+| Layer | Site | Effect |
+|-------|------|--------|
+| 1 — proof gate | `ipccall_direct_proof_enabled()` (`mod.rs:3095`), consumed at `syscall_split.rs:243/298/310`, `trap_entry.rs:1403/1430`, `riscv64/trap.rs:451` | admits NR 6 / NR 7 to the split dispatcher at all |
+| 2 — **oracle endpoint confinement** | `ipccall_direct_oracle_request_endpoint_is` / `..._reply_endpoint_is` (`mod.rs:3496/3502`), enforced inside `try_split_ipccall_direct_into_frame` (`syscall_split.rs:648`) and its NR 7 twin | services **only the oracle's** request/reply endpoint; every other endpoint returns `None` → legacy broad-lock path |
+
+Layer 2's own comment states the intent: *"confine the off-lock request path to the oracle's
+request endpoint so a NORMAL system IpcCall (the live service chain) stays byte-identical on
+its legacy path **even while the proof gate is armed**."*
+
+So removing only the proof-gate dependency makes the path *reachable* but leaves it
+declining every ordinary `IpcCall`. The two proof obligations — "normal feature-off x86 boots
+use the off-lock NR6/NR7 path" and "no broad-lock fallback for eligible x86 NR6/NR7" — are
+**unachievable** by that change alone.
+
+Removing layer 2 as well is not a small increment, and it collides with a documented
+constraint (`doc/IPC.md` §8.6). The blocked-server / blocked-caller acknowledgement is a
+**single slot** classified ORACLE-ONLY / SINGLE-OUTSTANDING-PAIR, whose real-build `publish`
+carries a fail-closed overwrite fuse that **refuses** a second simultaneous pair
+(`mod.rs:5223`, `5265`, `5512`). The off-lock request path requires a committed ack before it
+will service a call. A production service chain runs many concurrent bound `IpcCall`s — the
+x86_64 ServerDies cell measured **54 reverse links in a single boot** — so unconfining the
+path would drive multiple outstanding pairs through a one-pair slot.
+
+**Prerequisite:** replace the single-slot ack with the endpoint-indexed, generation-bearing
+bounded store the Stage 199A2D1 race model already names as required for genuine multi-pair
+concurrency. That is its own increment, and it must land before any production-default flip.
+Until then the correct statement is that the off-lock NR 6 / NR 7 transaction is
+**live-proven for one outstanding pair on the oracle's endpoints**, not production-ready.
 
 ---
 
