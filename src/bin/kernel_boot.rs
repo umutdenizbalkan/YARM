@@ -88,10 +88,10 @@ fn main() {
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_main(start_info_ptr: usize) -> ! {
     yarm::arch::boot_entry::prepare_arch_boot(start_info_ptr);
-    #[cfg(target_arch = "x86_64")]
-    run();
-    #[cfg(not(target_arch = "x86_64"))]
-    yarm::arch::boot_entry::run_kernel_boot(run);
+    // The per-architecture choice between calling `run` directly and going through
+    // `run_kernel_boot`'s staging pass lives in `arch::boot_entry`, not here: this bin must
+    // route ISA details through `src/arch/*`.
+    yarm::arch::boot_entry::enter_kernel_run_loop(run);
     unreachable!("kernel run loop should not return");
 }
 

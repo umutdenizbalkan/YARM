@@ -125,6 +125,14 @@ documents, not live links.
 
 ## Validation
 
+**Two guards enforce the rules in this file.**
+
+`tests/broad_lock_census_guard.rs` (6 tests) recomputes the Stage 204A broad-lock census
+from source and fails if a production `SharedKernel::with` / `with_cpu` callsite is added
+or removed without re-classifying it in `doc/KERNEL_UNLOCK_AUDIT.md` §1,
+`doc/KERNEL_LOCKING.md` §0.2 and `doc/STATUS.md` §0. Stage 204A is the one canonical stage
+recorded COMPLETE, and a census is only complete while it matches the tree.
+
 **`tests/doc_fragmentation_guard.rs` enforces this file's rules.** It fails the build when
 a new `doc/STAGE_*.md` (or other per-stage / duplicate-status / readiness / checklist /
 PR-plan shape) appears without explicit approval. Approval requires **both** an entry in

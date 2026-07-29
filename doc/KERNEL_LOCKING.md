@@ -67,6 +67,11 @@ complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
 | runtime-required | **46** | the real retirement surface |
 | undocumented | **0** | every site enumerated with file, line and enclosing function |
 
+This table is machine-checked: `tests/broad_lock_census_guard.rs` recomputes the per-file
+census from source on every test run and fails if a production `with` / `with_cpu` callsite
+is added or removed without updating it here, in `doc/KERNEL_UNLOCK_AUDIT.md` §1 and in
+`doc/STATUS.md` §0.
+
 > **Naming hazard.** `runtime.rs:3696` sits inside `smp_request_wake_target_split_read` — a
 > function whose name ends in `_split_read` but which takes the **broad** lock
 > (`self.with(|k| k.task_home_cpu(tid))`). It is the only such case in the tree. Do not

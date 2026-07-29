@@ -121,7 +121,7 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 
 | Stage | Definition | Status | Evidence / what is missing |
 |-------|-----------|--------|----------------------------|
-| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 51 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. |
+| **204A** | **Broad-lock callsite census.** Authoritative list of every runtime use of `SharedKernel::with_cpu`, `SpinLock<KernelState>`, raw `KernelState` mutation and the legacy global-lock syscall handler, each classified boot-only / test-only / runtime-required / obsolete fallback. **No undocumented runtime callsite may remain.** | **COMPLETE** | Delivered by `doc/KERNEL_UNLOCK_AUDIT.md` §1: all 51 callsites enumerated with file, line and enclosing function, each classified. Result: **0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: **none exists**. **Guarded** by `tests/broad_lock_census_guard.rs`, which recomputes the census from source and fails if a production callsite is added or removed without re-classifying it — so a COMPLETE 204A cannot silently rot. |
 | **204B** | Decompose `KernelState` ownership into per-CPU / task / scheduler / IPC / capability / VM / timer / IRQ / boot components. `SharedKernel` may remain a container but must not serialize the whole kernel. | **OPEN** (partial foundation) | `KernelState` already carries 11 ranked domain locks and a full set of `*_split_mut` / `*_split_read` seams — the substrate exists. But `with_cpu` still forms a broad `&mut KernelState`, so the container still serializes the kernel. |
 | **204C** | Remove fallback-to-global handlers. An unsupported configuration must use an explicitly supported localized path or fail with a clear diagnostic — never reacquire the monolithic lock. | **OPEN** | Five fallback families live: the default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, the drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding — `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, retirement-enable flags, old fallback dispatch, class-specific one-shot logging, obsolete foundation oracles, compatibility drain branches. Keep validation oracles, but validating production paths rather than enabling them. | **OPEN** | All of the named scaffolding is live. |
@@ -145,12 +145,23 @@ Three distinct levels; a stage is **COMPLETE** only at the third.
 | 4 — VM | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
 | 5 — Lifecycle | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |
 | 6 — Timer/IRQ/sched | 0 of 4 | 203A, 203C, 203D | 203B |
-| 7 — Monolith removal | **204A** | 204B | 204C, 204D, 204E |
+| 7 — Monolith removal | **1 of 5** (204A) | 204B | 204C, 204D, 204E |
 | 8 — Seal | 0 of 4 | 205A | 205B, 205C, 205D |
-| **Total** | **1 of 34** | 11 | 22 |
+| **Total** | **1 of 35** | 12 | 22 |
 
 **No canonical stage in Phases 2–6 or 8 is complete.** The single completed stage is the
 census (204A), which is documentation, not lock retirement.
+
+> **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
+> was the only row written without an `N of M` denominator, and the totals silently counted it
+> as four stages. **The dropped stage was `204B` (decompose `KernelState` ownership), the sole
+> Phase-7 partial**, which is why both the total (34 → **35**) and the partial count
+> (11 → **12**) were low by exactly one. All 35 stages were, and remain, individually
+> documented and classified; only the summary arithmetic was wrong. `204B` is classified
+> **partial foundation**: the eleven ranked domain locks and the `*_split_mut` / `*_split_read`
+> seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`, so the
+> container still serializes the kernel.
+
 
 ### 0.5 Broad-lock callsite classification (Stage 204A result)
 

@@ -54,10 +54,13 @@ satisfies the canonical definition.**
 | Command | Result |
 |---------|--------|
 | `cargo test --lib -- --test-threads=1` | **ok — 3729 passed, 0 failed, 2 ignored** |
-| `cargo test --tests -- --test-threads=1` | **ok — 3729 lib + 146 integration, 0 failed** |
+| `cargo test --tests -- --test-threads=1` | **ok — 3881 passed, 0 failed** (3729 lib + 152 integration, default features) |
 | `cargo test --lib` (default parallel harness) | **completes — no abort in 5 of 5 runs**; 58–71 logical assertion failures remain, count varying per run |
-| `bash scripts/check-contract-doc-enforcement.sh` | **ok — gate passes** |
-| `cargo check` for x86_64 / AArch64 / RISC-V bare-metal `kernel_boot` | **clean** |
+| `cargo test --tests --features ipc-reply-timeout-oracle-core -- --test-threads=1` | **ok — 4045 passed, 0 failed** |
+| all 13 repository gate scripts | **13 of 13 pass** (§3.10) |
+| `cargo check` — x86_64 / AArch64 / RISC-V bare-metal `kernel_boot` | **clean** |
+| `cargo check` — x86_64 / AArch64 / RISC-V freestanding `crash_test_srv` | **clean** |
+| `cargo fmt --check`, `git diff --check` | **clean** |
 
 **The parallel abort is fixed.** The first revision of this audit recorded
 `cargo test --lib` aborting with `double free or corruption` / SIGABRT on 3 of 3 attempts
@@ -71,8 +74,17 @@ unsafety: modules that share process-global counters and one-shot latches
 (`stage200d1_server_death` 11, `stage200c_reply_timeout_transaction` 8,
 `stage198e3b2b_drain_switch` 8, `stage200d2a_deferred_death` 7, and ~15 more) fail
 non-deterministically when run concurrently. Every "hosted evidence" claim in this document
-is therefore still a **single-threaded** claim, and removing that contention is part of
-canonical Stage **205C**.
+is therefore still a **single-threaded** claim.
+
+**This is test-infrastructure debt, not canonical Stage 205C work.** 205C is a
+*long-running concurrency torture* of the running kernel — sustained IPC / spawn / exit /
+reap / fork / VM / cap / futex / timeout / IRQ / restart load, with lock-rank violations,
+duplicate current task, duplicate queue membership, cap-refcount anomalies and the various
+leak counters all required to be zero. What fails here is the *hosted test corpus* sharing
+process-global fixtures with itself. Removing that contention is a prerequisite for using
+the hosted suite as a concurrency harness, and it may therefore **precede or support** 205C,
+but it proves nothing about the kernel and closes no part of the stage. Do not report it as
+205C progress.
 
 ---
 
@@ -436,7 +448,7 @@ counts as done:
 
 | Stage | Scope | Status | Evidence and gap |
 |-------|-------|--------|------------------|
-| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 51 callsites enumerated with file, line and enclosing function. **0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). |
+| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 51 callsites enumerated with file, line and enclosing function. **0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (6 tests), which recomputes the census from source and fails on any added or removed production callsite. |
 | **204B** | Decompose `KernelState` ownership; `SharedKernel` may remain a container but must not serialize the kernel | **OPEN** — partial foundation | 11 ranked domain locks and a full seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`. |
 | **204C** | Remove fallback-to-global handlers | **OPEN** | Five families live: default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding | **OPEN** | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, one-shot class logging and the foundation oracles are all live. |
@@ -448,7 +460,7 @@ counts as done:
 |-------|-------|--------|------------------|
 | **205A** | Complete syscall matrix — arch, class, locks, blocking, post-lock work, rollback, **address-space restore**, live proof. **Every runtime cell localized.** | **OPEN** — matrix drafted, localization false | §2 supplies the matrix across all three architectures with locks / blocking / post-lock / rollback / hosted / live columns. Two gaps: the **address-space restore** column is not populated per cell, and the exit condition (every runtime cell localized) is false while 46 runtime-required broad callsites remain. **205A reports cells; it is not where defects are retired.** |
 | **205B** | Fault-injection matrix at every transactional boundary | **OPEN** — isolated precedents | Shared-region 12-case race seal, reply-cap 18-case negative seal, 24 deterministic ServerDies races. No unified matrix; no coverage of allocation failure, slot exhaustion, queue full, or shootdown failure. |
-| **205C** | Long-running concurrency torture with all anomaly counters zero | **OPEN** | No sustained harness exists. The hosted suite cannot currently serve as one: under a parallel harness it produces 58–71 shared-state assertion failures (§0). |
+| **205C** | Long-running concurrency torture with all anomaly counters zero | **OPEN** | No sustained harness exists, and no torture load has been run. Separately, the hosted suite cannot currently *serve* as such a harness because its own fixtures contend (§0) — that is test-infrastructure debt, a prerequisite rather than a part of this stage. |
 | **205D** | Cross-arch full-unlock seal — `KERNEL_RUNTIME_GLOBAL_LOCK_CALLS … count=0` ×3, `KERNEL_FULL_UNLOCK_SEAL … result=ok` ×3, `KERNEL_FULL_UNLOCK_CROSS_ARCH_SEAL arches=3 result=ok` | **OPEN** | **None of the three marker families exists anywhere in the tree** (grep over `src`, `crates`, `tests`, `scripts`). |
 
 ### 3.8 Summary
@@ -460,12 +472,23 @@ counts as done:
 | 4 — VM | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
 | 5 — Lifecycle | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |
 | 6 — Timer/IRQ/sched | 0 of 4 | 203A, 203C, 203D | 203B |
-| 7 — Monolith removal | **204A** | 204B | 204C, 204D, 204E |
+| 7 — Monolith removal | **1 of 5** (204A) | 204B | 204C, 204D, 204E |
 | 8 — Seal | 0 of 4 | 205A | 205B, 205C, 205D |
-| **Total** | **1 of 34** | 11 | 22 |
+| **Total** | **1 of 35** | 12 | 22 |
 
 **No canonical stage in Phases 2–6 or 8 is complete.** The one completed stage, 204A, is
 documentation rather than lock retirement.
+
+> **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
+> was the only row written without an `N of M` denominator, and the totals silently counted it
+> as four stages. **The dropped stage was `204B` (decompose `KernelState` ownership), the sole
+> Phase-7 partial**, which is why both the total (34 → **35**) and the partial count
+> (11 → **12**) were low by exactly one. All 35 stages were, and remain, individually
+> documented and classified; only the summary arithmetic was wrong. `204B` is classified
+> **partial foundation**: the eleven ranked domain locks and the `*_split_mut` / `*_split_read`
+> seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`, so the
+> container still serializes the kernel.
+
 
 ### 3.9 Documentation defects found during the stage mapping
 
@@ -485,34 +508,46 @@ documentation rather than lock retirement.
 
 ### 3.10 Gate status
 
-All nine documentation / contract gates pass:
+**Every repository gate passes — 13 of 13.**
 
 | Gate | Result |
 |------|--------|
-| `check-contract-doc-enforcement` | ✅ (was failing — repaired, see §3.9) |
-| `check-current-contracts` | ✅ |
-| `check-roadmap-readiness` | ✅ |
 | `check-boundary-milestone-freeze` | ✅ |
+| `check-ci-workflow-enforcement` | ✅ |
+| `check-contract-doc-enforcement` | ✅ (was failing — repaired, see §3.9) |
+| `check-crate-graph-boundary` | ✅ |
+| `check-current-contracts` | ✅ |
+| `check-hal-conformance-targets` | ✅ |
+| `check-kernel-arch-boundary` | ✅ (was failing — repaired, see below) |
+| `check-pr-scope-and-message` | ✅ |
 | `check-proc-vfs-codec-freeze` | ✅ |
+| `check-roadmap-readiness` | ✅ |
+| `check-service-arch-boundary` | ✅ (was failing — repaired, see below) |
 | `check-service-domain-ownership` | ✅ |
 | `check-tid-allocation-policy` | ✅ |
-| `check-ci-workflow-enforcement` | ✅ |
-| `check-hal-conformance-targets` | ✅ |
-| `check-crate-graph-boundary` | ✅ |
-| `check-pr-scope-and-message` | ✅ |
 
-**Two source-boundary gates fail, and both pre-date this work.** Verified failing at
-`origin/main` (`757993b`) and at the Pass 6 commit (`f8a3c04`), i.e. not introduced here.
-They are production-source violations, not documentation, and repairing them is unrelated
-production work that this audit deliberately did not perform:
+Two source-boundary gates were red on `origin/main` (`757993b`) and remained red through
+the first two revisions of this branch. Both are now repaired, minimally and
+architecturally — no behaviour changed in either case.
 
-| Gate | Failure |
-|------|---------|
-| `check-kernel-arch-boundary` | `architecture boundary violation pattern 'target_arch = "x86_64"' in src/bin/kernel_boot.rs` — lines 91 and 93 carry `#[cfg(target_arch = "x86_64")]` / `#[cfg(not(target_arch = "x86_64"))]` |
-| `check-service-arch-boundary` | `crates/yarm-control-plane-servers/src/bin/crash_test_srv.rs:1: missing delegation to service/runtime entrypoint` |
+**`check-kernel-arch-boundary`** rejected `target_arch = "x86_64"` in
+`src/bin/kernel_boot.rs`: the freestanding entry point chose between calling `run()`
+directly (x86_64, where `prepare_arch_boot` has already consumed the IRQ-controller
+description) and `run_kernel_boot(run)` (everything else). The rule is that the bin routes
+ISA details through `src/arch/*`, and that predicate is genuinely an arch-layer decision.
+It moved into `arch::boot_entry::enter_kernel_run_loop`, which the bin now calls
+unconditionally. The two-arm `cfg` is byte-identical; only its location changed.
 
-Because these two are red, **the branch is not gate-clean overall** even though every
-documentation gate passes. That distinction is stated rather than papered over.
+**`check-service-arch-boundary`** reported
+`crates/yarm-control-plane-servers/src/bin/crash_test_srv.rs:1: missing delegation to
+service/runtime entrypoint`. Every other control-plane bin is entry glue that calls
+`yarm_control_plane_servers::run_<name>()`; `crash_test_srv` alone carried its whole
+service body inline. The body moved to `control_plane::crash_test`, exported as
+`run_crash_test_srv()`, and the bin now matches its five siblings. The marker sequence
+(`CRASH_TEST_SRV_ENTRY` → `_READY` → `_DELAY_BEGIN` → `_DELAY_DONE` → `_FAULT_NOW`), the
+128-yield delay and the deterministic null-write fault that SUP-L5B depends on are all
+preserved; the delay bound is now a shared constant so the hosted and freestanding paths
+cannot drift.
 
 ---
 
@@ -555,7 +590,7 @@ census is the input to 204B.
 | **B6** | `FutexWait` off-lock seams landed helper-only and were never wired | `syscall_split.rs:786`–`803` | 203C; the largest blocking class stays broad-lock-only |
 | **B7** | Reply-timeout scan off-lock on x86_64 only; `IpcSend`/`IpcCall` timeouts untouched; broad fallback survives | `runtime.rs:3725`; `IPC_REPLY_TIMEOUT_LOCK_STATUS scan_broad_lock=1` on AArch64/RISC-V | 199E |
 | **B8** | RISC-V `ExitCurrentTask` live cell never earned — kernel chain proven correct, runner bound corrected, re-run not executed | `5488d8e` | 202D |
-| **B9** | Parallel `cargo test --lib` produces 58–71 shared-state assertion failures from process-global counters and one-shot latches | `stage200d1_server_death`, `stage200c_reply_timeout_transaction`, `stage198e3b2b_drain_switch`, `stage200d2a_deferred_death`, ~15 more | 205C; and every hosted claim remains single-threaded-only |
+| **B9** | Parallel `cargo test --lib` produces 58–71 shared-state assertion failures from process-global counters and one-shot latches — **test-infrastructure debt**, not a kernel defect and not 205C completion work | `stage200d1_server_death`, `stage200c_reply_timeout_transaction`, `stage198e3b2b_drain_switch`, `stage200d2a_deferred_death`, ~15 more | keeps every hosted claim single-threaded-only; a prerequisite for using the hosted suite as a 205C harness |
 | **B10** | AArch64 re-acquires the broad lock on its split return path | `trap_entry.rs:1432` | 204B/204E must localize it; **205A reports the cell, it does not retire it** |
 
 The memory-corruption blocker recorded in the first revision of this document is

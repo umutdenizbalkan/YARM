@@ -34,14 +34,19 @@ Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 | Command | Result |
 |---------|--------|
 | `cargo test --lib -- --test-threads=1` | ✅ 3729 passed, 0 failed, 2 ignored |
-| `cargo test --tests -- --test-threads=1` | ✅ 3729 lib + 146 integration, 0 failed |
-| `cargo test --lib` (default parallel harness) | ⚠️ **completes, 0 aborts in 5 runs** — 58–71 logical shared-state assertion failures remain |
-| `bash scripts/check-contract-doc-enforcement.sh` | ✅ passes |
+| `cargo test --tests -- --test-threads=1` | ✅ 3881 passed (3729 lib + 152 integration), 0 failed |
+| `cargo test --tests --features ipc-reply-timeout-oracle-core -- --test-threads=1` | ✅ 4045 passed, 0 failed |
+| `cargo test --lib` (default parallel harness) | ⚠️ **completes, 0 aborts** — 58–71 logical shared-state assertion failures remain |
+| all 13 repository gate scripts | ✅ **13 of 13 pass** |
 | `cargo check` — x86_64 / AArch64 / RISC-V bare-metal `kernel_boot` | ✅ clean |
+| `cargo check` — x86_64 / AArch64 / RISC-V freestanding `crash_test_srv` | ✅ clean |
+| `cargo fmt --check`, `git diff --check` | ✅ clean |
 
 The parallel memory corruption (three cross-test aliasing bugs) is **fixed**; see
-`doc/KERNEL_TEST_RULES.md` Rule H1. What remains is process-global test contention, which
-is canonical Stage 205C work.
+`doc/KERNEL_TEST_RULES.md` Rule H1. What remains is process-global test contention in the
+hosted corpus: **test-infrastructure debt, not canonical Stage 205C work.** It may precede
+or support 205C (which is a long-running torture of the running kernel) but closes no part
+of it.
 
 ### Canonical stage position
 
@@ -56,13 +61,24 @@ complete the canonical stage.**
 | 4 — VM (201A–201G) | 0 of 7 | 201B, 201F | 201A, 201C, 201D, 201E, 201G |
 | 5 — Lifecycle (202A–202F) | 0 of 6 | 202D | 202A, 202B, 202C, 202E, 202F |
 | 6 — Timer/IRQ/sched (203A–203D) | 0 of 4 | 203A, 203C, 203D | 203B |
-| 7 — Monolith removal (204A–204E) | **204A** | 204B | 204C, 204D, 204E |
+| 7 — Monolith removal (204A–204E) | **1 of 5** (204A) | 204B | 204C, 204D, 204E |
 | 8 — Seal (205A–205D) | 0 of 4 | 205A | 205B, 205C, 205D |
-| **Total** | **1 of 34** | 11 | 22 |
+| **Total** | **1 of 35** | 12 | 22 |
 
 **No canonical stage in Phases 2–6 or 8 is complete.** The one complete stage, 204A
 (broad-lock callsite census), is documentation rather than lock retirement: 51 callsites
 classified as 0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.
+
+> **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
+> was the only row written without an `N of M` denominator, and the totals silently counted it
+> as four stages. **The dropped stage was `204B` (decompose `KernelState` ownership), the sole
+> Phase-7 partial**, which is why both the total (34 → **35**) and the partial count
+> (11 → **12**) were low by exactly one. All 35 stages were, and remain, individually
+> documented and classified; only the summary arithmetic was wrong. `204B` is classified
+> **partial foundation**: the eleven ranked domain locks and the `*_split_mut` / `*_split_read`
+> seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`, so the
+> container still serializes the kernel.
+
 
 The historical stages labelled 200A/200B/200C (terminal ownership, deadline token,
 reply-timeout transaction) are IPC timeout work belonging to canonical **199E**. They
@@ -99,8 +115,9 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
    untouched; the broad fallback `run_reply_timeout_completion` survives (199E).
 8. **RISC-V `ExitCurrentTask` live cell** — kernel chain proven correct, runner bound
    corrected at `5488d8e`, re-run never executed (202D).
-9. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures** — blocks
-   205C and keeps every hosted claim single-threaded-only.
+9. **Parallel `cargo test --lib` produces 58–71 shared-state assertion failures** — keeps
+   every hosted claim single-threaded-only. Test-infrastructure debt; a prerequisite for
+   using the hosted suite as a 205C harness, not 205C completion work.
 10. **AArch64 re-acquires the broad lock on its split return path**
     (`src/arch/trap_entry.rs:1432`) — 204B/204E must localize it. 205A reports the cell; it
     is not where it gets retired.

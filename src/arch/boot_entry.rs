@@ -348,6 +348,27 @@ pub fn run_kernel_boot(run: fn()) {
     run_kernel_boot_with_irq_description(run, None);
 }
 
+/// Enter the kernel run loop from the freestanding entry point, after
+/// [`prepare_arch_boot`] has returned.
+///
+/// This owns the one architecture-dependent decision the boot **binary** used to make for
+/// itself: on x86_64 the IRQ-controller description has already been consumed by
+/// `prepare_arch_boot`, so the entry point calls `run` directly; every other architecture
+/// still needs the [`run_kernel_boot`] staging pass first. That `cfg` belongs in the arch
+/// layer, not in `src/bin/kernel_boot.rs` — the bin must route ISA details through
+/// `src/arch/*`, which `scripts/check-kernel-arch-boundary.sh` enforces by rejecting any
+/// `target_arch` predicate in the bin.
+///
+/// Behaviour is byte-identical to the two-arm `cfg` this replaces; only the location of the
+/// predicate changed.
+#[inline]
+pub fn enter_kernel_run_loop(run: fn()) {
+    #[cfg(target_arch = "x86_64")]
+    run();
+    #[cfg(not(target_arch = "x86_64"))]
+    run_kernel_boot(run);
+}
+
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]

@@ -238,8 +238,11 @@ Consequences that must be respected:
 * The CI step `cargo test -q` in `.github/workflows/compat-gates.yml` inherits the default
   parallel harness. It no longer crashes, but it will report logical failures until the
   shared-state contention is removed. Pin it to `--test-threads=1` or fix the contention.
-* Removing that contention is canonical Stage **205C** (long-running concurrency torture),
-  which cannot use the hosted suite as its harness until then.
+* This contention is **test-infrastructure debt, not canonical Stage 205C work.** 205C is a
+  long-running torture of the *running kernel*; what fails here is the hosted corpus sharing
+  process-global fixtures with itself. Removing it is a prerequisite for using the hosted
+  suite as a 205C harness and may precede or support that stage, but it proves nothing about
+  the kernel and closes no part of the stage.
 * A test that latches a one-shot static must reset it, or be written so a second
   observation is harmless — otherwise it passes alone and fails in a full run.
 * A test that publishes a pointer into process-global state must restore the previous value
@@ -293,7 +296,7 @@ this failure mode as a runner/oracle defect, not a kernel defect.**
 
 | Rule | Key point |
 |------|-----------|
-| H1. Single-threaded hosted | `cargo test` **must** use `--test-threads=1`. The parallel memory corruption is fixed; 58–71 logical shared-state failures remain (Stage 205C) |
+| H1. Single-threaded hosted | `cargo test` **must** use `--test-threads=1`. The parallel memory corruption is fixed; 58–71 logical shared-state failures remain — test-infrastructure debt, not Stage 205C |
 | H2. No hosted off-lock copy | `hosted-dev` disables the split user-copy; off-lock payload claims are unprovable hosted |
 | L1. Live cells | clean boot + full ordered sequence + distinct boot nonce; never a green seal for unachieved work |
 | L2. Arch-specific bounds | live-oracle loop bounds must be sized per architecture |
