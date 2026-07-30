@@ -940,12 +940,22 @@ return-lane parity (C). What remains is not defect repair but the enablement wor
 ~~C (return-lane parity)~~ **done** → **mode eligibility + production counters** →
 **gate removal** → **live flip proof**.
 
-The next increment is the one §6.1 originally described: replace the oracle endpoint
-confinement with generic production eligibility for the endpoint modes and rights the
-transaction actually supports (`Buffered` only — `Synchronous` carries rendezvous semantics
-the direct path does not reproduce; see §6.1.4), add the production counters and
-attestations, and only then remove the gates and prove the flip live. Until that lands the
-proof gate and endpoint confinement remain in place and no production default has changed.
+**Mode eligibility and the production counters have landed.**
+`src/kernel/direct_eligibility.rs` is the pure, exhaustive contract: NR6 requires `SEND`
+rights, a current endpoint incarnation, `Buffered` mode and a supported message shape, and
+`Synchronous` endpoints decline before any mutation to the legacy rendezvous path; NR7 stays
+tied to a live one-shot `Reply` object with no invented mode requirement.
+`src/kernel/direct_ipc_counters.rs` adds per-direction attempts / eligible /
+declined_ineligible_mode / declined_preflight / declined_pre_transaction / completed /
+failed_by_error_code / legacy_fallback_after_decline, plus the ack lifecycle and every
+fail-closed fuse, with a balance invariant proved live (`balanced=1`, both directions). The
+non-blocking gap §6.1.4 recorded is closed. See `doc/IPC.md` §8.6.4.
+
+What remains is the enablement step itself: **remove the two gates** (the proof gate and the
+oracle endpoint confinement) and prove the flip live. The counters make that auditable — on
+the current oracle boot they show 54 NR6 and 53 NR7 ordinary service-chain calls turned away
+by the confinement, which is precisely the population the flip would move onto the direct
+path. Until that lands the gates remain in place and no production default has changed.
 
 ---
 

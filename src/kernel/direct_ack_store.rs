@@ -338,6 +338,11 @@ pub(crate) struct DirectAckStore {
     /// operation — commit, consume, cancel, restore, snapshot — stays entirely lock-free.
     admission: AtomicBool,
     next_seq: AtomicU64,
+    reserves: AtomicU64,
+    /// Highest simultaneous LIVE-pair occupancy observed this boot. Never exceeds
+    /// [`DIRECT_ACK_STORE_CAPACITY`] by construction: it is sampled under the admission
+    /// guard immediately after a reservation is stamped.
+    occupancy_high_watermark: AtomicUsize,
     capacity_refusals: AtomicU64,
     endpoint_live_refusals: AtomicU64,
     stale_generation_rejections: AtomicU64,
@@ -355,6 +360,8 @@ impl DirectAckStore {
             slots: [const { AckSlot::new() }; DIRECT_ACK_STORE_CAPACITY],
             admission: AtomicBool::new(false),
             next_seq: AtomicU64::new(1),
+            reserves: AtomicU64::new(0),
+            occupancy_high_watermark: AtomicUsize::new(0),
             capacity_refusals: AtomicU64::new(0),
             endpoint_live_refusals: AtomicU64::new(0),
             stale_generation_rejections: AtomicU64::new(0),
@@ -378,6 +385,8 @@ impl DirectAckStore {
             slot.clear_fields();
             slot.state.store(SLOT_VACANT, Ordering::Release);
         }
+        self.reserves.store(0, Ordering::Relaxed);
+        self.occupancy_high_watermark.store(0, Ordering::Relaxed);
         self.capacity_refusals.store(0, Ordering::Relaxed);
         self.endpoint_live_refusals.store(0, Ordering::Relaxed);
         self.stale_generation_rejections.store(0, Ordering::Relaxed);
@@ -538,6 +547,12 @@ impl DirectAckStore {
             slot.payload_user_len.store(0, Ordering::Relaxed);
             slot.meta_user_ptr.store(0, Ordering::Relaxed);
             slot.meta_user_len.store(0, Ordering::Relaxed);
+            self.reserves.fetch_add(1, Ordering::Relaxed);
+            // Sample occupancy under the admission guard, so the watermark is a real
+            // simultaneous-pair count and can never exceed the capacity.
+            let live = self.live_pair_count();
+            self.occupancy_high_watermark
+                .fetch_max(live, Ordering::Relaxed);
             Ok(AckReservation {
                 slot: index,
                 slot_generation,
@@ -870,6 +885,19 @@ impl DirectAckStore {
     #[allow(dead_code)]
     pub(crate) fn duplicate_consume_rejection_count(&self) -> u64 {
         self.duplicate_consume_rejections.load(Ordering::Acquire)
+    }
+
+    /// Total successful reservations (the reserve half of the lifecycle).
+    #[allow(dead_code)]
+    pub(crate) fn reserve_count(&self) -> u64 {
+        self.reserves.load(Ordering::Acquire)
+    }
+
+    /// Highest simultaneous live-pair occupancy observed. Bounded by
+    /// [`DIRECT_ACK_STORE_CAPACITY`].
+    #[allow(dead_code)]
+    pub(crate) fn occupancy_high_watermark(&self) -> usize {
+        self.occupancy_high_watermark.load(Ordering::Acquire)
     }
 
     /// Total successful publications.

@@ -771,6 +771,72 @@ asserted to modify nothing. Attested live — see the seal above.
 The endpoint confinement remains load-bearing for scope, and the proof gate remains
 proof-only; no production default has been flipped. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.
 
+### 8.6.4 Direct-IPC eligibility and observability
+
+**Eligibility** (`src/kernel/direct_eligibility.rs`) is one pure, exhaustive classification
+over facts the call site gathers — no wildcard arm, so a new decline reason cannot be added
+without deciding what it means.
+
+NR6 is eligible only when the send cap resolves **with `SEND` rights**, names an `Endpoint`,
+the endpoint **incarnation is current** (slot occupied and generation matched), the mode is
+`Buffered`, and the message shape is one the transaction supports. **`Synchronous` endpoints
+decline before any mutation** and fall through to the legacy rendezvous path — the direct
+transaction claims a waiter and delivers straight into the receiver's address space, and does
+not reproduce the scheduling-level rendezvous. The mode check runs *before* the confinement
+check, so the decline stays meaningful once the confinement is eventually removed.
+
+NR7 eligibility is tied to a live one-shot `Reply` object and its exact caller /
+reply-endpoint incarnation, with **no `EndpointMode` requirement**: NR7 does not send to an
+endpoint, so the endpoint's queueing discipline never applies. The facts type has no place to
+express a mode, and a test pins that the classifier never mentions one.
+
+**Counters** (`src/kernel/direct_ipc_counters.rs`) are per-direction and observational —
+relaxed atomics incremented after a decision is already made, never read back into one. The
+terminal-bucket invariant is:
+
+```text
+attempts = declined_preflight        (ineligible)
+         + declined_pre_transaction  (eligible, but no ack / copy fault / no snapshot)
+         + completed
+         + failed (Σ failed_by_error_code)
+         + legacy_fallback_after_decline
+```
+
+with `eligible = attempts - declined_preflight` and `declined_ineligible_mode` the
+`Synchronous` subset of the preflight declines. The acknowledgement store reports
+reserve/commit/consume/cancel, live occupancy, an occupancy high-watermark bounded by
+`DIRECT_ACK_STORE_CAPACITY`, and every fail-closed fuse (capacity refusal, overwrite fuse,
+stale / foreign / duplicate / not-committed consumes).
+
+The attestation is emitted from the existing off-lock `DebugLog` observation point — no new
+emission site — and is bounded to **two latched samples per direction**: a `first` census as
+soon as that direction is attempted at all (the only sample an ordinary confinement-declining
+boot gets), and a `settled` sample once that direction produced a terminal beyond a preflight
+decline. The latches are per-direction because a reply necessarily follows its request.
+
+Observed on a live oracle boot:
+
+```
+IPC_DIRECT_PATH_COUNTERS phase=settled dir=nr6 attempts=55 eligible=1
+    declined_ineligible_mode=0 declined_preflight=54 declined_pre_txn=0 completed=1
+    failed=0 legacy_fallback=0 balanced=1
+IPC_DIRECT_PATH_COUNTERS phase=settled dir=nr7 attempts=55 eligible=2
+    declined_ineligible_mode=0 declined_preflight=53 declined_pre_txn=1 completed=1
+    failed=0 legacy_fallback=0 balanced=1
+IPC_DIRECT_ACK_COUNTERS phase=settled dir=nr6 reserve=1 commit=1 consume=1 cancel=0
+    live=0 high_watermark=1 capacity=8
+```
+
+The 54/53 preflight declines are the ordinary service chain being turned away by the endpoint
+confinement — exactly the census a production audit wants. The single NR7
+`declined_pre_txn` is the oracle server's bounded pre-acknowledgement retry, and the one
+`duplicate` fuse trip on the NR7 store is the oracle's deliberate duplicate-reply rejection.
+
+**`declined_pre_transaction` exists because a live boot found it missing.** The first
+attestation showed NR7 with `eligible=2` but only one terminal, `balanced=0`: eligible
+attempts that stopped at the ack claim were reaching no bucket at all. The invariant caught a
+real hole in its own model — the kind of thing only a real boot produces.
+
 **Retirement-seal isolation model — Model 1, serialized master.**
 `scripts/qemu-combined-retirement-seal.sh` runs the first-cohort (12), plain (6) and
 ordinary-cap (6) seals **strictly sequentially** — one QEMU at a time — each with a unique

@@ -78541,9 +78541,22 @@ mod stage199a2b4_live_oracle_guards {
     // unchanged legacy path. Provisioning binds the endpoint indices.
     #[test]
     fn offlock_path_is_oracle_endpoint_confined() {
-        // Gate selectivity.
-        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_request_endpoint_is(send_eidx)"));
-        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_reply_endpoint_is(reply_eidx)"));
+        // Gate selectivity. Stage 199D routes the confinement through the pure eligibility
+        // contract: the call site computes it and the contract declines `NotConfinedEndpoint`.
+        // Semantically unchanged — an unconfined endpoint still returns `None` to legacy.
+        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_request_endpoint_is(index)"));
+        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_reply_endpoint_is(eidx)"));
+        assert!(
+            SPLIT_SRC.contains("oracle_request_endpoint,")
+                && SPLIT_SRC.contains("oracle_reply_endpoint,"),
+            "the confinement flows into the eligibility facts"
+        );
+        let elig = include_str!("../direct_eligibility.rs");
+        assert!(
+            elig.contains("if !facts.oracle_request_endpoint {")
+                && elig.contains("if !facts.oracle_reply_endpoint {"),
+            "both classifiers still enforce the confinement"
+        );
         // Publisher selectivity (real builds only).
         assert!(MOD_SRC.contains("ipccall_direct_oracle_request_endpoint_is(index)"));
         assert!(MOD_SRC.contains("ipccall_direct_oracle_reply_endpoint_is(index)"));
@@ -80458,7 +80471,26 @@ mod stage199d_delivery_projection_differential {
     /// payload copy can succeed while the metadata copy faults.
     pub(super) const SERVER_FAR_META_VA: usize = 0x7000;
 
+    /// A fixture whose REQUEST endpoint is created with an explicit mode. Creating it with
+    /// the mode — rather than mutating one afterwards — means the test exercises a genuine
+    /// `Synchronous` endpoint and needs no test-only mutator in a production file.
+    fn fixture_with_mode(arm_proof_gate: bool, mode: crate::kernel::ipc::EndpointMode) -> Fx {
+        fixture_full(arm_proof_gate, ServerDest::Mapped, mode)
+    }
+
     fn fixture_with_dest(arm_proof_gate: bool, dest: ServerDest) -> Fx {
+        fixture_full(
+            arm_proof_gate,
+            dest,
+            crate::kernel::ipc::EndpointMode::Buffered,
+        )
+    }
+
+    fn fixture_full(
+        arm_proof_gate: bool,
+        dest: ServerDest,
+        request_mode: crate::kernel::ipc::EndpointMode,
+    ) -> Fx {
         ipccall_direct_ack::reset();
         set_ipccall_direct_proof_enabled(arm_proof_gate);
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
@@ -80495,7 +80527,9 @@ mod stage199d_delivery_projection_differential {
                     )
                     .expect("map server dest");
             }
-            let (_e, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
+            let (_e, req_send, req_recv) = state
+                .create_endpoint_with_mode(4, request_mode)
+                .expect("req ep");
             let send_cap_t1 = state
                 .grant_capability_task_to_task(0, req_send, 1)
                 .expect("send t1");
@@ -81564,6 +81598,419 @@ mod stage199d_delivery_projection_differential {
             }
         }
 
+        // ── Stage 199D: endpoint eligibility + observability ──────────────────────────
+
+        use crate::kernel::direct_eligibility::{
+            DirectRequestEligibility, classify_direct_request_eligibility,
+        };
+        use crate::kernel::direct_ipc_counters::DirectPathCounters;
+        use crate::kernel::ipc::EndpointMode;
+
+        /// Build the eligibility facts the NR6 call site would gather for `fx`'s send cap,
+        /// exactly as `try_split_ipccall_direct_into_frame` does.
+        fn request_facts_for(fx: &Fx) -> crate::kernel::direct_eligibility::DirectRequestFacts {
+            let send_cap_resolution = fx.k.resolve_endpoint_send_cap_split_read(1, fx.send_cap_t1);
+            let endpoint_mode = match send_cap_resolution {
+                Ok(crate::kernel::capabilities::CapObject::Endpoint { index, generation }) => {
+                    fx.k.endpoint_mode_split_read(index, generation)
+                }
+                _ => None,
+            };
+            crate::kernel::direct_eligibility::DirectRequestFacts {
+                payload_len: FRAMED.len(),
+                requester_available: true,
+                send_cap: send_cap_resolution,
+                endpoint_mode,
+                // The fixture's endpoint is the one under test; confinement is orthogonal
+                // here and is pinned by its own guards.
+                oracle_request_endpoint: true,
+            }
+        }
+
+        /// A BUFFERED endpoint is eligible, and the delivery it produces is byte-for-byte the
+        /// legacy one — the eligibility preflight changed nothing about what a receiver sees.
+        #[test]
+        fn buffered_endpoint_is_eligible_and_delivery_is_unchanged() {
+            on_big_stack(|| {
+                let fx = fixture(true);
+                let facts = request_facts_for(&fx);
+                assert_eq!(
+                    facts.endpoint_mode,
+                    Some(EndpointMode::Buffered),
+                    "the fixture endpoint is Buffered"
+                );
+                let verdict = classify_direct_request_eligibility(&facts);
+                assert!(
+                    verdict.endpoint().is_some(),
+                    "Buffered is eligible: {verdict:?}"
+                );
+                assert!(!verdict.is_ineligible_mode());
+                teardown();
+            });
+            // The delivered bytes and metadata are compared against the legacy path by
+            // `assert_deliveries_agree`; re-assert the headline case here so a change to the
+            // preflight that perturbed delivery would fail in THIS test too.
+            assert_deliveries_agree(0x0607, b"NR6call!", "buffered-eligible");
+        }
+
+        /// A SYNCHRONOUS endpoint declines before any mutation, and the legacy rendezvous
+        /// path still owns it: the legacy call succeeds and delivers, exactly as it does
+        /// without the direct path in the picture.
+        #[test]
+        fn synchronous_endpoint_declines_with_zero_mutation_and_legacy_keeps_rendezvous() {
+            on_big_stack(|| {
+                let fx = fixture_with_mode(true, EndpointMode::Synchronous);
+                let (eidx, egen) =
+                    match fx.k.resolve_endpoint_send_cap_split_read(1, fx.send_cap_t1) {
+                        Ok(crate::kernel::capabilities::CapObject::Endpoint {
+                            index,
+                            generation,
+                        }) => (index, generation),
+                        other => panic!("expected an endpoint, got {other:?}"),
+                    };
+                assert_eq!(
+                    fx.k.endpoint_mode_split_read(eidx, egen),
+                    Some(EndpointMode::Synchronous),
+                    "the fixture created a genuine Synchronous endpoint"
+                );
+
+                // Snapshot everything a decline must not touch.
+                let records_before = live_reply_records(&fx);
+                let waiter_before =
+                    fx.k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx)));
+                let status_before = fx.k.with(|s| s.task_status(2));
+                let ack_live_before = ipccall_direct_ack::live_pair_count();
+
+                let facts = request_facts_for(&fx);
+                let verdict = classify_direct_request_eligibility(&facts);
+                assert_eq!(verdict, DirectRequestEligibility::SynchronousMode);
+                assert_eq!(verdict.endpoint(), None, "nothing is serviced");
+                assert!(verdict.is_ineligible_mode());
+
+                // ZERO mutation: the classifier is pure and the call site returns before the
+                // ack claim, the copy and the transaction.
+                assert_eq!(live_reply_records(&fx), records_before, "no reply record");
+                assert_eq!(
+                    fx.k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiter_identity(eidx))),
+                    waiter_before,
+                    "the endpoint waiter is untouched"
+                );
+                assert_eq!(fx.k.with(|s| s.task_status(2)), status_before, "no wake");
+                assert_eq!(
+                    ipccall_direct_ack::live_pair_count(),
+                    ack_live_before,
+                    "no acknowledgement was claimed"
+                );
+                teardown();
+            });
+        }
+
+        /// Legacy preserves the rendezvous semantics of a Synchronous endpoint: with the
+        /// direct path declining, the legacy `IpcCall` still delivers to the blocked receiver
+        /// and wakes it exactly once.
+        #[test]
+        fn legacy_still_services_a_synchronous_endpoint() {
+            on_big_stack(|| {
+                let fx = fixture_with_mode(false, EndpointMode::Synchronous);
+                fx.k.with(|s| {
+                    s.write_user_memory_for_asid(fx.caller_asid, CALLER_FRAME_VA, FRAMED)
+                        .expect("stage request");
+                    s.enqueue_current_cpu(1).expect("enq1");
+                    while s.current_tid() != Some(1) {
+                        s.dispatch_next_task().expect("dispatch to caller");
+                    }
+                    let mut call = TrapFrame::new(
+                        crate::kernel::syscall::Syscall::IpcCall as usize,
+                        [
+                            fx.send_cap_t1.0 as usize,
+                            CALLER_FRAME_VA,
+                            FRAMED.len(),
+                            0,
+                            0,
+                            fx.reply_recv_cap_t1.0 as usize,
+                        ],
+                    );
+                    let r = s.handle_trap(Trap::Syscall, Some(&mut call));
+                    assert!(r.is_ok(), "legacy synchronous IpcCall: {r:?}");
+                    assert!(!call.is_error(), "legacy err={}", call.error);
+                    assert_eq!(
+                        s.task_status(2),
+                        Some(TaskStatus::Runnable),
+                        "the legacy rendezvous delivered and woke the receiver"
+                    );
+                });
+                // The receiver observes the canonical projection through the legacy path.
+                let observed = observe(&fx);
+                assert_eq!(observed.opcode(), 0x0607);
+                assert_eq!(observed.app_payload(), b"NR6call!");
+                teardown();
+            });
+        }
+
+        /// Rights and stale-generation declines are unchanged: a cap without `SEND`, and a
+        /// recycled endpoint incarnation, both decline before mutation.
+        #[test]
+        fn rights_and_stale_generation_declines_are_unchanged() {
+            on_big_stack(|| {
+                let fx = fixture(true);
+                // A cap that does not resolve at all (stands in for the rights failure the
+                // resolver reports — it enforces SEND and maps the miss to a KernelError).
+                let mut facts = request_facts_for(&fx);
+                facts.send_cap =
+                    fx.k.resolve_endpoint_send_cap_split_read(1, CapId(0xDEAD_BEEF));
+                assert!(facts.send_cap.is_err(), "a bogus cap must not resolve");
+                assert!(matches!(
+                    classify_direct_request_eligibility(&facts),
+                    DirectRequestEligibility::SendCapUnresolved(_)
+                ));
+
+                // A stale endpoint incarnation: the mode read for a bumped generation is None.
+                let (eidx, egen) =
+                    match fx.k.resolve_endpoint_send_cap_split_read(1, fx.send_cap_t1) {
+                        Ok(crate::kernel::capabilities::CapObject::Endpoint {
+                            index,
+                            generation,
+                        }) => (index, generation),
+                        other => panic!("expected an endpoint, got {other:?}"),
+                    };
+                assert_eq!(
+                    fx.k.endpoint_mode_split_read(eidx, egen.wrapping_add(1)),
+                    None,
+                    "a recycled generation is not the current incarnation"
+                );
+                let mut stale = request_facts_for(&fx);
+                stale.endpoint_mode = None;
+                assert_eq!(
+                    classify_direct_request_eligibility(&stale),
+                    DirectRequestEligibility::EndpointIncarnationGone
+                );
+                // Neither decline mutated anything: no record was reserved, and the
+                // acknowledgement the fixture published at its recv-v2 commit is still live
+                // and unconsumed (a decline never claims it).
+                assert_eq!(live_reply_records(&fx), 0, "no reply record");
+                assert_eq!(
+                    ipccall_direct_ack::live_pair_count(),
+                    1,
+                    "the published pair is untouched by a decline"
+                );
+                assert!(
+                    ipccall_direct_ack::is_claimable(eidx, egen),
+                    "the acknowledgement was never claimed"
+                );
+                teardown();
+            });
+        }
+
+        /// Every eligible attempt reaches exactly ONE terminal disposition, and the counters'
+        /// terminal-bucket invariant holds across a mixed run.
+        #[test]
+        fn every_eligible_attempt_reaches_exactly_one_terminal_disposition() {
+            on_big_stack(|| {
+                let counters = DirectPathCounters::new();
+                // A completed delivery.
+                {
+                    let fx = fixture(true);
+                    counters.note_attempt();
+                    counters.note_eligible();
+                    let (outcome, disposition) = drain_request(&fx, FRAMED);
+                    assert!(outcome.is_ok());
+                    crate::kernel::direct_ipc_counters::note_disposition(&counters, disposition);
+                    teardown();
+                }
+                // A failure (payload destination unmapped).
+                {
+                    let fx = fixture_with_dest(true, ServerDest::PayloadUnmapped);
+                    counters.note_attempt();
+                    counters.note_eligible();
+                    let (_outcome, disposition) = drain_request(&fx, FRAMED);
+                    assert!(matches!(disposition, DirectDisposition::Failed(_)));
+                    crate::kernel::direct_ipc_counters::note_disposition(&counters, disposition);
+                    teardown();
+                }
+                // A post-drain decline that hands over to legacy.
+                {
+                    let fx = fixture(true);
+                    counters.note_attempt();
+                    counters.note_eligible();
+                    let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack");
+                    let mut broken = ack;
+                    broken.recv_v2_committed = false;
+                    let work = DirectRequestPostWork {
+                        snapshot: IpcCallDirectSnapshot::build(
+                            fx.caller,
+                            fx.send_cap_t1,
+                            fx.reply_recv_cap_t1,
+                            FRAMED,
+                        )
+                        .expect("snapshot"),
+                        ack: broken,
+                        ack_seq,
+                    };
+                    let outcome = fx.k.drain_direct_request_post_work(&work);
+                    let disposition = classify_direct_request_outcome(&outcome);
+                    assert_eq!(disposition, DirectDisposition::DeclinedBeforeMutation);
+                    crate::kernel::direct_ipc_counters::note_disposition(&counters, disposition);
+                    teardown();
+                }
+                // A preflight decline (Synchronous).
+                counters.note_attempt();
+                counters.note_declined_preflight(true);
+
+                assert_eq!(counters.attempts(), 4);
+                assert_eq!(counters.completed(), 1);
+                assert_eq!(counters.failed_total(), 1);
+                assert_eq!(counters.legacy_fallback_after_decline(), 1);
+                assert_eq!(counters.declined_preflight(), 1);
+                assert_eq!(counters.declined_ineligible_mode(), 1);
+                assert_eq!(counters.eligible(), 3);
+                assert!(
+                    counters.terminals_balance(),
+                    "every attempt landed in exactly one terminal bucket"
+                );
+                assert!(counters.eligibility_balances());
+            });
+        }
+
+        /// Acknowledgement accounting balances at quiescence and the occupancy high-watermark
+        /// never exceeds the store's capacity.
+        #[test]
+        fn ack_accounting_balances_and_watermark_is_bounded() {
+            on_big_stack(|| {
+                let fx = fixture(true);
+                let store = ipccall_direct_ack::store();
+                // The fixture's recv-v2 commit published exactly one pair.
+                assert_eq!(store.reserve_count(), 1, "one reservation");
+                assert_eq!(store.commit_count(), 1, "one publication");
+                assert!(store.occupancy_high_watermark() >= 1);
+                let (_outcome, disposition) = drain_request(&fx, FRAMED);
+                assert_eq!(disposition, DirectDisposition::Completed);
+
+                // Quiescent: reserve == commit == consume, nothing cancelled, nothing live.
+                assert_eq!(
+                    store.reserve_count(),
+                    store.commit_count(),
+                    "reserve == commit"
+                );
+                assert_eq!(
+                    store.commit_count(),
+                    store.consume_count(),
+                    "commit == consume"
+                );
+                assert_eq!(store.cancel_count(), 0, "no rollback occurred");
+                assert_eq!(store.live_pair_count(), 0, "no pair left live");
+
+                // The watermark is a real simultaneous-pair count, bounded by capacity.
+                assert!(
+                    store.occupancy_high_watermark()
+                        <= crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY,
+                    "the high-watermark can never exceed the capacity"
+                );
+
+                // Every fail-closed fuse is clear on a healthy run.
+                assert_eq!(store.capacity_refusal_count(), 0, "no capacity refusal");
+                assert_eq!(store.endpoint_live_refusal_count(), 0, "no overwrite fuse");
+                assert_eq!(
+                    store.stale_generation_rejection_count(),
+                    0,
+                    "no stale consume"
+                );
+                assert_eq!(
+                    store.foreign_waiter_rejection_count(),
+                    0,
+                    "no foreign consume"
+                );
+                assert_eq!(
+                    store.duplicate_consume_rejection_count(),
+                    0,
+                    "no duplicate consume"
+                );
+                teardown();
+            });
+        }
+
+        /// The counters are wired at every terminal, and the attestation is one-shot and
+        /// emitted from the existing observational hook rather than a new emission site.
+        #[test]
+        fn counters_are_wired_and_the_attestation_is_bounded() {
+            let split = include_str!("../syscall_split.rs");
+            assert_eq!(
+                split.matches("COUNTERS.note_attempt();").count(),
+                2,
+                "both directions count attempts"
+            );
+            assert_eq!(
+                split.matches("COUNTERS.note_eligible();").count(),
+                2,
+                "both directions count eligibility"
+            );
+            assert_eq!(
+                split.matches("COUNTERS.note_declined_preflight(").count(),
+                2,
+                "both directions count preflight declines"
+            );
+            // Every post-eligibility, pre-transaction decline is counted too — otherwise
+            // `eligible` exceeds the terminals and the balance invariant cannot hold. A live
+            // boot found exactly this hole (the oracle's bounded pre-ack NR7 retries).
+            assert_eq!(
+                split
+                    .matches("COUNTERS.note_declined_pre_transaction();")
+                    .count(),
+                6,
+                "three pre-transaction decline sites per direction: copy, snapshot, ack claim"
+            );
+            for direction in ["REQUEST_COUNTERS", "REPLY_COUNTERS"] {
+                assert_eq!(
+                    split
+                        .matches(&alloc::format!(
+                            "{direction}.note_declined_pre_transaction();"
+                        ))
+                        .count(),
+                    3,
+                    "{direction}: copy, snapshot and ack-claim declines are all counted"
+                );
+            }
+            assert_eq!(
+                split
+                    .matches("direct_ipc_counters::note_disposition(")
+                    .count(),
+                2,
+                "both directions count their terminal disposition"
+            );
+            // Only the NR6 direction can report a MODE decline; NR7 has no mode requirement.
+            assert!(
+                split.contains("note_declined_preflight(verdict.is_ineligible_mode())"),
+                "NR6 reports the Synchronous subset"
+            );
+            assert!(
+                split.contains("REPLY_COUNTERS.note_declined_preflight(false)"),
+                "NR7 never reports a mode decline"
+            );
+            // The attestation reuses the existing off-lock DebugLog observation point.
+            assert!(
+                split.contains("direct_ipc_counters::maybe_emit_attestation();"),
+                "the attestation is emitted from the existing observational hook"
+            );
+            let counters = include_str!("../direct_ipc_counters.rs");
+            // Bounded to TWO latched samples: a "first" census as soon as the direct path is
+            // used at all (the only sample an ordinary confinement-declining boot gets), and
+            // a "settled" one once some attempt actually reached the transaction.
+            assert!(
+                counters.contains("attested_first: AtomicUsize")
+                    && counters.contains("attested_settled: AtomicUsize")
+                    && counters.contains("counters.attested_first.swap(1")
+                    && counters.contains("counters.attested_settled.swap(1"),
+                "two latched samples, and the latches are PER DIRECTION"
+            );
+            assert!(
+                counters.contains("fn has_transaction_terminal(&self) -> bool"),
+                "the settled sample waits for THAT direction's own terminal"
+            );
+            assert!(
+                counters.contains("if counters.attempts() == 0 {"),
+                "the attestation is a no-op until the direct path is actually used"
+            );
+        }
+
         // ── Stage 199D HARD-STOP C: return-lane parity ────────────────────────────────
 
         /// A fixture places a whole `KernelState` on the stack, so a test that builds more
@@ -82208,11 +82655,19 @@ mod stage199d_multi_pair_boundary {
             split.contains("reply_record_endpoint_ref_split_read(rec_idx, rec_gen)"),
             "NR7 reads the reply endpoint index AND generation"
         );
-        // Endpoint confinement and the proof gate are unchanged.
+        // Endpoint confinement and the proof gate are unchanged — since Stage 199D's
+        // eligibility contract they are computed at the call site and enforced by the pure
+        // classifier, which is the same decision expressed once instead of inline twice.
         assert!(
-            split.contains("ipccall_direct_oracle_request_endpoint_is(send_eidx)")
-                && split.contains("ipccall_direct_oracle_reply_endpoint_is(reply_eidx)"),
+            split.contains("ipccall_direct_oracle_request_endpoint_is(index)")
+                && split.contains("ipccall_direct_oracle_reply_endpoint_is(eidx)"),
             "endpoint confinement is unchanged"
+        );
+        let elig = include_str!("../direct_eligibility.rs");
+        assert!(
+            elig.contains("if !facts.oracle_request_endpoint {")
+                && elig.contains("if !facts.oracle_reply_endpoint {"),
+            "the classifiers enforce the confinement"
         );
     }
 

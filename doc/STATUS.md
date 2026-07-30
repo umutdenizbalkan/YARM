@@ -145,11 +145,16 @@ Full detail: `doc/IPC.md` §8.5.
    **return-lane parity is now met** (defect C: the successful direct NR6/NR7 frame writes
    `ret2 = SYSCALL_NO_TRANSFER_CAP` through the shared encoder, byte-for-byte equal to a
    successful legacy `IpcCall` frame, attested live — `ret2=18446744073709551615 ret2_ok=1`).
-   **No correctness defect remains.** What is left is the enablement work itself: replace the
-   oracle endpoint confinement with generic production eligibility for the endpoint modes and
-   rights the transaction supports (`Buffered` only), add the production counters, then remove
-   the gates and prove the flip live. Until then the proof gate and endpoint confinement stay
-   in place and no production default has changed. Full evidence is in
+   **No correctness defect remains**, and **mode eligibility + production counters have
+   landed**: `src/kernel/direct_eligibility.rs` (pure exhaustive contract — `SEND` rights,
+   current endpoint incarnation, `Buffered` only, `Synchronous` declines before mutation to
+   the legacy rendezvous path; NR7 needs no mode) and `src/kernel/direct_ipc_counters.rs`
+   (per-direction terminal buckets, ack lifecycle, occupancy high-watermark and every
+   fail-closed fuse, balance proved live). What is left is the enablement step itself: remove
+   the proof gate and the oracle endpoint confinement, then prove the flip live. The counters
+   make that auditable — the current oracle boot shows 54 NR6 / 53 NR7 ordinary service-chain
+   calls turned away by the confinement, exactly the population a flip would move. Until then
+   both gates stay in place and no production default has changed. Full evidence is in
    `doc/KERNEL_UNLOCK_AUDIT.md` §6.1; see also `doc/IPC.md` §8.6.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
