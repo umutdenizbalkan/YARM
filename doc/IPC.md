@@ -850,6 +850,91 @@ run's `COMBINED_RETIREMENT_SEAL result=ok`, emitting
 `RETIREMENT_SEAL_ISOLATION serialized=1 repeated_runs=3 successful_runs=3
 contaminated_runs=0 timeout_runs=0 result=ok`.
 
+### 8.6.5 The x86_64 production-default enablement — HELD OFF
+
+Every dependency on the proof oracle has been removed from admission, eligibility and
+acknowledgement publication. The enablement is now a single expression:
+
+```rust
+// src/kernel/boot/mod.rs
+pub const fn ipccall_direct_production_enabled() -> bool { false }
+//                                                        ^^^^^ → cfg!(target_arch = "x86_64")
+```
+
+It is **deliberately not flipped**. The flip was implemented, built and run on a normal
+feature-off x86_64 boot (no direct-IPC oracle knob), and hard-stopped on a service-chain
+regression. The A/B is exact — same tree, same artifacts, one constant:
+
+| `ipccall_direct_production_enabled()` | `scripts/qemu-x86_64-core-smoke.sh` |
+| --- | --- |
+| `false` (held off) | `all 6 service entries present exactly once` |
+| `cfg!(target_arch = "x86_64")` | 6 service entries **missing**, `PM_ELF_ZC_FAIL`, boot times out (status=124) |
+
+Four defects, all masked until now by the oracle's endpoint confinement:
+
+**1. Capability transfer is silently dropped — this is the one that breaks the boot.**
+Legacy `ipc_reply` reads `SYSCALL_ARG_TRANSFER_CAP`, validates it and stashes a transfer
+handle so the caller's `recv` installs the capability. The direct NR7 path
+(`try_split_ipcreply_direct_into_frame`) reads only `CAP`/`PTR`/`LEN`; neither the
+eligibility contract nor `ipccall_direct_txn` mentions a transferred capability anywhere.
+A cap-bearing reply taken by the direct path therefore loses the capability. Live chain:
+
+```
+USER_LOG tid=3 msg=PM_VFS_REPLY_FULL op=25 len=12 transferred_cap=0
+USER_LOG tid=3 msg=PM_ELF_ZC_FAIL image_id=7 reason=grant_ro_unsupported
+USER_LOG tid=3 msg=PM_VFS_SPAWN_FAIL_DETAIL image_id=7 site=mo_create err=grant_ro_unsupported
+```
+
+VFS's read-only memory-object grant never reaches PM, so blkcache, virtio-blk and the
+driver manager never spawn. **Fix direction:** the eligibility contract must decline any
+reply carrying a transfer cap (mutation-free, falls through to legacy) — or the transaction
+must reproduce the stash. Declining is the smaller, provable step.
+
+**2. The acknowledgement store has no production release path.** A pair is published
+whenever a task commits a blocking recv-v2, and cleared only by a direct delivery's
+`consume`. Publication is driven by *blocking*; consumption is driven by *direct delivery* —
+the two are not paired. Any recv satisfied by the legacy path, a timeout, or server death
+orphans a `Committed` slot permanently. `release_endpoint_index` exists but has no
+production caller; under confinement one endpoint published and always consumed, so the
+gap never showed.
+
+**3. Orphans trip the overwrite fuse.** Re-blocking on an endpoint that still holds an
+orphan is refused as `EndpointAlreadyLive`: **17 trips on one short boot** (7
+`IPCCALL_DIRECT_ACK_OVERWRITE_FUSE slot=server`, 10 `IPCREPLY_DIRECT_ACK_OVERWRITE_FUSE
+slot=caller`).
+
+**4. Capacity pressure is structural.** `DIRECT_ACK_STORE_CAPACITY` is 8, and a normal boot
+keeps more than 8 servers blocked in recv-v2 at once. Once the store fills, publication is
+refused and the direct path degrades to permanent legacy fallback with no signal but the
+counter.
+
+Blockers 2–4 are one defect's symptoms (an unpaired lifecycle). Blocker 1 is independent.
+
+**The quiescent attestation is what caught this**, and it is retained. It fires once, from
+the off-lock `DebugLog` point, only after `INIT_SPAWN_V5_REPLY_RECV_OK` establishes that the
+service chain is healthy, and checks eleven invariants per direction: attempts equal all
+terminal buckets; `completed > 0`; no confinement decline; no fallback after a terminal;
+ack live occupancy zero; `reserve = commit + cancel`; `commit = consume`; high-watermark
+within capacity; and every fuse clear. On the attempted flip it reported, correctly:
+
+```
+IPC_DIRECT_PRODUCTION_QUIESCENT dir=nr6 attempts=2 completed=1 failed=0 preflight=0
+    pre_txn=1 fallback=0 not_admitted=0 terminals=1 eligibility=1 completed_gt0=1
+    no_confinement=1 no_late_fallback=1 result=fail
+IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir=nr6 reserve=4 commit=4 consume=1 cancel=0 live=3
+    high_watermark=3 capacity=8 live_zero=0 reserve_resolves=1 commit_consumed=0
+    watermark_ok=1 fuses_clear=0
+IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=0 nr7_ok=0 result=fail
+```
+
+The direction-level counters are healthy — `not_admitted=0` proves the confinement really
+is gone, and `completed=1` proves ordinary feature-off production traffic took the direct
+path. It is the **ack lifecycle** that fails: `commit=4 consume=1 live=3`.
+
+**No production-default live seal is issued.** AArch64 and RISC-V are untouched and remain
+proof-gated. The oracle regression (`live_cells=2 result=ok`) and the feature-off boot both
+pass with the flip held off.
+
 ---
 
 ## 9. Authoring rule

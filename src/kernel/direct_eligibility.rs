@@ -70,8 +70,10 @@ pub(crate) struct DirectRequestFacts {
     /// The target endpoint's mode, or `None` when the incarnation named by the capability is
     /// no longer current (slot empty, out of range, or generation recycled).
     pub(crate) endpoint_mode: Option<EndpointMode>,
-    /// Stage 199A2B4 oracle endpoint confinement — unchanged by this increment.
-    pub(crate) oracle_request_endpoint: bool,
+    /// Whether this endpoint is admitted to the off-lock path. On x86_64 the direct
+    /// path is the production default, so this is unconditionally true; on other
+    /// architectures it is still the oracle endpoint confinement.
+    pub(crate) endpoint_admitted: bool,
 }
 
 /// Facts the NR7 call site gathers before the eligibility decision.
@@ -87,8 +89,8 @@ pub(crate) struct DirectReplyFacts {
     /// The reply-endpoint incarnation bound in that record, or `None` when the record is
     /// absent, generation-mismatched, or does not bind an endpoint.
     pub(crate) reply_endpoint: Option<(usize, u64)>,
-    /// Stage 199A2B4 oracle endpoint confinement — unchanged by this increment.
-    pub(crate) oracle_reply_endpoint: bool,
+    /// Whether this reply endpoint is admitted to the off-lock path. See the request twin.
+    pub(crate) endpoint_admitted: bool,
 }
 
 /// The exhaustive NR6 eligibility verdict.
@@ -111,8 +113,8 @@ pub(crate) enum DirectRequestEligibility {
     EndpointIncarnationGone,
     /// The endpoint is `Synchronous`: the legacy rendezvous path owns it.
     SynchronousMode,
-    /// Outside the oracle endpoint confinement (unchanged this increment).
-    NotConfinedEndpoint,
+    /// The endpoint is not admitted to the off-lock path (non-x86 oracle confinement).
+    EndpointNotAdmitted,
 }
 
 /// The exhaustive NR7 eligibility verdict.
@@ -132,8 +134,8 @@ pub(crate) enum DirectReplyEligibility {
     /// The record does not bind a reply-endpoint incarnation (absent / stale / not an
     /// endpoint).
     ReplyEndpointGone,
-    /// Outside the oracle endpoint confinement (unchanged this increment).
-    NotConfinedEndpoint,
+    /// The endpoint is not admitted to the off-lock path (non-x86 oracle confinement).
+    EndpointNotAdmitted,
 }
 
 impl DirectRequestEligibility {
@@ -210,8 +212,8 @@ pub(crate) fn classify_direct_request_eligibility(
         EndpointMode::Synchronous => return DirectRequestEligibility::SynchronousMode,
         EndpointMode::Buffered => {}
     }
-    if !facts.oracle_request_endpoint {
-        return DirectRequestEligibility::NotConfinedEndpoint;
+    if !facts.endpoint_admitted {
+        return DirectRequestEligibility::EndpointNotAdmitted;
     }
     DirectRequestEligibility::Eligible {
         endpoint_index: index,
@@ -240,8 +242,8 @@ pub(crate) fn classify_direct_reply_eligibility(
         Some(pair) => pair,
         None => return DirectReplyEligibility::ReplyEndpointGone,
     };
-    if !facts.oracle_reply_endpoint {
-        return DirectReplyEligibility::NotConfinedEndpoint;
+    if !facts.endpoint_admitted {
+        return DirectReplyEligibility::EndpointNotAdmitted;
     }
     DirectReplyEligibility::Eligible {
         endpoint_index: index,
@@ -262,7 +264,7 @@ mod tests {
                 generation: 11,
             }),
             endpoint_mode: Some(EndpointMode::Buffered),
-            oracle_request_endpoint: true,
+            endpoint_admitted: true,
         }
     }
 
@@ -272,7 +274,7 @@ mod tests {
             requester_available: true,
             reply_object: Ok((5, 2)),
             reply_endpoint: Some((4, 9)),
-            oracle_reply_endpoint: true,
+            endpoint_admitted: true,
         }
     }
 
@@ -304,7 +306,7 @@ mod tests {
             DirectRequestEligibility::SendCapUnresolved(KernelError::MissingRight),
             DirectRequestEligibility::NotAnEndpoint,
             DirectRequestEligibility::EndpointIncarnationGone,
-            DirectRequestEligibility::NotConfinedEndpoint,
+            DirectRequestEligibility::EndpointNotAdmitted,
         ] {
             assert!(!other.is_ineligible_mode(), "{other:?}");
         }
@@ -317,7 +319,7 @@ mod tests {
     fn synchronous_mode_is_reported_even_outside_the_confinement() {
         let mut facts = buffered_endpoint_facts();
         facts.endpoint_mode = Some(EndpointMode::Synchronous);
-        facts.oracle_request_endpoint = false;
+        facts.endpoint_admitted = false;
         assert_eq!(
             classify_direct_request_eligibility(&facts),
             DirectRequestEligibility::SynchronousMode
@@ -398,10 +400,10 @@ mod tests {
     #[test]
     fn confinement_is_unchanged_and_still_declines() {
         let mut facts = buffered_endpoint_facts();
-        facts.oracle_request_endpoint = false;
+        facts.endpoint_admitted = false;
         assert_eq!(
             classify_direct_request_eligibility(&facts),
-            DirectRequestEligibility::NotConfinedEndpoint
+            DirectRequestEligibility::EndpointNotAdmitted
         );
     }
 
@@ -473,10 +475,10 @@ mod tests {
     #[test]
     fn reply_confinement_is_unchanged_and_still_declines() {
         let mut facts = reply_facts();
-        facts.oracle_reply_endpoint = false;
+        facts.endpoint_admitted = false;
         assert_eq!(
             classify_direct_reply_eligibility(&facts),
-            DirectReplyEligibility::NotConfinedEndpoint
+            DirectReplyEligibility::EndpointNotAdmitted
         );
     }
 

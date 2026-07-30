@@ -951,11 +951,45 @@ failed_by_error_code / legacy_fallback_after_decline, plus the ack lifecycle and
 fail-closed fuse, with a balance invariant proved live (`balanced=1`, both directions). The
 non-blocking gap §6.1.4 recorded is closed. See `doc/IPC.md` §8.6.4.
 
-What remains is the enablement step itself: **remove the two gates** (the proof gate and the
-oracle endpoint confinement) and prove the flip live. The counters make that auditable — on
-the current oracle boot they show 54 NR6 and 53 NR7 ordinary service-chain calls turned away
-by the confinement, which is precisely the population the flip would move onto the direct
-path. Until that lands the gates remain in place and no production default has changed.
+### 6.1.6 The gates are removed; the flip is HELD OFF on four new live blockers
+
+**The gate removal has landed.** The outer proof-gate admission, the oracle request/reply
+endpoint confinement in eligibility, and the oracle-only filtering at both acknowledgement
+publication sites are all gone, replaced by arch-split predicates
+(`ipccall_direct_admission_enabled`, `ipccall_direct_publication_enabled`,
+`ipccall_direct_{request,reply}_endpoint_admitted`) that consult one compile-time constant.
+Oracle selectors survive for scenario setup and diagnostics only; structural guards pin that
+the split dispatcher contains no proof-gate and no oracle-endpoint reference, and that
+endpoint admission short-circuits on the production constant. AArch64 and RISC-V still
+resolve to the proof gate and the oracle confinement, so their boots are byte-identical.
+
+**The flip itself is held off.** `ipccall_direct_production_enabled()` returns `false`;
+changing it to `cfg!(target_arch = "x86_64")` is the whole enablement. It was flipped, built
+and run on a normal feature-off x86_64 boot, and hard-stopped:
+
+| constant | `scripts/qemu-x86_64-core-smoke.sh` |
+| --- | --- |
+| `false` | `all 6 service entries present exactly once` |
+| `cfg!(target_arch = "x86_64")` | 6 entries **missing**, `PM_ELF_ZC_FAIL`, boot times out |
+
+1. **Capability transfer is silently dropped** (fatal). The direct NR7 path never reads
+   `SYSCALL_ARG_TRANSFER_CAP`; legacy `ipc_reply` does, and stashes a transfer handle. A
+   cap-bearing reply taken by the direct path loses the capability, so VFS's read-only grant
+   never reaches PM and the blkcache / virtio-blk / driver-manager chain never spawns.
+2. **The acknowledgement store has no production release path.** Publication is driven by
+   blocking, consumption only by direct delivery; any legacy-satisfied recv orphans a
+   `Committed` slot forever.
+3. **Orphans trip the overwrite fuse** — 17 trips on one short boot.
+4. **Capacity pressure is structural** — capacity 8, more than 8 servers blocked at once.
+
+Blockers 2–4 are one unpaired-lifecycle defect; blocker 1 is independent and is the one that
+breaks the boot. All four were invisible under the confinement, which is exactly what the
+confinement was hiding. Full evidence, live markers and fix directions: `doc/IPC.md` §8.6.5.
+
+**No production-default seal is issued.** The oracle regression still passes
+(`live_cells=2 result=ok`) and the feature-off boot is healthy with the flip held off. The
+remaining sequence is: **transfer-cap handling** → **ack lifecycle release** → **capacity
+re-derivation** → **live flip proof**.
 
 ---
 
