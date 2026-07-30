@@ -1397,8 +1397,12 @@ mod ipccall_direct_oracle_core {
     pub(super) static SERVER_DUP_REJECTED: AtomicU32 = AtomicU32::new(0);
     pub(super) static SERVER_REPLY_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 
-    /// Request/reply payload contract. `ipc_call` frames the request as `[opcode_le(2)] ++
-    /// REQUEST_DATA`; `ipc_reply` sends `REPLY_DATA` raw (no opcode prefix).
+    /// Request/reply payload contract. `ipc_call` frames the request on the wire as
+    /// `[opcode_le(2)] ++ REQUEST_DATA`, but that framing is the KERNEL's to un-frame: the
+    /// receiver observes the application opcode in `IpcRecvMetaV2.opcode` and the application
+    /// data alone as the payload. This oracle consumes the ORDINARY production `ipc_recv_v2`
+    /// contract and never reparses the two-byte prefix — the same contract every production
+    /// server (VFS/PM/FS) uses. `ipc_reply` sends `REPLY_DATA` raw (no opcode prefix).
     const REQUEST_OPCODE: u16 = 0x0607;
     const REQUEST_DATA: [u8; 8] = *b"NR6call!";
     const REPLY_OPCODE: u16 = 0x0707;
@@ -1464,22 +1468,27 @@ mod ipccall_direct_oracle_core {
         };
         SERVER_CONTINUATIONS.fetch_add(1, Relaxed);
         let msg = rm.message;
-        let plen = msg.len as usize;
-        // The NR6 off-lock delivery preserves the framed request (`[opcode_le] ++ data`).
-        let framed_ok = plen == 2 + REQUEST_DATA.len()
-            && msg.payload[0..2] == REQUEST_OPCODE.to_le_bytes()
-            && msg.payload[2..plen] == REQUEST_DATA;
+        // ORDINARY production recv-v2 consumption: the application opcode comes from the
+        // metadata and the payload is the application data alone. No manual prefix reparse —
+        // if the kernel delivered the raw frame instead of the projection, `opcode` would be
+        // 0 and `as_slice()` would still carry the prefix, and this check would fail.
+        let opcode_ok = msg.opcode == REQUEST_OPCODE;
+        let data = msg.as_slice();
+        let data_ok = data == REQUEST_DATA;
+        let request_framing_ok = opcode_ok && data_ok;
         let reply_cap = rm.reply_cap.unwrap_or(0);
         // Fresh, receiver-local, resolvable reply cap (nonzero + distinct from the request cap).
         let reply_cap_ok = reply_cap != 0 && reply_cap != request_ep;
-        out.request_ok = framed_ok && reply_cap_ok;
+        out.request_ok = request_framing_ok && reply_cap_ok;
         SERVER_REQUEST_OK.store(u32::from(out.request_ok), Relaxed);
         yarm_user_rt::user_log!(
-            "IPCCALL_DIRECT_ORACLE_SERVER_RECV framed_ok={} reply_cap={} reply_cap_ok={} plen={}",
-            framed_ok as u32,
+            "IPCCALL_DIRECT_ORACLE_SERVER_RECV opcode={} opcode_ok={} data_ok={} plen={} reply_cap={} reply_cap_ok={}",
+            msg.opcode,
+            opcode_ok as u32,
+            data_ok as u32,
+            data.len(),
             reply_cap,
-            reply_cap_ok as u32,
-            plen
+            reply_cap_ok as u32
         );
         let reply_msg =
             match yarm_user_rt::ipc::Message::with_header(0, REPLY_OPCODE, 0, None, &REPLY_DATA) {

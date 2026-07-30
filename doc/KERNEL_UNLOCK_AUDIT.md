@@ -689,22 +689,17 @@ but the direct transaction body itself was written against the **oracle's** mess
 contract, not the production one. Three defects were found by audit; each would be a
 correctness regression on a normal boot, and none is a gating question.
 
-### 6.1.1 HARD-STOP A — the NR6 direct delivery does not conform to the recv-v2 contract
+### 6.1.1 HARD-STOP A — RESOLVED: the NR6 direct delivery now conforms
 
-Production `IpcCall` frames a request as `[app_opcode_le(2)] ++ data`
+**The defect.** Production `IpcCall` frames a request as `[app_opcode_le(2)] ++ data`
 (`crates/yarm-user-rt/src/lib.rs:986`). Because the kernel message is built with
-`opcode = OPCODE_INLINE` and `flags = FLAG_REPLY_CAP`, `should_strip_inline_opcode_prefix`
-(`src/kernel/syscall/ipc_abi.rs:70`) is **true**, so every legacy delivery path strips the
-2-byte prefix and reports the application opcode in the metadata — the immediate path
-(`src/kernel/syscall/ipc.rs:1439`), the blocked-waiter path (`src/kernel/syscall.rs:507`)
-and the split reply-cap executor (`src/runtime.rs:2131`, `snap.app_opcode`).
+`opcode = OPCODE_INLINE` and `flags = FLAG_REPLY_CAP`, the inline-prefix framing predicate
+is **true**, so every legacy delivery path stripped the 2-byte prefix and reported the
+application opcode in the metadata. The direct NR6 transaction did neither: it copied the
+snapshot payload verbatim and encoded `OPCODE_INLINE` with the unstripped length. A
+receiver observed:
 
-The direct NR6 transaction does neither. It copies `snapshot.payload()` verbatim
-(`src/kernel/ipccall_direct_txn.rs:286`) and encodes
-`encode_recv_v2_meta(0, OPCODE_INLINE, FLAG_REPLY_CAP, snapshot.payload_len, …)`
-(`:295`–`:302`). So a receiver would observe:
-
-| Metadata field | Legacy (blocked recv-v2 reply-cap delivery) | Direct NR6 |
+| Metadata field | Legacy (blocked recv-v2 reply-cap delivery) | Direct NR6 (before) |
 |---|---|---|
 | `meta.opcode` | application opcode (payload bytes 0..2) | `OPCODE_INLINE` (0) |
 | `meta.payload_len` | `data.len()` | `2 + data.len()` |
@@ -712,23 +707,55 @@ The direct NR6 transaction does neither. It copies `snapshot.payload()` verbatim
 | `meta.flags` | `0` | `FLAG_REPLY_CAP` |
 
 Userspace decodes **exclusively** from the metadata — `ipc_recv_v2` states it outright
-(`crates/yarm-user-rt/src/lib.rs:425`) and takes `opcode = meta.opcode`
-(`:469`) with `payload[..meta.payload_len]`. Production servers dispatch on that opcode
-(e.g. `crates/yarm-fs-servers/src/fs/initramfs/service.rs:212`,
-`if msg.opcode == VFS_OP_READ`). Under the flip, every service-chain request would arrive
-with opcode 0 and a payload shifted by two bytes: **silent request corruption**, not a
-fallback.
+(`crates/yarm-user-rt/src/lib.rs:425`) and takes `opcode = meta.opcode` (`:469`) with
+`payload[..meta.payload_len]`. Production servers dispatch on that opcode (e.g.
+`crates/yarm-fs-servers/src/fs/initramfs/service.rs:212`). The oracle did not catch it
+because its server reparsed the prefix itself and asserted the unstripped framing.
 
-The oracle does not catch this because it was written against the non-conforming
-delivery — its server re-parses the prefix itself and asserts the unstripped framing
-(`crates/yarm-control-plane-servers/src/control_plane/init/service.rs:1469`,
-`plen == 2 + REQUEST_DATA.len() && payload[0..2] == REQUEST_OPCODE.to_le_bytes()`). The
-earned live cell therefore proves the oracle contract, not the production contract.
+**The fix.** One canonical delivery projection now serves every path:
+`src/kernel/syscall/ipc_recv_core.rs` holds `RecvDelivery`,
+`project_recv_delivery(&Message)`, `project_recv_delivery_parts(opcode, flags, sender, raw)`
+and `should_strip_inline_opcode_prefix_parts`. It determines the receiver-visible
+application opcode, the payload offset and length, the reply-cap `recv_meta_flags`, and the
+malformed/too-short disposition (a framed message whose raw payload is shorter than the
+2-byte prefix falls back to the sender's own opcode and the verbatim payload — the frozen
+historical behaviour, preserved deliberately rather than "fixed" into a rejection).
 
-*Remediation:* make the NR6 transaction perform the same strip-and-report the legacy paths
-do, and rewrite the oracle server's assertions to the conforming form. That changes a
-delivered ABI and invalidates the existing round-trip cell, so it is its own increment with
-its own live proof — not something to fold into a gate removal.
+Converged onto it:
+
+| Site | What changed |
+|---|---|
+| `src/kernel/syscall.rs` × 4 (blocked-waiter completions) | four identical inline copies replaced by `project_recv_delivery` |
+| `src/kernel/syscall/ipc.rs` (immediate full-recv) | inline copy replaced by `project_recv_delivery` |
+| `src/kernel/syscall/ipc_abi.rs` | `should_strip_inline_opcode_prefix` delegates to the canonical rule |
+| `src/kernel/ipccall_direct_txn.rs` (direct NR6) | projects the header words it *would* have framed, copies `delivery.app_payload`, encodes via the shared blocked-waiter encoder |
+| `src/kernel/syscall.rs`, `src/runtime.rs`, direct NR6 | all three blocked-waiter producers share `encode_blocked_waiter_meta` |
+
+The oracle server was rewritten to consume the **ordinary production `ipc_recv_v2`
+contract** — `msg.opcode` from the metadata and `msg.as_slice()` as the data, with no manual
+prefix reparse. Its marker changed from `framed_ok=…` to `opcode_ok=… data_ok=…`, and the
+three per-arch runner greps were updated to match (the oracle core is arch-neutral).
+
+**Proof.** `stage199d_delivery_projection_differential` feeds the same message through BOTH
+deliveries and compares every receiver-visible field. Neither side is computed by the test:
+the legacy observation comes from a real `IpcCall` trap
+(`handle_ipc_call` → `complete_blocked_recv_for_waiter`, which writes the receiver's payload
+and metadata through `copy_to_user`; the deferred reply-cap producer declines in a hosted
+build because `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` is clear), and the direct observation
+comes from `drain_direct_request_post_work`. Compared: `status`, `opcode`, `flags`,
+`payload_len`, `cap_id`, `recv_meta_flags`, `sender_tid`, the payload bytes read back from
+the receiver's own address space, and the reply-cap identity (both resolve to a `Reply`
+object in the server's cnode). Cases: empty application data, nonzero application opcode,
+zero application opcode, the maximum framed inline payload (126 bytes of data in a 128-byte
+frame), and the malformed too-short prefix.
+
+**Live proof.** Re-earned round-trip cell at the conforming commit — see the seal recorded
+in `doc/IPC.md` §8.6. The previous combined seal (`2c07ac96`) is **superseded** for the NR6
+delivery path.
+
+**Scope kept.** The proof gate stays proof-only, the oracle endpoint confinement is
+unchanged, the error disposition (B) and return lanes (C) are untouched, and no endpoint-mode
+policy was added.
 
 ### 6.1.2 HARD-STOP B — the split path reports success regardless of the transaction outcome
 
@@ -775,14 +802,14 @@ frame-parity test against the legacy encoding.
 
 ### 6.1.5 Status
 
-The flip is **not** blocked by the two gates, and no longer by the acknowledgement store.
-It is blocked by three correctness defects in the transaction body, all of which exist
-because the transaction was built to satisfy an oracle whose userspace was written to
-match it. The gates are currently the only thing preventing those defects from reaching
-the service chain, so **removing them before fixing A–C would convert a contained
-proof-only path into a live regression**. The dependency-ordered remainder is:
-A (delivery conformance, with a re-earned round-trip cell) → B (error disposition) →
-C (return-lane parity) → mode-eligibility + counters → gate removal → live flip proof.
+The flip is **not** blocked by the two gates, nor by the acknowledgement store, nor — as of
+A — by delivery conformance. Two correctness defects remain in the transaction body: **B**
+(the split path reports success regardless of the transaction outcome) and **C** (the NR6
+caller's `ret2` lane diverges). The gates remain the only thing keeping those out of the
+service chain, so removing them before fixing B and C would still convert a contained
+proof-only path into a live regression. The dependency-ordered remainder is:
+~~A (delivery conformance)~~ **done** → B (error disposition) → C (return-lane parity) →
+mode-eligibility + production counters → gate removal → live flip proof.
 
 ---
 

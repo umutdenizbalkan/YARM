@@ -142,7 +142,7 @@ UDONE="X86_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok=1 reply_ok=1 duplicate_reply
 reply_ok_result=$(grep -aF "X86_IPCREPLY_DIRECT_SEND" "$NORM" | grep -aFc "result=ok" || true)
 [[ "$reply_ok_result" == "1" ]] || die "expected exactly one successful reply (got $reply_ok_result)"
 # The server observed the request + fresh reply cap once (one server continuation).
-if ! rg -a -q "IPCCALL_DIRECT_ORACLE_SERVER_RECV framed_ok=1 .* reply_cap_ok=1" "$NORM"; then
+if ! rg -a -q "IPCCALL_DIRECT_ORACLE_SERVER_RECV .*opcode_ok=1 data_ok=1 .*reply_cap_ok=1" "$NORM"; then
   die "server did not observe an exact request + fresh reply cap"
 fi
 

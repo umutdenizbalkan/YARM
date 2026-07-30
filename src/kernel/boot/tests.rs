@@ -76578,7 +76578,8 @@ mod stage199a2b2d_direct_request_txn {
     #[test]
     fn happy_path_delivers_once_and_wakes_server_once() {
         let fx = blocked_server_fixture();
-        let snap = snapshot_for(&fx, b"request!");
+        // Production `ipc_call` framing: `[app_opcode_le(2)] ++ data`.
+        let snap = snapshot_for(&fx, b"\x07\x06request!");
         let ack = ack_for(&fx);
         let mut lease = claimed_lease(7);
 
@@ -76586,11 +76587,35 @@ mod stage199a2b2d_direct_request_txn {
             fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 7)
                 .expect("composed transaction succeeds");
 
-        // Request payload delivered exactly once to the server's destination.
+        // Stage 199D HARD-STOP A: the server observes the CANONICAL receiver-visible
+        // projection — the inline opcode prefix is stripped and reported in the metadata,
+        // exactly as every legacy delivery path does.
         let delivered =
             fx.k.with(|s| s.read_user_memory_for_asid(fx.server_aspace_asid, SERVER_PAYLOAD_VA, 8))
                 .expect("read server payload");
-        assert_eq!(&delivered[..8], b"request!");
+        assert_eq!(
+            &delivered[..8],
+            b"request!",
+            "prefix stripped from the payload"
+        );
+        let meta =
+            fx.k.with(|s| s.read_user_memory_for_asid(fx.server_aspace_asid, SERVER_META_VA, 40))
+                .expect("read server meta");
+        assert_eq!(
+            u16::from_le_bytes([meta[8], meta[9]]),
+            0x0607,
+            "application opcode reported in meta.opcode"
+        );
+        assert_eq!(
+            u16::from_le_bytes([meta[10], meta[11]]),
+            0,
+            "meta.flags is 0"
+        );
+        assert_eq!(
+            u32::from_le_bytes([meta[12], meta[13], meta[14], meta[15]]),
+            8,
+            "meta.payload_len is the STRIPPED length"
+        );
 
         // One server-local reply cap, resolving to the reserved reply object.
         let resolved =
@@ -77122,13 +77147,15 @@ mod stage199a2b2f_wiring {
         let fx = fixture();
         let (ack, seq) = ipccall_direct_ack::sole_claim().expect("claim published ack");
         let work = DirectRequestPostWork {
-            snapshot: snapshot(&fx, b"request!"),
+            // Production `ipc_call` framing: `[app_opcode_le(2)] ++ data`.
+            snapshot: snapshot(&fx, b"\x07\x06request!"),
             ack,
             ack_seq: seq,
         };
         let out =
             fx.k.drain_direct_request_post_work(&work)
                 .expect("drain delivers");
+        // The wired drain delivers the canonical receiver-visible projection.
         let delivered =
             fx.k.with(|s| s.read_user_memory_for_asid(fx.server_asid, PAYLOAD_VA, 8))
                 .expect("read");
@@ -80318,6 +80345,657 @@ mod stage199a2d1_memory_ordering {
     }
 }
 
+/// Stage 199D HARD-STOP A — DIFFERENTIAL delivery-conformance tests.
+///
+/// The off-lock direct NR6 transaction used to deliver the raw `ipc_call` wire frame and
+/// report `OPCODE_INLINE`, while every legacy path stripped the 2-byte inline opcode prefix
+/// and reported the application opcode. Because userspace decodes exclusively from the
+/// recv-v2 metadata, that divergence silently handed a receiver a payload shifted by two
+/// bytes and an opcode of 0 — with no error anywhere.
+///
+/// These tests feed the SAME message through BOTH deliveries and compare everything a
+/// receiver can observe: the 40-byte metadata frame field by field, the payload bytes in the
+/// receiver's own address space, and the reply-cap identity. Neither side is computed by the
+/// test:
+///
+/// * the LEGACY observation comes from a real `IpcCall` trap
+///   (`handle_ipc_call` → `complete_blocked_recv_for_waiter`), which writes the receiver's
+///   payload and metadata through `copy_to_user`. In a hosted build
+///   `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` is clear, so the deferred reply-cap producer
+///   declines and this is the classic legacy completion;
+/// * the DIRECT observation comes from `drain_direct_request_post_work` driving the accepted
+///   off-lock transaction.
+///
+/// Cases cover empty application data, a nonzero application opcode, the maximum inline
+/// payload the framed path can carry, and the malformed too-short-prefix disposition.
+#[cfg(test)]
+mod stage199d_delivery_projection_differential {
+    use super::*;
+    use crate::kernel::boot::{ipccall_direct_ack, set_ipccall_direct_proof_enabled};
+    use crate::kernel::ipccall_direct::{IPC_DIRECT_PAYLOAD_MAX, IpcCallDirectSnapshot};
+    use crate::kernel::ipccall_direct_txn::DirectRequestPostWork;
+    use crate::kernel::syscall::IPC_RECV_META_V2_ENCODED_LEN;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    /// Receiver's payload destination and metadata destination (same 4 KiB page).
+    const SERVER_PAYLOAD_VA: usize = 0x4000;
+    const SERVER_META_VA: usize = 0x4080;
+    /// Caller's own buffer holding the framed request bytes.
+    const CALLER_FRAME_VA: usize = 0x5000;
+    /// The receiver advertises a full-size payload destination.
+    const SERVER_PAYLOAD_CAP: usize = IPC_DIRECT_PAYLOAD_MAX;
+
+    /// Everything a receiver can observe about one delivery.
+    #[derive(Debug, Clone, Copy)]
+    struct Observed {
+        meta: [u8; IPC_RECV_META_V2_ENCODED_LEN],
+        payload: [u8; IPC_DIRECT_PAYLOAD_MAX],
+        /// The receiver-local reply cap named by `meta.cap_id` resolved to a `Reply` object.
+        reply_cap_resolves: bool,
+    }
+
+    impl Observed {
+        fn status(&self) -> u64 {
+            u64::from_le_bytes(self.meta[0..8].try_into().unwrap())
+        }
+        fn opcode(&self) -> u16 {
+            u16::from_le_bytes(self.meta[8..10].try_into().unwrap())
+        }
+        fn msg_flags(&self) -> u16 {
+            u16::from_le_bytes(self.meta[10..12].try_into().unwrap())
+        }
+        fn payload_len(&self) -> u32 {
+            u32::from_le_bytes(self.meta[12..16].try_into().unwrap())
+        }
+        fn cap_id(&self) -> u64 {
+            u64::from_le_bytes(self.meta[16..24].try_into().unwrap())
+        }
+        fn recv_meta_flags(&self) -> u64 {
+            u64::from_le_bytes(self.meta[24..32].try_into().unwrap())
+        }
+        fn sender_tid(&self) -> u64 {
+            u64::from_le_bytes(self.meta[32..40].try_into().unwrap())
+        }
+        /// The application payload the receiver would hand to its dispatcher.
+        fn app_payload(&self) -> &[u8] {
+            &self.payload[..self.payload_len() as usize]
+        }
+    }
+
+    struct Fx {
+        k: SharedKernel,
+        caller: crate::kernel::boot::ReceiverWaiterIdentity,
+        caller_asid: Asid,
+        server_asid: Asid,
+        send_cap_t1: CapId,
+        reply_recv_cap_t1: CapId,
+    }
+
+    /// task1 = caller (own mapped frame buffer), task2 = server committed-blocked in a
+    /// recv-v2 of the request endpoint with a full-size payload destination.
+    fn fixture(arm_proof_gate: bool) -> Fx {
+        ipccall_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(arm_proof_gate);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid1, asid2, send_cap_t1, reply_recv_cap_t1) = k.with(|state| {
+            state.register_task(1).expect("t1");
+            state.register_task(2).expect("t2");
+            let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
+            let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, asid1).expect("b1");
+            state.bind_task_asid(2, asid2).expect("b2");
+            state
+                .map_user_page(
+                    aspace1,
+                    VirtAddr(CALLER_FRAME_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xA000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map caller frame");
+            state
+                .map_user_page(
+                    aspace2,
+                    VirtAddr(SERVER_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xB000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map server dest");
+            let (_e, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
+            let send_cap_t1 = state
+                .grant_capability_task_to_task(0, req_send, 1)
+                .expect("send t1");
+            let req_recv_t2 = state
+                .grant_capability_task_to_task(0, req_recv, 2)
+                .expect("recv t2");
+            let (_re, _reply_send, reply_recv) = state.create_endpoint(4).expect("reply ep");
+            let reply_recv_cap_t1 = state
+                .grant_capability_task_to_task(0, reply_recv, 1)
+                .expect("reply t1");
+            // Commit the server into a blocked recv-v2 with a FULL-SIZE payload destination.
+            state.enqueue_current_cpu(2).expect("enq2");
+            state.dispatch_next_task().expect("disp");
+            while state.current_tid() != Some(2) {
+                state.yield_current().expect("switch to server");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [
+                    req_recv_t2.0 as usize,
+                    SERVER_PAYLOAD_VA,
+                    SERVER_PAYLOAD_CAP,
+                    SERVER_META_VA,
+                    IPC_RECV_META_V2_ENCODED_LEN,
+                    0,
+                ],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(state.task_status(2), Some(TaskStatus::Blocked(_))),
+                "server must be committed-blocked in recv-v2"
+            );
+            (asid1, asid2, send_cap_t1, reply_recv_cap_t1)
+        });
+        Fx {
+            k,
+            caller: crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), asid1),
+            caller_asid: asid1,
+            server_asid: asid2,
+            send_cap_t1,
+            reply_recv_cap_t1,
+        }
+    }
+
+    fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        ipccall_direct_ack::reset();
+    }
+
+    /// The wire frame production `ipc_call` builds: `[app_opcode_le(2)] ++ data`.
+    fn framed(app_opcode: u16, data: &[u8]) -> ([u8; IPC_DIRECT_PAYLOAD_MAX], usize) {
+        let mut out = [0u8; IPC_DIRECT_PAYLOAD_MAX];
+        out[0..2].copy_from_slice(&app_opcode.to_le_bytes());
+        out[2..2 + data.len()].copy_from_slice(data);
+        (out, 2 + data.len())
+    }
+
+    fn observe(fx: &Fx) -> Observed {
+        // Read the metadata first: it is always written in full, and it is what tells the
+        // receiver how many payload bytes are valid. Then read EXACTLY that many payload
+        // bytes — reading beyond the delivered extent is not something a receiver would do.
+        let meta_raw = fx.k.with(|s| {
+            s.read_user_memory_for_asid(
+                fx.server_asid,
+                SERVER_META_VA,
+                IPC_RECV_META_V2_ENCODED_LEN,
+            )
+            .expect("read server meta")
+        });
+        let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
+        meta.copy_from_slice(&meta_raw[..IPC_RECV_META_V2_ENCODED_LEN]);
+        let delivered_len = u32::from_le_bytes(meta[12..16].try_into().unwrap()) as usize;
+        assert!(
+            delivered_len <= SERVER_PAYLOAD_CAP,
+            "delivered length {delivered_len} exceeds the receiver's advertised destination"
+        );
+        let mut payload = [0u8; IPC_DIRECT_PAYLOAD_MAX];
+        if delivered_len > 0 {
+            let payload_raw = fx.k.with(|s| {
+                s.read_user_memory_for_asid(fx.server_asid, SERVER_PAYLOAD_VA, delivered_len)
+                    .expect("read server payload")
+            });
+            payload[..delivered_len].copy_from_slice(&payload_raw[..delivered_len]);
+        }
+        let cap_id = u64::from_le_bytes(meta[16..24].try_into().unwrap());
+        let reply_cap_resolves = fx.k.with(|s| {
+            matches!(
+                s.resolve_capability_for_task(2, CapId(cap_id))
+                    .map(|c| c.object),
+                Ok(crate::kernel::capabilities::CapObject::Reply { .. })
+            )
+        });
+        Observed {
+            meta,
+            payload,
+            reply_cap_resolves,
+        }
+    }
+
+    /// LEGACY delivery: a real `IpcCall` trap from the caller to the blocked recv-v2 server.
+    fn run_legacy(app_opcode: u16, data: &[u8]) -> Observed {
+        // Proof gate OFF: the legacy path must be reached with no acknowledgement in play.
+        let fx = fixture(false);
+        let (frame_bytes, frame_len) = framed(app_opcode, data);
+        fx.k.with(|s| {
+            s.write_user_memory_for_asid(
+                fx.caller_asid,
+                CALLER_FRAME_VA,
+                &frame_bytes[..frame_len],
+            )
+            .expect("stage the framed request in the caller's memory");
+            // Run the caller.
+            s.enqueue_current_cpu(1).expect("enq1");
+            while s.current_tid() != Some(1) {
+                s.dispatch_next_task().expect("dispatch to caller");
+            }
+            let mut call = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcCall as usize,
+                [
+                    fx.send_cap_t1.0 as usize,
+                    CALLER_FRAME_VA,
+                    frame_len,
+                    0,
+                    0,
+                    fx.reply_recv_cap_t1.0 as usize,
+                ],
+            );
+            let r = s.handle_trap(Trap::Syscall, Some(&mut call));
+            assert!(r.is_ok(), "legacy IpcCall trap: {r:?}");
+            assert!(
+                !call.is_error(),
+                "legacy IpcCall returned err={}",
+                call.error
+            );
+            assert_eq!(
+                s.task_status(2),
+                Some(TaskStatus::Runnable),
+                "legacy delivery woke the server"
+            );
+        });
+        let observed = observe(&fx);
+        teardown();
+        observed
+    }
+
+    /// DIRECT delivery: the accepted off-lock NR6 transaction, driven through its drain.
+    fn run_direct(app_opcode: u16, data: &[u8]) -> Observed {
+        let fx = fixture(true);
+        let (frame_bytes, frame_len) = framed(app_opcode, data);
+        let (ack, ack_seq) =
+            ipccall_direct_ack::sole_claim().expect("recv-v2 commit published the server ack");
+        let snapshot = IpcCallDirectSnapshot::build(
+            fx.caller,
+            fx.send_cap_t1,
+            fx.reply_recv_cap_t1,
+            &frame_bytes[..frame_len],
+        )
+        .expect("owned request snapshot");
+        let work = DirectRequestPostWork {
+            snapshot,
+            ack,
+            ack_seq,
+        };
+        fx.k.drain_direct_request_post_work(&work)
+            .expect("direct request transaction delivers");
+        assert_eq!(
+            fx.k.with(|s| s.task_status(2)),
+            Some(TaskStatus::Runnable),
+            "direct delivery woke the server"
+        );
+        let observed = observe(&fx);
+        teardown();
+        observed
+    }
+
+    /// The whole point: every receiver-visible field agrees, and matches the production
+    /// contract (application opcode in the metadata, stripped payload, stripped length).
+    fn assert_deliveries_agree(app_opcode: u16, data: &[u8], case: &str) {
+        let legacy = run_legacy(app_opcode, data);
+        let direct = run_direct(app_opcode, data);
+
+        // ── Metadata, field by field ────────────────────────────────────────────────
+        assert_eq!(legacy.status(), direct.status(), "{case}: meta.status");
+        assert_eq!(legacy.opcode(), direct.opcode(), "{case}: meta.opcode");
+        assert_eq!(legacy.msg_flags(), direct.msg_flags(), "{case}: meta.flags");
+        assert_eq!(
+            legacy.payload_len(),
+            direct.payload_len(),
+            "{case}: meta.payload_len"
+        );
+        assert_eq!(
+            legacy.recv_meta_flags(),
+            direct.recv_meta_flags(),
+            "{case}: meta.recv_meta_flags"
+        );
+        assert_eq!(
+            legacy.sender_tid(),
+            direct.sender_tid(),
+            "{case}: meta.sender_tid"
+        );
+
+        // ── The absolute values the production contract requires ────────────────────
+        assert_eq!(direct.opcode(), app_opcode, "{case}: application opcode");
+        assert_eq!(
+            direct.msg_flags(),
+            0,
+            "{case}: blocked-waiter msg_flags is 0"
+        );
+        assert_eq!(direct.status(), 0, "{case}: blocked-waiter status is 0");
+        assert_eq!(
+            direct.payload_len() as usize,
+            data.len(),
+            "{case}: payload_len is the STRIPPED application length"
+        );
+        assert_eq!(
+            direct.recv_meta_flags(),
+            crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64,
+            "{case}: reply-cap present"
+        );
+        assert_eq!(direct.sender_tid(), 1, "{case}: sender tid is the caller");
+
+        // ── Payload bytes in the receiver's own address space ───────────────────────
+        assert_eq!(
+            legacy.app_payload(),
+            direct.app_payload(),
+            "{case}: application payload bytes"
+        );
+        assert_eq!(
+            direct.app_payload(),
+            data,
+            "{case}: the receiver sees ONLY the application data"
+        );
+
+        // ── Reply-cap identity ─────────────────────────────────────────────────────
+        assert!(
+            legacy.cap_id() != 0 && legacy.cap_id() != u64::MAX,
+            "{case}: legacy delivered a real reply cap"
+        );
+        assert!(
+            direct.cap_id() != 0 && direct.cap_id() != u64::MAX,
+            "{case}: direct delivered a real reply cap"
+        );
+        assert!(
+            legacy.reply_cap_resolves,
+            "{case}: legacy reply cap resolves to a Reply object in the server's cnode"
+        );
+        assert!(
+            direct.reply_cap_resolves,
+            "{case}: direct reply cap resolves to a Reply object in the server's cnode"
+        );
+    }
+
+    /// Empty application data: the frame is the 2-byte prefix alone, so the receiver must
+    /// observe a zero-length payload and still the application opcode.
+    #[test]
+    fn differential_empty_application_data() {
+        assert_deliveries_agree(0x0607, &[], "empty");
+    }
+
+    /// A nonzero application opcode with ordinary data — the case the defect corrupted.
+    #[test]
+    fn differential_nonzero_opcode_with_data() {
+        assert_deliveries_agree(0x0607, b"NR6call!", "nonzero-opcode");
+    }
+
+    /// An application opcode of zero is legal and must survive as zero (it is NOT a
+    /// "missing opcode" sentinel).
+    #[test]
+    fn differential_zero_application_opcode() {
+        assert_deliveries_agree(0, b"zeroop", "zero-opcode");
+    }
+
+    /// The maximum application payload the framed path can carry: the wire frame is exactly
+    /// `IPC_DIRECT_PAYLOAD_MAX`, so the application data is two bytes shorter.
+    #[test]
+    fn differential_maximum_inline_payload() {
+        let mut data = [0u8; IPC_DIRECT_PAYLOAD_MAX - 2];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        assert_eq!(data.len(), 126);
+        assert_deliveries_agree(0x1234, &data, "max-inline-payload");
+    }
+
+    /// Malformed framing: the sender flagged an inline prefix but the wire payload is
+    /// shorter than the prefix. Both paths must fall back to the sender's own opcode and
+    /// the verbatim payload — the frozen historical disposition, identically on both sides.
+    #[test]
+    fn differential_malformed_too_short_prefix() {
+        // Build the one-byte wire frame directly (the framed() helper always emits >= 2).
+        let legacy = {
+            let fx = fixture(false);
+            fx.k.with(|s| {
+                s.write_user_memory_for_asid(fx.caller_asid, CALLER_FRAME_VA, &[0xAB])
+                    .expect("stage a 1-byte frame");
+                s.enqueue_current_cpu(1).expect("enq1");
+                while s.current_tid() != Some(1) {
+                    s.dispatch_next_task().expect("dispatch to caller");
+                }
+                let mut call = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::IpcCall as usize,
+                    [
+                        fx.send_cap_t1.0 as usize,
+                        CALLER_FRAME_VA,
+                        1,
+                        0,
+                        0,
+                        fx.reply_recv_cap_t1.0 as usize,
+                    ],
+                );
+                let r = s.handle_trap(Trap::Syscall, Some(&mut call));
+                assert!(r.is_ok(), "legacy 1-byte IpcCall: {r:?}");
+            });
+            let o = observe(&fx);
+            teardown();
+            o
+        };
+        let direct = {
+            let fx = fixture(true);
+            let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack published");
+            let snapshot = IpcCallDirectSnapshot::build(
+                fx.caller,
+                fx.send_cap_t1,
+                fx.reply_recv_cap_t1,
+                &[0xAB],
+            )
+            .expect("snapshot");
+            let work = DirectRequestPostWork {
+                snapshot,
+                ack,
+                ack_seq,
+            };
+            fx.k.drain_direct_request_post_work(&work)
+                .expect("direct delivers");
+            let o = observe(&fx);
+            teardown();
+            o
+        };
+        assert_eq!(
+            legacy.opcode(),
+            direct.opcode(),
+            "malformed: both fall back to the sender's opcode"
+        );
+        assert_eq!(
+            direct.opcode(),
+            crate::kernel::syscall::OPCODE_INLINE,
+            "malformed: the sender's own opcode is reported, not a truncated read"
+        );
+        assert_eq!(legacy.payload_len(), direct.payload_len(), "malformed: len");
+        assert_eq!(
+            direct.payload_len(),
+            1,
+            "malformed: verbatim 1-byte payload"
+        );
+        assert_eq!(
+            legacy.app_payload(),
+            direct.app_payload(),
+            "malformed: payload bytes"
+        );
+        assert_eq!(direct.app_payload(), &[0xAB], "malformed: verbatim byte");
+    }
+
+    /// The canonical projection itself, exercised directly on the header words the direct
+    /// transaction uses — including the malformed disposition and the unframed case.
+    #[test]
+    fn projection_rule_is_the_single_source_of_truth() {
+        use crate::kernel::ipc::Message;
+        use crate::kernel::syscall::OPCODE_INLINE;
+        use crate::kernel::syscall::ipc_recv_core::{
+            INLINE_OPCODE_PREFIX_LEN, project_recv_delivery_parts,
+        };
+
+        // Framed (`ipc_call` shape): prefix stripped and reported.
+        let d =
+            project_recv_delivery_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP, 7, b"\x07\x06data");
+        assert_eq!(d.app_opcode, 0x0607);
+        assert_eq!(d.app_payload, b"data");
+        assert_eq!(d.stripped_prefix, INLINE_OPCODE_PREFIX_LEN);
+        assert_eq!(d.sender_tid, 7);
+        assert!(!d.inline_prefix_malformed());
+        assert_eq!(
+            d.reply_cap_recv_meta_flags(),
+            crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64
+        );
+
+        // Framed but too short: verbatim fallback, flagged malformed.
+        let d = project_recv_delivery_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP, 7, &[0xAB]);
+        assert_eq!(d.app_opcode, OPCODE_INLINE);
+        assert_eq!(d.app_payload, &[0xAB]);
+        assert_eq!(d.stripped_prefix, 0);
+        assert!(d.inline_prefix_malformed());
+
+        // Empty payload, framed: verbatim fallback (nothing to strip).
+        let d = project_recv_delivery_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP, 7, &[]);
+        assert_eq!(d.app_opcode, OPCODE_INLINE);
+        assert!(d.app_payload.is_empty());
+        assert!(d.inline_prefix_malformed());
+
+        // NOT framed (a reply: no prefix, plain flags): verbatim, sender's opcode.
+        let d = project_recv_delivery_parts(0x0707, 0, 9, b"reply-bytes");
+        assert_eq!(d.app_opcode, 0x0707);
+        assert_eq!(d.app_payload, b"reply-bytes");
+        assert_eq!(d.stripped_prefix, 0);
+        assert!(!d.inline_prefix_malformed());
+        assert_eq!(d.reply_cap_recv_meta_flags(), 0);
+
+        // FLAG_CAP_TRANSFER_PLAIN is deliberately NOT framed (reply-with-cap keeps bytes).
+        let d = project_recv_delivery_parts(
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER_PLAIN,
+            9,
+            b"\x07\x06verbatim",
+        );
+        assert_eq!(d.app_opcode, OPCODE_INLINE);
+        assert_eq!(d.app_payload, b"\x07\x06verbatim");
+        assert_eq!(d.stripped_prefix, 0);
+    }
+
+    /// Structural: the direct transaction reaches the shared projection and the shared
+    /// blocked-waiter encoder, and no longer copies the raw snapshot payload.
+    #[test]
+    fn direct_transaction_uses_the_shared_projection_and_encoder() {
+        let txn = include_str!("../ipccall_direct_txn.rs");
+        // Bound the slice to the NR6 request transaction: the NR7 reply twin lives after the
+        // Stage 199A2B3 banner and legitimately copies its own snapshot payload verbatim.
+        let req = txn
+            .split("pub(crate) fn ipc_call_direct_request_txn")
+            .nth(1)
+            .expect("request txn present")
+            .split("Stage 199A2B3 — the composed OFF-LOCK NR7")
+            .next()
+            .expect("body bounded by the NR7 banner");
+        assert!(
+            req.contains("ipc_recv_core::project_recv_delivery_parts("),
+            "the direct NR6 transaction must project through the canonical helper"
+        );
+        assert!(
+            req.contains("encode_blocked_waiter_meta("),
+            "the direct NR6 transaction must use the shared blocked-waiter encoder"
+        );
+        // The raw snapshot payload is the projection's INPUT and nothing else: the copy to
+        // the receiver must name the projected payload.
+        assert_eq!(
+            req.matches("snapshot.payload()").count(),
+            1,
+            "the raw snapshot payload must appear only as the projection input"
+        );
+        let copy_at = req
+            .find("ack.payload_user_ptr,")
+            .expect("the receiver payload copy is present");
+        let copy_arg = req[copy_at..]
+            .lines()
+            .nth(1)
+            .expect("the copied slice argument")
+            .trim();
+        assert_eq!(
+            copy_arg, "delivery.app_payload,",
+            "the direct NR6 transaction must copy the PROJECTED payload, not the raw frame"
+        );
+        assert!(
+            !req.contains("snapshot.payload_len as u32"),
+            "the raw unstripped length must not be reported"
+        );
+        // All three blocked-waiter producers share one encoder.
+        for (name, src) in [
+            ("syscall.rs", include_str!("../syscall.rs")),
+            ("runtime.rs", include_str!("../../runtime.rs")),
+        ] {
+            assert!(
+                src.contains("ipc_recv_core::encode_blocked_waiter_meta("),
+                "{name}: the blocked-waiter producer must use the shared encoder"
+            );
+        }
+        // The projection rule has exactly one implementation.
+        let core = include_str!("../syscall/ipc_recv_core.rs");
+        assert_eq!(
+            core.matches("pub(crate) fn should_strip_inline_opcode_prefix_parts(")
+                .count(),
+            1,
+            "one framing rule"
+        );
+        let abi = include_str!("../syscall/ipc_abi.rs");
+        assert!(
+            abi.contains(
+                "ipc_recv_core::should_strip_inline_opcode_prefix_parts(msg.opcode, msg.flags)"
+            ),
+            "the message-level predicate must delegate to the canonical rule"
+        );
+        // No legacy site re-derives the projection inline any more.
+        for (name, src) in [
+            ("syscall.rs", include_str!("../syscall.rs")),
+            ("syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+        ] {
+            assert!(
+                !src.contains("u16::from_le_bytes([payload[0], payload[1]])")
+                    && !src.contains("u16::from_le_bytes([raw_payload[0], raw_payload[1]])"),
+                "{name}: must not re-derive the inline-prefix projection inline"
+            );
+        }
+    }
+
+    /// The oracle server consumes the ORDINARY production recv-v2 contract.
+    #[test]
+    fn oracle_server_uses_the_production_recv_contract() {
+        let svc = include_str!(
+            "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let core = svc
+            .split("mod ipccall_direct_oracle_core {")
+            .nth(1)
+            .expect("oracle core present")
+            .split("\nmod ")
+            .next()
+            .expect("module bounded");
+        assert!(
+            core.contains("let opcode_ok = msg.opcode == REQUEST_OPCODE;"),
+            "the oracle server must read the application opcode from the metadata"
+        );
+        assert!(
+            core.contains("let data = msg.as_slice();") && core.contains("data == REQUEST_DATA"),
+            "the oracle server must consume the projected payload"
+        );
+        assert!(
+            !core.contains("msg.payload[0..2]") && !core.contains("2 + REQUEST_DATA.len()"),
+            "the oracle server must NOT reparse the two-byte inline prefix"
+        );
+    }
+}
+
 /// Stage 199D — bounded multi-pair acknowledgement boundary guards.
 ///
 /// The former single-slot ack modules are now endpoint-keyed views of the bounded,
@@ -81302,7 +81980,8 @@ mod stage199a2d2a_smp_request {
     #[test]
     fn nr6_txn_remote_enqueues_server_on_cpu1_with_bytes_and_record_available() {
         let fx = smp_server_fixture();
-        let snap = snapshot_for(&fx, b"REQ-SMP!");
+        // Production `ipc_call` framing: `[app_opcode_le(2)] ++ data`.
+        let snap = snapshot_for(&fx, b"\x07\x06REQ-SMP!");
         let ack = fx.published_ack;
         let mut lease = claimed_lease(21);
         // Run the ACCEPTED NR6 transaction (the client is on the BSP; the enqueue targets the

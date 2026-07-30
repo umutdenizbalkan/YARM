@@ -152,7 +152,7 @@ UDONE="AARCH64_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok=1 reply_ok=1 duplicate_r
 [[ "$(count "$UDONE")" == "1" ]] || die "userspace completion missing/duplicate: $UDONE"
 reply_ok_result=$(grep -aF "AARCH64_IPCREPLY_DIRECT_SEND" "$NORM" | grep -aFc "result=ok" || true)
 [[ "$reply_ok_result" == "1" ]] || die "expected exactly one successful reply (got $reply_ok_result)"
-if ! rg -a -q "IPCCALL_DIRECT_ORACLE_SERVER_RECV framed_ok=1 .* reply_cap_ok=1" "$NORM"; then
+if ! rg -a -q "IPCCALL_DIRECT_ORACLE_SERVER_RECV .*opcode_ok=1 data_ok=1 .*reply_cap_ok=1" "$NORM"; then
   die "server did not observe an exact request + fresh reply cap"
 fi
 
