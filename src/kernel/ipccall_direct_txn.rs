@@ -278,12 +278,28 @@ impl SharedKernel {
         self.bind_direct_reply_record_server_cap_split(idx, rgen, server_cap);
 
         // (8) copy request payload + recv-v2 metadata to the server, OUTSIDE all locks.
+        //
+        // Stage 199D HARD-STOP A: what the server observes is the CANONICAL receiver-visible
+        // projection, not the raw snapshot. `handle_ipc_call` frames the kernel message as
+        // `Message::with_header(caller_tid, OPCODE_INLINE, FLAG_REPLY_CAP, …, payload)`, and
+        // userspace `ipc_call` prepends `[app_opcode_le(2)]` to that payload — so the legacy
+        // blocked-waiter reply-cap delivery strips the prefix and reports the APPLICATION
+        // opcode. Projecting the same header words through the same rule here makes the
+        // off-lock delivery byte-identical to the legacy one: same opcode, same payload
+        // bytes, same length, same meta words. Delivering the raw snapshot instead handed
+        // the server opcode 0 and a payload shifted by two bytes.
+        let delivery = crate::kernel::syscall::ipc_recv_core::project_recv_delivery_parts(
+            crate::kernel::syscall::OPCODE_INLINE,
+            crate::kernel::ipc::Message::FLAG_REPLY_CAP,
+            snapshot.caller.tid.0,
+            snapshot.payload(),
+        );
         let server_asid_raw = ack.server.asid.0 as u64;
         if self
             .copy_slice_to_user_asid_split_write(
                 server_asid_raw,
                 ack.payload_user_ptr,
-                snapshot.payload(),
+                delivery.app_payload,
             )
             .is_err()
         {
@@ -292,15 +308,11 @@ impl SharedKernel {
             self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
             return Err(IpcCallDirectError::PayloadCopyFault);
         }
-        let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
-            0,
-            crate::kernel::syscall::OPCODE_INLINE,
-            crate::kernel::ipc::Message::FLAG_REPLY_CAP,
-            snapshot.payload_len as u32,
-            server_cap.0,
-            1, // recv_meta_flags: reply-cap-present (bit 0)
-            snapshot.caller.tid.0,
-        );
+        // Blocked-waiter meta: `status` and `msg_flags` are 0, `cap_id` is the freshly
+        // minted SERVER-LOCAL reply cap, `recv_meta_flags` carries the reply-cap bit —
+        // exactly the words `runtime.rs`'s blocked-waiter reply-cap executor writes.
+        let meta =
+            delivery.encode_blocked_waiter_meta(server_cap.0, delivery.reply_cap_recv_meta_flags());
         if self
             .copy_slice_to_user_asid_split_write(server_asid_raw, ack.meta_user_ptr, &meta)
             .is_err()

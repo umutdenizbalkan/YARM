@@ -599,6 +599,107 @@ rollback (`stage199d_multi_pair_races`).
 the off-lock NR6/NR7 path: the proof gate and the oracle endpoint confinement are
 unchanged, and no production default was flipped.
 
+### 8.6.1 The canonical receiver-visible delivery projection
+
+A sender frames a message one way; a receiver observes another. `ipc_send` / `ipc_call`
+prepend a 2-byte little-endian **application opcode** to the payload, because the kernel ABI
+carries no opcode lane — so the kernel must un-frame it and report the application opcode
+through the recv-v2 metadata instead. Userspace decodes **exclusively** from that metadata
+(`ipc_recv_v2` takes `opcode = meta.opcode` and `payload[..meta.payload_len]`), so getting
+the projection wrong does not fail loudly: it hands the receiver a payload shifted by two
+bytes and an opcode of 0.
+
+`src/kernel/syscall/ipc_recv_core.rs` holds the **single canonical rule**:
+
+* `RecvDelivery` — the receiver-visible projection: `app_opcode`, `app_payload`,
+  `stripped_prefix`, `raw_flags`, `sender_tid`.
+* `project_recv_delivery(&Message)` / `project_recv_delivery_parts(opcode, flags, sender,
+  raw)` — the projection itself; the `_parts` form serves producers that have not
+  materialized a `Message` (the off-lock direct NR6 transaction).
+* `should_strip_inline_opcode_prefix_parts` — the framing predicate.
+  `ipc_abi::should_strip_inline_opcode_prefix` delegates to it, so the header predicate and
+  the payload projection cannot drift apart.
+* `encode_blocked_waiter_meta` — the blocked-waiter metadata encoder (`status` and
+  `msg_flags` are 0), shared by all three blocked-waiter producers.
+* `RecvDelivery::reply_cap_recv_meta_flags` — the reply-cap `recv_meta_flags` word.
+  `FLAG_CAP_TRANSFER_PLAIN` deliberately does not set it; only `FLAG_REPLY_CAP` denotes a
+  reply cap.
+
+**Malformed / too-short disposition.** The prefix is stripped only when the sender framed
+one AND the raw payload is at least 2 bytes. A framed message with a shorter payload has no
+prefix to read, so the projection falls back to the sender's own `opcode` and the verbatim
+payload rather than fabricating an opcode from a truncated read.
+`RecvDelivery::inline_prefix_malformed()` names that case. This is the historical behaviour
+of every legacy site and is part of the frozen contract — it must not be turned into a
+rejection.
+
+**Producers that project through it:** the four blocked-waiter completions in `syscall.rs`,
+the immediate full-recv path in `syscall/ipc.rs`, the deferred reply-cap producer, and the
+off-lock direct NR6 transaction.
+
+**Stage 199D conformance record.** The direct NR6 transaction previously delivered the raw
+wire frame and reported `OPCODE_INLINE` with the unstripped length — the oracle's contract,
+not the production one, and the oracle server reparsed the prefix itself so nothing caught
+it. It now projects the header words it *would* have framed
+(`OPCODE_INLINE` + `FLAG_REPLY_CAP`), copies `delivery.app_payload`, and encodes through the
+shared blocked-waiter encoder, making its delivery byte-identical to the legacy one. The
+oracle server was rewritten to consume the ordinary production `ipc_recv_v2` contract with
+no manual prefix reparse.
+
+Proved by `stage199d_delivery_projection_differential`: the same message fed through BOTH
+deliveries — a real `IpcCall` trap for the legacy side, `drain_direct_request_post_work` for
+the direct side — with every receiver-visible field compared (`status`, `opcode`, `flags`,
+`payload_len`, `cap_id`, `recv_meta_flags`, `sender_tid`), the payload bytes read back from
+the receiver's own address space, and the reply-cap identity. Cases: empty application data,
+nonzero opcode, zero opcode, the maximum framed inline payload (126 data bytes in a 128-byte
+frame), and the malformed too-short prefix.
+
+**The NR7 reply direction was already conforming** — reply messages carry no opcode prefix,
+so its `OPCODE_INLINE`/verbatim encoding already matched `Message::new`.
+
+#### Replacement live seal (supersedes the pre-conformance combined seal)
+
+The NR6/NR7 direct round trip was re-earned against the conforming delivery. The seal below
+**supersedes** the identically-named seal earned at `2c07ac96`, which proved the oracle's
+message contract rather than the production one.
+
+| Field | Value |
+|---|---|
+| Seal | `STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=x86_64 classes=2 live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok` |
+| Exact commit | `458bb3d4505e1aac3747d4c653463bf1a07eb1b2` |
+| Exact tree | `97513076e09248c5fad86b1fd9ce3e3ca71da81f` |
+| Runner | `scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh`, QEMU 8.2.2 TCG, `-smp 1`, `yarm.x86_64_ipccall_direct_oracle=1` |
+| Supersedes | the same seal name at `2c07ac96` (pre-conformance NR6 delivery) |
+
+Conformance evidence from that boot log — the two numbers that were wrong before:
+
+```
+IPCCALL_DIRECT_ORACLE_SERVER_RECV opcode=1543 opcode_ok=1 data_ok=1 plen=8 reply_cap=1114117 reply_cap_ok=1
+```
+
+`opcode=1543` is `0x0607`, the **application** opcode (it was `0` before the fix), and
+`plen=8` is the **stripped** application length (it was `10`, the framed length). The
+`framed_ok=` marker of the old reparsing server is absent from the log entirely. Both kernel
+classes and the userspace completion appear exactly once:
+
+```
+IPCCALL_DIRECT_REQUEST_OK arch=x86_64 source_copy_offlock=1 reply_cap=1 server_wakes=1
+IPCREPLY_DIRECT_OK       arch=x86_64 source_copy_offlock=1 caller_wakes=1 one_shot=1
+X86_IPCREPLY_DIRECT_SEND attempts=1 early_retries=0 result=ok
+X86_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok=1 reply_ok=1 duplicate_reply=rejected
+    server_wakes=1 caller_wakes=1 client_continuations=1 server_continuations=1 result=ok
+YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1
+```
+
+The seal covers the NR6/NR7 **oracle-confined** round trip only. It is **not** a Stage 199D
+stage seal, and no production default was flipped.
+
+**Still non-conforming (not addressed here):** both split helpers discard the transaction
+result and report success unconditionally, and the NR6 caller's `ret2` lane returns `0` where
+the legacy path returns `SYSCALL_NO_TRANSFER_CAP`. Until those are fixed the endpoint
+confinement remains load-bearing for correctness, not merely for scope. See
+`doc/KERNEL_UNLOCK_AUDIT.md` §6.1.
+
 **Retirement-seal isolation model — Model 1, serialized master.**
 `scripts/qemu-combined-retirement-seal.sh` runs the first-cohort (12), plain (6) and
 ordinary-cap (6) seals **strictly sequentially** — one QEMU at a time — each with a unique

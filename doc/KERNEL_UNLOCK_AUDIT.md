@@ -683,13 +683,139 @@ by `stage199d_multi_pair_races` (deterministic barrier-aligned races over 2 and
 exhaustion, same-endpoint reservation, stale/foreign consumption, reserve→cancel rollback),
 `stage199d_multi_pair_boundary`, and the store's own unit tests. See `doc/IPC.md` §8.6.
 
-**Still blocking the flip:** the ack store no longer limits the system to one pair, but
-layer 2 (oracle endpoint confinement) and the layer-1 proof gate are **unchanged** — this
-increment deliberately did not widen who may use the off-lock path, flip any production
-default, or seal a stage. Unconfining still requires its own increment, and the correct
-statement today is that the off-lock NR 6 / NR 7 transaction is **live-proven for one
-outstanding pair on the oracle's endpoints**, with the multi-pair acknowledgement
-prerequisite now satisfied in hosted proof but not yet exercised live.
+**Still blocking the flip.** With the acknowledgement prerequisite met, the flip was
+attempted again and stopped a second time. Removing the two gates is *mechanically* small,
+but the direct transaction body itself was written against the **oracle's** message
+contract, not the production one. Three defects were found by audit; each would be a
+correctness regression on a normal boot, and none is a gating question.
+
+### 6.1.1 HARD-STOP A — RESOLVED: the NR6 direct delivery now conforms
+
+**The defect.** Production `IpcCall` frames a request as `[app_opcode_le(2)] ++ data`
+(`crates/yarm-user-rt/src/lib.rs:986`). Because the kernel message is built with
+`opcode = OPCODE_INLINE` and `flags = FLAG_REPLY_CAP`, the inline-prefix framing predicate
+is **true**, so every legacy delivery path stripped the 2-byte prefix and reported the
+application opcode in the metadata. The direct NR6 transaction did neither: it copied the
+snapshot payload verbatim and encoded `OPCODE_INLINE` with the unstripped length. A
+receiver observed:
+
+| Metadata field | Legacy (blocked recv-v2 reply-cap delivery) | Direct NR6 (before) |
+|---|---|---|
+| `meta.opcode` | application opcode (payload bytes 0..2) | `OPCODE_INLINE` (0) |
+| `meta.payload_len` | `data.len()` | `2 + data.len()` |
+| payload buffer | `data` | `[opcode_le] ++ data` |
+| `meta.flags` | `0` | `FLAG_REPLY_CAP` |
+
+Userspace decodes **exclusively** from the metadata — `ipc_recv_v2` states it outright
+(`crates/yarm-user-rt/src/lib.rs:425`) and takes `opcode = meta.opcode` (`:469`) with
+`payload[..meta.payload_len]`. Production servers dispatch on that opcode (e.g.
+`crates/yarm-fs-servers/src/fs/initramfs/service.rs:212`). The oracle did not catch it
+because its server reparsed the prefix itself and asserted the unstripped framing.
+
+**The fix.** One canonical delivery projection now serves every path:
+`src/kernel/syscall/ipc_recv_core.rs` holds `RecvDelivery`,
+`project_recv_delivery(&Message)`, `project_recv_delivery_parts(opcode, flags, sender, raw)`
+and `should_strip_inline_opcode_prefix_parts`. It determines the receiver-visible
+application opcode, the payload offset and length, the reply-cap `recv_meta_flags`, and the
+malformed/too-short disposition (a framed message whose raw payload is shorter than the
+2-byte prefix falls back to the sender's own opcode and the verbatim payload — the frozen
+historical behaviour, preserved deliberately rather than "fixed" into a rejection).
+
+Converged onto it:
+
+| Site | What changed |
+|---|---|
+| `src/kernel/syscall.rs` × 4 (blocked-waiter completions) | four identical inline copies replaced by `project_recv_delivery` |
+| `src/kernel/syscall/ipc.rs` (immediate full-recv) | inline copy replaced by `project_recv_delivery` |
+| `src/kernel/syscall/ipc_abi.rs` | `should_strip_inline_opcode_prefix` delegates to the canonical rule |
+| `src/kernel/ipccall_direct_txn.rs` (direct NR6) | projects the header words it *would* have framed, copies `delivery.app_payload`, encodes via the shared blocked-waiter encoder |
+| `src/kernel/syscall.rs`, `src/runtime.rs`, direct NR6 | all three blocked-waiter producers share `encode_blocked_waiter_meta` |
+
+The oracle server was rewritten to consume the **ordinary production `ipc_recv_v2`
+contract** — `msg.opcode` from the metadata and `msg.as_slice()` as the data, with no manual
+prefix reparse. Its marker changed from `framed_ok=…` to `opcode_ok=… data_ok=…`, and the
+three per-arch runner greps were updated to match (the oracle core is arch-neutral).
+
+**Proof.** `stage199d_delivery_projection_differential` feeds the same message through BOTH
+deliveries and compares every receiver-visible field. Neither side is computed by the test:
+the legacy observation comes from a real `IpcCall` trap
+(`handle_ipc_call` → `complete_blocked_recv_for_waiter`, which writes the receiver's payload
+and metadata through `copy_to_user`; the deferred reply-cap producer declines in a hosted
+build because `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` is clear), and the direct observation
+comes from `drain_direct_request_post_work`. Compared: `status`, `opcode`, `flags`,
+`payload_len`, `cap_id`, `recv_meta_flags`, `sender_tid`, the payload bytes read back from
+the receiver's own address space, and the reply-cap identity (both resolve to a `Reply`
+object in the server's cnode). Cases: empty application data, nonzero application opcode,
+zero application opcode, the maximum framed inline payload (126 bytes of data in a 128-byte
+frame), and the malformed too-short prefix.
+
+**Live proof.** Re-earned round-trip cell at commit
+`458bb3d4505e1aac3747d4c653463bf1a07eb1b2` (tree
+`97513076e09248c5fad86b1fd9ce3e3ca71da81f`):
+`STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=x86_64 classes=2 live_cells=2
+duplicate_replies=0 duplicate_wakes=0 result=ok`. The boot log carries the two numbers that
+were wrong before — `opcode=1543` (`0x0607`, the application opcode; previously `0`) and
+`plen=8` (the stripped length; previously `10`) — with `framed_ok=` absent and
+`YARM_BOOT_OK` present. This **supersedes** the identically-named seal earned at `2c07ac96`
+for the NR6 delivery path. Recorded in `doc/IPC.md` §8.6.1.
+
+**Scope kept.** The proof gate stays proof-only, the oracle endpoint confinement is
+unchanged, the error disposition (B) and return lanes (C) are untouched, and no endpoint-mode
+policy was added.
+
+### 6.1.2 HARD-STOP B — the split path reports success regardless of the transaction outcome
+
+Both direct helpers discard the transaction result:
+`let _ = shared.drain_direct_request_post_work(&work);` (`src/kernel/syscall_split.rs:686`)
+and `let _ = shared.drain_direct_reply_post_work(&work);` (`:786`), each followed
+unconditionally by `frame.set_ok(0, 0, 0); Some(Ok(()))`.
+
+Every failure the transaction classifies — `ServerGone`, `RecordFull`, `MintFailed`,
+`PayloadCopyFault`, `MetaCopyFault`, `WaiterLost`, `RecordCommitFailed` — is therefore
+reported to userspace as **success with no message delivered**. On the oracle path no
+failure ever occurs, so this is invisible today; on a production boot it is silent message
+loss with no error and no fallback.
+
+*Remediation:* map each transaction error to the canonical `SyscallError` the legacy path
+would have raised, or to a `None` fallback where the legacy path would have serviced the
+call. Requires a per-variant disposition table and hosted proof for every variant.
+
+### 6.1.3 HARD-STOP C — the NR6 caller's `ret2` lane diverges
+
+Legacy `handle_ipc_call` ends with `encode_transfer_cap_ret(frame, None)`
+(`src/kernel/syscall/ipc.rs:618`), which writes `ret2 = SYSCALL_NO_TRANSFER_CAP`
+(`u64::MAX`). The direct path writes `frame.set_ok(0, 0, 0)` — `ret2 = 0`. x86_64
+userspace currently reads only `ret.error` for `ipc_call`, so this is latent rather than
+active, but it is a divergence from the legacy return contract and the AArch64/RISC-V
+decoders do inspect the return lanes.
+
+*Remediation:* one line — `frame.set_ok(0, 0, SYSCALL_NO_TRANSFER_CAP as usize)` — plus a
+frame-parity test against the legacy encoding.
+
+### 6.1.4 Non-blocking gaps found in the same audit
+
+* **No endpoint-mode check.** The direct transaction never inspects `EndpointMode`. Generic
+  production eligibility must restrict it to the mode it actually implements (`Buffered`);
+  `Synchronous` endpoints carry rendezvous semantics (`src/kernel/boot/ipc_state.rs:5510`,
+  `:6092`) the direct path does not reproduce. Rights *are* already enforced —
+  `resolve_endpoint_send_cap_in_pid_from_raw` requires `SEND`
+  (`src/kernel/boot/orchestrator_state.rs:2084`) and the reply-endpoint resolver requires
+  `RECEIVE`.
+* **Observability.** The legacy path emits `IPC_CALL_BEGIN`, `IPC_CALL_WAKE_RECEIVER`,
+  `IPC_CALL_SPLIT_DELIVERY` and `IPC_CALL_SENT_OR_QUEUED`; the direct path emits none of
+  them. Any log-based check that assumes those markers on a normal boot would change
+  meaning under the flip.
+
+### 6.1.5 Status
+
+The flip is **not** blocked by the two gates, nor by the acknowledgement store, nor — as of
+A — by delivery conformance. Two correctness defects remain in the transaction body: **B**
+(the split path reports success regardless of the transaction outcome) and **C** (the NR6
+caller's `ret2` lane diverges). The gates remain the only thing keeping those out of the
+service chain, so removing them before fixing B and C would still convert a contained
+proof-only path into a live regression. The dependency-ordered remainder is:
+~~A (delivery conformance)~~ **done** → B (error disposition) → C (return-lane parity) →
+mode-eligibility + production counters → gate removal → live flip proof.
 
 ---
 

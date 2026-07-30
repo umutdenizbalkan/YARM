@@ -30,8 +30,7 @@
 //! `ipc.rs` are unaffected.
 
 use super::{
-    OPCODE_INLINE, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_TRANSFER_CAP, SYSCALL_NO_TRANSFER_CAP,
-    SyscallError,
+    SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_TRANSFER_CAP, SYSCALL_NO_TRANSFER_CAP, SyscallError,
 };
 use crate::kernel::boot::KernelState;
 use crate::kernel::capabilities::CapId;
@@ -66,9 +65,17 @@ pub(super) fn encode_transfer_cap_ret(
     Ok(())
 }
 
+/// True when the sender framed an inline opcode prefix on this message.
+///
+/// Delegates to the single canonical rule in
+/// [`super::ipc_recv_core::should_strip_inline_opcode_prefix_parts`] so the header
+/// predicate and the payload projection can never drift apart.
+///
+/// Retained as the message-level spelling of the rule (its module placement and visibility
+/// are pinned by the Stage 154 boundary guards) and exercised by the unit tests; every
+/// delivery path now reaches the rule through the projection instead of calling it directly.
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 pub(super) fn should_strip_inline_opcode_prefix(msg: &Message) -> bool {
-    msg.opcode == OPCODE_INLINE
-        && ((msg.flags & Message::FLAG_REPLY_CAP) != 0
-            || (msg.flags & Message::FLAG_CAP_TRANSFER) != 0)
+    super::ipc_recv_core::should_strip_inline_opcode_prefix_parts(msg.opcode, msg.flags)
 }

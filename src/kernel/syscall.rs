@@ -287,6 +287,10 @@ pub(crate) use self::helpers::{round_up_page, validate_user_region};
 // complete_blocked_recv_for_waiter keep their existing call sites unchanged.
 use self::debug::handle_debug_log;
 use self::initramfs::handle_create_initramfs_file_slice_mo;
+// `should_strip_inline_opcode_prefix` is re-imported here to keep the Stage 154 boundary
+// (the predicate lives in `ipc_abi`, never in this file) and is exercised by the unit tests;
+// the delivery paths now reach the rule through `ipc_recv_core::project_recv_delivery`.
+#[cfg_attr(not(test), allow(unused_imports))]
 use self::ipc_abi::{
     decode_ipc_send_timeout_ticks, encode_transfer_cap_ret, sender_tid_to_ret,
     should_strip_inline_opcode_prefix, transfer_cap_arg,
@@ -503,13 +507,10 @@ pub(crate) fn complete_blocked_recv_for_waiter(
         .resolve_capability_for_task(waiter_tid, blocked_state.recv_cap)
         .map_err(SyscallError::from)?
         .object;
-    let payload = msg.as_slice();
-    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2
-    {
-        (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
-    } else {
-        (msg.opcode, payload)
-    };
+    // Canonical receiver-visible projection (single rule, shared with every other
+    // delivery path including the off-lock direct NR6 transaction).
+    let delivery = self::ipc_recv_core::project_recv_delivery(msg);
+    let (app_opcode, app_payload) = (delivery.app_opcode, delivery.app_payload);
     if blocked_state.payload_user_len < app_payload.len() {
         return Err(SyscallError::InvalidArgs);
     }
@@ -575,12 +576,12 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     // same point (after materialization, before the meta copy) so the
     // copy-before/after and rollback ordering is unchanged.
     // Blocked-waiter encoding: status word and msg-flags word are 0 here
-    // (byte-identical to the pre-Stage-154 inline encoding).
-    let meta = self::ipc_recv_core::encode_recv_v2_meta(
-        0,
+    // (byte-identical to the pre-Stage-154 inline encoding). Stage 199D: this is the
+    // SHARED blocked-waiter encoder, so this legacy completion, the deferred reply-cap
+    // executor and the off-lock direct NR6 transaction emit one metadata layout.
+    let meta = self::ipc_recv_core::encode_blocked_waiter_meta(
         app_opcode,
-        0,
-        app_payload.len() as u32,
+        app_payload.len(),
         cap_id,
         recv_meta_flags as u64,
         msg.sender_tid.0,
@@ -699,13 +700,10 @@ pub(crate) fn produce_blocked_waiter_plain_delivery(
         .task_asid(waiter_tid)
         .ok_or(SyscallError::InvalidArgs)?;
 
-    let payload = msg.as_slice();
-    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2
-    {
-        (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
-    } else {
-        (msg.opcode, payload)
-    };
+    // Canonical receiver-visible projection (single rule, shared with every other
+    // delivery path including the off-lock direct NR6 transaction).
+    let delivery = self::ipc_recv_core::project_recv_delivery(msg);
+    let (app_opcode, app_payload) = (delivery.app_opcode, delivery.app_payload);
     if blocked_state.payload_user_len < app_payload.len() {
         return Err(SyscallError::InvalidArgs);
     }
@@ -857,13 +855,10 @@ pub(crate) fn produce_blocked_waiter_ordinary_cap_delivery(
         .map_err(SyscallError::from)?
         .object;
 
-    let payload = msg.as_slice();
-    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2
-    {
-        (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
-    } else {
-        (msg.opcode, payload)
-    };
+    // Canonical receiver-visible projection (single rule, shared with every other
+    // delivery path including the off-lock direct NR6 transaction).
+    let delivery = self::ipc_recv_core::project_recv_delivery(msg);
+    let (app_opcode, app_payload) = (delivery.app_opcode, delivery.app_payload);
     if blocked_state.payload_user_len < app_payload.len() {
         return Err(SyscallError::InvalidArgs);
     }
@@ -1208,13 +1203,10 @@ pub(crate) fn produce_blocked_waiter_reply_cap_delivery(
         .map_err(SyscallError::from)?
         .object;
 
-    let payload = msg.as_slice();
-    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2
-    {
-        (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
-    } else {
-        (msg.opcode, payload)
-    };
+    // Canonical receiver-visible projection (single rule, shared with every other
+    // delivery path including the off-lock direct NR6 transaction).
+    let delivery = self::ipc_recv_core::project_recv_delivery(msg);
+    let (app_opcode, app_payload) = (delivery.app_opcode, delivery.app_payload);
     if blocked_state.payload_user_len < app_payload.len() {
         return Err(SyscallError::InvalidArgs);
     }

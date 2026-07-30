@@ -86,6 +86,157 @@ use crate::kernel::boot::KernelState;
 use crate::kernel::capabilities::{CapObject, CapRights, Capability};
 use crate::kernel::ipc::Message;
 
+/// Width of the inline opcode prefix the `ipc_send` / `ipc_call` userspace framing
+/// prepends to the payload (`[app_opcode_le(2)] ++ data`).
+pub(crate) const INLINE_OPCODE_PREFIX_LEN: usize = 2;
+
+/// The RECEIVER-VISIBLE projection of a queued kernel [`Message`].
+///
+/// A sender frames a message one way; a receiver observes another. The `ipc_send` /
+/// `ipc_call` userspace helpers prepend a 2-byte little-endian application opcode to the
+/// payload, because the kernel ABI carries no opcode lane of its own — so the kernel must
+/// un-frame it and report the application opcode through the recv-v2 metadata instead.
+/// Getting that projection wrong does not fail loudly: it hands the receiver a payload
+/// shifted by two bytes and an opcode of 0.
+///
+/// This is the SINGLE canonical rule. Every delivery path — the immediate full-recv path,
+/// the blocked-waiter completion, the queued user-ASID split, the deferred reply-cap
+/// producer, and the off-lock direct NR6 transaction — projects through
+/// [`project_recv_delivery`] (or [`project_recv_delivery_parts`]) so a receiver cannot
+/// observe a different message depending on which path delivered it.
+///
+/// # Prefix disposition
+///
+/// The prefix is stripped only when the sender actually framed one AND the raw payload is
+/// long enough to hold it. A framed message whose raw payload is shorter than
+/// [`INLINE_OPCODE_PREFIX_LEN`] is **malformed**: there is no prefix to read, so the
+/// projection falls back to the sender's own `opcode` and the verbatim payload rather than
+/// fabricating an opcode from a truncated read. This is the historical behaviour of every
+/// legacy site and is part of the frozen contract — it must not be "fixed" into a rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecvDelivery<'a> {
+    /// Application opcode the receiver observes in `meta.opcode`.
+    pub(crate) app_opcode: u16,
+    /// Application payload the receiver observes; its length is `meta.payload_len`.
+    pub(crate) app_payload: &'a [u8],
+    /// Bytes consumed from the head of the raw payload as the inline opcode prefix: either
+    /// [`INLINE_OPCODE_PREFIX_LEN`] or 0.
+    pub(crate) stripped_prefix: usize,
+    /// The sender's raw flags word, as `meta.flags` on the IMMEDIATE delivery paths. The
+    /// blocked-waiter paths report 0 instead (see [`Self::encode_blocked_waiter_meta`]).
+    pub(crate) raw_flags: u16,
+    /// The sender thread id the receiver observes in `meta.sender_tid`.
+    pub(crate) sender_tid: u64,
+}
+
+// Which of these an individual build uses depends on its configuration: the reply-cap
+// accessors are live on freestanding targets (the off-lock direct NR6 transaction) but dead
+// in a hosted `lib` build, where nothing reaches that transaction; the malformed-prefix probe
+// is a test-facing predicate. They are part of the projection's contract in every build.
+#[allow(dead_code)]
+impl<'a> RecvDelivery<'a> {
+    /// True when the sender framed an inline opcode prefix but the raw payload was too
+    /// short to carry one — the malformed case that falls back to the verbatim projection.
+    pub(crate) fn inline_prefix_malformed(&self) -> bool {
+        self.stripped_prefix == 0
+            && (self.raw_flags & (Message::FLAG_REPLY_CAP | Message::FLAG_CAP_TRANSFER)) != 0
+    }
+
+    /// The `recv_meta_flags` word the receiver observes when this delivery carries a
+    /// receiver-local REPLY cap. `FLAG_CAP_TRANSFER_PLAIN` deliberately does not set it —
+    /// only `FLAG_REPLY_CAP` denotes a reply cap.
+    pub(crate) fn reply_cap_recv_meta_flags(&self) -> u64 {
+        if (self.raw_flags & Message::FLAG_REPLY_CAP) != 0 {
+            super::SYSCALL_RECV_META_REPLY_CAP as u64
+        } else {
+            0
+        }
+    }
+
+    /// Encode the recv-v2 metadata for a BLOCKED-WAITER delivery of THIS projection.
+    pub(crate) fn encode_blocked_waiter_meta(
+        &self,
+        cap_id: u64,
+        recv_meta_flags: u64,
+    ) -> [u8; IPC_RECV_META_V2_ENCODED_LEN] {
+        encode_blocked_waiter_meta(
+            self.app_opcode,
+            self.app_payload.len(),
+            cap_id,
+            recv_meta_flags,
+            self.sender_tid,
+        )
+    }
+}
+
+/// Encode the recv-v2 metadata for a BLOCKED-WAITER delivery from ALREADY-PROJECTED parts.
+///
+/// `status` and `msg_flags` are 0 — the deferred paths never report the sender/status word
+/// (see the field table on [`encode_recv_v2_meta`]) — the opcode and length are the
+/// receiver-visible ones, and `cap_id` is the freshly minted RECEIVER-LOCAL cap.
+///
+/// Two producers share this: the deferred reply-cap executor, whose snapshot was projected
+/// during its Phase A, and the off-lock direct NR6 transaction, which projects inline. They
+/// call the same encoder so their metadata cannot drift.
+pub(crate) fn encode_blocked_waiter_meta(
+    app_opcode: u16,
+    app_payload_len: usize,
+    cap_id: u64,
+    recv_meta_flags: u64,
+    sender_tid: u64,
+) -> [u8; IPC_RECV_META_V2_ENCODED_LEN] {
+    encode_recv_v2_meta(
+        0,
+        app_opcode,
+        0,
+        app_payload_len as u32,
+        cap_id,
+        recv_meta_flags,
+        sender_tid,
+    )
+}
+
+/// Project a queued [`Message`] onto what its receiver will observe.
+pub(crate) fn project_recv_delivery(msg: &Message) -> RecvDelivery<'_> {
+    project_recv_delivery_parts(msg.opcode, msg.flags, msg.sender_tid.0, msg.as_slice())
+}
+
+/// Project a message that has not been materialized into a [`Message`] — the off-lock
+/// direct NR6 transaction holds an owned payload snapshot and the header it WOULD have
+/// built, so it projects through the same rule instead of re-deriving one.
+pub(crate) fn project_recv_delivery_parts(
+    opcode: u16,
+    flags: u16,
+    sender_tid: u64,
+    raw_payload: &[u8],
+) -> RecvDelivery<'_> {
+    let framed = should_strip_inline_opcode_prefix_parts(opcode, flags);
+    if framed && raw_payload.len() >= INLINE_OPCODE_PREFIX_LEN {
+        RecvDelivery {
+            app_opcode: u16::from_le_bytes([raw_payload[0], raw_payload[1]]),
+            app_payload: &raw_payload[INLINE_OPCODE_PREFIX_LEN..],
+            stripped_prefix: INLINE_OPCODE_PREFIX_LEN,
+            raw_flags: flags,
+            sender_tid,
+        }
+    } else {
+        RecvDelivery {
+            app_opcode: opcode,
+            app_payload: raw_payload,
+            stripped_prefix: 0,
+            raw_flags: flags,
+            sender_tid,
+        }
+    }
+}
+
+/// The framing predicate on raw header words — the same rule as
+/// `should_strip_inline_opcode_prefix`, usable before a [`Message`] exists.
+pub(crate) fn should_strip_inline_opcode_prefix_parts(opcode: u16, flags: u16) -> bool {
+    opcode == super::OPCODE_INLINE
+        && ((flags & Message::FLAG_REPLY_CAP) != 0 || (flags & Message::FLAG_CAP_TRANSFER) != 0)
+}
+
 /// Serialize the 40-byte recv-v2 metadata frame.
 ///
 /// **Pure byte codec.** This is the single implementation of the frozen recv-v2

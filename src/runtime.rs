@@ -2126,11 +2126,12 @@ impl SharedKernel {
 
         // Phase B.2 — encode the recv-v2 meta with the fresh receiver-local CapId
         // and the reply-cap recv-meta flag (byte-identical to the legacy reply arm).
-        let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
-            0,
+        // The snapshot's opcode/length were already projected in Phase A; this uses the
+        // SHARED blocked-waiter encoder, so the off-lock direct NR6 transaction and this
+        // deferred executor emit the same metadata words for the same message.
+        let meta = crate::kernel::syscall::ipc_recv_core::encode_blocked_waiter_meta(
             snap.app_opcode,
-            0,
-            snap.payload_len as u32,
+            snap.payload_len,
             local_cap,
             crate::kernel::syscall::SYSCALL_RECV_META_REPLY_CAP as u64,
             snap.sender_tid,

@@ -130,14 +130,21 @@ Full detail: `doc/IPC.md` §8.5.
    two blockers that used to head this list**: the `IPC_SERVER_DEATH_LINK_LEAK` accounting
    failure is resolved, and `revalidate_idle_owner_after_drains` has now executed in QEMU
    (`EXIT_TASK_OWNER_REVALIDATED … committed=replacement`).
-2. **NR 6 / NR 7 off-lock direct IPC cannot be made production-default yet.** It is gated
-   twice: the proof gate *and* an oracle-endpoint confinement that services only the
-   oracle's endpoints. The **acknowledgement-store prerequisite is now met** — the
-   single-slot, one-outstanding-pair ack has been replaced by the bounded, endpoint-indexed,
-   generation-bearing multi-pair store (`src/kernel/direct_ack_store.rs`, Stage 199D), so a
-   real service chain's many concurrent bound `IpcCall`s (54 reverse links in one boot) no
-   longer collide in a one-pair slot. Both gates are still in place and unchanged; removing
-   the endpoint confinement is its own increment. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1 and
+2. **NR 6 / NR 7 off-lock direct IPC cannot be made production-default yet — two remaining
+   correctness defects in the transaction body, not the gates.** The acknowledgement-store
+   prerequisite *is* met (the bounded endpoint-indexed multi-pair store,
+   `src/kernel/direct_ack_store.rs`, Stage 199D), **delivery conformance is now met**
+   (defect A: the NR6 delivery projects through the one canonical receiver-visible
+   projection in `src/kernel/syscall/ipc_recv_core.rs`, byte-identical to the legacy
+   blocked-waiter delivery and proved by `stage199d_delivery_projection_differential` plus a
+   re-earned live round trip), and the two enablement gates are mechanically easy to remove.
+   Still blocking:
+   (B) both split helpers discard the transaction result and report success unconditionally,
+   turning every transaction failure into silent message loss;
+   (C) the NR6 caller's `ret2` lane returns `0` where the legacy path returns
+   `SYSCALL_NO_TRANSFER_CAP`.
+   The gates remain the only thing keeping these out of the service chain. Full evidence and
+   the dependency-ordered remediation are in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1; see also
    `doc/IPC.md` §8.6.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.

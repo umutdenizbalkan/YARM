@@ -30,8 +30,8 @@ use super::{
     SyscallError, clear_blocked_recv_state, complete_blocked_recv_for_waiter,
     current_task_has_user_asid, current_tid, decode_ipc_send_timeout_ticks,
     encode_transfer_cap_ret, materialize_received_message_cap, record_user_fault,
-    sender_tid_to_ret, should_strip_inline_opcode_prefix, transfer_cap_arg,
-    try_endpoint_split_recv, validate_endpoint_right, validate_user_region,
+    sender_tid_to_ret, transfer_cap_arg, try_endpoint_split_recv, validate_endpoint_right,
+    validate_user_region,
 };
 use crate::kernel::boot::{
     IpcEndpointSendResult, IpcSchedulerPlan, KernelError, KernelState, TransferSharedRegion,
@@ -1434,17 +1434,10 @@ fn handle_ipc_recv_result_with_empty_error(
                 recv_local_transfer.unwrap_or(SYSCALL_NO_TRANSFER_CAP),
                 recv_meta_flags
             );
-            let raw_payload = msg.as_slice();
-            let (app_opcode, app_payload, _stripped_prefix) =
-                if should_strip_inline_opcode_prefix(&msg) && raw_payload.len() >= 2 {
-                    (
-                        u16::from_le_bytes([raw_payload[0], raw_payload[1]]),
-                        &raw_payload[2..],
-                        1usize,
-                    )
-                } else {
-                    (msg.opcode, raw_payload, 0usize)
-                };
+            // Canonical receiver-visible projection (single rule, shared with every other
+            // delivery path including the off-lock direct NR6 transaction).
+            let delivery = super::ipc_recv_core::project_recv_delivery(&msg);
+            let (app_opcode, app_payload) = (delivery.app_opcode, delivery.app_payload);
             let recv_v2_meta_written = meta_ptr != 0 && meta_len >= IPC_RECV_META_V2_ENCODED_LEN;
             if recv_v2_meta_written {
                 // recv-v2: write metadata struct to the caller's meta buffer.
