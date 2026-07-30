@@ -141,13 +141,16 @@ Full detail: `doc/IPC.md` §8.5.
    **error disposition is now met** (defect B: one pure exhaustive mapping per direction in
    `src/kernel/direct_disposition.rs` — `Completed` / `DeclinedBeforeMutation` /
    `Failed(SyscallError)`, no wildcard arm, neither drain's `Result` discarded, with
-   fault-injection and empirical legacy error-code parity for both copy faults). Still
-   blocking:
-   (C) the NR6 caller's `ret2` lane returns `0` where the legacy path returns
-   `SYSCALL_NO_TRANSFER_CAP`.
-   The gates remain the only thing keeping it out of the service chain. Full evidence and
-   the dependency-ordered remediation are in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1; see also
-   `doc/IPC.md` §8.6.
+   fault-injection and empirical legacy error-code parity for both copy faults), and
+   **return-lane parity is now met** (defect C: the successful direct NR6/NR7 frame writes
+   `ret2 = SYSCALL_NO_TRANSFER_CAP` through the shared encoder, byte-for-byte equal to a
+   successful legacy `IpcCall` frame, attested live — `ret2=18446744073709551615 ret2_ok=1`).
+   **No correctness defect remains.** What is left is the enablement work itself: replace the
+   oracle endpoint confinement with generic production eligibility for the endpoint modes and
+   rights the transaction supports (`Buffered` only), add the production counters, then remove
+   the gates and prove the flip live. Until then the proof gate and endpoint confinement stay
+   in place and no production default has changed. Full evidence is in
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1; see also `doc/IPC.md` §8.6.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

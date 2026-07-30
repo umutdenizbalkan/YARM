@@ -852,17 +852,69 @@ with no yield between them, the two waiter reads hit the same slot, and the reco
 branches are defensive. No production test hook was added to force them (a guard asserts the
 transaction carries none). All five are `Failed`, pinned by test.
 
-### 6.1.3 HARD-STOP C — the NR6 caller's `ret2` lane diverges
+### 6.1.3 HARD-STOP C — RESOLVED: the successful return lanes match legacy
 
-Legacy `handle_ipc_call` ends with `encode_transfer_cap_ret(frame, None)`
-(`src/kernel/syscall/ipc.rs:618`), which writes `ret2 = SYSCALL_NO_TRANSFER_CAP`
-(`u64::MAX`). The direct path writes `frame.set_ok(0, 0, 0)` — `ret2 = 0`. x86_64
-userspace currently reads only `ret.error` for `ipc_call`, so this is latent rather than
-active, but it is a divergence from the legacy return contract and the AArch64/RISC-V
-decoders do inspect the return lanes.
+**The defect.** Legacy `handle_ipc_call` ends its success path with
+`frame.set_ok(0, 0, 0)` followed by `encode_transfer_cap_ret(frame, None)?`
+(`src/kernel/syscall/ipc.rs`), which writes `ret2 = SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`).
+The direct path wrote `set_ok(0, 0, 0)` alone, leaving `ret2 = 0` — a silent divergence from
+the legacy ABI on the **successful** path.
 
-*Remediation:* one line — `frame.set_ok(0, 0, SYSCALL_NO_TRANSFER_CAP as usize)` — plus a
-frame-parity test against the legacy encoding.
+**The audit did not confirm NR7 was already correct.** `handle_ipc_reply` ends with the
+*identical* two-call encoding, so the direct reply path's `ret2` diverged exactly as NR6's
+did. Both are fixed by one shared encoder, which is precisely why sharing it is correct
+rather than merely convenient.
+
+**The fix.** `direct_disposition::apply_direct_disposition` is the single frame-encoding site
+for both directions:
+
+| Disposition | Frame effect |
+|---|---|
+| `Completed` | `set_ok(0, 0, SYSCALL_NO_TRANSFER_CAP as usize)` — the sentinel comes from the same constant `encode_transfer_cap_ret` writes, not a duplicated literal |
+| `Failed(err)` | `set_err(err.code())`, which zeroes `ret0`/`ret1`/`ret2` first, so no stale success value — including the sentinel — can survive |
+| `DeclinedBeforeMutation` | nothing written; the legacy fallback receives a pristine frame |
+
+Neither split helper writes a return lane after the drain (asserted structurally).
+
+**Proof.**
+
+* `direct_request_success_lanes_match_legacy_byte_for_byte` — runs a SUCCESSFUL legacy
+  `IpcCall` trap, captures `error`/`ret0`/`ret1`/`ret2`, and compares every lane against the
+  production encoder's output. The encoder is fed a **poisoned** frame first, so parity
+  cannot be an accident of a zeroed frame.
+* `direct_reply_success_lanes_match_legacy_byte_for_byte` — pins at source level that both
+  legacy handlers end with the same `set_ok` + `encode_transfer_cap_ret` pair (adjacent
+  lines), and that `encode_transfer_cap_ret(_, None)` writes `SYSCALL_NO_TRANSFER_CAP`, then
+  asserts the encoder's lanes. Driving a successful legacy `IpcReply` end-to-end
+  additionally requires the caller committed-blocked on its reply endpoint, which the
+  NR6-oriented fixture does not arrange; the lane *values* are pinned empirically by the
+  `IpcCall` baseline and the *encoding* is pinned for both handlers.
+* `failed_dispositions_leave_no_stale_success_lane` — starts from a full success frame
+  (sentinel present) and asserts every `Failed` arm clears all three lanes.
+* `declined_disposition_leaves_the_frame_untouched` — asserts no return lane, no syscall
+  argument and not the syscall number changes before fallback.
+* `successful_drain_encodes_the_legacy_success_lanes` — end-to-end through the real drain.
+
+**Live attestation.** `yarm-user-rt` gained `ipc_call_with_transfer_ret`, which `ipc_call`
+delegates to (one syscall sequence, identical behaviour), returning the transfer-cap lane.
+The oracle client compares it against `SYSCALL_NO_TRANSFER_CAP`, emits
+`IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2`, and **gates** its round-trip completion on it; the
+runner requires that marker with the exact numeric sentinel. Observed on the sealed boot:
+
+```
+IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2 ret2=18446744073709551615
+    expected=18446744073709551615 ret2_ok=1 result=ok
+```
+
+Replacement seal at commit `a4bb63e3e83e93ecc3e9e33582e493c8b37c33fe` (tree
+`2f0fddddfccd2b5018c761a32967804d8f64ea95`), recorded in `doc/IPC.md` §8.6.
+
+**One thing the live run caught that hosted tests could not.** The first attempt also added
+`call_ret2_ok=1` to the round-trip completion marker. `user_log` truncates at 192 bytes and
+that line was already at the cap, so the boot silently clipped ` result=ok` and the runner
+failed closed. The evidence now rides in the dedicated marker and the completion literal is
+unchanged; the completion is still *gated* on the attestation. A hosted test could not have
+found this — only a real boot through the real logging path.
 
 ### 6.1.4 Non-blocking gaps found in the same audit
 
@@ -880,14 +932,20 @@ frame-parity test against the legacy encoding.
 
 ### 6.1.5 Status
 
-The flip is **not** blocked by the two gates, nor by the acknowledgement store, nor — as of
-A — by delivery conformance, nor — as of B — by error disposition. One correctness defect
-remains: **C** (the NR6 caller's `ret2` lane returns `0` where the legacy path returns
-`SYSCALL_NO_TRANSFER_CAP`). The gates remain the only thing keeping it out of the service
-chain. The dependency-ordered remainder is:
+**All three correctness defects are resolved.** The flip is no longer blocked by the two
+gates, the acknowledgement store, delivery conformance (A), error disposition (B), or
+return-lane parity (C). What remains is not defect repair but the enablement work itself:
+
 ~~A (delivery conformance)~~ **done** → ~~B (error disposition)~~ **done** →
-C (return-lane parity) → mode-eligibility + production counters → gate removal →
-live flip proof.
+~~C (return-lane parity)~~ **done** → **mode eligibility + production counters** →
+**gate removal** → **live flip proof**.
+
+The next increment is the one §6.1 originally described: replace the oracle endpoint
+confinement with generic production eligibility for the endpoint modes and rights the
+transaction actually supports (`Buffered` only — `Synchronous` carries rendezvous semantics
+the direct path does not reproduce; see §6.1.4), add the production counters and
+attestations, and only then remove the gates and prove the flip live. Until that lands the
+proof gate and endpoint confinement remain in place and no production default has changed.
 
 ---
 
