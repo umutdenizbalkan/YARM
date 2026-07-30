@@ -38,6 +38,9 @@ pub(crate) struct IpcCallDirectSuccess {
 /// waiter, no usable reply authority, and zero wake; retryable variants restore the
 /// acknowledgement lease, terminal (server-gone) variants discard it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Constructed on freestanding targets, where the transaction runs; a hosted `lib`
+// build compiles no route to it, so the variants look unconstructed there.
+#[allow(dead_code)]
 pub(crate) enum IpcCallDirectError {
     /// No exact committed blocked server — canonical `WouldBlock`, no mutation, no
     /// queued fallback. Lease restored.
@@ -425,6 +428,9 @@ pub(crate) struct IpcReplyDirectSuccess {
 /// blocked, no duplicate wake, and either restores the acknowledgement (exact caller
 /// retryable) or discards it (stale authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Constructed on freestanding targets, where the transaction runs; a hosted `lib`
+// build compiles no route to it, so the variants look unconstructed there.
+#[allow(dead_code)]
 pub(crate) enum IpcReplyDirectError {
     /// No committed caller acknowledgement — canonical `WouldBlock`, no mutation.
     WouldBlock,
@@ -433,8 +439,16 @@ pub(crate) enum IpcReplyDirectError {
     /// The reservation precondition failed (generation mismatch, wrong bound replier,
     /// a non-`Available` / aliased record, or a reservation-precondition violation).
     ReservePreconditionFailed,
-    /// The exact caller reply-endpoint waiter was changed/missing.
+    /// The exact caller reply-endpoint waiter was changed/missing at the PRE-reserve
+    /// check — before any reservation and before any user copy, so nothing was delivered
+    /// and the legacy path may still run.
     WaiterLost,
+    /// The exact caller reply-endpoint waiter was changed/missing at the CLAIM, which runs
+    /// strictly after the reply payload AND metadata have already been copied into the
+    /// caller's address space. Distinct from [`Self::WaiterLost`] precisely because the
+    /// post-states differ: this one can never be a legacy fallback (see
+    /// `crate::kernel::direct_disposition`).
+    WaiterLostAfterCopy,
     /// The caller exited / was replaced (before or after the claim).
     CallerGone,
     /// The reply payload copy to the caller faulted.
@@ -559,7 +573,9 @@ impl SharedKernel {
             Some(c) => c,
             None => {
                 self.settle_reply_after_reserve(ack, idx, rgen, lease, lease_commit_seq);
-                return Err(IpcReplyDirectError::WaiterLost);
+                // POST-copy: the reply payload and metadata are already in the caller's
+                // address space, so this can never fall back to the legacy reply path.
+                return Err(IpcReplyDirectError::WaiterLostAfterCopy);
             }
         };
 

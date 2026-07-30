@@ -138,12 +138,14 @@ Full detail: `doc/IPC.md` §8.5.
    projection in `src/kernel/syscall/ipc_recv_core.rs`, byte-identical to the legacy
    blocked-waiter delivery and proved by `stage199d_delivery_projection_differential` plus a
    re-earned live round trip), and the two enablement gates are mechanically easy to remove.
-   Still blocking:
-   (B) both split helpers discard the transaction result and report success unconditionally,
-   turning every transaction failure into silent message loss;
+   **error disposition is now met** (defect B: one pure exhaustive mapping per direction in
+   `src/kernel/direct_disposition.rs` — `Completed` / `DeclinedBeforeMutation` /
+   `Failed(SyscallError)`, no wildcard arm, neither drain's `Result` discarded, with
+   fault-injection and empirical legacy error-code parity for both copy faults). Still
+   blocking:
    (C) the NR6 caller's `ret2` lane returns `0` where the legacy path returns
    `SYSCALL_NO_TRANSFER_CAP`.
-   The gates remain the only thing keeping these out of the service chain. Full evidence and
+   The gates remain the only thing keeping it out of the service chain. Full evidence and
    the dependency-ordered remediation are in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1; see also
    `doc/IPC.md` §8.6.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and

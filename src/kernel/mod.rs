@@ -7,6 +7,7 @@ pub mod cap_transfer_split;
 pub mod capabilities;
 pub mod deadline_token;
 pub mod direct_ack_store;
+pub mod direct_disposition;
 pub mod dispatch_post_work;
 pub mod frame_allocator;
 pub mod global_allocator;

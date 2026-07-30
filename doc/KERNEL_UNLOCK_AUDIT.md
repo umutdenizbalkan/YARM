@@ -763,22 +763,94 @@ for the NR6 delivery path. Recorded in `doc/IPC.md` §8.6.1.
 unchanged, the error disposition (B) and return lanes (C) are untouched, and no endpoint-mode
 policy was added.
 
-### 6.1.2 HARD-STOP B — the split path reports success regardless of the transaction outcome
+### 6.1.2 HARD-STOP B — RESOLVED: typed disposition contract
 
-Both direct helpers discard the transaction result:
-`let _ = shared.drain_direct_request_post_work(&work);` (`src/kernel/syscall_split.rs:686`)
-and `let _ = shared.drain_direct_reply_post_work(&work);` (`:786`), each followed
-unconditionally by `frame.set_ok(0, 0, 0); Some(Ok(()))`.
+**The defect.** Both split helpers discarded the transaction result
+(`let _ = shared.drain_direct_request_post_work(&work);` and its NR7 twin), each followed
+unconditionally by `frame.set_ok(0, 0, 0)`. Every failure the transaction classifies became
+**success with no message delivered** — silent loss, no error, no fallback. Invisible on the
+oracle path, which never fails.
 
-Every failure the transaction classifies — `ServerGone`, `RecordFull`, `MintFailed`,
-`PayloadCopyFault`, `MetaCopyFault`, `WaiterLost`, `RecordCommitFailed` — is therefore
-reported to userspace as **success with no message delivered**. On the oracle path no
-failure ever occurs, so this is invisible today; on a production boot it is silent message
-loss with no error and no fallback.
+**The fix.** `src/kernel/direct_disposition.rs` holds one pure, exhaustive mapping per
+direction onto three dispositions — `Completed`, `DeclinedBeforeMutation`,
+`Failed(SyscallError)`. **No wildcard arm**: adding a variant to either error enum is a
+compile error until its disposition is decided. Neither drain's `Result` is discarded.
 
-*Remediation:* map each transaction error to the canonical `SyscallError` the legacy path
-would have raised, or to a `None` fallback where the legacy path would have serviced the
-call. Requires a per-variant disposition table and hosted proof for every variant.
+`DeclinedBeforeMutation` is admissible only when all six conditions hold of the state the
+transaction *leaves*: no reply record reserved or committed, no capability minted or
+installed, no user payload/meta copied, no waiter or run-queue change, no acknowledgement
+committed as a delivery, no wake published. Two clarifications are load-bearing and are
+recorded in the module: a completed rollback of a `Reserved` (never-invokable) record and a
+revoked provisional mint genuinely leave nothing; and a claimed-then-discarded
+acknowledgement published nothing — it only forfeits the direct path's own retry, which
+fails safe. Any *attempted* user copy disqualifies fallback, because a faulted copy may have
+written a prefix.
+
+`Failed` encodes the canonical error with `frame.set_err(err.code())` — byte-for-byte how the
+global-lock handler encodes a `SyscallError` (`fault_state.rs`), so frame parity reduces to
+error-code equality.
+
+#### Request disposition table (14 variants, exhaustive)
+
+| Variant | Disposition | State left behind | Legacy equivalent |
+|---|---|---|---|
+| `WouldBlock` | Declined | pristine; ack restored | legacy queues or blocks the caller |
+| `LeaseNotClaimed` | Declined | pristine (duplicate drain) | legacy re-runs the send |
+| `CallerGone` | Declined | pristine; no cap resolved | legacy raises the canonical cap error |
+| `SendEndpoint(_)` | Declined | pristine | `validate_endpoint_right(cap, SEND)` |
+| `ReplyEndpoint(_)` | Declined | pristine | `validate_endpoint_right(reply, RECEIVE)` |
+| `EndpointGenerationChanged` | Declined | pristine | legacy re-resolves the endpoint |
+| `RecordFull` | Declined | pristine (probe/reserve refused) | `create_reply_cap_for_caller` table-full error |
+| `ServerCnodeMissing` | Declined | reservation cancelled | legacy fails later in materialization |
+| `MintFailed` | Declined | reservation cancelled, mint revoked | `materialize_received_message_cap` → `CapabilityFull` |
+| `PayloadCopyFault` | **Failed(`InvalidArgs`)** | a user copy was attempted | `complete_blocked_recv_for_waiter` → `InvalidArgs` |
+| `MetaCopyFault` | **Failed(`InvalidArgs`)** | a user copy was attempted | same, after rolling the cap back |
+| `WaiterLost` | **Failed(`WrongObject`)** | payload **and** meta already in the server's address space | none — legacy would have *queued*; see below |
+| `ServerGone` | **Failed(`ServerDied`)** | waiter claimed, deliberately not restored | the request will never be answered by that incarnation |
+| `RecordCommitFailed` | **Failed(`Internal`)** | server committed `Runnable` | defensive; unreachable |
+
+#### Reply disposition table (10 variants, exhaustive)
+
+| Variant | Disposition | State left behind | Legacy equivalent |
+|---|---|---|---|
+| `WouldBlock` | Declined | pristine | legacy `ipc_reply` runs |
+| `LeaseNotClaimed` | Declined | pristine (duplicate drain) | legacy re-runs the reply |
+| `ReplyCapResolve(_)` | Declined | pristine | legacy raises the canonical cap error |
+| `ReservePreconditionFailed` | Declined | pristine (reservation refused) | legacy one-shot/stale-record error |
+| `WaiterLost` | Declined | pristine — the **pre-reserve, pre-copy** check | legacy re-resolves the caller waiter |
+| `PayloadCopyFault` | **Failed(`InvalidArgs`)** | a user copy was attempted | legacy reply copy fault → `InvalidArgs` |
+| `MetaCopyFault` | **Failed(`InvalidArgs`)** | a user copy was attempted | same |
+| `WaiterLostAfterCopy` | **Failed(`WrongObject`)** | reply already in the caller's address space | stale reply authority |
+| `CallerGone` | **Failed(`WrongObject`)** | waiter claimed, record discarded | the reply cap names a caller that no longer exists |
+| `RecordConsumeFailed` | **Failed(`Internal`)** | caller committed `Runnable` | defensive; unreachable |
+
+**One enum change was required.** The reply `WaiterLost` was returned from *two* positions
+with **different** post-states — step (2), before any reservation or copy, and step (5),
+after both copies had landed in the caller's address space. One variant cannot carry two
+dispositions, so step (5) is now `WaiterLostAfterCopy`.
+
+**Where honest parity does not exist.** For request `WaiterLost`, legacy would find no
+endpoint waiter and *queue* the message, returning success. The direct path cannot queue —
+the request bytes are already in the server's buffer — so it reports the stale-authority
+error rather than inventing parity or risking a duplicate delivery. This is recorded rather
+than papered over.
+
+**Proof.** `stage199d_delivery_projection_differential::injection` injects each
+deterministically reachable variant through the real drain and asserts the exact error, its
+disposition, zero reply-record/cap/waiter/wake leak, and zero duplicate delivery. For both
+copy faults the frame error code is compared against the code the **legacy path actually
+produces** for the same injected condition (an unmapped destination), measured in the same
+test. The pure mapping is covered exhaustively by `direct_disposition`'s own tests, whose
+per-variant tables are the mutation guards: every arm is pinned individually, the tables are
+asserted duplicate-free and count-exact, and `failure()`/`permits_legacy_fallback()` are
+asserted mutually exclusive.
+
+**Race-only variants.** `ServerGone`, reply `CallerGone`, `WaiterLostAfterCopy`,
+`RecordCommitFailed` and `RecordConsumeFailed` cannot be injected deterministically in a
+single-threaded hosted build: the prevalidate and commit steps evaluate the *same* predicate
+with no yield between them, the two waiter reads hit the same slot, and the record-commit
+branches are defensive. No production test hook was added to force them (a guard asserts the
+transaction carries none). All five are `Failed`, pinned by test.
 
 ### 6.1.3 HARD-STOP C — the NR6 caller's `ret2` lane diverges
 
@@ -809,13 +881,13 @@ frame-parity test against the legacy encoding.
 ### 6.1.5 Status
 
 The flip is **not** blocked by the two gates, nor by the acknowledgement store, nor — as of
-A — by delivery conformance. Two correctness defects remain in the transaction body: **B**
-(the split path reports success regardless of the transaction outcome) and **C** (the NR6
-caller's `ret2` lane diverges). The gates remain the only thing keeping those out of the
-service chain, so removing them before fixing B and C would still convert a contained
-proof-only path into a live regression. The dependency-ordered remainder is:
-~~A (delivery conformance)~~ **done** → B (error disposition) → C (return-lane parity) →
-mode-eligibility + production counters → gate removal → live flip proof.
+A — by delivery conformance, nor — as of B — by error disposition. One correctness defect
+remains: **C** (the NR6 caller's `ret2` lane returns `0` where the legacy path returns
+`SYSCALL_NO_TRANSFER_CAP`). The gates remain the only thing keeping it out of the service
+chain. The dependency-ordered remainder is:
+~~A (delivery conformance)~~ **done** → ~~B (error disposition)~~ **done** →
+C (return-lane parity) → mode-eligibility + production counters → gate removal →
+live flip proof.
 
 ---
 

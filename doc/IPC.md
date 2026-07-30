@@ -694,9 +694,38 @@ YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1
 The seal covers the NR6/NR7 **oracle-confined** round trip only. It is **not** a Stage 199D
 stage seal, and no production default was flipped.
 
-**Still non-conforming (not addressed here):** both split helpers discard the transaction
-result and report success unconditionally, and the NR6 caller's `ret2` lane returns `0` where
-the legacy path returns `SYSCALL_NO_TRANSFER_CAP`. Until those are fixed the endpoint
+### 8.6.2 The direct-transaction disposition contract
+
+Every direct NR6/NR7 outcome is classified, never discarded. `src/kernel/direct_disposition.rs`
+maps each transaction result onto exactly one of:
+
+* **`Completed`** — keep the existing successful frame encoding;
+* **`DeclinedBeforeMutation`** — nothing was delivered and nothing observable was left
+  behind, so the split helper returns `None` and the legacy path runs;
+* **`Failed(SyscallError)`** — the legacy path must NOT run; the canonical error is encoded
+  with `frame.set_err(err.code())`, byte-for-byte how the global-lock handler encodes a
+  `SyscallError`.
+
+The mapping is pure and **exhaustive with no wildcard arm**, so a new error variant is a
+compile error until its disposition is decided. Fallback is admissible only when all six of
+these hold of the state the transaction leaves: no reply record reserved or committed, no
+capability minted or installed, no user payload/meta copied, no waiter or run-queue change,
+no acknowledgement committed as a delivery, no wake published. Any *attempted* user copy
+disqualifies fallback — a faulted copy may have written a prefix of its bytes.
+
+Past the publication line — the endpoint waiter claimed, the request bytes in the receiver's
+address space, or the receiver committed `Runnable` — every variant is `Failed`
+unconditionally, because running legacy afterwards would deliver the same message twice.
+
+The reply direction's `WaiterLost` was split into `WaiterLost` (the pre-reserve, pre-copy
+check — fallback-safe) and `WaiterLostAfterCopy` (the claim, which runs after both copies
+have landed — never a fallback), because one variant cannot carry two post-states.
+
+Full per-variant tables, the legacy equivalent of each, and the cases where honest parity
+does not exist are in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.2.
+
+**Still non-conforming (not addressed here):** the NR6 caller's `ret2` lane returns `0` where
+the legacy path returns `SYSCALL_NO_TRANSFER_CAP`. Until that is fixed the endpoint
 confinement remains load-bearing for correctness, not merely for scope. See
 `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.
 
