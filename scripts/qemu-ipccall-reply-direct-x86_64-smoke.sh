@@ -145,6 +145,11 @@ reply_ok_result=$(grep -aF "X86_IPCREPLY_DIRECT_SEND" "$NORM" | grep -aFc "resul
 if ! rg -a -q "IPCCALL_DIRECT_ORACLE_SERVER_RECV .*opcode_ok=1 data_ok=1 .*reply_cap_ok=1" "$NORM"; then
   die "server did not observe an exact request + fresh reply cap"
 fi
+# Stage 199D HARD-STOP C: the SUCCESSFUL NR6 return frame carried the legacy transfer-cap
+# sentinel in ret2 (18446744073709551615 = u64::MAX), never 0.
+if ! rg -a -q "IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2 ret2=18446744073709551615 expected=18446744073709551615 ret2_ok=1 result=ok" "$NORM"; then
+  die "NR6 successful return ret2 did not match the legacy SYSCALL_NO_TRANSFER_CAP sentinel"
+fi
 
 # ── 4c. Hard-stop conditions ──
 grep -aF "X86_IPCCALL_DIRECT_ROUNDTRIP_DONE" "$NORM" | grep -aq "result=fail" && die "roundtrip completion result=fail"

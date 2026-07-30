@@ -687,24 +687,13 @@ fn try_split_ipccall_direct_into_frame(
     // mapping is pure and exhaustive (`crate::kernel::direct_disposition`) — no wildcard arm,
     // so a new error variant cannot silently inherit "success".
     let outcome = shared.drain_direct_request_post_work(&work);
-    match crate::kernel::direct_disposition::classify_direct_request_outcome(&outcome) {
-        // NR6 is request-send-only: return Ok now (the caller blocks via a later recv).
-        // Return lanes unchanged (HARD-STOP C is out of scope).
-        crate::kernel::direct_disposition::DirectDisposition::Completed => {
-            frame.set_ok(0, 0, 0);
-            Some(Ok(()))
-        }
-        // Nothing was delivered and nothing observable was left behind: the legacy
-        // global-lock IpcCall may run. `None` propagates unchanged to that fallback.
-        crate::kernel::direct_disposition::DirectDisposition::DeclinedBeforeMutation => None,
-        // Past the publication line (or a user copy was attempted): the legacy path must NOT
-        // run — it would deliver the same request a second time. Encode the canonical error
-        // exactly as the global-lock handler does (`trapframe.set_err(e.code())`).
-        crate::kernel::direct_disposition::DirectDisposition::Failed(err) => {
-            frame.set_err(err.code());
-            Some(Ok(()))
-        }
-    }
+    let disposition = crate::kernel::direct_disposition::classify_direct_request_outcome(&outcome);
+    // Stage 199D HARD-STOP C: the frame is encoded by the SHARED encoder, which reproduces
+    // the legacy `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(frame, None)` success lanes
+    // (`ret2 = SYSCALL_NO_TRANSFER_CAP`), zeroes every lane on failure, and leaves the frame
+    // untouched on a decline so the legacy global-lock IpcCall runs against a pristine frame.
+    // NR6 is request-send-only: success returns now (the caller blocks via a later recv).
+    crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition).map(|()| Ok(()))
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -803,18 +792,12 @@ fn try_split_ipcreply_direct_into_frame(
     };
     // Stage 199D HARD-STOP B: classified, never discarded — see the NR6 twin.
     let outcome = shared.drain_direct_reply_post_work(&work);
-    match crate::kernel::direct_disposition::classify_direct_reply_outcome(&outcome) {
-        // NR7 delivers the reply and wakes the caller; the replier itself returns Ok.
-        crate::kernel::direct_disposition::DirectDisposition::Completed => {
-            frame.set_ok(0, 0, 0);
-            Some(Ok(()))
-        }
-        crate::kernel::direct_disposition::DirectDisposition::DeclinedBeforeMutation => None,
-        crate::kernel::direct_disposition::DirectDisposition::Failed(err) => {
-            frame.set_err(err.code());
-            Some(Ok(()))
-        }
-    }
+    let disposition = crate::kernel::direct_disposition::classify_direct_reply_outcome(&outcome);
+    // Same shared encoder as the NR6 twin: legacy `handle_ipc_reply` ends with the identical
+    // `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(frame, None)` pair, so NR7's success lanes
+    // are the same three values. NR7 delivers the reply and wakes the caller; the replier
+    // itself returns Ok.
+    crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition).map(|()| Ok(()))
 }
 
 #[cfg(feature = "hosted-dev")]

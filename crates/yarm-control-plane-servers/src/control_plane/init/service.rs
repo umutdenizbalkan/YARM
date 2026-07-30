@@ -1396,6 +1396,9 @@ mod ipccall_direct_oracle_core {
     pub(super) static SERVER_REPLY_OK: AtomicU32 = AtomicU32::new(0);
     pub(super) static SERVER_DUP_REJECTED: AtomicU32 = AtomicU32::new(0);
     pub(super) static SERVER_REPLY_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    /// Stage 199D HARD-STOP C: the successful NR6 return frame carried the legacy
+    /// transfer-cap sentinel in `ret2` (1) or diverged (0).
+    pub(super) static CLIENT_CALL_RET2_OK: AtomicU32 = AtomicU32::new(0);
 
     /// Request/reply payload contract. `ipc_call` frames the request on the wire as
     /// `[opcode_le(2)] ++ REQUEST_DATA`, but that framing is the KERNEL's to un-frame: the
@@ -1563,6 +1566,10 @@ mod ipccall_direct_oracle_core {
         pub dup_rejected: u32,
         pub server_cont: u32,
         pub client_cont: u32,
+        /// Stage 199D HARD-STOP C: the transfer-cap return lane the SUCCESSFUL NR6 call
+        /// actually returned, and whether it equals the legacy sentinel.
+        pub call_ret2: u64,
+        pub call_ret2_ok: bool,
     }
 
     /// Parent(client) core (ARCH-NEUTRAL): wait on the liveness handshake (server then recv-blocks),
@@ -1583,6 +1590,8 @@ mod ipccall_direct_oracle_core {
             dup_rejected: 0,
             server_cont: 0,
             client_cont: 0,
+            call_ret2: 0,
+            call_ret2_ok: false,
         };
         // Authoritative liveness handshake: block until the server wakes us. On a single CPU the
         // server then commits its blocked recv before we resume (its wake enqueues us, no preempt).
@@ -1608,9 +1617,18 @@ mod ipccall_direct_oracle_core {
         while out.call_attempts < MAX_ATTEMPTS {
             out.call_attempts += 1;
             // SAFETY: `request_ep` = request SEND cap; `reply_ep` = reply-endpoint RECEIVE cap.
-            match unsafe { yarm_user_rt::syscall::ipc_call(request_ep, reply_ep, &request_msg) } {
-                Ok(()) => {
+            // Stage 199D HARD-STOP C: capture the transfer-cap return lane so the successful
+            // NR6 return ABI is attested LIVE, not merely asserted in hosted tests.
+            match unsafe {
+                yarm_user_rt::syscall::ipc_call_with_transfer_ret(
+                    request_ep,
+                    reply_ep,
+                    &request_msg,
+                )
+            } {
+                Ok(ret2) => {
                     out.called = true;
+                    out.call_ret2 = ret2;
                     break;
                 }
                 Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
@@ -1632,6 +1650,17 @@ mod ipccall_direct_oracle_core {
         yarm_user_rt::user_log!(
             "IPCCALL_DIRECT_ORACLE_CLIENT_CALL_OK attempts={}",
             out.call_attempts
+        );
+        // Stage 199D HARD-STOP C: the SUCCESSFUL NR6 return frame must carry the legacy
+        // transfer-cap sentinel in ret2 (u64::MAX), never 0. Attested here on a live boot.
+        out.call_ret2_ok = out.call_ret2 == yarm_user_rt::syscall::SYSCALL_NO_TRANSFER_CAP;
+        CLIENT_CALL_RET2_OK.store(u32::from(out.call_ret2_ok), Relaxed);
+        yarm_user_rt::user_log!(
+            "IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2 ret2={} expected={} ret2_ok={} result={}",
+            out.call_ret2,
+            yarm_user_rt::syscall::SYSCALL_NO_TRANSFER_CAP,
+            out.call_ret2_ok as u32,
+            if out.call_ret2_ok { "ok" } else { "fail" }
         );
         // Block on the reply endpoint — commits the BlockedCallerAck and dispatches the woken server,
         // which replies (NR7) and wakes us exactly once.
@@ -1744,6 +1773,11 @@ fn run_x86_ipccall_direct_oracle(init_tid: u64) {
         && out.dup_rejected == 1
         && out.server_cont == 1
         && out.client_cont == 1
+        // Stage 199D HARD-STOP C: the successful NR6 return ABI is part of the round trip.
+        // The evidence rides in the dedicated `..._CLIENT_CALL_RET2` marker rather than in
+        // this literal: `user_log` truncates at 192 bytes and this line is already at the
+        // cap, so lengthening it would silently clip `result=ok`.
+        && out.call_ret2_ok
     {
         yarm_user_rt::user_log!(
             "X86_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok=1 reply_ok=1 duplicate_reply=rejected server_wakes=1 caller_wakes=1 client_continuations=1 server_continuations=1 result=ok"

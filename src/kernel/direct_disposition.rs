@@ -17,8 +17,9 @@
 //!
 //! # The three dispositions
 //!
-//! * [`DirectDisposition::Completed`] — the transaction committed. The caller keeps its
-//!   existing successful frame encoding (unchanged: HARD-STOP C is out of scope here).
+//! * [`DirectDisposition::Completed`] — the transaction committed. The success frame is
+//!   encoded by [`apply_direct_disposition`], which reproduces the legacy return lanes
+//!   exactly (Stage 199D HARD-STOP C).
 //! * [`DirectDisposition::DeclinedBeforeMutation`] — nothing observable changed and nothing
 //!   was delivered, so the syscall may run its legacy path. The helper returns `None`.
 //! * [`DirectDisposition::Failed`] — something irreversible happened, or a user copy was
@@ -65,7 +66,59 @@
 use crate::kernel::ipccall_direct_txn::{
     IpcCallDirectError, IpcCallDirectSuccess, IpcReplyDirectError, IpcReplyDirectSuccess,
 };
-use crate::kernel::syscall::SyscallError;
+use crate::kernel::syscall::{SYSCALL_NO_TRANSFER_CAP, SyscallError};
+use crate::kernel::trapframe::TrapFrame;
+
+/// Apply a disposition to the trap frame and report whether the syscall was handled.
+///
+/// `Some(())` — handled; the split helper returns `Some(Ok(()))`.
+/// `None` — declined; the frame is **untouched** and the legacy path runs.
+///
+/// This is the single frame-encoding site for both directions, so the return-lane contract
+/// cannot drift between NR6 and NR7 or between the success and failure arms. Hosted tests
+/// drive this exact function, which is why it is not inlined into the (freestanding-only)
+/// split helpers.
+///
+/// # Stage 199D HARD-STOP C — the success lanes
+///
+/// The legacy `handle_ipc_call` and `handle_ipc_reply` BOTH end their success path with
+///
+/// ```text
+/// frame.set_ok(0, 0, 0);
+/// encode_transfer_cap_ret(frame, None)?;   // → set_ret2(SYSCALL_NO_TRANSFER_CAP)
+/// ```
+///
+/// so the legacy success frame is `error = 0`, `ret0 = 0`, `ret1 = 0`,
+/// `ret2 = SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`) — *not* zero. The direct path previously
+/// wrote `set_ok(0, 0, 0)` alone, leaving `ret2 = 0`: a silent divergence from the legacy
+/// ABI on the **successful** path. It now writes the same three lanes, taking the sentinel
+/// from [`SYSCALL_NO_TRANSFER_CAP`] — the very constant `encode_transfer_cap_ret` writes —
+/// rather than duplicating the literal.
+///
+/// # Failure and decline
+///
+/// `Failed` encodes with `set_err`, which zeroes `ret0`/`ret1`/`ret2` before setting the
+/// error code, so a failure can never leave a stale success value in any return lane —
+/// including the `ret2` sentinel this fix introduces. `DeclinedBeforeMutation` writes
+/// nothing at all: the legacy path is entitled to a pristine frame.
+#[allow(dead_code)] // freestanding-live; hosted `lib` compiles no route to the split helpers
+pub(crate) fn apply_direct_disposition(
+    frame: &mut TrapFrame,
+    disposition: DirectDisposition,
+) -> Option<()> {
+    match disposition {
+        DirectDisposition::Completed => {
+            // Byte-identical to the legacy `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(None)`.
+            frame.set_ok(0, 0, SYSCALL_NO_TRANSFER_CAP as usize);
+            Some(())
+        }
+        DirectDisposition::DeclinedBeforeMutation => None,
+        DirectDisposition::Failed(err) => {
+            frame.set_err(err.code());
+            Some(())
+        }
+    }
+}
 
 /// What the trap-entry gate must do with a direct-transaction outcome.
 ///

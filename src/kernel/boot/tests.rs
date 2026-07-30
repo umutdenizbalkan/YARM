@@ -81564,6 +81564,300 @@ mod stage199d_delivery_projection_differential {
             }
         }
 
+        // ── Stage 199D HARD-STOP C: return-lane parity ────────────────────────────────
+
+        /// A fixture places a whole `KernelState` on the stack, so a test that builds more
+        /// than one of them runs on an 8 MiB thread — the same accommodation the Stage 199
+        /// race tests use.
+        fn on_big_stack<F: FnOnce() + Send + 'static>(body: F) {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn(body)
+                .expect("spawn")
+                .join()
+                .expect("join");
+        }
+
+        /// Every lane a syscall return can carry.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct Lanes {
+            error: usize,
+            ret0: usize,
+            ret1: usize,
+            ret2: usize,
+        }
+
+        fn lanes_of(frame: &TrapFrame) -> Lanes {
+            Lanes {
+                error: frame.error,
+                ret0: frame.ret0,
+                ret1: frame.ret1,
+                ret2: frame.ret2,
+            }
+        }
+
+        /// Run a SUCCESSFUL legacy `IpcCall` and capture every returned lane.
+        fn legacy_request_success_lanes() -> Lanes {
+            let fx = fixture(false);
+            let lanes = fx.k.with(|s| {
+                s.write_user_memory_for_asid(fx.caller_asid, CALLER_FRAME_VA, FRAMED)
+                    .expect("stage the framed request");
+                s.enqueue_current_cpu(1).expect("enq1");
+                while s.current_tid() != Some(1) {
+                    s.dispatch_next_task().expect("dispatch to caller");
+                }
+                let mut call = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::IpcCall as usize,
+                    [
+                        fx.send_cap_t1.0 as usize,
+                        CALLER_FRAME_VA,
+                        FRAMED.len(),
+                        0,
+                        0,
+                        fx.reply_recv_cap_t1.0 as usize,
+                    ],
+                );
+                let r = s.handle_trap(Trap::Syscall, Some(&mut call));
+                assert!(r.is_ok(), "legacy IpcCall trap: {r:?}");
+                assert!(
+                    !call.is_error(),
+                    "the legacy call must SUCCEED for a parity baseline"
+                );
+                assert_eq!(
+                    s.task_status(2),
+                    Some(TaskStatus::Runnable),
+                    "legacy success delivered and woke the server"
+                );
+                lanes_of(&call)
+            });
+            teardown();
+            lanes
+        }
+
+        /// Assert, at the source level, that BOTH legacy handlers end their success path with
+        /// the identical two-call return-lane encoding.
+        ///
+        /// Driving a successful legacy `IpcReply` end-to-end additionally requires the caller
+        /// to be committed-blocked on its reply endpoint, which this NR6-oriented fixture does
+        /// not arrange. Pinning the shared encoding is the honest equivalent: it is exactly
+        /// what makes ONE shared encoder correct for both directions, and the lane VALUES are
+        /// pinned empirically by the legacy `IpcCall` baseline.
+        fn assert_legacy_handlers_share_the_success_encoding() {
+            let ipc = include_str!("../syscall/ipc.rs");
+            for handler in [
+                "pub(super) fn handle_ipc_call",
+                "pub(super) fn handle_ipc_reply",
+            ] {
+                let body = ipc.split(handler).nth(1).expect("handler present");
+                assert!(
+                    body.contains("frame.set_ok(0, 0, 0);")
+                        && body.contains("encode_transfer_cap_ret(frame, None)?;"),
+                    "{handler}: success must encode set_ok(0,0,0) then encode_transfer_cap_ret(None)"
+                );
+                // The two calls are adjacent on the success path (ignoring indentation).
+                let at = body
+                    .find("frame.set_ok(0, 0, 0);")
+                    .expect("success set_ok present");
+                let next = body[at..].lines().nth(1).expect("a following line").trim();
+                assert_eq!(
+                    next, "encode_transfer_cap_ret(frame, None)?;",
+                    "{handler}: the sentinel encode must immediately follow set_ok"
+                );
+            }
+            // `encode_transfer_cap_ret(_, None)` writes exactly the canonical sentinel.
+            let abi = include_str!("../syscall/ipc_abi.rs");
+            assert!(
+                abi.contains("let value = cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);")
+                    && abi.contains("frame.set_ret2("),
+                "encode_transfer_cap_ret must write SYSCALL_NO_TRANSFER_CAP into ret2 for None"
+            );
+        }
+
+        /// The SUCCESS lanes the direct path writes, produced by the production encoder.
+        fn direct_success_lanes() -> Lanes {
+            let mut frame =
+                TrapFrame::new(crate::kernel::syscall::Syscall::IpcCall as usize, [0; 6]);
+            // Poison every lane first, so parity cannot be an accident of a zeroed frame.
+            frame.set_ok(0xDEAD, 0xBEEF, 0xF00D);
+            frame.error = 0x1234;
+            assert_eq!(
+                crate::kernel::direct_disposition::apply_direct_disposition(
+                    &mut frame,
+                    DirectDisposition::Completed
+                ),
+                Some(()),
+                "a completed transaction is handled, never declined"
+            );
+            lanes_of(&frame)
+        }
+
+        /// THE HARD-STOP C parity test: a successful direct NR6 return frame must equal a
+        /// successful legacy `IpcCall` return frame in EVERY lane — including `ret2`, which
+        /// legacy sets to `SYSCALL_NO_TRANSFER_CAP` and the direct path used to leave at 0.
+        #[test]
+        fn direct_request_success_lanes_match_legacy_byte_for_byte() {
+            let legacy = legacy_request_success_lanes();
+            let direct = direct_success_lanes();
+            assert_eq!(legacy.error, direct.error, "error/status lane");
+            assert_eq!(legacy.ret0, direct.ret0, "ret0");
+            assert_eq!(legacy.ret1, direct.ret1, "ret1");
+            assert_eq!(legacy.ret2, direct.ret2, "ret2");
+            assert_eq!(legacy, direct, "every lane");
+            // And the absolute values the legacy ABI specifies.
+            assert_eq!(direct.error, 0, "success");
+            assert_eq!(direct.ret0, 0);
+            assert_eq!(direct.ret1, 0);
+            assert_eq!(
+                direct.ret2,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+                "ret2 is the NO-transfer-cap sentinel, not 0"
+            );
+            assert_ne!(direct.ret2, 0, "the HARD-STOP C defect is gone");
+        }
+
+        /// NR7's audit. Legacy `handle_ipc_reply` ends with the SAME
+        /// `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(frame, None)` pair as `handle_ipc_call`,
+        /// so both legacy directions return the same three lanes — which is why ONE shared
+        /// encoder is correct, and why the direct reply path matches legacy too.
+        ///
+        /// The audit did NOT confirm the prior assumption that NR7 already matched: before
+        /// this change the direct reply path also wrote `set_ok(0, 0, 0)`, so its `ret2`
+        /// diverged from legacy exactly as NR6's did.
+        #[test]
+        fn direct_reply_success_lanes_match_legacy_byte_for_byte() {
+            assert_legacy_handlers_share_the_success_encoding();
+            let direct = direct_success_lanes();
+            assert_eq!(
+                direct.ret2,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+                "the reply success path also returns the NO-transfer-cap sentinel"
+            );
+            assert_eq!(direct.error, 0);
+            assert_eq!(direct.ret0, 0);
+            assert_eq!(direct.ret1, 0);
+            // Both split helpers route through the ONE encoder — no per-direction encoding.
+            let split = include_str!("../syscall_split.rs");
+            assert_eq!(
+                split
+                    .matches("direct_disposition::apply_direct_disposition(frame, disposition)")
+                    .count(),
+                2,
+                "NR6 and NR7 share the single encoder"
+            );
+        }
+
+        /// Every `Failed` arm must zero all three return lanes — a failure may never leave a
+        /// stale success value behind, including the new `ret2` sentinel.
+        #[test]
+        fn failed_dispositions_leave_no_stale_success_lane() {
+            let codes = [
+                crate::kernel::syscall::SyscallError::InvalidArgs,
+                crate::kernel::syscall::SyscallError::WrongObject,
+                crate::kernel::syscall::SyscallError::ServerDied,
+                crate::kernel::syscall::SyscallError::Internal,
+            ];
+            for err in codes {
+                let mut frame =
+                    TrapFrame::new(crate::kernel::syscall::Syscall::IpcCall as usize, [0; 6]);
+                // Start from a full SUCCESS frame — the worst case for a stale lane.
+                assert_eq!(
+                    crate::kernel::direct_disposition::apply_direct_disposition(
+                        &mut frame,
+                        DirectDisposition::Completed
+                    ),
+                    Some(())
+                );
+                assert_ne!(
+                    frame.ret2, 0,
+                    "the success sentinel is present to begin with"
+                );
+                assert_eq!(
+                    crate::kernel::direct_disposition::apply_direct_disposition(
+                        &mut frame,
+                        DirectDisposition::Failed(err)
+                    ),
+                    Some(()),
+                    "a failure is handled, never declined"
+                );
+                assert_eq!(frame.error, err.code(), "{err:?}: canonical error code");
+                assert_eq!(frame.ret0, 0, "{err:?}: ret0 cleared");
+                assert_eq!(frame.ret1, 0, "{err:?}: ret1 cleared");
+                assert_eq!(
+                    frame.ret2, 0,
+                    "{err:?}: the success sentinel must NOT survive into a failure"
+                );
+            }
+        }
+
+        /// A decline must not modify the frame at all: the legacy fallback is entitled to the
+        /// frame exactly as the trap delivered it.
+        #[test]
+        fn declined_disposition_leaves_the_frame_untouched() {
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcCall as usize,
+                [11, 22, 33, 44, 55, 66],
+            );
+            frame.set_ok(0xAAAA, 0xBBBB, 0xCCCC);
+            frame.error = 0xEEEE;
+            let before = lanes_of(&frame);
+            let args_before: [usize; 6] = core::array::from_fn(|i| frame.arg(i));
+            assert_eq!(
+                crate::kernel::direct_disposition::apply_direct_disposition(
+                    &mut frame,
+                    DirectDisposition::DeclinedBeforeMutation
+                ),
+                None,
+                "a decline is NOT handled — the legacy path must run"
+            );
+            assert_eq!(lanes_of(&frame), before, "no return lane was modified");
+            let args_after: [usize; 6] = core::array::from_fn(|i| frame.arg(i));
+            assert_eq!(args_after, args_before, "no syscall argument was modified");
+            assert_eq!(
+                frame.syscall_num(),
+                crate::kernel::syscall::Syscall::IpcCall as usize,
+                "the syscall number is untouched"
+            );
+        }
+
+        /// End-to-end through the real drain: a SUCCESSFUL direct request, classified and
+        /// encoded exactly as production does, yields the legacy success lanes.
+        #[test]
+        fn successful_drain_encodes_the_legacy_success_lanes() {
+            let legacy = legacy_request_success_lanes();
+
+            let fx = fixture(true);
+            let (outcome, disposition) = drain_request(&fx, FRAMED);
+            assert!(
+                outcome.is_ok(),
+                "the direct transaction must succeed: {outcome:?}"
+            );
+            assert_eq!(disposition, DirectDisposition::Completed);
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcCall as usize,
+                [
+                    fx.send_cap_t1.0 as usize,
+                    CALLER_FRAME_VA,
+                    FRAMED.len(),
+                    0,
+                    0,
+                    fx.reply_recv_cap_t1.0 as usize,
+                ],
+            );
+            assert_eq!(
+                crate::kernel::direct_disposition::apply_direct_disposition(
+                    &mut frame,
+                    disposition
+                ),
+                Some(())
+            );
+            assert_eq!(
+                lanes_of(&frame),
+                legacy,
+                "every returned lane matches legacy"
+            );
+            teardown();
+        }
+
         // ── Structural guards on the mapping itself ───────────────────────────────────
 
         /// The split helpers classify the outcome and never discard it, and the mapping has
@@ -81581,26 +81875,15 @@ mod stage199d_delivery_projection_differential {
                     && split.contains("classify_direct_reply_outcome(&outcome)"),
                 "both helpers must classify through the typed contract"
             );
-            // Each helper has all three arms.
-            for arm in [
-                "DirectDisposition::Completed =>",
-                "DirectDisposition::DeclinedBeforeMutation => None,",
-                "DirectDisposition::Failed(err) => {",
-            ] {
-                assert_eq!(
-                    split.matches(arm).count(),
-                    2,
-                    "both directions must handle {arm}"
-                );
-            }
+            // Stage 199D HARD-STOP C: both helpers encode the frame through the SINGLE
+            // shared encoder, so neither can write a return lane of its own.
             assert_eq!(
-                split.matches("frame.set_err(err.code());").count(),
+                split
+                    .matches("direct_disposition::apply_direct_disposition(frame, disposition)")
+                    .count(),
                 2,
-                "the canonical error is encoded exactly as the global-lock handler does"
+                "both directions must encode through the shared encoder"
             );
-            // HARD-STOP C untouched: each direct helper's success arm still writes
-            // set_ok(0, 0, 0). Scoped to the two helper bodies — other split classes
-            // (DebugLog, …) legitimately use the same encoding.
             for helper in [
                 "fn try_split_ipccall_direct_into_frame",
                 "fn try_split_ipcreply_direct_into_frame",
@@ -81612,17 +81895,61 @@ mod stage199d_delivery_projection_differential {
                     .split("\n#[cfg(")
                     .next()
                     .expect("body bounded");
-                assert_eq!(
-                    body.matches("frame.set_ok(0, 0, 0);").count(),
-                    1,
-                    "{helper}: the success arm's return lanes are unchanged"
+                // The success lanes are the encoder's alone.
+                assert!(
+                    !body.contains("frame.set_ok(") && !body.contains("frame.set_ret2("),
+                    "{helper}: must not encode success return lanes itself"
                 );
-                assert_eq!(
-                    body.matches("frame.set_err(err.code());").count(),
-                    1,
-                    "{helper}: exactly one canonical error encoding"
+                // Nothing writes the frame AFTER the drain: everything past the transaction
+                // goes through the shared encoder. (The pre-drain SMP selectors legitimately
+                // write a non-mutating WouldBlock / duplicate refusal before any drain.)
+                let drain_at = body
+                    .find("drain_direct_")
+                    .expect("the helper drives a drain");
+                let after_drain = &body[drain_at..];
+                assert!(
+                    !after_drain.contains("frame.set_"),
+                    "{helper}: no return lane may be written after the drain"
                 );
             }
+
+            // The shared encoder has all three arms, and only the success arm writes lanes.
+            let disp = include_str!("../direct_disposition.rs");
+            let encoder = disp
+                .split("pub(crate) fn apply_direct_disposition(")
+                .nth(1)
+                .expect("encoder present")
+                .split("\n}\n")
+                .next()
+                .expect("encoder body bounded");
+            for arm in [
+                "DirectDisposition::Completed => {",
+                "DirectDisposition::DeclinedBeforeMutation => None,",
+                "DirectDisposition::Failed(err) => {",
+            ] {
+                assert_eq!(
+                    encoder.matches(arm).count(),
+                    1,
+                    "the encoder must handle {arm}"
+                );
+            }
+            assert!(
+                encoder.contains("frame.set_ok(0, 0, SYSCALL_NO_TRANSFER_CAP as usize);"),
+                "the success lanes must use the canonical NO-transfer-cap sentinel"
+            );
+            assert!(
+                !encoder.contains("frame.set_ok(0, 0, 0)"),
+                "ret2 = 0 on success is the HARD-STOP C defect"
+            );
+            assert!(
+                !encoder.contains("u64::MAX"),
+                "the sentinel must come from the canonical constant, not a duplicated literal"
+            );
+            assert_eq!(
+                encoder.matches("frame.set_err(err.code());").count(),
+                1,
+                "the canonical error is encoded exactly as the global-lock handler does"
+            );
 
             let disp = include_str!("../direct_disposition.rs");
             // No wildcard arm in either mapping.
@@ -81665,6 +81992,40 @@ mod stage199d_delivery_projection_differential {
         assert!(
             !core.contains("msg.payload[0..2]") && !core.contains("2 + REQUEST_DATA.len()"),
             "the oracle server must NOT reparse the two-byte inline prefix"
+        );
+        // Stage 199D HARD-STOP C: the client attests the SUCCESSFUL NR6 return lane live.
+        assert!(
+            core.contains("ipc_call_with_transfer_ret(") && core.contains("out.call_ret2 = ret2;"),
+            "the oracle client must capture the transfer-cap return lane"
+        );
+        assert!(
+            core.contains("out.call_ret2 == yarm_user_rt::syscall::SYSCALL_NO_TRANSFER_CAP"),
+            "the oracle client must compare ret2 against the canonical sentinel"
+        );
+        assert!(
+            core.contains("IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2"),
+            "the oracle client must emit the ret2 attestation marker"
+        );
+        // The round-trip completion is GATED on that attestation: a ret2 divergence suppresses
+        // `result=ok`. The evidence rides in the dedicated marker rather than in the completion
+        // literal, because `user_log` truncates at 192 bytes and that line is already at the
+        // cap — lengthening it silently clipped `result=ok` on a real boot.
+        assert!(
+            svc.contains("&& out.call_ret2_ok"),
+            "the round-trip completion must be gated on live ret2 parity"
+        );
+        let runner = include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh");
+        assert!(
+            runner.contains(
+                "IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2 ret2=18446744073709551615 expected=18446744073709551615 ret2_ok=1 result=ok"
+            ),
+            "the runner must require the live ret2 attestation with its exact value"
+        );
+        // 18446744073709551615 == u64::MAX == SYSCALL_NO_TRANSFER_CAP.
+        assert_eq!(
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+            u64::MAX,
+            "the sentinel the runner pins numerically"
         );
     }
 }
