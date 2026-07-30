@@ -41,15 +41,25 @@ pub(super) fn sender_tid_to_ret(tid: u64) -> Result<usize, SyscallError> {
     usize::try_from(tid).map_err(|_| SyscallError::Internal)
 }
 
+/// The **one canonical presence predicate** for the transfer-capability argument.
+///
+/// `SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`) is the only encoding that means "no capability".
+/// Every other value — **including a raw `0`** — names one; `transfer_cap_arg_zero_is_not_treated_as_none`
+/// pins that. Any code that needs to know whether a frame carries a transfer cap must ask
+/// here rather than re-testing the sentinel, so the direct-IPC eligibility contract and the
+/// legacy decode can never disagree about what "cap-bearing" means.
+pub(crate) fn transfer_cap_arg_present(frame: &TrapFrame) -> bool {
+    frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64 != SYSCALL_NO_TRANSFER_CAP
+}
+
 pub(super) fn transfer_cap_arg(
     _kernel: &KernelState,
     frame: &TrapFrame,
 ) -> Result<Option<CapId>, SyscallError> {
-    let raw = frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64;
-    if raw == SYSCALL_NO_TRANSFER_CAP {
+    if !transfer_cap_arg_present(frame) {
         return Ok(None);
     }
-    Ok(Some(CapId(raw)))
+    Ok(Some(CapId(frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64)))
 }
 
 pub(super) fn decode_ipc_send_timeout_ticks(frame: &TrapFrame) -> u64 {

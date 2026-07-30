@@ -935,6 +935,130 @@ path. It is the **ack lifecycle** that fails: `commit=4 consume=1 live=3`.
 proof-gated. The oracle regression (`live_cells=2 result=ok`) and the feature-off boot both
 pass with the flip held off.
 
+### 8.6.6 Transfer-cap safety and the authoritative acknowledgement lease
+
+Blockers 1–3 of §8.6.5 are closed. Blocker 4 (capacity) remains, and the flip stays held off.
+
+#### Transfer-cap safety (blocker 1)
+
+`DirectReplyFacts` now carries `transfer_cap_present`, and
+`DirectReplyEligibility::TransferCapUnsupported` declines a cap-bearing reply **before any
+mutation**, falling through to the legacy path which does the transfer. Direct capability
+transfer is still unimplemented; declining is the entire fix.
+
+Three properties make this structural rather than careful:
+
+* **One presence predicate.** `ipc_abi::transfer_cap_arg_present` is the single place the
+  `SYSCALL_NO_TRANSFER_CAP` sentinel is tested, and the legacy `transfer_cap_arg` decode is
+  built on it. So the direct contract and `ipc_reply` cannot disagree about what "cap-bearing"
+  means — including the trap that a raw `0` **is** a capability id, not an absence.
+* **The check precedes every capability resolution.** It runs before the reply object is
+  resolved, so a cap-bearing reply never reaches an endpoint incarnation, an acknowledgement
+  claim, a payload copy, or the transaction. Only the two checks that need no capability at all
+  (payload length, requester availability) outrank it.
+* **The transaction has no transfer machinery at all.** `ipccall_direct.rs` and
+  `ipccall_direct_txn.rs` contain no `transfer_cap`, `stash_transfer_handle` or
+  `validate_transfer_cap` — which is *why* the decline is necessary rather than merely prudent.
+
+NR6 needs no equivalent: `IpcCall` **repurposes** the `SYSCALL_ARG_TRANSFER_CAP` slot for the
+reply-endpoint receive capability, and the direct request path reads that slot the same way
+`handle_ipc_call` does, so no capability transfer is in flight on the request side.
+
+#### The acknowledgement lease is owned by the endpoint waiter lifecycle (blockers 2–3)
+
+Publication was driven by *blocking* and consumption by *delivery*, and the two were never
+paired. The lease now ends when its waiter is removed, for any reason.
+
+`DirectAckStore::release(endpoint, waiter)` is the non-direct terminal edge. It adds a fourth
+slot state, `Released` — terminal, spent, never consumed — and is exact in all four components
+(endpoint index, endpoint generation, waiter TID, waiter ASID). Only `Released(seq)` mutates:
+`Absent`, `StaleGeneration`, `ForeignWaiter`, `NotCommitted`, `AlreadyConsumed` and
+`AlreadyReleased` all leave the slot untouched.
+
+**Centralized in the waiter primitives, not at the terminal branches.** Every canonical closing
+edge in the kernel — direct consume, legacy delivery, timeout, cancellation, task/server death,
+endpoint destruction, stale waiter cleanup — funnels through exactly three `IpcSubsystem`
+methods:
+
+| primitive | closing edges it serves |
+| --- | --- |
+| `take_endpoint_waiter` | direct claim, `wake_waiter_for_endpoint`, `ipc_reply` wake plan, shared-region claim |
+| `clear_endpoint_waiter_if_identity` | legacy split-send delivery, recv-v2 finalize, sync rendezvous handoff |
+| `clear_endpoint_waiters_for_identity` | task/server death, timeout batch, cancellation, stale cleanup |
+
+`IpcSubsystem::release_direct_ack_lease` is called from those three and nowhere else, reading
+the live `endpoint_generations` entry so the release is generation-bearing. A guard pins that no
+terminal branch anywhere releases a lease by hand: coverage is a property of the structure, and
+a new removal path gets it for free.
+
+**The two terminal edges are mutually exclusive.** `consume` refuses a `Released` slot
+(`AckConsume::AlreadyReleased`, counted as a crossed terminal) — which is what stops a delivery
+into a departed waiter's buffers. `release` on a `Consumed` slot reports `AlreadyConsumed` and
+retires nothing; that ordering is the ordinary trace of a successful direct delivery, counted
+separately as `release_after_consume`. A deterministic 200-run race pins that exactly one of the
+two mutates, in either order.
+
+`release` takes the leaf admission guard, because it must be excluded against slot **recycling**:
+a release that observed a slot as `Committed` must never retire a different pair that was
+reserved and re-committed into that slot meanwhile. The common case — a removal on an endpoint
+that never published — is resolved lock-free before the guard is taken, so ordinary waiter
+removals pay nothing. A second 200-run race pins that a stale release cannot touch a recycled
+pair.
+
+#### Live evidence, feature-off x86_64 boot, flip temporarily enabled
+
+| | first attempt (§8.6.5) | with this increment |
+| --- | --- | --- |
+| service entries | 6 **missing**, boot timed out | **all 6 present exactly once** |
+| `PM_ELF_ZC_FAIL` | 1 (`grant_ro_unsupported`) | **0** |
+| overwrite fuse | **17** trips | **0** |
+| leases retired by their waiter | n/a (no release edge) | NR6 **52**, NR7 **64** |
+| cap-bearing replies declined | n/a (silently robbed) | **10** |
+
+```
+IPC_DIRECT_PRODUCTION_QUIESCENT dir=nr6 attempts=54 completed=53 failed=0 preflight=0
+    pre_txn=1 fallback=0 not_admitted=0 transfer_cap=0
+IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir=nr6 reserve=113 commit=113 consume=53 release=52
+    rel_after_consume=53 cancel=0 live=8 spent=0 high_watermark=8 capacity=8
+IPC_DIRECT_PRODUCTION_QUIESCENT dir=nr7 attempts=53 completed=41 failed=0 preflight=10
+    pre_txn=2 fallback=0 not_admitted=0 transfer_cap=10
+IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir=nr7 reserve=113 commit=113 consume=41 release=64
+    rel_after_consume=41 cancel=0 live=8 spent=0 high_watermark=8 capacity=8
+```
+
+**The genuine post-release high-watermark is 8 — the full capacity — and there is exactly one
+`CAPACITY_REFUSED` per store.** The eight live leases are **not** orphans; the accounting is
+exact in both directions:
+
+```text
+reserve == consume + release + cancel + live
+    nr6:  113 == 53 + 52 + 0 + 8
+    nr7:  113 == 41 + 64 + 0 + 8
+```
+
+Ten distinct servers blocked in recv-v2 over the boot, and at `INIT_IDLE_PARK_BEGIN` the
+resident services (PM, VFS, ramfs, ext4, blkcache, virtio-blk, driver manager, init) are all
+parked holding legitimate leases. The store is simply **saturated**: a ninth parked server gets
+no lease and its endpoint falls back to legacy. That is blocker 4 exactly, and resizing is out
+of scope for this increment.
+
+#### Two measurement corrections the live boot forced
+
+* **The quiescent trigger moved to `INIT_IDLE_PARK_BEGIN`.** At the previous trigger
+  (`INIT_SPAWN_V5_REPLY_RECV_OK`) the boot measured `high_watermark=2` and then went on to
+  saturate all eight slots — an early sample reported as a settled one. The bounded
+  per-direction census still fires at first use, so a boot that never reaches the park loses no
+  diagnostic.
+* **`live == 0` is not a valid quiescence requirement** for a running microkernel: a healthy
+  system always has its resident services parked in recv-v2, each holding a legitimate lease.
+  It is still reported, but `QuiescentVerdict::ok` now requires `no_orphaned_lease`
+  (`reserve == consume + release + cancel + live`) — the leak invariant that holds at any
+  instant — instead of `ack_live_zero` and `terminal_edges_balance`.
+
+Kernel log lines are capped at `PRB_MSG_MAX = 192` bytes and truncate silently, so the quiescent
+attestation is split into four lines per direction; the first version clipped its own verdict
+flags.
+
 ---
 
 ## 9. Authoring rule

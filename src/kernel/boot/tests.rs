@@ -81298,14 +81298,43 @@ mod stage199d_delivery_projection_differential {
         #[test]
         fn injected_waiter_lost_is_failed_and_never_falls_back() {
             let fx = fixture(true);
+            // CLAIM FIRST, then remove the waiter. Since Stage 199D made the acknowledgement
+            // lease owned by the waiter lifecycle, removing the waiter first would RELEASE the
+            // lease and leave nothing to claim — the drain would never run and this mapping arm
+            // would go untested. Claiming first keeps the injection honest: the transaction
+            // holds a genuine acknowledgement whose waiter has since departed.
+            let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack published");
+            let endpoint_index = ack.endpoint_index;
             fx.k.with(|s| {
                 s.with_ipc_state_mut(|ipc| {
-                    if let Some(idv) = ipc.endpoint_waiter_identity(ipc_endpoint_index_of(&fx)) {
+                    if let Some(idv) = ipc.endpoint_waiter_identity(endpoint_index) {
                         ipc.clear_endpoint_waiters_for_identity(idv);
                     }
                 })
             });
-            let (outcome, disposition) = drain_request(&fx, FRAMED);
+            // MUTUAL EXCLUSION: the direct edge already resolved this pair, so the removal
+            // released nothing — it only recorded the benign release-after-consume.
+            let store = ipccall_direct_ack::store();
+            assert_eq!(store.release_count(), 0, "consume already took this pair");
+            assert_eq!(
+                store.release_after_consume_count(),
+                1,
+                "the removal observed the direct edge had won"
+            );
+            let snapshot = IpcCallDirectSnapshot::build(
+                fx.caller,
+                fx.send_cap_t1,
+                fx.reply_recv_cap_t1,
+                FRAMED,
+            )
+            .expect("snapshot");
+            let work = DirectRequestPostWork {
+                snapshot,
+                ack,
+                ack_seq,
+            };
+            let outcome = fx.k.drain_direct_request_post_work(&work);
+            let disposition = classify_direct_request_outcome(&outcome);
             assert_eq!(outcome, Err(IpcCallDirectError::WaiterLost));
             assert_eq!(
                 disposition,
@@ -81317,14 +81346,6 @@ mod stage199d_delivery_projection_differential {
             );
             assert_no_request_leak(&fx, "waiter-lost");
             teardown();
-        }
-
-        /// The endpoint index the fixture's acknowledgement names.
-        fn ipc_endpoint_index_of(fx: &Fx) -> usize {
-            let (index, _generation) =
-                ipccall_direct_ack::sole_pair_endpoint().expect("one published pair");
-            let _ = fx;
-            index
         }
 
         // ── Declined variants: pristine slate, legacy may run ──────────────────────────
@@ -82014,10 +82035,21 @@ mod stage199d_delivery_projection_differential {
                 2,
                 "both directions count eligibility"
             );
+            // NR6 uses the base reporter (mode subset); NR7 uses the reply reporter
+            // (transfer-cap subset). Exactly one preflight decline site per direction.
             assert_eq!(
-                split.matches("COUNTERS.note_declined_preflight(").count(),
-                2,
-                "both directions count preflight declines"
+                split
+                    .matches("REQUEST_COUNTERS.note_declined_preflight(")
+                    .count(),
+                1,
+                "NR6 counts its preflight declines once"
+            );
+            assert_eq!(
+                split
+                    .matches("REPLY_COUNTERS.note_declined_preflight_reply(")
+                    .count(),
+                1,
+                "NR7 counts its preflight declines once, through the reply reporter"
             );
             // Every post-eligibility, pre-transaction decline is counted too — otherwise
             // `eligible` exceeds the terminals and the balance invariant cannot hold. A live
@@ -82059,14 +82091,24 @@ mod stage199d_delivery_projection_differential {
                 ),
                 "NR6 reports the Synchronous subset"
             );
+            // NR7's reporter takes no mode argument at all — the type system, not a
+            // convention, is what stops it from inventing one.
             assert!(
-                flat.contains("REPLY_COUNTERS.note_declined_preflight( false,"),
-                "NR7 never reports a mode decline"
+                !flat.contains("REPLY_COUNTERS.note_declined_preflight("),
+                "NR7 must not reach the mode-bearing reporter"
             );
-            // Both directions additionally report the admission decline so the
-            // production-default boot can prove no confinement decline remains.
+            assert!(
+                flat.contains(
+                    "REPLY_COUNTERS.note_declined_preflight_reply( verdict == \
+                     crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted, \
+                     verdict.is_transfer_cap_decline(), );"
+                ),
+                "NR7 reports the admission and transfer-cap subsets"
+            );
+            // Both directions report the admission decline so the production-default boot can
+            // prove no confinement decline remains.
             assert_eq!(
-                flat.matches("EndpointNotAdmitted, );").count(),
+                flat.matches("EndpointNotAdmitted,").count(),
                 2,
                 "both directions report the endpoint-admission decline separately"
             );
@@ -82615,7 +82657,8 @@ mod stage199d_production_default_guards {
     }
 
     /// The flip is HELD OFF against a recorded, reproducible live failure — not forgotten.
-    /// The doc comment carries all four blockers so nobody re-flips it blind.
+    /// The doc comment tracks every blocker and its current state, so nobody re-flips it
+    /// blind and nobody re-litigates a blocker that is already closed.
     #[test]
     fn the_held_off_flip_records_every_live_blocker() {
         let doc = MODRS
@@ -82630,20 +82673,35 @@ mod stage199d_production_default_guards {
             "the predicate says plainly that it is held off"
         );
         for blocker in [
-            "SYSCALL_ARG_TRANSFER_CAP",   // 1: capability transfer is dropped
-            "no production release path", // 2: unpaired ack lifecycle
-            "overwrite fuse",             // 3: orphans refuse re-blocking
-            "DIRECT_ACK_STORE_CAPACITY",  // 4: structural capacity pressure
+            "transfer_cap_present",      // 1: capability transfer — FIXED
+            "waiter lifecycle",          // 2: unpaired ack lifecycle — FIXED
+            "overwrite fuse",            // 3: orphans refuse re-blocking — FIXED
+            "DIRECT_ACK_STORE_CAPACITY", // 4: structural capacity — the remaining blocker
         ] {
             assert!(
                 doc.contains(blocker),
-                "the held-off record must name the {blocker} blocker"
+                "the held-off record must still account for the {blocker} blocker"
             );
         }
-        // The live evidence is named, so the claim is checkable rather than asserted.
+        // The three closed blockers are marked closed, and the open one is not.
+        assert_eq!(
+            doc.matches("**FIXED.**").count(),
+            3,
+            "three blockers are recorded as fixed"
+        );
         assert!(
-            doc.contains("PM_ELF_ZC_FAIL") && doc.contains("transferred_cap=0"),
-            "the boot markers that prove blocker 1 are recorded"
+            doc.contains("the remaining blocker"),
+            "the one open blocker is named as open"
+        );
+        // The live evidence is named, so every claim is checkable rather than asserted.
+        assert!(
+            doc.contains("PM_ELF_ZC_FAIL count=0")
+                && doc.contains("all 6 service entries present exactly once"),
+            "the boot markers that prove blocker 1 is closed are recorded"
+        );
+        assert!(
+            doc.contains("reserve == consume + release + cancel + live"),
+            "the accounting that proves the 8 live leases are not orphans is recorded"
         );
         assert!(
             !crate::kernel::boot::ipccall_direct_production_enabled(),
@@ -82922,8 +82980,8 @@ mod stage199d_production_default_guards {
         assert!(v.ok(), "a healthy direction passes: {v:?}");
         assert!(v.terminals_balance && v.eligibility_balances && v.completed_positive);
         assert!(v.no_confinement_decline && v.no_fallback_after_terminal);
-        assert!(v.ack_live_zero && v.reserve_resolves && v.commit_consumed);
-        assert!(v.watermark_bounded && v.fuses_clear);
+        assert!(v.ack_live_zero && v.reserve_resolves && v.terminal_edges_balance);
+        assert!(v.terminals_mutually_exclusive && v.watermark_bounded && v.fuses_clear);
 
         // completed == 0 is caught.
         let empty = DirectPathCounters::new();
@@ -82992,10 +83050,39 @@ mod stage199d_production_default_guards {
                 && counters.contains("QUIESCENT_ATTESTED.swap(1"),
             "the attestation is one-shot"
         );
+        // The trigger is init PARKING, not init's first successful round trip. A live boot
+        // measured `high_watermark=2` at the earlier marker and then went on to saturate all
+        // eight slots, so the early sample reported a settled state that had not happened yet.
         assert!(
             SPLIT.contains("maybe_emit_quiescent_attestation(")
-                && SPLIT.contains("msg.starts_with(\"INIT_SPAWN_V5_REPLY_RECV_OK\")"),
-            "the trigger is init's completed spawn round trip through PM"
+                && SPLIT.contains("msg.starts_with(\"INIT_IDLE_PARK_BEGIN\")"),
+            "the trigger is init parking after every spawn completed"
+        );
+        assert!(
+            !SPLIT.contains("maybe_emit_quiescent_attestation(\n                msg.starts_with(\"INIT_SPAWN_V5_REPLY_RECV_OK\")"),
+            "the early, pre-settlement trigger is not used for the quiescent sample"
+        );
+        // `live == 0` is reported but must NOT gate the verdict: a running microkernel always
+        // has its resident services parked in recv-v2, each holding a legitimate lease.
+        // CODE only — the arm above legitimately names what it excludes.
+        let ok_body: alloc::string::String = counters
+            .split("impl QuiescentVerdict {")
+            .nth(1)
+            .expect("verdict impl present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(
+            !ok_body.contains("self.ack_live_zero"),
+            "live == 0 is not a quiescence requirement for a running system"
+        );
+        assert!(
+            ok_body.contains("self.no_orphaned_lease"),
+            "the leak invariant that holds at any instant is what gates the verdict"
         );
     }
 }
@@ -83270,6 +83357,99 @@ mod stage199d_multi_pair_races {
     fn publish(store: &DirectAckStore, e: AckEndpoint, w: AckWaiter) -> u64 {
         let reservation = store.reserve(e, w).expect("reserve");
         store.commit(reservation, fields(e, w)).expect("commit")
+    }
+
+    /// RACE — the two terminal edges on ONE published pair. Whoever wins, exactly one of them
+    /// mutates: the acknowledgement is either delivered or retired, never both and never
+    /// neither, and the pair never ends up live.
+    #[test]
+    fn f_consume_races_release_and_exactly_one_terminal_wins() {
+        for run in 0..RUNS {
+            let store = Arc::new(DirectAckStore::new());
+            let (e, w) = (ep(run % DIRECT_ACK_STORE_CAPACITY, 9), waiter(31, 4));
+            publish(&store, e, w);
+            let barrier = Arc::new(Barrier::new(2));
+            let consumed = Arc::new(AtomicUsize::new(0));
+            let released = Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for t in 0..2 {
+                let (store, barrier) = (Arc::clone(&store), Arc::clone(&barrier));
+                let (consumed, released) = (Arc::clone(&consumed), Arc::clone(&released));
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    if t == 0 {
+                        if store.consume(e, Some(w)).ok().is_some() {
+                            consumed.fetch_add(1, O::Relaxed);
+                        }
+                    } else if store.release(e, w).released_seq().is_some() {
+                        released.fetch_add(1, O::Relaxed);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("join");
+            }
+            assert_eq!(
+                consumed.load(O::Relaxed) + released.load(O::Relaxed),
+                1,
+                "run {run}: exactly one terminal edge mutated"
+            );
+            assert_eq!(store.live_pair_count(), 0, "run {run}: nothing left live");
+            assert_eq!(
+                store.reserve_count(),
+                store.consume_count() + store.release_count() + store.cancel_count(),
+                "run {run}: the lifecycle balances"
+            );
+        }
+    }
+
+    /// RACE — a release against a concurrent RECYCLE of the same slot. This is the window the
+    /// admission guard exists to close: a release that observed the slot as committed must
+    /// never retire a *different* pair that was reserved and published into that slot in the
+    /// meantime.
+    #[test]
+    fn g_release_never_retires_a_recycled_pair() {
+        for run in 0..RUNS {
+            let store = Arc::new(DirectAckStore::new());
+            let (old_e, old_w) = (ep(1, 5), waiter(41, 1));
+            publish(&store, old_e, old_w);
+            // Spend it, so the slot is recyclable and the release is a duplicate.
+            assert!(store.consume(old_e, Some(old_w)).ok().is_some());
+            // A fresh pair on the SAME index, same waiter, a LATER incarnation.
+            let (new_e, new_w) = (ep(1, 6), waiter(41, 1));
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for t in 0..2 {
+                let (store, barrier) = (Arc::clone(&store), Arc::clone(&barrier));
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    if t == 0 {
+                        // The stale removal of the OLD incarnation's waiter.
+                        let _ = store.release(old_e, old_w);
+                    } else {
+                        publish(&store, new_e, new_w);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("join");
+            }
+            // Whatever the interleaving, the NEW incarnation's lease is intact: it is live and
+            // claimable, and the stale release retired nothing of it.
+            assert!(
+                store.is_claimable(new_e),
+                "run {run}: the fresh lease survived the stale release"
+            );
+            assert_eq!(
+                store.release_count(),
+                0,
+                "run {run}: the stale release retired nothing"
+            );
+            assert!(
+                store.consume(new_e, Some(new_w)).ok().is_some(),
+                "run {run}: and the fresh acknowledgement is still deliverable"
+            );
+        }
     }
 
     fn spawn_all<F>(threads: usize, barrier: Arc<Barrier>, body: F)
@@ -100648,5 +100828,930 @@ mod parallel_state_isolation {
             !crate::arch::boot_entry::has_staged_irq_description_for_test(),
             "no test may leave an IRQ description staged for the next boot"
         );
+    }
+}
+
+/// Stage 199D — **the acknowledgement lease is owned by the endpoint waiter lifecycle.**
+///
+/// A direct-IPC acknowledgement is published when a task commits a blocking recv-v2. Before
+/// this increment the only way to retire one was a direct delivery's `consume`, so
+/// publication was driven by *blocking* and consumption by *delivery* and the two were never
+/// paired: every waiter satisfied by the legacy path, a timeout, a cancellation, task or
+/// server death, endpoint destruction or stale cleanup orphaned a committed slot forever.
+/// On a live feature-off x86_64 boot that produced 17 overwrite-fuse trips and drove the
+/// bounded store toward permanent capacity refusal.
+///
+/// The lease now ends at the waiter's own removal, centralized inside the three `IpcSubsystem`
+/// waiter primitives every canonical closing edge funnels through.
+mod stage199d_ack_lease_lifecycle {
+    use super::*;
+    use crate::kernel::boot::{ipccall_direct_ack, set_ipccall_direct_proof_enabled};
+    use crate::kernel::direct_ack_store::{
+        AckConsume, AckEndpoint, AckFields, AckRelease, AckWaiter, DIRECT_ACK_STORE_CAPACITY,
+        DirectAckStore,
+    };
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Asid, Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const PAYLOAD_VA: usize = 0x4000;
+    const META_VA: usize = 0x4080;
+
+    // ── Store-level: the release edge itself ──────────────────────────────────────────
+
+    fn ep(index: usize, generation: u64) -> AckEndpoint {
+        AckEndpoint::new(index, generation)
+    }
+    fn w(tid: u64, asid: u16) -> AckWaiter {
+        AckWaiter::new(tid, asid)
+    }
+
+    /// Publish one committed pair and return the store holding it.
+    fn store_with_pair(endpoint: AckEndpoint, waiter: AckWaiter) -> DirectAckStore {
+        let store = DirectAckStore::new();
+        let r = store.reserve(endpoint, waiter).expect("reserve");
+        store
+            .commit(
+                r,
+                AckFields {
+                    endpoint,
+                    waiter,
+                    payload_user_ptr: 0x9000,
+                    payload_user_len: 64,
+                    meta_user_ptr: 0x9100,
+                    meta_user_len: 40,
+                },
+            )
+            .expect("commit");
+        store
+    }
+
+    /// The happy edge: the exact waiter departs, the lease ends once, the slot is spent.
+    #[test]
+    fn an_exact_release_retires_the_lease_exactly_once() {
+        let (e, waiter) = (ep(3, 7), w(11, 2));
+        let store = store_with_pair(e, waiter);
+        assert!(store.is_claimable(e));
+
+        let seq = store.release(e, waiter).released_seq().expect("released");
+        assert_ne!(seq, 0, "the retired publication sequence is reported");
+        assert_eq!(store.release_count(), 1);
+        assert_eq!(store.live_pair_count(), 0, "the pair is no longer live");
+        assert_eq!(store.released_pair_count(), 1, "and is findable as spent");
+        assert!(!store.is_claimable(e), "a released lease is not claimable");
+        assert_eq!(store.snapshot(e), None, "and yields no acknowledgement");
+
+        // EXACTLY ONCE: a second release mutates nothing and is classified as the duplicate.
+        assert_eq!(store.release(e, waiter), AckRelease::AlreadyReleased);
+        assert_eq!(store.release_count(), 1, "still one release");
+        assert_eq!(store.duplicate_release_rejection_count(), 1);
+    }
+
+    /// Release is exact in the endpoint *incarnation*: a pair published for an earlier
+    /// generation of the same index survives a release aimed at a later one, and vice versa.
+    #[test]
+    fn a_stale_generation_release_mutates_nothing() {
+        let (e, waiter) = (ep(3, 7), w(11, 2));
+        let store = store_with_pair(e, waiter);
+
+        for wrong in [ep(3, 6), ep(3, 8), ep(3, 0)] {
+            assert_eq!(store.release(wrong, waiter), AckRelease::StaleGeneration);
+        }
+        assert_eq!(store.release_count(), 0, "nothing was retired");
+        assert!(store.is_claimable(e), "the real lease is untouched");
+        assert_eq!(store.stale_generation_rejection_count(), 3);
+        // A different endpoint index is simply absent — and deliberately uncounted, because
+        // it is what almost every waiter removal in the kernel looks like.
+        assert_eq!(store.release(ep(4, 7), waiter), AckRelease::Absent);
+        assert_eq!(
+            store.stale_generation_rejection_count(),
+            3,
+            "absent ≠ stale"
+        );
+    }
+
+    /// Release is exact in the waiter incarnation: a replacement task that reused the numeric
+    /// TID with a fresh ASID can never retire its predecessor's lease.
+    #[test]
+    fn a_foreign_waiter_release_mutates_nothing() {
+        let (e, waiter) = (ep(3, 7), w(11, 2));
+        let store = store_with_pair(e, waiter);
+
+        assert_eq!(store.release(e, w(11, 9)), AckRelease::ForeignWaiter);
+        assert_eq!(store.release(e, w(12, 2)), AckRelease::ForeignWaiter);
+        assert_eq!(store.release_count(), 0);
+        assert_eq!(store.foreign_waiter_rejection_count(), 2);
+        assert!(store.is_claimable(e), "the real lease is untouched");
+        // ...and the real waiter still can.
+        assert!(store.release(e, waiter).released_seq().is_some());
+    }
+
+    /// A reservation is the publisher's, not the waiter's: releasing one mutates nothing, so
+    /// the publisher's own commit-time re-verify stays the authority.
+    #[test]
+    fn releasing_a_reservation_mutates_nothing() {
+        let (e, waiter) = (ep(3, 7), w(11, 2));
+        let store = DirectAckStore::new();
+        let r = store.reserve(e, waiter).expect("reserve");
+
+        assert_eq!(store.release(e, waiter), AckRelease::NotCommitted);
+        assert_eq!(store.release_count(), 0);
+        assert!(store.cancel(r), "the publisher can still cancel its own");
+        assert_eq!(store.cancel_count(), 1);
+    }
+
+    // ── The two terminal edges are mutually exclusive ─────────────────────────────────
+
+    /// Direct consume first: the removal that follows finds the pair already consumed and
+    /// retires nothing. This is the ordinary shape of a successful direct delivery.
+    #[test]
+    fn consume_then_release_is_benign_and_retires_nothing() {
+        let (e, waiter) = (ep(3, 7), w(11, 2));
+        let store = store_with_pair(e, waiter);
+
+        assert!(store.consume(e, Some(waiter)).ok().is_some());
+        assert_eq!(store.release(e, waiter), AckRelease::AlreadyConsumed);
+        assert_eq!(store.release_count(), 0, "the direct edge already won");
+        assert_eq!(store.release_after_consume_count(), 1);
+        assert_eq!(
+            store.crossed_terminal_rejection_count(),
+            0,
+            "this order is expected, not a crossing"
+        );
+        assert_eq!(store.consume_count(), 1);
+    }
+
+    /// Release first: a direct claim that arrives afterwards is REFUSED. Without this the
+    /// direct path would copy a reply into the buffers of a task that is no longer waiting.
+    #[test]
+    fn release_then_consume_is_refused_as_a_crossed_terminal() {
+        let (e, waiter) = (ep(3, 7), w(11, 2));
+        let store = store_with_pair(e, waiter);
+
+        assert!(store.release(e, waiter).released_seq().is_some());
+        assert_eq!(store.consume(e, Some(waiter)), AckConsume::AlreadyReleased);
+        // The identity-blind consumer is refused too — a released lease is gone for everyone.
+        assert_eq!(store.consume(e, None), AckConsume::AlreadyReleased);
+        assert_eq!(store.consume_count(), 0, "nothing was handed out");
+        assert_eq!(store.crossed_terminal_rejection_count(), 2);
+        assert_eq!(store.release_count(), 1);
+    }
+
+    /// Whichever edge wins, exactly one of them mutates — never both, never neither.
+    #[test]
+    fn every_ordering_produces_exactly_one_mutating_terminal() {
+        for release_first in [false, true] {
+            let (e, waiter) = (ep(1, 1), w(5, 1));
+            let store = store_with_pair(e, waiter);
+            if release_first {
+                let _ = store.release(e, waiter);
+                let _ = store.consume(e, Some(waiter));
+            } else {
+                let _ = store.consume(e, Some(waiter));
+                let _ = store.release(e, waiter);
+            }
+            assert_eq!(
+                store.consume_count() + store.release_count(),
+                1,
+                "release_first={release_first}: exactly one mutating terminal"
+            );
+            assert_eq!(store.reserve_count(), 1);
+            assert_eq!(
+                store.reserve_count(),
+                store.consume_count() + store.release_count() + store.cancel_count(),
+                "release_first={release_first}: the lifecycle balances"
+            );
+            assert_eq!(store.live_pair_count(), 0);
+        }
+    }
+
+    /// A released slot is spent, so it is recyclable — which is what turns the orphan leak
+    /// back into bounded, self-limiting occupancy. Without recycling, a store whose leases
+    /// all ended through the non-direct edge would still refuse every new reservation.
+    #[test]
+    fn released_slots_are_recycled_and_relieve_capacity() {
+        let store = DirectAckStore::new();
+        // Fill the store, then end every lease through the NON-direct edge.
+        for i in 0..DIRECT_ACK_STORE_CAPACITY {
+            let (e, waiter) = (ep(i, 1), w(100 + i as u64, 1));
+            let r = store.reserve(e, waiter).expect("reserve");
+            store
+                .commit(
+                    r,
+                    AckFields {
+                        endpoint: e,
+                        waiter,
+                        payload_user_ptr: 0,
+                        payload_user_len: 0,
+                        meta_user_ptr: 0,
+                        meta_user_len: 0,
+                    },
+                )
+                .expect("commit");
+        }
+        assert_eq!(store.live_pair_count(), DIRECT_ACK_STORE_CAPACITY);
+        // One more would be refused right now — this is exactly the live failure mode.
+        assert!(store.reserve(ep(99, 1), w(999, 1)).is_err());
+        assert_eq!(store.capacity_refusal_count(), 1);
+
+        for i in 0..DIRECT_ACK_STORE_CAPACITY {
+            assert!(
+                store
+                    .release(ep(i, 1), w(100 + i as u64, 1))
+                    .released_seq()
+                    .is_some()
+            );
+        }
+        assert_eq!(store.live_pair_count(), 0, "no orphan survives");
+        assert_eq!(store.released_pair_count(), DIRECT_ACK_STORE_CAPACITY);
+
+        // And the store admits a fresh pair again.
+        let r = store.reserve(ep(99, 1), w(999, 1)).expect("recycled");
+        assert_eq!(r.endpoint(), ep(99, 1));
+        assert_eq!(
+            store.capacity_refusal_count(),
+            1,
+            "no further capacity refusal"
+        );
+        assert!(store.occupancy_high_watermark() <= DIRECT_ACK_STORE_CAPACITY);
+    }
+
+    /// The released slot keeps its endpoint key (so duplicates stay detectable) but drops the
+    /// departed waiter's identity and its userspace destination pointers.
+    #[test]
+    fn a_released_lease_retains_no_waiter_identity_or_user_pointer() {
+        let (e, waiter) = (ep(3, 7), w(11, 2));
+        let store = store_with_pair(e, waiter);
+        assert!(store.release(e, waiter).released_seq().is_some());
+        assert_eq!(
+            store.snapshot(e),
+            None,
+            "no acknowledgement fields survive a released lease"
+        );
+        // Still findable — that is what makes the duplicate distinguishable from absent.
+        assert_eq!(store.release(e, waiter), AckRelease::AlreadyReleased);
+        assert_ne!(store.release(ep(4, 7), waiter), AckRelease::AlreadyReleased);
+    }
+
+    /// Multiple independent pairs resolve independently: retiring one lease leaves every
+    /// other pair claimable, at its own exact incarnation.
+    #[test]
+    fn releasing_one_pair_leaves_every_other_pair_intact() {
+        let store = DirectAckStore::new();
+        for i in 0..4usize {
+            let (e, waiter) = (ep(i, (i as u64) + 1), w(20 + i as u64, 1));
+            let r = store.reserve(e, waiter).expect("reserve");
+            store
+                .commit(
+                    r,
+                    AckFields {
+                        endpoint: e,
+                        waiter,
+                        payload_user_ptr: 0,
+                        payload_user_len: 0,
+                        meta_user_ptr: 0,
+                        meta_user_len: 0,
+                    },
+                )
+                .expect("commit");
+        }
+        assert!(store.release(ep(1, 2), w(21, 1)).released_seq().is_some());
+        // Pair 1 is gone; 0, 2 and 3 are untouched and still claimable.
+        assert!(!store.is_claimable(ep(1, 2)));
+        for i in [0usize, 2, 3] {
+            assert!(
+                store.is_claimable(ep(i, (i as u64) + 1)),
+                "pair {i} untouched"
+            );
+        }
+        assert_eq!(store.live_pair_count(), 3);
+        assert_eq!(store.release_count(), 1);
+        assert_eq!(store.stale_generation_rejection_count(), 0);
+        assert_eq!(store.foreign_waiter_rejection_count(), 0);
+    }
+
+    // ── Kernel-level: every canonical closing edge ───────────────────────────────────
+
+    struct Fx {
+        k: SharedKernel,
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        server: crate::kernel::boot::ReceiverWaiterIdentity,
+    }
+
+    /// One server (tid 2) committed-blocked in recv-v2 on a request endpoint, with its
+    /// acknowledgement published exactly as a production recv commit publishes it.
+    fn fixture() -> Fx {
+        ipccall_direct_ack::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid2 = k.with(|state| {
+            state.register_task(2).expect("t2");
+            let (asid2, aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(2, asid2).expect("b2");
+            state
+                .map_user_page(
+                    aspace2,
+                    VirtAddr(PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xB000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map");
+            let (_e, _send, req_recv) = state.create_endpoint(4).expect("req ep");
+            let req_recv_t2 = state
+                .grant_capability_task_to_task(0, req_recv, 2)
+                .expect("recv t2");
+            state.enqueue_current_cpu(2).expect("enq2");
+            state.dispatch_next_task().expect("disp");
+            while state.current_tid() != Some(2) {
+                state.yield_current().expect("switch");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [req_recv_t2.0 as usize, PAYLOAD_VA, 8, META_VA, 40, 0],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(matches!(state.task_status(2), Some(TaskStatus::Blocked(_))));
+            asid2
+        });
+        let (endpoint_index, endpoint_generation) =
+            ipccall_direct_ack::sole_pair_endpoint().expect("recv commit published one pair");
+        assert!(
+            ipccall_direct_ack::sole_is_claimable(),
+            "the lease starts live"
+        );
+        Fx {
+            k,
+            endpoint_index,
+            endpoint_generation,
+            server: crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), asid2),
+        }
+    }
+
+    fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        ipccall_direct_ack::reset();
+    }
+
+    /// Every closing edge must leave the store in the same state: lease retired exactly once,
+    /// nothing live, nothing claimable, and no fuse tripped.
+    fn assert_lease_retired(edge: &str) {
+        let store = ipccall_direct_ack::store();
+        assert_eq!(store.release_count(), 1, "{edge}: the lease was retired");
+        assert_eq!(store.live_pair_count(), 0, "{edge}: no orphan survives");
+        assert!(
+            !ipccall_direct_ack::sole_is_claimable(),
+            "{edge}: nothing claimable"
+        );
+        assert_eq!(
+            ipccall_direct_ack::sole_claim(),
+            None,
+            "{edge}: a direct claim after the edge yields nothing"
+        );
+        assert_eq!(
+            store.reserve_count(),
+            store.consume_count() + store.release_count() + store.cancel_count(),
+            "{edge}: the lifecycle balances"
+        );
+        assert_eq!(store.endpoint_live_refusal_count(), 0, "{edge}: no fuse");
+        assert_eq!(store.stale_generation_rejection_count(), 0, "{edge}: exact");
+        assert_eq!(store.foreign_waiter_rejection_count(), 0, "{edge}: exact");
+        assert_eq!(store.duplicate_release_rejection_count(), 0, "{edge}: once");
+    }
+
+    /// CLOSING EDGE — task / server death (`clear_ipc_waiters_for_tid`, the real exit and
+    /// death sweep).
+    #[test]
+    fn task_death_retires_the_lease() {
+        let fx = fixture();
+        fx.k.with(|s| s.clear_ipc_waiters_for_tid(2));
+        assert_lease_retired("task-death");
+        teardown();
+    }
+
+    /// CLOSING EDGE — legacy delivery (`ipc_clear_plain_receiver_waiter_only`, the recv-v2
+    /// split-send finalizer). This is the edge that produced the live orphan leak: an
+    /// ordinary legacy-delivered message satisfied the waiter and left the pair committed.
+    #[test]
+    fn legacy_delivery_retires_the_lease() {
+        let fx = fixture();
+        fx.k.with(|s| s.ipc_clear_plain_receiver_waiter_only(fx.endpoint_index, ThreadId(2)));
+        assert_lease_retired("legacy-delivery");
+        teardown();
+    }
+
+    /// CLOSING EDGE — endpoint wake / destruction (`wake_waiter_for_endpoint`, which takes
+    /// the waiter unconditionally).
+    #[test]
+    fn endpoint_wake_retires_the_lease() {
+        let fx = fixture();
+        fx.k.with(|s| s.wake_waiter_for_endpoint(fx.endpoint_index).expect("wake"));
+        assert_lease_retired("endpoint-wake");
+        teardown();
+    }
+
+    /// CLOSING EDGE — timeout / cancellation / stale cleanup, which all clear by complete
+    /// identity through the same sweep primitive.
+    #[test]
+    fn identity_sweep_retires_the_lease() {
+        let fx = fixture();
+        fx.k.with(|s| {
+            s.with_ipc_state_mut(|ipc| ipc.clear_endpoint_waiters_for_identity(fx.server))
+        });
+        assert_lease_retired("identity-sweep");
+        teardown();
+    }
+
+    /// A sweep for a DIFFERENT identity removes no waiter and retires no lease — the stale
+    /// cleanup of a replacement task cannot rob its predecessor.
+    #[test]
+    fn a_foreign_identity_sweep_retires_nothing() {
+        let fx = fixture();
+        let foreign = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), Asid(0xBEE));
+        fx.k.with(|s| s.with_ipc_state_mut(|ipc| ipc.clear_endpoint_waiters_for_identity(foreign)));
+        let store = ipccall_direct_ack::store();
+        assert_eq!(store.release_count(), 0, "no lease was retired");
+        assert_eq!(store.foreign_waiter_rejection_count(), 0, "and none tried");
+        assert!(
+            ipccall_direct_ack::sole_is_claimable(),
+            "the real lease is untouched"
+        );
+        teardown();
+    }
+
+    /// MIXED RACE — the direct edge wins, then the waiter is removed. Exactly one mutating
+    /// terminal, and the removal is recorded as the benign release-after-consume.
+    #[test]
+    fn direct_consume_then_waiter_removal_is_one_terminal() {
+        let fx = fixture();
+        assert!(ipccall_direct_ack::sole_claim().is_some(), "direct wins");
+        fx.k.with(|s| s.clear_ipc_waiters_for_tid(2));
+        let store = ipccall_direct_ack::store();
+        assert_eq!(store.consume_count(), 1);
+        assert_eq!(store.release_count(), 0);
+        assert_eq!(store.release_after_consume_count(), 1);
+        assert_eq!(store.crossed_terminal_rejection_count(), 0);
+        assert_eq!(
+            store.reserve_count(),
+            store.consume_count() + store.release_count() + store.cancel_count()
+        );
+        assert_eq!(store.live_pair_count(), 0);
+        teardown();
+    }
+
+    /// MIXED RACE — the waiter is removed first, then a direct claim arrives. The claim is
+    /// REFUSED, which is precisely what stops a delivery into a departed waiter's buffers.
+    #[test]
+    fn waiter_removal_then_direct_claim_refuses_the_claim() {
+        let fx = fixture();
+        fx.k.with(|s| s.clear_ipc_waiters_for_tid(2));
+        assert_eq!(
+            ipccall_direct_ack::sole_claim(),
+            None,
+            "the departed waiter's lease cannot be claimed"
+        );
+        let store = ipccall_direct_ack::store();
+        assert_eq!(store.release_count(), 1);
+        assert_eq!(store.consume_count(), 0);
+        assert_eq!(store.crossed_terminal_rejection_count(), 1);
+        assert_eq!(store.live_pair_count(), 0);
+        teardown();
+    }
+
+    /// The endpoint GENERATION carried into the release comes from the live generation table,
+    /// so a lease published for an earlier incarnation of a recycled endpoint slot is never
+    /// retired by the new incarnation's waiter.
+    #[test]
+    fn release_uses_the_live_endpoint_generation() {
+        let fx = fixture();
+        let store = ipccall_direct_ack::store();
+        // A pair on the SAME index but a different incarnation is not this waiter's lease.
+        assert_eq!(
+            store.release(
+                AckEndpoint::new(fx.endpoint_index, fx.endpoint_generation.wrapping_add(1)),
+                AckWaiter::new(fx.server.tid.0, fx.server.asid.0),
+            ),
+            AckRelease::StaleGeneration
+        );
+        assert!(ipccall_direct_ack::sole_is_claimable(), "still live");
+        // The real removal, at the real generation, does retire it.
+        fx.k.with(|s| s.clear_ipc_waiters_for_tid(2));
+        assert_eq!(store.release_count(), 1);
+        teardown();
+    }
+
+    // ── Quiescence ───────────────────────────────────────────────────────────────────
+
+    /// After a mixed workload — some pairs consumed directly, some released by their waiter,
+    /// some cancelled before publication — the store balances and no fuse has tripped.
+    #[test]
+    fn a_mixed_workload_balances_at_quiescence() {
+        let store = DirectAckStore::new();
+        let mut consumed = 0u64;
+        let mut released = 0u64;
+        let mut cancelled = 0u64;
+        for i in 0..24usize {
+            let (e, waiter) = (ep(i % 6, 3), w(40 + i as u64, 1));
+            let r = store.reserve(e, waiter).expect("reserve");
+            if i % 4 == 3 {
+                // Abandoned before publication.
+                assert!(store.cancel(r));
+                cancelled += 1;
+                continue;
+            }
+            store
+                .commit(
+                    r,
+                    AckFields {
+                        endpoint: e,
+                        waiter,
+                        payload_user_ptr: 0,
+                        payload_user_len: 0,
+                        meta_user_ptr: 0,
+                        meta_user_len: 0,
+                    },
+                )
+                .expect("commit");
+            if i % 2 == 0 {
+                assert!(store.consume(e, Some(waiter)).ok().is_some());
+                consumed += 1;
+                // The waiter departs afterwards, as it always does on a delivery.
+                assert_eq!(store.release(e, waiter), AckRelease::AlreadyConsumed);
+            } else {
+                assert!(store.release(e, waiter).released_seq().is_some());
+                released += 1;
+            }
+        }
+        assert_eq!(store.consume_count(), consumed);
+        assert_eq!(store.release_count(), released);
+        assert_eq!(store.cancel_count(), cancelled);
+        // The invariant this whole increment exists to make true.
+        assert_eq!(
+            store.reserve_count(),
+            store.consume_count() + store.release_count() + store.cancel_count(),
+            "reserve == consume + release + cancel"
+        );
+        assert_eq!(store.live_pair_count(), 0, "live == 0");
+        assert_eq!(store.endpoint_live_refusal_count(), 0, "no overwrite fuse");
+        assert_eq!(store.capacity_refusal_count(), 0, "no capacity pressure");
+        assert_eq!(store.stale_generation_rejection_count(), 0, "no stale");
+        assert_eq!(store.foreign_waiter_rejection_count(), 0, "no foreign");
+        assert_eq!(store.duplicate_consume_rejection_count(), 0, "no duplicate");
+        assert_eq!(store.duplicate_release_rejection_count(), 0, "no duplicate");
+        assert_eq!(store.crossed_terminal_rejection_count(), 0, "no crossing");
+        assert_eq!(store.not_committed_rejection_count(), 0);
+        assert!(store.occupancy_high_watermark() <= DIRECT_ACK_STORE_CAPACITY);
+        // The quiescent verdict agrees.
+        let counters = crate::kernel::direct_ipc_counters::DirectPathCounters::new();
+        counters.note_attempt();
+        counters.note_eligible();
+        counters.note_completed();
+        let v = crate::kernel::direct_ipc_counters::quiescent_verdict(&counters, &store);
+        assert!(v.terminal_edges_balance && v.terminals_mutually_exclusive && v.ack_live_zero);
+        assert!(v.fuses_clear && v.watermark_bounded, "{v:?}");
+    }
+
+    /// **The regression this increment exists for.** Without the lease being owned by the
+    /// waiter lifecycle, repeated ordinary legacy-satisfied recv cycles on one endpoint
+    /// orphan a slot each time, trip the overwrite fuse on every re-block, and exhaust the
+    /// bounded store. With it, the same workload is flat.
+    #[test]
+    fn repeated_legacy_satisfied_cycles_do_not_accumulate_orphans() {
+        let store = DirectAckStore::new();
+        for round in 0..(DIRECT_ACK_STORE_CAPACITY as u64 * 4) {
+            let (e, waiter) = (ep(2, 5), w(77, 1));
+            let r = store
+                .reserve(e, waiter)
+                .unwrap_or_else(|err| panic!("round {round}: reserve refused ({err:?})"));
+            store
+                .commit(
+                    r,
+                    AckFields {
+                        endpoint: e,
+                        waiter,
+                        payload_user_ptr: 0,
+                        payload_user_len: 0,
+                        meta_user_ptr: 0,
+                        meta_user_len: 0,
+                    },
+                )
+                .expect("commit");
+            // Satisfied by the LEGACY path: the waiter departs, no direct delivery happens.
+            assert!(store.release(e, waiter).released_seq().is_some());
+            assert_eq!(
+                store.live_pair_count(),
+                0,
+                "round {round}: nothing orphaned"
+            );
+        }
+        assert_eq!(
+            store.endpoint_live_refusal_count(),
+            0,
+            "the overwrite fuse never trips: each cycle's lease ended with its waiter"
+        );
+        assert_eq!(
+            store.capacity_refusal_count(),
+            0,
+            "capacity never pressured"
+        );
+        assert_eq!(store.occupancy_high_watermark(), 1, "one pair at a time");
+        assert_eq!(
+            store.reserve_count(),
+            store.release_count(),
+            "every reservation ended at the non-direct edge"
+        );
+    }
+
+    // ── Centralization guards ────────────────────────────────────────────────────────
+
+    /// The lease release lives INSIDE the waiter primitives, and every canonical closing edge
+    /// reaches it only by removing a waiter. No terminal branch anywhere in the kernel
+    /// releases a lease by hand — which is what makes coverage structural rather than a
+    /// matter of remembering.
+    #[test]
+    fn the_release_is_centralized_in_the_waiter_primitives() {
+        let ipc_state = include_str!("ipc_state.rs");
+        // Exactly one release helper, called from exactly the three removal primitives.
+        assert_eq!(
+            ipc_state
+                .matches("fn release_direct_ack_lease(&self, idx: usize")
+                .count(),
+            1,
+            "one centralized lease-release helper"
+        );
+        assert_eq!(
+            ipc_state.matches("self.release_direct_ack_lease(").count(),
+            3,
+            "take_endpoint_waiter, clear_endpoint_waiter_if_identity and the identity sweep"
+        );
+        for primitive in [
+            "pub(crate) fn take_endpoint_waiter(&mut self, idx: usize)",
+            "pub(crate) fn clear_endpoint_waiter_if_identity(",
+            "pub(crate) fn clear_endpoint_waiters_for_identity(",
+        ] {
+            let body = ipc_state
+                .split(primitive)
+                .nth(1)
+                .expect("primitive present")
+                .split("\n    }\n")
+                .next()
+                .expect("body bounded");
+            assert!(
+                body.contains("release_direct_ack_lease("),
+                "{primitive}: retires the lease of the waiter it removes"
+            );
+        }
+        // The helper asks BOTH stores, at the live endpoint generation.
+        let helper = ipc_state
+            .split("fn release_direct_ack_lease(&self, idx: usize")
+            .nth(1)
+            .expect("helper present")
+            .split("\n    }\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            helper.contains("self.endpoint_generations.get(idx)"),
+            "the release is generation-bearing"
+        );
+        assert!(
+            helper.contains("ipccall_direct_ack::release(idx, generation, waiter)")
+                && helper.contains("ipcreply_direct_ack::release(idx, generation, waiter)"),
+            "both blocked-server and blocked-caller leases are retired"
+        );
+    }
+
+    /// No ad-hoc release is scattered across terminal branches: outside the one centralized
+    /// helper, nothing in the kernel calls the stores' release entry points.
+    #[test]
+    fn no_terminal_branch_releases_a_lease_by_hand() {
+        for (name, src) in [
+            ("runtime.rs", include_str!("../../runtime.rs")),
+            ("syscall_split.rs", include_str!("../syscall_split.rs")),
+            (
+                "ipccall_direct_txn.rs",
+                include_str!("../ipccall_direct_txn.rs"),
+            ),
+            ("shared_region_txn.rs", include_str!("shared_region_txn.rs")),
+            ("syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+        ] {
+            for forbidden in [
+                "ipccall_direct_ack::release(",
+                "ipcreply_direct_ack::release(",
+                "release_endpoint_index(",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "{name}: must not release a lease directly ({forbidden}) — \
+                     removing the waiter is what ends the lease"
+                );
+            }
+        }
+        // `release_endpoint_index` survives only as the hosted fixture recycler.
+        let modrs = include_str!("mod.rs");
+        assert_eq!(
+            modrs.matches("STORE.release_endpoint_index(").count(),
+            2,
+            "only the two hosted-only publish shortcuts recycle a slot by index"
+        );
+        for line in modrs
+            .lines()
+            .filter(|l| l.contains("STORE.release_endpoint_index("))
+        {
+            let _ = line;
+        }
+        assert_eq!(
+            modrs
+                .matches("#[cfg(feature = \"hosted-dev\")]\n        STORE.release_endpoint_index(")
+                .count(),
+            2,
+            "both are hosted-only"
+        );
+    }
+}
+
+/// Stage 199D — **transfer-capability safety on the direct reply path.**
+///
+/// Legacy `ipc_reply` reads `SYSCALL_ARG_TRANSFER_CAP`, validates it and stashes a transfer
+/// handle that the caller's `recv` installs. The direct NR7 transaction copies payload and
+/// metadata and wakes the caller; it mints, stashes and installs nothing. Servicing a
+/// cap-bearing reply off-lock therefore delivered the payload and **silently dropped the
+/// capability** — live, that showed up as `PM_VFS_REPLY_FULL transferred_cap=0` →
+/// `PM_ELF_ZC_FAIL reason=grant_ro_unsupported`, and the blkcache / virtio-blk /
+/// driver-manager chain never spawned.
+///
+/// Direct capability transfer is deliberately **not** implemented here. A cap-bearing reply
+/// declines before any mutation and the legacy path does the transfer.
+mod stage199d_transfer_cap_safety {
+    use crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP;
+    use crate::kernel::syscall::ipc_abi::transfer_cap_arg_present;
+    use crate::kernel::trapframe::TrapFrame;
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+
+    fn frame_with_transfer_arg(raw: usize) -> TrapFrame {
+        let mut frame = TrapFrame::zeroed();
+        frame.set_arg(crate::kernel::syscall::SYSCALL_ARG_TRANSFER_CAP, raw);
+        frame
+    }
+
+    /// `SYSCALL_NO_TRANSFER_CAP` is the ONLY encoding that means "no capability". A raw `0` is
+    /// a capability id, which is exactly the trap a hand-rolled `!= 0` test would fall into.
+    #[test]
+    fn only_the_sentinel_counts_as_absent() {
+        assert!(!transfer_cap_arg_present(&frame_with_transfer_arg(
+            SYSCALL_NO_TRANSFER_CAP as usize
+        )));
+        for raw in [0usize, 1, 2, 65539, usize::MAX - 1] {
+            assert!(
+                transfer_cap_arg_present(&frame_with_transfer_arg(raw)),
+                "raw {raw} names a capability"
+            );
+        }
+        // A zeroed frame reads as PRESENT (cap id 0) — fail-closed for the direct path, which
+        // will decline rather than assume there is nothing to transfer.
+        assert!(transfer_cap_arg_present(&TrapFrame::zeroed()));
+    }
+
+    /// There is ONE presence predicate, and the legacy decode is built on it — so the direct
+    /// eligibility contract and `ipc_reply` can never disagree about what "cap-bearing" means.
+    #[test]
+    fn the_legacy_decode_is_built_on_the_same_predicate() {
+        let abi = include_str!("../syscall/ipc_abi.rs");
+        assert!(
+            abi.contains("pub(crate) fn transfer_cap_arg_present(frame: &TrapFrame) -> bool {"),
+            "the canonical presence predicate exists"
+        );
+        let decode = abi
+            .split("pub(super) fn transfer_cap_arg(")
+            .nth(1)
+            .expect("legacy decode present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            decode.contains("if !transfer_cap_arg_present(frame) {"),
+            "the legacy decode delegates to the canonical predicate"
+        );
+        assert!(
+            !decode.contains("== SYSCALL_NO_TRANSFER_CAP"),
+            "the sentinel is tested in exactly one place"
+        );
+        // And the direct path asks the same question the same way.
+        assert!(
+            SPLIT.contains(
+                "transfer_cap_present: crate::kernel::syscall::ipc_abi::transfer_cap_arg_present(frame)"
+            ),
+            "the direct reply path uses the canonical predicate, not its own sentinel test"
+        );
+    }
+
+    /// The direct reply transaction has no capability-transfer machinery at all. This is the
+    /// structural reason the decline is *necessary* rather than merely cautious: there is
+    /// nothing in the transaction that could carry a capability even if it wanted to.
+    #[test]
+    fn the_direct_reply_transaction_cannot_transfer_a_capability() {
+        for (name, src) in [
+            ("ipccall_direct.rs", include_str!("../ipccall_direct.rs")),
+            (
+                "ipccall_direct_txn.rs",
+                include_str!("../ipccall_direct_txn.rs"),
+            ),
+        ] {
+            for absent in [
+                "transfer_cap",
+                "stash_transfer_handle",
+                "transfer_handle",
+                "validate_transfer_cap",
+            ] {
+                assert!(
+                    !src.contains(absent),
+                    "{name}: the direct transaction has no {absent} — which is why a \
+                     cap-bearing reply must decline instead of being serviced"
+                );
+            }
+        }
+    }
+
+    /// The decline happens in the eligibility preflight, whose `None` arm returns before the
+    /// acknowledgement claim, the payload copy and the transaction. So a cap-bearing reply
+    /// cannot enter the direct transaction: it is stopped by control flow, not by a check
+    /// inside the transaction that could be reordered or forgotten.
+    #[test]
+    fn the_decline_precedes_every_mutation_in_the_reply_path() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("NR7 helper present")
+            .split("\n#[cfg(feature = \"hosted-dev\")]")
+            .next()
+            .expect("body bounded");
+        let flat = body
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        let decline_at = flat
+            .find("REPLY_COUNTERS.note_declined_preflight_reply(")
+            .expect("the preflight decline is reported");
+        // Every mutating or user-memory-touching step comes AFTER the decline arm.
+        for later in [
+            "ipcreply_direct_ack::claim(",
+            "copy_from_user_asid_split_read(",
+            "IpcReplyDirectSnapshot::build(",
+            "drain_direct_reply_post_work(",
+        ] {
+            let at = flat
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} present in the NR7 helper"));
+            assert!(
+                decline_at < at,
+                "the transfer-cap decline must precede {later}"
+            );
+        }
+        // The decline arm itself returns — it does not fall through.
+        assert!(
+            flat[decline_at..].starts_with(
+                "REPLY_COUNTERS.note_declined_preflight_reply( verdict == \
+                 crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted, \
+                 verdict.is_transfer_cap_decline(), ); return None;"
+            ),
+            "the preflight decline returns None so the legacy path runs"
+        );
+    }
+
+    /// The transfer-cap decline is observable on a live boot, as a breakdown of the preflight
+    /// declines rather than a new terminal bucket — so the balance invariant is untouched and
+    /// the boot log still says how much ordinary reply traffic is cap-bearing.
+    #[test]
+    fn the_decline_is_counted_without_disturbing_the_balance() {
+        use crate::kernel::direct_ipc_counters::DirectPathCounters;
+        let c = DirectPathCounters::new();
+        c.note_attempt();
+        c.note_declined_preflight_reply(false, true);
+        assert_eq!(c.declined_transfer_cap(), 1);
+        assert_eq!(c.declined_preflight(), 1, "it IS a preflight decline");
+        assert_eq!(
+            c.declined_ineligible_mode(),
+            0,
+            "NR7 has no mode decline to confuse it with"
+        );
+        assert_eq!(c.declined_not_admitted(), 0);
+        assert!(c.terminals_balance(), "still exactly one terminal");
+        assert!(c.eligibility_balances());
+
+        // A non-transfer-cap preflight decline does not touch the breakdown.
+        let c2 = DirectPathCounters::new();
+        c2.note_attempt();
+        c2.note_declined_preflight_reply(true, false);
+        assert_eq!(c2.declined_transfer_cap(), 0);
+        assert_eq!(c2.declined_not_admitted(), 1);
+        assert!(c2.terminals_balance());
+
+        // The reply reporter can never report a mode decline: it has no argument for one.
+        let c3 = DirectPathCounters::new();
+        c3.note_attempt();
+        c3.note_declined_preflight_reply(false, false);
+        assert_eq!(c3.declined_ineligible_mode(), 0);
     }
 }

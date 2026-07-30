@@ -168,7 +168,28 @@ Full detail: `doc/IPC.md` §8.5.
    it confirmed the gate removal worked (`not_admitted=0`, `completed=1` on ordinary
    feature-off traffic). No production-default seal is issued; the oracle regression still
    passes (`live_cells=2 result=ok`) and the feature-off boot is healthy with the flip held
-   off. Full evidence is in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6; see also `doc/IPC.md` §8.6.5.
+   off. **Three of the four blockers are now closed.** Transfer-cap safety: NR7 eligibility
+   carries `transfer_cap_present` and a cap-bearing reply declines before any mutation to the
+   legacy path, asked through the one canonical `transfer_cap_arg_present` predicate the legacy
+   decode is built on (direct capability transfer stays unimplemented). Ack lifecycle: the lease
+   is now owned by the endpoint waiter lifecycle — `DirectAckStore::release` is a fourth
+   `Released` state and the non-direct terminal edge, exact in
+   `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}`, centralized in the three
+   `IpcSubsystem` waiter-removal primitives every canonical closing edge funnels through and
+   called nowhere else; direct consume and non-direct release are mutually exclusive terminals
+   proved by two 200-run races. **Live, feature-off x86 boot with the flip temporarily on: the
+   service chain is fully healthy** (all 6 service entries exactly once, `PM_ELF_ZC_FAIL
+   count=0`), the overwrite fuse went **17 → 0**, 52 NR6 / 64 NR7 leases were retired by their
+   waiters, and 10 cap-bearing replies declined. **Capacity is the only blocker left:** the
+   genuine post-release high-watermark is **8 = full capacity** with one `CAPACITY_REFUSED` per
+   store, and the 8 live leases are *not* orphans —
+   `reserve == consume + release + cancel + live` is exact both ways (113 == 53+52+0+8,
+   113 == 41+64+0+8) — they are ten-odd resident services legitimately parked in recv-v2.
+   Resizing was out of scope. Also corrected: the quiescent trigger moved to
+   `INIT_IDLE_PARK_BEGIN` (the earlier one sampled `high_watermark=2` before saturation), and
+   `live == 0` is not a valid quiescence requirement for a running microkernel — the verdict now
+   requires `no_orphaned_lease`. Full evidence is in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.7;
+   see also `doc/IPC.md` §8.6.5–§8.6.6.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

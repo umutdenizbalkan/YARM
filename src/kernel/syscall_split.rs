@@ -426,12 +426,19 @@ fn try_split_debug_log_into_frame(
             // it costs nothing on a boot that never takes the direct path.
             crate::kernel::direct_ipc_counters::maybe_emit_attestation();
             // Stage 199D production flip: the FINAL quiescent attestation, emitted once, only
-            // after the normal service chain has reported healthy. `INIT_SPAWN_V5_REPLY_RECV_OK`
-            // is init's completed spawn round trip through PM — a full IpcCall + reply through
-            // the ordinary chain — so it is the earliest point at which "the service chain
-            // works" is established fact rather than assumption.
+            // after the normal service chain has reported healthy AND settled.
+            //
+            // `INIT_IDLE_PARK_BEGIN` is init parking after every spawn has completed — the
+            // latest point in the boot that is still a service-chain marker, and the closest
+            // thing to quiescence the kernel gets to observe. The earlier
+            // `INIT_SPAWN_V5_REPLY_RECV_OK` proves the chain *works*, but it fires while most
+            // servers have not even started, so an occupancy or high-watermark reading taken
+            // there is an early sample masquerading as a settled one — a live boot measured a
+            // watermark of 2 at that point and then went on to exhaust all 8 slots. The
+            // bounded per-direction census (`maybe_emit_attestation`) still covers a boot that
+            // never reaches the park, so moving this later loses no diagnostic on failure.
             crate::kernel::direct_ipc_counters::maybe_emit_quiescent_attestation(
-                msg.starts_with("INIT_SPAWN_V5_REPLY_RECV_OK"),
+                msg.starts_with("INIT_IDLE_PARK_BEGIN"),
             );
         }
         // Copy failed (no mapping / not user-readable) — same as the global handler's
@@ -821,14 +828,19 @@ fn try_split_ipcreply_direct_into_frame(
         reply_object,
         reply_endpoint,
         endpoint_admitted,
+        // Asked through the SAME canonical predicate the legacy `transfer_cap_arg` decode
+        // uses, so the two can never disagree about what "cap-bearing" means. The direct
+        // transaction cannot transfer a capability, so a cap-bearing reply must decline
+        // before any mutation rather than deliver the payload and drop the capability.
+        transfer_cap_present: crate::kernel::syscall::ipc_abi::transfer_cap_arg_present(frame),
     };
     let verdict = classify_direct_reply_eligibility(&facts);
     let Some((reply_eidx, reply_egen)) = verdict.endpoint() else {
         // NR7 has no mode decline by construction, so this is never an ineligible-mode count.
-        REPLY_COUNTERS.note_declined_preflight(
-            false,
+        REPLY_COUNTERS.note_declined_preflight_reply(
             verdict
                 == crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted,
+            verdict.is_transfer_cap_decline(),
         );
         return None; // ineligible: no ack claim, no copy, no mutation — legacy path
     };

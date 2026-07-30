@@ -3113,37 +3113,41 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # HELD OFF — four live blockers (Stage 199D production-default attempt)
+/// # HELD OFF — one live blocker remains (Stage 199D)
 ///
 /// Every dependency on the proof oracle has been removed from admission, eligibility and
 /// acknowledgement publication: flipping this to `cfg!(target_arch = "x86_64")` is the
-/// entire enablement. It is deliberately NOT flipped, because the attempt was run on a
-/// normal feature-off x86_64 boot and hard-stopped on a service-chain regression. The
-/// quiescent attestation, the ack lifecycle counters and the boot log between them pin
-/// four defects that the oracle's endpoint confinement had been hiding:
+/// entire enablement. The first attempt hard-stopped on a service-chain regression with four
+/// defects the oracle's endpoint confinement had been hiding. **Three are now fixed and one
+/// remains.**
 ///
-/// 1. **Capability transfer is silently dropped (fatal).** Legacy `ipc_reply` reads
-///    `SYSCALL_ARG_TRANSFER_CAP` and stashes a transfer handle; the direct NR7 path reads
-///    only CAP/PTR/LEN and neither the eligibility contract nor the transaction has any
-///    notion of a transferred capability. A cap-bearing reply taken by the direct path
-///    loses the capability. Live: `PM_VFS_REPLY_FULL op=25 transferred_cap=0` →
-///    `PM_ELF_ZC_FAIL reason=grant_ro_unsupported` → blkcache / virtio-blk /
-///    driver-manager never spawn → boot times out.
-/// 2. **The acknowledgement store has no production release path.** A pair is published
-///    whenever a task blocks in recv-v2 and cleared only by a direct delivery's `consume`.
-///    Any recv satisfied by the legacy path, a timeout, or server death orphans a
-///    `Committed` slot forever. Under confinement one endpoint published and always
-///    consumed, so this never showed.
-/// 3. **Orphans trip the overwrite fuse.** Re-blocking on an endpoint that still holds an
-///    orphan is refused as `EndpointAlreadyLive`: 17 trips on one short boot (7 server,
-///    10 caller).
-/// 4. **Capacity pressure is structural.** `DIRECT_ACK_STORE_CAPACITY` is 8 and a normal
-///    boot has more than 8 servers blocked in recv-v2 at once, so once the store fills,
-///    publication is refused and the direct path degrades to permanent legacy fallback
-///    with no signal but the counter.
+/// 1. ~~Capability transfer is silently dropped.~~ **FIXED.** NR7 eligibility now carries
+///    `transfer_cap_present`, asked through the same canonical `transfer_cap_arg_present`
+///    predicate the legacy decode uses, and a cap-bearing reply declines before any mutation
+///    to the legacy path. Live on a feature-off boot with the flip on: `transfer_cap=10`
+///    declines, `PM_ELF_ZC_FAIL count=0`, and **all 6 service entries present exactly once**.
+///    Direct capability transfer is still unimplemented — declining is the whole fix.
+/// 2. ~~The acknowledgement store has no production release path.~~ **FIXED.** The lease is
+///    now owned by the endpoint waiter lifecycle: the three `IpcSubsystem` waiter-removal
+///    primitives every canonical closing edge funnels through retire the exact
+///    `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` lease. Live:
+///    `release=52` (NR6) and `release=64` (NR7) leases retired that previously orphaned.
+/// 3. ~~Orphans trip the overwrite fuse.~~ **FIXED.** 17 trips on the first attempt, **0**
+///    now — each cycle's lease ends with its own waiter, so a re-block is never refused.
+/// 4. **Capacity is structurally too small — the remaining blocker.**
+///    `DIRECT_ACK_STORE_CAPACITY` is 8, and a normal boot parks more than that: ten distinct
+///    servers blocked in recv-v2 over one boot, and at `INIT_IDLE_PARK_BEGIN` the store sits
+///    at `live=8 high_watermark=8 capacity=8` with one `CAPACITY_REFUSED` per store. Those 8
+///    are **not** orphans — the accounting is exact in both directions
+///    (`reserve == consume + release + cancel + live`, 113 == 53+52+0+8 and 113 == 41+64+0+8)
+///    — they are resident services legitimately parked. The store is simply saturated, so a
+///    ninth parked server gets no lease and its endpoint silently falls back to legacy.
+///    Resizing is deliberately out of scope here.
 ///
-/// Blockers 2–4 are one defect's symptoms (an unpaired lifecycle); blocker 1 is
-/// independent and is the one that breaks the boot.
+/// Note that `live == 0` is **not** a valid quiescence requirement for a running microkernel:
+/// a healthy system always has its resident services parked in recv-v2, each holding a
+/// legitimate lease. `QuiescentVerdict::no_orphaned_lease` is the leak invariant that holds at
+/// any instant, and it passes.
 pub const fn ipccall_direct_production_enabled() -> bool {
     false
 }
@@ -5454,6 +5458,20 @@ pub mod ipccall_direct_ack {
         }
     }
 
+    /// End the lease held for EXACTLY this endpoint incarnation and server incarnation —
+    /// the NON-DIRECT terminal edge, driven by the endpoint waiter's own lifecycle. Called
+    /// from the one centralized waiter-removal primitive, never from a terminal branch.
+    pub fn release(
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        server: ReceiverWaiterIdentity,
+    ) -> crate::kernel::direct_ack_store::AckRelease {
+        STORE.release(
+            AckEndpoint::new(endpoint_index, endpoint_generation),
+            AckWaiter::new(server.tid.0, server.asid.0),
+        )
+    }
+
     /// Re-arm (restore) a consumed ack for a retryable rollback of the SAME publication
     /// (matching seq). A superseded publication cannot be restored — it stays consumed.
     pub fn restore(seq: u64) -> bool {
@@ -5811,6 +5829,19 @@ pub mod ipcreply_direct_ack {
             AckConsume::Consumed(fields, seq) => Some((ack_of(fields), seq)),
             _ => None,
         }
+    }
+
+    /// End the lease held for EXACTLY this reply-endpoint incarnation and caller
+    /// incarnation — the NON-DIRECT terminal edge. See the request twin.
+    pub fn release(
+        endpoint_index: usize,
+        endpoint_generation: u64,
+        caller: ReceiverWaiterIdentity,
+    ) -> crate::kernel::direct_ack_store::AckRelease {
+        STORE.release(
+            AckEndpoint::new(endpoint_index, endpoint_generation),
+            AckWaiter::new(caller.tid.0, caller.asid.0),
+        )
     }
 
     /// Re-arm a consumed ack for a retryable rollback of the SAME publication.

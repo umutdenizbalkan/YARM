@@ -265,7 +265,7 @@ mod ipc;
 // Stage 198D-S: re-export the authoritative direct-only reply-cap policy switch so
 // the policy guard test can assert it as a compile-time constant.
 pub(crate) use ipc::REPLY_CAP_QUEUEING_SUPPORTED;
-mod ipc_abi;
+pub(crate) mod ipc_abi;
 // Stage 154: D1/D5 cap-boundary landing zone. Holds the pure recv-v2 meta
 // codec today; the stateful cap/materialization seams stay in syscall.rs until
 // a QEMU-validated re-home (doc/KERNEL_UNLOCKING.md §5.1.2).

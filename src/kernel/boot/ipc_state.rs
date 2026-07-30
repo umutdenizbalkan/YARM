@@ -699,9 +699,51 @@ impl IpcSubsystem {
         displaced
     }
 
+    /// Stage 199D — **the one place a departing endpoint receive-waiter retires its
+    /// direct-IPC acknowledgement lease.**
+    ///
+    /// A direct-IPC acknowledgement is published when a task commits a blocking recv-v2, and
+    /// it names that exact waiter's `{tid, asid}` together with the userspace payload and
+    /// metadata pointers the delivery would write to. The lease is therefore only meaningful
+    /// for as long as the waiter is linked: the moment the slot is cleared, any pair still
+    /// holding that identity is stale, and a direct delivery that claimed it would copy into
+    /// the buffers of a task that is no longer waiting.
+    ///
+    /// Before this hook the only way to retire a pair was a direct delivery's `consume`, so
+    /// **publication was driven by blocking and consumption by delivery, and the two were
+    /// never paired**: every waiter satisfied by the legacy path, a timeout, a cancellation,
+    /// task or server death, endpoint destruction or stale cleanup orphaned a committed slot
+    /// permanently.
+    ///
+    /// It lives *inside* the waiter accessors rather than at the terminal branches on purpose.
+    /// Every canonical removal edge in the kernel — `take_endpoint_waiter`,
+    /// `clear_endpoint_waiter_if_identity`, `clear_endpoint_waiters_for_identity` — funnels
+    /// through these three primitives, so hooking them makes the lease structurally owned by
+    /// the waiter lifecycle. Scattering `release` calls across the terminal branches would
+    /// make coverage a matter of vigilance; here a new removal path gets it for free, and a
+    /// guard test pins that no caller releases a lease directly.
+    ///
+    /// Both stores are asked, because the same endpoint-index space carries blocked *servers*
+    /// (a request endpoint) and blocked *callers* (a reply endpoint). Each release is exact in
+    /// all four components — endpoint index, endpoint generation, waiter TID, waiter ASID — so
+    /// the store that does not hold this pair mutates nothing and is not even counted.
+    fn release_direct_ack_lease(&self, idx: usize, waiter: ReceiverWaiterIdentity) {
+        // The endpoint GENERATION is what makes the release safe against slot recycling: a
+        // pair published for an earlier incarnation of this index must survive untouched.
+        let Some(&generation) = self.endpoint_generations.get(idx) else {
+            return;
+        };
+        let _ = crate::kernel::boot::ipccall_direct_ack::release(idx, generation, waiter);
+        let _ = crate::kernel::boot::ipcreply_direct_ack::release(idx, generation, waiter);
+    }
+
     /// Unconditionally take (remove + return) the waiter at `idx`.
     pub(crate) fn take_endpoint_waiter(&mut self, idx: usize) -> Option<ReceiverWaiterIdentity> {
-        self.endpoint_waiters.get_mut(idx).and_then(Option::take)
+        let taken = self.endpoint_waiters.get_mut(idx).and_then(Option::take);
+        if let Some(waiter) = taken {
+            self.release_direct_ack_lease(idx, waiter);
+        }
+        taken
     }
 
     /// Clear the slot at `idx` iff it EXACTLY matches `identity` (full generation-bearing compare).
@@ -713,6 +755,7 @@ impl IpcSubsystem {
     ) -> bool {
         if self.endpoint_waiters.get(idx).copied().flatten() == Some(identity) {
             self.endpoint_waiters[idx] = None;
+            self.release_direct_ack_lease(idx, identity);
             true
         } else {
             false
@@ -722,9 +765,12 @@ impl IpcSubsystem {
     /// Clear EVERY endpoint receive-waiter slot whose complete identity matches `identity`
     /// (task-teardown / timeout cleanup — identity-keyed, so a replacement waiter is never removed).
     pub(crate) fn clear_endpoint_waiters_for_identity(&mut self, identity: ReceiverWaiterIdentity) {
-        for waiter in self.endpoint_waiters.iter_mut() {
-            if *waiter == Some(identity) {
-                *waiter = None;
+        // Indexed rather than iterator-based so the lease release — which reads the endpoint
+        // generation table — can run per slot without holding a mutable borrow across it.
+        for idx in 0..self.endpoint_waiters.len() {
+            if self.endpoint_waiters[idx] == Some(identity) {
+                self.endpoint_waiters[idx] = None;
+                self.release_direct_ack_lease(idx, identity);
             }
         }
     }

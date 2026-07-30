@@ -91,6 +91,15 @@ pub(crate) struct DirectReplyFacts {
     pub(crate) reply_endpoint: Option<(usize, u64)>,
     /// Whether this reply endpoint is admitted to the off-lock path. See the request twin.
     pub(crate) endpoint_admitted: bool,
+    /// Whether the reply carries a **transferred capability** in `SYSCALL_ARG_TRANSFER_CAP`.
+    ///
+    /// The direct transaction has no notion of capability transfer: it copies the payload and
+    /// metadata into the caller's address space and wakes it, with nothing that mints, stashes
+    /// or installs a capability. Legacy `ipc_reply` validates the transfer cap and stashes a
+    /// transfer handle that the caller's `recv` then installs. So a cap-bearing reply serviced
+    /// off-lock would deliver the payload and **silently drop the capability** — the receiver
+    /// sees a successful reply with `transferred_cap=0` and no way to tell it was robbed.
+    pub(crate) transfer_cap_present: bool,
 }
 
 /// The exhaustive NR6 eligibility verdict.
@@ -134,6 +143,10 @@ pub(crate) enum DirectReplyEligibility {
     /// The record does not bind a reply-endpoint incarnation (absent / stale / not an
     /// endpoint).
     ReplyEndpointGone,
+    /// The reply carries a transferred capability, which the direct transaction cannot
+    /// deliver. The legacy path owns it; declining here is what stops the capability from
+    /// being silently dropped.
+    TransferCapUnsupported,
     /// The endpoint is not admitted to the off-lock path (non-x86 oracle confinement).
     EndpointNotAdmitted,
 }
@@ -167,6 +180,14 @@ impl DirectReplyEligibility {
             } => Some((endpoint_index, endpoint_generation)),
             _ => None,
         }
+    }
+
+    /// True for the one decline that exists because the reply carries a capability the direct
+    /// transaction cannot transfer. Reported separately so a live boot can show how much
+    /// ordinary reply traffic is cap-bearing — which is the size of the work that
+    /// implementing direct capability transfer would unlock.
+    pub(crate) fn is_transfer_cap_decline(self) -> bool {
+        matches!(self, Self::TransferCapUnsupported)
     }
 }
 
@@ -226,6 +247,11 @@ pub(crate) fn classify_direct_request_eligibility(
 /// Deliberately imposes **no** `EndpointMode` requirement: NR7 consumes a one-shot reply
 /// authority and delivers to a caller already committed-blocked on its reply endpoint, so
 /// the endpoint's queueing discipline never applies.
+///
+/// The transfer-cap check runs **before any capability resolution**: it is the cheapest check
+/// there is (one already-read frame argument), and a cap-bearing reply must never get far
+/// enough to claim an acknowledgement, so putting it early makes that structural rather than
+/// incidental.
 pub(crate) fn classify_direct_reply_eligibility(
     facts: &DirectReplyFacts,
 ) -> DirectReplyEligibility {
@@ -234,6 +260,12 @@ pub(crate) fn classify_direct_reply_eligibility(
     }
     if !facts.requester_available {
         return DirectReplyEligibility::RequesterUnavailable;
+    }
+    // The direct transaction copies payload + metadata and wakes the caller. It mints,
+    // stashes and installs nothing, so it cannot carry a capability — decline before any
+    // mutation and let the legacy path do the transfer.
+    if facts.transfer_cap_present {
+        return DirectReplyEligibility::TransferCapUnsupported;
     }
     if let Err(err) = facts.reply_object {
         return DirectReplyEligibility::ReplyCapUnresolved(err);
@@ -275,6 +307,7 @@ mod tests {
             reply_object: Ok((5, 2)),
             reply_endpoint: Some((4, 9)),
             endpoint_admitted: true,
+            transfer_cap_present: false,
         }
     }
 
@@ -496,6 +529,135 @@ mod tests {
             classify_direct_reply_eligibility(&facts),
             DirectReplyEligibility::RequesterUnavailable
         );
+    }
+
+    // ── NR7 transfer-capability safety ─────────────────────────────────────────────────
+
+    /// **The headline rule.** A reply carrying a transferred capability is ineligible, and it
+    /// declines for that reason specifically — not folded into a generic decline — because the
+    /// direct transaction has no way to deliver the capability and would otherwise deliver the
+    /// payload and drop it silently.
+    #[test]
+    fn a_cap_bearing_reply_is_ineligible() {
+        let mut facts = reply_facts();
+        facts.transfer_cap_present = true;
+        let verdict = classify_direct_reply_eligibility(&facts);
+        assert_eq!(verdict, DirectReplyEligibility::TransferCapUnsupported);
+        assert!(verdict.is_transfer_cap_decline());
+        assert_eq!(
+            verdict.endpoint(),
+            None,
+            "a decline services nothing: no endpoint to claim an acknowledgement for"
+        );
+        // And it is the ONLY transfer-cap decline.
+        for other in [
+            DirectReplyEligibility::PayloadTooLong,
+            DirectReplyEligibility::RequesterUnavailable,
+            DirectReplyEligibility::ReplyCapUnresolved(KernelError::WrongObject),
+            DirectReplyEligibility::ReplyEndpointGone,
+            DirectReplyEligibility::EndpointNotAdmitted,
+            DirectReplyEligibility::Eligible {
+                endpoint_index: 1,
+                endpoint_generation: 1,
+            },
+        ] {
+            assert!(!other.is_transfer_cap_decline(), "{other:?}");
+        }
+    }
+
+    /// A reply with no transferred capability stays direct-eligible — the check narrows the
+    /// direct path, it does not close it.
+    #[test]
+    fn a_reply_without_a_transfer_cap_remains_eligible() {
+        let facts = reply_facts();
+        assert!(!facts.transfer_cap_present);
+        assert_eq!(
+            classify_direct_reply_eligibility(&facts),
+            DirectReplyEligibility::Eligible {
+                endpoint_index: 4,
+                endpoint_generation: 9,
+            }
+        );
+    }
+
+    /// The transfer-cap decline wins over every *later* check, so a cap-bearing reply can
+    /// never reach capability resolution, an endpoint incarnation, or an acknowledgement —
+    /// no matter what else is true about it. This is what makes "cannot enter the direct
+    /// transaction" a property of the ordering rather than of the call site's care.
+    #[test]
+    fn a_cap_bearing_reply_declines_before_any_capability_resolution() {
+        let mut facts = reply_facts();
+        facts.transfer_cap_present = true;
+        // Perfectly valid reply object, live endpoint, admitted: still declined.
+        assert_eq!(
+            classify_direct_reply_eligibility(&facts),
+            DirectReplyEligibility::TransferCapUnsupported
+        );
+        // Broken reply object: the transfer-cap decline is still what is reported, so the
+        // classifier never even inspects the capability.
+        facts.reply_object = Err(KernelError::InvalidCapability);
+        facts.reply_endpoint = None;
+        facts.endpoint_admitted = false;
+        assert_eq!(
+            classify_direct_reply_eligibility(&facts),
+            DirectReplyEligibility::TransferCapUnsupported
+        );
+        // Only the two checks that need no capability at all outrank it.
+        let mut too_long = reply_facts();
+        too_long.transfer_cap_present = true;
+        too_long.payload_len = IPC_DIRECT_PAYLOAD_MAX + 1;
+        assert_eq!(
+            classify_direct_reply_eligibility(&too_long),
+            DirectReplyEligibility::PayloadTooLong
+        );
+        let mut no_requester = reply_facts();
+        no_requester.transfer_cap_present = true;
+        no_requester.requester_available = false;
+        assert_eq!(
+            classify_direct_reply_eligibility(&no_requester),
+            DirectReplyEligibility::RequesterUnavailable
+        );
+    }
+
+    /// NR6 has no transfer-cap fact, and must not grow one: `IpcCall` repurposes the
+    /// `SYSCALL_ARG_TRANSFER_CAP` slot for the reply-endpoint receive capability, which the
+    /// direct request path already reads the same way the legacy handler does.
+    #[test]
+    fn request_eligibility_has_no_transfer_cap_concept() {
+        let src = include_str!("direct_eligibility.rs");
+        let facts = src
+            .split("pub(crate) struct DirectRequestFacts {")
+            .nth(1)
+            .expect("facts present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            !facts.contains("transfer_cap"),
+            "NR6 has no transfer capability in flight"
+        );
+        let body = src
+            .split("pub(crate) fn classify_direct_request_eligibility(")
+            .nth(1)
+            .expect("classifier present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(!body.contains("transfer_cap"));
+    }
+
+    /// The transfer-cap check is a decline, never a failure: it yields no endpoint, so the
+    /// call site's `verdict.endpoint()` guard is what makes it mutation-free. Pinned here so
+    /// nobody can turn it into an error return that would change the syscall's ABI.
+    #[test]
+    fn the_transfer_cap_decline_carries_no_error_and_no_endpoint() {
+        let verdict = DirectReplyEligibility::TransferCapUnsupported;
+        assert_eq!(verdict.endpoint(), None);
+        // It is not an error-carrying variant — the legacy path returns the real result.
+        assert!(!matches!(
+            verdict,
+            DirectReplyEligibility::ReplyCapUnresolved(_)
+        ));
     }
 
     /// Exhaustiveness: neither classifier has a wildcard arm on the facts it decides over.
