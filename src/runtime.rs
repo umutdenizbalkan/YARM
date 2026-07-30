@@ -3588,6 +3588,27 @@ impl SharedKernel {
     /// EXACT `{tid, asid}` identity. Used by the direct request transaction's rollback
     /// policy to decide whether the acknowledgement lease is restorable (server + waiter
     /// intact) or must be discarded (waiter changed/missing). No mutation.
+    /// rank 3 — read the LIVE incarnation state of an endpoint off-lock: its
+    /// [`EndpointMode`], but only when the slot is occupied AND the generation matches.
+    ///
+    /// `None` means "this endpoint incarnation is not current" — the slot is empty, out of
+    /// range, or has been recycled to a newer generation. The Stage 199D eligibility contract
+    /// treats that as a decline, so a stale send cap can never reach the direct transaction.
+    pub(crate) fn endpoint_mode_split_read(
+        &self,
+        eidx: usize,
+        egen: u64,
+    ) -> Option<crate::kernel::ipc::EndpointMode> {
+        self.with_ipc_split_mut(|ipc| {
+            if eidx >= ipc.endpoints.len() || ipc.endpoint_generations[eidx] != egen {
+                return None;
+            }
+            ipc.endpoints[eidx]
+                .as_ref()
+                .map(|storage| kernel_ref(storage).mode())
+        })
+    }
+
     pub(crate) fn endpoint_waiter_is_split_read(
         &self,
         eidx: usize,

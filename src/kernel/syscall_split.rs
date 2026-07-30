@@ -417,6 +417,11 @@ fn try_split_debug_log_into_frame(
                 msg,
                 shared.live_server_reply_link_count_split_read(),
             );
+            // Stage 199D: the direct-IPC counter attestation. Read-only, one-shot, and a
+            // strict no-op until at least one direct attempt has occurred — it reuses this
+            // existing observation point rather than adding an emission site of its own, so
+            // it costs nothing on a boot that never takes the direct path.
+            crate::kernel::direct_ipc_counters::maybe_emit_attestation();
         }
         // Copy failed (no mapping / not user-readable) — same as the global handler's
         // `DEBUG_LOG_COPY_FAIL` path: OK, no log.
@@ -626,33 +631,54 @@ fn try_split_ipccall_direct_into_frame(
     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
     // NR6 ABI: arg(CAP)=send cap, arg(TRANSFER_CAP)=reply-endpoint recv cap,
     // arg(PTR)=payload ptr, arg(LEN)=len.
+    use crate::kernel::direct_eligibility::{
+        DirectRequestFacts, classify_direct_request_eligibility,
+    };
+    use crate::kernel::direct_ipc_counters::REQUEST as REQUEST_COUNTERS;
     let send_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let reply_cap = CapId(frame.arg(crate::kernel::syscall::SYSCALL_ARG_TRANSFER_CAP) as u64);
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
-    if len > IPC_DIRECT_PAYLOAD_MAX {
-        return None; // invalid length: no ack claim, no mutation — legacy path
-    }
-    let tid = shared.current_tid_authoritative(cpu)?;
-    // Stage 199A2B4: confine the off-lock request path to the oracle's request endpoint so a
-    // NORMAL system IpcCall (the live service chain) stays byte-identical on its legacy path even
-    // while the proof gate is armed. Any other endpoint → None (legacy). No ack claim, no copy.
-    let send_endpoint = shared
-        .resolve_endpoint_send_cap_split_read(tid, send_cap)
-        .ok()?;
-    // Stage 199D: the acknowledgement store is endpoint-INDEXED and generation-BEARING, so
-    // the consumer names the EXACT endpoint incarnation it is entitled to. A recycled
-    // endpoint slot (same index, newer generation) can no longer consume the older
-    // incarnation's acknowledgement.
-    let (send_eidx, send_egen) = match send_endpoint {
-        crate::kernel::capabilities::CapObject::Endpoint { index, generation } => {
-            (index, generation)
-        }
-        _ => return None,
+    REQUEST_COUNTERS.note_attempt();
+
+    // ── Stage 199D eligibility preflight ────────────────────────────────────────────────
+    //
+    // Gather the facts (reads only — a decline here mutates nothing), then decide through the
+    // ONE pure exhaustive contract. A `Synchronous` endpoint declines here and falls through
+    // to the legacy rendezvous path, which is the only path that reproduces its scheduling
+    // semantics. The Stage 199A2B4 oracle confinement is carried into the facts unchanged.
+    let tid = shared.current_tid_authoritative(cpu);
+    let send_cap_resolution = match tid {
+        Some(tid) => shared.resolve_endpoint_send_cap_split_read(tid, send_cap),
+        None => Err(crate::kernel::boot::KernelError::InvalidCapability),
     };
-    if !crate::kernel::boot::ipccall_direct_oracle_request_endpoint_is(send_eidx) {
-        return None;
-    }
+    let endpoint_mode = match send_cap_resolution {
+        Ok(crate::kernel::capabilities::CapObject::Endpoint { index, generation }) => {
+            shared.endpoint_mode_split_read(index, generation)
+        }
+        _ => None,
+    };
+    let oracle_request_endpoint = match send_cap_resolution {
+        Ok(crate::kernel::capabilities::CapObject::Endpoint { index, .. }) => {
+            crate::kernel::boot::ipccall_direct_oracle_request_endpoint_is(index)
+        }
+        _ => false,
+    };
+    let facts = DirectRequestFacts {
+        payload_len: len,
+        requester_available: tid.is_some(),
+        send_cap: send_cap_resolution,
+        endpoint_mode,
+        oracle_request_endpoint,
+    };
+    let verdict = classify_direct_request_eligibility(&facts);
+    let Some((send_eidx, send_egen)) = verdict.endpoint() else {
+        REQUEST_COUNTERS.note_declined_preflight(verdict.is_ineligible_mode());
+        return None; // ineligible: no ack claim, no copy, no mutation — legacy path
+    };
+    REQUEST_COUNTERS.note_eligible();
+    let tid = tid.expect("eligibility requires an available requester");
+    let _ = IPC_DIRECT_PAYLOAD_MAX;
     // Stage 199A2D2C2B2: on the cross-CPU REQUEST path, if the server has NOT yet published its
     // blocked-server acknowledgement (it is not yet blocked in recv-v2), return a NON-MUTATING
     // WouldBlock so the CPU-0 client retries — never the legacy blocking IpcCall path, and never any
@@ -671,13 +697,28 @@ fn try_split_ipccall_direct_into_frame(
         crate::kernel::vm::Asid(asid_raw as u16),
     );
     // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing.
-    let payload = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len)?;
-    let snapshot = IpcCallDirectSnapshot::build(caller, send_cap, reply_cap, &payload[..len])?;
+    //
+    // From here to the ack claim, every decline is ELIGIBLE-but-pre-transaction: nothing has
+    // been mutated, so the legacy path runs — but it must still land in a terminal bucket, or
+    // the counters' balance invariant cannot hold.
+    let Some(payload) = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len) else {
+        REQUEST_COUNTERS.note_declined_pre_transaction();
+        return None;
+    };
+    let Some(snapshot) = IpcCallDirectSnapshot::build(caller, send_cap, reply_cap, &payload[..len])
+    else {
+        REQUEST_COUNTERS.note_declined_pre_transaction();
+        return None;
+    };
     // Consume the acknowledgement published for EXACTLY this endpoint incarnation, at most
     // once (Stage 199D endpoint-keyed, generation-bearing store). A pair belonging to any
     // other endpoint, any other endpoint generation, or already consumed by a duplicate
     // trap yields `None` — no copy result is used, nothing is mutated, NR6 stays legacy.
-    let (ack, ack_seq) = crate::kernel::boot::ipccall_direct_ack::claim(send_eidx, send_egen)?;
+    let Some((ack, ack_seq)) = crate::kernel::boot::ipccall_direct_ack::claim(send_eidx, send_egen)
+    else {
+        REQUEST_COUNTERS.note_declined_pre_transaction();
+        return None;
+    };
     let work = crate::kernel::ipccall_direct_txn::DirectRequestPostWork {
         snapshot,
         ack,
@@ -688,6 +729,7 @@ fn try_split_ipccall_direct_into_frame(
     // so a new error variant cannot silently inherit "success".
     let outcome = shared.drain_direct_request_post_work(&work);
     let disposition = crate::kernel::direct_disposition::classify_direct_request_outcome(&outcome);
+    crate::kernel::direct_ipc_counters::note_disposition(&REQUEST_COUNTERS, disposition);
     // Stage 199D HARD-STOP C: the frame is encoded by the SHARED encoder, which reproduces
     // the legacy `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(frame, None)` success lanes
     // (`ret2 = SYSCALL_NO_TRANSFER_CAP`), zeroes every lane on failure, and leaves the frame
@@ -728,24 +770,52 @@ fn try_split_ipcreply_direct_into_frame(
     use crate::kernel::ipccall_direct::{IPC_DIRECT_PAYLOAD_MAX, IpcReplyDirectSnapshot};
     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_LEN, SYSCALL_ARG_PTR};
     // NR7 ABI: arg(CAP)=reply cap, arg(PTR)=payload ptr, arg(LEN)=len.
+    use crate::kernel::direct_eligibility::{DirectReplyFacts, classify_direct_reply_eligibility};
+    use crate::kernel::direct_ipc_counters::REPLY as REPLY_COUNTERS;
     let reply_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let len = frame.arg(SYSCALL_ARG_LEN);
-    if len > IPC_DIRECT_PAYLOAD_MAX {
-        return None; // invalid length: no ack claim, no mutation — legacy path
-    }
-    let tid = shared.current_tid_authoritative(cpu)?;
-    // Stage 199A2B4: confine the off-lock reply path to the oracle's reply endpoint so a NORMAL
-    // system IpcReply (the live service chain) stays byte-identical on its legacy path even while
-    // the proof gate is armed. Resolve the reply cap → record → its bound reply endpoint index; any
-    // other reply endpoint → None (legacy). No ack claim, no copy, no mutation.
-    let (rec_idx, rec_gen) = shared.resolve_reply_cap_split_read(tid, reply_cap).ok()?;
+    REPLY_COUNTERS.note_attempt();
+
+    // ── Stage 199D eligibility preflight ────────────────────────────────────────────────
+    //
+    // NR7 eligibility is tied to a live ONE-SHOT `Reply` object and its exact caller /
+    // reply-endpoint incarnation. There is deliberately NO `EndpointMode` requirement: NR7
+    // does not send to an endpoint, it consumes a reply authority the request path already
+    // minted and delivers to a caller already committed-blocked on its reply endpoint, so the
+    // endpoint's queueing discipline never applies. The Stage 199A2B4 oracle confinement is
+    // carried into the facts unchanged.
+    let tid = shared.current_tid_authoritative(cpu);
+    let reply_object = match tid {
+        Some(tid) => shared.resolve_reply_cap_split_read(tid, reply_cap),
+        None => Err(crate::kernel::boot::KernelError::InvalidCapability),
+    };
     // Stage 199D: carry the reply endpoint GENERATION too — the acknowledgement store is
     // keyed by the exact endpoint incarnation, not by index alone.
-    let (reply_eidx, reply_egen) = shared.reply_record_endpoint_ref_split_read(rec_idx, rec_gen)?;
-    if !crate::kernel::boot::ipccall_direct_oracle_reply_endpoint_is(reply_eidx) {
-        return None;
-    }
+    let reply_endpoint = match reply_object {
+        Ok((rec_idx, rec_gen)) => shared.reply_record_endpoint_ref_split_read(rec_idx, rec_gen),
+        Err(_) => None,
+    };
+    let oracle_reply_endpoint = match reply_endpoint {
+        Some((eidx, _)) => crate::kernel::boot::ipccall_direct_oracle_reply_endpoint_is(eidx),
+        None => false,
+    };
+    let facts = DirectReplyFacts {
+        payload_len: len,
+        requester_available: tid.is_some(),
+        reply_object,
+        reply_endpoint,
+        oracle_reply_endpoint,
+    };
+    let verdict = classify_direct_reply_eligibility(&facts);
+    let Some((reply_eidx, reply_egen)) = verdict.endpoint() else {
+        // NR7 has no mode decline by construction, so this is never an ineligible-mode count.
+        REPLY_COUNTERS.note_declined_preflight(false);
+        return None; // ineligible: no ack claim, no copy, no mutation — legacy path
+    };
+    REPLY_COUNTERS.note_eligible();
+    let tid = tid.expect("eligibility requires an available requester");
+    let _ = IPC_DIRECT_PAYLOAD_MAX;
     // Stage 199A2D2C2C: on the cross-CPU REPLY path, bound the CPU-1 server's pre-ack NR7 retry and
     // refuse a duplicate NR7 — WITHOUT touching the legacy path or the accepted transaction. The
     // blocked-caller ack VALID bit is published exactly once (when the CPU-0 caller blocks on its reply
@@ -779,12 +849,25 @@ fn try_split_ipcreply_direct_into_frame(
         crate::kernel::ipc::ThreadId(tid),
         crate::kernel::vm::Asid(asid_raw as u16),
     );
-    // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing.
-    let payload = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len)?;
-    let snapshot = IpcReplyDirectSnapshot::build(replier, reply_cap, &payload[..len])?;
+    // Source copy OFF-LOCK (no broad/ranked lock held). A fault mutates nothing. As on the
+    // NR6 twin, every decline from here to the ack claim is eligible-but-pre-transaction and
+    // is counted as such — the oracle server's bounded pre-acknowledgement retries live here.
+    let Some(payload) = shared.copy_from_user_asid_split_read(asid_raw, user_ptr, len) else {
+        REPLY_COUNTERS.note_declined_pre_transaction();
+        return None;
+    };
+    let Some(snapshot) = IpcReplyDirectSnapshot::build(replier, reply_cap, &payload[..len]) else {
+        REPLY_COUNTERS.note_declined_pre_transaction();
+        return None;
+    };
     // Consume the acknowledgement published for EXACTLY this reply-endpoint incarnation,
     // at most once (Stage 199D endpoint-keyed, generation-bearing store).
-    let (ack, ack_seq) = crate::kernel::boot::ipcreply_direct_ack::claim(reply_eidx, reply_egen)?;
+    let Some((ack, ack_seq)) =
+        crate::kernel::boot::ipcreply_direct_ack::claim(reply_eidx, reply_egen)
+    else {
+        REPLY_COUNTERS.note_declined_pre_transaction();
+        return None;
+    };
     let work = crate::kernel::ipccall_direct_txn::DirectReplyPostWork {
         snapshot,
         ack,
@@ -793,6 +876,7 @@ fn try_split_ipcreply_direct_into_frame(
     // Stage 199D HARD-STOP B: classified, never discarded — see the NR6 twin.
     let outcome = shared.drain_direct_reply_post_work(&work);
     let disposition = crate::kernel::direct_disposition::classify_direct_reply_outcome(&outcome);
+    crate::kernel::direct_ipc_counters::note_disposition(&REPLY_COUNTERS, disposition);
     // Same shared encoder as the NR6 twin: legacy `handle_ipc_reply` ends with the identical
     // `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(frame, None)` pair, so NR7's success lanes
     // are the same three values. NR7 delivers the reply and wakes the caller; the replier
