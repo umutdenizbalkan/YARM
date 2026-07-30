@@ -749,9 +749,15 @@ object in the server's cnode). Cases: empty application data, nonzero applicatio
 zero application opcode, the maximum framed inline payload (126 bytes of data in a 128-byte
 frame), and the malformed too-short prefix.
 
-**Live proof.** Re-earned round-trip cell at the conforming commit — see the seal recorded
-in `doc/IPC.md` §8.6. The previous combined seal (`2c07ac96`) is **superseded** for the NR6
-delivery path.
+**Live proof.** Re-earned round-trip cell at commit
+`458bb3d4505e1aac3747d4c653463bf1a07eb1b2` (tree
+`97513076e09248c5fad86b1fd9ce3e3ca71da81f`):
+`STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=x86_64 classes=2 live_cells=2
+duplicate_replies=0 duplicate_wakes=0 result=ok`. The boot log carries the two numbers that
+were wrong before — `opcode=1543` (`0x0607`, the application opcode; previously `0`) and
+`plen=8` (the stripped length; previously `10`) — with `framed_ok=` absent and
+`YARM_BOOT_OK` present. This **supersedes** the identically-named seal earned at `2c07ac96`
+for the NR6 delivery path. Recorded in `doc/IPC.md` §8.6.1.
 
 **Scope kept.** The proof gate stays proof-only, the oracle endpoint confinement is
 unchanged, the error disposition (B) and return lanes (C) are untouched, and no endpoint-mode
