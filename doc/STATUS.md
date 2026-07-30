@@ -150,12 +150,25 @@ Full detail: `doc/IPC.md` §8.5.
    current endpoint incarnation, `Buffered` only, `Synchronous` declines before mutation to
    the legacy rendezvous path; NR7 needs no mode) and `src/kernel/direct_ipc_counters.rs`
    (per-direction terminal buckets, ack lifecycle, occupancy high-watermark and every
-   fail-closed fuse, balance proved live). What is left is the enablement step itself: remove
-   the proof gate and the oracle endpoint confinement, then prove the flip live. The counters
-   make that auditable — the current oracle boot shows 54 NR6 / 53 NR7 ordinary service-chain
-   calls turned away by the confinement, exactly the population a flip would move. Until then
-   both gates stay in place and no production default has changed. Full evidence is in
-   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1; see also `doc/IPC.md` §8.6.
+   fail-closed fuse, balance proved live). **Both gates are now removed** — admission,
+   eligibility and both acknowledgement publication sites consult arch-split predicates over
+   one compile-time constant, with structural guards pinning that no proof-gate or
+   oracle-endpoint reference survives on the x86 path, and AArch64/RISC-V unchanged. **The
+   flip itself is HELD OFF on four newly-found live blockers.** Flipping
+   `ipccall_direct_production_enabled()` to `cfg!(target_arch = "x86_64")` and booting a
+   normal feature-off x86_64 image regressed the service chain: (i) the direct NR7 path never
+   reads `SYSCALL_ARG_TRANSFER_CAP`, so a cap-bearing reply **silently drops the capability**
+   (`PM_VFS_REPLY_FULL transferred_cap=0` → `PM_ELF_ZC_FAIL reason=grant_ro_unsupported` →
+   blkcache / virtio-blk / driver-manager never spawn → boot times out); (ii) the
+   acknowledgement store has **no production release path**, so every legacy-satisfied recv
+   orphans a `Committed` slot; (iii) orphans trip the overwrite fuse — 17 trips on one short
+   boot; (iv) capacity 8 is structurally too small for the number of servers blocked at once.
+   The quiescent attestation added for this increment is what caught it
+   (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL … result=fail`, `commit=4 consume=1 live=3`), and
+   it confirmed the gate removal worked (`not_admitted=0`, `completed=1` on ordinary
+   feature-off traffic). No production-default seal is issued; the oracle regression still
+   passes (`live_cells=2 result=ok`) and the feature-off boot is healthy with the flip held
+   off. Full evidence is in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6; see also `doc/IPC.md` §8.6.5.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

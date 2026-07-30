@@ -233,15 +233,14 @@ pub(crate) fn try_split_dispatch_into_frame(
         }
         return None;
     };
-    // Stage 199A2B3/199A2B4: IpcCall (NR 6) + IpcReply (NR 7) are NOT in the static NR-only
-    // whitelist (a normal boot must reach neither off-lock gate), but they ARE eligible for the
-    // proof-gated direct request/reply gates below when the internal proof gate is armed. Passing
-    // them through the NR-gate ONLY under `ipccall_direct_proof_enabled()` keeps normal boots
-    // byte-identical (gate off → this early-return fires exactly as before) while making the live
-    // gates genuinely reachable (the runtime gate prevents the compiler proving the routes dead).
-    let direct_ipc_gate_armed = matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)
-        && crate::kernel::boot::ipccall_direct_proof_enabled();
-    if classify_split_eligible_nr_only(syscall).is_none() && !direct_ipc_gate_armed {
+    // Stage 199D: IpcCall (NR 6) + IpcReply (NR 7) are not in the static NR-only whitelist,
+    // but they ARE admitted to the direct request/reply gates below. On x86_64 that admission
+    // is UNCONDITIONAL — the off-lock path is the production default, with no proof gate and
+    // no oracle selector in the condition. On AArch64/RISC-V admission still requires the
+    // proof gate, so their normal boots stay byte-identical.
+    let direct_ipc_admitted = matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)
+        && crate::kernel::boot::ipccall_direct_admission_enabled();
+    if classify_split_eligible_nr_only(syscall).is_none() && !direct_ipc_admitted {
         if probe {
             crate::yarm_log!(
                 "YARM_SPLIT_DISPATCH_FALLBACK reason=nr_not_eligible nr={}",
@@ -295,7 +294,9 @@ pub(crate) fn try_split_dispatch_into_frame(
     // attempted when the internal proof gate is armed; the helper snapshots the request
     // off-lock and drives the accepted off-lock transaction. Off the gate — or for any
     // case it cannot service — it returns `None`, so NR 6 stays on its existing path.
-    if matches!(syscall, Syscall::IpcCall) && crate::kernel::boot::ipccall_direct_proof_enabled() {
+    if matches!(syscall, Syscall::IpcCall)
+        && crate::kernel::boot::ipccall_direct_admission_enabled()
+    {
         if let Some(result) = try_split_ipccall_direct_into_frame(shared, cpu, frame) {
             return Some(result);
         }
@@ -307,7 +308,9 @@ pub(crate) fn try_split_dispatch_into_frame(
     // (reserve → caller-copy → exact-waiter claim → record Consumed → single enqueue).
     // Off the gate — or for any case it cannot service — it returns `None`, so NR 7
     // stays on its existing global-lock path.
-    if matches!(syscall, Syscall::IpcReply) && crate::kernel::boot::ipccall_direct_proof_enabled() {
+    if matches!(syscall, Syscall::IpcReply)
+        && crate::kernel::boot::ipccall_direct_admission_enabled()
+    {
         if let Some(result) = try_split_ipcreply_direct_into_frame(shared, cpu, frame) {
             return Some(result);
         }
@@ -422,6 +425,14 @@ fn try_split_debug_log_into_frame(
             // existing observation point rather than adding an emission site of its own, so
             // it costs nothing on a boot that never takes the direct path.
             crate::kernel::direct_ipc_counters::maybe_emit_attestation();
+            // Stage 199D production flip: the FINAL quiescent attestation, emitted once, only
+            // after the normal service chain has reported healthy. `INIT_SPAWN_V5_REPLY_RECV_OK`
+            // is init's completed spawn round trip through PM — a full IpcCall + reply through
+            // the ordinary chain — so it is the earliest point at which "the service chain
+            // works" is established fact rather than assumption.
+            crate::kernel::direct_ipc_counters::maybe_emit_quiescent_attestation(
+                msg.starts_with("INIT_SPAWN_V5_REPLY_RECV_OK"),
+            );
         }
         // Copy failed (no mapping / not user-readable) — same as the global handler's
         // `DEBUG_LOG_COPY_FAIL` path: OK, no log.
@@ -658,9 +669,9 @@ fn try_split_ipccall_direct_into_frame(
         }
         _ => None,
     };
-    let oracle_request_endpoint = match send_cap_resolution {
+    let endpoint_admitted = match send_cap_resolution {
         Ok(crate::kernel::capabilities::CapObject::Endpoint { index, .. }) => {
-            crate::kernel::boot::ipccall_direct_oracle_request_endpoint_is(index)
+            crate::kernel::boot::ipccall_direct_request_endpoint_admitted(index)
         }
         _ => false,
     };
@@ -669,11 +680,15 @@ fn try_split_ipccall_direct_into_frame(
         requester_available: tid.is_some(),
         send_cap: send_cap_resolution,
         endpoint_mode,
-        oracle_request_endpoint,
+        endpoint_admitted,
     };
     let verdict = classify_direct_request_eligibility(&facts);
     let Some((send_eidx, send_egen)) = verdict.endpoint() else {
-        REQUEST_COUNTERS.note_declined_preflight(verdict.is_ineligible_mode());
+        REQUEST_COUNTERS.note_declined_preflight(
+            verdict.is_ineligible_mode(),
+            verdict
+                == crate::kernel::direct_eligibility::DirectRequestEligibility::EndpointNotAdmitted,
+        );
         return None; // ineligible: no ack claim, no copy, no mutation — legacy path
     };
     REQUEST_COUNTERS.note_eligible();
@@ -796,8 +811,8 @@ fn try_split_ipcreply_direct_into_frame(
         Ok((rec_idx, rec_gen)) => shared.reply_record_endpoint_ref_split_read(rec_idx, rec_gen),
         Err(_) => None,
     };
-    let oracle_reply_endpoint = match reply_endpoint {
-        Some((eidx, _)) => crate::kernel::boot::ipccall_direct_oracle_reply_endpoint_is(eidx),
+    let endpoint_admitted = match reply_endpoint {
+        Some((eidx, _)) => crate::kernel::boot::ipccall_direct_reply_endpoint_admitted(eidx),
         None => false,
     };
     let facts = DirectReplyFacts {
@@ -805,12 +820,16 @@ fn try_split_ipcreply_direct_into_frame(
         requester_available: tid.is_some(),
         reply_object,
         reply_endpoint,
-        oracle_reply_endpoint,
+        endpoint_admitted,
     };
     let verdict = classify_direct_reply_eligibility(&facts);
     let Some((reply_eidx, reply_egen)) = verdict.endpoint() else {
         // NR7 has no mode decline by construction, so this is never an ineligible-mode count.
-        REPLY_COUNTERS.note_declined_preflight(false);
+        REPLY_COUNTERS.note_declined_preflight(
+            false,
+            verdict
+                == crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted,
+        );
         return None; // ineligible: no ack claim, no copy, no mutation — legacy path
     };
     REPLY_COUNTERS.note_eligible();

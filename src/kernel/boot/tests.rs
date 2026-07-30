@@ -70704,13 +70704,15 @@ mod stage199a1_ipccall_direct_audit {
         assert!(SPLIT_SRC.contains("fn try_split_ipccall_direct_into_frame"));
         assert!(SPLIT_SRC.contains("fn try_split_ipcreply_direct_into_frame"));
         // Both are reached ONLY behind the default-off proof gate, so a normal boot is unchanged.
+        // Stage 199D: the arms are reached behind `ipccall_direct_admission_enabled()`, which
+        // is UNCONDITIONAL on x86_64 (production default) and still the proof gate elsewhere.
         assert!(
-            SPLIT_SRC.contains(
-                "matches!(syscall, Syscall::IpcCall) && crate::kernel::boot::ipccall_direct_proof_enabled()"
-            ) && SPLIT_SRC.contains(
-                "matches!(syscall, Syscall::IpcReply) && crate::kernel::boot::ipccall_direct_proof_enabled()"
-            ),
-            "the NR6/NR7 off-lock gates must be reached only behind the proof gate"
+            SPLIT_SRC.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "the NR6/NR7 off-lock gates are reached behind the arch-split admission predicate"
+        );
+        assert!(
+            !SPLIT_SRC.contains("ipccall_direct_proof_enabled()"),
+            "no proof-gate dependency survives in the split dispatcher"
         );
         // The pre-lock OWNED source snapshot is copied off-lock (no broad/ranked lock).
         assert!(SPLIT_SRC.contains("copy_from_user_asid_split_read"));
@@ -76054,14 +76056,14 @@ mod stage199a2b1_offlock_foundations {
     // false, so the broad-lock fallback is unchanged in production.
     #[test]
     fn direct_classes_default_off_no_live_split_arm() {
-        // The NR6 + NR7 direct arms are present but guarded by the default-off proof gate.
-        assert!(
-            SPLIT_SRC.contains(
-                "matches!(syscall, Syscall::IpcCall) && crate::kernel::boot::ipccall_direct_proof_enabled()"
-            ) && SPLIT_SRC.contains(
-                "matches!(syscall, Syscall::IpcReply) && crate::kernel::boot::ipccall_direct_proof_enabled()"
-            ),
-            "the NR6/NR7 direct split arms must be reached only behind the proof gate"
+        // Stage 199D: the NR6 + NR7 direct arms are guarded by the arch-split admission
+        // predicate — unconditional on x86_64, proof-gated on AArch64/RISC-V.
+        assert_eq!(
+            SPLIT_SRC
+                .matches("crate::kernel::boot::ipccall_direct_admission_enabled()")
+                .count(),
+            3,
+            "the whitelist guard plus both direct arms use the admission predicate"
         );
         // The proof gate itself defaults to false (default-off in production).
         const MOD_SRC: &str = include_str!("mod.rs");
@@ -77099,7 +77101,7 @@ mod stage199a2b2f_wiring {
 
     // No publication when the gate is off.
     #[test]
-    fn no_publish_when_gate_off() {
+    fn publication_is_unconditional_on_x86_production_default() {
         set_ipccall_direct_proof_enabled(false);
         ipccall_direct_ack::reset();
         // Reuse the fixture builder body but with the gate off: build directly.
@@ -77133,9 +77135,23 @@ mod stage199a2b2f_wiring {
             );
             let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
         });
+        // Stage 199D PRODUCTION FLIP: publication tracks the ARCH-SPLIT predicate, not the
+        // proof gate. With the gate off, an ordinary recv-v2 commit publishes exactly when
+        // production admission is enabled — so this one assertion pins both the enabled
+        // behaviour and the held-off behaviour, and neither can drift from the predicate.
+        assert_eq!(
+            ipccall_direct_ack::sole_snapshot().is_some(),
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            "publication follows production admission, never the proof gate"
+        );
+        let mod_src = include_str!("mod.rs");
         assert!(
-            ipccall_direct_ack::sole_snapshot().is_none(),
-            "gate off: no ack published"
+            mod_src.contains("if !ipccall_direct_publication_enabled() {"),
+            "publication asks the arch-split predicate"
+        );
+        assert!(
+            mod_src.contains("pub fn ipccall_direct_publication_enabled() -> bool {\n    ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()\n}"),
+            "x86 publishes unconditionally; other arches stay proof-gated"
         );
         teardown();
     }
@@ -78114,7 +78130,7 @@ mod stage199a2b3_wiring {
 
     // No publication when the gate is off.
     #[test]
-    fn no_publish_when_gate_off() {
+    fn publication_is_unconditional_on_x86_production_default() {
         set_ipccall_direct_proof_enabled(false);
         ipcreply_direct_ack::reset();
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
@@ -78154,9 +78170,11 @@ mod stage199a2b3_wiring {
             );
             let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
         });
-        assert!(
-            ipcreply_direct_ack::sole_snapshot().is_none(),
-            "gate off: no caller ack published"
+        // Stage 199D PRODUCTION FLIP — see the NR6 twin.
+        assert_eq!(
+            ipcreply_direct_ack::sole_snapshot().is_some(),
+            crate::kernel::boot::ipccall_direct_production_enabled(),
+            "publication follows production admission, never the proof gate"
         );
         teardown();
     }
@@ -78541,26 +78559,62 @@ mod stage199a2b4_live_oracle_guards {
     // unchanged legacy path. Provisioning binds the endpoint indices.
     #[test]
     fn offlock_path_is_oracle_endpoint_confined() {
-        // Gate selectivity. Stage 199D routes the confinement through the pure eligibility
-        // contract: the call site computes it and the contract declines `NotConfinedEndpoint`.
-        // Semantically unchanged — an unconfined endpoint still returns `None` to legacy.
-        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_request_endpoint_is(index)"));
-        assert!(SPLIT_SRC.contains("ipccall_direct_oracle_reply_endpoint_is(eidx)"));
+        // Stage 199D PRODUCTION-DEFAULT FLIP. On x86_64 the off-lock path is the default and
+        // NOTHING oracle-shaped participates in admission, eligibility or publication. On
+        // AArch64/RISC-V the confinement is unchanged. Both halves live in the arch-split
+        // admission predicates, so this guard now pins the SPLIT rather than the confinement.
         assert!(
-            SPLIT_SRC.contains("oracle_request_endpoint,")
-                && SPLIT_SRC.contains("oracle_reply_endpoint,"),
-            "the confinement flows into the eligibility facts"
+            SPLIT_SRC.contains("ipccall_direct_request_endpoint_admitted(index)")
+                && SPLIT_SRC.contains("ipccall_direct_reply_endpoint_admitted(eidx)"),
+            "eligibility asks the arch-split admission predicate, not an oracle endpoint list"
+        );
+        assert!(
+            SPLIT_SRC.contains("endpoint_admitted,"),
+            "admission flows into the eligibility facts"
         );
         let elig = include_str!("../direct_eligibility.rs");
-        assert!(
-            elig.contains("if !facts.oracle_request_endpoint {")
-                && elig.contains("if !facts.oracle_reply_endpoint {"),
-            "both classifiers still enforce the confinement"
+        assert_eq!(
+            elig.matches("if !facts.endpoint_admitted {").count(),
+            2,
+            "both classifiers enforce endpoint admission"
         );
-        // Publisher selectivity (real builds only).
-        assert!(MOD_SRC.contains("ipccall_direct_oracle_request_endpoint_is(index)"));
-        assert!(MOD_SRC.contains("ipccall_direct_oracle_reply_endpoint_is(index)"));
-        // Provisioning binds the endpoints.
+        // The arch split itself: x86_64 is unconditional, other arches keep the oracle test.
+        assert!(
+            MOD_SRC.contains("pub const fn ipccall_direct_production_enabled() -> bool {")
+                && MOD_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            "production admission is a compile-time x86_64 constant, not a runtime knob"
+        );
+        for predicate in [
+            "pub fn ipccall_direct_admission_enabled() -> bool {",
+            "pub fn ipccall_direct_publication_enabled() -> bool {",
+            "pub fn ipccall_direct_request_endpoint_admitted(eidx: usize) -> bool {",
+            "pub fn ipccall_direct_reply_endpoint_admitted(eidx: usize) -> bool {",
+        ] {
+            let body = MOD_SRC
+                .split(predicate)
+                .nth(1)
+                .expect("predicate present")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded");
+            assert!(
+                body.contains("ipccall_direct_production_enabled()"),
+                "{predicate}: x86_64 admits unconditionally"
+            );
+        }
+        // Publisher selectivity is now the SAME arch-split admission, not an oracle test.
+        assert!(
+            MOD_SRC.contains("if !ipccall_direct_request_endpoint_admitted(index) {")
+                && MOD_SRC.contains("if !ipccall_direct_reply_endpoint_admitted(index) {"),
+            "both publication sites use the arch-split endpoint admission"
+        );
+        assert!(
+            !MOD_SRC.contains("if !ipccall_direct_oracle_request_endpoint_is(index) {")
+                && !MOD_SRC.contains("if !ipccall_direct_oracle_reply_endpoint_is(index) {"),
+            "no oracle-endpoint filter survives at either publication site"
+        );
+        // Provisioning still binds the endpoints — the oracle keeps them for SCENARIO SETUP
+        // and diagnostics; they simply no longer control production eligibility.
         assert!(MOD_SRC.contains("set_ipccall_direct_oracle_endpoints(req_idx, rep_idx)"));
         // Runtime: only the exact provisioned endpoint indices match.
         set_ipccall_direct_oracle_endpoints(6, 7);
@@ -78578,9 +78632,9 @@ mod stage199a2b4_live_oracle_guards {
     #[test]
     fn live_routes_reachable_only_behind_proof_gate() {
         assert!(SPLIT_SRC.contains(
-            "matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"
+            "matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_admission_enabled()"
         ));
-        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_admitted"));
     }
 
     // (userspace completion cannot substitute for kernel markers) The userspace round-trip
@@ -78726,10 +78780,20 @@ mod stage199a2c1_aarch64_guards {
         assert!(call_gate.contains("SYSCALL_ARG_TRANSFER_CAP"));
         assert!(call_gate.contains("SYSCALL_ARG_PTR") && call_gate.contains("SYSCALL_ARG_LEN"));
         // The whitelist reachability guard keeps the live drains from being silently DCE'd.
-        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_admitted"));
         assert!(
-            SPLIT_SRC.contains("matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"),
-            "IpcCall/IpcReply must pass the NR whitelist only behind the armed proof gate"
+            SPLIT_SRC.contains("matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "IpcCall/IpcReply pass the NR whitelist behind the arch-split admission predicate"
+        );
+        // AArch64 itself is UNCHANGED by the x86_64 production flip: its ABI import and its
+        // handled-syscall finalize are still gated on the armed proof gate.
+        const AARCH64_TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        assert_eq!(
+            AARCH64_TRAP_ENTRY
+                .matches("&& crate::kernel::boot::ipccall_direct_proof_enabled())")
+                .count(),
+            2,
+            "AArch64 import + finalize remain proof-gated"
         );
     }
 
@@ -78934,7 +78998,7 @@ mod stage199a2c2_riscv_guards {
         );
         // The whitelist reachability guard (syscall_split) keeps the drains from being DCE'd.
         const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
-        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_admitted"));
     }
 
     // (six args a0..a5) The off-lock gates read all six NR6/NR7 arguments the RISC-V bridge imported.
@@ -79244,8 +79308,15 @@ mod stage199a2c3_matrix_guards {
         const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
         const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
         // Shared whitelist reachability guard (x86_64 + AArch64 via the shared entry).
-        assert!(SPLIT_SRC.contains("&& !direct_ipc_gate_armed"));
-        assert!(SPLIT_SRC.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"));
+        assert!(SPLIT_SRC.contains("&& !direct_ipc_admitted"));
+        // Stage 199D: the shared dispatcher uses the arch-split admission predicate — x86_64
+        // admits unconditionally, AArch64 and RISC-V remain proof-gated at their own arch
+        // entry points, which the two assertions below pin.
+        assert!(SPLIT_SRC.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"));
+        assert!(
+            !SPLIT_SRC.contains("ipccall_direct_proof_enabled()"),
+            "no proof-gate dependency survives in the shared dispatcher"
+        );
         // AArch64 import + RISC-V trap both gate NR6/NR7 on the direct proof gate.
         assert!(TRAP_ENTRY_SRC.contains("ipccall_direct_proof_enabled()"));
         assert!(RISCV_TRAP_SRC.contains("|| is_ipc_direct"));
@@ -81621,9 +81692,9 @@ mod stage199d_delivery_projection_differential {
                 requester_available: true,
                 send_cap: send_cap_resolution,
                 endpoint_mode,
-                // The fixture's endpoint is the one under test; confinement is orthogonal
-                // here and is pinned by its own guards.
-                oracle_request_endpoint: true,
+                // On x86_64 every endpoint is admitted (production default); the arch split
+                // is pinned by its own guards.
+                endpoint_admitted: true,
             }
         }
 
@@ -81854,7 +81925,7 @@ mod stage199d_delivery_projection_differential {
                 }
                 // A preflight decline (Synchronous).
                 counters.note_attempt();
-                counters.note_declined_preflight(true);
+                counters.note_declined_preflight(true, false);
 
                 assert_eq!(counters.attempts(), 4);
                 assert_eq!(counters.completed(), 1);
@@ -81977,13 +82048,27 @@ mod stage199d_delivery_projection_differential {
                 "both directions count their terminal disposition"
             );
             // Only the NR6 direction can report a MODE decline; NR7 has no mode requirement.
+            // Whitespace-collapsed so rustfmt's line breaking cannot break the guard.
+            let flat = split
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
             assert!(
-                split.contains("note_declined_preflight(verdict.is_ineligible_mode())"),
+                flat.contains(
+                    "REQUEST_COUNTERS.note_declined_preflight( verdict.is_ineligible_mode(),"
+                ),
                 "NR6 reports the Synchronous subset"
             );
             assert!(
-                split.contains("REPLY_COUNTERS.note_declined_preflight(false)"),
+                flat.contains("REPLY_COUNTERS.note_declined_preflight( false,"),
                 "NR7 never reports a mode decline"
+            );
+            // Both directions additionally report the admission decline so the
+            // production-default boot can prove no confinement decline remains.
+            assert_eq!(
+                flat.matches("EndpointNotAdmitted, );").count(),
+                2,
+                "both directions report the endpoint-admission decline separately"
             );
             // The attestation reuses the existing off-lock DebugLog observation point.
             assert!(
@@ -82477,6 +82562,444 @@ mod stage199d_delivery_projection_differential {
     }
 }
 
+/// Stage 199D — x86_64 NR6/NR7 PRODUCTION-DEFAULT guards.
+///
+/// The off-lock direct request/reply path is the default on x86_64. These guards pin that
+/// **no oracle selector and no proof gate participates in normal admission, eligibility or
+/// acknowledgement publication**, and — equally important — that AArch64 and RISC-V are
+/// untouched: their admission and publication remain proof-gated and oracle-confined.
+#[cfg(test)]
+mod stage199d_production_default_guards {
+    use crate::kernel::direct_ipc_counters::{DirectPathCounters, quiescent_verdict};
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const MODRS: &str = include_str!("mod.rs");
+    const ELIG: &str = include_str!("../direct_eligibility.rs");
+
+    /// Production admission is a COMPILE-TIME constant — not a knob, not a selector, not a
+    /// runtime flag anything can set — and the enablement is the whole of its body, so the
+    /// flip is one expression once the recorded blockers are cleared.
+    #[test]
+    fn production_admission_is_a_compile_time_constant() {
+        let body = MODRS
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .expect("predicate present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert_eq!(
+            body.trim(),
+            "false",
+            "the body is a bare constant: flipping it to `cfg!(target_arch = \"x86_64\")` \
+             is the entire x86_64 production-default enablement"
+        );
+        for forbidden in [
+            "oracle",
+            "proof",
+            "load(",
+            "ENABLED",
+            "selector",
+            "feature = ",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "production admission must not consult {forbidden}"
+            );
+        }
+        // It is `const fn`, so it cannot read runtime state even by accident.
+        assert!(
+            MODRS.contains("pub const fn ipccall_direct_production_enabled()"),
+            "the predicate is const"
+        );
+    }
+
+    /// The flip is HELD OFF against a recorded, reproducible live failure — not forgotten.
+    /// The doc comment carries all four blockers so nobody re-flips it blind.
+    #[test]
+    fn the_held_off_flip_records_every_live_blocker() {
+        let doc = MODRS
+            .split("/// True iff the direct NR6/NR7 path is the production default")
+            .nth(1)
+            .expect("predicate documented")
+            .split("pub const fn ipccall_direct_production_enabled()")
+            .next()
+            .expect("doc bounded");
+        assert!(
+            doc.contains("HELD OFF"),
+            "the predicate says plainly that it is held off"
+        );
+        for blocker in [
+            "SYSCALL_ARG_TRANSFER_CAP",   // 1: capability transfer is dropped
+            "no production release path", // 2: unpaired ack lifecycle
+            "overwrite fuse",             // 3: orphans refuse re-blocking
+            "DIRECT_ACK_STORE_CAPACITY",  // 4: structural capacity pressure
+        ] {
+            assert!(
+                doc.contains(blocker),
+                "the held-off record must name the {blocker} blocker"
+            );
+        }
+        // The live evidence is named, so the claim is checkable rather than asserted.
+        assert!(
+            doc.contains("PM_ELF_ZC_FAIL") && doc.contains("transferred_cap=0"),
+            "the boot markers that prove blocker 1 are recorded"
+        );
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "held off means held off"
+        );
+    }
+
+    /// Endpoint admission is the ARCH-SPLIT predicate, never an oracle endpoint list: it is
+    /// `production || oracle_match`, so the moment production admission is enabled every
+    /// endpoint index is admitted, and while it is held off the oracle selector is the only
+    /// thing left deciding — which is exactly the pre-flip behaviour.
+    #[test]
+    fn endpoint_admission_is_the_arch_split_predicate_not_an_oracle_list() {
+        crate::kernel::boot::set_ipccall_direct_proof_enabled(false);
+        crate::kernel::boot::set_ipccall_direct_oracle_endpoints(6, 7);
+        let production = crate::kernel::boot::ipccall_direct_production_enabled();
+        for eidx in [0usize, 1, 5, 6, 7, 99, usize::MAX] {
+            assert_eq!(
+                crate::kernel::boot::ipccall_direct_request_endpoint_admitted(eidx),
+                production || eidx == 6,
+                "request endpoint {eidx}: admission is production || oracle_match"
+            );
+            assert_eq!(
+                crate::kernel::boot::ipccall_direct_reply_endpoint_admitted(eidx),
+                production || eidx == 7,
+                "reply endpoint {eidx}: admission is production || oracle_match"
+            );
+        }
+        // The source shape is what guarantees the flip admits everything: neither predicate
+        // consults anything but the production constant and the oracle selector.
+        for which in ["request", "reply"] {
+            let body = MODRS
+                .split(&alloc::format!(
+                    "pub fn ipccall_direct_{which}_endpoint_admitted(eidx: usize) -> bool {{"
+                ))
+                .nth(1)
+                .expect("predicate present")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded");
+            assert_eq!(
+                body.trim(),
+                alloc::format!(
+                    "ipccall_direct_production_enabled() || \
+                     ipccall_direct_oracle_{which}_endpoint_is(eidx)"
+                ),
+                "{which} admission short-circuits on the production constant"
+            );
+        }
+    }
+
+    /// The split dispatcher carries NO proof-gate dependency at all.
+    #[test]
+    fn the_split_dispatcher_has_no_proof_gate_dependency() {
+        assert!(
+            !SPLIT.contains("ipccall_direct_proof_enabled"),
+            "no proof-gate reference survives in the split dispatcher"
+        );
+        assert_eq!(
+            SPLIT
+                .matches("crate::kernel::boot::ipccall_direct_admission_enabled()")
+                .count(),
+            3,
+            "the whitelist guard and both direct arms use the admission predicate"
+        );
+    }
+
+    /// Normal admission and eligibility carry NO oracle-endpoint dependency: the only
+    /// oracle-shaped names left in the split dispatcher are the arch-split admission
+    /// predicates themselves.
+    #[test]
+    fn normal_admission_has_no_oracle_endpoint_dependency() {
+        assert!(
+            !SPLIT.contains("ipccall_direct_oracle_request_endpoint_is")
+                && !SPLIT.contains("ipccall_direct_oracle_reply_endpoint_is"),
+            "no direct oracle-endpoint test survives in the split dispatcher"
+        );
+        assert!(
+            SPLIT.contains("ipccall_direct_request_endpoint_admitted(index)")
+                && SPLIT.contains("ipccall_direct_reply_endpoint_admitted(eidx)"),
+            "eligibility asks the arch-split admission predicate instead"
+        );
+        // The eligibility contract itself names no oracle at all.
+        assert!(
+            !ELIG.contains("oracle_request_endpoint") && !ELIG.contains("oracle_reply_endpoint"),
+            "the eligibility contract carries no oracle concept"
+        );
+    }
+
+    /// BOTH acknowledgement publication sites are free of oracle-only filtering and of the
+    /// proof gate.
+    #[test]
+    fn acknowledgement_publication_has_no_oracle_or_proof_dependency() {
+        for publisher in [
+            "pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack",
+            "pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack",
+        ] {
+            let body = MODRS
+                .split(publisher)
+                .nth(1)
+                .expect("publisher present")
+                .split("\n/// ")
+                .next()
+                .expect("body bounded");
+            assert!(
+                body.contains("if !ipccall_direct_publication_enabled() {"),
+                "{publisher}: publication asks the arch-split predicate"
+            );
+            assert!(
+                !body.contains("if !ipccall_direct_proof_enabled() {"),
+                "{publisher}: no proof-gate filter survives"
+            );
+            assert!(
+                !body.contains("ipccall_direct_oracle_request_endpoint_is(index)")
+                    && !body.contains("ipccall_direct_oracle_reply_endpoint_is(index)"),
+                "{publisher}: no oracle-endpoint filter survives"
+            );
+            assert!(
+                body.contains("_endpoint_admitted(index)"),
+                "{publisher}: endpoint filtering is the arch-split admission"
+            );
+        }
+    }
+
+    /// Nothing blocks an otherwise eligible production pair from reserving, committing or
+    /// consuming its acknowledgement: the store's own API carries no oracle concept.
+    #[test]
+    fn the_acknowledgement_stores_carry_no_oracle_concept() {
+        let store = include_str!("../direct_ack_store.rs");
+        // CODE only — the prose above legitimately names the things it promises not to do.
+        let code: alloc::string::String = store
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in ["oracle", "proof_enabled", "ORACLE"] {
+            assert!(
+                !code.contains(forbidden),
+                "the bounded ack store must not know about {forbidden}"
+            );
+        }
+        // Both endpoint-keyed views are reachable for ANY endpoint on x86.
+        crate::kernel::boot::ipccall_direct_ack::reset();
+        crate::kernel::boot::set_ipccall_direct_proof_enabled(false);
+        crate::kernel::boot::set_ipccall_direct_oracle_endpoints(usize::MAX, usize::MAX);
+        let store = crate::kernel::boot::ipccall_direct_ack::store();
+        let ep = crate::kernel::direct_ack_store::AckEndpoint::new(42, 7);
+        let waiter = crate::kernel::direct_ack_store::AckWaiter::new(9, 1);
+        let reservation = store
+            .reserve(ep, waiter)
+            .expect("an ordinary endpoint may reserve with no oracle provisioned");
+        let fields = crate::kernel::direct_ack_store::AckFields {
+            endpoint: ep,
+            waiter,
+            payload_user_ptr: 0x1000,
+            payload_user_len: 8,
+            meta_user_ptr: 0x2000,
+            meta_user_len: 40,
+        };
+        store.commit(reservation, fields).expect("and may commit");
+        assert!(
+            store.consume(ep, Some(waiter)).ok().is_some(),
+            "and may consume"
+        );
+        crate::kernel::boot::ipccall_direct_ack::reset();
+    }
+
+    /// AArch64 and RISC-V are UNCHANGED: their arch entry points still gate NR6/NR7 on the
+    /// armed proof gate, and the shared admission predicate still consults it for them.
+    #[test]
+    fn other_architectures_remain_proof_gated() {
+        let trap_entry = include_str!("../../arch/trap_entry.rs");
+        let riscv = include_str!("../../arch/riscv64/trap.rs");
+        assert_eq!(
+            trap_entry
+                .matches("&& crate::kernel::boot::ipccall_direct_proof_enabled())")
+                .count(),
+            2,
+            "AArch64 import + finalize remain proof-gated"
+        );
+        assert!(
+            riscv.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"),
+            "RISC-V trap admission remains proof-gated"
+        );
+        // The shared predicates fall back to the proof gate off x86.
+        for predicate in [
+            "pub fn ipccall_direct_admission_enabled() -> bool {",
+            "pub fn ipccall_direct_publication_enabled() -> bool {",
+        ] {
+            let body = MODRS
+                .split(predicate)
+                .nth(1)
+                .expect("predicate present")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded");
+            assert!(
+                body.contains(
+                    "ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()"
+                ),
+                "{predicate}: non-x86 still consults the proof gate"
+            );
+        }
+        for predicate in [
+            "pub fn ipccall_direct_request_endpoint_admitted(eidx: usize) -> bool {",
+            "pub fn ipccall_direct_reply_endpoint_admitted(eidx: usize) -> bool {",
+        ] {
+            let body = MODRS
+                .split(predicate)
+                .nth(1)
+                .expect("predicate present")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded");
+            assert!(
+                body.contains("ipccall_direct_oracle_"),
+                "{predicate}: non-x86 keeps the oracle confinement"
+            );
+        }
+    }
+
+    /// Oracle selectors survive for SCENARIO SETUP and diagnostics only — provisioning still
+    /// binds the endpoints, and the runtime predicates still answer, but nothing production
+    /// consults them on x86.
+    #[test]
+    fn oracle_selectors_remain_for_setup_and_diagnostics_only() {
+        assert!(
+            MODRS.contains(
+                "pub fn ipccall_direct_oracle_request_endpoint_is(eidx: usize) -> bool {"
+            ) && MODRS.contains("set_ipccall_direct_oracle_endpoints(req_idx, rep_idx)"),
+            "provisioning and the predicates remain for scenario setup"
+        );
+        crate::kernel::boot::set_ipccall_direct_oracle_endpoints(6, 7);
+        assert!(crate::kernel::boot::ipccall_direct_oracle_request_endpoint_is(6));
+        assert!(!crate::kernel::boot::ipccall_direct_oracle_request_endpoint_is(7));
+        // ...but nothing on the production side reads them directly: every production
+        // consumer goes through the arch-split admission predicate, so enabling production
+        // admission bypasses the selector outright.
+        assert!(
+            !SPLIT.contains("ipccall_direct_oracle_request_endpoint_is")
+                && !SPLIT.contains("ipccall_direct_oracle_reply_endpoint_is"),
+            "the split dispatcher reaches the selector only via the admission predicate"
+        );
+        crate::kernel::boot::set_ipccall_direct_oracle_endpoints(usize::MAX, usize::MAX);
+    }
+
+    /// The quiescent verdict is a REAL check: a healthy set passes, and each broken
+    /// invariant is individually detected.
+    #[test]
+    fn the_quiescent_verdict_detects_each_broken_invariant() {
+        use crate::kernel::direct_ack_store::{AckEndpoint, AckFields, AckWaiter, DirectAckStore};
+        let store = DirectAckStore::new();
+        let counters = DirectPathCounters::new();
+        // A healthy direction: one attempt, eligible, completed; one pair fully resolved.
+        counters.note_attempt();
+        counters.note_eligible();
+        counters.note_completed();
+        let ep = AckEndpoint::new(1, 1);
+        let w = AckWaiter::new(2, 1);
+        let r = store.reserve(ep, w).expect("reserve");
+        store
+            .commit(
+                r,
+                AckFields {
+                    endpoint: ep,
+                    waiter: w,
+                    payload_user_ptr: 0,
+                    payload_user_len: 0,
+                    meta_user_ptr: 0,
+                    meta_user_len: 0,
+                },
+            )
+            .expect("commit");
+        assert!(store.consume(ep, Some(w)).ok().is_some());
+        let v = quiescent_verdict(&counters, &store);
+        assert!(v.ok(), "a healthy direction passes: {v:?}");
+        assert!(v.terminals_balance && v.eligibility_balances && v.completed_positive);
+        assert!(v.no_confinement_decline && v.no_fallback_after_terminal);
+        assert!(v.ack_live_zero && v.reserve_resolves && v.commit_consumed);
+        assert!(v.watermark_bounded && v.fuses_clear);
+
+        // completed == 0 is caught.
+        let empty = DirectPathCounters::new();
+        empty.note_attempt();
+        empty.note_declined_preflight(false, false);
+        assert!(!quiescent_verdict(&empty, &store).completed_positive);
+
+        // A confinement decline is caught.
+        let confined = DirectPathCounters::new();
+        confined.note_attempt();
+        confined.note_declined_preflight(false, true);
+        assert!(!quiescent_verdict(&confined, &store).no_confinement_decline);
+
+        // A post-transaction fallback is caught.
+        let late = DirectPathCounters::new();
+        late.note_attempt();
+        late.note_eligible();
+        late.note_legacy_fallback_after_decline();
+        assert!(!quiescent_verdict(&late, &store).no_fallback_after_terminal);
+
+        // A live pair, an unbalanced reserve and a tripped fuse are each caught.
+        let dirty = DirectAckStore::new();
+        let held = dirty.reserve(ep, w).expect("reserve");
+        let v = quiescent_verdict(&counters, &dirty);
+        assert!(!v.ack_live_zero, "a live pair is caught");
+        assert!(!v.reserve_resolves, "an unresolved reservation is caught");
+        assert!(dirty.cancel(held));
+        assert!(quiescent_verdict(&counters, &dirty).reserve_resolves);
+        // Trip the duplicate-consume fuse.
+        let r2 = dirty.reserve(ep, w).expect("reserve");
+        dirty
+            .commit(
+                r2,
+                AckFields {
+                    endpoint: ep,
+                    waiter: w,
+                    payload_user_ptr: 0,
+                    payload_user_len: 0,
+                    meta_user_ptr: 0,
+                    meta_user_len: 0,
+                },
+            )
+            .expect("commit");
+        assert!(dirty.consume(ep, Some(w)).ok().is_some());
+        assert!(
+            dirty.consume(ep, Some(w)).ok().is_none(),
+            "duplicate refused"
+        );
+        assert!(
+            !quiescent_verdict(&counters, &dirty).fuses_clear,
+            "a tripped fuse is caught"
+        );
+    }
+
+    /// The final attestation is one-shot and fires only after the service chain is healthy.
+    #[test]
+    fn the_quiescent_attestation_is_gated_on_service_chain_health() {
+        let counters = include_str!("../direct_ipc_counters.rs");
+        assert!(
+            counters.contains("pub(crate) fn maybe_emit_quiescent_attestation(service_chain_healthy: bool) -> bool {")
+                && counters.contains("if !service_chain_healthy {"),
+            "the attestation refuses to fire before the chain is healthy"
+        );
+        assert!(
+            counters.contains("static QUIESCENT_ATTESTED: AtomicUsize")
+                && counters.contains("QUIESCENT_ATTESTED.swap(1"),
+            "the attestation is one-shot"
+        );
+        assert!(
+            SPLIT.contains("maybe_emit_quiescent_attestation(")
+                && SPLIT.contains("msg.starts_with(\"INIT_SPAWN_V5_REPLY_RECV_OK\")"),
+            "the trigger is init's completed spawn round trip through PM"
+        );
+    }
+}
+
 /// Stage 199D — bounded multi-pair acknowledgement boundary guards.
 ///
 /// The former single-slot ack modules are now endpoint-keyed views of the bounded,
@@ -82655,19 +83178,19 @@ mod stage199d_multi_pair_boundary {
             split.contains("reply_record_endpoint_ref_split_read(rec_idx, rec_gen)"),
             "NR7 reads the reply endpoint index AND generation"
         );
-        // Endpoint confinement and the proof gate are unchanged — since Stage 199D's
-        // eligibility contract they are computed at the call site and enforced by the pure
-        // classifier, which is the same decision expressed once instead of inline twice.
+        // Stage 199D production flip: endpoint ADMISSION replaced the oracle confinement.
+        // The consumers still name the exact incarnation; what changed is WHICH endpoints are
+        // admitted — on x86_64, all of them.
         assert!(
-            split.contains("ipccall_direct_oracle_request_endpoint_is(index)")
-                && split.contains("ipccall_direct_oracle_reply_endpoint_is(eidx)"),
-            "endpoint confinement is unchanged"
+            split.contains("ipccall_direct_request_endpoint_admitted(index)")
+                && split.contains("ipccall_direct_reply_endpoint_admitted(eidx)"),
+            "eligibility asks the arch-split admission predicate"
         );
         let elig = include_str!("../direct_eligibility.rs");
-        assert!(
-            elig.contains("if !facts.oracle_request_endpoint {")
-                && elig.contains("if !facts.oracle_reply_endpoint {"),
-            "the classifiers enforce the confinement"
+        assert_eq!(
+            elig.matches("if !facts.endpoint_admitted {").count(),
+            2,
+            "both classifiers enforce endpoint admission"
         );
     }
 

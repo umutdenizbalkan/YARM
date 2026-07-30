@@ -3096,6 +3096,89 @@ pub fn ipccall_direct_proof_enabled() -> bool {
     IPCCALL_DIRECT_PROOF_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+// ─── Stage 199D: x86_64 NR6/NR7 PRODUCTION-DEFAULT admission ───────────────────────────
+//
+// The off-lock direct request/reply path is the DEFAULT on x86_64. No knob, no oracle, no
+// runtime selector participates: `cfg!(target_arch = "x86_64")` is the whole condition, so a
+// normal feature-off boot takes it for every eligible call. Correctness rests on the Stage
+// 199D increments that preceded this flip — the canonical recv-v2 delivery projection, the
+// typed disposition contract, return-lane parity, the bounded multi-pair acknowledgement
+// stores, and the Buffered-only eligibility contract that sends Synchronous endpoints to the
+// legacy rendezvous path.
+//
+// AArch64 and RISC-V are UNCHANGED: they remain proof-gated and oracle-confined, so their
+// admission and publication predicates below still consult the proof gate and the oracle
+// endpoints exactly as before.
+
+/// True iff the direct NR6/NR7 path is the production default on this architecture.
+/// A compile-time constant, not a runtime knob.
+///
+/// # HELD OFF — four live blockers (Stage 199D production-default attempt)
+///
+/// Every dependency on the proof oracle has been removed from admission, eligibility and
+/// acknowledgement publication: flipping this to `cfg!(target_arch = "x86_64")` is the
+/// entire enablement. It is deliberately NOT flipped, because the attempt was run on a
+/// normal feature-off x86_64 boot and hard-stopped on a service-chain regression. The
+/// quiescent attestation, the ack lifecycle counters and the boot log between them pin
+/// four defects that the oracle's endpoint confinement had been hiding:
+///
+/// 1. **Capability transfer is silently dropped (fatal).** Legacy `ipc_reply` reads
+///    `SYSCALL_ARG_TRANSFER_CAP` and stashes a transfer handle; the direct NR7 path reads
+///    only CAP/PTR/LEN and neither the eligibility contract nor the transaction has any
+///    notion of a transferred capability. A cap-bearing reply taken by the direct path
+///    loses the capability. Live: `PM_VFS_REPLY_FULL op=25 transferred_cap=0` →
+///    `PM_ELF_ZC_FAIL reason=grant_ro_unsupported` → blkcache / virtio-blk /
+///    driver-manager never spawn → boot times out.
+/// 2. **The acknowledgement store has no production release path.** A pair is published
+///    whenever a task blocks in recv-v2 and cleared only by a direct delivery's `consume`.
+///    Any recv satisfied by the legacy path, a timeout, or server death orphans a
+///    `Committed` slot forever. Under confinement one endpoint published and always
+///    consumed, so this never showed.
+/// 3. **Orphans trip the overwrite fuse.** Re-blocking on an endpoint that still holds an
+///    orphan is refused as `EndpointAlreadyLive`: 17 trips on one short boot (7 server,
+///    10 caller).
+/// 4. **Capacity pressure is structural.** `DIRECT_ACK_STORE_CAPACITY` is 8 and a normal
+///    boot has more than 8 servers blocked in recv-v2 at once, so once the store fills,
+///    publication is refused and the direct path degrades to permanent legacy fallback
+///    with no signal but the counter.
+///
+/// Blockers 2–4 are one defect's symptoms (an unpaired lifecycle); blocker 1 is
+/// independent and is the one that breaks the boot.
+pub const fn ipccall_direct_production_enabled() -> bool {
+    false
+}
+
+/// True iff NR6/NR7 may be admitted to the split dispatcher at all.
+///
+/// x86_64: always (production default). Other architectures: only while the proof gate is
+/// armed, which is what keeps their normal boots byte-identical.
+pub fn ipccall_direct_admission_enabled() -> bool {
+    ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()
+}
+
+/// True iff a blocked-waiter acknowledgement may be published at all.
+///
+/// Same split as [`ipccall_direct_admission_enabled`]: unconditional on x86_64, proof-gated
+/// elsewhere. Without this the request path would find nothing to claim and every ordinary
+/// call would decline to legacy.
+pub fn ipccall_direct_publication_enabled() -> bool {
+    ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()
+}
+
+/// True iff this REQUEST endpoint index is admitted to the off-lock path.
+///
+/// x86_64: every endpoint is admitted — the Buffered-only eligibility contract, not an
+/// oracle endpoint list, is what decides. Other architectures: still confined to the
+/// oracle's provisioned request endpoint.
+pub fn ipccall_direct_request_endpoint_admitted(eidx: usize) -> bool {
+    ipccall_direct_production_enabled() || ipccall_direct_oracle_request_endpoint_is(eidx)
+}
+
+/// True iff this REPLY endpoint index is admitted to the off-lock path. See the request twin.
+pub fn ipccall_direct_reply_endpoint_admitted(eidx: usize) -> bool {
+    ipccall_direct_production_enabled() || ipccall_direct_oracle_reply_endpoint_is(eidx)
+}
+
 // ─── Stage 199A2B4: x86_64 DIRECT IpcCall/IpcReply live round-trip oracle ───────────────
 /// Startup slot-5 selector value that tells init to run the x86_64 DIRECT IpcCall/IpcReply
 /// live round-trip oracle (mirrors `yarm_user_rt::syscall::IPCCALL_DIRECT_ORACLE_SELECTOR`).
@@ -5458,18 +5541,20 @@ pub(crate) fn maybe_publish_ipccall_direct_blocked_server_ack(
     state: &crate::kernel::task::BlockedRecvState,
 ) {
     use crate::kernel::capabilities::CapObject;
-    if !ipccall_direct_proof_enabled() {
+    if !ipccall_direct_publication_enabled() {
         return;
     }
     let CapObject::Endpoint { index, generation } = endpoint else {
         return;
     };
-    // Stage 199A2B4: on a REAL boot, publish ONLY for the oracle's request endpoint, so a
-    // service-chain recv-v2 never populates the single-slot ack (the off-lock request path is
-    // oracle-confined). Hosted wiring tests have no service chain and no provisioned oracle
-    // endpoint, so they keep the unconfined publish the fixtures rely on.
+    // Stage 199D: on x86_64 EVERY endpoint publishes — the off-lock request path is the
+    // production default and its eligibility contract, not an oracle endpoint list, decides
+    // what it services. On AArch64/RISC-V this still confines publication to the oracle's
+    // provisioned request endpoint, so their normal boots stay byte-identical. Hosted wiring
+    // tests have no service chain and no provisioned oracle endpoint, so they keep the
+    // unconfined publish the fixtures rely on.
     #[cfg(not(feature = "hosted-dev"))]
-    if !ipccall_direct_oracle_request_endpoint_is(index) {
+    if !ipccall_direct_request_endpoint_admitted(index) {
         return;
     }
     // Complete-commit contract: recv-v2, valid payload dest, non-null meta dest.
@@ -5810,17 +5895,17 @@ pub(crate) fn maybe_publish_ipcreply_direct_blocked_caller_ack(
     state: &crate::kernel::task::BlockedRecvState,
 ) {
     use crate::kernel::capabilities::CapObject;
-    if !ipccall_direct_proof_enabled() {
+    if !ipccall_direct_publication_enabled() {
         return;
     }
     let CapObject::Endpoint { index, generation } = endpoint else {
         return;
     };
-    // Stage 199A2B4: on a REAL boot, publish ONLY for the oracle's reply endpoint, so a
-    // service-chain recv-v2 never populates the single-slot caller ack (the off-lock reply path is
-    // oracle-confined). Hosted wiring tests keep the unconfined publish their fixtures rely on.
+    // Stage 199D: on x86_64 EVERY reply endpoint publishes — production default. On
+    // AArch64/RISC-V this still confines publication to the oracle's provisioned reply
+    // endpoint. Hosted wiring tests keep the unconfined publish their fixtures rely on.
     #[cfg(not(feature = "hosted-dev"))]
-    if !ipccall_direct_oracle_reply_endpoint_is(index) {
+    if !ipccall_direct_reply_endpoint_admitted(index) {
         return;
     }
     if state.recv_abi != crate::kernel::task::RecvAbiVariant::RecvV2

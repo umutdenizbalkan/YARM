@@ -63,6 +63,7 @@ pub(crate) struct DirectPathCounters {
     declined_ineligible_mode: AtomicU64,
     declined_preflight: AtomicU64,
     declined_pre_transaction: AtomicU64,
+    declined_not_admitted: AtomicU64,
     completed: AtomicU64,
     legacy_fallback_after_decline: AtomicU64,
     failed_by_code: [AtomicU64; FAILED_CODE_SLOTS],
@@ -79,6 +80,7 @@ impl DirectPathCounters {
             declined_ineligible_mode: AtomicU64::new(0),
             declined_preflight: AtomicU64::new(0),
             declined_pre_transaction: AtomicU64::new(0),
+            declined_not_admitted: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             legacy_fallback_after_decline: AtomicU64::new(0),
             failed_by_code: [const { AtomicU64::new(0) }; FAILED_CODE_SLOTS],
@@ -93,6 +95,7 @@ impl DirectPathCounters {
         self.declined_ineligible_mode.store(0, Ordering::Relaxed);
         self.declined_preflight.store(0, Ordering::Relaxed);
         self.declined_pre_transaction.store(0, Ordering::Relaxed);
+        self.declined_not_admitted.store(0, Ordering::Relaxed);
         self.completed.store(0, Ordering::Relaxed);
         self.legacy_fallback_after_decline
             .store(0, Ordering::Relaxed);
@@ -120,11 +123,16 @@ impl DirectPathCounters {
 
     /// The attempt was declined by the eligibility contract, before any mutation.
     /// `ineligible_mode` marks the `Synchronous`-endpoint subset.
-    pub(crate) fn note_declined_preflight(&self, ineligible_mode: bool) {
+    pub(crate) fn note_declined_preflight(&self, ineligible_mode: bool, not_admitted: bool) {
         self.declined_preflight.fetch_add(1, Ordering::Relaxed);
         if ineligible_mode {
             self.declined_ineligible_mode
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        // On x86_64 the endpoint confinement is gone, so this must stay 0: a non-zero count
+        // means an otherwise eligible endpoint was still being turned away.
+        if not_admitted {
+            self.declined_not_admitted.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -170,6 +178,9 @@ impl DirectPathCounters {
     }
     pub(crate) fn declined_pre_transaction(&self) -> u64 {
         self.declined_pre_transaction.load(Ordering::Acquire)
+    }
+    pub(crate) fn declined_not_admitted(&self) -> u64 {
+        self.declined_not_admitted.load(Ordering::Acquire)
     }
     pub(crate) fn completed(&self) -> u64 {
         self.completed.load(Ordering::Acquire)
@@ -234,6 +245,143 @@ pub(crate) fn note_disposition(
 pub(crate) fn reset() {
     REQUEST.reset();
     REPLY.reset();
+}
+
+/// Latch for the single final quiescent attestation.
+static QUIESCENT_ATTESTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The production-default invariant set, evaluated at quiescence. Every field is a hard
+/// requirement of the Stage 199D x86_64 flip; the emitter reports each individually so a boot
+/// log shows exactly which one failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuiescentVerdict {
+    /// attempts == the sum of all terminal buckets.
+    pub(crate) terminals_balance: bool,
+    /// eligible + declined_preflight == attempts.
+    pub(crate) eligibility_balances: bool,
+    /// Ordinary feature-off production traffic actually took the direct path.
+    pub(crate) completed_positive: bool,
+    /// No endpoint was turned away for non-admission — the confinement is gone.
+    pub(crate) no_confinement_decline: bool,
+    /// No legacy fallback happened AFTER the transaction ran. The two decline classes that
+    /// do hand over (preflight and pre-transaction) are mutation-free by construction:
+    /// preflight never touches state, pre-transaction stops before the ack claim.
+    pub(crate) no_fallback_after_terminal: bool,
+    /// The acknowledgement store is empty.
+    pub(crate) ack_live_zero: bool,
+    /// reserve == commit + cancel: every reservation resolved exactly once.
+    pub(crate) reserve_resolves: bool,
+    /// commit == consume: every publication was consumed exactly once.
+    pub(crate) commit_consumed: bool,
+    /// The occupancy high-watermark never exceeded the bounded capacity.
+    pub(crate) watermark_bounded: bool,
+    /// Every fail-closed fuse is clear.
+    pub(crate) fuses_clear: bool,
+}
+
+impl QuiescentVerdict {
+    pub(crate) fn ok(&self) -> bool {
+        self.terminals_balance
+            && self.eligibility_balances
+            && self.completed_positive
+            && self.no_confinement_decline
+            && self.no_fallback_after_terminal
+            && self.ack_live_zero
+            && self.reserve_resolves
+            && self.commit_consumed
+            && self.watermark_bounded
+            && self.fuses_clear
+    }
+}
+
+/// Evaluate the quiescent invariants for one direction.
+pub(crate) fn quiescent_verdict(
+    counters: &DirectPathCounters,
+    store: &crate::kernel::direct_ack_store::DirectAckStore,
+) -> QuiescentVerdict {
+    QuiescentVerdict {
+        terminals_balance: counters.terminals_balance(),
+        eligibility_balances: counters.eligibility_balances(),
+        completed_positive: counters.completed() > 0,
+        no_confinement_decline: counters.declined_not_admitted() == 0,
+        no_fallback_after_terminal: counters.legacy_fallback_after_decline() == 0,
+        ack_live_zero: store.live_pair_count() == 0,
+        reserve_resolves: store.reserve_count() == store.commit_count() + store.cancel_count(),
+        commit_consumed: store.commit_count() == store.consume_count(),
+        watermark_bounded: store.occupancy_high_watermark()
+            <= crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY,
+        fuses_clear: store.capacity_refusal_count() == 0
+            && store.endpoint_live_refusal_count() == 0
+            && store.stale_generation_rejection_count() == 0
+            && store.foreign_waiter_rejection_count() == 0
+            && store.duplicate_consume_rejection_count() == 0
+            && store.not_committed_rejection_count() == 0,
+    }
+}
+
+/// Emit the FINAL quiescent production attestation, exactly once, only after the normal
+/// service chain has reported healthy. Read-only and one-shot.
+pub(crate) fn maybe_emit_quiescent_attestation(service_chain_healthy: bool) -> bool {
+    if !service_chain_healthy {
+        return false;
+    }
+    if QUIESCENT_ATTESTED.swap(1, Ordering::AcqRel) != 0 {
+        return false;
+    }
+    let req_store = crate::kernel::boot::ipccall_direct_ack::store();
+    let rep_store = crate::kernel::boot::ipcreply_direct_ack::store();
+    let nr6 = quiescent_verdict(&REQUEST, req_store);
+    let nr7 = quiescent_verdict(&REPLY, rep_store);
+    emit_quiescent("nr6", &REQUEST, req_store, nr6);
+    emit_quiescent("nr7", &REPLY, rep_store, nr7);
+    crate::yarm_log!(
+        "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok={} nr7_ok={} result={}",
+        nr6.ok() as u8,
+        nr7.ok() as u8,
+        if nr6.ok() && nr7.ok() { "ok" } else { "fail" },
+    );
+    true
+}
+
+fn emit_quiescent(
+    which: &str,
+    counters: &DirectPathCounters,
+    store: &crate::kernel::direct_ack_store::DirectAckStore,
+    v: QuiescentVerdict,
+) {
+    crate::yarm_log!(
+        "IPC_DIRECT_PRODUCTION_QUIESCENT dir={} attempts={} completed={} failed={} preflight={} pre_txn={} fallback={} not_admitted={} terminals={} eligibility={} completed_gt0={} no_confinement={} no_late_fallback={} result={}",
+        which,
+        counters.attempts(),
+        counters.completed(),
+        counters.failed_total(),
+        counters.declined_preflight(),
+        counters.declined_pre_transaction(),
+        counters.legacy_fallback_after_decline(),
+        counters.declined_not_admitted(),
+        v.terminals_balance as u8,
+        v.eligibility_balances as u8,
+        v.completed_positive as u8,
+        v.no_confinement_decline as u8,
+        v.no_fallback_after_terminal as u8,
+        if v.ok() { "ok" } else { "fail" },
+    );
+    crate::yarm_log!(
+        "IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir={} reserve={} commit={} consume={} cancel={} live={} high_watermark={} capacity={} live_zero={} reserve_resolves={} commit_consumed={} watermark_ok={} fuses_clear={}",
+        which,
+        store.reserve_count(),
+        store.commit_count(),
+        store.consume_count(),
+        store.cancel_count(),
+        store.live_pair_count(),
+        store.occupancy_high_watermark(),
+        crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY,
+        v.ack_live_zero as u8,
+        v.reserve_resolves as u8,
+        v.commit_consumed as u8,
+        v.watermark_bounded as u8,
+        v.fuses_clear as u8,
+    );
 }
 
 /// Emit the direct-IPC attestation, at most **twice per direction** per boot. Purely a
@@ -358,10 +506,10 @@ mod tests {
         let c = fresh();
         // A preflight decline (Synchronous).
         c.note_attempt();
-        c.note_declined_preflight(true);
+        c.note_declined_preflight(true, false);
         // A preflight decline for another reason.
         c.note_attempt();
-        c.note_declined_preflight(false);
+        c.note_declined_preflight(false, false);
         // A completed transaction.
         c.note_attempt();
         c.note_eligible();
@@ -449,7 +597,7 @@ mod tests {
         c.note_attempt();
         c.note_eligible();
         c.note_failed(SyscallError::WrongObject);
-        c.note_declined_preflight(true);
+        c.note_declined_preflight(true, false);
         c.note_legacy_fallback_after_decline();
         c.reset();
         assert_eq!(c.attempts(), 0);
