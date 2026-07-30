@@ -64,6 +64,9 @@ pub(crate) struct DirectPathCounters {
     declined_preflight: AtomicU64,
     declined_pre_transaction: AtomicU64,
     declined_not_admitted: AtomicU64,
+    /// NR7 only: declines caused by a reply carrying a transferred capability the direct
+    /// transaction cannot deliver. A *breakdown* of `declined_preflight`, never a bucket.
+    declined_transfer_cap: AtomicU64,
     completed: AtomicU64,
     legacy_fallback_after_decline: AtomicU64,
     failed_by_code: [AtomicU64; FAILED_CODE_SLOTS],
@@ -81,6 +84,7 @@ impl DirectPathCounters {
             declined_preflight: AtomicU64::new(0),
             declined_pre_transaction: AtomicU64::new(0),
             declined_not_admitted: AtomicU64::new(0),
+            declined_transfer_cap: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             legacy_fallback_after_decline: AtomicU64::new(0),
             failed_by_code: [const { AtomicU64::new(0) }; FAILED_CODE_SLOTS],
@@ -96,6 +100,7 @@ impl DirectPathCounters {
         self.declined_preflight.store(0, Ordering::Relaxed);
         self.declined_pre_transaction.store(0, Ordering::Relaxed);
         self.declined_not_admitted.store(0, Ordering::Relaxed);
+        self.declined_transfer_cap.store(0, Ordering::Relaxed);
         self.completed.store(0, Ordering::Relaxed);
         self.legacy_fallback_after_decline
             .store(0, Ordering::Relaxed);
@@ -133,6 +138,19 @@ impl DirectPathCounters {
         // means an otherwise eligible endpoint was still being turned away.
         if not_admitted {
             self.declined_not_admitted.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The NR7 twin of [`Self::note_declined_preflight`]. NR7 has no `EndpointMode`
+    /// requirement, so it can never report a mode decline; it has a transfer-cap decline
+    /// instead, which NR6 cannot have: `IpcCall` **repurposes** the `SYSCALL_ARG_TRANSFER_CAP`
+    /// slot for the reply-endpoint receive capability (`handle_ipc_call`'s `reply_recv_cap`),
+    /// and the direct request path reads that same slot the same way, so no capability
+    /// transfer is in flight on the request side at all.
+    pub(crate) fn note_declined_preflight_reply(&self, not_admitted: bool, transfer_cap: bool) {
+        self.note_declined_preflight(false, not_admitted);
+        if transfer_cap {
+            self.declined_transfer_cap.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -181,6 +199,9 @@ impl DirectPathCounters {
     }
     pub(crate) fn declined_not_admitted(&self) -> u64 {
         self.declined_not_admitted.load(Ordering::Acquire)
+    }
+    pub(crate) fn declined_transfer_cap(&self) -> u64 {
+        self.declined_transfer_cap.load(Ordering::Acquire)
     }
     pub(crate) fn completed(&self) -> u64 {
         self.completed.load(Ordering::Acquire)
@@ -268,11 +289,36 @@ pub(crate) struct QuiescentVerdict {
     /// preflight never touches state, pre-transaction stops before the ack claim.
     pub(crate) no_fallback_after_terminal: bool,
     /// The acknowledgement store is empty.
+    ///
+    /// **Reported, but deliberately NOT part of [`QuiescentVerdict::ok`].** A healthy
+    /// microkernel never reaches a state with no parked servers: at the latest observable
+    /// point in a boot, every resident service (PM, VFS, ramfs, ext4, blkcache, virtio-blk,
+    /// the driver manager, init) is blocked in recv-v2 waiting for work, and each of those
+    /// waiters legitimately holds a live lease. A live boot measured `live=8` there with ten
+    /// distinct servers having blocked — so requiring zero would be requiring the system to be
+    /// dead. [`Self::no_orphaned_lease`] is the leak invariant that actually holds while
+    /// running.
     pub(crate) ack_live_zero: bool,
     /// reserve == commit + cancel: every reservation resolved exactly once.
     pub(crate) reserve_resolves: bool,
-    /// commit == consume: every publication was consumed exactly once.
-    pub(crate) commit_consumed: bool,
+    /// `reserve == consume + release + cancel`: every reservation reached a terminal edge and
+    /// none is still outstanding. True only at genuine quiescence — see
+    /// [`Self::no_orphaned_lease`] for the form that holds on a running system.
+    pub(crate) terminal_edges_balance: bool,
+    /// **The lease-lifecycle invariant, in the form that holds at any instant.**
+    ///
+    /// `reserve == consume + release + cancel + live`: every reservation is either still LIVE
+    /// (its waiter is parked and its lease is legitimately claimable) or reached exactly one of
+    /// the three terminal edges — consumed by a direct delivery, released by its departing
+    /// endpoint waiter, or cancelled before publication. Nothing is unaccounted for.
+    ///
+    /// This is the invariant the increment exists to make true, and before the lease was owned
+    /// by the waiter lifecycle it could not hold on a production boot: `release` did not exist,
+    /// so every legacy-satisfied recv left a committed pair that was neither live-and-claimable
+    /// nor terminated — an orphan, indistinguishable in the accounting from a parked server.
+    pub(crate) no_orphaned_lease: bool,
+    /// No pair resolved through BOTH terminal edges, in either order.
+    pub(crate) terminals_mutually_exclusive: bool,
     /// The occupancy high-watermark never exceeded the bounded capacity.
     pub(crate) watermark_bounded: bool,
     /// Every fail-closed fuse is clear.
@@ -286,9 +332,12 @@ impl QuiescentVerdict {
             && self.completed_positive
             && self.no_confinement_decline
             && self.no_fallback_after_terminal
-            && self.ack_live_zero
             && self.reserve_resolves
-            && self.commit_consumed
+            // Neither `ack_live_zero` nor `terminal_edges_balance` is required: both need a
+            // system with no parked servers, which a running microkernel never is.
+            // `no_orphaned_lease` is the leak check that holds at any instant.
+            && self.no_orphaned_lease
+            && self.terminals_mutually_exclusive
             && self.watermark_bounded
             && self.fuses_clear
     }
@@ -307,7 +356,17 @@ pub(crate) fn quiescent_verdict(
         no_fallback_after_terminal: counters.legacy_fallback_after_decline() == 0,
         ack_live_zero: store.live_pair_count() == 0,
         reserve_resolves: store.reserve_count() == store.commit_count() + store.cancel_count(),
-        commit_consumed: store.commit_count() == store.consume_count(),
+        terminal_edges_balance: store.reserve_count()
+            == store.consume_count() + store.release_count() + store.cancel_count(),
+        no_orphaned_lease: store.reserve_count()
+            == store.consume_count()
+                + store.release_count()
+                + store.cancel_count()
+                + store.live_pair_count() as u64,
+        // A consume refused because the lease had already been released is the only way the
+        // two edges can collide; the reverse order (release after consume) is the ordinary
+        // trace of a successful direct delivery and is counted separately, not here.
+        terminals_mutually_exclusive: store.crossed_terminal_rejection_count() == 0,
         watermark_bounded: store.occupancy_high_watermark()
             <= crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY,
         fuses_clear: store.capacity_refusal_count() == 0
@@ -315,6 +374,7 @@ pub(crate) fn quiescent_verdict(
             && store.stale_generation_rejection_count() == 0
             && store.foreign_waiter_rejection_count() == 0
             && store.duplicate_consume_rejection_count() == 0
+            && store.duplicate_release_rejection_count() == 0
             && store.not_committed_rejection_count() == 0,
     }
 }
@@ -349,8 +409,10 @@ fn emit_quiescent(
     store: &crate::kernel::direct_ack_store::DirectAckStore,
     v: QuiescentVerdict,
 ) {
+    // Split across four lines per direction: `PRB_MSG_MAX` is 192 bytes and a kernel log line
+    // is truncated silently, so one wide line would clip its own verdict flags.
     crate::yarm_log!(
-        "IPC_DIRECT_PRODUCTION_QUIESCENT dir={} attempts={} completed={} failed={} preflight={} pre_txn={} fallback={} not_admitted={} terminals={} eligibility={} completed_gt0={} no_confinement={} no_late_fallback={} result={}",
+        "IPC_DIRECT_PRODUCTION_QUIESCENT dir={} attempts={} completed={} failed={} preflight={} pre_txn={} fallback={} not_admitted={} transfer_cap={}",
         which,
         counters.attempts(),
         counters.completed(),
@@ -359,6 +421,11 @@ fn emit_quiescent(
         counters.declined_pre_transaction(),
         counters.legacy_fallback_after_decline(),
         counters.declined_not_admitted(),
+        counters.declined_transfer_cap(),
+    );
+    crate::yarm_log!(
+        "IPC_DIRECT_PRODUCTION_QUIESCENT_FLAGS dir={} terminals={} eligibility={} completed_gt0={} no_confinement={} no_late_fallback={} result={}",
+        which,
         v.terminals_balance as u8,
         v.eligibility_balances as u8,
         v.completed_positive as u8,
@@ -367,18 +434,27 @@ fn emit_quiescent(
         if v.ok() { "ok" } else { "fail" },
     );
     crate::yarm_log!(
-        "IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir={} reserve={} commit={} consume={} cancel={} live={} high_watermark={} capacity={} live_zero={} reserve_resolves={} commit_consumed={} watermark_ok={} fuses_clear={}",
+        "IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir={} reserve={} commit={} consume={} release={} rel_after_consume={} cancel={} live={} spent={} high_watermark={} capacity={}",
         which,
         store.reserve_count(),
         store.commit_count(),
         store.consume_count(),
+        store.release_count(),
+        store.release_after_consume_count(),
         store.cancel_count(),
         store.live_pair_count(),
+        store.released_pair_count(),
         store.occupancy_high_watermark(),
         crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY,
+    );
+    crate::yarm_log!(
+        "IPC_DIRECT_PRODUCTION_ACK_FLAGS dir={} live_zero={} reserve_resolves={} no_orphan={} terminal_edges={} exclusive={} watermark_ok={} fuses_clear={}",
+        which,
         v.ack_live_zero as u8,
         v.reserve_resolves as u8,
-        v.commit_consumed as u8,
+        v.no_orphaned_lease as u8,
+        v.terminal_edges_balance as u8,
+        v.terminals_mutually_exclusive as u8,
         v.watermark_bounded as u8,
         v.fuses_clear as u8,
     );
@@ -459,19 +535,29 @@ fn emit_direction(
         (counters.terminals_balance() && counters.eligibility_balances()) as u8,
     );
     crate::yarm_log!(
-        "IPC_DIRECT_ACK_COUNTERS phase={} dir={} reserve={} commit={} consume={} cancel={} live={} high_watermark={} capacity={}",
+        "IPC_DIRECT_TRANSFER_CAP phase={} dir={} declined_transfer_cap={} declined_not_admitted={}",
+        phase,
+        which,
+        counters.declined_transfer_cap(),
+        counters.declined_not_admitted(),
+    );
+    crate::yarm_log!(
+        "IPC_DIRECT_ACK_COUNTERS phase={} dir={} reserve={} commit={} consume={} release={} release_after_consume={} cancel={} live={} spent_released={} high_watermark={} capacity={}",
         phase,
         which,
         store.reserve_count(),
         store.commit_count(),
         store.consume_count(),
+        store.release_count(),
+        store.release_after_consume_count(),
         store.cancel_count(),
         store.live_pair_count(),
+        store.released_pair_count(),
         store.occupancy_high_watermark(),
         crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY,
     );
     crate::yarm_log!(
-        "IPC_DIRECT_ACK_FUSES phase={} dir={} capacity_refused={} overwrite_fuse={} stale={} foreign={} duplicate={} not_committed={}",
+        "IPC_DIRECT_ACK_FUSES phase={} dir={} capacity_refused={} overwrite_fuse={} stale={} foreign={} duplicate={} dup_release={} crossed={} not_committed={}",
         phase,
         which,
         store.capacity_refusal_count(),
@@ -479,6 +565,8 @@ fn emit_direction(
         store.stale_generation_rejection_count(),
         store.foreign_waiter_rejection_count(),
         store.duplicate_consume_rejection_count(),
+        store.duplicate_release_rejection_count(),
+        store.crossed_terminal_rejection_count(),
         store.not_committed_rejection_count(),
     );
 }

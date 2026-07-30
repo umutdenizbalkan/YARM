@@ -991,6 +991,47 @@ confinement was hiding. Full evidence, live markers and fix directions: `doc/IPC
 remaining sequence is: **transfer-cap handling** → **ack lifecycle release** → **capacity
 re-derivation** → **live flip proof**.
 
+### 6.1.7 Blockers 1–3 closed; capacity is the only one left
+
+**Transfer-cap safety.** `DirectReplyFacts::transfer_cap_present` +
+`DirectReplyEligibility::TransferCapUnsupported`: a cap-bearing reply declines before any
+mutation and the legacy path does the transfer. The presence question is asked through the one
+canonical `ipc_abi::transfer_cap_arg_present` predicate the legacy decode is itself built on, so
+the two cannot disagree — including that a raw `0` *is* a capability id. The check precedes every
+capability resolution, so a cap-bearing reply can never reach an acknowledgement claim or the
+transaction, and the transaction contains no transfer machinery at all. Direct capability
+transfer remains unimplemented.
+
+**The acknowledgement lease is owned by the endpoint waiter lifecycle.**
+`DirectAckStore::release` is a fourth slot state (`Released`) and the non-direct terminal edge,
+exact in endpoint index, endpoint generation, waiter TID and waiter ASID. It is called from
+`IpcSubsystem::release_direct_ack_lease`, which is called from exactly the three waiter-removal
+primitives every canonical closing edge funnels through — `take_endpoint_waiter`,
+`clear_endpoint_waiter_if_identity`, `clear_endpoint_waiters_for_identity` — and nowhere else.
+Direct consume and non-direct release are mutually exclusive terminals, proved by two 200-run
+deterministic races (edge-vs-edge, and release-vs-slot-recycle).
+
+**Live, feature-off x86_64 boot with the flip temporarily enabled:** the service chain is fully
+healthy (**all 6 service entries present exactly once**, `PM_ELF_ZC_FAIL count=0` — blocker 1
+gone), the overwrite fuse went from **17 trips to 0**, and **52 NR6 / 64 NR7** leases were
+retired by their departing waiters. **10** cap-bearing replies declined to legacy.
+
+**The only remaining blocker is capacity.** The genuine post-release high-watermark is **8 —
+full capacity** — with one `CAPACITY_REFUSED` per store. The eight live leases are not orphans:
+`reserve == consume + release + cancel + live` is exact in both directions (113 == 53+52+0+8 and
+113 == 41+64+0+8). Ten distinct servers blocked over the boot, and at `INIT_IDLE_PARK_BEGIN` the
+resident services are all parked holding legitimate leases. `DIRECT_ACK_STORE_CAPACITY = 8` is
+simply smaller than the steady-state parked-server count, so a ninth endpoint gets no lease and
+falls back to legacy. Resizing was explicitly out of scope for this increment.
+
+Two measurement corrections the live boot forced: the quiescent trigger moved to
+`INIT_IDLE_PARK_BEGIN` (the previous trigger read `high_watermark=2` before the store went on to
+saturate), and **`live == 0` is not a valid quiescence requirement for a running microkernel** —
+`QuiescentVerdict::ok` now requires `no_orphaned_lease` instead. Full evidence: `doc/IPC.md`
+§8.6.6.
+
+The flip stays held off. Remaining sequence: **capacity re-derivation** → **live flip proof**.
+
 ---
 
 ## 7. Method and limits

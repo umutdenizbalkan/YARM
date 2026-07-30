@@ -88,6 +88,16 @@ const SLOT_VACANT: u8 = 0;
 const SLOT_RESERVED: u8 = 1;
 const SLOT_COMMITTED: u8 = 2;
 const SLOT_CONSUMED: u8 = 3;
+/// Terminal, spent, and **not** consumed: the waiter this pair was published for left through
+/// a non-direct edge (legacy delivery, timeout, cancellation, death, endpoint destruction,
+/// stale cleanup), so the lease is over and the acknowledgement was never handed out.
+///
+/// A distinct terminal state rather than a return to `Vacant`, for the same reason
+/// `Consumed` is: a spent slot must stay *findable* so a duplicate release is
+/// distinguishable from an absent pair, and so [`DirectAckStore::consume`] can refuse a
+/// pair whose lease has already ended instead of silently delivering into a departed
+/// waiter's buffers.
+const SLOT_RELEASED: u8 = 4;
 
 /// Sentinel stored in a slot's endpoint index while the slot holds no pair.
 const NO_ENDPOINT: usize = usize::MAX;
@@ -224,6 +234,11 @@ pub(crate) enum AckConsume {
     NotCommitted,
     /// The pair was already consumed — a duplicate trap/drain.
     AlreadyConsumed,
+    /// The lease already ended through a NON-direct edge: the waiter this acknowledgement
+    /// was published for has been removed (legacy delivery, timeout, cancellation, death,
+    /// endpoint destruction, stale cleanup). This is the mutual-exclusion refusal — the two
+    /// terminal edges can never both resolve one pair.
+    AlreadyReleased,
 }
 
 impl AckConsume {
@@ -234,6 +249,64 @@ impl AckConsume {
             Self::Consumed(fields, seq) => Some((fields, seq)),
             _ => None,
         }
+    }
+}
+
+/// The outcome of an attempted **lease release** — the non-direct terminal edge, taken when
+/// the endpoint receive-waiter a pair was published for is removed for any reason other than
+/// a direct delivery.
+///
+/// Only [`AckRelease::Released`] mutates. Every other variant leaves the slot exactly as it
+/// was, so a foreign, stale or repeated release is a pure no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckRelease {
+    /// The exact committed pair was live and its lease is now over. Carries the publication
+    /// sequence that was retired. The only mutating result, and it happens at most once.
+    Released(u64),
+    /// No slot holds a pair for this endpoint index. **The overwhelmingly common case** —
+    /// most endpoint waiters never had an acknowledgement published — and a pure no-op, so
+    /// it is deliberately not counted.
+    Absent,
+    /// A pair exists for this endpoint index, but for a different endpoint *incarnation*.
+    /// Releasing it would retire a lease belonging to a later endpoint generation.
+    StaleGeneration,
+    /// The pair matches the endpoint exactly but names a different waiter incarnation — a
+    /// replacement task that reused the numeric TID with a fresh ASID is not our waiter.
+    ForeignWaiter,
+    /// The pair is reserved but not yet published: the publisher still owns it and will
+    /// commit or cancel. Reachable only when a removal interleaves a publisher's
+    /// reserve → commit window, which cannot happen on a uniprocessor boot.
+    NotCommitted,
+    /// The direct edge already consumed this pair. **Expected and benign**: it is exactly
+    /// what a successful direct delivery leaves behind, since the transaction consumes the
+    /// acknowledgement and then removes the waiter it delivered to.
+    AlreadyConsumed,
+    /// This lease was already released — a duplicate non-direct terminal.
+    AlreadyReleased,
+}
+
+impl AckRelease {
+    /// The retired publication sequence, when this call is the one that ended the lease.
+    pub(crate) fn released_seq(self) -> Option<u64> {
+        match self {
+            Self::Released(seq) => Some(seq),
+            Self::Absent
+            | Self::StaleGeneration
+            | Self::ForeignWaiter
+            | Self::NotCommitted
+            | Self::AlreadyConsumed
+            | Self::AlreadyReleased => None,
+        }
+    }
+
+    /// True for the outcomes that indicate a real accounting anomaly, as opposed to the
+    /// ordinary no-ops (`Absent`, `AlreadyConsumed`) and the SMP-only publisher race
+    /// (`NotCommitted`). These are the ones a quiescent attestation requires to be zero.
+    pub(crate) fn is_anomaly(self) -> bool {
+        matches!(
+            self,
+            Self::StaleGeneration | Self::ForeignWaiter | Self::AlreadyReleased
+        )
     }
 }
 
@@ -349,8 +422,19 @@ pub(crate) struct DirectAckStore {
     foreign_waiter_rejections: AtomicU64,
     not_committed_rejections: AtomicU64,
     duplicate_consume_rejections: AtomicU64,
+    duplicate_release_rejections: AtomicU64,
+    /// Consumption refused because the lease had already ended through a non-direct edge.
+    /// The mutual-exclusion counter: it is the direct edge arriving after the waiter left.
+    crossed_terminal_rejections: AtomicU64,
     commits: AtomicU64,
     consumes: AtomicU64,
+    /// Leases retired through the non-direct terminal edge. The fourth resolution alongside
+    /// consume and cancel: `reserves == consumes + releases + cancels` at quiescence.
+    releases: AtomicU64,
+    /// Releases that found the pair already consumed by the direct edge. Not an anomaly —
+    /// one is produced by every successful direct delivery — but tracked, because it is the
+    /// bridge term that makes the reserve/terminal balance legible.
+    releases_after_consume: AtomicU64,
     cancels: AtomicU64,
 }
 
@@ -368,8 +452,12 @@ impl DirectAckStore {
             foreign_waiter_rejections: AtomicU64::new(0),
             not_committed_rejections: AtomicU64::new(0),
             duplicate_consume_rejections: AtomicU64::new(0),
+            duplicate_release_rejections: AtomicU64::new(0),
+            crossed_terminal_rejections: AtomicU64::new(0),
             commits: AtomicU64::new(0),
             consumes: AtomicU64::new(0),
+            releases: AtomicU64::new(0),
+            releases_after_consume: AtomicU64::new(0),
             cancels: AtomicU64::new(0),
         }
     }
@@ -394,8 +482,13 @@ impl DirectAckStore {
         self.not_committed_rejections.store(0, Ordering::Relaxed);
         self.duplicate_consume_rejections
             .store(0, Ordering::Relaxed);
+        self.duplicate_release_rejections
+            .store(0, Ordering::Relaxed);
+        self.crossed_terminal_rejections.store(0, Ordering::Relaxed);
         self.commits.store(0, Ordering::Relaxed);
         self.consumes.store(0, Ordering::Relaxed);
+        self.releases.store(0, Ordering::Relaxed);
+        self.releases_after_consume.store(0, Ordering::Relaxed);
         self.cancels.store(0, Ordering::Relaxed);
     }
 
@@ -420,8 +513,10 @@ impl DirectAckStore {
     }
 
     /// Take exclusive ownership of a slot to reserve into: a vacant slot if one exists,
-    /// otherwise the least recently published SPENT (consumed) slot, whose acknowledgement
-    /// has already transferred ownership and can no longer be claimed.
+    /// otherwise the least recently published SPENT slot — one whose lease has already
+    /// reached a terminal edge, either `Consumed` (the acknowledgement transferred ownership)
+    /// or `Released` (the waiter left and it never will). Neither can be claimed again, so
+    /// both are safe to recycle.
     ///
     /// Returns `None` only when every slot holds a LIVE pair — the true capacity bound on
     /// simultaneously outstanding pairs.
@@ -442,21 +537,22 @@ impl DirectAckStore {
         }
         // No vacant slot: recycle the spent pair with the lowest publication sequence.
         loop {
-            let mut victim: Option<(usize, u64)> = None;
+            let mut victim: Option<(usize, u64, u8)> = None;
             for (index, slot) in self.slots.iter().enumerate() {
-                if slot.state.load(Ordering::Acquire) != SLOT_CONSUMED {
+                let state = slot.state.load(Ordering::Acquire);
+                if state != SLOT_CONSUMED && state != SLOT_RELEASED {
                     continue;
                 }
                 let seq = slot.seq.load(Ordering::Relaxed);
-                if victim.is_none_or(|(_, best)| seq < best) {
-                    victim = Some((index, seq));
+                if victim.is_none_or(|(_, best, _)| seq < best) {
+                    victim = Some((index, seq, state));
                 }
             }
-            let (index, _) = victim?;
+            let (index, _, spent_state) = victim?;
             if self.slots[index]
                 .state
                 .compare_exchange(
-                    SLOT_CONSUMED,
+                    spent_state,
                     SLOT_RESERVED,
                     Ordering::AcqRel,
                     Ordering::Acquire,
@@ -644,6 +740,14 @@ impl DirectAckStore {
                 .fetch_add(1, Ordering::Relaxed);
             return AckConsume::StaleGeneration;
         }
+        // MUTUAL EXCLUSION, checked before the waiter compare: a released slot has had its
+        // waiter identity wiped, so comparing identities first would misreport an ended lease
+        // as a foreign waiter. The two terminal edges can never both resolve one pair.
+        if slot.state.load(Ordering::Acquire) == SLOT_RELEASED {
+            self.crossed_terminal_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return AckConsume::AlreadyReleased;
+        }
         if let Some(expected) = expect_waiter
             && slot.waiter() != expected
         {
@@ -663,6 +767,7 @@ impl DirectAckStore {
                 return AckConsume::AlreadyConsumed;
             }
             SLOT_COMMITTED => {}
+            // `SLOT_RELEASED` is already refused above; `SLOT_VACANT` cannot be found.
             _ => return AckConsume::Absent,
         }
         // Exactly-once ownership transfer.
@@ -682,6 +787,121 @@ impl DirectAckStore {
         }
         self.consumes.fetch_add(1, Ordering::Relaxed);
         AckConsume::Consumed(slot.fields(), slot.seq.load(Ordering::Relaxed))
+    }
+
+    /// End the lease on the acknowledgement published for EXACTLY this endpoint incarnation
+    /// and waiter incarnation — the **non-direct terminal edge**, at most once.
+    ///
+    /// This is what makes the lease owned by the endpoint waiter's lifecycle rather than by
+    /// the direct delivery path. A pair is published when a task commits a blocking recv-v2;
+    /// before this edge existed the only way to retire one was a direct delivery's
+    /// [`Self::consume`], so every waiter satisfied by the legacy path, a timeout, a
+    /// cancellation, task or server death, endpoint destruction, or stale cleanup orphaned a
+    /// committed slot **permanently**. Publication was driven by blocking and consumption by
+    /// delivery, and the two were never paired.
+    ///
+    /// Identity is exact in all four components: endpoint index, endpoint generation, waiter
+    /// TID and waiter ASID. A stale generation or a foreign waiter mutates nothing, so a
+    /// replacement task that reused a numeric TID can never retire its predecessor's lease,
+    /// and a recycled endpoint slot can never retire the previous incarnation's.
+    /// # Why this takes the admission guard
+    ///
+    /// Release is the one operation that must be excluded against slot **recycling**. A
+    /// consumer racing a release cannot corrupt anything — `consume` and `release` both
+    /// compare-exchange out of `Committed`, so exactly one wins. But a *recycle* can: if a
+    /// release observes slot `i` as `Committed` for its endpoint, and slot `i` is then
+    /// consumed, re-reserved and re-committed for a fresh pair before the release's own
+    /// compare-exchange runs, that exchange would retire a lease it never inspected.
+    ///
+    /// `acquire_slot` — the only recycler — takes this guard, so holding it here makes
+    /// "find the slot, verify its identity, retire it" one decision, exactly as reservation
+    /// makes "check uniqueness, allocate" one decision. The guard is a leaf: taking it while
+    /// holding the IPC state lock is safe because its critical section takes no other lock.
+    ///
+    /// The overwhelmingly common case — a waiter removal on an endpoint that never published —
+    /// is resolved **lock-free before the guard is taken**, so ordinary removals pay nothing.
+    pub(crate) fn release(&self, endpoint: AckEndpoint, waiter: AckWaiter) -> AckRelease {
+        if self.find_slot_for_index(endpoint.index).is_none() {
+            // No pair for this endpoint: the ordinary case for the vast majority of waiter
+            // removals. Deliberately uncounted — this is on every endpoint waiter removal.
+            return AckRelease::Absent;
+        }
+        self.lock_admission();
+        let outcome = self.release_locked(endpoint, waiter);
+        self.unlock_admission();
+        outcome
+    }
+
+    /// The release decision. Callers hold the admission guard, so no slot can be recycled
+    /// between the identity checks and the state transition.
+    fn release_locked(&self, endpoint: AckEndpoint, waiter: AckWaiter) -> AckRelease {
+        let Some(index) = self.find_slot_for_index(endpoint.index) else {
+            return AckRelease::Absent;
+        };
+        let slot = &self.slots[index];
+        if slot.endpoint_generation.load(Ordering::Relaxed) != endpoint.generation {
+            self.stale_generation_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return AckRelease::StaleGeneration;
+        }
+        // Terminal states are checked BEFORE the waiter compare, because both of them wipe
+        // the waiter identity: comparing first would report a spent lease as a foreign one.
+        match slot.state.load(Ordering::Acquire) {
+            SLOT_CONSUMED => {
+                // The direct edge won. Expected — every successful direct delivery consumes
+                // the acknowledgement and then removes the waiter it delivered to.
+                self.releases_after_consume.fetch_add(1, Ordering::Relaxed);
+                return AckRelease::AlreadyConsumed;
+            }
+            SLOT_RELEASED => {
+                self.duplicate_release_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return AckRelease::AlreadyReleased;
+            }
+            SLOT_RESERVED => {
+                // The publisher still owns this slot and will commit or cancel it; its
+                // commit re-verifies the waiter identity under the IPC lock, so a removal
+                // that lands here makes that re-verify fail and the publisher cancels.
+                self.not_committed_rejections
+                    .fetch_add(1, Ordering::Relaxed);
+                return AckRelease::NotCommitted;
+            }
+            SLOT_COMMITTED => {}
+            _ => return AckRelease::Absent,
+        }
+        if slot.waiter() != waiter {
+            self.foreign_waiter_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return AckRelease::ForeignWaiter;
+        }
+        // Exactly-once: whichever CPU wins this CAS ends the lease; a loser sees `Released`
+        // on its own re-read and reports the duplicate instead of retiring it twice.
+        if slot
+            .state
+            .compare_exchange(
+                SLOT_COMMITTED,
+                SLOT_RELEASED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            self.duplicate_release_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return AckRelease::AlreadyReleased;
+        }
+        let seq = slot.seq.load(Ordering::Relaxed);
+        // The lease is over: drop the departed waiter's identity and its userspace
+        // destination pointers. The endpoint key and sequence stay, so the spent slot remains
+        // findable for duplicate detection and recyclable in publication order.
+        slot.waiter_tid.store(0, Ordering::Relaxed);
+        slot.waiter_asid.store(0, Ordering::Relaxed);
+        slot.payload_user_ptr.store(0, Ordering::Relaxed);
+        slot.payload_user_len.store(0, Ordering::Relaxed);
+        slot.meta_user_ptr.store(0, Ordering::Relaxed);
+        slot.meta_user_len.store(0, Ordering::Relaxed);
+        self.releases.fetch_add(1, Ordering::Relaxed);
+        AckRelease::Released(seq)
     }
 
     /// Re-arm a consumed acknowledgement for a retryable rollback of the SAME publication.
@@ -910,6 +1130,36 @@ impl DirectAckStore {
     #[allow(dead_code)]
     pub(crate) fn consume_count(&self) -> u64 {
         self.consumes.load(Ordering::Acquire)
+    }
+
+    /// Total leases retired through the non-direct terminal edge.
+    pub(crate) fn release_count(&self) -> u64 {
+        self.releases.load(Ordering::Acquire)
+    }
+
+    /// Releases that found the pair already consumed by the direct edge. Benign — one per
+    /// successful direct delivery — and the bridge term in the terminal balance.
+    pub(crate) fn release_after_consume_count(&self) -> u64 {
+        self.releases_after_consume.load(Ordering::Acquire)
+    }
+
+    /// Releases rejected because the lease had already been released.
+    pub(crate) fn duplicate_release_rejection_count(&self) -> u64 {
+        self.duplicate_release_rejections.load(Ordering::Acquire)
+    }
+
+    /// Consumptions refused because the lease had already ended through the non-direct edge.
+    /// The mutual-exclusion counter.
+    pub(crate) fn crossed_terminal_rejection_count(&self) -> u64 {
+        self.crossed_terminal_rejections.load(Ordering::Acquire)
+    }
+
+    /// Number of slots holding a lease that has been released (spent, never consumed).
+    pub(crate) fn released_pair_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.state.load(Ordering::Acquire) == SLOT_RELEASED)
+            .count()
     }
 
     /// Total cancelled reservations.
