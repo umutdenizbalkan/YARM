@@ -763,34 +763,158 @@ for the NR6 delivery path. Recorded in `doc/IPC.md` §8.6.1.
 unchanged, the error disposition (B) and return lanes (C) are untouched, and no endpoint-mode
 policy was added.
 
-### 6.1.2 HARD-STOP B — the split path reports success regardless of the transaction outcome
+### 6.1.2 HARD-STOP B — RESOLVED: typed disposition contract
 
-Both direct helpers discard the transaction result:
-`let _ = shared.drain_direct_request_post_work(&work);` (`src/kernel/syscall_split.rs:686`)
-and `let _ = shared.drain_direct_reply_post_work(&work);` (`:786`), each followed
-unconditionally by `frame.set_ok(0, 0, 0); Some(Ok(()))`.
+**The defect.** Both split helpers discarded the transaction result
+(`let _ = shared.drain_direct_request_post_work(&work);` and its NR7 twin), each followed
+unconditionally by `frame.set_ok(0, 0, 0)`. Every failure the transaction classifies became
+**success with no message delivered** — silent loss, no error, no fallback. Invisible on the
+oracle path, which never fails.
 
-Every failure the transaction classifies — `ServerGone`, `RecordFull`, `MintFailed`,
-`PayloadCopyFault`, `MetaCopyFault`, `WaiterLost`, `RecordCommitFailed` — is therefore
-reported to userspace as **success with no message delivered**. On the oracle path no
-failure ever occurs, so this is invisible today; on a production boot it is silent message
-loss with no error and no fallback.
+**The fix.** `src/kernel/direct_disposition.rs` holds one pure, exhaustive mapping per
+direction onto three dispositions — `Completed`, `DeclinedBeforeMutation`,
+`Failed(SyscallError)`. **No wildcard arm**: adding a variant to either error enum is a
+compile error until its disposition is decided. Neither drain's `Result` is discarded.
 
-*Remediation:* map each transaction error to the canonical `SyscallError` the legacy path
-would have raised, or to a `None` fallback where the legacy path would have serviced the
-call. Requires a per-variant disposition table and hosted proof for every variant.
+`DeclinedBeforeMutation` is admissible only when all six conditions hold of the state the
+transaction *leaves*: no reply record reserved or committed, no capability minted or
+installed, no user payload/meta copied, no waiter or run-queue change, no acknowledgement
+committed as a delivery, no wake published. Two clarifications are load-bearing and are
+recorded in the module: a completed rollback of a `Reserved` (never-invokable) record and a
+revoked provisional mint genuinely leave nothing; and a claimed-then-discarded
+acknowledgement published nothing — it only forfeits the direct path's own retry, which
+fails safe. Any *attempted* user copy disqualifies fallback, because a faulted copy may have
+written a prefix.
 
-### 6.1.3 HARD-STOP C — the NR6 caller's `ret2` lane diverges
+`Failed` encodes the canonical error with `frame.set_err(err.code())` — byte-for-byte how the
+global-lock handler encodes a `SyscallError` (`fault_state.rs`), so frame parity reduces to
+error-code equality.
 
-Legacy `handle_ipc_call` ends with `encode_transfer_cap_ret(frame, None)`
-(`src/kernel/syscall/ipc.rs:618`), which writes `ret2 = SYSCALL_NO_TRANSFER_CAP`
-(`u64::MAX`). The direct path writes `frame.set_ok(0, 0, 0)` — `ret2 = 0`. x86_64
-userspace currently reads only `ret.error` for `ipc_call`, so this is latent rather than
-active, but it is a divergence from the legacy return contract and the AArch64/RISC-V
-decoders do inspect the return lanes.
+#### Request disposition table (14 variants, exhaustive)
 
-*Remediation:* one line — `frame.set_ok(0, 0, SYSCALL_NO_TRANSFER_CAP as usize)` — plus a
-frame-parity test against the legacy encoding.
+| Variant | Disposition | State left behind | Legacy equivalent |
+|---|---|---|---|
+| `WouldBlock` | Declined | pristine; ack restored | legacy queues or blocks the caller |
+| `LeaseNotClaimed` | Declined | pristine (duplicate drain) | legacy re-runs the send |
+| `CallerGone` | Declined | pristine; no cap resolved | legacy raises the canonical cap error |
+| `SendEndpoint(_)` | Declined | pristine | `validate_endpoint_right(cap, SEND)` |
+| `ReplyEndpoint(_)` | Declined | pristine | `validate_endpoint_right(reply, RECEIVE)` |
+| `EndpointGenerationChanged` | Declined | pristine | legacy re-resolves the endpoint |
+| `RecordFull` | Declined | pristine (probe/reserve refused) | `create_reply_cap_for_caller` table-full error |
+| `ServerCnodeMissing` | Declined | reservation cancelled | legacy fails later in materialization |
+| `MintFailed` | Declined | reservation cancelled, mint revoked | `materialize_received_message_cap` → `CapabilityFull` |
+| `PayloadCopyFault` | **Failed(`InvalidArgs`)** | a user copy was attempted | `complete_blocked_recv_for_waiter` → `InvalidArgs` |
+| `MetaCopyFault` | **Failed(`InvalidArgs`)** | a user copy was attempted | same, after rolling the cap back |
+| `WaiterLost` | **Failed(`WrongObject`)** | payload **and** meta already in the server's address space | none — legacy would have *queued*; see below |
+| `ServerGone` | **Failed(`ServerDied`)** | waiter claimed, deliberately not restored | the request will never be answered by that incarnation |
+| `RecordCommitFailed` | **Failed(`Internal`)** | server committed `Runnable` | defensive; unreachable |
+
+#### Reply disposition table (10 variants, exhaustive)
+
+| Variant | Disposition | State left behind | Legacy equivalent |
+|---|---|---|---|
+| `WouldBlock` | Declined | pristine | legacy `ipc_reply` runs |
+| `LeaseNotClaimed` | Declined | pristine (duplicate drain) | legacy re-runs the reply |
+| `ReplyCapResolve(_)` | Declined | pristine | legacy raises the canonical cap error |
+| `ReservePreconditionFailed` | Declined | pristine (reservation refused) | legacy one-shot/stale-record error |
+| `WaiterLost` | Declined | pristine — the **pre-reserve, pre-copy** check | legacy re-resolves the caller waiter |
+| `PayloadCopyFault` | **Failed(`InvalidArgs`)** | a user copy was attempted | legacy reply copy fault → `InvalidArgs` |
+| `MetaCopyFault` | **Failed(`InvalidArgs`)** | a user copy was attempted | same |
+| `WaiterLostAfterCopy` | **Failed(`WrongObject`)** | reply already in the caller's address space | stale reply authority |
+| `CallerGone` | **Failed(`WrongObject`)** | waiter claimed, record discarded | the reply cap names a caller that no longer exists |
+| `RecordConsumeFailed` | **Failed(`Internal`)** | caller committed `Runnable` | defensive; unreachable |
+
+**One enum change was required.** The reply `WaiterLost` was returned from *two* positions
+with **different** post-states — step (2), before any reservation or copy, and step (5),
+after both copies had landed in the caller's address space. One variant cannot carry two
+dispositions, so step (5) is now `WaiterLostAfterCopy`.
+
+**Where honest parity does not exist.** For request `WaiterLost`, legacy would find no
+endpoint waiter and *queue* the message, returning success. The direct path cannot queue —
+the request bytes are already in the server's buffer — so it reports the stale-authority
+error rather than inventing parity or risking a duplicate delivery. This is recorded rather
+than papered over.
+
+**Proof.** `stage199d_delivery_projection_differential::injection` injects each
+deterministically reachable variant through the real drain and asserts the exact error, its
+disposition, zero reply-record/cap/waiter/wake leak, and zero duplicate delivery. For both
+copy faults the frame error code is compared against the code the **legacy path actually
+produces** for the same injected condition (an unmapped destination), measured in the same
+test. The pure mapping is covered exhaustively by `direct_disposition`'s own tests, whose
+per-variant tables are the mutation guards: every arm is pinned individually, the tables are
+asserted duplicate-free and count-exact, and `failure()`/`permits_legacy_fallback()` are
+asserted mutually exclusive.
+
+**Race-only variants.** `ServerGone`, reply `CallerGone`, `WaiterLostAfterCopy`,
+`RecordCommitFailed` and `RecordConsumeFailed` cannot be injected deterministically in a
+single-threaded hosted build: the prevalidate and commit steps evaluate the *same* predicate
+with no yield between them, the two waiter reads hit the same slot, and the record-commit
+branches are defensive. No production test hook was added to force them (a guard asserts the
+transaction carries none). All five are `Failed`, pinned by test.
+
+### 6.1.3 HARD-STOP C — RESOLVED: the successful return lanes match legacy
+
+**The defect.** Legacy `handle_ipc_call` ends its success path with
+`frame.set_ok(0, 0, 0)` followed by `encode_transfer_cap_ret(frame, None)?`
+(`src/kernel/syscall/ipc.rs`), which writes `ret2 = SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`).
+The direct path wrote `set_ok(0, 0, 0)` alone, leaving `ret2 = 0` — a silent divergence from
+the legacy ABI on the **successful** path.
+
+**The audit did not confirm NR7 was already correct.** `handle_ipc_reply` ends with the
+*identical* two-call encoding, so the direct reply path's `ret2` diverged exactly as NR6's
+did. Both are fixed by one shared encoder, which is precisely why sharing it is correct
+rather than merely convenient.
+
+**The fix.** `direct_disposition::apply_direct_disposition` is the single frame-encoding site
+for both directions:
+
+| Disposition | Frame effect |
+|---|---|
+| `Completed` | `set_ok(0, 0, SYSCALL_NO_TRANSFER_CAP as usize)` — the sentinel comes from the same constant `encode_transfer_cap_ret` writes, not a duplicated literal |
+| `Failed(err)` | `set_err(err.code())`, which zeroes `ret0`/`ret1`/`ret2` first, so no stale success value — including the sentinel — can survive |
+| `DeclinedBeforeMutation` | nothing written; the legacy fallback receives a pristine frame |
+
+Neither split helper writes a return lane after the drain (asserted structurally).
+
+**Proof.**
+
+* `direct_request_success_lanes_match_legacy_byte_for_byte` — runs a SUCCESSFUL legacy
+  `IpcCall` trap, captures `error`/`ret0`/`ret1`/`ret2`, and compares every lane against the
+  production encoder's output. The encoder is fed a **poisoned** frame first, so parity
+  cannot be an accident of a zeroed frame.
+* `direct_reply_success_lanes_match_legacy_byte_for_byte` — pins at source level that both
+  legacy handlers end with the same `set_ok` + `encode_transfer_cap_ret` pair (adjacent
+  lines), and that `encode_transfer_cap_ret(_, None)` writes `SYSCALL_NO_TRANSFER_CAP`, then
+  asserts the encoder's lanes. Driving a successful legacy `IpcReply` end-to-end
+  additionally requires the caller committed-blocked on its reply endpoint, which the
+  NR6-oriented fixture does not arrange; the lane *values* are pinned empirically by the
+  `IpcCall` baseline and the *encoding* is pinned for both handlers.
+* `failed_dispositions_leave_no_stale_success_lane` — starts from a full success frame
+  (sentinel present) and asserts every `Failed` arm clears all three lanes.
+* `declined_disposition_leaves_the_frame_untouched` — asserts no return lane, no syscall
+  argument and not the syscall number changes before fallback.
+* `successful_drain_encodes_the_legacy_success_lanes` — end-to-end through the real drain.
+
+**Live attestation.** `yarm-user-rt` gained `ipc_call_with_transfer_ret`, which `ipc_call`
+delegates to (one syscall sequence, identical behaviour), returning the transfer-cap lane.
+The oracle client compares it against `SYSCALL_NO_TRANSFER_CAP`, emits
+`IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2`, and **gates** its round-trip completion on it; the
+runner requires that marker with the exact numeric sentinel. Observed on the sealed boot:
+
+```
+IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2 ret2=18446744073709551615
+    expected=18446744073709551615 ret2_ok=1 result=ok
+```
+
+Replacement seal at commit `a4bb63e3e83e93ecc3e9e33582e493c8b37c33fe` (tree
+`2f0fddddfccd2b5018c761a32967804d8f64ea95`), recorded in `doc/IPC.md` §8.6.
+
+**One thing the live run caught that hosted tests could not.** The first attempt also added
+`call_ret2_ok=1` to the round-trip completion marker. `user_log` truncates at 192 bytes and
+that line was already at the cap, so the boot silently clipped ` result=ok` and the runner
+failed closed. The evidence now rides in the dedicated marker and the completion literal is
+unchanged; the completion is still *gated* on the attestation. A hosted test could not have
+found this — only a real boot through the real logging path.
 
 ### 6.1.4 Non-blocking gaps found in the same audit
 
@@ -808,14 +932,20 @@ frame-parity test against the legacy encoding.
 
 ### 6.1.5 Status
 
-The flip is **not** blocked by the two gates, nor by the acknowledgement store, nor — as of
-A — by delivery conformance. Two correctness defects remain in the transaction body: **B**
-(the split path reports success regardless of the transaction outcome) and **C** (the NR6
-caller's `ret2` lane diverges). The gates remain the only thing keeping those out of the
-service chain, so removing them before fixing B and C would still convert a contained
-proof-only path into a live regression. The dependency-ordered remainder is:
-~~A (delivery conformance)~~ **done** → B (error disposition) → C (return-lane parity) →
-mode-eligibility + production counters → gate removal → live flip proof.
+**All three correctness defects are resolved.** The flip is no longer blocked by the two
+gates, the acknowledgement store, delivery conformance (A), error disposition (B), or
+return-lane parity (C). What remains is not defect repair but the enablement work itself:
+
+~~A (delivery conformance)~~ **done** → ~~B (error disposition)~~ **done** →
+~~C (return-lane parity)~~ **done** → **mode eligibility + production counters** →
+**gate removal** → **live flip proof**.
+
+The next increment is the one §6.1 originally described: replace the oracle endpoint
+confinement with generic production eligibility for the endpoint modes and rights the
+transaction actually supports (`Buffered` only — `Synchronous` carries rendezvous semantics
+the direct path does not reproduce; see §6.1.4), add the production counters and
+attestations, and only then remove the gates and prove the flip live. Until that lands the
+proof gate and endpoint confinement remain in place and no production default has changed.
 
 ---
 

@@ -84,7 +84,10 @@ pub mod syscall {
     /// Stage 200D-0: terminate the CALLING task (NR 16). Must match
     /// `kernel::syscall::SYSCALL_EXIT_CURRENT_TASK_NR`.
     pub const SYSCALL_EXIT_CURRENT_TASK_NR: usize = 16;
-    const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
+    /// The `ret2` sentinel a syscall returns when it transfers NO capability. `pub` since
+    /// Stage 199D HARD-STOP C so an oracle can attest the NR6/NR7 success return-lane ABI
+    /// live; it is the same value the kernel's `SYSCALL_NO_TRANSFER_CAP` writes.
+    pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
     const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
     const SYSCALL_RECV_META_TRANSFERRED_CAP: usize = 1 << 1;
@@ -999,6 +1002,25 @@ pub mod syscall {
         reply_recv_cap: u32,
         msg: &Message,
     ) -> core::result::Result<(), SyscallError> {
+        // SAFETY: delegated verbatim to the transfer-ret variant — one implementation.
+        unsafe { ipc_call_with_transfer_ret(ep_cap, reply_recv_cap, msg) }.map(|_ret2| ())
+    }
+
+    /// Exactly [`ipc_call`], additionally returning the transfer-cap return lane (`ret2`).
+    ///
+    /// Stage 199D HARD-STOP C: `ipc_call` succeeds with `ret2 = SYSCALL_NO_TRANSFER_CAP`,
+    /// and an oracle needs to observe that lane to attest the successful-return ABI live.
+    /// `ipc_call` delegates here, so there is exactly one syscall sequence and the
+    /// behaviour of both is identical.
+    ///
+    /// # Safety
+    /// As [`ipc_call`].
+    #[inline]
+    pub unsafe fn ipc_call_with_transfer_ret(
+        ep_cap: u32,
+        reply_recv_cap: u32,
+        msg: &Message,
+    ) -> core::result::Result<u64, SyscallError> {
         // Prepend the 2-byte opcode (LE) before the payload bytes so the receiver
         // can reconstruct the application-level opcode. The kernel ABI only passes
         // raw bytes; msg.opcode is not carried in return registers.
@@ -1020,7 +1042,7 @@ pub mod syscall {
         if ret.ret1 == args[1] && ret.ret2 == args[2] {
             return Err(decode_syscall_error(ret.ret0));
         }
-        Ok(())
+        Ok(ret.ret2 as u64)
     }
 
     #[inline]

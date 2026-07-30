@@ -657,19 +657,30 @@ frame), and the malformed too-short prefix.
 **The NR7 reply direction was already conforming** — reply messages carry no opcode prefix,
 so its `OPCODE_INLINE`/verbatim encoding already matched `Message::new`.
 
-#### Replacement live seal (supersedes the pre-conformance combined seal)
+#### Replacement live seal (current)
 
-The NR6/NR7 direct round trip was re-earned against the conforming delivery. The seal below
-**supersedes** the identically-named seal earned at `2c07ac96`, which proved the oracle's
-message contract rather than the production one.
+The NR6/NR7 direct round trip has been re-earned twice: once for delivery conformance
+(HARD-STOP A) and again for the successful-return ABI (HARD-STOP C, which changed the NR6
+`ret2` lane). The seal below is the current one.
 
 | Field | Value |
 |---|---|
 | Seal | `STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=x86_64 classes=2 live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok` |
-| Exact commit | `458bb3d4505e1aac3747d4c653463bf1a07eb1b2` |
-| Exact tree | `97513076e09248c5fad86b1fd9ce3e3ca71da81f` |
+| Exact commit | `a4bb63e3e83e93ecc3e9e33582e493c8b37c33fe` |
+| Exact tree | `2f0fddddfccd2b5018c761a32967804d8f64ea95` |
 | Runner | `scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh`, QEMU 8.2.2 TCG, `-smp 1`, `yarm.x86_64_ipccall_direct_oracle=1` |
-| Supersedes | the same seal name at `2c07ac96` (pre-conformance NR6 delivery) |
+| Supersedes | `458bb3d4` (delivery conformance, pre-`ret2`-parity) and `2c07ac96` (pre-conformance NR6 delivery) |
+
+**Return-lane parity attested live** — the successful NR6 call returned the legacy
+transfer-cap sentinel, not 0:
+
+```
+IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2 ret2=18446744073709551615
+    expected=18446744073709551615 ret2_ok=1 result=ok
+```
+
+`18446744073709551615` is `u64::MAX` = `SYSCALL_NO_TRANSFER_CAP`. The round-trip completion
+is gated on this attestation, and the runner requires the marker with that exact value.
 
 Conformance evidence from that boot log — the two numbers that were wrong before:
 
@@ -694,11 +705,71 @@ YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1
 The seal covers the NR6/NR7 **oracle-confined** round trip only. It is **not** a Stage 199D
 stage seal, and no production default was flipped.
 
-**Still non-conforming (not addressed here):** both split helpers discard the transaction
-result and report success unconditionally, and the NR6 caller's `ret2` lane returns `0` where
-the legacy path returns `SYSCALL_NO_TRANSFER_CAP`. Until those are fixed the endpoint
-confinement remains load-bearing for correctness, not merely for scope. See
-`doc/KERNEL_UNLOCK_AUDIT.md` §6.1.
+### 8.6.2 The direct-transaction disposition contract
+
+Every direct NR6/NR7 outcome is classified, never discarded. `src/kernel/direct_disposition.rs`
+maps each transaction result onto exactly one of:
+
+* **`Completed`** — keep the existing successful frame encoding;
+* **`DeclinedBeforeMutation`** — nothing was delivered and nothing observable was left
+  behind, so the split helper returns `None` and the legacy path runs;
+* **`Failed(SyscallError)`** — the legacy path must NOT run; the canonical error is encoded
+  with `frame.set_err(err.code())`, byte-for-byte how the global-lock handler encodes a
+  `SyscallError`.
+
+The mapping is pure and **exhaustive with no wildcard arm**, so a new error variant is a
+compile error until its disposition is decided. Fallback is admissible only when all six of
+these hold of the state the transaction leaves: no reply record reserved or committed, no
+capability minted or installed, no user payload/meta copied, no waiter or run-queue change,
+no acknowledgement committed as a delivery, no wake published. Any *attempted* user copy
+disqualifies fallback — a faulted copy may have written a prefix of its bytes.
+
+Past the publication line — the endpoint waiter claimed, the request bytes in the receiver's
+address space, or the receiver committed `Runnable` — every variant is `Failed`
+unconditionally, because running legacy afterwards would deliver the same message twice.
+
+The reply direction's `WaiterLost` was split into `WaiterLost` (the pre-reserve, pre-copy
+check — fallback-safe) and `WaiterLostAfterCopy` (the claim, which runs after both copies
+have landed — never a fallback), because one variant cannot carry two post-states.
+
+Full per-variant tables, the legacy equivalent of each, and the cases where honest parity
+does not exist are in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.2.
+
+### 8.6.3 The successful-return lane contract
+
+Legacy `handle_ipc_call` **and** `handle_ipc_reply` both end their success path with
+
+```text
+frame.set_ok(0, 0, 0);
+encode_transfer_cap_ret(frame, None)?;   // → set_ret2(SYSCALL_NO_TRANSFER_CAP)
+```
+
+so a successful NR6 or NR7 returns `error = 0`, `ret0 = 0`, `ret1 = 0`,
+`ret2 = SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`) — *not* zero. The direct path wrote
+`set_ok(0, 0, 0)` alone, leaving `ret2 = 0`: a silent divergence on the **successful** path,
+in both directions (the NR7 audit did not confirm the prior assumption that it already
+matched).
+
+`direct_disposition::apply_direct_disposition` is now the single frame-encoding site for both
+directions:
+
+* **Completed** → `set_ok(0, 0, SYSCALL_NO_TRANSFER_CAP as usize)`, taking the sentinel from
+  the same constant `encode_transfer_cap_ret` writes rather than duplicating the literal;
+* **Failed** → `set_err`, which zeroes `ret0`/`ret1`/`ret2` before setting the code, so a
+  failure can never leave a stale success value in any lane — including the sentinel;
+* **DeclinedBeforeMutation** → nothing is written; the legacy fallback gets a pristine frame,
+  arguments and syscall number included.
+
+Neither split helper writes a return lane after the drain. Proved by
+`stage199d_delivery_projection_differential::injection`: a successful legacy `IpcCall` trap
+supplies the empirical lane baseline and every lane is compared against the production
+encoder's output (fed a poisoned frame first, so parity cannot be an accident of zeroes); the
+shared legacy encoding is pinned at source level for both handlers; every `Failed` arm is
+asserted to clear all three lanes starting from a full success frame; and a decline is
+asserted to modify nothing. Attested live — see the seal above.
+
+The endpoint confinement remains load-bearing for scope, and the proof gate remains
+proof-only; no production default has been flipped. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.
 
 **Retirement-seal isolation model — Model 1, serialized master.**
 `scripts/qemu-combined-retirement-seal.sh` runs the first-cohort (12), plain (6) and

@@ -80431,15 +80431,38 @@ mod stage199d_delivery_projection_differential {
         server_asid: Asid,
         send_cap_t1: CapId,
         reply_recv_cap_t1: CapId,
+        /// A cap owned by task 0, usable to fill another task's cnode from outside it.
+        filler_global: CapId,
     }
 
     /// task1 = caller (own mapped frame buffer), task2 = server committed-blocked in a
     /// recv-v2 of the request endpoint with a full-size payload destination.
     fn fixture(arm_proof_gate: bool) -> Fx {
+        fixture_with_dest(arm_proof_gate, ServerDest::Mapped)
+    }
+
+    /// Which of the server's recv-v2 destinations are actually backed by a mapping. Leaving
+    /// one unmapped is the deterministic fault injection for a user-copy fault.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ServerDest {
+        /// Both the payload and metadata destinations are mapped (the healthy case).
+        Mapped,
+        /// The payload destination is unmapped → the payload copy faults.
+        PayloadUnmapped,
+        /// The payload destination is mapped but the metadata destination is on a separate,
+        /// unmapped page → the payload copy succeeds and the metadata copy faults.
+        MetaUnmapped,
+    }
+
+    /// Metadata destination on a SEPARATE page, used by `ServerDest::MetaUnmapped` so the
+    /// payload copy can succeed while the metadata copy faults.
+    pub(super) const SERVER_FAR_META_VA: usize = 0x7000;
+
+    fn fixture_with_dest(arm_proof_gate: bool, dest: ServerDest) -> Fx {
         ipccall_direct_ack::reset();
         set_ipccall_direct_proof_enabled(arm_proof_gate);
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
-        let (asid1, asid2, send_cap_t1, reply_recv_cap_t1) = k.with(|state| {
+        let (asid1, asid2, send_cap_t1, reply_recv_cap_t1, filler_global) = k.with(|state| {
             state.register_task(1).expect("t1");
             state.register_task(2).expect("t2");
             let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
@@ -80456,16 +80479,22 @@ mod stage199d_delivery_projection_differential {
                     },
                 )
                 .expect("map caller frame");
-            state
-                .map_user_page(
-                    aspace2,
-                    VirtAddr(SERVER_PAYLOAD_VA as u64),
-                    Mapping {
-                        phys: PhysAddr(0xB000),
-                        flags: PageFlags::USER_RW,
-                    },
-                )
-                .expect("map server dest");
+            // Deterministic copy-fault injection: withhold the mapping the failing copy
+            // needs. `PayloadUnmapped` leaves the payload destination unbacked;
+            // `MetaUnmapped` maps the payload page but points the metadata destination at a
+            // separate, unbacked page so the payload copy succeeds first.
+            if dest != ServerDest::PayloadUnmapped {
+                state
+                    .map_user_page(
+                        aspace2,
+                        VirtAddr(SERVER_PAYLOAD_VA as u64),
+                        Mapping {
+                            phys: PhysAddr(0xB000),
+                            flags: PageFlags::USER_RW,
+                        },
+                    )
+                    .expect("map server dest");
+            }
             let (_e, req_send, req_recv) = state.create_endpoint(4).expect("req ep");
             let send_cap_t1 = state
                 .grant_capability_task_to_task(0, req_send, 1)
@@ -80473,7 +80502,7 @@ mod stage199d_delivery_projection_differential {
             let req_recv_t2 = state
                 .grant_capability_task_to_task(0, req_recv, 2)
                 .expect("recv t2");
-            let (_re, _reply_send, reply_recv) = state.create_endpoint(4).expect("reply ep");
+            let (_re, reply_send_global, reply_recv) = state.create_endpoint(4).expect("reply ep");
             let reply_recv_cap_t1 = state
                 .grant_capability_task_to_task(0, reply_recv, 1)
                 .expect("reply t1");
@@ -80483,13 +80512,18 @@ mod stage199d_delivery_projection_differential {
             while state.current_tid() != Some(2) {
                 state.yield_current().expect("switch to server");
             }
+            let meta_va = if dest == ServerDest::MetaUnmapped {
+                SERVER_FAR_META_VA
+            } else {
+                SERVER_META_VA
+            };
             let mut recv = TrapFrame::new(
                 crate::kernel::syscall::Syscall::IpcRecv as usize,
                 [
                     req_recv_t2.0 as usize,
                     SERVER_PAYLOAD_VA,
                     SERVER_PAYLOAD_CAP,
-                    SERVER_META_VA,
+                    meta_va,
                     IPC_RECV_META_V2_ENCODED_LEN,
                     0,
                 ],
@@ -80499,7 +80533,13 @@ mod stage199d_delivery_projection_differential {
                 matches!(state.task_status(2), Some(TaskStatus::Blocked(_))),
                 "server must be committed-blocked in recv-v2"
             );
-            (asid1, asid2, send_cap_t1, reply_recv_cap_t1)
+            (
+                asid1,
+                asid2,
+                send_cap_t1,
+                reply_recv_cap_t1,
+                reply_send_global,
+            )
         });
         Fx {
             k,
@@ -80508,6 +80548,7 @@ mod stage199d_delivery_projection_differential {
             server_asid: asid2,
             send_cap_t1,
             reply_recv_cap_t1,
+            filler_global,
         }
     }
 
@@ -80968,6 +81009,965 @@ mod stage199d_delivery_projection_differential {
         }
     }
 
+    /// Stage 199D HARD-STOP B — deterministic fault injection for the typed disposition
+    /// contract.
+    ///
+    /// Nested inside the differential module so it reuses the caller+blocked-server fixture
+    /// (including the `ServerDest` copy-fault injection). For every variant the direct
+    /// transaction can reach deterministically in a single-threaded hosted build, this
+    /// injects the fault through the REAL drain and proves: the exact error variant, its
+    /// disposition, that no message / cap / reply record / waiter / acknowledgement / wake
+    /// leaked, and that duplicate delivery and duplicate wake stay zero. Where legacy can be
+    /// driven to the same condition, the frame error code is compared against the code legacy
+    /// actually produces.
+    mod injection {
+        use super::*;
+        use crate::kernel::direct_disposition::{
+            DirectDisposition, classify_direct_reply_outcome, classify_direct_request_outcome,
+        };
+        use crate::kernel::ipccall_direct::{
+            AckLease, BlockedCallerAck, BlockedServerAck, IpcReplyDirectSnapshot,
+        };
+        use crate::kernel::ipccall_direct_txn::{
+            DirectReplyPostWork, IpcCallDirectError, IpcReplyDirectError,
+        };
+
+        /// Live reply-record count — the reply-record leak probe.
+        fn live_reply_records(fx: &Fx) -> usize {
+            fx.k.with(|s| {
+                (0..crate::kernel::boot::MAX_REPLY_CAPS)
+                    .filter(|i| s.reply_cap_record_present(*i))
+                    .count()
+            })
+        }
+
+        /// Assert the full no-leak invariant after a failed or declined request drain.
+        fn assert_no_request_leak(fx: &Fx, case: &str) {
+            assert_eq!(live_reply_records(fx), 0, "{case}: no reply record leaked");
+            assert!(
+                matches!(
+                    fx.k.with(|s| s.task_status(2)),
+                    Some(TaskStatus::Blocked(_))
+                ),
+                "{case}: the server stays blocked — no wake published"
+            );
+            assert_ne!(
+                fx.k.with(|s| s.current_tid()),
+                Some(2),
+                "{case}: zero wake (the server never dispatched)"
+            );
+        }
+
+        /// Drive the request drain once and return (outcome, disposition).
+        fn drain_request(
+            fx: &Fx,
+            framed_payload: &[u8],
+        ) -> (
+            Result<crate::kernel::ipccall_direct_txn::IpcCallDirectSuccess, IpcCallDirectError>,
+            DirectDisposition,
+        ) {
+            let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack published");
+            let snapshot = IpcCallDirectSnapshot::build(
+                fx.caller,
+                fx.send_cap_t1,
+                fx.reply_recv_cap_t1,
+                framed_payload,
+            )
+            .expect("snapshot");
+            let work = DirectRequestPostWork {
+                snapshot,
+                ack,
+                ack_seq,
+            };
+            let outcome = fx.k.drain_direct_request_post_work(&work);
+            let disposition = classify_direct_request_outcome(&outcome);
+            (outcome, disposition)
+        }
+
+        /// Run the LEGACY IpcCall against this fixture and return the frame's error code
+        /// (`None` when legacy returned success).
+        fn legacy_error_code(fx: &Fx, framed_payload: &[u8]) -> Option<usize> {
+            fx.k.with(|s| {
+                s.write_user_memory_for_asid(fx.caller_asid, CALLER_FRAME_VA, framed_payload)
+                    .expect("stage the framed request");
+                s.enqueue_current_cpu(1).expect("enq1");
+                while s.current_tid() != Some(1) {
+                    s.dispatch_next_task().expect("dispatch to caller");
+                }
+                let mut call = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::IpcCall as usize,
+                    [
+                        fx.send_cap_t1.0 as usize,
+                        CALLER_FRAME_VA,
+                        framed_payload.len(),
+                        0,
+                        0,
+                        fx.reply_recv_cap_t1.0 as usize,
+                    ],
+                );
+                // The legacy handler encodes a SyscallError into the frame via
+                // `set_err(e.code())` and returns Ok — the same encoding the direct path's
+                // `Failed` arm uses, so comparing codes IS frame parity.
+                let r = s.handle_trap(Trap::Syscall, Some(&mut call));
+                assert!(r.is_ok(), "legacy trap should not be fatal: {r:?}");
+                call.error_code()
+            })
+        }
+
+        const FRAMED: &[u8] = b"\x07\x06NR6call!";
+
+        // ── Failed variants: legacy raises a comparable error ───────────────────────────
+
+        /// PayloadCopyFault: the server's payload destination is unmapped. Legacy's
+        /// blocked-waiter completion returns `InvalidArgs`; the direct path must encode the
+        /// SAME code and must NOT fall back.
+        #[test]
+        fn injected_payload_copy_fault_is_failed_and_matches_legacy() {
+            let legacy_code = {
+                let fx = fixture_with_dest(false, ServerDest::PayloadUnmapped);
+                let code = legacy_error_code(&fx, FRAMED);
+                teardown();
+                code
+            };
+            assert_eq!(
+                legacy_code,
+                Some(crate::kernel::syscall::SyscallError::InvalidArgs.code()),
+                "legacy raises InvalidArgs on a blocked-waiter payload copy fault"
+            );
+
+            let fx = fixture_with_dest(true, ServerDest::PayloadUnmapped);
+            let (outcome, disposition) = drain_request(&fx, FRAMED);
+            assert_eq!(outcome, Err(IpcCallDirectError::PayloadCopyFault));
+            assert_eq!(
+                disposition,
+                DirectDisposition::Failed(crate::kernel::syscall::SyscallError::InvalidArgs),
+                "an attempted user copy can never be a legacy fallback"
+            );
+            assert!(!disposition.permits_legacy_fallback());
+            assert_eq!(
+                disposition.failure().map(|e| e.code()),
+                legacy_code,
+                "frame error-code parity with the legacy path"
+            );
+            assert_no_request_leak(&fx, "payload-copy-fault");
+            teardown();
+        }
+
+        /// MetaCopyFault: the payload copy succeeds, the metadata destination is unmapped.
+        /// Legacy rolls the materialized cap back and returns `InvalidArgs`.
+        #[test]
+        fn injected_meta_copy_fault_is_failed_and_matches_legacy() {
+            let legacy_code = {
+                let fx = fixture_with_dest(false, ServerDest::MetaUnmapped);
+                let code = legacy_error_code(&fx, FRAMED);
+                teardown();
+                code
+            };
+            assert_eq!(
+                legacy_code,
+                Some(crate::kernel::syscall::SyscallError::InvalidArgs.code()),
+                "legacy raises InvalidArgs on a blocked-waiter meta copy fault"
+            );
+
+            let fx = fixture_with_dest(true, ServerDest::MetaUnmapped);
+            let (outcome, disposition) = drain_request(&fx, FRAMED);
+            assert_eq!(outcome, Err(IpcCallDirectError::MetaCopyFault));
+            assert_eq!(
+                disposition,
+                DirectDisposition::Failed(crate::kernel::syscall::SyscallError::InvalidArgs)
+            );
+            assert!(!disposition.permits_legacy_fallback());
+            assert_eq!(disposition.failure().map(|e| e.code()), legacy_code);
+            assert_no_request_leak(&fx, "meta-copy-fault");
+            teardown();
+        }
+
+        /// WaiterLost: the endpoint waiter slot is cleared while the server task stays
+        /// `Blocked`, so step (4) passes, both copies land in the server's address space,
+        /// and the step-(9) claim fails. The request bytes are already delivered, so falling
+        /// back to legacy would deliver a SECOND copy — the disposition must be `Failed`.
+        ///
+        /// Legacy has no equivalent error here: with no endpoint waiter it would QUEUE the
+        /// message and return success. That is exactly why this cannot fall through, and why
+        /// the mapping reports the stale-authority error instead of inventing parity.
+        #[test]
+        fn injected_waiter_lost_is_failed_and_never_falls_back() {
+            let fx = fixture(true);
+            fx.k.with(|s| {
+                s.with_ipc_state_mut(|ipc| {
+                    if let Some(idv) = ipc.endpoint_waiter_identity(ipc_endpoint_index_of(&fx)) {
+                        ipc.clear_endpoint_waiters_for_identity(idv);
+                    }
+                })
+            });
+            let (outcome, disposition) = drain_request(&fx, FRAMED);
+            assert_eq!(outcome, Err(IpcCallDirectError::WaiterLost));
+            assert_eq!(
+                disposition,
+                DirectDisposition::Failed(crate::kernel::syscall::SyscallError::WrongObject)
+            );
+            assert!(
+                !disposition.permits_legacy_fallback(),
+                "the request payload is already in the server's address space"
+            );
+            assert_no_request_leak(&fx, "waiter-lost");
+            teardown();
+        }
+
+        /// The endpoint index the fixture's acknowledgement names.
+        fn ipc_endpoint_index_of(fx: &Fx) -> usize {
+            let (index, _generation) =
+                ipccall_direct_ack::sole_pair_endpoint().expect("one published pair");
+            let _ = fx;
+            index
+        }
+
+        // ── Declined variants: pristine slate, legacy may run ──────────────────────────
+
+        /// A non-committed acknowledgement: nothing was touched, so legacy must run.
+        #[test]
+        fn injected_wouldblock_declines_with_a_pristine_slate() {
+            let fx = fixture(true);
+            let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack");
+            let mut broken = ack;
+            broken.recv_v2_committed = false;
+            let work = DirectRequestPostWork {
+                snapshot: IpcCallDirectSnapshot::build(
+                    fx.caller,
+                    fx.send_cap_t1,
+                    fx.reply_recv_cap_t1,
+                    FRAMED,
+                )
+                .expect("snapshot"),
+                ack: broken,
+                ack_seq,
+            };
+            let outcome = fx.k.drain_direct_request_post_work(&work);
+            assert_eq!(outcome, Err(IpcCallDirectError::WouldBlock));
+            let disposition = classify_direct_request_outcome(&outcome);
+            assert_eq!(disposition, DirectDisposition::DeclinedBeforeMutation);
+            assert!(disposition.permits_legacy_fallback());
+            assert!(
+                disposition.failure().is_none(),
+                "a decline carries no error"
+            );
+            assert_no_request_leak(&fx, "wouldblock");
+            teardown();
+        }
+
+        /// A duplicate drain of an already-consumed acknowledgement: the lease is not
+        /// `ClaimedByWork`, nothing is touched, legacy may run.
+        #[test]
+        fn injected_lease_not_claimed_declines() {
+            let fx = fixture(true);
+            let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack");
+            let snapshot = IpcCallDirectSnapshot::build(
+                fx.caller,
+                fx.send_cap_t1,
+                fx.reply_recv_cap_t1,
+                FRAMED,
+            )
+            .expect("snapshot");
+            // A lease claimed for a DIFFERENT sequence cannot proceed.
+            let mut lease = AckLease::new_available();
+            lease.claim(ack_seq.wrapping_add(1)).expect("claim other");
+            let outcome =
+                fx.k.ipc_call_direct_request_txn(&snapshot, &ack, &mut lease, ack_seq);
+            assert_eq!(outcome, Err(IpcCallDirectError::LeaseNotClaimed));
+            let disposition = classify_direct_request_outcome(&outcome);
+            assert_eq!(disposition, DirectDisposition::DeclinedBeforeMutation);
+            assert_no_request_leak(&fx, "lease-not-claimed");
+            teardown();
+        }
+
+        /// The caller's incarnation changed: nothing resolved, nothing touched.
+        #[test]
+        fn injected_caller_gone_declines() {
+            let fx = fixture(true);
+            let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack");
+            // A snapshot whose caller ASID no longer matches the live task.
+            let stale_caller = crate::kernel::boot::ReceiverWaiterIdentity::new(
+                ThreadId(1),
+                Asid(fx.caller.asid.0.wrapping_add(1)),
+            );
+            let snapshot = IpcCallDirectSnapshot::build(
+                stale_caller,
+                fx.send_cap_t1,
+                fx.reply_recv_cap_t1,
+                FRAMED,
+            )
+            .expect("snapshot");
+            let work = DirectRequestPostWork {
+                snapshot,
+                ack,
+                ack_seq,
+            };
+            let outcome = fx.k.drain_direct_request_post_work(&work);
+            assert_eq!(outcome, Err(IpcCallDirectError::CallerGone));
+            assert_eq!(
+                classify_direct_request_outcome(&outcome),
+                DirectDisposition::DeclinedBeforeMutation
+            );
+            assert_no_request_leak(&fx, "caller-gone");
+            teardown();
+        }
+
+        /// A stale endpoint generation in the acknowledgement.
+        #[test]
+        fn injected_endpoint_generation_change_declines() {
+            let fx = fixture(true);
+            let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack");
+            let mut stale = ack;
+            stale.endpoint_generation = stale.endpoint_generation.wrapping_add(1);
+            let work = DirectRequestPostWork {
+                snapshot: IpcCallDirectSnapshot::build(
+                    fx.caller,
+                    fx.send_cap_t1,
+                    fx.reply_recv_cap_t1,
+                    FRAMED,
+                )
+                .expect("snapshot"),
+                ack: stale,
+                ack_seq,
+            };
+            let outcome = fx.k.drain_direct_request_post_work(&work);
+            assert_eq!(outcome, Err(IpcCallDirectError::EndpointGenerationChanged));
+            assert_eq!(
+                classify_direct_request_outcome(&outcome),
+                DirectDisposition::DeclinedBeforeMutation
+            );
+            assert_no_request_leak(&fx, "endpoint-generation-change");
+            teardown();
+        }
+
+        /// The SEND endpoint cap does not resolve — legacy's `validate_endpoint_right`
+        /// raises the canonical cap error, so declining hands it the whole decision.
+        #[test]
+        fn injected_send_endpoint_resolve_failure_declines() {
+            let fx = fixture(true);
+            let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack");
+            let snapshot = IpcCallDirectSnapshot::build(
+                fx.caller,
+                CapId(0xDEAD_BEEF),
+                fx.reply_recv_cap_t1,
+                FRAMED,
+            )
+            .expect("snapshot");
+            let work = DirectRequestPostWork {
+                snapshot,
+                ack,
+                ack_seq,
+            };
+            let outcome = fx.k.drain_direct_request_post_work(&work);
+            assert!(
+                matches!(outcome, Err(IpcCallDirectError::SendEndpoint(_))),
+                "expected SendEndpoint, got {outcome:?}"
+            );
+            assert_eq!(
+                classify_direct_request_outcome(&outcome),
+                DirectDisposition::DeclinedBeforeMutation
+            );
+            assert_no_request_leak(&fx, "send-endpoint");
+            teardown();
+        }
+
+        /// The reply-endpoint RECEIVE cap does not resolve.
+        #[test]
+        fn injected_reply_endpoint_resolve_failure_declines() {
+            let fx = fixture(true);
+            let (ack, ack_seq) = ipccall_direct_ack::sole_claim().expect("ack");
+            let snapshot =
+                IpcCallDirectSnapshot::build(fx.caller, fx.send_cap_t1, CapId(0xDEAD_BEEF), FRAMED)
+                    .expect("snapshot");
+            let work = DirectRequestPostWork {
+                snapshot,
+                ack,
+                ack_seq,
+            };
+            let outcome = fx.k.drain_direct_request_post_work(&work);
+            assert!(
+                matches!(outcome, Err(IpcCallDirectError::ReplyEndpoint(_))),
+                "expected ReplyEndpoint, got {outcome:?}"
+            );
+            assert_eq!(
+                classify_direct_request_outcome(&outcome),
+                DirectDisposition::DeclinedBeforeMutation
+            );
+            assert_no_request_leak(&fx, "reply-endpoint");
+            teardown();
+        }
+
+        /// The server's cnode is full so the provisional reply-cap mint fails. The
+        /// reservation is cancelled and the mint never landed, so the slate is pristine and
+        /// legacy — which raises `CapabilityFull` from its own materialization — may run.
+        #[test]
+        fn injected_mint_failure_declines_with_a_pristine_slate() {
+            let fx = fixture(true);
+            // Fill task2's cnode using a global cap (the server is blocked, so it cannot
+            // create objects itself).
+            fx.k.with(|s| {
+                for _ in 0..8192 {
+                    if s.grant_capability_task_to_task(0, fx.filler_global, 2)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let (outcome, disposition) = drain_request(&fx, FRAMED);
+            assert_eq!(outcome, Err(IpcCallDirectError::MintFailed));
+            assert_eq!(disposition, DirectDisposition::DeclinedBeforeMutation);
+            assert!(disposition.permits_legacy_fallback());
+            assert_no_request_leak(&fx, "mint-failed");
+            teardown();
+        }
+
+        // ── Reply direction ───────────────────────────────────────────────────────────
+
+        fn caller_ack(fx: &Fx) -> BlockedCallerAck {
+            BlockedCallerAck {
+                caller: fx.caller,
+                endpoint_index: 0,
+                endpoint_generation: 0,
+                recv_v2_committed: true,
+                payload_user_ptr: SERVER_PAYLOAD_VA,
+                payload_user_len: 8,
+                meta_user_ptr: SERVER_META_VA,
+                meta_user_len: IPC_RECV_META_V2_ENCODED_LEN,
+            }
+        }
+
+        /// A non-committed caller acknowledgement declines with nothing touched.
+        #[test]
+        fn injected_reply_wouldblock_declines() {
+            let fx = fixture(true);
+            let mut ack = caller_ack(&fx);
+            ack.recv_v2_committed = false;
+            let snapshot =
+                IpcReplyDirectSnapshot::build(fx.caller, CapId(1), b"reply").expect("snapshot");
+            let work = DirectReplyPostWork {
+                snapshot,
+                ack,
+                ack_seq: 1,
+            };
+            let outcome = fx.k.drain_direct_reply_post_work(&work);
+            assert_eq!(outcome, Err(IpcReplyDirectError::WouldBlock));
+            let disposition = classify_direct_reply_outcome(&outcome);
+            assert_eq!(disposition, DirectDisposition::DeclinedBeforeMutation);
+            assert!(disposition.failure().is_none());
+            assert_eq!(live_reply_records(&fx), 0, "no reply record leaked");
+            teardown();
+        }
+
+        /// A reply cap that does not resolve to a live `Reply` object declines: legacy
+        /// `ipc_reply` raises the canonical error itself.
+        #[test]
+        fn injected_reply_cap_resolve_failure_declines() {
+            let fx = fixture(true);
+            let ack = caller_ack(&fx);
+            let snapshot = IpcReplyDirectSnapshot::build(fx.caller, CapId(0xDEAD), b"reply")
+                .expect("snapshot");
+            let work = DirectReplyPostWork {
+                snapshot,
+                ack,
+                ack_seq: 1,
+            };
+            let outcome = fx.k.drain_direct_reply_post_work(&work);
+            assert!(
+                matches!(outcome, Err(IpcReplyDirectError::ReplyCapResolve(_))),
+                "expected ReplyCapResolve, got {outcome:?}"
+            );
+            assert_eq!(
+                classify_direct_reply_outcome(&outcome),
+                DirectDisposition::DeclinedBeforeMutation
+            );
+            assert_eq!(live_reply_records(&fx), 0);
+            teardown();
+        }
+
+        /// A duplicate reply drain: the lease is not `ClaimedByWork`.
+        #[test]
+        fn injected_reply_lease_not_claimed_declines() {
+            let fx = fixture(true);
+            let ack = caller_ack(&fx);
+            let snapshot =
+                IpcReplyDirectSnapshot::build(fx.caller, CapId(1), b"reply").expect("snapshot");
+            let mut lease = AckLease::new_available();
+            lease.claim(99).expect("claim other");
+            let outcome = fx.k.ipc_reply_direct_txn(&snapshot, &ack, &mut lease, 7);
+            assert_eq!(outcome, Err(IpcReplyDirectError::LeaseNotClaimed));
+            assert_eq!(
+                classify_direct_reply_outcome(&outcome),
+                DirectDisposition::DeclinedBeforeMutation
+            );
+            teardown();
+        }
+
+        // ── Race-only variants ────────────────────────────────────────────────────────
+
+        /// Some variants are reachable only through a genuine cross-CPU race and cannot be
+        /// injected deterministically in a single-threaded hosted build:
+        ///
+        /// * request `ServerGone` and reply `CallerGone` — the transaction's prevalidate and
+        ///   commit steps evaluate the SAME predicate (`asid` match + `Blocked(EndpointReceive)`)
+        ///   with no yield between them, so a single thread cannot make the first pass and the
+        ///   second fail;
+        /// * reply `WaiterLostAfterCopy` — the step-(2) check and the step-(5) claim read the
+        ///   same endpoint waiter slot with no yield between them;
+        /// * `RecordCommitFailed` / `RecordConsumeFailed` — defensive branches that are
+        ///   unreachable for an exact live reservation.
+        ///
+        /// Their mappings are covered exhaustively by the pure disposition tests. This test
+        /// pins that ALL of them are `Failed` — none may ever become a fallback — and that no
+        /// production test hook was added to force them.
+        #[test]
+        fn race_only_variants_are_all_failed_and_never_fall_back() {
+            for (variant, expected) in [
+                (
+                    IpcCallDirectError::ServerGone,
+                    crate::kernel::syscall::SyscallError::ServerDied,
+                ),
+                (
+                    IpcCallDirectError::RecordCommitFailed,
+                    crate::kernel::syscall::SyscallError::Internal,
+                ),
+            ] {
+                let d = classify_direct_request_outcome(&Err(variant));
+                assert_eq!(d, DirectDisposition::Failed(expected), "{variant:?}");
+                assert!(!d.permits_legacy_fallback(), "{variant:?}");
+            }
+            for (variant, expected) in [
+                (
+                    IpcReplyDirectError::WaiterLostAfterCopy,
+                    crate::kernel::syscall::SyscallError::WrongObject,
+                ),
+                (
+                    IpcReplyDirectError::CallerGone,
+                    crate::kernel::syscall::SyscallError::WrongObject,
+                ),
+                (
+                    IpcReplyDirectError::RecordConsumeFailed,
+                    crate::kernel::syscall::SyscallError::Internal,
+                ),
+            ] {
+                let d = classify_direct_reply_outcome(&Err(variant));
+                assert_eq!(d, DirectDisposition::Failed(expected), "{variant:?}");
+                assert!(!d.permits_legacy_fallback(), "{variant:?}");
+            }
+            // No production fault-injection hook exists to force these.
+            let txn = include_str!("../ipccall_direct_txn.rs");
+            for forbidden in ["FORCE_", "fault_inject", "test_hook", "#[cfg(test)]"] {
+                assert!(
+                    !txn.contains(forbidden),
+                    "the transaction must carry no test hook ({forbidden})"
+                );
+            }
+        }
+
+        // ── Stage 199D HARD-STOP C: return-lane parity ────────────────────────────────
+
+        /// A fixture places a whole `KernelState` on the stack, so a test that builds more
+        /// than one of them runs on an 8 MiB thread — the same accommodation the Stage 199
+        /// race tests use.
+        fn on_big_stack<F: FnOnce() + Send + 'static>(body: F) {
+            std::thread::Builder::new()
+                .stack_size(16 * 1024 * 1024)
+                .spawn(body)
+                .expect("spawn")
+                .join()
+                .expect("join");
+        }
+
+        /// Every lane a syscall return can carry.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct Lanes {
+            error: usize,
+            ret0: usize,
+            ret1: usize,
+            ret2: usize,
+        }
+
+        fn lanes_of(frame: &TrapFrame) -> Lanes {
+            Lanes {
+                error: frame.error,
+                ret0: frame.ret0,
+                ret1: frame.ret1,
+                ret2: frame.ret2,
+            }
+        }
+
+        /// Run a SUCCESSFUL legacy `IpcCall` and capture every returned lane.
+        fn legacy_request_success_lanes() -> Lanes {
+            let fx = fixture(false);
+            let lanes = fx.k.with(|s| {
+                s.write_user_memory_for_asid(fx.caller_asid, CALLER_FRAME_VA, FRAMED)
+                    .expect("stage the framed request");
+                s.enqueue_current_cpu(1).expect("enq1");
+                while s.current_tid() != Some(1) {
+                    s.dispatch_next_task().expect("dispatch to caller");
+                }
+                let mut call = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::IpcCall as usize,
+                    [
+                        fx.send_cap_t1.0 as usize,
+                        CALLER_FRAME_VA,
+                        FRAMED.len(),
+                        0,
+                        0,
+                        fx.reply_recv_cap_t1.0 as usize,
+                    ],
+                );
+                let r = s.handle_trap(Trap::Syscall, Some(&mut call));
+                assert!(r.is_ok(), "legacy IpcCall trap: {r:?}");
+                assert!(
+                    !call.is_error(),
+                    "the legacy call must SUCCEED for a parity baseline"
+                );
+                assert_eq!(
+                    s.task_status(2),
+                    Some(TaskStatus::Runnable),
+                    "legacy success delivered and woke the server"
+                );
+                lanes_of(&call)
+            });
+            teardown();
+            lanes
+        }
+
+        /// Assert, at the source level, that BOTH legacy handlers end their success path with
+        /// the identical two-call return-lane encoding.
+        ///
+        /// Driving a successful legacy `IpcReply` end-to-end additionally requires the caller
+        /// to be committed-blocked on its reply endpoint, which this NR6-oriented fixture does
+        /// not arrange. Pinning the shared encoding is the honest equivalent: it is exactly
+        /// what makes ONE shared encoder correct for both directions, and the lane VALUES are
+        /// pinned empirically by the legacy `IpcCall` baseline.
+        fn assert_legacy_handlers_share_the_success_encoding() {
+            let ipc = include_str!("../syscall/ipc.rs");
+            for handler in [
+                "pub(super) fn handle_ipc_call",
+                "pub(super) fn handle_ipc_reply",
+            ] {
+                let body = ipc.split(handler).nth(1).expect("handler present");
+                assert!(
+                    body.contains("frame.set_ok(0, 0, 0);")
+                        && body.contains("encode_transfer_cap_ret(frame, None)?;"),
+                    "{handler}: success must encode set_ok(0,0,0) then encode_transfer_cap_ret(None)"
+                );
+                // The two calls are adjacent on the success path (ignoring indentation).
+                let at = body
+                    .find("frame.set_ok(0, 0, 0);")
+                    .expect("success set_ok present");
+                let next = body[at..].lines().nth(1).expect("a following line").trim();
+                assert_eq!(
+                    next, "encode_transfer_cap_ret(frame, None)?;",
+                    "{handler}: the sentinel encode must immediately follow set_ok"
+                );
+            }
+            // `encode_transfer_cap_ret(_, None)` writes exactly the canonical sentinel.
+            let abi = include_str!("../syscall/ipc_abi.rs");
+            assert!(
+                abi.contains("let value = cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);")
+                    && abi.contains("frame.set_ret2("),
+                "encode_transfer_cap_ret must write SYSCALL_NO_TRANSFER_CAP into ret2 for None"
+            );
+        }
+
+        /// The SUCCESS lanes the direct path writes, produced by the production encoder.
+        fn direct_success_lanes() -> Lanes {
+            let mut frame =
+                TrapFrame::new(crate::kernel::syscall::Syscall::IpcCall as usize, [0; 6]);
+            // Poison every lane first, so parity cannot be an accident of a zeroed frame.
+            frame.set_ok(0xDEAD, 0xBEEF, 0xF00D);
+            frame.error = 0x1234;
+            assert_eq!(
+                crate::kernel::direct_disposition::apply_direct_disposition(
+                    &mut frame,
+                    DirectDisposition::Completed
+                ),
+                Some(()),
+                "a completed transaction is handled, never declined"
+            );
+            lanes_of(&frame)
+        }
+
+        /// THE HARD-STOP C parity test: a successful direct NR6 return frame must equal a
+        /// successful legacy `IpcCall` return frame in EVERY lane — including `ret2`, which
+        /// legacy sets to `SYSCALL_NO_TRANSFER_CAP` and the direct path used to leave at 0.
+        #[test]
+        fn direct_request_success_lanes_match_legacy_byte_for_byte() {
+            let legacy = legacy_request_success_lanes();
+            let direct = direct_success_lanes();
+            assert_eq!(legacy.error, direct.error, "error/status lane");
+            assert_eq!(legacy.ret0, direct.ret0, "ret0");
+            assert_eq!(legacy.ret1, direct.ret1, "ret1");
+            assert_eq!(legacy.ret2, direct.ret2, "ret2");
+            assert_eq!(legacy, direct, "every lane");
+            // And the absolute values the legacy ABI specifies.
+            assert_eq!(direct.error, 0, "success");
+            assert_eq!(direct.ret0, 0);
+            assert_eq!(direct.ret1, 0);
+            assert_eq!(
+                direct.ret2,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+                "ret2 is the NO-transfer-cap sentinel, not 0"
+            );
+            assert_ne!(direct.ret2, 0, "the HARD-STOP C defect is gone");
+        }
+
+        /// NR7's audit. Legacy `handle_ipc_reply` ends with the SAME
+        /// `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(frame, None)` pair as `handle_ipc_call`,
+        /// so both legacy directions return the same three lanes — which is why ONE shared
+        /// encoder is correct, and why the direct reply path matches legacy too.
+        ///
+        /// The audit did NOT confirm the prior assumption that NR7 already matched: before
+        /// this change the direct reply path also wrote `set_ok(0, 0, 0)`, so its `ret2`
+        /// diverged from legacy exactly as NR6's did.
+        #[test]
+        fn direct_reply_success_lanes_match_legacy_byte_for_byte() {
+            assert_legacy_handlers_share_the_success_encoding();
+            let direct = direct_success_lanes();
+            assert_eq!(
+                direct.ret2,
+                crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
+                "the reply success path also returns the NO-transfer-cap sentinel"
+            );
+            assert_eq!(direct.error, 0);
+            assert_eq!(direct.ret0, 0);
+            assert_eq!(direct.ret1, 0);
+            // Both split helpers route through the ONE encoder — no per-direction encoding.
+            let split = include_str!("../syscall_split.rs");
+            assert_eq!(
+                split
+                    .matches("direct_disposition::apply_direct_disposition(frame, disposition)")
+                    .count(),
+                2,
+                "NR6 and NR7 share the single encoder"
+            );
+        }
+
+        /// Every `Failed` arm must zero all three return lanes — a failure may never leave a
+        /// stale success value behind, including the new `ret2` sentinel.
+        #[test]
+        fn failed_dispositions_leave_no_stale_success_lane() {
+            let codes = [
+                crate::kernel::syscall::SyscallError::InvalidArgs,
+                crate::kernel::syscall::SyscallError::WrongObject,
+                crate::kernel::syscall::SyscallError::ServerDied,
+                crate::kernel::syscall::SyscallError::Internal,
+            ];
+            for err in codes {
+                let mut frame =
+                    TrapFrame::new(crate::kernel::syscall::Syscall::IpcCall as usize, [0; 6]);
+                // Start from a full SUCCESS frame — the worst case for a stale lane.
+                assert_eq!(
+                    crate::kernel::direct_disposition::apply_direct_disposition(
+                        &mut frame,
+                        DirectDisposition::Completed
+                    ),
+                    Some(())
+                );
+                assert_ne!(
+                    frame.ret2, 0,
+                    "the success sentinel is present to begin with"
+                );
+                assert_eq!(
+                    crate::kernel::direct_disposition::apply_direct_disposition(
+                        &mut frame,
+                        DirectDisposition::Failed(err)
+                    ),
+                    Some(()),
+                    "a failure is handled, never declined"
+                );
+                assert_eq!(frame.error, err.code(), "{err:?}: canonical error code");
+                assert_eq!(frame.ret0, 0, "{err:?}: ret0 cleared");
+                assert_eq!(frame.ret1, 0, "{err:?}: ret1 cleared");
+                assert_eq!(
+                    frame.ret2, 0,
+                    "{err:?}: the success sentinel must NOT survive into a failure"
+                );
+            }
+        }
+
+        /// A decline must not modify the frame at all: the legacy fallback is entitled to the
+        /// frame exactly as the trap delivered it.
+        #[test]
+        fn declined_disposition_leaves_the_frame_untouched() {
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcCall as usize,
+                [11, 22, 33, 44, 55, 66],
+            );
+            frame.set_ok(0xAAAA, 0xBBBB, 0xCCCC);
+            frame.error = 0xEEEE;
+            let before = lanes_of(&frame);
+            let args_before: [usize; 6] = core::array::from_fn(|i| frame.arg(i));
+            assert_eq!(
+                crate::kernel::direct_disposition::apply_direct_disposition(
+                    &mut frame,
+                    DirectDisposition::DeclinedBeforeMutation
+                ),
+                None,
+                "a decline is NOT handled — the legacy path must run"
+            );
+            assert_eq!(lanes_of(&frame), before, "no return lane was modified");
+            let args_after: [usize; 6] = core::array::from_fn(|i| frame.arg(i));
+            assert_eq!(args_after, args_before, "no syscall argument was modified");
+            assert_eq!(
+                frame.syscall_num(),
+                crate::kernel::syscall::Syscall::IpcCall as usize,
+                "the syscall number is untouched"
+            );
+        }
+
+        /// End-to-end through the real drain: a SUCCESSFUL direct request, classified and
+        /// encoded exactly as production does, yields the legacy success lanes.
+        #[test]
+        fn successful_drain_encodes_the_legacy_success_lanes() {
+            let legacy = legacy_request_success_lanes();
+
+            let fx = fixture(true);
+            let (outcome, disposition) = drain_request(&fx, FRAMED);
+            assert!(
+                outcome.is_ok(),
+                "the direct transaction must succeed: {outcome:?}"
+            );
+            assert_eq!(disposition, DirectDisposition::Completed);
+            let mut frame = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcCall as usize,
+                [
+                    fx.send_cap_t1.0 as usize,
+                    CALLER_FRAME_VA,
+                    FRAMED.len(),
+                    0,
+                    0,
+                    fx.reply_recv_cap_t1.0 as usize,
+                ],
+            );
+            assert_eq!(
+                crate::kernel::direct_disposition::apply_direct_disposition(
+                    &mut frame,
+                    disposition
+                ),
+                Some(())
+            );
+            assert_eq!(
+                lanes_of(&frame),
+                legacy,
+                "every returned lane matches legacy"
+            );
+            teardown();
+        }
+
+        // ── Structural guards on the mapping itself ───────────────────────────────────
+
+        /// The split helpers classify the outcome and never discard it, and the mapping has
+        /// no wildcard arm.
+        #[test]
+        fn split_helpers_classify_and_never_discard() {
+            let split = include_str!("../syscall_split.rs");
+            assert!(
+                !split.contains("let _ = shared.drain_direct_request_post_work")
+                    && !split.contains("let _ = shared.drain_direct_reply_post_work"),
+                "the transaction Result must never be discarded"
+            );
+            assert!(
+                split.contains("classify_direct_request_outcome(&outcome)")
+                    && split.contains("classify_direct_reply_outcome(&outcome)"),
+                "both helpers must classify through the typed contract"
+            );
+            // Stage 199D HARD-STOP C: both helpers encode the frame through the SINGLE
+            // shared encoder, so neither can write a return lane of its own.
+            assert_eq!(
+                split
+                    .matches("direct_disposition::apply_direct_disposition(frame, disposition)")
+                    .count(),
+                2,
+                "both directions must encode through the shared encoder"
+            );
+            for helper in [
+                "fn try_split_ipccall_direct_into_frame",
+                "fn try_split_ipcreply_direct_into_frame",
+            ] {
+                let body = split
+                    .split(helper)
+                    .nth(1)
+                    .expect("helper present")
+                    .split("\n#[cfg(")
+                    .next()
+                    .expect("body bounded");
+                // The success lanes are the encoder's alone.
+                assert!(
+                    !body.contains("frame.set_ok(") && !body.contains("frame.set_ret2("),
+                    "{helper}: must not encode success return lanes itself"
+                );
+                // Nothing writes the frame AFTER the drain: everything past the transaction
+                // goes through the shared encoder. (The pre-drain SMP selectors legitimately
+                // write a non-mutating WouldBlock / duplicate refusal before any drain.)
+                let drain_at = body
+                    .find("drain_direct_")
+                    .expect("the helper drives a drain");
+                let after_drain = &body[drain_at..];
+                assert!(
+                    !after_drain.contains("frame.set_"),
+                    "{helper}: no return lane may be written after the drain"
+                );
+            }
+
+            // The shared encoder has all three arms, and only the success arm writes lanes.
+            let disp = include_str!("../direct_disposition.rs");
+            let encoder = disp
+                .split("pub(crate) fn apply_direct_disposition(")
+                .nth(1)
+                .expect("encoder present")
+                .split("\n}\n")
+                .next()
+                .expect("encoder body bounded");
+            for arm in [
+                "DirectDisposition::Completed => {",
+                "DirectDisposition::DeclinedBeforeMutation => None,",
+                "DirectDisposition::Failed(err) => {",
+            ] {
+                assert_eq!(
+                    encoder.matches(arm).count(),
+                    1,
+                    "the encoder must handle {arm}"
+                );
+            }
+            assert!(
+                encoder.contains("frame.set_ok(0, 0, SYSCALL_NO_TRANSFER_CAP as usize);"),
+                "the success lanes must use the canonical NO-transfer-cap sentinel"
+            );
+            assert!(
+                !encoder.contains("frame.set_ok(0, 0, 0)"),
+                "ret2 = 0 on success is the HARD-STOP C defect"
+            );
+            assert!(
+                !encoder.contains("u64::MAX"),
+                "the sentinel must come from the canonical constant, not a duplicated literal"
+            );
+            assert_eq!(
+                encoder.matches("frame.set_err(err.code());").count(),
+                1,
+                "the canonical error is encoded exactly as the global-lock handler does"
+            );
+
+            let disp = include_str!("../direct_disposition.rs");
+            // No wildcard arm in either mapping.
+            let mappings = disp
+                .split("pub(crate) fn classify_direct_")
+                .skip(1)
+                .collect::<alloc::vec::Vec<_>>();
+            assert_eq!(mappings.len(), 2, "two mappings");
+            for m in mappings {
+                let body = m.split("\n}\n").next().expect("body");
+                assert!(
+                    !body.contains("_ =>") && !body.contains("_err =>"),
+                    "the mapping must be exhaustive with no wildcard arm"
+                );
+            }
+        }
+    }
+
     /// The oracle server consumes the ORDINARY production recv-v2 contract.
     #[test]
     fn oracle_server_uses_the_production_recv_contract() {
@@ -80992,6 +81992,40 @@ mod stage199d_delivery_projection_differential {
         assert!(
             !core.contains("msg.payload[0..2]") && !core.contains("2 + REQUEST_DATA.len()"),
             "the oracle server must NOT reparse the two-byte inline prefix"
+        );
+        // Stage 199D HARD-STOP C: the client attests the SUCCESSFUL NR6 return lane live.
+        assert!(
+            core.contains("ipc_call_with_transfer_ret(") && core.contains("out.call_ret2 = ret2;"),
+            "the oracle client must capture the transfer-cap return lane"
+        );
+        assert!(
+            core.contains("out.call_ret2 == yarm_user_rt::syscall::SYSCALL_NO_TRANSFER_CAP"),
+            "the oracle client must compare ret2 against the canonical sentinel"
+        );
+        assert!(
+            core.contains("IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2"),
+            "the oracle client must emit the ret2 attestation marker"
+        );
+        // The round-trip completion is GATED on that attestation: a ret2 divergence suppresses
+        // `result=ok`. The evidence rides in the dedicated marker rather than in the completion
+        // literal, because `user_log` truncates at 192 bytes and that line is already at the
+        // cap — lengthening it silently clipped `result=ok` on a real boot.
+        assert!(
+            svc.contains("&& out.call_ret2_ok"),
+            "the round-trip completion must be gated on live ret2 parity"
+        );
+        let runner = include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-smoke.sh");
+        assert!(
+            runner.contains(
+                "IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2 ret2=18446744073709551615 expected=18446744073709551615 ret2_ok=1 result=ok"
+            ),
+            "the runner must require the live ret2 attestation with its exact value"
+        );
+        // 18446744073709551615 == u64::MAX == SYSCALL_NO_TRANSFER_CAP.
+        assert_eq!(
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+            u64::MAX,
+            "the sentinel the runner pins numerically"
         );
     }
 }

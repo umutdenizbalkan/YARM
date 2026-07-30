@@ -683,10 +683,17 @@ fn try_split_ipccall_direct_into_frame(
         ack,
         ack_seq,
     };
-    let _ = shared.drain_direct_request_post_work(&work);
-    // NR6 is request-send-only: return Ok now (the caller blocks via a later recv).
-    frame.set_ok(0, 0, 0);
-    Some(Ok(()))
+    // Stage 199D HARD-STOP B: the transaction outcome is CLASSIFIED, never discarded. The
+    // mapping is pure and exhaustive (`crate::kernel::direct_disposition`) — no wildcard arm,
+    // so a new error variant cannot silently inherit "success".
+    let outcome = shared.drain_direct_request_post_work(&work);
+    let disposition = crate::kernel::direct_disposition::classify_direct_request_outcome(&outcome);
+    // Stage 199D HARD-STOP C: the frame is encoded by the SHARED encoder, which reproduces
+    // the legacy `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(frame, None)` success lanes
+    // (`ret2 = SYSCALL_NO_TRANSFER_CAP`), zeroes every lane on failure, and leaves the frame
+    // untouched on a decline so the legacy global-lock IpcCall runs against a pristine frame.
+    // NR6 is request-send-only: success returns now (the caller blocks via a later recv).
+    crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition).map(|()| Ok(()))
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -783,10 +790,14 @@ fn try_split_ipcreply_direct_into_frame(
         ack,
         ack_seq,
     };
-    let _ = shared.drain_direct_reply_post_work(&work);
-    // NR7 delivers the reply and wakes the caller; the replier itself returns Ok.
-    frame.set_ok(0, 0, 0);
-    Some(Ok(()))
+    // Stage 199D HARD-STOP B: classified, never discarded — see the NR6 twin.
+    let outcome = shared.drain_direct_reply_post_work(&work);
+    let disposition = crate::kernel::direct_disposition::classify_direct_reply_outcome(&outcome);
+    // Same shared encoder as the NR6 twin: legacy `handle_ipc_reply` ends with the identical
+    // `set_ok(0, 0, 0)` + `encode_transfer_cap_ret(frame, None)` pair, so NR7's success lanes
+    // are the same three values. NR7 delivers the reply and wakes the caller; the replier
+    // itself returns Ok.
+    crate::kernel::direct_disposition::apply_direct_disposition(frame, disposition).map(|()| Ok(()))
 }
 
 #[cfg(feature = "hosted-dev")]
