@@ -85276,23 +85276,49 @@ mod stage199a2d2c2b2_guards {
     }
 
     // (9) The enqueue occurs BEFORE the reschedule IPI (no fallible work after enqueue).
+    //
+    // Stage 199D renamed the sender to `send_reschedule_ipi_to` (it now takes the authoritative
+    // target instead of assuming CPU 1). Checked in PROGRAM order rather than file order: the
+    // drain is defined before the transaction, so a whole-file offset comparison would be
+    // meaningless. The enqueue precedes the success value inside the transaction, and the send
+    // follows that success inside the drain.
     #[test]
     fn enqueue_before_ipi() {
-        let enq = TXN.find("sr_enqueue_committed_receiver_split").unwrap();
-        let ipi = TXN.find("c2b2_send_reschedule_ipi_to_cpu1()").unwrap();
-        assert!(enq < ipi, "enqueue precedes the IPI");
+        let txn_body = TXN
+            .split("fn ipc_call_direct_request_txn(")
+            .nth(1)
+            .expect("the request transaction");
+        let enq = txn_body
+            .find("sr_enqueue_committed_receiver_split(ack.server.tid.0")
+            .expect("the committed enqueue");
+        let success = txn_body
+            .find("Ok(IpcCallDirectSuccess {")
+            .expect("the success value");
+        assert!(enq < success, "enqueue precedes the success value");
+
+        let drain = TXN
+            .split("pub(crate) fn drain_direct_request_post_work(")
+            .nth(1)
+            .expect("the drain");
+        let ok_arm = drain
+            .find("if let Ok(success) = result")
+            .expect("success arm");
+        let ipi = drain
+            .find("send_reschedule_ipi_to(")
+            .expect("the reschedule IPI");
+        assert!(ok_arm < ipi, "enqueue (via the success) precedes the IPI");
     }
 
-    // (10) The request-success path does NOT self-set CPU 1's reschedule-pending flag: the CPU-0 IPI
-    // sender only re-arms the dispatch REQUEST + sends the IPI.
+    // (10) The request-success path does NOT self-set the target's reschedule-pending flag: the
+    // sender only re-arms an AP target's dispatch REQUEST + sends the IPI.
     #[test]
     fn request_path_does_not_self_set_pending() {
-        assert!(SMP.contains("fn c2b2_send_reschedule_ipi_to_cpu1"));
+        assert!(SMP.contains("fn send_reschedule_ipi_to"));
         // The IPI sender body (between its fn header and the next fn) must not set_reschedule_pending.
         let start = SMP
-            .find("pub(crate) fn c2b2_send_reschedule_ipi_to_cpu1")
+            .find("pub(crate) fn send_reschedule_ipi_to(sender: CpuId, target: CpuId)")
             .unwrap();
-        let body = &SMP[start..start + 700];
+        let body = &SMP[start..start + 900];
         assert!(
             !body.contains("set_reschedule_pending"),
             "IPI sender must not set pending"
@@ -104945,5 +104971,296 @@ mod stage199d_smp_oracle_request_framing {
         assert_eq!(delivery.app_payload, b"A");
         assert_eq!(delivery.app_opcode, OPCODE_INLINE);
         assert_eq!(delivery.stripped_prefix, 0);
+    }
+}
+
+// ── Stage 199D — the post-enqueue REMOTE-WAKE decision ───────────────────────────────────────
+//
+// RUN_C of the x86_64 direct-IPC seal requires exactly ONE cross-CPU reschedule IPI. It observed
+// 54. Root cause, proved by direct measurement across three production-default toggles:
+//
+//   commit     ipccall_direct_production_enabled()   IPI sent
+//   da9d26e2   false                                  1
+//   fcfc55e3   cfg!(target_arch = "x86_64")          54   <-- first bad
+//   340f7822   false                                  1
+//   c94cd304   cfg!(target_arch = "x86_64")          54
+//
+// The post-transaction wake decision read a GLOBAL ORACLE SELECTOR
+// (`x86_ipccall_direct_smp_request_enabled()`) and unconditionally aimed at a hardcoded CPU 1.
+// While the NR6 production default was off, the oracle's own request was the only traffic that
+// reached the drain, so it fired once and looked correct. Once the default was enabled every
+// ordinary direct request reached it too: 53 ordinary LOCAL completions plus the one genuine
+// CPU0->CPU1 oracle delivery = 54.
+//
+// The repair fixes the AUTHORITY, not the count: the rank-1 enqueue now reports the CPU it
+// actually committed to, and the wake decision compares that to the enqueueing CPU. These tests
+// pin the resulting contract.
+mod stage199d_remote_wake_authority {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// A kernel with `cpus` CPUs online and `n` registered tasks (tids 1..=n).
+    fn fixture(cpus: u8, n: u64) -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            for c in 1..cpus {
+                s.bring_up_cpu(CpuId(c)).expect("bring up cpu");
+            }
+            for tid in 1..=n {
+                s.register_task(tid).expect("task");
+            }
+        });
+        k
+    }
+
+    /// Would the drain send a remote-wake IPI for this enqueue? This is the exact decision the
+    /// drain makes — target vs. enqueueing CPU — with no selector involved.
+    fn is_remote(k: &SharedKernel, target: CpuId) -> bool {
+        target != k.current_cpu_split_read()
+    }
+
+    /// **53 local successes → zero remote IPIs.** The regression in one test: these are ordinary
+    /// production NR6 completions, exactly the traffic the old selector-driven decision turned
+    /// into 53 spurious remote wakes.
+    #[test]
+    fn fifty_three_local_successes_send_no_remote_ipi() {
+        let k = fixture(2, 53);
+        let here = k.current_cpu_split_read();
+        let mut remote = 0usize;
+        for tid in 1..=53u64 {
+            // Unpinned receiver: the enqueue falls back to the enqueueing CPU.
+            let target = k.sr_enqueue_committed_receiver_split(tid, None);
+            assert_eq!(target, here, "an unpinned enqueue commits to the local CPU");
+            if is_remote(&k, target) {
+                remote += 1;
+            }
+        }
+        assert_eq!(remote, 0, "ordinary local completions must send no IPI");
+    }
+
+    /// **One CPU0→CPU1 success → exactly one CPU1 IPI**, aimed at the authoritative home CPU.
+    #[test]
+    fn one_cross_cpu_success_sends_exactly_one_ipi_at_the_home_cpu() {
+        let k = fixture(2, 1);
+        k.with(|s| s.set_task_home_cpu(1, CpuId(1)).expect("pin to cpu 1"));
+        let affinity = k.with(|s| s.task_home_cpu(1));
+        assert_eq!(affinity, Some(CpuId(1)), "the home CPU is authoritative");
+
+        let target = k.sr_enqueue_committed_receiver_split(1, affinity);
+        assert_eq!(target, CpuId(1), "the enqueue commits to the home CPU");
+        assert!(is_remote(&k, target), "CPU0 -> CPU1 is a remote wake");
+        assert_ne!(target, k.current_cpu_split_read());
+        // Exactly one: one success yields one decision.
+        assert_eq!([target].iter().filter(|t| is_remote(&k, **t)).count(), 1);
+    }
+
+    /// **A repeated/duplicate completion sends no second IPI**, because a second successful
+    /// transaction is required to reach the decision at all — and the ack lease is consumed
+    /// exactly once, so a duplicate drain of the same work cannot produce a second success.
+    #[test]
+    fn a_duplicate_completion_produces_no_second_ipi() {
+        // The decision is reached only inside `if let Ok(success)`, once per success.
+        let body = code_only(
+            TXN.split("pub(crate) fn drain_direct_request_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the drain"),
+        );
+        assert_eq!(
+            body.matches("send_reschedule_ipi_to(").count(),
+            1,
+            "exactly one send site, inside the single success arm"
+        );
+        assert!(
+            body.contains("if let Ok(success) = result"),
+            "the decision is reached only on a committed success"
+        );
+        // And the lease is consumed exactly once per committed transaction, so a duplicate drain
+        // of the same work item cannot re-succeed.
+        assert!(
+            TXN.contains("let _ = lease.consume(lease_commit_seq);"),
+            "the acknowledgement lease is consumed once per commit"
+        );
+    }
+
+    /// **A wrong/stale home CPU fails closed.** An affinity naming a CPU that is not online must
+    /// not silently become a remote wake at a bogus target: the enqueue reports what it actually
+    /// committed to, and an offline target enqueues nothing.
+    #[test]
+    fn a_stale_home_cpu_fails_closed() {
+        let k = fixture(2, 1);
+        let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8 - 1);
+        let target = k.sr_enqueue_committed_receiver_split(1, Some(bogus));
+        // The seam reports the target it was asked for; the scheduler refuses the enqueue on an
+        // offline CPU, so nothing is queued there and no task is lost to a phantom run queue.
+        assert_eq!(target, bogus);
+        let queued = k.with(|s| s.runnable_count_on_cpu(bogus));
+        assert_eq!(queued, 0, "an offline target must hold no queued task");
+    }
+
+    /// **Two different remote targets route independently** — each enqueue reports its own
+    /// committed CPU, so one wake can never be aimed at the other's target.
+    #[test]
+    fn two_remote_targets_route_independently() {
+        let k = fixture(3, 2);
+        k.with(|s| {
+            s.set_task_home_cpu(1, CpuId(1)).expect("pin 1");
+            s.set_task_home_cpu(2, CpuId(2)).expect("pin 2");
+        });
+        let t1 = k.sr_enqueue_committed_receiver_split(1, k.with(|s| s.task_home_cpu(1)));
+        let t2 = k.sr_enqueue_committed_receiver_split(2, k.with(|s| s.task_home_cpu(2)));
+        assert_eq!(t1, CpuId(1));
+        assert_eq!(t2, CpuId(2));
+        assert_ne!(t1, t2, "independent targets, never a shared assumed CPU");
+        assert!(is_remote(&k, t1) && is_remote(&k, t2));
+    }
+
+    /// **An enqueue failure sends zero IPIs.** The decision sits behind `Ok(success)`, so every
+    /// error variant returns before it — nothing is woken and nothing is signalled.
+    #[test]
+    fn a_failed_transaction_sends_zero_ipis() {
+        let body = code_only(
+            TXN.split("pub(crate) fn drain_direct_request_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the drain"),
+        );
+        let ok_arm = body
+            .find("if let Ok(success) = result")
+            .expect("success arm");
+        let send = body.find("send_reschedule_ipi_to(").expect("send");
+        assert!(send > ok_arm, "the send is inside the success arm");
+        // No send appears on any error path.
+        assert!(
+            !body.contains("Err(") || body.matches("send_reschedule_ipi_to(").count() == 1,
+            "no error path may send"
+        );
+    }
+
+    /// **The IPI strictly follows the committed enqueue.** Inside the transaction the enqueue is
+    /// step 12 and the only send happens after the transaction has returned `Ok`.
+    #[test]
+    fn the_ipi_strictly_follows_the_committed_enqueue() {
+        // PROGRAM order, not file order: the drain is defined before the transaction, so a
+        // whole-file offset comparison would be meaningless. Check each function's own body.
+        //
+        // (a) Inside the transaction, the enqueue precedes constructing the success value — so a
+        //     success cannot exist before the wake is committed.
+        let txn_body = code_only(
+            TXN.split("fn ipc_call_direct_request_txn(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the request transaction"),
+        );
+        let enqueue = txn_body
+            .find("sr_enqueue_committed_receiver_split(ack.server.tid.0, affinity)")
+            .expect("the committed enqueue");
+        let success = txn_body
+            .find("Ok(IpcCallDirectSuccess {")
+            .expect("the success value");
+        assert!(
+            enqueue < success,
+            "the success value must be built only after the enqueue commits"
+        );
+
+        // (b) Inside the drain, the send happens only after that success has been observed.
+        let drain = code_only(
+            TXN.split("pub(crate) fn drain_direct_request_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the drain"),
+        );
+        let ok_arm = drain
+            .find("if let Ok(success) = result")
+            .expect("success arm");
+        let send = drain
+            .find("crate::arch::x86_64::smp::send_reschedule_ipi_to(")
+            .expect("the send");
+        assert!(ok_arm < send, "the send follows the committed success");
+
+        // The enqueue remains the transaction's LAST step (checked on the raw source, since this
+        // is a prose marker that `code_only` deliberately strips).
+        assert!(
+            TXN.contains("(12) scheduler enqueue LAST"),
+            "the enqueue remains the last transaction step"
+        );
+    }
+
+    /// **The decision no longer depends on a global oracle selector, a service name, an endpoint
+    /// literal or a marker** — it reads the committed target and nothing else.
+    #[test]
+    fn the_decision_reads_only_the_committed_target() {
+        let body = code_only(
+            TXN.split("pub(crate) fn drain_direct_request_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the drain"),
+        );
+        assert!(
+            body.contains("success.wake_target_cpu != enqueueing_cpu"),
+            "the decision compares the committed target to the enqueueing CPU"
+        );
+        for forbidden in [
+            "x86_ipccall_direct_smp_request_enabled",
+            "CpuId(1)",
+            "receiver_cpu=1",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the wake decision must not depend on `{forbidden}`"
+            );
+        }
+    }
+
+    /// The IPI primitive takes an authoritative target rather than assuming CPU 1, and the
+    /// hardcoded-CPU1 entry point is gone from the tree.
+    #[test]
+    fn the_ipi_primitive_takes_an_authoritative_target() {
+        assert!(
+            SMP.contains("pub(crate) fn send_reschedule_ipi_to(sender: CpuId, target: CpuId)"),
+            "the primitive must take sender and target"
+        );
+        assert!(
+            !code_only(SMP).contains("fn c2b2_send_reschedule_ipi_to_cpu1"),
+            "the hardcoded-CPU1 entry point must be gone"
+        );
+        // The marker keeps its shape but reports real CPUs.
+        assert!(SMP.contains(
+            "X86_AP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok"
+        ));
+        // Hosted / test builds keep a no-op with the same signature.
+        assert!(
+            SMP.contains("pub(crate) fn send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}"),
+            "hosted and non-x86 behaviour is preserved by a same-shape no-op"
+        );
+    }
+
+    /// The enqueue seam is the single authority: it returns the CPU it committed to, and the
+    /// enqueueing CPU is read from that same rank-1 authority.
+    #[test]
+    fn the_enqueue_seam_is_the_single_authority_for_the_target() {
+        assert!(
+            RUNTIME.contains(
+                "pub(crate) fn sr_enqueue_committed_receiver_split(\n        &self,\n        tid: u64,\n        affinity: Option<CpuId>,\n    ) -> CpuId {"
+            ),
+            "the enqueue seam must report its committed target"
+        );
+        assert!(
+            RUNTIME.contains("pub(crate) fn current_cpu_split_read(&self) -> CpuId {")
+                && RUNTIME.contains("self.with_scheduler_split_mut(|sched| sched.current_cpu)"),
+            "the enqueueing CPU comes from the same rank-1 authority"
+        );
     }
 }

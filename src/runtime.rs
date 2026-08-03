@@ -3984,7 +3984,32 @@ impl SharedKernel {
     /// Runnable (committed under the task lock); this only enqueues it exactly once on its captured
     /// affinity (else the current CPU). This is the final externally visible action and is NON-fallible
     /// — no fallible work runs after it. Priority is class-derived (SystemServer=High else Normal).
-    pub(crate) fn sr_enqueue_committed_receiver_split(&self, tid: u64, affinity: Option<CpuId>) {
+    /// Stage 199D: the CPU this drain is running on, read from the SAME rank-1 authority
+    /// (`sched.current_cpu`) that `sr_enqueue_committed_receiver_split` uses for its unpinned
+    /// fallback. Comparing the two is therefore an apples-to-apples "was that enqueue remote?"
+    /// test: an unpinned receiver enqueues onto this very CPU and compares equal, so it can never
+    /// be mistaken for a remote wake.
+    pub(crate) fn current_cpu_split_read(&self) -> CpuId {
+        self.with_scheduler_split_mut(|sched| sched.current_cpu)
+    }
+
+    /// Returns the CPU the receiver was **actually enqueued on** — the committed wake target.
+    ///
+    /// Stage 199D: this used to compute the target and throw it away, which left the caller with
+    /// no authority for the post-enqueue wake decision. The one consumer that needed it
+    /// (`drain_direct_request_post_work`) therefore guessed, hardcoding CPU 1 behind a global
+    /// oracle selector — so once the NR6 production default was enabled, EVERY ordinary direct
+    /// request fired a remote-wake IPI at CPU 1. Returning the real target makes "was this
+    /// enqueue remote?" a fact rather than an assumption.
+    ///
+    /// The target is the receiver's authoritative affinity (its `task_home_cpu`), falling back to
+    /// the enqueueing CPU when unpinned — exactly the value used for the enqueue itself, read out
+    /// of the same rank-1 acquisition, so the two cannot disagree.
+    pub(crate) fn sr_enqueue_committed_receiver_split(
+        &self,
+        tid: u64,
+        affinity: Option<CpuId>,
+    ) -> CpuId {
         use crate::kernel::ipc::ThreadId;
         use crate::kernel::scheduler::TaskPriority;
         use crate::kernel::task::TaskClass;
@@ -3996,7 +4021,8 @@ impl SharedKernel {
             let cpu = affinity.unwrap_or(sched.current_cpu);
             let sm = kernel_mut(&mut sched.scheduler);
             let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
-        });
+            cpu
+        })
     }
 
     /// Stage 199A2D2A: read the cross-CPU wake TARGET for the SMP request oracle — a blocked

@@ -2352,27 +2352,38 @@ static AP_SAVED_RESUME_DONE: [AtomicBool; crate::arch::platform_constants::MAX_C
 static C2B2_RESCHEDULE_IPI_SENT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// Stage 199A2D2C2B2: sent from CPU 0 (the client's NR6 delivery context) STRICTLY AFTER the server
-/// was enqueued on CPU 1 — the canonical remote-wake IPI. It re-arms CPU 1's dispatch REQUEST (so its
-/// managed idle loop re-enters the dispatcher on the wake) and sends vector 0xF1 to CPU 1. It does NOT
-/// set CPU 1's reschedule-PENDING flag (CPU 1 sets that itself on IPI receipt) and does NOT touch
-/// CPU 0's pending flag. One IPI requested per delivery.
+/// Stage 199D: the canonical remote-wake IPI, sent STRICTLY AFTER a committed enqueue placed a
+/// woken task on a DIFFERENT CPU's run queue.
+///
+/// `target` is the CPU the enqueue actually committed to — the receiver's authoritative home CPU,
+/// reported by `sr_enqueue_committed_receiver_split`. It is a parameter rather than a constant
+/// because the previous form hardcoded CPU 1 behind a global oracle selector, which turned every
+/// ordinary direct request into a remote wake once the NR6 production default was enabled.
+///
+/// Sends vector 0xF1 to `target`. It does NOT set the target's reschedule-PENDING flag (the target
+/// sets that itself on IPI receipt) and does not touch the sender's. An AP target additionally has
+/// its dispatch REQUEST re-armed so its managed idle loop re-enters the dispatcher; the BSP needs
+/// no such re-arm because it dispatches through its normal timer-driven scheduler. One IPI
+/// requested per remote delivery.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
-pub(crate) fn c2b2_send_reschedule_ipi_to_cpu1() {
+pub(crate) fn send_reschedule_ipi_to(sender: CpuId, target: CpuId) {
     use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
     let n = C2B2_RESCHEDULE_IPI_SENT.fetch_add(1, Ordering::AcqRel) + 1;
-    // Re-arm CPU 1's dispatch request (distinct from the reschedule-pending flag).
-    super::percpu::set_ap_dispatch_request(CpuId(1), 1);
+    // Re-arm an AP target's dispatch request (distinct from the reschedule-pending flag). The BSP
+    // dispatches via its timer tick and has no managed idle loop to re-arm.
+    if target.0 != 0 {
+        super::percpu::set_ap_dispatch_request(target, 1);
+    }
     crate::kernel::printk::printk_emit_sync(format_args!(
-        "X86_AP_RESCHEDULE_IPI_SENT sender_cpu=0 receiver_cpu=1 reason=remote_enqueue count={} result=ok",
-        n
+        "X86_AP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok",
+        sender.0, target.0, n
     ));
-    wait_for_icr_idle(1, "before_c2b2_reschedule");
-    write_icr(1, AP_REMOTE_WAKE_VECTOR as u32);
+    wait_for_icr_idle(target.0, "before_remote_wake_reschedule");
+    write_icr(target.0, AP_REMOTE_WAKE_VECTOR as u32);
 }
 
 #[cfg(any(test, feature = "hosted-dev"))]
-pub(crate) fn c2b2_send_reschedule_ipi_to_cpu1() {}
+pub(crate) fn send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}
 
 /// Stage 199A2D2C2C: count of cross-CPU reply reschedule IPIs this oracle REQUESTED (exactly one for
 /// the one committed caller enqueue on CPU 0).

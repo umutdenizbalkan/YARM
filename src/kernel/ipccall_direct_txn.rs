@@ -32,6 +32,11 @@ pub(crate) struct IpcCallDirectSuccess {
     pub(crate) record_index: usize,
     pub(crate) record_generation: u64,
     pub(crate) server_reply_cap: CapId,
+    /// The CPU the woken server was **actually enqueued on**, as reported by the rank-1 enqueue
+    /// itself. This is the authority for the post-transaction wake decision: comparing it to the
+    /// enqueueing CPU is what distinguishes a local enqueue (no IPI) from a genuine remote one
+    /// (exactly one IPI, aimed here). It is never assumed and never derived from a selector.
+    pub(crate) wake_target_cpu: crate::kernel::scheduler::CpuId,
 }
 
 /// Failure classification. Every variant leaves the server blocked with a valid
@@ -106,19 +111,41 @@ impl SharedKernel {
             // Retryable pre-claim rollback: re-arm the published acknowledgement.
             crate::kernel::boot::ipccall_direct_ack::restore(work.ack_seq);
         }
-        if result.is_ok() {
+        if let Ok(success) = result {
             // Stage 199A2B4: a genuine off-lock request delivery completed — emit the NR6
             // live success + retirement markers (one-shot; no-op unless the x86 oracle
             // feature+selector are both active).
             crate::kernel::boot::emit_ipccall_direct_request_live_markers();
-            // Stage 199A2D2C2B2: the server was just enqueued on CPU 1 (its captured affinity). On the
-            // cross-CPU REQUEST path, CPU 0 now sends the canonical reschedule/remote-wake IPI to CPU 1
-            // — the request path never self-sets CPU 1's pending flag; the CPU-1 side sets it on IPI
-            // receipt. Strictly AFTER the enqueue (no fallible work follows). No-op off the C2B2 path.
+            // Stage 199D — the post-enqueue REMOTE-WAKE decision.
+            //
+            // The woken server was enqueued on `success.wake_target_cpu`, reported by the rank-1
+            // enqueue itself. A wake IPI is needed only when that target is a DIFFERENT CPU from
+            // the one running this drain: a local enqueue lands on our own run queue and the
+            // ordinary dispatcher picks it up.
+            //
+            // This decision used to read `x86_ipccall_direct_smp_request_enabled()` — a global
+            // oracle selector — and unconditionally aim at a hardcoded CPU 1. While the NR6
+            // production default was off, the oracle's single request was the only traffic that
+            // reached here, so it fired once and looked correct. Once the default was enabled
+            // (`fcfc55e3`), EVERY ordinary direct request in the boot fired it too: 53 ordinary
+            // local completions plus the one genuine CPU0→CPU1 oracle delivery = the 54 remote-wake
+            // IPIs the seal rejected. The selector was never authority for "is this wake remote?".
+            //
+            // Now the enqueue's own committed target decides, so ordinary local traffic sends
+            // nothing regardless of any selector, and a real remote enqueue is woken on its
+            // authoritative home CPU rather than an assumed one. Strictly after the enqueue commit:
+            // the transaction has returned `Ok` and no fallible work follows.
+            let _ = success;
             #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-            if crate::kernel::boot::x86_ipccall_direct_smp_request_enabled() {
-                crate::kernel::boot::ipccall_direct_smp_request_note_delivered();
-                crate::arch::x86_64::smp::c2b2_send_reschedule_ipi_to_cpu1();
+            {
+                let enqueueing_cpu = self.current_cpu_split_read();
+                if success.wake_target_cpu != enqueueing_cpu {
+                    crate::kernel::boot::ipccall_direct_smp_request_note_delivered();
+                    crate::arch::x86_64::smp::send_reschedule_ipi_to(
+                        enqueueing_cpu,
+                        success.wake_target_cpu,
+                    );
+                }
             }
         }
         result
@@ -386,14 +413,17 @@ impl SharedKernel {
                     );
                     return Err(IpcCallDirectError::RecordCommitFailed);
                 }
-                // (12) scheduler enqueue LAST — the single, non-fallible wake.
-                self.sr_enqueue_committed_receiver_split(ack.server.tid.0, affinity);
+                // (12) scheduler enqueue LAST — the single, non-fallible wake. It reports the CPU
+                //      it actually enqueued on, which becomes this success's wake target.
+                let wake_target_cpu =
+                    self.sr_enqueue_committed_receiver_split(ack.server.tid.0, affinity);
                 // (13) consume the acknowledgement lease exactly once.
                 let _ = lease.consume(lease_commit_seq);
                 Ok(IpcCallDirectSuccess {
                     record_index: idx,
                     record_generation: rgen,
                     server_reply_cap: server_cap,
+                    wake_target_cpu,
                 })
             }
             // Server exited / was replaced after the identity claim: the claimed waiter
