@@ -2398,19 +2398,19 @@ static C2C_RESCHEDULE_IPI_SENT: core::sync::atomic::AtomicU64 =
 /// does NOT set CPU 0's reschedule-pending flag (CPU 0 sets that itself on IPI receipt) and performs no
 /// dispatch here. One IPI requested per reply delivery.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
-pub(crate) fn c2c_send_reschedule_ipi_to_cpu0() {
+pub(crate) fn c2c_send_reschedule_ipi_to(sender: CpuId, target: CpuId) {
     use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
     let n = C2C_RESCHEDULE_IPI_SENT.fetch_add(1, Ordering::AcqRel) + 1;
     crate::kernel::printk::printk_emit_sync(format_args!(
-        "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0 reason=remote_enqueue count={} result=ok",
-        n
+        "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok",
+        sender.0, target.0, n
     ));
-    wait_for_icr_idle(0, "before_c2c_reschedule");
-    write_icr(0, AP_REMOTE_WAKE_VECTOR as u32);
+    wait_for_icr_idle(target.0, "before_c2c_reschedule");
+    write_icr(target.0, AP_REMOTE_WAKE_VECTOR as u32);
 }
 
 #[cfg(any(test, feature = "hosted-dev"))]
-pub(crate) fn c2c_send_reschedule_ipi_to_cpu0() {}
+pub(crate) fn c2c_send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}
 
 /// Stage 199A2D2C2C: the CPU-0 (BSP) saved-frame resume of the oracle client. In SMP=2 the BSP's
 /// steady-state trap handler dispatches via the D6 local seam, which is single-CPU-only, so a

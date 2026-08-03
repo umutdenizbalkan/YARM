@@ -452,6 +452,10 @@ use crate::kernel::ipccall_direct::{BlockedCallerAck, IpcReplyDirectSnapshot};
 pub(crate) struct IpcReplyDirectSuccess {
     pub(crate) record_index: usize,
     pub(crate) record_generation: u64,
+    /// The CPU the woken caller was **actually enqueued on**, reported by the rank-1 enqueue.
+    /// The reverse-direction twin of `IpcCallDirectSuccess::wake_target_cpu`, and the authority
+    /// for the reverse remote-wake decision.
+    pub(crate) wake_target_cpu: crate::kernel::scheduler::CpuId,
 }
 
 /// Failure classification for the NR7 direct reply. Every variant leaves the caller
@@ -621,12 +625,15 @@ impl SharedKernel {
                     lease.discard();
                     return Err(IpcReplyDirectError::RecordConsumeFailed);
                 }
-                // (8) enqueue the caller LAST — the single, non-fallible wake.
-                self.sr_enqueue_committed_receiver_split(ack.caller.tid.0, affinity);
+                // (8) enqueue the caller LAST — the single, non-fallible wake. It reports the
+                //     CPU it actually enqueued on, which becomes this success's wake target.
+                let wake_target_cpu =
+                    self.sr_enqueue_committed_receiver_split(ack.caller.tid.0, affinity);
                 let _ = lease.consume(lease_commit_seq);
                 Ok(IpcReplyDirectSuccess {
                     record_index: idx,
                     record_generation: rgen,
+                    wake_target_cpu,
                 })
             }
             // Caller exited / replaced after the claim: the claimed waiter belonged to
@@ -685,20 +692,37 @@ impl SharedKernel {
         if lease.is_available() {
             crate::kernel::boot::ipcreply_direct_ack::restore(work.ack_seq);
         }
-        if result.is_ok() {
+        if let Ok(success) = result {
             // Stage 199A2B4: a genuine off-lock reply delivery completed — emit the NR7 live
             // success + retirement markers (one-shot; no-op unless the x86 oracle
             // feature+selector are both active).
             crate::kernel::boot::emit_ipcreply_direct_live_markers();
-            // Stage 199A2D2C2C: the caller was just enqueued on CPU 0 (its captured home affinity). On
-            // the cross-CPU REPLY path, CPU 1 now sends the canonical reschedule/remote-wake IPI to
-            // CPU 0 — strictly AFTER the single enqueue (no fallible work follows). CPU 0 sets its own
-            // pending flag on IPI receipt (never a self-set from here) and dispatches via its normal
-            // scheduler (no dispatch in the IPI handler). No-op off the C2C reply path.
+            // Stage 199D — the post-enqueue REVERSE remote-wake decision, the exact mirror of the
+            // NR6 twin in `drain_direct_request_post_work`.
+            //
+            // The woken caller was enqueued on `success.wake_target_cpu`. A wake IPI is needed
+            // only when that target is a DIFFERENT CPU from the one running this drain; a local
+            // enqueue lands on our own run queue and the ordinary dispatcher picks it up.
+            //
+            // This used to read `x86_ipccall_direct_smp_reply_enabled()` — a global oracle
+            // selector — and aim at a hardcoded CPU 0, so every ordinary direct NR7 completion
+            // fired a reverse wake once the NR6/NR7 production default was on. That produced a
+            // spurious extra `X86_BSP_RESCHEDULE_IPI_SENT` before the oracle's own reply, which
+            // RUN_D rejects (it requires exactly one). Strictly after the enqueue commit: the
+            // transaction has returned `Ok` and no fallible work follows. The target sets its own
+            // pending flag on IPI receipt (never a self-set from here) and dispatches through its
+            // normal scheduler — no dispatch in the IPI handler.
+            let _ = success;
             #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
-            if crate::kernel::boot::x86_ipccall_direct_smp_reply_enabled() {
-                crate::kernel::boot::ipcreply_direct_smp_reply_note_delivered();
-                crate::arch::x86_64::smp::c2c_send_reschedule_ipi_to_cpu0();
+            {
+                let enqueueing_cpu = self.current_cpu_split_read();
+                if success.wake_target_cpu != enqueueing_cpu {
+                    crate::kernel::boot::ipcreply_direct_smp_reply_note_delivered();
+                    crate::arch::x86_64::smp::c2c_send_reschedule_ipi_to(
+                        enqueueing_cpu,
+                        success.wake_target_cpu,
+                    );
+                }
             }
         }
         result

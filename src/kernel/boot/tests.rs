@@ -85659,24 +85659,43 @@ mod stage199a2d2c2c_reply_guards {
         assert!(body.contains(
             "self.ipc_reply_direct_txn(&work.snapshot, &work.ack, &mut lease, work.ack_seq)"
         ));
-        assert!(body.contains("if result.is_ok()"));
-        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        // Stage 199D: the reverse wake decision no longer reads a global oracle selector and no
+        // longer assumes CPU 0 — it compares the enqueue's own committed target to the
+        // enqueueing CPU, so an ordinary LOCAL direct NR7 completion sends nothing.
+        assert!(body.contains("if let Ok(success) = result"));
+        assert!(body.contains("success.wake_target_cpu != enqueueing_cpu"));
+        // Negative check on CODE only: the drain's comment legitimately explains which selector
+        // the decision no longer reads, and a raw text match would trip on that prose.
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("x86_ipccall_direct_smp_reply_enabled()"));
         assert!(body.contains("ipcreply_direct_smp_reply_note_delivered()"));
-        assert!(body.contains("c2c_send_reschedule_ipi_to_cpu0()"));
+        assert!(body.contains("c2c_send_reschedule_ipi_to("));
     }
 
     // 5. The reverse IPI is sent AFTER the enqueue (from the success branch), targets APIC id 0, and
     //    emits the canonical SENT marker; it never re-arms an AP dispatch request.
     #[test]
     fn reverse_ipi_targets_cpu0() {
-        assert!(SMP.contains("pub(crate) fn c2c_send_reschedule_ipi_to_cpu0()"));
-        assert!(SMP.contains("X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0"));
+        // Stage 199D: the primitive takes the AUTHORITATIVE target rather than assuming CPU 0.
+        // The caller (the reply drain) supplies the enqueue's committed target, so the genuine
+        // reverse wake still reads `sender_cpu=1 receiver_cpu=0` in the marker.
+        assert!(
+            SMP.contains("pub(crate) fn c2c_send_reschedule_ipi_to(sender: CpuId, target: CpuId)")
+        );
+        assert!(SMP.contains(
+            "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok"
+        ));
         let f = SMP
-            .split("pub(crate) fn c2c_send_reschedule_ipi_to_cpu0() {")
+            .split("pub(crate) fn c2c_send_reschedule_ipi_to(sender: CpuId, target: CpuId) {")
             .nth(1)
             .unwrap();
         let body = &f[..f.find("\n}\n").unwrap()];
-        assert!(body.contains("write_icr(0, AP_REMOTE_WAKE_VECTOR as u32)"));
+        assert!(body.contains("write_icr(target.0, AP_REMOTE_WAKE_VECTOR as u32)"));
+        // Still never re-arms an AP dispatch request: the BSP dispatches on its timer tick.
         assert!(!body.contains("set_ap_dispatch_request"));
     }
 
@@ -104846,6 +104865,57 @@ mod stage199d_smp_oracle_request_framing {
 
     const EXEC_STATE: &str = include_str!("exec_state.rs");
 
+    /// **The RUN_D reverse-direction root cause, as an executable fact.**
+    ///
+    /// `SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`) is the ONE encoding meaning "no capability";
+    /// every other value — including a raw `0` — NAMES one. The AP oracle server's NR7 left
+    /// arg5 at 0, so it was a CAP-BEARING reply naming capability id 0. Before the Stage 199D
+    /// transfer-cap safety increment the NR7 gate had no transfer-cap fact at all, so the
+    /// malformed argument was ignored and the reply was delivered — which is why the
+    /// bidirectional seal passed at 4605ebc7. Once the gate correctly declined cap-bearing
+    /// replies, the reply fell to legacy, where capability id 0 fails to resolve, and RUN_D
+    /// timed out. The stub now passes `SYSCALL_NO_TRANSFER_CAP`.
+    #[test]
+    fn a_zero_transfer_cap_argument_is_cap_bearing_not_absent() {
+        use crate::kernel::syscall::ipc_abi::transfer_cap_arg_present;
+        use crate::kernel::syscall::{SYSCALL_ARG_TRANSFER_CAP, SYSCALL_NO_TRANSFER_CAP};
+        let mut frame = crate::kernel::trapframe::TrapFrame::new(7, [0; 6]);
+        // A raw zero NAMES capability 0 — this is the canonical contract, not an accident.
+        frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, 0);
+        assert!(
+            transfer_cap_arg_present(&frame),
+            "arg5 = 0 names capability id 0; it does NOT mean 'no capability'"
+        );
+        // Only the sentinel means absent.
+        frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, SYSCALL_NO_TRANSFER_CAP as usize);
+        assert!(
+            !transfer_cap_arg_present(&frame),
+            "only SYSCALL_NO_TRANSFER_CAP means 'no capability'"
+        );
+    }
+
+    /// Both NR7 sites in the AP oracle server stub load `-1` into r9 (arg5) before `syscall`,
+    /// and the stub's length is unchanged — the four bytes were freed by `push imm8; pop reg`
+    /// rather than inserted, so every relative jump displacement stays valid.
+    #[test]
+    fn the_ap_oracle_server_declares_no_transfer_cap_on_both_nr7_sites() {
+        // `49 83 C9 FF` = `or r9, -1` -> arg5 = u64::MAX = SYSCALL_NO_TRANSFER_CAP.
+        // Whitespace-collapsed: rustfmt wraps the byte array, so one occurrence spans two lines.
+        let flat = EXEC_STATE
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            flat.matches("0x49, 0x83, 0xC9, 0xFF").count(),
+            2,
+            "both the genuine reply and the duplicate-barrier NR7 must declare no transfer cap"
+        );
+        assert!(
+            EXEC_STATE.contains("const RECV_V2_SERVER_STUB_C2C: [u8; 262]"),
+            "the stub length must be unchanged so its jump displacements stay valid"
+        );
+    }
+
     /// The exact bytes the oracle client stages into its payload page, read from the source of
     /// truth rather than restated, so the guard cannot drift from the shipped constant.
     fn oracle_request_bytes() -> alloc::vec::Vec<u8> {
@@ -105244,6 +105314,79 @@ mod stage199d_remote_wake_authority {
         assert!(
             SMP.contains("pub(crate) fn send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}"),
             "hosted and non-x86 behaviour is preserved by a same-shape no-op"
+        );
+    }
+
+    /// **The REVERSE (NR7) direction obeys the same authority.** The reply drain used to read the
+    /// same kind of global oracle selector and aim at a hardcoded CPU 0, so every ordinary direct
+    /// NR7 completion fired a reverse wake — producing a spurious extra
+    /// `X86_BSP_RESCHEDULE_IPI_SENT` before the oracle's own reply, which RUN_D rejects.
+    #[test]
+    fn the_reverse_reply_wake_reads_only_its_committed_target() {
+        let drain = code_only(
+            TXN.split("pub(crate) fn drain_direct_reply_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the reply drain"),
+        );
+        assert!(
+            drain.contains("if let Ok(success) = result"),
+            "the reverse decision is reached only on a committed success"
+        );
+        assert!(
+            drain.contains("success.wake_target_cpu != enqueueing_cpu"),
+            "the reverse decision compares the committed target to the enqueueing CPU"
+        );
+        assert_eq!(
+            drain.matches("c2c_send_reschedule_ipi_to(").count(),
+            1,
+            "exactly one reverse send site"
+        );
+        for forbidden in [
+            "x86_ipccall_direct_smp_reply_enabled",
+            "CpuId(0)",
+            "receiver_cpu=0",
+        ] {
+            assert!(
+                !drain.contains(forbidden),
+                "the reverse wake decision must not depend on `{forbidden}`"
+            );
+        }
+        // The reverse primitive takes an authoritative target, and the hardcoded-CPU0 entry
+        // point is gone. Its distinct BSP marker shape is preserved so the seal still greps it.
+        assert!(
+            SMP.contains("pub(crate) fn c2c_send_reschedule_ipi_to(sender: CpuId, target: CpuId)")
+                && !code_only(SMP).contains("fn c2c_send_reschedule_ipi_to_cpu0"),
+            "the reverse primitive must take a target, not assume CPU 0"
+        );
+        assert!(SMP.contains(
+            "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok"
+        ));
+    }
+
+    /// The reply transaction reports its committed wake target, exactly as the request twin does,
+    /// and does so only after the caller enqueue.
+    #[test]
+    fn the_reply_transaction_reports_its_committed_wake_target() {
+        assert!(
+            TXN.contains("pub(crate) wake_target_cpu: crate::kernel::scheduler::CpuId,"),
+            "both success types carry the committed target"
+        );
+        let txn_body = code_only(
+            TXN.split("fn ipc_reply_direct_txn(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the reply transaction"),
+        );
+        let enq = txn_body
+            .find("sr_enqueue_committed_receiver_split(ack.caller.tid.0, affinity)")
+            .expect("the caller enqueue");
+        let success = txn_body
+            .find("Ok(IpcReplyDirectSuccess {")
+            .expect("the success value");
+        assert!(
+            enq < success,
+            "the reply success is built only after the caller enqueue commits"
         );
     }
 
