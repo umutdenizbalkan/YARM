@@ -95,7 +95,7 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 | `ExitCurrentTask` NR 16 | **2 of 3** | x86_64 `0b5e98f`, AArch64; 202D (one sub-path; RISC-V unearned) |
 | **Server death (`ServerDies`) — x86_64** | **1 of 3** | **`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`; canonical 199D server-crash-cleanup increment** |
 | **Accepted total (production-path)** | **39** | 30 + 6 + 2 + 1 |
-| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated**, ⚠️ **not currently reproducible** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok` was earned at `ccceb03d`; proves the 199D mechanism, **not** the production path. The seal does **not** reproduce at HEAD — see §0.1 below. |
+| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D mechanism, **not** the production path. Originally earned at `ccceb03d`; **re-earned at `7d5a22c9`** after three repairs — see §0.1. |
 
 > **On the total.** There is no aggregate live-cell counter anywhere in the tree; the only
 > in-tree aggregate is Stage 198F's `total_live_cells=30`. The figure above is computed from
@@ -133,7 +133,7 @@ deliberately not folded into that repair.
 |---|---------|-----------|--------|
 | 1 | RUN_C: `X86_AP_RECV_V2_VALIDATE_FAIL`; request-OK / user-validated absent | `458bb3d4` | ✅ **repaired** (`db783142`) |
 | 2 | RUN_C: `X86_AP_RESCHEDULE_IPI_SENT sender_cpu=0 receiver_cpu=1` fires **54×**, seal requires 1 | `fcfc55e3` | ✅ **repaired** (`6784a3ae`) |
-| 3 | RUN_D: reverse NR7 direction never completes — `IPCREPLY_DIRECT_SMP_REPLY_OK=0`, `result=fail reason=timeout_before_completion` | not yet bisected | ❌ open |
+| 3 | RUN_D: reverse NR7 never completes — `IPCREPLY_DIRECT_SMP_REPLY_OK=0`, `timeout_before_completion` | `458bb3d4`-era transfer-cap decline vs. a malformed oracle NR7 | ✅ **repaired** (`7d5a22c9`) |
 
 **Defect 1 (repaired).** `ipc_call` (NR6) sends `opcode = OPCODE_INLINE` with `FLAG_REPLY_CAP`,
 which by the frozen recv-v2 contract makes the raw payload a **framed** message: first two bytes
@@ -168,18 +168,47 @@ carries it in `IpcCallDirectSuccess`, and decides the wake by comparing it to th
 so a local enqueue sends nothing regardless of any selector, and a real remote enqueue is woken on
 its authoritative home CPU.
 
-**Defect 3 (open — the sole remaining blocker).** RUN_D's *forward* direction is now fully
-healthy (`IPCCALL_DIRECT_SMP_REQUEST_OK=1`, `X86_AP_RECV_V2_USER_VALIDATED cpu=1`, forward IPI
-`sent=1`), and the reverse IPI is requested exactly once
-(`X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0` = 1) — but the reply never lands:
-`IPCREPLY_DIRECT_SMP_REPLY_OK=0` and `X86_BSP_REPLY_USER_VALIDATED cpu=0` = 0, so the run ends
-`result=fail reason=timeout_before_completion`. Not bisected.
+**Defect 3 (repaired).** RUN_D's first missing boundary was **#4, the direct NR7 eligibility
+verdict**: the AP's `nr=7` never split-dispatched. Instrumentation named it —
+`verdict=TransferCapUnsupported transfer_cap=true arg5=0x0`.
 
-The four-run seal at `6784a3ae` now reaches RUN_D: RUN_A ✅ (feature-off, marker-clean),
-RUN_B ✅ (`request=1 reply=1 server_wakes=1 caller_wakes=1 duplicate_reply=rejected`),
-**RUN_C ✅** (`AP saved-dispatch=1 request_user_consumed=1 no ring-3 fault`), then
-`result=fail reason=D_smoke` on defect 3 — the only remaining blocker. Standalone RUN_C reports
-`sent=1 received=1 request_ok=1 continuation=1 user_validated=1`.
+`SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`) is the ONE encoding meaning "no capability"; every other
+value — **including a raw `0`** — NAMES one (pinned by
+`transfer_cap_arg_zero_is_not_treated_as_none`). The AP oracle server left arg5 at 0, so its
+reply was cap-bearing. At `4605ebc7` the NR7 gate had no transfer-cap fact at all, so the
+malformed argument was ignored and the reply was delivered — which is why the bidirectional seal
+passed there. Once the Stage 199D transfer-cap safety increment correctly declined cap-bearing
+replies, the reply fell to legacy, where capability id 0 fails to resolve, and RUN_D timed out.
+Both NR7 sites now declare `SYSCALL_NO_TRANSFER_CAP`; the four bytes were freed via
+`push imm8; pop reg` rather than inserted, so the stub length and every jump displacement are
+unchanged.
+
+Repairing that exposed **defect 2's mirror on the reverse path** — the reply drain also read a
+global oracle selector and aimed at a hardcoded CPU 0, so the process manager's ordinary NR7 fired
+a spurious reverse IPI. Fixed identically to the forward path: the reply transaction reports its
+committed wake target and the drain compares it to the enqueueing CPU.
+
+### 0.2 The seal reproduces
+
+`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok` at exact clean commit `7d5a22c9`, all four
+fresh runs from one commit with a clean-tree re-check after each:
+
+* **RUN_A** feature-off core smoke, marker-clean;
+* **RUN_B** `request=1 reply=1 server_wakes=1 caller_wakes=1 duplicate_reply=rejected`;
+* **RUN_C** `AP saved-dispatch=1 request_user_consumed=1 no ring-3 fault`;
+* **RUN_D** `request/reply cross-CPU=1, user-consumed both dirs, IPIs 1/1, continuations 1/1,
+  dup refused, no fuse`.
+
+Seal counters: `cross_cpu_request_smp2=1 cross_cpu_reply_smp2=1 request_user_consumed=1
+reply_user_consumed=1 trap_depth_errors=0 wrong_current_task=0 duplicate_replies=0
+duplicate_wakes=0 overwrite_fuse_trips=0`.
+
+This **preserves historical Stage 199 evidence and adds no live cell** — the six cells remain
+knob-gated and prove the 199D mechanism, not the production path.
+
+All three defects are repaired and the four-run seal reproduces — see §0.2. Standalone RUN_C
+reports `sent=1 received=1 request_ok=1 continuation=1 user_validated=1`; standalone RUN_D
+reports `cross_cpu_request=1 cross_cpu_reply=1 duplicate_replies=0 result=ok`.
 
 Unaffected and re-verified live at `db783142`: x86 production core boot, ServerDies
 (`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL … result=ok`), and the x86 reply-timeout retirement smoke.
