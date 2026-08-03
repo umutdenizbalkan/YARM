@@ -1200,57 +1200,64 @@ tree, follows the write, and is preceded by every refusal arm.
 
 Live effect: `created` went from **0 to 54** on the ServerDies boot.
 
-#### The close edge has the identical divergence
+#### Close parity, delivered the same way
 
-Fixing creation exposed its mirror image. Of the four reverse-link close sites, only two stamp:
+All four closing paths — `KernelState::detach_server_reply_link_exact`,
+`KernelState::take_server_reply_link`, `SharedKernel::unregister_server_reply_link_split` and
+the reply-timeout domain's `rt_detach_server_link` — now delegate to
+`boot::close_server_reply_link`. Two of the four used to remove links without stamping at all,
+which is why unifying creation produced `created=54 closed=13`.
 
-| site | stamps `note_link_closed` |
+| selector | used by |
 | --- | --- |
-| `KernelState::detach_server_reply_link_exact` (ordinary terminal close) | yes |
-| `KernelState::take_server_reply_link` (exit-path close) | yes |
-| `SharedKernel::unregister_server_reply_link_split` (the direct NR7 close) | **no** |
-| `rt_detach_server_reply_link` (reply-timeout domain close) | **no** |
+| `Exact { record_index, record_generation }` | every ordinary terminal close |
+| `Any` | the exiting-server take path, and only it |
 
-With the direct path as the production default, the split close retires the reverse link for
-every direct NR7 reply without counting it:
+| case | removes | outcome | stamps |
+| --- | --- | --- | --- |
+| `Exact`, link matches the record | yes | `Closed(link)` | **yes** |
+| `Any`, a link is present | yes | `Closed(link)` | **yes** |
+| no link present (absent, or a repeat) | no | `AlreadyAbsent` | no |
+| `Exact`, same slot at a later generation | no | `StaleRecordGeneration` | no |
+| `Exact`, a different record is live | no | `DifferentLiveLink` | no |
+
+The stamp follows a genuine `Some(link) → None` mutation and is attributed by the **removed**
+link's record identity, not by the selector, so the `Any` path reports the record it actually
+closed. Every caller's return contract is preserved exactly, including the split seam's
+defensive server re-verify, which stays at that call site. There is now exactly one link-close
+mutation and one `note_link_closed` call in the tree, mirroring the one install mutation and one
+`note_link_created` call; guards pin both.
+
+Live: `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT created=54 closed=54 live_links=0 scope=system`,
+with the ServerDies scoped vector `[1, 1, 1, 1, 1, 1, 1, 1, 1]`, one PeerDeath winner and one
+caller wake.
+
+#### Still held off: the reply-vs-timeout terminal race
+
+With the flip on, the normal core boot, the direct NR6/NR7 oracle regression and the ServerDies
+regression all pass. `scripts/qemu-ipc-reply-timeout-matrix-smoke.sh` does not: its **x86_64
+reply-wins** cell fails. That cell is causal, not a wall-clock margin — a collector is held
+before the terminal claim so the reply provably wins — and with the direct path as the default
+the reply loses:
 
 ```text
-IPC_SERVER_DEATH_LINK_LEAK created=54 closed=13 scope=system result=fail
-STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 result=fail
+IPC_REPLY_WIN_RESERVE arch=x86_64 outcome=ok                  (legacy reserved the terminal)
+IPC_REPLY_WIN_ROLLBACK arch=x86_64 ...                        (forbidden — the reply rolled back)
+IPC_REPLY_TIMEOUT_DEFERRED arch=x86_64 published=1 drained=1  (forbidden — the timeout won)
+IPC_REPLY_BEATS_TIMEOUT_OK ...                                (required, count 0)
 ```
 
-The 41 missing closes are exactly the 41 direct NR7 completions on that boot. The links
-themselves are installed and removed correctly — this is an accounting gap, as the creation one
-was — but while it is open the attestation that would detect a *real* reverse-link leak is wrong
-on the production path, now in the permissive direction.
+The A/B is exact — same clean tree, same harness, `MATRIX_ARCHES=x86_64`, one constant. Flip
+**off**: both x86 cells pass, `timeout_wins=1 reply_wins=1`, zero `[fail]` lines. Flip **on**:
+the reply-wins cell fails as above.
 
-The fix is the exact mirror of the creation one: one shared close decision that both seams
-delegate to, with the stamp on the arm that genuinely removes a link, and the reply-timeout site
-brought onto it too. `g10c_the_close_edge_is_not_yet_shared_and_the_flip_is_held_off` pins the
-asymmetry and the held-off constant together, so neither can be quietly changed alone.
-
-#### Everything else about the flip is proven healthy
-
-With `ipccall_direct_production_enabled()` temporarily on, at commit `c94cd304`:
-
-```text
-YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1
-[ok] x86_64 core smoke: all 6 service entries present exactly once
-[ok] Phase 3B: PM_ELF_ZC_FAIL count=0
-nr6 attempts=54 completed=53 failed=0 fallback=0 not_admitted=0   flags all ok
-nr7 attempts=53 completed=41 failed=0 fallback=0 transfer_cap=10  flags all ok
-ack reserve=114 commit=114 consume=53 release=52 cancel=0 live=9 high_watermark=9
-    capacity=256 fuses_clear=1 no_orphan=1 exclusive=1
-census waiters_current=10 high_watermark=10 eligible=9 live_leases=9
-bijection waiters_without_lease=0 leases_without_waiter=0 identity=0 generation=0 dup=0
-IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok
-```
-
-53 NR6 and 41 NR7 ordinary syscalls serviced entirely off-lock with **zero** broad-lock entries,
-zero capacity refusals, zero fuse trips, zero stale/foreign/duplicate/crossed terminals, and an
-exact lease/waiter bijection. The oracle regression passes with the flip on
-(`live_cells=2 result=ok`). Only the ServerDies close accounting stands between this and the
-production-default seal.
+The shape says legacy `handle_ipc_reply` ran, reserved the reply win, and then
+`KernelState::ipc_reply` failed, so the win rolled back, the deadline was re-armed and the
+timeout's deferred path completed. `reserve_reply_win_before_copy` /
+`commit_reply_win_after_delivery` / `rollback_reply_win` live only on the legacy reply path;
+the direct NR7 path neither participates in that lease nor leaves the record in the state legacy
+expects. Until the direct reply path either takes the terminal lease itself or provably declines
+every reply the causal gate has armed, the production default stays off.
 
 AArch64 and RISC-V are untouched and remain proof-gated.
 

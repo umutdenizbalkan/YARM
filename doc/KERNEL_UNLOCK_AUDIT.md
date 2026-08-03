@@ -1100,9 +1100,29 @@ completed off-lock with zero broad-lock entries, zero capacity refusals, zero fu
 lease/waiter bijection (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1
 result=ok`), and the oracle regression passing with the flip on (`live_cells=2 result=ok`).
 
-The constant is restored to `false`. The fix is the exact mirror of the one just landed: one
-shared close decision both seams delegate to, plus the reply-timeout site. Full evidence:
-`doc/IPC.md` §8.6.8.
+The constant is restored to `false`.
+
+### 6.1.10 Close parity closed; the reply-vs-timeout race remains
+
+**Reverse-link CLOSE accounting is now identical on all four closing paths**, which delegate to
+`boot::close_server_reply_link` with an `Exact`/`Any` selector. Two of the four used to remove
+links without stamping. There is now exactly one close mutation and one `note_link_closed` call
+in the tree, mirroring creation. Live: `created=54 closed=54 live_links=0`, ServerDies scoped
+vector `[1;9]`, one PeerDeath winner, one caller wake, seal `result=ok`.
+
+**With the flip on, three of the four live runs pass** — the normal core boot
+(`YARM_BOOT_OK`, all 6 service entries, `PM_ELF_ZC_FAIL count=0`, 53 NR6 + 41 NR7 off-lock with
+zero broad-lock entries, quiescent seal and waiter bijection both `result=ok`), the direct
+NR6/NR7 oracle regression (`live_cells=2 result=ok`) and ServerDies.
+
+**The reply-timeout matrix does not.** Its x86_64 reply-wins cell — causal, not a wall-clock
+margin — has the reply lose: `IPC_REPLY_WIN_RESERVE outcome=ok` then `IPC_REPLY_WIN_ROLLBACK`
+and `IPC_REPLY_TIMEOUT_DEFERRED published=1 drained=1`, with `IPC_REPLY_BEATS_TIMEOUT_OK`
+absent. The A/B is exact on the same clean tree and harness: flip off, both x86 cells pass; flip
+on, reply-wins fails. `reserve_reply_win_before_copy` / `commit_reply_win_after_delivery` /
+`rollback_reply_win` live only on the legacy reply path, and the direct NR7 path neither
+participates in that lease nor leaves the record in the state legacy expects. The constant is
+restored to `false`. Full evidence: `doc/IPC.md` §8.6.8.
 
 ---
 

@@ -208,7 +208,18 @@ Full detail: `doc/IPC.md` §8.5.
    and closed correctly (an instrumentation gap in the split twin, not a link leak), but while it
    is open the attestation that would detect a *real* reverse-link leak is blind on the
    production path. AArch64 and RISC-V are untouched and remain proof-gated. Full evidence is in
-   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.9; see also `doc/IPC.md` §8.6.5–§8.6.8.
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.10; see also `doc/IPC.md` §8.6.5–§8.6.8.
+   **Blocker 6 (link CLOSE accounting) is now closed too** — all four closing paths delegate to
+   the one `close_server_reply_link` decision, so `links_created == links_closed` is a
+   meaningful invariant on the production path; live `created=54 closed=54 live_links=0`,
+   ServerDies vector `[1;9]`, seal `result=ok`. With the flip on, the core boot, the direct
+   NR6/NR7 oracle regression and ServerDies all pass. **The reply-timeout matrix does not:** its
+   x86_64 reply-wins cell (causal, not a wall-clock margin) has the reply lose —
+   `IPC_REPLY_WIN_ROLLBACK` and `IPC_REPLY_TIMEOUT_DEFERRED` present, `IPC_REPLY_BEATS_TIMEOUT_OK`
+   absent — because the reply-win terminal lease lives only on the legacy reply path and the
+   direct NR7 path neither takes it nor leaves the record as legacy expects. Exact A/B on one
+   clean tree: flip off both x86 cells pass, flip on reply-wins fails. The constant is restored
+   to `false`.
    **Blocker 5 (link CREATION accounting) is now closed** — both installation seams delegate to
    the one `install_server_reply_link` decision, so the creation stamp cannot drift; live,
    `created` went 0 → 54. That exposed its mirror on the CLOSE edge: of four close sites only two
