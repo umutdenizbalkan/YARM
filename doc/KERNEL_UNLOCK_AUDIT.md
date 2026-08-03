@@ -1078,6 +1078,32 @@ legacy one does, then re-run ServerDies.
 
 AArch64 and RISC-V are untouched and remain proof-gated. Full evidence: `doc/IPC.md` §8.6.7.
 
+### 6.1.9 Creation parity closed; the close edge mirrors it
+
+**Reverse-link CREATION accounting is now identical on both installation paths.** The legacy and
+split seams carried independent copies of the same decision and drifted — the split twin
+installed the link without stamping `note_link_created`. Both now delegate to
+`boot::install_server_reply_link`: one status gate, one set of match arms, one stamp, with the
+stamp unreachable from every refusal arm. Live, `created` went from 0 to 54.
+
+**That exposed the mirror defect on the CLOSE edge.** Of four close sites only two stamp
+`note_link_closed`; `SharedKernel::unregister_server_reply_link_split` (the direct NR7 close) and
+`rt_detach_server_reply_link` (reply-timeout domain) do not. With the direct path as the
+production default the totals read `created=54 closed=13` — the 41 missing closes being exactly
+the 41 direct NR7 completions — and the ServerDies seal fails. As with creation the links are
+correct and this is an accounting gap, but the leak attestation is now wrong in the permissive
+direction on the production path.
+
+**Everything else about the flip is proven healthy** at commit `c94cd304`: `YARM_BOOT_OK`, all 6
+service entries exactly once, `PM_ELF_ZC_FAIL count=0`, 53 NR6 and 41 NR7 ordinary syscalls
+completed off-lock with zero broad-lock entries, zero capacity refusals, zero fuse trips, exact
+lease/waiter bijection (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1
+result=ok`), and the oracle regression passing with the flip on (`live_cells=2 result=ok`).
+
+The constant is restored to `false`. The fix is the exact mirror of the one just landed: one
+shared close decision both seams delegate to, plus the reply-timeout site. Full evidence:
+`doc/IPC.md` §8.6.8.
+
 ---
 
 ## 7. Method and limits

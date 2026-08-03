@@ -3124,38 +3124,62 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # ENABLED on x86_64 — Stage 199D production default
+/// # HELD OFF — one live blocker remains (Stage 199D)
 ///
-/// The off-lock direct NR6/NR7 path is the **production default on x86_64**: ordinary
-/// `IpcCall`/`IpcReply` traffic is serviced before the broad kernel lock, with no oracle, no
-/// proof gate and no endpoint confinement involved. AArch64 and RISC-V still resolve to the
-/// proof gate and the oracle confinement, so their boots are byte-identical.
+/// Flipping this to `cfg!(target_arch = "x86_64")` is the whole enablement, and with it on
+/// the normal feature-off x86_64 boot is **fully healthy**: `YARM_BOOT_OK`, all 6 service
+/// entries exactly once, `PM_ELF_ZC_FAIL count=0`, 53 NR6 and 41 NR7 ordinary syscalls
+/// completed off-lock with zero broad-lock entries, zero capacity refusals, zero fuse trips,
+/// and an exact lease/waiter bijection
+/// (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`). The x86
+/// direct NR6/NR7 oracle regression passes with it on (`live_cells=2 result=ok`).
 ///
-/// It took five blockers to get here, every one found by a live boot rather than by
-/// inspection, and every one closed:
+/// Five of the original blockers are closed:
 ///
-/// 1. **Capability transfer was silently dropped.** NR7 eligibility carries
-///    `transfer_cap_present`, asked through the one canonical `transfer_cap_arg_present`
-///    predicate the legacy decode is itself built on; a cap-bearing reply declines before any
-///    mutation and the legacy path does the transfer. Direct capability transfer remains
-///    unimplemented — declining is the whole fix.
-/// 2. **The acknowledgement store had no production release path.** The lease is owned by the
-///    endpoint waiter lifecycle: the three `IpcSubsystem` waiter-removal primitives every
-///    canonical closing edge funnels through retire the exact
-///    `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` lease.
-/// 3. **Orphans tripped the overwrite fuse** — 17 trips on the first attempt, 0 now.
-/// 4. **Capacity was a magic 8**, smaller than the number of services a normal boot parks in
-///    recv-v2 at once. [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`] is now
-///    [`ENDPOINT_WAITER_SLOTS`] — one slot per endpoint index, derived at compile time from
-///    the authoritative endpoint receive-waiter table rather than chosen.
-/// 5. **The ServerDies link accounting was blind to the direct path.**
-///    `register_server_reply_link_split` installed the reverse link without stamping the
-///    creation edge, while its legacy twin stamped it — so with the direct path as the default
-///    the system-wide leak totals read `created=0 closed=13`. Both paths now delegate to
-///    [`install_server_reply_link`], the ONE installation decision, so the accounting is
-///    identical by construction rather than by inspection.
+/// 1. ~~Capability transfer silently dropped.~~ **FIXED** — NR7 eligibility carries
+///    `transfer_cap_present`; a cap-bearing reply declines before any mutation.
+/// 2. ~~No production release path.~~ **FIXED** — the acknowledgement lease is owned by the
+///    endpoint waiter lifecycle.
+/// 3. ~~Orphans trip the overwrite fuse.~~ **FIXED** — 17 trips before, 0 now.
+/// 4. ~~Magic capacity of 8.~~ **FIXED** — [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`]
+///    is [`ENDPOINT_WAITER_SLOTS`], one slot per endpoint index, derived at compile time.
+/// 5. ~~The link CREATION edge was blind to the direct path.~~ **FIXED** — both installation
+///    seams delegate to [`install_server_reply_link`], the ONE installation decision, so the
+///    creation stamp cannot drift. Live: `created` went from 0 to 54.
+///
+/// # The remaining blocker: the link CLOSE edge has the same split/legacy divergence
+///
+/// Fixing the creation edge exposed its mirror image. There are four reverse-link close
+/// sites, and only two of them stamp `server_dies_counters::note_link_closed`:
+///
+/// | site | stamps |
+/// | --- | --- |
+/// | `KernelState::detach_server_reply_link_exact` (ordinary terminal close) | yes |
+/// | `KernelState::take_server_reply_link` (exit-path close) | yes |
+/// | `SharedKernel::unregister_server_reply_link_split` (the direct NR7 close) | **no** |
+/// | `rt_detach_server_reply_link` (the reply-timeout domain close) | **no** |
+///
+/// With the direct path as the production default, `unregister_server_reply_link_split`
+/// retires the reverse link for every direct NR7 reply without counting it, so the
+/// system-wide totals report far more creations than closes:
+///
+/// ```text
+/// IPC_SERVER_DEATH_LINK_LEAK created=54 closed=13 scope=system result=fail
+/// STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 result=fail
+/// ```
+///
+/// The 41 missing closes are exactly the 41 direct NR7 completions on that boot. As with the
+/// creation edge the links themselves are correct — installed and removed properly — and this
+/// is an accounting gap, but the same reasoning applies: while it is open the attestation that
+/// would detect a *real* reverse-link leak is wrong on the production path, now in the
+/// permissive direction.
+///
+/// The fix is the exact mirror of the creation one: give the close its own single shared
+/// decision that both the legacy and split seams delegate to, with the stamp on the arm that
+/// genuinely removes a link, and bring the reply-timeout site onto it too. Until that lands
+/// the production default stays off.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    cfg!(target_arch = "x86_64")
+    false
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.

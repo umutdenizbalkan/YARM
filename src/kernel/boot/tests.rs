@@ -82636,9 +82636,9 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
-            "the whole condition is the target architecture: x86_64 is production-default, \
-             every other architecture is not"
+            "false",
+            "the body is a bare constant: flipping it to `cfg!(target_arch = \"x86_64\")` \
+             is the entire x86_64 production-default enablement"
         );
         for forbidden in [
             "oracle",
@@ -82661,10 +82661,10 @@ mod stage199d_production_default_guards {
     }
 
     /// The flip is HELD OFF against a recorded, reproducible live failure — not forgotten.
-    /// The doc comment records how the production default was earned: every blocker that had
-    /// to be closed. A regression that re-opens one should have to edit this record.
+    /// The doc comment tracks every blocker and its state — the five that are closed, and the
+    /// one that is not — so nobody re-flips it blind and nobody re-litigates a closed one.
     #[test]
-    fn the_production_default_records_every_closed_blocker() {
+    fn the_held_off_flip_records_every_live_blocker() {
         let doc = MODRS
             .split("/// True iff the direct NR6/NR7 path is the production default")
             .nth(1)
@@ -82673,31 +82673,43 @@ mod stage199d_production_default_guards {
             .next()
             .expect("doc bounded");
         assert!(
-            doc.contains("ENABLED on x86_64"),
-            "the predicate says plainly that x86_64 is production-default"
+            doc.contains("HELD OFF"),
+            "the predicate says plainly that it is held off"
         );
         for blocker in [
-            "transfer_cap_present",      // 1: capability transfer
-            "waiter lifecycle",          // 2: unpaired ack lifecycle
-            "overwrite fuse",            // 3: orphans refusing re-blocking
-            "ENDPOINT_WAITER_SLOTS",     // 4: the structural capacity
-            "install_server_reply_link", // 5: the ServerDies accounting gap
+            "transfer_cap_present",               // 1 — FIXED
+            "endpoint waiter lifecycle",          // 2 — FIXED
+            "overwrite fuse",                     // 3 — FIXED
+            "ENDPOINT_WAITER_SLOTS",              // 4 — FIXED
+            "install_server_reply_link",          // 5 — FIXED
+            "unregister_server_reply_link_split", // 6 — OPEN: the close edge
         ] {
             assert!(
                 doc.contains(blocker),
-                "the record must account for the {blocker} blocker"
+                "the held-off record must account for the {blocker} blocker"
             );
         }
-        // AArch64 and RISC-V are explicitly unchanged.
-        assert!(
-            doc.contains("AArch64 and RISC-V still resolve to the")
-                && doc.contains("boots are byte-identical"),
-            "the record states that no other architecture was ported"
+        assert_eq!(
+            doc.matches("**FIXED**").count(),
+            5,
+            "five blockers are recorded as fixed"
         );
-        // On this (x86_64-modelled) hosted build the default really is on.
-        assert!(crate::kernel::boot::ipccall_direct_production_enabled());
-        assert!(crate::kernel::boot::ipccall_direct_admission_enabled());
-        assert!(crate::kernel::boot::ipccall_direct_publication_enabled());
+        assert!(
+            doc.contains("The remaining blocker"),
+            "the one open blocker is named as open"
+        );
+        assert!(
+            doc.contains("IPC_SERVER_DEATH_LINK_LEAK created=54 closed=13"),
+            "the marker that proves the open blocker is recorded"
+        );
+        assert!(
+            doc.contains("nr6_ok=1 nr7_ok=1 census_ok=1 result=ok"),
+            "the evidence that the rest of the flip is healthy is recorded too"
+        );
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "held off means held off"
+        );
     }
 
     /// Endpoint admission is the ARCH-SPLIT predicate, never an oracle endpoint list: it is
@@ -93110,6 +93122,49 @@ mod stage200d1_publication_and_guards {
                 && helper.contains("crate::kernel::task::TaskStatus::Running")
                 && helper.contains("crate::kernel::task::TaskStatus::Blocked(_)"),
             "an incarnation that has committed to exit is refused"
+        );
+    }
+
+    /// **Close-edge parity is NOT yet achieved** — this guard records the asymmetry so it
+    /// cannot be forgotten, and will need inverting when it is fixed.
+    ///
+    /// Unifying the creation edge exposed its mirror image: of the four reverse-link close
+    /// sites, only two stamp `note_link_closed`. With the direct NR6/NR7 path as the
+    /// production default the two silent ones retire links without counting them, and the
+    /// system-wide totals read `created=54 closed=13` — the 41 missing closes being exactly
+    /// the 41 direct NR7 completions on that boot. It is the reason
+    /// `ipccall_direct_production_enabled()` is still `false`.
+    #[test]
+    fn g10c_the_close_edge_is_not_yet_shared_and_the_flip_is_held_off() {
+        // The two counted close sites, both on the legacy seam.
+        assert_eq!(
+            IPC_STATE_SRC.matches("note_link_closed(").count(),
+            2,
+            "detach_server_reply_link_exact and take_server_reply_link count their closes"
+        );
+        // The split close site removes a link and counts nothing.
+        let split_close = RUNTIME_SRC
+            .split("pub(crate) fn unregister_server_reply_link_split(")
+            .nth(1)
+            .expect("the split close seam")
+            .split("\n    }\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            split_close.contains("tcb.server_reply_link = None;"),
+            "the split seam removes the link"
+        );
+        assert!(
+            !split_close.contains("note_link_closed"),
+            "KNOWN GAP: the split close does not count — see the held-off record on \
+             `ipccall_direct_production_enabled`. When this is fixed, invert this assertion \
+             and re-run the x86 ServerDies regression."
+        );
+        // Because that gap is open, the production default must stay off: with it on, the
+        // ServerDies audit fails on `IPC_SERVER_DEATH_LINK_LEAK`.
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "the production default must stay off while a close edge is uncounted"
         );
     }
 

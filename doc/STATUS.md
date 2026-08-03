@@ -208,7 +208,14 @@ Full detail: `doc/IPC.md` §8.5.
    and closed correctly (an instrumentation gap in the split twin, not a link leak), but while it
    is open the attestation that would detect a *real* reverse-link leak is blind on the
    production path. AArch64 and RISC-V are untouched and remain proof-gated. Full evidence is in
-   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.8; see also `doc/IPC.md` §8.6.5–§8.6.7.
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.9; see also `doc/IPC.md` §8.6.5–§8.6.8.
+   **Blocker 5 (link CREATION accounting) is now closed** — both installation seams delegate to
+   the one `install_server_reply_link` decision, so the creation stamp cannot drift; live,
+   `created` went 0 → 54. That exposed its mirror on the CLOSE edge: of four close sites only two
+   stamp `note_link_closed`, and the direct NR7 close (`unregister_server_reply_link_split`) is
+   one of the silent ones, so with the flip on the totals read `created=54 closed=13` and
+   ServerDies fails. Everything else about the flip is proven healthy at commit `c94cd304`. The
+   constant is restored to `false`; the fix is the exact mirror of the creation one.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

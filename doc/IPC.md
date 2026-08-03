@@ -1177,6 +1177,81 @@ detect a *real* reverse-link leak is blind on the production path, which is prec
 ServerDies cell exists to guarantee. The fix is to stamp the creation edge in the split twin as
 the legacy one does and re-run the regression.
 
+### 8.6.8 Reverse-link creation parity — and the close edge that mirrors it
+
+**Creation parity is done.** `KernelState::register_server_reply_link` and
+`SharedKernel::register_server_reply_link_split` carried independent copies of the same
+installation decision and drifted: the split twin installed the link without stamping
+`server_dies_counters::note_link_created`, while the legacy one stamped it. Both now delegate to
+`boot::install_server_reply_link` — one status gate, one set of match arms, one stamp — so the
+accounting is identical by construction rather than by inspection.
+
+| case | installs | returns | stamps |
+| --- | --- | --- | --- |
+| no link present | yes | `true` | **yes** |
+| identical link already present (duplicate retry) | no | `true` | no |
+| a DIFFERENT live link present | no | `false` | no |
+| incarnation has committed to exit | no | `false` | no |
+
+A missing or foreign TCB never reaches the decision — both callers resolve the exact
+`{tid, asid}` incarnation first. The stamp sits in the `None =>` arm *after* the write, so it is
+unreachable without a genuine installation; guards pin that the stamp exists exactly once in the
+tree, follows the write, and is preceded by every refusal arm.
+
+Live effect: `created` went from **0 to 54** on the ServerDies boot.
+
+#### The close edge has the identical divergence
+
+Fixing creation exposed its mirror image. Of the four reverse-link close sites, only two stamp:
+
+| site | stamps `note_link_closed` |
+| --- | --- |
+| `KernelState::detach_server_reply_link_exact` (ordinary terminal close) | yes |
+| `KernelState::take_server_reply_link` (exit-path close) | yes |
+| `SharedKernel::unregister_server_reply_link_split` (the direct NR7 close) | **no** |
+| `rt_detach_server_reply_link` (reply-timeout domain close) | **no** |
+
+With the direct path as the production default, the split close retires the reverse link for
+every direct NR7 reply without counting it:
+
+```text
+IPC_SERVER_DEATH_LINK_LEAK created=54 closed=13 scope=system result=fail
+STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 result=fail
+```
+
+The 41 missing closes are exactly the 41 direct NR7 completions on that boot. The links
+themselves are installed and removed correctly — this is an accounting gap, as the creation one
+was — but while it is open the attestation that would detect a *real* reverse-link leak is wrong
+on the production path, now in the permissive direction.
+
+The fix is the exact mirror of the creation one: one shared close decision that both seams
+delegate to, with the stamp on the arm that genuinely removes a link, and the reply-timeout site
+brought onto it too. `g10c_the_close_edge_is_not_yet_shared_and_the_flip_is_held_off` pins the
+asymmetry and the held-off constant together, so neither can be quietly changed alone.
+
+#### Everything else about the flip is proven healthy
+
+With `ipccall_direct_production_enabled()` temporarily on, at commit `c94cd304`:
+
+```text
+YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1
+[ok] x86_64 core smoke: all 6 service entries present exactly once
+[ok] Phase 3B: PM_ELF_ZC_FAIL count=0
+nr6 attempts=54 completed=53 failed=0 fallback=0 not_admitted=0   flags all ok
+nr7 attempts=53 completed=41 failed=0 fallback=0 transfer_cap=10  flags all ok
+ack reserve=114 commit=114 consume=53 release=52 cancel=0 live=9 high_watermark=9
+    capacity=256 fuses_clear=1 no_orphan=1 exclusive=1
+census waiters_current=10 high_watermark=10 eligible=9 live_leases=9
+bijection waiters_without_lease=0 leases_without_waiter=0 identity=0 generation=0 dup=0
+IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok
+```
+
+53 NR6 and 41 NR7 ordinary syscalls serviced entirely off-lock with **zero** broad-lock entries,
+zero capacity refusals, zero fuse trips, zero stale/foreign/duplicate/crossed terminals, and an
+exact lease/waiter bijection. The oracle regression passes with the flip on
+(`live_cells=2 result=ok`). Only the ServerDies close accounting stands between this and the
+production-default seal.
+
 AArch64 and RISC-V are untouched and remain proof-gated.
 
 ---
