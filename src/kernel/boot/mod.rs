@@ -3124,66 +3124,49 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # HELD OFF — one live blocker remains (Stage 199D)
+/// # ENABLED on x86_64 — Stage 199D production default
 ///
-/// Flipping this to `cfg!(target_arch = "x86_64")` is the whole enablement, and with it on
-/// the normal feature-off x86_64 boot, the direct NR6/NR7 oracle regression and the ServerDies
-/// regression **all pass**:
+/// The off-lock direct NR6/NR7 path is the **production default on x86_64**: ordinary
+/// `IpcCall`/`IpcReply` traffic is serviced before the broad kernel lock, with no oracle, no
+/// proof gate and no endpoint confinement involved. AArch64 and RISC-V still resolve to the
+/// proof gate and the oracle confinement, so their boots are byte-identical.
 ///
-/// ```text
-/// YARM_BOOT_OK; all 6 service entries exactly once; PM_ELF_ZC_FAIL count=0
-/// 53 NR6 + 41 NR7 ordinary syscalls off-lock, zero broad-lock entries
-/// IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok
-/// IPC_DIRECT_WAITER_BIJECTION dir=nr6/nr7 ... result=ok
-/// STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL classes=2 live_cells=2 result=ok
-/// IPC_SERVER_DEATH_TRANSITION_AUDIT vector=[1, 1, 1, 1, 1, 1, 1, 1, 1] result=ok
-/// IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT created=54 closed=54 live_links=0 scope=system
-/// STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL live_cells=1 result=ok
-/// ```
+/// Seven blockers stood between the mechanism and this default. Every one was found by a live
+/// boot rather than by inspection, and every one is closed:
 ///
-/// Six blockers are closed:
-///
-/// 1. ~~Capability transfer silently dropped.~~ **FIXED** — NR7 eligibility carries
-///    `transfer_cap_present`; a cap-bearing reply declines before any mutation.
-/// 2. ~~No production release path.~~ **FIXED** — the acknowledgement lease is owned by the
-///    endpoint waiter lifecycle.
-/// 3. ~~Orphans trip the overwrite fuse.~~ **FIXED** — 17 trips before, 0 now.
-/// 4. ~~Magic capacity of 8.~~ **FIXED** — [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`]
-///    is [`ENDPOINT_WAITER_SLOTS`], one slot per endpoint index, derived at compile time.
-/// 5. ~~The reverse-link CREATION edge was blind to the direct path.~~ **FIXED** — both
-///    installation seams delegate to [`install_server_reply_link`].
-/// 6. ~~The reverse-link CLOSE edge had the same divergence.~~ **FIXED** — all four closing
+/// 1. **Capability transfer was silently dropped.** NR7 eligibility carries
+///    `transfer_cap_present`, asked through the one canonical `transfer_cap_arg_present`
+///    predicate the legacy decode is itself built on; a cap-bearing reply declines before any
+///    mutation and the legacy path does the transfer.
+/// 2. **The acknowledgement store had no production release path.** The lease is owned by the
+///    endpoint waiter lifecycle: the three `IpcSubsystem` waiter-removal primitives every
+///    canonical closing edge funnels through retire the exact
+///    `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` lease.
+/// 3. **Orphans tripped the overwrite fuse** — 17 trips on the first attempt, 0 now.
+/// 4. **Capacity was a magic 8.** [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`]
+///    is now [`ENDPOINT_WAITER_SLOTS`] — one slot per endpoint index, derived at compile time
+///    from the authoritative endpoint receive-waiter table rather than chosen.
+/// 5. **The reverse-link CREATION edge was blind to the direct path.** Both installation seams
+///    delegate to [`install_server_reply_link`].
+/// 6. **The reverse-link CLOSE edge had the same divergence**, permissively. All four closing
 ///    paths delegate to [`close_server_reply_link`], so `links_created == links_closed` is a
-///    meaningful leak invariant on the production path. Live: `created=54 closed=54`.
+///    meaningful leak invariant on the production path.
+/// 7. **Terminal-arbitrated replies lost their race.** A reply whose record is arbitrated by an
+///    armed terminal-ownership / reply-timeout cell must reserve the terminal before its caller
+///    copy and commit it after; that lease lives only on the legacy path, so servicing one
+///    off-lock made the reply reserve, roll back, and lose to the timeout's deferred path. NR7
+///    eligibility now carries `terminal_arbitrated`, read from the authoritative cell and exact
+///    in record index AND generation, and such a reply declines before any mutation.
 ///
-/// # The remaining blocker: the reply-vs-timeout terminal race
+/// Both reverse-link edges and both installation edges are single shared decisions, and the
+/// arbitrated reply population is explicitly ineligible — so the direct path services exactly
+/// the traffic whose semantics it reproduces.
 ///
-/// `scripts/qemu-ipc-reply-timeout-matrix-smoke.sh` fails its **x86_64 reply-wins** cell with
-/// the flip on. That cell is CAUSAL, not a wall-clock margin: a collector is held before the
-/// terminal claim so the reply provably wins. With the direct path as the production default
-/// the reply loses instead:
-///
-/// ```text
-/// IPC_REPLY_WIN_RESERVE arch=x86_64 outcome=ok      (legacy reserved the terminal)
-/// IPC_REPLY_WIN_ROLLBACK arch=x86_64 ...            (forbidden — the reply then rolled back)
-/// IPC_REPLY_TIMEOUT_DEFERRED arch=x86_64 published=1 drained=1  (forbidden — timeout won)
-/// IPC_REPLY_BEATS_TIMEOUT_OK ... count 0            (required, absent)
-/// ```
-///
-/// The A/B is exact — same clean tree, same harness, `MATRIX_ARCHES=x86_64`, one constant:
-/// with the flip **off** both x86 cells pass (`timeout_wins=1 reply_wins=1`, zero `[fail]`
-/// lines); with it **on** the reply-wins cell fails as above.
-///
-/// The shape says legacy `handle_ipc_reply` ran, reserved the reply win, and then
-/// `KernelState::ipc_reply` failed, so the win rolled back, the deadline was re-armed, and the
-/// timeout's deferred path completed. `reserve_reply_win_before_copy` /
-/// `commit_reply_win_after_delivery` / `rollback_reply_win` live only on the legacy reply
-/// path, and the direct NR7 path neither participates in that lease nor leaves the record in
-/// the state legacy expects. Until the direct reply path either takes the terminal lease
-/// itself or provably declines every reply the causal gate has armed, the production default
-/// stays off.
+/// **Future canonical 199E work:** porting the reply-win terminal lease into the direct NR7
+/// transaction, which would let the arbitrated population go off-lock too. Until then those
+/// replies take the legacy path by design, counted as `declined_terminal_arbitration`.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    false
+    cfg!(target_arch = "x86_64")
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.

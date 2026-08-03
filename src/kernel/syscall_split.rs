@@ -852,6 +852,16 @@ fn try_split_ipcreply_direct_into_frame(
         // transaction cannot transfer a capability, so a cap-bearing reply must decline
         // before any mutation rather than deliver the payload and drop the capability.
         transfer_cap_present: crate::kernel::syscall::ipc_abi::transfer_cap_arg_present(frame),
+        // Read from the authoritative terminal-ownership cell, exact in record index AND
+        // generation. An arbitrated reply must reserve its terminal before the caller copy
+        // and commit it after so a concurrent timeout provably loses; that lease lives only
+        // on the legacy path, so this reply declines before any mutation.
+        terminal_arbitrated: match reply_object {
+            Ok((rec_idx, rec_gen)) => {
+                shared.reply_record_terminal_arbitrated_split_read(rec_idx, rec_gen)
+            }
+            Err(_) => false,
+        },
     };
     let verdict = classify_direct_reply_eligibility(&facts);
     let Some((reply_eidx, reply_egen)) = verdict.endpoint() else {
@@ -860,6 +870,7 @@ fn try_split_ipcreply_direct_into_frame(
             verdict
                 == crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted,
             verdict.is_transfer_cap_decline(),
+            verdict.is_terminal_arbitration_decline(),
         );
         return None; // ineligible: no ack claim, no copy, no mutation — legacy path
     };

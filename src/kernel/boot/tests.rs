@@ -82105,9 +82105,10 @@ mod stage199d_delivery_projection_differential {
                 flat.contains(
                     "REPLY_COUNTERS.note_declined_preflight_reply( verdict == \
                      crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted, \
-                     verdict.is_transfer_cap_decline(), );"
+                     verdict.is_transfer_cap_decline(), \
+                     verdict.is_terminal_arbitration_decline(), );"
                 ),
-                "NR7 reports the admission and transfer-cap subsets"
+                "NR7 reports the admission, transfer-cap and terminal-arbitration subsets"
             );
             // Both directions report the admission decline so the production-default boot can
             // prove no confinement decline remains.
@@ -82636,9 +82637,9 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "false",
-            "the body is a bare constant: flipping it to `cfg!(target_arch = \"x86_64\")` \
-             is the entire x86_64 production-default enablement"
+            "cfg!(target_arch = \"x86_64\")",
+            "the whole condition is the target architecture: x86_64 is production-default, \
+             every other architecture is not"
         );
         for forbidden in [
             "oracle",
@@ -82661,10 +82662,10 @@ mod stage199d_production_default_guards {
     }
 
     /// The flip is HELD OFF against a recorded, reproducible live failure — not forgotten.
-    /// The doc comment tracks every blocker and its state — the six that are closed, and the
-    /// one that is not — so nobody re-flips it blind and nobody re-litigates a closed one.
+    /// The doc comment records how the production default was earned: every blocker that had
+    /// to be closed, and the work deliberately left for canonical 199E.
     #[test]
-    fn the_held_off_flip_records_every_live_blocker() {
+    fn the_production_default_records_every_closed_blocker() {
         let doc = MODRS
             .split("/// True iff the direct NR6/NR7 path is the production default")
             .nth(1)
@@ -82673,44 +82674,42 @@ mod stage199d_production_default_guards {
             .next()
             .expect("doc bounded");
         assert!(
-            doc.contains("HELD OFF"),
-            "the predicate says plainly that it is held off"
+            doc.contains("ENABLED on x86_64"),
+            "the predicate says plainly that x86_64 is production-default"
         );
         for blocker in [
-            "transfer_cap_present",          // 1 — FIXED
-            "endpoint waiter lifecycle",     // 2 — FIXED
-            "overwrite fuse",                // 3 — FIXED
-            "ENDPOINT_WAITER_SLOTS",         // 4 — FIXED
-            "install_server_reply_link",     // 5 — FIXED
-            "close_server_reply_link",       // 6 — FIXED
-            "reserve_reply_win_before_copy", // 7 — OPEN: the reply-vs-timeout race
+            "transfer_cap_present",      // 1: capability transfer
+            "endpoint waiter lifecycle", // 2: unpaired ack lifecycle
+            "overwrite fuse",            // 3: orphans refusing re-blocking
+            "ENDPOINT_WAITER_SLOTS",     // 4: the structural capacity
+            "install_server_reply_link", // 5: the link creation edge
+            "close_server_reply_link",   // 6: the link close edge
+            "terminal_arbitrated",       // 7: the reply-vs-timeout race
         ] {
             assert!(
                 doc.contains(blocker),
-                "the held-off record must account for the {blocker} blocker"
+                "the record must account for the {blocker} blocker"
             );
         }
-        assert_eq!(
-            doc.matches("**FIXED**").count(),
-            6,
-            "six blockers are recorded as fixed"
-        );
         assert!(
-            doc.contains("The remaining blocker"),
-            "the one open blocker is named as open"
+            doc.contains("links_created == links_closed"),
+            "the record states why the leak invariant is meaningful"
         );
+        // The deferred work is named as future canonical 199E work, not forgotten.
         assert!(
-            doc.contains("IPC_REPLY_WIN_ROLLBACK") && doc.contains("IPC_REPLY_BEATS_TIMEOUT_OK"),
-            "the markers that prove the open blocker are recorded"
+            doc.contains("Future canonical 199E work")
+                && doc.contains("terminal lease into the direct NR7"),
+            "porting the terminal lease is recorded as future 199E work"
         );
+        // AArch64 and RISC-V are explicitly unchanged.
         assert!(
-            doc.contains("created=54 closed=54"),
-            "the link balance the close unification earned is recorded"
+            doc.contains("AArch64 and RISC-V still resolve to the")
+                && doc.contains("boots are byte-identical"),
+            "the record states that no other architecture was ported"
         );
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "held off means held off"
-        );
+        assert!(crate::kernel::boot::ipccall_direct_production_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_admission_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_publication_enabled());
     }
 
     /// Endpoint admission is the ARCH-SPLIT predicate, never an oracle endpoint list: it is
@@ -102339,7 +102338,8 @@ mod stage199d_transfer_cap_safety {
             flat[decline_at..].starts_with(
                 "REPLY_COUNTERS.note_declined_preflight_reply( verdict == \
                  crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted, \
-                 verdict.is_transfer_cap_decline(), ); return None;"
+                 verdict.is_transfer_cap_decline(), \
+                 verdict.is_terminal_arbitration_decline(), ); return None;"
             ),
             "the preflight decline returns None so the legacy path runs"
         );
@@ -102353,7 +102353,7 @@ mod stage199d_transfer_cap_safety {
         use crate::kernel::direct_ipc_counters::DirectPathCounters;
         let c = DirectPathCounters::new();
         c.note_attempt();
-        c.note_declined_preflight_reply(false, true);
+        c.note_declined_preflight_reply(false, true, false);
         assert_eq!(c.declined_transfer_cap(), 1);
         assert_eq!(c.declined_preflight(), 1, "it IS a preflight decline");
         assert_eq!(
@@ -102368,7 +102368,7 @@ mod stage199d_transfer_cap_safety {
         // A non-transfer-cap preflight decline does not touch the breakdown.
         let c2 = DirectPathCounters::new();
         c2.note_attempt();
-        c2.note_declined_preflight_reply(true, false);
+        c2.note_declined_preflight_reply(true, false, false);
         assert_eq!(c2.declined_transfer_cap(), 0);
         assert_eq!(c2.declined_not_admitted(), 1);
         assert!(c2.terminals_balance());
@@ -102376,7 +102376,7 @@ mod stage199d_transfer_cap_safety {
         // The reply reporter can never report a mode decline: it has no argument for one.
         let c3 = DirectPathCounters::new();
         c3.note_attempt();
-        c3.note_declined_preflight_reply(false, false);
+        c3.note_declined_preflight_reply(false, false, false);
         assert_eq!(c3.declined_ineligible_mode(), 0);
     }
 }
@@ -102957,5 +102957,338 @@ mod stage199d_link_creation_parity {
             0,
             "no reverse link survives quiescence"
         );
+    }
+}
+
+/// Stage 199D — **terminal-arbitration safety on the direct reply path.**
+///
+/// A reply whose record is arbitrated by an armed terminal-ownership / reply-timeout race must
+/// reserve the terminal before its caller copy and commit it after, so a concurrent timeout
+/// claimant provably loses. That lease — `reserve_reply_win_before_copy` → delivery →
+/// `commit_reply_win_after_delivery`, with `rollback_reply_win` on a retryable fault — lives
+/// only on the legacy reply path. Servicing an arbitrated reply off-lock lost the race the
+/// caller was promised: live, the reply reserved, rolled back, and the timeout's deferred path
+/// completed instead (`IPC_REPLY_WIN_ROLLBACK` + `IPC_REPLY_TIMEOUT_DEFERRED`, with
+/// `IPC_REPLY_BEATS_TIMEOUT_OK` absent).
+///
+/// Porting the lease into the direct transaction is future canonical 199E work. This increment
+/// makes the arbitrated population explicitly ineligible instead.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage199d_terminal_arbitration_safety {
+    use super::*;
+    use crate::kernel::terminal_ownership::TerminalIdentity;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+
+    /// A kernel with one reserved reply record bound to a caller and a replier.
+    fn fixture() -> (SharedKernel, usize, u64) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (index, generation) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("caller asid");
+            let (sasid, _sp) = s.create_user_address_space().expect("server asid");
+            s.bind_task_asid(1, casid).expect("bind caller");
+            s.bind_task_asid(2, sasid).expect("bind server");
+            let (_e, _send, _recv) = s.create_endpoint(4).expect("reply ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            s.reserve_direct_reply_record(
+                caller,
+                replier,
+                crate::kernel::capabilities::CapObject::Endpoint {
+                    index: 0,
+                    generation: 1,
+                },
+            )
+            .expect("reserve record")
+        });
+        (k, index, generation)
+    }
+
+    fn identity_for(index: usize, generation: u64) -> TerminalIdentity {
+        TerminalIdentity {
+            reply_record_index: index,
+            reply_record_generation: generation,
+            caller_tid: ThreadId(1),
+            caller_asid: Asid(1),
+            replier_tid: ThreadId(2),
+            replier_asid: Asid(2),
+            reply_endpoint_index: 0,
+            reply_endpoint_generation: 1,
+            blocked_recv_generation: 1,
+            deadline_token_generation: Some(1),
+        }
+    }
+
+    /// An UNARMED record is not arbitrated — the ordinary case, and the one that stays
+    /// direct-eligible.
+    #[test]
+    fn an_unarmed_record_is_not_arbitrated() {
+        let (k, index, generation) = fixture();
+        assert!(
+            !k.reply_record_terminal_arbitrated_split_read(index, generation),
+            "a vacant terminal cell arbitrates nothing"
+        );
+    }
+
+    /// An ARMED record IS arbitrated, and the predicate reads it from the authoritative cell.
+    #[test]
+    fn an_armed_record_is_arbitrated() {
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        assert!(
+            k.reply_record_terminal_arbitrated_split_read(index, generation),
+            "an armed terminal cell arbitrates this record"
+        );
+    }
+
+    /// EXACTNESS: a cell armed for another record incarnation — the previous occupant of a
+    /// recycled slot, or a different slot entirely — arbitrates nothing here.
+    #[test]
+    fn arbitration_is_exact_in_record_index_and_generation() {
+        let (k, index, generation) = fixture();
+        // Armed for a DIFFERENT generation of this slot: not this incarnation's race.
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation.wrapping_add(1))));
+        assert!(
+            !k.reply_record_terminal_arbitrated_split_read(index, generation),
+            "a cell armed for a stale generation arbitrates nothing"
+        );
+        // Armed for a different SLOT.
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index + 1, generation)));
+        assert!(!k.reply_record_terminal_arbitrated_split_read(index, generation));
+        // And a stale/foreign query against the real armed cell mutates nothing and reads
+        // false.
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+        assert!(
+            !k.reply_record_terminal_arbitrated_split_read(index, generation.wrapping_add(1)),
+            "a stale generation query reads false"
+        );
+        assert!(
+            !k.reply_record_terminal_arbitrated_split_read(usize::MAX, generation),
+            "an out-of-range index reads false"
+        );
+        // The cell is untouched by any of those reads.
+        assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+    }
+
+    /// The predicate is read-only: repeated reads never mutate the cell or the record.
+    #[test]
+    fn the_predicate_mutates_nothing() {
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let epoch_before = k.with(|s| s.reply_terminal_epoch(index));
+        for _ in 0..8 {
+            assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+        }
+        assert_eq!(
+            k.with(|s| s.reply_terminal_epoch(index)),
+            epoch_before,
+            "reading the arbitration fact never re-arms or disturbs the cell"
+        );
+    }
+
+    /// **An armed record can never enter the direct transaction.** The fact feeds the
+    /// eligibility contract, whose decline arm returns before anything mutates.
+    #[test]
+    fn an_armed_record_never_reaches_the_direct_transaction() {
+        use crate::kernel::direct_eligibility::{
+            DirectReplyEligibility, DirectReplyFacts, classify_direct_reply_eligibility,
+        };
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let facts = DirectReplyFacts {
+            payload_len: 8,
+            requester_available: true,
+            reply_object: Ok((index, generation)),
+            reply_endpoint: Some((0, 1)),
+            endpoint_admitted: true,
+            transfer_cap_present: false,
+            terminal_arbitrated: k.reply_record_terminal_arbitrated_split_read(index, generation),
+        };
+        let verdict = classify_direct_reply_eligibility(&facts);
+        assert_eq!(
+            verdict,
+            DirectReplyEligibility::TerminalArbitrationUnsupported
+        );
+        assert_eq!(
+            verdict.endpoint(),
+            None,
+            "no endpoint is yielded, so no acknowledgement can be claimed"
+        );
+        // Disarming the same record makes it eligible again — the fact is the only thing
+        // standing between this reply and the direct path.
+        let mut unarmed = facts;
+        unarmed.terminal_arbitrated = false;
+        assert_eq!(
+            classify_direct_reply_eligibility(&unarmed),
+            DirectReplyEligibility::Eligible {
+                endpoint_index: 0,
+                endpoint_generation: 1,
+            }
+        );
+    }
+
+    /// The fact is derived from the CANONICAL predicate — never from an oracle selector, a
+    /// marker or a counter.
+    #[test]
+    fn the_fact_comes_from_the_authoritative_state_only() {
+        assert!(
+            SPLIT.contains("shared.reply_record_terminal_arbitrated_split_read(rec_idx, rec_gen)"),
+            "the call site asks the canonical predicate with the exact record incarnation"
+        );
+        let predicate = include_str!("../../runtime.rs")
+            .split("pub(crate) fn reply_record_terminal_arbitrated_split_read(")
+            .nth(1)
+            .expect("predicate present")
+            .split("\n    }\n")
+            .next()
+            .expect("body bounded");
+        // Reads the authoritative store, exact in index AND generation.
+        assert!(
+            predicate.contains("ipc.reply_terminal_ownership.get(index)")
+                && predicate.contains("ipc.reply_cap_generations.get(index)")
+                && predicate.contains("identity.reply_record_index == index")
+                && predicate.contains("identity.reply_record_generation == generation"),
+            "the predicate is the authoritative cell, exact in index and generation"
+        );
+        // A vacant cell (epoch 0) is not arbitration.
+        assert!(predicate.contains("cell.current_epoch() == 0"));
+        // NOT inferred from selectors, markers or counters.
+        for forbidden in [
+            "oracle",
+            "yarm_log",
+            "note_",
+            "_COUNTERS",
+            "IPC_REPLY_TIMEOUT_MODE",
+            "selector",
+        ] {
+            assert!(
+                !predicate.contains(forbidden),
+                "the predicate must not infer arbitration from {forbidden}"
+            );
+        }
+        // ONE rank-3 acquisition covers both reads, so the pair cannot be torn.
+        assert_eq!(
+            predicate.matches("self.with_ipc_split_mut(").count(),
+            1,
+            "the record generation and the terminal cell are read together"
+        );
+    }
+
+    /// The decline precedes every mutation in the NR7 helper — ack claim, payload copy,
+    /// snapshot build and the transaction call all come after the preflight decline arm.
+    #[test]
+    fn the_decline_precedes_every_mutation() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("NR7 helper present")
+            .split("\n#[cfg(feature = \"hosted-dev\")]")
+            .next()
+            .expect("body bounded");
+        let flat = body
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        let fact_at = flat
+            .find("terminal_arbitrated:")
+            .expect("the fact is gathered");
+        let decline_at = flat
+            .find("REPLY_COUNTERS.note_declined_preflight_reply(")
+            .expect("the preflight decline is reported");
+        assert!(
+            fact_at < decline_at,
+            "the fact is gathered before the verdict"
+        );
+        for later in [
+            "ipcreply_direct_ack::claim(",
+            "copy_from_user_asid_split_read(",
+            "IpcReplyDirectSnapshot::build(",
+            "drain_direct_reply_post_work(",
+        ] {
+            let at = flat
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} present in the NR7 helper"));
+            assert!(
+                decline_at < at,
+                "the terminal-arbitration decline must precede {later}"
+            );
+        }
+    }
+
+    /// The decline has its OWN counter, as a breakdown of the preflight declines rather than a
+    /// new terminal bucket, so the balance invariant is untouched and a live boot can show how
+    /// much of the reply population is arbitrated.
+    #[test]
+    fn the_decline_is_counted_separately_without_disturbing_the_balance() {
+        use crate::kernel::direct_ipc_counters::DirectPathCounters;
+        let c = DirectPathCounters::new();
+        c.note_attempt();
+        c.note_declined_preflight_reply(false, false, true);
+        assert_eq!(c.declined_terminal_arbitration(), 1);
+        assert_eq!(c.declined_preflight(), 1, "it IS a preflight decline");
+        assert_eq!(
+            c.declined_transfer_cap(),
+            0,
+            "not confused with transfer-cap"
+        );
+        assert_eq!(c.declined_ineligible_mode(), 0);
+        assert_eq!(c.declined_not_admitted(), 0);
+        assert!(c.terminals_balance(), "still exactly one terminal");
+        assert!(c.eligibility_balances());
+        // The two NR7 breakdowns are independent.
+        let c2 = DirectPathCounters::new();
+        c2.note_attempt();
+        c2.note_declined_preflight_reply(false, true, false);
+        assert_eq!(c2.declined_terminal_arbitration(), 0);
+        assert_eq!(c2.declined_transfer_cap(), 1);
+        assert!(c2.terminals_balance());
+    }
+
+    /// The legacy reply path still owns the terminal lease, and the direct transaction still
+    /// does not — which is exactly why the arbitrated population is declined. Pinned so that
+    /// porting the lease (future canonical 199E work) has to update this guard deliberately.
+    #[test]
+    fn the_terminal_lease_remains_legacy_only() {
+        let legacy = include_str!("../syscall/ipc.rs");
+        for lease in [
+            "reserve_reply_win_before_copy",
+            "commit_reply_win_after_delivery",
+            "rollback_reply_win",
+        ] {
+            assert!(
+                legacy.contains(lease),
+                "the legacy reply path takes the terminal lease ({lease})"
+            );
+        }
+        for (name, src) in [
+            ("syscall_split.rs", SPLIT),
+            (
+                "ipccall_direct_txn.rs",
+                include_str!("../ipccall_direct_txn.rs"),
+            ),
+            ("ipccall_direct.rs", include_str!("../ipccall_direct.rs")),
+        ] {
+            for lease in [
+                "reserve_reply_win_before_copy",
+                "commit_reply_win_after_delivery",
+                "rollback_reply_win",
+            ] {
+                let code: alloc::string::String = src
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join("\n");
+                assert!(
+                    !code.contains(lease),
+                    "{name}: the direct path does not take the terminal lease ({lease}) — \
+                     which is why an arbitrated reply must decline to legacy"
+                );
+            }
+        }
     }
 }

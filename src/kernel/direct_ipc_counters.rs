@@ -67,6 +67,10 @@ pub(crate) struct DirectPathCounters {
     /// NR7 only: declines caused by a reply carrying a transferred capability the direct
     /// transaction cannot deliver. A *breakdown* of `declined_preflight`, never a bucket.
     declined_transfer_cap: AtomicU64,
+    /// NR7 only: declines caused by an armed terminal-ownership / reply-timeout race. A
+    /// *breakdown* of `declined_preflight`, never a bucket. This is the population that must
+    /// take the legacy reply path so its terminal lease can make the reply provably win.
+    declined_terminal_arbitration: AtomicU64,
     completed: AtomicU64,
     legacy_fallback_after_decline: AtomicU64,
     failed_by_code: [AtomicU64; FAILED_CODE_SLOTS],
@@ -85,6 +89,7 @@ impl DirectPathCounters {
             declined_pre_transaction: AtomicU64::new(0),
             declined_not_admitted: AtomicU64::new(0),
             declined_transfer_cap: AtomicU64::new(0),
+            declined_terminal_arbitration: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             legacy_fallback_after_decline: AtomicU64::new(0),
             failed_by_code: [const { AtomicU64::new(0) }; FAILED_CODE_SLOTS],
@@ -101,6 +106,8 @@ impl DirectPathCounters {
         self.declined_pre_transaction.store(0, Ordering::Relaxed);
         self.declined_not_admitted.store(0, Ordering::Relaxed);
         self.declined_transfer_cap.store(0, Ordering::Relaxed);
+        self.declined_terminal_arbitration
+            .store(0, Ordering::Relaxed);
         self.completed.store(0, Ordering::Relaxed);
         self.legacy_fallback_after_decline
             .store(0, Ordering::Relaxed);
@@ -147,10 +154,19 @@ impl DirectPathCounters {
     /// slot for the reply-endpoint receive capability (`handle_ipc_call`'s `reply_recv_cap`),
     /// and the direct request path reads that same slot the same way, so no capability
     /// transfer is in flight on the request side at all.
-    pub(crate) fn note_declined_preflight_reply(&self, not_admitted: bool, transfer_cap: bool) {
+    pub(crate) fn note_declined_preflight_reply(
+        &self,
+        not_admitted: bool,
+        transfer_cap: bool,
+        terminal_arbitration: bool,
+    ) {
         self.note_declined_preflight(false, not_admitted);
         if transfer_cap {
             self.declined_transfer_cap.fetch_add(1, Ordering::Relaxed);
+        }
+        if terminal_arbitration {
+            self.declined_terminal_arbitration
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -202,6 +218,9 @@ impl DirectPathCounters {
     }
     pub(crate) fn declined_transfer_cap(&self) -> u64 {
         self.declined_transfer_cap.load(Ordering::Acquire)
+    }
+    pub(crate) fn declined_terminal_arbitration(&self) -> u64 {
+        self.declined_terminal_arbitration.load(Ordering::Acquire)
     }
     pub(crate) fn completed(&self) -> u64 {
         self.completed.load(Ordering::Acquire)
@@ -455,7 +474,7 @@ fn emit_quiescent(
     // Split across four lines per direction: `PRB_MSG_MAX` is 192 bytes and a kernel log line
     // is truncated silently, so one wide line would clip its own verdict flags.
     crate::yarm_log!(
-        "IPC_DIRECT_PRODUCTION_QUIESCENT dir={} attempts={} completed={} failed={} preflight={} pre_txn={} fallback={} not_admitted={} transfer_cap={}",
+        "IPC_DIRECT_PRODUCTION_QUIESCENT dir={} attempts={} completed={} failed={} preflight={} pre_txn={} fallback={} not_admitted={} transfer_cap={} arbitrated={}",
         which,
         counters.attempts(),
         counters.completed(),
@@ -465,6 +484,7 @@ fn emit_quiescent(
         counters.legacy_fallback_after_decline(),
         counters.declined_not_admitted(),
         counters.declined_transfer_cap(),
+        counters.declined_terminal_arbitration(),
     );
     crate::yarm_log!(
         "IPC_DIRECT_PRODUCTION_QUIESCENT_FLAGS dir={} terminals={} eligibility={} completed_gt0={} no_confinement={} no_late_fallback={} result={}",
@@ -578,10 +598,11 @@ fn emit_direction(
         (counters.terminals_balance() && counters.eligibility_balances()) as u8,
     );
     crate::yarm_log!(
-        "IPC_DIRECT_TRANSFER_CAP phase={} dir={} declined_transfer_cap={} declined_not_admitted={}",
+        "IPC_DIRECT_TRANSFER_CAP phase={} dir={} declined_transfer_cap={} declined_terminal_arbitration={} declined_not_admitted={}",
         phase,
         which,
         counters.declined_transfer_cap(),
+        counters.declined_terminal_arbitration(),
         counters.declined_not_admitted(),
     );
     crate::yarm_log!(

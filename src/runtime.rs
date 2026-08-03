@@ -4337,6 +4337,57 @@ impl SharedKernel {
     /// broad lock: the caller is the off-lock DebugLog split path, and adding a broad
     /// acquisition there would both re-enter the lock this programme is retiring and break
     /// the Stage 204A census (`tests/broad_lock_census_guard.rs` would fail).
+    /// Stage 199D — whether this reply-record incarnation participates in an armed
+    /// terminal-ownership / reply-timeout race.
+    ///
+    /// The canonical predicate, read from the authoritative state itself
+    /// (`reply_terminal_ownership`, co-located with and indexed identically to `reply_caps`) —
+    /// never inferred from oracle selectors, markers or counters.
+    ///
+    /// # Exactness
+    ///
+    /// A cell is arbitrating THIS reply only when its epoch is non-zero (a vacant cell is
+    /// epoch 0 with `TerminalIdentity::ZERO`) **and** its immutable identity names this exact
+    /// record index AND generation. A cell armed for a previous occupant of a recycled slot
+    /// names the old generation and is correctly reported as not arbitrating this one.
+    ///
+    /// # Why this is not a TOCTOU test
+    ///
+    /// Two properties make the read exact rather than a sample:
+    ///
+    /// 1. **Internal consistency.** The record generation and the terminal cell are read under
+    ///    ONE rank-3 acquisition, so the pair cannot be torn — the generation cannot advance
+    ///    between reading it and reading the cell armed for it.
+    /// 2. **Arming strictly precedes reply deliverability.** The cell is armed by
+    ///    `maybe_arm_reply_timeout_oracle` at the caller's blocking-recv publication
+    ///    (`IPC_RECV_BLOCK_REGISTER`), which happens *before* the blocked-caller
+    ///    acknowledgement is published at `IPC_RECV_BLOCKED_STATE_SAVE`. The direct NR7 path
+    ///    cannot reach eligibility for a record whose caller has not yet published that
+    ///    acknowledgement. So a cell cannot transition unarmed → armed for this incarnation
+    ///    between this read and the transaction: the arming already happened, or the reply is
+    ///    not deliverable yet at all.
+    pub(crate) fn reply_record_terminal_arbitrated_split_read(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            // One acquisition covers both reads, so the record incarnation and the cell armed
+            // for it are observed together.
+            if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
+                return false;
+            }
+            let Some(cell) = ipc.reply_terminal_ownership.get(index) else {
+                return false;
+            };
+            if cell.current_epoch() == 0 {
+                return false; // vacant: never armed
+            }
+            let identity = cell.identity();
+            identity.reply_record_index == index && identity.reply_record_generation == generation
+        })
+    }
+
     /// Stage 199D — the **final lease/waiter bijection**, measured from the waiter table.
     ///
     /// Two passes over the endpoint table, keyed by endpoint index (the acknowledgement store
