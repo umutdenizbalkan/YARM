@@ -1050,19 +1050,31 @@ and a final two-pass bijection matching live leases against eligible waiters on 
 (rank 3) and task (rank 2) split seams, never simultaneously, so it adds no broad-lock
 acquisition; `tests/broad_lock_census_guard.rs` enforces that.
 
-**FIRST PRODUCTION-DEFAULT LIVE SEAL.** Normal feature-off x86_64 boot, no oracle knob:
-`YARM_BOOT_OK`, all 6 service entries exactly once, `PM_ELF_ZC_FAIL count=0`;
-**53 NR6 and 41 NR7 ordinary syscalls completed on the direct path with zero broad-lock
-entries**; zero capacity refusals and zero overwrite-fuse trips; zero stale, foreign, duplicate
-or crossed terminals; and an exact lease/waiter bijection in both directions
-(`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`). Ten
-cap-bearing NR7 replies correctly stayed on the mutation-free legacy fallback. The oracle
-regression (`live_cells=2 result=ok`) and the ServerDies regression both still pass.
+**The flip is healthy — and held off on a fifth blocker.** With the constant temporarily
+enabled, the normal feature-off x86_64 boot is fully healthy: `YARM_BOOT_OK`, all 6 service
+entries exactly once, `PM_ELF_ZC_FAIL count=0`, **53 NR6 and 41 NR7 ordinary syscalls completed
+on the direct path with zero broad-lock entries**, zero capacity refusals, zero overwrite-fuse
+trips, zero stale/foreign/duplicate/crossed terminals, and an exact lease/waiter bijection in
+both directions (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1
+result=ok`). Ten cap-bearing NR7 replies correctly stayed on the mutation-free legacy fallback.
+The x86 direct NR6/NR7 oracle regression passes with the flip on (`live_cells=2 result=ok`).
 
 `live=9` and `terminal_edges=0` are reported, not gated: they are nine resident services
 legitimately parked in recv-v2, each holding a valid lease. `no_orphan=1` —
 `reserve == consume + release + cancel + live`, 114 == 53+52+0+9 and 114 == 41+64+0+9 — is the
 leak invariant that holds on a running system, and the census confirms it independently.
+
+**No seal is issued and the constant is restored to `false`: the ServerDies regression fails.**
+`SharedKernel::register_server_reply_link_split` — the direct NR6 transaction's reverse-link
+installation — writes `tcb.server_reply_link` but does not stamp
+`server_dies_counters::note_link_created`, while its legacy twin
+`KernelState::register_server_reply_link` does. With the direct path as the default, every
+request installs a link the system-wide leak accounting never counts as created while the close
+edge still counts: `IPC_SERVER_DEATH_LINK_LEAK created=0 closed=13 scope=system result=fail`.
+The links are installed and closed correctly — this is an instrumentation gap in the split twin,
+not a link leak — but while it is open the attestation that would detect a *real* reverse-link
+leak is blind on the production path. Fix: stamp the creation edge in the split twin as the
+legacy one does, then re-run ServerDies.
 
 AArch64 and RISC-V are untouched and remain proof-gated. Full evidence: `doc/IPC.md` §8.6.7.
 

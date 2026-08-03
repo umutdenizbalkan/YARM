@@ -130,7 +130,7 @@ Full detail: `doc/IPC.md` §8.5.
    two blockers that used to head this list**: the `IPC_SERVER_DEATH_LINK_LEAK` accounting
    failure is resolved, and `revalidate_idle_owner_after_drains` has now executed in QEMU
    (`EXIT_TASK_OWNER_REVALIDATED … committed=replacement`).
-2. **NR 6 / NR 7 off-lock direct IPC IS the x86_64 production default** (was: cannot be made production-default yet — two remaining
+2. **NR 6 / NR 7 off-lock direct IPC is one blocker from production-default** (was: cannot be made production-default yet — two remaining
    correctness defects in the transaction body, not the gates.** The acknowledgement-store
    prerequisite *is* met (the bounded endpoint-indexed multi-pair store,
    `src/kernel/direct_ack_store.rs`, Stage 199D), **delivery conformance is now met**
@@ -200,9 +200,15 @@ Full detail: `doc/IPC.md` §8.5.
    broad-lock entries**, zero capacity refusals, zero overwrite-fuse trips, zero stale/foreign/
    duplicate/crossed terminals, exact bijection both directions
    (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`), plus the
-   oracle regression (`live_cells=2 result=ok`) and ServerDies. AArch64 and RISC-V are untouched
-   and remain proof-gated. Full evidence is in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.8; see
-   also `doc/IPC.md` §8.6.5–§8.6.7.
+   oracle regression (`live_cells=2 result=ok`). **No seal is issued and the constant is restored
+   to `false`:** the ServerDies regression fails, because
+   `SharedKernel::register_server_reply_link_split` — the direct NR6 reverse-link installation —
+   does not stamp `note_link_created` while its legacy twin does, so with the direct path as the
+   default the system-wide leak accounting sees `created=0 closed=13`. The links are installed
+   and closed correctly (an instrumentation gap in the split twin, not a link leak), but while it
+   is open the attestation that would detect a *real* reverse-link leak is blind on the
+   production path. AArch64 and RISC-V are untouched and remain proof-gated. Full evidence is in
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.8; see also `doc/IPC.md` §8.6.5–§8.6.7.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

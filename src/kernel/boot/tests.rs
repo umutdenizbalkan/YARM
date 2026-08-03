@@ -82636,9 +82636,9 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
-            "the whole condition is the target architecture: x86_64 is production-default, \
-             every other architecture is not"
+            "false",
+            "the body is a bare constant: flipping it to `cfg!(target_arch = \"x86_64\")` \
+             is the entire x86_64 production-default enablement"
         );
         for forbidden in [
             "oracle",
@@ -82661,11 +82661,10 @@ mod stage199d_production_default_guards {
     }
 
     /// The flip is HELD OFF against a recorded, reproducible live failure — not forgotten.
-    /// The doc comment records how the production default was earned: every blocker that had
-    /// to be closed, and the live evidence for each. A future regression that re-opens one
-    /// should have to edit this record deliberately.
+    /// The doc comment tracks every blocker and its state — the four that are closed, and the
+    /// one that is not — so nobody re-flips it blind and nobody re-litigates a closed one.
     #[test]
-    fn the_production_default_records_every_closed_blocker() {
+    fn the_held_off_flip_records_every_live_blocker() {
         let doc = MODRS
             .split("/// True iff the direct NR6/NR7 path is the production default")
             .nth(1)
@@ -82674,39 +82673,44 @@ mod stage199d_production_default_guards {
             .next()
             .expect("doc bounded");
         assert!(
-            doc.contains("ENABLED on x86_64"),
-            "the predicate says plainly that x86_64 is production-default"
+            doc.contains("HELD OFF"),
+            "the predicate says plainly that it is held off"
         );
         for blocker in [
-            "transfer_cap_present",  // 1: capability transfer
-            "waiter lifecycle",      // 2: unpaired ack lifecycle
-            "overwrite fuse",        // 3: orphans refusing re-blocking
-            "ENDPOINT_WAITER_SLOTS", // 4: the structural capacity
+            "transfer_cap_present",             // 1: capability transfer — FIXED
+            "waiter lifecycle",                 // 2: unpaired ack lifecycle — FIXED
+            "overwrite fuse",                   // 3: orphans refusing re-blocking — FIXED
+            "DIRECT_ACK_STORE_CAPACITY",        // 4: magic capacity — FIXED
+            "register_server_reply_link_split", // 5: the ServerDies gap — OPEN
         ] {
             assert!(
                 doc.contains(blocker),
-                "the record must account for the {blocker} blocker"
+                "the held-off record must account for the {blocker} blocker"
             );
         }
-        // The live evidence is named, so every claim is checkable rather than asserted.
-        for evidence in [
-            "PM_ELF_ZC_FAIL count=0",
-            "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok",
-            "bijection waiters_without_lease=0 leases_without_waiter=0",
-            "capacity=256",
-        ] {
-            assert!(doc.contains(evidence), "the record must cite {evidence}");
-        }
-        // AArch64 and RISC-V are explicitly unchanged.
-        assert!(
-            doc.contains("AArch64 and RISC-V still resolve to the")
-                && doc.contains("boots are byte-identical"),
-            "the record states that no other architecture was ported"
+        assert_eq!(
+            doc.matches("**FIXED**").count(),
+            4,
+            "four blockers are recorded as fixed"
         );
-        // On this (x86_64-modelled) hosted build the default really is on.
-        assert!(crate::kernel::boot::ipccall_direct_production_enabled());
-        assert!(crate::kernel::boot::ipccall_direct_admission_enabled());
-        assert!(crate::kernel::boot::ipccall_direct_publication_enabled());
+        assert!(
+            doc.contains("The remaining blocker"),
+            "the one open blocker is named as open"
+        );
+        // The live evidence is named, so every claim is checkable rather than asserted.
+        assert!(
+            doc.contains("IPC_SERVER_DEATH_LINK_LEAK created=0 closed=13")
+                && doc.contains("STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 result=fail"),
+            "the markers that prove the open blocker are recorded"
+        );
+        assert!(
+            doc.contains("nr6_ok=1 nr7_ok=1 census_ok=1 result=ok"),
+            "the evidence that the rest of the flip is healthy is recorded too"
+        );
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "held off means held off"
+        );
     }
 
     /// Endpoint admission is the ARCH-SPLIT predicate, never an oracle endpoint list: it is

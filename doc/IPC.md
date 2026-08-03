@@ -1112,9 +1112,10 @@ pins that it never references the store it audits.
 `LeaseBijection::ok()` requires equal populations *and* zero violations: a count-only check
 would miss a store that held one extra lease and dropped another waiter's.
 
-#### First production-default live seal
+#### The flip is healthy — and HELD OFF on a fifth blocker
 
-Normal feature-off x86_64 boot, no direct-IPC oracle knob:
+With `ipccall_direct_production_enabled()` temporarily enabled, the normal feature-off x86_64
+boot is fully healthy:
 
 ```text
 YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1
@@ -1145,6 +1146,7 @@ IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok
 counts (`YARM_LOCK_SPLIT_DISPATCH nr=6` ×53, `nr=7` ×41) match `completed` exactly, with **zero**
 broad-lock NR6/NR7 entries. Zero capacity refusals, zero overwrite-fuse trips, zero stale,
 foreign, duplicate or crossed terminals, and an exact lease/waiter bijection in both directions.
+The x86 direct NR6/NR7 oracle regression passes with the flip on (`live_cells=2 result=ok`).
 
 The ten `transfer_cap` declines are cap-bearing replies correctly staying on the mutation-free
 legacy path — the population that used to be silently robbed.
@@ -1155,6 +1157,25 @@ resident services legitimately parked in recv-v2, each holding a valid lease) an
 `reserve == consume + release + cancel + live`, exactly 114 == 53+52+0+9 and 114 == 41+64+0+9 —
 is the leak invariant that holds on a running system. The census independently confirms it:
 10 waiters, 9 eligible, 9 leases, zero mismatches.
+
+**No seal is issued, and the constant is restored to `false`, because the ServerDies regression
+fails.** `SharedKernel::register_server_reply_link_split` — the direct NR6 transaction's
+reverse-link installation — writes `tcb.server_reply_link` but does **not** stamp
+`server_dies_counters::note_link_created`, while its legacy twin
+`KernelState::register_server_reply_link` does. With the direct path as the production default,
+every request installs a link the system-wide leak accounting never counts as created while the
+close edge still counts:
+
+```text
+IPC_SERVER_DEATH_LINK_LEAK created=0 closed=13 scope=system result=fail
+STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 result=fail
+```
+
+The links themselves are installed and closed correctly — this is an instrumentation gap in the
+split twin, not a link leak. It is not cosmetic: while it is open, the attestation that would
+detect a *real* reverse-link leak is blind on the production path, which is precisely what the
+ServerDies cell exists to guarantee. The fix is to stamp the creation edge in the split twin as
+the legacy one does and re-run the regression.
 
 AArch64 and RISC-V are untouched and remain proof-gated.
 

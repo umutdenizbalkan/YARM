@@ -3124,54 +3124,51 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # ENABLED on x86_64 — Stage 199D production default
+/// # HELD OFF — one live blocker remains (Stage 199D)
 ///
-/// The off-lock direct NR6/NR7 path is the **production default on x86_64**: ordinary
-/// `IpcCall`/`IpcReply` traffic is serviced before the broad kernel lock, with no oracle, no
-/// proof gate and no endpoint confinement involved. AArch64 and RISC-V still resolve to the
-/// proof gate and the oracle confinement, so their boots are byte-identical.
+/// Every part of the enablement is done: flipping this to `cfg!(target_arch = "x86_64")` is
+/// the whole change, and with it on a normal feature-off x86_64 boot is **fully healthy** —
+/// `YARM_BOOT_OK`, all 6 service entries exactly once, `PM_ELF_ZC_FAIL count=0`, 53 NR6 and
+/// 41 NR7 ordinary syscalls completed off-lock with zero broad-lock entries, zero capacity
+/// refusals, zero fuse trips and an exact lease/waiter bijection
+/// (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`). The x86
+/// direct NR6/NR7 oracle regression also passes with it on (`live_cells=2 result=ok`).
 ///
-/// It took four blockers to get here, every one of them found by a live feature-off boot
-/// rather than by inspection, and every one closed:
+/// Four of the original blockers are closed:
 ///
-/// 1. **Capability transfer was silently dropped.** NR7 eligibility now carries
-///    `transfer_cap_present`, asked through the one canonical `transfer_cap_arg_present`
-///    predicate the legacy decode is itself built on; a cap-bearing reply declines before any
-///    mutation and the legacy path does the transfer. Direct capability transfer remains
-///    unimplemented — declining is the whole fix.
-/// 2. **The acknowledgement store had no production release path.** The lease is now owned by
-///    the endpoint waiter lifecycle: the three `IpcSubsystem` waiter-removal primitives every
-///    canonical closing edge funnels through retire the exact
-///    `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` lease.
-/// 3. **Orphans tripped the overwrite fuse** — 17 trips on the first attempt, 0 now.
-/// 4. **Capacity was a magic 8**, smaller than the number of services a normal boot parks in
-///    recv-v2 at once, so the store saturated and silently degraded those endpoints to legacy.
-///    [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`] is now
-///    [`ENDPOINT_WAITER_SLOTS`] — one slot per endpoint index, derived at compile time from
-///    the authoritative endpoint receive-waiter table rather than chosen. A lease exists
-///    exactly while a waiter does, so the bound is not merely sufficient but exact, and
-///    capacity exhaustion is impossible by construction.
+/// 1. ~~Capability transfer silently dropped.~~ **FIXED** — NR7 eligibility carries
+///    `transfer_cap_present`, asked through the canonical `transfer_cap_arg_present`
+///    predicate; a cap-bearing reply declines before any mutation to the legacy path. Ten
+///    such declines on a live boot, and `PM_ELF_ZC_FAIL count=0`.
+/// 2. ~~No production release path.~~ **FIXED** — the lease is owned by the endpoint
+///    waiter lifecycle, retired from the three waiter-removal primitives.
+/// 3. ~~Orphans trip the overwrite fuse.~~ **FIXED** — 17 trips before, 0 now.
+/// 4. ~~Magic capacity of 8.~~ **FIXED** — [`DIRECT_ACK_STORE_CAPACITY`] is
+///    [`ENDPOINT_WAITER_SLOTS`], one slot per endpoint index, derived at compile time from
+///    the authoritative endpoint receive-waiter table.
 ///
-/// Live evidence, normal feature-off x86_64 boot (`scripts/qemu-x86_64-core-smoke.sh`):
+/// # The remaining blocker: the ServerDies link accounting is blind to the direct path
+///
+/// [`crate::runtime::SharedKernel::register_server_reply_link_split`] — the direct NR6
+/// transaction's reverse-link installation — writes `tcb.server_reply_link` but does **not**
+/// stamp `server_dies_counters::note_link_created`, while its legacy twin
+/// `KernelState::register_server_reply_link` does. With the direct path as the production
+/// default, every request installs a link the system-wide leak accounting never counts as
+/// created, while the close edge still counts:
 ///
 /// ```text
-/// YARM_BOOT_OK present_cpus=1 ...          all 6 service entries present exactly once
-/// PM_ELF_ZC_FAIL count=0
-/// nr6 attempts=54 completed=53 failed=0 fallback=0 not_admitted=0   flags all ok
-/// nr7 attempts=53 completed=41 failed=0 fallback=0 transfer_cap=10  flags all ok
-/// ack  reserve=114 commit=114 consume=53 release=52 cancel=0 live=9 high_watermark=9
-///      capacity=256  fuses_clear=1  no_orphan=1  exclusive=1
-/// census waiters_current=10 high_watermark=10 eligible=9 live_leases=9
-/// bijection waiters_without_lease=0 leases_without_waiter=0 identity=0 generation=0 dup=0
-/// IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok
+/// IPC_SERVER_DEATH_LINK_LEAK created=0 closed=13 scope=system result=fail
+/// STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 result=fail
 /// ```
 ///
-/// 53 NR6 and 41 NR7 syscalls were serviced entirely by the split dispatcher with **zero**
-/// broad-lock entries, zero capacity refusals and zero overwrite-fuse trips, and the
-/// independent waiter census — measured from the waiter table, not from the store's own books
-/// — found an exact one-to-one correspondence between live leases and eligible waiters.
+/// The links themselves are installed and closed correctly — this is an instrumentation gap
+/// in the split twin, not a link leak. But it is not cosmetic: while it is open, the
+/// attestation that would detect a *real* reverse-link leak is blind on the production path,
+/// which is exactly the property the ServerDies cell exists to guarantee. The fix is to stamp
+/// the creation edge in the split twin as the legacy one does, and then re-run the ServerDies
+/// regression; until that lands the production default stays off.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    cfg!(target_arch = "x86_64")
+    false
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.
