@@ -1292,40 +1292,10 @@ impl KernelState {
             else {
                 return false;
             };
-            // Stage 200D-1: an incarnation that has already committed to exit must never be
-            // published as an authorized replier. Teardown snapshots the link AFTER the
-            // status flips, so a link installed now would never be looked at and the caller
-            // would block forever with no death claim. Refusing forces the NR6 publication
-            // to roll back, which is the only other permitted outcome of that race.
-            if !matches!(
-                tcb.status,
-                TaskStatus::Runnable | TaskStatus::Running | TaskStatus::Blocked(_)
-            ) {
-                return false;
-            }
-            match tcb.server_reply_link {
-                Some(existing) if existing == link => true,
-                Some(_) => false,
-                None => {
-                    tcb.server_reply_link = Some(link);
-                    // Stage 199D: a NEW reverse link now exists in the server's TCB. The
-                    // idempotent re-registration arm above returns `true` without installing
-                    // anything and deliberately does not count.
-                    //
-                    // This is the SYSTEM-WIDE creation edge — it fires for every bound
-                    // `IpcCall`, not just the armed ServerDies one — so it feeds the
-                    // unscoped leak totals. `note_link_created` adds it to the armed
-                    // transaction's vector only when the record identities match, which is
-                    // what stopped the 54 unrelated calls from being compared against one
-                    // death's single detach.
-                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-                    crate::kernel::boot::server_dies_counters::note_link_created(
-                        record_index,
-                        record_generation,
-                    );
-                    true
-                }
-            }
+            // Stage 199D: the status gate, the match arms and the creation stamp all live in
+            // the ONE shared decision, so the legacy and split installation edges cannot drift
+            // apart again — they did, and the ServerDies leak accounting went blind.
+            crate::kernel::boot::install_server_reply_link(tcb, link)
         })
     }
 

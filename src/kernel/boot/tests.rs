@@ -82636,9 +82636,9 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "false",
-            "the body is a bare constant: flipping it to `cfg!(target_arch = \"x86_64\")` \
-             is the entire x86_64 production-default enablement"
+            "cfg!(target_arch = \"x86_64\")",
+            "the whole condition is the target architecture: x86_64 is production-default, \
+             every other architecture is not"
         );
         for forbidden in [
             "oracle",
@@ -82661,10 +82661,10 @@ mod stage199d_production_default_guards {
     }
 
     /// The flip is HELD OFF against a recorded, reproducible live failure — not forgotten.
-    /// The doc comment tracks every blocker and its state — the four that are closed, and the
-    /// one that is not — so nobody re-flips it blind and nobody re-litigates a closed one.
+    /// The doc comment records how the production default was earned: every blocker that had
+    /// to be closed. A regression that re-opens one should have to edit this record.
     #[test]
-    fn the_held_off_flip_records_every_live_blocker() {
+    fn the_production_default_records_every_closed_blocker() {
         let doc = MODRS
             .split("/// True iff the direct NR6/NR7 path is the production default")
             .nth(1)
@@ -82673,44 +82673,31 @@ mod stage199d_production_default_guards {
             .next()
             .expect("doc bounded");
         assert!(
-            doc.contains("HELD OFF"),
-            "the predicate says plainly that it is held off"
+            doc.contains("ENABLED on x86_64"),
+            "the predicate says plainly that x86_64 is production-default"
         );
         for blocker in [
-            "transfer_cap_present",             // 1: capability transfer — FIXED
-            "waiter lifecycle",                 // 2: unpaired ack lifecycle — FIXED
-            "overwrite fuse",                   // 3: orphans refusing re-blocking — FIXED
-            "DIRECT_ACK_STORE_CAPACITY",        // 4: magic capacity — FIXED
-            "register_server_reply_link_split", // 5: the ServerDies gap — OPEN
+            "transfer_cap_present",      // 1: capability transfer
+            "waiter lifecycle",          // 2: unpaired ack lifecycle
+            "overwrite fuse",            // 3: orphans refusing re-blocking
+            "ENDPOINT_WAITER_SLOTS",     // 4: the structural capacity
+            "install_server_reply_link", // 5: the ServerDies accounting gap
         ] {
             assert!(
                 doc.contains(blocker),
-                "the held-off record must account for the {blocker} blocker"
+                "the record must account for the {blocker} blocker"
             );
         }
-        assert_eq!(
-            doc.matches("**FIXED**").count(),
-            4,
-            "four blockers are recorded as fixed"
-        );
+        // AArch64 and RISC-V are explicitly unchanged.
         assert!(
-            doc.contains("The remaining blocker"),
-            "the one open blocker is named as open"
+            doc.contains("AArch64 and RISC-V still resolve to the")
+                && doc.contains("boots are byte-identical"),
+            "the record states that no other architecture was ported"
         );
-        // The live evidence is named, so every claim is checkable rather than asserted.
-        assert!(
-            doc.contains("IPC_SERVER_DEATH_LINK_LEAK created=0 closed=13")
-                && doc.contains("STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 result=fail"),
-            "the markers that prove the open blocker are recorded"
-        );
-        assert!(
-            doc.contains("nr6_ok=1 nr7_ok=1 census_ok=1 result=ok"),
-            "the evidence that the rest of the flip is healthy is recorded too"
-        );
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "held off means held off"
-        );
+        // On this (x86_64-modelled) hosted build the default really is on.
+        assert!(crate::kernel::boot::ipccall_direct_production_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_admission_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_publication_enabled());
     }
 
     /// Endpoint admission is the ARCH-SPLIT predicate, never an oracle endpoint list: it is
@@ -92840,6 +92827,7 @@ mod stage200d1_publication_and_guards {
     const SERVER_DIED: usize = 10;
 
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
     const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
@@ -93083,22 +93071,106 @@ mod stage200d1_publication_and_guards {
     }
 
     /// A reverse link is never silently overwritten, and registration refuses an exiting
-    /// incarnation on BOTH the broad and the split seam.
+    /// incarnation — on BOTH the broad and the split seam, because both delegate to the ONE
+    /// shared installation decision.
+    ///
+    /// This used to assert that each seam carried its own copy of the match arms. They did,
+    /// and they drifted: the split copy installed the link without stamping the creation edge,
+    /// so with the direct NR6 path as the production default the ServerDies leak accounting
+    /// went blind (`created=0 closed=13`). Duplicated-and-compared is now replaced by shared:
+    /// there is one decision, so there is nothing left to drift.
     #[test]
     fn g10_no_silent_link_overwrite_and_exiting_gate() {
-        for src in [IPC_STATE_SRC, RUNTIME_SRC] {
+        // Both seams delegate; neither carries its own arms any more.
+        for (name, src) in [("ipc_state.rs", IPC_STATE_SRC), ("runtime.rs", RUNTIME_SRC)] {
             assert!(
-                src.contains(
-                    "Some(existing) if existing == link => true,\n                Some(_) => false,"
-                ),
-                "a different live link must fail, never overwrite"
+                src.contains("crate::kernel::boot::install_server_reply_link(tcb, link)"),
+                "{name}: the installation edge delegates to the shared decision"
+            );
+            assert!(
+                !src.contains("tcb.server_reply_link = Some(link);"),
+                "{name}: no seam installs a link itself"
             );
         }
+        // And the shared decision is the one that refuses overwrite and gates on exiting.
+        let helper = MOD_SRC
+            .split("pub(crate) fn install_server_reply_link(")
+            .nth(1)
+            .expect("shared decision present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
         assert!(
-            IPC_STATE_SRC
-                .contains("TaskStatus::Runnable | TaskStatus::Running | TaskStatus::Blocked(_)")
+            helper.contains("Some(existing) if existing == link => true,")
+                && helper.contains("Some(_) => false,"),
+            "a different live link must fail, never overwrite"
         );
-        assert!(RUNTIME_SRC.contains("crate::kernel::task::TaskStatus::Runnable"));
+        assert!(
+            helper.contains("crate::kernel::task::TaskStatus::Runnable")
+                && helper.contains("crate::kernel::task::TaskStatus::Running")
+                && helper.contains("crate::kernel::task::TaskStatus::Blocked(_)"),
+            "an incarnation that has committed to exit is refused"
+        );
+    }
+
+    /// **Creation-edge parity.** The creation stamp exists exactly once in the tree, inside
+    /// the shared decision, on the arm that genuinely installs — so legacy and split
+    /// installation are accounted identically by construction rather than by inspection.
+    #[test]
+    fn g10b_the_creation_edge_is_stamped_exactly_once_and_only_on_a_real_install() {
+        assert_eq!(
+            MOD_SRC
+                .matches("server_dies_counters::note_link_created(")
+                .count(),
+            1,
+            "exactly one creation stamp in the tree"
+        );
+        for (name, src) in [("ipc_state.rs", IPC_STATE_SRC), ("runtime.rs", RUNTIME_SRC)] {
+            // CODE only — the comments at each seam legitimately explain the edge they
+            // delegate, including why this drifted before.
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("note_link_created"),
+                "{name}: no seam stamps the creation edge itself"
+            );
+        }
+        let helper = MOD_SRC
+            .split("pub(crate) fn install_server_reply_link(")
+            .nth(1)
+            .expect("shared decision present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        // The stamp is in the `None =>` arm — the only one that writes the link — and comes
+        // after the write, so it can never be reached without a genuine installation.
+        let install_at = helper
+            .find("tcb.server_reply_link = Some(link);")
+            .expect("the install writes the link");
+        let stamp_at = helper
+            .find("note_link_created(")
+            .expect("the install stamps the creation edge");
+        assert!(
+            install_at < stamp_at,
+            "the creation edge is stamped only after the link is genuinely installed"
+        );
+        // Neither early-return arm can reach the stamp.
+        for refusal in [
+            "Some(existing) if existing == link => true,",
+            "Some(_) => false,",
+        ] {
+            let at = helper.find(refusal).expect("refusal arm present");
+            assert!(at < stamp_at, "the {refusal} arm precedes the stamp");
+        }
+        // The close accounting is untouched by this change.
+        assert_eq!(
+            IPC_STATE_SRC.matches("note_link_closed(").count(),
+            2,
+            "the two close edges are unchanged"
+        );
     }
 
     /// The NR6 transaction reserves link capacity BEFORE publishing the record, so no
@@ -97420,18 +97492,26 @@ mod stage200d2b1bi_counters {
     #[test]
     fn i09_counters_attached_to_real_operations() {
         let _g = globals_guard();
-        // 1 link created — inside the arm that installs a NEW link.
-        let reg = IPC_SRC
-            .split("pub(crate) fn register_server_reply_link(")
+        // 1 link created — inside the arm that installs a NEW link. Stage 199D moved that arm
+        // into the ONE shared installation decision, used by BOTH the legacy and the split
+        // registration seams, because the two copies drifted and the split one stopped
+        // counting entirely.
+        let mod_src = include_str!("mod.rs");
+        let reg = mod_src
+            .split("pub(crate) fn install_server_reply_link(")
             .nth(1)
-            .expect("register");
-        let reg = reg.split("\n    /// ").next().unwrap();
+            .expect("the shared installation decision");
+        let reg = reg.split("\n}\n").next().unwrap();
         assert!(reg.contains("tcb.server_reply_link = Some(link);"));
         let install = reg.find("tcb.server_reply_link = Some(link);").unwrap();
-        // Stage 199D: the creation edge now reports its RECORD IDENTITY, so the count can
-        // be attributed to the armed transaction instead of to every call in the system.
+        // The creation edge reports its RECORD IDENTITY, so the count can be attributed to
+        // the armed transaction instead of to every call in the system.
         let rec = reg.find("note_link_created(").expect("class 1");
         assert!(install < rec, "counted after the real install");
+        // Both registration seams reach it, and neither counts on its own.
+        for src in [IPC_SRC, include_str!("../../runtime.rs")] {
+            assert!(src.contains("crate::kernel::boot::install_server_reply_link(tcb, link)"));
+        }
         // 2 link detached — only when a link was actually taken.
         let take = IPC_SRC
             .split("pub(crate) fn take_server_reply_link(")
@@ -102128,5 +102208,296 @@ mod stage199d_waiter_census {
                 "the census must not read the store it audits ({forbidden})"
             );
         }
+    }
+}
+
+/// Stage 199D — **reverse-link creation accounting parity** between the legacy and split
+/// installation paths.
+///
+/// The two paths carried independent copies of the installation decision and drifted: the
+/// split twin installed the link but never stamped the system-wide creation edge, while the
+/// legacy one did. With the direct NR6 path as the x86_64 production default that made the
+/// ServerDies leak accounting blind — `IPC_SERVER_DEATH_LINK_LEAK created=0 closed=13` — so
+/// the attestation that exists to catch a *real* reverse-link leak could no longer see one.
+///
+/// Both paths now delegate to one shared decision, so the accounting is identical by
+/// construction. These tests prove the counting behaviour of each arm.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage199d_link_creation_parity {
+    use super::*;
+    use crate::kernel::boot::server_dies_counters as c;
+    use crate::kernel::task::{ServerReplyLink, TaskStatus};
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const SERVER_TID: u64 = 2;
+    const REC: usize = 3;
+    const GEN: u64 = 7;
+
+    /// One registered, ASID-bound server task ready to receive a reverse link.
+    fn fixture() -> (SharedKernel, Asid) {
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            s.register_task(SERVER_TID).expect("server");
+            let (asid, _sp) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(SERVER_TID, asid).expect("bind");
+            asid
+        });
+        assert_eq!(c::link_totals(), (0, 0), "a fresh instance counts nothing");
+        (k, asid)
+    }
+
+    fn link(asid: Asid) -> ServerReplyLink {
+        ServerReplyLink {
+            server_tid: SERVER_TID,
+            server_asid: asid,
+            reply_record_index: REC,
+            reply_record_generation: GEN,
+        }
+    }
+
+    /// LEGACY install: created +1.
+    #[test]
+    fn a_legacy_install_counts_one_creation() {
+        let (k, asid) = fixture();
+        assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN)));
+        assert_eq!(c::link_totals(), (1, 0), "legacy install: created +1");
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t
+                .iter()
+                .flatten()
+                .find(|x| x.tid.0 == SERVER_TID)
+                .and_then(|x| x.server_reply_link))),
+            Some(link(asid)),
+            "and the exact link is installed"
+        );
+    }
+
+    /// SPLIT install: created +1 — identical to legacy. This is the arm that used to count
+    /// nothing at all.
+    #[test]
+    fn a_split_install_counts_one_creation() {
+        let (k, asid) = fixture();
+        assert!(k.register_server_reply_link_split(SERVER_TID, asid, REC, GEN));
+        assert_eq!(c::link_totals(), (1, 0), "split install: created +1");
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t
+                .iter()
+                .flatten()
+                .find(|x| x.tid.0 == SERVER_TID)
+                .and_then(|x| x.server_reply_link))),
+            Some(link(asid)),
+            "and the exact link is installed"
+        );
+    }
+
+    /// The two paths agree exactly — the property the drift broke.
+    #[test]
+    fn both_paths_account_a_creation_identically() {
+        let (k, asid) = fixture();
+        assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN)));
+        let legacy = c::link_totals();
+        let (k2, asid2) = fixture();
+        assert!(k2.register_server_reply_link_split(SERVER_TID, asid2, REC, GEN));
+        let split = c::link_totals();
+        assert_eq!(
+            legacy, split,
+            "legacy and split account a creation identically"
+        );
+        assert_eq!(split, (1, 0));
+        let _ = k;
+    }
+
+    /// DUPLICATE retry on either path: +0. The link is already there, so nothing is
+    /// installed and nothing may be counted.
+    #[test]
+    fn a_duplicate_install_counts_nothing() {
+        for split in [false, true] {
+            let (k, asid) = fixture();
+            let install = |k: &SharedKernel| {
+                if split {
+                    k.register_server_reply_link_split(SERVER_TID, asid, REC, GEN)
+                } else {
+                    k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN))
+                }
+            };
+            assert!(install(&k));
+            assert_eq!(c::link_totals(), (1, 0));
+            // Idempotent re-registration of the IDENTICAL link succeeds and counts nothing.
+            for _ in 0..3 {
+                assert!(install(&k), "split={split}: duplicate retry still succeeds");
+            }
+            assert_eq!(
+                c::link_totals(),
+                (1, 0),
+                "split={split}: a duplicate retry counts nothing"
+            );
+        }
+    }
+
+    /// FAILED installs count nothing: a foreign/missing TCB, a different live link, and an
+    /// incarnation that has committed to exit.
+    #[test]
+    fn a_failed_install_counts_nothing() {
+        for split in [false, true] {
+            let (k, asid) = fixture();
+            let install = |k: &SharedKernel, tid: u64, a: Asid, rec: usize, rgen: u64| {
+                if split {
+                    k.register_server_reply_link_split(tid, a, rec, rgen)
+                } else {
+                    k.with(|s| s.register_server_reply_link(tid, a, rec, rgen))
+                }
+            };
+            // MISSING TCB.
+            assert!(
+                !install(&k, 9999, asid, REC, GEN),
+                "split={split}: no such task"
+            );
+            assert_eq!(c::link_totals(), (0, 0), "split={split}: missing TCB");
+            // FOREIGN incarnation: right numeric TID, wrong ASID.
+            assert!(!install(&k, SERVER_TID, Asid(0xBEE), REC, GEN));
+            assert_eq!(c::link_totals(), (0, 0), "split={split}: foreign ASID");
+
+            // A genuine install, then a DIFFERENT live link must be refused, not replace it.
+            assert!(install(&k, SERVER_TID, asid, REC, GEN));
+            assert_eq!(c::link_totals(), (1, 0));
+            assert!(
+                !install(&k, SERVER_TID, asid, REC, GEN + 1),
+                "split={split}: a different record generation must not replace a live link"
+            );
+            assert!(!install(&k, SERVER_TID, asid, REC + 1, GEN));
+            assert_eq!(
+                c::link_totals(),
+                (1, 0),
+                "split={split}: a refused replacement counts nothing"
+            );
+            assert_eq!(
+                k.with(|s| s.with_tcbs(|t| t
+                    .iter()
+                    .flatten()
+                    .find(|x| x.tid.0 == SERVER_TID)
+                    .and_then(|x| x.server_reply_link))),
+                Some(link(asid)),
+                "split={split}: the original link survives untouched"
+            );
+        }
+    }
+
+    /// An incarnation that has committed to exit is refused on both paths, and counts nothing.
+    #[test]
+    fn an_exiting_incarnation_is_refused_and_counts_nothing() {
+        for split in [false, true] {
+            let (k, asid) = fixture();
+            k.with(|s| {
+                s.with_tcbs_mut(|t| {
+                    if let Some(tcb) = t.iter_mut().flatten().find(|x| x.tid.0 == SERVER_TID) {
+                        tcb.status = TaskStatus::Exited(0);
+                    }
+                })
+            });
+            let ok = if split {
+                k.register_server_reply_link_split(SERVER_TID, asid, REC, GEN)
+            } else {
+                k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN))
+            };
+            assert!(!ok, "split={split}: an exiting incarnation is refused");
+            assert_eq!(
+                c::link_totals(),
+                (0, 0),
+                "split={split}: and counts nothing"
+            );
+        }
+    }
+
+    /// One install plus one terminal close balances 1/1 — on either installation path,
+    /// through the single closing seam.
+    #[test]
+    fn one_install_and_one_close_balance() {
+        for split in [false, true] {
+            let (k, asid) = fixture();
+            if split {
+                assert!(k.register_server_reply_link_split(SERVER_TID, asid, REC, GEN));
+            } else {
+                assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN)));
+            }
+            assert_eq!(c::link_totals(), (1, 0));
+            let outcome = k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN));
+            assert_eq!(
+                outcome,
+                crate::kernel::boot::DetachOutcome::Detached,
+                "split={split}: the exact link is detached"
+            );
+            let (created, closed) = c::link_totals();
+            assert_eq!(
+                (created, closed),
+                (1, 1),
+                "split={split}: one install, one close, balanced"
+            );
+            // A repeated close is idempotent and counts nothing more.
+            assert_eq!(
+                k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN)),
+                crate::kernel::boot::DetachOutcome::AlreadyAbsent
+            );
+            assert_eq!(c::link_totals(), (1, 1), "split={split}: still balanced");
+        }
+    }
+
+    /// Many ordinary direct-path transactions balance system-wide at quiescence — the
+    /// invariant the ServerDies audit actually checks (`links_created == links_closed`).
+    #[test]
+    fn many_direct_transactions_balance_system_wide_at_quiescence() {
+        const SERVERS: u64 = 12;
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut servers = alloc::vec::Vec::new();
+        k.with(|s| {
+            for n in 0..SERVERS {
+                let tid = 2 + n;
+                s.register_task(tid).expect("server");
+                let (asid, _sp) = s.create_user_address_space().expect("asid");
+                s.bind_task_asid(tid, asid).expect("bind");
+                servers.push((tid, asid));
+            }
+        });
+        // Every install goes through the SPLIT path, as it does when the direct NR6
+        // transaction is the production default.
+        for (i, (tid, asid)) in servers.iter().enumerate() {
+            assert!(k.register_server_reply_link_split(*tid, *asid, i, GEN));
+        }
+        assert_eq!(
+            c::link_totals(),
+            (SERVERS as u32, 0),
+            "every direct install is counted"
+        );
+        // A duplicate storm changes nothing.
+        for (i, (tid, asid)) in servers.iter().enumerate() {
+            assert!(k.register_server_reply_link_split(*tid, *asid, i, GEN));
+        }
+        assert_eq!(c::link_totals(), (SERVERS as u32, 0));
+
+        // Each reaches its ordinary terminal close.
+        for (i, (tid, asid)) in servers.iter().enumerate() {
+            assert_eq!(
+                k.with(|s| s.detach_server_reply_link_exact(*tid, *asid, i, GEN)),
+                crate::kernel::boot::DetachOutcome::Detached
+            );
+        }
+        let (created, closed) = c::link_totals();
+        assert_eq!(created, SERVERS as u32);
+        assert_eq!(
+            created, closed,
+            "system-wide balance at quiescence: created == closed"
+        );
+        // And no TCB retains a link.
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t
+                .iter()
+                .flatten()
+                .filter(|x| x.server_reply_link.is_some())
+                .count())),
+            0,
+            "no reverse link survives quiescence"
+        );
     }
 }

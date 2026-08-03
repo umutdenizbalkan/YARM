@@ -3151,28 +3151,12 @@ impl SharedKernel {
             else {
                 return false;
             };
-            // Stage 200D-1: an incarnation that has already committed to exit must never
-            // be published as an authorized replier. Teardown snapshots the link AFTER the
-            // status flips, so registering here would install an authority nobody will
-            // ever look at — the caller would block forever with no death claim. Refusing
-            // makes the NR6 publication roll back instead, which is the only other
-            // permitted outcome of this race.
-            if !matches!(
-                tcb.status,
-                crate::kernel::task::TaskStatus::Runnable
-                    | crate::kernel::task::TaskStatus::Running
-                    | crate::kernel::task::TaskStatus::Blocked(_)
-            ) {
-                return false;
-            }
-            match tcb.server_reply_link {
-                Some(existing) if existing == link => true,
-                Some(_) => false,
-                None => {
-                    tcb.server_reply_link = Some(link);
-                    true
-                }
-            }
+            // Stage 199D: the SAME shared decision the legacy path uses — status gate, match
+            // arms and creation stamp together. This edge previously installed the link
+            // without stamping `note_link_created`, so with the direct NR6 path as the
+            // production default the system-wide leak accounting saw `created=0 closed=13`
+            // and the attestation that would catch a real leak was blind.
+            crate::kernel::boot::install_server_reply_link(tcb, link)
         })
     }
 
