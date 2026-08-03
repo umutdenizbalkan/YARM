@@ -1136,6 +1136,36 @@ matrix cells could not be executed — `qemu-system-aarch64`/`qemu-system-riscv6
 installed in this environment — and neither architecture was changed. Canonical 199D remains
 open. Full evidence: `doc/IPC.md` §8.6.9.
 
+### 6.1.11 AArch64 NR6/NR7 readiness — NOT READY, three blockers
+
+**The canonical contract stack is already AArch64-ready.** Eligibility, disposition, the
+acknowledgement store, the waiter census, the counters, the projection and `ipccall_direct.rs`
+contain **zero** `target_arch` references; the transaction body has two, both selector-gated
+x86 SMP-oracle IPI sends. Neither the transaction nor the split helper takes a broad lock. No
+AArch64 semantic copy is needed.
+
+**Three blockers, all in the AArch64 arch bracketing:**
+
+1. **The syscall-ABI import is proof-gated.** `pre_split_import_syscall_abi` admits NR6/NR7
+   only under `ipccall_direct_proof_enabled()`, so with the proof gate off `nr` stays 0 and the
+   split dispatcher declines — flipping the production predicate alone would be a silent no-op
+   on AArch64. *Fix:* ask the canonical `ipccall_direct_admission_enabled()`.
+2. **The split return path reacquires the broad lock — decisive.**
+   `finalize_split_handled_syscall` calls `shared.with_cpu(...)` to save the user context,
+   restore arch thread state and export x0..x5. Every HANDLED AArch64 split syscall, NR6/NR7
+   included, takes the broad lock on the way out. x86_64's finalize is an empty no-op because
+   its trap stub returns from the ret lanes. *Fix:* move those three steps onto task-domain
+   (rank 2) seams, or prove they need no kernel state. Real work, not a config flip.
+3. **Off-lock authoritative dispatch is x86_64-only.** `d6_genuine_enabled()` is
+   `cfg!(target_arch = "x86_64")`, so an AArch64 wake's downstream dispatch and saved-frame
+   resume run under the broad lock. The transaction still completes (it only enqueues), but the
+   end-to-end wake is not off-lock.
+
+Nothing was staged live; the production default is unchanged (x86_64 only).
+`stage199d_aarch64_readiness_audit` pins all three blockers and the two ready properties, so the
+map is executable. `qemu-system-aarch64` is also absent here, so no AArch64 live suite could
+run regardless. Full evidence: `doc/IPC.md` §8.6.10.
+
 ---
 
 ## 7. Method and limits

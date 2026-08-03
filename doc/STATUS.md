@@ -228,6 +228,19 @@ Full detail: `doc/IPC.md` §8.5.
    fail/leak/duplicate/stale/fatal markers. The AArch64 and RISC-V matrix cells could not run
    (`qemu-system-aarch64`/`riscv64` absent here); neither architecture was changed and both
    remain proof-gated. Canonical 199D remains open — this is an increment, not a stage seal.
+   **AArch64 NR6/NR7 is audited and NOT ready.** The canonical contract stack is already
+   architecture-neutral (zero `target_arch` references across eligibility, disposition, the ack
+   store, the census, the counters and the projection; the transaction body has two, both
+   selector-gated x86 SMP IPI sends) and takes no broad lock — so no AArch64 semantic copy is
+   needed. Three blockers remain, all in the AArch64 arch bracketing: (i) the syscall-ABI import
+   admits NR6/NR7 only under the proof gate, so flipping the production predicate alone would be
+   a silent no-op; (ii) **decisive** — `finalize_split_handled_syscall` calls `with_cpu`, so
+   every HANDLED AArch64 split syscall reacquires the broad lock to save the user context,
+   restore arch thread state and export x0..x5 (x86_64's finalize is an empty no-op); (iii)
+   `d6_genuine_enabled()` is x86_64-only, so an AArch64 wake's downstream dispatch runs under the
+   broad lock. Nothing was staged live; production default unchanged (x86_64 only).
+   `qemu-system-aarch64` is also absent here. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.11 and
+   `doc/IPC.md` §8.6.10.
    **Blocker 5 (link CREATION accounting) is now closed** — both installation seams delegate to
    the one `install_server_reply_link` decision, so the creation stamp cannot drift; live,
    `created` went 0 → 54. That exposed its mirror on the CLOSE edge: of four close sites only two

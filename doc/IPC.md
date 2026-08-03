@@ -1338,6 +1338,86 @@ AArch64 and RISC-V are untouched and remain proof-gated.
 
 AArch64 and RISC-V are untouched and remain proof-gated.
 
+### 8.6.10 AArch64 NR6/NR7 production-readiness audit — NOT READY
+
+**Question:** can an eligible NR6/NR7 transaction complete on AArch64 without reacquiring the
+broad `KernelState` lock? **Answer: no.** Three blockers, all outside the canonical contracts.
+
+#### What IS ready
+
+The whole canonical contract stack is **architecture-neutral** — `direct_eligibility.rs`,
+`direct_disposition.rs`, `direct_ack_store.rs`, `direct_ack_census.rs`,
+`direct_ipc_counters.rs`, `ipccall_direct.rs` and `ipc_recv_core.rs` contain **zero**
+`target_arch` references, and `ipccall_direct_txn.rs` has exactly two, both selector-gated x86
+SMP-oracle IPI sends that are no-ops at SMP=1. The transaction body and the split helper take
+no broad lock at all. **No AArch64 semantic copy is needed or wanted.**
+
+Per audited area:
+
+| area | AArch64 status |
+| --- | --- |
+| admission / endpoint confinement | predicates already `production \|\| proof/oracle` — no AArch64 branch needed; **but see blocker 1** |
+| ack publication + consumption | arch-neutral; publication gated by `ipccall_direct_publication_enabled()` + `_endpoint_admitted`, consumption in the split helper |
+| recv-v2 projection | arch-neutral — one shared `project_recv_delivery` |
+| return-lane parity | frame encoding arch-neutral; **delivery of those lanes is blocker 2** |
+| transfer-cap decline | arch-neutral (`transfer_cap_arg_present`) |
+| terminal-arbitration decline | arch-neutral (authoritative terminal cell) |
+| waiter / lease lifecycle | arch-neutral — one slot per endpoint index, released from the three waiter primitives |
+| reverse-link create / close accounting | arch-neutral — one shared install decision, one shared close decision |
+| blocked-task wake | enqueue is arch-neutral via the scheduler split seam; **downstream dispatch is blocker 3** |
+| saved-frame return | **blocker 2** |
+
+#### BLOCKER 1 — the AArch64 syscall-ABI import is still proof-gated
+
+`pre_split_import_syscall_abi` admits NR6/NR7 only when `ipccall_direct_proof_enabled()`.
+With the proof gate off, `nr` stays 0, the split dispatcher declines and NR6/NR7 fall back to
+the broad-lock path — so **flipping the production predicate alone would be a silent no-op on
+AArch64**, not an enablement.
+
+*Fix:* ask the canonical `ipccall_direct_admission_enabled()` — the same predicate the split
+dispatcher already uses. No AArch64-specific admission rule is introduced.
+
+#### BLOCKER 2 — the AArch64 split return path reacquires the broad lock (decisive)
+
+```rust
+// src/arch/trap_entry.rs — #[cfg(target_arch = "aarch64")]
+let _ = shared.with_cpu(cpu, |kernel| {
+    super::aarch64::trap::split_finalize_handled_syscall(kernel, cpu, frame)
+});
+```
+
+`with_cpu` **is** the broad `KernelState` lock. Every HANDLED AArch64 split syscall — NR6/NR7
+included — reacquires it on the way out, to save the user context
+(`kernel.set_thread_user_context`), restore arch thread state (`restore_arch_thread_state`) and
+export x0..x5. x86_64 needs none of this: its trap stub already returns results from the ret
+lanes, so its `finalize_split_handled_syscall` is a genuine empty no-op.
+
+This is why the audit's answer is *not ready*. The split seam is clean; the arch return path
+is not. The same finalize is additionally proof-gated for NR6/NR7 — blocker 1's return-path
+twin.
+
+*Fix:* move the context save, the arch thread-state restore and the GPR export onto per-domain
+seams (task, rank 2), or prove they need no kernel state. This is real work, not a config flip,
+and it is the gating item for AArch64 NR6/NR7.
+
+#### BLOCKER 3 — off-lock authoritative dispatch is x86_64-only
+
+`d6_genuine_enabled()` is `cfg!(target_arch = "x86_64")`. The direct transaction only
+*enqueues* the woken task through the scheduler split seam, so this does not stop the
+transaction completing — but on AArch64 the woken task's dispatch and saved-frame resume still
+run under the broad lock, so the **end-to-end** wake is not off-lock.
+
+#### Outcome
+
+Nothing was staged live and the production default is unchanged (x86_64 only):
+`stage199d_aarch64_readiness_audit` pins all three blockers plus the two ready properties, so
+the map is executable and cannot drift. When blockers 1 and 2 are closed, widening the one
+constant is the whole enablement — the arch-split predicates already have the right shape and
+need no AArch64 branch.
+
+The live suite additionally cannot run here: `qemu-system-aarch64` is not installed in this
+environment.
+
 ---
 
 ## 9. Authoring rule

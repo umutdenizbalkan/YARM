@@ -103292,3 +103292,265 @@ mod stage199d_terminal_arbitration_safety {
         }
     }
 }
+
+/// Stage 199D — **AArch64 NR6/NR7 production-readiness audit.**
+///
+/// The question this module answers is narrow and structural: can an *eligible* NR6/NR7
+/// transaction complete on AArch64 **without reacquiring the broad `KernelState` lock**?
+///
+/// The answer today is **no**, and these guards pin exactly why, so the blocker map is
+/// executable rather than prose and cannot drift while the fix is pending. Two of the three
+/// blockers are in the AArch64 trap entry/return bracketing; the third is the off-lock
+/// authoritative dispatch. **The canonical NR6/NR7 contract stack itself is architecture-
+/// neutral and already broad-lock-free** — no AArch64 semantic copy is needed or wanted.
+mod stage199d_aarch64_readiness_audit {
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const MODRS: &str = include_str!("mod.rs");
+
+    /// **READY.** Every canonical contract the direct path is built from is architecture-
+    /// neutral: none of them branches on `target_arch` at all, so enabling AArch64 requires no
+    /// per-architecture semantic copy of eligibility, disposition, the acknowledgement store,
+    /// the waiter census, the counters, the projection or the transaction body.
+    #[test]
+    fn the_canonical_contracts_are_architecture_neutral() {
+        for (name, src) in [
+            (
+                "direct_eligibility.rs",
+                include_str!("../direct_eligibility.rs"),
+            ),
+            (
+                "direct_disposition.rs",
+                include_str!("../direct_disposition.rs"),
+            ),
+            (
+                "direct_ack_store.rs",
+                include_str!("../direct_ack_store.rs"),
+            ),
+            (
+                "direct_ack_census.rs",
+                include_str!("../direct_ack_census.rs"),
+            ),
+            (
+                "direct_ipc_counters.rs",
+                include_str!("../direct_ipc_counters.rs"),
+            ),
+            ("ipccall_direct.rs", include_str!("../ipccall_direct.rs")),
+            (
+                "ipc_recv_core.rs",
+                include_str!("../syscall/ipc_recv_core.rs"),
+            ),
+        ] {
+            assert!(
+                !src.contains("target_arch"),
+                "{name}: a canonical contract must not branch on the architecture"
+            );
+        }
+        // The transaction body's only architecture conditionals are the x86 SMP oracle IPI
+        // sends, which are selector-gated no-ops and irrelevant to an SMP=1 production boot.
+        let txn = include_str!("../ipccall_direct_txn.rs");
+        assert_eq!(
+            txn.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "the only arch conditionals in the transaction are the two SMP oracle IPI sends"
+        );
+        assert_eq!(
+            txn.matches("target_arch").count(),
+            2,
+            "and there are no others"
+        );
+    }
+
+    /// **READY.** The transaction body and the split helper take no broad lock. This is the
+    /// half of the path that is already AArch64-ready.
+    #[test]
+    fn the_transaction_and_split_helper_take_no_broad_lock() {
+        for (name, src) in [
+            (
+                "ipccall_direct_txn.rs",
+                include_str!("../ipccall_direct_txn.rs"),
+            ),
+            ("ipccall_direct.rs", include_str!("../ipccall_direct.rs")),
+            ("syscall_split.rs", include_str!("../syscall_split.rs")),
+        ] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("with_cpu("),
+                "{name}: the direct path must not reacquire the broad lock"
+            );
+            assert!(
+                !code.contains("self.with(") && !code.contains("shared.with("),
+                "{name}: the direct path must not take the broad lock"
+            );
+        }
+    }
+
+    /// **BLOCKER 1 — admission.** The AArch64 syscall-ABI import still consults the PROOF
+    /// gate for NR6/NR7, not the arch-split admission predicate x86 uses. With the proof gate
+    /// off, `nr` stays 0, the split dispatcher declines, and NR6/NR7 fall back to the
+    /// broad-lock path — so flipping the production predicate alone would be a silent no-op on
+    /// AArch64 rather than an enablement.
+    #[test]
+    fn blocker1_the_aarch64_abi_import_is_still_proof_gated() {
+        let import = TRAP_ENTRY
+            .split("fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {")
+            .nth(1)
+            .expect("the AArch64 ABI import")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            import.contains("SYSCALL_IPC_CALL_NR") && import.contains("SYSCALL_IPC_REPLY_NR"),
+            "the import knows about NR6/NR7"
+        );
+        assert!(
+            import.contains("ipccall_direct_proof_enabled()"),
+            "BLOCKER: NR6/NR7 import is gated on the proof gate. The fix is to ask the \
+             canonical `ipccall_direct_admission_enabled()` instead — the same predicate the \
+             split dispatcher already uses — so no AArch64-specific admission rule is added."
+        );
+        assert!(
+            !import.contains("ipccall_direct_admission_enabled()"),
+            "when this flips, update this guard and re-audit"
+        );
+    }
+
+    /// **BLOCKER 2 — the decisive one.** A HANDLED split syscall on AArch64 returns to
+    /// userspace through `finalize_split_handled_syscall`, which takes the **broad
+    /// `KernelState` lock** (`with_cpu`) to save the user context, restore arch thread state
+    /// and export x0..x5. x86_64 needs none of that — its trap stub already returns results
+    /// from the ret lanes — so its finalize is a genuine no-op.
+    ///
+    /// This is why the audit's answer is "not ready": the split seam itself is clean, but
+    /// **every** handled AArch64 split syscall, NR6/NR7 included, reacquires the broad lock on
+    /// the way out.
+    #[test]
+    fn blocker2_the_aarch64_split_return_path_reacquires_the_broad_lock() {
+        let aarch64_finalize = TRAP_ENTRY
+            .split("#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(")
+            .nth(1)
+            .expect("the AArch64 finalize")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            aarch64_finalize.contains("shared.with_cpu(cpu, |kernel| {"),
+            "BLOCKER: the AArch64 split return path takes the broad lock. Retiring it means \
+             moving the context save, the arch thread-state restore and the GPR export onto \
+             per-domain seams (task rank 2), or proving they need no kernel state at all."
+        );
+        assert!(
+            aarch64_finalize.contains("split_finalize_handled_syscall(kernel, cpu, frame)"),
+            "and it does so to run the arch return-path restore"
+        );
+        // The same finalize is ALSO still proof-gated for NR6/NR7 — the return-path twin of
+        // blocker 1.
+        assert!(
+            aarch64_finalize.contains("ipccall_direct_proof_enabled()"),
+            "BLOCKER 1's twin: the return path admits NR6/NR7 only under the proof gate"
+        );
+        // x86_64 / riscv64 need nothing here.
+        let other = TRAP_ENTRY
+            .split("#[cfg(not(target_arch = \"aarch64\"))]\nfn finalize_split_handled_syscall(")
+            .nth(1)
+            .expect("the non-AArch64 finalize")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            !other.contains("with_cpu"),
+            "x86_64/riscv64 return from the ret lanes and take no lock"
+        );
+    }
+
+    /// **BLOCKER 3 — the wake's downstream dispatch.** The off-lock authoritative
+    /// (queue-advancing) dispatch is a compile-time x86_64 constant. The direct transaction
+    /// itself only *enqueues* the woken task through the scheduler split seam, so this does
+    /// not stop the transaction completing — but on AArch64 the woken task's dispatch and
+    /// saved-frame resume still run under the broad lock, so the end-to-end wake is not
+    /// off-lock.
+    #[test]
+    fn blocker3_off_lock_authoritative_dispatch_is_x86_only() {
+        let body = MODRS
+            .split("pub(crate) fn d6_genuine_enabled() -> bool {")
+            .nth(1)
+            .expect("the dispatch gate")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            body.contains("cfg!(target_arch = \"x86_64\")"),
+            "BLOCKER: the authoritative off-lock dispatch is x86_64-only, so an AArch64 wake \
+             completes its dispatch under the broad lock"
+        );
+    }
+
+    /// The production default is unchanged by this audit: x86_64 only. Nothing was staged
+    /// live, because the path is not structurally ready.
+    #[test]
+    fn the_audit_changed_no_production_default() {
+        let body = MODRS
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .expect("predicate present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert_eq!(
+            body.trim(),
+            "cfg!(target_arch = \"x86_64\")",
+            "AArch64 stays off until its blockers are closed"
+        );
+        assert!(
+            !cfg!(target_arch = "aarch64")
+                || !crate::kernel::boot::ipccall_direct_production_enabled()
+        );
+    }
+
+    /// The arch-split predicates are already shaped to admit AArch64 with no new rule: each is
+    /// `production || <existing proof/oracle path>`, so closing the blockers and widening the
+    /// one constant is the whole enablement — there is no AArch64 branch to add.
+    #[test]
+    fn the_arch_split_predicates_need_no_aarch64_branch() {
+        for predicate in [
+            "pub fn ipccall_direct_admission_enabled() -> bool {",
+            "pub fn ipccall_direct_publication_enabled() -> bool {",
+        ] {
+            let body = MODRS
+                .split(predicate)
+                .nth(1)
+                .expect("predicate present")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded");
+            assert_eq!(
+                body.trim(),
+                "ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()",
+                "{predicate}: one shape for every architecture"
+            );
+        }
+        for which in ["request", "reply"] {
+            let body = MODRS
+                .split(&alloc::format!(
+                    "pub fn ipccall_direct_{which}_endpoint_admitted(eidx: usize) -> bool {{"
+                ))
+                .nth(1)
+                .expect("predicate present")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded");
+            assert_eq!(
+                body.trim(),
+                alloc::format!(
+                    "ipccall_direct_production_enabled() || \
+                     ipccall_direct_oracle_{which}_endpoint_is(eidx)"
+                ),
+                "{which} admission: one shape for every architecture"
+            );
+        }
+    }
+}
