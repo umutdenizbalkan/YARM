@@ -82636,9 +82636,9 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "false",
-            "the body is a bare constant: flipping it to `cfg!(target_arch = \"x86_64\")` \
-             is the entire x86_64 production-default enablement"
+            "cfg!(target_arch = \"x86_64\")",
+            "the whole condition is the target architecture: x86_64 is production-default, \
+             every other architecture is not"
         );
         for forbidden in [
             "oracle",
@@ -82661,10 +82661,10 @@ mod stage199d_production_default_guards {
     }
 
     /// The flip is HELD OFF against a recorded, reproducible live failure — not forgotten.
-    /// The doc comment tracks every blocker and its state — the five that are closed, and the
-    /// one that is not — so nobody re-flips it blind and nobody re-litigates a closed one.
+    /// The doc comment records how the production default was earned: every blocker that had
+    /// to be closed. A regression that re-opens one should have to edit this record.
     #[test]
-    fn the_held_off_flip_records_every_live_blocker() {
+    fn the_production_default_records_every_closed_blocker() {
         let doc = MODRS
             .split("/// True iff the direct NR6/NR7 path is the production default")
             .nth(1)
@@ -82673,43 +82673,36 @@ mod stage199d_production_default_guards {
             .next()
             .expect("doc bounded");
         assert!(
-            doc.contains("HELD OFF"),
-            "the predicate says plainly that it is held off"
+            doc.contains("ENABLED on x86_64"),
+            "the predicate says plainly that x86_64 is production-default"
         );
         for blocker in [
-            "transfer_cap_present",               // 1 — FIXED
-            "endpoint waiter lifecycle",          // 2 — FIXED
-            "overwrite fuse",                     // 3 — FIXED
-            "ENDPOINT_WAITER_SLOTS",              // 4 — FIXED
-            "install_server_reply_link",          // 5 — FIXED
-            "unregister_server_reply_link_split", // 6 — OPEN: the close edge
+            "transfer_cap_present",      // 1: capability transfer
+            "endpoint waiter lifecycle", // 2: unpaired ack lifecycle
+            "overwrite fuse",            // 3: orphans refusing re-blocking
+            "ENDPOINT_WAITER_SLOTS",     // 4: the structural capacity
+            "install_server_reply_link", // 5: the creation edge
+            "close_server_reply_link",   // 6: the close edge
         ] {
             assert!(
                 doc.contains(blocker),
-                "the held-off record must account for the {blocker} blocker"
+                "the record must account for the {blocker} blocker"
             );
         }
-        assert_eq!(
-            doc.matches("**FIXED**").count(),
-            5,
-            "five blockers are recorded as fixed"
-        );
         assert!(
-            doc.contains("The remaining blocker"),
-            "the one open blocker is named as open"
+            doc.contains("links_created == links_closed"),
+            "the record states why the leak invariant is now meaningful"
         );
+        // AArch64 and RISC-V are explicitly unchanged.
         assert!(
-            doc.contains("IPC_SERVER_DEATH_LINK_LEAK created=54 closed=13"),
-            "the marker that proves the open blocker is recorded"
+            doc.contains("AArch64 and RISC-V still resolve to the")
+                && doc.contains("boots are byte-identical"),
+            "the record states that no other architecture was ported"
         );
-        assert!(
-            doc.contains("nr6_ok=1 nr7_ok=1 census_ok=1 result=ok"),
-            "the evidence that the rest of the flip is healthy is recorded too"
-        );
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "held off means held off"
-        );
+        // On this (x86_64-modelled) hosted build the default really is on.
+        assert!(crate::kernel::boot::ipccall_direct_production_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_admission_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_publication_enabled());
     }
 
     /// Endpoint admission is the ARCH-SPLIT predicate, never an oracle endpoint list: it is
@@ -93125,46 +93118,102 @@ mod stage200d1_publication_and_guards {
         );
     }
 
-    /// **Close-edge parity is NOT yet achieved** — this guard records the asymmetry so it
-    /// cannot be forgotten, and will need inverting when it is fixed.
+    /// **Close-edge parity.** All four closing paths delegate to the ONE shared close
+    /// decision, and the close stamp exists exactly once in the tree — the exact mirror of the
+    /// creation edge.
     ///
-    /// Unifying the creation edge exposed its mirror image: of the four reverse-link close
-    /// sites, only two stamp `note_link_closed`. With the direct NR6/NR7 path as the
-    /// production default the two silent ones retire links without counting them, and the
-    /// system-wide totals read `created=54 closed=13` — the 41 missing closes being exactly
-    /// the 41 direct NR7 completions on that boot. It is the reason
-    /// `ipccall_direct_production_enabled()` is still `false`.
+    /// The four paths used to carry independent copies, and two of them — the direct NR7 close
+    /// and the reply-timeout close — removed links without stamping at all. Unifying the
+    /// creation edge made that visible (`created=54 closed=13`, the 41 missing closes being
+    /// exactly the direct NR7 completions on that boot) and the leak attestation was wrong on
+    /// the production path in the permissive direction.
     #[test]
-    fn g10c_the_close_edge_is_not_yet_shared_and_the_flip_is_held_off() {
-        // The two counted close sites, both on the legacy seam.
+    fn g10c_every_close_path_delegates_to_the_one_shared_decision() {
+        // Exactly one close mutation and one close stamp in the whole tree, both inside the
+        // shared decision.
         assert_eq!(
-            IPC_STATE_SRC.matches("note_link_closed(").count(),
-            2,
-            "detach_server_reply_link_exact and take_server_reply_link count their closes"
+            MOD_SRC.matches("tcb.server_reply_link = None;").count(),
+            1,
+            "one place removes a reverse link"
         );
-        // The split close site removes a link and counts nothing.
-        let split_close = RUNTIME_SRC
-            .split("pub(crate) fn unregister_server_reply_link_split(")
+        assert_eq!(
+            MOD_SRC
+                .matches("server_dies_counters::note_link_closed(")
+                .count(),
+            1,
+            "one close stamp in the tree"
+        );
+        for (name, src) in [("ipc_state.rs", IPC_STATE_SRC), ("runtime.rs", RUNTIME_SRC)] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("server_reply_link = None"),
+                "{name}: no seam removes a link itself"
+            );
+            assert!(
+                !code.contains("server_reply_link.take()"),
+                "{name}: no seam takes a link itself"
+            );
+            assert!(
+                !code.contains("note_link_closed"),
+                "{name}: no seam stamps the close edge itself"
+            );
+        }
+        // All FOUR closing paths delegate.
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("crate::kernel::boot::close_server_reply_link(")
+                .count(),
+            3,
+            "detach_exact, take (exit path) and the reply-timeout close all delegate"
+        );
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("crate::kernel::boot::close_server_reply_link(")
+                .count(),
+            1,
+            "the direct NR7 close delegates"
+        );
+        // The stamp follows a genuine mutation and is unreachable from every refusal arm.
+        let body = MOD_SRC
+            .split("pub(crate) fn close_server_reply_link(")
             .nth(1)
-            .expect("the split close seam")
-            .split("\n    }\n")
+            .expect("the shared close decision")
+            .split("\n}\n")
             .next()
             .expect("body bounded");
+        let remove_at = body
+            .find("tcb.server_reply_link = None;")
+            .expect("the close removes the link");
+        let stamp_at = body
+            .find("note_link_closed(")
+            .expect("the close stamps the close edge");
         assert!(
-            split_close.contains("tcb.server_reply_link = None;"),
-            "the split seam removes the link"
+            remove_at < stamp_at,
+            "the close edge is stamped only after a genuine Some(link) -> None mutation"
+        );
+        for refusal in [
+            "return LinkCloseOutcome::AlreadyAbsent;",
+            "LinkCloseOutcome::StaleRecordGeneration",
+            "LinkCloseOutcome::DifferentLiveLink",
+        ] {
+            let at = body.find(refusal).expect("refusal arm present");
+            assert!(at < stamp_at, "the {refusal} arm precedes the stamp");
+        }
+        // `Any` is the exiting-server take path's selector, and only that path's.
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("crate::kernel::boot::LinkCloseSelector::Any")
+                .count(),
+            1,
+            "Any is used by exactly one path: the exiting-server take"
         );
         assert!(
-            !split_close.contains("note_link_closed"),
-            "KNOWN GAP: the split close does not count — see the held-off record on \
-             `ipccall_direct_production_enabled`. When this is fixed, invert this assertion \
-             and re-run the x86 ServerDies regression."
-        );
-        // Because that gap is open, the production default must stay off: with it on, the
-        // ServerDies audit fails on `IPC_SERVER_DEATH_LINK_LEAK`.
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "the production default must stay off while a close edge is uncounted"
+            !RUNTIME_SRC.contains("LinkCloseSelector::Any"),
+            "no split seam may close indiscriminately"
         );
     }
 
@@ -93220,11 +93269,13 @@ mod stage200d1_publication_and_guards {
             let at = helper.find(refusal).expect("refusal arm present");
             assert!(at < stamp_at, "the {refusal} arm precedes the stamp");
         }
-        // The close accounting is untouched by this change.
+        // The close edge is unified in exactly the same way — see `g10c`.
         assert_eq!(
-            IPC_STATE_SRC.matches("note_link_closed(").count(),
-            2,
-            "the two close edges are unchanged"
+            MOD_SRC
+                .matches("server_dies_counters::note_link_closed(")
+                .count(),
+            1,
+            "one close stamp in the tree, mirroring the one creation stamp"
         );
     }
 
@@ -97567,27 +97618,33 @@ mod stage200d2b1bi_counters {
         for src in [IPC_SRC, include_str!("../../runtime.rs")] {
             assert!(src.contains("crate::kernel::boot::install_server_reply_link(tcb, link)"));
         }
-        // 2 link detached — only when a link was actually taken.
-        let take = IPC_SRC
-            .split("pub(crate) fn take_server_reply_link(")
+        // 2 link detached — only when a link was actually removed. Stage 199D moved the close
+        // arms into the ONE shared close decision too, used by all FOUR closing paths, because
+        // two of the four copies removed links without counting them at all.
+        let close = mod_src
+            .split("pub(crate) fn close_server_reply_link(")
             .nth(1)
-            .expect("take");
-        let take = take.split("\n    /// ").next().unwrap();
-        // Stage 199D: the exit-path close reports the identity of the link it removed.
-        assert!(take.contains("if let Some(link) = taken {"));
-        assert!(take.contains("note_link_closed("));
-        assert!(take.contains("link.reply_record_index"));
-        // The ORDINARY terminal close is the second real closing edge and must also report.
-        let detach = IPC_SRC
-            .split("pub(crate) fn detach_server_reply_link_exact(")
-            .nth(1)
-            .expect("detach");
-        let detach = detach.split("\n    /// ").next().unwrap();
-        assert!(detach.contains("tcb.server_reply_link = None;"));
-        assert!(
-            detach.contains("note_link_closed("),
-            "the ordinary terminal close counts too — it used to count nothing, which is \
-             why created/closed was not a valid leak invariant"
+            .expect("the shared close decision");
+        let close = close.split("\n}\n").next().unwrap();
+        assert!(close.contains("tcb.server_reply_link = None;"));
+        let remove = close.find("tcb.server_reply_link = None;").unwrap();
+        let closed = close.find("note_link_closed(").expect("class 2");
+        assert!(remove < closed, "counted after the real removal");
+        // The close is attributed by the REMOVED link's identity, not by the selector, so the
+        // `Any` path reports the record it actually closed.
+        assert!(close.contains("link.reply_record_index"));
+        // All four closing paths reach it, and none counts on its own.
+        assert_eq!(
+            IPC_SRC
+                .matches("crate::kernel::boot::close_server_reply_link(")
+                .count(),
+            3
+        );
+        assert_eq!(
+            include_str!("../../runtime.rs")
+                .matches("crate::kernel::boot::close_server_reply_link(")
+                .count(),
+            1
         );
         // 3/4/5 deferred queue operations.
         for (f, class, must) in [
@@ -97675,8 +97732,9 @@ mod stage200d2b1bi_counters {
             .sum();
         assert_eq!(created, 1, "one reverse-link creation edge");
         assert_eq!(
-            closed, 2,
-            "two reverse-link closing edges: ordinary terminal + exit"
+            closed, 1,
+            "one reverse-link closing edge: all four closing paths delegate to the shared \
+             close decision, exactly as all installation paths delegate to the shared install"
         );
         // The scoped helpers are the ONLY way the link classes are reached, so an unscoped
         // link count cannot reappear by accident.
@@ -101790,6 +101848,343 @@ mod stage199d_ack_lease_lifecycle {
             2,
             "both are hosted-only"
         );
+    }
+}
+
+/// Stage 199D — **reverse-link CLOSE accounting parity** across all four closing paths.
+///
+/// The mirror of `stage199d_link_creation_parity`. The four paths carried independent copies
+/// of the close decision, and two of them — the direct NR7 close and the reply-timeout close —
+/// removed links without stamping at all. Unifying the creation edge made that visible: the
+/// system totals read `created=54 closed=13`, the 41 missing closes being exactly the direct
+/// NR7 completions on that boot, and the leak attestation was wrong on the production path in
+/// the permissive direction.
+///
+/// All four now delegate to `boot::close_server_reply_link`, so the accounting is identical by
+/// construction. These tests prove the counting behaviour of every arm and every caller.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage199d_link_close_parity {
+    use super::*;
+    use crate::kernel::boot::server_dies_counters as c;
+    use crate::kernel::boot::{DetachOutcome, LinkCloseOutcome, LinkCloseSelector};
+    use crate::kernel::task::ServerReplyLink;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const SERVER_TID: u64 = 2;
+    const REC: usize = 3;
+    const GEN: u64 = 7;
+
+    /// One server task holding exactly one installed reverse link.
+    fn fixture() -> (SharedKernel, Asid) {
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            s.register_task(SERVER_TID).expect("server");
+            let (asid, _sp) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(SERVER_TID, asid).expect("bind");
+            asid
+        });
+        assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN)));
+        assert_eq!(c::link_totals(), (1, 0), "one creation, no close yet");
+        (k, asid)
+    }
+
+    fn link_of(k: &SharedKernel) -> Option<ServerReplyLink> {
+        k.with(|s| {
+            s.with_tcbs(|t| {
+                t.iter()
+                    .flatten()
+                    .find(|x| x.tid.0 == SERVER_TID)
+                    .and_then(|x| x.server_reply_link)
+            })
+        })
+    }
+
+    /// CALLER 1 — the ordinary terminal close: closes once, stamps once.
+    #[test]
+    fn detach_exact_closes_and_stamps_once() {
+        let (k, asid) = fixture();
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN)),
+            DetachOutcome::Detached
+        );
+        assert_eq!(c::link_totals(), (1, 1), "creation + close balance 1/1");
+        assert_eq!(link_of(&k), None, "the link is gone");
+    }
+
+    /// CALLER 2 — the exiting-server take path: closes once, stamps once, returns the link.
+    #[test]
+    fn take_closes_and_stamps_once_and_returns_the_link() {
+        let (k, asid) = fixture();
+        let taken = k.with(|s| s.take_server_reply_link(SERVER_TID, asid));
+        assert_eq!(
+            taken.map(|l| (l.reply_record_index, l.reply_record_generation)),
+            Some((REC, GEN)),
+            "the removed link is returned"
+        );
+        assert_eq!(c::link_totals(), (1, 1), "creation + close balance 1/1");
+        assert_eq!(link_of(&k), None);
+    }
+
+    /// CALLER 3 — the direct NR7 close: closes once, stamps once. This is the path that used
+    /// to remove the link and count nothing.
+    #[test]
+    fn the_split_close_closes_and_stamps_once() {
+        let (k, asid) = fixture();
+        assert!(k.unregister_server_reply_link_split(SERVER_TID, asid, REC, GEN));
+        assert_eq!(c::link_totals(), (1, 1), "creation + close balance 1/1");
+        assert_eq!(link_of(&k), None);
+    }
+
+    /// A server holding a link for a REAL reserved reply record, which is what the
+    /// reply-timeout close resolves the replier from.
+    fn fixture_with_record() -> (SharedKernel, Asid, usize, u64) {
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, index, generation) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(SERVER_TID).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("caller asid");
+            let (asid, _sp) = s.create_user_address_space().expect("server asid");
+            s.bind_task_asid(1, casid).expect("bind caller");
+            s.bind_task_asid(SERVER_TID, asid).expect("bind server");
+            let (_e, _send, _recv) = s.create_endpoint(4).expect("reply ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier =
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(SERVER_TID), asid);
+            let (index, generation) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("reserve record");
+            (asid, index, generation)
+        });
+        assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, index, generation)));
+        assert_eq!(c::link_totals(), (1, 0));
+        (k, asid, index, generation)
+    }
+
+    /// CALLER 4 — the reply-timeout domain close: closes once, stamps once. Silent before
+    /// this increment.
+    #[test]
+    fn the_reply_timeout_close_closes_and_stamps_once() {
+        let (k, _asid, index, generation) = fixture_with_record();
+        let closed = k.with(|s| crate::kernel::boot::rt_detach_server_link(s, index, generation));
+        assert!(closed, "the reply-timeout close removed the link");
+        assert_eq!(c::link_totals(), (1, 1), "creation + close balance 1/1");
+        assert_eq!(link_of(&k), None);
+        // Repeat is idempotent and counts nothing more.
+        assert!(!k.with(|s| crate::kernel::boot::rt_detach_server_link(s, index, generation)));
+        assert_eq!(c::link_totals(), (1, 1));
+    }
+
+    /// The reply-timeout close is exact: a stale record generation removes nothing and counts
+    /// nothing.
+    #[test]
+    fn the_reply_timeout_close_is_exact() {
+        let (k, _asid, index, generation) = fixture_with_record();
+        assert!(!k.with(|s| crate::kernel::boot::rt_detach_server_link(
+            s,
+            index,
+            generation.wrapping_add(1)
+        )));
+        assert_eq!(c::link_totals(), (1, 0), "a stale close counts nothing");
+        assert!(link_of(&k).is_some(), "and the live link survives");
+    }
+
+    /// EXACT mismatch, absent and repeat all stamp ZERO and disturb nothing.
+    #[test]
+    fn mismatch_absent_and_repeat_stamp_zero() {
+        // A DIFFERENT live record: refused, nothing removed, nothing counted.
+        let (k, asid) = fixture();
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC + 1, GEN)),
+            DetachOutcome::DifferentLiveLink
+        );
+        // The SAME slot at a later generation: the slot was reused, so this close belongs to
+        // a previous occupant.
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN + 1)),
+            DetachOutcome::StaleRecordGeneration
+        );
+        // A FOREIGN server incarnation: numeric TID reuse with a fresh ASID.
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, Asid(0xBEE), REC, GEN)),
+            DetachOutcome::StaleServerIdentity
+        );
+        // And the split seam agrees on every one of them.
+        assert!(!k.unregister_server_reply_link_split(SERVER_TID, asid, REC + 1, GEN));
+        assert!(!k.unregister_server_reply_link_split(SERVER_TID, asid, REC, GEN + 1));
+        assert!(!k.unregister_server_reply_link_split(SERVER_TID, Asid(0xBEE), REC, GEN));
+        assert_eq!(
+            c::link_totals(),
+            (1, 0),
+            "not one of those closes counted, and the link is untouched"
+        );
+        assert!(
+            link_of(&k).is_some(),
+            "the live link survives every refusal"
+        );
+
+        // Now close it for real, then REPEAT on every path: idempotent, and still 1/1.
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN)),
+            DetachOutcome::Detached
+        );
+        assert_eq!(c::link_totals(), (1, 1));
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN)),
+            DetachOutcome::AlreadyAbsent
+        );
+        assert!(!k.unregister_server_reply_link_split(SERVER_TID, asid, REC, GEN));
+        assert_eq!(k.with(|s| s.take_server_reply_link(SERVER_TID, asid)), None);
+        assert_eq!(
+            c::link_totals(),
+            (1, 1),
+            "a repeated close on any path is idempotent and counts nothing"
+        );
+    }
+
+    /// The `Any` selector removes exactly the present link — whichever record it names — and
+    /// is a no-op when there is none.
+    #[test]
+    fn any_removes_exactly_the_present_link() {
+        c::reset_instance();
+        let mut tcb = crate::kernel::task::ThreadControlBlock::new(
+            crate::kernel::ipc::ThreadId(SERVER_TID),
+            Some(Asid(5)),
+        );
+        tcb.status = crate::kernel::task::TaskStatus::Runnable;
+        // No link: `Any` is a pure no-op.
+        assert_eq!(
+            crate::kernel::boot::close_server_reply_link(&mut tcb, LinkCloseSelector::Any),
+            LinkCloseOutcome::AlreadyAbsent
+        );
+        assert_eq!(c::link_totals(), (0, 0));
+        // A link naming an arbitrary record is removed regardless of which record it is.
+        let link = ServerReplyLink {
+            server_tid: SERVER_TID,
+            server_asid: Asid(5),
+            reply_record_index: 41,
+            reply_record_generation: 9,
+        };
+        tcb.server_reply_link = Some(link);
+        assert_eq!(
+            crate::kernel::boot::close_server_reply_link(&mut tcb, LinkCloseSelector::Any),
+            LinkCloseOutcome::Closed(link)
+        );
+        assert_eq!(tcb.server_reply_link, None);
+        assert_eq!(
+            c::link_totals(),
+            (0, 1),
+            "one close, attributed to record 41"
+        );
+        // Repeat is idempotent.
+        assert_eq!(
+            crate::kernel::boot::close_server_reply_link(&mut tcb, LinkCloseSelector::Any),
+            LinkCloseOutcome::AlreadyAbsent
+        );
+        assert_eq!(c::link_totals(), (0, 1));
+    }
+
+    /// Creation plus EACH closing edge balances 1/1 — the property the whole increment exists
+    /// to establish.
+    #[test]
+    fn creation_plus_each_closing_edge_balances() {
+        for edge in ["detach_exact", "take", "split", "reply_timeout"] {
+            // The reply-timeout close resolves its replier from a real reply record.
+            let (k, asid, rec, generation) = if edge == "reply_timeout" {
+                fixture_with_record()
+            } else {
+                let (k, asid) = fixture();
+                (k, asid, REC, GEN)
+            };
+            let closed = match edge {
+                "detach_exact" => {
+                    k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, rec, generation))
+                        == DetachOutcome::Detached
+                }
+                "take" => k
+                    .with(|s| s.take_server_reply_link(SERVER_TID, asid))
+                    .is_some(),
+                "split" => k.unregister_server_reply_link_split(SERVER_TID, asid, rec, generation),
+                _ => k.with(|s| crate::kernel::boot::rt_detach_server_link(s, rec, generation)),
+            };
+            assert!(closed, "{edge}: the link was closed");
+            let (created, closed_n) = c::link_totals();
+            assert_eq!(
+                (created, closed_n),
+                (1, 1),
+                "{edge}: creation + close balance 1/1"
+            );
+            assert_eq!(link_of(&k), None, "{edge}: no link survives");
+        }
+    }
+
+    /// Ordinary direct NR6/NR7 batches balance system-wide: many installs through the SPLIT
+    /// install seam, many closes through the SPLIT close seam.
+    #[test]
+    fn direct_batches_balance_system_wide() {
+        const SERVERS: u64 = 12;
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut servers = alloc::vec::Vec::new();
+        k.with(|s| {
+            for n in 0..SERVERS {
+                let tid = 2 + n;
+                s.register_task(tid).expect("server");
+                let (asid, _sp) = s.create_user_address_space().expect("asid");
+                s.bind_task_asid(tid, asid).expect("bind");
+                servers.push((tid, asid));
+            }
+        });
+        // Two full request/reply rounds, entirely on the direct-path seams.
+        for round in 0..2u64 {
+            for (i, (tid, asid)) in servers.iter().enumerate() {
+                assert!(k.register_server_reply_link_split(*tid, *asid, i, GEN + round));
+            }
+            assert_eq!(c::link_totals().0, SERVERS as u32 * (round + 1) as u32);
+            for (i, (tid, asid)) in servers.iter().enumerate() {
+                assert!(k.unregister_server_reply_link_split(*tid, *asid, i, GEN + round));
+            }
+            let (created, closed) = c::link_totals();
+            assert_eq!(
+                created, closed,
+                "round {round}: system-wide balance after every direct transaction"
+            );
+        }
+        assert_eq!(c::link_totals(), (24, 24));
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t
+                .iter()
+                .flatten()
+                .filter(|x| x.server_reply_link.is_some())
+                .count())),
+            0,
+            "no reverse link survives quiescence"
+        );
+    }
+
+    /// A ServerDies-shaped exit close balances: the server is torn down while holding a live
+    /// link, and the exit-path take closes it exactly once.
+    #[test]
+    fn a_serverdies_shaped_exit_close_balances() {
+        let (k, asid) = fixture();
+        // The exiting incarnation still holds its authority.
+        assert!(link_of(&k).is_some());
+        let taken = k.with(|s| s.take_server_reply_link(SERVER_TID, asid));
+        assert!(taken.is_some(), "the exit path takes the live link");
+        let (created, closed) = c::link_totals();
+        assert_eq!((created, closed), (1, 1), "exit close balances 1/1");
+        // A second teardown pass (idempotent teardown is normal) counts nothing more.
+        assert_eq!(k.with(|s| s.take_server_reply_link(SERVER_TID, asid)), None);
+        assert_eq!(c::link_totals(), (1, 1));
     }
 }
 

@@ -3212,16 +3212,30 @@ impl SharedKernel {
             else {
                 return false;
             };
-            match tcb.server_reply_link {
-                Some(link)
-                    if link.matches_server(server_tid, server_asid)
-                        && link.matches_record(record_index, record_generation) =>
-                {
-                    tcb.server_reply_link = None;
-                    true
-                }
-                _ => false,
+            // Stage 199D: the direct NR7 close, on the SAME shared decision the legacy seams
+            // use. It used to remove the link without stamping the close edge, so with the
+            // direct path as the production default the system totals read
+            // `created=54 closed=13` and the leak attestation was wrong permissively.
+            //
+            // The defensive server re-verify stays HERE, ahead of the shared decision: the
+            // TCB lookup already pinned `{tid, asid}`, so this only rejects a link that names
+            // some other server, which would be an installation bug. Preserving it keeps this
+            // seam's `false` contract byte-identical.
+            if !tcb
+                .server_reply_link
+                .is_some_and(|l| l.matches_server(server_tid, server_asid))
+            {
+                return false;
             }
+            crate::kernel::boot::close_server_reply_link(
+                tcb,
+                crate::kernel::boot::LinkCloseSelector::Exact {
+                    record_index,
+                    record_generation,
+                },
+            )
+            .closed()
+            .is_some()
         })
     }
 

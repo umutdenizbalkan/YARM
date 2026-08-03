@@ -3124,62 +3124,41 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # HELD OFF — one live blocker remains (Stage 199D)
+/// # ENABLED on x86_64 — Stage 199D production default
 ///
-/// Flipping this to `cfg!(target_arch = "x86_64")` is the whole enablement, and with it on
-/// the normal feature-off x86_64 boot is **fully healthy**: `YARM_BOOT_OK`, all 6 service
-/// entries exactly once, `PM_ELF_ZC_FAIL count=0`, 53 NR6 and 41 NR7 ordinary syscalls
-/// completed off-lock with zero broad-lock entries, zero capacity refusals, zero fuse trips,
-/// and an exact lease/waiter bijection
-/// (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`). The x86
-/// direct NR6/NR7 oracle regression passes with it on (`live_cells=2 result=ok`).
+/// The off-lock direct NR6/NR7 path is the **production default on x86_64**: ordinary
+/// `IpcCall`/`IpcReply` traffic is serviced before the broad kernel lock, with no oracle, no
+/// proof gate and no endpoint confinement involved. AArch64 and RISC-V still resolve to the
+/// proof gate and the oracle confinement, so their boots are byte-identical.
 ///
-/// Five of the original blockers are closed:
+/// Six blockers stood between the mechanism and this default. Every one was found by a live
+/// boot rather than by inspection, and every one is closed:
 ///
-/// 1. ~~Capability transfer silently dropped.~~ **FIXED** — NR7 eligibility carries
-///    `transfer_cap_present`; a cap-bearing reply declines before any mutation.
-/// 2. ~~No production release path.~~ **FIXED** — the acknowledgement lease is owned by the
-///    endpoint waiter lifecycle.
-/// 3. ~~Orphans trip the overwrite fuse.~~ **FIXED** — 17 trips before, 0 now.
-/// 4. ~~Magic capacity of 8.~~ **FIXED** — [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`]
-///    is [`ENDPOINT_WAITER_SLOTS`], one slot per endpoint index, derived at compile time.
-/// 5. ~~The link CREATION edge was blind to the direct path.~~ **FIXED** — both installation
-///    seams delegate to [`install_server_reply_link`], the ONE installation decision, so the
-///    creation stamp cannot drift. Live: `created` went from 0 to 54.
+/// 1. **Capability transfer was silently dropped.** NR7 eligibility carries
+///    `transfer_cap_present`, asked through the one canonical `transfer_cap_arg_present`
+///    predicate the legacy decode is itself built on; a cap-bearing reply declines before any
+///    mutation and the legacy path does the transfer. Direct capability transfer remains
+///    unimplemented — declining is the whole fix.
+/// 2. **The acknowledgement store had no production release path.** The lease is owned by the
+///    endpoint waiter lifecycle: the three `IpcSubsystem` waiter-removal primitives every
+///    canonical closing edge funnels through retire the exact
+///    `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` lease.
+/// 3. **Orphans tripped the overwrite fuse** — 17 trips on the first attempt, 0 now.
+/// 4. **Capacity was a magic 8**, smaller than the number of services a normal boot parks in
+///    recv-v2 at once. [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`] is now
+///    [`ENDPOINT_WAITER_SLOTS`] — one slot per endpoint index, derived at compile time from
+///    the authoritative endpoint receive-waiter table rather than chosen.
+/// 5. **The reverse-link CREATION edge was blind to the direct path.** Both installation seams
+///    now delegate to [`install_server_reply_link`].
+/// 6. **The reverse-link CLOSE edge had the same divergence**, in the permissive direction:
+///    two of the four closing paths removed links without counting them. All four now delegate
+///    to [`close_server_reply_link`].
 ///
-/// # The remaining blocker: the link CLOSE edge has the same split/legacy divergence
-///
-/// Fixing the creation edge exposed its mirror image. There are four reverse-link close
-/// sites, and only two of them stamp `server_dies_counters::note_link_closed`:
-///
-/// | site | stamps |
-/// | --- | --- |
-/// | `KernelState::detach_server_reply_link_exact` (ordinary terminal close) | yes |
-/// | `KernelState::take_server_reply_link` (exit-path close) | yes |
-/// | `SharedKernel::unregister_server_reply_link_split` (the direct NR7 close) | **no** |
-/// | `rt_detach_server_reply_link` (the reply-timeout domain close) | **no** |
-///
-/// With the direct path as the production default, `unregister_server_reply_link_split`
-/// retires the reverse link for every direct NR7 reply without counting it, so the
-/// system-wide totals report far more creations than closes:
-///
-/// ```text
-/// IPC_SERVER_DEATH_LINK_LEAK created=54 closed=13 scope=system result=fail
-/// STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL arch=x86_64 result=fail
-/// ```
-///
-/// The 41 missing closes are exactly the 41 direct NR7 completions on that boot. As with the
-/// creation edge the links themselves are correct — installed and removed properly — and this
-/// is an accounting gap, but the same reasoning applies: while it is open the attestation that
-/// would detect a *real* reverse-link leak is wrong on the production path, now in the
-/// permissive direction.
-///
-/// The fix is the exact mirror of the creation one: give the close its own single shared
-/// decision that both the legacy and split seams delegate to, with the stamp on the arm that
-/// genuinely removes a link, and bring the reply-timeout site onto it too. Until that lands
-/// the production default stays off.
+/// Both link edges are single shared decisions, so creation and close accounting are identical
+/// across the legacy and split seams by construction rather than by inspection — which is what
+/// makes `links_created == links_closed` a meaningful leak invariant on the production path.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    false
+    cfg!(target_arch = "x86_64")
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.
@@ -4158,6 +4137,116 @@ pub(crate) fn install_server_reply_link(
             true
         }
     }
+}
+
+/// The reply-timeout domain's reverse-link close, re-exported so the fourth closing path has a
+/// direct behavioural test rather than only a structural one. It stays a narrow-domain helper
+/// with no production callers outside `ipc_state`.
+pub(crate) use ipc_state::rt_detach_server_link;
+
+/// Which reverse link a close is entitled to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkCloseSelector {
+    /// Remove the link **only** if it names this exact reply-record incarnation. Every
+    /// ordinary terminal close uses this: reply, timeout, caller exit, endpoint destruction,
+    /// cancellation and rollback all know which record they are finalizing, and a close that
+    /// does not name it has no business removing an authority.
+    Exact {
+        record_index: usize,
+        record_generation: u64,
+    },
+    /// Remove whatever link is present, whichever record it names.
+    ///
+    /// Used **only** by the exiting-server take path, which is not finalizing one record —
+    /// the whole incarnation is going away, so any authority it still holds must go with it.
+    Any,
+}
+
+/// The outcome of a reverse-link close.
+///
+/// Only [`LinkCloseOutcome::Closed`] mutates. Every other variant leaves the slot exactly as
+/// it was, so an absent, stale, foreign, repeated or non-matching close is a pure no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkCloseOutcome {
+    /// A link was genuinely removed, and is returned. The only mutating result, and the only
+    /// one that stamps the close edge.
+    Closed(crate::kernel::task::ServerReplyLink),
+    /// No link was present — the idempotent repeat case.
+    AlreadyAbsent,
+    /// The same record slot at a DIFFERENT generation: the slot was reclaimed and reused, so
+    /// this close belongs to a previous occupant and must mutate nothing.
+    StaleRecordGeneration,
+    /// A different outstanding record is live on this server. Removing it would silently
+    /// strip a valid authority, so it is refused.
+    DifferentLiveLink,
+}
+
+impl LinkCloseOutcome {
+    /// The removed link, when this call is the one that closed it.
+    pub(crate) fn closed(self) -> Option<crate::kernel::task::ServerReplyLink> {
+        match self {
+            Self::Closed(link) => Some(link),
+            Self::AlreadyAbsent | Self::StaleRecordGeneration | Self::DifferentLiveLink => None,
+        }
+    }
+}
+
+/// Stage 199D — **THE single reverse-link CLOSE decision**, shared by all four closing paths:
+/// `KernelState::detach_server_reply_link_exact`, `KernelState::take_server_reply_link`,
+/// `SharedKernel::unregister_server_reply_link_split` and the reply-timeout domain's
+/// `rt_detach_server_link`.
+///
+/// The exact mirror of [`install_server_reply_link`], and it exists for the same reason. The
+/// four paths carried independent copies of this decision and two of them — the direct NR7
+/// close and the reply-timeout close — removed links without stamping the close edge, while
+/// the other two stamped. Unifying the *creation* edge made that visible: the system totals
+/// went to `created=54 closed=13`, the 41 missing closes being exactly the direct NR7
+/// completions on that boot, and the leak attestation was wrong on the production path in the
+/// permissive direction.
+///
+/// Sharing the decision — not merely the stamp — is what makes it unrepeatable: one set of
+/// match arms and one `note_link_closed` call, on the arm that genuinely removes a link.
+///
+/// | case | removes | outcome | stamps |
+/// | --- | --- | --- | --- |
+/// | `Exact`, link matches the record incarnation | yes | `Closed(link)` | **yes** |
+/// | `Any`, a link is present | yes | `Closed(link)` | **yes** |
+/// | no link present (absent, or a repeated close) | no | `AlreadyAbsent` | no |
+/// | `Exact`, same slot at a different generation | no | `StaleRecordGeneration` | no |
+/// | `Exact`, a different record is live | no | `DifferentLiveLink` | no |
+///
+/// A missing or foreign TCB never reaches here — every caller resolves the exact
+/// `{tid, asid}` incarnation first and reports its own contract's failure without calling in.
+pub(crate) fn close_server_reply_link(
+    tcb: &mut crate::kernel::task::ThreadControlBlock,
+    selector: LinkCloseSelector,
+) -> LinkCloseOutcome {
+    let Some(link) = tcb.server_reply_link else {
+        return LinkCloseOutcome::AlreadyAbsent;
+    };
+    if let LinkCloseSelector::Exact {
+        record_index,
+        record_generation,
+    } = selector
+        && !link.matches_record(record_index, record_generation)
+    {
+        // Same slot, later incarnation: the slot was reclaimed and this close belongs to a
+        // previous occupant. Distinguished from a wholly different record because the two are
+        // very different bugs, and both callers that care report them separately.
+        return if link.reply_record_index == record_index {
+            LinkCloseOutcome::StaleRecordGeneration
+        } else {
+            LinkCloseOutcome::DifferentLiveLink
+        };
+    }
+    tcb.server_reply_link = None;
+    // The SYSTEM-WIDE close edge, stamped exactly once and only after a genuine
+    // `Some(link) -> None` mutation. It is attributed by the REMOVED link's record identity,
+    // not by the selector, so the `Any` path reports the record it actually closed and the
+    // armed ServerDies vector is moved only when it is that transaction's own link.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    server_dies_counters::note_link_closed(link.reply_record_index, link.reply_record_generation);
+    LinkCloseOutcome::Closed(link)
 }
 
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]

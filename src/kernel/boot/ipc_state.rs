@@ -205,7 +205,13 @@ fn rt_claim_endpoint_waiter_exact<D: ReplyTimeoutDomains>(
 /// This is the narrow-transaction counterpart of
 /// `KernelState::finalize_server_reply_link_for_record`; both close the SAME single
 /// lifecycle edge, so no terminal path can complete a record and leave its link live.
-fn rt_detach_server_link<D: ReplyTimeoutDomains>(d: &mut D, index: usize, generation: u64) -> bool {
+// `pub(crate)` so the fourth closing path has a direct behavioural test rather than only a
+// structural one; it stays a narrow-domain helper with no callers outside this module.
+pub(crate) fn rt_detach_server_link<D: ReplyTimeoutDomains>(
+    d: &mut D,
+    index: usize,
+    generation: u64,
+) -> bool {
     let bound = d.rtd_ipc(|ipc| {
         if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
             return None;
@@ -226,13 +232,17 @@ fn rt_detach_server_link<D: ReplyTimeoutDomains>(d: &mut D, index: usize, genera
         else {
             return false;
         };
-        match tcb.server_reply_link {
-            Some(link) if link.matches_record(index, generation) => {
-                tcb.server_reply_link = None;
-                true
-            }
-            _ => false,
-        }
+        // Stage 199D: the reply-timeout domain's close, on the SAME shared decision as the
+        // other three. It used to remove the link and count nothing.
+        crate::kernel::boot::close_server_reply_link(
+            tcb,
+            crate::kernel::boot::LinkCloseSelector::Exact {
+                record_index: index,
+                record_generation: generation,
+            },
+        )
+        .closed()
+        .is_some()
     })
 }
 
@@ -1325,32 +1335,22 @@ impl KernelState {
             else {
                 return DetachOutcome::StaleServerIdentity;
             };
-            match tcb.server_reply_link {
-                None => DetachOutcome::AlreadyAbsent,
-                Some(link) if link.matches_record(record_index, record_generation) => {
-                    tcb.server_reply_link = None;
-                    // Stage 199D: the ORDINARY terminal close — reply, timeout, caller exit,
-                    // endpoint destruction, cancellation, rollback. It used to count nothing
-                    // at all, which is why the created/detached pair was not even a valid
-                    // leak invariant. It is a genuine removal, so it closes a link for the
-                    // system totals; it moves the armed vector only if it is the armed
-                    // record's link (the reply-wins case, which the audit then correctly
-                    // fails on `PeerDeathWinner == 0`).
-                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-                    crate::kernel::boot::server_dies_counters::note_link_closed(
-                        record_index,
-                        record_generation,
-                    );
-                    DetachOutcome::Detached
-                }
-                // Same slot, different generation: the slot was reclaimed and reused, so
-                // this unlink belongs to a previous occupant and must mutate nothing.
-                Some(link) if link.reply_record_index == record_index => {
-                    DetachOutcome::StaleRecordGeneration
-                }
-                // A different outstanding record is live on this server. Removing it
-                // would silently strip a valid authority, so it is refused.
-                Some(_) => DetachOutcome::DifferentLiveLink,
+            // Stage 199D: the ORDINARY terminal close — reply, timeout, caller exit, endpoint
+            // destruction, cancellation, rollback. The match arms and the close stamp live in
+            // the ONE shared decision, so this path and the three others cannot drift apart
+            // again; two of them used to remove links without counting them at all.
+            use crate::kernel::boot::{LinkCloseOutcome, LinkCloseSelector};
+            match crate::kernel::boot::close_server_reply_link(
+                tcb,
+                LinkCloseSelector::Exact {
+                    record_index,
+                    record_generation,
+                },
+            ) {
+                LinkCloseOutcome::Closed(_) => DetachOutcome::Detached,
+                LinkCloseOutcome::AlreadyAbsent => DetachOutcome::AlreadyAbsent,
+                LinkCloseOutcome::StaleRecordGeneration => DetachOutcome::StaleRecordGeneration,
+                LinkCloseOutcome::DifferentLiveLink => DetachOutcome::DifferentLiveLink,
             }
         })
     }
@@ -1424,25 +1424,22 @@ impl KernelState {
         server_tid: u64,
         server_asid: Asid,
     ) -> Option<crate::kernel::task::ServerReplyLink> {
-        let taken = self.with_tcbs_mut(|tcbs| {
-            tcbs.iter_mut()
-                .flatten()
-                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
-                .and_then(|t| t.server_reply_link.take())
-        });
-        // Stage 199D: the EXIT-PATH close. Counted only when a link was ACTUALLY removed —
+        // Stage 199D: the EXIT-PATH close, and the ONLY user of the `Any` selector — this is
+        // not finalizing one record, the whole incarnation is going away, so any authority it
+        // still holds must go with it. The removal and its stamp are the shared decision's;
         // the lookup is exact on {tid, asid}, so a reused numeric TID with a different ASID
-        // matches nothing, detaches nothing and records nothing. The removed link carries
-        // the record identity, so the close is attributed to the transaction that owns it
-        // rather than to whichever transaction happens to be armed.
-        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-        if let Some(link) = taken {
-            crate::kernel::boot::server_dies_counters::note_link_closed(
-                link.reply_record_index,
-                link.reply_record_generation,
-            );
-        }
-        taken
+        // matches nothing, detaches nothing and records nothing.
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))?;
+            crate::kernel::boot::close_server_reply_link(
+                tcb,
+                crate::kernel::boot::LinkCloseSelector::Any,
+            )
+            .closed()
+        })
     }
 
     /// Total live reverse links (hosted leak accounting only).
