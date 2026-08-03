@@ -95,7 +95,7 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 | `ExitCurrentTask` NR 16 | **2 of 3** | x86_64 `0b5e98f`, AArch64; 202D (one sub-path; RISC-V unearned) |
 | **Server death (`ServerDies`) — x86_64** | **1 of 3** | **`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`; canonical 199D server-crash-cleanup increment** |
 | **Accepted total (production-path)** | **39** | 30 + 6 + 2 + 1 |
-| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D mechanism, **not** the production path |
+| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated**, ⚠️ **not currently reproducible** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok` was earned at `ccceb03d`; proves the 199D mechanism, **not** the production path. The seal does **not** reproduce at HEAD — see §0.1 below. |
 
 > **On the total.** There is no aggregate live-cell counter anywhere in the tree; the only
 > in-tree aggregate is Stage 198F's `total_live_cells=30`. The figure above is computed from
@@ -122,6 +122,50 @@ Exact commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
   survivor and health attested.
 
 Full detail: `doc/IPC.md` §8.5.
+
+### 0.1 x86_64 SMP=2 direct-IPC seal — reproduction status
+
+The four-run `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` was earned at `ccceb03d`. It does **not**
+reproduce at HEAD. Three independent defects were found; **one is repaired**, two are open and
+deliberately not folded into that repair.
+
+| # | Symptom | First bad | Status |
+|---|---------|-----------|--------|
+| 1 | RUN_C: `X86_AP_RECV_V2_VALIDATE_FAIL`; request-OK / user-validated absent | `458bb3d4` | ✅ **repaired** (`db783142`) |
+| 2 | RUN_C: `X86_AP_RESCHEDULE_IPI_SENT sender_cpu=0 receiver_cpu=1` fires **54×**, seal requires 1 | in `(da9d26e2, f3c2e00c]` | ❌ open |
+| 3 | RUN_D: reverse NR7 direction never completes — `IPCREPLY_DIRECT_SMP_REPLY_OK=0`, `result=fail reason=timeout_before_completion` | not yet bisected | ❌ open |
+
+**Defect 1 (repaired).** `ipc_call` (NR6) sends `opcode = OPCODE_INLINE` with `FLAG_REPLY_CAP`,
+which by the frozen recv-v2 contract makes the raw payload a **framed** message: first two bytes
+are the inline application opcode, the rest is application data. Every legacy path stripped that
+prefix; `458bb3d4` correctly converged the direct NR6 path onto the one canonical
+`project_recv_delivery`. The x86 SMP oracle's CPU-0 client had **never framed its request** — it
+staged eight bare bytes `NR6-REQ!`. Pre-`458bb3d4` the unstripped delivery meant the CPU-1 server
+saw exactly those eight bytes and validated; afterwards they were correctly reinterpreted as
+`opcode = 0x524E` plus a six-byte payload `6-REQ!`, so the server's ring-3 comparison failed.
+**The kernel was right; the oracle was asserting pre-conformance framing.** The repair stages a
+genuine two-byte inline opcode ahead of the payload (wire length 8 → 10) in both client stubs; the
+CPU-1 server stub is unchanged. Boundaries 1–13 of the causal chain now all pass.
+
+**Defect 2 (open).** Provably independent of defect 1 — the IPI count is 54 both with and without
+that fix. It was 1 at `ccceb03d`, `ffc8e3ee`, `458bb3d4`, `8dfdb204`, `42e07907`, `3a0d61cb` and
+`da9d26e2`, and 54 by `f3c2e00c`, so its first-bad range is `(da9d26e2, f3c2e00c]` — which
+includes several Stage 199D commits. All 54 sends precede the request completing and only one is
+received.
+
+**Defect 3 (open).** RUN_D's *forward* direction now passes (`IPCCALL_DIRECT_SMP_REQUEST_OK=1`,
+`X86_AP_RECV_V2_USER_VALIDATED cpu=1`), so the framing repair helps there too; the reverse NR7
+direction never completes.
+
+The four-run seal at `db783142` records: RUN_A ✅ (feature-off, marker-clean), RUN_B ✅
+(`request=1 reply=1 server_wakes=1 caller_wakes=1 duplicate_reply=rejected`), then
+`result=fail reason=C_smoke` on defect 2. It stops at the first failure, so RUN_D is only
+reachable standalone.
+
+Unaffected and re-verified live at `db783142`: x86 production core boot, ServerDies
+(`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL … result=ok`), and the x86 reply-timeout retirement smoke.
+The reply-timeout **matrix** fails only at its first AArch64 cell because `qemu-system-aarch64` is
+not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_off_clean=2`).
 
 ### Immediate blockers
 
