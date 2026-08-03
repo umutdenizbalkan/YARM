@@ -1646,7 +1646,44 @@ impl KernelState {
         const CLIENT_NR6_FAIL_MARKER: &[u8] = b"X86_BSP_NR6_REQUEST cpu=0 result=fail\n";
         const _: () = assert!(CLIENT_NR6_MARKER.len() == 55);
         const _: () = assert!(CLIENT_NR6_FAIL_MARKER.len() == 38);
-        const CLIENT_NR6_REQUEST: &[u8] = b"NR6-REQ!";
+        // Stage 199D repair — the request must be staged in PRODUCTION FRAMING.
+        //
+        // `ipc_call` (NR6) sends `opcode = OPCODE_INLINE` with `FLAG_REPLY_CAP`, which by the frozen
+        // recv-v2 contract means the raw payload is a FRAMED message: its first two bytes are the
+        // inline application opcode and the remainder is the application data. Every legacy delivery
+        // path stripped that prefix; commit 458bb3d4 made the direct NR6 path conform, via the one
+        // canonical `project_recv_delivery`.
+        //
+        // This oracle client had never framed its request — it staged eight bare bytes. Under the
+        // pre-458bb3d4 direct path, which delivered the raw wire frame unstripped, the CPU-1 server
+        // happened to observe `NR6-REQ!` with `payload_len = 8` and validated. Once the direct path
+        // started conforming, those same eight bytes were correctly reinterpreted as
+        // `opcode = 0x524E` ("NR") plus a SIX-byte application payload `6-REQ!`, the server's ring-3
+        // comparison failed, `X86_AP_RECV_V2_VALIDATE_FAIL` fired, and the terminal request-OK
+        // marker — gated on the server's continuation — was never emitted. The kernel was right and
+        // the oracle was asserting pre-conformance framing.
+        //
+        // Staging a genuine two-byte inline opcode ahead of the payload restores the invariant the
+        // proof is actually about — *the receiver observes exactly the application bytes the sender
+        // sent* — and makes the oracle exercise production framing rather than an artefact of it.
+        // The CPU-1 server stub is UNCHANGED: it still validates `NR6-REQ!` and `payload_len == 8`,
+        // which is precisely what the conforming projection now delivers.
+        const CLIENT_NR6_INLINE_OPCODE: u16 = 0x0199;
+        const CLIENT_NR6_APP_PAYLOAD: &[u8] = b"NR6-REQ!";
+        const CLIENT_NR6_REQUEST: &[u8] = &[
+            0x99, 0x01, // CLIENT_NR6_INLINE_OPCODE, little-endian
+            b'N', b'R', b'6', b'-', b'R', b'E', b'Q', b'!',
+        ];
+        /// The wire length the client passes to NR6: two-byte prefix + eight application bytes.
+        const CLIENT_NR6_WIRE_LEN: u8 = 10;
+        // The staged bytes really are the declared opcode followed by the declared payload, and the
+        // wire length really is their sum. Compile-time, so the three cannot drift apart.
+        const _: () = assert!(CLIENT_NR6_REQUEST.len() == CLIENT_NR6_WIRE_LEN as usize);
+        const _: () = assert!(CLIENT_NR6_APP_PAYLOAD.len() == 8);
+        const _: () = assert!(CLIENT_NR6_REQUEST[0] == CLIENT_NR6_INLINE_OPCODE.to_le_bytes()[0]);
+        const _: () = assert!(CLIENT_NR6_REQUEST[1] == CLIENT_NR6_INLINE_OPCODE.to_le_bytes()[1]);
+        const _: () = assert!(CLIENT_NR6_REQUEST[2] == CLIENT_NR6_APP_PAYLOAD[0]);
+        const _: () = assert!(CLIENT_NR6_REQUEST[9] == CLIENT_NR6_APP_PAYLOAD[7]);
         // Stage 199A2D2C2C: reverse-direction (NR7 reply) client markers. After the NR6 SEND, the C2C
         // client issues a genuine recv-v2 on its OWN reply endpoint (blocking on CPU 0). When the CPU-1
         // server's reply is delivered + the client's saved frame resumes, it validates the reply bytes
@@ -1670,7 +1707,9 @@ impl KernelState {
         const RECV_V2_SERVER_REPLY_SRC_VA: u64 = 0x0000_0000_2005_0000;
         const CLIENT_STUB: [u8; 97] = [
             0x31, 0xDB, 0xFF, 0xC3, 0xB8, 0x06, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x00, 0x00,
-            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x00, 0x00,
+            // `mov edx, 0x0A` @20 — the FRAMED wire length (2-byte inline opcode + 8 app bytes),
+            // pinned to CLIENT_NR6_WIRE_LEN by the const assert below.
+            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x0A, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x00, 0x00,
             0x00, 0x00, 0x0F, 0x05, 0x85, 0xC9, 0x74, 0x10, 0x83, 0xF9, 0x07, 0x75, 0x25, 0x83,
             0xFB, 0x40, 0x73, 0x20, 0x31, 0xC0, 0x0F, 0x05, 0xEB, 0xCE, 0xB8, 0x0F, 0x00, 0x00,
             0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x37, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8,
@@ -1678,6 +1717,12 @@ impl KernelState {
             0x00, 0x01, 0x02, 0x20, 0xBE, 0x26, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xE4,
         ];
         const CLIENT_STUB_SEND_CAP_PATCH_OFFSET: usize = 10;
+        /// Offset of the NR6 length immediate (`mov edx, imm32`) in both client stubs.
+        const CLIENT_STUB_NR6_LEN_OFFSET: usize = 20;
+        // The hex immediate baked into each stub IS the declared framed wire length. Compile-time,
+        // so the machine code and the staged request can never disagree about the length again —
+        // which is exactly how the un-framed request went unnoticed until a live QEMU run.
+        const _: () = assert!(CLIENT_STUB[CLIENT_STUB_NR6_LEN_OFFSET] == CLIENT_NR6_WIRE_LEN);
         const CLIENT_STUB_REPLY_CAP_PATCH_OFFSET: usize = 26;
         // Stage 199A2D2C2C: the REVERSE-direction client stub. Prefix identical to CLIENT_STUB (bounded
         // NR6 retry, SEND cap @10, reply RECEIVE cap in NR6 arg5/R9 @26), but after X86_BSP_NR6_REQUEST_
@@ -1690,7 +1735,9 @@ impl KernelState {
         // (@26, @83) are patched to the SAME client reply RECEIVE cap.
         const CLIENT_STUB_C2C: [u8; 248] = [
             0x31, 0xDB, 0xFF, 0xC3, 0xB8, 0x06, 0x00, 0x00, 0x00, 0xBF, 0x11, 0x11, 0x11, 0x11,
-            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x22, 0x22,
+            // `mov edx, 0x0A` @20 — the FRAMED NR6 wire length. The later `mov edx, 8` in this stub
+            // is the recv-v2 REPLY length and stays 8: NR7 replies carry no opcode prefix.
+            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x0A, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x22, 0x22,
             0x22, 0x22, 0x0F, 0x05, 0x85, 0xC9, 0x74, 0x18, 0x83, 0xF9, 0x07, 0x0F, 0x85, 0xB1,
             0x00, 0x00, 0x00, 0x83, 0xFB, 0x40, 0x0F, 0x83, 0xA8, 0x00, 0x00, 0x00, 0x31, 0xC0,
             0x0F, 0x05, 0xEB, 0xC6, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x02, 0x20,
@@ -1709,6 +1756,8 @@ impl KernelState {
             0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
         ];
         const CLIENT_C2C_SEND_CAP_PATCH_OFFSET: usize = 10;
+        // Same tie for the reverse-direction client: its NR6 send uses the framed wire length.
+        const _: () = assert!(CLIENT_STUB_C2C[CLIENT_STUB_NR6_LEN_OFFSET] == CLIENT_NR6_WIRE_LEN);
         const CLIENT_C2C_REPLY_R9_PATCH_OFFSET: usize = 26;
         const CLIENT_C2C_REPLY_RECV_PATCH_OFFSET: usize = 83;
         const CLIENT_CODE_VA: u64 = 0x0000_0000_2000_0000;

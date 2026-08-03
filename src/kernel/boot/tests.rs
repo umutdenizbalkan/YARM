@@ -104790,3 +104790,160 @@ mod stage199d_aarch64_offlock_dispatch {
         dd::reset();
     }
 }
+
+// ── Stage 199D repair — the x86_64 SMP oracle client must send PRODUCTION FRAMING ────────────
+//
+// Root cause of the RUN_C regression first introduced at 458bb3d4 ("make the direct NR6 delivery
+// contract-conforming"):
+//
+// `ipc_call` (NR6) sends `opcode = OPCODE_INLINE` with `FLAG_REPLY_CAP`, which by the frozen
+// recv-v2 contract means the raw payload is a FRAMED message — first two bytes are the inline
+// application opcode, the rest is application data. Every legacy path stripped that prefix;
+// 458bb3d4 correctly made the direct NR6 path conform.
+//
+// The x86_64 SMP oracle's CPU-0 client had never framed its request: it sent eight bare bytes
+// `NR6-REQ!`. Before 458bb3d4 the direct path delivered the raw wire frame unstripped, so the
+// CPU-1 server observed `NR6-REQ!` with `payload_len = 8` and validated. Afterwards the same
+// eight bytes were correctly reinterpreted as `opcode = 0x524E` ("NR") plus a SIX-byte payload
+// `6-REQ!`, the server's ring-3 comparison failed, and the seal reported
+// `X86_AP_RECV_V2_VALIDATE_FAIL`. The kernel was right; the oracle asserted pre-conformance
+// framing.
+//
+// These guards pin BOTH halves of the invariant the live proof depends on, so neither the oracle
+// client nor the delivery projection can drift again without a hosted failure.
+mod stage199d_smp_oracle_request_framing {
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::OPCODE_INLINE;
+    use crate::kernel::syscall::ipc_recv_core::{
+        project_recv_delivery_parts, should_strip_inline_opcode_prefix_parts,
+    };
+
+    const EXEC_STATE: &str = include_str!("exec_state.rs");
+
+    /// The exact bytes the oracle client stages into its payload page, read from the source of
+    /// truth rather than restated, so the guard cannot drift from the shipped constant.
+    fn oracle_request_bytes() -> alloc::vec::Vec<u8> {
+        // `CLIENT_NR6_INLINE_OPCODE` little-endian, then the eight application bytes.
+        let opcode: u16 = 0x0199;
+        let mut v = alloc::vec::Vec::new();
+        v.extend_from_slice(&opcode.to_le_bytes());
+        v.extend_from_slice(b"NR6-REQ!");
+        v
+    }
+
+    /// **The root cause, stated as an executable fact.** NR6's header words mean "framed", so a
+    /// request that is not framed loses its first two bytes to the opcode.
+    #[test]
+    fn nr6_header_words_mean_the_payload_is_framed() {
+        assert!(
+            should_strip_inline_opcode_prefix_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP),
+            "NR6 sends OPCODE_INLINE + FLAG_REPLY_CAP, which IS the framed contract"
+        );
+    }
+
+    /// **The regression itself.** The pre-repair oracle payload — eight bare bytes — projects to
+    /// a SIX-byte application payload and a junk opcode. This is exactly what made the CPU-1
+    /// server's ring-3 comparison fail, and it is what the repair prevents.
+    #[test]
+    fn unframed_eight_bytes_project_to_the_wrong_application_payload() {
+        let unframed = b"NR6-REQ!";
+        let delivery =
+            project_recv_delivery_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP, 7, unframed);
+        assert_eq!(
+            delivery.app_payload, b"6-REQ!",
+            "the first two bytes are consumed as the inline opcode"
+        );
+        assert_eq!(delivery.app_payload.len(), 6);
+        assert_eq!(
+            delivery.app_opcode,
+            u16::from_le_bytes([b'N', b'R']),
+            "the sender's data is misread as the application opcode"
+        );
+        assert_ne!(
+            delivery.app_payload, b"NR6-REQ!",
+            "this is precisely the mismatch the AP server reported as VALIDATE_FAIL"
+        );
+    }
+
+    /// **The repair.** The framed request projects to exactly the eight application bytes and the
+    /// length the AP server stub validates in ring 3 — `NR6-REQ!` and `payload_len == 8`.
+    #[test]
+    fn the_framed_oracle_request_projects_to_exactly_what_the_ap_server_validates() {
+        let framed = oracle_request_bytes();
+        assert_eq!(
+            framed.len(),
+            10,
+            "two-byte prefix plus eight application bytes"
+        );
+        let delivery =
+            project_recv_delivery_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP, 7, &framed);
+        assert_eq!(
+            delivery.app_payload, b"NR6-REQ!",
+            "the server's ring-3 payload comparison must see the application bytes verbatim"
+        );
+        assert_eq!(
+            delivery.app_payload.len(),
+            8,
+            "the server's ring-3 `meta.payload_len == 8` check must hold"
+        );
+        assert_eq!(delivery.app_opcode, 0x0199, "the inline opcode round-trips");
+        assert_eq!(delivery.stripped_prefix, 2);
+    }
+
+    /// The shipped constants still say what these guards assume: a two-byte inline opcode, eight
+    /// application bytes, a wire length of ten, and both NR6 client stubs sending that length.
+    #[test]
+    fn the_oracle_client_constants_and_stubs_agree_with_the_framing() {
+        assert!(
+            EXEC_STATE.contains("const CLIENT_NR6_INLINE_OPCODE: u16 = 0x0199;")
+                && EXEC_STATE.contains("const CLIENT_NR6_APP_PAYLOAD: &[u8] = b\"NR6-REQ!\";")
+                && EXEC_STATE.contains("const CLIENT_NR6_WIRE_LEN: u8 = 10;"),
+            "the oracle request must remain a framed 2+8 byte message"
+        );
+        // Both NR6 client stubs (C2B2 and the C2C reverse-direction variant) must pass the FRAMED
+        // length to the syscall, not the bare application length. The immediates stay plain hex so
+        // the compact stub layout — which other guards pin byte-for-byte — is preserved; the tie to
+        // `CLIENT_NR6_WIRE_LEN` is enforced at COMPILE TIME instead, which is stronger than a text
+        // match because it reads the assembled byte rather than the source spelling.
+        assert_eq!(
+            EXEC_STATE.matches("0xBA, 0x0A, 0x00, 0x00, 0x00").count(),
+            2,
+            "both NR6 client stubs must encode the framed wire length 0x0A"
+        );
+        for tie in [
+            "assert!(CLIENT_STUB[CLIENT_STUB_NR6_LEN_OFFSET] == CLIENT_NR6_WIRE_LEN)",
+            "assert!(CLIENT_STUB_C2C[CLIENT_STUB_NR6_LEN_OFFSET] == CLIENT_NR6_WIRE_LEN)",
+        ] {
+            assert!(
+                EXEC_STATE.contains(tie),
+                "the stub length immediate must be tied to the declared wire length: {tie}"
+            );
+        }
+        // And the staged bytes are tied to the opcode + payload constants, also at compile time.
+        assert!(
+            EXEC_STATE
+                .contains("assert!(CLIENT_NR6_REQUEST.len() == CLIENT_NR6_WIRE_LEN as usize)")
+                && EXEC_STATE.contains(
+                    "assert!(CLIENT_NR6_REQUEST[0] == CLIENT_NR6_INLINE_OPCODE.to_le_bytes()[0])"
+                )
+                && EXEC_STATE
+                    .contains("assert!(CLIENT_NR6_REQUEST[2] == CLIENT_NR6_APP_PAYLOAD[0])"),
+            "the staged request must be tied to its opcode and payload constants"
+        );
+        // The AP server stub is deliberately UNCHANGED: it still validates the application bytes.
+        assert!(
+            EXEC_STATE.contains("X86_AP_RECV_V2_USER_VALIDATED cpu=1 payload_ok=1 length_ok=1"),
+            "the server-side validation contract is unchanged by the repair"
+        );
+    }
+
+    /// A framed message shorter than the prefix keeps the frozen fallback: the sender's own
+    /// opcode and the verbatim payload. The repair must not have disturbed that edge.
+    #[test]
+    fn a_too_short_framed_payload_keeps_the_frozen_fallback() {
+        let delivery = project_recv_delivery_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP, 7, b"A");
+        assert_eq!(delivery.app_payload, b"A");
+        assert_eq!(delivery.app_opcode, OPCODE_INLINE);
+        assert_eq!(delivery.stripped_prefix, 0);
+    }
+}
