@@ -321,6 +321,19 @@ impl OwnerRevalidation {
     }
 }
 
+/// Stage 199D — the **exact entering task identity** a handled split syscall returns to.
+///
+/// Captured at trap entry, BEFORE the split dispatch runs, and carried through the return
+/// path. The return must never re-discover an unqualified "current task" after a direct
+/// transaction: the transaction can wake and enqueue another task, and on a stale or replaced
+/// incarnation an unqualified lookup would commit this syscall's register state into somebody
+/// else's TCB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SplitReturnIdentity {
+    pub(crate) tid: u64,
+    pub(crate) asid: crate::kernel::vm::Asid,
+}
+
 impl SharedKernel {
     /// Stage 114 fix: this used to also cache `scheduler_state` /
     /// `boot_config_state_lock` / `boot_config` raw pointers computed from
@@ -1041,6 +1054,93 @@ impl SharedKernel {
         let _guard = task_lock.lock();
         let tcbs = unsafe { &mut *tcbs };
         f(kernel_mut(tcbs).as_mut_slice())
+    }
+
+    /// Stage 199D: task (rank 2) split-mut seam exposing the TCB array and the TLS-restore
+    /// table together — see `KernelState::task_return_split_mut_ptrs_from_raw`.
+    fn with_task_return_split_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut [Option<crate::kernel::task::ThreadControlBlock>],
+            &mut [Option<crate::kernel::ipc::ThreadId>],
+        ) -> R,
+    ) -> R {
+        // SAFETY: same pattern as `with_task_tcbs_split_mut` — the task lock serializes both
+        // storages, which live in the same domain.
+        let (task_lock, tcbs, tls) =
+            unsafe { KernelState::task_return_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let tcbs = unsafe { &mut *tcbs };
+        let tls = unsafe { &mut *tls };
+        f(
+            kernel_mut(tcbs).as_mut_slice(),
+            kernel_mut(tls).as_mut_slice(),
+        )
+    }
+
+    /// Stage 199D — bounded rank-2 transaction #1 of the handled split return: validate the
+    /// EXACT entering incarnation and take its pending TLS-restore request.
+    ///
+    /// `None` means the incarnation is stale — the task is gone, or its ASID no longer
+    /// matches, or it is the idle task. The caller then skips the restore entirely, which is
+    /// exactly what the legacy broad-lock path did when `current_tid()` was absent, `0`, or
+    /// had no ASID. `Some(tls)` carries the TLS base to place in the TLS lane, `None` inside
+    /// when no restore was pending.
+    pub(crate) fn split_return_take_tls_split(
+        &self,
+        id: SplitReturnIdentity,
+    ) -> Option<Option<usize>> {
+        if id.tid == 0 {
+            return None; // the idle task, exactly as the legacy path bailed
+        }
+        self.with_task_return_split_mut(|tcbs, tls_pending| {
+            let tcb = tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == id.tid && t.asid == Some(id.asid))?;
+            let tls_base = tcb.tls_ptr.map(|ptr| ptr.0 as usize);
+            // Take the pending request at most once, exactly as `take_tls_restore_request`.
+            let pending = tls_pending
+                .iter()
+                .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == id.tid));
+            match pending {
+                Some(idx) => {
+                    tls_pending[idx] = None;
+                    Some(tls_base)
+                }
+                None => Some(None),
+            }
+        })
+    }
+
+    /// Stage 199D — bounded rank-2 transaction #2 of the handled split return: commit the
+    /// final user context into the EXACT entering incarnation's TCB.
+    ///
+    /// `false` when the incarnation is stale, in which case nothing is written — the legacy
+    /// path's `set_thread_user_context` likewise did nothing for an absent task, and writing
+    /// into a replacement task's TCB would be strictly worse than not writing at all.
+    pub(crate) fn split_return_commit_context_split(
+        &self,
+        id: SplitReturnIdentity,
+        context: crate::kernel::task::UserRegisterContext,
+    ) -> bool {
+        if id.tid == 0 {
+            return false;
+        }
+        self.with_task_return_split_mut(|tcbs, _| {
+            match tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == id.tid && t.asid == Some(id.asid))
+            {
+                Some(tcb) => {
+                    tcb.user_context = context;
+                    true
+                }
+                None => false,
+            }
+        })
     }
 
     /// Stage 108: VM/user-spaces (rank 5) split-mut seam.

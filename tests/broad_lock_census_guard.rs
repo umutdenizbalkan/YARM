@@ -28,7 +28,10 @@ use std::path::{Path, PathBuf};
 const EXPECTED_WITH_CPU: &[(&str, usize)] = &[
     ("src/arch/riscv64/boot.rs", 1),
     ("src/arch/riscv64/trap.rs", 8),
-    ("src/arch/trap_entry.rs", 12),
+    // Stage 199D: 12 -> 11. The AArch64 handled-split return path no longer reacquires the
+    // broad lock to finalize a syscall; it uses two bounded rank-2 task-domain transactions
+    // (exact-incarnation TLS take, exact-incarnation context commit) instead.
+    ("src/arch/trap_entry.rs", 11),
     ("src/arch/x86_64/descriptor_tables.rs", 2),
     ("src/arch/x86_64/smp.rs", 4),
     ("src/kernel/boot/thread_state.rs", 1),
@@ -61,7 +64,7 @@ const THREAD_LOCAL_FALSE_POSITIVES: usize = 1;
 /// sites are the **bodies** of `SharedKernel::lock` / `with` / `with_cpu` — the
 /// implementations that every callsite goes through, not callsites themselves. Adding them
 /// would double-count the lock.
-const AUDITED_WITH_CPU_TOTAL: usize = 41;
+const AUDITED_WITH_CPU_TOTAL: usize = 40; // Stage 199D: 41 -> 40 (AArch64 split return)
 const AUDITED_WITH_BROAD_TOTAL: usize = 10;
 const AUDITED_STATE_LOCK_TOTAL: usize = 3;
 const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_BROAD_TOTAL;
@@ -70,7 +73,7 @@ const AUDITED_ACQUISITION_TOTAL: usize = AUDITED_WITH_CPU_TOTAL + AUDITED_WITH_B
 const CLASS_BOOT_ONLY: usize = 0;
 const CLASS_TEST_ONLY: usize = 3;
 const CLASS_OBSOLETE: usize = 2;
-const CLASS_RUNTIME_REQUIRED: usize = 46;
+const CLASS_RUNTIME_REQUIRED: usize = 45; // Stage 199D: 46 -> 45 (AArch64 split return)
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

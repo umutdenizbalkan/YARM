@@ -1340,6 +1340,10 @@ AArch64 and RISC-V are untouched and remain proof-gated.
 
 ### 8.6.10 AArch64 NR6/NR7 production-readiness audit — NOT READY
 
+> **Superseded in part by §8.6.11:** blockers 1 and 2 below are now **CLOSED**. Blocker 3
+> remains open, so the answer to the question below is still *not ready*, and the AArch64
+> production default is still OFF. This section is retained as the original audit.
+
 **Question:** can an eligible NR6/NR7 transaction complete on AArch64 without reacquiring the
 broad `KernelState` lock? **Answer: no.** Three blockers, all outside the canonical contracts.
 
@@ -1417,6 +1421,86 @@ need no AArch64 branch.
 
 The live suite additionally cannot run here: `qemu-system-aarch64` is not installed in this
 environment.
+
+### 8.6.11 AArch64 blockers 1 and 2 CLOSED; blocker 3 still open
+
+Structural preparation only. **The AArch64 production default is unchanged (OFF)**, no live
+AArch64 seal was issued, and no dispatch class was retired.
+
+#### Blocker 1 — CLOSED: the ABI import uses the canonical admission predicate
+
+`pre_split_import_syscall_abi` (and its return-path twin `finalize_split_handled_syscall`) now
+admit NR6/NR7 through `crate::kernel::boot::ipccall_direct_admission_enabled()` — literally the
+same predicate the split dispatcher itself consults. No `ipccall_direct_proof_enabled()` call
+survives anywhere in `src/arch/trap_entry.rs`, so AArch64 has **no architecture-specific
+admission rule** left. The predicate is still `production || proof` and production is
+`cfg!(target_arch = "x86_64")`, so on AArch64 it still resolves to the armed proof gate today:
+a normal AArch64 boot keeps `nr = 0` and falls back byte-identically. When the production
+constant is eventually widened, the import follows automatically instead of silently no-opping.
+
+#### Blocker 2 — CLOSED: the handled split return takes no broad lock
+
+`shared.with_cpu(cpu, |kernel| split_finalize_handled_syscall(kernel, cpu, frame))` is gone.
+`split_finalize_handled_syscall` is now driven by an **exact entering task identity**
+`SplitReturnIdentity { tid, asid }`, captured in `handle_trap_entry_shared` *before*
+`try_split_dispatch_into_frame` runs and threaded to both finalize call sites (the `Ok` arm and
+the handled-`Err(TrapHandleError::Syscall)` arm). Nothing after the direct transaction
+re-discovers an unqualified "current task".
+
+The return work is separated into:
+
+* **Frame-only work, outside every lock** — resume PC from `last_vector_raw_elr()` with **no
+  extra `+4`** (unchanged Stage 195B contract), `export_syscall_result_to_user_gprs`, the
+  `args[0..2]` ← `x0..x2` resynchronisation, and all six diagnostic markers.
+* **Two bounded rank-2 task-domain transactions** — `split_return_take_tls_split(id)` (exact
+  incarnation validation + TLS-restore take) and `split_return_commit_context_split(id, ctx)`
+  (the final post-export context commit). Both validate `t.tid.0 == id.tid && t.asid ==
+  Some(id.asid)` and mutate nothing on a stale identity. Both go through
+  `KernelState::task_return_split_mut_ptrs_from_raw`, which takes **one** rank-2 task lock over
+  two same-domain storages (`tcbs`, `tls_restore_pending`).
+
+**The pre-export save → restore → re-read round trip was proved redundant and removed** — not
+merely relocated. `TrapFrame::apply_user_context(capture_user_context())` is an exact identity
+pair (both move the same nine fields: `instruction_ptr`, `stack_ptr`, `user_gprs`, `arg0..arg5`
+— nothing else), and `set_thread_user_context` / `thread_user_context` store and return
+`tcb.user_context` verbatim. The pre-export save's only consumer was the read-back inside
+`restore_arch_thread_state`, and the post-export save overwrites the result before anything can
+observe it — so the round trip could only ever restore what it had just written. What is *not*
+redundant, and is kept, is the TLS-restore take and the stale-incarnation bail (which still logs
+`SCHED_ENTER_IDLE`, exactly as the legacy path did when `current_tid()` was absent, `0`, or had
+no ASID; the export still runs).
+
+Preserved byte-for-byte: success and canonical-error return lanes, ELR/SPSR/SP and all user
+GPRs, x18 TLS restoration, stale-identity failure behaviour, and **every** existing AArch64
+split class — DebugLog (NR 15) and FutexWake (NR 10) included, not only NR6/NR7. The path
+**never** falls back to the broad path after a handled direct transaction.
+
+*Census effect:* `src/arch/trap_entry.rs` drops 12 → 11 audited `with_cpu` sites; the tree total
+falls 51 → **50**, `AUDITED_WITH_CPU_TOTAL` 41 → **40**, `CLASS_RUNTIME_REQUIRED` 46 → **45**.
+No new broad-lock acquisition site was introduced anywhere.
+
+#### Blocker 3 — STILL OPEN
+
+`d6_genuine_enabled()` remains `cfg!(target_arch = "x86_64")`, unchanged and explicitly open.
+The direct transaction only *enqueues* the woken task through the scheduler split seam, so this
+does not stop an NR6/NR7 transaction completing; but on AArch64 the woken task's dispatch and
+saved-frame resume still run under the broad lock, so the **end-to-end** wake is not yet
+off-lock. This is the sole remaining gating item for an AArch64 production flip.
+
+#### Executable proof
+
+`stage199d_aarch64_readiness_audit` now pins blockers 1 and 2 as *closed* and blocker 3 as
+*open*. `stage199d_split_return_without_broad_lock` adds 11 tests: the capture/apply round-trip
+identity, the provably dead pre-export save, TLS exactness and take-once, stale-incarnation
+rejection mutating nothing, the full saved context including the x18 TLS lane, the success and
+error lanes, plus four structural guards — handled split finalization contains no `with_cpu`,
+`with`, `KernelState` or broad-lock call; the entering identity is captured before the split
+dispatch; import and dispatcher share one admission predicate; `d6_genuine_enabled()` is
+untouched. `stage160c` / `stage160d` were re-pinned to the new contract, including a **negative**
+pin that the removed round trip cannot creep back.
+
+`qemu-system-aarch64` is still not installed here, so no AArch64 live run was possible — which
+is consistent with this increment being structural preparation with the production default OFF.
 
 ---
 

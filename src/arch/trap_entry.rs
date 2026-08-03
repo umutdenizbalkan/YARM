@@ -179,6 +179,12 @@ pub fn handle_trap_entry_shared(
             // x86_64/riscv64). Without this the AArch64 split dispatch sees nr=0
             // and always falls back (Stage 160B).
             pre_split_import_syscall_abi(frame);
+            // Stage 199D: capture the EXACT entering task identity {tid, asid} BEFORE the
+            // split dispatch runs. The AArch64 return path must commit this syscall's
+            // register state into THIS incarnation, never into whatever task an unqualified
+            // "current" lookup would find afterwards — a direct NR6/NR7 transaction wakes and
+            // enqueues another task, so that lookup is not a safe question to ask after it.
+            let entering = split_return_identity(shared, cpu);
             if let Some(result) =
                 crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
             {
@@ -186,10 +192,10 @@ pub fn handle_trap_entry_shared(
                     Ok(()) => {
                         // Stage 160C: a HANDLED split syscall must return to
                         // userspace via the arch syscall-return ABI (export results
-                        // + advance past the trap instruction). AArch64-only and
-                        // proof-knob-gated; no-op on x86_64/riscv64, whose trap
-                        // return already does this from the ret lanes.
-                        finalize_split_handled_syscall(shared, cpu, frame);
+                        // + advance past the trap instruction). AArch64-only;
+                        // no-op on x86_64/riscv64, whose trap return already does
+                        // this from the ret lanes.
+                        finalize_split_handled_syscall(shared, cpu, entering, frame);
                         crate::yarm_log!(
                             "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=ok",
                             SPLIT_DISPATCH_ARCH_TAG,
@@ -221,7 +227,7 @@ pub fn handle_trap_entry_shared(
                         // arm — the error code must reach userspace (AArch64 via the
                         // user GPR lanes) and the SVC must advance (this is a
                         // completed syscall, not a WouldBlock retry).
-                        finalize_split_handled_syscall(shared, cpu, frame);
+                        finalize_split_handled_syscall(shared, cpu, entering, frame);
                         crate::yarm_log!(
                             "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=handled_err code={}",
                             SPLIT_DISPATCH_ARCH_TAG,
@@ -1398,9 +1404,14 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply
         // gates. With the gate off, `nr` stays 0 and the split dispatcher declines them (unchanged
         // global-lock fallback) — this keeps a normal boot byte-identical.
+        // Stage 199D: admit IpcCall (NR 6) + IpcReply (NR 7) through the CANONICAL
+        // `ipccall_direct_admission_enabled()` — the same predicate the split dispatcher
+        // itself uses — so AArch64 gains no architecture-specific admission rule. It is
+        // still `production || proof`, and the AArch64 production default is OFF, so a
+        // normal AArch64 boot keeps `nr = 0` here and falls back byte-identically.
         || ((raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
             || raw_nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)
-            && crate::kernel::boot::ipccall_direct_proof_enabled())
+            && crate::kernel::boot::ipccall_direct_admission_enabled())
     {
         super::aarch64::trap::split_import_syscall_abi(frame);
     }
@@ -1409,35 +1420,60 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
 fn pre_split_import_syscall_abi(_frame: &mut TrapFrame) {}
 
 #[cfg(target_arch = "aarch64")]
+fn split_return_identity(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+) -> crate::runtime::SplitReturnIdentity {
+    // Scheduler (rank 1) + task (rank 2) reads only — the same authoritative current-task
+    // read the split helpers use, qualified with the incarnation's ASID.
+    let tid = shared.current_tid_authoritative(cpu).unwrap_or(0);
+    crate::runtime::SplitReturnIdentity {
+        tid,
+        asid: crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16),
+    }
+}
+#[cfg(not(target_arch = "aarch64"))]
+fn split_return_identity(
+    _shared: &crate::runtime::SharedKernel,
+    _cpu: CpuId,
+) -> crate::runtime::SplitReturnIdentity {
+    crate::runtime::SplitReturnIdentity {
+        tid: 0,
+        asid: crate::kernel::vm::Asid(0),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 fn finalize_split_handled_syscall(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
+    entering: crate::runtime::SplitReturnIdentity,
     frame: &mut TrapFrame,
 ) {
     // Stage 195A / 197A: finalize is reached ONLY when the split dispatcher HANDLED the
     // syscall. In production the newly-eligible AArch64 pre-lock classes are DebugLog
-    // (nr=15) and FutexWake (nr=10), so this runs for those — mirroring the selective ABI
-    // import — plus the oracle-validated classes. The brief `with_cpu` here is the ARCH
-    // RETURN-PATH restore (export result to x0..x5 + advance past the SVC), NOT the split
-    // seam.
+    // (nr=15) and FutexWake (nr=10), plus the oracle-validated classes.
+    //
+    // Stage 199D: this NO LONGER takes the broad `KernelState` lock. The return work is
+    // split into frame-only steps outside every lock and two bounded rank-2 task-domain
+    // transactions (exact-incarnation TLS take, exact-incarnation context commit) — see
+    // `split_finalize_handled_syscall`. NR6/NR7 are admitted through the canonical
+    // `ipccall_direct_admission_enabled()` predicate, matching the import above.
     if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
-        // Stage 199A2C1: a HANDLED off-lock IpcCall/IpcReply returns via the AArch64 syscall-return
-        // ABI (export x0..x5 + advance ELR past the SVC) — mirroring the selective import above.
         || ((frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
             || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)
-            && crate::kernel::boot::ipccall_direct_proof_enabled())
+            && crate::kernel::boot::ipccall_direct_admission_enabled())
     {
-        let _ = shared.with_cpu(cpu, |kernel| {
-            super::aarch64::trap::split_finalize_handled_syscall(kernel, cpu, frame)
-        });
+        super::aarch64::trap::split_finalize_handled_syscall(shared, cpu, entering, frame);
     }
 }
 #[cfg(not(target_arch = "aarch64"))]
 fn finalize_split_handled_syscall(
     _shared: &crate::runtime::SharedKernel,
     _cpu: CpuId,
+    _entering: crate::runtime::SplitReturnIdentity,
     _frame: &mut TrapFrame,
 ) {
 }

@@ -272,26 +272,23 @@ pub(crate) fn split_import_syscall_abi(frame: &mut TrapFrame) {
 /// (`handle_trap_entry_with_fault_bookkeeping_mode`). The split path never
 /// switches tasks, so `task_switched == false` always holds here.
 pub(crate) fn split_finalize_handled_syscall(
-    kernel: &mut KernelState,
-    cpu: CpuId,
+    shared: &crate::runtime::SharedKernel,
+    _cpu: CpuId,
+    id: crate::runtime::SplitReturnIdentity,
     frame: &mut TrapFrame,
-) -> Result<(), TrapHandleError> {
+) {
+    // ── Frame-only, outside every lock ───────────────────────────────────────────────
+    //
     // Stage 195B fix: the resume PC is `last_vector_raw_elr()` with NO `+4`. On AArch64 the
     // synchronous-exception ELR_EL1 for an `SVC` already points at the instruction FOLLOWING
     // the `SVC`, exactly as the proven global non-IpcRecv return path uses it
     // (`syscall_resume_pc = raw_vector_return_pc`, no `+4`). The earlier `+4` over-advanced by
     // one instruction, skipping the caller's return-register load (`mov rN, x0`); DebugLog
-    // tolerated the skip (it ignores its return), but a multi-return-lane split class — the
-    // now-removed NR 27 InitramfsReadChunk, whose caller read x0 (error lane) and x1 (byte
-    // count) — returned a stale register (decoded as Internal). The fix is retained: it guards
-    // every split-dispatched class whose caller consumes a return value (e.g. FutexWake's count).
+    // tolerated the skip (it ignores its return), but a multi-return-lane split class returned
+    // a stale register. The fix is retained: it guards every split-dispatched class whose
+    // caller consumes a return value (e.g. FutexWake's count).
     let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr() as usize;
     frame.set_saved_pc(resume_pc);
-    if let Some(tid) = kernel.current_tid() {
-        let mut ctx = frame.capture_user_context();
-        ctx.instruction_ptr = crate::kernel::vm::VirtAddr(resume_pc as u64);
-        let _ = kernel.set_thread_user_context(tid, ctx);
-    }
     crate::yarm_log!(
         "AARCH64_SPLIT_CONTEXT_SAVE_DONE x0=0x{:x}",
         frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0)
@@ -300,34 +297,66 @@ pub(crate) fn split_finalize_handled_syscall(
         "AARCH64_SPLIT_SVC_ADVANCE_DONE pc=0x{:016x}",
         resume_pc as u64
     );
-    // Export ordering mirrors the global non-task-switched syscall-return path
-    // (context-save → restore → export). `restore_arch_thread_state` does not
-    // touch the error lane, so `export_syscall_result_to_user_gprs` still sees the
-    // error encoded by `set_err` and writes it to x0. The diagnostics prove
-    // x0_after carries the error code (e.g. InvalidArgs = 2) on the rollback path.
     crate::yarm_log!(
         "AARCH64_SPLIT_ABI_EXPORT_BEGIN err={} x0_before=0x{:x}",
         frame.error_code().unwrap_or(0),
         frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0)
     );
-    restore_arch_thread_state(kernel, cpu, Some(frame), true)?;
+
+    // ── Bounded rank-2 task-domain transaction #1: exact incarnation + TLS ───────────
+    //
+    // Stage 199D: this replaces `shared.with_cpu(...)` — the BROAD `KernelState` lock — which
+    // every HANDLED AArch64 split syscall used to reacquire on its way out, so an eligible
+    // NR6/NR7 transaction could never complete without retaking it.
+    //
+    // The legacy sequence was: save context → `restore_arch_thread_state` (which read that
+    // same context straight back out of the TCB and applied it to the frame, then took TLS) →
+    // export → re-sync args → save context again.
+    //
+    // **The pre-export save and the read-back are provably redundant for a NON-SWITCHING split
+    // return, and are removed.** `TrapFrame::apply_user_context(capture_user_context())` is an
+    // exact identity — the two move the same nine fields (pc, sp, user_gprs, args[0..5]) and
+    // nothing else — and `set_thread_user_context` / `thread_user_context` store and return
+    // `tcb.user_context` verbatim. The pre-export save's ONLY consumer was that read-back, and
+    // the post-export save overwrites it before anything else can observe it. So the round
+    // trip could only ever restore what it had just written. What is NOT redundant, and is
+    // kept, is the TLS-restore take and the stale-incarnation bail.
+    //
+    // `None` = stale incarnation: skip the restore exactly as the legacy path did when
+    // `current_tid()` was absent, `0`, or had no ASID — the export below still runs.
+    if let Some(tls) = shared.split_return_take_tls_split(id) {
+        frame.set_user_gpr(
+            crate::arch::aarch64::syscall_abi::REG_X18_TLS,
+            tls.unwrap_or(0),
+        );
+        #[cfg(test)]
+        {
+            let idx = _cpu.0 as usize;
+            if idx < MAX_CPUS {
+                LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
+            }
+        }
+    } else {
+        crate::yarm_log!("SCHED_ENTER_IDLE");
+    }
+
+    // ── Frame-only, outside every lock ───────────────────────────────────────────────
+    //
+    // The export sees the error encoded by `set_err` and writes it to x0; the diagnostics
+    // prove x0_after carries the error code (e.g. InvalidArgs = 2) on the rollback path.
     export_syscall_result_to_user_gprs(frame);
-    // Stage 195B fix: re-sync args[0..2] to the just-exported x0..x2 and RE-SAVE the TCB
-    // AFTER export — byte-identical to the global non-task-switched return path
-    // (`handle_trap_entry_with_fault_bookkeeping_mode`). The pre-export
-    // `set_thread_user_context` above snapshotted the ORIGINAL syscall args (x0 = arg0);
-    // without this re-save the resumed task reads the stale x0 instead of the exported
-    // return value. DebugLog masked this (it ignores its return); the now-removed NR 27
-    // InitramfsReadChunk (whose caller read x0 for the error lane and x1 for the byte count)
-    // exposed it. The re-save is retained for every return-consuming split class (e.g. FutexWake).
+    // Stage 195B fix: re-sync args[0..2] to the just-exported x0..x2 — byte-identical to the
+    // global non-task-switched return path. Without this the resumed task reads the stale x0
+    // (the original syscall arg0) instead of the exported return value.
     frame.set_arg(0, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0));
     frame.set_arg(1, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1));
     frame.set_arg(2, frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2));
-    if let Some(tid) = kernel.current_tid() {
-        let mut ctx = frame.capture_user_context();
-        ctx.instruction_ptr = crate::kernel::vm::VirtAddr(resume_pc as u64);
-        let _ = kernel.set_thread_user_context(tid, ctx);
-    }
+
+    // ── Bounded rank-2 task-domain transaction #2: the final context commit ──────────
+    let mut ctx = frame.capture_user_context();
+    ctx.instruction_ptr = crate::kernel::vm::VirtAddr(resume_pc as u64);
+    let _ = shared.split_return_commit_context_split(id, ctx);
+
     crate::yarm_log!(
         "AARCH64_SPLIT_ABI_EXPORT_DONE err={} x0_after=0x{:x}",
         frame.error_code().unwrap_or(0),
@@ -347,7 +376,6 @@ pub(crate) fn split_finalize_handled_syscall(
             frame.syscall_num()
         ),
     }
-    Ok(())
 }
 
 pub fn decode_trap_context(context: Aarch64TrapContext) -> TrapEvent {

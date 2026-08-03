@@ -23,9 +23,9 @@ Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **41** |
+| Production `SharedKernel::with_cpu` callsites | **40** |
 | Production broad `SharedKernel::with` callsites | **10** |
-| **Total production broad-lock acquisition sites** | **51** |
+| **Total production broad-lock acquisition sites** | **50** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **x86_64 only** (`d6_genuine_enabled()` is compile-time false elsewhere) |
@@ -67,8 +67,8 @@ complete the canonical stage.**
 | **Total** | **1 of 35** | 12 | 22 |
 
 **No canonical stage in Phases 2–6 or 8 is complete.** The one complete stage, 204A
-(broad-lock callsite census), is documentation rather than lock retirement: 51 callsites
-classified as 0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.
+(broad-lock callsite census), is documentation rather than lock retirement: 50 callsites
+classified as 0 boot-only, 3 test-only, 2 obsolete, 45 runtime-required, 0 undocumented.
 
 > **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
 > was the only row written without an `N of M` denominator, and the totals silently counted it
@@ -241,6 +241,25 @@ Full detail: `doc/IPC.md` §8.5.
    broad lock. Nothing was staged live; production default unchanged (x86_64 only).
    `qemu-system-aarch64` is also absent here. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.11 and
    `doc/IPC.md` §8.6.10.
+   **AArch64 blockers (i) and (ii) are now CLOSED; (iii) remains open.** (i) The syscall-ABI
+   import and its return-path twin now admit NR6/NR7 through the canonical
+   `ipccall_direct_admission_enabled()`; no `ipccall_direct_proof_enabled()` call survives in
+   `src/arch/trap_entry.rs`, so AArch64 carries no architecture-specific admission rule (the
+   predicate is still `production || proof` and production is x86_64-only, so AArch64 still
+   resolves to the proof gate — a normal boot is byte-identical). (ii) The `with_cpu` wrapper
+   around `split_finalize_handled_syscall` is gone: the finalize is driven by an exact entering
+   identity `{tid, asid}` captured *before* the split dispatch, and splits into frame-only work
+   outside every lock plus two bounded rank-2 task-domain transactions (exact-incarnation TLS
+   take, exact-incarnation context commit). The pre-export save → restore → read-back round trip
+   was **proved redundant and removed** — `apply_user_context(capture_user_context())` is an
+   exact nine-field identity and the post-export save overwrites it before anything observes it.
+   Byte-for-byte preserved: success and error lanes, ELR/SPSR/SP and all user GPRs, x18 TLS,
+   stale-identity behaviour and every existing AArch64 split class. Census: `trap_entry.rs`
+   12 → 11, tree total 51 → 50, `AUDITED_WITH_CPU_TOTAL` 41 → 40, `CLASS_RUNTIME_REQUIRED`
+   46 → 45; no new broad-lock site. (iii) `d6_genuine_enabled()` is unchanged and explicitly
+   open — the sole remaining gating item. **The AArch64 production default stays OFF**; this is
+   structural preparation only, with no AArch64 flip and no QEMU seal (`qemu-system-aarch64`
+   still absent). See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.12 and `doc/IPC.md` §8.6.11.
    **Blocker 5 (link CREATION accounting) is now closed** — both installation seams delegate to
    the one `install_server_reply_link` decision, so the creation stamp cannot drift; live,
    `created` went 0 → 54. That exposed its mirror on the CLOSE edge: of four close sites only two
@@ -484,7 +503,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **51** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **50** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there

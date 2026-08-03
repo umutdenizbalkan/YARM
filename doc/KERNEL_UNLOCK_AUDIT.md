@@ -130,7 +130,7 @@ lines excluded.
 | `SharedKernel::with_cpu` | **41** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **10** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **51** |
+| **Total broad-lock acquisition sites** | **50** |
 
 ### 1.3 `with_cpu` — 41 production callsites
 
@@ -197,7 +197,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **3** |
 | obsolete | **2** |
-| runtime-required | **46** |
+| runtime-required | **45** |
 | undocumented | **0** |
 
 #### test-only (3)
@@ -441,14 +441,14 @@ counts as done:
 |-------|-------|--------|------------------|
 | **203A** | Timer tick + deadline processing; **no broad lock from timer interrupt context** | **OPEN** — partial foundation | The tick is handled inside `handle_trap_entry_with_fault_bookkeeping_mode`, i.e. inside `with_cpu`. `scheduler_tick_now_split_read` and the post-lock reply-timeout drain are partial foundations. |
 | **203B** | IRQ delivery — ack, notification delivery, waiter wake, mask/unmask; fast paths never take the broad lock | **OPEN** | External IRQs enter the same broad trap closure. |
-| **203C** | Scheduler core; rank-1/rank-2 seams become **authoritative, not compatibility helpers** | **OPEN** — partial | The rank-1 seam is authoritative for queue-advancing dispatch on **x86_64 only**: `d6_genuine_enabled()` (`mod.rs:766`) is compile-time **false** on AArch64 and RISC-V. ~20 of the 46 runtime-required callsites are drain re-acquisitions that exist precisely because the seams are not authoritative end to end. |
+| **203C** | Scheduler core; rank-1/rank-2 seams become **authoritative, not compatibility helpers** | **OPEN** — partial | The rank-1 seam is authoritative for queue-advancing dispatch on **x86_64 only**: `d6_genuine_enabled()` (`mod.rs:766`) is compile-time **false** on AArch64 and RISC-V. ~20 of the 45 runtime-required callsites are drain re-acquisitions that exist precisely because the seams are not authoritative end to end. |
 | **203D** | Cross-CPU work; AArch64/RISC-V may stay BSP-only **provided APs are explicitly wake-only and no runnable task can be stranded** | **OPEN** — x86_64 live-proven, knob-gated | x86_64: shootdown mailboxes, reschedule IPIs both directions, remote wake, cross-CPU placement, per-CPU current — all live at SMP=2 under default-off knobs; production scheduler still BSP-only. The AArch64/RISC-V wake-only + no-stranding argument the stage requires is **not documented**. |
 
 ### 3.6 Phase 7 — Remove the monolithic runtime path
 
 | Stage | Scope | Status | Evidence and gap |
 |-------|-------|--------|------------------|
-| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 51 callsites enumerated with file, line and enclosing function. **0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.** Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (6 tests), which recomputes the census from source and fails on any added or removed production callsite. |
+| **204A** | Broad-lock callsite census, every runtime use classified boot-only / test-only / runtime-required / obsolete fallback; **no undocumented runtime callsite** | **COMPLETE** | §1.4a: all 50 callsites enumerated with file, line and enclosing function. **0 boot-only, 3 test-only, 2 obsolete, 45 runtime-required, 0 undocumented.** (Stage 199D retired one: the AArch64 handled-split syscall return.) Raw/global `KernelState` mutation outside the three `SharedKernel` methods: none exists (§1.5). Kept honest by `tests/broad_lock_census_guard.rs` (6 tests), which recomputes the census from source and fails on any added or removed production callsite. |
 | **204B** | Decompose `KernelState` ownership; `SharedKernel` may remain a container but must not serialize the kernel | **OPEN** — partial foundation | 11 ranked domain locks and a full seam set already exist, but `with_cpu` still forms a broad `&mut KernelState`. |
 | **204C** | Remove fallback-to-global handlers | **OPEN** | Five families live: default-deny `_ => None` (`syscall_split.rs:885`), four in-helper `None` declines, drain `reason=state_changed` re-acquires, the reply-timeout broad completion, and `d6_genuine_enabled()` being compile-time false on two architectures. |
 | **204D** | Remove retirement scaffolding | **OPEN** | `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, one-shot class logging and the foundation oracles are all live. |
@@ -458,7 +458,7 @@ counts as done:
 
 | Stage | Scope | Status | Evidence and gap |
 |-------|-------|--------|------------------|
-| **205A** | Complete syscall matrix — arch, class, locks, blocking, post-lock work, rollback, **address-space restore**, live proof. **Every runtime cell localized.** | **OPEN** — matrix drafted, localization false | §2 supplies the matrix across all three architectures with locks / blocking / post-lock / rollback / hosted / live columns. Two gaps: the **address-space restore** column is not populated per cell, and the exit condition (every runtime cell localized) is false while 46 runtime-required broad callsites remain. **205A reports cells; it is not where defects are retired.** |
+| **205A** | Complete syscall matrix — arch, class, locks, blocking, post-lock work, rollback, **address-space restore**, live proof. **Every runtime cell localized.** | **OPEN** — matrix drafted, localization false | §2 supplies the matrix across all three architectures with locks / blocking / post-lock / rollback / hosted / live columns. Two gaps: the **address-space restore** column is not populated per cell, and the exit condition (every runtime cell localized) is false while 45 runtime-required broad callsites remain. **205A reports cells; it is not where defects are retired.** |
 | **205B** | Fault-injection matrix at every transactional boundary | **OPEN** — isolated precedents | Shared-region 12-case race seal, reply-cap 18-case negative seal, 24 deterministic ServerDies races. No unified matrix; no coverage of allocation failure, slot exhaustion, queue full, or shootdown failure. |
 | **205C** | Long-running concurrency torture with all anomaly counters zero | **OPEN** | No sustained harness exists, and no torture load has been run. Separately, the hosted suite cannot currently *serve* as such a harness because its own fixtures contend (§0) — that is test-infrastructure debt, a prerequisite rather than a part of this stage. |
 | **205D** | Cross-arch full-unlock seal — `KERNEL_RUNTIME_GLOBAL_LOCK_CALLS … count=0` ×3, `KERNEL_FULL_UNLOCK_SEAL … result=ok` ×3, `KERNEL_FULL_UNLOCK_CROSS_ARCH_SEAL arches=3 result=ok` | **OPEN** | **None of the three marker families exists anywhere in the tree** (grep over `src`, `crates`, `tests`, `scripts`). |
@@ -1165,6 +1165,45 @@ Nothing was staged live; the production default is unchanged (x86_64 only).
 `stage199d_aarch64_readiness_audit` pins all three blockers and the two ready properties, so the
 map is executable. `qemu-system-aarch64` is also absent here, so no AArch64 live suite could
 run regardless. Full evidence: `doc/IPC.md` §8.6.10.
+
+### 6.1.12 AArch64 blockers 1 and 2 CLOSED; blocker 3 still open
+
+Structural preparation only — **the AArch64 production default remains OFF**, no live AArch64
+seal was issued, no RISC-V work, no dispatch retirement.
+
+1. **CLOSED — the syscall-ABI import uses the canonical predicate.** Both
+   `pre_split_import_syscall_abi` and its return-path twin `finalize_split_handled_syscall`
+   admit NR6/NR7 through `ipccall_direct_admission_enabled()`, the same predicate the split
+   dispatcher uses; **no `ipccall_direct_proof_enabled()` call survives in
+   `src/arch/trap_entry.rs`**, so AArch64 has no architecture-specific admission rule. The
+   predicate is still `production || proof` with production `cfg!(target_arch = "x86_64")`, so
+   AArch64 still resolves to the armed proof gate and a normal boot is byte-identical.
+2. **CLOSED — the handled split return takes no broad lock.** The `shared.with_cpu(...)`
+   wrapper is gone. `split_finalize_handled_syscall` is driven by an exact entering identity
+   `SplitReturnIdentity { tid, asid }` captured *before* `try_split_dispatch_into_frame` and
+   threaded to both finalize call sites, so nothing after the direct transaction re-discovers an
+   unqualified "current task". Work is split into frame-only steps outside every lock (resume PC
+   from `last_vector_raw_elr()` with no extra `+4`, `export_syscall_result_to_user_gprs`, the
+   `args[0..2]` resync, diagnostics) and **two bounded rank-2 task-domain transactions**:
+   `split_return_take_tls_split(id)` and `split_return_commit_context_split(id, ctx)`, both
+   exact-incarnation validated and both reaching storage through
+   `KernelState::task_return_split_mut_ptrs_from_raw` — one rank-2 lock over two same-domain
+   storages. **The pre-export save → restore → read-back round trip was proved redundant and
+   removed**, not relocated: `apply_user_context(capture_user_context())` is an exact nine-field
+   identity, the TCB setter/getter are verbatim, the read-back was the save's only consumer, and
+   the post-export save overwrites it before anything observes it. The TLS take and the
+   stale-incarnation bail are kept. Byte-for-byte preserved: success and error lanes, ELR/SPSR/SP
+   and all user GPRs, x18 TLS, stale-identity behaviour, and every existing AArch64 split class.
+   No fallback to the broad path after a handled direct transaction.
+   *Census effect:* `src/arch/trap_entry.rs` 12 → 11; tree total 51 → **50**;
+   `AUDITED_WITH_CPU_TOTAL` 41 → **40**; `CLASS_RUNTIME_REQUIRED` 46 → **45**. No new
+   broad-lock acquisition site was introduced.
+3. **STILL OPEN — off-lock authoritative dispatch is x86_64-only.** `d6_genuine_enabled()` is
+   unchanged. The sole remaining gating item for an AArch64 production flip.
+
+`stage199d_aarch64_readiness_audit` now pins 1 and 2 closed and 3 open;
+`stage199d_split_return_without_broad_lock` adds 11 differential and structural tests against
+the legacy AArch64 non-task-switched return. Full evidence: `doc/IPC.md` §8.6.11.
 
 ---
 

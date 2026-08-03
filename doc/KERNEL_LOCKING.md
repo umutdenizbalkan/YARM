@@ -54,7 +54,7 @@ lines excluded.
 | `SharedKernel::with_cpu` | **41** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **10** |
 | Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
-| **Total broad-lock acquisition sites** | **51** |
+| **Total broad-lock acquisition sites** | **50** |
 
 Canonical Stage **204A** additionally requires each site classified. That classification is
 complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
@@ -64,7 +64,7 @@ complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
 | boot-only | **0** | — |
 | test-only | **3** | `runtime.rs:1244`, `1248` (`ipc_recv_with_deadline_split_bridge`), `runtime.rs:2654` |
 | obsolete | **2** | `runtime.rs:2644` (`handle_trap_with_cpu`, **no in-tree caller at all**); `runtime.rs:3725` (`run_reply_timeout_completion`, superseded by `OffLockReplyTimeout`) |
-| runtime-required | **46** | the real retirement surface |
+| runtime-required | **45** | the real retirement surface |
 | undocumented | **0** | every site enumerated with file, line and enclosing function |
 
 This table is machine-checked: `tests/broad_lock_census_guard.rs` recomputes the per-file

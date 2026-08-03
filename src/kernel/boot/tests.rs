@@ -43063,10 +43063,22 @@ mod stage160c_aarch64_trap_abi_bracketing {
     fn stage160c_exports_and_advances_on_handled_split() {
         assert_eq!(
             TRAP_ENTRY_SRC
-                .matches("finalize_split_handled_syscall(shared, cpu, frame)")
+                .matches("finalize_split_handled_syscall(shared, cpu, entering, frame)")
                 .count(),
             2,
             "finalize must run on both the Ok and handled-error split arms"
+        );
+        // Stage 199D: the entering identity is captured BEFORE the split dispatch, so the
+        // finalize never re-discovers an unqualified "current task" after the transaction.
+        let ent = TRAP_ENTRY_SRC
+            .find("let entering = split_return_identity(shared, cpu);")
+            .expect("entering identity capture");
+        let disp = TRAP_ENTRY_SRC
+            .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+            .expect("split dispatch call");
+        assert!(
+            ent < disp,
+            "the entering {{tid, asid}} must be captured before the split dispatch"
         );
         assert!(
             AARCH64_TRAP_SRC.contains("fn split_finalize_handled_syscall(")
@@ -43175,9 +43187,15 @@ mod stage160d_aarch64_split_error_export_parity {
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
 
-    // 1. The split finalize export ordering mirrors the global path exactly:
-    //    context-save (set_thread_user_context) → restore_arch_thread_state →
-    //    export_syscall_result_to_user_gprs.
+    // 1. The split finalize export ordering still mirrors the observable global path.
+    //
+    //    Stage 199D closed AArch64 readiness blocker 2 by removing the broad-lock
+    //    reacquisition. The legacy sequence was context-save → restore_arch_thread_state
+    //    (which read that same context straight back out of the TCB) → export → re-sync →
+    //    context-save. The pre-export save and its read-back were proved redundant for a
+    //    NON-SWITCHING split return and removed; what survives, and is pinned here, is the
+    //    ordering userspace can actually observe: TLS restore → export → final context
+    //    commit. The removed round trip is pinned negatively so it cannot creep back.
     #[test]
     fn stage160d_split_finalize_mirrors_global_export_order() {
         let f = AARCH64_TRAP_SRC
@@ -43185,18 +43203,22 @@ mod stage160d_aarch64_split_error_export_parity {
             .nth(1)
             .and_then(|s| s.split("\npub fn ").next())
             .expect("split finalize must exist");
-        let ctx_save = f
-            .find("set_thread_user_context(tid, ctx)")
-            .expect("context save");
-        let restore = f
-            .find("restore_arch_thread_state(kernel, cpu, Some(frame), true)")
-            .expect("restore");
+        let tls = f
+            .find("split_return_take_tls_split(id)")
+            .expect("TLS restore take");
         let export = f
             .find("export_syscall_result_to_user_gprs(frame)")
             .expect("export");
+        let commit = f
+            .find("split_return_commit_context_split(id, ctx)")
+            .expect("final context commit");
         assert!(
-            ctx_save < restore && restore < export,
-            "split finalize must order context-save → restore → export, mirroring the global path"
+            tls < export && export < commit,
+            "split finalize must order TLS-restore → export → final context commit"
+        );
+        assert!(
+            !f.contains("restore_arch_thread_state("),
+            "the proved-redundant pre-export save/read-back round trip must stay removed"
         );
     }
 
@@ -78744,27 +78766,48 @@ mod stage199a2c1_aarch64_guards {
         set_ipccall_direct_proof_enabled(false);
     }
 
-    // (AArch64 NR6/NR7 split eligibility) The shared trap entry imports the six-argument ABI + admits
-    // NR6/NR7 into the split dispatcher ONLY behind the direct proof gate, and finalizes a handled
-    // NR6/NR7 via the AArch64 syscall-return ABI (export x0..x5 + advance ELR).
+    // (AArch64 NR6/NR7 split eligibility) The shared trap entry imports the six-argument ABI +
+    // admits NR6/NR7 into the split dispatcher behind the CANONICAL admission predicate, and
+    // finalizes a handled NR6/NR7 via the AArch64 syscall-return ABI (export x0..x5 + advance ELR).
+    //
+    // Stage 199D closed AArch64 readiness blocker 1: the import used to consult the proof-only
+    // predicate directly, giving AArch64 its own admission rule. It now uses the same
+    // `ipccall_direct_admission_enabled()` the split dispatcher uses. That predicate is still
+    // `production || proof`, and the AArch64 production default remains OFF, so a normal AArch64
+    // boot is byte-identical — this is structural preparation only.
     #[test]
     fn aarch64_nr6_nr7_split_eligibility_gated() {
-        // Import admits NR6/NR7 only behind the proof gate (all six args imported via split_import).
+        // Import admits NR6/NR7 behind the canonical predicate (all six args via split_import).
         assert!(TRAP_ENTRY_SRC.contains("split_import_syscall_abi(frame)"));
         assert!(
             TRAP_ENTRY_SRC.contains(
-                "(raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || raw_nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_proof_enabled()"
+                "(raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || raw_nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_admission_enabled()"
             ),
-            "NR6/NR7 ABI import must be admitted only behind the direct proof gate"
+            "NR6/NR7 ABI import must be admitted behind the canonical admission predicate"
         );
-        // Finalize (export results + advance ELR) admits a handled NR6/NR7 behind the gate.
+        // Finalize (export results + advance ELR) admits a handled NR6/NR7 behind the same one.
         assert!(
             TRAP_ENTRY_SRC.contains(
-                "(frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_proof_enabled()"
+                "(frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_admission_enabled()"
             ),
             "a handled NR6/NR7 must finalize via the AArch64 syscall-return ABI"
         );
-        assert!(TRAP_ENTRY_SRC.contains("split_finalize_handled_syscall(kernel, cpu, frame)"));
+        assert!(
+            TRAP_ENTRY_SRC.contains("split_finalize_handled_syscall(shared, cpu, entering, frame)")
+        );
+        // The AArch64 production default stays OFF: the predicate is production||proof and
+        // production is x86_64-only, so nothing about a normal AArch64 boot changes.
+        const BOOT_SRC: &str = include_str!("mod.rs");
+        assert!(
+            BOOT_SRC.contains(
+                "pub fn ipccall_direct_admission_enabled() -> bool {\n    ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()\n}"
+            ),
+            "the canonical admission predicate remains production || proof"
+        );
+        assert!(
+            BOOT_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            "production default remains x86_64-only, so AArch64 stays OFF"
+        );
     }
 
     // (six trap arguments) The off-lock gates read all six NR6/NR7 arguments from the imported frame
@@ -78787,15 +78830,21 @@ mod stage199a2c1_aarch64_guards {
             SPLIT_SRC.contains("matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_admission_enabled()"),
             "IpcCall/IpcReply pass the NR whitelist behind the arch-split admission predicate"
         );
-        // AArch64 itself is UNCHANGED by the x86_64 production flip: its ABI import and its
-        // handled-syscall finalize are still gated on the armed proof gate.
+        // AArch64 itself is UNCHANGED by the x86_64 production flip. Stage 199D blocker 1 moved
+        // its ABI import and its handled-syscall finalize onto the CANONICAL admission predicate
+        // (one shared rule, no AArch64-specific copy); because production is x86_64-only that
+        // predicate still resolves to the armed proof gate on AArch64.
         const AARCH64_TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         assert_eq!(
             AARCH64_TRAP_ENTRY
-                .matches("&& crate::kernel::boot::ipccall_direct_proof_enabled())")
+                .matches("&& crate::kernel::boot::ipccall_direct_admission_enabled())")
                 .count(),
             2,
-            "AArch64 import + finalize remain proof-gated"
+            "AArch64 import + finalize share the canonical admission predicate"
+        );
+        assert!(
+            !AARCH64_TRAP_ENTRY.contains("ipccall_direct_proof_enabled()"),
+            "no proof-only admission rule survives at the AArch64 trap entry"
         );
     }
 
@@ -79319,8 +79368,13 @@ mod stage199a2c3_matrix_guards {
             !SPLIT_SRC.contains("ipccall_direct_proof_enabled()"),
             "no proof-gate dependency survives in the shared dispatcher"
         );
-        // AArch64 import + RISC-V trap both gate NR6/NR7 on the direct proof gate.
-        assert!(TRAP_ENTRY_SRC.contains("ipccall_direct_proof_enabled()"));
+        // Stage 199D blocker 1: the AArch64 import now shares the canonical admission
+        // predicate with the dispatcher rather than reading the proof gate directly. Because
+        // production is x86_64-only, AArch64 still resolves to the proof gate in practice.
+        assert!(TRAP_ENTRY_SRC.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"));
+        assert!(!TRAP_ENTRY_SRC.contains("ipccall_direct_proof_enabled()"));
+        // RISC-V (blocker-equivalent work not in scope) still gates at its own trap entry.
+        assert!(RISCV_TRAP_SRC.contains("ipccall_direct_proof_enabled()"));
         assert!(RISCV_TRAP_SRC.contains("|| is_ipc_direct"));
     }
 
@@ -82872,18 +82926,24 @@ mod stage199d_production_default_guards {
         crate::kernel::boot::ipccall_direct_ack::reset();
     }
 
-    /// AArch64 and RISC-V are UNCHANGED: their arch entry points still gate NR6/NR7 on the
-    /// armed proof gate, and the shared admission predicate still consults it for them.
+    /// AArch64 and RISC-V remain OFF by default. Stage 199D blocker 1 moved the AArch64 trap
+    /// entry onto the CANONICAL admission predicate — which is `production || proof` with
+    /// production x86_64-only, so AArch64 still resolves to the armed proof gate. RISC-V is
+    /// untouched and still reads the proof gate at its own arch entry point.
     #[test]
     fn other_architectures_remain_proof_gated() {
         let trap_entry = include_str!("../../arch/trap_entry.rs");
         let riscv = include_str!("../../arch/riscv64/trap.rs");
         assert_eq!(
             trap_entry
-                .matches("&& crate::kernel::boot::ipccall_direct_proof_enabled())")
+                .matches("&& crate::kernel::boot::ipccall_direct_admission_enabled())")
                 .count(),
             2,
-            "AArch64 import + finalize remain proof-gated"
+            "AArch64 import + finalize share the canonical admission predicate"
+        );
+        assert!(
+            !trap_entry.contains("ipccall_direct_proof_enabled()"),
+            "no AArch64-specific proof-only admission rule survives"
         );
         assert!(
             riscv.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"),
@@ -103389,13 +103449,13 @@ mod stage199d_aarch64_readiness_audit {
         }
     }
 
-    /// **BLOCKER 1 — admission.** The AArch64 syscall-ABI import still consults the PROOF
-    /// gate for NR6/NR7, not the arch-split admission predicate x86 uses. With the proof gate
-    /// off, `nr` stays 0, the split dispatcher declines, and NR6/NR7 fall back to the
-    /// broad-lock path — so flipping the production predicate alone would be a silent no-op on
-    /// AArch64 rather than an enablement.
+    /// **BLOCKER 1 — CLOSED.** The AArch64 syscall-ABI import now asks the canonical
+    /// `ipccall_direct_admission_enabled()` for NR6/NR7 — the same predicate the split
+    /// dispatcher uses — so AArch64 carries no architecture-specific admission rule. It is
+    /// still `production || proof`, and the AArch64 production default is OFF, so a normal
+    /// AArch64 boot keeps `nr = 0` here and falls back byte-identically.
     #[test]
-    fn blocker1_the_aarch64_abi_import_is_still_proof_gated() {
+    fn blocker1_closed_the_abi_import_uses_the_canonical_admission_predicate() {
         let import = TRAP_ENTRY
             .split("fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {")
             .nth(1)
@@ -103408,52 +103468,39 @@ mod stage199d_aarch64_readiness_audit {
             "the import knows about NR6/NR7"
         );
         assert!(
-            import.contains("ipccall_direct_proof_enabled()"),
-            "BLOCKER: NR6/NR7 import is gated on the proof gate. The fix is to ask the \
-             canonical `ipccall_direct_admission_enabled()` instead — the same predicate the \
-             split dispatcher already uses — so no AArch64-specific admission rule is added."
+            import.contains("ipccall_direct_admission_enabled()"),
+            "CLOSED: the import asks the canonical admission predicate"
         );
         assert!(
-            !import.contains("ipccall_direct_admission_enabled()"),
-            "when this flips, update this guard and re-audit"
+            !import.contains("ipccall_direct_proof_enabled()"),
+            "and no longer the proof-only predicate"
         );
     }
 
-    /// **BLOCKER 2 — the decisive one.** A HANDLED split syscall on AArch64 returns to
-    /// userspace through `finalize_split_handled_syscall`, which takes the **broad
-    /// `KernelState` lock** (`with_cpu`) to save the user context, restore arch thread state
-    /// and export x0..x5. x86_64 needs none of that — its trap stub already returns results
-    /// from the ret lanes — so its finalize is a genuine no-op.
-    ///
-    /// This is why the audit's answer is "not ready": the split seam itself is clean, but
-    /// **every** handled AArch64 split syscall, NR6/NR7 included, reacquires the broad lock on
-    /// the way out.
+    /// **BLOCKER 2 — CLOSED.** The AArch64 handled-split return no longer reacquires the
+    /// broad `KernelState` lock. It is frame-only work outside every lock plus two bounded
+    /// rank-2 task-domain transactions keyed on the exact entering `{tid, asid}` incarnation.
+    /// The pre-export context save and its read-back were proved redundant for a
+    /// non-switching return and removed; the broad-lock census fell 41 → 40.
+    /// See `stage199d_split_return_without_broad_lock` for the differential proofs.
     #[test]
-    fn blocker2_the_aarch64_split_return_path_reacquires_the_broad_lock() {
+    fn blocker2_closed_the_split_return_takes_no_broad_lock() {
         let aarch64_finalize = TRAP_ENTRY
             .split("#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(")
             .nth(1)
-            .expect("the AArch64 finalize")
+            .expect("the AArch64 finalize wrapper")
             .split("\n}\n")
             .next()
             .expect("body bounded");
         assert!(
-            aarch64_finalize.contains("shared.with_cpu(cpu, |kernel| {"),
-            "BLOCKER: the AArch64 split return path takes the broad lock. Retiring it means \
-             moving the context save, the arch thread-state restore and the GPR export onto \
-             per-domain seams (task rank 2), or proving they need no kernel state at all."
+            !aarch64_finalize.contains("with_cpu"),
+            "CLOSED: the AArch64 split return path takes no broad lock"
         );
         assert!(
-            aarch64_finalize.contains("split_finalize_handled_syscall(kernel, cpu, frame)"),
-            "and it does so to run the arch return-path restore"
+            aarch64_finalize.contains("ipccall_direct_admission_enabled()"),
+            "and admits NR6/NR7 through the canonical predicate, matching the import"
         );
-        // The same finalize is ALSO still proof-gated for NR6/NR7 — the return-path twin of
-        // blocker 1.
-        assert!(
-            aarch64_finalize.contains("ipccall_direct_proof_enabled()"),
-            "BLOCKER 1's twin: the return path admits NR6/NR7 only under the proof gate"
-        );
-        // x86_64 / riscv64 need nothing here.
+        // x86_64 / riscv64 still need nothing here.
         let other = TRAP_ENTRY
             .split("#[cfg(not(target_arch = \"aarch64\"))]\nfn finalize_split_handled_syscall(")
             .nth(1)
@@ -103461,10 +103508,7 @@ mod stage199d_aarch64_readiness_audit {
             .split("\n}\n")
             .next()
             .expect("body bounded");
-        assert!(
-            !other.contains("with_cpu"),
-            "x86_64/riscv64 return from the ret lanes and take no lock"
-        );
+        assert!(!other.contains("with_cpu"));
     }
 
     /// **BLOCKER 3 — the wake's downstream dispatch.** The off-lock authoritative
@@ -103552,5 +103596,402 @@ mod stage199d_aarch64_readiness_audit {
                 "{which} admission: one shape for every architecture"
             );
         }
+    }
+}
+
+/// Stage 199D — **broad-lock-free handled-split syscall return** (AArch64 blocker 2).
+///
+/// The AArch64 handled-split return used to reacquire the broad `KernelState` lock
+/// (`shared.with_cpu`) to save the user context, restore arch thread state and export
+/// x0..x5 — so no eligible NR6/NR7 transaction could complete without retaking it. It is now
+/// frame-only work outside every lock plus two bounded rank-2 task-domain transactions.
+///
+/// The legacy sequence was: save context → read that same context back out of the TCB and
+/// apply it to the frame → take TLS → export → re-sync args → save context again. These tests
+/// prove the removed round trip was redundant, and that the two transactions are exact in the
+/// entering `{tid, asid}` incarnation.
+mod stage199d_split_return_without_broad_lock {
+    use super::*;
+    use crate::kernel::task::UserRegisterContext;
+    use crate::kernel::vm::{Asid, VirtAddr};
+    use crate::runtime::{SharedKernel, SplitReturnIdentity};
+
+    const TID: u64 = 2;
+
+    fn fixture() -> (SharedKernel, Asid) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            s.register_task(TID).expect("task");
+            let (asid, _sp) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(TID, asid).expect("bind");
+            asid
+        });
+        (k, asid)
+    }
+
+    fn id(asid: Asid) -> SplitReturnIdentity {
+        SplitReturnIdentity { tid: TID, asid }
+    }
+
+    /// Strip comment lines: a structural guard must read the CODE, not the prose that
+    /// legitimately explains which construct was removed.
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// A frame with every lane distinctly poisoned, so any dropped or crossed field shows up.
+    fn poisoned_frame() -> TrapFrame {
+        let mut f = TrapFrame::new(15, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        for i in 0..32 {
+            f.set_user_gpr(i, 0xA000 + i);
+        }
+        f.set_saved_pc(0xDEAD_0000);
+        f.set_saved_sp(0xBEEF_0000);
+        f
+    }
+
+    /// **The proof that the removed round trip was redundant.**
+    ///
+    /// The legacy path saved the frame's context into the TCB and then read it straight back
+    /// and applied it to the frame. `apply_user_context(capture_user_context())` moves the same
+    /// nine fields both ways and nothing else, and the TCB setter/getter store and return the
+    /// context verbatim — so the round trip could only ever restore what it had just written.
+    #[test]
+    fn the_context_round_trip_is_an_exact_identity() {
+        let before = poisoned_frame();
+        let mut after = poisoned_frame();
+        after.apply_user_context(before.capture_user_context());
+        assert_eq!(
+            after, before,
+            "apply(capture(frame)) must be an exact identity on the frame"
+        );
+        // And through the TCB, which is what the legacy path actually did.
+        let (k, asid) = fixture();
+        let mut ctx = before.capture_user_context();
+        ctx.instruction_ptr = VirtAddr(0x4321);
+        assert!(k.split_return_commit_context_split(id(asid), ctx));
+        let read_back = k.with(|s| s.thread_user_context(TID)).expect("context");
+        assert_eq!(
+            read_back, ctx,
+            "the TCB stores and returns the context verbatim"
+        );
+        let mut round_tripped = poisoned_frame();
+        round_tripped.apply_user_context(read_back);
+        let mut directly = poisoned_frame();
+        directly.apply_user_context(ctx);
+        assert_eq!(
+            round_tripped, directly,
+            "saving to the TCB and reading back is indistinguishable from applying directly"
+        );
+    }
+
+    /// The pre-export save's only consumer was that read-back, and the post-export save
+    /// overwrites it before anything else can observe it — so the whole pre-export save is
+    /// dead for a non-switching return. Proved by running both orders and comparing the TCB.
+    #[test]
+    fn the_pre_export_save_is_dead_for_a_non_switching_return() {
+        let (k, asid) = fixture();
+        let frame = poisoned_frame();
+        let resume = VirtAddr(0x9000);
+
+        // LEGACY order: pre-export save, then (frame work), then post-export save.
+        let mut pre = frame.capture_user_context();
+        pre.instruction_ptr = resume;
+        assert!(k.split_return_commit_context_split(id(asid), pre));
+        let mut post_frame = poisoned_frame();
+        post_frame.set_user_gpr(0, 0x1234); // stand-in for the export
+        let mut post = post_frame.capture_user_context();
+        post.instruction_ptr = resume;
+        assert!(k.split_return_commit_context_split(id(asid), post));
+        let legacy = k.with(|s| s.thread_user_context(TID)).expect("ctx");
+
+        // NEW order: post-export save only.
+        let (k2, asid2) = fixture();
+        assert!(k2.split_return_commit_context_split(id(asid2), post));
+        let new = k2.with(|s| s.thread_user_context(TID)).expect("ctx");
+
+        assert_eq!(
+            legacy, new,
+            "dropping the pre-export save leaves the committed context byte-identical"
+        );
+    }
+
+    /// Transaction #1 is exact in `{tid, asid}` and takes the TLS-restore request at most once.
+    #[test]
+    fn the_tls_transaction_is_exact_and_take_once() {
+        let (k, asid) = fixture();
+        // No pending request: Some(None) — a live incarnation with nothing to restore.
+        assert_eq!(k.split_return_take_tls_split(id(asid)), Some(None));
+
+        // Arm a TLS base + a pending restore for this task.
+        // `set_thread_tls_base` installs the base AND marks the restore pending.
+        k.with(|s| s.set_thread_tls_base(TID, 0x7FF0).expect("tls"));
+        assert_eq!(
+            k.split_return_take_tls_split(id(asid)),
+            Some(Some(0x7FF0)),
+            "the pending restore yields the TLS base"
+        );
+        assert_eq!(
+            k.split_return_take_tls_split(id(asid)),
+            Some(None),
+            "and it is taken exactly once"
+        );
+    }
+
+    /// A stale or foreign incarnation is rejected by BOTH transactions, and neither mutates.
+    #[test]
+    fn a_stale_incarnation_is_rejected_and_mutates_nothing() {
+        let (k, asid) = fixture();
+        k.with(|s| s.set_thread_tls_base(TID, 0x7FF0).expect("tls"));
+        let before = k.with(|s| s.thread_user_context(TID));
+
+        for stale in [
+            SplitReturnIdentity {
+                tid: TID,
+                asid: Asid(0xBEE),
+            }, // numeric TID reuse
+            SplitReturnIdentity { tid: 9999, asid }, // no such task
+            SplitReturnIdentity { tid: 0, asid },    // the idle task
+        ] {
+            assert_eq!(
+                k.split_return_take_tls_split(stale),
+                None,
+                "{stale:?}: a stale incarnation takes no TLS"
+            );
+            let mut ctx = poisoned_frame().capture_user_context();
+            ctx.instruction_ptr = VirtAddr(0xFFFF);
+            assert!(
+                !k.split_return_commit_context_split(stale, ctx),
+                "{stale:?}: a stale incarnation commits no context"
+            );
+        }
+        assert_eq!(
+            k.with(|s| s.thread_user_context(TID)),
+            before,
+            "the real incarnation's context is untouched by every rejection"
+        );
+        // The pending TLS restore survives every rejected take.
+        assert_eq!(k.split_return_take_tls_split(id(asid)), Some(Some(0x7FF0)));
+    }
+
+    /// The committed context carries the full saved state — PC, SP and every user GPR
+    /// including the TLS lane — byte-for-byte.
+    #[test]
+    fn the_committed_context_preserves_the_full_saved_state() {
+        let (k, asid) = fixture();
+        let mut frame = poisoned_frame();
+        // The AArch64 TLS lane is x18 at index 15.
+        frame.set_user_gpr(15, 0x7FF0);
+        let resume = VirtAddr(0x9000);
+        let mut ctx = frame.capture_user_context();
+        ctx.instruction_ptr = resume;
+        assert!(k.split_return_commit_context_split(id(asid), ctx));
+
+        let got = k.with(|s| s.thread_user_context(TID)).expect("ctx");
+        assert_eq!(got.instruction_ptr, resume, "ELR/resume PC");
+        assert_eq!(got.stack_ptr, VirtAddr(frame.saved_sp() as u64), "SP");
+        for i in 0..32 {
+            assert_eq!(got.user_gprs[i], frame.user_gpr(i), "x{i}");
+        }
+        assert_eq!(
+            got.user_gprs[15], 0x7FF0,
+            "x18 TLS lane survives the commit"
+        );
+        assert_eq!(
+            (got.arg0, got.arg1, got.arg2, got.arg3, got.arg4, got.arg5),
+            (
+                frame.arg(0),
+                frame.arg(1),
+                frame.arg(2),
+                frame.arg(3),
+                frame.arg(4),
+                frame.arg(5)
+            ),
+            "every argument lane"
+        );
+    }
+
+    /// Success and error return lanes both round-trip through the commit unchanged — the
+    /// transaction is register-shape agnostic, so it cannot perturb either encoding.
+    #[test]
+    fn success_and_error_return_lanes_survive_the_commit() {
+        for err in [None, Some(2usize)] {
+            let (k, asid) = fixture();
+            let mut frame = poisoned_frame();
+            match err {
+                Some(code) => {
+                    frame.set_err(code);
+                    frame.set_user_gpr(0, code);
+                    for lane in 1..=5 {
+                        frame.set_user_gpr(lane, 0);
+                    }
+                }
+                None => {
+                    frame.set_ok(0xAA, 0xBB, 0xCC);
+                    frame.set_user_gpr(0, 0xAA);
+                    frame.set_user_gpr(1, 0xBB);
+                    frame.set_user_gpr(2, 0xCC);
+                }
+            }
+            frame.set_arg(0, frame.user_gpr(0));
+            frame.set_arg(1, frame.user_gpr(1));
+            frame.set_arg(2, frame.user_gpr(2));
+            let mut ctx = frame.capture_user_context();
+            ctx.instruction_ptr = VirtAddr(0x9000);
+            assert!(k.split_return_commit_context_split(id(asid), ctx));
+            let got = k.with(|s| s.thread_user_context(TID)).expect("ctx");
+            assert_eq!(got.user_gprs[0], frame.user_gpr(0), "err={err:?}: x0 lane");
+            assert_eq!(got.user_gprs[1], frame.user_gpr(1), "err={err:?}: x1 lane");
+            assert_eq!(got.user_gprs[2], frame.user_gpr(2), "err={err:?}: x2 lane");
+            assert_eq!(got.arg0, frame.user_gpr(0), "err={err:?}: arg0 resync");
+        }
+    }
+
+    // ── Structural guards ────────────────────────────────────────────────────────────
+
+    /// The handled split finalization contains no broad-lock call of any kind.
+    #[test]
+    fn the_handled_split_finalization_takes_no_broad_lock() {
+        let trap_entry = include_str!("../../arch/trap_entry.rs");
+        let aarch64 = include_str!("../../arch/aarch64/trap.rs");
+
+        // CODE only — the prose legitimately names what was removed and why.
+        let finalize = code_only(
+            aarch64
+                .split("pub(crate) fn split_finalize_handled_syscall(")
+                .nth(1)
+                .expect("the AArch64 finalization")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded"),
+        );
+        for forbidden in ["with_cpu", "KernelState", "shared.with(", ".with(|"] {
+            assert!(
+                !finalize.contains(forbidden),
+                "the handled split finalization must not use {forbidden}"
+            );
+        }
+        assert!(
+            finalize.contains("shared.split_return_take_tls_split(id)")
+                && finalize.contains("shared.split_return_commit_context_split(id, ctx)"),
+            "it uses the two bounded rank-2 task-domain transactions"
+        );
+        // The dispatcher-side wrapper does not either.
+        let wrapper = trap_entry
+            .split("#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(")
+            .nth(1)
+            .expect("the wrapper")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            !wrapper.contains("with_cpu"),
+            "the wrapper must not reacquire the broad lock either"
+        );
+    }
+
+    /// The import and the dispatcher agree on ONE admission predicate — no AArch64-specific
+    /// admission rule was introduced.
+    #[test]
+    fn the_import_and_dispatcher_share_one_admission_predicate() {
+        let trap_entry = include_str!("../../arch/trap_entry.rs");
+        let split = include_str!("../syscall_split.rs");
+        let import = trap_entry
+            .split("fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {")
+            .nth(1)
+            .expect("the import")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            import.contains("ipccall_direct_admission_enabled()"),
+            "the import asks the canonical admission predicate"
+        );
+        assert!(
+            !import.contains("ipccall_direct_proof_enabled()"),
+            "and no longer the proof-only predicate"
+        );
+        assert!(
+            split.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "the dispatcher asks the same one"
+        );
+    }
+
+    /// The return path uses the EXACT entering identity, captured before the split dispatch —
+    /// it never re-discovers an unqualified current task afterwards.
+    #[test]
+    fn the_return_path_uses_the_exact_entering_identity() {
+        let trap_entry = include_str!("../../arch/trap_entry.rs");
+        let flat = trap_entry
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        let capture = flat
+            .find("let entering = split_return_identity(shared, cpu);")
+            .expect("the identity is captured");
+        let dispatch = flat
+            .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+            .expect("the split dispatch");
+        assert!(
+            capture < dispatch,
+            "the entering identity is captured BEFORE the split dispatch runs"
+        );
+        let aarch64 = include_str!("../../arch/aarch64/trap.rs");
+        let finalize = code_only(
+            aarch64
+                .split("pub(crate) fn split_finalize_handled_syscall(")
+                .nth(1)
+                .expect("the finalization")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded"),
+        );
+        assert!(
+            !finalize.contains("current_tid"),
+            "the finalization must not re-discover an unqualified current task"
+        );
+        // Both transactions validate the incarnation exactly.
+        let runtime = include_str!("../../runtime.rs");
+        assert_eq!(
+            runtime
+                .matches("t.tid.0 == id.tid && t.asid == Some(id.asid)")
+                .count(),
+            2,
+            "both return transactions validate the exact tid+asid incarnation"
+        );
+    }
+
+    /// Blocker 3 is untouched and explicitly still open.
+    #[test]
+    fn blocker3_remains_open_and_unchanged() {
+        let modrs = include_str!("mod.rs");
+        let body = modrs
+            .split("pub(crate) fn d6_genuine_enabled() -> bool {")
+            .nth(1)
+            .expect("the dispatch gate")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            body.contains("cfg!(target_arch = \"x86_64\")"),
+            "blocker 3 (off-lock authoritative dispatch is x86_64-only) is unchanged and OPEN"
+        );
+    }
+
+    /// The AArch64 production default stays OFF — this increment is structural preparation.
+    #[test]
+    fn the_aarch64_production_default_stays_off() {
+        let modrs = include_str!("mod.rs");
+        let body = modrs
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .expect("predicate present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert_eq!(body.trim(), "cfg!(target_arch = \"x86_64\")");
     }
 }
