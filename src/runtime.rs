@@ -1143,48 +1143,77 @@ impl SharedKernel {
         })
     }
 
-    /// Stage 199D — post-lock dispatch step 1: revalidate the EXACT outgoing incarnation and
-    /// its committed blocked state, through the rank-2 task seam only.
+    /// Stage 199D — post-lock dispatch: observe the outgoing incarnation, for DIAGNOSTICS ONLY.
     ///
-    /// This is the fence that makes the whole drain safe to run with the broad lock dropped.
-    /// The work item was published by the in-lock commit; between then and now the outgoing
-    /// caller may have been replied to, timed out, exited, or had its TID reused. Each of
-    /// those is a DIFFERENT race with a different correct response, so the outcome is a typed
-    /// enum rather than a bool — see `RevalidateOutcome`.
+    /// The work item was published by the commit that removed the caller from `current`. From
+    /// that instant the CPU runs nothing and owes a dispatch, and **nothing observed here
+    /// cancels that debt**. In particular a caller that a reply or timeout has made `Runnable`
+    /// is simply back on the run queue, where the authoritative dequeue may select it like any
+    /// other candidate; refusing to dispatch on that basis would leave the CPU idle-but-not-idle
+    /// with a stale frame to `eret` through, which is the defect this observation used to cause.
     ///
-    /// The revalidation is exact in all three coordinates: `{tid, asid}` identifies the
-    /// incarnation (a replacement task reusing the TID has a different ASID), and
-    /// `blocked_recv_generation` identifies the *block* (a caller that unblocked and re-blocked
-    /// has advanced it, so the item refers to a block that is already over).
-    pub(crate) fn direct_dispatch_revalidate_split(
+    /// So this returns a typed observation, not a verdict. The drain logs it and settles
+    /// regardless. `{tid, asid}` is exact: a replacement incarnation reusing the TID reads as
+    /// `Gone` rather than being mistaken for the original.
+    pub(crate) fn direct_dispatch_observe_outgoing_split(
         &self,
         work: crate::kernel::direct_dispatch::DirectDispatchWork,
-    ) -> crate::kernel::direct_dispatch::RevalidateOutcome {
-        use crate::kernel::direct_dispatch::RevalidateOutcome;
+    ) -> crate::kernel::direct_dispatch::OutgoingObservation {
+        use crate::kernel::direct_dispatch::OutgoingObservation;
         if work.outgoing_tid == 0 {
-            return RevalidateOutcome::StaleIdentity;
+            return OutgoingObservation::Gone;
         }
         self.with_task_tcbs_split_mut(|tcbs| {
             let Some(tcb) = tcbs.iter().flatten().find(|t| {
                 t.tid.0 == work.outgoing_tid
                     && t.asid == Some(crate::kernel::vm::Asid(work.outgoing_asid))
             }) else {
-                return RevalidateOutcome::StaleIdentity;
+                return OutgoingObservation::Gone;
             };
-            if tcb.blocked_recv_generation != work.blocked_generation {
-                return RevalidateOutcome::StaleIdentity;
-            }
             match tcb.status {
                 crate::kernel::task::TaskStatus::Blocked(
                     crate::kernel::task::WaitReason::EndpointReceive(_),
-                ) => RevalidateOutcome::Ok,
-                // A reply won the race and made the caller runnable again. Dispatching it away
-                // now would be a DUPLICATE wake, so this is a refusal, not a state change.
+                ) => OutgoingObservation::StillBlocked,
                 crate::kernel::task::TaskStatus::Runnable
-                | crate::kernel::task::TaskStatus::Running => RevalidateOutcome::AlreadyRunnable,
-                _ => RevalidateOutcome::StateChanged,
+                | crate::kernel::task::TaskStatus::Running => OutgoingObservation::MadeRunnable,
+                _ => OutgoingObservation::OtherState,
             }
         })
+    }
+
+    /// Stage 199D — post-lock dispatch: EXACT rollback of a partially committed dispatch.
+    ///
+    /// Called only when the dequeue already mutated scheduler state (it selected `incoming`,
+    /// set `current` and the task was marked `Running`) and a LATER step then failed. Returning
+    /// "declined" at that point would leave the scheduler believing `incoming` is running while
+    /// the CPU `eret`s through somebody else's frame, so the mutation is undone exactly:
+    ///
+    /// * status `Running` → `Runnable` (rank 2);
+    /// * `current` cleared and `incoming` re-enqueued at the head so it is not lost (rank 1).
+    ///
+    /// Returns `true` iff the rollback fully succeeded. The caller takes the explicit fatal path
+    /// either way — this restores the invariant before halting so the failure is diagnosable and
+    /// the scheduler is not left in a torn state.
+    pub(crate) fn direct_dispatch_rollback_split(&self, cpu: CpuId, incoming: u64) -> bool {
+        // Rank 2 first: undo the status mutation.
+        let status_ok = self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == incoming) {
+                Some(tcb) => {
+                    tcb.status = crate::kernel::task::TaskStatus::Runnable;
+                    true
+                }
+                None => false,
+            }
+        });
+        // Rank 1: undo the dequeue and the current-set with the EXISTING exact inverse —
+        // `preempt_reenqueue_only_on` re-enqueues the current task and clears `current` without
+        // dispatching, which is precisely what `dispatch_next_on` did in reverse. No new
+        // scheduler primitive, so no second scheduler policy.
+        let sched_ok = self.with_scheduler_split_mut(|sched| {
+            let restored = kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu);
+            restored == Some(crate::kernel::ipc::ThreadId(incoming))
+        });
+        status_ok && sched_ok
     }
 
     /// Stage 199D — post-lock dispatch step 3b: does the authoritative `current` slot agree
@@ -1208,13 +1237,17 @@ impl SharedKernel {
     /// Reads the incoming ASID through the rank-2 task seam, then performs the activation
     /// through the SAME arch primitive the in-lock path uses
     /// (`hal_adapters::switch_address_space`, which carries the established AArch64
-    /// DSB/ISB/TLBI ordering), and records it in the single authoritative activation cell so
-    /// every existing `hal.active_asid()` consumer observes it.
+    /// DSB/ISB/TLBI ordering), and records it against **this CPU** in the authoritative
+    /// per-CPU activation table so every existing `active_asid_on` consumer observes it.
     ///
     /// No `KernelState` is touched: the HAL's activation record was moved out of `KernelState`
-    /// to a lock-free cell precisely so this step needs no broad lock. Returns the activated
-    /// ASID, or `None` when the incoming task has none (nothing is activated).
-    pub(crate) fn direct_dispatch_activate_asid_split(&self, incoming: u64) -> Option<u16> {
+    /// to a lock-free per-CPU table precisely so this step needs no broad lock. Returns the
+    /// activated ASID, or `None` when the incoming task has none (nothing is activated).
+    pub(crate) fn direct_dispatch_activate_asid_split(
+        &self,
+        cpu: CpuId,
+        incoming: u64,
+    ) -> Option<u16> {
         let asid = self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()
                 .flatten()
@@ -1222,7 +1255,7 @@ impl SharedKernel {
                 .and_then(|t| t.asid)
         })?;
         crate::arch::hal_adapters::switch_address_space(asid);
-        crate::arch::hal::note_address_space_activated(asid);
+        crate::arch::hal::note_address_space_activated(cpu, asid);
         Some(asid.0)
     }
 

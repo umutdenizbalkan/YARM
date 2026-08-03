@@ -1593,26 +1593,96 @@ nothing**, and proof/oracle confinement is retained.
 
 #### Proof and limits
 
-`stage199d_aarch64_offlock_dispatch` (17 tests) plus `kernel::direct_dispatch` (7 tests) prove:
-NR6 advances the queue exactly once; NR7 never publishes and never switches; publication follows
-the committed blocked state; each stale coordinate (tid, asid, generation) is refused
-individually; a refused drain mutates nothing; the incoming task's exact ASID, complete frame and
-TLS are restored, TLS taken once; the restore can never return the outgoing task's frame; a
-dispatch/current disagreement is fail closed; the post-lock path contains no `with_cpu`, broad
-`with` or `KernelState`; the drain reuses the existing machinery; FutexWait/Yield markers and
-deferral state survive untouched. The broad-lock census is **unchanged at 50** with a new guard
-asserting it stays at 50 or decreases.
+`stage199d_aarch64_offlock_dispatch` plus `kernel::direct_dispatch` carry the proof
+obligations. **Live acceptance is pending:** `qemu-system-aarch64` is not installed in this
+environment, so no AArch64 live suite could run; the production default is OFF for exactly that
+reason.
 
-**Live acceptance is pending.** `qemu-system-aarch64` is not installed in this environment, so
-no AArch64 live suite could run; the production default is OFF for exactly that reason.
+### 8.6.13 Correctness repair of the post-lock dispatch
 
-One observation, recorded rather than acted on: `tcb.blocked_recv_generation` is declared, read
-by the reply-timeout revalidation and carried by this work item, but **nothing in the tree
-increments it** — it is always 0. The work item captures and exactly compares the authoritative
-field, so the mechanism is correct whatever that field's cadence becomes; but today the
-generation coordinate cannot by itself detect a re-block, and the load-bearing checks are the
-`{tid, asid}` coordinates and the status arms. Making the field advance would change
-reply-timeout terminal arbitration and is out of scope here.
+The §8.6.12 landing had four defects. Each is repaired below; none required weakening the
+contract, and the AArch64 production default is still OFF.
+
+#### (1) The publication protocol was a boolean
+
+A single `PENDING` flag conflated three distinct conditions — *being written*, *readable*, and
+*being read* — so it was only correct under an unstated non-reentrancy assumption. It is
+replaced by an explicit per-CPU state machine:
+
+```text
+  EMPTY --publisher CAS--> WRITING --payload written, Release--> READY
+  READY --taker CAS (AcqRel)--> READING --payload read--> EMPTY
+```
+
+A publisher claims only `EMPTY`; a taker claims only `READY`; the slot returns to `EMPTY` only
+after the taker has copied the payload out. So a second publisher can never overwrite a slot in
+`WRITING`/`READY`/`READING`, a second taker can never observe a half-written payload or
+double-take a readable one, and a publisher can never begin overwriting a payload a reader still
+holds. `PublishOutcome::SlotBusy` carries the state actually observed, so a decline is
+diagnosable rather than anonymous.
+
+#### (2) The `current`-clear is a DEBT, not an opportunity
+
+This was the serious one. Once the NR6 commit removes the caller from `current`, **the CPU is
+running nothing** and the trap frame the drain would `eret` through belongs to a parked task.
+The previous drain treated its pre-mutation revalidation as a *verdict*: a caller that a reply or
+timeout had made `Runnable` produced `OutgoingAlreadyRunnable`, the drain returned "declined",
+and the CPU `eret`-ed through the stale frame with `current` still `None` and the woken task
+still queued.
+
+The revalidation is now an **observation** (`OutgoingObservation`), used for diagnostics only.
+Settlement is unconditional: every taken debt ends in exactly one of
+
+* `Settlement::Dispatched` — one task selected, activated and restored; or
+* `Settlement::Idle` — the run queue was empty, so the established idle primitive is entered.
+
+A wake before the drain does not cancel the debt; the woken caller is simply back on the run
+queue, where the authoritative dequeue may select it like any other candidate. There is no
+"declined" return path.
+
+After the dequeue has mutated scheduler state (selected a task, set `current`, marked it
+`Running`), a later failure — dequeue/`current` disagreement, or no saved context to resume —
+**rolls that mutation back exactly** (status `Running` → `Runnable`; `current` cleared and the
+task re-enqueued, via the existing `preempt_reenqueue_only_on` inverse) and then takes an
+**explicit fatal path** that never returns to userspace. Partially committed scheduler state is
+never returned through.
+
+The one remaining no-debt exit is a **superseded lease** (below), where a later cycle
+demonstrably owns settlement.
+
+#### (3) `blocked_recv_generation` claimed protection it could not provide
+
+The field is declared and read by the reply-timeout revalidation, but **nothing in the tree
+increments it** — every TCB reports 0 forever, so it could not distinguish any two dispatch
+cycles. Rather than change reply-timeout terminal arbitration (out of scope), the claim is
+withdrawn and replaced by a dedicated **per-CPU dispatch lease**: a monotonically increasing
+epoch opened at exactly one site — the `current`-clear commit that creates the debt — and carried
+in the work item. `lease_is_current` then decides staleness for real: an item whose lease is no
+longer this CPU's current lease belongs to a cycle already settled elsewhere, so it owes nothing
+and must not dispatch. A hosted test asserts both halves: that the old coordinate is
+indistinguishable across tasks, and that the lease is not.
+
+#### (4) `ACTIVE_ASID` was one global cell
+
+`TTBR0_EL1` and `CR3` are per-core registers, so "the active address space" is not a global
+fact. A single cell let one core's activation overwrite another's, and would let a consumer on
+CPU 0 compute a page-table root from CPU 1's ASID. The record is now a per-CPU table keyed by
+`CpuId`, and the `Hal::switch_address_space` trait method takes the `CpuId` explicitly so the
+key cannot be inferred wrongly. `SelectedIsaHal::active_asid_on(cpu)` replaces `active_asid()`;
+all five consumers (x86_64 D6 diagnostics and the demand-paging CR3 correction) pass
+`self.current_cpu()`. An out-of-range CPU index aliases no slot.
+
+#### Coverage
+
+Tests added or rewritten cover: wake-before-drain dispatching the now-runnable caller with the
+debt taken exactly once; an exited/stale outgoing task still settling the CPU; no stale-frame
+`eret`; transactional rollback after a partially committed dispatch, checked on all three
+coordinates (queue, `current`, status); publisher, taker and recycle races, each driven
+deterministically rather than by timing; independent active-ASID values on two CPUs; and the
+absence of any broad-lock acquisition with the census held at 50.
+
+Because the HAL authority changed globally, the **x86_64 live** core-boot and ServerDies
+regressions were re-run in addition to the hosted battery.
 
 ---
 

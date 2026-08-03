@@ -2197,6 +2197,22 @@ impl KernelState {
 
     /// Stage 200D-1 — hosted-only: drive a task's status directly, so the
     /// registration-versus-exit race can be stepped deterministically instead of raced.
+    /// Stage 199D — read a task's `blocked_recv_generation`.
+    ///
+    /// Exists so a test can DEMONSTRATE that this coordinate never advances: nothing in the
+    /// tree increments it, so it is always 0 and could never have distinguished one dispatch
+    /// cycle from another. That is why the post-lock dispatch item carries a real per-CPU
+    /// dispatch lease instead.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn blocked_recv_generation_for_test(&self, tid: u64) -> Option<u64> {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.blocked_recv_generation)
+        })
+    }
+
     #[cfg(any(test, feature = "hosted-dev"))]
     pub(crate) fn set_task_status_for_test(&mut self, tid: u64, status: TaskStatus) {
         self.with_tcbs_mut(|tcbs| {
@@ -3318,49 +3334,59 @@ impl KernelState {
             // Single-DISPATCHER, exactly as the x86_64 sibling above: the out-of-lock dequeue
             // is the accepted slice only while one CPU dispatches user tasks.
             let single_cpu = self.dispatching_cpu_count() <= 1;
-            let blocked_generation = self
-                .with_tcbs(|tcbs| {
-                    tcbs.iter()
-                        .flatten()
-                        .find(|tcb| tcb.tid.0 == plan.blocked_tid.0)
-                        .map(|tcb| tcb.blocked_recv_generation)
-                })
-                .unwrap_or(0);
-            let work = crate::kernel::direct_dispatch::DirectDispatchWork {
-                outgoing_tid: plan.blocked_tid.0,
-                outgoing_asid: plan.receiver_asid.0,
-                blocked_generation,
-                cpu: cpu.0 as u8,
-                class: crate::kernel::direct_dispatch::DirectDispatchClass::IpcCall,
-            };
-            if trap_path
-                && single_cpu
-                && crate::kernel::direct_dispatch::try_publish(work)
-                    == crate::kernel::direct_dispatch::PublishOutcome::Published
-            {
+            if trap_path && single_cpu {
+                // Open the dispatch lease HERE — bound to this exact `current`-clear, and to no
+                // other. The lease is what makes the debt identifiable: a drain holding an item
+                // whose lease is no longer this CPU's current one knows a later cycle already
+                // owns settlement. It is opened only on the path that actually publishes, so
+                // the lease counter and the debt cannot drift apart.
+                //
+                // (This replaces `tcb.blocked_recv_generation`, which is declared and read but
+                // never incremented anywhere in the tree — always zero, and therefore incapable
+                // of distinguishing one cycle from another.)
+                let lease = crate::kernel::direct_dispatch::open_dispatch_lease(cpu);
+                let work = crate::kernel::direct_dispatch::DirectDispatchWork {
+                    outgoing_tid: plan.blocked_tid.0,
+                    outgoing_asid: plan.receiver_asid.0,
+                    lease,
+                    cpu: cpu.0,
+                    class: crate::kernel::direct_dispatch::DirectDispatchClass::IpcCall,
+                };
+                let published = crate::kernel::direct_dispatch::try_publish(work);
+                if published == crate::kernel::direct_dispatch::PublishOutcome::Published {
+                    crate::yarm_log!(
+                        "AARCH64_DIRECT_DISPATCH_PUBLISHED tid={} asid={} lease={} cpu={} class=IpcCall",
+                        work.outgoing_tid,
+                        work.outgoing_asid,
+                        work.lease,
+                        cpu.0
+                    );
+                    // The out-of-lock trap-entry drain performs the single authoritative
+                    // queue-advancing dispatch; do NOT dispatch in-lock here.
+                    return Ok(plan.blocked_tid);
+                }
+                // Publication was declined (the slot is busy). The in-lock dispatch below
+                // settles this cycle instead, and the lease we just opened supersedes any
+                // older outstanding item — which is exactly the signal its drain needs to
+                // know that its debt has been taken over.
                 crate::yarm_log!(
-                    "AARCH64_DIRECT_DISPATCH_PUBLISHED tid={} asid={} blocked_generation={} cpu={} class=IpcCall",
-                    work.outgoing_tid,
-                    work.outgoing_asid,
-                    work.blocked_generation,
-                    cpu.0
+                    "AARCH64_DIRECT_DISPATCH_FALLBACK reason=slot_busy tid={} lease={} observed={:?}",
+                    plan.blocked_tid.0,
+                    lease,
+                    published
                 );
-                // The out-of-lock trap-entry drain performs the single authoritative
-                // queue-advancing dispatch; do NOT dispatch in-lock here.
-                return Ok(plan.blocked_tid);
             }
-            let reason = if !trap_path {
-                "no_trap_drainer"
-            } else if !single_cpu {
-                "multi_cpu"
-            } else {
-                "already_published"
-            };
-            crate::yarm_log!(
-                "AARCH64_DIRECT_DISPATCH_FALLBACK reason={} tid={}",
-                reason,
-                plan.blocked_tid.0
-            );
+            if !trap_path || !single_cpu {
+                crate::yarm_log!(
+                    "AARCH64_DIRECT_DISPATCH_FALLBACK reason={} tid={}",
+                    if !trap_path {
+                        "no_trap_drainer"
+                    } else {
+                        "multi_cpu"
+                    },
+                    plan.blocked_tid.0
+                );
+            }
         }
         let _ = self.dispatch_next_task()?;
         Ok(plan.blocked_tid)

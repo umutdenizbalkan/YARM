@@ -1271,6 +1271,45 @@ decreases and that the drain acquires no broad lock.
 proof obligations. Live acceptance is pending: `qemu-system-aarch64` is absent here. Full
 evidence: `doc/IPC.md` §8.6.12.
 
+
+### 6.1.14 Correctness repair of the post-lock dispatch
+
+The §6.1.13 landing had four defects. All are repaired; the AArch64 production default is still
+OFF and no live seal was issued.
+
+1. **Publication protocol.** The `PENDING` boolean conflated *being written*, *readable* and
+   *being read*, so it was correct only under an unstated non-reentrancy assumption. Replaced by
+   an explicit per-CPU state machine `EMPTY → WRITING → READY → READING → EMPTY`: a publisher
+   claims only `EMPTY`, a taker only `READY`, and the slot recycles only after the payload has
+   been copied out. A second publisher can never overwrite `WRITING`/`READY`/`READING`, and a
+   publisher can never overwrite a payload a reader still holds.
+
+2. **The `current`-clear is a DEBT (the serious defect).** The drain treated its pre-mutation
+   revalidation as a verdict: a caller a reply or timeout had made `Runnable` produced
+   `OutgoingAlreadyRunnable`, the drain returned "declined", and the CPU `eret`-ed through a
+   parked task's frame with `current` still `None` and the woken task still queued. The
+   revalidation is now an **observation** used for diagnostics only, and settlement is
+   unconditional: every taken debt ends in `Dispatched` or `Idle`. A wake before the drain does
+   not cancel the debt — the woken caller is a normal dequeue candidate. After the dequeue has
+   mutated scheduler state, a later failure rolls back **exactly** (status, `current`, queue —
+   via the existing `preempt_reenqueue_only_on` inverse) and takes an **explicit fatal path**
+   that never returns to userspace. The only remaining no-debt exit is a superseded lease.
+
+3. **The generation claim.** `tcb.blocked_recv_generation` is never incremented anywhere in the
+   tree — always 0, so it could not distinguish any two cycles. The claim is withdrawn and
+   replaced by a per-CPU **dispatch lease**: a monotonic epoch opened at exactly one site (the
+   `current`-clear commit) and carried in the item, so `lease_is_current` decides staleness for
+   real. Changing the reply-timeout arbitration that also reads that field stays out of scope.
+
+4. **`ACTIVE_ASID` was one global cell.** `TTBR0_EL1`/`CR3` are per-core registers, so a single
+   cell let one core's activation overwrite another's. The record is now a per-CPU table keyed
+   by `CpuId`; `Hal::switch_address_space` takes the `CpuId` explicitly; `active_asid_on(cpu)`
+   replaces `active_asid()` and all five consumers pass `self.current_cpu()`.
+
+Census unchanged at **50 / 40 / 45** — the repair added no broad-lock acquisition. Because the
+HAL authority changed globally, the x86_64 live core-boot and ServerDies regressions were re-run
+alongside the hosted battery. Full evidence: `doc/IPC.md` §8.6.13.
+
 ---
 
 ## 7. Method and limits

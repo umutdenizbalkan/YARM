@@ -290,6 +290,26 @@ Full detail: `doc/IPC.md` §8.5.
    and drains nothing. Broad-lock census **unchanged at 50**, with a new guard pinning "50 or
    fewer". No live seal — `qemu-system-aarch64` remains absent. See
    `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.13 and `doc/IPC.md` §8.6.12.
+   **That landing had four defects, now repaired.** (a) The publication protocol was a single
+   `PENDING` boolean conflating *being written* / *readable* / *being read*, correct only under
+   an unstated non-reentrancy assumption — replaced by an explicit per-CPU state machine
+   `EMPTY → WRITING → READY → READING → EMPTY`, where a publisher claims only `EMPTY`, a taker
+   only `READY`, and the slot recycles only after the payload is copied out. (b) **The serious
+   one:** the drain treated its pre-mutation revalidation as a verdict, so a caller that a reply
+   or timeout had made `Runnable` caused it to return "declined" — `eret`-ing through a parked
+   task's frame with `current` still `None`. The `current`-clear is now modelled as a **debt**:
+   the revalidation is diagnostics only, and every taken debt settles as either `Dispatched` or
+   `Idle`. After the dequeue mutates scheduler state, a later failure rolls back exactly
+   (status, `current`, queue) and takes an explicit fatal path that never returns to userspace;
+   the only no-debt exit is a superseded lease. (c) `tcb.blocked_recv_generation` is never
+   incremented anywhere in the tree — always 0 — so the "generation-bearing stale-cycle
+   protection" claim was withdrawn and replaced by a real per-CPU **dispatch lease**, a
+   monotonic epoch opened at exactly one site (the `current`-clear commit). (d) `ACTIVE_ASID`
+   was one global cell although `TTBR0_EL1`/`CR3` are per-core registers; it is now a per-CPU
+   table keyed by `CpuId`, `Hal::switch_address_space` takes the `CpuId` explicitly, and
+   `active_asid_on(cpu)` replaces `active_asid()`. Census unchanged at 50 / 40 / 45. Because the
+   HAL authority changed globally, the x86_64 live core-boot and ServerDies regressions were
+   re-run. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.14 and `doc/IPC.md` §8.6.13.
    **Blocker 5 (link CREATION accounting) is now closed** — both installation seams delegate to
    the one `install_server_reply_link` decision, so the creation stamp cannot drift; live,
    `created` went 0 → 54. That exposed its mirror on the CLOSE edge: of four close sites only two

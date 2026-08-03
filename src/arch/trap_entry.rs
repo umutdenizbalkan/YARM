@@ -544,111 +544,128 @@ pub fn handle_trap_entry_shared(
     // point: the ASID activation and the EL0 frame/TLS restore, which those drains obtain from a
     // brief `with_cpu` re-acquire, are obtained here from bounded rank-2 task seams.
     //
-    // The work item is typed and generation-bearing (`direct_dispatch::DirectDispatchWork`), and
-    // every race is a named, fail-closed arm of `DrainOutcome` — there is no wildcard, so an
-    // unclassified race cannot inherit "dispatched".
+    // ## Settlement is a DEBT, not a choice
+    //
+    // The commit that published the work item removed the caller from `current`. From that
+    // instant this CPU is running NOTHING, and the trap frame we would `eret` through belongs to
+    // a task the scheduler has parked. So once a live item is taken, this drain MUST settle —
+    // resume exactly one task, or enter the idle primitive. There is no "declined" path back to
+    // userspace, because that path would resume a parked task through a stale frame.
+    //
+    // In particular, observing that a reply or timeout made the outgoing caller `Runnable` does
+    // NOT cancel the debt: that caller is simply back on the run queue, and the authoritative
+    // dequeue may select it like any other candidate. The observation is logged and nothing
+    // more.
+    //
+    // The one case that legitimately owes nothing is a SUPERSEDED lease: a later `current`-clear
+    // on this CPU opened a newer lease and took over settlement, so this item's cycle is already
+    // closed.
     #[cfg(target_arch = "aarch64")]
     if crate::kernel::direct_dispatch::is_pending(cpu_idx) {
-        use crate::kernel::direct_dispatch::{self as dd, DrainOutcome};
-        // Taking is destructive, so a published item drives at most ONE dispatch no matter how
-        // many traps observe this CPU — the no-duplicate-wake edge.
+        use crate::kernel::direct_dispatch::{self as dd, DrainOutcome, Settlement};
+        // The slot state machine makes the take destructive and exclusive: exactly one drain can
+        // claim a READY item, so a published debt is settled once and only once.
         let outcome = match dd::take(cpu_idx) {
-            None => DrainOutcome::NoWork,
+            None => DrainOutcome::NoDebtNothingPublished,
             Some(work) => {
                 crate::yarm_log!(
-                    "AARCH64_DIRECT_DISPATCH_BEGIN cpu={} outgoing={} class={:?}",
+                    "AARCH64_DIRECT_DISPATCH_BEGIN cpu={} outgoing={} lease={} class={:?}",
                     cpu.0,
                     work.outgoing_tid,
+                    work.lease,
                     work.class
                 );
-                // (1) Revalidate the EXACT outgoing incarnation and its committed blocked
-                //     state. Each failure is a DIFFERENT race with its own named outcome.
-                match shared.direct_dispatch_revalidate_split(work).refusal() {
-                    Some(refusal) => {
-                        crate::yarm_log!(
-                            "AARCH64_DIRECT_DISPATCH_REFUSED cpu={} outgoing={} reason={:?}",
-                            cpu.0,
-                            work.outgoing_tid,
-                            refusal
-                        );
-                        refusal
-                    }
-                    None => {
-                        crate::yarm_log!(
-                            "AARCH64_DIRECT_DISPATCH_REVERIFY_OK tid={} asid={} blocked_generation={}",
-                            work.outgoing_tid,
-                            work.outgoing_asid,
-                            work.blocked_generation
-                        );
-                        // (2) ONE authoritative dequeue under the rank-1 scheduler seam. This is
-                        //     the single queue-advancing step for the cycle.
-                        match shared.futex_wait_dispatch_step_mut(cpu) {
-                            None => {
-                                // (6b) No runnable task. A SUCCESSFUL idle: the outgoing caller
-                                //      stays parked, `current` stays clear, no frame is
-                                //      restored and no incoming task is fabricated.
-                                crate::yarm_log!(
-                                    "AARCH64_DIRECT_DISPATCH_NO_INCOMING cpu={}",
-                                    cpu.0
-                                );
-                                dd::note_outcome(DrainOutcome::Idle);
-                                crate::yarm_log!("AARCH64_DIRECT_DISPATCH_DONE result=idle");
-                                // Enter the established idle primitive with the broad guard
-                                // already dropped. Never returns.
-                                super::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(
-                                    cpu,
-                                    work.outgoing_tid,
-                                );
-                            }
-                            Some(inc) => {
-                                // (3) Mark the selected task Running (rank-2), then confirm the
-                                //     authoritative `current` slot agrees with the selection.
-                                //     A disagreement resumes NOTHING rather than the wrong task.
-                                shared.d6_genuine_mark_running_via_task_seam(Some(inc));
-                                if !shared.direct_dispatch_current_agrees_split_read(cpu, inc) {
-                                    crate::yarm_log!(
-                                        "AARCH64_DIRECT_DISPATCH_REFUSED cpu={} incoming={} reason=DispatchCurrentDisagreement",
-                                        cpu.0,
-                                        inc
-                                    );
-                                    DrainOutcome::DispatchCurrentDisagreement
-                                } else {
-                                    crate::yarm_log!(
-                                        "AARCH64_DIRECT_DISPATCH_CURRENT_SET_OK cpu={} tid={}",
-                                        cpu.0,
-                                        inc
-                                    );
-                                    crate::yarm_log!(
-                                        "AARCH64_DIRECT_DISPATCH_RUNNING_OK tid={}",
-                                        inc
-                                    );
-                                    // (4)+(5) ASID/TTBR0 activation and the complete EL0 frame +
-                                    //         x18 TLS restore, all through rank-2 seams.
-                                    let resumed = match frame.as_deref_mut() {
-                                        Some(f) => {
-                                            super::aarch64::trap::direct_dispatch_resume_incoming(
-                                                shared, inc, f,
-                                            )
-                                        }
-                                        None => false,
-                                    };
-                                    if resumed {
-                                        crate::yarm_log!(
-                                            "AARCH64_DIRECT_DISPATCH_FRAME_OK tid={}",
-                                            inc
-                                        );
-                                        DrainOutcome::Dispatched { incoming: inc }
-                                    } else {
-                                        // No saved context (or no frame to restore into): fail
-                                        // closed rather than eret through a stale frame.
-                                        crate::yarm_log!(
-                                            "AARCH64_DIRECT_DISPATCH_REFUSED cpu={} incoming={} reason=DispatchCurrentDisagreement detail=no_saved_frame",
-                                            cpu.0,
-                                            inc
-                                        );
-                                        DrainOutcome::DispatchCurrentDisagreement
+                if !dd::lease_is_current(cpu, work.lease) {
+                    // A later current-clear owns settlement; this item's cycle is closed. This is
+                    // the ONLY way out of the drain without settling, and it is sound precisely
+                    // because the newer cycle is the one now holding the debt.
+                    crate::yarm_log!(
+                        "AARCH64_DIRECT_DISPATCH_SUPERSEDED cpu={} outgoing={} item_lease={} current_lease={}",
+                        cpu.0,
+                        work.outgoing_tid,
+                        work.lease,
+                        dd::current_lease(cpu)
+                    );
+                    DrainOutcome::NoDebtSupersededLease
+                } else {
+                    // Pre-mutation observation — DIAGNOSTICS ONLY. Whatever the outgoing task
+                    // has become, this CPU still owes a dispatch.
+                    let observed = shared.direct_dispatch_observe_outgoing_split(work);
+                    crate::yarm_log!(
+                        "AARCH64_DIRECT_DISPATCH_OUTGOING tid={} asid={} observed={:?} debt=owed",
+                        work.outgoing_tid,
+                        work.outgoing_asid,
+                        observed
+                    );
+                    // (2) ONE authoritative dequeue under the rank-1 scheduler seam. This is the
+                    //     single queue-advancing step for the cycle. It may legitimately select
+                    //     the outgoing caller itself, if a reply re-queued it.
+                    match shared.futex_wait_dispatch_step_mut(cpu) {
+                        None => {
+                            // SETTLE (idle). The run queue is empty: the outgoing caller stays
+                            // parked, `current` stays clear, no frame is restored and no incoming
+                            // task is fabricated. A success, not a failure.
+                            crate::yarm_log!("AARCH64_DIRECT_DISPATCH_NO_INCOMING cpu={}", cpu.0);
+                            dd::note_outcome(DrainOutcome::Settled(Settlement::Idle));
+                            crate::yarm_log!(
+                                "AARCH64_DIRECT_DISPATCH_DONE result=idle settled=1 broad_lock=0"
+                            );
+                            // The established idle primitive, broad guard already dropped.
+                            // Never returns.
+                            super::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(
+                                cpu,
+                                work.outgoing_tid,
+                            );
+                        }
+                        Some(inc) => {
+                            // From here the scheduler is MUTATED: `inc` was dequeued and made
+                            // current. Any later failure must roll that back exactly and take
+                            // the explicit fatal path — never return with it half-committed.
+                            shared.d6_genuine_mark_running_via_task_seam(Some(inc));
+                            let agrees = shared.direct_dispatch_current_agrees_split_read(cpu, inc);
+                            let resumed = agrees
+                                && match frame.as_deref_mut() {
+                                    Some(f) => {
+                                        super::aarch64::trap::direct_dispatch_resume_incoming(
+                                            shared, cpu, inc, f,
+                                        )
                                     }
-                                }
+                                    None => false,
+                                };
+                            if resumed {
+                                crate::yarm_log!(
+                                    "AARCH64_DIRECT_DISPATCH_CURRENT_SET_OK cpu={} tid={}",
+                                    cpu.0,
+                                    inc
+                                );
+                                crate::yarm_log!("AARCH64_DIRECT_DISPATCH_RUNNING_OK tid={}", inc);
+                                crate::yarm_log!("AARCH64_DIRECT_DISPATCH_FRAME_OK tid={}", inc);
+                                DrainOutcome::Settled(Settlement::Dispatched { incoming: inc })
+                            } else {
+                                // Either the dequeue and `current` disagree, or the selected task
+                                // has no saved context to resume. Both are kernel-invariant
+                                // violations, not races. Undo the scheduler mutation EXACTLY,
+                                // then halt: returning "declined" here would leave the scheduler
+                                // believing `inc` is running while we eret through another
+                                // task's frame.
+                                let rolled_back = shared.direct_dispatch_rollback_split(cpu, inc);
+                                crate::yarm_log!(
+                                    "AARCH64_DIRECT_DISPATCH_ROLLBACK cpu={} incoming={} reason={} rolled_back={}",
+                                    cpu.0,
+                                    inc,
+                                    if agrees {
+                                        "no_saved_frame"
+                                    } else {
+                                        "current_disagreement"
+                                    },
+                                    rolled_back as u32
+                                );
+                                dd::note_outcome(DrainOutcome::RolledBackFatal);
+                                super::aarch64::trap::enter_post_lock_dispatch_fatal(
+                                    cpu,
+                                    inc,
+                                    rolled_back,
+                                );
                             }
                         }
                     }
@@ -656,15 +673,20 @@ pub fn handle_trap_entry_shared(
             }
         };
         dd::note_outcome(outcome);
-        // (6a) Return through the EXISTING eret model: the frame this drain restored is the one
-        //      the AArch64 vector epilogue erets from. No second return path is introduced.
+        // Return through the EXISTING eret model: the frame this drain restored is the one the
+        // AArch64 vector epilogue erets from. No second return path is introduced.
+        //
+        // Reaching here means either the debt was settled by a dispatch, or there was no debt to
+        // settle. The idle and fatal settlements never return at all.
+        debug_assert!(outcome.debt_is_discharged());
         crate::yarm_log!(
-            "AARCH64_DIRECT_DISPATCH_DONE result={} broad_lock=0",
-            if outcome.advanced_queue() {
-                "ok"
-            } else {
-                "declined"
-            }
+            "AARCH64_DIRECT_DISPATCH_DONE result={} settled={} broad_lock=0",
+            match outcome {
+                DrainOutcome::Settled(Settlement::Dispatched { .. }) => "ok",
+                DrainOutcome::NoDebtSupersededLease => "superseded",
+                _ => "no_work",
+            },
+            outcome.owed_a_debt() as u32
         );
     }
 

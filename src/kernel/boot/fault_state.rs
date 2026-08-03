@@ -1289,7 +1289,7 @@ impl KernelState {
                                 task_flags
                             );
                         }
-                        self.hal.switch_address_space(task_asid);
+                        self.hal.switch_address_space(self.current_cpu(), task_asid);
                         crate::arch::selected_isa::page_table::invalidate_page(page);
                     }
                     // Stage 138: hardware CR3 PTE walk to confirm the CPU will

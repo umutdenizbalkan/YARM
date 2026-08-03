@@ -83,6 +83,31 @@ pub(crate) fn enter_post_lock_idle_after_direct_dispatch(cpu: CpuId, outgoing_ti
     idle_no_eret_loop();
 }
 
+/// Stage 199D (AARCH64 BLOCKER 3) — the EXPLICIT FATAL path of the post-lock dispatch drain.
+///
+/// Reached only when the drain had already mutated scheduler state (dequeued a task, set
+/// `current`, marked it `Running`) and a later step then failed — the dequeue and `current`
+/// disagreeing, or the selected task having no saved context to resume. Both are kernel-
+/// invariant violations rather than races: the dequeue is what sets `current`, and a runnable
+/// task without a saved context cannot be resumed by any path.
+///
+/// The caller has already rolled the scheduler mutation back exactly, so the state is
+/// consistent when we stop; `rolled_back` records whether that succeeded. We deliberately do
+/// NOT return: the alternative would be to `eret` through a frame belonging to a task the
+/// scheduler has parked, which is precisely the corruption this path exists to prevent. Halting
+/// with a named marker keeps the failure diagnosable in a live log.
+pub(crate) fn enter_post_lock_dispatch_fatal(cpu: CpuId, incoming: u64, rolled_back: bool) -> ! {
+    crate::yarm_log!(
+        "AARCH64_DIRECT_DISPATCH_FATAL cpu={} incoming={} rolled_back={} reason=partial_dispatch_unrecoverable",
+        cpu.0,
+        incoming,
+        rolled_back as u32
+    );
+    // `current` is clear and the task is back on the run queue (when the rollback succeeded), so
+    // this is the same wake-capable halt the idle outcome uses — not a spin that masks the fault.
+    idle_no_eret_loop();
+}
+
 /// Stage 199D (AARCH64 BLOCKER 3) — steps 4 and 5 of the post-lock dispatch: activate the
 /// incoming task's address space and restore its complete EL0 frame and TLS state.
 ///
@@ -110,11 +135,12 @@ pub(crate) fn enter_post_lock_idle_after_direct_dispatch(cpu: CpuId, outgoing_ti
 /// frame is left untouched and the caller fails closed.
 pub(crate) fn direct_dispatch_resume_incoming(
     shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
     incoming: u64,
     frame: &mut TrapFrame,
 ) -> bool {
-    // (1) ASID / TTBR0.
-    let asid = shared.direct_dispatch_activate_asid_split(incoming);
+    // (1) ASID / TTBR0, recorded against THIS CPU — an active address space is per-core state.
+    let asid = shared.direct_dispatch_activate_asid_split(cpu, incoming);
     crate::yarm_log!(
         "AARCH64_DIRECT_DISPATCH_TTBR0_OK tid={} asid={}",
         incoming,
@@ -131,7 +157,10 @@ pub(crate) fn direct_dispatch_resume_incoming(
     );
     #[cfg(test)]
     {
-        LAST_RESTORED_TLS_BASE[0].store(tls.unwrap_or(0), Ordering::Relaxed);
+        let idx = cpu.0 as usize;
+        if idx < MAX_CPUS {
+            LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
+        }
     }
     // (4) The remotely-completed blocked syscall, consumed before the mirror below.
     #[cfg(feature = "ipc-reply-timeout-oracle-core")]

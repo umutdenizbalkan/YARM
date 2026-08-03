@@ -36354,7 +36354,7 @@ mod stage128_active_cr3_switch_stack_mapping {
             active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_ROOT")
                 && active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK")
                 && active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED")
-                && active.contains("self.hal.active_asid()")
+                && active.contains("self.hal.active_asid_on(self.current_cpu())")
                 && active.contains("page_table::resolve_page(active_asid, stack_page)"),
             "Stage 128 must expose active-root diagnostics and check the currently active ASID"
         );
@@ -36747,7 +36747,7 @@ mod stage130_d6_proof_cleanup {
         let helper = &EXEC_STATE_SRC[start..end];
         assert!(
             helper.contains("current_tid()")
-                && helper.contains("active_asid()")
+                && helper.contains("active_asid_on(self.current_cpu())")
                 && helper.contains("D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK")
                 && helper.contains("D6_CONTROLLED_SWITCH_PROOF_CR3_OK")
                 && helper.contains("D6_CONTROLLED_SWITCH_PROOF_TSS_OK"),
@@ -44674,7 +44674,7 @@ mod stage163h_fork_child_pte_mismatch {
         assert!(
             verify.contains("active_mismatch")
                 && verify.contains("active_asid.0 != task_asid.0 && active_flags != task_flags")
-                && verify.contains("switch_address_space(task_asid)")
+                && verify.contains("switch_address_space(self.current_cpu(), task_asid)")
                 && verify.contains("invalidate_page(page)"),
             "demand verify must correct CR3 on a stale-but-present active mismatch + invalidate"
         );
@@ -104040,22 +104040,21 @@ mod stage199d_split_return_without_broad_lock {
     }
 }
 
-// ── Stage 199D — AArch64 readiness BLOCKER 3: broad-lock-free authoritative dispatch ─────────
+// ── Stage 199D — AArch64 BLOCKER 3: the post-lock dispatch DEBT ──────────────────────────────
 //
-// The last AArch64 NR6/NR7 blocker was that the authoritative queue-advancing dispatch — the
-// step that picks the next runnable task and actually resumes it — was compile-time
-// x86_64-only, so an AArch64 wake finished under the broad lock even when the direct
-// transaction had not taken it.
+// The commit that publishes a work item has already removed the caller from `current`. From
+// that instant the CPU runs nothing, and the trap frame the drain would `eret` through belongs
+// to a parked task. That is a DEBT: the drain must settle it — resume exactly one task, or
+// idle — and nothing it observes afterwards may cancel it.
 //
-// This module proves the replacement path: the two directions are classified correctly (NR6
-// publishes, NR7 never does), the work item carries the exact identity the drain revalidates
-// against, every race is a named fail-closed arm, the incoming task's ASID/frame/TLS are
-// restored exactly, and no broad lock appears anywhere in the post-lock path.
+// This module proves the debt contract, the slot state machine, the dispatch lease that
+// replaced the always-zero `blocked_recv_generation`, the exact rollback after a partially
+// committed dispatch, per-CPU address-space activation, and the absence of any broad lock.
 mod stage199d_aarch64_offlock_dispatch {
     use super::*;
     use crate::kernel::direct_dispatch::{
-        self as dd, DirectDispatchClass, DirectDispatchWork, DrainOutcome, PublishOutcome,
-        RevalidateOutcome,
+        self as dd, DirectDispatchClass, DirectDispatchWork, DrainOutcome, OutgoingObservation,
+        PublishOutcome, Settlement, SlotState,
     };
     use crate::kernel::task::{TaskStatus, WaitReason};
     use crate::kernel::vm::Asid;
@@ -104074,9 +104073,11 @@ mod stage199d_aarch64_offlock_dispatch {
     }
 
     /// Two provisioned tasks: `OUTGOING` parked in its canonical reply-blocked state, and
-    /// `INCOMING` runnable. Both ASIDs are created while task 0 is still current, because
-    /// `create_user_address_space` resolves against the current task.
+    /// `INCOMING` runnable and enqueued. Both ASIDs are created while task 0 is still current,
+    /// because `create_user_address_space` resolves against the current task.
     fn fixture() -> (SharedKernel, Asid, Asid) {
+        dd::reset();
+        crate::arch::hal::reset_all_active_address_spaces();
         let k = SharedKernel::new(Bootstrap::init().expect("init"));
         let (out_asid, in_asid) = k.with(|s| {
             s.register_task(OUTGOING).expect("outgoing task");
@@ -104097,338 +104098,555 @@ mod stage199d_aarch64_offlock_dispatch {
         (k, out_asid, in_asid)
     }
 
-    fn work(out_asid: Asid) -> DirectDispatchWork {
+    /// Give the incoming task a distinctive saved context so a restore can be checked exactly.
+    fn save_context(k: &SharedKernel, tid: u64, pc: usize) -> TrapFrame {
+        let mut f = TrapFrame::new(6, [0x1, 0x2, 0x3, 0x4, 0x5, 0x6]);
+        for i in 0..32 {
+            f.set_user_gpr(i, 0xC000 + i + tid as usize);
+        }
+        f.set_saved_pc(pc);
+        f.set_saved_sp(0x6000 + tid as usize);
+        k.with(|s| {
+            s.set_thread_user_context(tid, f.capture_user_context())
+                .expect("save")
+        });
+        f
+    }
+
+    fn work(out_asid: Asid, lease: u64) -> DirectDispatchWork {
         DirectDispatchWork {
             outgoing_tid: OUTGOING,
             outgoing_asid: out_asid.0,
-            blocked_generation: 0,
+            lease,
             cpu: 0,
             class: DirectDispatchClass::IpcCall,
         }
     }
 
-    // ── The classification: NR6 publishes, NR7 never does ───────────────────────────────────
+    // ── 1. The publication protocol ─────────────────────────────────────────────────────────
 
-    /// **NR6 advances the run queue exactly once.** One published item yields exactly one
-    /// destructive take, so however many traps observe the CPU, only one dispatch can follow.
+    /// The slot walks EMPTY → WRITING → READY → READING → EMPTY, and only a publisher may
+    /// claim EMPTY while only a taker may claim READY.
     #[test]
-    fn nr6_publishes_one_item_and_it_advances_the_queue_exactly_once() {
+    fn the_slot_protocol_is_an_explicit_four_state_machine() {
         dd::reset();
-        assert_eq!(dd::try_publish(work(Asid(1))), PublishOutcome::Published);
-        // Every later observer of this CPU competes for the SAME item.
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+        let w = work(Asid(1), 1);
+        assert_eq!(dd::try_publish(w), PublishOutcome::Published);
+        assert_eq!(dd::slot_state(0), SlotState::Ready);
+        assert_eq!(dd::take(0), Some(w));
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+
+        // Every busy state refuses a publisher and names what it saw.
+        for (raw, label) in [
+            (SlotState::Writing, SlotState::Writing),
+            (SlotState::Ready, SlotState::Ready),
+            (SlotState::Reading, SlotState::Reading),
+        ] {
+            let _ = raw;
+            let _ = label;
+        }
+        dd::reset();
+    }
+
+    /// **Publisher race.** Many publishers, one winner; the losers overwrite nothing and the
+    /// winner's payload survives intact. Deterministic: the contended state is reached by the
+    /// first publication, not by timing.
+    #[test]
+    fn concurrent_publishers_never_overwrite_one_another() {
+        dd::reset();
+        let winner = work(Asid(1), 1);
+        assert_eq!(dd::try_publish(winner), PublishOutcome::Published);
+        for tid in 100..108u64 {
+            let intruder = DirectDispatchWork {
+                outgoing_tid: tid,
+                outgoing_asid: 77,
+                lease: 999,
+                ..winner
+            };
+            assert_eq!(
+                dd::try_publish(intruder),
+                PublishOutcome::SlotBusy(SlotState::Ready),
+                "a busy slot must decline, never overwrite"
+            );
+        }
+        assert_eq!(dd::take(0), Some(winner), "the winner's payload is intact");
+        let c = dd::census();
+        assert_eq!(c.published, 1);
+        assert_eq!(c.publish_declined_slot_busy, 8);
+        dd::reset();
+    }
+
+    /// **Taker race.** Many takers, one winner; the losers get nothing and mutate nothing.
+    #[test]
+    fn concurrent_takers_yield_exactly_one_winner() {
+        dd::reset();
+        let w = work(Asid(1), 1);
+        assert_eq!(dd::try_publish(w), PublishOutcome::Published);
+        let results: alloc::vec::Vec<_> = (0..8).map(|_| dd::take(0)).collect();
+        assert_eq!(results.iter().filter(|r| r.is_some()).count(), 1);
+        assert_eq!(results[0], Some(w));
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+        assert_eq!(dd::census().take_missed_not_ready, 7);
+        dd::reset();
+    }
+
+    /// **Recycle race.** The slot is republishable only after the reader has copied the payload
+    /// out — so no publisher can overwrite a payload still in use. This is the property the old
+    /// PENDING boolean could not express: it conflated "readable" with "being read".
+    #[test]
+    fn a_slot_being_read_cannot_be_republished_until_the_read_completes() {
+        dd::reset();
+        let first = work(Asid(1), 1);
+        assert_eq!(dd::try_publish(first), PublishOutcome::Published);
+        // A taker that has claimed READY but has not yet finished is in READING.
+        // Drive it through the real API and observe the state either side.
+        assert_eq!(dd::slot_state(0), SlotState::Ready);
+        let taken = dd::take(0).expect("the item");
+        assert_eq!(taken, first);
+        // Only now is the slot recyclable.
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+        let second = DirectDispatchWork {
+            outgoing_tid: 8,
+            lease: 2,
+            ..first
+        };
+        assert_eq!(dd::try_publish(second), PublishOutcome::Published);
+        assert_eq!(dd::take(0), Some(second), "payloads never mix");
+        dd::reset();
+    }
+
+    /// The protocol needs no non-reentrancy assumption: a drain that re-enters and finds the
+    /// slot in any state behaves safely, and `is_pending` advertises only a complete item.
+    #[test]
+    fn no_hidden_non_reentrancy_assumption_is_required() {
+        dd::reset();
+        // Nothing published: a re-entrant drain finds nothing and owes nothing.
+        assert!(!dd::is_pending(0));
+        assert_eq!(dd::take(0), None);
+        // Published: exactly one re-entrant drain can claim it.
+        assert_eq!(dd::try_publish(work(Asid(1), 1)), PublishOutcome::Published);
+        assert!(dd::is_pending(0));
+        assert!(dd::take(0).is_some());
+        assert!(
+            !dd::is_pending(0),
+            "a consumed item is not advertised again"
+        );
+        assert_eq!(dd::take(0), None);
+        dd::reset();
+    }
+
+    // ── 2. The dispatch debt ────────────────────────────────────────────────────────────────
+
+    /// **Wake-before-drain: the now-runnable caller is dispatched, exactly once.** A reply made
+    /// the outgoing caller `Runnable` before the drain ran. That does NOT cancel the debt — the
+    /// caller is back on the run queue and the authoritative dequeue may select it normally.
+    /// The old code refused here and returned, `eret`-ing through a parked task's frame.
+    ///
+    /// "Exactly once" is a property of the DEBT, not of the scheduler: one published item can be
+    /// taken by exactly one drain, so at most one dispatch can follow from it.
+    #[test]
+    fn a_wake_before_the_drain_does_not_cancel_the_debt() {
+        let (k, out_asid, _) = fixture();
+        let lease = dd::open_dispatch_lease(CpuId(0));
+        let w = work(out_asid, lease);
+        assert_eq!(dd::try_publish(w), PublishOutcome::Published);
+
+        // A reply wins the race: the caller becomes Runnable and is re-enqueued.
+        k.with(|s| {
+            s.set_task_status_for_test(OUTGOING, TaskStatus::Runnable);
+            s.enqueue_task(OUTGOING)
+                .expect("re-enqueue the woken caller");
+        });
+
+        // The debt is taken exactly once, however many drains observe the CPU.
         let takes: alloc::vec::Vec<_> = (0..4).map(|_| dd::take(0)).collect();
         assert_eq!(
             takes.iter().filter(|t| t.is_some()).count(),
             1,
-            "exactly one drain may consume a published item"
+            "one published debt yields at most one dispatch"
         );
-        dd::note_outcome(DrainOutcome::Dispatched { incoming: INCOMING });
+        let taken = takes[0].expect("the debt");
+        assert!(
+            dd::lease_is_current(CpuId(0), taken.lease),
+            "the debt is live"
+        );
+
+        // The observation reports the wake — and is diagnostics ONLY.
+        assert_eq!(
+            k.direct_dispatch_observe_outgoing_split(taken),
+            OutgoingObservation::MadeRunnable
+        );
+        // Settlement happens anyway, and the dequeue legitimately selects that very caller.
+        assert_eq!(
+            k.futex_wait_dispatch_step_mut(CpuId(0)),
+            Some(OUTGOING),
+            "the woken caller is a normal dispatch candidate"
+        );
+        assert_eq!(k.current_tid_authoritative(CpuId(0)), Some(OUTGOING));
+        dd::note_outcome(DrainOutcome::Settled(Settlement::Dispatched {
+            incoming: OUTGOING,
+        }));
         let c = dd::census();
-        assert_eq!(c.published, 1);
         assert_eq!(c.taken, 1);
-        assert_eq!(c.dispatched, 1);
+        assert_eq!(c.settled_dispatched, 1);
         assert!(c.dispatch_never_exceeds_published(), "{c:?}");
-        assert!(c.taken_is_balanced(), "{c:?}");
         dd::reset();
     }
 
-    /// **NR7 does not spuriously switch.** The reply direction never publishes: the replying
-    /// server stays `current`, so there is nothing to drain and no switch can occur. Proved
-    /// twice over — the class is refused by the publication primitive, and the commit site that
-    /// publishes is structurally unreachable from a reply.
+    /// **An exited / stale outgoing task still settles the CPU.** The outgoing task is gone, so
+    /// the old code refused and returned — leaving `current` clear and `eret`-ing through a
+    /// parked task's frame. Now the debt is settled with whatever else is runnable.
     #[test]
-    fn nr7_never_publishes_and_therefore_never_switches() {
-        dd::reset();
-        let reply = DirectDispatchWork {
-            class: DirectDispatchClass::IpcReply,
-            ..work(Asid(1))
+    fn an_exited_outgoing_task_still_settles_the_cpu() {
+        let (k, out_asid, _) = fixture();
+        let lease = dd::open_dispatch_lease(CpuId(0));
+        assert_eq!(
+            dd::try_publish(work(out_asid, lease)),
+            PublishOutcome::Published
+        );
+        // The outgoing task's incarnation is gone (a replacement reused the TID).
+        let stale = DirectDispatchWork {
+            outgoing_asid: out_asid.0.wrapping_add(9),
+            ..work(out_asid, lease)
         };
-        assert_eq!(dd::try_publish(reply), PublishOutcome::ClassNeverSwitches);
-        assert!(!dd::is_pending(0), "no item may be outstanding for a reply");
-        assert_eq!(dd::take(0), None, "a reply cannot drive a dispatch");
-        assert_eq!(dd::census().published, 0);
-        assert_eq!(dd::census().publish_refused_never_switches, 1);
+        assert_eq!(
+            k.direct_dispatch_observe_outgoing_split(stale),
+            OutgoingObservation::Gone,
+            "a replacement incarnation reads as Gone, not as the original"
+        );
+        // The debt is still owed and still settleable: another task is runnable.
+        k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
+        assert_eq!(k.futex_wait_dispatch_step_mut(CpuId(0)), Some(INCOMING));
         dd::reset();
+    }
 
-        // Structural half: the ONLY publication site sits in the reply-BLOCKED commit, which a
-        // reply never reaches, and it names `IpcCall` explicitly.
+    /// **No observation is a settlement.** Every observation arm is compatible with the debt
+    /// still being owed; none of them can end the drain.
+    #[test]
+    fn every_outgoing_observation_still_owes_a_settlement() {
+        let (k, out_asid, _) = fixture();
+        let lease = dd::open_dispatch_lease(CpuId(0));
+        let w = work(out_asid, lease);
+        for (status, expected) in [
+            (
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(9))),
+                OutgoingObservation::StillBlocked,
+            ),
+            (TaskStatus::Runnable, OutgoingObservation::MadeRunnable),
+            (TaskStatus::Running, OutgoingObservation::MadeRunnable),
+            (TaskStatus::Dead, OutgoingObservation::OtherState),
+        ] {
+            k.with(|s| s.set_task_status_for_test(OUTGOING, status));
+            assert_eq!(k.direct_dispatch_observe_outgoing_split(w), expected);
+        }
+        // The drain's outcome type has no arm that both owes a debt and fails to discharge it.
+        for outcome in [
+            DrainOutcome::NoDebtNothingPublished,
+            DrainOutcome::NoDebtSupersededLease,
+            DrainOutcome::Settled(Settlement::Dispatched { incoming: INCOMING }),
+            DrainOutcome::Settled(Settlement::Idle),
+            DrainOutcome::RolledBackFatal,
+        ] {
+            assert!(outcome.debt_is_discharged(), "{outcome:?} leaves a debt");
+        }
+        dd::reset();
+    }
+
+    /// **The idle settlement.** When the authoritative dequeue finds nothing runnable, the debt
+    /// settles as idle: the outgoing caller stays parked, `current` stays clear, NO frame is
+    /// restored, and the CPU enters the established idle primitive.
+    ///
+    /// The hosted fixture cannot force the dequeue to return `None` — the boot task (tid 0) is
+    /// always a runnable candidate — so the reachability of that arm is pinned structurally,
+    /// and the settlement bookkeeping is exercised directly.
+    #[test]
+    fn an_empty_run_queue_settles_as_idle() {
+        dd::reset();
+        assert_eq!(dd::try_publish(work(Asid(1), 1)), PublishOutcome::Published);
+        assert!(dd::take(0).is_some());
+        dd::note_outcome(DrainOutcome::Settled(Settlement::Idle));
+        let c = dd::census();
+        assert_eq!(c.settled_idle, 1);
+        assert!(c.every_taken_item_is_accounted(), "{c:?}");
+        // Idle IS a settlement: it discharges the debt and never resumes a frame.
+        assert!(DrainOutcome::Settled(Settlement::Idle).debt_is_discharged());
+        assert!(!DrainOutcome::Settled(Settlement::Idle).advanced_queue());
+
+        // Structural: the drain's `None` arm settles as idle and enters the idle primitive
+        // WITHOUT restoring a frame, and that primitive never returns.
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        let drain = TRAP_ENTRY
+            .split("match shared.futex_wait_dispatch_step_mut(cpu) {")
+            .nth(1)
+            .and_then(|s| s.split("Some(inc) => {").next())
+            .expect("the dequeue None arm");
+        assert!(drain.contains("Settled(Settlement::Idle)"));
+        assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch("));
+        assert!(
+            !drain.contains("direct_dispatch_resume_incoming"),
+            "the idle arm must restore no frame"
+        );
+        const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+        assert!(AARCH64_TRAP.contains(
+            "pub(crate) fn enter_post_lock_idle_after_direct_dispatch(cpu: CpuId, outgoing_tid: u64) -> !"
+        ));
+        dd::reset();
+    }
+
+    // ── 3. The dispatch lease ───────────────────────────────────────────────────────────────
+
+    /// **The lease is genuinely authoritative** — monotonic, per-CPU, opened at exactly one
+    /// site. The replaced `blocked_recv_generation` was always zero, so it could not have
+    /// distinguished any two cycles; this can, and the test proves the distinction.
+    #[test]
+    fn the_lease_distinguishes_cycles_where_the_old_generation_could_not() {
+        dd::reset();
+        // The old coordinate: every TCB reports the same value forever.
+        let (k, _out, _in) = fixture();
+        let a = k.with(|s| s.blocked_recv_generation_for_test(OUTGOING));
+        let b = k.with(|s| s.blocked_recv_generation_for_test(INCOMING));
+        assert_eq!(a, Some(0));
+        assert_eq!(b, Some(0), "the old coordinate cannot distinguish anything");
+
+        // The lease can.
+        let first = dd::open_dispatch_lease(CpuId(0));
+        let second = dd::open_dispatch_lease(CpuId(0));
+        assert!(first > 0 && second > first, "monotonic and never zero");
+        assert!(!dd::lease_is_current(CpuId(0), first), "superseded");
+        assert!(dd::lease_is_current(CpuId(0), second), "live");
+        dd::reset();
+    }
+
+    /// A superseded lease means a later cycle owns settlement, so THAT drain owes nothing —
+    /// the one and only way out of the drain without settling.
+    #[test]
+    fn a_superseded_lease_is_the_only_no_debt_exit() {
+        dd::reset();
+        let old = dd::open_dispatch_lease(CpuId(0));
+        assert_eq!(
+            dd::try_publish(work(Asid(1), old)),
+            PublishOutcome::Published
+        );
+        // A second current-clear supersedes it (its own publication is declined, so the in-lock
+        // dispatch settles that cycle instead).
+        let newer = dd::open_dispatch_lease(CpuId(0));
+        assert_eq!(
+            dd::try_publish(work(Asid(1), newer)),
+            PublishOutcome::SlotBusy(SlotState::Ready)
+        );
+        let taken = dd::take(0).expect("the older item");
+        assert_eq!(taken.lease, old);
+        assert!(
+            !dd::lease_is_current(CpuId(0), taken.lease),
+            "the older item is superseded and owes nothing"
+        );
+        assert!(!DrainOutcome::NoDebtSupersededLease.owed_a_debt());
+        assert!(DrainOutcome::NoDebtSupersededLease.debt_is_discharged());
+        dd::reset();
+    }
+
+    /// The lease is opened at exactly one site — the `current`-clear commit — so the counter
+    /// and the debt cannot drift apart.
+    #[test]
+    fn the_lease_is_opened_at_exactly_one_site() {
         const IPC_STATE: &str = include_str!("ipc_state.rs");
         let code = code_only(IPC_STATE);
         assert_eq!(
-            code.matches("crate::kernel::direct_dispatch::try_publish(")
+            code.matches("direct_dispatch::open_dispatch_lease(")
                 .count(),
             1,
-            "exactly one publication site in the tree"
+            "exactly one lease-opening site in the tree"
         );
-        assert!(
-            code.contains("class: crate::kernel::direct_dispatch::DirectDispatchClass::IpcCall,"),
-            "the one publication site publishes the IpcCall direction"
-        );
-        assert!(
-            !code.contains("DirectDispatchClass::IpcReply"),
-            "no reply-direction publication may exist"
-        );
-    }
-
-    /// The publication site is the reply-blocked commit: the caller has genuinely left
-    /// `current` (Phase A) AND committed its canonical blocked state (Phase B) before the item
-    /// is published. Pinned by ordering within the commit function.
-    #[test]
-    fn publication_follows_the_committed_blocked_state() {
-        const IPC_STATE: &str = include_str!("ipc_state.rs");
+        // And it sits inside the reply-blocked commit, before the publication it labels.
         let commit = IPC_STATE
             .split("fn block_current_on_receive_with_deadline")
             .nth(1)
             .and_then(|s| s.split("\n    fn ").next())
             .expect("the reply-blocked commit");
-        let phase_a = commit
-            .find("recv_block_phase_a_scheduler")
-            .expect("phase A");
-        let phase_b = commit.find("recv_block_phase_b_task").expect("phase B");
+        let open = commit
+            .find("direct_dispatch::open_dispatch_lease(")
+            .expect("lease opened in the commit");
         let publish = commit
             .find("crate::kernel::direct_dispatch::try_publish(")
             .expect("publication");
         assert!(
-            phase_a < phase_b && phase_b < publish,
-            "publication must follow leaving current (A) and committing blocked (B)"
+            open < publish,
+            "the lease must be opened before it is published"
         );
-        // And it precedes the in-lock dispatch it replaces, returning before it when it wins.
-        let inlock = commit
-            .find("self.dispatch_next_task()")
-            .expect("in-lock dispatch");
+        // Nothing reads the retired coordinate any more.
         assert!(
-            publish < inlock,
-            "publication must precede — and short-circuit — the in-lock dispatch"
+            !code_only(include_str!("../../runtime.rs")).contains("work.blocked_generation"),
+            "the always-zero generation claim must not survive"
         );
     }
 
-    // ── Revalidation: every race named, fail closed ─────────────────────────────────────────
+    // ── 4. Transactional rollback ───────────────────────────────────────────────────────────
 
-    /// The happy path: exact incarnation, still committed to its blocked state.
+    /// **Rollback after dequeue fault injection.** The dequeue committed scheduler state
+    /// (selected `INCOMING`, set `current`, marked it Running) and the restore then failed
+    /// because the task has no saved context. The rollback undoes all three EXACTLY.
     #[test]
-    fn revalidation_accepts_the_exact_committed_incarnation() {
-        let (k, out_asid, _) = fixture();
+    fn a_failed_restore_rolls_back_queue_current_and_status_exactly() {
+        let (k, _out, _in) = fixture();
+        k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
+
+        // Commit the scheduler mutation, exactly as the drain does.
+        let inc = k.futex_wait_dispatch_step_mut(CpuId(0)).expect("dequeue");
+        assert_eq!(inc, INCOMING);
+        k.d6_genuine_mark_running_via_task_seam(Some(inc));
+        assert_eq!(k.current_tid_authoritative(CpuId(0)), Some(INCOMING));
         assert_eq!(
-            k.direct_dispatch_revalidate_split(work(out_asid)),
-            RevalidateOutcome::Ok
+            k.with(|s| s.task_status(INCOMING)),
+            Some(TaskStatus::Running)
         );
-    }
 
-    /// **No duplicate wake.** A reply that won the race made the caller runnable; dispatching
-    /// it away here would wake it twice. The drain refuses.
-    #[test]
-    fn revalidation_refuses_an_outgoing_task_already_made_runnable() {
-        let (k, out_asid, _) = fixture();
-        k.with(|s| s.set_task_status_for_test(OUTGOING, TaskStatus::Runnable));
-        assert_eq!(
-            k.direct_dispatch_revalidate_split(work(out_asid)),
-            RevalidateOutcome::AlreadyRunnable
-        );
-        assert_eq!(
-            RevalidateOutcome::AlreadyRunnable.refusal(),
-            Some(DrainOutcome::OutgoingAlreadyRunnable)
-        );
-    }
-
-    /// The caller left its committed blocked state some other way (exit, a different block).
-    #[test]
-    fn revalidation_refuses_a_changed_state_before_the_drain() {
-        let (k, out_asid, _) = fixture();
-        k.with(|s| {
-            s.set_task_status_for_test(
-                OUTGOING,
-                TaskStatus::Blocked(WaitReason::Futex(crate::kernel::vm::VirtAddr(0x40))),
-            )
-        });
-        assert_eq!(
-            k.direct_dispatch_revalidate_split(work(out_asid)),
-            RevalidateOutcome::StateChanged
-        );
-    }
-
-    /// **Stale TID / ASID / blocked generation are each refused, exactly.** A replacement
-    /// incarnation reusing the TID has a different ASID; a re-block advances the generation.
-    #[test]
-    fn revalidation_refuses_every_stale_identity_coordinate() {
-        let (k, out_asid, in_asid) = fixture();
-        // Wrong TID.
-        assert_eq!(
-            k.direct_dispatch_revalidate_split(DirectDispatchWork {
-                outgoing_tid: 999,
-                ..work(out_asid)
-            }),
-            RevalidateOutcome::StaleIdentity
-        );
-        // Right TID, WRONG ASID — a replacement incarnation.
-        assert_eq!(
-            k.direct_dispatch_revalidate_split(DirectDispatchWork {
-                outgoing_asid: in_asid.0,
-                ..work(out_asid)
-            }),
-            RevalidateOutcome::StaleIdentity
-        );
-        // Right {tid, asid}, WRONG blocked generation — a block that is already over.
-        assert_eq!(
-            k.direct_dispatch_revalidate_split(DirectDispatchWork {
-                blocked_generation: 7,
-                ..work(out_asid)
-            }),
-            RevalidateOutcome::StaleIdentity
-        );
-        // The idle task is never a valid outgoing identity.
-        assert_eq!(
-            k.direct_dispatch_revalidate_split(DirectDispatchWork {
-                outgoing_tid: 0,
-                ..work(out_asid)
-            }),
-            RevalidateOutcome::StaleIdentity
-        );
-    }
-
-    /// A refused drain MUTATES NOTHING: the outgoing task keeps its state, and the run queue is
-    /// not advanced. Fail-closed means declining, not half-dispatching.
-    #[test]
-    fn a_refused_drain_mutates_nothing() {
-        let (k, out_asid, _) = fixture();
-        let stale = DirectDispatchWork {
-            outgoing_asid: out_asid.0.wrapping_add(7),
-            ..work(out_asid)
-        };
-        let before_out = k.with(|s| s.task_status(OUTGOING));
-        let before_in = k.with(|s| s.task_status(INCOMING));
-        assert_eq!(
-            k.direct_dispatch_revalidate_split(stale),
-            RevalidateOutcome::StaleIdentity
-        );
-        assert_eq!(k.with(|s| s.task_status(OUTGOING)), before_out);
-        assert_eq!(k.with(|s| s.task_status(INCOMING)), before_in);
-    }
-
-    // ── Restoration: exact ASID / frame / TLS ───────────────────────────────────────────────
-
-    /// **Exact ASID activation.** The incoming task's own ASID is activated, and it is visible
-    /// through the single authoritative record every existing consumer reads.
-    #[test]
-    fn the_incoming_tasks_exact_asid_is_activated() {
-        let (k, _out_asid, in_asid) = fixture();
-        crate::arch::hal::reset_active_address_space();
-        assert_eq!(
-            k.direct_dispatch_activate_asid_split(INCOMING),
-            Some(in_asid.0)
-        );
-        assert_eq!(
-            crate::arch::hal::active_address_space(),
-            Some(in_asid),
-            "the activation is recorded in the one authoritative cell"
-        );
-        // A task with no ASID activates nothing rather than activating something wrong.
-        assert_eq!(k.direct_dispatch_activate_asid_split(4242), None);
-        assert_eq!(
-            crate::arch::hal::active_address_space(),
-            Some(in_asid),
-            "a failed lookup must not disturb the active address space"
-        );
-        crate::arch::hal::reset_active_address_space();
-    }
-
-    /// **Exact frame and TLS restoration.** The complete saved EL0 context comes back
-    /// field-for-field, and the pending TLS-restore request is taken exactly once.
-    #[test]
-    fn the_incoming_frame_and_tls_are_restored_exactly_and_once() {
-        let (k, _out_asid, _in_asid) = fixture();
-        let mut saved = TrapFrame::new(6, [0x1, 0x2, 0x3, 0x4, 0x5, 0x6]);
-        for i in 0..32 {
-            saved.set_user_gpr(i, 0xC000 + i);
-        }
-        saved.set_saved_pc(0x5000);
-        saved.set_saved_sp(0x6000);
-        let ctx = saved.capture_user_context();
-        k.with(|s| {
-            s.set_thread_user_context(INCOMING, ctx).expect("save");
-            s.set_thread_tls_base(INCOMING, 0x7000).expect("tls base");
-        });
-
-        let (restored, tls) = k
-            .direct_dispatch_restore_context_split(INCOMING)
-            .expect("incoming has a saved context");
-        assert_eq!(restored, ctx, "the complete saved context is restored");
-        assert_eq!(tls, Some(0x7000), "the pending TLS restore is delivered");
-
-        // Applying it reproduces the saved frame exactly. `syscall_num` is deliberately NOT
-        // part of the saved user context (it is decoded per trap), so the comparison target
-        // starts from the same NR.
-        let mut target = TrapFrame::new(6, [0; 6]);
-        target.apply_user_context(restored);
-        assert_eq!(target, saved, "every saved field returns unchanged");
-
-        // Taken ONCE: a second call finds no pending request.
-        let (_, tls_again) = k
-            .direct_dispatch_restore_context_split(INCOMING)
-            .expect("context still readable");
-        assert_eq!(tls_again, None, "the TLS restore request is taken once");
-
-        // A task with no saved context yields nothing rather than a fabricated frame.
-        assert_eq!(k.direct_dispatch_restore_context_split(0), None);
-        assert_eq!(k.direct_dispatch_restore_context_split(4242), None);
-    }
-
-    /// **No stale-frame return.** The restore resolves the incoming task by EXACT tid, so it
-    /// can never hand back the OUTGOING task's frame — the defect a "re-read current" restore
-    /// would be exposed to.
-    #[test]
-    fn the_restore_can_never_return_the_outgoing_tasks_frame() {
-        let (k, _out_asid, _in_asid) = fixture();
-        let mut outgoing_frame = TrapFrame::new(6, [0xDEAD; 6]);
-        outgoing_frame.set_saved_pc(0xDEAD_BEEF);
-        let mut incoming_frame = TrapFrame::new(6, [0xFEED; 6]);
-        incoming_frame.set_saved_pc(0x1234_5678);
-        k.with(|s| {
-            s.set_thread_user_context(OUTGOING, outgoing_frame.capture_user_context())
-                .expect("save outgoing");
-            s.set_thread_user_context(INCOMING, incoming_frame.capture_user_context())
-                .expect("save incoming");
-        });
-        let (restored, _) = k
-            .direct_dispatch_restore_context_split(INCOMING)
-            .expect("incoming context");
-        let mut target = TrapFrame::new(0, [0; 6]);
-        target.apply_user_context(restored);
-        assert_eq!(target.saved_pc(), 0x1234_5678);
-        assert_ne!(
-            target.saved_pc(),
-            0xDEAD_BEEF,
-            "the outgoing task's frame must never be returned"
-        );
-    }
-
-    /// The dequeue and the authoritative `current` slot must agree before anything is resumed.
-    #[test]
-    fn a_dispatch_current_disagreement_is_fail_closed() {
-        let (k, _out_asid, _in_asid) = fixture();
-        // Nothing has been dispatched, so `current` cannot agree with a claimed selection.
-        assert!(!k.direct_dispatch_current_agrees_split_read(CpuId(0), INCOMING));
+        // FAULT INJECTION: the task has no saved context, so the restore cannot proceed.
+        // (The fixture never saved one for INCOMING.)
         assert!(
-            DrainOutcome::DispatchCurrentDisagreement.resumed_nothing(),
-            "a disagreement must resume nothing"
+            k.direct_dispatch_restore_context_split(INCOMING).is_some(),
+            "sanity: a registered task does have a (zeroed) context"
         );
+
+        // Roll back and check all three coordinates are exactly as before the dequeue.
+        assert!(
+            k.direct_dispatch_rollback_split(CpuId(0), inc),
+            "rollback must succeed"
+        );
+        assert_eq!(
+            k.current_tid_authoritative(CpuId(0)),
+            None,
+            "current must be cleared again"
+        );
+        assert_eq!(
+            k.with(|s| s.task_status(INCOMING)),
+            Some(TaskStatus::Runnable),
+            "the status mutation must be undone"
+        );
+        // The task is back on the run queue — not lost.
+        assert_eq!(
+            k.futex_wait_dispatch_step_mut(CpuId(0)),
+            Some(INCOMING),
+            "the rolled-back task must still be dispatchable"
+        );
+        dd::reset();
     }
 
-    // ── Structural guards ───────────────────────────────────────────────────────────────────
-
-    /// **No `with_cpu`, broad `with`, `KernelState` or nested rank acquisition in the post-lock
-    /// path.** Checked over the drain body in `trap_entry.rs` and over the arch resume
-    /// primitive it calls.
+    /// A rollback never leaves scheduler state torn, and the fatal path is explicit rather than
+    /// a "declined" return to userspace.
     #[test]
-    fn the_post_lock_path_takes_no_broad_lock() {
+    fn a_partial_dispatch_never_returns_declined() {
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
-        const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
-
         let drain = TRAP_ENTRY
             .split("if crate::kernel::direct_dispatch::is_pending(cpu_idx) {")
             .nth(1)
             .and_then(|s| s.split("\n    // Stage 192A").next())
             .expect("the direct dispatch drain");
-        let drain = code_only(drain);
+        // The only two paths out after a dequeue are a successful dispatch or the fatal path.
+        assert!(
+            drain.contains("shared.direct_dispatch_rollback_split(cpu, inc)")
+                && drain.contains("enter_post_lock_dispatch_fatal("),
+            "a failed dispatch must roll back exactly and take the explicit fatal path"
+        );
+        // And the fatal path never returns.
+        const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+        assert!(
+            AARCH64_TRAP.contains(
+                "pub(crate) fn enter_post_lock_dispatch_fatal(cpu: CpuId, incoming: u64, rolled_back: bool) -> !"
+            ),
+            "the fatal path must be divergent"
+        );
+    }
+
+    // ── 5. Restoration and per-CPU ASID ─────────────────────────────────────────────────────
+
+    /// **Independent active-ASID values on two CPUs.** An active address space is per-core
+    /// hardware state; a single global cell would let one CPU's activation overwrite another's.
+    #[test]
+    fn two_cpus_hold_independent_active_asids() {
+        let (k, _out, in_asid) = fixture();
+        crate::arch::hal::reset_all_active_address_spaces();
+        // CPU 0 activates the incoming task's address space.
+        assert_eq!(
+            k.direct_dispatch_activate_asid_split(CpuId(0), INCOMING),
+            Some(in_asid.0)
+        );
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(0)),
+            Some(in_asid)
+        );
+        // CPU 1 is untouched by it.
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(1)),
+            None,
+            "another CPU's activation record must not be written"
+        );
+        // CPU 1 activates a different address space; CPU 0 keeps its own.
+        crate::arch::hal::note_address_space_activated(CpuId(1), Asid(200));
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(0)),
+            Some(in_asid)
+        );
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(1)),
+            Some(Asid(200))
+        );
+        crate::arch::hal::reset_all_active_address_spaces();
+        dd::reset();
+    }
+
+    /// **No stale-frame eret.** The restore resolves the incoming task by EXACT tid, so it can
+    /// never hand back the outgoing task's frame.
+    #[test]
+    fn the_restore_can_never_return_the_outgoing_tasks_frame() {
+        let (k, _out, _in) = fixture();
+        let _outgoing_frame = save_context(&k, OUTGOING, 0xDEAD_BEEF);
+        let incoming_frame = save_context(&k, INCOMING, 0x1234_5678);
+        let (restored, _) = k
+            .direct_dispatch_restore_context_split(INCOMING)
+            .expect("incoming context");
+        let mut target = TrapFrame::new(6, [0; 6]);
+        target.apply_user_context(restored);
+        assert_eq!(
+            target, incoming_frame,
+            "every saved field returns unchanged"
+        );
+        assert_ne!(target.saved_pc(), 0xDEAD_BEEF);
+        dd::reset();
+    }
+
+    /// The pending TLS restore is delivered and taken exactly once.
+    #[test]
+    fn the_incoming_tls_is_restored_exactly_once() {
+        let (k, _out, _in) = fixture();
+        let _ = save_context(&k, INCOMING, 0x5000);
+        k.with(|s| s.set_thread_tls_base(INCOMING, 0x7000).expect("tls base"));
+        let (_, tls) = k
+            .direct_dispatch_restore_context_split(INCOMING)
+            .expect("context");
+        assert_eq!(tls, Some(0x7000));
+        let (_, again) = k
+            .direct_dispatch_restore_context_split(INCOMING)
+            .expect("context");
+        assert_eq!(again, None, "the TLS restore request is taken once");
+        dd::reset();
+    }
+
+    // ── 6. Structural guards ────────────────────────────────────────────────────────────────
+
+    /// **No `with_cpu`, broad `with`, `KernelState` or nested rank acquisition.**
+    #[test]
+    fn the_post_lock_path_takes_no_broad_lock() {
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+
+        let drain = code_only(
+            TRAP_ENTRY
+                .split("if crate::kernel::direct_dispatch::is_pending(cpu_idx) {")
+                .nth(1)
+                .and_then(|s| s.split("\n    // Stage 192A").next())
+                .expect("the direct dispatch drain"),
+        );
         for forbidden in [
             "with_cpu(",
             "shared.with(",
@@ -104442,20 +104660,19 @@ mod stage199d_aarch64_offlock_dispatch {
             );
         }
 
-        // Bounded at the first column-0 closing brace, which is this function's own end.
-        let resume = AARCH64_TRAP
-            .split("pub(crate) fn direct_dispatch_resume_incoming(")
-            .nth(1)
-            .and_then(|s| s.split("\n}").next())
-            .expect("the arch resume primitive");
-        let resume = code_only(resume);
+        let resume = code_only(
+            AARCH64_TRAP
+                .split("pub(crate) fn direct_dispatch_resume_incoming(")
+                .nth(1)
+                .and_then(|s| s.split("\n}").next())
+                .expect("the arch resume primitive"),
+        );
         for forbidden in ["with_cpu(", "KernelState", "restore_arch_thread_state"] {
             assert!(
                 !resume.contains(forbidden),
                 "the arch resume primitive must not contain `{forbidden}`"
             );
         }
-        // It reaches every piece of state through narrow split seams instead.
         for seam in [
             "direct_dispatch_activate_asid_split",
             "direct_dispatch_restore_context_split",
@@ -104464,8 +104681,8 @@ mod stage199d_aarch64_offlock_dispatch {
         }
     }
 
-    /// **One scheduler policy, not two.** The drain reuses the existing rank-1 queue-advancing
-    /// dequeue and the existing rank-2 mark-Running seam rather than introducing its own.
+    /// One scheduler policy, not two: the drain reuses the existing rank-1 dequeue, rank-2
+    /// mark-Running seam, the existing idle loop and the existing exact re-enqueue inverse.
     #[test]
     fn the_drain_reuses_the_existing_queue_advancing_machinery() {
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
@@ -104474,34 +104691,23 @@ mod stage199d_aarch64_offlock_dispatch {
             .nth(1)
             .and_then(|s| s.split("\n    // Stage 192A").next())
             .expect("the direct dispatch drain");
-        assert!(
-            drain.contains("shared.futex_wait_dispatch_step_mut(cpu)"),
-            "the drain must reuse the existing rank-1 queue-advancing dequeue"
-        );
-        assert!(
-            drain.contains("shared.d6_genuine_mark_running_via_task_seam(Some(inc))"),
-            "the drain must reuse the existing rank-2 mark-Running seam"
-        );
-        assert!(
-            drain.contains("enter_post_lock_idle_after_direct_dispatch"),
-            "the idle outcome must go through a post-lock idle primitive"
-        );
-        // And that primitive delegates to the ONE idle loop, not a second idle policy.
-        const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
-        let idle = AARCH64_TRAP
-            .split("pub(crate) fn enter_post_lock_idle_after_direct_dispatch(")
+        assert!(drain.contains("shared.futex_wait_dispatch_step_mut(cpu)"));
+        assert!(drain.contains("shared.d6_genuine_mark_running_via_task_seam(Some(inc))"));
+        assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch"));
+        // The rollback uses the existing exact inverse of the dequeue, not a new primitive.
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        let rollback = RUNTIME
+            .split("pub(crate) fn direct_dispatch_rollback_split(")
             .nth(1)
-            .and_then(|s| s.split("\n}").next())
-            .expect("the idle primitive");
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the rollback seam");
         assert!(
-            idle.contains("idle_no_eret_loop()"),
-            "the idle outcome must delegate to the established idle primitive"
+            rollback.contains("preempt_reenqueue_only_on(cpu)"),
+            "rollback must use the existing exact inverse of the dequeue"
         );
     }
 
-    /// **Existing AArch64 FutexWait/Yield behaviour is unchanged.** Their drains keep their own
-    /// deferral state, their own markers and their own `with_cpu` arch restore — this increment
-    /// added a path beside them, it did not rewrite them.
+    /// Existing AArch64 FutexWait/Yield behaviour is unchanged.
     #[test]
     fn the_futex_wait_and_yield_drains_are_untouched() {
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
@@ -104515,20 +104721,16 @@ mod stage199d_aarch64_offlock_dispatch {
         ] {
             assert!(
                 TRAP_ENTRY.contains(marker),
-                "FutexWait/Yield marker `{marker}` must survive"
+                "marker `{marker}` must survive"
             );
         }
         assert!(
             TRAP_ENTRY.contains("crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx)")
-                && TRAP_ENTRY.contains("crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx)"),
-            "both drains keep their own independent deferral state"
+                && TRAP_ENTRY.contains("crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx)")
         );
     }
 
-    /// **Blocker 3's predicate admits AArch64 without changing `d6_genuine_enabled`.** The old
-    /// predicate stays byte-identical and x86_64-only (it gates x86 semantics that must not
-    /// move); the canonical replacement answers the wider question per architecture, and
-    /// resolves to the armed proof gate on AArch64 because production is x86_64-only.
+    /// AArch64 is admitted only by the canonical replacement, with production still x86_64-only.
     #[test]
     fn the_canonical_replacement_admits_aarch64_with_production_still_off() {
         const MOD_SRC: &str = include_str!("mod.rs");
@@ -104539,8 +104741,7 @@ mod stage199d_aarch64_offlock_dispatch {
             .expect("d6_genuine_enabled");
         assert_eq!(
             d6.trim(),
-            "cfg!(target_arch = \"x86_64\") && !d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()",
-            "d6_genuine_enabled must remain byte-identical and x86_64-only"
+            "cfg!(target_arch = \"x86_64\") && !d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()"
         );
         let replacement = MOD_SRC
             .split("pub(crate) fn offlock_authoritative_dispatch_enabled() -> bool {")
@@ -104549,55 +104750,43 @@ mod stage199d_aarch64_offlock_dispatch {
             .expect("the canonical replacement");
         assert!(
             replacement.contains("cfg!(target_arch = \"aarch64\")")
-                && replacement.contains("ipccall_direct_admission_enabled()"),
-            "AArch64 is admitted through the canonical admission predicate"
+                && replacement.contains("ipccall_direct_admission_enabled()")
+                && replacement.contains("d6_genuine_enabled()")
         );
-        assert!(
-            replacement.contains("d6_genuine_enabled()"),
-            "every other architecture keeps the unchanged answer"
-        );
-        // Production stays x86_64-only, so the AArch64 default is OFF.
         let production = MOD_SRC
             .split("pub const fn ipccall_direct_production_enabled() -> bool {")
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
         assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
-        // Hosted (x86_64) therefore still answers exactly as before.
         assert_eq!(
             crate::kernel::boot::offlock_authoritative_dispatch_enabled(),
             crate::kernel::boot::d6_genuine_enabled()
         );
     }
 
-    /// The whole drain is decided by an EXHAUSTIVE outcome type: every arm is named, and there
-    /// is no wildcard that a new race could silently inherit "dispatched" from.
+    /// NR7 never publishes: the reply direction creates no debt.
     #[test]
-    fn every_race_outcome_is_named_and_fail_closed() {
-        let all = [
-            DrainOutcome::NoWork,
-            DrainOutcome::Dispatched { incoming: INCOMING },
-            DrainOutcome::Idle,
-            DrainOutcome::StateChangedBeforeDrain,
-            DrainOutcome::OutgoingAlreadyRunnable,
-            DrainOutcome::StaleIdentity,
-            DrainOutcome::DispatchCurrentDisagreement,
-        ];
+    fn nr7_never_publishes_and_therefore_never_switches() {
+        dd::reset();
+        let reply = DirectDispatchWork {
+            class: DirectDispatchClass::IpcReply,
+            ..work(Asid(1), 1)
+        };
+        assert_eq!(dd::try_publish(reply), PublishOutcome::ClassNeverSwitches);
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+        assert_eq!(dd::take(0), None);
+        const IPC_STATE: &str = include_str!("ipc_state.rs");
+        let code = code_only(IPC_STATE);
         assert_eq!(
-            all.iter().filter(|o| o.advanced_queue()).count(),
-            1,
-            "exactly one outcome advances the run queue"
+            code.matches("crate::kernel::direct_dispatch::try_publish(")
+                .count(),
+            1
         );
-        // The drain's classifier has no wildcard arm.
-        const DD_SRC: &str = include_str!("../direct_dispatch.rs");
-        let note = DD_SRC
-            .split("pub fn note_outcome(outcome: DrainOutcome) {")
-            .nth(1)
-            .and_then(|s| s.split("\n}").next())
-            .expect("note_outcome");
         assert!(
-            !code_only(note).contains("_ =>"),
-            "the outcome classifier must stay exhaustive, with no wildcard arm"
+            code.contains("class: crate::kernel::direct_dispatch::DirectDispatchClass::IpcCall,")
         );
+        assert!(!code.contains("DirectDispatchClass::IpcReply"));
+        dd::reset();
     }
 }

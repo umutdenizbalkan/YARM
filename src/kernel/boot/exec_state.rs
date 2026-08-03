@@ -2730,7 +2730,7 @@ impl KernelState {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn d2_recv_switch_incoming_asid(&mut self, incoming: u64) {
         if let Some(asid) = self.task_asid(incoming) {
-            self.hal.switch_address_space(asid);
+            self.hal.switch_address_space(self.current_cpu(), asid);
         }
     }
 
@@ -2846,7 +2846,7 @@ impl KernelState {
                 if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!("DISPATCH: before switch_address_space asid={}", asid.0);
                 }
-                self.hal.switch_address_space(asid);
+                self.hal.switch_address_space(self.current_cpu(), asid);
                 if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!("DISPATCH: after switch_address_space asid={}", asid.0);
                     if self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
@@ -3321,7 +3321,7 @@ impl KernelState {
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);
             if let Some(asid) = incoming_asid {
-                self.hal.switch_address_space(asid);
+                self.hal.switch_address_space(self.current_cpu(), asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
             if outgoing_tid != Some(tid) {
@@ -3403,7 +3403,7 @@ impl KernelState {
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);
             if let Some(asid) = incoming_asid {
-                self.hal.switch_address_space(asid);
+                self.hal.switch_address_space(self.current_cpu(), asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
             if outgoing_tid != Some(tid) {
@@ -3440,7 +3440,10 @@ impl KernelState {
     pub(crate) fn d6_emit_proof_cleanup_arch_markers(&mut self) {
         let current_tid = self.current_tid().unwrap_or(u64::MAX);
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK tid={}", current_tid);
-        let active_asid = self.hal.active_asid().map_or(0, |asid| asid.0);
+        let active_asid = self
+            .hal
+            .active_asid_on(self.current_cpu())
+            .map_or(0, |asid| asid.0);
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CR3_OK asid={}", active_asid);
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_TSS_OK");
         // Stage 139: force-restore hardware CR3 to the current task's address
@@ -3456,7 +3459,7 @@ impl KernelState {
                 hw_cr3,
                 task_asid.0
             );
-            self.hal.switch_address_space(task_asid);
+            self.hal.switch_address_space(self.current_cpu(), task_asid);
             crate::yarm_log!("D6_PROOF_CR3_CLEANUP_OK");
         }
     }
@@ -3503,7 +3506,9 @@ impl KernelState {
     /// Stage 133: narrow diagnostic accessor — returns the numeric ASID currently
     /// active in the HAL without exposing the private `hal` field.
     pub(crate) fn d6_diag_active_asid_num(&self) -> usize {
-        self.hal.active_asid().map_or(0, |a| a.0 as usize)
+        self.hal
+            .active_asid_on(self.current_cpu())
+            .map_or(0, |a| a.0 as usize)
     }
 }
 
