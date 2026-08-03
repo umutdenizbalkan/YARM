@@ -778,6 +778,34 @@ pub(crate) fn d6_genuine_enabled() -> bool {
     cfg!(target_arch = "x86_64") && !d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()
 }
 
+/// Stage 199D — the CANONICAL replacement for [`d6_genuine_enabled`] as the "may this
+/// architecture run the authoritative queue-advancing dispatch outside the broad lock?"
+/// question, now that AArch64 readiness blocker 3 is structurally closed.
+///
+/// `d6_genuine_enabled` deliberately stays byte-identical and x86_64-only: it gates the D6
+/// queue-NEUTRAL dispatch slice and three `exec_state` decisions whose x86_64 semantics must
+/// not change, and widening it would silently alter AArch64 FutexWait/Yield behaviour. This
+/// predicate is the wider question, answered per architecture:
+///
+/// * **x86_64** — unchanged: exactly `d6_genuine_enabled()`.
+/// * **AArch64** — admitted, but only through the same `ipccall_direct_admission_enabled()`
+///   the direct NR6/NR7 path already uses, and only when no D6-switch diagnostic owns the
+///   switch path. Because `ipccall_direct_production_enabled()` is x86_64-only, that resolves
+///   to the armed proof/oracle gate on AArch64: **the AArch64 production default is OFF** and
+///   an ordinary AArch64 boot publishes no work item and drains nothing.
+/// * **RISC-V** — not admitted (no RISC-V work in this increment).
+// The only production caller is the AArch64 publication site; a hosted (x86_64) `lib` build
+// compiles no route to it, exactly like the sibling arch-gated predicates.
+#[allow(dead_code)]
+pub(crate) fn offlock_authoritative_dispatch_enabled() -> bool {
+    if cfg!(target_arch = "aarch64") {
+        return ipccall_direct_admission_enabled()
+            && !d6_controlled_switch_proof_enabled()
+            && !d6_switch_a_enabled();
+    }
+    d6_genuine_enabled()
+}
+
 /// Stage 167: per-CPU count of genuine scheduler-seam dispatch observations.
 pub(crate) static D6_GENUINE_SEAM_COUNT: [core::sync::atomic::AtomicU64;
     crate::kernel::scheduler::MAX_CPUS] =

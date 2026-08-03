@@ -1340,9 +1340,10 @@ AArch64 and RISC-V are untouched and remain proof-gated.
 
 ### 8.6.10 AArch64 NR6/NR7 production-readiness audit — NOT READY
 
-> **Superseded in part by §8.6.11:** blockers 1 and 2 below are now **CLOSED**. Blocker 3
-> remains open, so the answer to the question below is still *not ready*, and the AArch64
-> production default is still OFF. This section is retained as the original audit.
+> **Superseded by §8.6.11 and §8.6.12:** all three blockers below are now closed —
+> blockers 1 and 2 in §8.6.11, blocker 3 structurally in §8.6.12. The AArch64 production
+> default is still OFF and live acceptance is still pending (`qemu-system-aarch64` is absent
+> here). This section is retained as the original audit.
 
 **Question:** can an eligible NR6/NR7 transaction complete on AArch64 without reacquiring the
 broad `KernelState` lock? **Answer: no.** Three blockers, all outside the canonical contracts.
@@ -1501,6 +1502,117 @@ pin that the removed round trip cannot creep back.
 
 `qemu-system-aarch64` is still not installed here, so no AArch64 live run was possible — which
 is consistent with this increment being structural preparation with the production default OFF.
+
+### 8.6.12 AArch64 blocker 3 CLOSED structurally; live acceptance pending
+
+The last blocker: the authoritative queue-advancing dispatch — the step that picks the next
+runnable task and *actually resumes it* — was reachable only through `d6_genuine_enabled()`, a
+compile-time x86_64 constant. An eligible NR6/NR7 transaction could complete off-lock, but the
+**end-to-end** wake still finished under the broad lock on AArch64.
+
+**The AArch64 production default remains OFF.** No flip, no live seal, no RISC-V work.
+
+#### The two directions, classified
+
+| direction | what happens | dispatch work published? |
+| --- | --- | --- |
+| **NR6** | the caller leaves `current` and commits `Blocked(EndpointReceive(reply_cap))` | **yes** — exactly one item, at that commit |
+| **NR7** | the replying server **remains `current`**; the caller is woken/enqueued once inside the transaction | **never** |
+
+NR7 returns through the narrow handled-return finalizer from §8.6.11 and forces no context
+switch. That is enforced twice over: a reply never reaches the reply-blocked commit that
+publishes, and `direct_dispatch::try_publish` independently REFUSES the `IpcReply` class, so the
+contract holds even against a mistaken future caller.
+
+The NR6 publication site is the reply-blocked commit itself — after Phase A removed the caller
+from `current`, Phase B committed the blocked TCB and Phase C published the waiter. Publishing
+earlier would name a block that had not happened yet; the ordering is pinned structurally.
+
+#### The typed, generation-bearing work item
+
+`DirectDispatchWork { outgoing_tid, outgoing_asid, blocked_generation, cpu, class }`.
+
+The existing FutexWait/Yield deferrals record a bare TID, which suffices for those classes. It
+does **not** suffice here: between publication and drain the caller may have been replied to,
+timed out, exited, or had its TID reused by a replacement incarnation in another address space.
+A bare TID cannot distinguish those. So `{tid, asid}` identifies the *incarnation*,
+`blocked_generation` identifies the *block*, `cpu` confines the item to its publisher, and
+`class` makes the NR6/NR7 distinction a type rather than a convention.
+
+Publication is single-shot (per-CPU compare-exchange; a second publication declines rather than
+overwriting) and the drain **takes** the item destructively — so a published item drives at most
+one dispatch however many traps observe the CPU. That is the no-duplicate-wake edge.
+
+#### The drain, outside the broad lock
+
+1. revalidate the exact outgoing incarnation and its committed blocked state (rank 2);
+2. **one** authoritative dequeue through the rank-1 scheduler seam;
+3. mark the selected task Running (rank 2), then confirm the authoritative `current` slot agrees
+   with the selection;
+4. activate its ASID/TTBR0 through the same arch primitive the in-lock path uses, carrying the
+   established AArch64 DSB/ISB/TLBI ordering;
+5. restore its complete EL0 frame and x18 TLS state, plus — before the argument mirror — any
+   parked blocked-syscall completion, byte-for-byte as the in-lock resume does;
+6. return through the existing eret model, or enter the existing `idle_no_eret_loop()` primitive
+   when nothing is runnable.
+
+**One scheduler policy, not two:** steps 2 and 3 reuse the *existing* rank-1 queue-advancing
+dequeue and rank-2 mark-Running seam that FutexWait and Yield already use, and the idle outcome
+delegates to the same idle loop the normal path, the 195F FutexWait idle and the 200D-0C1 exit
+idle all use. What differs is only that this drain takes **no broad lock**: the ASID activation
+and the frame/TLS restore, which those drains obtain from a brief `with_cpu` re-acquire, are
+obtained here from bounded rank-2 seams. Each seam acquires and releases before the next — no
+nested rank acquisition. **Existing AArch64 FutexWait/Yield behaviour is unchanged**; this
+increment added a path beside them.
+
+To make step 4 possible without a `KernelState` mutation, the HAL's active-ASID record moved out
+of `SelectedIsaHal` (reachable only under the broad lock) into a lock-free cell.
+`SelectedIsaHal::active_asid()` now READS that cell, so this keeps **one** authority rather than
+creating a second: an off-lock activation and an in-lock activation are observed identically by
+every existing consumer.
+
+#### Races: exhaustive and fail closed
+
+`DrainOutcome` has no wildcard arm, so a new race must be named before the drain compiles:
+`NoWork`, `Dispatched`, `Idle`, `StateChangedBeforeDrain`, `OutgoingAlreadyRunnable`,
+`StaleIdentity`, `DispatchCurrentDisagreement`. Exactly one arm advances the run queue; every
+other resumes nothing and mutates nothing. `Idle` is a **success**: the caller stays parked,
+`current` stays clear, no frame is restored and no incoming task is fabricated. **No broad-lock
+fallback exists anywhere after a direct transaction has committed.**
+
+#### Admission
+
+`d6_genuine_enabled()` is deliberately **unchanged and still x86_64-only** — it gates the D6
+queue-neutral slice and three `exec_state` decisions whose x86_64 semantics must not move.
+AArch64 is admitted by the canonical replacement,
+`offlock_authoritative_dispatch_enabled()`: x86_64 answers exactly `d6_genuine_enabled()`,
+AArch64 answers `ipccall_direct_admission_enabled()` (minus the D6-switch diagnostics), RISC-V
+is not admitted. Because `ipccall_direct_production_enabled()` is x86_64-only, AArch64 resolves
+to the armed proof/oracle gate: **an ordinary AArch64 boot publishes nothing and drains
+nothing**, and proof/oracle confinement is retained.
+
+#### Proof and limits
+
+`stage199d_aarch64_offlock_dispatch` (17 tests) plus `kernel::direct_dispatch` (7 tests) prove:
+NR6 advances the queue exactly once; NR7 never publishes and never switches; publication follows
+the committed blocked state; each stale coordinate (tid, asid, generation) is refused
+individually; a refused drain mutates nothing; the incoming task's exact ASID, complete frame and
+TLS are restored, TLS taken once; the restore can never return the outgoing task's frame; a
+dispatch/current disagreement is fail closed; the post-lock path contains no `with_cpu`, broad
+`with` or `KernelState`; the drain reuses the existing machinery; FutexWait/Yield markers and
+deferral state survive untouched. The broad-lock census is **unchanged at 50** with a new guard
+asserting it stays at 50 or decreases.
+
+**Live acceptance is pending.** `qemu-system-aarch64` is not installed in this environment, so
+no AArch64 live suite could run; the production default is OFF for exactly that reason.
+
+One observation, recorded rather than acted on: `tcb.blocked_recv_generation` is declared, read
+by the reply-timeout revalidation and carried by this work item, but **nothing in the tree
+increments it** — it is always 0. The work item captures and exactly compares the authoritative
+field, so the mechanism is correct whatever that field's cadence becomes; but today the
+generation coordinate cannot by itself detect a re-block, and the load-bearing checks are the
+`{tid, asid}` coordinates and the status arms. Making the field advance would change
+reply-timeout terminal arbitration and is out of scope here.
 
 ---
 

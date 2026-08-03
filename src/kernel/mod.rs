@@ -8,6 +8,7 @@ pub mod capabilities;
 pub mod deadline_token;
 pub mod direct_ack_census;
 pub mod direct_ack_store;
+pub mod direct_dispatch;
 pub mod direct_disposition;
 pub mod direct_eligibility;
 pub mod direct_ipc_counters;

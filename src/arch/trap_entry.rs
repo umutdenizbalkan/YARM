@@ -531,6 +531,143 @@ pub fn handle_trap_entry_shared(
         }
     }
 
+    // ── Stage 199D (AARCH64 BLOCKER 3): the post-lock DIRECT dispatch drain ──────────────────
+    //
+    // Closes the last AArch64 NR6/NR7 readiness blocker: the authoritative queue-advancing
+    // dispatch used to be compile-time x86_64-only, so an AArch64 wake finished under the broad
+    // lock even when the direct transaction itself had not taken it.
+    //
+    // What makes this drain different from the FutexWait/Yield drains directly below is not the
+    // scheduler policy — it deliberately reuses the SAME rank-1 dequeue
+    // (`futex_wait_dispatch_step_mut`) and the SAME rank-2 mark-Running seam, so there is one
+    // scheduler policy in the tree, not two. What differs is that it takes NO broad lock at any
+    // point: the ASID activation and the EL0 frame/TLS restore, which those drains obtain from a
+    // brief `with_cpu` re-acquire, are obtained here from bounded rank-2 task seams.
+    //
+    // The work item is typed and generation-bearing (`direct_dispatch::DirectDispatchWork`), and
+    // every race is a named, fail-closed arm of `DrainOutcome` — there is no wildcard, so an
+    // unclassified race cannot inherit "dispatched".
+    #[cfg(target_arch = "aarch64")]
+    if crate::kernel::direct_dispatch::is_pending(cpu_idx) {
+        use crate::kernel::direct_dispatch::{self as dd, DrainOutcome};
+        // Taking is destructive, so a published item drives at most ONE dispatch no matter how
+        // many traps observe this CPU — the no-duplicate-wake edge.
+        let outcome = match dd::take(cpu_idx) {
+            None => DrainOutcome::NoWork,
+            Some(work) => {
+                crate::yarm_log!(
+                    "AARCH64_DIRECT_DISPATCH_BEGIN cpu={} outgoing={} class={:?}",
+                    cpu.0,
+                    work.outgoing_tid,
+                    work.class
+                );
+                // (1) Revalidate the EXACT outgoing incarnation and its committed blocked
+                //     state. Each failure is a DIFFERENT race with its own named outcome.
+                match shared.direct_dispatch_revalidate_split(work).refusal() {
+                    Some(refusal) => {
+                        crate::yarm_log!(
+                            "AARCH64_DIRECT_DISPATCH_REFUSED cpu={} outgoing={} reason={:?}",
+                            cpu.0,
+                            work.outgoing_tid,
+                            refusal
+                        );
+                        refusal
+                    }
+                    None => {
+                        crate::yarm_log!(
+                            "AARCH64_DIRECT_DISPATCH_REVERIFY_OK tid={} asid={} blocked_generation={}",
+                            work.outgoing_tid,
+                            work.outgoing_asid,
+                            work.blocked_generation
+                        );
+                        // (2) ONE authoritative dequeue under the rank-1 scheduler seam. This is
+                        //     the single queue-advancing step for the cycle.
+                        match shared.futex_wait_dispatch_step_mut(cpu) {
+                            None => {
+                                // (6b) No runnable task. A SUCCESSFUL idle: the outgoing caller
+                                //      stays parked, `current` stays clear, no frame is
+                                //      restored and no incoming task is fabricated.
+                                crate::yarm_log!(
+                                    "AARCH64_DIRECT_DISPATCH_NO_INCOMING cpu={}",
+                                    cpu.0
+                                );
+                                dd::note_outcome(DrainOutcome::Idle);
+                                crate::yarm_log!("AARCH64_DIRECT_DISPATCH_DONE result=idle");
+                                // Enter the established idle primitive with the broad guard
+                                // already dropped. Never returns.
+                                super::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(
+                                    cpu,
+                                    work.outgoing_tid,
+                                );
+                            }
+                            Some(inc) => {
+                                // (3) Mark the selected task Running (rank-2), then confirm the
+                                //     authoritative `current` slot agrees with the selection.
+                                //     A disagreement resumes NOTHING rather than the wrong task.
+                                shared.d6_genuine_mark_running_via_task_seam(Some(inc));
+                                if !shared.direct_dispatch_current_agrees_split_read(cpu, inc) {
+                                    crate::yarm_log!(
+                                        "AARCH64_DIRECT_DISPATCH_REFUSED cpu={} incoming={} reason=DispatchCurrentDisagreement",
+                                        cpu.0,
+                                        inc
+                                    );
+                                    DrainOutcome::DispatchCurrentDisagreement
+                                } else {
+                                    crate::yarm_log!(
+                                        "AARCH64_DIRECT_DISPATCH_CURRENT_SET_OK cpu={} tid={}",
+                                        cpu.0,
+                                        inc
+                                    );
+                                    crate::yarm_log!(
+                                        "AARCH64_DIRECT_DISPATCH_RUNNING_OK tid={}",
+                                        inc
+                                    );
+                                    // (4)+(5) ASID/TTBR0 activation and the complete EL0 frame +
+                                    //         x18 TLS restore, all through rank-2 seams.
+                                    let resumed = match frame.as_deref_mut() {
+                                        Some(f) => {
+                                            super::aarch64::trap::direct_dispatch_resume_incoming(
+                                                shared, inc, f,
+                                            )
+                                        }
+                                        None => false,
+                                    };
+                                    if resumed {
+                                        crate::yarm_log!(
+                                            "AARCH64_DIRECT_DISPATCH_FRAME_OK tid={}",
+                                            inc
+                                        );
+                                        DrainOutcome::Dispatched { incoming: inc }
+                                    } else {
+                                        // No saved context (or no frame to restore into): fail
+                                        // closed rather than eret through a stale frame.
+                                        crate::yarm_log!(
+                                            "AARCH64_DIRECT_DISPATCH_REFUSED cpu={} incoming={} reason=DispatchCurrentDisagreement detail=no_saved_frame",
+                                            cpu.0,
+                                            inc
+                                        );
+                                        DrainOutcome::DispatchCurrentDisagreement
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        dd::note_outcome(outcome);
+        // (6a) Return through the EXISTING eret model: the frame this drain restored is the one
+        //      the AArch64 vector epilogue erets from. No second return path is introduced.
+        crate::yarm_log!(
+            "AARCH64_DIRECT_DISPATCH_DONE result={} broad_lock=0",
+            if outcome.advanced_queue() {
+                "ok"
+            } else {
+                "declined"
+            }
+        );
+    }
+
     // Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): drain the deferred FutexWait
     // queue-advancing dispatch OUTSIDE the global lock — the direct analogue of the
     // D2-GENUINE recv drain above. The in-lock `futex_wait_current` published

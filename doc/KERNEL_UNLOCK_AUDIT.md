@@ -127,26 +127,26 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **41** |
+| `SharedKernel::with_cpu` | **40** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **10** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
 | **Total broad-lock acquisition sites** | **50** |
 
-### 1.3 `with_cpu` — 41 production callsites
+### 1.3 `with_cpu` — 40 production callsites
 
 | File | Count | Lines |
 |------|-------|-------|
-| `src/runtime.rs` | 13 | 389, 670, 1350, 1450, 1484, 1533, 1701, 1714, 1846, 2190, 2368, 2402, 2644 |
-| `src/arch/trap_entry.rs` | 12 | 299, 423, 499, 558, 644, 674, 747, 805, 1055, 1202, 1295, 1432 |
+| `src/runtime.rs` | 13 | 402, 683, 1602, 1702, 1736, 1785, 1953, 1966, 2098, 2443, 2621, 2655, 2897 |
+| `src/arch/trap_entry.rs` | 11 | 305, 429, 505, 701, 787, 817, 890, 948, 1198, 1345, 1438 |
 | `src/arch/riscv64/trap.rs` | 8 | 563, 659, 727, 825, 870, 958, 1063, 1194 |
 | `src/arch/x86_64/smp.rs` | 4 | 2179, 2455, 2571, 2664 |
 | `src/arch/x86_64/descriptor_tables.rs` | 2 | 1249, 1305 |
 | `src/arch/riscv64/boot.rs` | 1 | 1048 |
 | `src/kernel/boot/thread_state.rs` | 1 | 232 |
 
-Structural reading of those 41:
+Structural reading of those 40:
 
-* **1 is the authoritative trap dispatch** — `trap_entry.rs:299` (`handle_trap_entry_shared`)
+* **1 is the authoritative trap dispatch** — `trap_entry.rs:305` (`handle_trap_entry_shared`)
   and its RISC-V twin `riscv64/trap.rs:563`. These are *the* global lock of the system: every
   syscall that is not on the split whitelist, plus every timer IRQ, external IRQ and page
   fault, runs its entire handler inside this closure.
@@ -156,9 +156,14 @@ Structural reading of those 41:
   acquisitions and still count.
 * **2 are identity snapshots** — `descriptor_tables.rs:1249/1305` read `current_tid()` under
   the broad lock purely to compute `entering_tid`/`exiting_tid`.
-* **1 is the AArch64 split return path** — `trap_entry.rs:1432`, see §2.4.
 * The remainder are SMP bring-up (`x86_64/smp.rs`), RISC-V resume
   (`riscv64/boot.rs:1048`) and thread creation (`thread_state.rs:232`).
+
+> The AArch64 split-return site that used to sit at `trap_entry.rs:1432` is **gone**: Stage 199D
+> removed it when readiness blocker 2 was closed (§6.1.12), taking `trap_entry.rs` from 12 to 11
+> and the tree from 51 to 50. Blocker 3's post-lock direct dispatch drain (§6.1.13) added **no**
+> replacement — unlike the drains above it takes no `with_cpu` at all — so this table is
+> unchanged at 40 across that increment.
 
 ### 1.4 Broad `.with(|state| …)` — 10 production callsites
 
@@ -1204,6 +1209,67 @@ seal was issued, no RISC-V work, no dispatch retirement.
 `stage199d_aarch64_readiness_audit` now pins 1 and 2 closed and 3 open;
 `stage199d_split_return_without_broad_lock` adds 11 differential and structural tests against
 the legacy AArch64 non-task-switched return. Full evidence: `doc/IPC.md` §8.6.11.
+
+### 6.1.13 AArch64 blocker 3 CLOSED structurally; live acceptance pending
+
+The authoritative queue-advancing dispatch — the step that picks the next runnable task and
+actually resumes it — was reachable only through `d6_genuine_enabled()`, a compile-time x86_64
+constant, so an AArch64 wake finished under the broad lock even when the direct transaction had
+not taken it. **The AArch64 production default remains OFF; no flip, no live seal, no RISC-V
+work, no dispatch retirement.**
+
+**Classification.** NR6 publishes post-lock dispatch work exactly at the reply-blocked commit —
+after Phase A removed the caller from `current`, Phase B committed
+`Blocked(EndpointReceive(reply_cap))` and Phase C published the waiter. NR7 publishes **nothing**:
+the replying server stays `current`, the caller is woken/enqueued once inside the transaction,
+and the replier returns through §6.1.12's narrow handled-return finalizer. Enforced twice — a
+reply never reaches the publishing commit, and `try_publish` independently refuses the
+`IpcReply` class.
+
+**The work item** is typed and generation-bearing:
+`DirectDispatchWork { outgoing_tid, outgoing_asid, blocked_generation, cpu, class }`. `{tid,
+asid}` identifies the incarnation, `blocked_generation` the block, `cpu` confines it to its
+publisher, `class` makes the direction a type. Publication is a per-CPU compare-exchange
+(single-shot; a second declines rather than overwrites) and the drain **takes** it destructively,
+so one item drives at most one dispatch.
+
+**The drain**, with the broad guard already dropped: (1) revalidate the exact outgoing
+incarnation and committed blocked state (rank 2); (2) **one** authoritative dequeue through the
+rank-1 scheduler seam; (3) mark Running (rank 2) and confirm the authoritative `current` slot
+agrees with the selection; (4) activate ASID/TTBR0 through the same arch primitive and ordering
+the in-lock path uses; (5) restore the complete EL0 frame, x18 TLS and any parked blocked-syscall
+completion; (6) return through the existing eret model, or the existing `idle_no_eret_loop()`
+primitive when nothing is runnable.
+
+Steps 2–3 and the idle outcome **reuse the existing machinery** — the same rank-1 dequeue and
+rank-2 mark-Running seam FutexWait/Yield use, and the same idle loop — so there is one scheduler
+policy in the tree, not two. What differs is that this drain takes **no broad lock**: what those
+drains obtain from a brief `with_cpu` re-acquire, this obtains from bounded rank-2 seams, each
+acquired and released before the next (no nested rank acquisition). **AArch64 FutexWait/Yield
+behaviour is unchanged.**
+
+To make step 4 possible without a `KernelState` mutation, the HAL's active-ASID record moved out
+of `SelectedIsaHal` into a lock-free cell that `SelectedIsaHal::active_asid()` now reads — one
+authority, not two, so on- and off-lock activations are observed identically.
+
+**Races are exhaustive and fail closed.** `DrainOutcome` has no wildcard arm: `NoWork`,
+`Dispatched`, `Idle`, `StateChangedBeforeDrain`, `OutgoingAlreadyRunnable`, `StaleIdentity`,
+`DispatchCurrentDisagreement`. Exactly one advances the queue; every other resumes nothing and
+mutates nothing. **No broad-lock fallback exists after a direct transaction has committed.**
+
+**Admission.** `d6_genuine_enabled()` is unchanged and still x86_64-only (it gates the D6
+queue-neutral slice and three `exec_state` decisions). AArch64 is admitted by the canonical
+replacement `offlock_authoritative_dispatch_enabled()`, which resolves to
+`ipccall_direct_admission_enabled()` there — and because production is x86_64-only, that is the
+armed proof/oracle gate. An ordinary AArch64 boot publishes nothing and drains nothing.
+
+**Census: unchanged at 50**, with a new guard
+(`stage199d_blocker3_added_no_broad_lock_acquisition_site`) asserting it stays at 50 or
+decreases and that the drain acquires no broad lock.
+
+`stage199d_aarch64_offlock_dispatch` (17 tests) and `kernel::direct_dispatch` (7 tests) carry the
+proof obligations. Live acceptance is pending: `qemu-system-aarch64` is absent here. Full
+evidence: `doc/IPC.md` §8.6.12.
 
 ---
 

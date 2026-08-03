@@ -1143,6 +1143,158 @@ impl SharedKernel {
         })
     }
 
+    /// Stage 199D — post-lock dispatch step 1: revalidate the EXACT outgoing incarnation and
+    /// its committed blocked state, through the rank-2 task seam only.
+    ///
+    /// This is the fence that makes the whole drain safe to run with the broad lock dropped.
+    /// The work item was published by the in-lock commit; between then and now the outgoing
+    /// caller may have been replied to, timed out, exited, or had its TID reused. Each of
+    /// those is a DIFFERENT race with a different correct response, so the outcome is a typed
+    /// enum rather than a bool — see `RevalidateOutcome`.
+    ///
+    /// The revalidation is exact in all three coordinates: `{tid, asid}` identifies the
+    /// incarnation (a replacement task reusing the TID has a different ASID), and
+    /// `blocked_recv_generation` identifies the *block* (a caller that unblocked and re-blocked
+    /// has advanced it, so the item refers to a block that is already over).
+    pub(crate) fn direct_dispatch_revalidate_split(
+        &self,
+        work: crate::kernel::direct_dispatch::DirectDispatchWork,
+    ) -> crate::kernel::direct_dispatch::RevalidateOutcome {
+        use crate::kernel::direct_dispatch::RevalidateOutcome;
+        if work.outgoing_tid == 0 {
+            return RevalidateOutcome::StaleIdentity;
+        }
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs.iter().flatten().find(|t| {
+                t.tid.0 == work.outgoing_tid
+                    && t.asid == Some(crate::kernel::vm::Asid(work.outgoing_asid))
+            }) else {
+                return RevalidateOutcome::StaleIdentity;
+            };
+            if tcb.blocked_recv_generation != work.blocked_generation {
+                return RevalidateOutcome::StaleIdentity;
+            }
+            match tcb.status {
+                crate::kernel::task::TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(_),
+                ) => RevalidateOutcome::Ok,
+                // A reply won the race and made the caller runnable again. Dispatching it away
+                // now would be a DUPLICATE wake, so this is a refusal, not a state change.
+                crate::kernel::task::TaskStatus::Runnable
+                | crate::kernel::task::TaskStatus::Running => RevalidateOutcome::AlreadyRunnable,
+                _ => RevalidateOutcome::StateChanged,
+            }
+        })
+    }
+
+    /// Stage 199D — post-lock dispatch step 3b: does the authoritative `current` slot agree
+    /// with what the rank-1 dequeue just selected?
+    ///
+    /// The dequeue in `futex_wait_dispatch_step_mut` both selects the incoming task and sets
+    /// `current`. Reading `current` back through the scheduler seam and comparing it to the
+    /// selection is what turns "the dispatcher said X" into "the machine will resume X". A
+    /// disagreement is fail-closed: the drain resumes nothing rather than resuming a task the
+    /// scheduler does not consider current.
+    pub(crate) fn direct_dispatch_current_agrees_split_read(
+        &self,
+        cpu: CpuId,
+        incoming: u64,
+    ) -> bool {
+        self.current_tid_authoritative(cpu) == Some(incoming)
+    }
+
+    /// Stage 199D — post-lock dispatch step 4: activate the incoming task's address space.
+    ///
+    /// Reads the incoming ASID through the rank-2 task seam, then performs the activation
+    /// through the SAME arch primitive the in-lock path uses
+    /// (`hal_adapters::switch_address_space`, which carries the established AArch64
+    /// DSB/ISB/TLBI ordering), and records it in the single authoritative activation cell so
+    /// every existing `hal.active_asid()` consumer observes it.
+    ///
+    /// No `KernelState` is touched: the HAL's activation record was moved out of `KernelState`
+    /// to a lock-free cell precisely so this step needs no broad lock. Returns the activated
+    /// ASID, or `None` when the incoming task has none (nothing is activated).
+    pub(crate) fn direct_dispatch_activate_asid_split(&self, incoming: u64) -> Option<u16> {
+        let asid = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == incoming)
+                .and_then(|t| t.asid)
+        })?;
+        crate::arch::hal_adapters::switch_address_space(asid);
+        crate::arch::hal::note_address_space_activated(asid);
+        Some(asid.0)
+    }
+
+    /// Stage 199D — post-lock dispatch step 5: restore the incoming task's complete saved user
+    /// context and its TLS state into `frame`, through the rank-2 task seam only.
+    ///
+    /// This is the narrow-seam equivalent of the in-lock
+    /// `resume_current_thread_with_frame` + TLS lane write that
+    /// `restore_arch_thread_state` performs, with two differences that are both deliberate:
+    ///
+    /// * it resolves the task by EXACT tid rather than by re-reading `current`, so it cannot
+    ///   restore a different task than the one the dequeue selected;
+    /// * it takes the pending TLS-restore request in the SAME rank-2 acquisition as the
+    ///   context read, so the two cannot straddle a lock boundary.
+    ///
+    /// Returns the TLS base to place in the TLS lane (`Some(None)` = no restore pending), or
+    /// `None` when the task has no saved context to restore.
+    pub(crate) fn direct_dispatch_restore_context_split(
+        &self,
+        incoming: u64,
+    ) -> Option<(crate::kernel::task::UserRegisterContext, Option<usize>)> {
+        if incoming == 0 {
+            return None;
+        }
+        self.with_task_return_split_mut(|tcbs, tls_pending| {
+            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == incoming)?;
+            let context = tcb.user_context;
+            let tls_base = tcb.tls_ptr.map(|ptr| ptr.0 as usize);
+            let pending = tls_pending
+                .iter()
+                .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == incoming));
+            let tls = match pending {
+                Some(idx) => {
+                    tls_pending[idx] = None;
+                    tls_base
+                }
+                None => None,
+            };
+            Some((context, tls))
+        })
+    }
+
+    /// Stage 199D — post-lock dispatch step 5b: consume the incoming task's parked
+    /// blocked-syscall completion, through the rank-2 task seam only.
+    ///
+    /// Byte-for-byte the same decision as `KernelState::take_blocked_syscall_completion`,
+    /// which the in-lock resume path calls: the entry is taken either way (a stale one must
+    /// not linger to be seen by a later receive), it is RETURNED only on an exact
+    /// `{tid, asid, blocked_generation}` match, and an exact take clears the residue that
+    /// belongs to that completion alone. Keeping the two identical is what makes the incoming
+    /// task's resume lanes the same whether the dispatch ran in-lock or off-lock.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn direct_dispatch_take_completion_split(
+        &self,
+        incoming: u64,
+    ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == incoming)?;
+            let pending = tcb.pending_syscall_completion?;
+            let exact = pending.tid == incoming
+                && tcb.asid == Some(pending.asid)
+                && tcb.blocked_recv_generation == pending.blocked_generation;
+            tcb.pending_syscall_completion = None;
+            if !exact {
+                return None;
+            }
+            tcb.ipc_timeout_fired = false;
+            tcb.blocked_recv_state = None;
+            Some(pending)
+        })
+    }
+
     /// Stage 108: VM/user-spaces (rank 5) split-mut seam.
     ///
     /// # Validation status

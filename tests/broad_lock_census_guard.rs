@@ -313,3 +313,26 @@ fn documents_publish_the_same_census_totals() {
         );
     }
 }
+
+/// Stage 199D (AArch64 blocker 3): the post-lock direct dispatch drain must not have added a
+/// broad-lock acquisition site. The requirement is that the census stays at 50 or DECREASES —
+/// a drain that reached for `with_cpu` to do its ASID activation or frame restore, as the
+/// FutexWait and Yield drains legitimately do, would push it to 51 and fail here.
+#[test]
+fn stage199d_blocker3_added_no_broad_lock_acquisition_site() {
+    assert!(
+        AUDITED_ACQUISITION_TOTAL <= 50,
+        "the broad-lock census must stay at 50 or decrease; it is {AUDITED_ACQUISITION_TOTAL}"
+    );
+    // The drain and the arch resume primitive it calls contain no acquisition of their own.
+    let trap_entry = std::fs::read_to_string("src/arch/trap_entry.rs").expect("trap_entry.rs");
+    let drain = trap_entry
+        .split("if crate::kernel::direct_dispatch::is_pending(cpu_idx) {")
+        .nth(1)
+        .and_then(|s| s.split("\n    // Stage 192A").next())
+        .expect("the direct dispatch drain");
+    assert!(
+        !drain.contains("with_cpu(") && !drain.contains("shared.with("),
+        "the post-lock direct dispatch drain must acquire no broad lock"
+    );
+}

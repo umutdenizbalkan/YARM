@@ -67,6 +67,101 @@ pub(crate) fn enter_post_lock_idle_after_exit(cpu: CpuId, exiting_tid: u64) -> !
     idle_no_eret_loop();
 }
 
+/// Stage 199D (AARCH64 BLOCKER 3) — the idle outcome of the post-lock direct dispatch drain.
+///
+/// Not a third idle policy: it delegates to the identical `idle_no_eret_loop()` primitive the
+/// normal path, the 195F FutexWait idle outcome and the 200D-0C1 exit idle outcome all use.
+/// Only the attestation differs, so a live log can tell which drain idled. The outgoing caller
+/// stays parked, `current` stays clear, NO frame is restored, and the broad guard is already
+/// dropped so a wake IRQ re-enters the trap path and dispatches normally. Never returns.
+pub(crate) fn enter_post_lock_idle_after_direct_dispatch(cpu: CpuId, outgoing_tid: u64) -> ! {
+    crate::yarm_log!(
+        "AARCH64_DIRECT_DISPATCH_IDLE_ENTERED cpu={} outgoing_tid={} primitive=idle_no_eret_loop result=ok",
+        cpu.0,
+        outgoing_tid
+    );
+    idle_no_eret_loop();
+}
+
+/// Stage 199D (AARCH64 BLOCKER 3) — steps 4 and 5 of the post-lock dispatch: activate the
+/// incoming task's address space and restore its complete EL0 frame and TLS state.
+///
+/// This is the broad-lock-free twin of what `restore_arch_thread_state_post_switch` does under
+/// `with_cpu` for the FutexWait/Yield drains. It reproduces that path's observable effects
+/// exactly, in the same order, but reaches every piece of state through bounded rank-2 task
+/// seams instead of the broad `KernelState` lock:
+///
+/// 1. **ASID/TTBR0 activation** — through the SAME arch primitive
+///    (`hal_adapters::switch_address_space`, carrying the established AArch64 DSB/ISB/TLBI
+///    ordering), recorded in the single authoritative activation cell.
+/// 2. **Complete saved EL0 context** — `apply_user_context` restores ELR, SP and all user
+///    GPRs, resolved by EXACT incoming tid rather than by re-reading `current`.
+/// 3. **x18 TLS** — the pending TLS-restore request is taken in the same rank-2 acquisition
+///    as the context read, so the two cannot straddle a lock boundary.
+/// 4. **Blocked-syscall completion** — consumed BEFORE the argument mirror and encoded into
+///    the resume lanes, exactly as the in-lock path does, so a remotely completed caller
+///    (e.g. a timed-out receive) resumes with its canonical result rather than stale receive
+///    arguments. ELR is deliberately untouched: it was advanced once at block time.
+/// 5. **Argument mirror** — `user_gprs[x0..x5] <- args[0..5]`, the `!syscall_return` branch of
+///    `restore_arch_thread_state`. This drain resumes a task that is NOT returning from the
+///    syscall being handled, so the mirror applies exactly as it does after a switch.
+///
+/// Returns `false` when the incoming task has no saved context to restore, in which case the
+/// frame is left untouched and the caller fails closed.
+pub(crate) fn direct_dispatch_resume_incoming(
+    shared: &crate::runtime::SharedKernel,
+    incoming: u64,
+    frame: &mut TrapFrame,
+) -> bool {
+    // (1) ASID / TTBR0.
+    let asid = shared.direct_dispatch_activate_asid_split(incoming);
+    crate::yarm_log!(
+        "AARCH64_DIRECT_DISPATCH_TTBR0_OK tid={} asid={}",
+        incoming,
+        asid.unwrap_or(0)
+    );
+    // (2)+(3) Complete saved EL0 context and the TLS-restore take, one rank-2 acquisition.
+    let Some((context, tls)) = shared.direct_dispatch_restore_context_split(incoming) else {
+        return false;
+    };
+    frame.apply_user_context(context);
+    frame.set_user_gpr(
+        crate::arch::aarch64::syscall_abi::REG_X18_TLS,
+        tls.unwrap_or(0),
+    );
+    #[cfg(test)]
+    {
+        LAST_RESTORED_TLS_BASE[0].store(tls.unwrap_or(0), Ordering::Relaxed);
+    }
+    // (4) The remotely-completed blocked syscall, consumed before the mirror below.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    if let Some(done) = shared.direct_dispatch_take_completion_split(incoming) {
+        frame.set_arg(0, done.result as usize);
+        for lane in 1..=5 {
+            frame.set_arg(lane, 0);
+        }
+        crate::yarm_log!(
+            "AARCH64_BLOCKED_SYSCALL_COMPLETION_CONSUMED tid={} class={:?} result={} blocked_generation={} elr=0x{:016x} result=ok",
+            incoming,
+            done.syscall_class,
+            done.result,
+            done.blocked_generation,
+            frame.saved_pc() as u64
+        );
+        crate::kernel::boot::maybe_emit_reply_timeout_class_retired();
+    }
+    // (5) The argument mirror — the same six named lanes, in the same order, as the
+    //     `!syscall_return` branch of `restore_arch_thread_state`.
+    use crate::arch::aarch64::syscall_abi::{REG_X0, REG_X1, REG_X2, REG_X3, REG_X4, REG_X5};
+    frame.set_user_gpr(REG_X0, frame.arg(0));
+    frame.set_user_gpr(REG_X1, frame.arg(1));
+    frame.set_user_gpr(REG_X2, frame.arg(2));
+    frame.set_user_gpr(REG_X3, frame.arg(3));
+    frame.set_user_gpr(REG_X4, frame.arg(4));
+    frame.set_user_gpr(REG_X5, frame.arg(5));
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Aarch64TrapContext {
     pub esr_el1: u32,

@@ -28,7 +28,7 @@ Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 | **Total production broad-lock acquisition sites** | **50** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
-| Off-lock authoritative dispatch | **x86_64 only** (`d6_genuine_enabled()` is compile-time false elsewhere) |
+| Off-lock authoritative dispatch | **x86_64 (live) + AArch64 (structural, proof-gated)** via `offlock_authoritative_dispatch_enabled()`; `d6_genuine_enabled()` itself remains compile-time x86_64-only. RISC-V not admitted. |
 
 ### Hosted validation (re-executed, not inherited)
 
@@ -260,6 +260,36 @@ Full detail: `doc/IPC.md` §8.5.
    open — the sole remaining gating item. **The AArch64 production default stays OFF**; this is
    structural preparation only, with no AArch64 flip and no QEMU seal (`qemu-system-aarch64`
    still absent). See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.12 and `doc/IPC.md` §8.6.11.
+   **AArch64 blocker (iii) is now CLOSED STRUCTURALLY; live acceptance is pending.** The
+   authoritative queue-advancing dispatch — the step that picks the next runnable task and
+   actually resumes it — is no longer reachable only through the x86_64-only
+   `d6_genuine_enabled()`. Classification: **NR6** publishes exactly one typed,
+   generation-bearing work item
+   (`DirectDispatchWork { outgoing_tid, outgoing_asid, blocked_generation, cpu, class }`) at the
+   reply-blocked commit, i.e. only after the caller genuinely left `current` and committed
+   `Blocked(EndpointReceive(reply_cap))`; **NR7** publishes nothing — the replier stays
+   `current`, the caller is woken once inside the transaction, and the replier returns through
+   the narrow handled-return finalizer (enforced twice: a reply never reaches the publishing
+   commit, and `try_publish` refuses the `IpcReply` class). Publication is single-shot per CPU
+   and the drain takes the item destructively, so one item drives at most one dispatch. The
+   drain runs with the broad guard dropped: revalidate the exact incarnation and committed
+   blocked state (rank 2) → one authoritative dequeue (rank 1) → mark Running (rank 2) +
+   current-set agreement → ASID/TTBR0 activation → complete EL0 frame, x18 TLS and any parked
+   blocked-syscall completion → existing eret model, or the existing `idle_no_eret_loop()`
+   primitive. It **reuses** the FutexWait/Yield rank-1 dequeue, rank-2 mark-Running seam and
+   idle loop — one scheduler policy, not two — and differs only in taking **no broad lock**:
+   what those drains get from a brief `with_cpu`, this gets from bounded rank-2 seams, each
+   released before the next. Existing AArch64 FutexWait/Yield behaviour is unchanged. To avoid a
+   `KernelState` mutation in the activation step, the HAL's active-ASID record moved out of
+   `SelectedIsaHal` into a lock-free cell that `active_asid()` now reads — one authority, not
+   two. Races are exhaustive and fail closed (`DrainOutcome`, no wildcard arm); no broad-lock
+   fallback exists after a direct transaction has committed. `d6_genuine_enabled()` itself is
+   byte-identical and still x86_64-only; AArch64 is admitted by the canonical replacement
+   `offlock_authoritative_dispatch_enabled()`, which resolves to the armed proof/oracle gate
+   there, so **the AArch64 production default stays OFF** and an ordinary AArch64 boot publishes
+   and drains nothing. Broad-lock census **unchanged at 50**, with a new guard pinning "50 or
+   fewer". No live seal — `qemu-system-aarch64` remains absent. See
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.13 and `doc/IPC.md` §8.6.12.
    **Blocker 5 (link CREATION accounting) is now closed** — both installation seams delegate to
    the one `install_server_reply_link` decision, so the creation stamp cannot drift; live,
    `created` went 0 → 54. That exposed its mirror on the CLOSE edge: of four close sites only two

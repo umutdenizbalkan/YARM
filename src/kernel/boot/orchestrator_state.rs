@@ -25,6 +25,9 @@ pub(crate) fn set_with_tcbs_probe(active: bool) {
 ///
 /// Both storages live in the task domain and are serialized by the same `task_state_lock`,
 /// so the handled-split return takes ONE rank-2 acquisition rather than straddling two.
+// Names the return type of a projector whose callers are AArch64-gated; a hosted `lib` build
+// compiles no route to it, exactly like the sibling `*_from_raw` projectors.
+#[allow(dead_code)]
 pub(crate) type TaskReturnSplitPtrs = (
     *const crate::kernel::lock::SpinLockIrq<()>,
     *mut KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,

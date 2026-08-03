@@ -3290,6 +3290,78 @@ impl KernelState {
                 plan.blocked_tid.0
             );
         }
+        // Stage 199D (AARCH64 BLOCKER 3): publish the typed, generation-bearing post-lock
+        // dispatch work item for the NR6 direction.
+        //
+        // THIS is the exact point the classification names: Phase A removed the caller from
+        // `current`, Phase B committed it to `Blocked(EndpointReceive(reply_cap))`, and Phase C
+        // published its waiter. The caller has genuinely left `current` AND committed to its
+        // canonical reply-blocked state — the run queue now needs advancing, and until it is
+        // advanced no task is running on this CPU. Publishing anywhere earlier would name a
+        // block that had not happened yet.
+        //
+        // NR7 is the other direction and is absent here BY CONSTRUCTION: a reply never reaches
+        // this commit (the replying server stays `current`), and `direct_dispatch::try_publish`
+        // independently refuses `IpcReply` so the contract cannot be violated even by mistake.
+        //
+        // Confinement: `offlock_authoritative_dispatch_enabled()` resolves to the armed
+        // proof/oracle gate on AArch64 (production is x86_64-only), so an ordinary AArch64 boot
+        // publishes nothing and reaches the unchanged in-lock `dispatch_next_task()` below.
+        // Declining publication is always safe for exactly that reason.
+        #[cfg(target_arch = "aarch64")]
+        if crate::kernel::boot::offlock_authoritative_dispatch_enabled() {
+            let cpu = self.current_cpu();
+            let cpu_idx = cpu.0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            // Single-DISPATCHER, exactly as the x86_64 sibling above: the out-of-lock dequeue
+            // is the accepted slice only while one CPU dispatches user tasks.
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            let blocked_generation = self
+                .with_tcbs(|tcbs| {
+                    tcbs.iter()
+                        .flatten()
+                        .find(|tcb| tcb.tid.0 == plan.blocked_tid.0)
+                        .map(|tcb| tcb.blocked_recv_generation)
+                })
+                .unwrap_or(0);
+            let work = crate::kernel::direct_dispatch::DirectDispatchWork {
+                outgoing_tid: plan.blocked_tid.0,
+                outgoing_asid: plan.receiver_asid.0,
+                blocked_generation,
+                cpu: cpu.0 as u8,
+                class: crate::kernel::direct_dispatch::DirectDispatchClass::IpcCall,
+            };
+            if trap_path
+                && single_cpu
+                && crate::kernel::direct_dispatch::try_publish(work)
+                    == crate::kernel::direct_dispatch::PublishOutcome::Published
+            {
+                crate::yarm_log!(
+                    "AARCH64_DIRECT_DISPATCH_PUBLISHED tid={} asid={} blocked_generation={} cpu={} class=IpcCall",
+                    work.outgoing_tid,
+                    work.outgoing_asid,
+                    work.blocked_generation,
+                    cpu.0
+                );
+                // The out-of-lock trap-entry drain performs the single authoritative
+                // queue-advancing dispatch; do NOT dispatch in-lock here.
+                return Ok(plan.blocked_tid);
+            }
+            let reason = if !trap_path {
+                "no_trap_drainer"
+            } else if !single_cpu {
+                "multi_cpu"
+            } else {
+                "already_published"
+            };
+            crate::yarm_log!(
+                "AARCH64_DIRECT_DISPATCH_FALLBACK reason={} tid={}",
+                reason,
+                plan.blocked_tid.0
+            );
+        }
         let _ = self.dispatch_next_task()?;
         Ok(plan.blocked_tid)
     }

@@ -21,14 +21,52 @@ pub trait Hal {
     fn decode_trap_event(&self, context: &Self::TrapContext) -> TrapEvent;
 }
 
+/// Stage 199D — the AUTHORITATIVE record of which address space is currently activated.
+///
+/// This used to be a plain field inside `SelectedIsaHal`, which lives inside `KernelState` and
+/// is therefore reachable only under the broad lock. AArch64 blocker 3 needs the incoming
+/// task's ASID/TTBR0 activated from the post-lock dispatch drain, where the broad lock is
+/// deliberately not held — and writing the record there would be a `KernelState` mutation.
+///
+/// Moving the record to a lock-free cell keeps ONE authority rather than creating a second:
+/// [`SelectedIsaHal::active_asid`] READS this cell, so an activation performed off-lock and an
+/// activation performed under the broad lock are observed identically by every existing
+/// consumer. `u32::MAX` is the "nothing activated yet" sentinel (`Asid` is a `u16`).
+static ACTIVE_ASID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Record an address-space activation. Called by every activation path, on and off lock.
+pub(crate) fn note_address_space_activated(asid: Asid) {
+    ACTIVE_ASID.store(asid.0 as u32, core::sync::atomic::Ordering::Release);
+}
+
+/// The currently activated address space, or `None` if none has been activated yet.
+pub(crate) fn active_address_space() -> Option<Asid> {
+    match ACTIVE_ASID.load(core::sync::atomic::Ordering::Acquire) {
+        u32::MAX => None,
+        raw => Some(Asid(raw as u16)),
+    }
+}
+
+/// Clear the activation record. Test-support and boot-reset only.
+// Reachable from the tests below and from a boot reset; a plain hosted `lib` build compiles no
+// route to it, exactly like the sibling `*_from_raw` domain projectors.
+#[allow(dead_code)]
+pub(crate) fn reset_active_address_space() {
+    ACTIVE_ASID.store(u32::MAX, core::sync::atomic::Ordering::Release);
+}
+
 #[derive(Debug, Default)]
 pub struct SelectedIsaHal {
-    active_asid: Option<Asid>,
+    _private: (),
 }
 
 impl SelectedIsaHal {
+    /// The currently activated address space.
+    ///
+    /// Reads the single authoritative record, so a switch performed by the off-lock AArch64
+    /// dispatch drain is visible here exactly as an in-lock switch is.
     pub fn active_asid(&self) -> Option<Asid> {
-        self.active_asid
+        active_address_space()
     }
 }
 
@@ -37,7 +75,7 @@ impl Hal for SelectedIsaHal {
 
     fn switch_address_space(&mut self, asid: Asid) {
         crate::arch::hal_adapters::switch_address_space(asid);
-        self.active_asid = Some(asid);
+        note_address_space_activated(asid);
     }
 
     fn acknowledge_interrupt(&mut self, _cpu: CpuId, irq_line: u16) {
@@ -269,8 +307,27 @@ mod tests {
 
     #[test]
     fn selected_isa_hal_tracks_last_switched_asid() {
+        reset_active_address_space();
         let mut hal = SelectedIsaHal::default();
+        assert_eq!(hal.active_asid(), None, "nothing activated yet");
         hal.switch_address_space(Asid(42));
         assert_eq!(hal.active_asid(), Some(Asid(42)));
+        reset_active_address_space();
+    }
+
+    /// Stage 199D: the activation record is authoritative, not a per-HAL cache. An activation
+    /// recorded by the off-lock AArch64 dispatch drain — which holds no `KernelState` and so
+    /// has no HAL instance to write into — is observed by an ordinary in-lock `active_asid()`
+    /// read exactly as an in-lock switch would be. One record, both paths.
+    #[test]
+    fn off_lock_activation_is_visible_through_the_hal_accessor() {
+        reset_active_address_space();
+        let hal = SelectedIsaHal::default();
+        note_address_space_activated(Asid(17));
+        assert_eq!(hal.active_asid(), Some(Asid(17)));
+        // A second HAL instance agrees — there is no per-instance cache to go stale.
+        assert_eq!(SelectedIsaHal::default().active_asid(), Some(Asid(17)));
+        reset_active_address_space();
+        assert_eq!(hal.active_asid(), None);
     }
 }
