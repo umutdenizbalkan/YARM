@@ -1030,7 +1030,41 @@ saturate), and **`live == 0` is not a valid quiescence requirement for a running
 `QuiescentVerdict::ok` now requires `no_orphaned_lease` instead. Full evidence: `doc/IPC.md`
 §8.6.6.
 
-The flip stays held off. Remaining sequence: **capacity re-derivation** → **live flip proof**.
+### 6.1.8 Blocker 4 closed — x86_64 NR6/NR7 is the production default
+
+**Capacity is derived, not chosen.** `DIRECT_ACK_STORE_CAPACITY` is
+`crate::kernel::boot::ENDPOINT_WAITER_SLOTS` — the length of the authoritative endpoint
+receive-waiter table — with compile-time assertions pinning `>=` and `==` against it. A lease
+exists exactly while an endpoint receive-waiter does, so the bound is exact rather than merely
+sufficient. The store is one slot per endpoint index, which makes endpoint uniqueness and the
+absence of capacity exhaustion structural, turns reservation into a single compare-exchange,
+removes the leaf admission spinlock entirely (every store operation is now lock-free), and
+removes the release-vs-recycle race with it.
+
+**An independent waiter census** (`src/kernel/direct_ack_census.rs`) measures the same
+population from the endpoint receive-waiter table, deliberately unbounded by the store's
+capacity — that is what lets it detect an under-sized store rather than agreeing with one. It
+reports current and high-watermark waiter counts maintained by the waiter table's own mutators,
+and a final two-pass bijection matching live leases against eligible waiters on the complete
+`{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` identity. It runs on the IPC
+(rank 3) and task (rank 2) split seams, never simultaneously, so it adds no broad-lock
+acquisition; `tests/broad_lock_census_guard.rs` enforces that.
+
+**FIRST PRODUCTION-DEFAULT LIVE SEAL.** Normal feature-off x86_64 boot, no oracle knob:
+`YARM_BOOT_OK`, all 6 service entries exactly once, `PM_ELF_ZC_FAIL count=0`;
+**53 NR6 and 41 NR7 ordinary syscalls completed on the direct path with zero broad-lock
+entries**; zero capacity refusals and zero overwrite-fuse trips; zero stale, foreign, duplicate
+or crossed terminals; and an exact lease/waiter bijection in both directions
+(`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`). Ten
+cap-bearing NR7 replies correctly stayed on the mutation-free legacy fallback. The oracle
+regression (`live_cells=2 result=ok`) and the ServerDies regression both still pass.
+
+`live=9` and `terminal_edges=0` are reported, not gated: they are nine resident services
+legitimately parked in recv-v2, each holding a valid lease. `no_orphan=1` —
+`reserve == consume + release + cancel + live`, 114 == 53+52+0+9 and 114 == 41+64+0+9 — is the
+leak invariant that holds on a running system, and the census confirms it independently.
+
+AArch64 and RISC-V are untouched and remain proof-gated. Full evidence: `doc/IPC.md` §8.6.7.
 
 ---
 

@@ -130,7 +130,7 @@ Full detail: `doc/IPC.md` §8.5.
    two blockers that used to head this list**: the `IPC_SERVER_DEATH_LINK_LEAK` accounting
    failure is resolved, and `revalidate_idle_owner_after_drains` has now executed in QEMU
    (`EXIT_TASK_OWNER_REVALIDATED … committed=replacement`).
-2. **NR 6 / NR 7 off-lock direct IPC cannot be made production-default yet — two remaining
+2. **NR 6 / NR 7 off-lock direct IPC IS the x86_64 production default** (was: cannot be made production-default yet — two remaining
    correctness defects in the transaction body, not the gates.** The acknowledgement-store
    prerequisite *is* met (the bounded endpoint-indexed multi-pair store,
    `src/kernel/direct_ack_store.rs`, Stage 199D), **delivery conformance is now met**
@@ -188,8 +188,21 @@ Full detail: `doc/IPC.md` §8.5.
    Resizing was out of scope. Also corrected: the quiescent trigger moved to
    `INIT_IDLE_PARK_BEGIN` (the earlier one sampled `high_watermark=2` before saturation), and
    `live == 0` is not a valid quiescence requirement for a running microkernel — the verdict now
-   requires `no_orphaned_lease`. Full evidence is in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.7;
-   see also `doc/IPC.md` §8.6.5–§8.6.6.
+   requires `no_orphaned_lease`. **Blocker 4 is now closed too and the flip is ON.**
+   `DIRECT_ACK_STORE_CAPACITY` is derived at compile time from `ENDPOINT_WAITER_SLOTS`, the
+   authoritative endpoint receive-waiter table, with one slot per endpoint index — which makes
+   endpoint uniqueness and the absence of capacity exhaustion structural, reduces reservation to
+   a single compare-exchange, and removes the store's last lock. An independent waiter census
+   (`src/kernel/direct_ack_census.rs`), unbounded by the store's capacity and running on split
+   seams only, proves an exact lease/waiter bijection. **First production-default live seal:**
+   normal feature-off x86_64 boot with `YARM_BOOT_OK`, all 6 service entries exactly once,
+   `PM_ELF_ZC_FAIL count=0`, **53 NR6 and 41 NR7 ordinary syscalls completed off-lock with zero
+   broad-lock entries**, zero capacity refusals, zero overwrite-fuse trips, zero stale/foreign/
+   duplicate/crossed terminals, exact bijection both directions
+   (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`), plus the
+   oracle regression (`live_cells=2 result=ok`) and ServerDies. AArch64 and RISC-V are untouched
+   and remain proof-gated. Full evidence is in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.8; see
+   also `doc/IPC.md` §8.6.5–§8.6.7.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

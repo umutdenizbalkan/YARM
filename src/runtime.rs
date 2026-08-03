@@ -4339,6 +4339,75 @@ impl SharedKernel {
     /// broad lock: the caller is the off-lock DebugLog split path, and adding a broad
     /// acquisition there would both re-enter the lock this programme is retiring and break
     /// the Stage 204A census (`tests/broad_lock_census_guard.rs` would fail).
+    /// Stage 199D — the **final lease/waiter bijection**, measured from the waiter table.
+    ///
+    /// Two passes over the endpoint table, keyed by endpoint index (the acknowledgement store
+    /// is one slot per endpoint index, so the lease lookup is O(1)):
+    ///
+    /// 1. every endpoint receive-waiter is classified — eligible waiters must have exactly one
+    ///    live lease at their exact incarnation;
+    /// 2. every live lease must have exactly one eligible waiter behind it.
+    ///
+    /// Neither pass consults the store's own counters, so the two accounts are independent: a
+    /// store that balanced its books while dropping or orphaning a lease is caught here. The
+    /// previous capacity-8 store did exactly that — its counters read clean while a ninth
+    /// parked server was refused a lease.
+    ///
+    /// **Split-seam only — no broad lock.** The IPC (rank 3) and task (rank 2) domains are
+    /// taken one index at a time and never simultaneously, so this adds no broad-lock
+    /// acquisition to the split dispatcher that hosts it. It allocates nothing: the comparison
+    /// is accumulated in place rather than materialising either set.
+    pub(crate) fn direct_ack_lease_bijection(
+        &self,
+        store: &crate::kernel::direct_ack_store::DirectAckStore,
+        endpoint_admitted: impl Fn(usize) -> bool,
+    ) -> crate::kernel::direct_ack_census::LeaseBijection {
+        use crate::kernel::direct_ack_census::{CensusWaiter, LeaseBijection, classify_slot};
+        let slots = self.with_ipc_split_mut(|ipc| ipc.endpoint_waiters.len());
+        let mut out = LeaseBijection::default();
+        for idx in 0..slots {
+            let entry = self.with_ipc_split_mut(|ipc| {
+                ipc.endpoint_waiters[idx]
+                    .map(|id| (id.tid.0, id.asid.0, ipc.endpoint_generations[idx]))
+            });
+            let waiter = entry.map(|(tid, asid, generation)| CensusWaiter {
+                endpoint_index: idx,
+                endpoint_generation: generation,
+                tid,
+                asid,
+                // Eligible exactly when the acknowledgement publication contract would publish
+                // for it: a fully committed recv-v2 on an admitted endpoint. Re-derived from
+                // committed state rather than remembered, so a lease issued against a waiter
+                // that never qualified is detectable.
+                eligible: endpoint_admitted(idx)
+                    && self.blocked_recv_v2_commit_is_complete_split_read(tid),
+            });
+            let lease = store
+                .live_lease_at(idx)
+                .map(|(generation, w)| (generation, w.tid, w.asid));
+            classify_slot(waiter, lease, &mut out);
+        }
+        out.duplicate_endpoint_incarnations = store.duplicate_live_incarnations();
+        out
+    }
+
+    /// Whether this task is blocked in a FULLY committed recv-v2 — the same contract the
+    /// acknowledgement publication site applies (recv-v2 ABI, a valid payload destination and
+    /// a non-null metadata destination). Task domain (rank 2) only.
+    pub(crate) fn blocked_recv_v2_commit_is_complete_split_read(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.blocked_recv_state.as_ref())
+                .is_some_and(|state| {
+                    state.recv_abi == crate::kernel::task::RecvAbiVariant::RecvV2
+                        && state.payload_user_ptr != 0
+                        && state.meta_user_ptr != 0
+                })
+        })
+    }
+
     pub(crate) fn live_server_reply_link_count_split_read(&self) -> usize {
         self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()

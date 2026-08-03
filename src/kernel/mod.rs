@@ -6,6 +6,7 @@ pub(crate) mod boot_command_line;
 pub mod cap_transfer_split;
 pub mod capabilities;
 pub mod deadline_token;
+pub mod direct_ack_census;
 pub mod direct_ack_store;
 pub mod direct_disposition;
 pub mod direct_eligibility;

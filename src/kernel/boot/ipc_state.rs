@@ -696,6 +696,12 @@ impl IpcSubsystem {
     ) -> Option<ReceiverWaiterIdentity> {
         let displaced = self.endpoint_waiters.get(idx).copied().flatten();
         self.endpoint_waiters[idx] = Some(identity);
+        // Stage 199D independent census: the waiter table's own publisher maintains the
+        // count, so it cannot drift by a path forgetting to report. A displacement is net
+        // zero — one waiter left as another arrived.
+        if displaced.is_none() {
+            crate::kernel::direct_ack_census::note_waiter_linked();
+        }
         displaced
     }
 
@@ -737,11 +743,23 @@ impl IpcSubsystem {
         let _ = crate::kernel::boot::ipcreply_direct_ack::release(idx, generation, waiter);
     }
 
+    /// Report one endpoint receive-waiter removal to the independent census.
+    ///
+    /// Separate from [`Self::release_direct_ack_lease`] on purpose: the census must stay a
+    /// measurement of the WAITER TABLE, independent of whether the acknowledgement store had
+    /// a lease for that waiter — otherwise it could not detect a store that failed to issue
+    /// one. It is called from the same three primitives for the same reason: coverage should
+    /// be structural, not remembered.
+    fn note_waiter_removed(&self) {
+        crate::kernel::direct_ack_census::note_waiter_unlinked();
+    }
+
     /// Unconditionally take (remove + return) the waiter at `idx`.
     pub(crate) fn take_endpoint_waiter(&mut self, idx: usize) -> Option<ReceiverWaiterIdentity> {
         let taken = self.endpoint_waiters.get_mut(idx).and_then(Option::take);
         if let Some(waiter) = taken {
             self.release_direct_ack_lease(idx, waiter);
+            self.note_waiter_removed();
         }
         taken
     }
@@ -756,6 +774,7 @@ impl IpcSubsystem {
         if self.endpoint_waiters.get(idx).copied().flatten() == Some(identity) {
             self.endpoint_waiters[idx] = None;
             self.release_direct_ack_lease(idx, identity);
+            self.note_waiter_removed();
             true
         } else {
             false
@@ -771,6 +790,7 @@ impl IpcSubsystem {
             if self.endpoint_waiters[idx] == Some(identity) {
                 self.endpoint_waiters[idx] = None;
                 self.release_direct_ack_lease(idx, identity);
+                self.note_waiter_removed();
             }
         }
     }

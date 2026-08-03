@@ -1059,6 +1059,105 @@ Kernel log lines are capped at `PRB_MSG_MAX = 192` bytes and truncate silently, 
 attestation is split into four lines per direction; the first version clipped its own verdict
 flags.
 
+### 8.6.7 The structural capacity, the waiter census, and the production default
+
+Blocker 4 is closed and the x86_64 production default is **ON**.
+
+#### Capacity is derived, not chosen
+
+`DIRECT_ACK_STORE_CAPACITY` is now `crate::kernel::boot::ENDPOINT_WAITER_SLOTS` — the length of
+the authoritative endpoint receive-waiter table — with two compile-time assertions pinning
+`>=` and `==` against it. A lease exists exactly while an endpoint receive-waiter does, so the
+bound is not merely sufficient, it is exact. The magic 8 is gone and no number was read off a
+boot to replace it.
+
+The store is now **one slot per endpoint index**: the slot's position *is* the endpoint index.
+That makes several previously-defended properties structural instead:
+
+| property | before | now |
+| --- | --- | --- |
+| endpoint uniqueness | leaf admission spinlock over check+allocate | impossible — an index has one slot |
+| capacity exhaustion | real, and hit on a live boot | impossible for a valid index |
+| reserve | lock + scan + allocation policy | one compare-exchange on one word |
+| release vs. slot recycling | needed the admission guard | no slot is ever reused by another endpoint |
+| lookup | linear scan | `slots[endpoint_index]` |
+
+The admission spinlock is gone, so **every** store operation is lock-free. Occupancy is
+maintained incrementally (a scan would be O(table) on the blocking-recv path);
+`live_pair_count_scan` is the independent derivation the tests compare it against on every
+transition. `AckReserveError::CapacityExhausted` survives only as a fail-closed guard for an
+endpoint index outside the table, which cannot arise.
+
+#### The independent waiter census
+
+`src/kernel/direct_ack_census.rs` measures the same population from the other side. The store
+can balance its own books while being wrong — capacity 8 did exactly that, refusing a ninth
+parked server a lease while every one of its counters read clean — so the census reads the
+endpoint receive-waiter table instead, and **is not bounded by the store's capacity**. A guard
+pins that it never references the store it audits.
+
+* **Running census** — current and high-watermark endpoint receive-waiter counts, maintained by
+  the waiter table's own mutators (one link site, and the same three removal primitives that
+  retire the lease), so the watermark is a true peak rather than whatever a log happened to
+  sample.
+* **Final bijection** — two passes over the endpoint table at `INIT_IDLE_PARK_BEGIN`, matching
+  live leases against eligible waiters on the complete
+  `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` identity. Eligibility is
+  re-derived from committed state (`recv_abi == RecvV2`, non-null payload and metadata
+  destinations, endpoint admitted), not remembered, so a lease issued against a waiter that
+  never qualified is detectable. It runs on the IPC (rank 3) and task (rank 2) **split seams,
+  one index at a time and never simultaneously** — it adds no broad-lock acquisition, and
+  `tests/broad_lock_census_guard.rs` enforces that.
+
+`LeaseBijection::ok()` requires equal populations *and* zero violations: a count-only check
+would miss a store that held one extra lease and dropped another waiter's.
+
+#### First production-default live seal
+
+Normal feature-off x86_64 boot, no direct-IPC oracle knob:
+
+```text
+YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1
+[ok] x86_64 core smoke: all 6 service entries present exactly once
+[ok] Phase 3B: PM_ELF_ZC_FAIL count=0
+
+IPC_DIRECT_PRODUCTION_QUIESCENT dir=nr6 attempts=54 completed=53 failed=0 preflight=0
+    pre_txn=1 fallback=0 not_admitted=0 transfer_cap=0
+IPC_DIRECT_PRODUCTION_QUIESCENT_FLAGS dir=nr6 terminals=1 eligibility=1 completed_gt0=1
+    no_confinement=1 no_late_fallback=1 result=ok
+IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir=nr6 reserve=114 commit=114 consume=53 release=52
+    rel_after_consume=53 cancel=0 live=9 spent=3 high_watermark=9 capacity=256
+IPC_DIRECT_PRODUCTION_ACK_FLAGS dir=nr6 live_zero=0 reserve_resolves=1 no_orphan=1
+    terminal_edges=0 exclusive=1 watermark_ok=1 fuses_clear=1
+IPC_DIRECT_PRODUCTION_QUIESCENT dir=nr7 attempts=53 completed=41 failed=0 preflight=10
+    pre_txn=2 fallback=0 not_admitted=0 transfer_cap=10
+IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir=nr7 reserve=114 commit=114 consume=41 release=64
+    rel_after_consume=41 cancel=0 live=9 spent=0 high_watermark=9 capacity=256
+IPC_DIRECT_WAITER_CENSUS dir=nr6 waiters_current=10 waiters_high_watermark=10
+    ack_capacity=256 eligible=9 live_leases=9
+IPC_DIRECT_WAITER_BIJECTION dir=nr6 waiters_without_lease=0 leases_without_waiter=0
+    identity_mismatch=0 generation_mismatch=0 duplicate_incarnation=0 result=ok
+IPC_DIRECT_WAITER_BIJECTION dir=nr7 ... result=ok
+IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok
+```
+
+**53 NR6 and 41 NR7 ordinary syscalls were serviced entirely off-lock** — the split-dispatch
+counts (`YARM_LOCK_SPLIT_DISPATCH nr=6` ×53, `nr=7` ×41) match `completed` exactly, with **zero**
+broad-lock NR6/NR7 entries. Zero capacity refusals, zero overwrite-fuse trips, zero stale,
+foreign, duplicate or crossed terminals, and an exact lease/waiter bijection in both directions.
+
+The ten `transfer_cap` declines are cap-bearing replies correctly staying on the mutation-free
+legacy path — the population that used to be silently robbed.
+
+Two readings that are *not* violations and are reported rather than gated: `live=9` (nine
+resident services legitimately parked in recv-v2, each holding a valid lease) and
+`terminal_edges=0` (the same fact). `no_orphan=1` —
+`reserve == consume + release + cancel + live`, exactly 114 == 53+52+0+9 and 114 == 41+64+0+9 —
+is the leak invariant that holds on a running system. The census independently confirms it:
+10 waiters, 9 eligible, 9 leases, zero mismatches.
+
+AArch64 and RISC-V are untouched and remain proof-gated.
+
 ---
 
 ## 9. Authoring rule

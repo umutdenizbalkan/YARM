@@ -72,6 +72,17 @@ use tid_allocation_policy::{TidAllocationCursor, TidAllocationPolicy};
 
 const MAX_ENDPOINTS: usize = 256;
 
+/// The length of the authoritative endpoint receive-waiter table
+/// ([`IpcSubsystem::endpoint_waiters`]), and the single place that length is named.
+///
+/// This is the **structural bound** on simultaneously outstanding direct-IPC acknowledgement
+/// leases: a lease exists exactly while an endpoint receive-waiter does, so there can never be
+/// more of them than there are waiter slots.
+/// [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`] is defined as this constant,
+/// and a compile-time assertion in that module pins the relationship — so the acknowledgement
+/// store cannot be under-sized by editing one of them.
+pub(crate) const ENDPOINT_WAITER_SLOTS: usize = MAX_ENDPOINTS;
+
 #[cfg(feature = "hosted-dev")]
 const MAX_ENDPOINT_SENDER_WAITERS: usize = 8;
 #[cfg(not(feature = "hosted-dev"))]
@@ -3113,43 +3124,54 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # HELD OFF — one live blocker remains (Stage 199D)
+/// # ENABLED on x86_64 — Stage 199D production default
 ///
-/// Every dependency on the proof oracle has been removed from admission, eligibility and
-/// acknowledgement publication: flipping this to `cfg!(target_arch = "x86_64")` is the
-/// entire enablement. The first attempt hard-stopped on a service-chain regression with four
-/// defects the oracle's endpoint confinement had been hiding. **Three are now fixed and one
-/// remains.**
+/// The off-lock direct NR6/NR7 path is the **production default on x86_64**: ordinary
+/// `IpcCall`/`IpcReply` traffic is serviced before the broad kernel lock, with no oracle, no
+/// proof gate and no endpoint confinement involved. AArch64 and RISC-V still resolve to the
+/// proof gate and the oracle confinement, so their boots are byte-identical.
 ///
-/// 1. ~~Capability transfer is silently dropped.~~ **FIXED.** NR7 eligibility now carries
-///    `transfer_cap_present`, asked through the same canonical `transfer_cap_arg_present`
-///    predicate the legacy decode uses, and a cap-bearing reply declines before any mutation
-///    to the legacy path. Live on a feature-off boot with the flip on: `transfer_cap=10`
-///    declines, `PM_ELF_ZC_FAIL count=0`, and **all 6 service entries present exactly once**.
-///    Direct capability transfer is still unimplemented — declining is the whole fix.
-/// 2. ~~The acknowledgement store has no production release path.~~ **FIXED.** The lease is
-///    now owned by the endpoint waiter lifecycle: the three `IpcSubsystem` waiter-removal
-///    primitives every canonical closing edge funnels through retire the exact
-///    `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` lease. Live:
-///    `release=52` (NR6) and `release=64` (NR7) leases retired that previously orphaned.
-/// 3. ~~Orphans trip the overwrite fuse.~~ **FIXED.** 17 trips on the first attempt, **0**
-///    now — each cycle's lease ends with its own waiter, so a re-block is never refused.
-/// 4. **Capacity is structurally too small — the remaining blocker.**
-///    `DIRECT_ACK_STORE_CAPACITY` is 8, and a normal boot parks more than that: ten distinct
-///    servers blocked in recv-v2 over one boot, and at `INIT_IDLE_PARK_BEGIN` the store sits
-///    at `live=8 high_watermark=8 capacity=8` with one `CAPACITY_REFUSED` per store. Those 8
-///    are **not** orphans — the accounting is exact in both directions
-///    (`reserve == consume + release + cancel + live`, 113 == 53+52+0+8 and 113 == 41+64+0+8)
-///    — they are resident services legitimately parked. The store is simply saturated, so a
-///    ninth parked server gets no lease and its endpoint silently falls back to legacy.
-///    Resizing is deliberately out of scope here.
+/// It took four blockers to get here, every one of them found by a live feature-off boot
+/// rather than by inspection, and every one closed:
 ///
-/// Note that `live == 0` is **not** a valid quiescence requirement for a running microkernel:
-/// a healthy system always has its resident services parked in recv-v2, each holding a
-/// legitimate lease. `QuiescentVerdict::no_orphaned_lease` is the leak invariant that holds at
-/// any instant, and it passes.
+/// 1. **Capability transfer was silently dropped.** NR7 eligibility now carries
+///    `transfer_cap_present`, asked through the one canonical `transfer_cap_arg_present`
+///    predicate the legacy decode is itself built on; a cap-bearing reply declines before any
+///    mutation and the legacy path does the transfer. Direct capability transfer remains
+///    unimplemented — declining is the whole fix.
+/// 2. **The acknowledgement store had no production release path.** The lease is now owned by
+///    the endpoint waiter lifecycle: the three `IpcSubsystem` waiter-removal primitives every
+///    canonical closing edge funnels through retire the exact
+///    `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` lease.
+/// 3. **Orphans tripped the overwrite fuse** — 17 trips on the first attempt, 0 now.
+/// 4. **Capacity was a magic 8**, smaller than the number of services a normal boot parks in
+///    recv-v2 at once, so the store saturated and silently degraded those endpoints to legacy.
+///    [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`] is now
+///    [`ENDPOINT_WAITER_SLOTS`] — one slot per endpoint index, derived at compile time from
+///    the authoritative endpoint receive-waiter table rather than chosen. A lease exists
+///    exactly while a waiter does, so the bound is not merely sufficient but exact, and
+///    capacity exhaustion is impossible by construction.
+///
+/// Live evidence, normal feature-off x86_64 boot (`scripts/qemu-x86_64-core-smoke.sh`):
+///
+/// ```text
+/// YARM_BOOT_OK present_cpus=1 ...          all 6 service entries present exactly once
+/// PM_ELF_ZC_FAIL count=0
+/// nr6 attempts=54 completed=53 failed=0 fallback=0 not_admitted=0   flags all ok
+/// nr7 attempts=53 completed=41 failed=0 fallback=0 transfer_cap=10  flags all ok
+/// ack  reserve=114 commit=114 consume=53 release=52 cancel=0 live=9 high_watermark=9
+///      capacity=256  fuses_clear=1  no_orphan=1  exclusive=1
+/// census waiters_current=10 high_watermark=10 eligible=9 live_leases=9
+/// bijection waiters_without_lease=0 leases_without_waiter=0 identity=0 generation=0 dup=0
+/// IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok
+/// ```
+///
+/// 53 NR6 and 41 NR7 syscalls were serviced entirely by the split dispatcher with **zero**
+/// broad-lock entries, zero capacity refusals and zero overwrite-fuse trips, and the
+/// independent waiter census — measured from the waiter table, not from the store's own books
+/// — found an exact one-to-one correspondence between live leases and eligible waiters.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    false
+    cfg!(target_arch = "x86_64")
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.

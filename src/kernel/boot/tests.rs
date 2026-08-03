@@ -70579,7 +70579,9 @@ mod stage199a1_ipccall_direct_audit {
     #[test]
     fn caller_and_server_identity_are_tid_asid_generation_bearing() {
         assert!(
-            DEFS_SRC.contains("endpoint_waiters: [Option<ReceiverWaiterIdentity>; MAX_ENDPOINTS]")
+            DEFS_SRC.contains(
+                "endpoint_waiters: [Option<ReceiverWaiterIdentity>; ENDPOINT_WAITER_SLOTS]"
+            )
         );
         assert!(IPC_STATE_SRC.contains("fn endpoint_waiter_identity"));
         assert!(IPC_STATE_SRC.contains("ReceiverWaiterIdentity"));
@@ -80247,10 +80249,12 @@ mod stage199a2d1_memory_ordering {
     #[test]
     fn ack_reserve_and_consume_are_acqrel_acquire_cas() {
         let body = store_src();
-        // Reserving a slot is the CAS that makes two racing CPUs resolve to one winner.
+        // Reserving this endpoint's slot is the CAS that makes two racing CPUs resolve to one
+        // winner. It moves from whatever non-live state the slot is in (`Vacant`, or either
+        // spent terminal) to `Reserved` — one word, one decision, no allocation policy.
         assert!(
             body.contains(
-                "                    SLOT_VACANT,\n                    SLOT_RESERVED,\n                    Ordering::AcqRel,\n                    Ordering::Acquire,"
+                "                .compare_exchange(current, SLOT_RESERVED, Ordering::AcqRel, Ordering::Acquire)"
             ),
             "the reserve CAS must be AcqRel success / Acquire failure"
         );
@@ -82632,9 +82636,9 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "false",
-            "the body is a bare constant: flipping it to `cfg!(target_arch = \"x86_64\")` \
-             is the entire x86_64 production-default enablement"
+            "cfg!(target_arch = \"x86_64\")",
+            "the whole condition is the target architecture: x86_64 is production-default, \
+             every other architecture is not"
         );
         for forbidden in [
             "oracle",
@@ -82657,10 +82661,11 @@ mod stage199d_production_default_guards {
     }
 
     /// The flip is HELD OFF against a recorded, reproducible live failure — not forgotten.
-    /// The doc comment tracks every blocker and its current state, so nobody re-flips it
-    /// blind and nobody re-litigates a blocker that is already closed.
+    /// The doc comment records how the production default was earned: every blocker that had
+    /// to be closed, and the live evidence for each. A future regression that re-opens one
+    /// should have to edit this record deliberately.
     #[test]
-    fn the_held_off_flip_records_every_live_blocker() {
+    fn the_production_default_records_every_closed_blocker() {
         let doc = MODRS
             .split("/// True iff the direct NR6/NR7 path is the production default")
             .nth(1)
@@ -82669,44 +82674,39 @@ mod stage199d_production_default_guards {
             .next()
             .expect("doc bounded");
         assert!(
-            doc.contains("HELD OFF"),
-            "the predicate says plainly that it is held off"
+            doc.contains("ENABLED on x86_64"),
+            "the predicate says plainly that x86_64 is production-default"
         );
         for blocker in [
-            "transfer_cap_present",      // 1: capability transfer — FIXED
-            "waiter lifecycle",          // 2: unpaired ack lifecycle — FIXED
-            "overwrite fuse",            // 3: orphans refuse re-blocking — FIXED
-            "DIRECT_ACK_STORE_CAPACITY", // 4: structural capacity — the remaining blocker
+            "transfer_cap_present",  // 1: capability transfer
+            "waiter lifecycle",      // 2: unpaired ack lifecycle
+            "overwrite fuse",        // 3: orphans refusing re-blocking
+            "ENDPOINT_WAITER_SLOTS", // 4: the structural capacity
         ] {
             assert!(
                 doc.contains(blocker),
-                "the held-off record must still account for the {blocker} blocker"
+                "the record must account for the {blocker} blocker"
             );
         }
-        // The three closed blockers are marked closed, and the open one is not.
-        assert_eq!(
-            doc.matches("**FIXED.**").count(),
-            3,
-            "three blockers are recorded as fixed"
-        );
-        assert!(
-            doc.contains("the remaining blocker"),
-            "the one open blocker is named as open"
-        );
         // The live evidence is named, so every claim is checkable rather than asserted.
+        for evidence in [
+            "PM_ELF_ZC_FAIL count=0",
+            "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok",
+            "bijection waiters_without_lease=0 leases_without_waiter=0",
+            "capacity=256",
+        ] {
+            assert!(doc.contains(evidence), "the record must cite {evidence}");
+        }
+        // AArch64 and RISC-V are explicitly unchanged.
         assert!(
-            doc.contains("PM_ELF_ZC_FAIL count=0")
-                && doc.contains("all 6 service entries present exactly once"),
-            "the boot markers that prove blocker 1 is closed are recorded"
+            doc.contains("AArch64 and RISC-V still resolve to the")
+                && doc.contains("boots are byte-identical"),
+            "the record states that no other architecture was ported"
         );
-        assert!(
-            doc.contains("reserve == consume + release + cancel + live"),
-            "the accounting that proves the 8 live leases are not orphans is recorded"
-        );
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "held off means held off"
-        );
+        // On this (x86_64-modelled) hosted build the default really is on.
+        assert!(crate::kernel::boot::ipccall_direct_production_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_admission_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_publication_enabled());
     }
 
     /// Endpoint admission is the ARCH-SPLIT predicate, never an oracle endpoint list: it is
@@ -83041,9 +83041,22 @@ mod stage199d_production_default_guards {
     fn the_quiescent_attestation_is_gated_on_service_chain_health() {
         let counters = include_str!("../direct_ipc_counters.rs");
         assert!(
-            counters.contains("pub(crate) fn maybe_emit_quiescent_attestation(service_chain_healthy: bool) -> bool {")
+            counters.contains("pub(crate) fn maybe_emit_quiescent_attestation(")
                 && counters.contains("if !service_chain_healthy {"),
             "the attestation refuses to fire before the chain is healthy"
+        );
+        // It also carries the INDEPENDENT waiter census, measured from the endpoint waiter
+        // table rather than from the store's own counters.
+        assert!(
+            counters.contains("crate::kernel::direct_ack_census::LeaseBijection")
+                && counters.contains("fn emit_census(")
+                && counters.contains("IPC_DIRECT_WAITER_BIJECTION dir=")
+                && counters.contains("IPC_DIRECT_WAITER_CENSUS dir="),
+            "the quiescent attestation reports the independent waiter census"
+        );
+        assert!(
+            counters.contains("census_ok={}") && counters.contains("&& census_ok {"),
+            "the seal fails unless the lease/waiter bijection is exact"
         );
         assert!(
             counters.contains("static QUIESCENT_ATTESTED: AtomicUsize")
@@ -83281,17 +83294,82 @@ mod stage199d_multi_pair_boundary {
         );
     }
 
-    /// The store is bounded and holds strictly more than one pair.
+    /// The store is bounded, holds more than one pair, and its capacity is **derived from
+    /// the authoritative endpoint receive-waiter table** rather than chosen.
+    ///
+    /// A magic 8 was smaller than the number of services a normal boot parks in recv-v2 at
+    /// once, so the store saturated and silently degraded those endpoints to legacy. The
+    /// replacement is not a bigger number read off that boot: it is the waiter table's own
+    /// length, so the two cannot drift.
     #[test]
-    fn store_capacity_is_bounded_and_multi_pair() {
+    fn store_capacity_is_derived_from_the_endpoint_waiter_table() {
         assert!(
             DIRECT_ACK_STORE_CAPACITY > 1,
             "a multi-pair store holds more than one pair"
         );
-        assert!(
-            DIRECT_ACK_STORE_CAPACITY <= 64,
-            "the store stays bounded (no allocation, fixed footprint)"
+        // Bounded: a fixed array, no allocation. The bound is the waiter table.
+        assert_eq!(
+            DIRECT_ACK_STORE_CAPACITY,
+            crate::kernel::boot::ENDPOINT_WAITER_SLOTS,
+            "capacity IS the endpoint receive-waiter table length"
         );
+        assert!(
+            DIRECT_ACK_STORE_CAPACITY >= crate::kernel::boot::ENDPOINT_WAITER_SLOTS,
+            "capacity may never be smaller than the table it covers"
+        );
+        // The tie is at COMPILE time, not merely asserted here.
+        let store_src = include_str!("../direct_ack_store.rs");
+        assert!(
+            store_src.contains(
+                "pub const DIRECT_ACK_STORE_CAPACITY: usize = \
+                 crate::kernel::boot::ENDPOINT_WAITER_SLOTS;"
+            ),
+            "the capacity is defined as the table length, not copied from it"
+        );
+        assert_eq!(
+            store_src
+                .matches("const _: () = assert!(DIRECT_ACK_STORE_CAPACITY")
+                .count(),
+            2,
+            "compile-time assertions pin >= and == against the waiter table"
+        );
+        // And the real array in the kernel is that long.
+        let k = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        let waiter_slots = k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiters.len()));
+        assert_eq!(
+            waiter_slots, DIRECT_ACK_STORE_CAPACITY,
+            "the live waiter table is exactly as long as the store"
+        );
+        // No magic literal survives anywhere near the capacity definition.
+        assert!(
+            !store_src.contains("DIRECT_ACK_STORE_CAPACITY: usize = 8"),
+            "the magic capacity is gone"
+        );
+    }
+
+    /// One slot per endpoint index: reservation cannot fail for want of a slot, and no slot is
+    /// ever shared between two endpoint indices.
+    #[test]
+    fn every_endpoint_index_always_has_its_own_slot() {
+        use crate::kernel::direct_ack_store::{AckEndpoint, AckWaiter, DirectAckStore};
+        let store = DirectAckStore::new();
+        // EVERY index in the table reserves, simultaneously, with no refusal.
+        for i in 0..DIRECT_ACK_STORE_CAPACITY {
+            store
+                .reserve(AckEndpoint::new(i, 1), AckWaiter::new(1000 + i as u64, 1))
+                .unwrap_or_else(|e| panic!("endpoint {i} must always have a slot ({e:?})"));
+        }
+        assert_eq!(store.live_pair_count(), DIRECT_ACK_STORE_CAPACITY);
+        assert_eq!(store.capacity_refusal_count(), 0, "no capacity refusal");
+        assert_eq!(store.endpoint_live_refusal_count(), 0, "no overwrite fuse");
+        assert_eq!(store.occupancy_high_watermark(), DIRECT_ACK_STORE_CAPACITY);
+        // The slot a reservation names is the endpoint index itself.
+        let r = DirectAckStore::new()
+            .reserve(AckEndpoint::new(42, 7), AckWaiter::new(9, 1))
+            .expect("reserve");
+        assert_eq!(r.slot(), 42, "the slot IS the endpoint index");
     }
 
     #[test]
@@ -101025,16 +101103,17 @@ mod stage199d_ack_lease_lifecycle {
         }
     }
 
-    /// A released slot is spent, so it is recyclable — which is what turns the orphan leak
-    /// back into bounded, self-limiting occupancy. Without recycling, a store whose leases
-    /// all ended through the non-direct edge would still refuse every new reservation.
+    /// A released slot is spent, so this endpoint index can re-reserve it. Combined with the
+    /// per-endpoint-index slot mapping, that is what makes occupancy self-limiting: a store
+    /// whose leases all ended through the non-direct edge is immediately reusable, and an
+    /// endpoint whose waiter comes and goes never accumulates anything.
     #[test]
-    fn released_slots_are_recycled_and_relieve_capacity() {
+    fn released_slots_are_reusable_by_their_own_endpoint() {
         let store = DirectAckStore::new();
-        // Fill the store, then end every lease through the NON-direct edge.
+        // Fill the whole table, then end every lease through the NON-direct edge.
         for i in 0..DIRECT_ACK_STORE_CAPACITY {
             let (e, waiter) = (ep(i, 1), w(100 + i as u64, 1));
-            let r = store.reserve(e, waiter).expect("reserve");
+            let r = store.reserve(e, waiter).expect("every index has a slot");
             store
                 .commit(
                     r,
@@ -101050,9 +101129,11 @@ mod stage199d_ack_lease_lifecycle {
                 .expect("commit");
         }
         assert_eq!(store.live_pair_count(), DIRECT_ACK_STORE_CAPACITY);
-        // One more would be refused right now — this is exactly the live failure mode.
-        assert!(store.reserve(ep(99, 1), w(999, 1)).is_err());
-        assert_eq!(store.capacity_refusal_count(), 1);
+        assert_eq!(
+            store.capacity_refusal_count(),
+            0,
+            "a full table is the normal maximum, not a refusal"
+        );
 
         for i in 0..DIRECT_ACK_STORE_CAPACITY {
             assert!(
@@ -101063,17 +101144,19 @@ mod stage199d_ack_lease_lifecycle {
             );
         }
         assert_eq!(store.live_pair_count(), 0, "no orphan survives");
+        assert_eq!(store.live_pair_count_scan(), 0);
         assert_eq!(store.released_pair_count(), DIRECT_ACK_STORE_CAPACITY);
 
-        // And the store admits a fresh pair again.
-        let r = store.reserve(ep(99, 1), w(999, 1)).expect("recycled");
-        assert_eq!(r.endpoint(), ep(99, 1));
-        assert_eq!(
-            store.capacity_refusal_count(),
-            1,
-            "no further capacity refusal"
-        );
-        assert!(store.occupancy_high_watermark() <= DIRECT_ACK_STORE_CAPACITY);
+        // Each endpoint re-reserves its own slot at a fresh incarnation.
+        for i in 0..DIRECT_ACK_STORE_CAPACITY {
+            let r = store
+                .reserve(ep(i, 2), w(200 + i as u64, 1))
+                .expect("spent slot is reusable");
+            assert_eq!(r.slot(), i, "an endpoint always returns to its own slot");
+        }
+        assert_eq!(store.capacity_refusal_count(), 0);
+        assert_eq!(store.endpoint_live_refusal_count(), 0);
+        assert_eq!(store.occupancy_high_watermark(), DIRECT_ACK_STORE_CAPACITY);
     }
 
     /// The released slot keeps its endpoint key (so duplicates stay detectable) but drops the
@@ -101753,5 +101836,293 @@ mod stage199d_transfer_cap_safety {
         c3.note_attempt();
         c3.note_declined_preflight_reply(false, false);
         assert_eq!(c3.declined_ineligible_mode(), 0);
+    }
+}
+
+/// Stage 199D — the **independent endpoint receive-waiter census**, end to end.
+///
+/// The acknowledgement store can balance its own books while still being wrong: the previous
+/// capacity-8 store did exactly that, refusing a ninth parked server a lease while every one of
+/// its own counters read clean. These tests measure the same population from the waiter table
+/// and require an exact one-to-one correspondence with the store's live leases.
+mod stage199d_waiter_census {
+    use super::*;
+    use crate::kernel::boot::{ipccall_direct_ack, set_ipccall_direct_proof_enabled};
+    use crate::kernel::direct_ack_census as census;
+    use crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const PAYLOAD_VA: usize = 0x4000;
+    const META_VA: usize = 0x4080;
+
+    /// `servers` tasks, each committed-blocked in recv-v2 on its own endpoint.
+    fn fixture(servers: usize) -> SharedKernel {
+        ipccall_direct_ack::reset();
+        census::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|state| {
+            // Provision everything FIRST, while task 0 is still current: creating an address
+            // space needs a live current task, and once the first server blocks there is not
+            // one to spare.
+            let mut caps = alloc::vec::Vec::new();
+            for n in 0..servers {
+                let tid = 2 + n as u64;
+                state.register_task(tid).expect("task");
+                let (asid, aspace) = state.create_user_address_space().expect("asid");
+                state.bind_task_asid(tid, asid).expect("bind");
+                state
+                    .map_user_page(
+                        aspace,
+                        VirtAddr(PAYLOAD_VA as u64),
+                        Mapping {
+                            phys: PhysAddr(0xB000 + (n as u64) * 0x1000),
+                            flags: PageFlags::USER_RW,
+                        },
+                    )
+                    .expect("map");
+                let (_e, _s, recv) = state.create_endpoint(4).expect("ep");
+                let recv_t = state
+                    .grant_capability_task_to_task(0, recv, tid)
+                    .expect("recv cap");
+                caps.push((tid, recv_t));
+            }
+            for (tid, recv_t) in caps {
+                state.enqueue_current_cpu(tid).expect("enq");
+                state.dispatch_next_task().expect("disp");
+                while state.current_tid() != Some(tid) {
+                    state.yield_current().expect("switch");
+                }
+                let mut recv_frame = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::IpcRecv as usize,
+                    [recv_t.0 as usize, PAYLOAD_VA, 8, META_VA, 40, 0],
+                );
+                let _ = state.handle_trap(Trap::Syscall, Some(&mut recv_frame));
+                assert!(matches!(
+                    state.task_status(tid),
+                    Some(TaskStatus::Blocked(_))
+                ));
+            }
+        });
+        k
+    }
+
+    fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        ipccall_direct_ack::reset();
+        census::reset();
+    }
+
+    fn bijection(k: &SharedKernel) -> census::LeaseBijection {
+        k.direct_ack_lease_bijection(ipccall_direct_ack::store(), |_| true)
+    }
+
+    /// Every eligible waiter has exactly one live lease, and every live lease has exactly one
+    /// waiter — matched on the complete `{index, generation, tid, asid}` identity.
+    #[test]
+    fn every_blocked_waiter_has_exactly_one_lease_and_vice_versa() {
+        let k = fixture(5);
+        let b = bijection(&k);
+        assert_eq!(b.eligible_waiters, 5, "five committed recv-v2 waiters");
+        assert_eq!(b.live_leases, 5, "and five live leases");
+        assert_eq!(b.waiters_without_lease, 0);
+        assert_eq!(b.leases_without_waiter, 0);
+        assert_eq!(b.identity_mismatches, 0);
+        assert_eq!(b.generation_mismatches, 0);
+        assert_eq!(b.duplicate_endpoint_incarnations, 0);
+        assert!(b.ok(), "{b:?}");
+        teardown();
+    }
+
+    /// The running census tracks the waiter table and its peak, and is NOT clamped to the
+    /// acknowledgement store's capacity.
+    #[test]
+    fn the_running_census_tracks_the_waiter_table() {
+        let k = fixture(6);
+        assert_eq!(census::waiters_current(), 6);
+        assert_eq!(census::waiters_high_watermark(), 6);
+        // Removing waiters lowers the current count and leaves the peak.
+        k.with(|s| {
+            s.clear_ipc_waiters_for_tid(2);
+            s.clear_ipc_waiters_for_tid(3);
+        });
+        assert_eq!(census::waiters_current(), 4);
+        assert_eq!(census::waiters_high_watermark(), 6, "the peak is a peak");
+        // And the bijection follows: four waiters, four leases.
+        let b = bijection(&k);
+        assert_eq!(b.eligible_waiters, 4);
+        assert_eq!(b.live_leases, 4);
+        assert!(b.ok(), "{b:?}");
+        teardown();
+    }
+
+    /// A lease whose waiter is gone is caught — the orphan the whole lease lifecycle exists to
+    /// prevent. Injected by force-dropping the waiter behind the store's back.
+    #[test]
+    fn an_orphaned_lease_is_detected() {
+        let k = fixture(3);
+        assert!(bijection(&k).ok());
+        // Remove the waiter WITHOUT going through the primitives, so no lease is retired.
+        k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                for idx in 0..ipc.endpoint_waiters.len() {
+                    if ipc.endpoint_waiters[idx].is_some() {
+                        ipc.endpoint_waiters[idx] = None;
+                        break;
+                    }
+                }
+            })
+        });
+        let b = bijection(&k);
+        assert_eq!(b.leases_without_waiter, 1, "the orphan is visible");
+        assert_eq!(b.eligible_waiters, 2);
+        assert_eq!(b.live_leases, 3);
+        assert!(!b.ok(), "an orphaned lease fails the bijection");
+        teardown();
+    }
+
+    /// A waiter with no lease is caught — the under-sized-store symptom that capacity 8
+    /// produced live, where a ninth parked server was silently refused.
+    #[test]
+    fn a_waiter_without_a_lease_is_detected() {
+        let k = fixture(3);
+        assert!(bijection(&k).ok());
+        // Drop one lease behind the waiter's back.
+        let idx = ipccall_direct_ack::store()
+            .live_lease_at(0)
+            .map(|_| 0usize)
+            .or_else(|| {
+                (0..DIRECT_ACK_STORE_CAPACITY)
+                    .find(|i| ipccall_direct_ack::store().live_lease_at(*i).is_some())
+            })
+            .expect("a live lease");
+        assert!(ipccall_direct_ack::store().release_endpoint_index(idx));
+        let b = bijection(&k);
+        assert_eq!(
+            b.waiters_without_lease, 1,
+            "the lease-less waiter is visible"
+        );
+        assert_eq!(b.eligible_waiters, 3);
+        assert_eq!(b.live_leases, 2);
+        assert!(!b.ok());
+        teardown();
+    }
+
+    /// The store's own books balance at the same time the bijection holds:
+    /// `reserve == consume + release + cancel + live`.
+    #[test]
+    fn the_store_balances_while_the_bijection_holds() {
+        let k = fixture(4);
+        let store = ipccall_direct_ack::store();
+        let balance = |store: &crate::kernel::direct_ack_store::DirectAckStore, at: &str| {
+            assert_eq!(
+                store.reserve_count(),
+                store.consume_count()
+                    + store.release_count()
+                    + store.cancel_count()
+                    + store.live_pair_count() as u64,
+                "{at}: reserve == consume + release + cancel + live"
+            );
+            assert_eq!(
+                store.live_pair_count(),
+                store.live_pair_count_scan(),
+                "{at}: the occupancy counter agrees with the slots"
+            );
+        };
+        balance(store, "all blocked");
+        assert!(bijection(&k).ok());
+
+        // One delivered directly, one waiter simply removed.
+        assert!(
+            ipccall_direct_ack::sole_claim().is_none(),
+            "four pairs, not one"
+        );
+        let first = (0..DIRECT_ACK_STORE_CAPACITY)
+            .find(|i| store.live_lease_at(*i).is_some())
+            .expect("a live lease");
+        let (egen, w) = store.live_lease_at(first).expect("lease");
+        assert!(
+            ipccall_direct_ack::claim(first, egen).is_some(),
+            "direct delivery consumes it"
+        );
+        k.with(|s| s.clear_ipc_waiters_for_tid(w.tid));
+        balance(store, "after a direct delivery");
+
+        k.with(|s| s.clear_ipc_waiters_for_tid(3));
+        balance(store, "after a legacy-satisfied waiter left");
+
+        let b = bijection(&k);
+        assert!(b.ok(), "the bijection still holds: {b:?}");
+        assert_eq!(b.eligible_waiters, b.live_leases);
+        assert_eq!(store.endpoint_live_refusal_count(), 0, "no overwrite fuse");
+        assert_eq!(store.capacity_refusal_count(), 0, "no capacity refusal");
+        assert_eq!(store.crossed_terminal_rejection_count(), 0);
+        assert_eq!(store.duplicate_release_rejection_count(), 0);
+        assert_eq!(store.stale_generation_rejection_count(), 0);
+        assert_eq!(store.foreign_waiter_rejection_count(), 0);
+        teardown();
+    }
+
+    /// The regression the structural capacity closes: more simultaneously parked servers than
+    /// the old magic capacity of 8, every one of them holding a lease.
+    #[test]
+    fn more_parked_servers_than_the_old_magic_capacity_all_hold_leases() {
+        const SERVERS: usize = 12; // > the retired capacity of 8
+        assert!(
+            DIRECT_ACK_STORE_CAPACITY >= SERVERS,
+            "the structural bound covers a realistic service chain"
+        );
+        let k = fixture(SERVERS);
+        let store = ipccall_direct_ack::store();
+        assert_eq!(store.live_pair_count(), SERVERS);
+        assert_eq!(
+            store.capacity_refusal_count(),
+            0,
+            "no server is refused a lease: this is what capacity 8 got wrong"
+        );
+        assert_eq!(store.endpoint_live_refusal_count(), 0);
+        assert_eq!(census::waiters_high_watermark(), SERVERS);
+        let b = bijection(&k);
+        assert_eq!(b.eligible_waiters, SERVERS);
+        assert_eq!(b.live_leases, SERVERS);
+        assert!(b.ok(), "{b:?}");
+        teardown();
+    }
+
+    /// The census is wired into the waiter primitives, not sprinkled across call sites.
+    #[test]
+    fn the_census_is_maintained_by_the_waiter_table_itself() {
+        let ipc_state = include_str!("ipc_state.rs");
+        assert_eq!(
+            ipc_state
+                .matches("crate::kernel::direct_ack_census::note_waiter_linked();")
+                .count(),
+            1,
+            "exactly one link site: the waiter table's own publisher"
+        );
+        assert_eq!(
+            ipc_state.matches("self.note_waiter_removed();").count(),
+            3,
+            "the same three removal primitives that retire the lease"
+        );
+        // The census must NOT be derived from the store — that is what makes it independent.
+        let census_src = include_str!("../direct_ack_census.rs");
+        let code: alloc::string::String = census_src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "DirectAckStore",
+            "ipccall_direct_ack",
+            "ipcreply_direct_ack",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the census must not read the store it audits ({forbidden})"
+            );
+        }
     }
 }

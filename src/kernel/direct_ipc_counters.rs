@@ -381,7 +381,13 @@ pub(crate) fn quiescent_verdict(
 
 /// Emit the FINAL quiescent production attestation, exactly once, only after the normal
 /// service chain has reported healthy. Read-only and one-shot.
-pub(crate) fn maybe_emit_quiescent_attestation(service_chain_healthy: bool) -> bool {
+pub(crate) fn maybe_emit_quiescent_attestation(
+    service_chain_healthy: bool,
+    census: Option<(
+        crate::kernel::direct_ack_census::LeaseBijection,
+        crate::kernel::direct_ack_census::LeaseBijection,
+    )>,
+) -> bool {
     if !service_chain_healthy {
         return false;
     }
@@ -394,13 +400,50 @@ pub(crate) fn maybe_emit_quiescent_attestation(service_chain_healthy: bool) -> b
     let nr7 = quiescent_verdict(&REPLY, rep_store);
     emit_quiescent("nr6", &REQUEST, req_store, nr6);
     emit_quiescent("nr7", &REPLY, rep_store, nr7);
+    // The INDEPENDENT waiter census, measured from the endpoint receive-waiter table rather
+    // than from the store's own books — see `crate::kernel::direct_ack_census`.
+    let (nr6_bij, nr7_bij) = match census {
+        Some(pair) => pair,
+        None => Default::default(),
+    };
+    let census_ok = emit_census("nr6", nr6_bij) & emit_census("nr7", nr7_bij);
     crate::yarm_log!(
-        "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok={} nr7_ok={} result={}",
+        "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok={} nr7_ok={} census_ok={} result={}",
         nr6.ok() as u8,
         nr7.ok() as u8,
-        if nr6.ok() && nr7.ok() { "ok" } else { "fail" },
+        census_ok as u8,
+        if nr6.ok() && nr7.ok() && census_ok {
+            "ok"
+        } else {
+            "fail"
+        },
     );
     true
+}
+
+/// Emit one direction's independent waiter census. Returns whether the bijection is exact.
+fn emit_census(which: &str, b: crate::kernel::direct_ack_census::LeaseBijection) -> bool {
+    use crate::kernel::direct_ack_census as census;
+    crate::yarm_log!(
+        "IPC_DIRECT_WAITER_CENSUS dir={} waiters_current={} waiters_high_watermark={} ack_capacity={} eligible={} live_leases={}",
+        which,
+        census::waiters_current(),
+        census::waiters_high_watermark(),
+        crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY,
+        b.eligible_waiters,
+        b.live_leases,
+    );
+    crate::yarm_log!(
+        "IPC_DIRECT_WAITER_BIJECTION dir={} waiters_without_lease={} leases_without_waiter={} identity_mismatch={} generation_mismatch={} duplicate_incarnation={} result={}",
+        which,
+        b.waiters_without_lease,
+        b.leases_without_waiter,
+        b.identity_mismatches,
+        b.generation_mismatches,
+        b.duplicate_endpoint_incarnations,
+        if b.ok() { "ok" } else { "fail" },
+    );
+    b.ok()
 }
 
 fn emit_quiescent(
