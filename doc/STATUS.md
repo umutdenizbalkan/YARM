@@ -130,7 +130,7 @@ Full detail: `doc/IPC.md` §8.5.
    two blockers that used to head this list**: the `IPC_SERVER_DEATH_LINK_LEAK` accounting
    failure is resolved, and `revalidate_idle_owner_after_drains` has now executed in QEMU
    (`EXIT_TASK_OWNER_REVALIDATED … committed=replacement`).
-2. **NR 6 / NR 7 off-lock direct IPC is one blocker from production-default** (was: cannot be made production-default yet — two remaining
+2. **NR 6 / NR 7 off-lock direct IPC IS the x86_64 production default** (was: cannot be made production-default yet — two remaining
    correctness defects in the transaction body, not the gates.** The acknowledgement-store
    prerequisite *is* met (the bounded endpoint-indexed multi-pair store,
    `src/kernel/direct_ack_store.rs`, Stage 199D), **delivery conformance is now met**
@@ -209,17 +209,25 @@ Full detail: `doc/IPC.md` §8.5.
    is open the attestation that would detect a *real* reverse-link leak is blind on the
    production path. AArch64 and RISC-V are untouched and remain proof-gated. Full evidence is in
    `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.10; see also `doc/IPC.md` §8.6.5–§8.6.8.
-   **Blocker 6 (link CLOSE accounting) is now closed too** — all four closing paths delegate to
-   the one `close_server_reply_link` decision, so `links_created == links_closed` is a
-   meaningful invariant on the production path; live `created=54 closed=54 live_links=0`,
-   ServerDies vector `[1;9]`, seal `result=ok`. With the flip on, the core boot, the direct
-   NR6/NR7 oracle regression and ServerDies all pass. **The reply-timeout matrix does not:** its
-   x86_64 reply-wins cell (causal, not a wall-clock margin) has the reply lose —
-   `IPC_REPLY_WIN_ROLLBACK` and `IPC_REPLY_TIMEOUT_DEFERRED` present, `IPC_REPLY_BEATS_TIMEOUT_OK`
-   absent — because the reply-win terminal lease lives only on the legacy reply path and the
-   direct NR7 path neither takes it nor leaves the record as legacy expects. Exact A/B on one
-   clean tree: flip off both x86 cells pass, flip on reply-wins fails. The constant is restored
-   to `false`.
+   **Blockers 6 and 7 are now closed and the x86_64 production default is ON.**
+   All four reverse-link closing paths delegate to the one `close_server_reply_link` decision,
+   so `links_created == links_closed` is a meaningful invariant on the production path. And
+   terminal-arbitrated NR7 replies are explicitly ineligible: `DirectReplyFacts::terminal_arbitrated`
+   is read from the authoritative `reply_terminal_ownership` cell, exact in record index AND
+   generation under one rank-3 acquisition, and such a reply declines before any mutation so the
+   legacy terminal lease can make it provably beat a concurrent timeout. Porting that lease into
+   the direct transaction is future canonical **199E** work.
+   **FIRST x86_64 NR6/NR7 PRODUCTION-DEFAULT LIVE SEAL, exact commit `0b5ec254`:** core boot with
+   `YARM_BOOT_OK`, all 6 service entries exactly once, `PM_ELF_ZC_FAIL count=0`, **53 NR6 + 41 NR7
+   ordinary syscalls off-lock with zero broad-lock entries**,
+   `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok` and waiter/lease
+   bijection `result=ok`; oracle regression `live_cells=2 result=ok`; ServerDies vector `[1;9]`,
+   `created=54 closed=54 live_links=0`, one PeerDeath winner and one caller wake; and both x86
+   reply-timeout matrix cells with zero `[fail]` lines — reply-wins `reserve=1 commit=1
+   rollback=0 deferred=0 arbitrated=1`, timeout-wins unchanged with `late_reply=rejected`. Zero
+   fail/leak/duplicate/stale/fatal markers. The AArch64 and RISC-V matrix cells could not run
+   (`qemu-system-aarch64`/`riscv64` absent here); neither architecture was changed and both
+   remain proof-gated. Canonical 199D remains open — this is an increment, not a stage seal.
    **Blocker 5 (link CREATION accounting) is now closed** — both installation seams delegate to
    the one `install_server_reply_link` decision, so the creation stamp cannot drift; live,
    `created` went 0 → 54. That exposed its mirror on the CLOSE edge: of four close sites only two

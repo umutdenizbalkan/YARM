@@ -1232,32 +1232,109 @@ Live: `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT created=54 closed=54 live_links=0
 with the ServerDies scoped vector `[1, 1, 1, 1, 1, 1, 1, 1, 1]`, one PeerDeath winner and one
 caller wake.
 
-#### Still held off: the reply-vs-timeout terminal race
+### 8.6.9 Terminal-arbitrated replies are ineligible — and the production default is ON
 
-With the flip on, the normal core boot, the direct NR6/NR7 oracle regression and the ServerDies
-regression all pass. `scripts/qemu-ipc-reply-timeout-matrix-smoke.sh` does not: its **x86_64
-reply-wins** cell fails. That cell is causal, not a wall-clock margin — a collector is held
-before the terminal claim so the reply provably wins — and with the direct path as the default
-the reply loses:
+A reply whose record is arbitrated by an armed terminal-ownership / reply-timeout cell must
+reserve the terminal *before* its caller copy and commit it *after*, so a concurrent timeout
+claimant provably loses. That lease — `reserve_reply_win_before_copy` → delivery →
+`commit_reply_win_after_delivery`, with `rollback_reply_win` on a retryable fault — lives only
+on the legacy reply path. Servicing an arbitrated reply off-lock therefore lost the race the
+caller was promised: the reply reserved, rolled back, and the timeout's deferred path completed.
+
+Rather than port the lease, the arbitrated population is now **explicitly ineligible** for
+direct NR7. Porting it is recorded as future canonical 199E work.
+
+#### The fact is canonical and exact
+
+`SharedKernel::reply_record_terminal_arbitrated_split_read(index, generation)` reads the
+authoritative `reply_terminal_ownership` cell — co-located with, and indexed identically to,
+`reply_caps`. Never an oracle selector, a marker or a counter. A cell arbitrates this reply only
+when its epoch is non-zero (a vacant cell is epoch 0 with `TerminalIdentity::ZERO`) **and** its
+immutable identity names this exact record index **and** generation, so a cell armed for a
+previous occupant of a recycled slot correctly arbitrates nothing.
+
+**It is not a TOCTOU test**, for two independent reasons:
+
+1. **Internal consistency.** The record generation and the terminal cell are read under ONE
+   rank-3 acquisition, so the pair cannot be torn — the generation cannot advance between
+   reading it and reading the cell armed for it.
+2. **Arming strictly precedes reply deliverability.** The cell is armed by
+   `maybe_arm_reply_timeout_oracle` at the caller's blocking-recv publication
+   (`IPC_RECV_BLOCK_REGISTER`), which happens *before* the blocked-caller acknowledgement is
+   published at `IPC_RECV_BLOCKED_STATE_SAVE`. The direct NR7 path cannot reach eligibility for
+   a record whose caller has not yet published that acknowledgement. A cell therefore cannot go
+   unarmed → armed for this incarnation between the read and the transaction: either the arming
+   already happened, or the reply is not deliverable yet at all.
+
+#### The decline precedes every mutation
+
+`DirectReplyEligibility::TerminalArbitrationUnsupported` is returned as soon as the record
+identity is known — before the endpoint is even resolved, and therefore before the
+acknowledgement claim, any record reservation or consumption, the payload/meta copy, any waiter
+mutation or wake, the reverse-link close, and any direct transaction call, all of which happen
+only on the `Eligible` arm. It carries no error and no endpoint, so the legacy path returns the
+real result. Its own counter, `declined_terminal_arbitration`, is a breakdown of
+`declined_preflight` rather than a new bucket, so the terminal-balance invariant is untouched.
+
+#### FIRST x86_64 NR6/NR7 PRODUCTION-DEFAULT LIVE SEAL
+
+Exact commit `0b5ec254`. `ipccall_direct_production_enabled()` is
+`cfg!(target_arch = "x86_64")`.
+
+**1. Normal feature-off x86 core boot**
 
 ```text
-IPC_REPLY_WIN_RESERVE arch=x86_64 outcome=ok                  (legacy reserved the terminal)
-IPC_REPLY_WIN_ROLLBACK arch=x86_64 ...                        (forbidden — the reply rolled back)
-IPC_REPLY_TIMEOUT_DEFERRED arch=x86_64 published=1 drained=1  (forbidden — the timeout won)
-IPC_REPLY_BEATS_TIMEOUT_OK ...                                (required, count 0)
+YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1
+[ok] x86_64 core smoke: all 6 service entries present exactly once
+[ok] Phase 3B: PM_ELF_ZC_FAIL count=0
+IPC_DIRECT_PRODUCTION_QUIESCENT dir=nr7 attempts=53 completed=41 failed=0 preflight=10
+    pre_txn=2 fallback=0 not_admitted=0 transfer_cap=10 arbitrated=0
+IPC_DIRECT_WAITER_BIJECTION dir=nr6 ... result=ok
+IPC_DIRECT_WAITER_BIJECTION dir=nr7 ... result=ok
+IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok
+YARM_LOCK_SPLIT_DISPATCH nr=6 ×53   nr=7 ×41   (zero broad-lock NR6/NR7 entries)
 ```
 
-The A/B is exact — same clean tree, same harness, `MATRIX_ARCHES=x86_64`, one constant. Flip
-**off**: both x86 cells pass, `timeout_wins=1 reply_wins=1`, zero `[fail]` lines. Flip **on**:
-the reply-wins cell fails as above.
+**2. Direct NR6/NR7 oracle regression** —
+`STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL classes=2 live_cells=2 duplicate_replies=0
+duplicate_wakes=0 result=ok`
 
-The shape says legacy `handle_ipc_reply` ran, reserved the reply win, and then
-`KernelState::ipc_reply` failed, so the win rolled back, the deadline was re-armed and the
-timeout's deferred path completed. `reserve_reply_win_before_copy` /
-`commit_reply_win_after_delivery` / `rollback_reply_win` live only on the legacy reply path;
-the direct NR7 path neither participates in that lease nor leaves the record in the state legacy
-expects. Until the direct reply path either takes the terminal lease itself or provably declines
-every reply the causal gate has armed, the production default stays off.
+**3. ServerDies regression**
+
+```text
+IPC_SERVER_DEATH_TRANSITION_AUDIT vector=[1, 1, 1, 1, 1, 1, 1, 1, 1] result_before_enqueue=1 result=ok
+IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT created=54 closed=54 live_links=0 scope=system result=ok
+STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL live_cells=1 caller_wakes=1 peer_death_winners=1 result=ok
+```
+
+**4. x86 reply-timeout matrix, both cells** — zero `[fail]` lines.
+
+```text
+reply-wins    IPC_REPLY_WIN_RESERVE = 1        IPC_REPLY_WIN_ROLLBACK = 0
+              IPC_REPLY_TIMEOUT_DEFERRED = 0
+              IPC_REPLY_BEATS_TIMEOUT_OK arch=x86_64 terminal=Reply reply_copies=1
+                  deadline_disarmed=1 late_timeout_claims=0 caller_wakes=1 result=ok
+              IPC_DIRECT_PRODUCTION_QUIESCENT dir=nr7 ... arbitrated=1
+              IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok
+
+timeout-wins  IPC_REPLY_TIMEOUT_OK arch=x86_64 terminal=Timeout timeout_result=TimedOut
+                  caller_wakes=1 reply_aliases_invalid=1 late_reply_successes=0 result=ok
+              X86_IPC_REPLY_TIMEOUT_DONE caller_result=TimedOut late_reply=rejected result=ok
+```
+
+The `arbitrated=1` on the reply-wins boot is the whole causal chain in one number: exactly one
+NR7 reply — the arbitrated one — declined to legacy, legacy took the terminal lease, and the
+reply provably beat the timeout with zero rollback and zero deferred completion, while the other
+41 ordinary replies still went off-lock.
+
+Zero `result=fail`, leak, duplicate, stale or fatal markers in any run.
+
+> The AArch64 and RISC-V matrix cells could not be executed: `qemu-system-aarch64` and
+> `qemu-system-riscv64` are not installed in this environment. Neither architecture was changed
+> — both still resolve to the proof gate and the oracle confinement — so their behaviour is
+> byte-identical by construction, but the 3-arch matrix seal remains unearned here.
+
+AArch64 and RISC-V are untouched and remain proof-gated.
 
 AArch64 and RISC-V are untouched and remain proof-gated.
 
