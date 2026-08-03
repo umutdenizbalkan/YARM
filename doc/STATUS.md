@@ -132,7 +132,7 @@ deliberately not folded into that repair.
 | # | Symptom | First bad | Status |
 |---|---------|-----------|--------|
 | 1 | RUN_C: `X86_AP_RECV_V2_VALIDATE_FAIL`; request-OK / user-validated absent | `458bb3d4` | ✅ **repaired** (`db783142`) |
-| 2 | RUN_C: `X86_AP_RESCHEDULE_IPI_SENT sender_cpu=0 receiver_cpu=1` fires **54×**, seal requires 1 | in `(da9d26e2, f3c2e00c]` | ❌ open |
+| 2 | RUN_C: `X86_AP_RESCHEDULE_IPI_SENT sender_cpu=0 receiver_cpu=1` fires **54×**, seal requires 1 | `fcfc55e3` | ✅ **repaired** (`6784a3ae`) |
 | 3 | RUN_D: reverse NR7 direction never completes — `IPCREPLY_DIRECT_SMP_REPLY_OK=0`, `result=fail reason=timeout_before_completion` | not yet bisected | ❌ open |
 
 **Defect 1 (repaired).** `ipc_call` (NR6) sends `opcode = OPCODE_INLINE` with `FLAG_REPLY_CAP`,
@@ -147,20 +147,39 @@ saw exactly those eight bytes and validated; afterwards they were correctly rein
 genuine two-byte inline opcode ahead of the payload (wire length 8 → 10) in both client stubs; the
 CPU-1 server stub is unchanged. Boundaries 1–13 of the causal chain now all pass.
 
-**Defect 2 (open).** Provably independent of defect 1 — the IPI count is 54 both with and without
-that fix. It was 1 at `ccceb03d`, `ffc8e3ee`, `458bb3d4`, `8dfdb204`, `42e07907`, `3a0d61cb` and
-`da9d26e2`, and 54 by `f3c2e00c`, so its first-bad range is `(da9d26e2, f3c2e00c]` — which
-includes several Stage 199D commits. All 54 sends precede the request completing and only one is
-received.
+**Defect 2 (repaired).** First bad commit **`fcfc55e3`**. The candidate range toggles
+`ipccall_direct_production_enabled()` on and off repeatedly, so the signal is non-monotonic and
+`git bisect` is the wrong tool; testing the toggle points directly gives an exact correlation:
 
-**Defect 3 (open).** RUN_D's *forward* direction now passes (`IPCCALL_DIRECT_SMP_REQUEST_OK=1`,
-`X86_AP_RECV_V2_USER_VALIDATED cpu=1`), so the framing repair helps there too; the reverse NR7
-direction never completes.
+| commit | `ipccall_direct_production_enabled()` | IPI sent |
+|---|---|---|
+| `da9d26e2` | `false` | 1 |
+| **`fcfc55e3`** | `cfg!(target_arch = "x86_64")` | **54** |
+| `340f7822` | `false` | 1 |
+| `c94cd304` | `cfg!(target_arch = "x86_64")` | **54** |
 
-The four-run seal at `db783142` records: RUN_A ✅ (feature-off, marker-clean), RUN_B ✅
-(`request=1 reply=1 server_wakes=1 caller_wakes=1 duplicate_reply=rejected`), then
-`result=fail reason=C_smoke` on defect 2. It stops at the first failure, so RUN_D is only
-reachable standalone.
+**54 = 53 ordinary local direct-NR6 completions + the 1 genuine CPU0→CPU1 oracle delivery.** The
+post-transaction wake decision read a global oracle selector — a question that selector cannot
+answer — and aimed at a hardcoded CPU 1. The real authority was absent:
+`sr_enqueue_committed_receiver_split` computed the target CPU and discarded it. While the
+production default was off, the oracle's own request was the only traffic reaching the drain, so it
+fired once and looked correct. The repair makes the enqueue **return** its committed target,
+carries it in `IpcCallDirectSuccess`, and decides the wake by comparing it to the enqueueing CPU —
+so a local enqueue sends nothing regardless of any selector, and a real remote enqueue is woken on
+its authoritative home CPU.
+
+**Defect 3 (open — the sole remaining blocker).** RUN_D's *forward* direction is now fully
+healthy (`IPCCALL_DIRECT_SMP_REQUEST_OK=1`, `X86_AP_RECV_V2_USER_VALIDATED cpu=1`, forward IPI
+`sent=1`), and the reverse IPI is requested exactly once
+(`X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0` = 1) — but the reply never lands:
+`IPCREPLY_DIRECT_SMP_REPLY_OK=0` and `X86_BSP_REPLY_USER_VALIDATED cpu=0` = 0, so the run ends
+`result=fail reason=timeout_before_completion`. Not bisected.
+
+The four-run seal at `6784a3ae` now reaches RUN_D: RUN_A ✅ (feature-off, marker-clean),
+RUN_B ✅ (`request=1 reply=1 server_wakes=1 caller_wakes=1 duplicate_reply=rejected`),
+**RUN_C ✅** (`AP saved-dispatch=1 request_user_consumed=1 no ring-3 fault`), then
+`result=fail reason=D_smoke` on defect 3 — the only remaining blocker. Standalone RUN_C reports
+`sent=1 received=1 request_ok=1 continuation=1 user_validated=1`.
 
 Unaffected and re-verified live at `db783142`: x86 production core boot, ServerDies
 (`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL … result=ok`), and the x86 reply-timeout retirement smoke.
