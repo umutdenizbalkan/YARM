@@ -645,7 +645,29 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    **Links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent.** The earliest missing link is now 1 — no
    RISC-V task is pinned to a non-boot CPU — so `RISCV_REMOTE_WAKE` stays **D**,
    `RISCV_199D_READINESS` stays `case_b`, coordinate 23 stays OPEN and the ledger stays
-   40 / 6 / 46. See §6.1.22. `stage199d_riscv_canonical_admission` (11 tests) pins the
+   40 / 6 / 46. See §6.1.22.
+   **Chain link 1 HARD-STOPPED — no code written, link 1 remains ABSENT.** The pre-audit found
+   conditions 1–4 satisfiable (the existing oracle already spawns a disposable child server that
+   runs on CPU 0 and parks in the exact NR6 waiter state; `set_task_home_cpu` is arch-neutral; and
+   `sr_enqueue_committed_receiver_split` would genuinely commit to CPU 1 now that it is online),
+   but **condition 5 — safe retirement — is not**. Once the transaction commits, the task sits in
+   CPU 1's runqueue and CPU 1 never dispatches. `RingQueue::remove_tid` is **private to
+   `scheduler.rs`** and reachable only through `on_preempt_prefer`, which also dispatches; there is
+   no `Scheduler`- or `KernelState`-level "remove this TID from that CPU's runqueue". The only two
+   routes are excluded by the condition itself: dispatching it on CPU 1 *schedules* the task there
+   (destroying the wake-only idle-current invariant, which `install_ap_idle_current` refuses to
+   restore while a current exists) and leaves a Runnable-but-unqueued window; or adding a generic
+   removal seam, which is new production scheduler surface. A proof that observed the commit and
+   left the task parked on CPU 1 forever would violate the required "no leaked oracle task"
+   evidence and was **not** fabricated. **The contract that must be split first:** a generic
+   non-dispatching `Scheduler::withdraw_queued_tid_on(cpu, tid)` that removes the TID from that
+   CPU's queues without touching `current`, dispatching, or altering TCB status —
+   `RingQueue::remove_tid` already has the mechanics and compaction; only the non-dispatching path
+   to it is missing. Splitting into link 1A/1B does not help: retirement blocks NR6 and NR7
+   identically. Chain unchanged — links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent;
+   `RISCV_REMOTE_WAKE` recomputes to **D**; `RISCV_199D_READINESS` stays `case_b`; coordinate 23
+   stays OPEN; ledger stays 40 / 6 / 46; `probe_extension(0x735049)` still uncalled.
+   See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.23. `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.

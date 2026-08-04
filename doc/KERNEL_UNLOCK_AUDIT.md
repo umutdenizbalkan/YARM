@@ -2331,6 +2331,79 @@ probed and remains a hard-stop for the later transport increment.
 
 ---
 
+### 6.1.23 RISC-V chain link 1 — HARD-STOP on retirement; link 1 remains ABSENT
+
+Pre-audit only. **No code was written**, no oracle was added and no chain entry moved. Links
+2, 3, 7 and 9 remain present; **1, 4, 5, 6, 8 and 10 remain absent**; `RISCV_REMOTE_WAKE` recomputes
+unchanged to **D**; `RISCV_199D_READINESS` remains **`case_b`**; coordinate 23 remains **OPEN**;
+the ledger remains **40 / 6 / 46**. `probe_extension(0x735049)` remains uncalled.
+
+The hard-stop asked whether a disposable proof task can satisfy five conditions.
+**Conditions 1–4 are satisfiable. Condition 5 is not.**
+
+| # | Condition | Verdict |
+|---|---|---|
+| 1 | created and run initially on CPU 0 | **YES** — the existing RISC-V direct-IPC oracle already spawns a disposable child server that runs on the boot hart. |
+| 2 | parked in the exact NR6/NR7 waiter state | **YES** — that server blocks in recv-v2 and publishes its blocked-server acknowledgement; the green `STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL` is the standing proof. |
+| 3 | `home_cpu = CpuId(1)` via generic `set_task_home_cpu` | **YES** — the seam is architecture-neutral and already carries `CpuId(1)` on x86_64. |
+| 4 | remotely enqueued to CPU 1 without executing there | **YES** — `sr_enqueue_committed_receiver_split` uses `affinity.unwrap_or(sched.current_cpu)` and `enqueue_on_with_priority` accepts CPU 1 now that it is online (§6.1.22); the hart never dispatches, so it would never execute. |
+| 5 | **safely removed/retired afterwards, without modifying production scheduler or lifecycle semantics** | **NO** |
+
+#### Why condition 5 fails
+
+Once the transaction commits the enqueue, the task sits in **CPU 1's runqueue**, and CPU 1 never
+dispatches. Removing it requires a seam that does not exist:
+
+* `RingQueue::remove_tid` is **private to `scheduler.rs`** and is reachable from exactly one
+  caller — `on_preempt_prefer`, which also *dispatches*. Verified exhaustively: no reference to
+  `remove_tid` exists anywhere outside `src/kernel/scheduler.rs`.
+* There is **no `Scheduler`-level** "remove this TID from that CPU's runqueue" method.
+* There is **no `KernelState`-level** equivalent — `task_present_in_any_runqueue` and
+  `task_present_anywhere` are read-only, and `peek_next_runnable_on` is a non-mutating peek.
+
+That leaves two routes, and both are excluded by the condition itself:
+
+1. **Dispatch it on CPU 1** (`dispatch_next_on(CpuId(1))`, then `block_current_on`). This
+   *schedules* the task onto CPU 1 — it becomes CPU 1's `current` — which is exactly the
+   "no ordinary runnable-task placement / `target_executed=0`" property the proof is supposed to
+   establish, and it destroys the wake-only idle-current invariant: `install_ap_idle_current`
+   refuses to restore the tid-0 placeholder while a current task is present
+   (`SchedulerError::AlreadyQueued`). It also leaves a window in which the task is `Runnable` but
+   in no queue — a lost task.
+2. **Add a generic `Scheduler` removal seam.** That is new **production scheduler surface**, which
+   condition 5 explicitly forbids.
+
+Fabricating a proof that skipped retirement — observing the commit and leaving the task parked on
+CPU 1's runqueue forever — would violate the required post-cleanup evidence ("CPU 1 runqueue
+contains no leaked oracle task") and is not done here.
+
+#### The exact contract that must be split first
+
+Link 1 needs a **generic, arch-neutral, non-dispatching runqueue withdrawal**:
+
+```
+Scheduler::withdraw_queued_tid_on(cpu: CpuId, tid: ThreadId) -> bool
+```
+
+removing `tid` from `cpu`'s priority queues **without** touching `current`, **without**
+dispatching, and **without** altering the task's TCB status — with a `KernelState` wrapper beside
+`task_present_in_any_runqueue`. `RingQueue::remove_tid` already implements the queue mechanics and
+already compacts correctly (`ring_queue_remove_tid_compacts_correctly`); what is missing is the
+non-dispatching path to it. That seam is production scheduler surface and belongs in its own
+increment, with its own guards proving it never dispatches and never changes task status.
+
+Only once withdrawal exists can a disposable task be enqueued to CPU 1 and then retired, which is
+what makes the `RISCV_REMOTE_ENQUEUE_COMMITTED … target_executed=0 result=ok` observation safe to
+take.
+
+#### Scope note
+
+Both directions were considered. Splitting into **link 1A (NR6)** and **link 1B (NR7)** does not
+help: retirement blocks both identically, since both end in a committed enqueue on CPU 1. No
+partial proof is claimed.
+
+---
+
 
 ## 7. Method and limits
 
