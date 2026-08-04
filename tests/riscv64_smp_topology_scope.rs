@@ -235,8 +235,11 @@ fn smoke_script_enforces_per_n_topology() {
             "smoke script missing per-N case arm: {arm}"
         );
     }
+    // Stage 199D link 2: online_cpus tracks --smp N now that trap-ready secondaries are
+    // registered scheduler-online WAKE-ONLY. The non-dispatch guarantee that `online_cpus=1`
+    // used to stand in for is asserted directly by the per-CPU tuple the smoke also pins.
     assert!(
-        smoke.contains("YARM_BOOT_OK present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=1"),
+        smoke.contains("YARM_BOOT_OK present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=${QEMU_SMP}"),
         "smoke must assert YARM_BOOT_OK uses the staged bitmap"
     );
     assert!(

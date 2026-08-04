@@ -168,9 +168,22 @@ fn smoke_script_rejects_present_cpus_one_under_smp_gt_one() {
     // The per-N bitmap assertion encodes both the expected present_cpus
     // count and the expected bitmap, so a fallback to present_cpus=1
     // under --smp >1 is rejected via mismatch with the expected_bitmap_hex.
+    //
+    // Stage 199D link 2: `online_cpus` is no longer pinned to 1 — every trap-ready secondary is
+    // registered scheduler-online in the WAKE-ONLY (non-dispatchable) state, so
+    // online_cpus == present_cpus. The safety that `online_cpus=1` used to stand in for is now
+    // asserted directly, by the per-CPU non-dispatch tuple below.
     assert!(
-        SMOKE_SCRIPT.contains("YARM_BOOT_OK present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=1"),
-        "smoke must enforce per-N present_cpus/bitmap from --smp value"
+        SMOKE_SCRIPT.contains("YARM_BOOT_OK present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=${QEMU_SMP}"),
+        "smoke must enforce per-N present_cpus/bitmap/online_cpus from --smp value"
+    );
+    assert!(
+        SMOKE_SCRIPT.contains("wake_only=1 dispatchable=0 user_dispatch=0 timer=0 queue=0 irq=0"),
+        "an online secondary must be pinned non-dispatchable in every dimension"
+    );
+    assert!(
+        SMOKE_SCRIPT.contains("-smp 1 must emit no secondary marker"),
+        "single-hart runs must stay free of secondary markers"
     );
 }
 

@@ -595,8 +595,13 @@ if (( QEMU_SMP >= 2 )); then
 fi
 
 # Topology assertions: YARM must report present_cpus matching --smp N, and the
-# present_bitmap must be the contiguous 0..N-1 mask for QEMU virt. online_cpus
-# remains 1 until RISC-V SMP scheduling is implemented.
+# present_bitmap must be the contiguous 0..N-1 mask for QEMU virt.
+#
+# Stage 199D link 2: `online_cpus` is no longer pinned to 1. Every TRAP-READY-acknowledged
+# secondary is registered scheduler-online in the WAKE-ONLY (explicitly non-dispatchable) state,
+# so online_cpus == present_cpus. Wake-only CPUs accept no task placement
+# (`least_loaded_online_cpu` skips them) and never dispatch (`dispatching = online & !wake_only`),
+# so this is NOT a claim of RISC-V SMP user dispatch — the per-CPU assertions below pin that.
 expected_bitmap_hex=""
 case "$QEMU_SMP" in
   1) expected_bitmap_hex="0x1" ;;
@@ -605,10 +610,54 @@ case "$QEMU_SMP" in
   4) expected_bitmap_hex="0xf" ;;
 esac
 if [[ -n "$expected_bitmap_hex" ]]; then
-  if ! rg -n "YARM_BOOT_OK present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=1" "$LOGFILE" >/dev/null 2>&1; then
-    echo "[fail] YARM_BOOT_OK must report present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=1"
+  if ! rg -an "YARM_BOOT_OK present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=${QEMU_SMP}" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] YARM_BOOT_OK must report present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=${QEMU_SMP}"
     failures=$((failures + 1))
   fi
+fi
+
+# Stage 199D link 2: every secondary that came online must be WAKE-ONLY, and must have done so
+# only after publishing its link-7 trap-ready state. At -smp 1 there are no secondaries, so none
+# of these markers may appear at all.
+if [[ "$QEMU_SMP" -gt 1 ]]; then
+  expected_secondaries=$(( QEMU_SMP - 1 ))
+  for marker in \
+    "RISCV_SECONDARY_CPU_ID_BOUND" \
+    "RISCV_SECONDARY_KERNEL_SATP_ACTIVE" \
+    "RISCV_SECONDARY_SSCRATCH_READY" \
+    "RISCV_SECONDARY_TRAP_VECTOR_INSTALLED" \
+    "RISCV_SECONDARY_INTERRUPTS_DISABLED" \
+    "RISCV_SECONDARY_TRAP_READY_PARKED" \
+    "RISCV_SCHEDULER_SMP_ONLINE cpu="; do
+    seen=$(rg -ac -- "$marker" "$LOGFILE" 2>/dev/null || echo 0)
+    if [[ "$seen" != "$expected_secondaries" ]]; then
+      echo "[fail] expected ${expected_secondaries}x '${marker}', saw ${seen}"
+      failures=$((failures + 1))
+    fi
+  done
+  # The online secondary must be non-dispatchable in every dimension it reports.
+  if ! rg -an "RISCV_SCHEDULER_SMP_ONLINE cpu=[0-9]+ present=1 online=1 wake_only=1 dispatchable=0 user_dispatch=0 timer=0 queue=0 irq=0" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] RISCV_SCHEDULER_SMP_ONLINE must report wake_only=1 and every dispatch dimension 0"
+    failures=$((failures + 1))
+  fi
+  # Trap-ready state must precede the scheduler registration.
+  ready_line=$(rg -an "RISCV_SECONDARY_TRAP_READY_PARKED" "$LOGFILE" 2>/dev/null | head -n1 | cut -d: -f1)
+  online_line=$(rg -an "RISCV_SCHEDULER_SMP_ONLINE cpu=" "$LOGFILE" 2>/dev/null | head -n1 | cut -d: -f1)
+  if [[ "$ready_line" =~ ^[0-9]+$ && "$online_line" =~ ^[0-9]+$ ]] \
+     && (( ready_line >= online_line )); then
+    echo "[fail] scheduler registration must follow the trap-ready park (ready=${ready_line} online=${online_line})"
+    failures=$((failures + 1))
+  fi
+else
+  for marker in \
+    "RISCV_SECONDARY_CPU_ID_BOUND" \
+    "RISCV_SECONDARY_TRAP_READY_PARKED" \
+    "RISCV_SCHEDULER_SMP_ONLINE"; do
+    if rg -an -- "$marker" "$LOGFILE" >/dev/null 2>&1; then
+      echo "[fail] -smp 1 must emit no secondary marker, but '${marker}' is present"
+      failures=$((failures + 1))
+    fi
+  done
 fi
 
 # Boot hart must not be parked: the RISCV_BOOT_HART_SELECTED hart=N and the
@@ -622,7 +671,9 @@ if [[ -n "$boot_hart" ]]; then
   fi
 fi
 
-# Scheduler-online breadcrumb: always required (RISC-V SMP scheduling is off).
+# Scheduler breadcrumb emitted during the DTB scan, BEFORE kernel bootstrap. It records the
+# scheduler state at that moment; Stage 199D link 2's RISCV_SCHEDULER_SMP_ONLINE supersedes it
+# later in the boot for any trap-ready secondary. Still always required.
 if ! rg -n "RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled" "$LOGFILE" >/dev/null 2>&1; then
   echo "[fail] RISCV_SCHEDULER_BSP_ONLY breadcrumb missing"
   failures=$((failures + 1))

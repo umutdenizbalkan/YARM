@@ -108250,7 +108250,10 @@ mod stage199d_riscv_remote_wake_readiness {
                 what: "the scheduler brings CPU 1 online so an enqueue can target it",
                 seam: "RISCV_SCHEDULER_SMP_ONLINE",
                 scope: Scope::Riscv,
-                present: false,
+                // Stage 199D link 2 closed: trap-ready secondaries are registered through the
+                // GENERIC mark_cpu_wake_only + bring_up_cpu + install_ap_idle_current sequence,
+                // scheduler-online but explicitly NON-DISPATCHABLE.
+                present: true,
             },
             Link {
                 step: 3,
@@ -108328,6 +108331,9 @@ mod stage199d_riscv_remote_wake_readiness {
         // nothing downstream can be exercised until it exists.
         let first = missing[0];
         match first {
+            // Link 1 alone still means the remote target cannot be NAMED: no RISC-V task is
+            // pinned to a non-boot CPU, so `wake_target_cpu` is always the enqueueing CPU even
+            // though CPU 1 is now scheduler-online (wake-only).
             1 | 2 => RemoteEnqueueUnreachableUnderCurrentTopology,
             3 => Other("the committed wake target itself is missing"),
             4 | 5 if missing.iter().all(|s| *s == 4 || *s == 5) => TransportOnlyMissing,
@@ -108357,8 +108363,9 @@ mod stage199d_riscv_remote_wake_readiness {
             .collect();
         assert_eq!(
             missing,
-            alloc::vec![1u8, 2, 4, 5, 6, 8, 10],
-            "link 7 (hart-local trap-ready foundation) is now closed; 3 and 9 already were"
+            alloc::vec![1u8, 4, 5, 6, 8, 10],
+            "links 2, 3, 7 and 9 are closed; the earliest missing link is 1 (no RISC-V task is \
+             pinned to a non-boot CPU), so the verdict is still D"
         );
         assert_ne!(classify(), TransportOnlyMissing);
         assert_ne!(classify(), TransportAndTrapConsumerMissing);
@@ -108612,9 +108619,9 @@ mod stage199d_riscv_remote_wake_readiness {
         );
         assert_eq!(
             missing_non_transport,
-            alloc::vec![1u8, 2, 6, 8, 10],
-            "topology, interrupt enablement, decoder arm and AP dispatch are still absent \
-             (link 7, the trap-ready foundation, is closed)"
+            alloc::vec![1u8, 6, 8, 10],
+            "affinity, interrupt enablement, decoder arm and AP dispatch are still absent \
+             (links 2 and 7 are closed)"
         );
     }
 
@@ -108816,9 +108823,19 @@ mod stage199d_riscv_secondary_trap_ready {
             .split("fn claim_logical_cpu_id_for_hart")
             .nth(1)
             .expect("the claim fn");
+        // The scheduler bound now constrains the ALLOCATED logical id, not the hart id — the
+        // two are not the same, since the boot hart may be any hart and always owns logical 0.
         assert!(
-            claim.contains("hart_id >= crate::kernel::scheduler::MAX_CPUS"),
-            "out-of-range for the scheduler must be refused"
+            claim.contains("for id in 1..crate::kernel::scheduler::MAX_CPUS.min(64)"),
+            "the allocated logical id must be bounded by the scheduler's MAX_CPUS"
+        );
+        assert!(
+            claim.contains("let id = candidate?;"),
+            "exhausting the logical CPU space must fail closed"
+        );
+        assert!(
+            claim.contains("hart_id >= QEMU_VIRT_HSM_SECONDARY_HART_LIMIT"),
+            "a hart outside the handoff table must be refused"
         );
         assert!(
             claim.contains("hart_id == boot_hart_id()"),
@@ -108828,9 +108845,16 @@ mod stage199d_riscv_secondary_trap_ready {
             claim.contains("compare_exchange_weak"),
             "the claim must be atomic so a duplicate cannot be handed to two harts"
         );
+        // Duplication is now prevented BY CONSTRUCTION rather than by a check: the id is chosen
+        // from the free set and claimed with a compare-and-swap, so two harts cannot be handed
+        // the same logical CPU even under a concurrent claim.
         assert!(
-            claim.contains("return None; // duplicate — fail closed"),
-            "a duplicate must fail closed"
+            claim.contains("if seen & (1u64 << id) == 0 {"),
+            "the id must be chosen from the FREE set"
+        );
+        assert!(
+            claim.contains("seen | (1u64 << id)"),
+            "and claimed atomically against the observed word"
         );
         // And the secondary declines to install a vector without a valid mapping.
         assert!(
@@ -108978,5 +109002,315 @@ mod stage199d_riscv_secondary_trap_ready {
         assert!(
             TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,")
         );
+    }
+}
+
+// ── RISC-V remote-wake chain link 2 — CPU 1 scheduler-online, WAKE-ONLY ──────────────────────
+//
+// Logical CPU 1 is now registered scheduler-online in the explicitly NON-DISPATCHABLE wake-only
+// state, through the generic mechanism x86_64 (183.5) and AArch64 (195D) already use. It accepts
+// no task placement, runs no dispatcher, owns no timer, consumes no queue and admits no
+// interrupt — the secondary hart stays in its link-7 `wfi` park.
+//
+// This does NOT advance the verdict: link 1 (no RISC-V task is pinned to a non-boot CPU) is still
+// absent, so the committed `wake_target_cpu` remains the enqueueing CPU and
+// `RISCV_REMOTE_WAKE` remains **D**.
+mod stage199d_riscv_link2_wake_only_online {
+    use super::*;
+
+    const BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+    const TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+    const SCHED: &str = include_str!("../../kernel/scheduler.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+    const SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+
+    fn registration() -> &'static str {
+        let at = BOOT
+            .find("fn riscv_bring_trap_ready_secondaries_online_wake_only")
+            .expect("the link-2 registration fn");
+        let end = BOOT[at..].find("\n}").map(|i| at + i).unwrap_or(BOOT.len());
+        &BOOT[at..end]
+    }
+
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    /// **Link 2 is present only because the GENERIC scheduler reports the CPU online AND
+    /// wake-only.** Wake-only is what makes "online" safe: the scheduler's own placement seam
+    /// skips such CPUs, so onlining does not make CPU 1 eligible for ordinary task placement.
+    #[test]
+    fn link_two_rests_on_generic_online_plus_wake_only() {
+        let reg = registration();
+        assert!(
+            reg.contains("kernel.mark_cpu_wake_only(cpu, true)"),
+            "the generic wake-only mark is used"
+        );
+        assert!(
+            reg.contains("kernel.bring_up_cpu(cpu)"),
+            "the generic bring-up handshake is used"
+        );
+        assert!(
+            reg.contains("kernel.install_ap_idle_current(cpu)"),
+            "the existing idle-current convention is used"
+        );
+        // Wake-only is marked BEFORE onlining — no window in which the CPU is online and
+        // placement-eligible.
+        let mark = reg.find("mark_cpu_wake_only(cpu, true)").expect("mark");
+        let online = reg.find("bring_up_cpu(cpu)").expect("bring up");
+        assert!(
+            mark < online,
+            "wake-only must be marked before the CPU is onlined"
+        );
+        // And the scheduler genuinely excludes wake-only CPUs from placement.
+        assert!(
+            SCHED.contains("if self.wake_only & (1u64 << idx) != 0 {")
+                && SCHED.contains("continue;"),
+            "least_loaded_online_cpu must skip wake-only CPUs"
+        );
+    }
+
+    /// No RISC-V-private scheduler and no second online bitmap were created.
+    #[test]
+    fn no_riscv_private_scheduler_or_second_bitmap() {
+        let reg = code_lines(registration());
+        for forbidden in [
+            "static mut",
+            "AtomicU64::new",
+            "online_bitmap =",
+            "fn schedule",
+        ] {
+            assert!(
+                !reg.iter().any(|l| l.contains(forbidden)),
+                "the registration must use only generic seams: `{forbidden}`"
+            );
+        }
+        // The one bitmap it reads is the scheduler's own.
+        for seam in [
+            "kernel.present_cpu_bitmap()",
+            "kernel.online_cpu_bitmap()",
+            "kernel.wake_only_cpu_bitmap()",
+        ] {
+            assert!(
+                registration().contains(seam),
+                "the read-back must come from the generic scheduler seam `{seam}`"
+            );
+        }
+    }
+
+    /// **Publication happens only after the scheduler state READS BACK present=1 online=1
+    /// wake_only=1**, and a partial registration is rolled back instead of reported.
+    #[test]
+    fn the_marker_is_published_only_after_a_three_way_read_back() {
+        let reg = registration();
+        let rb = reg.find("let present_rb").expect("the read-back");
+        let publish = reg
+            .find("RISCV_SCHEDULER_SMP_ONLINE cpu={} present=1 online=1 wake_only=1")
+            .expect("the publication");
+        assert!(rb < publish, "the read-back must precede publication");
+        assert!(
+            reg.contains("if present_rb && online_rb && wake_only_rb {"),
+            "all three must hold before publishing"
+        );
+        assert!(
+            reg.contains("reason=readback_mismatch"),
+            "a mismatch must be reported, not published as success"
+        );
+        // A failed read-back rolls the wake-only mark back.
+        let mismatch = reg.find("reason=readback_mismatch").expect("mismatch arm");
+        assert!(
+            reg[..mismatch]
+                .rfind("mark_cpu_wake_only(cpu, false)")
+                .is_some(),
+            "a mismatch must roll back the wake-only mark"
+        );
+    }
+
+    /// Registration is gated on the hart having acknowledged TRAP_READY_PARKED — the required
+    /// ordering (steps 1-4 before step 5).
+    #[test]
+    fn registration_requires_a_consumed_trap_ready_ack() {
+        assert!(
+            registration().contains("riscv_trap_ready_acked_bitmap()"),
+            "only trap-ready-acked harts may be registered"
+        );
+        // The ack bit is set where the boot hart CONSUMES the ack.
+        let park = BOOT
+            .find("fn park_qemu_virt_secondaries_once")
+            .expect("the park fn");
+        let body = &BOOT[park..];
+        let wait = body
+            .find("wait_for_secondary_ack(slot)")
+            .expect("the ack wait");
+        let set = body.find("RISCV64_TRAP_READY_ACKED").expect("the ack bit");
+        assert!(wait < set, "the bit is set only after the ack is consumed");
+        // And the secondary acks only after publishing TRAP_READY_PARKED.
+        let sec = BOOT
+            .find("extern \"C\" fn yarm_riscv64_secondary_boot")
+            .expect("secondary");
+        let secbody = &BOOT[sec..];
+        let ready = secbody
+            .find("RISCV_SECONDARY_TRAP_READY_PARKED")
+            .expect("ready marker");
+        let ack = secbody
+            .find("RISCV64_SECONDARY_ACK_PARKED")
+            .expect("the ack write");
+        assert!(
+            ready < ack,
+            "the secondary acks only after it is trap-ready parked"
+        );
+    }
+
+    /// The hart-id → logical-CpuId mapping does not assume they are equal. OpenSBI chooses the
+    /// boot hart nondeterministically, and the boot hart is always logical CPU 0.
+    #[test]
+    fn the_logical_cpu_mapping_reserves_zero_for_the_boot_hart() {
+        assert!(
+            BOOT.contains("core::sync::atomic::AtomicU64::new(1)"),
+            "logical id 0 must be PRE-CLAIMED for the boot hart"
+        );
+        let claim = BOOT
+            .split("fn claim_logical_cpu_id_for_hart")
+            .nth(1)
+            .expect("the claim fn");
+        assert!(
+            claim.contains("for id in 1..crate::kernel::scheduler::MAX_CPUS.min(64)"),
+            "secondaries are allocated the lowest free id at or above 1"
+        );
+        assert!(
+            !claim.contains("Ok(_) => return Some(hart_id)"),
+            "the hart id must not be returned as the logical CpuId"
+        );
+    }
+
+    // ── What must NOT have happened ─────────────────────────────────────────────────────────
+
+    /// Link 7 remains present; links 1, 4, 5, 6, 8 and 10 remain absent.
+    #[test]
+    fn only_link_two_moved() {
+        // Link 7 (trap-ready foundation) still there.
+        assert!(BOOT.contains("RISCV_SECONDARY_TRAP_VECTOR_INSTALLED"));
+        // 1 — no RISC-V affinity to a non-boot CPU.
+        for src in [BOOT, TRAP] {
+            assert!(!src.contains("set_task_home_cpu"), "no RISC-V task pinning");
+        }
+        // 4/5 — no arch wake seam, no SBI IPI probe or implementation.
+        assert!(
+            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
+            "no SBI IPI extension or probe was added"
+        );
+        assert!(
+            !BOOT.contains("send_ipi") && !TRAP.contains("send_ipi"),
+            "no arch wake seam was added"
+        );
+        // 6 — no SSIE enablement.
+        for src in [BOOT, TRAP] {
+            assert!(!src.contains("csrs sie, "), "no sie enablement");
+        }
+        assert!(BOOT.contains("csrw sie, zero"), "sie stays cleared");
+        // 8 — no cause-1 decoder arm.
+        assert!(
+            !TRAP.contains("IRQ_SUPERVISOR_SOFT"),
+            "no software-interrupt arm"
+        );
+        // 10 — no secondary dispatch or user return.
+        let sec = BOOT
+            .find("extern \"C\" fn yarm_riscv64_secondary_boot")
+            .expect("secondary");
+        let end = BOOT[sec..]
+            .find("\n}")
+            .map(|i| sec + i)
+            .unwrap_or(BOOT.len());
+        let code = code_lines(&BOOT[sec..end]);
+        for forbidden in [
+            "dispatch",
+            "enter_user",
+            "sret",
+            "enqueue",
+            "process_cross_cpu",
+        ] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "the secondary must have no dispatch/user-return path: `{forbidden}`"
+            );
+        }
+    }
+
+    /// The secondary never calls the scheduler — registration is entirely the boot hart's.
+    #[test]
+    fn the_secondary_never_calls_the_scheduler() {
+        let sec = BOOT
+            .find("extern \"C\" fn yarm_riscv64_secondary_boot")
+            .expect("secondary");
+        let end = BOOT[sec..]
+            .find("\n}")
+            .map(|i| sec + i)
+            .unwrap_or(BOOT.len());
+        let code = code_lines(&BOOT[sec..end]);
+        for forbidden in [
+            "mark_cpu_wake_only",
+            "bring_up_cpu",
+            "install_ap_idle_current",
+            "with_cpu(",
+        ] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "the secondary must not register itself: `{forbidden}`"
+            );
+        }
+        // The registration runs on the boot hart, with a live &mut KernelState.
+        assert!(
+            BOOT.contains("riscv_bring_trap_ready_secondaries_online_wake_only(kernel);"),
+            "the boot hart performs the registration"
+        );
+    }
+
+    /// The smoke gate proves the wake-only state live, and forbids the markers at `-smp 1`.
+    #[test]
+    fn the_smoke_gate_pins_the_wake_only_state() {
+        assert!(
+            SMOKE.contains("online_cpus=${QEMU_SMP}"),
+            "the gate must expect online_cpus == present_cpus"
+        );
+        assert!(
+            SMOKE.contains(
+                "RISCV_SCHEDULER_SMP_ONLINE cpu=[0-9]+ present=1 online=1 wake_only=1 \
+                 dispatchable=0 user_dispatch=0 timer=0 queue=0 irq=0"
+            ) || SMOKE.contains("wake_only=1 dispatchable=0 user_dispatch=0 timer=0 queue=0 irq=0"),
+            "the gate must pin every non-dispatch dimension"
+        );
+        assert!(
+            SMOKE.contains("-smp 1 must emit no secondary marker"),
+            "the gate must forbid secondary markers at -smp 1"
+        );
+        assert!(
+            SMOKE.contains("scheduler registration must follow the trap-ready park"),
+            "the gate must pin the ordering"
+        );
+    }
+
+    /// Every downstream verdict is unchanged.
+    #[test]
+    fn the_verdicts_and_ledger_are_unchanged() {
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,"),
+            "coordinate 23 stays OPEN"
+        );
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
     }
 }

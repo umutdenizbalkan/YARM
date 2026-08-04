@@ -2223,6 +2223,114 @@ The next increment remains link 2 — bring CPU 1 online — under the hard-stop
 
 ---
 
+### 6.1.22 RISC-V remote-wake chain link 2 — CPU 1 scheduler-online, WAKE-ONLY
+
+Logical CPU 1 is registered scheduler-online in the explicitly **non-dispatchable** wake-only
+state. **The verdict does not move**: link 1 is still absent, so `RISCV_REMOTE_WAKE` remains
+**D**, `RISCV_199D_READINESS` remains **`case_b`**, coordinate 23 remains **OPEN**, and the ledger
+stays **40 / 6 / 46**. No production flip, no new live cell.
+
+#### Pre-audit: the tree already represents the required state — no hard-stop
+
+The hard-stop asked whether `present=1`, `online=1`, `wake_only=1` plus no dispatch, no placement,
+no timer, no queue consumption and no interrupt admission can be represented simultaneously. They
+can, through the **generic** mechanism x86_64 (Stage 183.5) and AArch64 (Stage 195D) already use:
+
+* `mark_cpu_wake_only(cpu, bool)` → `Scheduler::set_cpu_wake_only`, with `wake_only_bitmap()`.
+* **`least_loaded_online_cpu` skips wake-only CPUs outright** — *"wake-only CPUs are online but
+  accept no task placement (no dispatcher runs on them yet) — never balance onto them."* This is
+  the decisive fact: onlining does **not** make CPU 1 eligible for ordinary placement.
+* `dispatching = online_cpu_bitmap() & !wake_only_bitmap()` keeps user dispatch BSP-only.
+* `install_ap_idle_current(cpu)` installs the scheduler-owned idle current (tid 0), the existing
+  convention for an online-but-non-dispatching CPU.
+
+No RISC-V-private scheduler and no second online bitmap were created.
+
+#### Ordering, as required
+
+1. HSM start succeeds (§6.1.21). 2. The secondary publishes CpuId, SATP read-back, private
+`sscratch`, real `stvec` and the interrupts-disabled proof. 3. It publishes
+`RISCV_SECONDARY_TRAP_READY_PARKED` and **only then** sets `ack`. 4. The boot hart consumes the
+ack and records the CpuId in `RISCV64_TRAP_READY_ACKED` — so the bit means *link 7 completed on
+that hart*. 5. On the boot hart, with a live `&mut KernelState`,
+`riscv_bring_trap_ready_secondaries_online_wake_only` marks **wake-only first** (no window in
+which the CPU is online and placement-eligible), then brings it up, then installs the idle
+current. 6. `RISCV_SCHEDULER_SMP_ONLINE` is published **only after** the scheduler state reads
+back `present=1 online=1 wake_only=1`; a mismatch rolls the wake-only mark back and reports
+`reason=readback_mismatch` instead.
+
+The secondary itself never calls the scheduler — it stays in its link-7 `wfi` park with
+`SIE`/`SSIE`/`STIE`/`SEIE` all off.
+
+#### A real defect the live run exposed
+
+The first `-smp 2` run after registration failed with `online_cpus=1` and **`hart=0 cpu=0`** in
+the secondary's own markers. The cause: **OpenSBI chooses the boot hart nondeterministically** —
+that run entered on hart 1 — while the trap bridge always names the boot hart
+`CpuId(BOOTSTRAP_CPU_ID)`. Link 7's mapping assumed `hart_id == logical CpuId`, so secondary
+hart 0 claimed logical CpuId 0: **the boot hart's own id**. The duplicate check could not catch
+it because nothing had claimed bit 0 — the claim word was initialised to `0` even though its own
+doc comment said bit 0 was pre-claimed.
+
+Fixed: logical id 0 is genuinely pre-claimed for the boot hart, and each secondary is allocated
+the **lowest free id ≥ 1** in hart-id order. Verified across three consecutive `-smp 2` runs that
+booted on hart 0 *and* hart 1 — `cpu=1` and `online_cpus=2` in every one. This was a latent link-7
+defect that only a second hart could expose.
+
+A second, smaller defect: the new smoke assertions used `rg -n` on a log containing control
+bytes, so ripgrep printed *"binary file matches"* instead of line numbers and `set -u` tripped on
+the extracted value. The line-number and count lookups now use `-a`, and the ordering comparison
+validates both operands are numeric before arithmetic.
+
+#### The smoke gate had to change, and how
+
+`scripts/qemu-riscv64-core-smoke.sh` hard-required `online_cpus=1` at **any** `-smp`, which would
+have failed this increment by construction. It now expects `online_cpus == present_cpus` and adds
+per-CPU assertions that make onlining safe to accept: every secondary marker exactly
+`N-1` times, the full non-dispatch tuple, the trap-ready-before-registration ordering, and — at
+`-smp 1` — that **no** secondary marker appears at all. The pre-bootstrap
+`RISCV_SCHEDULER_BSP_ONLY` breadcrumb is unchanged and still required; it records the state at DTB
+scan time, which `RISCV_SCHEDULER_SMP_ONLINE` supersedes later in the boot.
+
+#### Live evidence
+
+**`-smp 2` — `[ok] qemu-riscv64-core-smoke passed (smp=2)`.**
+
+```
+RISCV_SECONDARY_CPU_ID_BOUND hart=1 cpu=1 trap_stack_top=0x815fd7c0
+RISCV_SECONDARY_KERNEL_SATP_ACTIVE hart=1 cpu=1 satp=0x0 sfence=1
+RISCV_SECONDARY_SSCRATCH_READY hart=1 cpu=1 sscratch=0x815fd7c0
+RISCV_SECONDARY_TRAP_VECTOR_INSTALLED hart=1 cpu=1 stvec=0x8023a380 expected=0x8023a380
+RISCV_SECONDARY_INTERRUPTS_DISABLED hart=1 cpu=1 sie=0x0 sstatus_sie=0 ssie=0 stie=0 seie=0
+RISCV_SECONDARY_TRAP_READY_PARKED hart=1 cpu=1 online=0 user=0 scheduler=0
+RISCV_SCHEDULER_SMP_ONLINE cpu=1 present=1 online=1 wake_only=1 dispatchable=0 user_dispatch=0 timer=0 queue=0 irq=0
+YARM_BOOT_OK present_cpus=2 present_bitmap=0x3 online_cpus=2
+```
+
+`present_cpus=2`, `online_cpus=2`, CPU 1 explicitly `wake_only=1`; all six link-7 markers exactly
+once and in causal order with `stvec`, `sscratch`, SATP and interrupt read-backs **unchanged**
+from §6.1.21. **Zero CPU-1 activity**: no `SCHED_DISPATCH`, `RISCV_STARTUP_ARGS`, dequeue, timer
+tick or task switch names `cpu=1` — hart 1's *only* log lines are its trap-ready sequence and its
+HSM start. Services and the boot-hart idle chain are healthy; `RISCV_EARLY_TRAP`,
+`RISCV_TRAP_UNHANDLED`, `PAGE_FAULT_UNHANDLED`, `RISCV_TRAP_HANDLE_FAILED`, `PANIC`,
+`RISCV_SCHEDULER_SMP_ONLINE_FAIL`, `RISCV_SECONDARY_TRAP_READY_DECLINED` and
+`RISCV_SECONDARY_CPU_ID_REJECTED` are all 0.
+
+**`-smp 1` — unchanged.** `[ok] … passed (smp=1)`,
+`YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1`, **zero** secondary and link-2
+markers, and the proof-gated direct-IPC seal is still green:
+`STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=riscv64 classes=2 live_cells=2 result=ok`.
+
+#### Chain status
+
+Links **2, 3, 7 and 9 present**; **1, 4, 5, 6, 8 and 10 absent**. The earliest missing link is now
+**1** — no RISC-V task is pinned to a non-boot CPU, so the committed `wake_target_cpu` is still
+always the enqueueing CPU and a remote enqueue still cannot be *named*, let alone signalled. That
+is why the verdict stays **D** even with CPU 1 online. `probe_extension(0x735049)` was **not**
+probed and remains a hard-stop for the later transport increment.
+
+---
+
 
 ## 7. Method and limits
 

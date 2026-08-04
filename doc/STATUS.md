@@ -617,7 +617,35 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    trap-stack top, `sie=0x0 sstatus_sie=0 ssie=0 stie=0 seie=0`, **`online_cpus` still 1**, no
    user/scheduler/timer work on hart 1, a healthy boot-hart service chain and no unexpected trap.
    **Link 2 remains absent**, so `RISCV_REMOTE_WAKE` stays **D**, `RISCV_199D_READINESS` stays
-   `case_b`, coordinate 23 stays OPEN and the ledger stays 40 / 6 / 46. See §6.1.21. `stage199d_riscv_canonical_admission` (11 tests) pins the
+   `case_b`, coordinate 23 stays OPEN and the ledger stays 40 / 6 / 46. See §6.1.21.
+   **Chain link 2 is now CLOSED — CPU 1 is scheduler-online, WAKE-ONLY.** The pre-audit found the
+   tree already represents the required state through the **generic** mechanism x86_64 (183.5) and
+   AArch64 (195D) use — no hard-stop, no RISC-V-private scheduler, no second bitmap. The decisive
+   fact is that `least_loaded_online_cpu` **skips wake-only CPUs outright**, so onlining does not
+   make CPU 1 eligible for ordinary placement, and `dispatching = online & !wake_only` keeps user
+   dispatch BSP-only. Wake-only is marked *before* onlining (no placement window), the idle current
+   (tid 0) is installed, and `RISCV_SCHEDULER_SMP_ONLINE` is published only after the scheduler
+   state **reads back** `present=1 online=1 wake_only=1` — a mismatch rolls back and reports
+   instead. Registration is gated on the hart having acknowledged `TRAP_READY_PARKED`, and the
+   secondary never calls the scheduler.
+   **A latent link-7 defect surfaced here:** OpenSBI chooses the boot hart *nondeterministically*
+   (one `-smp 2` run entered on hart 1), while the bridge always names the boot hart `CpuId(0)`.
+   The mapping had assumed `hart_id == logical CpuId`, so secondary hart 0 claimed the boot hart's
+   own logical id — and the duplicate check could not catch it because the claim word was
+   initialised to `0` despite its comment saying bit 0 was pre-claimed. Logical id 0 is now
+   genuinely reserved and secondaries take the lowest free id ≥ 1; verified across three `-smp 2`
+   runs that booted on hart 0 *and* hart 1, `cpu=1` and `online_cpus=2` every time.
+   Live: `-smp 2` passes with `present_cpus=2 online_cpus=2`, `wake_only=1 dispatchable=0
+   user_dispatch=0 timer=0 queue=0 irq=0`, all six link-7 markers once and in order with
+   read-backs unchanged, and **no `cpu=1` dispatch, user-entry, dequeue, timer or task-switch
+   marker at all** — hart 1's only lines are its trap-ready sequence. `-smp 1` unchanged with zero
+   secondary markers and the direct-IPC seal still `live_cells=2 result=ok`. The core smoke gate
+   was updated (it hard-required `online_cpus=1` at any `-smp`) to expect
+   `online_cpus == present_cpus` plus per-CPU non-dispatch assertions and a `-smp 1` marker ban.
+   **Links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent.** The earliest missing link is now 1 — no
+   RISC-V task is pinned to a non-boot CPU — so `RISCV_REMOTE_WAKE` stays **D**,
+   `RISCV_199D_READINESS` stays `case_b`, coordinate 23 stays OPEN and the ledger stays
+   40 / 6 / 46. See §6.1.22. `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
