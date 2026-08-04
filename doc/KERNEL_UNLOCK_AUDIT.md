@@ -1449,7 +1449,7 @@ Three in-scope blockers remain. None is a defect in the landed x86_64 production
 | 1 | AArch64 off-lock NR6/NR7 + authoritative dispatch (#21) | `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | Landed and exercised hosted (`stage199d_aarch64_offlock_dispatch`, 17 tests). Needs the sequence below; **not** flipped in this audit-only increment. |
 | 2 | AArch64 broad-lock-free handled-syscall return (#22) | `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | Same sequence, behind #1 — the return path is only observable live once a direct AArch64 transaction runs. |
 | 3 | ServerDies live — AArch64 and RISC-V (#16, 1 of 3 earned) | `LIVE_EVIDENCE_PENDING` | x86_64 is sealed (`f5669cb5`). The AArch64 cell falls out of the AArch64 sequence; the RISC-V cell is the **last** link of the separate RISC-V chain. |
-| 4 | RISC-V off-lock NR6/NR7 (#23) | `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` | The code does not exist — proof-gated only, with no post-lock dispatch — and it sits behind a target-spec repair. Four independent links, below. |
+| 4 | RISC-V off-lock NR6/NR7 (#23) | `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` | The code does not exist — proof-gated only, with no post-lock dispatch. Four independent links, below; **link 1 (target-spec) is closed, links 2–4 are not**, so the coordinate stays OPEN. |
 
 **AArch64 required sequence.** AArch64 is not "just a missing emulator": live evidence
 additionally requires enabling the production predicate, and that enablement is only justified
@@ -1463,15 +1463,87 @@ once the proof/oracle run has passed.
 **RISC-V dependency chain — four independent links, not one missing emulator.** Naming RISC-V
 alongside AArch64 as a single environment gap was the taxonomy error this repair corrects.
 
-1. **kernel target-spec / toolchain repair** — `targets/riscv64-yarm-none.json` declares LLVM
-   triple `riscv64gc-unknown-none-elf`, which the current LLVM rejects, so the RISC-V kernel
-   target does not configure at all. (The USER target declares `riscv64-unknown-none-elf` and
-   builds.) Not repaired here.
+1. **kernel target-spec / toolchain repair** — link 1 is **CLOSED**; see §6.1.16.
 2. **RISC-V off-lock NR6/NR7 code** — proof-gated only today, with no post-lock dispatch.
 3. **RISC-V production enablement.**
 4. **live RISC-V NR6/NR7 and ServerDies evidence.**
 
 Only link 4 is an evidence gap; links 1–3 are code, and each strictly precedes the next.
+Coordinate 23 remains **OPEN** on links 2–4.
+
+### 6.1.16 RISC-V dependency-chain link 1 — CLOSED (target-spec only)
+
+A target-spec-only repair. **No runtime semantics, production predicate, ABI, ISA, memory layout
+or linker semantics changed**, and no QEMU seal is required or claimed. Coordinate 23 stays OPEN,
+the closure tally is unchanged, and the live-evidence ledger is unchanged at 40 / 6 / 46.
+
+**The failure, reproduced at the clean parent `2db42681`:**
+
+```
+error: failed to parse target machine config to target machine:
+       could not create LLVM TargetMachine for triple: riscv64gc-unknown-none-elf
+```
+
+**The rejected field is `llvm-target`.** `riscv64gc` is a **Rust target-name** component, not an
+LLVM architecture — LLVM has no `riscv64gc` arch, so `Triple` parsed it as unknown and
+`createTargetMachine` failed before any codegen. The filename and Rust target name never had to
+equal the LLVM triple, and in this tree they never did elsewhere: every other spec already names
+a real LLVM arch (`x86_64-unknown-none`, `aarch64-unknown-none`), and the sibling
+`riscv64-yarm-user-none.json` has always declared `riscv64-unknown-none-elf` and built fine.
+
+The accepted triple was derived from the installed toolchain, not substituted blindly. The
+toolchain's own built-in `riscv64gc-unknown-none-elf` **Rust target** declares
+`llvm-target: "riscv64"` — proof that the `gc` belongs to the Rust name and the ISA belongs in
+`features`. Probing rustc 1.99.0-nightly / LLVM 22.1.8 directly:
+
+| Candidate triple | Result |
+|---|---|
+| `riscv64gc-unknown-none-elf` | **REJECTED** — `could not create LLVM TargetMachine` |
+| `riscv64-unknown-none-elf` | accepted |
+| `riscv64` | accepted |
+| `riscv64-unknown-elf` | accepted |
+
+**The repair is one token** — `riscv64gc-unknown-none-elf` → `riscv64-unknown-none-elf`, matching
+the sibling user target. Every other field is byte-identical: `arch` riscv64, features
+`+m,+a,+f,+d,+c`, `llvm-abiname` lp64d, little endian, 64-bit pointers, static relocation, medium
+code model, max atomic width 64, panic abort, and the same `-Ttargets/riscv64-yarm-none.ld`.
+
+**Proofs.**
+
+1. **rustc creates the target and prints its cfg** — the command that previously failed now
+   emits a full cfg set.
+2. **`target_arch="riscv64"`; `target_feature` covers `m`, `a`, `f`, `d`, `c`** (plus LLVM 22's
+   implied decompositions `zaamo`, `zalrsc`, `zca`, `zicsr`). The ISA/ABI cfg is **identical** to
+   the already-working RISC-V user target, so the expansion is the toolchain's, not the repair's.
+3. **Freestanding kernel builds feature-off** against the custom spec.
+4. **Kernel builds with `riscv-ipccall-direct-oracle`** and with `riscv-shared-region-direct-oracle`.
+5. **RISC-V user target still builds.**
+6. **Control-plane and fs server packages build** for the RISC-V user target
+   (`yarm-control-plane-servers`, `yarm-fs-servers`); `init_server`, `process_manager` and
+   `vfs_server` all link as `EXEC`, machine RISC-V, flags `0x5` — the same ABI as the kernel.
+7. **The linked kernel ELF is static and correct**: `EXEC` (not `DYN`), entry `0x80200000` =
+   `_start` = `__kernel_start` from the linker script, two `PT_LOAD` segments R‑E and RW,
+   `.text.boot` first, **no `INTERP`, no dynamic section, 0 undefined symbols, 0 relocations**.
+8. **ELF flags `0x5` = `EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE`** — RV64GC + lp64d, intact.
+9. **x86_64 and AArch64 freestanding kernel and user checks are unchanged** (all pass).
+
+**Differential against the existing build path.** `scripts/build-qemu-riscv64-artifacts.sh` and
+`.cargo/config.toml` drive the RISC-V kernel through the **built-in** `riscv64gc-unknown-none-elf`
+Rust target with the YARM linker script applied via `rustflags` — which is why the broken custom
+spec never blocked the artifact build. Linking the same binary both ways gives identical
+`type=EXEC`, `machine=RISC-V`, `entry=0x80200000` and `flags=0x5, RVC, double-float ABI`, with
+`PT_LOAD` addresses, permissions and alignment identical; only segment byte sizes differ slightly
+(the built-in target lists `+zicsr,+zifencei` explicitly). **The layout contract is unchanged.**
+Nothing in the build path was repointed — that is not a target-spec repair.
+
+**Guards.** `stage199d_riscv_target_spec_guards` (8 tests) pins the LLVM triple, the ISA feature
+set and the ABI as three **independent** propositions, so the triple can never be "fixed" by
+weakening what it used to imply. The triple's architecture component must be exactly `riscv64`;
+`riscv64gc` must never reappear in any RISC-V spec; each of `+m`, `+a`, `+f`, `+d`, `+c` is
+asserted individually **by name**; `lp64d` is pinned; the kernel and user specs must agree on ISA
+and ABI; and the preserved machine-shape fields plus the `ENTRY(_start)` /
+`KERNEL_LOAD_BASE = 0x80200000` contract are pinned. Each guard is mutation-tested: restoring the
+`riscv64gc` triple, dropping `+c`, and switching `lp64d` to `lp64` each fail by name.
 
 ---
 

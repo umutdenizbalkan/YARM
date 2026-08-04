@@ -105881,11 +105881,15 @@ mod stage199d_closure_matrix {
     /// RISC-V is a FOUR-link chain, not one missing emulator. Each link is independent and
     /// strictly ordered; naming them together with AArch64 was the taxonomy error.
     const RISCV_SEQUENCE: &[&str] = &[
-        "1. kernel target-spec / toolchain repair (targets/riscv64-yarm-none.json declares an LLVM triple the current LLVM rejects)",
+        "1. [CLOSED] kernel target-spec / toolchain repair — the LLVM triple named the Rust target name `riscv64gc`; it now names the LLVM architecture, ISA and ABI unchanged",
         "2. RISC-V off-lock NR6/NR7 code (no post-lock dispatch exists; proof-gated only)",
         "3. RISC-V production enablement",
         "4. live RISC-V NR6/NR7 and ServerDies evidence",
     ];
+
+    /// Links of `RISCV_SEQUENCE` that are closed. Link 1 only — closing it does NOT advance
+    /// coordinate 23, which stays OPEN on links 2–4.
+    const RISCV_LINKS_CLOSED: usize = 1;
 
     // ── Path-addressed source table: evidence resolves against ONE named file ────────────────
 
@@ -106217,6 +106221,40 @@ mod stage199d_closure_matrix {
         );
     }
 
+    /// **RISC-V dependency-chain link 1 is CLOSED, and closing it advances nothing else.** The
+    /// custom kernel target now configures; links 2–4 are untouched and coordinate 23 stays
+    /// OPEN. This is the guard against a target-spec repair being read as RISC-V progress.
+    #[test]
+    fn only_riscv_chain_link_one_is_closed() {
+        assert_eq!(RISCV_LINKS_CLOSED, 1, "exactly one link is closed");
+        assert!(
+            RISCV_SEQUENCE[0].contains("[CLOSED]"),
+            "link 1 is the closed one"
+        );
+        for (i, link) in RISCV_SEQUENCE.iter().enumerate().skip(RISCV_LINKS_CLOSED) {
+            assert!(
+                !link.contains("[CLOSED]"),
+                "RISC-V chain link {} must remain open: `{link}`",
+                i + 1
+            );
+        }
+        let riscv = MATRIX.iter().find(|c| c.id == 23).expect("RISC-V row");
+        assert_eq!(
+            riscv.status, Open,
+            "closing the target-spec link does NOT advance coordinate 23 — the off-lock NR6/NR7 \
+             code, production enablement and live evidence are all still outstanding"
+        );
+        assert_eq!(riscv.blocker, CodeThenEnablementThenEvidence);
+        assert!(
+            riscv.evidence.is_empty(),
+            "coordinate 23 claims no live evidence"
+        );
+        assert!(
+            AUDIT.contains("link 1 is **CLOSED**"),
+            "the audit must record link 1 as closed"
+        );
+    }
+
     /// **The verdict, COMPUTED from the in-scope matrix.** Canonical 199D is closable only when
     /// every IN-SCOPE coordinate is COMPLETE. The 199E deferral is excluded from both sides of
     /// that question: it can neither close 199D nor block it.
@@ -106452,6 +106490,227 @@ mod stage199d_live_evidence_ledger {
         assert!(
             HISTORY.contains("0b5ec254"),
             "the production-default row must name its exact commit"
+        );
+    }
+}
+
+// ── RISC-V target-spec guards — triple pinned SEPARATELY from ISA and ABI ────────────────────
+//
+// Canonical 199D RISC-V dependency-chain link 1. The custom kernel target declared
+// `"llvm-target": "riscv64gc-unknown-none-elf"`. `riscv64gc` is a **Rust target-name**
+// component, not an LLVM architecture: LLVM has no `riscv64gc` arch, so `Triple` parsed it as
+// unknown and `createTargetMachine` failed outright —
+//
+//     error: failed to parse target machine config to target machine:
+//            could not create LLVM TargetMachine for triple: riscv64gc-unknown-none-elf
+//
+// — which meant the RISC-V kernel target could not be configured at all. The repair is one
+// token: the triple names the architecture (`riscv64-unknown-none-elf`, the same triple the
+// sibling user target has always used), and the **ISA lives in `features`**, where it always
+// did.
+//
+// The obvious wrong repair is to "fix the triple" by weakening what it used to imply — dropping
+// `+c`, `+f`, `+d` or switching `lp64d` for `lp64`. The kernel would still build; it would
+// silently be a different machine. These guards therefore pin the triple, the ISA feature set
+// and the ABI as three INDEPENDENT propositions, so no future edit can trade one for another.
+mod stage199d_riscv_target_spec_guards {
+    use super::*;
+
+    const KERNEL_JSON: &str = include_str!("../../../targets/riscv64-yarm-none.json");
+    const USER_JSON: &str = include_str!("../../../targets/riscv64-yarm-user-none.json");
+    const KERNEL_LD: &str = include_str!("../../../targets/riscv64-yarm-none.ld");
+
+    /// The LLVM architecture this project targets. The `gc` spelling is a Rust target name and
+    /// is NOT a valid LLVM arch — pinning the distinction is the whole point of link 1.
+    const LLVM_ARCH: &str = "riscv64";
+    const REJECTED_LLVM_ARCH: &str = "riscv64gc";
+    const SUPPORTED_TRIPLE: &str = "riscv64-unknown-none-elf";
+
+    /// The RV64GC ISA capability, carried by `features` and nowhere else.
+    const REQUIRED_FEATURES: &[(&str, &str)] = &[
+        ("+m", "integer multiply/divide"),
+        (
+            "+a",
+            "atomics — the kernel's lock and IPC seams require them",
+        ),
+        ("+f", "single-precision float"),
+        (
+            "+d",
+            "double-precision float — lp64d passes doubles in FPRs",
+        ),
+        ("+c", "compressed instructions"),
+    ];
+
+    const REQUIRED_ABI: &str = "lp64d";
+
+    /// Value of a JSON string field, without pulling in a parser.
+    fn string_field<'a>(json: &'a str, key: &str) -> &'a str {
+        let needle = alloc::format!("\"{key}\"");
+        let at = json
+            .find(&needle)
+            .unwrap_or_else(|| panic!("target spec has no `{key}` field"));
+        let rest = &json[at + needle.len()..];
+        let colon = rest.find(':').expect("field separator");
+        let after = &rest[colon + 1..];
+        let open = after.find('"').expect("string value opening quote");
+        let tail = &after[open + 1..];
+        let close = tail.find('"').expect("string value closing quote");
+        &tail[..close]
+    }
+
+    /// Value of a JSON number field.
+    fn number_field(json: &str, key: &str) -> u64 {
+        let needle = alloc::format!("\"{key}\"");
+        let at = json
+            .find(&needle)
+            .unwrap_or_else(|| panic!("target spec has no `{key}` field"));
+        let rest = &json[at + needle.len()..];
+        let colon = rest.find(':').expect("field separator");
+        let after = rest[colon + 1..].trim_start();
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        after[..end].parse().expect("numeric value")
+    }
+
+    // ── 1. The triple ───────────────────────────────────────────────────────────────────────
+
+    /// The triple's architecture component must be an LLVM arch. This is the exact field that
+    /// broke the target, so it is pinned on its own.
+    #[test]
+    fn the_llvm_triple_names_an_llvm_architecture() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            let triple = string_field(json, "llvm-target");
+            let arch = triple.split('-').next().expect("triple architecture");
+            assert_eq!(
+                arch, LLVM_ARCH,
+                "the {what} target's LLVM triple must begin with the LLVM architecture `{LLVM_ARCH}`, \
+                 not a Rust target name — got `{triple}`"
+            );
+        }
+        assert_eq!(
+            string_field(KERNEL_JSON, "llvm-target"),
+            SUPPORTED_TRIPLE,
+            "the kernel triple is the one this toolchain accepts"
+        );
+    }
+
+    /// The exact rejected spelling must never come back, in any target spec.
+    #[test]
+    fn the_rejected_riscv64gc_triple_never_returns() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            assert!(
+                !json.contains(REJECTED_LLVM_ARCH),
+                "the {what} target spec names `{REJECTED_LLVM_ARCH}`, which the current LLVM \
+                 rejects with `could not create LLVM TargetMachine for triple` — it is a Rust \
+                 target name, not an LLVM architecture"
+            );
+        }
+    }
+
+    // ── 2. The ISA, pinned independently of the triple ──────────────────────────────────────
+
+    /// Every RV64GC extension is present in `features`. Asserted one at a time so that dropping
+    /// `+c`, `+f` or `+d` fails by name rather than as an opaque string mismatch.
+    #[test]
+    fn the_isa_feature_set_is_rv64gc() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            let features = string_field(json, "features");
+            for (ext, why) in REQUIRED_FEATURES {
+                assert!(
+                    features.split(',').any(|f| f.trim() == *ext),
+                    "the {what} target dropped `{ext}` ({why}) from its ISA feature set `{features}` \
+                     — the triple must never be repaired by weakening the ISA"
+                );
+            }
+        }
+    }
+
+    /// **The separation.** The ISA is carried by `features`; the triple must not encode it. If a
+    /// future edit pushes the ISA back into the triple, LLVM breaks again.
+    #[test]
+    fn the_isa_is_carried_by_features_and_not_by_the_triple() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            let triple = string_field(json, "llvm-target");
+            let arch = triple.split('-').next().expect("triple architecture");
+            assert_eq!(
+                arch.len(),
+                LLVM_ARCH.len(),
+                "the {what} target's triple architecture `{arch}` carries ISA letters — the ISA \
+                 belongs in `features`, and encoding it here is what broke the target"
+            );
+            let features = string_field(json, "features");
+            assert!(
+                features.starts_with('+'),
+                "the {what} target's ISA must be an explicit feature list, got `{features}`"
+            );
+        }
+    }
+
+    // ── 3. The ABI, pinned independently of both ────────────────────────────────────────────
+
+    /// `lp64d` passes doubles in floating-point registers. Silently moving to `lp64` would
+    /// change every FP call boundary while still compiling.
+    #[test]
+    fn the_abi_is_lp64d() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            assert_eq!(
+                string_field(json, "llvm-abiname"),
+                REQUIRED_ABI,
+                "the {what} target must keep the `{REQUIRED_ABI}` ABI"
+            );
+        }
+    }
+
+    /// Kernel and user targets must not drift apart: they share one ISA and one ABI, or the
+    /// kernel and the servers it loads disagree about how to pass arguments.
+    #[test]
+    fn the_kernel_and_user_targets_agree_on_isa_and_abi() {
+        assert_eq!(
+            string_field(KERNEL_JSON, "features"),
+            string_field(USER_JSON, "features"),
+            "kernel and user RISC-V targets must share one ISA feature set"
+        );
+        assert_eq!(
+            string_field(KERNEL_JSON, "llvm-abiname"),
+            string_field(USER_JSON, "llvm-abiname"),
+            "kernel and user RISC-V targets must share one ABI"
+        );
+    }
+
+    // ── 4. Everything the repair had to preserve ────────────────────────────────────────────
+
+    /// The machine-shape fields the target-spec repair was required to leave alone.
+    #[test]
+    fn the_preserved_target_spec_invariants_are_intact() {
+        assert_eq!(string_field(KERNEL_JSON, "arch"), "riscv64");
+        assert_eq!(string_field(KERNEL_JSON, "target-endian"), "little");
+        assert_eq!(number_field(KERNEL_JSON, "target-pointer-width"), 64);
+        assert_eq!(string_field(KERNEL_JSON, "relocation-model"), "static");
+        assert_eq!(
+            string_field(KERNEL_JSON, "code-model"),
+            "medium",
+            "the kernel links at 0x80200000 under the medium code model"
+        );
+        assert_eq!(number_field(KERNEL_JSON, "max-atomic-width"), 64);
+        assert_eq!(string_field(KERNEL_JSON, "panic-strategy"), "abort");
+    }
+
+    /// The linker script and entry/layout contract are the ones that already existed — a
+    /// target-spec repair must not move the kernel.
+    #[test]
+    fn the_linker_script_and_entry_contract_are_unchanged() {
+        assert!(
+            KERNEL_JSON.contains("-Ttargets/riscv64-yarm-none.ld"),
+            "the kernel target must keep linking through the existing YARM linker script"
+        );
+        assert!(
+            KERNEL_LD.contains("ENTRY(_start)"),
+            "the entry symbol contract is `_start`"
+        );
+        assert!(
+            KERNEL_LD.contains("KERNEL_LOAD_BASE = 0x80200000"),
+            "the RISC-V kernel load base is unchanged"
         );
     }
 }

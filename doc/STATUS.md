@@ -453,6 +453,24 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    kernel target-spec/toolchain repair → off-lock NR6/NR7 code → production enablement → live
    NR6/NR7 and ServerDies evidence. Nothing in the list is a defect in the landed x86_64
    production path. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.15.
+   **RISC-V chain link 1 is now CLOSED — target-spec only.** The custom kernel target declared
+   `"llvm-target": "riscv64gc-unknown-none-elf"`; `riscv64gc` is a Rust *target-name* component,
+   not an LLVM architecture, so LLVM 22 failed with `could not create LLVM TargetMachine for
+   triple` and the RISC-V kernel target could not be configured at all. The accepted triple was
+   derived from the toolchain — rustc's own built-in `riscv64gc-unknown-none-elf` Rust target
+   declares `llvm-target: "riscv64"` — and the repair is one token, to
+   `riscv64-unknown-none-elf`, the triple the sibling user target has always used. **Nothing else
+   changed**: `+m,+a,+f,+d,+c`, `lp64d`, little endian, 64-bit pointers, static relocation,
+   medium code model, max atomic width 64, panic abort and the existing linker script are all
+   byte-identical, and the linked ELF is `EXEC` at entry `0x80200000` = `_start` with no
+   interpreter, no dynamic section, zero undefined symbols, zero relocations and flags `0x5`
+   (RVC + double-float ABI). The build path was **not** repointed — it already used the built-in
+   target, and linking both ways yields identical entry, ELF flags and `PT_LOAD` layout.
+   `stage199d_riscv_target_spec_guards` (8 tests) pins the triple, the ISA feature set and the
+   ABI as three independent propositions, each mutation-tested, so the triple can never be
+   "fixed" by dropping `+c`/`+f`/`+d` or switching `lp64d`. **Links 2–4 are untouched and
+   coordinate 23 stays OPEN**; the tally and the 40 / 6 / 46 ledger are unchanged. No QEMU seal
+   is required for a target-spec-only repair. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.16.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
