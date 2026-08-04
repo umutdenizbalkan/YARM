@@ -105411,216 +105411,523 @@ mod stage199d_remote_wake_authority {
 // ── Canonical Stage 199D closure matrix ──────────────────────────────────────────────────────
 //
 // The audit deliverable, made EXECUTABLE. Every coordinate of canonical 199D is classified, and
-// each classification names the exact source seam, hosted test module and live marker that
-// support it. The tests below verify those names actually exist in the tree, so a coordinate
-// cannot claim COMPLETE against a seam that was renamed or a test that was deleted — and the
-// final verdict is COMPUTED from the matrix rather than asserted beside it.
+// each classification names the exact source seam, the hosted test module, and the live evidence
+// that supports it.
+//
+// **Evidence is bound to the coordinate it semantically proves.** An earlier revision of this
+// matrix checked only that a marker literal existed *somewhere* in the tree, which let
+// `IPC_DIRECT_TRANSFER_CAP` — a transfer-cap counter dump — stand as the evidence for the
+// reply-vs-timeout terminal race, a proposition it says nothing about. Each evidence entry now
+// names the file **and the emitting function** whose body must contain the literal, plus the
+// exact observation (field assignment or live count) the seal must show. A marker emitted by an
+// unrelated reporter can no longer be borrowed as proof.
+//
+// The final verdict is COMPUTED from the matrix rather than asserted beside it.
 mod stage199d_closure_matrix {
     use super::*;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Status {
-        /// Landed, exercised hosted, and proven by a live seal on every architecture the
+        /// Landed, exercised hosted, and proven by live evidence on every architecture the
         /// coordinate claims.
         Complete,
-        /// Landed and exercised hosted; the live seal cannot be taken in this environment.
-        StructurallyCompleteLivePending,
+        /// Landed and exercised hosted; live evidence cannot be taken in this environment, and
+        /// for AArch64 a conditional production enablement is also required first.
+        StructurallyComplete,
         /// Landed for some architectures / sub-paths only.
         Partial,
         /// Not retired.
         Open,
+        /// **Not a 199D coordinate.** Belongs to canonical 199E and is excluded from the 199D
+        /// tally and from `CANONICAL_199D_CLOSABLE` entirely — it is neither COMPLETE nor a
+        /// blocker here.
+        DeferredToCanonical199E,
     }
     use Status::*;
 
+    /// Why a non-COMPLETE coordinate is not complete. Distinguishing these is the point: a
+    /// missing emulator, a missing production flip and missing code are not the same debt.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BlockerKind {
+        /// COMPLETE — nothing outstanding.
+        None,
+        /// Live evidence is unobtainable here AND the architecture's production predicate must
+        /// be enabled first, in a stated order. Not a code blocker.
+        LiveEvidencePendingAndConditionalProductionEnablement,
+        /// Code is landed and enabled; only the live run is missing.
+        LiveEvidencePending,
+        /// Code does not exist yet, and reaching live evidence needs an ordered chain beyond it.
+        CodeThenEnablementThenEvidence,
+        /// Out of 199D scope — tracked against canonical 199E.
+        OutOfScope199E,
+    }
+    use BlockerKind::*;
+
+    /// The observation a live run must show for an evidence entry to count.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Observation {
+        /// The emitting format string must carry this field, and the audit must record it.
+        Field(&'static str),
+        /// The audit must record this marker's observed live count as exactly this value.
+        Count(u32),
+        /// Presence of the marker in a live run is itself the observation.
+        Present,
+    }
+    use Observation::*;
+
+    struct Evidence {
+        marker: &'static str,
+        /// Repo-relative path of the file that EMITS (or, for a runner-composed seal, RECORDS)
+        /// the marker. The literal must be in this file — not merely somewhere in the tree.
+        emitter_file: &'static str,
+        /// The function in `emitter_file` whose body must contain the literal. `""` only for a
+        /// runner-composed seal line that no kernel function emits.
+        emitter_fn: &'static str,
+        observation: Observation,
+    }
+
     struct Coordinate {
+        id: u8,
         name: &'static str,
         status: Status,
+        blocker: BlockerKind,
         /// Source seam — must exist in the tree.
         seam: &'static str,
         /// Hosted test module — must exist in `tests.rs`.
         test: &'static str,
-        /// Live marker — must exist in the tree for a COMPLETE cell; "" when live is pending.
-        marker: &'static str,
+        /// Causal live evidence, each entry bound to its emitter. Empty when live is pending,
+        /// open, or deferred.
+        evidence: &'static [Evidence],
     }
 
     const MATRIX: &[Coordinate] = &[
         // ── NR6 request path ────────────────────────────────────────────────────────────────
         Coordinate {
+            id: 1,
             name: "NR6 reply-record creation",
             status: Complete,
+            blocker: None,
             seam: "fn reserve_direct_reply_record_split",
             test: "stage199d_ack_lease_lifecycle",
-            marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_ACK_COUNTERS",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("reserve="),
+            }],
         },
         Coordinate {
+            id: 2,
             name: "NR6 provisional reply-cap mint",
             status: Complete,
+            blocker: None,
             seam: "fn sr_mint_split",
             test: "stage199d_ack_lease_lifecycle",
-            marker: "IPCCALL_DIRECT_REQUEST_OK",
+            evidence: &[Evidence {
+                marker: "IPCCALL_DIRECT_REQUEST_OK",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn emit_ipccall_direct_request_live_markers",
+                observation: Present,
+            }],
         },
         Coordinate {
+            id: 3,
             name: "NR6 reverse-link installation accounting",
             status: Complete,
+            blocker: None,
             seam: "fn install_server_reply_link",
             test: "stage199d_link_creation_parity",
-            marker: "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT",
+            evidence: &[Evidence {
+                marker: "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn maybe_emit_server_dies_link_balance",
+                observation: Field("created="),
+            }],
         },
         Coordinate {
+            id: 4,
             name: "NR6 server wake (enqueue LAST, non-fallible)",
             status: Complete,
+            blocker: None,
             seam: "fn sr_enqueue_committed_receiver_split",
             test: "stage199d_remote_wake_authority",
-            marker: "IPCCALL_DIRECT_REQUEST_OK",
+            evidence: &[Evidence {
+                marker: "IPCCALL_DIRECT_REQUEST_OK",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn emit_ipccall_direct_request_live_markers",
+                observation: Present,
+            }],
         },
         Coordinate {
+            id: 5,
             name: "NR6 delivery projection (inline-opcode framing parity)",
             status: Complete,
+            blocker: None,
             seam: "fn project_recv_delivery",
             test: "stage199d_delivery_projection_differential",
-            marker: "X86_AP_RECV_V2_USER_VALIDATED",
+            evidence: &[Evidence {
+                marker: "X86_AP_RECV_V2_USER_VALIDATED",
+                emitter_file: "src/kernel/boot/exec_state.rs",
+                emitter_fn: "fn build_ap_workload",
+                observation: Present,
+            }],
         },
         // ── NR7 reply path ──────────────────────────────────────────────────────────────────
         Coordinate {
+            id: 6,
             name: "NR7 one-shot record consumption (duplicate barrier)",
             status: Complete,
+            blocker: None,
             seam: "fn consume_reply_record_split",
             test: "stage199d_link_close_parity",
-            marker: "IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED",
+            evidence: &[Evidence {
+                marker: "IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED",
+                emitter_file: "src/kernel/syscall_split.rs",
+                emitter_fn: "fn try_split_ipcreply_direct_into_frame",
+                observation: Present,
+            }],
         },
         Coordinate {
+            id: 7,
             name: "NR7 reverse-link close accounting",
             status: Complete,
+            blocker: None,
             seam: "fn close_server_reply_link",
             test: "stage199d_link_close_parity",
-            marker: "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT",
+            evidence: &[Evidence {
+                marker: "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn maybe_emit_server_dies_link_balance",
+                observation: Field("closed="),
+            }],
         },
         Coordinate {
+            id: 8,
             name: "NR7 caller wake (enqueue LAST, non-fallible)",
             status: Complete,
+            blocker: None,
             seam: "fn sr_claim_endpoint_waiter_split",
             test: "stage199d_remote_wake_authority",
-            marker: "IPCREPLY_DIRECT_OK",
+            evidence: &[Evidence {
+                marker: "IPCREPLY_DIRECT_OK",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn emit_ipcreply_direct_live_markers",
+                observation: Present,
+            }],
         },
         // ── Wake authority ──────────────────────────────────────────────────────────────────
         Coordinate {
+            id: 9,
             name: "Local enqueue authority — no IPI",
             status: Complete,
+            blocker: None,
             seam: "fn current_cpu_split_read",
             test: "stage199d_remote_wake_authority",
-            marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn maybe_emit_quiescent_attestation",
+                observation: Field("result="),
+            }],
         },
         Coordinate {
+            id: 10,
             name: "Remote enqueue authority — one IPI at the home CPU",
             status: Complete,
+            blocker: None,
             seam: "fn send_reschedule_ipi_to",
             test: "stage199d_remote_wake_authority",
-            marker: "X86_AP_RESCHEDULE_IPI_SENT",
+            evidence: &[Evidence {
+                marker: "X86_AP_RESCHEDULE_IPI_SENT",
+                emitter_file: "src/arch/x86_64/smp.rs",
+                emitter_fn: "fn send_reschedule_ipi_to",
+                observation: Present,
+            }],
         },
         Coordinate {
+            id: 11,
             name: "Reverse (NR7) remote enqueue authority",
             status: Complete,
+            blocker: None,
             seam: "fn c2c_send_reschedule_ipi_to",
             test: "stage199d_remote_wake_authority",
-            marker: "X86_BSP_RESCHEDULE_IPI_SENT",
+            evidence: &[Evidence {
+                marker: "X86_BSP_RESCHEDULE_IPI_SENT",
+                emitter_file: "src/arch/x86_64/smp.rs",
+                emitter_fn: "fn c2c_send_reschedule_ipi_to",
+                observation: Present,
+            }],
         },
         // ── Declines and fallbacks ──────────────────────────────────────────────────────────
         Coordinate {
+            id: 12,
             name: "Transfer-cap decline before mutation -> legacy",
             status: Complete,
+            blocker: None,
             seam: "fn transfer_cap_arg_present",
             test: "stage199d_transfer_cap_safety",
-            marker: "IPC_DIRECT_TRANSFER_CAP",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_TRANSFER_CAP",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("declined_transfer_cap="),
+            }],
         },
+        // ── The 199D terminal-arbitration SAFETY coordinate ─────────────────────────────────
+        //
+        // What 199D owns is the *safety* proposition: a terminal-arbitrated NR7 declines BEFORE
+        // any mutation, so the legacy terminal lease wins the causal reply-vs-timeout race
+        // intact. Its evidence is therefore the causal reply-win set — reserve once, beat the
+        // timeout once, never roll back, never defer a timeout claim, with the direct path
+        // recording the arbitrated decline. Not a transfer-cap counter.
         Coordinate {
-            name: "Terminal-arbitrated reply fallback -> legacy",
+            id: 13,
+            name: "Terminal-arbitrated NR7 declines before mutation; legacy wins the causal \
+                   reply-vs-timeout race",
             status: Complete,
+            blocker: None,
             seam: "fn reply_record_terminal_arbitrated_split_read",
             test: "stage199d_terminal_arbitration_safety",
-            marker: "IPC_DIRECT_TRANSFER_CAP",
+            evidence: &[
+                Evidence {
+                    marker: "IPC_DIRECT_PRODUCTION_QUIESCENT",
+                    emitter_file: "src/kernel/direct_ipc_counters.rs",
+                    emitter_fn: "fn emit_quiescent",
+                    observation: Field("arbitrated="),
+                },
+                Evidence {
+                    marker: "IPC_REPLY_WIN_RESERVE",
+                    emitter_file: "src/kernel/boot/ipc_state.rs",
+                    emitter_fn: "fn reserve_reply_win_before_copy",
+                    observation: Count(1),
+                },
+                Evidence {
+                    marker: "IPC_REPLY_BEATS_TIMEOUT_OK",
+                    emitter_file: "src/kernel/boot/ipc_state.rs",
+                    emitter_fn: "fn commit_reply_win_after_delivery",
+                    observation: Count(1),
+                },
+                Evidence {
+                    marker: "IPC_REPLY_WIN_ROLLBACK",
+                    emitter_file: "src/kernel/boot/ipc_state.rs",
+                    emitter_fn: "fn rollback_reply_win",
+                    observation: Count(0),
+                },
+                Evidence {
+                    marker: "IPC_REPLY_TIMEOUT_DEFERRED",
+                    emitter_file: "src/runtime.rs",
+                    emitter_fn: "fn drain_reply_timeout_post_work",
+                    observation: Count(0),
+                },
+            ],
         },
-        // ── Terminal races ──────────────────────────────────────────────────────────────────
+        // ── Excluded from 199D entirely ─────────────────────────────────────────────────────
+        //
+        // Porting the terminal lease INTO the direct transaction — so the direct path can
+        // arbitrate rather than decline — is a 199E deliverable. 199D's contract is the decline,
+        // and the decline is proven (id 13). This row exists so the deferral is visible and
+        // typed, NOT so it can be counted: it is excluded from the tally and from the verdict.
         Coordinate {
-            name: "Reply-vs-timeout terminal race",
-            status: Partial, // declined to legacy by design; the direct terminal lease is 199E
-            seam: "fn reply_record_terminal_arbitrated_split_read",
+            id: 14,
+            name: "Terminal-lease port into the direct transaction (direct-path arbitration)",
+            status: DeferredToCanonical199E,
+            blocker: OutOfScope199E,
+            seam: "fn reserve_reply_win_before_copy",
             test: "stage199d_terminal_arbitration_safety",
-            marker: "",
+            evidence: &[],
         },
+        // ── Remaining terminal races ────────────────────────────────────────────────────────
         Coordinate {
+            id: 15,
             name: "Caller exit / replacement terminal race",
             status: Complete,
+            blocker: None,
             seam: "fn direct_caller_exact_still_blocked",
             test: "stage199d_ack_lease_lifecycle",
-            marker: "IPC_DIRECT_ACK_FUSES",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_ACK_FUSES",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("stale="),
+            }],
         },
         Coordinate {
-            name: "Server death terminal race (reply-link cleanup)",
-            status: Partial, // x86_64 sealed; AArch64 + RISC-V live cells unearned
+            id: 16,
+            name: "Server death terminal race (reply-link cleanup) — x86_64 only",
+            status: Partial,
+            blocker: LiveEvidencePending,
             seam: "fn close_server_reply_link",
             test: "stage199d_link_close_parity",
-            marker: "STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL",
+            evidence: &[Evidence {
+                marker: "STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL",
+                emitter_file: "doc/PROJECT_HISTORY.md",
+                emitter_fn: "",
+                observation: Field("live_cells=1"),
+            }],
         },
         // ── Acknowledgement lifecycle ───────────────────────────────────────────────────────
         Coordinate {
+            id: 17,
             name: "Stale generation / foreign / duplicate release",
             status: Complete,
+            blocker: None,
             seam: "fn release_endpoint_index",
             test: "stage199d_ack_lease_lifecycle",
-            marker: "IPC_DIRECT_ACK_FUSES",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_ACK_FUSES",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("dup_release="),
+            }],
         },
         Coordinate {
+            id: 18,
             name: "Recycled-slot behaviour (positional, endpoint-keyed)",
             status: Complete,
+            blocker: None,
             seam: "pub mod direct_ack_store",
             test: "stage199d_ack_lease_lifecycle",
-            marker: "IPC_DIRECT_ACK_COUNTERS",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_ACK_COUNTERS",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("spent_released="),
+            }],
         },
         Coordinate {
+            id: 19,
             name: "Waiter census / lease bijection",
             status: Complete,
+            blocker: None,
             seam: "pub mod direct_ack_census",
             test: "stage199d_waiter_census",
-            marker: "IPC_DIRECT_WAITER_BIJECTION",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_WAITER_BIJECTION",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_census",
+                observation: Field("waiters_without_lease="),
+            }],
         },
         // ── Per-architecture production status ──────────────────────────────────────────────
         Coordinate {
+            id: 20,
             name: "x86_64 production default ON + live sealed",
             status: Complete,
+            blocker: None,
             seam: "fn ipccall_direct_production_enabled",
             test: "stage199d_production_default_guards",
-            marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn maybe_emit_quiescent_attestation",
+                observation: Field("nr6_ok="),
+            }],
         },
         Coordinate {
+            id: 21,
             name: "AArch64 off-lock NR6/NR7 + authoritative dispatch",
-            status: StructurallyCompleteLivePending, // qemu-system-aarch64 absent
+            status: StructurallyComplete,
+            blocker: LiveEvidencePendingAndConditionalProductionEnablement,
             seam: "fn offlock_authoritative_dispatch_enabled",
             test: "stage199d_aarch64_offlock_dispatch",
-            marker: "",
+            evidence: &[],
         },
         Coordinate {
+            id: 22,
             name: "AArch64 broad-lock-free handled-syscall return",
-            status: StructurallyCompleteLivePending,
+            status: StructurallyComplete,
+            blocker: LiveEvidencePendingAndConditionalProductionEnablement,
             seam: "fn split_finalize_handled_syscall",
             test: "stage199d_split_return_without_broad_lock",
-            marker: "",
+            evidence: &[],
         },
         Coordinate {
+            id: 23,
             name: "RISC-V off-lock NR6/NR7",
-            status: Open, // proof-gated only; no post-lock dispatch; kernel target does not build here
+            status: Open,
+            blocker: CodeThenEnablementThenEvidence,
             seam: "fn ipccall_direct_proof_enabled",
             test: "stage199a2c3_matrix_guards",
-            marker: "",
+            evidence: &[],
         },
         // ── SMP preservation ────────────────────────────────────────────────────────────────
         Coordinate {
+            id: 24,
             name: "SMP=2 cross-CPU request/reply preservation",
             status: Complete,
+            blocker: None,
             seam: "fn drain_direct_reply_post_work",
             test: "stage199d_smp_oracle_request_framing",
-            marker: "STAGE_199_X86_DIRECT_IPC_FINAL_SEAL",
+            evidence: &[Evidence {
+                marker: "STAGE_199_X86_DIRECT_IPC_FINAL_SEAL",
+                emitter_file: "scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh",
+                emitter_fn: "",
+                observation: Field("cross_cpu_request_smp2=1"),
+            }],
         },
     ];
+
+    // ── The ordered enablement / repair sequences the non-COMPLETE rows depend on ────────────
+
+    /// AArch64 is NOT "just a missing emulator". Live evidence additionally requires enabling
+    /// the AArch64 production predicate, and the enablement is only justified once the
+    /// proof/oracle run has passed. This audit-only increment does not flip it.
+    const AARCH64_SEQUENCE: &[&str] = &[
+        "1. proof/oracle QEMU run under qemu-system-aarch64 (AArch64 production predicate still OFF)",
+        "2. enable the AArch64 production predicate",
+        "3. on ONE exact commit: normal feature-off boot + direct oracle + ServerDies + timeout regressions",
+    ];
+
+    /// RISC-V is a FOUR-link chain, not one missing emulator. Each link is independent and
+    /// strictly ordered; naming them together with AArch64 was the taxonomy error.
+    const RISCV_SEQUENCE: &[&str] = &[
+        "1. kernel target-spec / toolchain repair (targets/riscv64-yarm-none.json declares an LLVM triple the current LLVM rejects)",
+        "2. RISC-V off-lock NR6/NR7 code (no post-lock dispatch exists; proof-gated only)",
+        "3. RISC-V production enablement",
+        "4. live RISC-V NR6/NR7 and ServerDies evidence",
+    ];
+
+    // ── Path-addressed source table: evidence resolves against ONE named file ────────────────
+
+    fn source_of(path: &str) -> &'static str {
+        match path {
+            "src/kernel/boot/mod.rs" => include_str!("mod.rs"),
+            "src/kernel/boot/ipc_state.rs" => include_str!("ipc_state.rs"),
+            "src/kernel/boot/exec_state.rs" => include_str!("exec_state.rs"),
+            "src/runtime.rs" => include_str!("../../runtime.rs"),
+            "src/arch/x86_64/smp.rs" => include_str!("../../arch/x86_64/smp.rs"),
+            "src/kernel/direct_ipc_counters.rs" => include_str!("../direct_ipc_counters.rs"),
+            "src/kernel/syscall_split.rs" => include_str!("../syscall_split.rs"),
+            "src/kernel/ipccall_direct_txn.rs" => include_str!("../ipccall_direct_txn.rs"),
+            "doc/PROJECT_HISTORY.md" => include_str!("../../../doc/PROJECT_HISTORY.md"),
+            "scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh" => {
+                include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh")
+            }
+            other => panic!("no source registered for evidence file `{other}`"),
+        }
+    }
+
+    /// The body of `name` in `src`, from its signature to the first line that closes it at the
+    /// same indentation. Used to bind a marker to the function that actually emits it.
+    fn function_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let at = src.find(name)?;
+        let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let indent: usize = src[line_start..at]
+            .chars()
+            .take_while(|c| *c == ' ')
+            .count();
+        let closer = alloc::format!("\n{}}}", " ".repeat(indent));
+        let end = src[at..].find(&closer).map(|i| at + i)?;
+        Some(&src[at..end])
+    }
+
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    fn in_scope() -> impl Iterator<Item = &'static Coordinate> {
+        MATRIX
+            .iter()
+            .filter(|c| c.status != DeferredToCanonical199E)
+    }
 
     /// Every coordinate names a seam that EXISTS in the tree.
     #[test]
@@ -105642,7 +105949,8 @@ mod stage199d_closure_matrix {
         for c in MATRIX {
             assert!(
                 SOURCES.iter().any(|s| s.contains(c.seam)),
-                "coordinate `{}` names a seam that does not exist: `{}`",
+                "coordinate {} `{}` names a seam that does not exist: `{}`",
+                c.id,
                 c.name,
                 c.seam
             );
@@ -105657,103 +105965,316 @@ mod stage199d_closure_matrix {
             let decl = alloc::format!("mod {} {{", c.test);
             assert!(
                 TESTS.contains(&decl),
-                "coordinate `{}` names a test module that does not exist: `{}`",
+                "coordinate {} `{}` names a test module that does not exist: `{}`",
+                c.id,
                 c.name,
                 c.test
             );
         }
     }
 
-    /// Every COMPLETE coordinate names a live marker that EXISTS in the tree — a COMPLETE cell
-    /// must be backed by something a live boot can actually emit, not by prose.
+    /// **The semantic bind.** Each evidence marker must live in the file the coordinate names,
+    /// inside the function the coordinate names as its emitter. Existing *somewhere* in the
+    /// tree is not evidence of anything.
     #[test]
-    fn every_complete_coordinate_names_a_real_live_marker() {
-        const SOURCES: &[&str] = &[
-            include_str!("mod.rs"),
-            include_str!("ipc_state.rs"),
-            include_str!("../../runtime.rs"),
-            include_str!("../../arch/x86_64/smp.rs"),
-            include_str!("../direct_ipc_counters.rs"),
-            include_str!("../syscall_split.rs"),
-            include_str!("../ipccall_direct_txn.rs"),
-        ];
-        const SEAL_SCRIPTS: &str =
-            include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh");
-        const SD_DOC: &str = include_str!("../../../doc/PROJECT_HISTORY.md");
+    fn every_evidence_marker_is_emitted_by_the_function_that_claims_it() {
         for c in MATRIX {
-            if c.status != Complete {
-                continue;
-            }
-            assert!(
-                !c.marker.is_empty(),
-                "COMPLETE coordinate `{}` must name a live marker",
-                c.name
-            );
-            let found = SOURCES.iter().any(|s| s.contains(c.marker))
-                || SEAL_SCRIPTS.contains(c.marker)
-                || SD_DOC.contains(c.marker);
-            assert!(
-                found,
-                "COMPLETE coordinate `{}` names a marker that does not exist: `{}`",
-                c.name, c.marker
-            );
-        }
-    }
-
-    /// A coordinate whose live seal is pending must NOT claim a live marker — that is exactly
-    /// the confusion this classification exists to prevent.
-    #[test]
-    fn live_pending_coordinates_claim_no_live_marker() {
-        for c in MATRIX {
-            if c.status == StructurallyCompleteLivePending || c.status == Open {
+            for e in c.evidence {
+                let src = source_of(e.emitter_file);
                 assert!(
-                    c.marker.is_empty(),
-                    "coordinate `{}` is not live-sealed and must not claim marker `{}`",
+                    src.contains(e.marker),
+                    "coordinate {} `{}`: marker `{}` is not in its declared emitter file `{}`",
+                    c.id,
                     c.name,
-                    c.marker
+                    e.marker,
+                    e.emitter_file
+                );
+                if e.emitter_fn.is_empty() {
+                    continue;
+                }
+                let body = function_body(src, e.emitter_fn).unwrap_or_else(|| {
+                    panic!(
+                        "coordinate {} `{}`: emitter `{}` not found in `{}`",
+                        c.id, c.name, e.emitter_fn, e.emitter_file
+                    )
+                });
+                assert!(
+                    body.contains(e.marker),
+                    "coordinate {} `{}`: marker `{}` exists in `{}` but NOT inside `{}` — it is \
+                     emitted by some other reporter and cannot stand as this coordinate's proof",
+                    c.id,
+                    c.name,
+                    e.marker,
+                    e.emitter_file,
+                    e.emitter_fn
                 );
             }
         }
     }
 
-    /// **The verdict, COMPUTED from the matrix.** Canonical 199D is closable only when every
-    /// coordinate is COMPLETE. Anything less is not, and the arms below name what remains.
+    /// A `Field` observation must be a field the emitter actually prints; a `Count` observation
+    /// must be a live count the audit actually records. Neither can be invented.
+    #[test]
+    fn every_evidence_observation_is_supported_by_emitter_and_audit() {
+        for c in MATRIX {
+            for e in c.evidence {
+                let src = source_of(e.emitter_file);
+                match e.observation {
+                    Field(field) => {
+                        let scope = if e.emitter_fn.is_empty() {
+                            src
+                        } else {
+                            function_body(src, e.emitter_fn).expect("emitter body")
+                        };
+                        assert!(
+                            scope.contains(field),
+                            "coordinate {} `{}`: observation `{}` is not a field `{}` prints",
+                            c.id,
+                            c.name,
+                            field,
+                            e.marker
+                        );
+                    }
+                    Count(n) => {
+                        let recorded = alloc::format!("{}={}", e.marker, n);
+                        assert!(
+                            AUDIT.contains(&recorded),
+                            "coordinate {} `{}`: the audit does not record the live observation \
+                             `{}`",
+                            c.id,
+                            c.name,
+                            recorded
+                        );
+                    }
+                    Present => {}
+                }
+            }
+        }
+    }
+
+    /// The 199D terminal-arbitration coordinate carries the EXACT causal evidence set, and
+    /// specifically not `IPC_DIRECT_TRANSFER_CAP` — the regression this repair exists to pin.
+    #[test]
+    fn the_terminal_arbitration_coordinate_carries_the_causal_evidence_set() {
+        let c = MATRIX
+            .iter()
+            .find(|c| c.id == 13)
+            .expect("the terminal-arbitration safety coordinate");
+        assert_eq!(c.status, Complete);
+
+        let required: &[(&str, Observation)] = &[
+            ("IPC_DIRECT_PRODUCTION_QUIESCENT", Field("arbitrated=")),
+            ("IPC_REPLY_WIN_RESERVE", Count(1)),
+            ("IPC_REPLY_BEATS_TIMEOUT_OK", Count(1)),
+            ("IPC_REPLY_WIN_ROLLBACK", Count(0)),
+            ("IPC_REPLY_TIMEOUT_DEFERRED", Count(0)),
+        ];
+        assert_eq!(
+            c.evidence.len(),
+            required.len(),
+            "the causal evidence set is exactly five entries"
+        );
+        for (marker, obs) in required {
+            let got = c
+                .evidence
+                .iter()
+                .find(|e| e.marker == *marker)
+                .unwrap_or_else(|| panic!("causal evidence `{marker}` is missing"));
+            assert_eq!(got.observation, *obs, "wrong observation for `{marker}`");
+        }
+        assert!(
+            !c.evidence
+                .iter()
+                .any(|e| e.marker == "IPC_DIRECT_TRANSFER_CAP"),
+            "IPC_DIRECT_TRANSFER_CAP is a transfer-cap counter dump and says nothing about the \
+             reply-vs-timeout race — it must never be this coordinate's evidence again"
+        );
+    }
+
+    /// The terminal-lease port is DEFERRED to 199E: excluded from the tally, and it must not be
+    /// reachable as a 199D blocker.
+    #[test]
+    fn the_terminal_lease_port_is_deferred_and_excluded() {
+        let c = MATRIX
+            .iter()
+            .find(|c| c.id == 14)
+            .expect("the terminal-lease port row");
+        assert_eq!(c.status, DeferredToCanonical199E);
+        assert_eq!(c.blocker, OutOfScope199E);
+        assert!(
+            c.evidence.is_empty(),
+            "a deferred coordinate claims no 199D evidence"
+        );
+        assert!(
+            !in_scope().any(|c| c.id == 14),
+            "the deferred row must not appear in the in-scope tally"
+        );
+        assert_eq!(
+            MATRIX
+                .iter()
+                .filter(|c| c.status == DeferredToCanonical199E)
+                .count(),
+            1,
+            "exactly one row is deferred to 199E"
+        );
+    }
+
+    /// A coordinate without live evidence must not claim any, and a COMPLETE one must.
+    #[test]
+    fn evidence_presence_matches_status() {
+        for c in MATRIX {
+            match c.status {
+                Complete => assert!(
+                    !c.evidence.is_empty(),
+                    "COMPLETE coordinate {} `{}` must carry live evidence",
+                    c.id,
+                    c.name
+                ),
+                StructurallyComplete | Open | DeferredToCanonical199E => assert!(
+                    c.evidence.is_empty(),
+                    "coordinate {} `{}` is not live-sealed and must claim no evidence",
+                    c.id,
+                    c.name
+                ),
+                // PARTIAL means sealed on some architectures only — it does carry evidence for
+                // the sub-path it did earn.
+                Partial => {}
+            }
+        }
+    }
+
+    /// Blocker kind and status agree, and the AArch64 rows are typed as needing BOTH live
+    /// evidence and a conditional production enablement — not merely an emulator.
+    #[test]
+    fn blocker_kinds_are_accurate() {
+        for c in MATRIX {
+            match c.status {
+                Complete => assert_eq!(c.blocker, None, "coordinate {} is COMPLETE", c.id),
+                _ => assert_ne!(
+                    c.blocker, None,
+                    "non-COMPLETE coordinate {} must name a blocker kind",
+                    c.id
+                ),
+            }
+        }
+        for id in [21u8, 22] {
+            let c = MATRIX.iter().find(|c| c.id == id).expect("AArch64 row");
+            assert_eq!(c.status, StructurallyComplete);
+            assert_eq!(
+                c.blocker, LiveEvidencePendingAndConditionalProductionEnablement,
+                "AArch64 row {id} needs live evidence AND a conditional production enablement"
+            );
+        }
+        let riscv = MATRIX.iter().find(|c| c.id == 23).expect("RISC-V row");
+        assert_eq!(riscv.status, Open);
+        assert_eq!(
+            riscv.blocker, CodeThenEnablementThenEvidence,
+            "RISC-V is a code blocker with an ordered chain behind it, not a missing emulator"
+        );
+        assert_ne!(
+            riscv.blocker, LiveEvidencePendingAndConditionalProductionEnablement,
+            "RISC-V and AArch64 must not share one blocker kind"
+        );
+    }
+
+    /// The AArch64 and RISC-V sequences are recorded in order, and separately, in the audit.
+    #[test]
+    fn the_enablement_sequences_are_recorded_separately() {
+        assert_eq!(
+            AARCH64_SEQUENCE.len(),
+            3,
+            "the AArch64 sequence has 3 steps"
+        );
+        assert_eq!(RISCV_SEQUENCE.len(), 4, "the RISC-V chain has 4 links");
+        for phrase in [
+            "proof/oracle QEMU",
+            "enable the AArch64 production predicate",
+            "ServerDies",
+        ] {
+            assert!(
+                AARCH64_SEQUENCE.iter().any(|s| s.contains(phrase)),
+                "the AArch64 sequence must record `{phrase}`"
+            );
+        }
+        for phrase in [
+            "target-spec",
+            "off-lock NR6/NR7 code",
+            "production enablement",
+            "ServerDies evidence",
+        ] {
+            assert!(
+                RISCV_SEQUENCE.iter().any(|s| s.contains(phrase)),
+                "the RISC-V chain must record `{phrase}`"
+            );
+        }
+        assert!(
+            AUDIT.contains("LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT"),
+            "the audit must name the AArch64 blocker kind"
+        );
+        assert!(
+            AUDIT.contains("DEFERRED_TO_CANONICAL_199E"),
+            "the audit must name the deferral"
+        );
+    }
+
+    /// **The verdict, COMPUTED from the in-scope matrix.** Canonical 199D is closable only when
+    /// every IN-SCOPE coordinate is COMPLETE. The 199E deferral is excluded from both sides of
+    /// that question: it can neither close 199D nor block it.
     #[test]
     fn canonical_199d_closable_is_computed_from_the_matrix() {
-        let complete = MATRIX.iter().filter(|c| c.status == Complete).count();
-        let live_pending = MATRIX
-            .iter()
-            .filter(|c| c.status == StructurallyCompleteLivePending)
+        let complete = in_scope().filter(|c| c.status == Complete).count();
+        let structural = in_scope()
+            .filter(|c| c.status == StructurallyComplete)
             .count();
-        let partial = MATRIX.iter().filter(|c| c.status == Partial).count();
-        let open = MATRIX.iter().filter(|c| c.status == Open).count();
+        let partial = in_scope().filter(|c| c.status == Partial).count();
+        let open = in_scope().filter(|c| c.status == Open).count();
+        let deferred = MATRIX
+            .iter()
+            .filter(|c| c.status == DeferredToCanonical199E)
+            .count();
+
         assert_eq!(
-            complete + live_pending + partial + open,
+            complete + structural + partial + open,
+            in_scope().count(),
+            "every in-scope coordinate must be classified"
+        );
+        assert_eq!(
+            in_scope().count() + deferred,
             MATRIX.len(),
-            "every coordinate must be classified"
+            "the deferral is the only row outside the in-scope tally"
         );
 
-        let closable = live_pending == 0 && partial == 0 && open == 0;
+        let closable = structural == 0 && partial == 0 && open == 0;
         assert!(
             !closable,
             "the matrix says canonical 199D IS closable — update the audit verdict, which \
              currently records CANONICAL_199D_CLOSABLE=no"
         );
 
-        // The blockers, in dependency order. Recorded here so the count cannot drift silently.
-        assert_eq!(MATRIX.len(), 24, "canonical 199D coordinate count");
-        assert_eq!(complete, 19, "COMPLETE coordinates");
+        // The in-scope tally, recorded so it cannot drift silently.
+        assert_eq!(in_scope().count(), 23, "in-scope coordinate count");
+        assert_eq!(complete, 19, "COMPLETE");
         assert_eq!(
-            live_pending, 2,
-            "AArch64 off-lock dispatch + AArch64 broad-lock-free return, both awaiting \
-             qemu-system-aarch64"
+            structural, 2,
+            "AArch64 off-lock dispatch + AArch64 broad-lock-free return"
         );
-        assert_eq!(partial, 2, "reply-vs-timeout race + ServerDies 1-of-3");
+        assert_eq!(partial, 1, "ServerDies, 1 of 3 architectures");
         assert_eq!(open, 1, "RISC-V off-lock NR6/NR7");
+        assert_eq!(deferred, 1, "the 199E terminal-lease port, excluded");
+    }
+
+    /// Coordinate ids are unique and dense — the audit table and this matrix index the same way.
+    #[test]
+    fn coordinate_ids_are_unique_and_dense() {
+        for (i, c) in MATRIX.iter().enumerate() {
+            assert_eq!(c.id as usize, i + 1, "coordinate ids run 1..=n in order");
+        }
+        assert_eq!(MATRIX.len(), 24, "23 in-scope + 1 deferred");
     }
 
     /// The x86_64 production default is ON and the AArch64/RISC-V defaults are OFF — the audit
-    /// states this, and it must remain true of the tree it describes.
+    /// states this, and it must remain true of the tree it describes. This audit-only increment
+    /// flipped nothing.
     #[test]
     fn the_audited_production_defaults_are_what_the_matrix_claims() {
         const MOD_SRC: &str = include_str!("mod.rs");

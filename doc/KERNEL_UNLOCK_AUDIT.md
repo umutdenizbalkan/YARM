@@ -1312,8 +1312,9 @@ alongside the hosted battery. Full evidence: `doc/IPC.md` §8.6.13.
 
 ### 6.1.15 Canonical Stage 199D closure audit — `CANONICAL_199D_CLOSABLE=no`
 
-An audit increment: **no runtime or semantic code changed**. It reconciles the live-evidence
-ledger and classifies every coordinate of canonical 199D against the tree.
+An audit increment: **no runtime semantics, production predicate or target-spec changed**. It
+reconciles the live-evidence ledger and classifies every coordinate of canonical 199D against the
+tree.
 
 **Ledger reconciliation.** The accepted pre-production subtotal was **39** (30 Stage 198F + 6
 reply-timeout matrix + 2 `ExitCurrentTask` + 1 x86_64 ServerDies). The x86_64 NR6/NR7
@@ -1324,7 +1325,7 @@ frozen by `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` are knob-gated **mechanism** evi
 re-earning at `7d5a22c9` (§0.1 of `doc/STATUS.md`) preserves historical evidence and **adds no
 new cell**, so the combined total is **46**. The superseded pair "39 / 45" and the never-coherent
 "43" are retired. The arithmetic is recomputed from its constituent seals by
-`stage199d_live_evidence_ledger` (6 tests), and `PROJECT_HISTORY.md` now carries the previously
+`stage199d_live_evidence_ledger` (6 tests), and `PROJECT_HISTORY.md` carries the previously
 missing `0b5ec254` row.
 
 | Production / proof-gated / total | Figure | Arithmetic |
@@ -1333,40 +1334,107 @@ missing `0b5ec254` row.
 | Proof-gated (knob-gated mechanism) | **6** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL`, counted once |
 | Total | **46** | 40 + 6 |
 
-**The closure matrix.** 24 coordinates, each naming the exact source seam, hosted test module
-and live marker that support it. `stage199d_closure_matrix` (6 tests) verifies that every named
-seam and test module exists in the tree, that every COMPLETE cell names a marker a live boot can
-actually emit, that no live-pending or open cell claims a marker, and that the verdict is
-**computed** from the matrix rather than asserted beside it.
+#### Taxonomy
 
-| # | Coordinate | Status | Seam | Test | Live marker |
+Four in-scope classifications, plus one exclusion:
+
+| Classification | Meaning |
+|---|---|
+| `COMPLETE` | Landed, exercised hosted, and proven by live evidence on every architecture the coordinate claims. |
+| `STRUCTURALLY_COMPLETE` | Landed and exercised hosted; live evidence is not obtainable here. Carries a blocker kind. |
+| `PARTIAL` | Landed and sealed for some architectures / sub-paths only. |
+| `OPEN` | Not retired. |
+| `DEFERRED_TO_CANONICAL_199E` | **Not a 199D coordinate at all.** Excluded from the tally and from `CANONICAL_199D_CLOSABLE` — it can neither close 199D nor block it. |
+
+Blocker kinds are distinguished because a missing emulator, a missing production flip and missing
+code are not the same debt:
+
+* `LIVE_EVIDENCE_PENDING` — code landed and enabled; only the live run is missing.
+* `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` — live evidence is unobtainable
+  here **and** the architecture's production predicate must be enabled first, in a stated order.
+  Still not a code blocker.
+* `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` — the code does not exist yet, and reaching live evidence
+  needs an ordered chain beyond writing it.
+* `OUT_OF_SCOPE_199E` — tracked against canonical 199E.
+
+#### Evidence is bound to the coordinate it proves
+
+The previous revision of this audit checked only that a marker literal existed **somewhere** in
+the tree. That is not evidence: it let `IPC_DIRECT_TRANSFER_CAP` — a transfer-cap counter dump,
+emitted by `emit_direction` — stand as the proof for the reply-vs-timeout terminal race, a
+proposition it says nothing about. Every evidence entry now names the **file and the emitting
+function** whose body must contain the literal, plus the exact observation (a field the emitter
+actually prints, or a live count this audit actually records). A marker emitted by an unrelated
+reporter can no longer be borrowed. `stage199d_closure_matrix` enforces this in
+`every_evidence_marker_is_emitted_by_the_function_that_claims_it` and
+`every_evidence_observation_is_supported_by_emitter_and_audit`.
+
+#### The closure matrix
+
+23 in-scope coordinates plus 1 excluded deferral. `stage199d_closure_matrix` (12 tests) verifies
+that every named seam and test module exists, that every evidence marker is emitted by the
+function that claims it with the observation it claims, that no live-pending or open cell claims
+evidence, that blocker kinds agree with status, and that the verdict is **computed** from the
+in-scope matrix rather than asserted beside it.
+
+| # | Coordinate | Status | Seam | Test | Live evidence (emitter → observation) |
 |---|---|---|---|---|---|
-| 1 | NR6 reply-record creation | COMPLETE | `reserve_direct_reply_record_split` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` |
-| 2 | NR6 provisional reply-cap mint | COMPLETE | `sr_mint_split` | `stage199d_ack_lease_lifecycle` | `IPCCALL_DIRECT_REQUEST_OK` |
-| 3 | NR6 reverse-link installation accounting | COMPLETE | `install_server_reply_link` | `stage199d_link_creation_parity` | `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT` |
-| 4 | NR6 server wake (enqueue LAST, non-fallible) | COMPLETE | `sr_enqueue_committed_receiver_split` | `stage199d_remote_wake_authority` | `IPCCALL_DIRECT_REQUEST_OK` |
-| 5 | NR6 delivery projection (inline-opcode framing parity) | COMPLETE | `project_recv_delivery` | `stage199d_delivery_projection_differential` | `X86_AP_RECV_V2_USER_VALIDATED` |
-| 6 | NR7 one-shot record consumption (duplicate barrier) | COMPLETE | `consume_reply_record_split` | `stage199d_link_close_parity` | `IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED` |
-| 7 | NR7 reverse-link close accounting | COMPLETE | `close_server_reply_link` | `stage199d_link_close_parity` | `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT` |
-| 8 | NR7 caller wake (enqueue LAST, non-fallible) | COMPLETE | `sr_claim_endpoint_waiter_split` | `stage199d_remote_wake_authority` | `IPCREPLY_DIRECT_OK` |
-| 9 | Local enqueue authority — no IPI | COMPLETE | `current_cpu_split_read` | `stage199d_remote_wake_authority` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` |
-| 10 | Remote enqueue authority — one IPI at the home CPU | COMPLETE | `send_reschedule_ipi_to` | `stage199d_remote_wake_authority` | `X86_AP_RESCHEDULE_IPI_SENT` |
-| 11 | Reverse (NR7) remote enqueue authority | COMPLETE | `c2c_send_reschedule_ipi_to` | `stage199d_remote_wake_authority` | `X86_BSP_RESCHEDULE_IPI_SENT` |
-| 12 | Transfer-cap decline before mutation → legacy | COMPLETE | `transfer_cap_arg_present` | `stage199d_transfer_cap_safety` | `IPC_DIRECT_TRANSFER_CAP` |
-| 13 | Terminal-arbitrated reply fallback → legacy | COMPLETE | `reply_record_terminal_arbitrated_split_read` | `stage199d_terminal_arbitration_safety` | `IPC_DIRECT_TRANSFER_CAP` |
-| 14 | **Reply-vs-timeout terminal race** | **PARTIAL** | `reply_record_terminal_arbitrated_split_read` | `stage199d_terminal_arbitration_safety` | — |
-| 15 | Caller exit / replacement terminal race | COMPLETE | `direct_caller_exact_still_blocked` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_FUSES` |
-| 16 | **Server death terminal race (reply-link cleanup)** | **PARTIAL** | `close_server_reply_link` | `stage199d_link_close_parity` | `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL` (x86_64 only) |
-| 17 | Stale generation / foreign / duplicate release | COMPLETE | `release_endpoint_index` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_FUSES` |
-| 18 | Recycled-slot behaviour (positional, endpoint-keyed) | COMPLETE | `direct_ack_store` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_COUNTERS` |
-| 19 | Waiter census / lease bijection | COMPLETE | `direct_ack_census` | `stage199d_waiter_census` | `IPC_DIRECT_WAITER_BIJECTION` |
-| 20 | x86_64 production default ON + live sealed | COMPLETE | `ipccall_direct_production_enabled` | `stage199d_production_default_guards` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` |
-| 21 | **AArch64 off-lock NR6/NR7 + authoritative dispatch** | **STRUCTURALLY COMPLETE / LIVE PENDING** | `offlock_authoritative_dispatch_enabled` | `stage199d_aarch64_offlock_dispatch` | — |
-| 22 | **AArch64 broad-lock-free handled-syscall return** | **STRUCTURALLY COMPLETE / LIVE PENDING** | `split_finalize_handled_syscall` | `stage199d_split_return_without_broad_lock` | — |
-| 23 | **RISC-V off-lock NR6/NR7** | **OPEN** | `ipccall_direct_proof_enabled` | `stage199a2c3_matrix_guards` | — |
-| 24 | SMP=2 cross-CPU request/reply preservation | COMPLETE | `drain_direct_reply_post_work` | `stage199d_smp_oracle_request_framing` | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` |
+| 1 | NR6 reply-record creation | COMPLETE | `reserve_direct_reply_record_split` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_COUNTERS` (`emit_direction`) → `reserve=` |
+| 2 | NR6 provisional reply-cap mint | COMPLETE | `sr_mint_split` | `stage199d_ack_lease_lifecycle` | `IPCCALL_DIRECT_REQUEST_OK` (`emit_ipccall_direct_request_live_markers`) |
+| 3 | NR6 reverse-link installation accounting | COMPLETE | `install_server_reply_link` | `stage199d_link_creation_parity` | `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT` (`maybe_emit_server_dies_link_balance`) → `created=` |
+| 4 | NR6 server wake (enqueue LAST, non-fallible) | COMPLETE | `sr_enqueue_committed_receiver_split` | `stage199d_remote_wake_authority` | `IPCCALL_DIRECT_REQUEST_OK` (`emit_ipccall_direct_request_live_markers`) |
+| 5 | NR6 delivery projection (inline-opcode framing parity) | COMPLETE | `project_recv_delivery` | `stage199d_delivery_projection_differential` | `X86_AP_RECV_V2_USER_VALIDATED` (`build_ap_workload`) |
+| 6 | NR7 one-shot record consumption (duplicate barrier) | COMPLETE | `consume_reply_record_split` | `stage199d_link_close_parity` | `IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED` (`try_split_ipcreply_direct_into_frame`) |
+| 7 | NR7 reverse-link close accounting | COMPLETE | `close_server_reply_link` | `stage199d_link_close_parity` | `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT` (`maybe_emit_server_dies_link_balance`) → `closed=` |
+| 8 | NR7 caller wake (enqueue LAST, non-fallible) | COMPLETE | `sr_claim_endpoint_waiter_split` | `stage199d_remote_wake_authority` | `IPCREPLY_DIRECT_OK` (`emit_ipcreply_direct_live_markers`) |
+| 9 | Local enqueue authority — no IPI | COMPLETE | `current_cpu_split_read` | `stage199d_remote_wake_authority` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` (`maybe_emit_quiescent_attestation`) → `result=` |
+| 10 | Remote enqueue authority — one IPI at the home CPU | COMPLETE | `send_reschedule_ipi_to` | `stage199d_remote_wake_authority` | `X86_AP_RESCHEDULE_IPI_SENT` (`send_reschedule_ipi_to`) |
+| 11 | Reverse (NR7) remote enqueue authority | COMPLETE | `c2c_send_reschedule_ipi_to` | `stage199d_remote_wake_authority` | `X86_BSP_RESCHEDULE_IPI_SENT` (`c2c_send_reschedule_ipi_to`) |
+| 12 | Transfer-cap decline before mutation → legacy | COMPLETE | `transfer_cap_arg_present` | `stage199d_transfer_cap_safety` | `IPC_DIRECT_TRANSFER_CAP` (`emit_direction`) → `declined_transfer_cap=` |
+| 13 | **Terminal-arbitrated NR7 declines before mutation; legacy wins the causal reply-vs-timeout race** | **COMPLETE** | `reply_record_terminal_arbitrated_split_read` | `stage199d_terminal_arbitration_safety` | **the causal set — see below** |
+| 14 | *Terminal-lease port into the direct transaction (direct-path arbitration)* | **`DEFERRED_TO_CANONICAL_199E`** *(excluded from the tally)* | `reserve_reply_win_before_copy` | `stage199d_terminal_arbitration_safety` | — |
+| 15 | Caller exit / replacement terminal race | COMPLETE | `direct_caller_exact_still_blocked` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_FUSES` (`emit_direction`) → `stale=` |
+| 16 | **Server death terminal race (reply-link cleanup) — x86_64 only** | **PARTIAL** · `LIVE_EVIDENCE_PENDING` | `close_server_reply_link` | `stage199d_link_close_parity` | `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL` → `live_cells=1` |
+| 17 | Stale generation / foreign / duplicate release | COMPLETE | `release_endpoint_index` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_FUSES` (`emit_direction`) → `dup_release=` |
+| 18 | Recycled-slot behaviour (positional, endpoint-keyed) | COMPLETE | `direct_ack_store` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_COUNTERS` (`emit_direction`) → `spent_released=` |
+| 19 | Waiter census / lease bijection | COMPLETE | `direct_ack_census` | `stage199d_waiter_census` | `IPC_DIRECT_WAITER_BIJECTION` (`emit_census`) → `waiters_without_lease=` |
+| 20 | x86_64 production default ON + live sealed | COMPLETE | `ipccall_direct_production_enabled` | `stage199d_production_default_guards` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` (`maybe_emit_quiescent_attestation`) → `nr6_ok=` |
+| 21 | **AArch64 off-lock NR6/NR7 + authoritative dispatch** | **`STRUCTURALLY_COMPLETE`** · `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | `offlock_authoritative_dispatch_enabled` | `stage199d_aarch64_offlock_dispatch` | — |
+| 22 | **AArch64 broad-lock-free handled-syscall return** | **`STRUCTURALLY_COMPLETE`** · `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | `split_finalize_handled_syscall` | `stage199d_split_return_without_broad_lock` | — |
+| 23 | **RISC-V off-lock NR6/NR7** | **OPEN** · `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` | `ipccall_direct_proof_enabled` | `stage199a2c3_matrix_guards` | — |
+| 24 | SMP=2 cross-CPU request/reply preservation | COMPLETE | `drain_direct_reply_post_work` | `stage199d_smp_oracle_request_framing` | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` → `cross_cpu_request_smp2=1` |
 
-**Tally: 19 COMPLETE, 2 STRUCTURALLY COMPLETE / LIVE PENDING, 2 PARTIAL, 1 OPEN.**
+**In-scope tally: 19 COMPLETE, 2 STRUCTURALLY_COMPLETE (live + enablement pending), 1 PARTIAL,
+1 OPEN.** Plus 1 `DEFERRED_TO_CANONICAL_199E`, excluded from the tally.
+
+#### Coordinate 13 — the 199D terminal-arbitration safety proposition
+
+What 199D owns here is a **safety** proposition, and it is COMPLETE: a terminal-arbitrated NR7
+declines **before any mutation**, so the legacy terminal lease wins the causal reply-vs-timeout
+race intact. Its evidence is therefore the causal reply-win set, each entry emitted by the
+function that performs the step it attests:
+
+| Evidence | Emitter | Required observation |
+|---|---|---|
+| `IPC_DIRECT_PRODUCTION_QUIESCENT` | `emit_quiescent` (`src/kernel/direct_ipc_counters.rs`) | `arbitrated=1` |
+| `IPC_REPLY_WIN_RESERVE` | `reserve_reply_win_before_copy` (`src/kernel/boot/ipc_state.rs`) | count = 1 |
+| `IPC_REPLY_BEATS_TIMEOUT_OK` | `commit_reply_win_after_delivery` (`src/kernel/boot/ipc_state.rs`) | count = 1 |
+| `IPC_REPLY_WIN_ROLLBACK` | `rollback_reply_win` (`src/kernel/boot/ipc_state.rs`) | count = 0 |
+| `IPC_REPLY_TIMEOUT_DEFERRED` | `drain_reply_timeout_post_work` (`src/runtime.rs`) | count = 0 |
+
+Read together: the reply reserved the terminal once, beat the timeout once, never rolled back,
+and the timeout never deferred a claim — while the direct path recorded the arbitrated decline.
+That is the causal chain. `IPC_DIRECT_TRANSFER_CAP` is **not** part of it and must never be
+assigned here again; `the_terminal_arbitration_coordinate_carries_the_causal_evidence_set` pins
+both the required set and that exclusion.
+
+#### Coordinate 14 — deferred, not blocking
+
+Porting the terminal lease **into** the direct transaction, so the direct path can arbitrate
+rather than decline, is a canonical **199E** deliverable. 199D's contract is the decline, and the
+decline is proven at coordinate 13. Coordinate 14 is recorded so the deferral is visible and
+typed — **not** so it can be counted. It is `DEFERRED_TO_CANONICAL_199E`, excluded from the tally
+and from `CANONICAL_199D_CLOSABLE`: it can neither close 199D nor block it.
 
 #### Verdict
 
@@ -1374,20 +1442,39 @@ actually emit, that no live-pending or open cell claims a marker, and that the v
 CANONICAL_199D_CLOSABLE=no
 ```
 
-Minimal remaining blockers, in dependency order. Rows 21–22 depend on nothing but an
-environment; rows 14 and 23 are code.
+Three in-scope blockers remain. None is a defect in the landed x86_64 production path.
 
 | Order | Blocker | Kind | Why |
 |---|---|---|---|
-| 1 | AArch64 off-lock NR6/NR7 + authoritative dispatch (#21) | **unavailable-QEMU evidence** | Landed and exercised hosted (`stage199d_aarch64_offlock_dispatch`, 17 tests). `qemu-system-aarch64` is not installed here, so no live cell can be taken. No code work is known to remain. |
-| 2 | AArch64 broad-lock-free handled-syscall return (#22) | **unavailable-QEMU evidence** | Same environment gap. Blocked behind #1: the return path is only observable live once a direct AArch64 transaction runs. |
-| 3 | ServerDies live — AArch64, RISC-V (#16, 1 of 3 earned) | **unavailable-QEMU evidence** | x86_64 is sealed (`f5669cb5`). The AArch64 cell is blocked behind #1–#2; the RISC-V cell is blocked behind #5. |
-| 4 | Reply-vs-timeout terminal race (#14) | **code** | A terminal-arbitrated NR7 declines to legacy *by design*, so the direct path never arbitrates. Closing it means porting the terminal lease into the direct transaction — explicitly canonical **199E**, out of scope here. |
-| 5 | RISC-V off-lock NR6/NR7 (#23) | **code**, then evidence | Proof-gated only, with no post-lock dispatch. It is additionally blocked by a **pre-existing build failure**: `targets/riscv64-yarm-none.json` declares LLVM triple `riscv64gc-unknown-none-elf`, which the current LLVM rejects, so the RISC-V kernel target does not configure. That must be repaired before any RISC-V 199D work; both are out of scope here. |
+| 1 | AArch64 off-lock NR6/NR7 + authoritative dispatch (#21) | `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | Landed and exercised hosted (`stage199d_aarch64_offlock_dispatch`, 17 tests). Needs the sequence below; **not** flipped in this audit-only increment. |
+| 2 | AArch64 broad-lock-free handled-syscall return (#22) | `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | Same sequence, behind #1 — the return path is only observable live once a direct AArch64 transaction runs. |
+| 3 | ServerDies live — AArch64 and RISC-V (#16, 1 of 3 earned) | `LIVE_EVIDENCE_PENDING` | x86_64 is sealed (`f5669cb5`). The AArch64 cell falls out of the AArch64 sequence; the RISC-V cell is the **last** link of the separate RISC-V chain. |
+| 4 | RISC-V off-lock NR6/NR7 (#23) | `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` | The code does not exist — proof-gated only, with no post-lock dispatch — and it sits behind a target-spec repair. Four independent links, below. |
 
-Nothing in this list is a defect in the landed x86_64 production path. Rows 1–3 are the same
-missing emulator; rows 4–5 are deliberately deferred scope. Canonical 199D therefore stays open
-on evidence and on 199E, not on a known bug.
+**AArch64 required sequence.** AArch64 is not "just a missing emulator": live evidence
+additionally requires enabling the production predicate, and that enablement is only justified
+once the proof/oracle run has passed.
+
+1. proof/oracle QEMU run under `qemu-system-aarch64`, AArch64 production predicate still **OFF**;
+2. enable the AArch64 production predicate;
+3. on **one exact commit**: normal feature-off boot + direct oracle + ServerDies + timeout
+   regressions.
+
+**RISC-V dependency chain — four independent links, not one missing emulator.** Naming RISC-V
+alongside AArch64 as a single environment gap was the taxonomy error this repair corrects.
+
+1. **kernel target-spec / toolchain repair** — `targets/riscv64-yarm-none.json` declares LLVM
+   triple `riscv64gc-unknown-none-elf`, which the current LLVM rejects, so the RISC-V kernel
+   target does not configure at all. (The USER target declares `riscv64-unknown-none-elf` and
+   builds.) Not repaired here.
+2. **RISC-V off-lock NR6/NR7 code** — proof-gated only today, with no post-lock dispatch.
+3. **RISC-V production enablement.**
+4. **live RISC-V NR6/NR7 and ServerDies evidence.**
+
+Only link 4 is an evidence gap; links 1–3 are code, and each strictly precedes the next.
+
+---
+
 
 ---
 

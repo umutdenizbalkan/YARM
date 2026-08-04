@@ -428,19 +428,31 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    **40** production-path cells; the six knob-gated x86 SMP mechanism cells (re-earned at
    `7d5a22c9`, adding no new cell) give **46** in total. The superseded "39 / 45" pair and the
    never-coherent "43" are retired, and `PROJECT_HISTORY.md` gains the previously missing
-   `0b5ec254` row. The **executable closure matrix** (`stage199d_closure_matrix`, 6 tests)
-   classifies 24 coordinates — **19 COMPLETE, 2 STRUCTURALLY COMPLETE / LIVE PENDING, 2 PARTIAL,
-   1 OPEN** — each naming the exact seam, hosted test module and live marker that support it,
-   with the verdict *computed* from the matrix rather than asserted beside it. Five blockers
-   remain, in dependency order: (1) AArch64 off-lock NR6/NR7 + authoritative dispatch and
-   (2) the AArch64 broad-lock-free handled-syscall return, both **unavailable-QEMU evidence**
-   blockers (`qemu-system-aarch64` absent; no code work known to remain); (3) the AArch64 and
-   RISC-V ServerDies live cells, likewise evidence, blocked behind (1)–(2) and (5); (4) the
-   reply-vs-timeout terminal race, a **code** blocker deliberately deferred — a
-   terminal-arbitrated NR7 declines to legacy by design, and porting the terminal lease into the
-   direct transaction is canonical **199E**; and (5) RISC-V off-lock NR6/NR7, a **code** blocker
-   additionally gated by the pre-existing RISC-V kernel-target build failure. Nothing in the list
-   is a defect in the landed x86_64 production path. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.15.
+   `0b5ec254` row. The **executable closure matrix** (`stage199d_closure_matrix`, 12 tests)
+   classifies **23 in-scope coordinates — 19 COMPLETE, 2 `STRUCTURALLY_COMPLETE`, 1 PARTIAL,
+   1 OPEN** — plus **1 `DEFERRED_TO_CANONICAL_199E`, excluded from the tally**, with the verdict
+   *computed* from the in-scope matrix rather than asserted beside it.
+   **Evidence is bound to the coordinate it proves.** Checking that a marker literal exists
+   somewhere in the tree is not evidence: it let `IPC_DIRECT_TRANSFER_CAP`, a transfer-cap
+   counter dump, stand as proof for the reply-vs-timeout terminal race. Each entry now names the
+   file *and the emitting function* whose body must contain the literal, plus the exact
+   observation. The 199D safety coordinate — a terminal-arbitrated NR7 declines **before
+   mutation** so the legacy lease wins the causal race — is COMPLETE on the causal set
+   `IPC_DIRECT_PRODUCTION_QUIESCENT … arbitrated=1`, `IPC_REPLY_WIN_RESERVE` count 1,
+   `IPC_REPLY_BEATS_TIMEOUT_OK` count 1, `IPC_REPLY_WIN_ROLLBACK` count 0 and
+   `IPC_REPLY_TIMEOUT_DEFERRED` count 0. Porting the terminal lease *into* the direct transaction
+   is **199E**, so it is typed `DEFERRED_TO_CANONICAL_199E` and can neither close 199D nor block
+   it. Four in-scope blockers remain, in dependency order: (1) AArch64 off-lock NR6/NR7 +
+   authoritative dispatch and (2) the AArch64 broad-lock-free handled-syscall return, both
+   `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` — not merely a missing
+   emulator, since live evidence needs *proof/oracle QEMU → enable the AArch64 production
+   predicate → normal feature-off boot + direct oracle + ServerDies + timeout regressions on one
+   exact commit*, none of which this audit-only increment performs; (3) the AArch64 and RISC-V
+   ServerDies live cells, `LIVE_EVIDENCE_PENDING`; and (4) RISC-V off-lock NR6/NR7,
+   `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` — a **separate four-link chain**, not the AArch64 gap:
+   kernel target-spec/toolchain repair → off-lock NR6/NR7 code → production enablement → live
+   NR6/NR7 and ServerDies evidence. Nothing in the list is a defect in the landed x86_64
+   production path. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.15.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
