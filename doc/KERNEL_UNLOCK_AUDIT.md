@@ -2113,6 +2113,116 @@ answerable on RISC-V, and only then is the IPI transport worth writing.
 
 ---
 
+### 6.1.21 RISC-V blocker 3, link 7 — TRAP-READY PARKED secondary hart
+
+Recorded outcome: **link 7 and its hart-local prerequisites are structurally closed.** Hart 1 now owns a valid
+kernel execution/trap context and parks with every interrupt admission disabled. **Link 2 remains
+absent** — CPU 1 is *not* scheduler-online, runs no scheduler work and no userspace — so
+`RISCV_REMOTE_WAKE` remains **D**, `RISCV_199D_READINESS` remains **`case_b`**, coordinate 23
+remains **OPEN**, and the ledger stays **40 / 6 / 46**.
+
+#### Pre-analysis: where the trap bridge assumed BSP-only
+
+Exactly one code site assumed it — `yarm_riscv64_trap_bridge` opened with
+
+```rust
+let cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+```
+
+and the accepted **§6.1.18 (`d82ef8de`) narrow-snapshot proof rested on that premise**: it argued
+the dropped `set_current_cpu` rebind was vacuous *because* `current_cpu` was invariant on a
+BSP-only architecture. Requirement 5 forces the bridge to derive the real CpuId, so that premise
+can no longer hold by construction.
+
+**It is replaced, not deleted.** The per-hart argument: `with_cpu(cpu, ..)` calls
+`set_current_cpu(cpu)` and then reads `current_tid_on(current_cpu)`, so both reads resolve to
+`current_tid_on(cpu)` **for whatever `cpu` the bridge derives** — the equivalence never depended
+on *which* CPU it was. What the old premise additionally bought is now bought by the fact that
+only the boot hart can reach the bridge at all: the secondaries park with every interrupt
+admission disabled and never enter userspace, so no second hart generates a trap.
+`the_bridge_derives_a_per_hart_cpu_identity` replaces
+`riscv_current_cpu_binding_is_invariant` and pins both halves.
+
+#### What was implemented
+
+| # | Requirement | Implementation |
+|---|---|---|
+| 1 | authoritative logical CpuId, validated, fail-closed | `claim_logical_cpu_id_for_hart` refuses out-of-range (`MAX_CPUS`, handoff table, 64-bit claim word), the boot hart's own id, and duplicates — via an atomic `compare_exchange`. A rejected mapping leaves `cpu_id = usize::MAX` and the secondary parks **without** installing a vector (`RISCV_SECONDARY_TRAP_READY_DECLINED`). |
+| 2 | kernel address space + `sfence.vma`, no `Asid(0)` | The handoff carries the **boot hart's live `satp`**, read from its CSR at prepare time. The secondary writes it, executes `sfence.vma x0, x0`, then reads the CSR back. **No ASID is allocated**, so `Asid(0)` cannot be materialised — the guard forbids `ensure_asid_root`, `activate_asid`, `cr3_for_asid` and `Asid(0)` in that function. |
+| 3 | hart-local CPU binding before any shared code | `RISCV64_SECONDARY_CPU_IDS` / `RISCV64_SECONDARY_TRAP_STACK_TOPS` are published by the boot hart *before* the start request; the secondary's first marker is the binding. |
+| 4 | `sscratch` per the existing ABI | The trap vector's first act is `csrrw sp, sscratch, sp`, so `sscratch` is this hart's **private** trap-stack top from a dedicated `RISCV64_SECONDARY_TRAP_STACKS` array — not the boot hart's `RISCV_TRAP_STACK` (which it would corrupt) and not its own execution stack (which a trap would clobber). **No second frame convention.** |
+| 5 | the bridge derives the trapping CpuId | `riscv_logical_cpu_for_trap_frame(frame_ptr)`. Every trap frame is allocated on the trapping hart's own trap stack, so matching the frame against the published regions names the hart authoritatively — no new CSR, no per-CPU register convention, no lock. A frame outside every secondary region is the boot hart's, reproducing the previous constant exactly. |
+| 6 | real vector installed LAST | `stvec ← yarm_riscv64_trap_vector` only after identity, SATP, fence and `sscratch`; pinned by `the_real_vector_is_installed_last_of_the_state_steps`. |
+| 7 | all interrupt admission disabled | `csrw sie, zero` (SSIE, STIE and SEIE all off) and `csrci sstatus, 2`, both read back. |
+| 8 | dedicated trap-ready park | Terminal `wfi` loop; the guards forbid any scheduler, dispatch, enqueue, cross-CPU, timer, `sret` or `enter_user` token in the function's code lines. |
+
+**Markers report read-back CSR values, never intended values** — each `csrw` is followed by a
+`csrr` into the binding the marker prints, and `sfence.vma` sits between the SATP write and its
+read-back. `the_csr_markers_report_read_back_values` pins that ordering.
+
+#### A defect found and fixed by the live run
+
+The first `-smp 2` run passed the smoke but produced **garbled console output**: the secondary
+wrote its `ack` *before* emitting its markers, so the boot hart resumed from
+`wait_for_secondary_ack` mid-sequence and interleaved its own lines with hart 1's, corrupting
+both. The acknowledgement now lands **after** the trap-ready sequence, so `ack=1` attests
+"trap-ready and parked" rather than merely "reached Rust", and the two harts are never on the
+shared SBI console at once. The bounded poll budget was raised to cover the six console lines.
+
+#### Live evidence
+
+**`-smp 1` — unchanged.** `[ok] qemu-riscv64-core-smoke passed (smp=1)`,
+`YARM_BOOT_OK present_cpus=1 present_bitmap=0x1 online_cpus=1`, and **all six secondary markers
+count 0**. The proof-gated direct-IPC smoke still passes:
+`STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=riscv64 classes=2 live_cells=2 result=ok`.
+
+**`-smp 2` — `[ok] qemu-riscv64-core-smoke passed (smp=2)`.** Each marker exactly once, in causal
+order:
+
+```
+RISCV_SECONDARY_CPU_ID_BOUND hart=1 cpu=1 trap_stack_top=0x815fd7c0
+RISCV_SECONDARY_KERNEL_SATP_ACTIVE hart=1 cpu=1 satp=0x0 sfence=1
+RISCV_SECONDARY_SSCRATCH_READY hart=1 cpu=1 sscratch=0x815fd7c0
+RISCV_SECONDARY_TRAP_VECTOR_INSTALLED hart=1 cpu=1 stvec=0x8023a290 expected=0x8023a290
+RISCV_SECONDARY_INTERRUPTS_DISABLED hart=1 cpu=1 sie=0x0 sstatus_sie=0 ssie=0 stie=0 seie=0
+RISCV_SECONDARY_TRAP_READY_PARKED hart=1 cpu=1 online=0 user=0 scheduler=0
+YARM_RISCV64_SMP_HART_START hart=1 ret=0 ack=1 state=parked_not_online …
+```
+
+* **`present_cpus=2`** — `RISCV_HART_TOPOLOGY present_cpus=2 present_bitmap=0x3 boot_hart=0`.
+* **HSM start + ack exactly once** — `ret=0 ack=1`, one `RISCV_SECONDARY_HART_PARK`.
+* **Hart 1 owns `CpuId(1)`, not `CpuId(0)`** — every marker reads `cpu=1`.
+* **`stvec` is the real YARM trap entry** — read back equals `expected`.
+* **`sscratch` is valid for the existing frame ABI** — it equals the `trap_stack_top` reported by
+  the binding marker, a private per-hart trap stack.
+* **SIE, SSIE, STIE (and SEIE) all disabled** — read back as `0`.
+* **`online_cpus` remains exactly 1** — `RISCV_SCHEDULER_BSP_ONLY online_cpus=1
+  reason=riscv_smp_scheduler_not_enabled`, `YARM_BOOT_OK … online_cpus=1`.
+* **No user task, dispatch or timer on hart 1**, and no `RISCV_SECONDARY_TRAP_READY_DECLINED` or
+  `RISCV_SECONDARY_CPU_ID_REJECTED`.
+* **Boot hart healthy** — service chain up, terminal `RISCV_KERNEL_IDLE_WAITING_FOR_IO`.
+* **No unexpected trap, fault, reset or duplicate startup** — `RISCV_EARLY_TRAP`,
+  `RISCV_TRAP_UNHANDLED`, `PAGE_FAULT_UNHANDLED`, `RISCV_TRAP_HANDLE_FAILED`, `PANIC` all 0.
+
+**On `satp=0x0`.** That is the boot hart's *live* value at secondary-start time: RISC-V YARM
+executes the kernel in **bare mode** and switches `satp` only to enter a user address space. The
+correctness property being established is that hart 1's translation state is **identical to the
+boot hart's**, captured rather than invented; the marker reports the read-back, so it claims
+exactly that and no more.
+
+#### No hard-stop triggered
+
+Interrupts were not enabled to make the vector safe (the park emits no faulting instruction);
+neither the kernel `satp` nor the CpuId required a new global-lock dependency (a CSR read and a
+lock-free atomic claim); `online_cpus` stayed 1; hart 1 executed no userspace or scheduler work;
+`-smp 1` is unchanged; and no trap reached the new vector.
+
+**Chain status after this increment: links 3, 7 and 9 present; 1, 2, 4, 5, 6, 8, 10 absent.**
+The next increment remains link 2 — bring CPU 1 online — under the hard-stops already recorded in
+§6.1.20, including that `probe_extension(0x735049)` must succeed before any IPI transport work.
+
+---
+
 
 ## 7. Method and limits
 

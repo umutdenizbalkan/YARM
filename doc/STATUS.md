@@ -594,7 +594,30 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    hard-stops on `probe_extension(0x735049)`, `-smp 1` byte-identity, no user code on hart 1, and
    a healthy service chain at `online_cpus=2`. `stage199d_riscv_remote_wake_readiness` (13 tests)
    computes the classification from architecture-scoped seam probes. Ledger unchanged at
-   40 / 6 / 46; coordinate 23 stays OPEN. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.20. `stage199d_riscv_canonical_admission` (11 tests) pins the
+   40 / 6 / 46; coordinate 23 stays OPEN. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.20.
+   **Blocker-3 link 7 is now structurally CLOSED — the trap-ready parked secondary.** Hart 1 owns
+   a valid kernel execution/trap context and parks with every interrupt admission disabled: a
+   validated, atomically-claimed logical `CpuId(1)`; the boot hart's live `satp` captured from its
+   CSR and installed with the required `sfence.vma` (no ASID allocated, so `Asid(0)` cannot be
+   materialised); `sscratch` set to a **private** per-hart trap stack per the existing
+   `csrrw sp, sscratch, sp` frame ABI; and the real `yarm_riscv64_trap_vector` installed **last**,
+   only after identity, address space and trap stack are valid. All six markers report values
+   **read back from the CSRs**. `sie` is cleared outright and `sstatus.SIE` stays 0.
+   **The §6.1.18 narrow-snapshot premise was replaced, not deleted:** the bridge now *derives* the
+   trapping CpuId from the frame pointer (frames land on the trapping hart's own trap stack), and
+   the equivalence argument is re-made per-hart — `with_cpu(cpu, ..)` and
+   `current_tid_split_read(cpu)` both resolve to `current_tid_on(cpu)` for whatever cpu is
+   derived, and only the boot hart can reach the bridge while secondaries park interrupts-disabled
+   and never enter userspace. A live defect was found and fixed en route: the secondary acked
+   *before* emitting its markers, so the boot hart resumed mid-sequence and interleaved the shared
+   SBI console — the ack now lands after the sequence, making `ack=1` attest "trap-ready and
+   parked". Live: `-smp 1` unchanged with **zero** secondary markers and the direct-IPC smoke
+   still `live_cells=2 result=ok`; `-smp 2` passes with `present_cpus=2`, each marker exactly once
+   in causal order, `cpu=1`, `stvec` equal to the real vector, `sscratch` equal to the private
+   trap-stack top, `sie=0x0 sstatus_sie=0 ssie=0 stie=0 seie=0`, **`online_cpus` still 1**, no
+   user/scheduler/timer work on hart 1, a healthy boot-hart service chain and no unexpected trap.
+   **Link 2 remains absent**, so `RISCV_REMOTE_WAKE` stays **D**, `RISCV_199D_READINESS` stays
+   `case_b`, coordinate 23 stays OPEN and the ledger stays 40 / 6 / 46. See §6.1.21. `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.

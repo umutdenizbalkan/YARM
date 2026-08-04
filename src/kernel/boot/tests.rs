@@ -107212,8 +107212,8 @@ mod stage199d_riscv_production_readiness_audit {
             "and no IPI extension — there is no cross-hart wake authority to call"
         );
         assert!(
-            RISCV_BRIDGE.contains("RISC-V is BSP-only"),
-            "which is latent only because RISC-V runs one hart"
+            RISCV_BRIDGE.contains("RISCV_SCHEDULER_BSP_ONLY") || RISCV_BRIDGE.contains("online=0"),
+            "latent only because no RISC-V CPU beyond the boot hart is scheduler-online"
         );
     }
 
@@ -107533,34 +107533,59 @@ mod stage199d_riscv_narrow_trap_snapshots {
 
     // ── The premise that makes the dropped `set_current_cpu` vacuous ────────────────────────
 
-    /// `with_cpu` also REBINDS `current_cpu`; a pure read does not. On this bridge that side
-    /// effect is idempotent because RISC-V is BSP-only and the bridge always passes
-    /// `BOOTSTRAP_CPU_ID`. If that ever stops being true, this fails.
+    /// **The d82ef8de premise, REPLACED — not deleted.** That proof rested on "the bridge always
+    /// passes `BOOTSTRAP_CPU_ID` on a BSP-only architecture", which made the dropped
+    /// `set_current_cpu` rebind vacuous. Stage 199D link 7 makes the bridge DERIVE the trapping
+    /// CpuId, so that premise no longer holds by construction and is replaced by a per-hart one.
+    ///
+    /// The per-hart argument: `with_cpu(cpu, ..)` calls `set_current_cpu(cpu)` and then reads
+    /// `current_tid_on(current_cpu)`, so both reads resolve to `current_tid_on(cpu)` for whatever
+    /// `cpu` the bridge derives — the equivalence is independent of WHICH cpu that is. What the
+    /// old premise additionally bought (an idempotent rebind) is now bought by the fact that only
+    /// the boot hart can reach this bridge at all: the secondaries park with every interrupt
+    /// admission disabled and never enter userspace, so no second hart generates a trap.
     #[test]
-    fn riscv_current_cpu_binding_is_invariant() {
-        // Read structurally: a hosted x86 test build does not link the RISC-V arch module.
-        const RISCV_LAYOUT: &str = include_str!("../../arch/riscv64/platform_layout.rs");
+    fn the_bridge_derives_a_per_hart_cpu_identity() {
+        // The constant is gone; the derivation is in its place.
         assert!(
-            RISCV_LAYOUT.contains("pub const BOOTSTRAP_CPU_ID: u8 = 0;"),
-            "the bridge's CPU is the bootstrap hart"
-        );
-        assert!(
-            BRIDGE.contains("RISC-V is BSP-only (`online_cpus==1`)"),
-            "the BSP-only premise must stay recorded at the site that depends on it"
-        );
-        assert!(
-            bridge_body().contains(
+            !bridge_body().contains(
                 "let cpu = crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);"
             ),
-            "the bridge must not derive its CPU from anything but the bootstrap constant"
+            "the bridge must no longer hardcode the bootstrap CPU"
         );
-        // A single-hart scheduler admits no other CPU, so a rebind could only ever be a no-op.
-        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         assert!(
-            kernel
-                .with(|state| state.set_current_cpu(CpuId(1)))
-                .is_err(),
-            "while only one CPU is online, binding any other CPU must be refused"
+            bridge_body()
+                .contains("let cpu = riscv_logical_cpu_for_trap_frame(frame_ptr as usize);"),
+            "the bridge must derive the trapping CpuId from the frame pointer"
+        );
+        // The derivation is authoritative: frames are allocated on the trapping hart's own trap
+        // stack, because the vector's first act swaps sp with sscratch.
+        assert!(
+            BRIDGE.contains("csrrw sp, sscratch, sp"),
+            "the trap vector swaps sp with the per-hart trap stack — that is what makes the \
+             frame pointer name the hart"
+        );
+        assert!(
+            BRIDGE.contains("fn riscv_logical_cpu_for_trap_frame"),
+            "the derivation helper exists"
+        );
+        // A frame outside every secondary region falls back to the bootstrap CPU, reproducing the
+        // previous constant exactly for the boot hart.
+        let helper = BRIDGE
+            .split("fn riscv_logical_cpu_for_trap_frame")
+            .nth(1)
+            .expect("the helper body");
+        assert!(
+            helper.contains(
+                "crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID)"
+            ),
+            "the boot hart's identity is unchanged"
+        );
+        // And only the boot hart can reach the bridge: secondaries park interrupts-disabled.
+        assert!(
+            BRIDGE.contains("RISCV_SECONDARY_INTERRUPTS_DISABLED")
+                && BRIDGE.contains("RISCV_SECONDARY_TRAP_READY_PARKED"),
+            "the secondaries park with interrupt admission proven disabled"
         );
     }
 
@@ -108260,7 +108285,9 @@ mod stage199d_riscv_remote_wake_readiness {
                 what: "hart 1's stvec points at the YARM trap vector rather than a wfi park",
                 seam: "RISCV_SECONDARY_TRAP_VECTOR_INSTALLED",
                 scope: Scope::Riscv,
-                present: false,
+                // Stage 199D link 7 closed: the secondary installs the real YARM trap vector
+                // after stack, SATP, sfence, sscratch and CPU identity are valid.
+                present: true,
             },
             Link {
                 step: 8,
@@ -108330,8 +108357,8 @@ mod stage199d_riscv_remote_wake_readiness {
             .collect();
         assert_eq!(
             missing,
-            alloc::vec![1u8, 2, 4, 5, 6, 7, 8, 10],
-            "only the wake-target comparison (3) and the cross-CPU consumer (9) exist"
+            alloc::vec![1u8, 2, 4, 5, 6, 8, 10],
+            "link 7 (hart-local trap-ready foundation) is now closed; 3 and 9 already were"
         );
         assert_ne!(classify(), TransportOnlyMissing);
         assert_ne!(classify(), TransportAndTrapConsumerMissing);
@@ -108379,14 +108406,15 @@ mod stage199d_riscv_remote_wake_readiness {
         let at = RISCV_BOOT
             .find("extern \"C\" fn yarm_riscv64_secondary_boot")
             .expect("the secondary boot fn");
-        let body = &RISCV_BOOT[at..at + 1200];
+        let body = &RISCV_BOOT[at..];
+        let park = body.find("loop {").expect("the terminal park loop");
         assert!(
-            body.contains("asm!(\"wfi\""),
+            body[park..].contains("asm!(\"wfi\""),
             "the secondary's terminal state is a wfi loop"
         );
         assert!(
-            !body.contains("dispatch") && !body.contains("with_cpu"),
-            "the parked hart touches no scheduler or kernel state"
+            !body[..park].contains("dispatch_next_task") && !body[..park].contains("with_cpu("),
+            "the parked hart runs no scheduler work and takes no broad lock"
         );
     }
 
@@ -108439,9 +108467,19 @@ mod stage199d_riscv_remote_wake_readiness {
                 "no sie.SSIE enablement may exist yet"
             );
         }
+        // The trap-ready park REPORTS the ssie bit (read back from `sie`) — reporting is not
+        // enabling. What must not exist is a set of bit 1 in `sie`.
+        for src in [RISCV_BOOT, RISCV_TRAP, RISCV_TIMER] {
+            assert!(
+                !src.contains("csrs sie, ")
+                    && !src
+                        .contains("csrrs zero, sie, {0}\",\n                in(reg) 1usize << 1"),
+                "no sie.SSIE enablement may exist"
+            );
+        }
         assert!(
-            !RISCV_BOOT.contains("SSIE") && !RISCV_TRAP.contains("SSIE"),
-            "SSIE is not named anywhere — the enable does not exist"
+            RISCV_BOOT.contains("csrw sie, zero"),
+            "the secondary clears sie outright — SSIE, STIE and SEIE all off"
         );
     }
 
@@ -108574,8 +108612,9 @@ mod stage199d_riscv_remote_wake_readiness {
         );
         assert_eq!(
             missing_non_transport,
-            alloc::vec![1u8, 2, 6, 7, 8, 10],
-            "topology, interrupt enablement, trap vector, decoder arm and AP dispatch are all absent"
+            alloc::vec![1u8, 2, 6, 8, 10],
+            "topology, interrupt enablement, decoder arm and AP dispatch are still absent \
+             (link 7, the trap-ready foundation, is closed)"
         );
     }
 
@@ -108616,6 +108655,325 @@ mod stage199d_riscv_remote_wake_readiness {
             "the -smp 2 hart-start outcome must be recorded"
         );
         // Coordinate 23 stays OPEN and the ledger is untouched.
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,")
+        );
+    }
+}
+
+// ── RISC-V secondary hart: TRAP-READY PARKED foundation (blocker-3 link 7) ───────────────────
+//
+// Hart 1 now owns a valid kernel execution/trap context and parks with every interrupt admission
+// disabled. It is **not** scheduler-online, runs no scheduler work and no userspace: link 2
+// remains absent, `RISCV_REMOTE_WAKE` remains D, and coordinate 23 remains OPEN.
+mod stage199d_riscv_secondary_trap_ready {
+    use super::*;
+
+    const BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+    const TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    /// A top-level function's body, from its signature to the first column-0 `}`.
+    fn top_level_fn(src: &'static str, sig: &str) -> &'static str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("missing `{sig}`"));
+        let end = src[at..].find("\n}").map(|i| at + i).unwrap_or(src.len());
+        &src[at..end]
+    }
+
+    fn secondary_boot() -> &'static str {
+        top_level_fn(BOOT, "extern \"C\" fn yarm_riscv64_secondary_boot")
+    }
+
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    /// The six markers exist and are emitted in CAUSAL order — identity, then address space,
+    /// then trap stack, then vector, then the interrupt proof, then the park.
+    #[test]
+    fn the_six_trap_ready_markers_are_emitted_in_causal_order() {
+        const ORDER: &[&str] = &[
+            "RISCV_SECONDARY_CPU_ID_BOUND",
+            "RISCV_SECONDARY_KERNEL_SATP_ACTIVE",
+            "RISCV_SECONDARY_SSCRATCH_READY",
+            "RISCV_SECONDARY_TRAP_VECTOR_INSTALLED",
+            "RISCV_SECONDARY_INTERRUPTS_DISABLED",
+            "RISCV_SECONDARY_TRAP_READY_PARKED",
+        ];
+        let body = secondary_boot();
+        let mut last = 0usize;
+        for m in ORDER {
+            let at = body
+                .find(m)
+                .unwrap_or_else(|| panic!("marker `{m}` is missing from the secondary path"));
+            assert!(at > last, "marker `{m}` is emitted out of causal order");
+            last = at;
+        }
+        // Each reports both the hart id and the logical CpuId.
+        for m in ORDER {
+            let at = body.find(m).expect("marker");
+            let line = &body[at..at + 120];
+            assert!(
+                line.contains("hart={}"),
+                "marker `{m}` must report the hart id"
+            );
+        }
+    }
+
+    /// SATP, sscratch and stvec markers report values **read back from the CSRs**, never the
+    /// intended values — a write that silently did not take must not be reported as success.
+    #[test]
+    fn the_csr_markers_report_read_back_values() {
+        let body = secondary_boot();
+        for (write, read) in [
+            ("csrw satp, {v}", "csrr {out}, satp"),
+            ("csrw sscratch, {v}", "csrr {out}, sscratch"),
+            ("csrw stvec, {v}", "csrr {out}, stvec"),
+        ] {
+            let w = body
+                .find(write)
+                .unwrap_or_else(|| panic!("missing `{write}`"));
+            let r = body
+                .find(read)
+                .unwrap_or_else(|| panic!("missing `{read}`"));
+            assert!(
+                r > w,
+                "`{read}` must follow `{write}` — the report is a read-back"
+            );
+        }
+        for reported in ["satp_readback", "sscratch_readback", "stvec_readback"] {
+            assert!(
+                body.contains(reported),
+                "the marker must print the read-back binding `{reported}`"
+            );
+        }
+        // The SATP activation carries the required fence, between write and read-back.
+        let satp_w = body.find("csrw satp, {v}").expect("satp write");
+        let fence = body.find("sfence.vma x0, x0").expect("the required fence");
+        let satp_r = body.find("csrr {out}, satp").expect("satp read-back");
+        assert!(
+            satp_w < fence && fence < satp_r,
+            "sfence.vma must follow the SATP write and precede the read-back"
+        );
+    }
+
+    /// The real trap vector is installed only AFTER identity, address space and trap stack are
+    /// valid.
+    #[test]
+    fn the_real_vector_is_installed_last_of_the_state_steps() {
+        let body = secondary_boot();
+        let bound = body.find("RISCV_SECONDARY_CPU_ID_BOUND").expect("identity");
+        let satp = body
+            .find("RISCV_SECONDARY_KERNEL_SATP_ACTIVE")
+            .expect("satp");
+        let scratch = body
+            .find("RISCV_SECONDARY_SSCRATCH_READY")
+            .expect("sscratch");
+        let vector = body.find("csrw stvec, {v}").expect("the vector install");
+        assert!(
+            bound < vector && satp < vector && scratch < vector,
+            "stvec must be installed after identity, SATP and sscratch"
+        );
+        assert!(
+            body.contains("addr_of!(yarm_riscv64_trap_vector)"),
+            "the installed vector must be the REAL YARM trap entry"
+        );
+    }
+
+    /// `sscratch` follows the EXISTING trap-entry ABI — the vector swaps `sp` with it — and uses
+    /// a PRIVATE per-hart trap stack, not the boot hart's and not its own execution stack.
+    #[test]
+    fn sscratch_follows_the_existing_frame_abi_on_a_private_trap_stack() {
+        assert!(
+            BOOT.contains("csrrw sp, sscratch, sp"),
+            "the one frame convention: the vector swaps sp with sscratch"
+        );
+        assert!(
+            BOOT.contains("fn secondary_trap_stack_top"),
+            "secondaries get their own trap stack"
+        );
+        assert!(
+            BOOT.contains("RISCV64_SECONDARY_TRAP_STACKS"),
+            "…from a dedicated array, not RISCV_TRAP_STACK and not RISCV64_SECONDARY_STACKS"
+        );
+        assert!(
+            secondary_boot().contains("trap_stack_top"),
+            "sscratch is loaded from the handoff's trap-stack top"
+        );
+    }
+
+    /// The logical CpuId is validated and claimed exactly once; duplicates, out-of-range harts
+    /// and the boot hart itself all fail closed.
+    #[test]
+    fn the_cpu_id_mapping_is_validated_and_fails_closed() {
+        assert!(BOOT.contains("fn claim_logical_cpu_id_for_hart"));
+        let claim = BOOT
+            .split("fn claim_logical_cpu_id_for_hart")
+            .nth(1)
+            .expect("the claim fn");
+        assert!(
+            claim.contains("hart_id >= crate::kernel::scheduler::MAX_CPUS"),
+            "out-of-range for the scheduler must be refused"
+        );
+        assert!(
+            claim.contains("hart_id == boot_hart_id()"),
+            "the boot hart's own id must be refused"
+        );
+        assert!(
+            claim.contains("compare_exchange_weak"),
+            "the claim must be atomic so a duplicate cannot be handed to two harts"
+        );
+        assert!(
+            claim.contains("return None; // duplicate — fail closed"),
+            "a duplicate must fail closed"
+        );
+        // And the secondary declines to install a vector without a valid mapping.
+        assert!(
+            secondary_boot().contains("RISCV_SECONDARY_TRAP_READY_DECLINED"),
+            "an invalid mapping parks without installing a trap vector"
+        );
+    }
+
+    /// **No ASID is allocated and `Asid(0)` cannot be materialised.** The kernel root is the boot
+    /// hart's own live `satp`, captured from the CSR.
+    #[test]
+    fn the_kernel_root_is_captured_not_invented() {
+        let prep = top_level_fn(BOOT, "fn prepare_secondary_handoff");
+        assert!(
+            prep.contains("csrr {out}, satp"),
+            "the kernel root is READ from the boot hart's live satp CSR"
+        );
+        let code = code_lines(prep);
+        for forbidden in [
+            "ensure_asid_root",
+            "activate_asid",
+            "cr3_for_asid",
+            "Asid(0)",
+        ] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "the handoff must not allocate or materialise an address space: `{forbidden}`"
+            );
+        }
+    }
+
+    // ── Scope guards: what this increment must NOT have done ────────────────────────────────
+
+    /// CPU 1 is **not** scheduler-online: no registration call from the RISC-V secondary path.
+    #[test]
+    fn the_secondary_path_never_registers_a_scheduler_cpu() {
+        let body = secondary_boot();
+        let code = code_lines(body);
+        for forbidden in [
+            "set_online",
+            "bring_online",
+            "online_cpu",
+            "register_cpu",
+            "add_cpu",
+            "dispatch_next_task",
+            "enqueue",
+            "process_cross_cpu_work_for_cpu",
+        ] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "the secondary must not touch the scheduler: `{forbidden}`"
+            );
+        }
+        assert!(
+            BOOT.contains("RISCV_SCHEDULER_BSP_ONLY online_cpus=1"),
+            "the BSP-only scheduler attestation is unchanged"
+        );
+    }
+
+    /// No user work, no timer, no affinity, no IPI, no SSIE, no decoder arm.
+    #[test]
+    fn no_out_of_scope_capability_was_added() {
+        let body = secondary_boot();
+        let code = code_lines(body);
+        for forbidden in ["enter_user", "sret", "set_task_home_cpu", "timer"] {
+            assert!(
+                !code.iter().any(|l| l.contains(forbidden)),
+                "out of scope for the trap-ready park: `{forbidden}`"
+            );
+        }
+        assert!(
+            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
+            "no SBI IPI transport was added"
+        );
+        assert!(
+            !BOOT.contains("send_ipi") && !TRAP.contains("send_ipi"),
+            "no IPI send seam was added"
+        );
+        assert!(
+            !TRAP.contains("IRQ_SUPERVISOR_SOFT"),
+            "no software-interrupt decoder arm was added"
+        );
+        for src in [BOOT, TRAP] {
+            assert!(
+                !src.contains("set_task_home_cpu"),
+                "no RISC-V affinity to CPU 1"
+            );
+        }
+    }
+
+    /// Every interrupt admission is shut, and the marker proves it from read-back CSR bits.
+    #[test]
+    fn every_interrupt_admission_stays_disabled() {
+        let body = secondary_boot();
+        assert!(
+            body.contains("csrw sie, zero"),
+            "sie is cleared outright — SSIE, STIE and SEIE all off"
+        );
+        assert!(body.contains("csrci sstatus, 2"), "sstatus.SIE is cleared");
+        let marker = body
+            .find("RISCV_SECONDARY_INTERRUPTS_DISABLED")
+            .expect("the interrupt-proof marker");
+        let line = &body[marker..marker + 200];
+        for field in ["sstatus_sie=", "ssie=", "stie=", "seie="] {
+            assert!(
+                line.contains(field),
+                "the interrupt proof must report `{field}` from the read-back"
+            );
+        }
+    }
+
+    /// The park is terminal: `wfi` forever, with no scheduler or broad-lock work before it.
+    #[test]
+    fn the_hart_parks_terminally_after_the_markers() {
+        let body = secondary_boot();
+        let ready = body
+            .find("RISCV_SECONDARY_TRAP_READY_PARKED")
+            .expect("the ready marker");
+        let park = body[ready..].find("loop {").expect("the terminal loop") + ready;
+        assert!(
+            body[park..].contains("asm!(\"wfi\""),
+            "the terminal state is a wfi loop"
+        );
+        for l in code_lines(&body[..park]) {
+            assert!(
+                !l.contains("with_cpu(") && !l.contains("state.lock()"),
+                "the secondary takes no broad lock: `{l}`"
+            );
+        }
+    }
+
+    /// The audit records link 7 closed with link 2 still absent, and every downstream verdict
+    /// unchanged.
+    #[test]
+    fn the_record_keeps_every_downstream_verdict_unchanged() {
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+        assert!(
+            AUDIT.contains("link 7 and its hart-local prerequisites are structurally closed"),
+            "the audit must record link 7 as closed"
+        );
         const TESTS: &str = include_str!("tests.rs");
         assert!(
             TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,")

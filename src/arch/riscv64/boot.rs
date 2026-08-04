@@ -703,9 +703,19 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         early_marker!("RISCV_TRAP_HANDLE_FAILED reason=no_trap_shared_kernel");
         riscv_trap_halt("no_trap_shared_kernel");
     };
-    // RISC-V is BSP-only (`online_cpus==1`); the trapping CPU is always the
-    // bootstrap hart, so `current_cpu` is invariantly this value.
-    let cpu = crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
+    // Stage 199D link 7: DERIVE the trapping CPU from the frame pointer rather than assuming the
+    // bootstrap hart. Every trap frame is allocated on the trapping hart's own trap stack (the
+    // vector's first act is `csrrw sp, sscratch, sp`), so matching the frame against the
+    // published per-hart trap-stack regions names the hart authoritatively. A frame outside every
+    // secondary region is the boot hart's, which reproduces the previous constant exactly.
+    //
+    // The d82ef8de narrow-snapshot proof rested on "the bridge always passes BOOTSTRAP_CPU_ID on
+    // a BSP-only architecture". That premise is NOT silently deleted — it is replaced by a
+    // per-hart one: `current_tid_split_read(cpu)` and `with_cpu(cpu, ..)` both resolve to
+    // `current_tid_on(cpu)` for whatever `cpu` is derived here, and only the boot hart can reach
+    // this bridge while the secondaries park with every interrupt admission disabled and never
+    // enter userspace. See `stage199d_riscv_secondary_trap_ready`.
+    let cpu = riscv_logical_cpu_for_trap_frame(frame_ptr as usize);
     // Stage 199D (RISC-V readiness blocker 2): the ENTERING identity comes from the rank-1
     // scheduler seam, not the broad lock. `with_cpu(cpu, |k| k.current_tid())` resolves to
     // `current_tid_on(current_cpu)` AFTER `set_current_cpu(cpu)` rebinds it, so on this bridge —
@@ -1807,15 +1817,33 @@ const RISCV64_SECONDARY_ACK_START_REQUESTED: usize = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 const RISCV64_SECONDARY_ACK_PARKED: usize = 2;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-const RISCV64_SECONDARY_ACK_POLL_ITERS: usize = 100_000;
+// Stage 199D link 7: the ack now lands AFTER the trap-ready sequence, which emits six SBI
+// console lines (an ecall per byte), so the boot hart's bounded wait must cover them.
+const RISCV64_SECONDARY_ACK_POLL_ITERS: usize = 200_000_000;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SecondaryHartHandoff {
+    /// OFFSET 0 — the OpenSBI hart id. Read by Rust only.
     hart_id: usize,
+    /// OFFSET 8 — the hart's private execution stack top. **The secondary entry asm reads this
+    /// at a hardcoded `ld sp, 8(a1)`, so this field must stay at offset 8.**
     stack_top: usize,
+    /// OFFSET 16 — start/park acknowledgement.
     ack: usize,
+    /// Stage 199D link 7: the authoritative LOGICAL CpuId this hart owns. Validated and claimed
+    /// exactly once by the boot hart before the start request; `usize::MAX` means "no valid
+    /// mapping", and the secondary fails closed on it.
+    cpu_id: usize,
+    /// Stage 199D link 7: the authoritative kernel `satp`, captured from the BOOT HART's live CSR
+    /// rather than reconstructed. Installing the value the boot hart is actually executing on
+    /// needs no ASID allocation and cannot materialise `Asid(0)`.
+    kernel_satp: usize,
+    /// Stage 199D link 7: this hart's PRIVATE trap-stack top, the value `sscratch` must hold for
+    /// the existing trap-entry ABI (`yarm_riscv64_trap_vector` swaps `sp` with it). Separate from
+    /// `stack_top`: the vector would otherwise clobber the running stack.
+    trap_stack_top: usize,
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -1825,6 +1853,9 @@ impl SecondaryHartHandoff {
             hart_id: usize::MAX,
             stack_top: 0,
             ack: RISCV64_SECONDARY_ACK_EMPTY,
+            cpu_id: usize::MAX,
+            kernel_satp: 0,
+            trap_stack_top: 0,
         }
     }
 }
@@ -1841,6 +1872,105 @@ static mut RISCV64_SECONDARY_HANDOFFS: [SecondaryHartHandoff; QEMU_VIRT_HSM_SECO
 static mut RISCV64_SECONDARY_STACKS: [SecondaryHartStack; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
     [SecondaryHartStack([0; RISCV64_SECONDARY_STACK_BYTES]); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
 
+/// Stage 199D link 7: per-hart TRAP stacks. `sscratch` must point at a stack the trap vector can
+/// swap `sp` with; reusing `RISCV64_SECONDARY_STACKS` would let a trap clobber the very stack the
+/// parked hart is running on, and sharing the boot hart's `RISCV_TRAP_STACK` would corrupt it.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static mut RISCV64_SECONDARY_TRAP_STACKS: [SecondaryHartStack; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
+    [SecondaryHartStack([0; RISCV64_SECONDARY_STACK_BYTES]); QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+
+/// Stage 199D link 7: which logical CpuIds have been claimed, so a duplicate mapping fails closed.
+/// Bit N set ⇒ `CpuId(N)` is already owned. Bit 0 is pre-claimed for the boot hart.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static RISCV64_CPU_ID_CLAIMED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 199D link 7: the trap-stack top of each secondary, published so the trap bridge can
+/// derive the trapping hart's logical CpuId from the frame pointer it was handed. Index = slot;
+/// `0` = unclaimed.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static RISCV64_SECONDARY_TRAP_STACK_TOPS: [core::sync::atomic::AtomicUsize;
+    QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+
+/// Stage 199D link 7: logical CpuId owned by each secondary slot; `usize::MAX` = unowned.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static RISCV64_SECONDARY_CPU_IDS: [core::sync::atomic::AtomicUsize;
+    QEMU_VIRT_HSM_SECONDARY_HART_LIMIT] = [const { core::sync::atomic::AtomicUsize::new(usize::MAX) };
+    QEMU_VIRT_HSM_SECONDARY_HART_LIMIT];
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn secondary_trap_stack_top(slot: usize) -> usize {
+    let stacks = core::ptr::addr_of_mut!(RISCV64_SECONDARY_TRAP_STACKS) as *mut SecondaryHartStack;
+    (unsafe {
+        stacks
+            .add(slot)
+            .cast::<u8>()
+            .add(RISCV64_SECONDARY_STACK_BYTES) as usize
+    }) & !0xf
+}
+
+/// Validate and CLAIM the logical CpuId for `hart_id`, or fail closed.
+///
+/// QEMU-virt maps hart ids onto logical CPUs identically, but the mapping is validated rather
+/// than assumed: out of range for the scheduler's `MAX_CPUS`, out of range for the handoff table,
+/// the boot hart's own id, or an id already claimed all return `None`. The claim is a single
+/// compare-and-swap, so a duplicate can never be handed to two harts.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn claim_logical_cpu_id_for_hart(hart_id: usize) -> Option<usize> {
+    use core::sync::atomic::Ordering;
+    if hart_id >= QEMU_VIRT_HSM_SECONDARY_HART_LIMIT
+        || hart_id >= crate::kernel::scheduler::MAX_CPUS
+        || hart_id >= 64
+    {
+        return None;
+    }
+    if hart_id == boot_hart_id() {
+        return None;
+    }
+    let bit = 1u64 << hart_id;
+    let mut seen = RISCV64_CPU_ID_CLAIMED.load(Ordering::Acquire);
+    loop {
+        if seen & bit != 0 {
+            return None; // duplicate — fail closed
+        }
+        match RISCV64_CPU_ID_CLAIMED.compare_exchange_weak(
+            seen,
+            seen | bit,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(hart_id),
+            Err(observed) => seen = observed,
+        }
+    }
+}
+
+/// Stage 199D link 7: the logical CpuId of the hart whose trap stack contains `frame_ptr`.
+///
+/// The trap vector swaps `sp` with `sscratch`, so every trap frame is allocated on the trapping
+/// hart's OWN trap stack. Matching the frame against the published per-hart trap-stack regions is
+/// therefore an authoritative hart-local derivation — no new CSR, no per-CPU register convention,
+/// and no lock. A frame outside every secondary region belongs to the boot hart.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_logical_cpu_for_trap_frame(frame_ptr: usize) -> crate::kernel::scheduler::CpuId {
+    use core::sync::atomic::Ordering;
+    for slot in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
+        let top = RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].load(Ordering::Acquire);
+        if top == 0 {
+            continue;
+        }
+        let base = top.saturating_sub(RISCV64_SECONDARY_STACK_BYTES);
+        if frame_ptr >= base && frame_ptr < top {
+            let cpu = RISCV64_SECONDARY_CPU_IDS[slot].load(Ordering::Acquire);
+            if cpu != usize::MAX && cpu <= u8::MAX as usize {
+                return crate::kernel::scheduler::CpuId(cpu as u8);
+            }
+        }
+    }
+    crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID)
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 unsafe extern "C" {
     fn yarm_riscv64_secondary_entry() -> !;
@@ -1851,20 +1981,159 @@ unsafe extern "C" {
 extern "C" fn yarm_riscv64_secondary_boot(handoff_ptr: usize) -> ! {
     let mut hart_id = usize::MAX;
     if handoff_ptr != 0 {
-        let handoff = handoff_ptr as *mut SecondaryHartHandoff;
+        let handoff = handoff_ptr as *const SecondaryHartHandoff;
         unsafe {
             hart_id = core::ptr::read_volatile(core::ptr::addr_of!((*handoff).hart_id));
+        }
+    }
+    // Stage 199D link 7: the acknowledgement is written at the END of the trap-ready sequence,
+    // not here. The boot hart blocks on it in `wait_for_secondary_ack`, so deferring it (a) makes
+    // `ack=1` attest "trap-ready and parked" rather than merely "reached Rust", and (b) keeps the
+    // two harts off the shared SBI console at the same time — acking early let the boot hart
+    // resume mid-sequence and interleave its own markers with the secondary's, corrupting both.
+    // Required early-boot marker: a non-bootstrap hart has reached a safe,
+    // Rust-controlled park. This runs on the secondary's own per-hart stack,
+    // with interrupts masked, before it could ever touch kernel bootstrap.
+    early_marker!("RISCV_SECONDARY_HART_PARK hart={}", hart_id);
+    crate::arch::riscv64::console::write_line("YARM_RISCV64_SMP_SECONDARY_PARKED");
+
+    // ── Stage 199D link 7: TRAP-READY PARKED foundation ──────────────────────────────────
+    //
+    // Give this hart a valid kernel execution/trap context, then park with EVERY interrupt
+    // admission still disabled. No scheduler registration, no task selection, no user return,
+    // no timer, no cross-CPU work consumption — CPU 1 does NOT become scheduler-online here.
+    //
+    // Ordering is causal and load-bearing: identity → address space → trap stack → trap vector
+    // → interrupt proof → park. The real vector is installed LAST of the state steps, because
+    // until `satp`, `sscratch` and the CPU identity are valid a trap taken through it could not
+    // be serviced.
+    if handoff_ptr != 0 {
+        let handoff = handoff_ptr as *const SecondaryHartHandoff;
+        let (cpu_id, kernel_satp, trap_stack_top) = unsafe {
+            (
+                core::ptr::read_volatile(core::ptr::addr_of!((*handoff).cpu_id)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*handoff).kernel_satp)),
+                core::ptr::read_volatile(core::ptr::addr_of!((*handoff).trap_stack_top)),
+            )
+        };
+        // Fail closed: an unvalidated mapping parks in the pre-existing safe loop rather than
+        // installing a trap vector it has no identity to service.
+        if cpu_id == usize::MAX || trap_stack_top == 0 {
+            early_marker!(
+                "RISCV_SECONDARY_TRAP_READY_DECLINED hart={} reason=no_valid_cpu_id_mapping",
+                hart_id
+            );
+        } else {
+            // (1) hart-local CPU binding, published BEFORE any trap code can run.
+            early_marker!(
+                "RISCV_SECONDARY_CPU_ID_BOUND hart={} cpu={} trap_stack_top=0x{:x}",
+                hart_id,
+                cpu_id,
+                trap_stack_top
+            );
+            // (2) the authoritative kernel address space, followed by the required fence.
+            //     Every reported value is READ BACK from the CSR, never the intended value.
+            let satp_readback: usize;
+            unsafe {
+                core::arch::asm!(
+                    "csrw satp, {v}",
+                    "sfence.vma x0, x0",
+                    "csrr {out}, satp",
+                    v = in(reg) kernel_satp,
+                    out = out(reg) satp_readback,
+                    options(nostack, preserves_flags)
+                );
+            }
+            early_marker!(
+                "RISCV_SECONDARY_KERNEL_SATP_ACTIVE hart={} cpu={} satp=0x{:x} sfence=1",
+                hart_id,
+                cpu_id,
+                satp_readback
+            );
+            // (3) `sscratch` per the EXISTING trap-entry ABI: the vector's first act is
+            //     `csrrw sp, sscratch, sp`, so this must be this hart's own trap-stack top.
+            let sscratch_readback: usize;
+            unsafe {
+                core::arch::asm!(
+                    "csrw sscratch, {v}",
+                    "csrr {out}, sscratch",
+                    v = in(reg) trap_stack_top,
+                    out = out(reg) sscratch_readback,
+                    options(nostack, preserves_flags)
+                );
+            }
+            early_marker!(
+                "RISCV_SECONDARY_SSCRATCH_READY hart={} cpu={} sscratch=0x{:x}",
+                hart_id,
+                cpu_id,
+                sscratch_readback
+            );
+            // (4) the REAL trap vector — only now that identity, address space and trap stack
+            //     are all valid.
+            let stvec_readback: usize;
+            let vector = unsafe { core::ptr::addr_of!(yarm_riscv64_trap_vector) as usize };
+            unsafe {
+                core::arch::asm!(
+                    "csrw stvec, {v}",
+                    "csrr {out}, stvec",
+                    v = in(reg) vector,
+                    out = out(reg) stvec_readback,
+                    options(nostack, preserves_flags)
+                );
+            }
+            early_marker!(
+                "RISCV_SECONDARY_TRAP_VECTOR_INSTALLED hart={} cpu={} stvec=0x{:x} expected=0x{:x}",
+                hart_id,
+                cpu_id,
+                stvec_readback,
+                vector
+            );
+            // (5) prove every interrupt admission is still shut. `sie` is cleared outright (no
+            //     SSIE, no STIE, no SEIE) and `sstatus.SIE` stays 0 — both read back.
+            let sie_readback: usize;
+            let sstatus_readback: usize;
+            unsafe {
+                core::arch::asm!(
+                    "csrw sie, zero",
+                    "csrci sstatus, 2",
+                    "csrr {sie}, sie",
+                    "csrr {sst}, sstatus",
+                    sie = out(reg) sie_readback,
+                    sst = out(reg) sstatus_readback,
+                    options(nostack, preserves_flags)
+                );
+            }
+            early_marker!(
+                "RISCV_SECONDARY_INTERRUPTS_DISABLED hart={} cpu={} sie=0x{:x} sstatus_sie={} ssie={} stie={} seie={}",
+                hart_id,
+                cpu_id,
+                sie_readback,
+                (sstatus_readback >> 1) & 1,
+                (sie_readback >> 1) & 1,
+                (sie_readback >> 5) & 1,
+                (sie_readback >> 9) & 1
+            );
+            // (6) trap-ready, and parked. Nothing below this point runs any kernel work.
+            early_marker!(
+                "RISCV_SECONDARY_TRAP_READY_PARKED hart={} cpu={} online=0 user=0 scheduler=0",
+                hart_id,
+                cpu_id
+            );
+        }
+    }
+
+    // Trap-ready (or explicitly declined) and about to park: release the boot hart. Nothing below
+    // this point writes to the console, so the boot hart's own markers cannot interleave.
+    if handoff_ptr != 0 {
+        let handoff = handoff_ptr as *mut SecondaryHartHandoff;
+        unsafe {
             core::ptr::write_volatile(
                 core::ptr::addr_of_mut!((*handoff).ack),
                 RISCV64_SECONDARY_ACK_PARKED,
             );
         }
     }
-    // Required early-boot marker: a non-bootstrap hart has reached a safe,
-    // Rust-controlled park. This runs on the secondary's own per-hart stack,
-    // with interrupts masked, before it could ever touch kernel bootstrap.
-    early_marker!("RISCV_SECONDARY_HART_PARK hart={}", hart_id);
-    crate::arch::riscv64::console::write_line("YARM_RISCV64_SMP_SECONDARY_PARKED");
+
     loop {
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
@@ -1885,13 +2154,49 @@ fn secondary_stack_top(slot: usize) -> usize {
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
+    use core::sync::atomic::Ordering;
     let handoffs = core::ptr::addr_of_mut!(RISCV64_SECONDARY_HANDOFFS) as *mut SecondaryHartHandoff;
     let handoff = unsafe { handoffs.add(slot) };
+    // Stage 199D link 7: validate + claim the logical CpuId, capture the BOOT HART's live `satp`
+    // as the authoritative kernel root (no ASID is allocated, so `Asid(0)` cannot be
+    // materialised), and publish this hart's trap-stack region so the trap bridge can derive the
+    // trapping CpuId from a frame pointer. A rejected mapping leaves `cpu_id = usize::MAX` and
+    // the secondary fails closed into its pre-existing safe park.
+    let cpu_id = claim_logical_cpu_id_for_hart(hart_id).unwrap_or(usize::MAX);
+    let trap_stack_top = if cpu_id == usize::MAX {
+        0
+    } else {
+        secondary_trap_stack_top(slot)
+    };
+    let boot_hart_satp: usize;
+    unsafe {
+        core::arch::asm!("csrr {out}, satp", out = out(reg) boot_hart_satp,
+            options(nostack, nomem, preserves_flags));
+    }
+    if cpu_id != usize::MAX {
+        RISCV64_SECONDARY_CPU_IDS[slot].store(cpu_id, Ordering::Release);
+        RISCV64_SECONDARY_TRAP_STACK_TOPS[slot].store(trap_stack_top, Ordering::Release);
+    } else {
+        early_marker!(
+            "RISCV_SECONDARY_CPU_ID_REJECTED hart={} slot={} reason=invalid_or_duplicate",
+            hart_id,
+            slot
+        );
+    }
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).hart_id), hart_id);
         core::ptr::write_volatile(
             core::ptr::addr_of_mut!((*handoff).stack_top),
             secondary_stack_top(slot),
+        );
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).cpu_id), cpu_id);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*handoff).kernel_satp),
+            boot_hart_satp,
+        );
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*handoff).trap_stack_top),
+            trap_stack_top,
         );
         core::ptr::write_volatile(
             core::ptr::addr_of_mut!((*handoff).ack),
