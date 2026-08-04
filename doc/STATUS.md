@@ -551,15 +551,26 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    trip as before `c9840e0f`. *sepc-advanced-once, tp/TLS and SATP preservation are attested
    indirectly* — no marker prints them — by both sides completing their round trip
    (`client_continuations=1 server_continuations=1`) with zero fault markers.
-   **The feature-off core boot FAILS on a stale harness pattern, and is NOT repaired here.** The
-   boot is healthy (`YARM_BOOT_OK`, service chain up, ending in the script's own expected
-   `RISCV_KERNEL_IDLE_WAITING_FOR_IO … all_services_blocked`) and **no other rejected pattern
-   appears**; the single failure is `\bcapacity\b` in `REJECT_PATTERNS` colliding with the benign
-   `capacity=256` / `ack_capacity=256` quiescent reporters. Those reporters landed at `fcfc55e3`,
-   **20 commits before `c9840e0f`**, and the reject list has not been touched since — neither
-   blocker repair touches either side. It is a stale oracle pattern, the same class as the
-   `have_in` SIGPIPE defect in §0.1, not a RISC-V kernel defect. **Neither run adds a live cell**;
-   the ledger stays 40 / 6 / 46. `stage199d_riscv_canonical_admission` (11 tests) pins the
+   **The stale harness blocker is CLOSED and BOTH RISC-V SMP=1 smokes now pass.** The feature-off
+   core smoke had failed on `\bcapacity\b` in `REJECT_PATTERNS` — added at Stage 181 (`2a30515d`)
+   beside `Vm\(Full\)`/`\boom\b` as an exhaustion proxy, when nothing printed the word benignly —
+   colliding with the `capacity=256` / `ack_capacity=256` / `capacity_refused=0` reporters that
+   Stage 199D (`fcfc55e3`) made unconditional. Capacity checking is **narrowed, not removed**: the
+   bare word is replaced by the exact exhaustion forms the current emitters produce
+   (`capacity_refused=[1-9][0-9]*`, `reason=capacity_exhausted`, `reason=capacity\b`,
+   `reason=cow_capacity`, `reason=page_table_capacity`, `reason=user_vm_capacity`,
+   `reason=deferred_capacity`, `IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL`), plus explicit
+   `kernel_error=CapabilityFull` / `TaskTableFull` — which the retired word match never covered,
+   since they contain no "capacity". `tests/riscv_core_smoke_capacity_rejection.rs` (11 tests) is
+   behavioural: it parses the script's own `REJECT_PATTERNS` and evaluates fixtures with `rg`
+   exactly as the script does. **Feature-off core smoke PASSES** (`[ok] qemu-riscv64-core-smoke
+   passed`, `YARM_BOOT_OK`, service chain up, expected `RISCV_KERNEL_IDLE_WAITING_FOR_IO`
+   terminal, every exhaustion/fault/broad-lock predicate 0, and the direct-oracle markers
+   **absent** as feature-off requires). **Proof-gated direct smoke PASSES unchanged**
+   (`live_cells=2`, request/reply userspace validation, duplicate reply refused, both direct
+   classes retired off-lock with zero in-lock dispatch, fuses clean). **Neither run adds a live
+   cell**; the ledger stays 40 / 6 / 46, `RISCV_199D_READINESS` remains `case_b`, and coordinate
+   23 remains OPEN solely on cross-hart wake, production enablement and production live evidence. `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.

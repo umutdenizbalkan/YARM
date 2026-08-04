@@ -422,7 +422,41 @@ REJECT_PATTERNS=(
   'TRAP_HANDLE failed'
   'Vm\(Full\)'
   '\boom\b'
-  '\bcapacity\b'
+  # Stage 199D: the generic `\bcapacity\b` reject was RETIRED here. It was added at
+  # Stage 181 (2a30515d) beside `Vm\(Full\)` and `\boom\b` as a proxy for resource
+  # exhaustion, when no kernel marker printed the word benignly. Since Stage 199D
+  # (fcfc55e3) the structural ack-store bound and the independent waiter census report
+  # `capacity=256`, `ack_capacity=256` and `capacity_refused=0` on EVERY healthy boot,
+  # so the bare word stopped discriminating and failed a healthy RISC-V core boot.
+  #
+  # Capacity checking is NOT removed — it is narrowed to the exact exhaustion forms the
+  # current emitters produce:
+  #   direct ack store    IPC_DIRECT_ACK_FUSES ... capacity_refused=N   (N > 0)
+  #   shared region       SHARED_REGION_CANCEL_FUSE_SET reason=capacity_exhausted
+  #   reply-link install  IPC_SERVER_REPLY_LINK_REGISTER_FAIL ... reason=capacity result=rolled_back
+  #   fork COW            FORK_COW_FAIL reason=cow_capacity
+  #   kernel stack map    D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED ... reason=page_table_capacity
+  #   user VM grow        ... reason=user_vm_capacity
+  #   exit deferral       EXIT_TASK_SYSCALL_DECLINED ... reason=deferred_capacity
+  #   reply-cap mint      IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL ... cnode_capacity=
+  #
+  # `reason=capacity\b` does NOT match `reason=capacity_exhausted` (`_` is a word
+  # character, so there is no boundary), and `reason=deferred_capacity` deliberately does
+  # NOT match the benign `deferred_capacity=ok` in EXIT_TASK_PREFLIGHT_OK.
+  'capacity_refused=[1-9][0-9]*'
+  'reason=capacity_exhausted'
+  'reason=capacity\b'
+  'reason=cow_capacity'
+  'reason=page_table_capacity'
+  'reason=user_vm_capacity'
+  'reason=deferred_capacity'
+  'IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL'
+  # These two exhaustion errors surface only as the Debug field `kernel_error={:?}` of
+  # FORK_COW_FAIL, and were never covered by the retired word match (they do not contain
+  # the substring "capacity"). Named explicitly so the narrowing does not leave them the
+  # only unchecked `*Full` errors beside the already-rejected `Vm\(Full\)`.
+  'kernel_error=CapabilityFull'
+  'kernel_error=TaskTableFull'
   # Stage 184 (CROSS-ARCH-LIVE): the cross-arch live audit must not report a
   # blocked topology, an ungraduated seam, or any fallback/opt-out.
   'CROSS_ARCH_TOPOLOGY_BLOCKED arch=riscv64'

@@ -1873,43 +1873,82 @@ fault into the next instruction — neither happened. SATP/ASID preservation is 
 by both tasks continuing to execute in their own mappings (`USER_MAP_PA_CHECK asid=1 …`) with
 zero page-fault markers, rather than by a dedicated SATP marker.
 
-#### Run 1 — feature-off RISC-V core boot: FAILED on a stale harness pattern
+#### Run 1 — feature-off RISC-V core boot: the stale harness blocker, now CLOSED
 
-`scripts/qemu-riscv64-core-smoke.sh` reports **exactly one** failed check (it prints only
-failures):
+The first attempt failed on a **harness** pattern, not a kernel boundary:
 
 ```
 [fail] rejected pattern present: \bcapacity\b
 [fail] qemu-riscv64-core-smoke: 1 check(s) failed (qemu_status=124)
 ```
 
-**First missing causal boundary: none in the kernel.** The boot itself is healthy —
-`YARM_BOOT_OK present_cpus=1 online_cpus=1`, the service chain comes up, and it ends in the
-script's own expected terminal state, `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task
-all_services_blocked` → `RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io`. **No other rejected
-pattern appears at all.** The four `capacity` matches are benign quiescent diagnostics:
+The boot itself was healthy — `YARM_BOOT_OK`, service chain up, ending in the script's own
+expected `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked` →
+`RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io`, with **no other rejected pattern present**.
 
-```
-IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir=nr6 … live=0 spent=0 high_watermark=0 capacity=256
-IPC_DIRECT_WAITER_CENSUS dir=nr6 waiters_current=10 … ack_capacity=256 eligible=0 live_leases=0
-```
+**Why the pattern existed.** `\bcapacity\b` was added at **Stage 181 (`2a30515d`)**, in the
+resource-exhaustion cluster beside `Vm\(Full\)` and `\boom\b`. At that time no kernel marker
+printed the word benignly, so a bare word match was a sound proxy for "an allocator or table ran
+out". Stage 199D (`fcfc55e3`) replaced the magic ack-store capacity of 8 with a structural bound
+and added the independent waiter census; those reporters print `capacity=256`, `ack_capacity=256`
+and `capacity_refused=0` on **every** healthy boot, so the proxy stopped discriminating.
 
-`\bcapacity\b` sits in `REJECT_PATTERNS` beside `\boom\b` and `Vm\(Full\)` — it was written to
-catch a resource-exhaustion message, and now collides with the word `capacity=` in the structural
-ack-store and census reporters. Those two reporters were introduced at **`fcfc55e3`** (*"structural
-ack capacity, independent waiter census"*), **20 commits before `c9840e0f`**; the reject list has
-not been touched since. Neither `d82ef8de` (blocker 2) nor `c9840e0f` (blocker 1) touches the
-emitters or the script. The collision is therefore a **stale oracle pattern predating this work**,
-in the same class as the `have_in` SIGPIPE defect recorded in §0.1 — not a RISC-V kernel defect,
-and not a regression from the blocker repairs.
+**The repair narrows, it does not delete.** Every current log form carrying the word was
+enumerated and split:
 
-**Hard-stop: the pattern is NOT repaired here**, per the evidence-only scope of this task. The
-smallest fix would narrow the pattern to the exhaustion message it was written for (e.g.
-`capacity_refused=[1-9]`), leaving the quiescent reporters alone.
+| Benign — must be ACCEPTED | Genuine exhaustion — must still be REJECTED |
+|---|---|
+| `IPC_DIRECT_ACK_COUNTERS … capacity=256` | `IPC_DIRECT_ACK_FUSES … capacity_refused=N` (N > 0) |
+| `IPC_DIRECT_PRODUCTION_ACK_QUIESCENT … capacity=256` | `SHARED_REGION_CANCEL_FUSE_SET reason=capacity_exhausted` |
+| `IPC_DIRECT_WAITER_CENSUS … ack_capacity=256 eligible=0 live_leases=0` | `IPC_SERVER_REPLY_LINK_REGISTER_FAIL … reason=capacity result=rolled_back` |
+| `IPC_DIRECT_ACK_FUSES … capacity_refused=0` | `FORK_COW_FAIL reason=cow_capacity` |
+| `EXIT_TASK_PREFLIGHT_OK … deferred_capacity=ok result=ok` | `D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED … reason=page_table_capacity` / `reason=user_vm_capacity` |
+| | `EXIT_TASK_SYSCALL_DECLINED … reason=deferred_capacity result=would_block` |
+| | `IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL … cnode_capacity=` |
+
+The single generic pattern is replaced by that exact set. Two boundary subtleties are deliberate:
+`reason=capacity\b` does **not** match `reason=capacity_exhausted` (`_` is a word character, so
+there is no boundary), and `reason=deferred_capacity` does **not** match the benign
+`deferred_capacity=ok`. `CapabilityFull` and `TaskTableFull` — which surface only as the Debug
+field `kernel_error={:?}` of `FORK_COW_FAIL` and never contained the substring "capacity", so the
+retired word match never covered them — are named explicitly, so the narrowing leaves no `*Full`
+error unchecked beside the already-rejected `Vm\(Full\)`.
+
+`tests/riscv_core_smoke_capacity_rejection.rs` (11 tests) is **behavioural, not textual**: it
+parses `REJECT_PATTERNS` out of the script and evaluates fixture lines with `rg` exactly as the
+script does (`rg -n "$pat"`, regex). It proves `capacity=256`, `ack_capacity=256`,
+`capacity_refused=0` and `deferred_capacity=ok` are accepted; that `capacity_refused=1` and every
+multi-digit refusal, plus all seven named exhaustion forms, are rejected; that `Vm(Full)` is
+rejected **by the `Vm\(Full\)` pattern specifically** rather than incidentally; that OOM, PANIC,
+FATAL, ASSERT, page-fault, early-trap, in-lock-dispatch and publish-race rejections remain active;
+and that no bare-word capacity rejection survives.
+
+#### Both RISC-V SMP=1 smokes now PASS
+
+From one clean repair tree, after a fresh `scripts/build-qemu-riscv64-artifacts.sh`:
+
+**Feature-off core smoke — PASS.** `[ok] qemu-riscv64-core-smoke passed (smp=1, qemu_status=124)`,
+exit 0. `YARM_BOOT_OK present_cpus=1 online_cpus=1`; service chain up; terminal
+`RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked`. Every genuine
+exhaustion predicate reads 0, as do `Vm\(Full\)`, `\boom\b`, `RISCV_EARLY_TRAP`,
+`PAGE_FAULT_UNHANDLED`, `RISCV_TRAP_UNHANDLED`, `UNEXPECTED_INLOCK_DISPATCH`,
+`UNLOCK_GRADUATED_FALLBACK`, `D2_PUBLISH_RACE_UNWIND` and `duplicate_wake`. **The direct-oracle
+markers are absent**, as a feature-off run requires: `IPCCALL_DIRECT_REQUEST_OK`,
+`IPCREPLY_DIRECT_OK`, `IPCCALL_DIRECT_ORACLE*`, the live seal and both direct retirement classes
+all count 0.
+
+**Proof-gated direct smoke — PASS, unchanged.**
+`STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=riscv64 classes=2 live_cells=2
+duplicate_replies=0 duplicate_wakes=0 result=ok`, with request and reply userspace validation,
+the deliberate duplicate NR7 refused (`dup_rejected=1 err=Err(WrongObject)`), both direct classes
+retired off-lock and zero in-lock dispatch or fallback markers, and settled fuses clean in both
+directions apart from the one deliberate `duplicate=1`.
 
 **No live cell is added.** This revalidates historical proof-gated evidence after the trap-bridge
-and admission changes; the ledger stays **40 production / 6 knob-gated / 46 total**, and
-coordinate 23 remains **OPEN** on blocker 3.
+and admission changes; the ledger stays **40 production / 6 knob-gated / 46 total**,
+`RISCV_199D_READINESS` remains **`case_b`**, and coordinate 23 remains **OPEN** solely on the
+cross-hart wake requirement, production enablement, and production live evidence. The stale
+harness blocker is **closed**; it was never a kernel defect and closing it earns no cell.
 
 `stage199d_riscv_canonical_admission` (11 tests) pins: NR6 and NR7 both use canonical admission;
 no `ipccall_direct_proof_enabled()` call remains in the RISC-V ingress; all three admission
