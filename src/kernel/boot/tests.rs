@@ -109314,3 +109314,431 @@ mod stage199d_riscv_link2_wake_only_online {
         assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
     }
 }
+
+/// Stage 199D — the generic, architecture-neutral, non-dispatching runqueue-withdrawal
+/// foundation.
+///
+/// This is **not** RISC-V remote-wake link 1. It adds one seam —
+/// `SmpScheduler::withdraw_queued_tid_on(cpu, tid)` — whose sole authority is removing one queued
+/// occurrence of a TID from a named CPU's runqueue. It is wired into no oracle and no production
+/// path in this increment, so the remote-wake chain status is unchanged.
+mod stage199d_runqueue_withdrawal_foundation {
+    use super::*;
+    use crate::kernel::scheduler::WithdrawOutcome;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::runtime::SharedKernel;
+
+    const SCHED: &str = include_str!("../../kernel/scheduler.rs");
+    const SCHED_STATE: &str = include_str!("scheduler_state.rs");
+
+    /// Body of a method, from its signature to the matching close brace (brace-balanced, so it
+    /// never slices to end-of-file).
+    fn method_body(src: &'static str, sig: &str) -> &'static str {
+        let at = src.find(sig).unwrap_or_else(|| panic!("missing `{sig}`"));
+        let open = at + src[at..].find('{').expect("an opening brace");
+        let mut depth = 0usize;
+        for (i, ch) in src[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[at..open + i + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces after `{sig}`");
+    }
+
+    /// Executable lines only — a token inside a doc comment is documentation, not behaviour.
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .collect()
+    }
+
+    /// The full seam: both scheduler halves plus the narrow `KernelState` wrapper.
+    fn seam_code() -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        for line in code_lines(method_body(
+            SCHED,
+            "pub(crate) fn withdraw_queued_tid(&mut self, tid: ThreadId)",
+        )) {
+            s.push_str(line);
+            s.push('\n');
+        }
+        for line in code_lines(method_body(
+            SCHED,
+            "pub(crate) fn withdraw_queued_tid_on(&mut self, cpu: CpuId, tid: ThreadId)",
+        )) {
+            s.push_str(line);
+            s.push('\n');
+        }
+        for line in code_lines(method_body(
+            SCHED_STATE,
+            "pub(crate) fn withdraw_queued_tid_on(",
+        )) {
+            s.push_str(line);
+            s.push('\n');
+        }
+        // Non-vacuity: an extraction that silently produced nothing would make every
+        // forbidden-token guard below pass for the wrong reason.
+        assert!(
+            s.contains("remove_tid") && s.contains("WithdrawOutcome") && s.lines().count() >= 20,
+            "the seam extraction is degenerate:\n{s}"
+        );
+        s
+    }
+
+    /// Raw in-memory byte image of a TCB's `status` field, read in place.
+    fn status_image(state: &mut KernelState, tid: u64) -> alloc::vec::Vec<u8> {
+        let tcb = state.tcb_mut(tid).expect("a live TCB for the observed tid");
+        let ptr = core::ptr::addr_of!(tcb.status).cast::<u8>();
+        // SAFETY: `status` is a live, initialised, `Copy` field of a live TCB with no interior
+        // pointers, and the read covers exactly `size_of::<TaskStatus>()` bytes of it. The same
+        // field is imaged before and after the withdrawal, so any padding difference could only
+        // make this assertion stricter — never produce a false pass.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, core::mem::size_of::<TaskStatus>()) };
+        bytes.to_vec()
+    }
+
+    /// Boot a kernel with tid 900 dispatched as current on CPU 0 and tid 901 queued behind it.
+    fn kernel_with_queued_peer() -> SharedKernel {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state
+                .register_task_with_class(900, TaskClass::SystemServer)
+                .expect("current task");
+            state
+                .register_task_with_class(901, TaskClass::App)
+                .expect("queued peer");
+            state.enqueue_current_cpu(900).expect("enqueue current");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(900) {
+                state.yield_current().expect("switch to 900");
+            }
+            state.enqueue_current_cpu(901).expect("enqueue peer");
+        });
+        kernel
+    }
+
+    // ── (8) No task-state mutation ─────────────────────────────────────────────────────────
+
+    /// The narrow `KernelState` wrapper acquires only the scheduler state. Withdrawal is a
+    /// runqueue fact, not a lifecycle transition: the withdrawn task's status is byte-for-byte
+    /// what it was, for every status a queued task can legitimately hold.
+    #[test]
+    fn the_wrapper_leaves_the_task_status_byte_for_byte_unchanged() {
+        for status in [
+            TaskStatus::Runnable,
+            TaskStatus::Blocked(WaitReason::Poll),
+            TaskStatus::Blocked(WaitReason::Join(crate::kernel::ipc::ThreadId(900))),
+            TaskStatus::Exited(0x5a5a_5a5a),
+        ] {
+            let kernel = kernel_with_queued_peer();
+            kernel.with(|state| {
+                state.set_task_status_for_test(901, status);
+                let before = status_image(state, 901);
+                let typed_before = state.task_status(901);
+
+                assert_eq!(
+                    state.withdraw_queued_tid_on(CpuId(0), 901),
+                    WithdrawOutcome::Removed,
+                    "the peer is queued on CPU 0 and must be withdrawable"
+                );
+
+                let after = status_image(state, 901);
+                assert_eq!(
+                    before, after,
+                    "the TCB status image changed across a withdrawal of {status:?}"
+                );
+                assert_eq!(state.task_status(901), typed_before);
+                assert_eq!(state.task_status(901), Some(status));
+                assert!(state.task_exists(901), "the TCB itself must survive");
+            });
+        }
+    }
+
+    /// The task the withdrawal did NOT name is untouched too — status and TCB alike.
+    #[test]
+    fn the_wrapper_leaves_untargeted_tasks_untouched() {
+        let kernel = kernel_with_queued_peer();
+        kernel.with(|state| {
+            let current_before = status_image(state, 900);
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(0), 901),
+                WithdrawOutcome::Removed
+            );
+            assert_eq!(status_image(state, 900), current_before);
+            assert_eq!(state.current_tid(), Some(900), "current is unchanged");
+        });
+    }
+
+    // ── Typed outcomes through the wrapper ─────────────────────────────────────────────────
+
+    #[test]
+    fn the_wrapper_reports_each_typed_outcome() {
+        let kernel = kernel_with_queued_peer();
+        kernel.with(|state| {
+            // (3)(4) the current task — including any scheduler-owned idle current — is refused.
+            let before = status_image(state, 900);
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(0), 900),
+                WithdrawOutcome::RefusedCurrent
+            );
+            assert_eq!(status_image(state, 900), before);
+            assert_eq!(state.current_tid(), Some(900));
+
+            // A TID with no queued slot.
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(0), 4242),
+                WithdrawOutcome::NotQueued
+            );
+
+            // (1) an offline / out-of-range CPU is refused rather than silently retargeted.
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(7), 901),
+                WithdrawOutcome::InvalidCpu
+            );
+
+            // …and the peer is still queued after all three refusals.
+            assert_eq!(
+                state.withdraw_queued_tid_on(CpuId(0), 901),
+                WithdrawOutcome::Removed
+            );
+        });
+    }
+
+    // ── (2) Structurally non-dispatching ───────────────────────────────────────────────────
+
+    /// The seam contains no dispatch or context-switch token. This is the structural half of
+    /// "non-dispatching": the behavioural half lives in `scheduler::tests::withdraw_*`.
+    #[test]
+    fn the_seam_contains_no_dispatch_or_context_switch_token() {
+        let code = seam_code();
+        for forbidden in [
+            "dispatch_next",
+            "on_preempt_prefer",
+            "block_current",
+            "set_current",
+            "install_ap_idle_current",
+            "yield_current",
+            "switch_to",
+            "context_switch",
+            "preempt_reenqueue",
+            "self.current =",
+            "enqueue",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the withdrawal seam must not reference `{forbidden}`:\n{code}"
+            );
+        }
+    }
+
+    /// (8) No task-state mutation, structurally: the seam never reaches a TCB at all.
+    #[test]
+    fn the_seam_contains_no_task_state_mutation_token() {
+        let code = seam_code();
+        for forbidden in [
+            "tcb",
+            "Tcb",
+            "ThreadControlBlock",
+            "TaskStatus",
+            "status",
+            "with_tasks",
+            "set_task_status",
+            "task_mut",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the withdrawal seam must not touch task state via `{forbidden}`:\n{code}"
+            );
+        }
+    }
+
+    /// (7) No policy change, structurally: the seam names no topology, affinity, priority,
+    /// timeslice, balancing or timer knob.
+    #[test]
+    fn the_seam_changes_no_policy_state() {
+        let code = seam_code();
+        for forbidden in [
+            "bring_up_cpu",
+            "set_cpu_wake_only",
+            "mark_cpu_wake_only",
+            "set_present_cpu_bitmap",
+            "self.online",
+            "self.present",
+            "self.wake_only",
+            "home_cpu",
+            "affinity",
+            "timeslice",
+            "least_loaded",
+            "balance",
+            "timer",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the withdrawal seam must not change policy state via `{forbidden}`:\n{code}"
+            );
+        }
+    }
+
+    /// Architecture-neutral: the seam names no ISA, no firmware and no arch cfg.
+    #[test]
+    fn the_seam_has_no_architecture_specific_reference() {
+        let code = seam_code();
+        for forbidden in [
+            "riscv",
+            "Riscv",
+            "RISCV",
+            "aarch64",
+            "x86",
+            "target_arch",
+            "hart",
+            "sbi",
+            "Sbi",
+            "SBI",
+            "ipi",
+            "Ipi",
+            "satp",
+            "BOOTSTRAP_CPU_ID",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the withdrawal seam must stay architecture-neutral, found `{forbidden}`:\n{code}"
+            );
+        }
+    }
+
+    /// No duplicated queue algorithm: removal goes through the existing `RingQueue::remove_tid`
+    /// compaction, and the exact-one count shares `RingQueue::index` with the rest of the ring.
+    #[test]
+    fn the_seam_reuses_the_existing_compaction_mechanism() {
+        let per_cpu = method_body(
+            SCHED,
+            "pub(crate) fn withdraw_queued_tid(&mut self, tid: ThreadId)",
+        );
+        assert!(
+            per_cpu.contains(".remove_tid(tid)"),
+            "removal must delegate to RingQueue::remove_tid"
+        );
+        assert!(
+            per_cpu.contains(".count_tid(tid)"),
+            "the exact-one rule must count through the ring's own scan"
+        );
+        let count = method_body(SCHED, "fn count_tid(&self, tid: ThreadId) -> usize");
+        assert!(
+            count.contains("Self::index(self.head + offset)"),
+            "count_tid must reuse the ring's index mapping, not re-derive it"
+        );
+        for mutation in ["self.len", "self.head =", "self.tids["] {
+            assert!(
+                !code_lines(count)
+                    .iter()
+                    .any(|l| l.contains(mutation) && l.contains('=') && !l.contains("==")),
+                "count_tid must be a pure scan, found a write to `{mutation}`"
+            );
+        }
+    }
+
+    // ── Narrow visibility ──────────────────────────────────────────────────────────────────
+
+    /// The seam is `pub(crate)` at every level and adds no broader public API.
+    #[test]
+    fn the_seam_is_not_a_public_api() {
+        for (src, sig) in [
+            (SCHED, "fn withdraw_queued_tid(&mut self, tid: ThreadId)"),
+            (
+                SCHED,
+                "fn withdraw_queued_tid_on(&mut self, cpu: CpuId, tid: ThreadId)",
+            ),
+            (SCHED_STATE, "fn withdraw_queued_tid_on("),
+        ] {
+            let at = src.find(sig).expect("the seam signature");
+            let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let decl = &src[line_start..at + sig.len()];
+            assert!(
+                decl.trim_start().starts_with("pub(crate) fn"),
+                "the seam must stay pub(crate) or narrower: `{}`",
+                decl.trim()
+            );
+        }
+        assert!(
+            SCHED.contains("pub(crate) enum WithdrawOutcome"),
+            "the outcome type stays pub(crate) too"
+        );
+    }
+
+    // ── The increment wires nothing ────────────────────────────────────────────────────────
+
+    /// The seam has no caller outside the scheduler, its wrapper and tests: link 1 stays absent.
+    #[test]
+    fn the_seam_is_wired_into_no_oracle_or_production_path() {
+        fn visit(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+            for entry in std::fs::read_dir(root).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    visit(&path, f);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let src = std::fs::read_to_string(&path).expect("read file");
+                    f(&path, &src);
+                }
+            }
+        }
+
+        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        const OWNERS: &[&str] = &[
+            "src/kernel/scheduler.rs",
+            "src/kernel/boot/scheduler_state.rs",
+            "src/kernel/boot/tests.rs",
+        ];
+        let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        let mut owners_seen = 0usize;
+        visit(&repo_root.join("src"), &mut |path, src| {
+            let rel = path
+                .strip_prefix(&repo_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !src.contains("withdraw_queued_tid") {
+                return;
+            }
+            if OWNERS.contains(&rel.as_str()) {
+                owners_seen += 1;
+            } else {
+                callers.push(rel);
+            }
+        });
+        // Non-vacuity: the walk must actually have reached the files that DO name the seam.
+        assert_eq!(
+            owners_seen,
+            OWNERS.len(),
+            "the source walk missed a seam owner — the emptiness below would be meaningless"
+        );
+        assert!(
+            callers.is_empty(),
+            "the foundation must stay unwired in this increment; callers: {callers:?}"
+        );
+    }
+
+    /// The chain verdicts are unchanged by a foundation-only increment.
+    #[test]
+    fn the_remote_wake_verdicts_and_ledger_are_unchanged() {
+        const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+}

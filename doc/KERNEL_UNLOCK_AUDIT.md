@@ -2404,6 +2404,85 @@ partial proof is claimed.
 
 ---
 
+### 6.1.24 The generic non-dispatching runqueue-withdrawal foundation
+
+This closes the **contract split** §6.1.23 named as the prerequisite for link 1. It is **not**
+link 1. Nothing is wired: the seam has no caller outside the scheduler, its `KernelState` wrapper
+and tests, and that is machine-checked by a source-tree walk
+(`the_seam_is_wired_into_no_oracle_or_production_path`).
+
+**Verdicts unchanged.** Links 2, 3, 7, 9 present; **1, 4, 5, 6, 8, 10 absent**;
+`RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**; coordinate 23 **OPEN**;
+ledger **40 production / 6 knob-gated / 46 total**; **no live cell, no QEMU seal**. The
+production predicate is still `cfg!(target_arch = "x86_64")`.
+
+#### The seam
+
+```
+PriorityScheduler::withdraw_queued_tid(tid)          -> WithdrawOutcome   (pub(crate))
+SmpScheduler::withdraw_queued_tid_on(cpu, tid)       -> WithdrawOutcome   (pub(crate))
+KernelState::withdraw_queued_tid_on(cpu, tid: u64)   -> WithdrawOutcome   (pub(crate))
+```
+
+§6.1.23 sketched the return type as `bool`. **`bool` is genuinely ambiguous here**, so the
+smallest typed outcome is used instead: a bare `false` would conflate *not queued*, *is the
+CPU's current task*, *appears more than once* and *that CPU is not online* — four different
+facts with four different correct responses. Hence:
+
+| Outcome | Meaning |
+|---|---|
+| `Removed` | Exactly one queued incarnation was removed. |
+| `NotQueued` | The TID holds no queued slot on that CPU. Nothing mutated. |
+| `RefusedCurrent` | The TID is that CPU's `current` — including the scheduler-owned tid-0 idle placeholder. Refused **before** any mutation. |
+| `RefusedDuplicate` | More than one queued slot. **Fail closed**: no queue modified. |
+| `InvalidCpu` | CPU id out of range or not online. |
+
+#### Required semantics and where each is proved
+
+| # | Requirement | Proof |
+|---|---|---|
+| 1 | Exact CPU confinement | `withdraw_leaves_a_tid_queued_on_another_cpu_untouched`; only `schedulers[idx]` is reachable from the seam. |
+| 2 | Non-dispatching | Behavioural: `withdraw_changes_no_topology_or_current_state`. Structural: `the_seam_contains_no_dispatch_or_context_switch_token` bans `dispatch_next`, `on_preempt_prefer`, `block_current`, `set_current`, `install_ap_idle_current`, `yield_current`, `switch_to`, `context_switch`, `preempt_reenqueue`, `self.current =`, `enqueue`. |
+| 3 | Current-task protection, before mutation | `withdraw_refuses_the_current_task_without_mutation`; the `current` check is the first statement. |
+| 4 | Idle-task protection | `withdraw_preserves_the_scheduler_owned_idle_current` — tid 0 is `current` on a wake-only CPU, so (3) already covers it. |
+| 5 | Exact-one rule | `withdraw_fails_closed_on_a_duplicate_occurrence_with_zero_mutation`. `count_tid` scans **all three** priority queues first; mutation happens only at a total of exactly 1. |
+| 6 | Wrong-CPU behaviour | Same test as (1) — CPU 0's withdrawal reports `NotQueued` and CPU 1's queue is intact. |
+| 7 | No policy changes | `withdraw_changes_no_topology_or_current_state` compares online/present/wake-only bitmaps and both current slots; `the_seam_changes_no_policy_state` bans the topology, affinity, priority, timeslice, balancing and timer tokens. |
+| 8 | No task-state mutation | `the_wrapper_leaves_the_task_status_byte_for_byte_unchanged` images the TCB `status` field's raw bytes before and after, for `Runnable`, `Blocked(Poll)`, `Blocked(Join)` and `Exited`; `the_seam_contains_no_task_state_mutation_token` proves the seam never names a TCB at all. |
+| 9 | Queue integrity | `withdraw_handles_head_middle_and_tail_positions` (FIFO order of survivors) and `withdraw_compacts_a_wrapped_ring_queue` (head 56, len 10 over a 64-slot ring, removal at the last physical slot with successors past the wrap). |
+
+#### No duplicated queue algorithm
+
+Removal delegates to the existing `RingQueue::remove_tid` compaction, and the exact-one count
+reuses the ring's own `Self::index` mapping (`the_seam_reuses_the_existing_compaction_mechanism`,
+which also proves `count_tid` is a pure scan). The **one** thing withdrawal must do that
+`remove_tid` alone does not is update the membership mirror: `remove_tid`'s only pre-existing
+caller, `on_preempt_prefer`, moves the task queue → `current`, so it stays present in that
+scheduler and membership must *not* change. Withdrawal removes it from the scheduler entirely, so
+membership must be cleared — otherwise a later `enqueue_with_priority` would refuse the TID as
+already queued. `withdraw_removes_from_each_priority_queue` re-enqueues after every withdrawal
+precisely to pin that.
+
+#### Architecture neutrality and visibility
+
+`the_seam_has_no_architecture_specific_reference` bans `riscv`, `aarch64`, `x86`, `target_arch`,
+`hart`, `sbi`, `ipi`, `satp` and `BOOTSTRAP_CPU_ID`. `the_seam_is_not_a_public_api` pins every
+level — and `WithdrawOutcome` itself — at `pub(crate)`.
+
+Each forbidden-token guard was mutation-tested: injecting `dispatch_next_on` into the scheduler
+seam fails (2); injecting `set_task_status_for_test` into the `KernelState` wrapper fails (8)
+*and* fails the byte-for-byte status proof. Both guards also assert their own extraction is
+non-degenerate, so a broken slice cannot make them pass vacuously.
+
+#### What is still missing for link 1
+
+Withdrawal alone. The remaining link-1 work — spawning a disposable proof task, parking it in the
+NR6/NR7 waiter state, assigning `home_cpu = CpuId(1)`, observing
+`RISCV_REMOTE_ENQUEUE_COMMITTED … target_executed=0`, then retiring it through this seam — is a
+separate increment and is **not** claimed here.
+
+---
+
 
 ## 7. Method and limits
 

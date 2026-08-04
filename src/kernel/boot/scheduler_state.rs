@@ -54,6 +54,23 @@ impl KernelState {
         })
     }
 
+    /// Stage 199D: withdraw one queued incarnation of `tid` from `cpu`'s runqueue.
+    ///
+    /// A narrow wrapper over the scheduler seam — it acquires only the scheduler state and
+    /// **never touches a TCB**, so the task's status is byte-for-byte unchanged across the call.
+    /// Withdrawal is a runqueue fact, not a lifecycle transition: a withdrawn task keeps whatever
+    /// status it had, and the caller remains responsible for whatever comes next.
+    pub(crate) fn withdraw_queued_tid_on(
+        &mut self,
+        cpu: CpuId,
+        tid: u64,
+    ) -> crate::kernel::scheduler::WithdrawOutcome {
+        self.with_scheduler_state_mut(|sched| {
+            kernel_mut(&mut sched.scheduler)
+                .withdraw_queued_tid_on(cpu, crate::kernel::ipc::ThreadId(tid))
+        })
+    }
+
     /// Stage 183.5: the wake-only (online, no-placement) CPU bitmap.
     pub fn wake_only_cpu_bitmap(&self) -> u64 {
         self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).wake_only_bitmap())

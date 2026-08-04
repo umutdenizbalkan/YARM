@@ -667,7 +667,38 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    identically. Chain unchanged — links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent;
    `RISCV_REMOTE_WAKE` recomputes to **D**; `RISCV_199D_READINESS` stays `case_b`; coordinate 23
    stays OPEN; ledger stays 40 / 6 / 46; `probe_extension(0x735049)` still uncalled.
-   See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.23. `stage199d_riscv_canonical_admission` (11 tests) pins the
+   See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.23.
+
+   **The generic non-dispatching runqueue-withdrawal foundation is CLOSED — link 1 is still
+   ABSENT.** This closes the contract split §6.1.23 named as link 1's prerequisite, and nothing
+   more. Three `pub(crate)` levels — `PriorityScheduler::withdraw_queued_tid(tid)`,
+   `SmpScheduler::withdraw_queued_tid_on(cpu, tid)` and a narrow `KernelState` wrapper — remove
+   **exactly one** queued incarnation of a TID from a **named** CPU's runqueue and do nothing else.
+   §6.1.23 sketched the return as `bool`; `bool` is genuinely ambiguous here, so the smallest typed
+   outcome is used instead — `Removed` / `NotQueued` / `RefusedCurrent` / `RefusedDuplicate` /
+   `InvalidCpu` — because a bare `false` would conflate four facts with four different correct
+   responses. The current task is refused **before** any mutation (which is also what protects the
+   scheduler-owned tid-0 idle current on a wake-only CPU); a duplicate occurrence **fails closed**
+   with zero mutation, counted across all three priority queues first; an out-of-range or offline
+   CPU is refused rather than retargeted. Removal delegates to the existing
+   `RingQueue::remove_tid` compaction and the exact-one count reuses the ring's own `index`
+   mapping, so **no queue algorithm is duplicated**; the one thing withdrawal adds is the
+   membership-mirror update, which `remove_tid`'s only pre-existing caller (`on_preempt_prefer`,
+   which moves the task queue → `current`) must *not* do. 21 focused tests cover each priority
+   queue, head/middle/tail, wrapped compaction, the empty queue, the wrong CPU, current refusal,
+   idle-current preservation, duplicate fail-closed, invalid CPU, unrelated FIFO order,
+   online/present/wake-only bitmaps and both current slots. Structural guards prove the seam
+   contains no dispatch or context-switch token, no task-state-mutation token, no policy token and
+   no architecture-specific reference, and that it stays `pub(crate)`; each was mutation-tested and
+   each asserts its own extraction is non-degenerate. `KernelState::withdraw_queued_tid_on` images
+   the TCB `status` field's **raw bytes** before and after, for `Runnable`, `Blocked(Poll)`,
+   `Blocked(Join)` and `Exited`. **Nothing is wired**: a source-tree walk proves the seam has no
+   caller outside the scheduler, its wrapper and tests. Chain unchanged — links 2, 3, 7, 9 present;
+   1, 4, 5, 6, 8, 10 absent; `RISCV_REMOTE_WAKE` stays **D**; `RISCV_199D_READINESS` stays
+   `case_b`; coordinate 23 stays OPEN; **no live cell and no QEMU seal**; ledger stays
+   40 / 6 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.24.
+
+   `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
