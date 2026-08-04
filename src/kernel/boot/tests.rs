@@ -105407,3 +105407,1856 @@ mod stage199d_remote_wake_authority {
         );
     }
 }
+
+// ── Canonical Stage 199D closure matrix ──────────────────────────────────────────────────────
+//
+// The audit deliverable, made EXECUTABLE. Every coordinate of canonical 199D is classified, and
+// each classification names the exact source seam, the hosted test module, and the live evidence
+// that supports it.
+//
+// **Evidence is bound to the coordinate it semantically proves.** An earlier revision of this
+// matrix checked only that a marker literal existed *somewhere* in the tree, which let
+// `IPC_DIRECT_TRANSFER_CAP` — a transfer-cap counter dump — stand as the evidence for the
+// reply-vs-timeout terminal race, a proposition it says nothing about. Each evidence entry now
+// names the file **and the emitting function** whose body must contain the literal, plus the
+// exact observation (field assignment or live count) the seal must show. A marker emitted by an
+// unrelated reporter can no longer be borrowed as proof.
+//
+// The final verdict is COMPUTED from the matrix rather than asserted beside it.
+mod stage199d_closure_matrix {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Status {
+        /// Landed, exercised hosted, and proven by live evidence on every architecture the
+        /// coordinate claims.
+        Complete,
+        /// Landed and exercised hosted; live evidence cannot be taken in this environment, and
+        /// for AArch64 a conditional production enablement is also required first.
+        StructurallyComplete,
+        /// Landed for some architectures / sub-paths only.
+        Partial,
+        /// Not retired.
+        Open,
+        /// **Not a 199D coordinate.** Belongs to canonical 199E and is excluded from the 199D
+        /// tally and from `CANONICAL_199D_CLOSABLE` entirely — it is neither COMPLETE nor a
+        /// blocker here.
+        DeferredToCanonical199E,
+    }
+    use Status::*;
+
+    /// Why a non-COMPLETE coordinate is not complete. Distinguishing these is the point: a
+    /// missing emulator, a missing production flip and missing code are not the same debt.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BlockerKind {
+        /// COMPLETE — nothing outstanding.
+        None,
+        /// Live evidence is unobtainable here AND the architecture's production predicate must
+        /// be enabled first, in a stated order. Not a code blocker.
+        LiveEvidencePendingAndConditionalProductionEnablement,
+        /// Code is landed and enabled; only the live run is missing.
+        LiveEvidencePending,
+        /// Code does not exist yet, and reaching live evidence needs an ordered chain beyond it.
+        CodeThenEnablementThenEvidence,
+        /// Out of 199D scope — tracked against canonical 199E.
+        OutOfScope199E,
+    }
+    use BlockerKind::*;
+
+    /// The observation a live run must show for an evidence entry to count.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Observation {
+        /// The emitting format string must carry this field, and the audit must record it.
+        Field(&'static str),
+        /// The audit must record this marker's observed live count as exactly this value.
+        Count(u32),
+        /// Presence of the marker in a live run is itself the observation.
+        Present,
+    }
+    use Observation::*;
+
+    struct Evidence {
+        marker: &'static str,
+        /// Repo-relative path of the file that EMITS (or, for a runner-composed seal, RECORDS)
+        /// the marker. The literal must be in this file — not merely somewhere in the tree.
+        emitter_file: &'static str,
+        /// The function in `emitter_file` whose body must contain the literal. `""` only for a
+        /// runner-composed seal line that no kernel function emits.
+        emitter_fn: &'static str,
+        observation: Observation,
+    }
+
+    struct Coordinate {
+        id: u8,
+        name: &'static str,
+        status: Status,
+        blocker: BlockerKind,
+        /// Source seam — must exist in the tree.
+        seam: &'static str,
+        /// Hosted test module — must exist in `tests.rs`.
+        test: &'static str,
+        /// Causal live evidence, each entry bound to its emitter. Empty when live is pending,
+        /// open, or deferred.
+        evidence: &'static [Evidence],
+    }
+
+    const MATRIX: &[Coordinate] = &[
+        // ── NR6 request path ────────────────────────────────────────────────────────────────
+        Coordinate {
+            id: 1,
+            name: "NR6 reply-record creation",
+            status: Complete,
+            blocker: None,
+            seam: "fn reserve_direct_reply_record_split",
+            test: "stage199d_ack_lease_lifecycle",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_ACK_COUNTERS",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("reserve="),
+            }],
+        },
+        Coordinate {
+            id: 2,
+            name: "NR6 provisional reply-cap mint",
+            status: Complete,
+            blocker: None,
+            seam: "fn sr_mint_split",
+            test: "stage199d_ack_lease_lifecycle",
+            evidence: &[Evidence {
+                marker: "IPCCALL_DIRECT_REQUEST_OK",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn emit_ipccall_direct_request_live_markers",
+                observation: Present,
+            }],
+        },
+        Coordinate {
+            id: 3,
+            name: "NR6 reverse-link installation accounting",
+            status: Complete,
+            blocker: None,
+            seam: "fn install_server_reply_link",
+            test: "stage199d_link_creation_parity",
+            evidence: &[Evidence {
+                marker: "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn maybe_emit_server_dies_link_balance",
+                observation: Field("created="),
+            }],
+        },
+        Coordinate {
+            id: 4,
+            name: "NR6 server wake (enqueue LAST, non-fallible)",
+            status: Complete,
+            blocker: None,
+            seam: "fn sr_enqueue_committed_receiver_split",
+            test: "stage199d_remote_wake_authority",
+            evidence: &[Evidence {
+                marker: "IPCCALL_DIRECT_REQUEST_OK",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn emit_ipccall_direct_request_live_markers",
+                observation: Present,
+            }],
+        },
+        Coordinate {
+            id: 5,
+            name: "NR6 delivery projection (inline-opcode framing parity)",
+            status: Complete,
+            blocker: None,
+            seam: "fn project_recv_delivery",
+            test: "stage199d_delivery_projection_differential",
+            evidence: &[Evidence {
+                marker: "X86_AP_RECV_V2_USER_VALIDATED",
+                emitter_file: "src/kernel/boot/exec_state.rs",
+                emitter_fn: "fn build_ap_workload",
+                observation: Present,
+            }],
+        },
+        // ── NR7 reply path ──────────────────────────────────────────────────────────────────
+        Coordinate {
+            id: 6,
+            name: "NR7 one-shot record consumption (duplicate barrier)",
+            status: Complete,
+            blocker: None,
+            seam: "fn consume_reply_record_split",
+            test: "stage199d_link_close_parity",
+            evidence: &[Evidence {
+                marker: "IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED",
+                emitter_file: "src/kernel/syscall_split.rs",
+                emitter_fn: "fn try_split_ipcreply_direct_into_frame",
+                observation: Present,
+            }],
+        },
+        Coordinate {
+            id: 7,
+            name: "NR7 reverse-link close accounting",
+            status: Complete,
+            blocker: None,
+            seam: "fn close_server_reply_link",
+            test: "stage199d_link_close_parity",
+            evidence: &[Evidence {
+                marker: "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn maybe_emit_server_dies_link_balance",
+                observation: Field("closed="),
+            }],
+        },
+        Coordinate {
+            id: 8,
+            name: "NR7 caller wake (enqueue LAST, non-fallible)",
+            status: Complete,
+            blocker: None,
+            seam: "fn sr_claim_endpoint_waiter_split",
+            test: "stage199d_remote_wake_authority",
+            evidence: &[Evidence {
+                marker: "IPCREPLY_DIRECT_OK",
+                emitter_file: "src/kernel/boot/mod.rs",
+                emitter_fn: "fn emit_ipcreply_direct_live_markers",
+                observation: Present,
+            }],
+        },
+        // ── Wake authority ──────────────────────────────────────────────────────────────────
+        Coordinate {
+            id: 9,
+            name: "Local enqueue authority — no IPI",
+            status: Complete,
+            blocker: None,
+            seam: "fn current_cpu_split_read",
+            test: "stage199d_remote_wake_authority",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn maybe_emit_quiescent_attestation",
+                observation: Field("result="),
+            }],
+        },
+        Coordinate {
+            id: 10,
+            name: "Remote enqueue authority — one IPI at the home CPU",
+            status: Complete,
+            blocker: None,
+            seam: "fn send_reschedule_ipi_to",
+            test: "stage199d_remote_wake_authority",
+            evidence: &[Evidence {
+                marker: "X86_AP_RESCHEDULE_IPI_SENT",
+                emitter_file: "src/arch/x86_64/smp.rs",
+                emitter_fn: "fn send_reschedule_ipi_to",
+                observation: Present,
+            }],
+        },
+        Coordinate {
+            id: 11,
+            name: "Reverse (NR7) remote enqueue authority",
+            status: Complete,
+            blocker: None,
+            seam: "fn c2c_send_reschedule_ipi_to",
+            test: "stage199d_remote_wake_authority",
+            evidence: &[Evidence {
+                marker: "X86_BSP_RESCHEDULE_IPI_SENT",
+                emitter_file: "src/arch/x86_64/smp.rs",
+                emitter_fn: "fn c2c_send_reschedule_ipi_to",
+                observation: Present,
+            }],
+        },
+        // ── Declines and fallbacks ──────────────────────────────────────────────────────────
+        Coordinate {
+            id: 12,
+            name: "Transfer-cap decline before mutation -> legacy",
+            status: Complete,
+            blocker: None,
+            seam: "fn transfer_cap_arg_present",
+            test: "stage199d_transfer_cap_safety",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_TRANSFER_CAP",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("declined_transfer_cap="),
+            }],
+        },
+        // ── The 199D terminal-arbitration SAFETY coordinate ─────────────────────────────────
+        //
+        // What 199D owns is the *safety* proposition: a terminal-arbitrated NR7 declines BEFORE
+        // any mutation, so the legacy terminal lease wins the causal reply-vs-timeout race
+        // intact. Its evidence is therefore the causal reply-win set — reserve once, beat the
+        // timeout once, never roll back, never defer a timeout claim, with the direct path
+        // recording the arbitrated decline. Not a transfer-cap counter.
+        Coordinate {
+            id: 13,
+            name: "Terminal-arbitrated NR7 declines before mutation; legacy wins the causal \
+                   reply-vs-timeout race",
+            status: Complete,
+            blocker: None,
+            seam: "fn reply_record_terminal_arbitrated_split_read",
+            test: "stage199d_terminal_arbitration_safety",
+            evidence: &[
+                Evidence {
+                    marker: "IPC_DIRECT_PRODUCTION_QUIESCENT",
+                    emitter_file: "src/kernel/direct_ipc_counters.rs",
+                    emitter_fn: "fn emit_quiescent",
+                    observation: Field("arbitrated="),
+                },
+                Evidence {
+                    marker: "IPC_REPLY_WIN_RESERVE",
+                    emitter_file: "src/kernel/boot/ipc_state.rs",
+                    emitter_fn: "fn reserve_reply_win_before_copy",
+                    observation: Count(1),
+                },
+                Evidence {
+                    marker: "IPC_REPLY_BEATS_TIMEOUT_OK",
+                    emitter_file: "src/kernel/boot/ipc_state.rs",
+                    emitter_fn: "fn commit_reply_win_after_delivery",
+                    observation: Count(1),
+                },
+                Evidence {
+                    marker: "IPC_REPLY_WIN_ROLLBACK",
+                    emitter_file: "src/kernel/boot/ipc_state.rs",
+                    emitter_fn: "fn rollback_reply_win",
+                    observation: Count(0),
+                },
+                Evidence {
+                    marker: "IPC_REPLY_TIMEOUT_DEFERRED",
+                    emitter_file: "src/runtime.rs",
+                    emitter_fn: "fn drain_reply_timeout_post_work",
+                    observation: Count(0),
+                },
+            ],
+        },
+        // ── Excluded from 199D entirely ─────────────────────────────────────────────────────
+        //
+        // Porting the terminal lease INTO the direct transaction — so the direct path can
+        // arbitrate rather than decline — is a 199E deliverable. 199D's contract is the decline,
+        // and the decline is proven (id 13). This row exists so the deferral is visible and
+        // typed, NOT so it can be counted: it is excluded from the tally and from the verdict.
+        Coordinate {
+            id: 14,
+            name: "Terminal-lease port into the direct transaction (direct-path arbitration)",
+            status: DeferredToCanonical199E,
+            blocker: OutOfScope199E,
+            seam: "fn reserve_reply_win_before_copy",
+            test: "stage199d_terminal_arbitration_safety",
+            evidence: &[],
+        },
+        // ── Remaining terminal races ────────────────────────────────────────────────────────
+        Coordinate {
+            id: 15,
+            name: "Caller exit / replacement terminal race",
+            status: Complete,
+            blocker: None,
+            seam: "fn direct_caller_exact_still_blocked",
+            test: "stage199d_ack_lease_lifecycle",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_ACK_FUSES",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("stale="),
+            }],
+        },
+        Coordinate {
+            id: 16,
+            name: "Server death terminal race (reply-link cleanup) — x86_64 only",
+            status: Partial,
+            blocker: LiveEvidencePending,
+            seam: "fn close_server_reply_link",
+            test: "stage199d_link_close_parity",
+            evidence: &[Evidence {
+                marker: "STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL",
+                emitter_file: "doc/PROJECT_HISTORY.md",
+                emitter_fn: "",
+                observation: Field("live_cells=1"),
+            }],
+        },
+        // ── Acknowledgement lifecycle ───────────────────────────────────────────────────────
+        Coordinate {
+            id: 17,
+            name: "Stale generation / foreign / duplicate release",
+            status: Complete,
+            blocker: None,
+            seam: "fn release_endpoint_index",
+            test: "stage199d_ack_lease_lifecycle",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_ACK_FUSES",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("dup_release="),
+            }],
+        },
+        Coordinate {
+            id: 18,
+            name: "Recycled-slot behaviour (positional, endpoint-keyed)",
+            status: Complete,
+            blocker: None,
+            seam: "pub mod direct_ack_store",
+            test: "stage199d_ack_lease_lifecycle",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_ACK_COUNTERS",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_direction",
+                observation: Field("spent_released="),
+            }],
+        },
+        Coordinate {
+            id: 19,
+            name: "Waiter census / lease bijection",
+            status: Complete,
+            blocker: None,
+            seam: "pub mod direct_ack_census",
+            test: "stage199d_waiter_census",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_WAITER_BIJECTION",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn emit_census",
+                observation: Field("waiters_without_lease="),
+            }],
+        },
+        // ── Per-architecture production status ──────────────────────────────────────────────
+        Coordinate {
+            id: 20,
+            name: "x86_64 production default ON + live sealed",
+            status: Complete,
+            blocker: None,
+            seam: "fn ipccall_direct_production_enabled",
+            test: "stage199d_production_default_guards",
+            evidence: &[Evidence {
+                marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+                emitter_file: "src/kernel/direct_ipc_counters.rs",
+                emitter_fn: "fn maybe_emit_quiescent_attestation",
+                observation: Field("nr6_ok="),
+            }],
+        },
+        Coordinate {
+            id: 21,
+            name: "AArch64 off-lock NR6/NR7 + authoritative dispatch",
+            status: StructurallyComplete,
+            blocker: LiveEvidencePendingAndConditionalProductionEnablement,
+            seam: "fn offlock_authoritative_dispatch_enabled",
+            test: "stage199d_aarch64_offlock_dispatch",
+            evidence: &[],
+        },
+        Coordinate {
+            id: 22,
+            name: "AArch64 broad-lock-free handled-syscall return",
+            status: StructurallyComplete,
+            blocker: LiveEvidencePendingAndConditionalProductionEnablement,
+            seam: "fn split_finalize_handled_syscall",
+            test: "stage199d_split_return_without_broad_lock",
+            evidence: &[],
+        },
+        Coordinate {
+            id: 23,
+            name: "RISC-V off-lock NR6/NR7",
+            status: Open,
+            blocker: CodeThenEnablementThenEvidence,
+            seam: "fn ipccall_direct_proof_enabled",
+            test: "stage199a2c3_matrix_guards",
+            evidence: &[],
+        },
+        // ── SMP preservation ────────────────────────────────────────────────────────────────
+        Coordinate {
+            id: 24,
+            name: "SMP=2 cross-CPU request/reply preservation",
+            status: Complete,
+            blocker: None,
+            seam: "fn drain_direct_reply_post_work",
+            test: "stage199d_smp_oracle_request_framing",
+            evidence: &[Evidence {
+                marker: "STAGE_199_X86_DIRECT_IPC_FINAL_SEAL",
+                emitter_file: "scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh",
+                emitter_fn: "",
+                observation: Field("cross_cpu_request_smp2=1"),
+            }],
+        },
+    ];
+
+    // ── The ordered enablement / repair sequences the non-COMPLETE rows depend on ────────────
+
+    /// AArch64 is NOT "just a missing emulator". Live evidence additionally requires enabling
+    /// the AArch64 production predicate, and the enablement is only justified once the
+    /// proof/oracle run has passed. This audit-only increment does not flip it.
+    const AARCH64_SEQUENCE: &[&str] = &[
+        "1. proof/oracle QEMU run under qemu-system-aarch64 (AArch64 production predicate still OFF)",
+        "2. enable the AArch64 production predicate",
+        "3. on ONE exact commit: normal feature-off boot + direct oracle + ServerDies + timeout regressions",
+    ];
+
+    /// RISC-V is a FOUR-link chain, not one missing emulator. Each link is independent and
+    /// strictly ordered; naming them together with AArch64 was the taxonomy error.
+    const RISCV_SEQUENCE: &[&str] = &[
+        "1. [CLOSED] kernel target-spec / toolchain repair — the LLVM triple named the Rust target name `riscv64gc`; it now names the LLVM architecture, ISA and ABI unchanged",
+        "2. [AUDITED case_c] RISC-V off-lock NR6/NR7 code — the contract stack is inherited clean, but the trap bridge re-enters the broad lock on the return path even at SMP=1; see §6.1.17",
+        "3. RISC-V production enablement",
+        "4. live RISC-V NR6/NR7 and ServerDies evidence",
+    ];
+
+    /// Links of `RISCV_SEQUENCE` that are closed. Link 1 only — closing it does NOT advance
+    /// coordinate 23, which stays OPEN on links 2–4.
+    const RISCV_LINKS_CLOSED: usize = 1;
+
+    // ── Path-addressed source table: evidence resolves against ONE named file ────────────────
+
+    fn source_of(path: &str) -> &'static str {
+        match path {
+            "src/kernel/boot/mod.rs" => include_str!("mod.rs"),
+            "src/kernel/boot/ipc_state.rs" => include_str!("ipc_state.rs"),
+            "src/kernel/boot/exec_state.rs" => include_str!("exec_state.rs"),
+            "src/runtime.rs" => include_str!("../../runtime.rs"),
+            "src/arch/x86_64/smp.rs" => include_str!("../../arch/x86_64/smp.rs"),
+            "src/kernel/direct_ipc_counters.rs" => include_str!("../direct_ipc_counters.rs"),
+            "src/kernel/syscall_split.rs" => include_str!("../syscall_split.rs"),
+            "src/kernel/ipccall_direct_txn.rs" => include_str!("../ipccall_direct_txn.rs"),
+            "doc/PROJECT_HISTORY.md" => include_str!("../../../doc/PROJECT_HISTORY.md"),
+            "scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh" => {
+                include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh")
+            }
+            other => panic!("no source registered for evidence file `{other}`"),
+        }
+    }
+
+    /// The body of `name` in `src`, from its signature to the first line that closes it at the
+    /// same indentation. Used to bind a marker to the function that actually emits it.
+    fn function_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+        let at = src.find(name)?;
+        let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let indent: usize = src[line_start..at]
+            .chars()
+            .take_while(|c| *c == ' ')
+            .count();
+        let closer = alloc::format!("\n{}}}", " ".repeat(indent));
+        let end = src[at..].find(&closer).map(|i| at + i)?;
+        Some(&src[at..end])
+    }
+
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    fn in_scope() -> impl Iterator<Item = &'static Coordinate> {
+        MATRIX
+            .iter()
+            .filter(|c| c.status != DeferredToCanonical199E)
+    }
+
+    /// Every coordinate names a seam that EXISTS in the tree.
+    #[test]
+    fn every_coordinate_names_a_real_seam() {
+        const SOURCES: &[&str] = &[
+            include_str!("mod.rs"),
+            include_str!("ipc_state.rs"),
+            include_str!("../../runtime.rs"),
+            include_str!("../../arch/x86_64/smp.rs"),
+            include_str!("../../arch/trap_entry.rs"),
+            include_str!("../../arch/aarch64/trap.rs"),
+            include_str!("../ipccall_direct_txn.rs"),
+            include_str!("../direct_eligibility.rs"),
+            include_str!("../direct_ack_store.rs"),
+            include_str!("../syscall/ipc_abi.rs"),
+            include_str!("../syscall/ipc_recv_core.rs"),
+            include_str!("../mod.rs"),
+        ];
+        for c in MATRIX {
+            assert!(
+                SOURCES.iter().any(|s| s.contains(c.seam)),
+                "coordinate {} `{}` names a seam that does not exist: `{}`",
+                c.id,
+                c.name,
+                c.seam
+            );
+        }
+    }
+
+    /// Every coordinate names a hosted test module that EXISTS.
+    #[test]
+    fn every_coordinate_names_a_real_test_module() {
+        const TESTS: &str = include_str!("tests.rs");
+        for c in MATRIX {
+            let decl = alloc::format!("mod {} {{", c.test);
+            assert!(
+                TESTS.contains(&decl),
+                "coordinate {} `{}` names a test module that does not exist: `{}`",
+                c.id,
+                c.name,
+                c.test
+            );
+        }
+    }
+
+    /// **The semantic bind.** Each evidence marker must live in the file the coordinate names,
+    /// inside the function the coordinate names as its emitter. Existing *somewhere* in the
+    /// tree is not evidence of anything.
+    #[test]
+    fn every_evidence_marker_is_emitted_by_the_function_that_claims_it() {
+        for c in MATRIX {
+            for e in c.evidence {
+                let src = source_of(e.emitter_file);
+                assert!(
+                    src.contains(e.marker),
+                    "coordinate {} `{}`: marker `{}` is not in its declared emitter file `{}`",
+                    c.id,
+                    c.name,
+                    e.marker,
+                    e.emitter_file
+                );
+                if e.emitter_fn.is_empty() {
+                    continue;
+                }
+                let body = function_body(src, e.emitter_fn).unwrap_or_else(|| {
+                    panic!(
+                        "coordinate {} `{}`: emitter `{}` not found in `{}`",
+                        c.id, c.name, e.emitter_fn, e.emitter_file
+                    )
+                });
+                assert!(
+                    body.contains(e.marker),
+                    "coordinate {} `{}`: marker `{}` exists in `{}` but NOT inside `{}` — it is \
+                     emitted by some other reporter and cannot stand as this coordinate's proof",
+                    c.id,
+                    c.name,
+                    e.marker,
+                    e.emitter_file,
+                    e.emitter_fn
+                );
+            }
+        }
+    }
+
+    /// A `Field` observation must be a field the emitter actually prints; a `Count` observation
+    /// must be a live count the audit actually records. Neither can be invented.
+    #[test]
+    fn every_evidence_observation_is_supported_by_emitter_and_audit() {
+        for c in MATRIX {
+            for e in c.evidence {
+                let src = source_of(e.emitter_file);
+                match e.observation {
+                    Field(field) => {
+                        let scope = if e.emitter_fn.is_empty() {
+                            src
+                        } else {
+                            function_body(src, e.emitter_fn).expect("emitter body")
+                        };
+                        assert!(
+                            scope.contains(field),
+                            "coordinate {} `{}`: observation `{}` is not a field `{}` prints",
+                            c.id,
+                            c.name,
+                            field,
+                            e.marker
+                        );
+                    }
+                    Count(n) => {
+                        let recorded = alloc::format!("{}={}", e.marker, n);
+                        assert!(
+                            AUDIT.contains(&recorded),
+                            "coordinate {} `{}`: the audit does not record the live observation \
+                             `{}`",
+                            c.id,
+                            c.name,
+                            recorded
+                        );
+                    }
+                    Present => {}
+                }
+            }
+        }
+    }
+
+    /// The 199D terminal-arbitration coordinate carries the EXACT causal evidence set, and
+    /// specifically not `IPC_DIRECT_TRANSFER_CAP` — the regression this repair exists to pin.
+    #[test]
+    fn the_terminal_arbitration_coordinate_carries_the_causal_evidence_set() {
+        let c = MATRIX
+            .iter()
+            .find(|c| c.id == 13)
+            .expect("the terminal-arbitration safety coordinate");
+        assert_eq!(c.status, Complete);
+
+        let required: &[(&str, Observation)] = &[
+            ("IPC_DIRECT_PRODUCTION_QUIESCENT", Field("arbitrated=")),
+            ("IPC_REPLY_WIN_RESERVE", Count(1)),
+            ("IPC_REPLY_BEATS_TIMEOUT_OK", Count(1)),
+            ("IPC_REPLY_WIN_ROLLBACK", Count(0)),
+            ("IPC_REPLY_TIMEOUT_DEFERRED", Count(0)),
+        ];
+        assert_eq!(
+            c.evidence.len(),
+            required.len(),
+            "the causal evidence set is exactly five entries"
+        );
+        for (marker, obs) in required {
+            let got = c
+                .evidence
+                .iter()
+                .find(|e| e.marker == *marker)
+                .unwrap_or_else(|| panic!("causal evidence `{marker}` is missing"));
+            assert_eq!(got.observation, *obs, "wrong observation for `{marker}`");
+        }
+        assert!(
+            !c.evidence
+                .iter()
+                .any(|e| e.marker == "IPC_DIRECT_TRANSFER_CAP"),
+            "IPC_DIRECT_TRANSFER_CAP is a transfer-cap counter dump and says nothing about the \
+             reply-vs-timeout race — it must never be this coordinate's evidence again"
+        );
+    }
+
+    /// The terminal-lease port is DEFERRED to 199E: excluded from the tally, and it must not be
+    /// reachable as a 199D blocker.
+    #[test]
+    fn the_terminal_lease_port_is_deferred_and_excluded() {
+        let c = MATRIX
+            .iter()
+            .find(|c| c.id == 14)
+            .expect("the terminal-lease port row");
+        assert_eq!(c.status, DeferredToCanonical199E);
+        assert_eq!(c.blocker, OutOfScope199E);
+        assert!(
+            c.evidence.is_empty(),
+            "a deferred coordinate claims no 199D evidence"
+        );
+        assert!(
+            !in_scope().any(|c| c.id == 14),
+            "the deferred row must not appear in the in-scope tally"
+        );
+        assert_eq!(
+            MATRIX
+                .iter()
+                .filter(|c| c.status == DeferredToCanonical199E)
+                .count(),
+            1,
+            "exactly one row is deferred to 199E"
+        );
+    }
+
+    /// A coordinate without live evidence must not claim any, and a COMPLETE one must.
+    #[test]
+    fn evidence_presence_matches_status() {
+        for c in MATRIX {
+            match c.status {
+                Complete => assert!(
+                    !c.evidence.is_empty(),
+                    "COMPLETE coordinate {} `{}` must carry live evidence",
+                    c.id,
+                    c.name
+                ),
+                StructurallyComplete | Open | DeferredToCanonical199E => assert!(
+                    c.evidence.is_empty(),
+                    "coordinate {} `{}` is not live-sealed and must claim no evidence",
+                    c.id,
+                    c.name
+                ),
+                // PARTIAL means sealed on some architectures only — it does carry evidence for
+                // the sub-path it did earn.
+                Partial => {}
+            }
+        }
+    }
+
+    /// Blocker kind and status agree, and the AArch64 rows are typed as needing BOTH live
+    /// evidence and a conditional production enablement — not merely an emulator.
+    #[test]
+    fn blocker_kinds_are_accurate() {
+        for c in MATRIX {
+            match c.status {
+                Complete => assert_eq!(c.blocker, None, "coordinate {} is COMPLETE", c.id),
+                _ => assert_ne!(
+                    c.blocker, None,
+                    "non-COMPLETE coordinate {} must name a blocker kind",
+                    c.id
+                ),
+            }
+        }
+        for id in [21u8, 22] {
+            let c = MATRIX.iter().find(|c| c.id == id).expect("AArch64 row");
+            assert_eq!(c.status, StructurallyComplete);
+            assert_eq!(
+                c.blocker, LiveEvidencePendingAndConditionalProductionEnablement,
+                "AArch64 row {id} needs live evidence AND a conditional production enablement"
+            );
+        }
+        let riscv = MATRIX.iter().find(|c| c.id == 23).expect("RISC-V row");
+        assert_eq!(riscv.status, Open);
+        assert_eq!(
+            riscv.blocker, CodeThenEnablementThenEvidence,
+            "RISC-V is a code blocker with an ordered chain behind it, not a missing emulator"
+        );
+        assert_ne!(
+            riscv.blocker, LiveEvidencePendingAndConditionalProductionEnablement,
+            "RISC-V and AArch64 must not share one blocker kind"
+        );
+    }
+
+    /// The AArch64 and RISC-V sequences are recorded in order, and separately, in the audit.
+    #[test]
+    fn the_enablement_sequences_are_recorded_separately() {
+        assert_eq!(
+            AARCH64_SEQUENCE.len(),
+            3,
+            "the AArch64 sequence has 3 steps"
+        );
+        assert_eq!(RISCV_SEQUENCE.len(), 4, "the RISC-V chain has 4 links");
+        for phrase in [
+            "proof/oracle QEMU",
+            "enable the AArch64 production predicate",
+            "ServerDies",
+        ] {
+            assert!(
+                AARCH64_SEQUENCE.iter().any(|s| s.contains(phrase)),
+                "the AArch64 sequence must record `{phrase}`"
+            );
+        }
+        for phrase in [
+            "target-spec",
+            "off-lock NR6/NR7 code",
+            "production enablement",
+            "ServerDies evidence",
+        ] {
+            assert!(
+                RISCV_SEQUENCE.iter().any(|s| s.contains(phrase)),
+                "the RISC-V chain must record `{phrase}`"
+            );
+        }
+        assert!(
+            AUDIT.contains("LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT"),
+            "the audit must name the AArch64 blocker kind"
+        );
+        assert!(
+            AUDIT.contains("DEFERRED_TO_CANONICAL_199E"),
+            "the audit must name the deferral"
+        );
+    }
+
+    /// **RISC-V dependency-chain link 1 is CLOSED, and closing it advances nothing else.** The
+    /// custom kernel target now configures; links 2–4 are untouched and coordinate 23 stays
+    /// OPEN. This is the guard against a target-spec repair being read as RISC-V progress.
+    #[test]
+    fn only_riscv_chain_link_one_is_closed() {
+        assert_eq!(RISCV_LINKS_CLOSED, 1, "exactly one link is closed");
+        assert!(
+            RISCV_SEQUENCE[0].contains("[CLOSED]"),
+            "link 1 is the closed one"
+        );
+        for (i, link) in RISCV_SEQUENCE.iter().enumerate().skip(RISCV_LINKS_CLOSED) {
+            assert!(
+                !link.contains("[CLOSED]"),
+                "RISC-V chain link {} must remain open: `{link}`",
+                i + 1
+            );
+        }
+        let riscv = MATRIX.iter().find(|c| c.id == 23).expect("RISC-V row");
+        assert_eq!(
+            riscv.status, Open,
+            "closing the target-spec link does NOT advance coordinate 23 — the off-lock NR6/NR7 \
+             code, production enablement and live evidence are all still outstanding"
+        );
+        assert_eq!(riscv.blocker, CodeThenEnablementThenEvidence);
+        assert!(
+            riscv.evidence.is_empty(),
+            "coordinate 23 claims no live evidence"
+        );
+        assert!(
+            AUDIT.contains("link 1 is **CLOSED**"),
+            "the audit must record link 1 as closed"
+        );
+        // Link 2 is AUDITED, not closed — case C. The distinction is the whole point: an audit
+        // that found a decisive blocker must not read as progress.
+        assert!(
+            RISCV_SEQUENCE[1].contains("[AUDITED case_c]"),
+            "link 2 is audited"
+        );
+        assert!(
+            AUDIT.contains("RISCV_199D_READINESS=case_c"),
+            "and the audit records the case-C verdict"
+        );
+    }
+
+    /// **The verdict, COMPUTED from the in-scope matrix.** Canonical 199D is closable only when
+    /// every IN-SCOPE coordinate is COMPLETE. The 199E deferral is excluded from both sides of
+    /// that question: it can neither close 199D nor block it.
+    #[test]
+    fn canonical_199d_closable_is_computed_from_the_matrix() {
+        let complete = in_scope().filter(|c| c.status == Complete).count();
+        let structural = in_scope()
+            .filter(|c| c.status == StructurallyComplete)
+            .count();
+        let partial = in_scope().filter(|c| c.status == Partial).count();
+        let open = in_scope().filter(|c| c.status == Open).count();
+        let deferred = MATRIX
+            .iter()
+            .filter(|c| c.status == DeferredToCanonical199E)
+            .count();
+
+        assert_eq!(
+            complete + structural + partial + open,
+            in_scope().count(),
+            "every in-scope coordinate must be classified"
+        );
+        assert_eq!(
+            in_scope().count() + deferred,
+            MATRIX.len(),
+            "the deferral is the only row outside the in-scope tally"
+        );
+
+        let closable = structural == 0 && partial == 0 && open == 0;
+        assert!(
+            !closable,
+            "the matrix says canonical 199D IS closable — update the audit verdict, which \
+             currently records CANONICAL_199D_CLOSABLE=no"
+        );
+
+        // The in-scope tally, recorded so it cannot drift silently.
+        assert_eq!(in_scope().count(), 23, "in-scope coordinate count");
+        assert_eq!(complete, 19, "COMPLETE");
+        assert_eq!(
+            structural, 2,
+            "AArch64 off-lock dispatch + AArch64 broad-lock-free return"
+        );
+        assert_eq!(partial, 1, "ServerDies, 1 of 3 architectures");
+        assert_eq!(open, 1, "RISC-V off-lock NR6/NR7");
+        assert_eq!(deferred, 1, "the 199E terminal-lease port, excluded");
+    }
+
+    /// Coordinate ids are unique and dense — the audit table and this matrix index the same way.
+    #[test]
+    fn coordinate_ids_are_unique_and_dense() {
+        for (i, c) in MATRIX.iter().enumerate() {
+            assert_eq!(c.id as usize, i + 1, "coordinate ids run 1..=n in order");
+        }
+        assert_eq!(MATRIX.len(), 24, "23 in-scope + 1 deferred");
+    }
+
+    /// The x86_64 production default is ON and the AArch64/RISC-V defaults are OFF — the audit
+    /// states this, and it must remain true of the tree it describes. This audit-only increment
+    /// flipped nothing.
+    #[test]
+    fn the_audited_production_defaults_are_what_the_matrix_claims() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\")",
+            "x86_64 ON, every other architecture OFF"
+        );
+    }
+}
+
+// ── Canonical Stage 199D live-evidence ledger reconciliation ─────────────────────────────────
+//
+// The live-cell ledger is arithmetic over named seals, and arithmetic can be checked. Every
+// figure quoted in `doc/STATUS.md` is recomputed here from its constituent seals, so a total
+// cannot drift away from the seals that produce it, and the two counting policies
+// (production-path only, versus including knob-gated mechanism evidence) cannot be conflated.
+mod stage199d_live_evidence_ledger {
+    use super::*;
+
+    const STATUS: &str = include_str!("../../../doc/STATUS.md");
+    const HISTORY: &str = include_str!("../../../doc/PROJECT_HISTORY.md");
+
+    /// Each production-path contribution, with the seal that earned it.
+    const PRODUCTION_PATH: &[(&str, usize, &str)] = &[
+        (
+            "Stage 198F combined retirement",
+            30,
+            "STAGE_198F_COMPLETE_RETIREMENT_SEAL",
+        ),
+        (
+            "reply-timeout three-architecture matrix",
+            6,
+            "STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL",
+        ),
+        (
+            "ExitCurrentTask NR 16 (2 of 3)",
+            2,
+            "STAGE_200D0B3_X86_EXIT_CURRENT_TASK_REFREEZE_SEAL",
+        ),
+        (
+            "ServerDies live x86_64 (1 of 3)",
+            1,
+            "STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL",
+        ),
+        (
+            "x86_64 NR6/NR7 production default ON",
+            1,
+            "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+        ),
+    ];
+
+    /// Knob-gated mechanism evidence — real live cells, but NOT on the production path.
+    const KNOB_GATED: &[(&str, usize, &str)] = &[(
+        "Stage 199 x86 SMP direct IPC",
+        6,
+        "STAGE_199_X86_DIRECT_IPC_FINAL_SEAL",
+    )];
+
+    fn production_total() -> usize {
+        PRODUCTION_PATH.iter().map(|(_, n, _)| n).sum()
+    }
+    fn knob_gated_total() -> usize {
+        KNOB_GATED.iter().map(|(_, n, _)| n).sum()
+    }
+
+    /// The pre-production subtotal was 39; the `0b5ec254` production-default seal is exactly
+    /// ONE further production-path increment, so the production-path total is 40.
+    #[test]
+    fn production_path_total_is_forty() {
+        let pre_production: usize = PRODUCTION_PATH
+            .iter()
+            .filter(|(_, _, seal)| *seal != "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL")
+            .map(|(_, n, _)| n)
+            .sum();
+        assert_eq!(pre_production, 39, "the accepted pre-production subtotal");
+
+        let production_default = PRODUCTION_PATH
+            .iter()
+            .find(|(_, _, seal)| *seal == "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL")
+            .map(|(_, n, _)| *n)
+            .expect("the x86_64 production-default seal is a ledger row");
+        assert_eq!(
+            production_default, 1,
+            "the production-default seal is ONE increment, not a re-count of the mechanism"
+        );
+
+        assert_eq!(production_total(), 40, "39 + 1");
+    }
+
+    /// The six x86 SMP cells re-earned at `7d5a22c9` are the SAME six cells frozen by the
+    /// original `ccceb03d` seal. Re-earning preserves historical evidence and adds no cell.
+    #[test]
+    fn re_earning_the_smp_cells_adds_no_new_cell() {
+        assert_eq!(knob_gated_total(), 6, "knob-gated mechanism cells");
+        assert!(
+            STATUS.contains("re-earned at `7d5a22c9`"),
+            "the ledger must record where the six cells were re-earned"
+        );
+        assert!(
+            STATUS.contains("adds no new cell"),
+            "the ledger must state that re-earning adds no cell"
+        );
+        // The knob-gated row is counted once, and never inside the production-path column.
+        assert!(
+            !PRODUCTION_PATH
+                .iter()
+                .any(|(_, _, seal)| *seal == "STAGE_199_X86_DIRECT_IPC_FINAL_SEAL"),
+            "knob-gated mechanism evidence must not enter the production-path total"
+        );
+    }
+
+    /// Including knob-gated mechanism evidence gives 46. Both policies are stated, so neither
+    /// can be quoted as if it were the other.
+    #[test]
+    fn total_including_knob_gated_is_forty_six() {
+        assert_eq!(production_total() + knob_gated_total(), 46, "40 + 6");
+    }
+
+    /// The document quotes exactly these figures — 40 production-path, 46 including knob-gated,
+    /// with 39 preserved only as the superseded pre-production subtotal.
+    #[test]
+    fn the_status_ledger_quotes_the_computed_figures() {
+        assert!(
+            STATUS
+                .contains("| **Accepted total (production-path)** | **40** | 30 + 6 + 2 + 1 + 1 |"),
+            "STATUS must record the production-path total as 40 with its arithmetic"
+        );
+        assert!(
+            STATUS.contains(
+                "| **Total including knob-gated mechanism evidence** | **46** | 40 + 6 |"
+            ),
+            "STATUS must record the combined total as 46 with its arithmetic"
+        );
+        assert!(
+            STATUS.contains("*Pre-production subtotal* | *39*"),
+            "39 is preserved as the pre-production subtotal, not as the current total"
+        );
+        assert!(
+            !STATUS.contains("**Accepted total (production-path)** | **39**"),
+            "the superseded 39 total must not survive anywhere as the accepted total"
+        );
+        assert!(
+            !STATUS.contains("gives **45**"),
+            "the superseded 45 combined total must not survive"
+        );
+    }
+
+    /// Every seal named in the ledger arithmetic exists in the permanent record.
+    #[test]
+    fn every_ledger_seal_exists_in_the_permanent_record() {
+        for (what, _, seal) in PRODUCTION_PATH.iter().chain(KNOB_GATED.iter()) {
+            assert!(
+                HISTORY.contains(seal) || STATUS.contains(seal),
+                "ledger row `{what}` names a seal absent from the record: `{seal}`"
+            );
+        }
+    }
+
+    /// The permanent seal ledger carries a row for the production-default seal — the omission
+    /// this reconciliation exists to repair.
+    #[test]
+    fn the_permanent_ledger_carries_the_production_default_row() {
+        assert!(
+            HISTORY.contains(
+                "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok"
+            ),
+            "PROJECT_HISTORY must carry the production-default seal verbatim"
+        );
+        assert!(
+            HISTORY.contains("0b5ec254"),
+            "the production-default row must name its exact commit"
+        );
+    }
+}
+
+// ── RISC-V target-spec guards — triple pinned SEPARATELY from ISA and ABI ────────────────────
+//
+// Canonical 199D RISC-V dependency-chain link 1. The custom kernel target declared
+// `"llvm-target": "riscv64gc-unknown-none-elf"`. `riscv64gc` is a **Rust target-name**
+// component, not an LLVM architecture: LLVM has no `riscv64gc` arch, so `Triple` parsed it as
+// unknown and `createTargetMachine` failed outright —
+//
+//     error: failed to parse target machine config to target machine:
+//            could not create LLVM TargetMachine for triple: riscv64gc-unknown-none-elf
+//
+// — which meant the RISC-V kernel target could not be configured at all. The repair is one
+// token: the triple names the architecture (`riscv64-unknown-none-elf`, the same triple the
+// sibling user target has always used), and the **ISA lives in `features`**, where it always
+// did.
+//
+// The obvious wrong repair is to "fix the triple" by weakening what it used to imply — dropping
+// `+c`, `+f`, `+d` or switching `lp64d` for `lp64`. The kernel would still build; it would
+// silently be a different machine. These guards therefore pin the triple, the ISA feature set
+// and the ABI as three INDEPENDENT propositions, so no future edit can trade one for another.
+mod stage199d_riscv_target_spec_guards {
+    use super::*;
+
+    const KERNEL_JSON: &str = include_str!("../../../targets/riscv64-yarm-none.json");
+    const USER_JSON: &str = include_str!("../../../targets/riscv64-yarm-user-none.json");
+    const KERNEL_LD: &str = include_str!("../../../targets/riscv64-yarm-none.ld");
+
+    /// The LLVM architecture this project targets. The `gc` spelling is a Rust target name and
+    /// is NOT a valid LLVM arch — pinning the distinction is the whole point of link 1.
+    const LLVM_ARCH: &str = "riscv64";
+    const REJECTED_LLVM_ARCH: &str = "riscv64gc";
+    const SUPPORTED_TRIPLE: &str = "riscv64-unknown-none-elf";
+
+    /// The RV64GC ISA capability, carried by `features` and nowhere else.
+    const REQUIRED_FEATURES: &[(&str, &str)] = &[
+        ("+m", "integer multiply/divide"),
+        (
+            "+a",
+            "atomics — the kernel's lock and IPC seams require them",
+        ),
+        ("+f", "single-precision float"),
+        (
+            "+d",
+            "double-precision float — lp64d passes doubles in FPRs",
+        ),
+        ("+c", "compressed instructions"),
+    ];
+
+    const REQUIRED_ABI: &str = "lp64d";
+
+    /// Value of a JSON string field, without pulling in a parser.
+    fn string_field<'a>(json: &'a str, key: &str) -> &'a str {
+        let needle = alloc::format!("\"{key}\"");
+        let at = json
+            .find(&needle)
+            .unwrap_or_else(|| panic!("target spec has no `{key}` field"));
+        let rest = &json[at + needle.len()..];
+        let colon = rest.find(':').expect("field separator");
+        let after = &rest[colon + 1..];
+        let open = after.find('"').expect("string value opening quote");
+        let tail = &after[open + 1..];
+        let close = tail.find('"').expect("string value closing quote");
+        &tail[..close]
+    }
+
+    /// Value of a JSON number field.
+    fn number_field(json: &str, key: &str) -> u64 {
+        let needle = alloc::format!("\"{key}\"");
+        let at = json
+            .find(&needle)
+            .unwrap_or_else(|| panic!("target spec has no `{key}` field"));
+        let rest = &json[at + needle.len()..];
+        let colon = rest.find(':').expect("field separator");
+        let after = rest[colon + 1..].trim_start();
+        let end = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        after[..end].parse().expect("numeric value")
+    }
+
+    // ── 1. The triple ───────────────────────────────────────────────────────────────────────
+
+    /// The triple's architecture component must be an LLVM arch. This is the exact field that
+    /// broke the target, so it is pinned on its own.
+    #[test]
+    fn the_llvm_triple_names_an_llvm_architecture() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            let triple = string_field(json, "llvm-target");
+            let arch = triple.split('-').next().expect("triple architecture");
+            assert_eq!(
+                arch, LLVM_ARCH,
+                "the {what} target's LLVM triple must begin with the LLVM architecture `{LLVM_ARCH}`, \
+                 not a Rust target name — got `{triple}`"
+            );
+        }
+        assert_eq!(
+            string_field(KERNEL_JSON, "llvm-target"),
+            SUPPORTED_TRIPLE,
+            "the kernel triple is the one this toolchain accepts"
+        );
+    }
+
+    /// The exact rejected spelling must never come back, in any target spec.
+    #[test]
+    fn the_rejected_riscv64gc_triple_never_returns() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            assert!(
+                !json.contains(REJECTED_LLVM_ARCH),
+                "the {what} target spec names `{REJECTED_LLVM_ARCH}`, which the current LLVM \
+                 rejects with `could not create LLVM TargetMachine for triple` — it is a Rust \
+                 target name, not an LLVM architecture"
+            );
+        }
+    }
+
+    // ── 2. The ISA, pinned independently of the triple ──────────────────────────────────────
+
+    /// Every RV64GC extension is present in `features`. Asserted one at a time so that dropping
+    /// `+c`, `+f` or `+d` fails by name rather than as an opaque string mismatch.
+    #[test]
+    fn the_isa_feature_set_is_rv64gc() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            let features = string_field(json, "features");
+            for (ext, why) in REQUIRED_FEATURES {
+                assert!(
+                    features.split(',').any(|f| f.trim() == *ext),
+                    "the {what} target dropped `{ext}` ({why}) from its ISA feature set `{features}` \
+                     — the triple must never be repaired by weakening the ISA"
+                );
+            }
+        }
+    }
+
+    /// **The separation.** The ISA is carried by `features`; the triple must not encode it. If a
+    /// future edit pushes the ISA back into the triple, LLVM breaks again.
+    #[test]
+    fn the_isa_is_carried_by_features_and_not_by_the_triple() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            let triple = string_field(json, "llvm-target");
+            let arch = triple.split('-').next().expect("triple architecture");
+            assert_eq!(
+                arch.len(),
+                LLVM_ARCH.len(),
+                "the {what} target's triple architecture `{arch}` carries ISA letters — the ISA \
+                 belongs in `features`, and encoding it here is what broke the target"
+            );
+            let features = string_field(json, "features");
+            assert!(
+                features.starts_with('+'),
+                "the {what} target's ISA must be an explicit feature list, got `{features}`"
+            );
+        }
+    }
+
+    // ── 3. The ABI, pinned independently of both ────────────────────────────────────────────
+
+    /// `lp64d` passes doubles in floating-point registers. Silently moving to `lp64` would
+    /// change every FP call boundary while still compiling.
+    #[test]
+    fn the_abi_is_lp64d() {
+        for (what, json) in [("kernel", KERNEL_JSON), ("user", USER_JSON)] {
+            assert_eq!(
+                string_field(json, "llvm-abiname"),
+                REQUIRED_ABI,
+                "the {what} target must keep the `{REQUIRED_ABI}` ABI"
+            );
+        }
+    }
+
+    /// Kernel and user targets must not drift apart: they share one ISA and one ABI, or the
+    /// kernel and the servers it loads disagree about how to pass arguments.
+    #[test]
+    fn the_kernel_and_user_targets_agree_on_isa_and_abi() {
+        assert_eq!(
+            string_field(KERNEL_JSON, "features"),
+            string_field(USER_JSON, "features"),
+            "kernel and user RISC-V targets must share one ISA feature set"
+        );
+        assert_eq!(
+            string_field(KERNEL_JSON, "llvm-abiname"),
+            string_field(USER_JSON, "llvm-abiname"),
+            "kernel and user RISC-V targets must share one ABI"
+        );
+    }
+
+    // ── 4. Everything the repair had to preserve ────────────────────────────────────────────
+
+    /// The machine-shape fields the target-spec repair was required to leave alone.
+    #[test]
+    fn the_preserved_target_spec_invariants_are_intact() {
+        assert_eq!(string_field(KERNEL_JSON, "arch"), "riscv64");
+        assert_eq!(string_field(KERNEL_JSON, "target-endian"), "little");
+        assert_eq!(number_field(KERNEL_JSON, "target-pointer-width"), 64);
+        assert_eq!(string_field(KERNEL_JSON, "relocation-model"), "static");
+        assert_eq!(
+            string_field(KERNEL_JSON, "code-model"),
+            "medium",
+            "the kernel links at 0x80200000 under the medium code model"
+        );
+        assert_eq!(number_field(KERNEL_JSON, "max-atomic-width"), 64);
+        assert_eq!(string_field(KERNEL_JSON, "panic-strategy"), "abort");
+    }
+
+    /// The linker script and entry/layout contract are the ones that already existed — a
+    /// target-spec repair must not move the kernel.
+    #[test]
+    fn the_linker_script_and_entry_contract_are_unchanged() {
+        assert!(
+            KERNEL_JSON.contains("-Ttargets/riscv64-yarm-none.ld"),
+            "the kernel target must keep linking through the existing YARM linker script"
+        );
+        assert!(
+            KERNEL_LD.contains("ENTRY(_start)"),
+            "the entry symbol contract is `_start`"
+        );
+        assert!(
+            KERNEL_LD.contains("KERNEL_LOAD_BASE = 0x80200000"),
+            "the RISC-V kernel load base is unchanged"
+        );
+    }
+}
+
+// ── RISC-V canonical-199D production-readiness audit (chain link 2) ──────────────────────────
+//
+// ONE question: can an eligible RISC-V NR6/NR7 transaction complete end-to-end without entering
+// or re-entering the broad `KernelState` lock?
+//
+// **Answer: NO — case C.** A direct-transaction return-path code blocker remains even at SMP=1.
+// The architecture-neutral contract stack (eligibility, disposition, the ack store, the census,
+// the transaction, the projection, the reverse link) is already broad-lock-free and carries no
+// RISC-V special case, and the RISC-V trap wrapper's Phase-1 split return skips the broad-lock
+// phase entirely. But the RISC-V trap BRIDGE that wraps it brackets **every** trap — including a
+// handled NR6/NR7 — with three unconditional `with_cpu` acquisitions, so the syscall enters the
+// broad lock three times regardless.
+//
+// A point this audit is careful NOT to get wrong: NR6/NR7 do **not** need a post-lock
+// authoritative dispatch on RISC-V, because neither direction clears `current`. NR6 is
+// request-send-only and returns to its caller (the caller blocks later, on a separate `IpcRecv`);
+// NR7's replier stays `current` and only the peer is enqueued. The `current`-clear that DOES need
+// post-lock dispatch lives in `block_current_on_receive_with_deadline` — the recv path — and is
+// `#[cfg(target_arch = "aarch64")]`. Waking a task is not switching to it.
+mod stage199d_riscv_production_readiness_audit {
+    use super::*;
+
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BRIDGE: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+    const RISCV_ABI: &str = include_str!("../../arch/riscv64/syscall_abi.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const DISPATCH: &str = include_str!("../direct_dispatch.rs");
+    const SYSCALL: &str = include_str!("../syscall.rs");
+
+    /// The three cases the audit had to decide between.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Case {
+        /// A — structurally production-ready; only predicate enablement + live evidence remain.
+        StructurallyReady,
+        /// B — SMP=1 complete, remote enqueue lacks an authoritative wake/dispatch mechanism.
+        LocalCompleteRemoteMissing,
+        /// C — a direct-transaction or return-path code blocker remains even for SMP=1.
+        CodeBlockerEvenAtSmp1,
+    }
+
+    const VERDICT: Case = Case::CodeBlockerEvenAtSmp1;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BlockerSeverity {
+        /// Alone, this one silently disables the whole path.
+        SilentNoOp,
+        /// Decisive: the audited question is answered NO because of this.
+        Decisive,
+        /// Real, but unreachable at today's RISC-V topology (BSP-only).
+        LatentAtCurrentTopology,
+    }
+
+    struct Blocker {
+        id: u8,
+        what: &'static str,
+        site: &'static str,
+        severity: BlockerSeverity,
+    }
+
+    const BLOCKERS: &[Blocker] = &[
+        Blocker {
+            id: 1,
+            what: "NR6/NR7 admission is gated on the PROOF predicate, not the canonical \
+                   admission predicate — flipping the production default alone is a silent no-op",
+            site: "src/arch/riscv64/trap.rs",
+            severity: BlockerSeverity::SilentNoOp,
+        },
+        Blocker {
+            id: 2,
+            what: "the RISC-V trap bridge brackets every trap with three unconditional `with_cpu` \
+                   acquisitions — entering identity, resume identity and the SATP asid lookup — so \
+                   a HANDLED direct transaction still enters the broad lock three times",
+            site: "src/arch/riscv64/boot.rs",
+            severity: BlockerSeverity::Decisive,
+        },
+        Blocker {
+            id: 3,
+            what: "no RISC-V cross-hart wake authority: the post-enqueue reschedule IPI is \
+                   x86_64-cfg-gated and RISC-V exposes no SBI IPI / software-interrupt seam",
+            site: "src/kernel/ipccall_direct_txn.rs + src/arch/riscv64/sbi.rs",
+            severity: BlockerSeverity::LatentAtCurrentTopology,
+        },
+    ];
+
+    /// The body of `name` in `src`, signature to the matching close at the same indentation.
+    fn function_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let at = src
+            .find(name)
+            .unwrap_or_else(|| panic!("no such function: `{name}`"));
+        let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let indent = src[line_start..at]
+            .chars()
+            .take_while(|c| *c == ' ')
+            .count();
+        let closer = alloc::format!("\n{}}}", " ".repeat(indent));
+        let end = src[at..].find(&closer).map(|i| at + i).unwrap_or(src.len());
+        &src[at..end]
+    }
+
+    /// Lines of `body` that are code (not comments), for structural claims that must not be
+    /// satisfied by prose.
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    // ── The admission predicate ─────────────────────────────────────────────────────────────
+
+    /// **Blocker 1, pinned exactly.** RISC-V admits NR6/NR7 through
+    /// `ipccall_direct_proof_enabled()`. The canonical predicate the split dispatcher and the
+    /// AArch64 import both ask is `ipccall_direct_admission_enabled()` — RISC-V does not ask it,
+    /// so with the proof gate off NR6/NR7 are not split-eligible and enabling production alone
+    /// changes nothing.
+    #[test]
+    fn the_riscv_admission_predicate_is_the_proof_gate_not_the_canonical_one() {
+        let body = function_body(RISCV_TRAP, "pub fn handle_riscv_trap_entry_shared");
+        let code = code_lines(body);
+        assert!(
+            code.iter()
+                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
+            "RISC-V still admits NR6/NR7 on the proof gate — if this changed, the blocker map is stale"
+        );
+        assert!(
+            !code
+                .iter()
+                .any(|l| l.contains("ipccall_direct_admission_enabled()")),
+            "RISC-V does NOT ask the canonical admission predicate — blocker 1"
+        );
+        // The canonical predicate exists and IS what the portable import asks.
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        assert!(
+            TRAP_ENTRY.contains("ipccall_direct_admission_enabled()"),
+            "the canonical predicate is the portable one; RISC-V is the outlier"
+        );
+    }
+
+    /// Both NRs are named, so the gate covers request AND reply.
+    #[test]
+    fn both_nr6_and_nr7_are_named_by_the_riscv_gate() {
+        let body = function_body(RISCV_TRAP, "pub fn handle_riscv_trap_entry_shared");
+        assert!(body.contains("SYSCALL_IPC_CALL_NR"));
+        assert!(body.contains("SYSCALL_IPC_REPLY_NR"));
+    }
+
+    // ── Blocker 2: the broad lock after a handled direct transaction ────────────────────────
+
+    /// The contract stack itself is clean: the transaction module takes NO broad lock. The
+    /// blocker is not in the transaction.
+    #[test]
+    fn the_direct_transaction_itself_takes_no_broad_lock() {
+        for f in [
+            "fn drain_direct_request_post_work",
+            "fn drain_direct_reply_post_work",
+        ] {
+            let body = function_body(TXN, f);
+            for l in code_lines(body) {
+                assert!(
+                    !l.contains("with_cpu(") && !l.contains("state.lock()"),
+                    "`{f}` must not acquire the broad lock: `{l}`"
+                );
+            }
+        }
+        for l in code_lines(TXN) {
+            assert!(
+                !l.contains(".with_cpu(") && !l.contains("state.lock()"),
+                "the whole direct-transaction module must be broad-lock-free: `{l}`"
+            );
+        }
+    }
+
+    /// The RISC-V wrapper's Phase-1 split return is itself clean — it returns
+    /// `ReturnToCurrent` before the broad-lock phase, and never sets the drain-owed flag.
+    #[test]
+    fn the_riscv_wrapper_phase_one_returns_before_the_broad_lock_phase() {
+        let body = function_body(RISCV_TRAP, "pub fn handle_riscv_trap_entry_shared");
+        let split_at = body
+            .find("try_split_dispatch_into_frame")
+            .expect("the split dispatch call");
+        let first_return = body[split_at..]
+            .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
+            .expect("the handled early return")
+            + split_at;
+        let phase2 = body
+            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+            .expect("the phase-2 flag");
+        assert!(
+            first_return < phase2,
+            "the handled split path must return BEFORE the broad-lock phase is entered"
+        );
+        for l in code_lines(&body[..first_return]) {
+            assert!(
+                !l.contains("with_cpu("),
+                "nothing before the handled split return may take the broad lock: `{l}`"
+            );
+        }
+    }
+
+    /// **Blocker 2, pinned exactly — the decisive finding.** `current_tid_authoritative` is a
+    /// `with_cpu` acquisition, and the RISC-V trap BRIDGE calls it on entry and again on the
+    /// return path, then takes a third `with_cpu` for the SATP asid. All three are outside the
+    /// wrapper, so the Phase-1 early return does not avoid them.
+    #[test]
+    fn the_riscv_bridge_brackets_every_trap_with_broad_lock_acquisitions() {
+        assert!(
+            function_body(RUNTIME, "pub fn current_tid_authoritative").contains("self.with_cpu("),
+            "`current_tid_authoritative` IS a broad-lock acquisition — that is why the bridge's \
+             use of it matters"
+        );
+        let bridge = function_body(RISCV_BRIDGE, "extern \"C\" fn yarm_riscv64_trap_bridge");
+        let acquisitions: alloc::vec::Vec<&str> = code_lines(&bridge)
+            .into_iter()
+            .filter(|l| l.contains("current_tid_authoritative") || l.contains("with_cpu("))
+            .collect();
+        assert!(
+            acquisitions.len() >= 3,
+            "the bridge is expected to hold at least three broad-lock touches, found {}: {:?}",
+            acquisitions.len(),
+            acquisitions
+        );
+        // The two that a HANDLED direct transaction cannot avoid, by name.
+        assert!(
+            bridge
+                .contains("let entering_tid = shared.current_tid_authoritative(cpu).unwrap_or(0);"),
+            "the ENTERING identity is read through the broad lock, before the split dispatcher"
+        );
+        assert!(
+            bridge.contains(".current_tid_authoritative(cpu)"),
+            "the RESUME identity is re-read through the broad lock, after the handler returns"
+        );
+        assert!(
+            bridge.contains(".with_cpu(cpu, |k| k.task_asid(resume_tid))"),
+            "the SATP asid lookup is a third broad-lock acquisition on the return path"
+        );
+    }
+
+    /// The replacement seams ALREADY EXIST and are architecture-neutral — the smallest next
+    /// increment is a call-site swap, not a new mechanism and not a RISC-V semantic copy.
+    #[test]
+    fn the_broad_lock_free_replacement_seams_already_exist() {
+        assert!(
+            RUNTIME.contains("pub fn current_tid_split_read(&self, cpu: CpuId) -> Option<u64>")
+        );
+        assert!(RUNTIME.contains("pub fn task_asid_for_tid_split_read(&self, tid: u64) -> u64"));
+        let split_read = function_body(RUNTIME, "pub fn current_tid_split_read");
+        for l in code_lines(split_read) {
+            assert!(
+                !l.contains("with_cpu("),
+                "the replacement seam must not itself take the broad lock: `{l}`"
+            );
+        }
+    }
+
+    // ── NR6/NR7 keep the issuer current — no post-lock dispatch is owed ─────────────────────
+
+    /// NR6 is request-send-only and NR7's replier stays current. **Neither clears `current`**, so
+    /// no post-lock authoritative dispatch is required on RISC-V. This is the inference the
+    /// audit was told not to make, checked rather than assumed.
+    #[test]
+    fn neither_nr6_nor_nr7_clears_current() {
+        for f in [
+            "fn try_split_ipccall_direct_into_frame",
+            "fn try_split_ipcreply_direct_into_frame",
+        ] {
+            let body = function_body(SPLIT, f);
+            for l in code_lines(body) {
+                assert!(
+                    !l.contains("set_current") && !l.contains("dispatch_next_task"),
+                    "`{f}` must neither set nor clear `current`, nor dispatch: `{l}`"
+                );
+            }
+        }
+        assert!(
+            SPLIT.contains("NR6 is request-send-only: success returns now"),
+            "the NR6 contract is documented at the seam"
+        );
+        assert!(
+            SPLIT.contains("NR7 delivers the reply and wakes the caller; the replier"),
+            "the NR7 contract is documented at the seam"
+        );
+    }
+
+    /// The `current`-clear that DOES owe a post-lock dispatch lives on the RECV path, and its
+    /// publication is AArch64-only — it is not on the NR6/NR7 syscall path at all.
+    #[test]
+    fn the_current_clear_that_owes_dispatch_is_on_the_recv_path_and_is_aarch64_only() {
+        let body = function_body(IPC_STATE, "fn block_current_on_receive_with_deadline");
+        assert!(
+            body.contains("direct_dispatch::try_publish")
+                || body.contains("crate::kernel::direct_dispatch::try_publish"),
+            "the dispatch-debt publication lives in the recv-block commit"
+        );
+        assert!(
+            body.contains("#[cfg(target_arch = \"aarch64\")]"),
+            "and it is AArch64-only, so RISC-V publishes nothing"
+        );
+        // NR7 is refused by construction, independently of any caller.
+        let publish = function_body(DISPATCH, "pub fn try_publish");
+        assert!(
+            publish.contains("if work.class == DirectDispatchClass::IpcReply"),
+            "`try_publish` refuses the reply direction unconditionally"
+        );
+    }
+
+    // ── ABI / return parity ─────────────────────────────────────────────────────────────────
+
+    /// The ecall ABI import is complete: `a7` → nr and `a0..a5` → args, so all six lanes the
+    /// direct path reads are present.
+    #[test]
+    fn the_ecall_abi_import_covers_a7_and_a0_through_a5() {
+        assert!(
+            RISCV_BRIDGE
+                .contains("tframe.set_syscall_num(frame.regs[RiscvTrapFrame::A7] as usize);")
+        );
+        for (i, reg) in ["A0", "A1", "A2", "A3", "A4", "A5"].iter().enumerate() {
+            let expect =
+                alloc::format!("tframe.set_arg({i}, frame.regs[RiscvTrapFrame::{reg}] as usize);");
+            assert!(
+                RISCV_BRIDGE.contains(&expect),
+                "the ecall import must carry arg{i} from {reg}"
+            );
+        }
+        assert!(
+            RISCV_ABI.contains("pub const TRAPFRAME_ARG_REGS: usize = 6;"),
+            "RISC-V exposes six argument lanes"
+        );
+    }
+
+    /// The transfer-cap lane is the LAST argument on every architecture, so on RISC-V it is `a5`
+    /// — which the import above provides. The sentinel is the one encoding meaning "none".
+    #[test]
+    fn the_transfer_cap_lane_and_sentinel_are_available_on_riscv() {
+        assert!(
+            SYSCALL.contains(
+                "pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;"
+            ),
+            "the transfer-cap lane is derived from the per-arch argument count"
+        );
+        assert!(
+            SYSCALL.contains("pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;")
+        );
+    }
+
+    /// `sepc` advances by exactly 4, exactly once, and only for a user ecall.
+    #[test]
+    fn sepc_advances_exactly_once_for_an_ecall() {
+        assert!(
+            RISCV_BRIDGE.contains("let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };"),
+            "the single ecall PC advance"
+        );
+        assert!(RISCV_BRIDGE.contains("tframe.set_saved_pc(sepc + advance);"));
+        assert_eq!(
+            RISCV_BRIDGE
+                .matches("let advance = if scause == EXC_USER_ECALL")
+                .count(),
+            1,
+            "there must be exactly one advance site"
+        );
+    }
+
+    /// The same-task return lanes are the YARM ABI, matching the encoder the direct disposition
+    /// writes: a0=ret0, a1=ret1, a2=ret2, a3=error.
+    #[test]
+    fn the_same_task_return_lanes_match_the_shared_encoder() {
+        for (reg, lane) in [
+            ("A0", "tframe.ret0()"),
+            ("A1", "tframe.ret1()"),
+            ("A2", "tframe.ret2()"),
+        ] {
+            let expect = alloc::format!("frame.regs[RiscvTrapFrame::{reg}] = {lane} as u64;");
+            assert!(
+                RISCV_BRIDGE.contains(&expect),
+                "return lane {reg} must carry {lane}"
+            );
+        }
+        assert!(RISCV_BRIDGE.contains("frame.regs[RiscvTrapFrame::A3] = 0;"));
+    }
+
+    /// The GPR mirror preserves every non-ABI register — including `tp` (x4), the TLS base —
+    /// by restoring it from the saved frame rather than reconstructing it.
+    #[test]
+    fn non_abi_gprs_including_tp_are_mirrored_not_reconstructed() {
+        let bridge = function_body(RISCV_BRIDGE, "extern \"C\" fn yarm_riscv64_trap_bridge");
+        assert!(
+            bridge.contains("for n in 1..32usize {"),
+            "all 31 GPRs are mirrored"
+        );
+        assert!(
+            bridge.contains("frame.regs[i] = tframe.user_gpr(n) as usize as u64;"),
+            "non-ABI lanes come straight back from the saved frame — tp included"
+        );
+        // The skip list is ABI lanes only; tp/x4 is never in it.
+        let skip_start = bridge
+            .find("if i == RiscvTrapFrame::SP")
+            .expect("the skip list");
+        let skip = &bridge[skip_start..skip_start + 400];
+        assert!(
+            !skip.contains("RiscvTrapFrame::TP"),
+            "tp must not be skipped"
+        );
+    }
+
+    // ── Wake authority ──────────────────────────────────────────────────────────────────────
+
+    /// LOCAL enqueue is architecture-neutral and works on RISC-V: the enqueue seam reports the
+    /// CPU it actually committed to, and no IPI is sent for a local target.
+    #[test]
+    fn local_enqueue_authority_is_architecture_neutral() {
+        assert!(
+            RUNTIME.contains("pub(crate) fn sr_enqueue_committed_receiver_split")
+                && RUNTIME.contains("-> CpuId"),
+            "the enqueue seam reports its committed target"
+        );
+        for f in [
+            "fn drain_direct_request_post_work",
+            "fn drain_direct_reply_post_work",
+        ] {
+            let body = function_body(TXN, f);
+            assert!(
+                body.contains("if success.wake_target_cpu != enqueueing_cpu {"),
+                "`{f}` sends a wake ONLY when the committed target differs from the enqueueing CPU"
+            );
+        }
+    }
+
+    /// **Blocker 3, pinned exactly.** The remote wake is `x86_64`-cfg-gated, and RISC-V exposes
+    /// no IPI seam at all — the SBI surface carries HSM (hart start/status) but no IPI
+    /// extension. Latent only because RISC-V is BSP-only today.
+    #[test]
+    fn remote_wake_authority_is_absent_on_riscv() {
+        assert_eq!(
+            TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "both wake sends are x86_64-only — request and reply"
+        );
+        for l in code_lines(TXN) {
+            assert!(
+                !l.contains("riscv"),
+                "the transaction carries no RISC-V special case: `{l}`"
+            );
+        }
+        assert!(
+            RISCV_SBI.contains("SBI_EXT_HSM"),
+            "the SBI surface has hart start/status"
+        );
+        assert!(
+            !RISCV_SBI.contains("SBI_EXT_IPI") && !RISCV_SBI.contains("0x735049"),
+            "and no IPI extension — there is no cross-hart wake authority to call"
+        );
+        assert!(
+            RISCV_BRIDGE.contains("RISC-V is BSP-only"),
+            "which is latent only because RISC-V runs one hart"
+        );
+    }
+
+    // ── Declines ────────────────────────────────────────────────────────────────────────────
+
+    /// The transfer-cap and terminal-arbitration declines are in the shared, architecture-neutral
+    /// contract, so RISC-V inherits them with no copy.
+    #[test]
+    fn transfer_cap_and_terminal_arbitration_declines_are_inherited_unchanged() {
+        const ELIGIBILITY: &str = include_str!("../direct_eligibility.rs");
+        const DISPOSITION: &str = include_str!("../direct_disposition.rs");
+        for (what, src) in [("eligibility", ELIGIBILITY), ("disposition", DISPOSITION)] {
+            assert!(
+                !src.contains("target_arch"),
+                "the {what} contract must stay architecture-neutral"
+            );
+        }
+        assert!(
+            RUNTIME.contains("fn reply_record_terminal_arbitrated_split_read"),
+            "the terminal-arbitration read is a shared split seam"
+        );
+        // The decline lives in the PURE eligibility classifier, so it is reached before any
+        // mutation by construction — not by ordering discipline inside the transaction.
+        assert!(
+            ELIGIBILITY.contains("if facts.terminal_arbitrated {"),
+            "a terminal-arbitrated reply is declined by the pure classifier"
+        );
+        assert!(
+            ELIGIBILITY.contains("pub(crate) terminal_arbitrated: bool,"),
+            "the fact is carried into the classifier, not re-derived per architecture"
+        );
+    }
+
+    // ── The verdict ─────────────────────────────────────────────────────────────────────────
+
+    /// **Case C**, computed from the blocker map: a decisive return-path code blocker remains
+    /// even at SMP=1, so coordinate 23 stays OPEN.
+    #[test]
+    fn the_verdict_is_case_c_and_coordinate_23_stays_open() {
+        let decisive = BLOCKERS
+            .iter()
+            .filter(|b| b.severity == BlockerSeverity::Decisive)
+            .count();
+        assert_eq!(decisive, 1, "exactly one decisive blocker");
+        assert_eq!(
+            VERDICT,
+            Case::CodeBlockerEvenAtSmp1,
+            "a decisive blocker means neither case A nor case B"
+        );
+        assert_ne!(VERDICT, Case::StructurallyReady);
+        assert_ne!(VERDICT, Case::LocalCompleteRemoteMissing);
+        assert_eq!(BLOCKERS.len(), 3, "three genuine blockers");
+        for (i, b) in BLOCKERS.iter().enumerate() {
+            assert_eq!(b.id as usize, i + 1);
+            assert!(!b.what.is_empty() && !b.site.is_empty());
+        }
+        // Case B would require the SMP=1 path to be complete; blocker 2 says it is not.
+        assert!(
+            BLOCKERS
+                .iter()
+                .any(|b| b.severity == BlockerSeverity::Decisive
+                    && b.site == "src/arch/riscv64/boot.rs"),
+            "the decisive blocker is on the RISC-V return path"
+        );
+    }
+
+    /// The audit's conclusion is recorded in the canonical audit document.
+    #[test]
+    fn the_audit_document_records_case_c() {
+        const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_c"));
+        assert!(
+            AUDIT.contains("CONDITIONAL_PRODUCTION_ENABLEMENT_AND_LIVE_EVIDENCE"),
+            "the reclassification that was NOT taken must still be named, so the decision is legible"
+        );
+    }
+}

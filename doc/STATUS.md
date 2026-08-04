@@ -94,17 +94,30 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 | Reply-timeout matrix | **6** | `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`; 199E (one quarter of the stage) |
 | `ExitCurrentTask` NR 16 | **2 of 3** | x86_64 `0b5e98f`, AArch64; 202D (one sub-path; RISC-V unearned) |
 | **Server death (`ServerDies`) — x86_64** | **1 of 3** | **`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`; canonical 199D server-crash-cleanup increment** |
-| **Accepted total (production-path)** | **39** | 30 + 6 + 2 + 1 |
-| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D mechanism, **not** the production path. Originally earned at `ccceb03d`; **re-earned at `7d5a22c9`** after three repairs — see §0.1. |
+| *Pre-production subtotal* | *39* | *30 + 6 + 2 + 1 — the figure accepted before the x86_64 production default was flipped* |
+| **Direct IPC NR 6 / NR 7 — x86_64 production default ON** | **1** | **`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`, exact commit `0b5ec254`** — 53 NR6 + 41 NR7 ordinary syscalls off-lock with zero broad-lock entries on the **production** path; canonical 199D production-path increment |
+| **Accepted total (production-path)** | **40** | 30 + 6 + 2 + 1 + 1 |
+| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D **mechanism**, **not** the production path. Originally earned at `ccceb03d`; **re-earned at `7d5a22c9`** after three repairs — see §0.1. The re-earning restores historical evidence and **adds no new cell**. |
+| **Total including knob-gated mechanism evidence** | **46** | 40 + 6 |
 
 > **On the total.** There is no aggregate live-cell counter anywhere in the tree; the only
-> in-tree aggregate is Stage 198F's `total_live_cells=30`. The figure above is computed from
-> the seals listed and counts only **production-path** cells. Including the six knob-gated
-> Stage 199 functional cells gives **45**. A previously-quoted figure of **43** matches
-> neither: it requires counting the six knob-gated Stage 199 cells *and* excluding the two
-> `ExitCurrentTask` cells. Recorded here as **39** with the arithmetic visible rather than
-> asserting an unverifiable total — if the intended policy is to count knob-gated cells, the
-> number is 45 and this row should say so.
+> in-tree aggregate is Stage 198F's `total_live_cells=30`. The figures above are computed from
+> the seals listed, each of which is named with its exact commit.
+>
+> * **Production-path = 40.** The pre-production subtotal was **39** (30 + 6 + 2 + 1). The
+>   x86_64 NR6/NR7 production-default seal at `0b5ec254` is **one** production-path increment —
+>   the first live evidence that NR6/NR7 run off-lock with `ipccall_direct_production_enabled()`
+>   true rather than under a proof knob — so the production-path total is **40**.
+> * **Proof-gated / knob-gated = 6.** The six x86 SMP direct-IPC cells frozen by
+>   `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` are historical **mechanism** evidence. They were
+>   re-earned at `7d5a22c9` after the three repairs in §0.1; re-earning preserves evidence and
+>   **adds no new cell**, so they are counted once and only here.
+> * **Total = 46.** 40 + 6, stated explicitly so the two policies cannot be conflated.
+>
+> A previously-quoted figure of **43** matches neither policy: it requires counting the six
+> knob-gated Stage 199 cells *and* excluding the two `ExitCurrentTask` cells. The earlier
+> "39 / 45" pair predates the `0b5ec254` production-default seal and is superseded by
+> **40 / 46**.
 
 ### x86_64 ServerDies cell — evidence
 
@@ -409,6 +422,81 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    one of the silent ones, so with the flip on the totals read `created=54 closed=13` and
    ServerDies fails. Everything else about the flip is proven healthy at commit `c94cd304`. The
    constant is restored to `false`; the fix is the exact mirror of the creation one.
+   **CANONICAL 199D CLOSURE AUDIT — `CANONICAL_199D_CLOSABLE=no`.** An audit increment with no
+   runtime or semantic change. The live-evidence ledger is reconciled: the pre-production
+   subtotal of **39** plus the one production-path increment earned at `0b5ec254` gives
+   **40** production-path cells; the six knob-gated x86 SMP mechanism cells (re-earned at
+   `7d5a22c9`, adding no new cell) give **46** in total. The superseded "39 / 45" pair and the
+   never-coherent "43" are retired, and `PROJECT_HISTORY.md` gains the previously missing
+   `0b5ec254` row. The **executable closure matrix** (`stage199d_closure_matrix`, 12 tests)
+   classifies **23 in-scope coordinates — 19 COMPLETE, 2 `STRUCTURALLY_COMPLETE`, 1 PARTIAL,
+   1 OPEN** — plus **1 `DEFERRED_TO_CANONICAL_199E`, excluded from the tally**, with the verdict
+   *computed* from the in-scope matrix rather than asserted beside it.
+   **Evidence is bound to the coordinate it proves.** Checking that a marker literal exists
+   somewhere in the tree is not evidence: it let `IPC_DIRECT_TRANSFER_CAP`, a transfer-cap
+   counter dump, stand as proof for the reply-vs-timeout terminal race. Each entry now names the
+   file *and the emitting function* whose body must contain the literal, plus the exact
+   observation. The 199D safety coordinate — a terminal-arbitrated NR7 declines **before
+   mutation** so the legacy lease wins the causal race — is COMPLETE on the causal set
+   `IPC_DIRECT_PRODUCTION_QUIESCENT … arbitrated=1`, `IPC_REPLY_WIN_RESERVE` count 1,
+   `IPC_REPLY_BEATS_TIMEOUT_OK` count 1, `IPC_REPLY_WIN_ROLLBACK` count 0 and
+   `IPC_REPLY_TIMEOUT_DEFERRED` count 0. Porting the terminal lease *into* the direct transaction
+   is **199E**, so it is typed `DEFERRED_TO_CANONICAL_199E` and can neither close 199D nor block
+   it. Four in-scope blockers remain, in dependency order: (1) AArch64 off-lock NR6/NR7 +
+   authoritative dispatch and (2) the AArch64 broad-lock-free handled-syscall return, both
+   `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` — not merely a missing
+   emulator, since live evidence needs *proof/oracle QEMU → enable the AArch64 production
+   predicate → normal feature-off boot + direct oracle + ServerDies + timeout regressions on one
+   exact commit*, none of which this audit-only increment performs; (3) the AArch64 and RISC-V
+   ServerDies live cells, `LIVE_EVIDENCE_PENDING`; and (4) RISC-V off-lock NR6/NR7,
+   `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` — a **separate four-link chain**, not the AArch64 gap:
+   kernel target-spec/toolchain repair → off-lock NR6/NR7 code → production enablement → live
+   NR6/NR7 and ServerDies evidence. Nothing in the list is a defect in the landed x86_64
+   production path. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.15.
+   **RISC-V chain link 1 is now CLOSED — target-spec only.** The custom kernel target declared
+   `"llvm-target": "riscv64gc-unknown-none-elf"`; `riscv64gc` is a Rust *target-name* component,
+   not an LLVM architecture, so LLVM 22 failed with `could not create LLVM TargetMachine for
+   triple` and the RISC-V kernel target could not be configured at all. The accepted triple was
+   derived from the toolchain — rustc's own built-in `riscv64gc-unknown-none-elf` Rust target
+   declares `llvm-target: "riscv64"` — and the repair is one token, to
+   `riscv64-unknown-none-elf`, the triple the sibling user target has always used. **Nothing else
+   changed**: `+m,+a,+f,+d,+c`, `lp64d`, little endian, 64-bit pointers, static relocation,
+   medium code model, max atomic width 64, panic abort and the existing linker script are all
+   byte-identical, and the linked ELF is `EXEC` at entry `0x80200000` = `_start` with no
+   interpreter, no dynamic section, zero undefined symbols, zero relocations and flags `0x5`
+   (RVC + double-float ABI). The build path was **not** repointed — it already used the built-in
+   target, and linking both ways yields identical entry, ELF flags and `PT_LOAD` layout.
+   `stage199d_riscv_target_spec_guards` (8 tests) pins the triple, the ISA feature set and the
+   ABI as three independent propositions, each mutation-tested, so the triple can never be
+   "fixed" by dropping `+c`/`+f`/`+d` or switching `lp64d`. **Links 2–4 are untouched and
+   coordinate 23 stays OPEN**; the tally and the 40 / 6 / 46 ledger are unchanged. No QEMU seal
+   is required for a target-spec-only repair. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.16.
+   **RISC-V chain link 2 is AUDITED, not closed — `RISCV_199D_READINESS=case_c`.** An audit only;
+   no runtime code, production predicate or target spec changed. The question was whether an
+   eligible RISC-V NR6/NR7 transaction can complete end-to-end without entering or re-entering
+   the broad `KernelState` lock. **It cannot, even at SMP=1.** The architecture-neutral contract
+   stack is inherited clean — `ipccall_direct_txn.rs` takes no broad lock at all, eligibility and
+   disposition carry zero `target_arch` references, the ecall import covers `a7` + `a0..a5`, the
+   transfer-cap lane is `a5`, `sepc` advances exactly once, the return lanes are the YARM ABI, and
+   `tp` is mirrored back — and the RISC-V trap **wrapper**'s Phase-1 split return correctly skips
+   the broad-lock phase. But the trap **bridge** that wraps it brackets *every* trap with three
+   unconditional `with_cpu` acquisitions (entering identity, resume identity, SATP asid), so a
+   **handled** direct transaction enters the broad lock three times regardless. Three blockers:
+   (1) admission asks `ipccall_direct_proof_enabled()` rather than the canonical
+   `ipccall_direct_admission_enabled()`, so enabling production alone is a **silent no-op**;
+   (2) **decisive** — the three bridge acquisitions above; (3) no cross-hart wake authority (both
+   sends are x86_64-cfg-gated and SBI exposes no IPI extension), latent only because RISC-V is
+   BSP-only. **Not a blocker:** post-lock authoritative dispatch — neither NR6 nor NR7 clears
+   `current` (NR6 is request-send-only and the caller blocks on a *later* recv; NR7's replier
+   stays current), and the `current`-clear that owes dispatch lives in the AArch64-only recv-block
+   commit. Waking a task is not switching to it. **Smallest next increment:** swap the bridge's
+   three lookups to the already-existing architecture-neutral `current_tid_split_read` and
+   `task_asid_for_tid_split_read` seams — a call-site swap, no new mechanism, no RISC-V semantic
+   copy. Blocker 1 must not land first: admitting NR6/NR7 while the bridge still brackets the trap
+   would claim off-lock NR6/NR7 while taking the broad lock three times per syscall.
+   **Coordinate 23 stays OPEN**; tally and the 40 / 6 / 46 ledger unchanged.
+   `stage199d_riscv_production_readiness_audit` (18 tests) pins all of it. See
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.17.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

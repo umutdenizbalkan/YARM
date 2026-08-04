@@ -1310,7 +1310,355 @@ Census unchanged at **50 / 40 / 45** — the repair added no broad-lock acquisit
 HAL authority changed globally, the x86_64 live core-boot and ServerDies regressions were re-run
 alongside the hosted battery. Full evidence: `doc/IPC.md` §8.6.13.
 
+### 6.1.15 Canonical Stage 199D closure audit — `CANONICAL_199D_CLOSABLE=no`
+
+An audit increment: **no runtime semantics, production predicate or target-spec changed**. It
+reconciles the live-evidence ledger and classifies every coordinate of canonical 199D against the
+tree.
+
+**Ledger reconciliation.** The accepted pre-production subtotal was **39** (30 Stage 198F + 6
+reply-timeout matrix + 2 `ExitCurrentTask` + 1 x86_64 ServerDies). The x86_64 NR6/NR7
+production-default seal at `0b5ec254` is **one** production-path increment — the first live
+evidence of NR6/NR7 running off-lock with `ipccall_direct_production_enabled()` true rather than
+under a proof knob — so the production-path total is **40**. The six x86 SMP direct-IPC cells
+frozen by `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` are knob-gated **mechanism** evidence; their
+re-earning at `7d5a22c9` (§0.1 of `doc/STATUS.md`) preserves historical evidence and **adds no
+new cell**, so the combined total is **46**. The superseded pair "39 / 45" and the never-coherent
+"43" are retired. The arithmetic is recomputed from its constituent seals by
+`stage199d_live_evidence_ledger` (6 tests), and `PROJECT_HISTORY.md` carries the previously
+missing `0b5ec254` row.
+
+| Production / proof-gated / total | Figure | Arithmetic |
+|---|---|---|
+| Production-path | **40** | 30 + 6 + 2 + 1 + 1 |
+| Proof-gated (knob-gated mechanism) | **6** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL`, counted once |
+| Total | **46** | 40 + 6 |
+
+#### Taxonomy
+
+Four in-scope classifications, plus one exclusion:
+
+| Classification | Meaning |
+|---|---|
+| `COMPLETE` | Landed, exercised hosted, and proven by live evidence on every architecture the coordinate claims. |
+| `STRUCTURALLY_COMPLETE` | Landed and exercised hosted; live evidence is not obtainable here. Carries a blocker kind. |
+| `PARTIAL` | Landed and sealed for some architectures / sub-paths only. |
+| `OPEN` | Not retired. |
+| `DEFERRED_TO_CANONICAL_199E` | **Not a 199D coordinate at all.** Excluded from the tally and from `CANONICAL_199D_CLOSABLE` — it can neither close 199D nor block it. |
+
+Blocker kinds are distinguished because a missing emulator, a missing production flip and missing
+code are not the same debt:
+
+* `LIVE_EVIDENCE_PENDING` — code landed and enabled; only the live run is missing.
+* `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` — live evidence is unobtainable
+  here **and** the architecture's production predicate must be enabled first, in a stated order.
+  Still not a code blocker.
+* `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` — the code does not exist yet, and reaching live evidence
+  needs an ordered chain beyond writing it.
+* `OUT_OF_SCOPE_199E` — tracked against canonical 199E.
+
+#### Evidence is bound to the coordinate it proves
+
+The previous revision of this audit checked only that a marker literal existed **somewhere** in
+the tree. That is not evidence: it let `IPC_DIRECT_TRANSFER_CAP` — a transfer-cap counter dump,
+emitted by `emit_direction` — stand as the proof for the reply-vs-timeout terminal race, a
+proposition it says nothing about. Every evidence entry now names the **file and the emitting
+function** whose body must contain the literal, plus the exact observation (a field the emitter
+actually prints, or a live count this audit actually records). A marker emitted by an unrelated
+reporter can no longer be borrowed. `stage199d_closure_matrix` enforces this in
+`every_evidence_marker_is_emitted_by_the_function_that_claims_it` and
+`every_evidence_observation_is_supported_by_emitter_and_audit`.
+
+#### The closure matrix
+
+23 in-scope coordinates plus 1 excluded deferral. `stage199d_closure_matrix` (12 tests) verifies
+that every named seam and test module exists, that every evidence marker is emitted by the
+function that claims it with the observation it claims, that no live-pending or open cell claims
+evidence, that blocker kinds agree with status, and that the verdict is **computed** from the
+in-scope matrix rather than asserted beside it.
+
+| # | Coordinate | Status | Seam | Test | Live evidence (emitter → observation) |
+|---|---|---|---|---|---|
+| 1 | NR6 reply-record creation | COMPLETE | `reserve_direct_reply_record_split` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_COUNTERS` (`emit_direction`) → `reserve=` |
+| 2 | NR6 provisional reply-cap mint | COMPLETE | `sr_mint_split` | `stage199d_ack_lease_lifecycle` | `IPCCALL_DIRECT_REQUEST_OK` (`emit_ipccall_direct_request_live_markers`) |
+| 3 | NR6 reverse-link installation accounting | COMPLETE | `install_server_reply_link` | `stage199d_link_creation_parity` | `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT` (`maybe_emit_server_dies_link_balance`) → `created=` |
+| 4 | NR6 server wake (enqueue LAST, non-fallible) | COMPLETE | `sr_enqueue_committed_receiver_split` | `stage199d_remote_wake_authority` | `IPCCALL_DIRECT_REQUEST_OK` (`emit_ipccall_direct_request_live_markers`) |
+| 5 | NR6 delivery projection (inline-opcode framing parity) | COMPLETE | `project_recv_delivery` | `stage199d_delivery_projection_differential` | `X86_AP_RECV_V2_USER_VALIDATED` (`build_ap_workload`) |
+| 6 | NR7 one-shot record consumption (duplicate barrier) | COMPLETE | `consume_reply_record_split` | `stage199d_link_close_parity` | `IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED` (`try_split_ipcreply_direct_into_frame`) |
+| 7 | NR7 reverse-link close accounting | COMPLETE | `close_server_reply_link` | `stage199d_link_close_parity` | `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT` (`maybe_emit_server_dies_link_balance`) → `closed=` |
+| 8 | NR7 caller wake (enqueue LAST, non-fallible) | COMPLETE | `sr_claim_endpoint_waiter_split` | `stage199d_remote_wake_authority` | `IPCREPLY_DIRECT_OK` (`emit_ipcreply_direct_live_markers`) |
+| 9 | Local enqueue authority — no IPI | COMPLETE | `current_cpu_split_read` | `stage199d_remote_wake_authority` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` (`maybe_emit_quiescent_attestation`) → `result=` |
+| 10 | Remote enqueue authority — one IPI at the home CPU | COMPLETE | `send_reschedule_ipi_to` | `stage199d_remote_wake_authority` | `X86_AP_RESCHEDULE_IPI_SENT` (`send_reschedule_ipi_to`) |
+| 11 | Reverse (NR7) remote enqueue authority | COMPLETE | `c2c_send_reschedule_ipi_to` | `stage199d_remote_wake_authority` | `X86_BSP_RESCHEDULE_IPI_SENT` (`c2c_send_reschedule_ipi_to`) |
+| 12 | Transfer-cap decline before mutation → legacy | COMPLETE | `transfer_cap_arg_present` | `stage199d_transfer_cap_safety` | `IPC_DIRECT_TRANSFER_CAP` (`emit_direction`) → `declined_transfer_cap=` |
+| 13 | **Terminal-arbitrated NR7 declines before mutation; legacy wins the causal reply-vs-timeout race** | **COMPLETE** | `reply_record_terminal_arbitrated_split_read` | `stage199d_terminal_arbitration_safety` | **the causal set — see below** |
+| 14 | *Terminal-lease port into the direct transaction (direct-path arbitration)* | **`DEFERRED_TO_CANONICAL_199E`** *(excluded from the tally)* | `reserve_reply_win_before_copy` | `stage199d_terminal_arbitration_safety` | — |
+| 15 | Caller exit / replacement terminal race | COMPLETE | `direct_caller_exact_still_blocked` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_FUSES` (`emit_direction`) → `stale=` |
+| 16 | **Server death terminal race (reply-link cleanup) — x86_64 only** | **PARTIAL** · `LIVE_EVIDENCE_PENDING` | `close_server_reply_link` | `stage199d_link_close_parity` | `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL` → `live_cells=1` |
+| 17 | Stale generation / foreign / duplicate release | COMPLETE | `release_endpoint_index` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_FUSES` (`emit_direction`) → `dup_release=` |
+| 18 | Recycled-slot behaviour (positional, endpoint-keyed) | COMPLETE | `direct_ack_store` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_COUNTERS` (`emit_direction`) → `spent_released=` |
+| 19 | Waiter census / lease bijection | COMPLETE | `direct_ack_census` | `stage199d_waiter_census` | `IPC_DIRECT_WAITER_BIJECTION` (`emit_census`) → `waiters_without_lease=` |
+| 20 | x86_64 production default ON + live sealed | COMPLETE | `ipccall_direct_production_enabled` | `stage199d_production_default_guards` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` (`maybe_emit_quiescent_attestation`) → `nr6_ok=` |
+| 21 | **AArch64 off-lock NR6/NR7 + authoritative dispatch** | **`STRUCTURALLY_COMPLETE`** · `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | `offlock_authoritative_dispatch_enabled` | `stage199d_aarch64_offlock_dispatch` | — |
+| 22 | **AArch64 broad-lock-free handled-syscall return** | **`STRUCTURALLY_COMPLETE`** · `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | `split_finalize_handled_syscall` | `stage199d_split_return_without_broad_lock` | — |
+| 23 | **RISC-V off-lock NR6/NR7** | **OPEN** · `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` | `ipccall_direct_proof_enabled` | `stage199a2c3_matrix_guards` | — |
+| 24 | SMP=2 cross-CPU request/reply preservation | COMPLETE | `drain_direct_reply_post_work` | `stage199d_smp_oracle_request_framing` | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` → `cross_cpu_request_smp2=1` |
+
+**In-scope tally: 19 COMPLETE, 2 STRUCTURALLY_COMPLETE (live + enablement pending), 1 PARTIAL,
+1 OPEN.** Plus 1 `DEFERRED_TO_CANONICAL_199E`, excluded from the tally.
+
+#### Coordinate 13 — the 199D terminal-arbitration safety proposition
+
+What 199D owns here is a **safety** proposition, and it is COMPLETE: a terminal-arbitrated NR7
+declines **before any mutation**, so the legacy terminal lease wins the causal reply-vs-timeout
+race intact. Its evidence is therefore the causal reply-win set, each entry emitted by the
+function that performs the step it attests:
+
+| Evidence | Emitter | Required observation |
+|---|---|---|
+| `IPC_DIRECT_PRODUCTION_QUIESCENT` | `emit_quiescent` (`src/kernel/direct_ipc_counters.rs`) | `arbitrated=1` |
+| `IPC_REPLY_WIN_RESERVE` | `reserve_reply_win_before_copy` (`src/kernel/boot/ipc_state.rs`) | count = 1 |
+| `IPC_REPLY_BEATS_TIMEOUT_OK` | `commit_reply_win_after_delivery` (`src/kernel/boot/ipc_state.rs`) | count = 1 |
+| `IPC_REPLY_WIN_ROLLBACK` | `rollback_reply_win` (`src/kernel/boot/ipc_state.rs`) | count = 0 |
+| `IPC_REPLY_TIMEOUT_DEFERRED` | `drain_reply_timeout_post_work` (`src/runtime.rs`) | count = 0 |
+
+Read together: the reply reserved the terminal once, beat the timeout once, never rolled back,
+and the timeout never deferred a claim — while the direct path recorded the arbitrated decline.
+That is the causal chain. `IPC_DIRECT_TRANSFER_CAP` is **not** part of it and must never be
+assigned here again; `the_terminal_arbitration_coordinate_carries_the_causal_evidence_set` pins
+both the required set and that exclusion.
+
+#### Coordinate 14 — deferred, not blocking
+
+Porting the terminal lease **into** the direct transaction, so the direct path can arbitrate
+rather than decline, is a canonical **199E** deliverable. 199D's contract is the decline, and the
+decline is proven at coordinate 13. Coordinate 14 is recorded so the deferral is visible and
+typed — **not** so it can be counted. It is `DEFERRED_TO_CANONICAL_199E`, excluded from the tally
+and from `CANONICAL_199D_CLOSABLE`: it can neither close 199D nor block it.
+
+#### Verdict
+
+```
+CANONICAL_199D_CLOSABLE=no
+```
+
+Three in-scope blockers remain. None is a defect in the landed x86_64 production path.
+
+| Order | Blocker | Kind | Why |
+|---|---|---|---|
+| 1 | AArch64 off-lock NR6/NR7 + authoritative dispatch (#21) | `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | Landed and exercised hosted (`stage199d_aarch64_offlock_dispatch`, 17 tests). Needs the sequence below; **not** flipped in this audit-only increment. |
+| 2 | AArch64 broad-lock-free handled-syscall return (#22) | `LIVE_EVIDENCE_PENDING_AND_CONDITIONAL_PRODUCTION_ENABLEMENT` | Same sequence, behind #1 — the return path is only observable live once a direct AArch64 transaction runs. |
+| 3 | ServerDies live — AArch64 and RISC-V (#16, 1 of 3 earned) | `LIVE_EVIDENCE_PENDING` | x86_64 is sealed (`f5669cb5`). The AArch64 cell falls out of the AArch64 sequence; the RISC-V cell is the **last** link of the separate RISC-V chain. |
+| 4 | RISC-V off-lock NR6/NR7 (#23) | `CODE_THEN_ENABLEMENT_THEN_EVIDENCE` | The code does not exist — proof-gated only, with no post-lock dispatch. Four independent links, below; **link 1 (target-spec) is closed, links 2–4 are not**, so the coordinate stays OPEN. |
+
+**AArch64 required sequence.** AArch64 is not "just a missing emulator": live evidence
+additionally requires enabling the production predicate, and that enablement is only justified
+once the proof/oracle run has passed.
+
+1. proof/oracle QEMU run under `qemu-system-aarch64`, AArch64 production predicate still **OFF**;
+2. enable the AArch64 production predicate;
+3. on **one exact commit**: normal feature-off boot + direct oracle + ServerDies + timeout
+   regressions.
+
+**RISC-V dependency chain — four independent links, not one missing emulator.** Naming RISC-V
+alongside AArch64 as a single environment gap was the taxonomy error this repair corrects.
+
+1. **kernel target-spec / toolchain repair** — link 1 is **CLOSED**; see §6.1.16.
+2. **RISC-V off-lock NR6/NR7 code** — proof-gated only today, with no post-lock dispatch.
+3. **RISC-V production enablement.**
+4. **live RISC-V NR6/NR7 and ServerDies evidence.**
+
+Only link 4 is an evidence gap; links 1–3 are code, and each strictly precedes the next.
+Coordinate 23 remains **OPEN** on links 2–4.
+
+### 6.1.16 RISC-V dependency-chain link 1 — CLOSED (target-spec only)
+
+A target-spec-only repair. **No runtime semantics, production predicate, ABI, ISA, memory layout
+or linker semantics changed**, and no QEMU seal is required or claimed. Coordinate 23 stays OPEN,
+the closure tally is unchanged, and the live-evidence ledger is unchanged at 40 / 6 / 46.
+
+**The failure, reproduced at the clean parent `2db42681`:**
+
+```
+error: failed to parse target machine config to target machine:
+       could not create LLVM TargetMachine for triple: riscv64gc-unknown-none-elf
+```
+
+**The rejected field is `llvm-target`.** `riscv64gc` is a **Rust target-name** component, not an
+LLVM architecture — LLVM has no `riscv64gc` arch, so `Triple` parsed it as unknown and
+`createTargetMachine` failed before any codegen. The filename and Rust target name never had to
+equal the LLVM triple, and in this tree they never did elsewhere: every other spec already names
+a real LLVM arch (`x86_64-unknown-none`, `aarch64-unknown-none`), and the sibling
+`riscv64-yarm-user-none.json` has always declared `riscv64-unknown-none-elf` and built fine.
+
+The accepted triple was derived from the installed toolchain, not substituted blindly. The
+toolchain's own built-in `riscv64gc-unknown-none-elf` **Rust target** declares
+`llvm-target: "riscv64"` — proof that the `gc` belongs to the Rust name and the ISA belongs in
+`features`. Probing rustc 1.99.0-nightly / LLVM 22.1.8 directly:
+
+| Candidate triple | Result |
+|---|---|
+| `riscv64gc-unknown-none-elf` | **REJECTED** — `could not create LLVM TargetMachine` |
+| `riscv64-unknown-none-elf` | accepted |
+| `riscv64` | accepted |
+| `riscv64-unknown-elf` | accepted |
+
+**The repair is one token** — `riscv64gc-unknown-none-elf` → `riscv64-unknown-none-elf`, matching
+the sibling user target. Every other field is byte-identical: `arch` riscv64, features
+`+m,+a,+f,+d,+c`, `llvm-abiname` lp64d, little endian, 64-bit pointers, static relocation, medium
+code model, max atomic width 64, panic abort, and the same `-Ttargets/riscv64-yarm-none.ld`.
+
+**Proofs.**
+
+1. **rustc creates the target and prints its cfg** — the command that previously failed now
+   emits a full cfg set.
+2. **`target_arch="riscv64"`; `target_feature` covers `m`, `a`, `f`, `d`, `c`** (plus LLVM 22's
+   implied decompositions `zaamo`, `zalrsc`, `zca`, `zicsr`). The ISA/ABI cfg is **identical** to
+   the already-working RISC-V user target, so the expansion is the toolchain's, not the repair's.
+3. **Freestanding kernel builds feature-off** against the custom spec.
+4. **Kernel builds with `riscv-ipccall-direct-oracle`** and with `riscv-shared-region-direct-oracle`.
+5. **RISC-V user target still builds.**
+6. **Control-plane and fs server packages build** for the RISC-V user target
+   (`yarm-control-plane-servers`, `yarm-fs-servers`); `init_server`, `process_manager` and
+   `vfs_server` all link as `EXEC`, machine RISC-V, flags `0x5` — the same ABI as the kernel.
+7. **The linked kernel ELF is static and correct**: `EXEC` (not `DYN`), entry `0x80200000` =
+   `_start` = `__kernel_start` from the linker script, two `PT_LOAD` segments R‑E and RW,
+   `.text.boot` first, **no `INTERP`, no dynamic section, 0 undefined symbols, 0 relocations**.
+8. **ELF flags `0x5` = `EF_RISCV_RVC | EF_RISCV_FLOAT_ABI_DOUBLE`** — RV64GC + lp64d, intact.
+9. **x86_64 and AArch64 freestanding kernel and user checks are unchanged** (all pass).
+
+**Differential against the existing build path.** `scripts/build-qemu-riscv64-artifacts.sh` and
+`.cargo/config.toml` drive the RISC-V kernel through the **built-in** `riscv64gc-unknown-none-elf`
+Rust target with the YARM linker script applied via `rustflags` — which is why the broken custom
+spec never blocked the artifact build. Linking the same binary both ways gives identical
+`type=EXEC`, `machine=RISC-V`, `entry=0x80200000` and `flags=0x5, RVC, double-float ABI`, with
+`PT_LOAD` addresses, permissions and alignment identical; only segment byte sizes differ slightly
+(the built-in target lists `+zicsr,+zifencei` explicitly). **The layout contract is unchanged.**
+Nothing in the build path was repointed — that is not a target-spec repair.
+
+**Guards.** `stage199d_riscv_target_spec_guards` (8 tests) pins the LLVM triple, the ISA feature
+set and the ABI as three **independent** propositions, so the triple can never be "fixed" by
+weakening what it used to imply. The triple's architecture component must be exactly `riscv64`;
+`riscv64gc` must never reappear in any RISC-V spec; each of `+m`, `+a`, `+f`, `+d`, `+c` is
+asserted individually **by name**; `lp64d` is pinned; the kernel and user specs must agree on ISA
+and ABI; and the preserved machine-shape fields plus the `ENTRY(_start)` /
+`KERNEL_LOAD_BASE = 0x80200000` contract are pinned. Each guard is mutation-tested: restoring the
+`riscv64gc` triple, dropping `+c`, and switching `lp64d` to `lp64` each fail by name.
+
 ---
+
+
+---
+### 6.1.17 RISC-V dependency-chain link 2 — AUDIT ONLY: `RISCV_199D_READINESS=case_c`
+
+An audit. **No runtime code, production predicate or target spec changed.** One question:
+
+> Can an eligible RISC-V NR6/NR7 transaction complete end-to-end without entering or re-entering
+> the broad `KernelState` lock?
+
+**No.** A return-path code blocker remains even at SMP=1.
+
+```
+RISCV_199D_READINESS=case_c
+```
+
+Coordinate 23 stays **OPEN**. It is *not* reclassified to
+`STRUCTURALLY_COMPLETE / CONDITIONAL_PRODUCTION_ENABLEMENT_AND_LIVE_EVIDENCE`, because that
+classification would assert the mechanism is already structurally production-ready, and it is not.
+
+#### The traced path
+
+| Stage | Finding |
+|---|---|
+| ecall ABI import (`a7`, `a0..a5`) | **Complete.** `yarm_riscv64_trap_bridge` sets `a7` → `syscall_num` and `a0..a5` → `arg(0..5)`; all 31 GPRs are mirrored into the portable frame. `TRAPFRAME_ARG_REGS = 6`. |
+| Pre-global-lock decoding and admission | **Present but proof-gated.** `handle_riscv_trap_entry_shared` Phase 1 admits NR6/NR7 — but on `ipccall_direct_proof_enabled()`, **not** the canonical `ipccall_direct_admission_enabled()`. **Blocker 1.** |
+| Request/reply eligibility, pre-mutation declines | **Inherited unchanged.** `direct_eligibility` / `direct_disposition` contain **zero** `target_arch` references. A decline mutates nothing and falls to legacy. |
+| Acknowledgement claim and direct transaction | **Inherited unchanged and broad-lock-free.** The whole of `ipccall_direct_txn.rs` takes no broad lock; its only two `target_arch` references are the x86 wake sends. |
+| Payload/meta projection, transfer-cap sentinel | **Available.** `SYSCALL_ARG_TRANSFER_CAP = TRAPFRAME_ARG_REGS - 1` = `a5` on RISC-V, which the import provides; `SYSCALL_NO_TRANSFER_CAP` is the shared sentinel. |
+| Record / reverse-link lifecycle, census | **Inherited unchanged**, architecture-neutral. |
+| Caller/server enqueue target | **Authoritative.** `sr_enqueue_committed_receiver_split` returns the CPU it committed to; the drains compare it to `current_cpu_split_read()`. |
+| Local vs remote wake authority | **Local: correct on RISC-V.** No IPI for a local target, on any architecture. **Remote: absent.** Both wake sends are `#[cfg(target_arch = "x86_64")]`, and RISC-V exposes no IPI seam — the SBI surface carries HSM (hart start/status) and no IPI extension. **Blocker 3**, latent only because RISC-V is BSP-only. |
+| Result-lane encoding | **Parity.** Same-task return writes `a0=ret0`, `a1=ret1`, `a2=ret2`, `a3=error` — the YARM ABI, matching what `apply_direct_disposition` produces. |
+| `sepc` advancement | **Exactly once.** One site: `let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };`, pre-applied at import; `handle_trap_entry` deliberately adds no second `+4`. |
+| `sstatus`, SATP/ASID, GPRs, `tp`/TLS | **Preserved** — but the SATP activation is one of the broad-lock acquisitions below. `tp` (x4) is mirrored back from the saved frame; the write-back skip list is ABI lanes only and never contains `tp`. |
+| Trap return to the issuing task | **Correct**, and the issuer *is* still `current` (see below) — but the resume identity is re-derived through the broad lock. |
+| Broad-lock fallback / post-work reacquisition | **Three unconditional acquisitions bracket every trap.** **Blocker 2 — decisive.** |
+
+#### The decisive finding
+
+The RISC-V trap **wrapper** is clean: `handle_riscv_trap_entry_shared` Phase 1 returns
+`ReturnToCurrent` *before* the broad-lock phase, without ever setting
+`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, so no drain is owed and nothing is left true across the
+`sret`. The blocker is in the **bridge that wraps it**. `yarm_riscv64_trap_bridge` calls:
+
+* `let entering_tid = shared.current_tid_authoritative(cpu)` — **before** the split dispatcher;
+* `.current_tid_authoritative(cpu)` for `resume_tid` — **after** the handler returns;
+* `.with_cpu(cpu, |k| k.task_asid(resume_tid))` — the SATP asid lookup, also after.
+
+`current_tid_authoritative` is `self.with_cpu(cpu, |kernel| kernel.current_tid())` — a broad-lock
+acquisition. All three are outside the wrapper, so the Phase-1 early return does not avoid any of
+them: **a handled RISC-V NR6/NR7 enters the broad lock three times**, even though the transaction
+it performs is entirely broad-lock-free. This is the RISC-V analogue of AArch64 readiness blocker
+(ii) — same class of defect, different site.
+
+#### What is NOT a blocker: post-lock dispatch
+
+Neither NR6 nor NR7 clears `current`, so **no post-lock authoritative dispatch is owed on
+RISC-V.** Waking a task is not switching to it, and the audit checked this rather than inferring
+it:
+
+* **NR6 is request-send-only** — "success returns now (the caller blocks via a later recv)". It
+  copies off-lock, claims the ack, runs the transaction, encodes the success lanes and returns to
+  its own caller.
+* **NR7's replier stays `current`** — it "delivers the reply and wakes the caller"; the replier
+  itself returns `Ok`.
+* Neither split handler contains a `set_current` or a `dispatch_next_task`.
+* The `current`-clear that genuinely owes a post-lock dispatch is in
+  `block_current_on_receive_with_deadline` — the **recv** path, a different syscall — and its
+  publication is `#[cfg(target_arch = "aarch64")]`, so RISC-V publishes nothing.
+* `direct_dispatch::try_publish` refuses `DirectDispatchClass::IpcReply` unconditionally, so the
+  reply direction cannot acquire a debt even by mistake.
+
+Consequently `offlock_authoritative_dispatch_enabled()` resolving to `false` on RISC-V is **not**
+a blocker for NR6/NR7.
+
+#### Blocker map
+
+| # | Blocker | Severity | Site |
+|---|---|---|---|
+| 1 | NR6/NR7 admission asks `ipccall_direct_proof_enabled()`, not the canonical `ipccall_direct_admission_enabled()` — enabling the production default alone is a **silent no-op** | silent no-op | `src/arch/riscv64/trap.rs` |
+| 2 | The trap bridge brackets every trap with three unconditional `with_cpu` acquisitions — entering identity, resume identity, SATP asid — so a **handled** direct transaction still enters the broad lock three times | **decisive** | `src/arch/riscv64/boot.rs` |
+| 3 | No RISC-V cross-hart wake authority: both post-enqueue reschedule sends are x86_64-cfg-gated, and the SBI surface has no IPI extension | latent at current topology (BSP-only) | `src/kernel/ipccall_direct_txn.rs`, `src/arch/riscv64/sbi.rs` |
+
+Blocker 2 is why this is **case C** rather than case B: the SMP=1 path is not complete, so the
+question fails before remote wake is even reached.
+
+#### Smallest next code increment
+
+**Make the RISC-V trap bridge's identity and SATP lookups broad-lock-free** — blocker 2, alone.
+The replacement seams already exist and are architecture-neutral, so this is a call-site swap,
+not a new mechanism and not a RISC-V semantic copy:
+
+* `shared.current_tid_authoritative(cpu)` → `shared.current_tid_split_read(cpu)` (rank-1
+  scheduler seam; `current_tid_split_read_matches_with_cpu_current_tid_entering_snapshot` and its
+  exiting-snapshot twin already prove the equivalence);
+* `with_cpu(cpu, |k| k.task_asid(resume_tid))` → `task_asid_for_tid_split_read(resume_tid)`
+  (rank-2 task seam, already used by the NR6/NR7 split handlers themselves).
+
+Blocker 1 is a one-line predicate swap, but it must **not** land first or alone: admitting NR6/NR7
+while the bridge still brackets the trap would produce a path that claims off-lock NR6/NR7 while
+entering the broad lock three times per syscall — false evidence. Blocker 3 is only reachable once
+RISC-V boots more than one hart, and is not on the path to a first SMP=1 cell.
+
+The audit is executable: `stage199d_riscv_production_readiness_audit` (18 tests) pins the exact
+admission predicate, the absence of any broad lock inside the transaction, the presence of the
+three bridge acquisitions, the ABI import and return-lane parity, `sepc` advancing exactly once,
+`tp` preservation, local enqueue authority, the absent remote wake, the inherited transfer-cap and
+terminal-arbitration declines, that neither NR6 nor NR7 clears `current`, and the case-C verdict
+computed from the blocker map.
+
+---
+
 
 ## 7. Method and limits
 

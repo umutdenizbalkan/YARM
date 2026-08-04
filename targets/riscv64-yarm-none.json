@@ -1,5 +1,5 @@
 {
-  "llvm-target": "riscv64gc-unknown-none-elf",
+  "llvm-target": "riscv64-unknown-none-elf",
   "arch": "riscv64",
   "vendor": "yarm",
   "os": "none",
