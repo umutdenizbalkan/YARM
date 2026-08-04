@@ -94,17 +94,30 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 | Reply-timeout matrix | **6** | `STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL`, commit `72a4ebf`; 199E (one quarter of the stage) |
 | `ExitCurrentTask` NR 16 | **2 of 3** | x86_64 `0b5e98f`, AArch64; 202D (one sub-path; RISC-V unearned) |
 | **Server death (`ServerDies`) — x86_64** | **1 of 3** | **`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`; canonical 199D server-crash-cleanup increment** |
-| **Accepted total (production-path)** | **39** | 30 + 6 + 2 + 1 |
-| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D mechanism, **not** the production path. Originally earned at `ccceb03d`; **re-earned at `7d5a22c9`** after three repairs — see §0.1. |
+| *Pre-production subtotal* | *39* | *30 + 6 + 2 + 1 — the figure accepted before the x86_64 production default was flipped* |
+| **Direct IPC NR 6 / NR 7 — x86_64 production default ON** | **1** | **`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`, exact commit `0b5ec254`** — 53 NR6 + 41 NR7 ordinary syscalls off-lock with zero broad-lock entries on the **production** path; canonical 199D production-path increment |
+| **Accepted total (production-path)** | **40** | 30 + 6 + 2 + 1 + 1 |
+| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D **mechanism**, **not** the production path. Originally earned at `ccceb03d`; **re-earned at `7d5a22c9`** after three repairs — see §0.1. The re-earning restores historical evidence and **adds no new cell**. |
+| **Total including knob-gated mechanism evidence** | **46** | 40 + 6 |
 
 > **On the total.** There is no aggregate live-cell counter anywhere in the tree; the only
-> in-tree aggregate is Stage 198F's `total_live_cells=30`. The figure above is computed from
-> the seals listed and counts only **production-path** cells. Including the six knob-gated
-> Stage 199 functional cells gives **45**. A previously-quoted figure of **43** matches
-> neither: it requires counting the six knob-gated Stage 199 cells *and* excluding the two
-> `ExitCurrentTask` cells. Recorded here as **39** with the arithmetic visible rather than
-> asserting an unverifiable total — if the intended policy is to count knob-gated cells, the
-> number is 45 and this row should say so.
+> in-tree aggregate is Stage 198F's `total_live_cells=30`. The figures above are computed from
+> the seals listed, each of which is named with its exact commit.
+>
+> * **Production-path = 40.** The pre-production subtotal was **39** (30 + 6 + 2 + 1). The
+>   x86_64 NR6/NR7 production-default seal at `0b5ec254` is **one** production-path increment —
+>   the first live evidence that NR6/NR7 run off-lock with `ipccall_direct_production_enabled()`
+>   true rather than under a proof knob — so the production-path total is **40**.
+> * **Proof-gated / knob-gated = 6.** The six x86 SMP direct-IPC cells frozen by
+>   `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` are historical **mechanism** evidence. They were
+>   re-earned at `7d5a22c9` after the three repairs in §0.1; re-earning preserves evidence and
+>   **adds no new cell**, so they are counted once and only here.
+> * **Total = 46.** 40 + 6, stated explicitly so the two policies cannot be conflated.
+>
+> A previously-quoted figure of **43** matches neither policy: it requires counting the six
+> knob-gated Stage 199 cells *and* excluding the two `ExitCurrentTask` cells. The earlier
+> "39 / 45" pair predates the `0b5ec254` production-default seal and is superseded by
+> **40 / 46**.
 
 ### x86_64 ServerDies cell — evidence
 
@@ -409,6 +422,25 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    one of the silent ones, so with the flip on the totals read `created=54 closed=13` and
    ServerDies fails. Everything else about the flip is proven healthy at commit `c94cd304`. The
    constant is restored to `false`; the fix is the exact mirror of the creation one.
+   **CANONICAL 199D CLOSURE AUDIT — `CANONICAL_199D_CLOSABLE=no`.** An audit increment with no
+   runtime or semantic change. The live-evidence ledger is reconciled: the pre-production
+   subtotal of **39** plus the one production-path increment earned at `0b5ec254` gives
+   **40** production-path cells; the six knob-gated x86 SMP mechanism cells (re-earned at
+   `7d5a22c9`, adding no new cell) give **46** in total. The superseded "39 / 45" pair and the
+   never-coherent "43" are retired, and `PROJECT_HISTORY.md` gains the previously missing
+   `0b5ec254` row. The **executable closure matrix** (`stage199d_closure_matrix`, 6 tests)
+   classifies 24 coordinates — **19 COMPLETE, 2 STRUCTURALLY COMPLETE / LIVE PENDING, 2 PARTIAL,
+   1 OPEN** — each naming the exact seam, hosted test module and live marker that support it,
+   with the verdict *computed* from the matrix rather than asserted beside it. Five blockers
+   remain, in dependency order: (1) AArch64 off-lock NR6/NR7 + authoritative dispatch and
+   (2) the AArch64 broad-lock-free handled-syscall return, both **unavailable-QEMU evidence**
+   blockers (`qemu-system-aarch64` absent; no code work known to remain); (3) the AArch64 and
+   RISC-V ServerDies live cells, likewise evidence, blocked behind (1)–(2) and (5); (4) the
+   reply-vs-timeout terminal race, a **code** blocker deliberately deferred — a
+   terminal-arbitrated NR7 declines to legacy by design, and porting the terminal lease into the
+   direct transaction is canonical **199E**; and (5) RISC-V off-lock NR6/NR7, a **code** blocker
+   additionally gated by the pre-existing RISC-V kernel-target build failure. Nothing in the list
+   is a defect in the landed x86_64 production path. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.15.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

@@ -1310,6 +1310,85 @@ Census unchanged at **50 / 40 / 45** — the repair added no broad-lock acquisit
 HAL authority changed globally, the x86_64 live core-boot and ServerDies regressions were re-run
 alongside the hosted battery. Full evidence: `doc/IPC.md` §8.6.13.
 
+### 6.1.15 Canonical Stage 199D closure audit — `CANONICAL_199D_CLOSABLE=no`
+
+An audit increment: **no runtime or semantic code changed**. It reconciles the live-evidence
+ledger and classifies every coordinate of canonical 199D against the tree.
+
+**Ledger reconciliation.** The accepted pre-production subtotal was **39** (30 Stage 198F + 6
+reply-timeout matrix + 2 `ExitCurrentTask` + 1 x86_64 ServerDies). The x86_64 NR6/NR7
+production-default seal at `0b5ec254` is **one** production-path increment — the first live
+evidence of NR6/NR7 running off-lock with `ipccall_direct_production_enabled()` true rather than
+under a proof knob — so the production-path total is **40**. The six x86 SMP direct-IPC cells
+frozen by `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` are knob-gated **mechanism** evidence; their
+re-earning at `7d5a22c9` (§0.1 of `doc/STATUS.md`) preserves historical evidence and **adds no
+new cell**, so the combined total is **46**. The superseded pair "39 / 45" and the never-coherent
+"43" are retired. The arithmetic is recomputed from its constituent seals by
+`stage199d_live_evidence_ledger` (6 tests), and `PROJECT_HISTORY.md` now carries the previously
+missing `0b5ec254` row.
+
+| Production / proof-gated / total | Figure | Arithmetic |
+|---|---|---|
+| Production-path | **40** | 30 + 6 + 2 + 1 + 1 |
+| Proof-gated (knob-gated mechanism) | **6** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL`, counted once |
+| Total | **46** | 40 + 6 |
+
+**The closure matrix.** 24 coordinates, each naming the exact source seam, hosted test module
+and live marker that support it. `stage199d_closure_matrix` (6 tests) verifies that every named
+seam and test module exists in the tree, that every COMPLETE cell names a marker a live boot can
+actually emit, that no live-pending or open cell claims a marker, and that the verdict is
+**computed** from the matrix rather than asserted beside it.
+
+| # | Coordinate | Status | Seam | Test | Live marker |
+|---|---|---|---|---|---|
+| 1 | NR6 reply-record creation | COMPLETE | `reserve_direct_reply_record_split` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` |
+| 2 | NR6 provisional reply-cap mint | COMPLETE | `sr_mint_split` | `stage199d_ack_lease_lifecycle` | `IPCCALL_DIRECT_REQUEST_OK` |
+| 3 | NR6 reverse-link installation accounting | COMPLETE | `install_server_reply_link` | `stage199d_link_creation_parity` | `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT` |
+| 4 | NR6 server wake (enqueue LAST, non-fallible) | COMPLETE | `sr_enqueue_committed_receiver_split` | `stage199d_remote_wake_authority` | `IPCCALL_DIRECT_REQUEST_OK` |
+| 5 | NR6 delivery projection (inline-opcode framing parity) | COMPLETE | `project_recv_delivery` | `stage199d_delivery_projection_differential` | `X86_AP_RECV_V2_USER_VALIDATED` |
+| 6 | NR7 one-shot record consumption (duplicate barrier) | COMPLETE | `consume_reply_record_split` | `stage199d_link_close_parity` | `IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED` |
+| 7 | NR7 reverse-link close accounting | COMPLETE | `close_server_reply_link` | `stage199d_link_close_parity` | `IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT` |
+| 8 | NR7 caller wake (enqueue LAST, non-fallible) | COMPLETE | `sr_claim_endpoint_waiter_split` | `stage199d_remote_wake_authority` | `IPCREPLY_DIRECT_OK` |
+| 9 | Local enqueue authority — no IPI | COMPLETE | `current_cpu_split_read` | `stage199d_remote_wake_authority` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` |
+| 10 | Remote enqueue authority — one IPI at the home CPU | COMPLETE | `send_reschedule_ipi_to` | `stage199d_remote_wake_authority` | `X86_AP_RESCHEDULE_IPI_SENT` |
+| 11 | Reverse (NR7) remote enqueue authority | COMPLETE | `c2c_send_reschedule_ipi_to` | `stage199d_remote_wake_authority` | `X86_BSP_RESCHEDULE_IPI_SENT` |
+| 12 | Transfer-cap decline before mutation → legacy | COMPLETE | `transfer_cap_arg_present` | `stage199d_transfer_cap_safety` | `IPC_DIRECT_TRANSFER_CAP` |
+| 13 | Terminal-arbitrated reply fallback → legacy | COMPLETE | `reply_record_terminal_arbitrated_split_read` | `stage199d_terminal_arbitration_safety` | `IPC_DIRECT_TRANSFER_CAP` |
+| 14 | **Reply-vs-timeout terminal race** | **PARTIAL** | `reply_record_terminal_arbitrated_split_read` | `stage199d_terminal_arbitration_safety` | — |
+| 15 | Caller exit / replacement terminal race | COMPLETE | `direct_caller_exact_still_blocked` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_FUSES` |
+| 16 | **Server death terminal race (reply-link cleanup)** | **PARTIAL** | `close_server_reply_link` | `stage199d_link_close_parity` | `STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL` (x86_64 only) |
+| 17 | Stale generation / foreign / duplicate release | COMPLETE | `release_endpoint_index` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_FUSES` |
+| 18 | Recycled-slot behaviour (positional, endpoint-keyed) | COMPLETE | `direct_ack_store` | `stage199d_ack_lease_lifecycle` | `IPC_DIRECT_ACK_COUNTERS` |
+| 19 | Waiter census / lease bijection | COMPLETE | `direct_ack_census` | `stage199d_waiter_census` | `IPC_DIRECT_WAITER_BIJECTION` |
+| 20 | x86_64 production default ON + live sealed | COMPLETE | `ipccall_direct_production_enabled` | `stage199d_production_default_guards` | `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL` |
+| 21 | **AArch64 off-lock NR6/NR7 + authoritative dispatch** | **STRUCTURALLY COMPLETE / LIVE PENDING** | `offlock_authoritative_dispatch_enabled` | `stage199d_aarch64_offlock_dispatch` | — |
+| 22 | **AArch64 broad-lock-free handled-syscall return** | **STRUCTURALLY COMPLETE / LIVE PENDING** | `split_finalize_handled_syscall` | `stage199d_split_return_without_broad_lock` | — |
+| 23 | **RISC-V off-lock NR6/NR7** | **OPEN** | `ipccall_direct_proof_enabled` | `stage199a2c3_matrix_guards` | — |
+| 24 | SMP=2 cross-CPU request/reply preservation | COMPLETE | `drain_direct_reply_post_work` | `stage199d_smp_oracle_request_framing` | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` |
+
+**Tally: 19 COMPLETE, 2 STRUCTURALLY COMPLETE / LIVE PENDING, 2 PARTIAL, 1 OPEN.**
+
+#### Verdict
+
+```
+CANONICAL_199D_CLOSABLE=no
+```
+
+Minimal remaining blockers, in dependency order. Rows 21–22 depend on nothing but an
+environment; rows 14 and 23 are code.
+
+| Order | Blocker | Kind | Why |
+|---|---|---|---|
+| 1 | AArch64 off-lock NR6/NR7 + authoritative dispatch (#21) | **unavailable-QEMU evidence** | Landed and exercised hosted (`stage199d_aarch64_offlock_dispatch`, 17 tests). `qemu-system-aarch64` is not installed here, so no live cell can be taken. No code work is known to remain. |
+| 2 | AArch64 broad-lock-free handled-syscall return (#22) | **unavailable-QEMU evidence** | Same environment gap. Blocked behind #1: the return path is only observable live once a direct AArch64 transaction runs. |
+| 3 | ServerDies live — AArch64, RISC-V (#16, 1 of 3 earned) | **unavailable-QEMU evidence** | x86_64 is sealed (`f5669cb5`). The AArch64 cell is blocked behind #1–#2; the RISC-V cell is blocked behind #5. |
+| 4 | Reply-vs-timeout terminal race (#14) | **code** | A terminal-arbitrated NR7 declines to legacy *by design*, so the direct path never arbitrates. Closing it means porting the terminal lease into the direct transaction — explicitly canonical **199E**, out of scope here. |
+| 5 | RISC-V off-lock NR6/NR7 (#23) | **code**, then evidence | Proof-gated only, with no post-lock dispatch. It is additionally blocked by a **pre-existing build failure**: `targets/riscv64-yarm-none.json` declares LLVM triple `riscv64gc-unknown-none-elf`, which the current LLVM rejects, so the RISC-V kernel target does not configure. That must be repaired before any RISC-V 199D work; both are out of scope here. |
+
+Nothing in this list is a defect in the landed x86_64 production path. Rows 1–3 are the same
+missing emulator; rows 4–5 are deliberately deferred scope. Canonical 199D therefore stays open
+on evidence and on 199E, not on a known bug.
+
 ---
 
 ## 7. Method and limits

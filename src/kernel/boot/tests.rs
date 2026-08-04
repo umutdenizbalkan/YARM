@@ -105407,3 +105407,530 @@ mod stage199d_remote_wake_authority {
         );
     }
 }
+
+// ── Canonical Stage 199D closure matrix ──────────────────────────────────────────────────────
+//
+// The audit deliverable, made EXECUTABLE. Every coordinate of canonical 199D is classified, and
+// each classification names the exact source seam, hosted test module and live marker that
+// support it. The tests below verify those names actually exist in the tree, so a coordinate
+// cannot claim COMPLETE against a seam that was renamed or a test that was deleted — and the
+// final verdict is COMPUTED from the matrix rather than asserted beside it.
+mod stage199d_closure_matrix {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Status {
+        /// Landed, exercised hosted, and proven by a live seal on every architecture the
+        /// coordinate claims.
+        Complete,
+        /// Landed and exercised hosted; the live seal cannot be taken in this environment.
+        StructurallyCompleteLivePending,
+        /// Landed for some architectures / sub-paths only.
+        Partial,
+        /// Not retired.
+        Open,
+    }
+    use Status::*;
+
+    struct Coordinate {
+        name: &'static str,
+        status: Status,
+        /// Source seam — must exist in the tree.
+        seam: &'static str,
+        /// Hosted test module — must exist in `tests.rs`.
+        test: &'static str,
+        /// Live marker — must exist in the tree for a COMPLETE cell; "" when live is pending.
+        marker: &'static str,
+    }
+
+    const MATRIX: &[Coordinate] = &[
+        // ── NR6 request path ────────────────────────────────────────────────────────────────
+        Coordinate {
+            name: "NR6 reply-record creation",
+            status: Complete,
+            seam: "fn reserve_direct_reply_record_split",
+            test: "stage199d_ack_lease_lifecycle",
+            marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+        },
+        Coordinate {
+            name: "NR6 provisional reply-cap mint",
+            status: Complete,
+            seam: "fn sr_mint_split",
+            test: "stage199d_ack_lease_lifecycle",
+            marker: "IPCCALL_DIRECT_REQUEST_OK",
+        },
+        Coordinate {
+            name: "NR6 reverse-link installation accounting",
+            status: Complete,
+            seam: "fn install_server_reply_link",
+            test: "stage199d_link_creation_parity",
+            marker: "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT",
+        },
+        Coordinate {
+            name: "NR6 server wake (enqueue LAST, non-fallible)",
+            status: Complete,
+            seam: "fn sr_enqueue_committed_receiver_split",
+            test: "stage199d_remote_wake_authority",
+            marker: "IPCCALL_DIRECT_REQUEST_OK",
+        },
+        Coordinate {
+            name: "NR6 delivery projection (inline-opcode framing parity)",
+            status: Complete,
+            seam: "fn project_recv_delivery",
+            test: "stage199d_delivery_projection_differential",
+            marker: "X86_AP_RECV_V2_USER_VALIDATED",
+        },
+        // ── NR7 reply path ──────────────────────────────────────────────────────────────────
+        Coordinate {
+            name: "NR7 one-shot record consumption (duplicate barrier)",
+            status: Complete,
+            seam: "fn consume_reply_record_split",
+            test: "stage199d_link_close_parity",
+            marker: "IPCREPLY_DIRECT_SMP_DUPLICATE_REFUSED",
+        },
+        Coordinate {
+            name: "NR7 reverse-link close accounting",
+            status: Complete,
+            seam: "fn close_server_reply_link",
+            test: "stage199d_link_close_parity",
+            marker: "IPC_SERVER_DEATH_LINK_BALANCE_QUIESCENT",
+        },
+        Coordinate {
+            name: "NR7 caller wake (enqueue LAST, non-fallible)",
+            status: Complete,
+            seam: "fn sr_claim_endpoint_waiter_split",
+            test: "stage199d_remote_wake_authority",
+            marker: "IPCREPLY_DIRECT_OK",
+        },
+        // ── Wake authority ──────────────────────────────────────────────────────────────────
+        Coordinate {
+            name: "Local enqueue authority — no IPI",
+            status: Complete,
+            seam: "fn current_cpu_split_read",
+            test: "stage199d_remote_wake_authority",
+            marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+        },
+        Coordinate {
+            name: "Remote enqueue authority — one IPI at the home CPU",
+            status: Complete,
+            seam: "fn send_reschedule_ipi_to",
+            test: "stage199d_remote_wake_authority",
+            marker: "X86_AP_RESCHEDULE_IPI_SENT",
+        },
+        Coordinate {
+            name: "Reverse (NR7) remote enqueue authority",
+            status: Complete,
+            seam: "fn c2c_send_reschedule_ipi_to",
+            test: "stage199d_remote_wake_authority",
+            marker: "X86_BSP_RESCHEDULE_IPI_SENT",
+        },
+        // ── Declines and fallbacks ──────────────────────────────────────────────────────────
+        Coordinate {
+            name: "Transfer-cap decline before mutation -> legacy",
+            status: Complete,
+            seam: "fn transfer_cap_arg_present",
+            test: "stage199d_transfer_cap_safety",
+            marker: "IPC_DIRECT_TRANSFER_CAP",
+        },
+        Coordinate {
+            name: "Terminal-arbitrated reply fallback -> legacy",
+            status: Complete,
+            seam: "fn reply_record_terminal_arbitrated_split_read",
+            test: "stage199d_terminal_arbitration_safety",
+            marker: "IPC_DIRECT_TRANSFER_CAP",
+        },
+        // ── Terminal races ──────────────────────────────────────────────────────────────────
+        Coordinate {
+            name: "Reply-vs-timeout terminal race",
+            status: Partial, // declined to legacy by design; the direct terminal lease is 199E
+            seam: "fn reply_record_terminal_arbitrated_split_read",
+            test: "stage199d_terminal_arbitration_safety",
+            marker: "",
+        },
+        Coordinate {
+            name: "Caller exit / replacement terminal race",
+            status: Complete,
+            seam: "fn direct_caller_exact_still_blocked",
+            test: "stage199d_ack_lease_lifecycle",
+            marker: "IPC_DIRECT_ACK_FUSES",
+        },
+        Coordinate {
+            name: "Server death terminal race (reply-link cleanup)",
+            status: Partial, // x86_64 sealed; AArch64 + RISC-V live cells unearned
+            seam: "fn close_server_reply_link",
+            test: "stage199d_link_close_parity",
+            marker: "STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL",
+        },
+        // ── Acknowledgement lifecycle ───────────────────────────────────────────────────────
+        Coordinate {
+            name: "Stale generation / foreign / duplicate release",
+            status: Complete,
+            seam: "fn release_endpoint_index",
+            test: "stage199d_ack_lease_lifecycle",
+            marker: "IPC_DIRECT_ACK_FUSES",
+        },
+        Coordinate {
+            name: "Recycled-slot behaviour (positional, endpoint-keyed)",
+            status: Complete,
+            seam: "pub mod direct_ack_store",
+            test: "stage199d_ack_lease_lifecycle",
+            marker: "IPC_DIRECT_ACK_COUNTERS",
+        },
+        Coordinate {
+            name: "Waiter census / lease bijection",
+            status: Complete,
+            seam: "pub mod direct_ack_census",
+            test: "stage199d_waiter_census",
+            marker: "IPC_DIRECT_WAITER_BIJECTION",
+        },
+        // ── Per-architecture production status ──────────────────────────────────────────────
+        Coordinate {
+            name: "x86_64 production default ON + live sealed",
+            status: Complete,
+            seam: "fn ipccall_direct_production_enabled",
+            test: "stage199d_production_default_guards",
+            marker: "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+        },
+        Coordinate {
+            name: "AArch64 off-lock NR6/NR7 + authoritative dispatch",
+            status: StructurallyCompleteLivePending, // qemu-system-aarch64 absent
+            seam: "fn offlock_authoritative_dispatch_enabled",
+            test: "stage199d_aarch64_offlock_dispatch",
+            marker: "",
+        },
+        Coordinate {
+            name: "AArch64 broad-lock-free handled-syscall return",
+            status: StructurallyCompleteLivePending,
+            seam: "fn split_finalize_handled_syscall",
+            test: "stage199d_split_return_without_broad_lock",
+            marker: "",
+        },
+        Coordinate {
+            name: "RISC-V off-lock NR6/NR7",
+            status: Open, // proof-gated only; no post-lock dispatch; kernel target does not build here
+            seam: "fn ipccall_direct_proof_enabled",
+            test: "stage199a2c3_matrix_guards",
+            marker: "",
+        },
+        // ── SMP preservation ────────────────────────────────────────────────────────────────
+        Coordinate {
+            name: "SMP=2 cross-CPU request/reply preservation",
+            status: Complete,
+            seam: "fn drain_direct_reply_post_work",
+            test: "stage199d_smp_oracle_request_framing",
+            marker: "STAGE_199_X86_DIRECT_IPC_FINAL_SEAL",
+        },
+    ];
+
+    /// Every coordinate names a seam that EXISTS in the tree.
+    #[test]
+    fn every_coordinate_names_a_real_seam() {
+        const SOURCES: &[&str] = &[
+            include_str!("mod.rs"),
+            include_str!("ipc_state.rs"),
+            include_str!("../../runtime.rs"),
+            include_str!("../../arch/x86_64/smp.rs"),
+            include_str!("../../arch/trap_entry.rs"),
+            include_str!("../../arch/aarch64/trap.rs"),
+            include_str!("../ipccall_direct_txn.rs"),
+            include_str!("../direct_eligibility.rs"),
+            include_str!("../direct_ack_store.rs"),
+            include_str!("../syscall/ipc_abi.rs"),
+            include_str!("../syscall/ipc_recv_core.rs"),
+            include_str!("../mod.rs"),
+        ];
+        for c in MATRIX {
+            assert!(
+                SOURCES.iter().any(|s| s.contains(c.seam)),
+                "coordinate `{}` names a seam that does not exist: `{}`",
+                c.name,
+                c.seam
+            );
+        }
+    }
+
+    /// Every coordinate names a hosted test module that EXISTS.
+    #[test]
+    fn every_coordinate_names_a_real_test_module() {
+        const TESTS: &str = include_str!("tests.rs");
+        for c in MATRIX {
+            let decl = alloc::format!("mod {} {{", c.test);
+            assert!(
+                TESTS.contains(&decl),
+                "coordinate `{}` names a test module that does not exist: `{}`",
+                c.name,
+                c.test
+            );
+        }
+    }
+
+    /// Every COMPLETE coordinate names a live marker that EXISTS in the tree — a COMPLETE cell
+    /// must be backed by something a live boot can actually emit, not by prose.
+    #[test]
+    fn every_complete_coordinate_names_a_real_live_marker() {
+        const SOURCES: &[&str] = &[
+            include_str!("mod.rs"),
+            include_str!("ipc_state.rs"),
+            include_str!("../../runtime.rs"),
+            include_str!("../../arch/x86_64/smp.rs"),
+            include_str!("../direct_ipc_counters.rs"),
+            include_str!("../syscall_split.rs"),
+            include_str!("../ipccall_direct_txn.rs"),
+        ];
+        const SEAL_SCRIPTS: &str =
+            include_str!("../../../scripts/qemu-ipccall-reply-direct-x86_64-final-seal.sh");
+        const SD_DOC: &str = include_str!("../../../doc/PROJECT_HISTORY.md");
+        for c in MATRIX {
+            if c.status != Complete {
+                continue;
+            }
+            assert!(
+                !c.marker.is_empty(),
+                "COMPLETE coordinate `{}` must name a live marker",
+                c.name
+            );
+            let found = SOURCES.iter().any(|s| s.contains(c.marker))
+                || SEAL_SCRIPTS.contains(c.marker)
+                || SD_DOC.contains(c.marker);
+            assert!(
+                found,
+                "COMPLETE coordinate `{}` names a marker that does not exist: `{}`",
+                c.name, c.marker
+            );
+        }
+    }
+
+    /// A coordinate whose live seal is pending must NOT claim a live marker — that is exactly
+    /// the confusion this classification exists to prevent.
+    #[test]
+    fn live_pending_coordinates_claim_no_live_marker() {
+        for c in MATRIX {
+            if c.status == StructurallyCompleteLivePending || c.status == Open {
+                assert!(
+                    c.marker.is_empty(),
+                    "coordinate `{}` is not live-sealed and must not claim marker `{}`",
+                    c.name,
+                    c.marker
+                );
+            }
+        }
+    }
+
+    /// **The verdict, COMPUTED from the matrix.** Canonical 199D is closable only when every
+    /// coordinate is COMPLETE. Anything less is not, and the arms below name what remains.
+    #[test]
+    fn canonical_199d_closable_is_computed_from_the_matrix() {
+        let complete = MATRIX.iter().filter(|c| c.status == Complete).count();
+        let live_pending = MATRIX
+            .iter()
+            .filter(|c| c.status == StructurallyCompleteLivePending)
+            .count();
+        let partial = MATRIX.iter().filter(|c| c.status == Partial).count();
+        let open = MATRIX.iter().filter(|c| c.status == Open).count();
+        assert_eq!(
+            complete + live_pending + partial + open,
+            MATRIX.len(),
+            "every coordinate must be classified"
+        );
+
+        let closable = live_pending == 0 && partial == 0 && open == 0;
+        assert!(
+            !closable,
+            "the matrix says canonical 199D IS closable — update the audit verdict, which \
+             currently records CANONICAL_199D_CLOSABLE=no"
+        );
+
+        // The blockers, in dependency order. Recorded here so the count cannot drift silently.
+        assert_eq!(MATRIX.len(), 24, "canonical 199D coordinate count");
+        assert_eq!(complete, 19, "COMPLETE coordinates");
+        assert_eq!(
+            live_pending, 2,
+            "AArch64 off-lock dispatch + AArch64 broad-lock-free return, both awaiting \
+             qemu-system-aarch64"
+        );
+        assert_eq!(partial, 2, "reply-vs-timeout race + ServerDies 1-of-3");
+        assert_eq!(open, 1, "RISC-V off-lock NR6/NR7");
+    }
+
+    /// The x86_64 production default is ON and the AArch64/RISC-V defaults are OFF — the audit
+    /// states this, and it must remain true of the tree it describes.
+    #[test]
+    fn the_audited_production_defaults_are_what_the_matrix_claims() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\")",
+            "x86_64 ON, every other architecture OFF"
+        );
+    }
+}
+
+// ── Canonical Stage 199D live-evidence ledger reconciliation ─────────────────────────────────
+//
+// The live-cell ledger is arithmetic over named seals, and arithmetic can be checked. Every
+// figure quoted in `doc/STATUS.md` is recomputed here from its constituent seals, so a total
+// cannot drift away from the seals that produce it, and the two counting policies
+// (production-path only, versus including knob-gated mechanism evidence) cannot be conflated.
+mod stage199d_live_evidence_ledger {
+    use super::*;
+
+    const STATUS: &str = include_str!("../../../doc/STATUS.md");
+    const HISTORY: &str = include_str!("../../../doc/PROJECT_HISTORY.md");
+
+    /// Each production-path contribution, with the seal that earned it.
+    const PRODUCTION_PATH: &[(&str, usize, &str)] = &[
+        (
+            "Stage 198F combined retirement",
+            30,
+            "STAGE_198F_COMPLETE_RETIREMENT_SEAL",
+        ),
+        (
+            "reply-timeout three-architecture matrix",
+            6,
+            "STAGE_200_IPC_REPLY_TIMEOUT_MATRIX_SEAL",
+        ),
+        (
+            "ExitCurrentTask NR 16 (2 of 3)",
+            2,
+            "STAGE_200D0B3_X86_EXIT_CURRENT_TASK_REFREEZE_SEAL",
+        ),
+        (
+            "ServerDies live x86_64 (1 of 3)",
+            1,
+            "STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL",
+        ),
+        (
+            "x86_64 NR6/NR7 production default ON",
+            1,
+            "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL",
+        ),
+    ];
+
+    /// Knob-gated mechanism evidence — real live cells, but NOT on the production path.
+    const KNOB_GATED: &[(&str, usize, &str)] = &[(
+        "Stage 199 x86 SMP direct IPC",
+        6,
+        "STAGE_199_X86_DIRECT_IPC_FINAL_SEAL",
+    )];
+
+    fn production_total() -> usize {
+        PRODUCTION_PATH.iter().map(|(_, n, _)| n).sum()
+    }
+    fn knob_gated_total() -> usize {
+        KNOB_GATED.iter().map(|(_, n, _)| n).sum()
+    }
+
+    /// The pre-production subtotal was 39; the `0b5ec254` production-default seal is exactly
+    /// ONE further production-path increment, so the production-path total is 40.
+    #[test]
+    fn production_path_total_is_forty() {
+        let pre_production: usize = PRODUCTION_PATH
+            .iter()
+            .filter(|(_, _, seal)| *seal != "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL")
+            .map(|(_, n, _)| n)
+            .sum();
+        assert_eq!(pre_production, 39, "the accepted pre-production subtotal");
+
+        let production_default = PRODUCTION_PATH
+            .iter()
+            .find(|(_, _, seal)| *seal == "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL")
+            .map(|(_, n, _)| *n)
+            .expect("the x86_64 production-default seal is a ledger row");
+        assert_eq!(
+            production_default, 1,
+            "the production-default seal is ONE increment, not a re-count of the mechanism"
+        );
+
+        assert_eq!(production_total(), 40, "39 + 1");
+    }
+
+    /// The six x86 SMP cells re-earned at `7d5a22c9` are the SAME six cells frozen by the
+    /// original `ccceb03d` seal. Re-earning preserves historical evidence and adds no cell.
+    #[test]
+    fn re_earning_the_smp_cells_adds_no_new_cell() {
+        assert_eq!(knob_gated_total(), 6, "knob-gated mechanism cells");
+        assert!(
+            STATUS.contains("re-earned at `7d5a22c9`"),
+            "the ledger must record where the six cells were re-earned"
+        );
+        assert!(
+            STATUS.contains("adds no new cell"),
+            "the ledger must state that re-earning adds no cell"
+        );
+        // The knob-gated row is counted once, and never inside the production-path column.
+        assert!(
+            !PRODUCTION_PATH
+                .iter()
+                .any(|(_, _, seal)| *seal == "STAGE_199_X86_DIRECT_IPC_FINAL_SEAL"),
+            "knob-gated mechanism evidence must not enter the production-path total"
+        );
+    }
+
+    /// Including knob-gated mechanism evidence gives 46. Both policies are stated, so neither
+    /// can be quoted as if it were the other.
+    #[test]
+    fn total_including_knob_gated_is_forty_six() {
+        assert_eq!(production_total() + knob_gated_total(), 46, "40 + 6");
+    }
+
+    /// The document quotes exactly these figures — 40 production-path, 46 including knob-gated,
+    /// with 39 preserved only as the superseded pre-production subtotal.
+    #[test]
+    fn the_status_ledger_quotes_the_computed_figures() {
+        assert!(
+            STATUS
+                .contains("| **Accepted total (production-path)** | **40** | 30 + 6 + 2 + 1 + 1 |"),
+            "STATUS must record the production-path total as 40 with its arithmetic"
+        );
+        assert!(
+            STATUS.contains(
+                "| **Total including knob-gated mechanism evidence** | **46** | 40 + 6 |"
+            ),
+            "STATUS must record the combined total as 46 with its arithmetic"
+        );
+        assert!(
+            STATUS.contains("*Pre-production subtotal* | *39*"),
+            "39 is preserved as the pre-production subtotal, not as the current total"
+        );
+        assert!(
+            !STATUS.contains("**Accepted total (production-path)** | **39**"),
+            "the superseded 39 total must not survive anywhere as the accepted total"
+        );
+        assert!(
+            !STATUS.contains("gives **45**"),
+            "the superseded 45 combined total must not survive"
+        );
+    }
+
+    /// Every seal named in the ledger arithmetic exists in the permanent record.
+    #[test]
+    fn every_ledger_seal_exists_in_the_permanent_record() {
+        for (what, _, seal) in PRODUCTION_PATH.iter().chain(KNOB_GATED.iter()) {
+            assert!(
+                HISTORY.contains(seal) || STATUS.contains(seal),
+                "ledger row `{what}` names a seal absent from the record: `{seal}`"
+            );
+        }
+    }
+
+    /// The permanent seal ledger carries a row for the production-default seal — the omission
+    /// this reconciliation exists to repair.
+    #[test]
+    fn the_permanent_ledger_carries_the_production_default_row() {
+        assert!(
+            HISTORY.contains(
+                "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok"
+            ),
+            "PROJECT_HISTORY must carry the production-default seal verbatim"
+        );
+        assert!(
+            HISTORY.contains("0b5ec254"),
+            "the production-default row must name its exact commit"
+        );
+    }
+}
