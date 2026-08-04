@@ -105882,7 +105882,7 @@ mod stage199d_closure_matrix {
     /// strictly ordered; naming them together with AArch64 was the taxonomy error.
     const RISCV_SEQUENCE: &[&str] = &[
         "1. [CLOSED] kernel target-spec / toolchain repair — the LLVM triple named the Rust target name `riscv64gc`; it now names the LLVM architecture, ISA and ABI unchanged",
-        "2. RISC-V off-lock NR6/NR7 code (no post-lock dispatch exists; proof-gated only)",
+        "2. [AUDITED case_c] RISC-V off-lock NR6/NR7 code — the contract stack is inherited clean, but the trap bridge re-enters the broad lock on the return path even at SMP=1; see §6.1.17",
         "3. RISC-V production enablement",
         "4. live RISC-V NR6/NR7 and ServerDies evidence",
     ];
@@ -106252,6 +106252,16 @@ mod stage199d_closure_matrix {
         assert!(
             AUDIT.contains("link 1 is **CLOSED**"),
             "the audit must record link 1 as closed"
+        );
+        // Link 2 is AUDITED, not closed — case C. The distinction is the whole point: an audit
+        // that found a decisive blocker must not read as progress.
+        assert!(
+            RISCV_SEQUENCE[1].contains("[AUDITED case_c]"),
+            "link 2 is audited"
+        );
+        assert!(
+            AUDIT.contains("RISCV_199D_READINESS=case_c"),
+            "and the audit records the case-C verdict"
         );
     }
 
@@ -106711,6 +106721,542 @@ mod stage199d_riscv_target_spec_guards {
         assert!(
             KERNEL_LD.contains("KERNEL_LOAD_BASE = 0x80200000"),
             "the RISC-V kernel load base is unchanged"
+        );
+    }
+}
+
+// ── RISC-V canonical-199D production-readiness audit (chain link 2) ──────────────────────────
+//
+// ONE question: can an eligible RISC-V NR6/NR7 transaction complete end-to-end without entering
+// or re-entering the broad `KernelState` lock?
+//
+// **Answer: NO — case C.** A direct-transaction return-path code blocker remains even at SMP=1.
+// The architecture-neutral contract stack (eligibility, disposition, the ack store, the census,
+// the transaction, the projection, the reverse link) is already broad-lock-free and carries no
+// RISC-V special case, and the RISC-V trap wrapper's Phase-1 split return skips the broad-lock
+// phase entirely. But the RISC-V trap BRIDGE that wraps it brackets **every** trap — including a
+// handled NR6/NR7 — with three unconditional `with_cpu` acquisitions, so the syscall enters the
+// broad lock three times regardless.
+//
+// A point this audit is careful NOT to get wrong: NR6/NR7 do **not** need a post-lock
+// authoritative dispatch on RISC-V, because neither direction clears `current`. NR6 is
+// request-send-only and returns to its caller (the caller blocks later, on a separate `IpcRecv`);
+// NR7's replier stays `current` and only the peer is enqueued. The `current`-clear that DOES need
+// post-lock dispatch lives in `block_current_on_receive_with_deadline` — the recv path — and is
+// `#[cfg(target_arch = "aarch64")]`. Waking a task is not switching to it.
+mod stage199d_riscv_production_readiness_audit {
+    use super::*;
+
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BRIDGE: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+    const RISCV_ABI: &str = include_str!("../../arch/riscv64/syscall_abi.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const DISPATCH: &str = include_str!("../direct_dispatch.rs");
+    const SYSCALL: &str = include_str!("../syscall.rs");
+
+    /// The three cases the audit had to decide between.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Case {
+        /// A — structurally production-ready; only predicate enablement + live evidence remain.
+        StructurallyReady,
+        /// B — SMP=1 complete, remote enqueue lacks an authoritative wake/dispatch mechanism.
+        LocalCompleteRemoteMissing,
+        /// C — a direct-transaction or return-path code blocker remains even for SMP=1.
+        CodeBlockerEvenAtSmp1,
+    }
+
+    const VERDICT: Case = Case::CodeBlockerEvenAtSmp1;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BlockerSeverity {
+        /// Alone, this one silently disables the whole path.
+        SilentNoOp,
+        /// Decisive: the audited question is answered NO because of this.
+        Decisive,
+        /// Real, but unreachable at today's RISC-V topology (BSP-only).
+        LatentAtCurrentTopology,
+    }
+
+    struct Blocker {
+        id: u8,
+        what: &'static str,
+        site: &'static str,
+        severity: BlockerSeverity,
+    }
+
+    const BLOCKERS: &[Blocker] = &[
+        Blocker {
+            id: 1,
+            what: "NR6/NR7 admission is gated on the PROOF predicate, not the canonical \
+                   admission predicate — flipping the production default alone is a silent no-op",
+            site: "src/arch/riscv64/trap.rs",
+            severity: BlockerSeverity::SilentNoOp,
+        },
+        Blocker {
+            id: 2,
+            what: "the RISC-V trap bridge brackets every trap with three unconditional `with_cpu` \
+                   acquisitions — entering identity, resume identity and the SATP asid lookup — so \
+                   a HANDLED direct transaction still enters the broad lock three times",
+            site: "src/arch/riscv64/boot.rs",
+            severity: BlockerSeverity::Decisive,
+        },
+        Blocker {
+            id: 3,
+            what: "no RISC-V cross-hart wake authority: the post-enqueue reschedule IPI is \
+                   x86_64-cfg-gated and RISC-V exposes no SBI IPI / software-interrupt seam",
+            site: "src/kernel/ipccall_direct_txn.rs + src/arch/riscv64/sbi.rs",
+            severity: BlockerSeverity::LatentAtCurrentTopology,
+        },
+    ];
+
+    /// The body of `name` in `src`, signature to the matching close at the same indentation.
+    fn function_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let at = src
+            .find(name)
+            .unwrap_or_else(|| panic!("no such function: `{name}`"));
+        let line_start = src[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let indent = src[line_start..at]
+            .chars()
+            .take_while(|c| *c == ' ')
+            .count();
+        let closer = alloc::format!("\n{}}}", " ".repeat(indent));
+        let end = src[at..].find(&closer).map(|i| at + i).unwrap_or(src.len());
+        &src[at..end]
+    }
+
+    /// Lines of `body` that are code (not comments), for structural claims that must not be
+    /// satisfied by prose.
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    // ── The admission predicate ─────────────────────────────────────────────────────────────
+
+    /// **Blocker 1, pinned exactly.** RISC-V admits NR6/NR7 through
+    /// `ipccall_direct_proof_enabled()`. The canonical predicate the split dispatcher and the
+    /// AArch64 import both ask is `ipccall_direct_admission_enabled()` — RISC-V does not ask it,
+    /// so with the proof gate off NR6/NR7 are not split-eligible and enabling production alone
+    /// changes nothing.
+    #[test]
+    fn the_riscv_admission_predicate_is_the_proof_gate_not_the_canonical_one() {
+        let body = function_body(RISCV_TRAP, "pub fn handle_riscv_trap_entry_shared");
+        let code = code_lines(body);
+        assert!(
+            code.iter()
+                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
+            "RISC-V still admits NR6/NR7 on the proof gate — if this changed, the blocker map is stale"
+        );
+        assert!(
+            !code
+                .iter()
+                .any(|l| l.contains("ipccall_direct_admission_enabled()")),
+            "RISC-V does NOT ask the canonical admission predicate — blocker 1"
+        );
+        // The canonical predicate exists and IS what the portable import asks.
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        assert!(
+            TRAP_ENTRY.contains("ipccall_direct_admission_enabled()"),
+            "the canonical predicate is the portable one; RISC-V is the outlier"
+        );
+    }
+
+    /// Both NRs are named, so the gate covers request AND reply.
+    #[test]
+    fn both_nr6_and_nr7_are_named_by_the_riscv_gate() {
+        let body = function_body(RISCV_TRAP, "pub fn handle_riscv_trap_entry_shared");
+        assert!(body.contains("SYSCALL_IPC_CALL_NR"));
+        assert!(body.contains("SYSCALL_IPC_REPLY_NR"));
+    }
+
+    // ── Blocker 2: the broad lock after a handled direct transaction ────────────────────────
+
+    /// The contract stack itself is clean: the transaction module takes NO broad lock. The
+    /// blocker is not in the transaction.
+    #[test]
+    fn the_direct_transaction_itself_takes_no_broad_lock() {
+        for f in [
+            "fn drain_direct_request_post_work",
+            "fn drain_direct_reply_post_work",
+        ] {
+            let body = function_body(TXN, f);
+            for l in code_lines(body) {
+                assert!(
+                    !l.contains("with_cpu(") && !l.contains("state.lock()"),
+                    "`{f}` must not acquire the broad lock: `{l}`"
+                );
+            }
+        }
+        for l in code_lines(TXN) {
+            assert!(
+                !l.contains(".with_cpu(") && !l.contains("state.lock()"),
+                "the whole direct-transaction module must be broad-lock-free: `{l}`"
+            );
+        }
+    }
+
+    /// The RISC-V wrapper's Phase-1 split return is itself clean — it returns
+    /// `ReturnToCurrent` before the broad-lock phase, and never sets the drain-owed flag.
+    #[test]
+    fn the_riscv_wrapper_phase_one_returns_before_the_broad_lock_phase() {
+        let body = function_body(RISCV_TRAP, "pub fn handle_riscv_trap_entry_shared");
+        let split_at = body
+            .find("try_split_dispatch_into_frame")
+            .expect("the split dispatch call");
+        let first_return = body[split_at..]
+            .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
+            .expect("the handled early return")
+            + split_at;
+        let phase2 = body
+            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+            .expect("the phase-2 flag");
+        assert!(
+            first_return < phase2,
+            "the handled split path must return BEFORE the broad-lock phase is entered"
+        );
+        for l in code_lines(&body[..first_return]) {
+            assert!(
+                !l.contains("with_cpu("),
+                "nothing before the handled split return may take the broad lock: `{l}`"
+            );
+        }
+    }
+
+    /// **Blocker 2, pinned exactly — the decisive finding.** `current_tid_authoritative` is a
+    /// `with_cpu` acquisition, and the RISC-V trap BRIDGE calls it on entry and again on the
+    /// return path, then takes a third `with_cpu` for the SATP asid. All three are outside the
+    /// wrapper, so the Phase-1 early return does not avoid them.
+    #[test]
+    fn the_riscv_bridge_brackets_every_trap_with_broad_lock_acquisitions() {
+        assert!(
+            function_body(RUNTIME, "pub fn current_tid_authoritative").contains("self.with_cpu("),
+            "`current_tid_authoritative` IS a broad-lock acquisition — that is why the bridge's \
+             use of it matters"
+        );
+        let bridge = function_body(RISCV_BRIDGE, "extern \"C\" fn yarm_riscv64_trap_bridge");
+        let acquisitions: alloc::vec::Vec<&str> = code_lines(&bridge)
+            .into_iter()
+            .filter(|l| l.contains("current_tid_authoritative") || l.contains("with_cpu("))
+            .collect();
+        assert!(
+            acquisitions.len() >= 3,
+            "the bridge is expected to hold at least three broad-lock touches, found {}: {:?}",
+            acquisitions.len(),
+            acquisitions
+        );
+        // The two that a HANDLED direct transaction cannot avoid, by name.
+        assert!(
+            bridge
+                .contains("let entering_tid = shared.current_tid_authoritative(cpu).unwrap_or(0);"),
+            "the ENTERING identity is read through the broad lock, before the split dispatcher"
+        );
+        assert!(
+            bridge.contains(".current_tid_authoritative(cpu)"),
+            "the RESUME identity is re-read through the broad lock, after the handler returns"
+        );
+        assert!(
+            bridge.contains(".with_cpu(cpu, |k| k.task_asid(resume_tid))"),
+            "the SATP asid lookup is a third broad-lock acquisition on the return path"
+        );
+    }
+
+    /// The replacement seams ALREADY EXIST and are architecture-neutral — the smallest next
+    /// increment is a call-site swap, not a new mechanism and not a RISC-V semantic copy.
+    #[test]
+    fn the_broad_lock_free_replacement_seams_already_exist() {
+        assert!(
+            RUNTIME.contains("pub fn current_tid_split_read(&self, cpu: CpuId) -> Option<u64>")
+        );
+        assert!(RUNTIME.contains("pub fn task_asid_for_tid_split_read(&self, tid: u64) -> u64"));
+        let split_read = function_body(RUNTIME, "pub fn current_tid_split_read");
+        for l in code_lines(split_read) {
+            assert!(
+                !l.contains("with_cpu("),
+                "the replacement seam must not itself take the broad lock: `{l}`"
+            );
+        }
+    }
+
+    // ── NR6/NR7 keep the issuer current — no post-lock dispatch is owed ─────────────────────
+
+    /// NR6 is request-send-only and NR7's replier stays current. **Neither clears `current`**, so
+    /// no post-lock authoritative dispatch is required on RISC-V. This is the inference the
+    /// audit was told not to make, checked rather than assumed.
+    #[test]
+    fn neither_nr6_nor_nr7_clears_current() {
+        for f in [
+            "fn try_split_ipccall_direct_into_frame",
+            "fn try_split_ipcreply_direct_into_frame",
+        ] {
+            let body = function_body(SPLIT, f);
+            for l in code_lines(body) {
+                assert!(
+                    !l.contains("set_current") && !l.contains("dispatch_next_task"),
+                    "`{f}` must neither set nor clear `current`, nor dispatch: `{l}`"
+                );
+            }
+        }
+        assert!(
+            SPLIT.contains("NR6 is request-send-only: success returns now"),
+            "the NR6 contract is documented at the seam"
+        );
+        assert!(
+            SPLIT.contains("NR7 delivers the reply and wakes the caller; the replier"),
+            "the NR7 contract is documented at the seam"
+        );
+    }
+
+    /// The `current`-clear that DOES owe a post-lock dispatch lives on the RECV path, and its
+    /// publication is AArch64-only — it is not on the NR6/NR7 syscall path at all.
+    #[test]
+    fn the_current_clear_that_owes_dispatch_is_on_the_recv_path_and_is_aarch64_only() {
+        let body = function_body(IPC_STATE, "fn block_current_on_receive_with_deadline");
+        assert!(
+            body.contains("direct_dispatch::try_publish")
+                || body.contains("crate::kernel::direct_dispatch::try_publish"),
+            "the dispatch-debt publication lives in the recv-block commit"
+        );
+        assert!(
+            body.contains("#[cfg(target_arch = \"aarch64\")]"),
+            "and it is AArch64-only, so RISC-V publishes nothing"
+        );
+        // NR7 is refused by construction, independently of any caller.
+        let publish = function_body(DISPATCH, "pub fn try_publish");
+        assert!(
+            publish.contains("if work.class == DirectDispatchClass::IpcReply"),
+            "`try_publish` refuses the reply direction unconditionally"
+        );
+    }
+
+    // ── ABI / return parity ─────────────────────────────────────────────────────────────────
+
+    /// The ecall ABI import is complete: `a7` → nr and `a0..a5` → args, so all six lanes the
+    /// direct path reads are present.
+    #[test]
+    fn the_ecall_abi_import_covers_a7_and_a0_through_a5() {
+        assert!(
+            RISCV_BRIDGE
+                .contains("tframe.set_syscall_num(frame.regs[RiscvTrapFrame::A7] as usize);")
+        );
+        for (i, reg) in ["A0", "A1", "A2", "A3", "A4", "A5"].iter().enumerate() {
+            let expect =
+                alloc::format!("tframe.set_arg({i}, frame.regs[RiscvTrapFrame::{reg}] as usize);");
+            assert!(
+                RISCV_BRIDGE.contains(&expect),
+                "the ecall import must carry arg{i} from {reg}"
+            );
+        }
+        assert!(
+            RISCV_ABI.contains("pub const TRAPFRAME_ARG_REGS: usize = 6;"),
+            "RISC-V exposes six argument lanes"
+        );
+    }
+
+    /// The transfer-cap lane is the LAST argument on every architecture, so on RISC-V it is `a5`
+    /// — which the import above provides. The sentinel is the one encoding meaning "none".
+    #[test]
+    fn the_transfer_cap_lane_and_sentinel_are_available_on_riscv() {
+        assert!(
+            SYSCALL.contains(
+                "pub const SYSCALL_ARG_TRANSFER_CAP: usize = syscall_abi::TRAPFRAME_ARG_REGS - 1;"
+            ),
+            "the transfer-cap lane is derived from the per-arch argument count"
+        );
+        assert!(
+            SYSCALL.contains("pub const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;")
+        );
+    }
+
+    /// `sepc` advances by exactly 4, exactly once, and only for a user ecall.
+    #[test]
+    fn sepc_advances_exactly_once_for_an_ecall() {
+        assert!(
+            RISCV_BRIDGE.contains("let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };"),
+            "the single ecall PC advance"
+        );
+        assert!(RISCV_BRIDGE.contains("tframe.set_saved_pc(sepc + advance);"));
+        assert_eq!(
+            RISCV_BRIDGE
+                .matches("let advance = if scause == EXC_USER_ECALL")
+                .count(),
+            1,
+            "there must be exactly one advance site"
+        );
+    }
+
+    /// The same-task return lanes are the YARM ABI, matching the encoder the direct disposition
+    /// writes: a0=ret0, a1=ret1, a2=ret2, a3=error.
+    #[test]
+    fn the_same_task_return_lanes_match_the_shared_encoder() {
+        for (reg, lane) in [
+            ("A0", "tframe.ret0()"),
+            ("A1", "tframe.ret1()"),
+            ("A2", "tframe.ret2()"),
+        ] {
+            let expect = alloc::format!("frame.regs[RiscvTrapFrame::{reg}] = {lane} as u64;");
+            assert!(
+                RISCV_BRIDGE.contains(&expect),
+                "return lane {reg} must carry {lane}"
+            );
+        }
+        assert!(RISCV_BRIDGE.contains("frame.regs[RiscvTrapFrame::A3] = 0;"));
+    }
+
+    /// The GPR mirror preserves every non-ABI register — including `tp` (x4), the TLS base —
+    /// by restoring it from the saved frame rather than reconstructing it.
+    #[test]
+    fn non_abi_gprs_including_tp_are_mirrored_not_reconstructed() {
+        let bridge = function_body(RISCV_BRIDGE, "extern \"C\" fn yarm_riscv64_trap_bridge");
+        assert!(
+            bridge.contains("for n in 1..32usize {"),
+            "all 31 GPRs are mirrored"
+        );
+        assert!(
+            bridge.contains("frame.regs[i] = tframe.user_gpr(n) as usize as u64;"),
+            "non-ABI lanes come straight back from the saved frame — tp included"
+        );
+        // The skip list is ABI lanes only; tp/x4 is never in it.
+        let skip_start = bridge
+            .find("if i == RiscvTrapFrame::SP")
+            .expect("the skip list");
+        let skip = &bridge[skip_start..skip_start + 400];
+        assert!(
+            !skip.contains("RiscvTrapFrame::TP"),
+            "tp must not be skipped"
+        );
+    }
+
+    // ── Wake authority ──────────────────────────────────────────────────────────────────────
+
+    /// LOCAL enqueue is architecture-neutral and works on RISC-V: the enqueue seam reports the
+    /// CPU it actually committed to, and no IPI is sent for a local target.
+    #[test]
+    fn local_enqueue_authority_is_architecture_neutral() {
+        assert!(
+            RUNTIME.contains("pub(crate) fn sr_enqueue_committed_receiver_split")
+                && RUNTIME.contains("-> CpuId"),
+            "the enqueue seam reports its committed target"
+        );
+        for f in [
+            "fn drain_direct_request_post_work",
+            "fn drain_direct_reply_post_work",
+        ] {
+            let body = function_body(TXN, f);
+            assert!(
+                body.contains("if success.wake_target_cpu != enqueueing_cpu {"),
+                "`{f}` sends a wake ONLY when the committed target differs from the enqueueing CPU"
+            );
+        }
+    }
+
+    /// **Blocker 3, pinned exactly.** The remote wake is `x86_64`-cfg-gated, and RISC-V exposes
+    /// no IPI seam at all — the SBI surface carries HSM (hart start/status) but no IPI
+    /// extension. Latent only because RISC-V is BSP-only today.
+    #[test]
+    fn remote_wake_authority_is_absent_on_riscv() {
+        assert_eq!(
+            TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "both wake sends are x86_64-only — request and reply"
+        );
+        for l in code_lines(TXN) {
+            assert!(
+                !l.contains("riscv"),
+                "the transaction carries no RISC-V special case: `{l}`"
+            );
+        }
+        assert!(
+            RISCV_SBI.contains("SBI_EXT_HSM"),
+            "the SBI surface has hart start/status"
+        );
+        assert!(
+            !RISCV_SBI.contains("SBI_EXT_IPI") && !RISCV_SBI.contains("0x735049"),
+            "and no IPI extension — there is no cross-hart wake authority to call"
+        );
+        assert!(
+            RISCV_BRIDGE.contains("RISC-V is BSP-only"),
+            "which is latent only because RISC-V runs one hart"
+        );
+    }
+
+    // ── Declines ────────────────────────────────────────────────────────────────────────────
+
+    /// The transfer-cap and terminal-arbitration declines are in the shared, architecture-neutral
+    /// contract, so RISC-V inherits them with no copy.
+    #[test]
+    fn transfer_cap_and_terminal_arbitration_declines_are_inherited_unchanged() {
+        const ELIGIBILITY: &str = include_str!("../direct_eligibility.rs");
+        const DISPOSITION: &str = include_str!("../direct_disposition.rs");
+        for (what, src) in [("eligibility", ELIGIBILITY), ("disposition", DISPOSITION)] {
+            assert!(
+                !src.contains("target_arch"),
+                "the {what} contract must stay architecture-neutral"
+            );
+        }
+        assert!(
+            RUNTIME.contains("fn reply_record_terminal_arbitrated_split_read"),
+            "the terminal-arbitration read is a shared split seam"
+        );
+        // The decline lives in the PURE eligibility classifier, so it is reached before any
+        // mutation by construction — not by ordering discipline inside the transaction.
+        assert!(
+            ELIGIBILITY.contains("if facts.terminal_arbitrated {"),
+            "a terminal-arbitrated reply is declined by the pure classifier"
+        );
+        assert!(
+            ELIGIBILITY.contains("pub(crate) terminal_arbitrated: bool,"),
+            "the fact is carried into the classifier, not re-derived per architecture"
+        );
+    }
+
+    // ── The verdict ─────────────────────────────────────────────────────────────────────────
+
+    /// **Case C**, computed from the blocker map: a decisive return-path code blocker remains
+    /// even at SMP=1, so coordinate 23 stays OPEN.
+    #[test]
+    fn the_verdict_is_case_c_and_coordinate_23_stays_open() {
+        let decisive = BLOCKERS
+            .iter()
+            .filter(|b| b.severity == BlockerSeverity::Decisive)
+            .count();
+        assert_eq!(decisive, 1, "exactly one decisive blocker");
+        assert_eq!(
+            VERDICT,
+            Case::CodeBlockerEvenAtSmp1,
+            "a decisive blocker means neither case A nor case B"
+        );
+        assert_ne!(VERDICT, Case::StructurallyReady);
+        assert_ne!(VERDICT, Case::LocalCompleteRemoteMissing);
+        assert_eq!(BLOCKERS.len(), 3, "three genuine blockers");
+        for (i, b) in BLOCKERS.iter().enumerate() {
+            assert_eq!(b.id as usize, i + 1);
+            assert!(!b.what.is_empty() && !b.site.is_empty());
+        }
+        // Case B would require the SMP=1 path to be complete; blocker 2 says it is not.
+        assert!(
+            BLOCKERS
+                .iter()
+                .any(|b| b.severity == BlockerSeverity::Decisive
+                    && b.site == "src/arch/riscv64/boot.rs"),
+            "the decisive blocker is on the RISC-V return path"
+        );
+    }
+
+    /// The audit's conclusion is recorded in the canonical audit document.
+    #[test]
+    fn the_audit_document_records_case_c() {
+        const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_c"));
+        assert!(
+            AUDIT.contains("CONDITIONAL_PRODUCTION_ENABLEMENT_AND_LIVE_EVIDENCE"),
+            "the reclassification that was NOT taken must still be named, so the decision is legible"
         );
     }
 }

@@ -1549,6 +1549,116 @@ and ABI; and the preserved machine-shape fields plus the `ENTRY(_start)` /
 
 
 ---
+### 6.1.17 RISC-V dependency-chain link 2 — AUDIT ONLY: `RISCV_199D_READINESS=case_c`
+
+An audit. **No runtime code, production predicate or target spec changed.** One question:
+
+> Can an eligible RISC-V NR6/NR7 transaction complete end-to-end without entering or re-entering
+> the broad `KernelState` lock?
+
+**No.** A return-path code blocker remains even at SMP=1.
+
+```
+RISCV_199D_READINESS=case_c
+```
+
+Coordinate 23 stays **OPEN**. It is *not* reclassified to
+`STRUCTURALLY_COMPLETE / CONDITIONAL_PRODUCTION_ENABLEMENT_AND_LIVE_EVIDENCE`, because that
+classification would assert the mechanism is already structurally production-ready, and it is not.
+
+#### The traced path
+
+| Stage | Finding |
+|---|---|
+| ecall ABI import (`a7`, `a0..a5`) | **Complete.** `yarm_riscv64_trap_bridge` sets `a7` → `syscall_num` and `a0..a5` → `arg(0..5)`; all 31 GPRs are mirrored into the portable frame. `TRAPFRAME_ARG_REGS = 6`. |
+| Pre-global-lock decoding and admission | **Present but proof-gated.** `handle_riscv_trap_entry_shared` Phase 1 admits NR6/NR7 — but on `ipccall_direct_proof_enabled()`, **not** the canonical `ipccall_direct_admission_enabled()`. **Blocker 1.** |
+| Request/reply eligibility, pre-mutation declines | **Inherited unchanged.** `direct_eligibility` / `direct_disposition` contain **zero** `target_arch` references. A decline mutates nothing and falls to legacy. |
+| Acknowledgement claim and direct transaction | **Inherited unchanged and broad-lock-free.** The whole of `ipccall_direct_txn.rs` takes no broad lock; its only two `target_arch` references are the x86 wake sends. |
+| Payload/meta projection, transfer-cap sentinel | **Available.** `SYSCALL_ARG_TRANSFER_CAP = TRAPFRAME_ARG_REGS - 1` = `a5` on RISC-V, which the import provides; `SYSCALL_NO_TRANSFER_CAP` is the shared sentinel. |
+| Record / reverse-link lifecycle, census | **Inherited unchanged**, architecture-neutral. |
+| Caller/server enqueue target | **Authoritative.** `sr_enqueue_committed_receiver_split` returns the CPU it committed to; the drains compare it to `current_cpu_split_read()`. |
+| Local vs remote wake authority | **Local: correct on RISC-V.** No IPI for a local target, on any architecture. **Remote: absent.** Both wake sends are `#[cfg(target_arch = "x86_64")]`, and RISC-V exposes no IPI seam — the SBI surface carries HSM (hart start/status) and no IPI extension. **Blocker 3**, latent only because RISC-V is BSP-only. |
+| Result-lane encoding | **Parity.** Same-task return writes `a0=ret0`, `a1=ret1`, `a2=ret2`, `a3=error` — the YARM ABI, matching what `apply_direct_disposition` produces. |
+| `sepc` advancement | **Exactly once.** One site: `let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };`, pre-applied at import; `handle_trap_entry` deliberately adds no second `+4`. |
+| `sstatus`, SATP/ASID, GPRs, `tp`/TLS | **Preserved** — but the SATP activation is one of the broad-lock acquisitions below. `tp` (x4) is mirrored back from the saved frame; the write-back skip list is ABI lanes only and never contains `tp`. |
+| Trap return to the issuing task | **Correct**, and the issuer *is* still `current` (see below) — but the resume identity is re-derived through the broad lock. |
+| Broad-lock fallback / post-work reacquisition | **Three unconditional acquisitions bracket every trap.** **Blocker 2 — decisive.** |
+
+#### The decisive finding
+
+The RISC-V trap **wrapper** is clean: `handle_riscv_trap_entry_shared` Phase 1 returns
+`ReturnToCurrent` *before* the broad-lock phase, without ever setting
+`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`, so no drain is owed and nothing is left true across the
+`sret`. The blocker is in the **bridge that wraps it**. `yarm_riscv64_trap_bridge` calls:
+
+* `let entering_tid = shared.current_tid_authoritative(cpu)` — **before** the split dispatcher;
+* `.current_tid_authoritative(cpu)` for `resume_tid` — **after** the handler returns;
+* `.with_cpu(cpu, |k| k.task_asid(resume_tid))` — the SATP asid lookup, also after.
+
+`current_tid_authoritative` is `self.with_cpu(cpu, |kernel| kernel.current_tid())` — a broad-lock
+acquisition. All three are outside the wrapper, so the Phase-1 early return does not avoid any of
+them: **a handled RISC-V NR6/NR7 enters the broad lock three times**, even though the transaction
+it performs is entirely broad-lock-free. This is the RISC-V analogue of AArch64 readiness blocker
+(ii) — same class of defect, different site.
+
+#### What is NOT a blocker: post-lock dispatch
+
+Neither NR6 nor NR7 clears `current`, so **no post-lock authoritative dispatch is owed on
+RISC-V.** Waking a task is not switching to it, and the audit checked this rather than inferring
+it:
+
+* **NR6 is request-send-only** — "success returns now (the caller blocks via a later recv)". It
+  copies off-lock, claims the ack, runs the transaction, encodes the success lanes and returns to
+  its own caller.
+* **NR7's replier stays `current`** — it "delivers the reply and wakes the caller"; the replier
+  itself returns `Ok`.
+* Neither split handler contains a `set_current` or a `dispatch_next_task`.
+* The `current`-clear that genuinely owes a post-lock dispatch is in
+  `block_current_on_receive_with_deadline` — the **recv** path, a different syscall — and its
+  publication is `#[cfg(target_arch = "aarch64")]`, so RISC-V publishes nothing.
+* `direct_dispatch::try_publish` refuses `DirectDispatchClass::IpcReply` unconditionally, so the
+  reply direction cannot acquire a debt even by mistake.
+
+Consequently `offlock_authoritative_dispatch_enabled()` resolving to `false` on RISC-V is **not**
+a blocker for NR6/NR7.
+
+#### Blocker map
+
+| # | Blocker | Severity | Site |
+|---|---|---|---|
+| 1 | NR6/NR7 admission asks `ipccall_direct_proof_enabled()`, not the canonical `ipccall_direct_admission_enabled()` — enabling the production default alone is a **silent no-op** | silent no-op | `src/arch/riscv64/trap.rs` |
+| 2 | The trap bridge brackets every trap with three unconditional `with_cpu` acquisitions — entering identity, resume identity, SATP asid — so a **handled** direct transaction still enters the broad lock three times | **decisive** | `src/arch/riscv64/boot.rs` |
+| 3 | No RISC-V cross-hart wake authority: both post-enqueue reschedule sends are x86_64-cfg-gated, and the SBI surface has no IPI extension | latent at current topology (BSP-only) | `src/kernel/ipccall_direct_txn.rs`, `src/arch/riscv64/sbi.rs` |
+
+Blocker 2 is why this is **case C** rather than case B: the SMP=1 path is not complete, so the
+question fails before remote wake is even reached.
+
+#### Smallest next code increment
+
+**Make the RISC-V trap bridge's identity and SATP lookups broad-lock-free** — blocker 2, alone.
+The replacement seams already exist and are architecture-neutral, so this is a call-site swap,
+not a new mechanism and not a RISC-V semantic copy:
+
+* `shared.current_tid_authoritative(cpu)` → `shared.current_tid_split_read(cpu)` (rank-1
+  scheduler seam; `current_tid_split_read_matches_with_cpu_current_tid_entering_snapshot` and its
+  exiting-snapshot twin already prove the equivalence);
+* `with_cpu(cpu, |k| k.task_asid(resume_tid))` → `task_asid_for_tid_split_read(resume_tid)`
+  (rank-2 task seam, already used by the NR6/NR7 split handlers themselves).
+
+Blocker 1 is a one-line predicate swap, but it must **not** land first or alone: admitting NR6/NR7
+while the bridge still brackets the trap would produce a path that claims off-lock NR6/NR7 while
+entering the broad lock three times per syscall — false evidence. Blocker 3 is only reachable once
+RISC-V boots more than one hart, and is not on the path to a first SMP=1 cell.
+
+The audit is executable: `stage199d_riscv_production_readiness_audit` (18 tests) pins the exact
+admission predicate, the absence of any broad lock inside the transaction, the presence of the
+three bridge acquisitions, the ABI import and return-lane parity, `sepc` advancing exactly once,
+`tp` preservation, local enqueue authority, the absent remote wake, the inherited transfer-cap and
+terminal-arbitration declines, that neither NR6 nor NR7 clears `current`, and the case-C verdict
+computed from the blocker map.
+
+---
+
 
 ## 7. Method and limits
 

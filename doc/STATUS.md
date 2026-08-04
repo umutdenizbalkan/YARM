@@ -471,6 +471,32 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    "fixed" by dropping `+c`/`+f`/`+d` or switching `lp64d`. **Links 2–4 are untouched and
    coordinate 23 stays OPEN**; the tally and the 40 / 6 / 46 ledger are unchanged. No QEMU seal
    is required for a target-spec-only repair. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.16.
+   **RISC-V chain link 2 is AUDITED, not closed — `RISCV_199D_READINESS=case_c`.** An audit only;
+   no runtime code, production predicate or target spec changed. The question was whether an
+   eligible RISC-V NR6/NR7 transaction can complete end-to-end without entering or re-entering
+   the broad `KernelState` lock. **It cannot, even at SMP=1.** The architecture-neutral contract
+   stack is inherited clean — `ipccall_direct_txn.rs` takes no broad lock at all, eligibility and
+   disposition carry zero `target_arch` references, the ecall import covers `a7` + `a0..a5`, the
+   transfer-cap lane is `a5`, `sepc` advances exactly once, the return lanes are the YARM ABI, and
+   `tp` is mirrored back — and the RISC-V trap **wrapper**'s Phase-1 split return correctly skips
+   the broad-lock phase. But the trap **bridge** that wraps it brackets *every* trap with three
+   unconditional `with_cpu` acquisitions (entering identity, resume identity, SATP asid), so a
+   **handled** direct transaction enters the broad lock three times regardless. Three blockers:
+   (1) admission asks `ipccall_direct_proof_enabled()` rather than the canonical
+   `ipccall_direct_admission_enabled()`, so enabling production alone is a **silent no-op**;
+   (2) **decisive** — the three bridge acquisitions above; (3) no cross-hart wake authority (both
+   sends are x86_64-cfg-gated and SBI exposes no IPI extension), latent only because RISC-V is
+   BSP-only. **Not a blocker:** post-lock authoritative dispatch — neither NR6 nor NR7 clears
+   `current` (NR6 is request-send-only and the caller blocks on a *later* recv; NR7's replier
+   stays current), and the `current`-clear that owes dispatch lives in the AArch64-only recv-block
+   commit. Waking a task is not switching to it. **Smallest next increment:** swap the bridge's
+   three lookups to the already-existing architecture-neutral `current_tid_split_read` and
+   `task_asid_for_tid_split_read` seams — a call-site swap, no new mechanism, no RISC-V semantic
+   copy. Blocker 1 must not land first: admitting NR6/NR7 while the bridge still brackets the trap
+   would claim off-lock NR6/NR7 while taking the broad lock three times per syscall.
+   **Coordinate 23 stays OPEN**; tally and the 40 / 6 / 46 ledger unchanged.
+   `stage199d_riscv_production_readiness_audit` (18 tests) pins all of it. See
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.17.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
