@@ -515,9 +515,36 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    **Census: 50 / 40 / 45 → 49 / 39 / 44.** `stage199d_riscv_narrow_trap_snapshots` (16 tests)
    proves the narrow snapshots match the old authoritative results for same-current,
    switched-current, replacement and no-current, proves the fail-closed asid translation, and
-   pins that no broad-lock acquisition remains in the bridge. **Blockers 1 and 3 remain open**
-   (admission still proof-gated; no cross-hart wake), so `RISCV_199D_READINESS=case_c` stands and
-   **coordinate 23 stays OPEN**. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.18.
+   pins that no broad-lock acquisition remains in the bridge. See
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.18.
+   **RISC-V readiness blocker 1 is now CLOSED, and readiness recomputes to
+   `RISCV_199D_READINESS=case_b`.** The RISC-V Phase-1 whitelist asked
+   `ipccall_direct_proof_enabled()` *directly*, which made the RISC-V production predicate
+   un-flippable in practice: with the proof gate off, `nr` never reached
+   `try_split_dispatch_into_frame`, so enabling production would have been a **silent no-op**. It
+   now asks the canonical `ipccall_direct_admission_enabled()`. **Behaviour-preserving today, by
+   construction:** admission is `production || proof` and RISC-V production is
+   `cfg!(target_arch = "x86_64")` — a compile-time false — so on RISC-V the canonical predicate
+   reduces to *exactly* the proof gate the site used to ask. Selector off still declines NR6/NR7
+   to the unchanged broad-lock path; selector on admits the same population; no ordinary
+   feature-off traffic is newly admitted; x86_64 and AArch64 are untouched. All three admission
+   questions now flow through the one helper — the ABI import is unconditional on the RISC-V
+   bridge, whitelist admission is canonical, and handler reachability already was — and **no
+   `ipccall_direct_proof_enabled()` call survives anywhere in `src/arch/`**. Neither predicate's
+   implementation changed and no production default moved.
+   **Recomputed:** blockers 1 and 2 closed ⇒ the **SMP=1/local path is structurally complete**;
+   what remains is **blocker 3**, the absent cross-hart wake (both sends are x86_64-cfg-gated; SBI
+   has HSM but no IPI extension) — which is case B by definition. **Coordinate 23 remains OPEN**:
+   structural completeness is not production readiness, the remote-wake requirement is unresolved,
+   the RISC-V production predicate is still false, and no live evidence is earned.
+   **The RISC-V SMP=1 proof-gated QEMU smoke could NOT be run — `qemu-system-riscv64` is not
+   installed here — so the requested revalidation of the historical proof-gated evidence after the
+   trap-bridge change is outstanding and none of its observations are claimed.** The feature-off
+   RISC-V core boot is unavailable for the same reason; its artifacts were built to the end anyway
+   (`ARTIFACT_BUILD_INTEGRITY arch=riscv64 … result=ok`, linked `yarm-riscv64.bin` + initramfs),
+   so the change links into a bootable image — only the boot could not be observed. Neither run
+   would have added a live cell. `stage199d_riscv_canonical_admission` (11 tests) pins the
+   contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production

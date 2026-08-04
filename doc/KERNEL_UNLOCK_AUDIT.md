@@ -1764,6 +1764,104 @@ unchanged, and coordinate 23 still OPEN.
 
 ---
 
+### 6.1.19 RISC-V readiness blocker 1 — CLOSED; readiness recomputed to `case_b`
+
+The RISC-V Phase-1 whitelist asked `ipccall_direct_proof_enabled()` **directly**. That made the
+RISC-V production predicate un-flippable in practice: with the proof gate off, `nr` never reached
+`try_split_dispatch_into_frame`, so enabling production would have been a **silent no-op**. It now
+asks the canonical `ipccall_direct_admission_enabled()` — blocker 1 is **CLOSED**.
+
+Neither predicate's implementation changed, and the RISC-V production default was **not** enabled.
+
+#### Why this is behaviour-preserving today
+
+```rust
+pub fn ipccall_direct_admission_enabled() -> bool {
+    ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()
+}
+pub const fn ipccall_direct_production_enabled() -> bool { cfg!(target_arch = "x86_64") }
+```
+
+On RISC-V the first disjunct is a **compile-time false**, so canonical admission reduces to
+`false || proof` — *exactly* the predicate the site used to ask. Concretely:
+
+* **RISC-V production predicate remains false** — `cfg!(target_arch = "x86_64")` is unchanged and
+  no default moved.
+* **Proof selector OFF** — admission is closed, NR6/NR7 are not split-eligible, and they fall
+  through unchanged to the broad-lock handler. A normal boot stays byte-identical.
+* **Proof selector ON** — admission is open for exactly the same population as before; the
+  disjunction adds no term on RISC-V.
+* **No ordinary feature-off production traffic is newly admitted** — the whitelist still admits
+  exactly `DebugLog`, `FutexWake` and the gated direct-IPC term, and nothing else.
+* **x86_64 and AArch64 are unchanged** — the portable trap entry already asked the canonical
+  helper and was not touched.
+
+#### No direct proof-predicate dependency remains
+
+All three admission questions now flow through the one canonical helper, so a future production
+flip cannot silently no-op:
+
+| Question | Where | Status |
+|---|---|---|
+| NR6/NR7 ABI import | `yarm_riscv64_trap_bridge` | **unconditional** — `a7`→nr and `a0..a5`→args are imported for every ecall, so there was never a proof dependency here |
+| whitelist admission | `handle_riscv_trap_entry_shared` | **canonical** (repaired here) |
+| direct-handler reachability | `syscall_split::try_split_dispatch_into_frame` | **canonical** (already) |
+
+No `ipccall_direct_proof_enabled()` **call** survives anywhere in `src/arch/` — only a comment in
+the repaired site explaining what it used to ask.
+
+#### Recomputed readiness
+
+```
+RISCV_199D_READINESS=case_b
+```
+
+Blockers 1 and 2 are closed, so the **SMP=1 / local path is structurally complete**: admission is
+canonical, the contract stack is inherited broad-lock-free, the trap bridge is broad-lock-free on
+both sides of the wrapper call, the ABI import and return lanes have parity, `sepc` advances
+exactly once, `tp` is preserved, and local enqueue authority is architecture-neutral.
+
+What remains is **blocker 3 — no cross-hart wake authority**. Both post-enqueue reschedule sends
+are `#[cfg(target_arch = "x86_64")]` and the SBI surface exposes HSM but no IPI extension. That is
+precisely case B: *local delivery complete, remote enqueue lacks an authoritative wake mechanism.*
+The §6.1.17 case-C finding and its blocker map are preserved — an audit does not un-find what it
+found — with the recomputed verdict recorded beside it.
+
+**Coordinate 23 remains OPEN.** Structural completeness of the SMP=1 path is not production
+readiness: the remote-wake requirement is unresolved, the RISC-V production predicate is still
+false, and no live evidence has been earned.
+
+#### QEMU evidence — NOT taken
+
+The RISC-V SMP=1 proof-gated direct request/reply smoke (`scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh`)
+**could not be run: `qemu-system-riscv64` is not installed in this environment.** The requested
+revalidation of the historical proof-gated evidence after the trap-bridge runtime change is
+therefore **outstanding**, and none of its required observations — genuine NR6 request and NR7
+reply delivery, request/reply userspace validation, duplicate reply rejected, `sepc` advanced
+once, `a0`/`a1`/`a2`/`a3` return parity, `tp`/TLS and SATP preserved, zero broad-lock NR6/NR7
+entries, no fault/stale-identity/duplicate-wake/fatal marker — is claimed here. It would have
+added no live cell in any case; it is a revalidation of existing proof-gated evidence.
+
+The **feature-off RISC-V core boot** is unavailable for the same reason. Its artifacts were built
+to the end anyway — `scripts/build-qemu-riscv64-artifacts.sh` completed with
+`ARTIFACT_BUILD_INTEGRITY arch=riscv64 stale_artifact_acceptance=0 failed_build_rejected=1
+result=ok`, producing a linked `build-riscv64/yarm-riscv64.bin` and initramfs — so the change
+links into a bootable RISC-V image; only the boot itself could not be observed.
+
+Everything provable without an emulator was run: the feature-off and oracle RISC-V kernel builds,
+the full RISC-V artifact build and link, all four hosted configurations serially with integration
+binaries, every architecture's kernel and user target, fmt, clippy, the crate graph and the shell
+gates.
+
+`stage199d_riscv_canonical_admission` (11 tests) pins: NR6 and NR7 both use canonical admission;
+no `ipccall_direct_proof_enabled()` call remains in the RISC-V ingress; all three admission
+questions flow through the canonical helper; production-disabled admission equals the proof gate;
+feature-off stays marker-clean; the bridge stays broad-lock-free before and after a handled
+Phase-1 transaction (blocker 2 still closed); blocker 3 explicitly open; and no production
+predicate changed.
+
+---
+
 
 ## 7. Method and limits
 

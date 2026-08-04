@@ -439,16 +439,27 @@ pub fn handle_riscv_trap_entry_shared(
     // (sepc+4 once, sstatus preserved, a0 result lane from `set_ok`) finalizes them.
     // Every other syscall falls through to the unchanged broad-lock handler once.
     let nr = frame.syscall_num();
-    // Stage 199A2C2: admit IpcCall (NR 6) + IpcReply (NR 7) into the shared split dispatcher ONLY
-    // while the common direct proof gate is armed, so the off-lock request/reply gates run on
-    // RISC-V. The RISC-V bridge has already imported a7→nr + a0..a5→args into the portable frame, so
-    // all six arguments are present. With the gate off, NR6/NR7 are NOT split-eligible and fall
-    // through UNCHANGED to the broad-lock handler (a normal boot is byte-identical). A handled
-    // NR6/NR7 finalizes via the SAME same-task ecall write-back as DebugLog/FutexWake (sepc+4 once,
-    // sstatus preserved, a0 result lane from `set_ok`) → `ReturnToCurrent`.
+    // Stage 199A2C2 / Stage 199D (RISC-V readiness blocker 1): admit IpcCall (NR 6) + IpcReply
+    // (NR 7) into the shared split dispatcher through the CANONICAL admission predicate, so the
+    // off-lock request/reply gates run on RISC-V. The RISC-V bridge has already imported a7→nr +
+    // a0..a5→args into the portable frame, so all six arguments are present. With admission
+    // closed, NR6/NR7 are NOT split-eligible and fall through UNCHANGED to the broad-lock handler
+    // (a normal boot is byte-identical). A handled NR6/NR7 finalizes via the SAME same-task ecall
+    // write-back as DebugLog/FutexWake (sepc+4 once, sstatus preserved, a0 result lane from
+    // `set_ok`) → `ReturnToCurrent`.
+    //
+    // This asks `ipccall_direct_admission_enabled()`, NOT `ipccall_direct_proof_enabled()`. The
+    // two are equal on RISC-V *today* — admission is `production || proof` and production is
+    // `cfg!(target_arch = "x86_64")`, so on RISC-V it is `false || proof` — which is exactly why
+    // the swap is behaviour-preserving. What it buys is the future: while this asked the proof
+    // gate directly, flipping the RISC-V production predicate would have been a SILENT NO-OP,
+    // because `nr` would never reach `try_split_dispatch_into_frame`. Every one of the three
+    // questions — ABI import (unconditional on this bridge), whitelist admission (here) and
+    // direct-handler reachability (`syscall_split::try_split_dispatch_into_frame`) — now flows
+    // through the one canonical helper.
     let is_ipc_direct = (nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
         || nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)
-        && crate::kernel::boot::ipccall_direct_proof_enabled();
+        && crate::kernel::boot::ipccall_direct_admission_enabled();
     let split_eligible = is_syscall
         && (nr == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
             || nr == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR

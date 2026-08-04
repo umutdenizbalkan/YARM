@@ -79028,15 +79028,20 @@ mod stage199a2c2_riscv_guards {
         );
     }
 
-    // (RISC-V NR6/NR7 split eligibility + reachability) The RISC-V trap route admits NR6/NR7 into the
-    // shared split dispatcher ONLY behind the direct proof gate (the a7→nr + a0..a5→args import is
-    // done by the bridge); a handled NR6/NR7 finalizes via ReturnToCurrent. The whitelist reachability
-    // guard keeps the live drains from being DCE'd.
+    // (RISC-V NR6/NR7 split eligibility + reachability) The RISC-V trap route admits NR6/NR7 into
+    // the shared split dispatcher only behind the CANONICAL admission predicate (the a7→nr +
+    // a0..a5→args import is done by the bridge); a handled NR6/NR7 finalizes via ReturnToCurrent.
+    // The whitelist reachability guard keeps the live drains from being DCE'd.
+    //
+    // Stage 199D (RISC-V readiness blocker 1): this used to pin a DIRECT
+    // `ipccall_direct_proof_enabled()` call. Admission is `production || proof` and RISC-V
+    // production is a compile-time false, so the gate is unchanged in effect — but asking the
+    // canonical helper is what stops a future production flip from silently no-opping.
     #[test]
     fn riscv_nr6_nr7_split_eligibility_gated_and_reachable() {
         assert!(
-            TRAP_SRC.contains("(nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n        || nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n        && crate::kernel::boot::ipccall_direct_proof_enabled()"),
-            "RISC-V must admit NR6/NR7 into the split dispatcher only behind the direct proof gate"
+            TRAP_SRC.contains("(nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n        || nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n        && crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "RISC-V must admit NR6/NR7 into the split dispatcher behind the canonical predicate"
         );
         assert!(TRAP_SRC.contains("|| is_ipc_direct"));
         assert!(
@@ -82945,9 +82950,21 @@ mod stage199d_production_default_guards {
             !trap_entry.contains("ipccall_direct_proof_enabled()"),
             "no AArch64-specific proof-only admission rule survives"
         );
+        // Stage 199D (RISC-V readiness blocker 1): RISC-V now asks the CANONICAL predicate, like
+        // AArch64. It remains proof-gated in EFFECT — admission is `production || proof` and
+        // RISC-V production is false — but the mechanism is no longer a direct proof-gate call,
+        // so a future production flip cannot silently no-op.
         assert!(
-            riscv.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"),
-            "RISC-V trap admission remains proof-gated"
+            riscv.contains("&& crate::kernel::boot::ipccall_direct_admission_enabled();"),
+            "RISC-V trap admission uses the canonical predicate"
+        );
+        assert!(
+            !riscv
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.starts_with("//"))
+                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
+            "no RISC-V-specific proof-only admission rule survives"
         );
         // The shared predicates fall back to the proof gate off x86.
         for predicate in [
@@ -105882,7 +105899,7 @@ mod stage199d_closure_matrix {
     /// strictly ordered; naming them together with AArch64 was the taxonomy error.
     const RISCV_SEQUENCE: &[&str] = &[
         "1. [CLOSED] kernel target-spec / toolchain repair — the LLVM triple named the Rust target name `riscv64gc`; it now names the LLVM architecture, ISA and ABI unchanged",
-        "2. [AUDITED case_c; blocker 2 CLOSED] RISC-V off-lock NR6/NR7 code — the contract stack is inherited clean and the trap bridge no longer re-enters the broad lock (§6.1.18); admission is still proof-gated (blocker 1), so the link stays open",
+        "2. [case_b; blockers 1+2 CLOSED] RISC-V off-lock NR6/NR7 code — the SMP=1/local path is structurally complete (§6.1.18, §6.1.19); the link stays open on blocker 3, the absent cross-hart wake",
         "3. RISC-V production enablement",
         "4. live RISC-V NR6/NR7 and ServerDies evidence",
     ];
@@ -106257,8 +106274,8 @@ mod stage199d_closure_matrix {
         // The distinction is the whole point: closing the return-path blocker is not the same as
         // closing the link, because admission is still proof-gated.
         assert!(
-            RISCV_SEQUENCE[1].contains("[AUDITED case_c; blocker 2 CLOSED]"),
-            "link 2 is audited with its decisive blocker closed"
+            RISCV_SEQUENCE[1].contains("[case_b; blockers 1+2 CLOSED]"),
+            "link 2 carries the recomputed case-B classification with blockers 1 and 2 closed"
         );
         assert!(
             !RISCV_SEQUENCE[1].starts_with("2. [CLOSED]"),
@@ -106735,7 +106752,9 @@ mod stage199d_riscv_target_spec_guards {
 // ONE question: can an eligible RISC-V NR6/NR7 transaction complete end-to-end without entering
 // or re-entering the broad `KernelState` lock?
 //
-// **Answer: NO — case C.** A direct-transaction return-path code blocker remains even at SMP=1.
+// **Answer (recomputed after blockers 1 and 2 closed): case B.** The SMP=1 / local path is
+// structurally complete; what remains is the absent cross-hart wake. The original case-C finding
+// and its blocker map are preserved below — an audit does not un-find what it found.
 // The architecture-neutral contract stack (eligibility, disposition, the ack store, the census,
 // the transaction, the projection, the reverse link) is already broad-lock-free and carries no
 // RISC-V special case, and the RISC-V trap wrapper's Phase-1 split return skips the broad-lock
@@ -106774,7 +106793,9 @@ mod stage199d_riscv_production_readiness_audit {
         CodeBlockerEvenAtSmp1,
     }
 
-    const VERDICT: Case = Case::CodeBlockerEvenAtSmp1;
+    /// Recomputed after blockers 1 and 2 closed: the SMP=1 / local path is structurally
+    /// complete, and what remains is the absent cross-hart wake — case B, not case C.
+    const VERDICT: Case = Case::LocalCompleteRemoteMissing;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum BlockerSeverity {
@@ -106803,7 +106824,7 @@ mod stage199d_riscv_production_readiness_audit {
                    admission predicate — flipping the production default alone is a silent no-op",
             site: "src/arch/riscv64/trap.rs",
             severity: BlockerSeverity::SilentNoOp,
-            closed: false,
+            closed: true,
         },
         Blocker {
             id: 2,
@@ -106850,32 +106871,32 @@ mod stage199d_riscv_production_readiness_audit {
 
     // ── The admission predicate ─────────────────────────────────────────────────────────────
 
-    /// **Blocker 1, pinned exactly.** RISC-V admits NR6/NR7 through
-    /// `ipccall_direct_proof_enabled()`. The canonical predicate the split dispatcher and the
-    /// AArch64 import both ask is `ipccall_direct_admission_enabled()` — RISC-V does not ask it,
-    /// so with the proof gate off NR6/NR7 are not split-eligible and enabling production alone
-    /// changes nothing.
+    /// **Blocker 1 — CLOSED.** RISC-V admits NR6/NR7 through the canonical
+    /// `ipccall_direct_admission_enabled()`, the same predicate the portable import asks. It is
+    /// still proof-gated in EFFECT (admission is `production || proof`; RISC-V production is
+    /// false), so the admitted population is unchanged — but a future production flip can no
+    /// longer silently no-op.
     #[test]
-    fn the_riscv_admission_predicate_is_the_proof_gate_not_the_canonical_one() {
+    fn the_riscv_admission_predicate_is_canonical() {
         let body = function_body(RISCV_TRAP, "pub fn handle_riscv_trap_entry_shared");
         let code = code_lines(body);
         assert!(
             code.iter()
-                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
-            "RISC-V still admits NR6/NR7 on the proof gate — if this changed, the blocker map is stale"
+                .any(|l| l.contains("ipccall_direct_admission_enabled()")),
+            "RISC-V must ask the canonical admission predicate"
         );
         assert!(
             !code
                 .iter()
-                .any(|l| l.contains("ipccall_direct_admission_enabled()")),
-            "RISC-V does NOT ask the canonical admission predicate — blocker 1"
+                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
+            "no direct proof-gate call may remain — blocker 1 is closed"
         );
-        // The canonical predicate exists and IS what the portable import asks.
         const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         assert!(
             TRAP_ENTRY.contains("ipccall_direct_admission_enabled()"),
-            "the canonical predicate is the portable one; RISC-V is the outlier"
+            "RISC-V now asks the same predicate as the portable import"
         );
+        assert!(MATRIX_BLOCKER(1).closed, "blocker 1 is recorded closed");
     }
 
     /// Both NRs are named, so the gate covers request AND reply.
@@ -107236,20 +107257,36 @@ mod stage199d_riscv_production_readiness_audit {
             .iter()
             .filter(|b| b.severity == BlockerSeverity::Decisive)
             .count();
-        assert_eq!(decisive, 1, "exactly one decisive blocker");
+        assert_eq!(decisive, 1, "exactly one decisive blocker was found");
+        // Recomputed: blockers 1 and 2 are closed, so the SMP=1 / local path is structurally
+        // complete. The only survivor is the absent cross-hart wake — case B.
+        let open: alloc::vec::Vec<u8> = BLOCKERS
+            .iter()
+            .filter(|b| !b.closed)
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(open, alloc::vec![3], "only blocker 3 remains open");
         assert_eq!(
             VERDICT,
-            Case::CodeBlockerEvenAtSmp1,
-            "a decisive blocker means neither case A nor case B"
+            Case::LocalCompleteRemoteMissing,
+            "local complete, remote wake missing"
         );
-        assert_ne!(VERDICT, Case::StructurallyReady);
-        assert_ne!(VERDICT, Case::LocalCompleteRemoteMissing);
+        assert_ne!(
+            VERDICT,
+            Case::StructurallyReady,
+            "case A would require a cross-hart wake to exist"
+        );
+        assert_ne!(
+            VERDICT,
+            Case::CodeBlockerEvenAtSmp1,
+            "no code blocker remains at SMP=1"
+        );
         assert_eq!(BLOCKERS.len(), 3, "three genuine blockers");
         // Blocker 2 is closed; 1 and 3 remain, so the case-C verdict still stands — with
         // admission still proof-gated, an SMP=1 production boot does not run NR6/NR7 off-lock
         // at all, which is a code blocker reachable at SMP=1.
         assert!(MATRIX_BLOCKER(2).closed, "the decisive blocker is closed");
-        assert!(!MATRIX_BLOCKER(1).closed, "admission is still proof-gated");
+        assert!(MATRIX_BLOCKER(1).closed, "admission is now canonical");
         assert!(!MATRIX_BLOCKER(3).closed, "no cross-hart wake exists");
         for (i, b) in BLOCKERS.iter().enumerate() {
             assert_eq!(b.id as usize, i + 1);
@@ -107269,7 +107306,9 @@ mod stage199d_riscv_production_readiness_audit {
     #[test]
     fn the_audit_document_records_case_c() {
         const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+        // The original finding stays on the record; the recomputed verdict sits beside it.
         assert!(AUDIT.contains("RISCV_199D_READINESS=case_c"));
+        assert!(AUDIT.contains("RISCV_199D_READINESS=case_b"));
         assert!(
             AUDIT.contains("CONDITIONAL_PRODUCTION_ENABLEMENT_AND_LIVE_EVIDENCE"),
             "the reclassification that was NOT taken must still be named, so the decision is legible"
@@ -107639,22 +107678,24 @@ mod stage199d_riscv_narrow_trap_snapshots {
 
     // ── Scope: what this increment did NOT change ───────────────────────────────────────────
 
-    /// Blocker 1 is untouched: NR6/NR7 admission stays proof-gated.
+    /// Blocker 1 is now CLOSED by a later increment: admission is canonical. It remains
+    /// proof-gated in effect on RISC-V, because admission is `production || proof` and RISC-V
+    /// production is false.
     #[test]
-    fn blocker_one_remains_proof_gated() {
+    fn blocker_one_is_closed_admission_is_canonical() {
         let at = RISCV_TRAP
             .find("pub fn handle_riscv_trap_entry_shared")
             .expect("the wrapper");
         let wrapper = &RISCV_TRAP[at..];
         assert!(
-            wrapper.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"),
-            "RISC-V admission must still be the proof gate — blocker 1 is NOT closed here"
+            wrapper.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "RISC-V admission must ask the canonical predicate"
         );
         assert!(
             !code_lines(wrapper)
                 .iter()
-                .any(|l| l.contains("ipccall_direct_admission_enabled()")),
-            "this increment must not switch RISC-V to the canonical admission predicate"
+                .any(|l| l.contains("ipccall_direct_proof_enabled()")),
+            "no direct proof-gate call may remain in the RISC-V ingress"
         );
     }
 
@@ -107705,6 +107746,381 @@ mod stage199d_riscv_narrow_trap_snapshots {
         assert!(
             TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,"),
             "coordinate 23 must still be OPEN"
+        );
+    }
+}
+
+// ── RISC-V readiness blocker 1 CLOSED — canonical admission on the RISC-V ingress ────────────
+//
+// The RISC-V Phase-1 whitelist asked `ipccall_direct_proof_enabled()` directly. That made the
+// RISC-V production predicate un-flippable in practice: with the proof gate off, `nr` never
+// reached `try_split_dispatch_into_frame`, so enabling production would have been a SILENT
+// NO-OP. It now asks the canonical `ipccall_direct_admission_enabled()`.
+//
+// **Behaviour-preserving today, provably.** `ipccall_direct_admission_enabled()` is
+// `ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()`, and
+// `ipccall_direct_production_enabled()` is `cfg!(target_arch = "x86_64")` — false on RISC-V. So on
+// RISC-V the canonical predicate reduces to `false || proof`, i.e. *exactly* the proof gate the
+// site used to ask. Neither predicate's implementation changed and no production default moved.
+//
+// All three admission questions now flow through the one helper: the ABI import (unconditional on
+// the RISC-V bridge — `a7`→nr and `a0..a5`→args are set for every ecall), whitelist admission
+// (the site repaired here) and direct-handler reachability (`try_split_dispatch_into_frame`,
+// already canonical).
+mod stage199d_riscv_canonical_admission {
+    use super::*;
+
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BRIDGE: &str = include_str!("../../arch/riscv64/boot.rs");
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    fn wrapper() -> &'static str {
+        let at = RISCV_TRAP
+            .find("pub fn handle_riscv_trap_entry_shared")
+            .expect("the RISC-V trap wrapper");
+        let closer = "\n}";
+        let end = RISCV_TRAP[at..]
+            .find(closer)
+            .map(|i| at + i)
+            .unwrap_or(RISCV_TRAP.len());
+        &RISCV_TRAP[at..end]
+    }
+
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    // ── 1. NR6 and NR7 both use canonical admission ─────────────────────────────────────────
+
+    /// The RISC-V whitelist names both NRs and gates them on the canonical helper.
+    #[test]
+    fn riscv_nr6_and_nr7_both_use_canonical_admission() {
+        let w = wrapper();
+        let gate_at = w
+            .find("let is_ipc_direct = (nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR")
+            .expect("the NR6/NR7 admission gate");
+        let gate = &w[gate_at..gate_at + 400];
+        assert!(
+            gate.contains("SYSCALL_IPC_CALL_NR"),
+            "NR6 must be named by the gate"
+        );
+        assert!(
+            gate.contains("SYSCALL_IPC_REPLY_NR"),
+            "NR7 must be named by the gate"
+        );
+        assert!(
+            gate.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "the gate must ask the CANONICAL admission predicate"
+        );
+        // And the whitelist actually consumes it.
+        assert!(
+            w.contains("|| is_ipc_direct)"),
+            "`split_eligible` must include the direct-IPC admission decision"
+        );
+    }
+
+    // ── 2. No direct proof-predicate dependency remains in the arch ingress ─────────────────
+
+    /// **No `ipccall_direct_proof_enabled()` CALL survives anywhere in the RISC-V arch tree.**
+    /// Comments explaining the change are fine; a call is not.
+    #[test]
+    fn no_proof_predicate_call_remains_in_the_riscv_ingress() {
+        for (what, src) in [
+            ("riscv64/trap.rs", RISCV_TRAP),
+            ("riscv64/boot.rs", RISCV_BRIDGE),
+        ] {
+            for l in code_lines(src) {
+                assert!(
+                    !l.contains("ipccall_direct_proof_enabled()"),
+                    "{what} must not ask the proof predicate directly: `{l}`"
+                );
+            }
+        }
+    }
+
+    /// All three admission questions flow through the canonical helper: the import is
+    /// unconditional, the whitelist is canonical, and handler reachability is canonical.
+    #[test]
+    fn all_three_admission_questions_flow_through_the_canonical_helper() {
+        // (a) ABI import — unconditional on this bridge, so it cannot be a proof dependency.
+        for i in 0..6 {
+            let reg = ["A0", "A1", "A2", "A3", "A4", "A5"][i];
+            let expect =
+                alloc::format!("tframe.set_arg({i}, frame.regs[RiscvTrapFrame::{reg}] as usize);");
+            assert!(RISCV_BRIDGE.contains(&expect), "arg{i} import must exist");
+        }
+        assert!(
+            RISCV_BRIDGE
+                .contains("tframe.set_syscall_num(frame.regs[RiscvTrapFrame::A7] as usize);"),
+            "the nr import must exist"
+        );
+        // (b) whitelist admission — canonical (covered above).
+        assert!(wrapper().contains("ipccall_direct_admission_enabled()"));
+        // (c) direct-handler reachability — canonical.
+        assert_eq!(
+            SPLIT
+                .matches("crate::kernel::boot::ipccall_direct_admission_enabled()")
+                .count(),
+            3,
+            "the split dispatcher's three admission decisions stay canonical"
+        );
+        for l in code_lines(SPLIT) {
+            assert!(
+                !l.contains("ipccall_direct_proof_enabled()"),
+                "the split dispatcher must not ask the proof predicate: `{l}`"
+            );
+        }
+    }
+
+    // ── 3. Production-disabled admission equals the proof gate ──────────────────────────────
+
+    /// **The behaviour-preservation proof.** With production disabled, canonical admission IS the
+    /// proof gate — so this repair changes nothing today, on any architecture whose production
+    /// predicate is false.
+    #[test]
+    fn production_disabled_admission_equals_the_proof_gate() {
+        let admission = MOD_SRC
+            .split("pub fn ipccall_direct_admission_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the admission predicate");
+        assert_eq!(
+            admission.trim(),
+            "ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()",
+            "admission is production OR proof — so with production false it reduces to proof"
+        );
+        // Observable identity, on whatever architecture this test build targets: admission is
+        // exactly the disjunction. (This hosted build runs on x86_64, where production is TRUE —
+        // so the reduction below is asserted structurally rather than by running it here.)
+        assert_eq!(
+            crate::kernel::boot::ipccall_direct_admission_enabled(),
+            crate::kernel::boot::ipccall_direct_production_enabled()
+                || crate::kernel::boot::ipccall_direct_proof_enabled(),
+            "admission must be exactly production OR proof"
+        );
+        // The RISC-V reduction: production is `cfg!(target_arch = "x86_64")`, so on RISC-V the
+        // first disjunct is a compile-time false and admission IS the proof gate — which is what
+        // makes the repaired site behaviour-preserving there.
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\")",
+            "production is x86_64-only, so it is compile-time false on RISC-V"
+        );
+        assert!(
+            !cfg!(target_arch = "riscv64")
+                || !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "on a RISC-V build the production predicate must be false"
+        );
+    }
+
+    /// Proof selector OFF still declines NR6/NR7 to the unchanged broad-lock path, and ON admits
+    /// exactly the population it did before — because the predicate reduces to the same gate.
+    #[test]
+    fn the_admitted_population_is_unchanged_in_both_selector_states() {
+        // OFF: the proof selector is off by default, so on any architecture whose production
+        // predicate is false, admission is closed and NR6/NR7 decline to the broad-lock path.
+        // (This test build is x86_64, where production is true by design — so the RISC-V
+        // consequence is stated as an implication rather than run here.)
+        assert!(
+            !crate::kernel::boot::ipccall_direct_proof_enabled(),
+            "the proof selector is off by default"
+        );
+        assert!(
+            crate::kernel::boot::ipccall_direct_production_enabled()
+                || !crate::kernel::boot::ipccall_direct_admission_enabled(),
+            "with production false and the selector off, admission must be closed"
+        );
+        // The decline is structural: `split_eligible` requires `is_ipc_direct` for NR6/NR7, and
+        // the fall-through comment records that a normal boot is byte-identical.
+        let w = wrapper();
+        assert!(
+            w.contains("fall through UNCHANGED to the broad-lock handler")
+                && w.contains("a normal boot is byte-identical"),
+            "the feature-off contract must stay recorded at the gate"
+        );
+        // ON: the same gate value the site used to compute — no widening. The only other term is
+        // production, which is false on RISC-V.
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(
+            production.trim(),
+            "cfg!(target_arch = \"x86_64\")",
+            "production is x86_64-only, so on RISC-V admission adds no term beyond proof"
+        );
+    }
+
+    // ── 4. Feature-off stays marker-clean ───────────────────────────────────────────────────
+
+    /// No ordinary feature-off production traffic becomes newly admitted: the RISC-V whitelist
+    /// still admits exactly DebugLog, FutexWake and (gated) NR6/NR7 — nothing else — and emits
+    /// no direct-IPC marker of its own.
+    #[test]
+    fn feature_off_remains_marker_clean() {
+        let w = wrapper();
+        let at = w
+            .find("let split_eligible = is_syscall")
+            .expect("the whitelist");
+        let whitelist = &w[at..at + 320];
+        for nr in [
+            "SYSCALL_DEBUG_LOG_NR",
+            "SYSCALL_FUTEX_WAKE_NR",
+            "is_ipc_direct",
+        ] {
+            assert!(
+                whitelist.contains(nr),
+                "the whitelist must still admit `{nr}`"
+            );
+        }
+        // Nothing else was added to the whitelist.
+        assert_eq!(
+            whitelist.matches("nr == crate::kernel::syscall::").count(),
+            2,
+            "exactly two literal NRs plus the gated direct-IPC term"
+        );
+        // The arch-tagged NR6/NR7 markers are emitted by the kernel drain, not by this gate.
+        assert!(
+            w.contains("NR6/NR7 emit their arch-tagged retirement markers from the drain"),
+            "the gate must not introduce its own direct-IPC marker"
+        );
+    }
+
+    // ── 5–6. The bridge stays broad-lock-free; blocker 2 stays closed ───────────────────────
+
+    /// Blocker 2 stays closed: this repair did not reintroduce a broad-lock acquisition, and the
+    /// handled Phase-1 path is still clean on both sides of the wrapper call.
+    #[test]
+    fn blocker_two_stays_closed_and_the_bridge_stays_broad_lock_free() {
+        let at = RISCV_BRIDGE
+            .find("extern \"C\" fn yarm_riscv64_trap_bridge")
+            .expect("the bridge");
+        let end = RISCV_BRIDGE[at..]
+            .find("\n}")
+            .map(|i| at + i)
+            .unwrap_or(RISCV_BRIDGE.len());
+        let bridge = &RISCV_BRIDGE[at..end];
+        for l in code_lines(bridge) {
+            assert!(
+                !l.contains("current_tid_authoritative") && !l.contains("with_cpu("),
+                "the bridge must stay broad-lock-free: `{l}`"
+            );
+        }
+        assert!(bridge.contains("shared.current_tid_split_read(cpu).unwrap_or(0);"));
+        assert!(bridge.contains("shared.task_asid_for_tid_split_read(resume_tid)"));
+        // And the handled Phase-1 return still precedes the broad-lock phase.
+        let w = wrapper();
+        let handled = w
+            .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
+            .expect("handled return");
+        let phase2 = w
+            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+            .expect("broad-lock phase");
+        assert!(
+            handled < phase2,
+            "handled path returns before the broad lock"
+        );
+        for l in code_lines(&w[..handled]) {
+            assert!(
+                !l.contains("with_cpu("),
+                "nothing before the handled return may take the broad lock: `{l}`"
+            );
+        }
+    }
+
+    // ── 7. Cross-hart wake blocker 3 remains explicitly open ────────────────────────────────
+
+    /// Blocker 3 is untouched and stays explicitly open — which is why the readiness verdict
+    /// moves to case B rather than case A.
+    #[test]
+    fn cross_hart_wake_blocker_three_remains_open() {
+        const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+        assert!(
+            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
+            "no IPI extension may be introduced by this increment"
+        );
+        const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+        assert_eq!(
+            TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "both post-enqueue wake sends stay x86_64-only"
+        );
+        assert!(
+            AUDIT.contains("RISCV_199D_READINESS=case_b"),
+            "the audit must record the recomputed case-B verdict"
+        );
+        assert!(
+            AUDIT.contains("blocker 1 is **CLOSED**"),
+            "the audit must record blocker 1 as closed"
+        );
+    }
+
+    // ── 8. No production predicate changed ──────────────────────────────────────────────────
+
+    /// Neither predicate's implementation moved, and RISC-V production is still false.
+    #[test]
+    fn no_production_predicate_changed() {
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        let admission = MOD_SRC
+            .split("pub fn ipccall_direct_admission_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the admission predicate");
+        assert_eq!(
+            admission.trim(),
+            "ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()"
+        );
+    }
+
+    /// x86_64 and AArch64 ingress predicate behaviour is unchanged — the portable trap entry
+    /// already asked the canonical helper, and this increment did not touch it.
+    #[test]
+    fn x86_and_aarch64_predicate_behaviour_is_unchanged() {
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        assert_eq!(
+            TRAP_ENTRY
+                .matches("crate::kernel::boot::ipccall_direct_admission_enabled()")
+                .count(),
+            2,
+            "the portable import and its return-path twin stay canonical"
+        );
+        for l in code_lines(TRAP_ENTRY) {
+            assert!(
+                !l.contains("ipccall_direct_proof_enabled()"),
+                "the portable trap entry must not ask the proof predicate: `{l}`"
+            );
+        }
+    }
+
+    /// **Coordinate 23 stays OPEN.** Closing blocker 1 makes the SMP=1 path structurally
+    /// complete; it does not earn production enablement or live evidence, and blocker 3 stands.
+    #[test]
+    fn coordinate_23_stays_open() {
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,"),
+            "coordinate 23 must still be OPEN"
+        );
+        assert!(
+            AUDIT.contains("case_b"),
+            "and the audit must carry the recomputed classification"
         );
     }
 }
