@@ -67,6 +67,10 @@ pub(crate) struct DirectPathCounters {
     /// NR7 only: declines caused by a reply carrying a transferred capability the direct
     /// transaction cannot deliver. A *breakdown* of `declined_preflight`, never a bucket.
     declined_transfer_cap: AtomicU64,
+    /// NR7 only: declines caused by an armed terminal-ownership / reply-timeout race. A
+    /// *breakdown* of `declined_preflight`, never a bucket. This is the population that must
+    /// take the legacy reply path so its terminal lease can make the reply provably win.
+    declined_terminal_arbitration: AtomicU64,
     completed: AtomicU64,
     legacy_fallback_after_decline: AtomicU64,
     failed_by_code: [AtomicU64; FAILED_CODE_SLOTS],
@@ -85,6 +89,7 @@ impl DirectPathCounters {
             declined_pre_transaction: AtomicU64::new(0),
             declined_not_admitted: AtomicU64::new(0),
             declined_transfer_cap: AtomicU64::new(0),
+            declined_terminal_arbitration: AtomicU64::new(0),
             completed: AtomicU64::new(0),
             legacy_fallback_after_decline: AtomicU64::new(0),
             failed_by_code: [const { AtomicU64::new(0) }; FAILED_CODE_SLOTS],
@@ -101,6 +106,8 @@ impl DirectPathCounters {
         self.declined_pre_transaction.store(0, Ordering::Relaxed);
         self.declined_not_admitted.store(0, Ordering::Relaxed);
         self.declined_transfer_cap.store(0, Ordering::Relaxed);
+        self.declined_terminal_arbitration
+            .store(0, Ordering::Relaxed);
         self.completed.store(0, Ordering::Relaxed);
         self.legacy_fallback_after_decline
             .store(0, Ordering::Relaxed);
@@ -147,10 +154,19 @@ impl DirectPathCounters {
     /// slot for the reply-endpoint receive capability (`handle_ipc_call`'s `reply_recv_cap`),
     /// and the direct request path reads that same slot the same way, so no capability
     /// transfer is in flight on the request side at all.
-    pub(crate) fn note_declined_preflight_reply(&self, not_admitted: bool, transfer_cap: bool) {
+    pub(crate) fn note_declined_preflight_reply(
+        &self,
+        not_admitted: bool,
+        transfer_cap: bool,
+        terminal_arbitration: bool,
+    ) {
         self.note_declined_preflight(false, not_admitted);
         if transfer_cap {
             self.declined_transfer_cap.fetch_add(1, Ordering::Relaxed);
+        }
+        if terminal_arbitration {
+            self.declined_terminal_arbitration
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -202,6 +218,9 @@ impl DirectPathCounters {
     }
     pub(crate) fn declined_transfer_cap(&self) -> u64 {
         self.declined_transfer_cap.load(Ordering::Acquire)
+    }
+    pub(crate) fn declined_terminal_arbitration(&self) -> u64 {
+        self.declined_terminal_arbitration.load(Ordering::Acquire)
     }
     pub(crate) fn completed(&self) -> u64 {
         self.completed.load(Ordering::Acquire)
@@ -381,7 +400,13 @@ pub(crate) fn quiescent_verdict(
 
 /// Emit the FINAL quiescent production attestation, exactly once, only after the normal
 /// service chain has reported healthy. Read-only and one-shot.
-pub(crate) fn maybe_emit_quiescent_attestation(service_chain_healthy: bool) -> bool {
+pub(crate) fn maybe_emit_quiescent_attestation(
+    service_chain_healthy: bool,
+    census: Option<(
+        crate::kernel::direct_ack_census::LeaseBijection,
+        crate::kernel::direct_ack_census::LeaseBijection,
+    )>,
+) -> bool {
     if !service_chain_healthy {
         return false;
     }
@@ -394,13 +419,50 @@ pub(crate) fn maybe_emit_quiescent_attestation(service_chain_healthy: bool) -> b
     let nr7 = quiescent_verdict(&REPLY, rep_store);
     emit_quiescent("nr6", &REQUEST, req_store, nr6);
     emit_quiescent("nr7", &REPLY, rep_store, nr7);
+    // The INDEPENDENT waiter census, measured from the endpoint receive-waiter table rather
+    // than from the store's own books — see `crate::kernel::direct_ack_census`.
+    let (nr6_bij, nr7_bij) = match census {
+        Some(pair) => pair,
+        None => Default::default(),
+    };
+    let census_ok = emit_census("nr6", nr6_bij) & emit_census("nr7", nr7_bij);
     crate::yarm_log!(
-        "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok={} nr7_ok={} result={}",
+        "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok={} nr7_ok={} census_ok={} result={}",
         nr6.ok() as u8,
         nr7.ok() as u8,
-        if nr6.ok() && nr7.ok() { "ok" } else { "fail" },
+        census_ok as u8,
+        if nr6.ok() && nr7.ok() && census_ok {
+            "ok"
+        } else {
+            "fail"
+        },
     );
     true
+}
+
+/// Emit one direction's independent waiter census. Returns whether the bijection is exact.
+fn emit_census(which: &str, b: crate::kernel::direct_ack_census::LeaseBijection) -> bool {
+    use crate::kernel::direct_ack_census as census;
+    crate::yarm_log!(
+        "IPC_DIRECT_WAITER_CENSUS dir={} waiters_current={} waiters_high_watermark={} ack_capacity={} eligible={} live_leases={}",
+        which,
+        census::waiters_current(),
+        census::waiters_high_watermark(),
+        crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY,
+        b.eligible_waiters,
+        b.live_leases,
+    );
+    crate::yarm_log!(
+        "IPC_DIRECT_WAITER_BIJECTION dir={} waiters_without_lease={} leases_without_waiter={} identity_mismatch={} generation_mismatch={} duplicate_incarnation={} result={}",
+        which,
+        b.waiters_without_lease,
+        b.leases_without_waiter,
+        b.identity_mismatches,
+        b.generation_mismatches,
+        b.duplicate_endpoint_incarnations,
+        if b.ok() { "ok" } else { "fail" },
+    );
+    b.ok()
 }
 
 fn emit_quiescent(
@@ -412,7 +474,7 @@ fn emit_quiescent(
     // Split across four lines per direction: `PRB_MSG_MAX` is 192 bytes and a kernel log line
     // is truncated silently, so one wide line would clip its own verdict flags.
     crate::yarm_log!(
-        "IPC_DIRECT_PRODUCTION_QUIESCENT dir={} attempts={} completed={} failed={} preflight={} pre_txn={} fallback={} not_admitted={} transfer_cap={}",
+        "IPC_DIRECT_PRODUCTION_QUIESCENT dir={} attempts={} completed={} failed={} preflight={} pre_txn={} fallback={} not_admitted={} transfer_cap={} arbitrated={}",
         which,
         counters.attempts(),
         counters.completed(),
@@ -422,6 +484,7 @@ fn emit_quiescent(
         counters.legacy_fallback_after_decline(),
         counters.declined_not_admitted(),
         counters.declined_transfer_cap(),
+        counters.declined_terminal_arbitration(),
     );
     crate::yarm_log!(
         "IPC_DIRECT_PRODUCTION_QUIESCENT_FLAGS dir={} terminals={} eligibility={} completed_gt0={} no_confinement={} no_late_fallback={} result={}",
@@ -535,10 +598,11 @@ fn emit_direction(
         (counters.terminals_balance() && counters.eligibility_balances()) as u8,
     );
     crate::yarm_log!(
-        "IPC_DIRECT_TRANSFER_CAP phase={} dir={} declined_transfer_cap={} declined_not_admitted={}",
+        "IPC_DIRECT_TRANSFER_CAP phase={} dir={} declined_transfer_cap={} declined_terminal_arbitration={} declined_not_admitted={}",
         phase,
         which,
         counters.declined_transfer_cap(),
+        counters.declined_terminal_arbitration(),
         counters.declined_not_admitted(),
     );
     crate::yarm_log!(

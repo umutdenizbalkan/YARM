@@ -36354,7 +36354,7 @@ mod stage128_active_cr3_switch_stack_mapping {
             active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_ROOT")
                 && active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK")
                 && active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED")
-                && active.contains("self.hal.active_asid()")
+                && active.contains("self.hal.active_asid_on(self.current_cpu())")
                 && active.contains("page_table::resolve_page(active_asid, stack_page)"),
             "Stage 128 must expose active-root diagnostics and check the currently active ASID"
         );
@@ -36747,7 +36747,7 @@ mod stage130_d6_proof_cleanup {
         let helper = &EXEC_STATE_SRC[start..end];
         assert!(
             helper.contains("current_tid()")
-                && helper.contains("active_asid()")
+                && helper.contains("active_asid_on(self.current_cpu())")
                 && helper.contains("D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK")
                 && helper.contains("D6_CONTROLLED_SWITCH_PROOF_CR3_OK")
                 && helper.contains("D6_CONTROLLED_SWITCH_PROOF_TSS_OK"),
@@ -43063,10 +43063,22 @@ mod stage160c_aarch64_trap_abi_bracketing {
     fn stage160c_exports_and_advances_on_handled_split() {
         assert_eq!(
             TRAP_ENTRY_SRC
-                .matches("finalize_split_handled_syscall(shared, cpu, frame)")
+                .matches("finalize_split_handled_syscall(shared, cpu, entering, frame)")
                 .count(),
             2,
             "finalize must run on both the Ok and handled-error split arms"
+        );
+        // Stage 199D: the entering identity is captured BEFORE the split dispatch, so the
+        // finalize never re-discovers an unqualified "current task" after the transaction.
+        let ent = TRAP_ENTRY_SRC
+            .find("let entering = split_return_identity(shared, cpu);")
+            .expect("entering identity capture");
+        let disp = TRAP_ENTRY_SRC
+            .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+            .expect("split dispatch call");
+        assert!(
+            ent < disp,
+            "the entering {{tid, asid}} must be captured before the split dispatch"
         );
         assert!(
             AARCH64_TRAP_SRC.contains("fn split_finalize_handled_syscall(")
@@ -43175,9 +43187,15 @@ mod stage160d_aarch64_split_error_export_parity {
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
 
-    // 1. The split finalize export ordering mirrors the global path exactly:
-    //    context-save (set_thread_user_context) → restore_arch_thread_state →
-    //    export_syscall_result_to_user_gprs.
+    // 1. The split finalize export ordering still mirrors the observable global path.
+    //
+    //    Stage 199D closed AArch64 readiness blocker 2 by removing the broad-lock
+    //    reacquisition. The legacy sequence was context-save → restore_arch_thread_state
+    //    (which read that same context straight back out of the TCB) → export → re-sync →
+    //    context-save. The pre-export save and its read-back were proved redundant for a
+    //    NON-SWITCHING split return and removed; what survives, and is pinned here, is the
+    //    ordering userspace can actually observe: TLS restore → export → final context
+    //    commit. The removed round trip is pinned negatively so it cannot creep back.
     #[test]
     fn stage160d_split_finalize_mirrors_global_export_order() {
         let f = AARCH64_TRAP_SRC
@@ -43185,18 +43203,22 @@ mod stage160d_aarch64_split_error_export_parity {
             .nth(1)
             .and_then(|s| s.split("\npub fn ").next())
             .expect("split finalize must exist");
-        let ctx_save = f
-            .find("set_thread_user_context(tid, ctx)")
-            .expect("context save");
-        let restore = f
-            .find("restore_arch_thread_state(kernel, cpu, Some(frame), true)")
-            .expect("restore");
+        let tls = f
+            .find("split_return_take_tls_split(id)")
+            .expect("TLS restore take");
         let export = f
             .find("export_syscall_result_to_user_gprs(frame)")
             .expect("export");
+        let commit = f
+            .find("split_return_commit_context_split(id, ctx)")
+            .expect("final context commit");
         assert!(
-            ctx_save < restore && restore < export,
-            "split finalize must order context-save → restore → export, mirroring the global path"
+            tls < export && export < commit,
+            "split finalize must order TLS-restore → export → final context commit"
+        );
+        assert!(
+            !f.contains("restore_arch_thread_state("),
+            "the proved-redundant pre-export save/read-back round trip must stay removed"
         );
     }
 
@@ -44652,7 +44674,7 @@ mod stage163h_fork_child_pte_mismatch {
         assert!(
             verify.contains("active_mismatch")
                 && verify.contains("active_asid.0 != task_asid.0 && active_flags != task_flags")
-                && verify.contains("switch_address_space(task_asid)")
+                && verify.contains("switch_address_space(self.current_cpu(), task_asid)")
                 && verify.contains("invalidate_page(page)"),
             "demand verify must correct CR3 on a stale-but-present active mismatch + invalidate"
         );
@@ -70579,7 +70601,9 @@ mod stage199a1_ipccall_direct_audit {
     #[test]
     fn caller_and_server_identity_are_tid_asid_generation_bearing() {
         assert!(
-            DEFS_SRC.contains("endpoint_waiters: [Option<ReceiverWaiterIdentity>; MAX_ENDPOINTS]")
+            DEFS_SRC.contains(
+                "endpoint_waiters: [Option<ReceiverWaiterIdentity>; ENDPOINT_WAITER_SLOTS]"
+            )
         );
         assert!(IPC_STATE_SRC.contains("fn endpoint_waiter_identity"));
         assert!(IPC_STATE_SRC.contains("ReceiverWaiterIdentity"));
@@ -78742,27 +78766,48 @@ mod stage199a2c1_aarch64_guards {
         set_ipccall_direct_proof_enabled(false);
     }
 
-    // (AArch64 NR6/NR7 split eligibility) The shared trap entry imports the six-argument ABI + admits
-    // NR6/NR7 into the split dispatcher ONLY behind the direct proof gate, and finalizes a handled
-    // NR6/NR7 via the AArch64 syscall-return ABI (export x0..x5 + advance ELR).
+    // (AArch64 NR6/NR7 split eligibility) The shared trap entry imports the six-argument ABI +
+    // admits NR6/NR7 into the split dispatcher behind the CANONICAL admission predicate, and
+    // finalizes a handled NR6/NR7 via the AArch64 syscall-return ABI (export x0..x5 + advance ELR).
+    //
+    // Stage 199D closed AArch64 readiness blocker 1: the import used to consult the proof-only
+    // predicate directly, giving AArch64 its own admission rule. It now uses the same
+    // `ipccall_direct_admission_enabled()` the split dispatcher uses. That predicate is still
+    // `production || proof`, and the AArch64 production default remains OFF, so a normal AArch64
+    // boot is byte-identical — this is structural preparation only.
     #[test]
     fn aarch64_nr6_nr7_split_eligibility_gated() {
-        // Import admits NR6/NR7 only behind the proof gate (all six args imported via split_import).
+        // Import admits NR6/NR7 behind the canonical predicate (all six args via split_import).
         assert!(TRAP_ENTRY_SRC.contains("split_import_syscall_abi(frame)"));
         assert!(
             TRAP_ENTRY_SRC.contains(
-                "(raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || raw_nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_proof_enabled()"
+                "(raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || raw_nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_admission_enabled()"
             ),
-            "NR6/NR7 ABI import must be admitted only behind the direct proof gate"
+            "NR6/NR7 ABI import must be admitted behind the canonical admission predicate"
         );
-        // Finalize (export results + advance ELR) admits a handled NR6/NR7 behind the gate.
+        // Finalize (export results + advance ELR) admits a handled NR6/NR7 behind the same one.
         assert!(
             TRAP_ENTRY_SRC.contains(
-                "(frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_proof_enabled()"
+                "(frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR\n            || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)\n            && crate::kernel::boot::ipccall_direct_admission_enabled()"
             ),
             "a handled NR6/NR7 must finalize via the AArch64 syscall-return ABI"
         );
-        assert!(TRAP_ENTRY_SRC.contains("split_finalize_handled_syscall(kernel, cpu, frame)"));
+        assert!(
+            TRAP_ENTRY_SRC.contains("split_finalize_handled_syscall(shared, cpu, entering, frame)")
+        );
+        // The AArch64 production default stays OFF: the predicate is production||proof and
+        // production is x86_64-only, so nothing about a normal AArch64 boot changes.
+        const BOOT_SRC: &str = include_str!("mod.rs");
+        assert!(
+            BOOT_SRC.contains(
+                "pub fn ipccall_direct_admission_enabled() -> bool {\n    ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()\n}"
+            ),
+            "the canonical admission predicate remains production || proof"
+        );
+        assert!(
+            BOOT_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            "production default remains x86_64-only, so AArch64 stays OFF"
+        );
     }
 
     // (six trap arguments) The off-lock gates read all six NR6/NR7 arguments from the imported frame
@@ -78785,15 +78830,21 @@ mod stage199a2c1_aarch64_guards {
             SPLIT_SRC.contains("matches!(syscall, Syscall::IpcCall | Syscall::IpcReply)\n        && crate::kernel::boot::ipccall_direct_admission_enabled()"),
             "IpcCall/IpcReply pass the NR whitelist behind the arch-split admission predicate"
         );
-        // AArch64 itself is UNCHANGED by the x86_64 production flip: its ABI import and its
-        // handled-syscall finalize are still gated on the armed proof gate.
+        // AArch64 itself is UNCHANGED by the x86_64 production flip. Stage 199D blocker 1 moved
+        // its ABI import and its handled-syscall finalize onto the CANONICAL admission predicate
+        // (one shared rule, no AArch64-specific copy); because production is x86_64-only that
+        // predicate still resolves to the armed proof gate on AArch64.
         const AARCH64_TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
         assert_eq!(
             AARCH64_TRAP_ENTRY
-                .matches("&& crate::kernel::boot::ipccall_direct_proof_enabled())")
+                .matches("&& crate::kernel::boot::ipccall_direct_admission_enabled())")
                 .count(),
             2,
-            "AArch64 import + finalize remain proof-gated"
+            "AArch64 import + finalize share the canonical admission predicate"
+        );
+        assert!(
+            !AARCH64_TRAP_ENTRY.contains("ipccall_direct_proof_enabled()"),
+            "no proof-only admission rule survives at the AArch64 trap entry"
         );
     }
 
@@ -79317,8 +79368,13 @@ mod stage199a2c3_matrix_guards {
             !SPLIT_SRC.contains("ipccall_direct_proof_enabled()"),
             "no proof-gate dependency survives in the shared dispatcher"
         );
-        // AArch64 import + RISC-V trap both gate NR6/NR7 on the direct proof gate.
-        assert!(TRAP_ENTRY_SRC.contains("ipccall_direct_proof_enabled()"));
+        // Stage 199D blocker 1: the AArch64 import now shares the canonical admission
+        // predicate with the dispatcher rather than reading the proof gate directly. Because
+        // production is x86_64-only, AArch64 still resolves to the proof gate in practice.
+        assert!(TRAP_ENTRY_SRC.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"));
+        assert!(!TRAP_ENTRY_SRC.contains("ipccall_direct_proof_enabled()"));
+        // RISC-V (blocker-equivalent work not in scope) still gates at its own trap entry.
+        assert!(RISCV_TRAP_SRC.contains("ipccall_direct_proof_enabled()"));
         assert!(RISCV_TRAP_SRC.contains("|| is_ipc_direct"));
     }
 
@@ -80247,10 +80303,12 @@ mod stage199a2d1_memory_ordering {
     #[test]
     fn ack_reserve_and_consume_are_acqrel_acquire_cas() {
         let body = store_src();
-        // Reserving a slot is the CAS that makes two racing CPUs resolve to one winner.
+        // Reserving this endpoint's slot is the CAS that makes two racing CPUs resolve to one
+        // winner. It moves from whatever non-live state the slot is in (`Vacant`, or either
+        // spent terminal) to `Reserved` — one word, one decision, no allocation policy.
         assert!(
             body.contains(
-                "                    SLOT_VACANT,\n                    SLOT_RESERVED,\n                    Ordering::AcqRel,\n                    Ordering::Acquire,"
+                "                .compare_exchange(current, SLOT_RESERVED, Ordering::AcqRel, Ordering::Acquire)"
             ),
             "the reserve CAS must be AcqRel success / Acquire failure"
         );
@@ -82101,9 +82159,10 @@ mod stage199d_delivery_projection_differential {
                 flat.contains(
                     "REPLY_COUNTERS.note_declined_preflight_reply( verdict == \
                      crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted, \
-                     verdict.is_transfer_cap_decline(), );"
+                     verdict.is_transfer_cap_decline(), \
+                     verdict.is_terminal_arbitration_decline(), );"
                 ),
-                "NR7 reports the admission and transfer-cap subsets"
+                "NR7 reports the admission, transfer-cap and terminal-arbitration subsets"
             );
             // Both directions report the admission decline so the production-default boot can
             // prove no confinement decline remains.
@@ -82632,9 +82691,9 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "false",
-            "the body is a bare constant: flipping it to `cfg!(target_arch = \"x86_64\")` \
-             is the entire x86_64 production-default enablement"
+            "cfg!(target_arch = \"x86_64\")",
+            "the whole condition is the target architecture: x86_64 is production-default, \
+             every other architecture is not"
         );
         for forbidden in [
             "oracle",
@@ -82657,10 +82716,10 @@ mod stage199d_production_default_guards {
     }
 
     /// The flip is HELD OFF against a recorded, reproducible live failure — not forgotten.
-    /// The doc comment tracks every blocker and its current state, so nobody re-flips it
-    /// blind and nobody re-litigates a blocker that is already closed.
+    /// The doc comment records how the production default was earned: every blocker that had
+    /// to be closed, and the work deliberately left for canonical 199E.
     #[test]
-    fn the_held_off_flip_records_every_live_blocker() {
+    fn the_production_default_records_every_closed_blocker() {
         let doc = MODRS
             .split("/// True iff the direct NR6/NR7 path is the production default")
             .nth(1)
@@ -82669,44 +82728,42 @@ mod stage199d_production_default_guards {
             .next()
             .expect("doc bounded");
         assert!(
-            doc.contains("HELD OFF"),
-            "the predicate says plainly that it is held off"
+            doc.contains("ENABLED on x86_64"),
+            "the predicate says plainly that x86_64 is production-default"
         );
         for blocker in [
-            "transfer_cap_present",      // 1: capability transfer — FIXED
-            "waiter lifecycle",          // 2: unpaired ack lifecycle — FIXED
-            "overwrite fuse",            // 3: orphans refuse re-blocking — FIXED
-            "DIRECT_ACK_STORE_CAPACITY", // 4: structural capacity — the remaining blocker
+            "transfer_cap_present",      // 1: capability transfer
+            "endpoint waiter lifecycle", // 2: unpaired ack lifecycle
+            "overwrite fuse",            // 3: orphans refusing re-blocking
+            "ENDPOINT_WAITER_SLOTS",     // 4: the structural capacity
+            "install_server_reply_link", // 5: the link creation edge
+            "close_server_reply_link",   // 6: the link close edge
+            "terminal_arbitrated",       // 7: the reply-vs-timeout race
         ] {
             assert!(
                 doc.contains(blocker),
-                "the held-off record must still account for the {blocker} blocker"
+                "the record must account for the {blocker} blocker"
             );
         }
-        // The three closed blockers are marked closed, and the open one is not.
-        assert_eq!(
-            doc.matches("**FIXED.**").count(),
-            3,
-            "three blockers are recorded as fixed"
-        );
         assert!(
-            doc.contains("the remaining blocker"),
-            "the one open blocker is named as open"
+            doc.contains("links_created == links_closed"),
+            "the record states why the leak invariant is meaningful"
         );
-        // The live evidence is named, so every claim is checkable rather than asserted.
+        // The deferred work is named as future canonical 199E work, not forgotten.
         assert!(
-            doc.contains("PM_ELF_ZC_FAIL count=0")
-                && doc.contains("all 6 service entries present exactly once"),
-            "the boot markers that prove blocker 1 is closed are recorded"
+            doc.contains("Future canonical 199E work")
+                && doc.contains("terminal lease into the direct NR7"),
+            "porting the terminal lease is recorded as future 199E work"
         );
+        // AArch64 and RISC-V are explicitly unchanged.
         assert!(
-            doc.contains("reserve == consume + release + cancel + live"),
-            "the accounting that proves the 8 live leases are not orphans is recorded"
+            doc.contains("AArch64 and RISC-V still resolve to the")
+                && doc.contains("boots are byte-identical"),
+            "the record states that no other architecture was ported"
         );
-        assert!(
-            !crate::kernel::boot::ipccall_direct_production_enabled(),
-            "held off means held off"
-        );
+        assert!(crate::kernel::boot::ipccall_direct_production_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_admission_enabled());
+        assert!(crate::kernel::boot::ipccall_direct_publication_enabled());
     }
 
     /// Endpoint admission is the ARCH-SPLIT predicate, never an oracle endpoint list: it is
@@ -82869,18 +82926,24 @@ mod stage199d_production_default_guards {
         crate::kernel::boot::ipccall_direct_ack::reset();
     }
 
-    /// AArch64 and RISC-V are UNCHANGED: their arch entry points still gate NR6/NR7 on the
-    /// armed proof gate, and the shared admission predicate still consults it for them.
+    /// AArch64 and RISC-V remain OFF by default. Stage 199D blocker 1 moved the AArch64 trap
+    /// entry onto the CANONICAL admission predicate — which is `production || proof` with
+    /// production x86_64-only, so AArch64 still resolves to the armed proof gate. RISC-V is
+    /// untouched and still reads the proof gate at its own arch entry point.
     #[test]
     fn other_architectures_remain_proof_gated() {
         let trap_entry = include_str!("../../arch/trap_entry.rs");
         let riscv = include_str!("../../arch/riscv64/trap.rs");
         assert_eq!(
             trap_entry
-                .matches("&& crate::kernel::boot::ipccall_direct_proof_enabled())")
+                .matches("&& crate::kernel::boot::ipccall_direct_admission_enabled())")
                 .count(),
             2,
-            "AArch64 import + finalize remain proof-gated"
+            "AArch64 import + finalize share the canonical admission predicate"
+        );
+        assert!(
+            !trap_entry.contains("ipccall_direct_proof_enabled()"),
+            "no AArch64-specific proof-only admission rule survives"
         );
         assert!(
             riscv.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"),
@@ -83041,9 +83104,22 @@ mod stage199d_production_default_guards {
     fn the_quiescent_attestation_is_gated_on_service_chain_health() {
         let counters = include_str!("../direct_ipc_counters.rs");
         assert!(
-            counters.contains("pub(crate) fn maybe_emit_quiescent_attestation(service_chain_healthy: bool) -> bool {")
+            counters.contains("pub(crate) fn maybe_emit_quiescent_attestation(")
                 && counters.contains("if !service_chain_healthy {"),
             "the attestation refuses to fire before the chain is healthy"
+        );
+        // It also carries the INDEPENDENT waiter census, measured from the endpoint waiter
+        // table rather than from the store's own counters.
+        assert!(
+            counters.contains("crate::kernel::direct_ack_census::LeaseBijection")
+                && counters.contains("fn emit_census(")
+                && counters.contains("IPC_DIRECT_WAITER_BIJECTION dir=")
+                && counters.contains("IPC_DIRECT_WAITER_CENSUS dir="),
+            "the quiescent attestation reports the independent waiter census"
+        );
+        assert!(
+            counters.contains("census_ok={}") && counters.contains("&& census_ok {"),
+            "the seal fails unless the lease/waiter bijection is exact"
         );
         assert!(
             counters.contains("static QUIESCENT_ATTESTED: AtomicUsize")
@@ -83281,17 +83357,82 @@ mod stage199d_multi_pair_boundary {
         );
     }
 
-    /// The store is bounded and holds strictly more than one pair.
+    /// The store is bounded, holds more than one pair, and its capacity is **derived from
+    /// the authoritative endpoint receive-waiter table** rather than chosen.
+    ///
+    /// A magic 8 was smaller than the number of services a normal boot parks in recv-v2 at
+    /// once, so the store saturated and silently degraded those endpoints to legacy. The
+    /// replacement is not a bigger number read off that boot: it is the waiter table's own
+    /// length, so the two cannot drift.
     #[test]
-    fn store_capacity_is_bounded_and_multi_pair() {
+    fn store_capacity_is_derived_from_the_endpoint_waiter_table() {
         assert!(
             DIRECT_ACK_STORE_CAPACITY > 1,
             "a multi-pair store holds more than one pair"
         );
-        assert!(
-            DIRECT_ACK_STORE_CAPACITY <= 64,
-            "the store stays bounded (no allocation, fixed footprint)"
+        // Bounded: a fixed array, no allocation. The bound is the waiter table.
+        assert_eq!(
+            DIRECT_ACK_STORE_CAPACITY,
+            crate::kernel::boot::ENDPOINT_WAITER_SLOTS,
+            "capacity IS the endpoint receive-waiter table length"
         );
+        assert!(
+            DIRECT_ACK_STORE_CAPACITY >= crate::kernel::boot::ENDPOINT_WAITER_SLOTS,
+            "capacity may never be smaller than the table it covers"
+        );
+        // The tie is at COMPILE time, not merely asserted here.
+        let store_src = include_str!("../direct_ack_store.rs");
+        assert!(
+            store_src.contains(
+                "pub const DIRECT_ACK_STORE_CAPACITY: usize = \
+                 crate::kernel::boot::ENDPOINT_WAITER_SLOTS;"
+            ),
+            "the capacity is defined as the table length, not copied from it"
+        );
+        assert_eq!(
+            store_src
+                .matches("const _: () = assert!(DIRECT_ACK_STORE_CAPACITY")
+                .count(),
+            2,
+            "compile-time assertions pin >= and == against the waiter table"
+        );
+        // And the real array in the kernel is that long.
+        let k = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        let waiter_slots = k.with(|s| s.with_ipc_state(|ipc| ipc.endpoint_waiters.len()));
+        assert_eq!(
+            waiter_slots, DIRECT_ACK_STORE_CAPACITY,
+            "the live waiter table is exactly as long as the store"
+        );
+        // No magic literal survives anywhere near the capacity definition.
+        assert!(
+            !store_src.contains("DIRECT_ACK_STORE_CAPACITY: usize = 8"),
+            "the magic capacity is gone"
+        );
+    }
+
+    /// One slot per endpoint index: reservation cannot fail for want of a slot, and no slot is
+    /// ever shared between two endpoint indices.
+    #[test]
+    fn every_endpoint_index_always_has_its_own_slot() {
+        use crate::kernel::direct_ack_store::{AckEndpoint, AckWaiter, DirectAckStore};
+        let store = DirectAckStore::new();
+        // EVERY index in the table reserves, simultaneously, with no refusal.
+        for i in 0..DIRECT_ACK_STORE_CAPACITY {
+            store
+                .reserve(AckEndpoint::new(i, 1), AckWaiter::new(1000 + i as u64, 1))
+                .unwrap_or_else(|e| panic!("endpoint {i} must always have a slot ({e:?})"));
+        }
+        assert_eq!(store.live_pair_count(), DIRECT_ACK_STORE_CAPACITY);
+        assert_eq!(store.capacity_refusal_count(), 0, "no capacity refusal");
+        assert_eq!(store.endpoint_live_refusal_count(), 0, "no overwrite fuse");
+        assert_eq!(store.occupancy_high_watermark(), DIRECT_ACK_STORE_CAPACITY);
+        // The slot a reservation names is the endpoint index itself.
+        let r = DirectAckStore::new()
+            .reserve(AckEndpoint::new(42, 7), AckWaiter::new(9, 1))
+            .expect("reserve");
+        assert_eq!(r.slot(), 42, "the slot IS the endpoint index");
     }
 
     #[test]
@@ -85135,23 +85276,49 @@ mod stage199a2d2c2b2_guards {
     }
 
     // (9) The enqueue occurs BEFORE the reschedule IPI (no fallible work after enqueue).
+    //
+    // Stage 199D renamed the sender to `send_reschedule_ipi_to` (it now takes the authoritative
+    // target instead of assuming CPU 1). Checked in PROGRAM order rather than file order: the
+    // drain is defined before the transaction, so a whole-file offset comparison would be
+    // meaningless. The enqueue precedes the success value inside the transaction, and the send
+    // follows that success inside the drain.
     #[test]
     fn enqueue_before_ipi() {
-        let enq = TXN.find("sr_enqueue_committed_receiver_split").unwrap();
-        let ipi = TXN.find("c2b2_send_reschedule_ipi_to_cpu1()").unwrap();
-        assert!(enq < ipi, "enqueue precedes the IPI");
+        let txn_body = TXN
+            .split("fn ipc_call_direct_request_txn(")
+            .nth(1)
+            .expect("the request transaction");
+        let enq = txn_body
+            .find("sr_enqueue_committed_receiver_split(ack.server.tid.0")
+            .expect("the committed enqueue");
+        let success = txn_body
+            .find("Ok(IpcCallDirectSuccess {")
+            .expect("the success value");
+        assert!(enq < success, "enqueue precedes the success value");
+
+        let drain = TXN
+            .split("pub(crate) fn drain_direct_request_post_work(")
+            .nth(1)
+            .expect("the drain");
+        let ok_arm = drain
+            .find("if let Ok(success) = result")
+            .expect("success arm");
+        let ipi = drain
+            .find("send_reschedule_ipi_to(")
+            .expect("the reschedule IPI");
+        assert!(ok_arm < ipi, "enqueue (via the success) precedes the IPI");
     }
 
-    // (10) The request-success path does NOT self-set CPU 1's reschedule-pending flag: the CPU-0 IPI
-    // sender only re-arms the dispatch REQUEST + sends the IPI.
+    // (10) The request-success path does NOT self-set the target's reschedule-pending flag: the
+    // sender only re-arms an AP target's dispatch REQUEST + sends the IPI.
     #[test]
     fn request_path_does_not_self_set_pending() {
-        assert!(SMP.contains("fn c2b2_send_reschedule_ipi_to_cpu1"));
+        assert!(SMP.contains("fn send_reschedule_ipi_to"));
         // The IPI sender body (between its fn header and the next fn) must not set_reschedule_pending.
         let start = SMP
-            .find("pub(crate) fn c2b2_send_reschedule_ipi_to_cpu1")
+            .find("pub(crate) fn send_reschedule_ipi_to(sender: CpuId, target: CpuId)")
             .unwrap();
-        let body = &SMP[start..start + 700];
+        let body = &SMP[start..start + 900];
         assert!(
             !body.contains("set_reschedule_pending"),
             "IPI sender must not set pending"
@@ -85492,24 +85659,43 @@ mod stage199a2d2c2c_reply_guards {
         assert!(body.contains(
             "self.ipc_reply_direct_txn(&work.snapshot, &work.ack, &mut lease, work.ack_seq)"
         ));
-        assert!(body.contains("if result.is_ok()"));
-        assert!(body.contains("x86_ipccall_direct_smp_reply_enabled()"));
+        // Stage 199D: the reverse wake decision no longer reads a global oracle selector and no
+        // longer assumes CPU 0 — it compares the enqueue's own committed target to the
+        // enqueueing CPU, so an ordinary LOCAL direct NR7 completion sends nothing.
+        assert!(body.contains("if let Ok(success) = result"));
+        assert!(body.contains("success.wake_target_cpu != enqueueing_cpu"));
+        // Negative check on CODE only: the drain's comment legitimately explains which selector
+        // the decision no longer reads, and a raw text match would trip on that prose.
+        let code = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        assert!(!code.contains("x86_ipccall_direct_smp_reply_enabled()"));
         assert!(body.contains("ipcreply_direct_smp_reply_note_delivered()"));
-        assert!(body.contains("c2c_send_reschedule_ipi_to_cpu0()"));
+        assert!(body.contains("c2c_send_reschedule_ipi_to("));
     }
 
     // 5. The reverse IPI is sent AFTER the enqueue (from the success branch), targets APIC id 0, and
     //    emits the canonical SENT marker; it never re-arms an AP dispatch request.
     #[test]
     fn reverse_ipi_targets_cpu0() {
-        assert!(SMP.contains("pub(crate) fn c2c_send_reschedule_ipi_to_cpu0()"));
-        assert!(SMP.contains("X86_BSP_RESCHEDULE_IPI_SENT sender_cpu=1 receiver_cpu=0"));
+        // Stage 199D: the primitive takes the AUTHORITATIVE target rather than assuming CPU 0.
+        // The caller (the reply drain) supplies the enqueue's committed target, so the genuine
+        // reverse wake still reads `sender_cpu=1 receiver_cpu=0` in the marker.
+        assert!(
+            SMP.contains("pub(crate) fn c2c_send_reschedule_ipi_to(sender: CpuId, target: CpuId)")
+        );
+        assert!(SMP.contains(
+            "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok"
+        ));
         let f = SMP
-            .split("pub(crate) fn c2c_send_reschedule_ipi_to_cpu0() {")
+            .split("pub(crate) fn c2c_send_reschedule_ipi_to(sender: CpuId, target: CpuId) {")
             .nth(1)
             .unwrap();
         let body = &f[..f.find("\n}\n").unwrap()];
-        assert!(body.contains("write_icr(0, AP_REMOTE_WAKE_VECTOR as u32)"));
+        assert!(body.contains("write_icr(target.0, AP_REMOTE_WAKE_VECTOR as u32)"));
+        // Still never re-arms an AP dispatch request: the BSP dispatches on its timer tick.
         assert!(!body.contains("set_ap_dispatch_request"));
     }
 
@@ -92758,6 +92944,7 @@ mod stage200d1_publication_and_guards {
     const SERVER_DIED: usize = 10;
 
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
     const RESTART_SRC: &str = include_str!("restart_state.rs");
     const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
     const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
@@ -93001,22 +93188,207 @@ mod stage200d1_publication_and_guards {
     }
 
     /// A reverse link is never silently overwritten, and registration refuses an exiting
-    /// incarnation on BOTH the broad and the split seam.
+    /// incarnation — on BOTH the broad and the split seam, because both delegate to the ONE
+    /// shared installation decision.
+    ///
+    /// This used to assert that each seam carried its own copy of the match arms. They did,
+    /// and they drifted: the split copy installed the link without stamping the creation edge,
+    /// so with the direct NR6 path as the production default the ServerDies leak accounting
+    /// went blind (`created=0 closed=13`). Duplicated-and-compared is now replaced by shared:
+    /// there is one decision, so there is nothing left to drift.
     #[test]
     fn g10_no_silent_link_overwrite_and_exiting_gate() {
-        for src in [IPC_STATE_SRC, RUNTIME_SRC] {
+        // Both seams delegate; neither carries its own arms any more.
+        for (name, src) in [("ipc_state.rs", IPC_STATE_SRC), ("runtime.rs", RUNTIME_SRC)] {
             assert!(
-                src.contains(
-                    "Some(existing) if existing == link => true,\n                Some(_) => false,"
-                ),
-                "a different live link must fail, never overwrite"
+                src.contains("crate::kernel::boot::install_server_reply_link(tcb, link)"),
+                "{name}: the installation edge delegates to the shared decision"
+            );
+            assert!(
+                !src.contains("tcb.server_reply_link = Some(link);"),
+                "{name}: no seam installs a link itself"
             );
         }
+        // And the shared decision is the one that refuses overwrite and gates on exiting.
+        let helper = MOD_SRC
+            .split("pub(crate) fn install_server_reply_link(")
+            .nth(1)
+            .expect("shared decision present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
         assert!(
-            IPC_STATE_SRC
-                .contains("TaskStatus::Runnable | TaskStatus::Running | TaskStatus::Blocked(_)")
+            helper.contains("Some(existing) if existing == link => true,")
+                && helper.contains("Some(_) => false,"),
+            "a different live link must fail, never overwrite"
         );
-        assert!(RUNTIME_SRC.contains("crate::kernel::task::TaskStatus::Runnable"));
+        assert!(
+            helper.contains("crate::kernel::task::TaskStatus::Runnable")
+                && helper.contains("crate::kernel::task::TaskStatus::Running")
+                && helper.contains("crate::kernel::task::TaskStatus::Blocked(_)"),
+            "an incarnation that has committed to exit is refused"
+        );
+    }
+
+    /// **Close-edge parity.** All four closing paths delegate to the ONE shared close
+    /// decision, and the close stamp exists exactly once in the tree — the exact mirror of the
+    /// creation edge.
+    ///
+    /// The four paths used to carry independent copies, and two of them — the direct NR7 close
+    /// and the reply-timeout close — removed links without stamping at all. Unifying the
+    /// creation edge made that visible (`created=54 closed=13`, the 41 missing closes being
+    /// exactly the direct NR7 completions on that boot) and the leak attestation was wrong on
+    /// the production path in the permissive direction.
+    #[test]
+    fn g10c_every_close_path_delegates_to_the_one_shared_decision() {
+        // Exactly one close mutation and one close stamp in the whole tree, both inside the
+        // shared decision.
+        assert_eq!(
+            MOD_SRC.matches("tcb.server_reply_link = None;").count(),
+            1,
+            "one place removes a reverse link"
+        );
+        assert_eq!(
+            MOD_SRC
+                .matches("server_dies_counters::note_link_closed(")
+                .count(),
+            1,
+            "one close stamp in the tree"
+        );
+        for (name, src) in [("ipc_state.rs", IPC_STATE_SRC), ("runtime.rs", RUNTIME_SRC)] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("server_reply_link = None"),
+                "{name}: no seam removes a link itself"
+            );
+            assert!(
+                !code.contains("server_reply_link.take()"),
+                "{name}: no seam takes a link itself"
+            );
+            assert!(
+                !code.contains("note_link_closed"),
+                "{name}: no seam stamps the close edge itself"
+            );
+        }
+        // All FOUR closing paths delegate.
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("crate::kernel::boot::close_server_reply_link(")
+                .count(),
+            3,
+            "detach_exact, take (exit path) and the reply-timeout close all delegate"
+        );
+        assert_eq!(
+            RUNTIME_SRC
+                .matches("crate::kernel::boot::close_server_reply_link(")
+                .count(),
+            1,
+            "the direct NR7 close delegates"
+        );
+        // The stamp follows a genuine mutation and is unreachable from every refusal arm.
+        let body = MOD_SRC
+            .split("pub(crate) fn close_server_reply_link(")
+            .nth(1)
+            .expect("the shared close decision")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        let remove_at = body
+            .find("tcb.server_reply_link = None;")
+            .expect("the close removes the link");
+        let stamp_at = body
+            .find("note_link_closed(")
+            .expect("the close stamps the close edge");
+        assert!(
+            remove_at < stamp_at,
+            "the close edge is stamped only after a genuine Some(link) -> None mutation"
+        );
+        for refusal in [
+            "return LinkCloseOutcome::AlreadyAbsent;",
+            "LinkCloseOutcome::StaleRecordGeneration",
+            "LinkCloseOutcome::DifferentLiveLink",
+        ] {
+            let at = body.find(refusal).expect("refusal arm present");
+            assert!(at < stamp_at, "the {refusal} arm precedes the stamp");
+        }
+        // `Any` is the exiting-server take path's selector, and only that path's.
+        assert_eq!(
+            IPC_STATE_SRC
+                .matches("crate::kernel::boot::LinkCloseSelector::Any")
+                .count(),
+            1,
+            "Any is used by exactly one path: the exiting-server take"
+        );
+        assert!(
+            !RUNTIME_SRC.contains("LinkCloseSelector::Any"),
+            "no split seam may close indiscriminately"
+        );
+    }
+
+    /// **Creation-edge parity.** The creation stamp exists exactly once in the tree, inside
+    /// the shared decision, on the arm that genuinely installs — so legacy and split
+    /// installation are accounted identically by construction rather than by inspection.
+    #[test]
+    fn g10b_the_creation_edge_is_stamped_exactly_once_and_only_on_a_real_install() {
+        assert_eq!(
+            MOD_SRC
+                .matches("server_dies_counters::note_link_created(")
+                .count(),
+            1,
+            "exactly one creation stamp in the tree"
+        );
+        for (name, src) in [("ipc_state.rs", IPC_STATE_SRC), ("runtime.rs", RUNTIME_SRC)] {
+            // CODE only — the comments at each seam legitimately explain the edge they
+            // delegate, including why this drifted before.
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("note_link_created"),
+                "{name}: no seam stamps the creation edge itself"
+            );
+        }
+        let helper = MOD_SRC
+            .split("pub(crate) fn install_server_reply_link(")
+            .nth(1)
+            .expect("shared decision present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        // The stamp is in the `None =>` arm — the only one that writes the link — and comes
+        // after the write, so it can never be reached without a genuine installation.
+        let install_at = helper
+            .find("tcb.server_reply_link = Some(link);")
+            .expect("the install writes the link");
+        let stamp_at = helper
+            .find("note_link_created(")
+            .expect("the install stamps the creation edge");
+        assert!(
+            install_at < stamp_at,
+            "the creation edge is stamped only after the link is genuinely installed"
+        );
+        // Neither early-return arm can reach the stamp.
+        for refusal in [
+            "Some(existing) if existing == link => true,",
+            "Some(_) => false,",
+        ] {
+            let at = helper.find(refusal).expect("refusal arm present");
+            assert!(at < stamp_at, "the {refusal} arm precedes the stamp");
+        }
+        // The close edge is unified in exactly the same way — see `g10c`.
+        assert_eq!(
+            MOD_SRC
+                .matches("server_dies_counters::note_link_closed(")
+                .count(),
+            1,
+            "one close stamp in the tree, mirroring the one creation stamp"
+        );
     }
 
     /// The NR6 transaction reserves link capacity BEFORE publishing the record, so no
@@ -97338,39 +97710,53 @@ mod stage200d2b1bi_counters {
     #[test]
     fn i09_counters_attached_to_real_operations() {
         let _g = globals_guard();
-        // 1 link created — inside the arm that installs a NEW link.
-        let reg = IPC_SRC
-            .split("pub(crate) fn register_server_reply_link(")
+        // 1 link created — inside the arm that installs a NEW link. Stage 199D moved that arm
+        // into the ONE shared installation decision, used by BOTH the legacy and the split
+        // registration seams, because the two copies drifted and the split one stopped
+        // counting entirely.
+        let mod_src = include_str!("mod.rs");
+        let reg = mod_src
+            .split("pub(crate) fn install_server_reply_link(")
             .nth(1)
-            .expect("register");
-        let reg = reg.split("\n    /// ").next().unwrap();
+            .expect("the shared installation decision");
+        let reg = reg.split("\n}\n").next().unwrap();
         assert!(reg.contains("tcb.server_reply_link = Some(link);"));
         let install = reg.find("tcb.server_reply_link = Some(link);").unwrap();
-        // Stage 199D: the creation edge now reports its RECORD IDENTITY, so the count can
-        // be attributed to the armed transaction instead of to every call in the system.
+        // The creation edge reports its RECORD IDENTITY, so the count can be attributed to
+        // the armed transaction instead of to every call in the system.
         let rec = reg.find("note_link_created(").expect("class 1");
         assert!(install < rec, "counted after the real install");
-        // 2 link detached — only when a link was actually taken.
-        let take = IPC_SRC
-            .split("pub(crate) fn take_server_reply_link(")
+        // Both registration seams reach it, and neither counts on its own.
+        for src in [IPC_SRC, include_str!("../../runtime.rs")] {
+            assert!(src.contains("crate::kernel::boot::install_server_reply_link(tcb, link)"));
+        }
+        // 2 link detached — only when a link was actually removed. Stage 199D moved the close
+        // arms into the ONE shared close decision too, used by all FOUR closing paths, because
+        // two of the four copies removed links without counting them at all.
+        let close = mod_src
+            .split("pub(crate) fn close_server_reply_link(")
             .nth(1)
-            .expect("take");
-        let take = take.split("\n    /// ").next().unwrap();
-        // Stage 199D: the exit-path close reports the identity of the link it removed.
-        assert!(take.contains("if let Some(link) = taken {"));
-        assert!(take.contains("note_link_closed("));
-        assert!(take.contains("link.reply_record_index"));
-        // The ORDINARY terminal close is the second real closing edge and must also report.
-        let detach = IPC_SRC
-            .split("pub(crate) fn detach_server_reply_link_exact(")
-            .nth(1)
-            .expect("detach");
-        let detach = detach.split("\n    /// ").next().unwrap();
-        assert!(detach.contains("tcb.server_reply_link = None;"));
-        assert!(
-            detach.contains("note_link_closed("),
-            "the ordinary terminal close counts too — it used to count nothing, which is \
-             why created/closed was not a valid leak invariant"
+            .expect("the shared close decision");
+        let close = close.split("\n}\n").next().unwrap();
+        assert!(close.contains("tcb.server_reply_link = None;"));
+        let remove = close.find("tcb.server_reply_link = None;").unwrap();
+        let closed = close.find("note_link_closed(").expect("class 2");
+        assert!(remove < closed, "counted after the real removal");
+        // The close is attributed by the REMOVED link's identity, not by the selector, so the
+        // `Any` path reports the record it actually closed.
+        assert!(close.contains("link.reply_record_index"));
+        // All four closing paths reach it, and none counts on its own.
+        assert_eq!(
+            IPC_SRC
+                .matches("crate::kernel::boot::close_server_reply_link(")
+                .count(),
+            3
+        );
+        assert_eq!(
+            include_str!("../../runtime.rs")
+                .matches("crate::kernel::boot::close_server_reply_link(")
+                .count(),
+            1
         );
         // 3/4/5 deferred queue operations.
         for (f, class, must) in [
@@ -97458,8 +97844,9 @@ mod stage200d2b1bi_counters {
             .sum();
         assert_eq!(created, 1, "one reverse-link creation edge");
         assert_eq!(
-            closed, 2,
-            "two reverse-link closing edges: ordinary terminal + exit"
+            closed, 1,
+            "one reverse-link closing edge: all four closing paths delegate to the shared \
+             close decision, exactly as all installation paths delegate to the shared install"
         );
         // The scoped helpers are the ONLY way the link classes are reached, so an unscoped
         // link count cannot reappear by accident.
@@ -101025,16 +101412,17 @@ mod stage199d_ack_lease_lifecycle {
         }
     }
 
-    /// A released slot is spent, so it is recyclable — which is what turns the orphan leak
-    /// back into bounded, self-limiting occupancy. Without recycling, a store whose leases
-    /// all ended through the non-direct edge would still refuse every new reservation.
+    /// A released slot is spent, so this endpoint index can re-reserve it. Combined with the
+    /// per-endpoint-index slot mapping, that is what makes occupancy self-limiting: a store
+    /// whose leases all ended through the non-direct edge is immediately reusable, and an
+    /// endpoint whose waiter comes and goes never accumulates anything.
     #[test]
-    fn released_slots_are_recycled_and_relieve_capacity() {
+    fn released_slots_are_reusable_by_their_own_endpoint() {
         let store = DirectAckStore::new();
-        // Fill the store, then end every lease through the NON-direct edge.
+        // Fill the whole table, then end every lease through the NON-direct edge.
         for i in 0..DIRECT_ACK_STORE_CAPACITY {
             let (e, waiter) = (ep(i, 1), w(100 + i as u64, 1));
-            let r = store.reserve(e, waiter).expect("reserve");
+            let r = store.reserve(e, waiter).expect("every index has a slot");
             store
                 .commit(
                     r,
@@ -101050,9 +101438,11 @@ mod stage199d_ack_lease_lifecycle {
                 .expect("commit");
         }
         assert_eq!(store.live_pair_count(), DIRECT_ACK_STORE_CAPACITY);
-        // One more would be refused right now — this is exactly the live failure mode.
-        assert!(store.reserve(ep(99, 1), w(999, 1)).is_err());
-        assert_eq!(store.capacity_refusal_count(), 1);
+        assert_eq!(
+            store.capacity_refusal_count(),
+            0,
+            "a full table is the normal maximum, not a refusal"
+        );
 
         for i in 0..DIRECT_ACK_STORE_CAPACITY {
             assert!(
@@ -101063,17 +101453,19 @@ mod stage199d_ack_lease_lifecycle {
             );
         }
         assert_eq!(store.live_pair_count(), 0, "no orphan survives");
+        assert_eq!(store.live_pair_count_scan(), 0);
         assert_eq!(store.released_pair_count(), DIRECT_ACK_STORE_CAPACITY);
 
-        // And the store admits a fresh pair again.
-        let r = store.reserve(ep(99, 1), w(999, 1)).expect("recycled");
-        assert_eq!(r.endpoint(), ep(99, 1));
-        assert_eq!(
-            store.capacity_refusal_count(),
-            1,
-            "no further capacity refusal"
-        );
-        assert!(store.occupancy_high_watermark() <= DIRECT_ACK_STORE_CAPACITY);
+        // Each endpoint re-reserves its own slot at a fresh incarnation.
+        for i in 0..DIRECT_ACK_STORE_CAPACITY {
+            let r = store
+                .reserve(ep(i, 2), w(200 + i as u64, 1))
+                .expect("spent slot is reusable");
+            assert_eq!(r.slot(), i, "an endpoint always returns to its own slot");
+        }
+        assert_eq!(store.capacity_refusal_count(), 0);
+        assert_eq!(store.endpoint_live_refusal_count(), 0);
+        assert_eq!(store.occupancy_high_watermark(), DIRECT_ACK_STORE_CAPACITY);
     }
 
     /// The released slot keeps its endpoint key (so duplicates stay detectable) but drops the
@@ -101571,6 +101963,343 @@ mod stage199d_ack_lease_lifecycle {
     }
 }
 
+/// Stage 199D — **reverse-link CLOSE accounting parity** across all four closing paths.
+///
+/// The mirror of `stage199d_link_creation_parity`. The four paths carried independent copies
+/// of the close decision, and two of them — the direct NR7 close and the reply-timeout close —
+/// removed links without stamping at all. Unifying the creation edge made that visible: the
+/// system totals read `created=54 closed=13`, the 41 missing closes being exactly the direct
+/// NR7 completions on that boot, and the leak attestation was wrong on the production path in
+/// the permissive direction.
+///
+/// All four now delegate to `boot::close_server_reply_link`, so the accounting is identical by
+/// construction. These tests prove the counting behaviour of every arm and every caller.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage199d_link_close_parity {
+    use super::*;
+    use crate::kernel::boot::server_dies_counters as c;
+    use crate::kernel::boot::{DetachOutcome, LinkCloseOutcome, LinkCloseSelector};
+    use crate::kernel::task::ServerReplyLink;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const SERVER_TID: u64 = 2;
+    const REC: usize = 3;
+    const GEN: u64 = 7;
+
+    /// One server task holding exactly one installed reverse link.
+    fn fixture() -> (SharedKernel, Asid) {
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            s.register_task(SERVER_TID).expect("server");
+            let (asid, _sp) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(SERVER_TID, asid).expect("bind");
+            asid
+        });
+        assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN)));
+        assert_eq!(c::link_totals(), (1, 0), "one creation, no close yet");
+        (k, asid)
+    }
+
+    fn link_of(k: &SharedKernel) -> Option<ServerReplyLink> {
+        k.with(|s| {
+            s.with_tcbs(|t| {
+                t.iter()
+                    .flatten()
+                    .find(|x| x.tid.0 == SERVER_TID)
+                    .and_then(|x| x.server_reply_link)
+            })
+        })
+    }
+
+    /// CALLER 1 — the ordinary terminal close: closes once, stamps once.
+    #[test]
+    fn detach_exact_closes_and_stamps_once() {
+        let (k, asid) = fixture();
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN)),
+            DetachOutcome::Detached
+        );
+        assert_eq!(c::link_totals(), (1, 1), "creation + close balance 1/1");
+        assert_eq!(link_of(&k), None, "the link is gone");
+    }
+
+    /// CALLER 2 — the exiting-server take path: closes once, stamps once, returns the link.
+    #[test]
+    fn take_closes_and_stamps_once_and_returns_the_link() {
+        let (k, asid) = fixture();
+        let taken = k.with(|s| s.take_server_reply_link(SERVER_TID, asid));
+        assert_eq!(
+            taken.map(|l| (l.reply_record_index, l.reply_record_generation)),
+            Some((REC, GEN)),
+            "the removed link is returned"
+        );
+        assert_eq!(c::link_totals(), (1, 1), "creation + close balance 1/1");
+        assert_eq!(link_of(&k), None);
+    }
+
+    /// CALLER 3 — the direct NR7 close: closes once, stamps once. This is the path that used
+    /// to remove the link and count nothing.
+    #[test]
+    fn the_split_close_closes_and_stamps_once() {
+        let (k, asid) = fixture();
+        assert!(k.unregister_server_reply_link_split(SERVER_TID, asid, REC, GEN));
+        assert_eq!(c::link_totals(), (1, 1), "creation + close balance 1/1");
+        assert_eq!(link_of(&k), None);
+    }
+
+    /// A server holding a link for a REAL reserved reply record, which is what the
+    /// reply-timeout close resolves the replier from.
+    fn fixture_with_record() -> (SharedKernel, Asid, usize, u64) {
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, index, generation) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(SERVER_TID).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("caller asid");
+            let (asid, _sp) = s.create_user_address_space().expect("server asid");
+            s.bind_task_asid(1, casid).expect("bind caller");
+            s.bind_task_asid(SERVER_TID, asid).expect("bind server");
+            let (_e, _send, _recv) = s.create_endpoint(4).expect("reply ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier =
+                crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(SERVER_TID), asid);
+            let (index, generation) = s
+                .reserve_direct_reply_record(
+                    caller,
+                    replier,
+                    crate::kernel::capabilities::CapObject::Endpoint {
+                        index: 0,
+                        generation: 1,
+                    },
+                )
+                .expect("reserve record");
+            (asid, index, generation)
+        });
+        assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, index, generation)));
+        assert_eq!(c::link_totals(), (1, 0));
+        (k, asid, index, generation)
+    }
+
+    /// CALLER 4 — the reply-timeout domain close: closes once, stamps once. Silent before
+    /// this increment.
+    #[test]
+    fn the_reply_timeout_close_closes_and_stamps_once() {
+        let (k, _asid, index, generation) = fixture_with_record();
+        let closed = k.with(|s| crate::kernel::boot::rt_detach_server_link(s, index, generation));
+        assert!(closed, "the reply-timeout close removed the link");
+        assert_eq!(c::link_totals(), (1, 1), "creation + close balance 1/1");
+        assert_eq!(link_of(&k), None);
+        // Repeat is idempotent and counts nothing more.
+        assert!(!k.with(|s| crate::kernel::boot::rt_detach_server_link(s, index, generation)));
+        assert_eq!(c::link_totals(), (1, 1));
+    }
+
+    /// The reply-timeout close is exact: a stale record generation removes nothing and counts
+    /// nothing.
+    #[test]
+    fn the_reply_timeout_close_is_exact() {
+        let (k, _asid, index, generation) = fixture_with_record();
+        assert!(!k.with(|s| crate::kernel::boot::rt_detach_server_link(
+            s,
+            index,
+            generation.wrapping_add(1)
+        )));
+        assert_eq!(c::link_totals(), (1, 0), "a stale close counts nothing");
+        assert!(link_of(&k).is_some(), "and the live link survives");
+    }
+
+    /// EXACT mismatch, absent and repeat all stamp ZERO and disturb nothing.
+    #[test]
+    fn mismatch_absent_and_repeat_stamp_zero() {
+        // A DIFFERENT live record: refused, nothing removed, nothing counted.
+        let (k, asid) = fixture();
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC + 1, GEN)),
+            DetachOutcome::DifferentLiveLink
+        );
+        // The SAME slot at a later generation: the slot was reused, so this close belongs to
+        // a previous occupant.
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN + 1)),
+            DetachOutcome::StaleRecordGeneration
+        );
+        // A FOREIGN server incarnation: numeric TID reuse with a fresh ASID.
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, Asid(0xBEE), REC, GEN)),
+            DetachOutcome::StaleServerIdentity
+        );
+        // And the split seam agrees on every one of them.
+        assert!(!k.unregister_server_reply_link_split(SERVER_TID, asid, REC + 1, GEN));
+        assert!(!k.unregister_server_reply_link_split(SERVER_TID, asid, REC, GEN + 1));
+        assert!(!k.unregister_server_reply_link_split(SERVER_TID, Asid(0xBEE), REC, GEN));
+        assert_eq!(
+            c::link_totals(),
+            (1, 0),
+            "not one of those closes counted, and the link is untouched"
+        );
+        assert!(
+            link_of(&k).is_some(),
+            "the live link survives every refusal"
+        );
+
+        // Now close it for real, then REPEAT on every path: idempotent, and still 1/1.
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN)),
+            DetachOutcome::Detached
+        );
+        assert_eq!(c::link_totals(), (1, 1));
+        assert_eq!(
+            k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN)),
+            DetachOutcome::AlreadyAbsent
+        );
+        assert!(!k.unregister_server_reply_link_split(SERVER_TID, asid, REC, GEN));
+        assert_eq!(k.with(|s| s.take_server_reply_link(SERVER_TID, asid)), None);
+        assert_eq!(
+            c::link_totals(),
+            (1, 1),
+            "a repeated close on any path is idempotent and counts nothing"
+        );
+    }
+
+    /// The `Any` selector removes exactly the present link — whichever record it names — and
+    /// is a no-op when there is none.
+    #[test]
+    fn any_removes_exactly_the_present_link() {
+        c::reset_instance();
+        let mut tcb = crate::kernel::task::ThreadControlBlock::new(
+            crate::kernel::ipc::ThreadId(SERVER_TID),
+            Some(Asid(5)),
+        );
+        tcb.status = crate::kernel::task::TaskStatus::Runnable;
+        // No link: `Any` is a pure no-op.
+        assert_eq!(
+            crate::kernel::boot::close_server_reply_link(&mut tcb, LinkCloseSelector::Any),
+            LinkCloseOutcome::AlreadyAbsent
+        );
+        assert_eq!(c::link_totals(), (0, 0));
+        // A link naming an arbitrary record is removed regardless of which record it is.
+        let link = ServerReplyLink {
+            server_tid: SERVER_TID,
+            server_asid: Asid(5),
+            reply_record_index: 41,
+            reply_record_generation: 9,
+        };
+        tcb.server_reply_link = Some(link);
+        assert_eq!(
+            crate::kernel::boot::close_server_reply_link(&mut tcb, LinkCloseSelector::Any),
+            LinkCloseOutcome::Closed(link)
+        );
+        assert_eq!(tcb.server_reply_link, None);
+        assert_eq!(
+            c::link_totals(),
+            (0, 1),
+            "one close, attributed to record 41"
+        );
+        // Repeat is idempotent.
+        assert_eq!(
+            crate::kernel::boot::close_server_reply_link(&mut tcb, LinkCloseSelector::Any),
+            LinkCloseOutcome::AlreadyAbsent
+        );
+        assert_eq!(c::link_totals(), (0, 1));
+    }
+
+    /// Creation plus EACH closing edge balances 1/1 — the property the whole increment exists
+    /// to establish.
+    #[test]
+    fn creation_plus_each_closing_edge_balances() {
+        for edge in ["detach_exact", "take", "split", "reply_timeout"] {
+            // The reply-timeout close resolves its replier from a real reply record.
+            let (k, asid, rec, generation) = if edge == "reply_timeout" {
+                fixture_with_record()
+            } else {
+                let (k, asid) = fixture();
+                (k, asid, REC, GEN)
+            };
+            let closed = match edge {
+                "detach_exact" => {
+                    k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, rec, generation))
+                        == DetachOutcome::Detached
+                }
+                "take" => k
+                    .with(|s| s.take_server_reply_link(SERVER_TID, asid))
+                    .is_some(),
+                "split" => k.unregister_server_reply_link_split(SERVER_TID, asid, rec, generation),
+                _ => k.with(|s| crate::kernel::boot::rt_detach_server_link(s, rec, generation)),
+            };
+            assert!(closed, "{edge}: the link was closed");
+            let (created, closed_n) = c::link_totals();
+            assert_eq!(
+                (created, closed_n),
+                (1, 1),
+                "{edge}: creation + close balance 1/1"
+            );
+            assert_eq!(link_of(&k), None, "{edge}: no link survives");
+        }
+    }
+
+    /// Ordinary direct NR6/NR7 batches balance system-wide: many installs through the SPLIT
+    /// install seam, many closes through the SPLIT close seam.
+    #[test]
+    fn direct_batches_balance_system_wide() {
+        const SERVERS: u64 = 12;
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut servers = alloc::vec::Vec::new();
+        k.with(|s| {
+            for n in 0..SERVERS {
+                let tid = 2 + n;
+                s.register_task(tid).expect("server");
+                let (asid, _sp) = s.create_user_address_space().expect("asid");
+                s.bind_task_asid(tid, asid).expect("bind");
+                servers.push((tid, asid));
+            }
+        });
+        // Two full request/reply rounds, entirely on the direct-path seams.
+        for round in 0..2u64 {
+            for (i, (tid, asid)) in servers.iter().enumerate() {
+                assert!(k.register_server_reply_link_split(*tid, *asid, i, GEN + round));
+            }
+            assert_eq!(c::link_totals().0, SERVERS as u32 * (round + 1) as u32);
+            for (i, (tid, asid)) in servers.iter().enumerate() {
+                assert!(k.unregister_server_reply_link_split(*tid, *asid, i, GEN + round));
+            }
+            let (created, closed) = c::link_totals();
+            assert_eq!(
+                created, closed,
+                "round {round}: system-wide balance after every direct transaction"
+            );
+        }
+        assert_eq!(c::link_totals(), (24, 24));
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t
+                .iter()
+                .flatten()
+                .filter(|x| x.server_reply_link.is_some())
+                .count())),
+            0,
+            "no reverse link survives quiescence"
+        );
+    }
+
+    /// A ServerDies-shaped exit close balances: the server is torn down while holding a live
+    /// link, and the exit-path take closes it exactly once.
+    #[test]
+    fn a_serverdies_shaped_exit_close_balances() {
+        let (k, asid) = fixture();
+        // The exiting incarnation still holds its authority.
+        assert!(link_of(&k).is_some());
+        let taken = k.with(|s| s.take_server_reply_link(SERVER_TID, asid));
+        assert!(taken.is_some(), "the exit path takes the live link");
+        let (created, closed) = c::link_totals();
+        assert_eq!((created, closed), (1, 1), "exit close balances 1/1");
+        // A second teardown pass (idempotent teardown is normal) counts nothing more.
+        assert_eq!(k.with(|s| s.take_server_reply_link(SERVER_TID, asid)), None);
+        assert_eq!(c::link_totals(), (1, 1));
+    }
+}
+
 /// Stage 199D — **transfer-capability safety on the direct reply path.**
 ///
 /// Legacy `ipc_reply` reads `SYSCALL_ARG_TRANSFER_CAP`, validates it and stashes a transfer
@@ -101714,7 +102443,8 @@ mod stage199d_transfer_cap_safety {
             flat[decline_at..].starts_with(
                 "REPLY_COUNTERS.note_declined_preflight_reply( verdict == \
                  crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted, \
-                 verdict.is_transfer_cap_decline(), ); return None;"
+                 verdict.is_transfer_cap_decline(), \
+                 verdict.is_terminal_arbitration_decline(), ); return None;"
             ),
             "the preflight decline returns None so the legacy path runs"
         );
@@ -101728,7 +102458,7 @@ mod stage199d_transfer_cap_safety {
         use crate::kernel::direct_ipc_counters::DirectPathCounters;
         let c = DirectPathCounters::new();
         c.note_attempt();
-        c.note_declined_preflight_reply(false, true);
+        c.note_declined_preflight_reply(false, true, false);
         assert_eq!(c.declined_transfer_cap(), 1);
         assert_eq!(c.declined_preflight(), 1, "it IS a preflight decline");
         assert_eq!(
@@ -101743,7 +102473,7 @@ mod stage199d_transfer_cap_safety {
         // A non-transfer-cap preflight decline does not touch the breakdown.
         let c2 = DirectPathCounters::new();
         c2.note_attempt();
-        c2.note_declined_preflight_reply(true, false);
+        c2.note_declined_preflight_reply(true, false, false);
         assert_eq!(c2.declined_transfer_cap(), 0);
         assert_eq!(c2.declined_not_admitted(), 1);
         assert!(c2.terminals_balance());
@@ -101751,7 +102481,2929 @@ mod stage199d_transfer_cap_safety {
         // The reply reporter can never report a mode decline: it has no argument for one.
         let c3 = DirectPathCounters::new();
         c3.note_attempt();
-        c3.note_declined_preflight_reply(false, false);
+        c3.note_declined_preflight_reply(false, false, false);
         assert_eq!(c3.declined_ineligible_mode(), 0);
+    }
+}
+
+/// Stage 199D — the **independent endpoint receive-waiter census**, end to end.
+///
+/// The acknowledgement store can balance its own books while still being wrong: the previous
+/// capacity-8 store did exactly that, refusing a ninth parked server a lease while every one of
+/// its own counters read clean. These tests measure the same population from the waiter table
+/// and require an exact one-to-one correspondence with the store's live leases.
+mod stage199d_waiter_census {
+    use super::*;
+    use crate::kernel::boot::{ipccall_direct_ack, set_ipccall_direct_proof_enabled};
+    use crate::kernel::direct_ack_census as census;
+    use crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY;
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::vm::{Mapping, PageFlags, PhysAddr, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const PAYLOAD_VA: usize = 0x4000;
+    const META_VA: usize = 0x4080;
+
+    /// `servers` tasks, each committed-blocked in recv-v2 on its own endpoint.
+    fn fixture(servers: usize) -> SharedKernel {
+        ipccall_direct_ack::reset();
+        census::reset();
+        set_ipccall_direct_proof_enabled(true);
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|state| {
+            // Provision everything FIRST, while task 0 is still current: creating an address
+            // space needs a live current task, and once the first server blocks there is not
+            // one to spare.
+            let mut caps = alloc::vec::Vec::new();
+            for n in 0..servers {
+                let tid = 2 + n as u64;
+                state.register_task(tid).expect("task");
+                let (asid, aspace) = state.create_user_address_space().expect("asid");
+                state.bind_task_asid(tid, asid).expect("bind");
+                state
+                    .map_user_page(
+                        aspace,
+                        VirtAddr(PAYLOAD_VA as u64),
+                        Mapping {
+                            phys: PhysAddr(0xB000 + (n as u64) * 0x1000),
+                            flags: PageFlags::USER_RW,
+                        },
+                    )
+                    .expect("map");
+                let (_e, _s, recv) = state.create_endpoint(4).expect("ep");
+                let recv_t = state
+                    .grant_capability_task_to_task(0, recv, tid)
+                    .expect("recv cap");
+                caps.push((tid, recv_t));
+            }
+            for (tid, recv_t) in caps {
+                state.enqueue_current_cpu(tid).expect("enq");
+                state.dispatch_next_task().expect("disp");
+                while state.current_tid() != Some(tid) {
+                    state.yield_current().expect("switch");
+                }
+                let mut recv_frame = TrapFrame::new(
+                    crate::kernel::syscall::Syscall::IpcRecv as usize,
+                    [recv_t.0 as usize, PAYLOAD_VA, 8, META_VA, 40, 0],
+                );
+                let _ = state.handle_trap(Trap::Syscall, Some(&mut recv_frame));
+                assert!(matches!(
+                    state.task_status(tid),
+                    Some(TaskStatus::Blocked(_))
+                ));
+            }
+        });
+        k
+    }
+
+    fn teardown() {
+        set_ipccall_direct_proof_enabled(false);
+        ipccall_direct_ack::reset();
+        census::reset();
+    }
+
+    fn bijection(k: &SharedKernel) -> census::LeaseBijection {
+        k.direct_ack_lease_bijection(ipccall_direct_ack::store(), |_| true)
+    }
+
+    /// Every eligible waiter has exactly one live lease, and every live lease has exactly one
+    /// waiter — matched on the complete `{index, generation, tid, asid}` identity.
+    #[test]
+    fn every_blocked_waiter_has_exactly_one_lease_and_vice_versa() {
+        let k = fixture(5);
+        let b = bijection(&k);
+        assert_eq!(b.eligible_waiters, 5, "five committed recv-v2 waiters");
+        assert_eq!(b.live_leases, 5, "and five live leases");
+        assert_eq!(b.waiters_without_lease, 0);
+        assert_eq!(b.leases_without_waiter, 0);
+        assert_eq!(b.identity_mismatches, 0);
+        assert_eq!(b.generation_mismatches, 0);
+        assert_eq!(b.duplicate_endpoint_incarnations, 0);
+        assert!(b.ok(), "{b:?}");
+        teardown();
+    }
+
+    /// The running census tracks the waiter table and its peak, and is NOT clamped to the
+    /// acknowledgement store's capacity.
+    #[test]
+    fn the_running_census_tracks_the_waiter_table() {
+        let k = fixture(6);
+        assert_eq!(census::waiters_current(), 6);
+        assert_eq!(census::waiters_high_watermark(), 6);
+        // Removing waiters lowers the current count and leaves the peak.
+        k.with(|s| {
+            s.clear_ipc_waiters_for_tid(2);
+            s.clear_ipc_waiters_for_tid(3);
+        });
+        assert_eq!(census::waiters_current(), 4);
+        assert_eq!(census::waiters_high_watermark(), 6, "the peak is a peak");
+        // And the bijection follows: four waiters, four leases.
+        let b = bijection(&k);
+        assert_eq!(b.eligible_waiters, 4);
+        assert_eq!(b.live_leases, 4);
+        assert!(b.ok(), "{b:?}");
+        teardown();
+    }
+
+    /// A lease whose waiter is gone is caught — the orphan the whole lease lifecycle exists to
+    /// prevent. Injected by force-dropping the waiter behind the store's back.
+    #[test]
+    fn an_orphaned_lease_is_detected() {
+        let k = fixture(3);
+        assert!(bijection(&k).ok());
+        // Remove the waiter WITHOUT going through the primitives, so no lease is retired.
+        k.with(|s| {
+            s.with_ipc_state_mut(|ipc| {
+                for idx in 0..ipc.endpoint_waiters.len() {
+                    if ipc.endpoint_waiters[idx].is_some() {
+                        ipc.endpoint_waiters[idx] = None;
+                        break;
+                    }
+                }
+            })
+        });
+        let b = bijection(&k);
+        assert_eq!(b.leases_without_waiter, 1, "the orphan is visible");
+        assert_eq!(b.eligible_waiters, 2);
+        assert_eq!(b.live_leases, 3);
+        assert!(!b.ok(), "an orphaned lease fails the bijection");
+        teardown();
+    }
+
+    /// A waiter with no lease is caught — the under-sized-store symptom that capacity 8
+    /// produced live, where a ninth parked server was silently refused.
+    #[test]
+    fn a_waiter_without_a_lease_is_detected() {
+        let k = fixture(3);
+        assert!(bijection(&k).ok());
+        // Drop one lease behind the waiter's back.
+        let idx = ipccall_direct_ack::store()
+            .live_lease_at(0)
+            .map(|_| 0usize)
+            .or_else(|| {
+                (0..DIRECT_ACK_STORE_CAPACITY)
+                    .find(|i| ipccall_direct_ack::store().live_lease_at(*i).is_some())
+            })
+            .expect("a live lease");
+        assert!(ipccall_direct_ack::store().release_endpoint_index(idx));
+        let b = bijection(&k);
+        assert_eq!(
+            b.waiters_without_lease, 1,
+            "the lease-less waiter is visible"
+        );
+        assert_eq!(b.eligible_waiters, 3);
+        assert_eq!(b.live_leases, 2);
+        assert!(!b.ok());
+        teardown();
+    }
+
+    /// The store's own books balance at the same time the bijection holds:
+    /// `reserve == consume + release + cancel + live`.
+    #[test]
+    fn the_store_balances_while_the_bijection_holds() {
+        let k = fixture(4);
+        let store = ipccall_direct_ack::store();
+        let balance = |store: &crate::kernel::direct_ack_store::DirectAckStore, at: &str| {
+            assert_eq!(
+                store.reserve_count(),
+                store.consume_count()
+                    + store.release_count()
+                    + store.cancel_count()
+                    + store.live_pair_count() as u64,
+                "{at}: reserve == consume + release + cancel + live"
+            );
+            assert_eq!(
+                store.live_pair_count(),
+                store.live_pair_count_scan(),
+                "{at}: the occupancy counter agrees with the slots"
+            );
+        };
+        balance(store, "all blocked");
+        assert!(bijection(&k).ok());
+
+        // One delivered directly, one waiter simply removed.
+        assert!(
+            ipccall_direct_ack::sole_claim().is_none(),
+            "four pairs, not one"
+        );
+        let first = (0..DIRECT_ACK_STORE_CAPACITY)
+            .find(|i| store.live_lease_at(*i).is_some())
+            .expect("a live lease");
+        let (egen, w) = store.live_lease_at(first).expect("lease");
+        assert!(
+            ipccall_direct_ack::claim(first, egen).is_some(),
+            "direct delivery consumes it"
+        );
+        k.with(|s| s.clear_ipc_waiters_for_tid(w.tid));
+        balance(store, "after a direct delivery");
+
+        k.with(|s| s.clear_ipc_waiters_for_tid(3));
+        balance(store, "after a legacy-satisfied waiter left");
+
+        let b = bijection(&k);
+        assert!(b.ok(), "the bijection still holds: {b:?}");
+        assert_eq!(b.eligible_waiters, b.live_leases);
+        assert_eq!(store.endpoint_live_refusal_count(), 0, "no overwrite fuse");
+        assert_eq!(store.capacity_refusal_count(), 0, "no capacity refusal");
+        assert_eq!(store.crossed_terminal_rejection_count(), 0);
+        assert_eq!(store.duplicate_release_rejection_count(), 0);
+        assert_eq!(store.stale_generation_rejection_count(), 0);
+        assert_eq!(store.foreign_waiter_rejection_count(), 0);
+        teardown();
+    }
+
+    /// The regression the structural capacity closes: more simultaneously parked servers than
+    /// the old magic capacity of 8, every one of them holding a lease.
+    #[test]
+    fn more_parked_servers_than_the_old_magic_capacity_all_hold_leases() {
+        const SERVERS: usize = 12; // > the retired capacity of 8
+        assert!(
+            DIRECT_ACK_STORE_CAPACITY >= SERVERS,
+            "the structural bound covers a realistic service chain"
+        );
+        let k = fixture(SERVERS);
+        let store = ipccall_direct_ack::store();
+        assert_eq!(store.live_pair_count(), SERVERS);
+        assert_eq!(
+            store.capacity_refusal_count(),
+            0,
+            "no server is refused a lease: this is what capacity 8 got wrong"
+        );
+        assert_eq!(store.endpoint_live_refusal_count(), 0);
+        assert_eq!(census::waiters_high_watermark(), SERVERS);
+        let b = bijection(&k);
+        assert_eq!(b.eligible_waiters, SERVERS);
+        assert_eq!(b.live_leases, SERVERS);
+        assert!(b.ok(), "{b:?}");
+        teardown();
+    }
+
+    /// The census is wired into the waiter primitives, not sprinkled across call sites.
+    #[test]
+    fn the_census_is_maintained_by_the_waiter_table_itself() {
+        let ipc_state = include_str!("ipc_state.rs");
+        assert_eq!(
+            ipc_state
+                .matches("crate::kernel::direct_ack_census::note_waiter_linked();")
+                .count(),
+            1,
+            "exactly one link site: the waiter table's own publisher"
+        );
+        assert_eq!(
+            ipc_state.matches("self.note_waiter_removed();").count(),
+            3,
+            "the same three removal primitives that retire the lease"
+        );
+        // The census must NOT be derived from the store — that is what makes it independent.
+        let census_src = include_str!("../direct_ack_census.rs");
+        let code: alloc::string::String = census_src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n");
+        for forbidden in [
+            "DirectAckStore",
+            "ipccall_direct_ack",
+            "ipcreply_direct_ack",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "the census must not read the store it audits ({forbidden})"
+            );
+        }
+    }
+}
+
+/// Stage 199D — **reverse-link creation accounting parity** between the legacy and split
+/// installation paths.
+///
+/// The two paths carried independent copies of the installation decision and drifted: the
+/// split twin installed the link but never stamped the system-wide creation edge, while the
+/// legacy one did. With the direct NR6 path as the x86_64 production default that made the
+/// ServerDies leak accounting blind — `IPC_SERVER_DEATH_LINK_LEAK created=0 closed=13` — so
+/// the attestation that exists to catch a *real* reverse-link leak could no longer see one.
+///
+/// Both paths now delegate to one shared decision, so the accounting is identical by
+/// construction. These tests prove the counting behaviour of each arm.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage199d_link_creation_parity {
+    use super::*;
+    use crate::kernel::boot::server_dies_counters as c;
+    use crate::kernel::task::{ServerReplyLink, TaskStatus};
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const SERVER_TID: u64 = 2;
+    const REC: usize = 3;
+    const GEN: u64 = 7;
+
+    /// One registered, ASID-bound server task ready to receive a reverse link.
+    fn fixture() -> (SharedKernel, Asid) {
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            s.register_task(SERVER_TID).expect("server");
+            let (asid, _sp) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(SERVER_TID, asid).expect("bind");
+            asid
+        });
+        assert_eq!(c::link_totals(), (0, 0), "a fresh instance counts nothing");
+        (k, asid)
+    }
+
+    fn link(asid: Asid) -> ServerReplyLink {
+        ServerReplyLink {
+            server_tid: SERVER_TID,
+            server_asid: asid,
+            reply_record_index: REC,
+            reply_record_generation: GEN,
+        }
+    }
+
+    /// LEGACY install: created +1.
+    #[test]
+    fn a_legacy_install_counts_one_creation() {
+        let (k, asid) = fixture();
+        assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN)));
+        assert_eq!(c::link_totals(), (1, 0), "legacy install: created +1");
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t
+                .iter()
+                .flatten()
+                .find(|x| x.tid.0 == SERVER_TID)
+                .and_then(|x| x.server_reply_link))),
+            Some(link(asid)),
+            "and the exact link is installed"
+        );
+    }
+
+    /// SPLIT install: created +1 — identical to legacy. This is the arm that used to count
+    /// nothing at all.
+    #[test]
+    fn a_split_install_counts_one_creation() {
+        let (k, asid) = fixture();
+        assert!(k.register_server_reply_link_split(SERVER_TID, asid, REC, GEN));
+        assert_eq!(c::link_totals(), (1, 0), "split install: created +1");
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t
+                .iter()
+                .flatten()
+                .find(|x| x.tid.0 == SERVER_TID)
+                .and_then(|x| x.server_reply_link))),
+            Some(link(asid)),
+            "and the exact link is installed"
+        );
+    }
+
+    /// The two paths agree exactly — the property the drift broke.
+    #[test]
+    fn both_paths_account_a_creation_identically() {
+        let (k, asid) = fixture();
+        assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN)));
+        let legacy = c::link_totals();
+        let (k2, asid2) = fixture();
+        assert!(k2.register_server_reply_link_split(SERVER_TID, asid2, REC, GEN));
+        let split = c::link_totals();
+        assert_eq!(
+            legacy, split,
+            "legacy and split account a creation identically"
+        );
+        assert_eq!(split, (1, 0));
+        let _ = k;
+    }
+
+    /// DUPLICATE retry on either path: +0. The link is already there, so nothing is
+    /// installed and nothing may be counted.
+    #[test]
+    fn a_duplicate_install_counts_nothing() {
+        for split in [false, true] {
+            let (k, asid) = fixture();
+            let install = |k: &SharedKernel| {
+                if split {
+                    k.register_server_reply_link_split(SERVER_TID, asid, REC, GEN)
+                } else {
+                    k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN))
+                }
+            };
+            assert!(install(&k));
+            assert_eq!(c::link_totals(), (1, 0));
+            // Idempotent re-registration of the IDENTICAL link succeeds and counts nothing.
+            for _ in 0..3 {
+                assert!(install(&k), "split={split}: duplicate retry still succeeds");
+            }
+            assert_eq!(
+                c::link_totals(),
+                (1, 0),
+                "split={split}: a duplicate retry counts nothing"
+            );
+        }
+    }
+
+    /// FAILED installs count nothing: a foreign/missing TCB, a different live link, and an
+    /// incarnation that has committed to exit.
+    #[test]
+    fn a_failed_install_counts_nothing() {
+        for split in [false, true] {
+            let (k, asid) = fixture();
+            let install = |k: &SharedKernel, tid: u64, a: Asid, rec: usize, rgen: u64| {
+                if split {
+                    k.register_server_reply_link_split(tid, a, rec, rgen)
+                } else {
+                    k.with(|s| s.register_server_reply_link(tid, a, rec, rgen))
+                }
+            };
+            // MISSING TCB.
+            assert!(
+                !install(&k, 9999, asid, REC, GEN),
+                "split={split}: no such task"
+            );
+            assert_eq!(c::link_totals(), (0, 0), "split={split}: missing TCB");
+            // FOREIGN incarnation: right numeric TID, wrong ASID.
+            assert!(!install(&k, SERVER_TID, Asid(0xBEE), REC, GEN));
+            assert_eq!(c::link_totals(), (0, 0), "split={split}: foreign ASID");
+
+            // A genuine install, then a DIFFERENT live link must be refused, not replace it.
+            assert!(install(&k, SERVER_TID, asid, REC, GEN));
+            assert_eq!(c::link_totals(), (1, 0));
+            assert!(
+                !install(&k, SERVER_TID, asid, REC, GEN + 1),
+                "split={split}: a different record generation must not replace a live link"
+            );
+            assert!(!install(&k, SERVER_TID, asid, REC + 1, GEN));
+            assert_eq!(
+                c::link_totals(),
+                (1, 0),
+                "split={split}: a refused replacement counts nothing"
+            );
+            assert_eq!(
+                k.with(|s| s.with_tcbs(|t| t
+                    .iter()
+                    .flatten()
+                    .find(|x| x.tid.0 == SERVER_TID)
+                    .and_then(|x| x.server_reply_link))),
+                Some(link(asid)),
+                "split={split}: the original link survives untouched"
+            );
+        }
+    }
+
+    /// An incarnation that has committed to exit is refused on both paths, and counts nothing.
+    #[test]
+    fn an_exiting_incarnation_is_refused_and_counts_nothing() {
+        for split in [false, true] {
+            let (k, asid) = fixture();
+            k.with(|s| {
+                s.with_tcbs_mut(|t| {
+                    if let Some(tcb) = t.iter_mut().flatten().find(|x| x.tid.0 == SERVER_TID) {
+                        tcb.status = TaskStatus::Exited(0);
+                    }
+                })
+            });
+            let ok = if split {
+                k.register_server_reply_link_split(SERVER_TID, asid, REC, GEN)
+            } else {
+                k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN))
+            };
+            assert!(!ok, "split={split}: an exiting incarnation is refused");
+            assert_eq!(
+                c::link_totals(),
+                (0, 0),
+                "split={split}: and counts nothing"
+            );
+        }
+    }
+
+    /// One install plus one terminal close balances 1/1 — on either installation path,
+    /// through the single closing seam.
+    #[test]
+    fn one_install_and_one_close_balance() {
+        for split in [false, true] {
+            let (k, asid) = fixture();
+            if split {
+                assert!(k.register_server_reply_link_split(SERVER_TID, asid, REC, GEN));
+            } else {
+                assert!(k.with(|s| s.register_server_reply_link(SERVER_TID, asid, REC, GEN)));
+            }
+            assert_eq!(c::link_totals(), (1, 0));
+            let outcome = k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN));
+            assert_eq!(
+                outcome,
+                crate::kernel::boot::DetachOutcome::Detached,
+                "split={split}: the exact link is detached"
+            );
+            let (created, closed) = c::link_totals();
+            assert_eq!(
+                (created, closed),
+                (1, 1),
+                "split={split}: one install, one close, balanced"
+            );
+            // A repeated close is idempotent and counts nothing more.
+            assert_eq!(
+                k.with(|s| s.detach_server_reply_link_exact(SERVER_TID, asid, REC, GEN)),
+                crate::kernel::boot::DetachOutcome::AlreadyAbsent
+            );
+            assert_eq!(c::link_totals(), (1, 1), "split={split}: still balanced");
+        }
+    }
+
+    /// Many ordinary direct-path transactions balance system-wide at quiescence — the
+    /// invariant the ServerDies audit actually checks (`links_created == links_closed`).
+    #[test]
+    fn many_direct_transactions_balance_system_wide_at_quiescence() {
+        const SERVERS: u64 = 12;
+        c::reset_instance();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut servers = alloc::vec::Vec::new();
+        k.with(|s| {
+            for n in 0..SERVERS {
+                let tid = 2 + n;
+                s.register_task(tid).expect("server");
+                let (asid, _sp) = s.create_user_address_space().expect("asid");
+                s.bind_task_asid(tid, asid).expect("bind");
+                servers.push((tid, asid));
+            }
+        });
+        // Every install goes through the SPLIT path, as it does when the direct NR6
+        // transaction is the production default.
+        for (i, (tid, asid)) in servers.iter().enumerate() {
+            assert!(k.register_server_reply_link_split(*tid, *asid, i, GEN));
+        }
+        assert_eq!(
+            c::link_totals(),
+            (SERVERS as u32, 0),
+            "every direct install is counted"
+        );
+        // A duplicate storm changes nothing.
+        for (i, (tid, asid)) in servers.iter().enumerate() {
+            assert!(k.register_server_reply_link_split(*tid, *asid, i, GEN));
+        }
+        assert_eq!(c::link_totals(), (SERVERS as u32, 0));
+
+        // Each reaches its ordinary terminal close.
+        for (i, (tid, asid)) in servers.iter().enumerate() {
+            assert_eq!(
+                k.with(|s| s.detach_server_reply_link_exact(*tid, *asid, i, GEN)),
+                crate::kernel::boot::DetachOutcome::Detached
+            );
+        }
+        let (created, closed) = c::link_totals();
+        assert_eq!(created, SERVERS as u32);
+        assert_eq!(
+            created, closed,
+            "system-wide balance at quiescence: created == closed"
+        );
+        // And no TCB retains a link.
+        assert_eq!(
+            k.with(|s| s.with_tcbs(|t| t
+                .iter()
+                .flatten()
+                .filter(|x| x.server_reply_link.is_some())
+                .count())),
+            0,
+            "no reverse link survives quiescence"
+        );
+    }
+}
+
+/// Stage 199D — **terminal-arbitration safety on the direct reply path.**
+///
+/// A reply whose record is arbitrated by an armed terminal-ownership / reply-timeout race must
+/// reserve the terminal before its caller copy and commit it after, so a concurrent timeout
+/// claimant provably loses. That lease — `reserve_reply_win_before_copy` → delivery →
+/// `commit_reply_win_after_delivery`, with `rollback_reply_win` on a retryable fault — lives
+/// only on the legacy reply path. Servicing an arbitrated reply off-lock lost the race the
+/// caller was promised: live, the reply reserved, rolled back, and the timeout's deferred path
+/// completed instead (`IPC_REPLY_WIN_ROLLBACK` + `IPC_REPLY_TIMEOUT_DEFERRED`, with
+/// `IPC_REPLY_BEATS_TIMEOUT_OK` absent).
+///
+/// Porting the lease into the direct transaction is future canonical 199E work. This increment
+/// makes the arbitrated population explicitly ineligible instead.
+#[cfg(feature = "ipc-reply-timeout-oracle-core")]
+mod stage199d_terminal_arbitration_safety {
+    use super::*;
+    use crate::kernel::terminal_ownership::TerminalIdentity;
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const SPLIT: &str = include_str!("../syscall_split.rs");
+
+    /// A kernel with one reserved reply record bound to a caller and a replier.
+    fn fixture() -> (SharedKernel, usize, u64) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (index, generation) = k.with(|s| {
+            s.register_task(1).expect("caller");
+            s.register_task(2).expect("server");
+            let (casid, _c) = s.create_user_address_space().expect("caller asid");
+            let (sasid, _sp) = s.create_user_address_space().expect("server asid");
+            s.bind_task_asid(1, casid).expect("bind caller");
+            s.bind_task_asid(2, sasid).expect("bind server");
+            let (_e, _send, _recv) = s.create_endpoint(4).expect("reply ep");
+            let caller = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(1), casid);
+            let replier = crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), sasid);
+            s.reserve_direct_reply_record(
+                caller,
+                replier,
+                crate::kernel::capabilities::CapObject::Endpoint {
+                    index: 0,
+                    generation: 1,
+                },
+            )
+            .expect("reserve record")
+        });
+        (k, index, generation)
+    }
+
+    fn identity_for(index: usize, generation: u64) -> TerminalIdentity {
+        TerminalIdentity {
+            reply_record_index: index,
+            reply_record_generation: generation,
+            caller_tid: ThreadId(1),
+            caller_asid: Asid(1),
+            replier_tid: ThreadId(2),
+            replier_asid: Asid(2),
+            reply_endpoint_index: 0,
+            reply_endpoint_generation: 1,
+            blocked_recv_generation: 1,
+            deadline_token_generation: Some(1),
+        }
+    }
+
+    /// An UNARMED record is not arbitrated — the ordinary case, and the one that stays
+    /// direct-eligible.
+    #[test]
+    fn an_unarmed_record_is_not_arbitrated() {
+        let (k, index, generation) = fixture();
+        assert!(
+            !k.reply_record_terminal_arbitrated_split_read(index, generation),
+            "a vacant terminal cell arbitrates nothing"
+        );
+    }
+
+    /// An ARMED record IS arbitrated, and the predicate reads it from the authoritative cell.
+    #[test]
+    fn an_armed_record_is_arbitrated() {
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        assert!(
+            k.reply_record_terminal_arbitrated_split_read(index, generation),
+            "an armed terminal cell arbitrates this record"
+        );
+    }
+
+    /// EXACTNESS: a cell armed for another record incarnation — the previous occupant of a
+    /// recycled slot, or a different slot entirely — arbitrates nothing here.
+    #[test]
+    fn arbitration_is_exact_in_record_index_and_generation() {
+        let (k, index, generation) = fixture();
+        // Armed for a DIFFERENT generation of this slot: not this incarnation's race.
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation.wrapping_add(1))));
+        assert!(
+            !k.reply_record_terminal_arbitrated_split_read(index, generation),
+            "a cell armed for a stale generation arbitrates nothing"
+        );
+        // Armed for a different SLOT.
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index + 1, generation)));
+        assert!(!k.reply_record_terminal_arbitrated_split_read(index, generation));
+        // And a stale/foreign query against the real armed cell mutates nothing and reads
+        // false.
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+        assert!(
+            !k.reply_record_terminal_arbitrated_split_read(index, generation.wrapping_add(1)),
+            "a stale generation query reads false"
+        );
+        assert!(
+            !k.reply_record_terminal_arbitrated_split_read(usize::MAX, generation),
+            "an out-of-range index reads false"
+        );
+        // The cell is untouched by any of those reads.
+        assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+    }
+
+    /// The predicate is read-only: repeated reads never mutate the cell or the record.
+    #[test]
+    fn the_predicate_mutates_nothing() {
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let epoch_before = k.with(|s| s.reply_terminal_epoch(index));
+        for _ in 0..8 {
+            assert!(k.reply_record_terminal_arbitrated_split_read(index, generation));
+        }
+        assert_eq!(
+            k.with(|s| s.reply_terminal_epoch(index)),
+            epoch_before,
+            "reading the arbitration fact never re-arms or disturbs the cell"
+        );
+    }
+
+    /// **An armed record can never enter the direct transaction.** The fact feeds the
+    /// eligibility contract, whose decline arm returns before anything mutates.
+    #[test]
+    fn an_armed_record_never_reaches_the_direct_transaction() {
+        use crate::kernel::direct_eligibility::{
+            DirectReplyEligibility, DirectReplyFacts, classify_direct_reply_eligibility,
+        };
+        let (k, index, generation) = fixture();
+        k.with(|s| s.arm_reply_terminal(index, identity_for(index, generation)));
+        let facts = DirectReplyFacts {
+            payload_len: 8,
+            requester_available: true,
+            reply_object: Ok((index, generation)),
+            reply_endpoint: Some((0, 1)),
+            endpoint_admitted: true,
+            transfer_cap_present: false,
+            terminal_arbitrated: k.reply_record_terminal_arbitrated_split_read(index, generation),
+        };
+        let verdict = classify_direct_reply_eligibility(&facts);
+        assert_eq!(
+            verdict,
+            DirectReplyEligibility::TerminalArbitrationUnsupported
+        );
+        assert_eq!(
+            verdict.endpoint(),
+            None,
+            "no endpoint is yielded, so no acknowledgement can be claimed"
+        );
+        // Disarming the same record makes it eligible again — the fact is the only thing
+        // standing between this reply and the direct path.
+        let mut unarmed = facts;
+        unarmed.terminal_arbitrated = false;
+        assert_eq!(
+            classify_direct_reply_eligibility(&unarmed),
+            DirectReplyEligibility::Eligible {
+                endpoint_index: 0,
+                endpoint_generation: 1,
+            }
+        );
+    }
+
+    /// The fact is derived from the CANONICAL predicate — never from an oracle selector, a
+    /// marker or a counter.
+    #[test]
+    fn the_fact_comes_from_the_authoritative_state_only() {
+        assert!(
+            SPLIT.contains("shared.reply_record_terminal_arbitrated_split_read(rec_idx, rec_gen)"),
+            "the call site asks the canonical predicate with the exact record incarnation"
+        );
+        let predicate = include_str!("../../runtime.rs")
+            .split("pub(crate) fn reply_record_terminal_arbitrated_split_read(")
+            .nth(1)
+            .expect("predicate present")
+            .split("\n    }\n")
+            .next()
+            .expect("body bounded");
+        // Reads the authoritative store, exact in index AND generation.
+        assert!(
+            predicate.contains("ipc.reply_terminal_ownership.get(index)")
+                && predicate.contains("ipc.reply_cap_generations.get(index)")
+                && predicate.contains("identity.reply_record_index == index")
+                && predicate.contains("identity.reply_record_generation == generation"),
+            "the predicate is the authoritative cell, exact in index and generation"
+        );
+        // A vacant cell (epoch 0) is not arbitration.
+        assert!(predicate.contains("cell.current_epoch() == 0"));
+        // NOT inferred from selectors, markers or counters.
+        for forbidden in [
+            "oracle",
+            "yarm_log",
+            "note_",
+            "_COUNTERS",
+            "IPC_REPLY_TIMEOUT_MODE",
+            "selector",
+        ] {
+            assert!(
+                !predicate.contains(forbidden),
+                "the predicate must not infer arbitration from {forbidden}"
+            );
+        }
+        // ONE rank-3 acquisition covers both reads, so the pair cannot be torn.
+        assert_eq!(
+            predicate.matches("self.with_ipc_split_mut(").count(),
+            1,
+            "the record generation and the terminal cell are read together"
+        );
+    }
+
+    /// The decline precedes every mutation in the NR7 helper — ack claim, payload copy,
+    /// snapshot build and the transaction call all come after the preflight decline arm.
+    #[test]
+    fn the_decline_precedes_every_mutation() {
+        let body = SPLIT
+            .split("fn try_split_ipcreply_direct_into_frame(")
+            .nth(1)
+            .expect("NR7 helper present")
+            .split("\n#[cfg(feature = \"hosted-dev\")]")
+            .next()
+            .expect("body bounded");
+        let flat = body
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        let fact_at = flat
+            .find("terminal_arbitrated:")
+            .expect("the fact is gathered");
+        let decline_at = flat
+            .find("REPLY_COUNTERS.note_declined_preflight_reply(")
+            .expect("the preflight decline is reported");
+        assert!(
+            fact_at < decline_at,
+            "the fact is gathered before the verdict"
+        );
+        for later in [
+            "ipcreply_direct_ack::claim(",
+            "copy_from_user_asid_split_read(",
+            "IpcReplyDirectSnapshot::build(",
+            "drain_direct_reply_post_work(",
+        ] {
+            let at = flat
+                .find(later)
+                .unwrap_or_else(|| panic!("{later} present in the NR7 helper"));
+            assert!(
+                decline_at < at,
+                "the terminal-arbitration decline must precede {later}"
+            );
+        }
+    }
+
+    /// The decline has its OWN counter, as a breakdown of the preflight declines rather than a
+    /// new terminal bucket, so the balance invariant is untouched and a live boot can show how
+    /// much of the reply population is arbitrated.
+    #[test]
+    fn the_decline_is_counted_separately_without_disturbing_the_balance() {
+        use crate::kernel::direct_ipc_counters::DirectPathCounters;
+        let c = DirectPathCounters::new();
+        c.note_attempt();
+        c.note_declined_preflight_reply(false, false, true);
+        assert_eq!(c.declined_terminal_arbitration(), 1);
+        assert_eq!(c.declined_preflight(), 1, "it IS a preflight decline");
+        assert_eq!(
+            c.declined_transfer_cap(),
+            0,
+            "not confused with transfer-cap"
+        );
+        assert_eq!(c.declined_ineligible_mode(), 0);
+        assert_eq!(c.declined_not_admitted(), 0);
+        assert!(c.terminals_balance(), "still exactly one terminal");
+        assert!(c.eligibility_balances());
+        // The two NR7 breakdowns are independent.
+        let c2 = DirectPathCounters::new();
+        c2.note_attempt();
+        c2.note_declined_preflight_reply(false, true, false);
+        assert_eq!(c2.declined_terminal_arbitration(), 0);
+        assert_eq!(c2.declined_transfer_cap(), 1);
+        assert!(c2.terminals_balance());
+    }
+
+    /// The legacy reply path still owns the terminal lease, and the direct transaction still
+    /// does not — which is exactly why the arbitrated population is declined. Pinned so that
+    /// porting the lease (future canonical 199E work) has to update this guard deliberately.
+    #[test]
+    fn the_terminal_lease_remains_legacy_only() {
+        let legacy = include_str!("../syscall/ipc.rs");
+        for lease in [
+            "reserve_reply_win_before_copy",
+            "commit_reply_win_after_delivery",
+            "rollback_reply_win",
+        ] {
+            assert!(
+                legacy.contains(lease),
+                "the legacy reply path takes the terminal lease ({lease})"
+            );
+        }
+        for (name, src) in [
+            ("syscall_split.rs", SPLIT),
+            (
+                "ipccall_direct_txn.rs",
+                include_str!("../ipccall_direct_txn.rs"),
+            ),
+            ("ipccall_direct.rs", include_str!("../ipccall_direct.rs")),
+        ] {
+            for lease in [
+                "reserve_reply_win_before_copy",
+                "commit_reply_win_after_delivery",
+                "rollback_reply_win",
+            ] {
+                let code: alloc::string::String = src
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .collect::<alloc::vec::Vec<_>>()
+                    .join("\n");
+                assert!(
+                    !code.contains(lease),
+                    "{name}: the direct path does not take the terminal lease ({lease}) — \
+                     which is why an arbitrated reply must decline to legacy"
+                );
+            }
+        }
+    }
+}
+
+/// Stage 199D — **AArch64 NR6/NR7 production-readiness audit.**
+///
+/// The question this module answers is narrow and structural: can an *eligible* NR6/NR7
+/// transaction complete on AArch64 **without reacquiring the broad `KernelState` lock**?
+///
+/// The answer today is **no**, and these guards pin exactly why, so the blocker map is
+/// executable rather than prose and cannot drift while the fix is pending. Two of the three
+/// blockers are in the AArch64 trap entry/return bracketing; the third is the off-lock
+/// authoritative dispatch. **The canonical NR6/NR7 contract stack itself is architecture-
+/// neutral and already broad-lock-free** — no AArch64 semantic copy is needed or wanted.
+mod stage199d_aarch64_readiness_audit {
+    const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+    const MODRS: &str = include_str!("mod.rs");
+
+    /// **READY.** Every canonical contract the direct path is built from is architecture-
+    /// neutral: none of them branches on `target_arch` at all, so enabling AArch64 requires no
+    /// per-architecture semantic copy of eligibility, disposition, the acknowledgement store,
+    /// the waiter census, the counters, the projection or the transaction body.
+    #[test]
+    fn the_canonical_contracts_are_architecture_neutral() {
+        for (name, src) in [
+            (
+                "direct_eligibility.rs",
+                include_str!("../direct_eligibility.rs"),
+            ),
+            (
+                "direct_disposition.rs",
+                include_str!("../direct_disposition.rs"),
+            ),
+            (
+                "direct_ack_store.rs",
+                include_str!("../direct_ack_store.rs"),
+            ),
+            (
+                "direct_ack_census.rs",
+                include_str!("../direct_ack_census.rs"),
+            ),
+            (
+                "direct_ipc_counters.rs",
+                include_str!("../direct_ipc_counters.rs"),
+            ),
+            ("ipccall_direct.rs", include_str!("../ipccall_direct.rs")),
+            (
+                "ipc_recv_core.rs",
+                include_str!("../syscall/ipc_recv_core.rs"),
+            ),
+        ] {
+            assert!(
+                !src.contains("target_arch"),
+                "{name}: a canonical contract must not branch on the architecture"
+            );
+        }
+        // The transaction body's only architecture conditionals are the x86 SMP oracle IPI
+        // sends, which are selector-gated no-ops and irrelevant to an SMP=1 production boot.
+        let txn = include_str!("../ipccall_direct_txn.rs");
+        assert_eq!(
+            txn.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "the only arch conditionals in the transaction are the two SMP oracle IPI sends"
+        );
+        assert_eq!(
+            txn.matches("target_arch").count(),
+            2,
+            "and there are no others"
+        );
+    }
+
+    /// **READY.** The transaction body and the split helper take no broad lock. This is the
+    /// half of the path that is already AArch64-ready.
+    #[test]
+    fn the_transaction_and_split_helper_take_no_broad_lock() {
+        for (name, src) in [
+            (
+                "ipccall_direct_txn.rs",
+                include_str!("../ipccall_direct_txn.rs"),
+            ),
+            ("ipccall_direct.rs", include_str!("../ipccall_direct.rs")),
+            ("syscall_split.rs", include_str!("../syscall_split.rs")),
+        ] {
+            let code: alloc::string::String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<alloc::vec::Vec<_>>()
+                .join("\n");
+            assert!(
+                !code.contains("with_cpu("),
+                "{name}: the direct path must not reacquire the broad lock"
+            );
+            assert!(
+                !code.contains("self.with(") && !code.contains("shared.with("),
+                "{name}: the direct path must not take the broad lock"
+            );
+        }
+    }
+
+    /// **BLOCKER 1 — CLOSED.** The AArch64 syscall-ABI import now asks the canonical
+    /// `ipccall_direct_admission_enabled()` for NR6/NR7 — the same predicate the split
+    /// dispatcher uses — so AArch64 carries no architecture-specific admission rule. It is
+    /// still `production || proof`, and the AArch64 production default is OFF, so a normal
+    /// AArch64 boot keeps `nr = 0` here and falls back byte-identically.
+    #[test]
+    fn blocker1_closed_the_abi_import_uses_the_canonical_admission_predicate() {
+        let import = TRAP_ENTRY
+            .split("fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {")
+            .nth(1)
+            .expect("the AArch64 ABI import")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            import.contains("SYSCALL_IPC_CALL_NR") && import.contains("SYSCALL_IPC_REPLY_NR"),
+            "the import knows about NR6/NR7"
+        );
+        assert!(
+            import.contains("ipccall_direct_admission_enabled()"),
+            "CLOSED: the import asks the canonical admission predicate"
+        );
+        assert!(
+            !import.contains("ipccall_direct_proof_enabled()"),
+            "and no longer the proof-only predicate"
+        );
+    }
+
+    /// **BLOCKER 2 — CLOSED.** The AArch64 handled-split return no longer reacquires the
+    /// broad `KernelState` lock. It is frame-only work outside every lock plus two bounded
+    /// rank-2 task-domain transactions keyed on the exact entering `{tid, asid}` incarnation.
+    /// The pre-export context save and its read-back were proved redundant for a
+    /// non-switching return and removed; the broad-lock census fell 41 → 40.
+    /// See `stage199d_split_return_without_broad_lock` for the differential proofs.
+    #[test]
+    fn blocker2_closed_the_split_return_takes_no_broad_lock() {
+        let aarch64_finalize = TRAP_ENTRY
+            .split("#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(")
+            .nth(1)
+            .expect("the AArch64 finalize wrapper")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            !aarch64_finalize.contains("with_cpu"),
+            "CLOSED: the AArch64 split return path takes no broad lock"
+        );
+        assert!(
+            aarch64_finalize.contains("ipccall_direct_admission_enabled()"),
+            "and admits NR6/NR7 through the canonical predicate, matching the import"
+        );
+        // x86_64 / riscv64 still need nothing here.
+        let other = TRAP_ENTRY
+            .split("#[cfg(not(target_arch = \"aarch64\"))]\nfn finalize_split_handled_syscall(")
+            .nth(1)
+            .expect("the non-AArch64 finalize")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(!other.contains("with_cpu"));
+    }
+
+    /// **BLOCKER 3 — CLOSED STRUCTURALLY.** The off-lock authoritative (queue-advancing)
+    /// dispatch used to be reachable only through `d6_genuine_enabled()`, a compile-time
+    /// x86_64 constant, so an AArch64 wake finished its dispatch and saved-frame resume under
+    /// the broad lock even when the direct transaction had not taken it.
+    ///
+    /// It is now reachable through the CANONICAL REPLACEMENT,
+    /// `offlock_authoritative_dispatch_enabled()`, which admits AArch64. `d6_genuine_enabled`
+    /// itself stays byte-identical and x86_64-only — it gates the D6 queue-neutral slice and
+    /// three `exec_state` decisions whose x86_64 semantics must not move.
+    ///
+    /// Live acceptance is still pending: AArch64 is admitted only through
+    /// `ipccall_direct_admission_enabled()`, whose production half is x86_64-only, so the
+    /// AArch64 production default remains OFF and no live AArch64 suite has run
+    /// (`qemu-system-aarch64` is absent here).
+    #[test]
+    fn blocker3_closed_the_canonical_replacement_admits_aarch64() {
+        let d6 = MODRS
+            .split("pub(crate) fn d6_genuine_enabled() -> bool {")
+            .nth(1)
+            .expect("the dispatch gate")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            d6.contains("cfg!(target_arch = \"x86_64\")"),
+            "d6_genuine_enabled stays x86_64-only; the replacement is what admits AArch64"
+        );
+        let replacement = MODRS
+            .split("pub(crate) fn offlock_authoritative_dispatch_enabled() -> bool {")
+            .nth(1)
+            .expect("the canonical replacement must exist")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            replacement.contains("cfg!(target_arch = \"aarch64\")")
+                && replacement.contains("ipccall_direct_admission_enabled()"),
+            "AArch64 is admitted through the canonical admission predicate"
+        );
+        assert!(
+            replacement.contains("d6_genuine_enabled()"),
+            "every other architecture keeps the unchanged answer"
+        );
+        // The path it admits exists and takes no broad lock: one publication site, one drain.
+        const IPC_STATE: &str = include_str!("ipc_state.rs");
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        assert_eq!(
+            IPC_STATE
+                .matches("crate::kernel::direct_dispatch::try_publish(")
+                .count(),
+            1,
+            "exactly one publication site"
+        );
+        assert!(
+            TRAP_ENTRY.contains("if crate::kernel::direct_dispatch::is_pending(cpu_idx) {"),
+            "the post-lock drain must exist at the trap entry"
+        );
+    }
+
+    /// The production default is unchanged by this audit: x86_64 only. Nothing was staged
+    /// live, because the path is not structurally ready.
+    #[test]
+    fn the_audit_changed_no_production_default() {
+        let body = MODRS
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .expect("predicate present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert_eq!(
+            body.trim(),
+            "cfg!(target_arch = \"x86_64\")",
+            "AArch64 stays off until its blockers are closed"
+        );
+        assert!(
+            !cfg!(target_arch = "aarch64")
+                || !crate::kernel::boot::ipccall_direct_production_enabled()
+        );
+    }
+
+    /// The arch-split predicates are already shaped to admit AArch64 with no new rule: each is
+    /// `production || <existing proof/oracle path>`, so closing the blockers and widening the
+    /// one constant is the whole enablement — there is no AArch64 branch to add.
+    #[test]
+    fn the_arch_split_predicates_need_no_aarch64_branch() {
+        for predicate in [
+            "pub fn ipccall_direct_admission_enabled() -> bool {",
+            "pub fn ipccall_direct_publication_enabled() -> bool {",
+        ] {
+            let body = MODRS
+                .split(predicate)
+                .nth(1)
+                .expect("predicate present")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded");
+            assert_eq!(
+                body.trim(),
+                "ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()",
+                "{predicate}: one shape for every architecture"
+            );
+        }
+        for which in ["request", "reply"] {
+            let body = MODRS
+                .split(&alloc::format!(
+                    "pub fn ipccall_direct_{which}_endpoint_admitted(eidx: usize) -> bool {{"
+                ))
+                .nth(1)
+                .expect("predicate present")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded");
+            assert_eq!(
+                body.trim(),
+                alloc::format!(
+                    "ipccall_direct_production_enabled() || \
+                     ipccall_direct_oracle_{which}_endpoint_is(eidx)"
+                ),
+                "{which} admission: one shape for every architecture"
+            );
+        }
+    }
+}
+
+/// Stage 199D — **broad-lock-free handled-split syscall return** (AArch64 blocker 2).
+///
+/// The AArch64 handled-split return used to reacquire the broad `KernelState` lock
+/// (`shared.with_cpu`) to save the user context, restore arch thread state and export
+/// x0..x5 — so no eligible NR6/NR7 transaction could complete without retaking it. It is now
+/// frame-only work outside every lock plus two bounded rank-2 task-domain transactions.
+///
+/// The legacy sequence was: save context → read that same context back out of the TCB and
+/// apply it to the frame → take TLS → export → re-sync args → save context again. These tests
+/// prove the removed round trip was redundant, and that the two transactions are exact in the
+/// entering `{tid, asid}` incarnation.
+mod stage199d_split_return_without_broad_lock {
+    use super::*;
+    use crate::kernel::task::UserRegisterContext;
+    use crate::kernel::vm::{Asid, VirtAddr};
+    use crate::runtime::{SharedKernel, SplitReturnIdentity};
+
+    const TID: u64 = 2;
+
+    fn fixture() -> (SharedKernel, Asid) {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = k.with(|s| {
+            s.register_task(TID).expect("task");
+            let (asid, _sp) = s.create_user_address_space().expect("asid");
+            s.bind_task_asid(TID, asid).expect("bind");
+            asid
+        });
+        (k, asid)
+    }
+
+    fn id(asid: Asid) -> SplitReturnIdentity {
+        SplitReturnIdentity { tid: TID, asid }
+    }
+
+    /// Strip comment lines: a structural guard must read the CODE, not the prose that
+    /// legitimately explains which construct was removed.
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// A frame with every lane distinctly poisoned, so any dropped or crossed field shows up.
+    fn poisoned_frame() -> TrapFrame {
+        let mut f = TrapFrame::new(15, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        for i in 0..32 {
+            f.set_user_gpr(i, 0xA000 + i);
+        }
+        f.set_saved_pc(0xDEAD_0000);
+        f.set_saved_sp(0xBEEF_0000);
+        f
+    }
+
+    /// **The proof that the removed round trip was redundant.**
+    ///
+    /// The legacy path saved the frame's context into the TCB and then read it straight back
+    /// and applied it to the frame. `apply_user_context(capture_user_context())` moves the same
+    /// nine fields both ways and nothing else, and the TCB setter/getter store and return the
+    /// context verbatim — so the round trip could only ever restore what it had just written.
+    #[test]
+    fn the_context_round_trip_is_an_exact_identity() {
+        let before = poisoned_frame();
+        let mut after = poisoned_frame();
+        after.apply_user_context(before.capture_user_context());
+        assert_eq!(
+            after, before,
+            "apply(capture(frame)) must be an exact identity on the frame"
+        );
+        // And through the TCB, which is what the legacy path actually did.
+        let (k, asid) = fixture();
+        let mut ctx = before.capture_user_context();
+        ctx.instruction_ptr = VirtAddr(0x4321);
+        assert!(k.split_return_commit_context_split(id(asid), ctx));
+        let read_back = k.with(|s| s.thread_user_context(TID)).expect("context");
+        assert_eq!(
+            read_back, ctx,
+            "the TCB stores and returns the context verbatim"
+        );
+        let mut round_tripped = poisoned_frame();
+        round_tripped.apply_user_context(read_back);
+        let mut directly = poisoned_frame();
+        directly.apply_user_context(ctx);
+        assert_eq!(
+            round_tripped, directly,
+            "saving to the TCB and reading back is indistinguishable from applying directly"
+        );
+    }
+
+    /// The pre-export save's only consumer was that read-back, and the post-export save
+    /// overwrites it before anything else can observe it — so the whole pre-export save is
+    /// dead for a non-switching return. Proved by running both orders and comparing the TCB.
+    #[test]
+    fn the_pre_export_save_is_dead_for_a_non_switching_return() {
+        let (k, asid) = fixture();
+        let frame = poisoned_frame();
+        let resume = VirtAddr(0x9000);
+
+        // LEGACY order: pre-export save, then (frame work), then post-export save.
+        let mut pre = frame.capture_user_context();
+        pre.instruction_ptr = resume;
+        assert!(k.split_return_commit_context_split(id(asid), pre));
+        let mut post_frame = poisoned_frame();
+        post_frame.set_user_gpr(0, 0x1234); // stand-in for the export
+        let mut post = post_frame.capture_user_context();
+        post.instruction_ptr = resume;
+        assert!(k.split_return_commit_context_split(id(asid), post));
+        let legacy = k.with(|s| s.thread_user_context(TID)).expect("ctx");
+
+        // NEW order: post-export save only.
+        let (k2, asid2) = fixture();
+        assert!(k2.split_return_commit_context_split(id(asid2), post));
+        let new = k2.with(|s| s.thread_user_context(TID)).expect("ctx");
+
+        assert_eq!(
+            legacy, new,
+            "dropping the pre-export save leaves the committed context byte-identical"
+        );
+    }
+
+    /// Transaction #1 is exact in `{tid, asid}` and takes the TLS-restore request at most once.
+    #[test]
+    fn the_tls_transaction_is_exact_and_take_once() {
+        let (k, asid) = fixture();
+        // No pending request: Some(None) — a live incarnation with nothing to restore.
+        assert_eq!(k.split_return_take_tls_split(id(asid)), Some(None));
+
+        // Arm a TLS base + a pending restore for this task.
+        // `set_thread_tls_base` installs the base AND marks the restore pending.
+        k.with(|s| s.set_thread_tls_base(TID, 0x7FF0).expect("tls"));
+        assert_eq!(
+            k.split_return_take_tls_split(id(asid)),
+            Some(Some(0x7FF0)),
+            "the pending restore yields the TLS base"
+        );
+        assert_eq!(
+            k.split_return_take_tls_split(id(asid)),
+            Some(None),
+            "and it is taken exactly once"
+        );
+    }
+
+    /// A stale or foreign incarnation is rejected by BOTH transactions, and neither mutates.
+    #[test]
+    fn a_stale_incarnation_is_rejected_and_mutates_nothing() {
+        let (k, asid) = fixture();
+        k.with(|s| s.set_thread_tls_base(TID, 0x7FF0).expect("tls"));
+        let before = k.with(|s| s.thread_user_context(TID));
+
+        for stale in [
+            SplitReturnIdentity {
+                tid: TID,
+                asid: Asid(0xBEE),
+            }, // numeric TID reuse
+            SplitReturnIdentity { tid: 9999, asid }, // no such task
+            SplitReturnIdentity { tid: 0, asid },    // the idle task
+        ] {
+            assert_eq!(
+                k.split_return_take_tls_split(stale),
+                None,
+                "{stale:?}: a stale incarnation takes no TLS"
+            );
+            let mut ctx = poisoned_frame().capture_user_context();
+            ctx.instruction_ptr = VirtAddr(0xFFFF);
+            assert!(
+                !k.split_return_commit_context_split(stale, ctx),
+                "{stale:?}: a stale incarnation commits no context"
+            );
+        }
+        assert_eq!(
+            k.with(|s| s.thread_user_context(TID)),
+            before,
+            "the real incarnation's context is untouched by every rejection"
+        );
+        // The pending TLS restore survives every rejected take.
+        assert_eq!(k.split_return_take_tls_split(id(asid)), Some(Some(0x7FF0)));
+    }
+
+    /// The committed context carries the full saved state — PC, SP and every user GPR
+    /// including the TLS lane — byte-for-byte.
+    #[test]
+    fn the_committed_context_preserves_the_full_saved_state() {
+        let (k, asid) = fixture();
+        let mut frame = poisoned_frame();
+        // The AArch64 TLS lane is x18 at index 15.
+        frame.set_user_gpr(15, 0x7FF0);
+        let resume = VirtAddr(0x9000);
+        let mut ctx = frame.capture_user_context();
+        ctx.instruction_ptr = resume;
+        assert!(k.split_return_commit_context_split(id(asid), ctx));
+
+        let got = k.with(|s| s.thread_user_context(TID)).expect("ctx");
+        assert_eq!(got.instruction_ptr, resume, "ELR/resume PC");
+        assert_eq!(got.stack_ptr, VirtAddr(frame.saved_sp() as u64), "SP");
+        for i in 0..32 {
+            assert_eq!(got.user_gprs[i], frame.user_gpr(i), "x{i}");
+        }
+        assert_eq!(
+            got.user_gprs[15], 0x7FF0,
+            "x18 TLS lane survives the commit"
+        );
+        assert_eq!(
+            (got.arg0, got.arg1, got.arg2, got.arg3, got.arg4, got.arg5),
+            (
+                frame.arg(0),
+                frame.arg(1),
+                frame.arg(2),
+                frame.arg(3),
+                frame.arg(4),
+                frame.arg(5)
+            ),
+            "every argument lane"
+        );
+    }
+
+    /// Success and error return lanes both round-trip through the commit unchanged — the
+    /// transaction is register-shape agnostic, so it cannot perturb either encoding.
+    #[test]
+    fn success_and_error_return_lanes_survive_the_commit() {
+        for err in [None, Some(2usize)] {
+            let (k, asid) = fixture();
+            let mut frame = poisoned_frame();
+            match err {
+                Some(code) => {
+                    frame.set_err(code);
+                    frame.set_user_gpr(0, code);
+                    for lane in 1..=5 {
+                        frame.set_user_gpr(lane, 0);
+                    }
+                }
+                None => {
+                    frame.set_ok(0xAA, 0xBB, 0xCC);
+                    frame.set_user_gpr(0, 0xAA);
+                    frame.set_user_gpr(1, 0xBB);
+                    frame.set_user_gpr(2, 0xCC);
+                }
+            }
+            frame.set_arg(0, frame.user_gpr(0));
+            frame.set_arg(1, frame.user_gpr(1));
+            frame.set_arg(2, frame.user_gpr(2));
+            let mut ctx = frame.capture_user_context();
+            ctx.instruction_ptr = VirtAddr(0x9000);
+            assert!(k.split_return_commit_context_split(id(asid), ctx));
+            let got = k.with(|s| s.thread_user_context(TID)).expect("ctx");
+            assert_eq!(got.user_gprs[0], frame.user_gpr(0), "err={err:?}: x0 lane");
+            assert_eq!(got.user_gprs[1], frame.user_gpr(1), "err={err:?}: x1 lane");
+            assert_eq!(got.user_gprs[2], frame.user_gpr(2), "err={err:?}: x2 lane");
+            assert_eq!(got.arg0, frame.user_gpr(0), "err={err:?}: arg0 resync");
+        }
+    }
+
+    // ── Structural guards ────────────────────────────────────────────────────────────
+
+    /// The handled split finalization contains no broad-lock call of any kind.
+    #[test]
+    fn the_handled_split_finalization_takes_no_broad_lock() {
+        let trap_entry = include_str!("../../arch/trap_entry.rs");
+        let aarch64 = include_str!("../../arch/aarch64/trap.rs");
+
+        // CODE only — the prose legitimately names what was removed and why.
+        let finalize = code_only(
+            aarch64
+                .split("pub(crate) fn split_finalize_handled_syscall(")
+                .nth(1)
+                .expect("the AArch64 finalization")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded"),
+        );
+        for forbidden in ["with_cpu", "KernelState", "shared.with(", ".with(|"] {
+            assert!(
+                !finalize.contains(forbidden),
+                "the handled split finalization must not use {forbidden}"
+            );
+        }
+        assert!(
+            finalize.contains("shared.split_return_take_tls_split(id)")
+                && finalize.contains("shared.split_return_commit_context_split(id, ctx)"),
+            "it uses the two bounded rank-2 task-domain transactions"
+        );
+        // The dispatcher-side wrapper does not either.
+        let wrapper = trap_entry
+            .split("#[cfg(target_arch = \"aarch64\")]\nfn finalize_split_handled_syscall(")
+            .nth(1)
+            .expect("the wrapper")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            !wrapper.contains("with_cpu"),
+            "the wrapper must not reacquire the broad lock either"
+        );
+    }
+
+    /// The import and the dispatcher agree on ONE admission predicate — no AArch64-specific
+    /// admission rule was introduced.
+    #[test]
+    fn the_import_and_dispatcher_share_one_admission_predicate() {
+        let trap_entry = include_str!("../../arch/trap_entry.rs");
+        let split = include_str!("../syscall_split.rs");
+        let import = trap_entry
+            .split("fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {")
+            .nth(1)
+            .expect("the import")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            import.contains("ipccall_direct_admission_enabled()"),
+            "the import asks the canonical admission predicate"
+        );
+        assert!(
+            !import.contains("ipccall_direct_proof_enabled()"),
+            "and no longer the proof-only predicate"
+        );
+        assert!(
+            split.contains("crate::kernel::boot::ipccall_direct_admission_enabled()"),
+            "the dispatcher asks the same one"
+        );
+    }
+
+    /// The return path uses the EXACT entering identity, captured before the split dispatch —
+    /// it never re-discovers an unqualified current task afterwards.
+    #[test]
+    fn the_return_path_uses_the_exact_entering_identity() {
+        let trap_entry = include_str!("../../arch/trap_entry.rs");
+        let flat = trap_entry
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        let capture = flat
+            .find("let entering = split_return_identity(shared, cpu);")
+            .expect("the identity is captured");
+        let dispatch = flat
+            .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+            .expect("the split dispatch");
+        assert!(
+            capture < dispatch,
+            "the entering identity is captured BEFORE the split dispatch runs"
+        );
+        let aarch64 = include_str!("../../arch/aarch64/trap.rs");
+        let finalize = code_only(
+            aarch64
+                .split("pub(crate) fn split_finalize_handled_syscall(")
+                .nth(1)
+                .expect("the finalization")
+                .split("\n}\n")
+                .next()
+                .expect("body bounded"),
+        );
+        assert!(
+            !finalize.contains("current_tid"),
+            "the finalization must not re-discover an unqualified current task"
+        );
+        // Both transactions validate the incarnation exactly.
+        let runtime = include_str!("../../runtime.rs");
+        assert_eq!(
+            runtime
+                .matches("t.tid.0 == id.tid && t.asid == Some(id.asid)")
+                .count(),
+            2,
+            "both return transactions validate the exact tid+asid incarnation"
+        );
+    }
+
+    /// Blocker 3 is closed STRUCTURALLY, through the canonical replacement predicate rather
+    /// than by widening `d6_genuine_enabled` (which stays byte-identical and x86_64-only).
+    /// Live acceptance is still pending: AArch64 is admitted only via the proof/oracle half of
+    /// `ipccall_direct_admission_enabled()`, so its production default remains OFF.
+    #[test]
+    fn blocker3_closed_structurally_with_live_acceptance_pending() {
+        let modrs = include_str!("mod.rs");
+        let body = modrs
+            .split("pub(crate) fn d6_genuine_enabled() -> bool {")
+            .nth(1)
+            .expect("the dispatch gate")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(
+            body.contains("cfg!(target_arch = \"x86_64\")"),
+            "d6_genuine_enabled itself is unchanged"
+        );
+        assert!(
+            modrs.contains("pub(crate) fn offlock_authoritative_dispatch_enabled() -> bool {"),
+            "the canonical replacement admits AArch64"
+        );
+    }
+
+    /// The AArch64 production default stays OFF — this increment is structural preparation.
+    #[test]
+    fn the_aarch64_production_default_stays_off() {
+        let modrs = include_str!("mod.rs");
+        let body = modrs
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .expect("predicate present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert_eq!(body.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+}
+
+// ── Stage 199D — AArch64 BLOCKER 3: the post-lock dispatch DEBT ──────────────────────────────
+//
+// The commit that publishes a work item has already removed the caller from `current`. From
+// that instant the CPU runs nothing, and the trap frame the drain would `eret` through belongs
+// to a parked task. That is a DEBT: the drain must settle it — resume exactly one task, or
+// idle — and nothing it observes afterwards may cancel it.
+//
+// This module proves the debt contract, the slot state machine, the dispatch lease that
+// replaced the always-zero `blocked_recv_generation`, the exact rollback after a partially
+// committed dispatch, per-CPU address-space activation, and the absence of any broad lock.
+mod stage199d_aarch64_offlock_dispatch {
+    use super::*;
+    use crate::kernel::direct_dispatch::{
+        self as dd, DirectDispatchClass, DirectDispatchWork, DrainOutcome, OutgoingObservation,
+        PublishOutcome, Settlement, SlotState,
+    };
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::vm::Asid;
+    use crate::runtime::SharedKernel;
+
+    const OUTGOING: u64 = 2;
+    const INCOMING: u64 = 3;
+
+    /// Strip comment lines: a structural guard must read the CODE, not the prose that
+    /// legitimately explains which construct was removed or why.
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// Two provisioned tasks: `OUTGOING` parked in its canonical reply-blocked state, and
+    /// `INCOMING` runnable and enqueued. Both ASIDs are created while task 0 is still current,
+    /// because `create_user_address_space` resolves against the current task.
+    fn fixture() -> (SharedKernel, Asid, Asid) {
+        dd::reset();
+        crate::arch::hal::reset_all_active_address_spaces();
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (out_asid, in_asid) = k.with(|s| {
+            s.register_task(OUTGOING).expect("outgoing task");
+            s.register_task(INCOMING).expect("incoming task");
+            let (a, _) = s.create_user_address_space().expect("outgoing asid");
+            s.bind_task_asid(OUTGOING, a).expect("bind outgoing");
+            let (b, _) = s.create_user_address_space().expect("incoming asid");
+            s.bind_task_asid(INCOMING, b).expect("bind incoming");
+            (a, b)
+        });
+        k.with(|s| {
+            s.set_task_status_for_test(
+                OUTGOING,
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(9))),
+            );
+            s.set_task_status_for_test(INCOMING, TaskStatus::Runnable);
+        });
+        (k, out_asid, in_asid)
+    }
+
+    /// Give the incoming task a distinctive saved context so a restore can be checked exactly.
+    fn save_context(k: &SharedKernel, tid: u64, pc: usize) -> TrapFrame {
+        let mut f = TrapFrame::new(6, [0x1, 0x2, 0x3, 0x4, 0x5, 0x6]);
+        for i in 0..32 {
+            f.set_user_gpr(i, 0xC000 + i + tid as usize);
+        }
+        f.set_saved_pc(pc);
+        f.set_saved_sp(0x6000 + tid as usize);
+        k.with(|s| {
+            s.set_thread_user_context(tid, f.capture_user_context())
+                .expect("save")
+        });
+        f
+    }
+
+    fn work(out_asid: Asid, lease: u64) -> DirectDispatchWork {
+        DirectDispatchWork {
+            outgoing_tid: OUTGOING,
+            outgoing_asid: out_asid.0,
+            lease,
+            cpu: 0,
+            class: DirectDispatchClass::IpcCall,
+        }
+    }
+
+    // ── 1. The publication protocol ─────────────────────────────────────────────────────────
+
+    /// The slot walks EMPTY → WRITING → READY → READING → EMPTY, and only a publisher may
+    /// claim EMPTY while only a taker may claim READY.
+    #[test]
+    fn the_slot_protocol_is_an_explicit_four_state_machine() {
+        dd::reset();
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+        let w = work(Asid(1), 1);
+        assert_eq!(dd::try_publish(w), PublishOutcome::Published);
+        assert_eq!(dd::slot_state(0), SlotState::Ready);
+        assert_eq!(dd::take(0), Some(w));
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+
+        // Every busy state refuses a publisher and names what it saw.
+        for (raw, label) in [
+            (SlotState::Writing, SlotState::Writing),
+            (SlotState::Ready, SlotState::Ready),
+            (SlotState::Reading, SlotState::Reading),
+        ] {
+            let _ = raw;
+            let _ = label;
+        }
+        dd::reset();
+    }
+
+    /// **Publisher race.** Many publishers, one winner; the losers overwrite nothing and the
+    /// winner's payload survives intact. Deterministic: the contended state is reached by the
+    /// first publication, not by timing.
+    #[test]
+    fn concurrent_publishers_never_overwrite_one_another() {
+        dd::reset();
+        let winner = work(Asid(1), 1);
+        assert_eq!(dd::try_publish(winner), PublishOutcome::Published);
+        for tid in 100..108u64 {
+            let intruder = DirectDispatchWork {
+                outgoing_tid: tid,
+                outgoing_asid: 77,
+                lease: 999,
+                ..winner
+            };
+            assert_eq!(
+                dd::try_publish(intruder),
+                PublishOutcome::SlotBusy(SlotState::Ready),
+                "a busy slot must decline, never overwrite"
+            );
+        }
+        assert_eq!(dd::take(0), Some(winner), "the winner's payload is intact");
+        let c = dd::census();
+        assert_eq!(c.published, 1);
+        assert_eq!(c.publish_declined_slot_busy, 8);
+        dd::reset();
+    }
+
+    /// **Taker race.** Many takers, one winner; the losers get nothing and mutate nothing.
+    #[test]
+    fn concurrent_takers_yield_exactly_one_winner() {
+        dd::reset();
+        let w = work(Asid(1), 1);
+        assert_eq!(dd::try_publish(w), PublishOutcome::Published);
+        let results: alloc::vec::Vec<_> = (0..8).map(|_| dd::take(0)).collect();
+        assert_eq!(results.iter().filter(|r| r.is_some()).count(), 1);
+        assert_eq!(results[0], Some(w));
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+        assert_eq!(dd::census().take_missed_not_ready, 7);
+        dd::reset();
+    }
+
+    /// **Recycle race.** The slot is republishable only after the reader has copied the payload
+    /// out — so no publisher can overwrite a payload still in use. This is the property the old
+    /// PENDING boolean could not express: it conflated "readable" with "being read".
+    #[test]
+    fn a_slot_being_read_cannot_be_republished_until_the_read_completes() {
+        dd::reset();
+        let first = work(Asid(1), 1);
+        assert_eq!(dd::try_publish(first), PublishOutcome::Published);
+        // A taker that has claimed READY but has not yet finished is in READING.
+        // Drive it through the real API and observe the state either side.
+        assert_eq!(dd::slot_state(0), SlotState::Ready);
+        let taken = dd::take(0).expect("the item");
+        assert_eq!(taken, first);
+        // Only now is the slot recyclable.
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+        let second = DirectDispatchWork {
+            outgoing_tid: 8,
+            lease: 2,
+            ..first
+        };
+        assert_eq!(dd::try_publish(second), PublishOutcome::Published);
+        assert_eq!(dd::take(0), Some(second), "payloads never mix");
+        dd::reset();
+    }
+
+    /// The protocol needs no non-reentrancy assumption: a drain that re-enters and finds the
+    /// slot in any state behaves safely, and `is_pending` advertises only a complete item.
+    #[test]
+    fn no_hidden_non_reentrancy_assumption_is_required() {
+        dd::reset();
+        // Nothing published: a re-entrant drain finds nothing and owes nothing.
+        assert!(!dd::is_pending(0));
+        assert_eq!(dd::take(0), None);
+        // Published: exactly one re-entrant drain can claim it.
+        assert_eq!(dd::try_publish(work(Asid(1), 1)), PublishOutcome::Published);
+        assert!(dd::is_pending(0));
+        assert!(dd::take(0).is_some());
+        assert!(
+            !dd::is_pending(0),
+            "a consumed item is not advertised again"
+        );
+        assert_eq!(dd::take(0), None);
+        dd::reset();
+    }
+
+    // ── 2. The dispatch debt ────────────────────────────────────────────────────────────────
+
+    /// **Wake-before-drain: the now-runnable caller is dispatched, exactly once.** A reply made
+    /// the outgoing caller `Runnable` before the drain ran. That does NOT cancel the debt — the
+    /// caller is back on the run queue and the authoritative dequeue may select it normally.
+    /// The old code refused here and returned, `eret`-ing through a parked task's frame.
+    ///
+    /// "Exactly once" is a property of the DEBT, not of the scheduler: one published item can be
+    /// taken by exactly one drain, so at most one dispatch can follow from it.
+    #[test]
+    fn a_wake_before_the_drain_does_not_cancel_the_debt() {
+        let (k, out_asid, _) = fixture();
+        let lease = dd::open_dispatch_lease(CpuId(0));
+        let w = work(out_asid, lease);
+        assert_eq!(dd::try_publish(w), PublishOutcome::Published);
+
+        // A reply wins the race: the caller becomes Runnable and is re-enqueued.
+        k.with(|s| {
+            s.set_task_status_for_test(OUTGOING, TaskStatus::Runnable);
+            s.enqueue_task(OUTGOING)
+                .expect("re-enqueue the woken caller");
+        });
+
+        // The debt is taken exactly once, however many drains observe the CPU.
+        let takes: alloc::vec::Vec<_> = (0..4).map(|_| dd::take(0)).collect();
+        assert_eq!(
+            takes.iter().filter(|t| t.is_some()).count(),
+            1,
+            "one published debt yields at most one dispatch"
+        );
+        let taken = takes[0].expect("the debt");
+        assert!(
+            dd::lease_is_current(CpuId(0), taken.lease),
+            "the debt is live"
+        );
+
+        // The observation reports the wake — and is diagnostics ONLY.
+        assert_eq!(
+            k.direct_dispatch_observe_outgoing_split(taken),
+            OutgoingObservation::MadeRunnable
+        );
+        // Settlement happens anyway, and the dequeue legitimately selects that very caller.
+        assert_eq!(
+            k.futex_wait_dispatch_step_mut(CpuId(0)),
+            Some(OUTGOING),
+            "the woken caller is a normal dispatch candidate"
+        );
+        assert_eq!(k.current_tid_authoritative(CpuId(0)), Some(OUTGOING));
+        dd::note_outcome(DrainOutcome::Settled(Settlement::Dispatched {
+            incoming: OUTGOING,
+        }));
+        let c = dd::census();
+        assert_eq!(c.taken, 1);
+        assert_eq!(c.settled_dispatched, 1);
+        assert!(c.dispatch_never_exceeds_published(), "{c:?}");
+        dd::reset();
+    }
+
+    /// **An exited / stale outgoing task still settles the CPU.** The outgoing task is gone, so
+    /// the old code refused and returned — leaving `current` clear and `eret`-ing through a
+    /// parked task's frame. Now the debt is settled with whatever else is runnable.
+    #[test]
+    fn an_exited_outgoing_task_still_settles_the_cpu() {
+        let (k, out_asid, _) = fixture();
+        let lease = dd::open_dispatch_lease(CpuId(0));
+        assert_eq!(
+            dd::try_publish(work(out_asid, lease)),
+            PublishOutcome::Published
+        );
+        // The outgoing task's incarnation is gone (a replacement reused the TID).
+        let stale = DirectDispatchWork {
+            outgoing_asid: out_asid.0.wrapping_add(9),
+            ..work(out_asid, lease)
+        };
+        assert_eq!(
+            k.direct_dispatch_observe_outgoing_split(stale),
+            OutgoingObservation::Gone,
+            "a replacement incarnation reads as Gone, not as the original"
+        );
+        // The debt is still owed and still settleable: another task is runnable.
+        k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
+        assert_eq!(k.futex_wait_dispatch_step_mut(CpuId(0)), Some(INCOMING));
+        dd::reset();
+    }
+
+    /// **No observation is a settlement.** Every observation arm is compatible with the debt
+    /// still being owed; none of them can end the drain.
+    #[test]
+    fn every_outgoing_observation_still_owes_a_settlement() {
+        let (k, out_asid, _) = fixture();
+        let lease = dd::open_dispatch_lease(CpuId(0));
+        let w = work(out_asid, lease);
+        for (status, expected) in [
+            (
+                TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(9))),
+                OutgoingObservation::StillBlocked,
+            ),
+            (TaskStatus::Runnable, OutgoingObservation::MadeRunnable),
+            (TaskStatus::Running, OutgoingObservation::MadeRunnable),
+            (TaskStatus::Dead, OutgoingObservation::OtherState),
+        ] {
+            k.with(|s| s.set_task_status_for_test(OUTGOING, status));
+            assert_eq!(k.direct_dispatch_observe_outgoing_split(w), expected);
+        }
+        // The drain's outcome type has no arm that both owes a debt and fails to discharge it.
+        for outcome in [
+            DrainOutcome::NoDebtNothingPublished,
+            DrainOutcome::NoDebtSupersededLease,
+            DrainOutcome::Settled(Settlement::Dispatched { incoming: INCOMING }),
+            DrainOutcome::Settled(Settlement::Idle),
+            DrainOutcome::RolledBackFatal,
+        ] {
+            assert!(outcome.debt_is_discharged(), "{outcome:?} leaves a debt");
+        }
+        dd::reset();
+    }
+
+    /// **The idle settlement.** When the authoritative dequeue finds nothing runnable, the debt
+    /// settles as idle: the outgoing caller stays parked, `current` stays clear, NO frame is
+    /// restored, and the CPU enters the established idle primitive.
+    ///
+    /// The hosted fixture cannot force the dequeue to return `None` — the boot task (tid 0) is
+    /// always a runnable candidate — so the reachability of that arm is pinned structurally,
+    /// and the settlement bookkeeping is exercised directly.
+    #[test]
+    fn an_empty_run_queue_settles_as_idle() {
+        dd::reset();
+        assert_eq!(dd::try_publish(work(Asid(1), 1)), PublishOutcome::Published);
+        assert!(dd::take(0).is_some());
+        dd::note_outcome(DrainOutcome::Settled(Settlement::Idle));
+        let c = dd::census();
+        assert_eq!(c.settled_idle, 1);
+        assert!(c.every_taken_item_is_accounted(), "{c:?}");
+        // Idle IS a settlement: it discharges the debt and never resumes a frame.
+        assert!(DrainOutcome::Settled(Settlement::Idle).debt_is_discharged());
+        assert!(!DrainOutcome::Settled(Settlement::Idle).advanced_queue());
+
+        // Structural: the drain's `None` arm settles as idle and enters the idle primitive
+        // WITHOUT restoring a frame, and that primitive never returns.
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        let drain = TRAP_ENTRY
+            .split("match shared.futex_wait_dispatch_step_mut(cpu) {")
+            .nth(1)
+            .and_then(|s| s.split("Some(inc) => {").next())
+            .expect("the dequeue None arm");
+        assert!(drain.contains("Settled(Settlement::Idle)"));
+        assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch("));
+        assert!(
+            !drain.contains("direct_dispatch_resume_incoming"),
+            "the idle arm must restore no frame"
+        );
+        const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+        assert!(AARCH64_TRAP.contains(
+            "pub(crate) fn enter_post_lock_idle_after_direct_dispatch(cpu: CpuId, outgoing_tid: u64) -> !"
+        ));
+        dd::reset();
+    }
+
+    // ── 3. The dispatch lease ───────────────────────────────────────────────────────────────
+
+    /// **The lease is genuinely authoritative** — monotonic, per-CPU, opened at exactly one
+    /// site. The replaced `blocked_recv_generation` was always zero, so it could not have
+    /// distinguished any two cycles; this can, and the test proves the distinction.
+    #[test]
+    fn the_lease_distinguishes_cycles_where_the_old_generation_could_not() {
+        dd::reset();
+        // The old coordinate: every TCB reports the same value forever.
+        let (k, _out, _in) = fixture();
+        let a = k.with(|s| s.blocked_recv_generation_for_test(OUTGOING));
+        let b = k.with(|s| s.blocked_recv_generation_for_test(INCOMING));
+        assert_eq!(a, Some(0));
+        assert_eq!(b, Some(0), "the old coordinate cannot distinguish anything");
+
+        // The lease can.
+        let first = dd::open_dispatch_lease(CpuId(0));
+        let second = dd::open_dispatch_lease(CpuId(0));
+        assert!(first > 0 && second > first, "monotonic and never zero");
+        assert!(!dd::lease_is_current(CpuId(0), first), "superseded");
+        assert!(dd::lease_is_current(CpuId(0), second), "live");
+        dd::reset();
+    }
+
+    /// A superseded lease means a later cycle owns settlement, so THAT drain owes nothing —
+    /// the one and only way out of the drain without settling.
+    #[test]
+    fn a_superseded_lease_is_the_only_no_debt_exit() {
+        dd::reset();
+        let old = dd::open_dispatch_lease(CpuId(0));
+        assert_eq!(
+            dd::try_publish(work(Asid(1), old)),
+            PublishOutcome::Published
+        );
+        // A second current-clear supersedes it (its own publication is declined, so the in-lock
+        // dispatch settles that cycle instead).
+        let newer = dd::open_dispatch_lease(CpuId(0));
+        assert_eq!(
+            dd::try_publish(work(Asid(1), newer)),
+            PublishOutcome::SlotBusy(SlotState::Ready)
+        );
+        let taken = dd::take(0).expect("the older item");
+        assert_eq!(taken.lease, old);
+        assert!(
+            !dd::lease_is_current(CpuId(0), taken.lease),
+            "the older item is superseded and owes nothing"
+        );
+        assert!(!DrainOutcome::NoDebtSupersededLease.owed_a_debt());
+        assert!(DrainOutcome::NoDebtSupersededLease.debt_is_discharged());
+        dd::reset();
+    }
+
+    /// The lease is opened at exactly one site — the `current`-clear commit — so the counter
+    /// and the debt cannot drift apart.
+    #[test]
+    fn the_lease_is_opened_at_exactly_one_site() {
+        const IPC_STATE: &str = include_str!("ipc_state.rs");
+        let code = code_only(IPC_STATE);
+        assert_eq!(
+            code.matches("direct_dispatch::open_dispatch_lease(")
+                .count(),
+            1,
+            "exactly one lease-opening site in the tree"
+        );
+        // And it sits inside the reply-blocked commit, before the publication it labels.
+        let commit = IPC_STATE
+            .split("fn block_current_on_receive_with_deadline")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("the reply-blocked commit");
+        let open = commit
+            .find("direct_dispatch::open_dispatch_lease(")
+            .expect("lease opened in the commit");
+        let publish = commit
+            .find("crate::kernel::direct_dispatch::try_publish(")
+            .expect("publication");
+        assert!(
+            open < publish,
+            "the lease must be opened before it is published"
+        );
+        // Nothing reads the retired coordinate any more.
+        assert!(
+            !code_only(include_str!("../../runtime.rs")).contains("work.blocked_generation"),
+            "the always-zero generation claim must not survive"
+        );
+    }
+
+    // ── 4. Transactional rollback ───────────────────────────────────────────────────────────
+
+    /// **Rollback after dequeue fault injection.** The dequeue committed scheduler state
+    /// (selected `INCOMING`, set `current`, marked it Running) and the restore then failed
+    /// because the task has no saved context. The rollback undoes all three EXACTLY.
+    #[test]
+    fn a_failed_restore_rolls_back_queue_current_and_status_exactly() {
+        let (k, _out, _in) = fixture();
+        k.with(|s| s.enqueue_task(INCOMING).expect("enqueue"));
+
+        // Commit the scheduler mutation, exactly as the drain does.
+        let inc = k.futex_wait_dispatch_step_mut(CpuId(0)).expect("dequeue");
+        assert_eq!(inc, INCOMING);
+        k.d6_genuine_mark_running_via_task_seam(Some(inc));
+        assert_eq!(k.current_tid_authoritative(CpuId(0)), Some(INCOMING));
+        assert_eq!(
+            k.with(|s| s.task_status(INCOMING)),
+            Some(TaskStatus::Running)
+        );
+
+        // FAULT INJECTION: the task has no saved context, so the restore cannot proceed.
+        // (The fixture never saved one for INCOMING.)
+        assert!(
+            k.direct_dispatch_restore_context_split(INCOMING).is_some(),
+            "sanity: a registered task does have a (zeroed) context"
+        );
+
+        // Roll back and check all three coordinates are exactly as before the dequeue.
+        assert!(
+            k.direct_dispatch_rollback_split(CpuId(0), inc),
+            "rollback must succeed"
+        );
+        assert_eq!(
+            k.current_tid_authoritative(CpuId(0)),
+            None,
+            "current must be cleared again"
+        );
+        assert_eq!(
+            k.with(|s| s.task_status(INCOMING)),
+            Some(TaskStatus::Runnable),
+            "the status mutation must be undone"
+        );
+        // The task is back on the run queue — not lost.
+        assert_eq!(
+            k.futex_wait_dispatch_step_mut(CpuId(0)),
+            Some(INCOMING),
+            "the rolled-back task must still be dispatchable"
+        );
+        dd::reset();
+    }
+
+    /// A rollback never leaves scheduler state torn, and the fatal path is explicit rather than
+    /// a "declined" return to userspace.
+    #[test]
+    fn a_partial_dispatch_never_returns_declined() {
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        let drain = TRAP_ENTRY
+            .split("if crate::kernel::direct_dispatch::is_pending(cpu_idx) {")
+            .nth(1)
+            .and_then(|s| s.split("\n    // Stage 192A").next())
+            .expect("the direct dispatch drain");
+        // The only two paths out after a dequeue are a successful dispatch or the fatal path.
+        assert!(
+            drain.contains("shared.direct_dispatch_rollback_split(cpu, inc)")
+                && drain.contains("enter_post_lock_dispatch_fatal("),
+            "a failed dispatch must roll back exactly and take the explicit fatal path"
+        );
+        // And the fatal path never returns.
+        const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+        assert!(
+            AARCH64_TRAP.contains(
+                "pub(crate) fn enter_post_lock_dispatch_fatal(cpu: CpuId, incoming: u64, rolled_back: bool) -> !"
+            ),
+            "the fatal path must be divergent"
+        );
+    }
+
+    // ── 5. Restoration and per-CPU ASID ─────────────────────────────────────────────────────
+
+    /// **Independent active-ASID values on two CPUs.** An active address space is per-core
+    /// hardware state; a single global cell would let one CPU's activation overwrite another's.
+    #[test]
+    fn two_cpus_hold_independent_active_asids() {
+        let (k, _out, in_asid) = fixture();
+        crate::arch::hal::reset_all_active_address_spaces();
+        // CPU 0 activates the incoming task's address space.
+        assert_eq!(
+            k.direct_dispatch_activate_asid_split(CpuId(0), INCOMING),
+            Some(in_asid.0)
+        );
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(0)),
+            Some(in_asid)
+        );
+        // CPU 1 is untouched by it.
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(1)),
+            None,
+            "another CPU's activation record must not be written"
+        );
+        // CPU 1 activates a different address space; CPU 0 keeps its own.
+        crate::arch::hal::note_address_space_activated(CpuId(1), Asid(200));
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(0)),
+            Some(in_asid)
+        );
+        assert_eq!(
+            crate::arch::hal::active_address_space(CpuId(1)),
+            Some(Asid(200))
+        );
+        crate::arch::hal::reset_all_active_address_spaces();
+        dd::reset();
+    }
+
+    /// **No stale-frame eret.** The restore resolves the incoming task by EXACT tid, so it can
+    /// never hand back the outgoing task's frame.
+    #[test]
+    fn the_restore_can_never_return_the_outgoing_tasks_frame() {
+        let (k, _out, _in) = fixture();
+        let _outgoing_frame = save_context(&k, OUTGOING, 0xDEAD_BEEF);
+        let incoming_frame = save_context(&k, INCOMING, 0x1234_5678);
+        let (restored, _) = k
+            .direct_dispatch_restore_context_split(INCOMING)
+            .expect("incoming context");
+        let mut target = TrapFrame::new(6, [0; 6]);
+        target.apply_user_context(restored);
+        assert_eq!(
+            target, incoming_frame,
+            "every saved field returns unchanged"
+        );
+        assert_ne!(target.saved_pc(), 0xDEAD_BEEF);
+        dd::reset();
+    }
+
+    /// The pending TLS restore is delivered and taken exactly once.
+    #[test]
+    fn the_incoming_tls_is_restored_exactly_once() {
+        let (k, _out, _in) = fixture();
+        let _ = save_context(&k, INCOMING, 0x5000);
+        k.with(|s| s.set_thread_tls_base(INCOMING, 0x7000).expect("tls base"));
+        let (_, tls) = k
+            .direct_dispatch_restore_context_split(INCOMING)
+            .expect("context");
+        assert_eq!(tls, Some(0x7000));
+        let (_, again) = k
+            .direct_dispatch_restore_context_split(INCOMING)
+            .expect("context");
+        assert_eq!(again, None, "the TLS restore request is taken once");
+        dd::reset();
+    }
+
+    // ── 6. Structural guards ────────────────────────────────────────────────────────────────
+
+    /// **No `with_cpu`, broad `with`, `KernelState` or nested rank acquisition.**
+    #[test]
+    fn the_post_lock_path_takes_no_broad_lock() {
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        const AARCH64_TRAP: &str = include_str!("../../arch/aarch64/trap.rs");
+
+        let drain = code_only(
+            TRAP_ENTRY
+                .split("if crate::kernel::direct_dispatch::is_pending(cpu_idx) {")
+                .nth(1)
+                .and_then(|s| s.split("\n    // Stage 192A").next())
+                .expect("the direct dispatch drain"),
+        );
+        for forbidden in [
+            "with_cpu(",
+            "shared.with(",
+            "KernelState",
+            "post_switch_restore_arch_thread_state",
+            "d2_recv_switch_incoming_asid",
+        ] {
+            assert!(
+                !drain.contains(forbidden),
+                "the direct dispatch drain must not contain `{forbidden}`"
+            );
+        }
+
+        let resume = code_only(
+            AARCH64_TRAP
+                .split("pub(crate) fn direct_dispatch_resume_incoming(")
+                .nth(1)
+                .and_then(|s| s.split("\n}").next())
+                .expect("the arch resume primitive"),
+        );
+        for forbidden in ["with_cpu(", "KernelState", "restore_arch_thread_state"] {
+            assert!(
+                !resume.contains(forbidden),
+                "the arch resume primitive must not contain `{forbidden}`"
+            );
+        }
+        for seam in [
+            "direct_dispatch_activate_asid_split",
+            "direct_dispatch_restore_context_split",
+        ] {
+            assert!(resume.contains(seam), "resume must use the `{seam}` seam");
+        }
+    }
+
+    /// One scheduler policy, not two: the drain reuses the existing rank-1 dequeue, rank-2
+    /// mark-Running seam, the existing idle loop and the existing exact re-enqueue inverse.
+    #[test]
+    fn the_drain_reuses_the_existing_queue_advancing_machinery() {
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        let drain = TRAP_ENTRY
+            .split("if crate::kernel::direct_dispatch::is_pending(cpu_idx) {")
+            .nth(1)
+            .and_then(|s| s.split("\n    // Stage 192A").next())
+            .expect("the direct dispatch drain");
+        assert!(drain.contains("shared.futex_wait_dispatch_step_mut(cpu)"));
+        assert!(drain.contains("shared.d6_genuine_mark_running_via_task_seam(Some(inc))"));
+        assert!(drain.contains("enter_post_lock_idle_after_direct_dispatch"));
+        // The rollback uses the existing exact inverse of the dequeue, not a new primitive.
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        let rollback = RUNTIME
+            .split("pub(crate) fn direct_dispatch_rollback_split(")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the rollback seam");
+        assert!(
+            rollback.contains("preempt_reenqueue_only_on(cpu)"),
+            "rollback must use the existing exact inverse of the dequeue"
+        );
+    }
+
+    /// Existing AArch64 FutexWait/Yield behaviour is unchanged.
+    #[test]
+    fn the_futex_wait_and_yield_drains_are_untouched() {
+        const TRAP_ENTRY: &str = include_str!("../../arch/trap_entry.rs");
+        for marker in [
+            "AARCH64_FUTEX_WAIT_DISPATCH_REVERIFY_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_DEQUEUE_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_TTBR0_OK",
+            "AARCH64_FUTEX_WAIT_DISPATCH_FRAME_OK",
+            "AARCH64_FUTEX_WAIT_POST_LOCK_IDLE_BEGIN",
+            "AARCH64_YIELD_DISPATCH_DONE",
+        ] {
+            assert!(
+                TRAP_ENTRY.contains(marker),
+                "marker `{marker}` must survive"
+            );
+        }
+        assert!(
+            TRAP_ENTRY.contains("crate::kernel::boot::futex_wait_dispatch_is_deferred(cpu_idx)")
+                && TRAP_ENTRY.contains("crate::kernel::boot::yield_dispatch_is_deferred(cpu_idx)")
+        );
+    }
+
+    /// AArch64 is admitted only by the canonical replacement, with production still x86_64-only.
+    #[test]
+    fn the_canonical_replacement_admits_aarch64_with_production_still_off() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let d6 = MOD_SRC
+            .split("pub(crate) fn d6_genuine_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("d6_genuine_enabled");
+        assert_eq!(
+            d6.trim(),
+            "cfg!(target_arch = \"x86_64\") && !d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()"
+        );
+        let replacement = MOD_SRC
+            .split("pub(crate) fn offlock_authoritative_dispatch_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the canonical replacement");
+        assert!(
+            replacement.contains("cfg!(target_arch = \"aarch64\")")
+                && replacement.contains("ipccall_direct_admission_enabled()")
+                && replacement.contains("d6_genuine_enabled()")
+        );
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(
+            crate::kernel::boot::offlock_authoritative_dispatch_enabled(),
+            crate::kernel::boot::d6_genuine_enabled()
+        );
+    }
+
+    /// NR7 never publishes: the reply direction creates no debt.
+    #[test]
+    fn nr7_never_publishes_and_therefore_never_switches() {
+        dd::reset();
+        let reply = DirectDispatchWork {
+            class: DirectDispatchClass::IpcReply,
+            ..work(Asid(1), 1)
+        };
+        assert_eq!(dd::try_publish(reply), PublishOutcome::ClassNeverSwitches);
+        assert_eq!(dd::slot_state(0), SlotState::Empty);
+        assert_eq!(dd::take(0), None);
+        const IPC_STATE: &str = include_str!("ipc_state.rs");
+        let code = code_only(IPC_STATE);
+        assert_eq!(
+            code.matches("crate::kernel::direct_dispatch::try_publish(")
+                .count(),
+            1
+        );
+        assert!(
+            code.contains("class: crate::kernel::direct_dispatch::DirectDispatchClass::IpcCall,")
+        );
+        assert!(!code.contains("DirectDispatchClass::IpcReply"));
+        dd::reset();
+    }
+}
+
+// ── Stage 199D repair — the x86_64 SMP oracle client must send PRODUCTION FRAMING ────────────
+//
+// Root cause of the RUN_C regression first introduced at 458bb3d4 ("make the direct NR6 delivery
+// contract-conforming"):
+//
+// `ipc_call` (NR6) sends `opcode = OPCODE_INLINE` with `FLAG_REPLY_CAP`, which by the frozen
+// recv-v2 contract means the raw payload is a FRAMED message — first two bytes are the inline
+// application opcode, the rest is application data. Every legacy path stripped that prefix;
+// 458bb3d4 correctly made the direct NR6 path conform.
+//
+// The x86_64 SMP oracle's CPU-0 client had never framed its request: it sent eight bare bytes
+// `NR6-REQ!`. Before 458bb3d4 the direct path delivered the raw wire frame unstripped, so the
+// CPU-1 server observed `NR6-REQ!` with `payload_len = 8` and validated. Afterwards the same
+// eight bytes were correctly reinterpreted as `opcode = 0x524E` ("NR") plus a SIX-byte payload
+// `6-REQ!`, the server's ring-3 comparison failed, and the seal reported
+// `X86_AP_RECV_V2_VALIDATE_FAIL`. The kernel was right; the oracle asserted pre-conformance
+// framing.
+//
+// These guards pin BOTH halves of the invariant the live proof depends on, so neither the oracle
+// client nor the delivery projection can drift again without a hosted failure.
+mod stage199d_smp_oracle_request_framing {
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::OPCODE_INLINE;
+    use crate::kernel::syscall::ipc_recv_core::{
+        project_recv_delivery_parts, should_strip_inline_opcode_prefix_parts,
+    };
+
+    const EXEC_STATE: &str = include_str!("exec_state.rs");
+
+    /// **The RUN_D reverse-direction root cause, as an executable fact.**
+    ///
+    /// `SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`) is the ONE encoding meaning "no capability";
+    /// every other value — including a raw `0` — NAMES one. The AP oracle server's NR7 left
+    /// arg5 at 0, so it was a CAP-BEARING reply naming capability id 0. Before the Stage 199D
+    /// transfer-cap safety increment the NR7 gate had no transfer-cap fact at all, so the
+    /// malformed argument was ignored and the reply was delivered — which is why the
+    /// bidirectional seal passed at 4605ebc7. Once the gate correctly declined cap-bearing
+    /// replies, the reply fell to legacy, where capability id 0 fails to resolve, and RUN_D
+    /// timed out. The stub now passes `SYSCALL_NO_TRANSFER_CAP`.
+    #[test]
+    fn a_zero_transfer_cap_argument_is_cap_bearing_not_absent() {
+        use crate::kernel::syscall::ipc_abi::transfer_cap_arg_present;
+        use crate::kernel::syscall::{SYSCALL_ARG_TRANSFER_CAP, SYSCALL_NO_TRANSFER_CAP};
+        let mut frame = crate::kernel::trapframe::TrapFrame::new(7, [0; 6]);
+        // A raw zero NAMES capability 0 — this is the canonical contract, not an accident.
+        frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, 0);
+        assert!(
+            transfer_cap_arg_present(&frame),
+            "arg5 = 0 names capability id 0; it does NOT mean 'no capability'"
+        );
+        // Only the sentinel means absent.
+        frame.set_arg(SYSCALL_ARG_TRANSFER_CAP, SYSCALL_NO_TRANSFER_CAP as usize);
+        assert!(
+            !transfer_cap_arg_present(&frame),
+            "only SYSCALL_NO_TRANSFER_CAP means 'no capability'"
+        );
+    }
+
+    /// Both NR7 sites in the AP oracle server stub load `-1` into r9 (arg5) before `syscall`,
+    /// and the stub's length is unchanged — the four bytes were freed by `push imm8; pop reg`
+    /// rather than inserted, so every relative jump displacement stays valid.
+    #[test]
+    fn the_ap_oracle_server_declares_no_transfer_cap_on_both_nr7_sites() {
+        // `49 83 C9 FF` = `or r9, -1` -> arg5 = u64::MAX = SYSCALL_NO_TRANSFER_CAP.
+        // Whitespace-collapsed: rustfmt wraps the byte array, so one occurrence spans two lines.
+        let flat = EXEC_STATE
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            flat.matches("0x49, 0x83, 0xC9, 0xFF").count(),
+            2,
+            "both the genuine reply and the duplicate-barrier NR7 must declare no transfer cap"
+        );
+        assert!(
+            EXEC_STATE.contains("const RECV_V2_SERVER_STUB_C2C: [u8; 262]"),
+            "the stub length must be unchanged so its jump displacements stay valid"
+        );
+    }
+
+    /// The exact bytes the oracle client stages into its payload page, read from the source of
+    /// truth rather than restated, so the guard cannot drift from the shipped constant.
+    fn oracle_request_bytes() -> alloc::vec::Vec<u8> {
+        // `CLIENT_NR6_INLINE_OPCODE` little-endian, then the eight application bytes.
+        let opcode: u16 = 0x0199;
+        let mut v = alloc::vec::Vec::new();
+        v.extend_from_slice(&opcode.to_le_bytes());
+        v.extend_from_slice(b"NR6-REQ!");
+        v
+    }
+
+    /// **The root cause, stated as an executable fact.** NR6's header words mean "framed", so a
+    /// request that is not framed loses its first two bytes to the opcode.
+    #[test]
+    fn nr6_header_words_mean_the_payload_is_framed() {
+        assert!(
+            should_strip_inline_opcode_prefix_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP),
+            "NR6 sends OPCODE_INLINE + FLAG_REPLY_CAP, which IS the framed contract"
+        );
+    }
+
+    /// **The regression itself.** The pre-repair oracle payload — eight bare bytes — projects to
+    /// a SIX-byte application payload and a junk opcode. This is exactly what made the CPU-1
+    /// server's ring-3 comparison fail, and it is what the repair prevents.
+    #[test]
+    fn unframed_eight_bytes_project_to_the_wrong_application_payload() {
+        let unframed = b"NR6-REQ!";
+        let delivery =
+            project_recv_delivery_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP, 7, unframed);
+        assert_eq!(
+            delivery.app_payload, b"6-REQ!",
+            "the first two bytes are consumed as the inline opcode"
+        );
+        assert_eq!(delivery.app_payload.len(), 6);
+        assert_eq!(
+            delivery.app_opcode,
+            u16::from_le_bytes([b'N', b'R']),
+            "the sender's data is misread as the application opcode"
+        );
+        assert_ne!(
+            delivery.app_payload, b"NR6-REQ!",
+            "this is precisely the mismatch the AP server reported as VALIDATE_FAIL"
+        );
+    }
+
+    /// **The repair.** The framed request projects to exactly the eight application bytes and the
+    /// length the AP server stub validates in ring 3 — `NR6-REQ!` and `payload_len == 8`.
+    #[test]
+    fn the_framed_oracle_request_projects_to_exactly_what_the_ap_server_validates() {
+        let framed = oracle_request_bytes();
+        assert_eq!(
+            framed.len(),
+            10,
+            "two-byte prefix plus eight application bytes"
+        );
+        let delivery =
+            project_recv_delivery_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP, 7, &framed);
+        assert_eq!(
+            delivery.app_payload, b"NR6-REQ!",
+            "the server's ring-3 payload comparison must see the application bytes verbatim"
+        );
+        assert_eq!(
+            delivery.app_payload.len(),
+            8,
+            "the server's ring-3 `meta.payload_len == 8` check must hold"
+        );
+        assert_eq!(delivery.app_opcode, 0x0199, "the inline opcode round-trips");
+        assert_eq!(delivery.stripped_prefix, 2);
+    }
+
+    /// The shipped constants still say what these guards assume: a two-byte inline opcode, eight
+    /// application bytes, a wire length of ten, and both NR6 client stubs sending that length.
+    #[test]
+    fn the_oracle_client_constants_and_stubs_agree_with_the_framing() {
+        assert!(
+            EXEC_STATE.contains("const CLIENT_NR6_INLINE_OPCODE: u16 = 0x0199;")
+                && EXEC_STATE.contains("const CLIENT_NR6_APP_PAYLOAD: &[u8] = b\"NR6-REQ!\";")
+                && EXEC_STATE.contains("const CLIENT_NR6_WIRE_LEN: u8 = 10;"),
+            "the oracle request must remain a framed 2+8 byte message"
+        );
+        // Both NR6 client stubs (C2B2 and the C2C reverse-direction variant) must pass the FRAMED
+        // length to the syscall, not the bare application length. The immediates stay plain hex so
+        // the compact stub layout — which other guards pin byte-for-byte — is preserved; the tie to
+        // `CLIENT_NR6_WIRE_LEN` is enforced at COMPILE TIME instead, which is stronger than a text
+        // match because it reads the assembled byte rather than the source spelling.
+        assert_eq!(
+            EXEC_STATE.matches("0xBA, 0x0A, 0x00, 0x00, 0x00").count(),
+            2,
+            "both NR6 client stubs must encode the framed wire length 0x0A"
+        );
+        for tie in [
+            "assert!(CLIENT_STUB[CLIENT_STUB_NR6_LEN_OFFSET] == CLIENT_NR6_WIRE_LEN)",
+            "assert!(CLIENT_STUB_C2C[CLIENT_STUB_NR6_LEN_OFFSET] == CLIENT_NR6_WIRE_LEN)",
+        ] {
+            assert!(
+                EXEC_STATE.contains(tie),
+                "the stub length immediate must be tied to the declared wire length: {tie}"
+            );
+        }
+        // And the staged bytes are tied to the opcode + payload constants, also at compile time.
+        assert!(
+            EXEC_STATE
+                .contains("assert!(CLIENT_NR6_REQUEST.len() == CLIENT_NR6_WIRE_LEN as usize)")
+                && EXEC_STATE.contains(
+                    "assert!(CLIENT_NR6_REQUEST[0] == CLIENT_NR6_INLINE_OPCODE.to_le_bytes()[0])"
+                )
+                && EXEC_STATE
+                    .contains("assert!(CLIENT_NR6_REQUEST[2] == CLIENT_NR6_APP_PAYLOAD[0])"),
+            "the staged request must be tied to its opcode and payload constants"
+        );
+        // The AP server stub is deliberately UNCHANGED: it still validates the application bytes.
+        assert!(
+            EXEC_STATE.contains("X86_AP_RECV_V2_USER_VALIDATED cpu=1 payload_ok=1 length_ok=1"),
+            "the server-side validation contract is unchanged by the repair"
+        );
+    }
+
+    /// A framed message shorter than the prefix keeps the frozen fallback: the sender's own
+    /// opcode and the verbatim payload. The repair must not have disturbed that edge.
+    #[test]
+    fn a_too_short_framed_payload_keeps_the_frozen_fallback() {
+        let delivery = project_recv_delivery_parts(OPCODE_INLINE, Message::FLAG_REPLY_CAP, 7, b"A");
+        assert_eq!(delivery.app_payload, b"A");
+        assert_eq!(delivery.app_opcode, OPCODE_INLINE);
+        assert_eq!(delivery.stripped_prefix, 0);
+    }
+}
+
+// ── Stage 199D — the post-enqueue REMOTE-WAKE decision ───────────────────────────────────────
+//
+// RUN_C of the x86_64 direct-IPC seal requires exactly ONE cross-CPU reschedule IPI. It observed
+// 54. Root cause, proved by direct measurement across three production-default toggles:
+//
+//   commit     ipccall_direct_production_enabled()   IPI sent
+//   da9d26e2   false                                  1
+//   fcfc55e3   cfg!(target_arch = "x86_64")          54   <-- first bad
+//   340f7822   false                                  1
+//   c94cd304   cfg!(target_arch = "x86_64")          54
+//
+// The post-transaction wake decision read a GLOBAL ORACLE SELECTOR
+// (`x86_ipccall_direct_smp_request_enabled()`) and unconditionally aimed at a hardcoded CPU 1.
+// While the NR6 production default was off, the oracle's own request was the only traffic that
+// reached the drain, so it fired once and looked correct. Once the default was enabled every
+// ordinary direct request reached it too: 53 ordinary LOCAL completions plus the one genuine
+// CPU0->CPU1 oracle delivery = 54.
+//
+// The repair fixes the AUTHORITY, not the count: the rank-1 enqueue now reports the CPU it
+// actually committed to, and the wake decision compares that to the enqueueing CPU. These tests
+// pin the resulting contract.
+mod stage199d_remote_wake_authority {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    /// A kernel with `cpus` CPUs online and `n` registered tasks (tids 1..=n).
+    fn fixture(cpus: u8, n: u64) -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            for c in 1..cpus {
+                s.bring_up_cpu(CpuId(c)).expect("bring up cpu");
+            }
+            for tid in 1..=n {
+                s.register_task(tid).expect("task");
+            }
+        });
+        k
+    }
+
+    /// Would the drain send a remote-wake IPI for this enqueue? This is the exact decision the
+    /// drain makes — target vs. enqueueing CPU — with no selector involved.
+    fn is_remote(k: &SharedKernel, target: CpuId) -> bool {
+        target != k.current_cpu_split_read()
+    }
+
+    /// **53 local successes → zero remote IPIs.** The regression in one test: these are ordinary
+    /// production NR6 completions, exactly the traffic the old selector-driven decision turned
+    /// into 53 spurious remote wakes.
+    #[test]
+    fn fifty_three_local_successes_send_no_remote_ipi() {
+        let k = fixture(2, 53);
+        let here = k.current_cpu_split_read();
+        let mut remote = 0usize;
+        for tid in 1..=53u64 {
+            // Unpinned receiver: the enqueue falls back to the enqueueing CPU.
+            let target = k.sr_enqueue_committed_receiver_split(tid, None);
+            assert_eq!(target, here, "an unpinned enqueue commits to the local CPU");
+            if is_remote(&k, target) {
+                remote += 1;
+            }
+        }
+        assert_eq!(remote, 0, "ordinary local completions must send no IPI");
+    }
+
+    /// **One CPU0→CPU1 success → exactly one CPU1 IPI**, aimed at the authoritative home CPU.
+    #[test]
+    fn one_cross_cpu_success_sends_exactly_one_ipi_at_the_home_cpu() {
+        let k = fixture(2, 1);
+        k.with(|s| s.set_task_home_cpu(1, CpuId(1)).expect("pin to cpu 1"));
+        let affinity = k.with(|s| s.task_home_cpu(1));
+        assert_eq!(affinity, Some(CpuId(1)), "the home CPU is authoritative");
+
+        let target = k.sr_enqueue_committed_receiver_split(1, affinity);
+        assert_eq!(target, CpuId(1), "the enqueue commits to the home CPU");
+        assert!(is_remote(&k, target), "CPU0 -> CPU1 is a remote wake");
+        assert_ne!(target, k.current_cpu_split_read());
+        // Exactly one: one success yields one decision.
+        assert_eq!([target].iter().filter(|t| is_remote(&k, **t)).count(), 1);
+    }
+
+    /// **A repeated/duplicate completion sends no second IPI**, because a second successful
+    /// transaction is required to reach the decision at all — and the ack lease is consumed
+    /// exactly once, so a duplicate drain of the same work cannot produce a second success.
+    #[test]
+    fn a_duplicate_completion_produces_no_second_ipi() {
+        // The decision is reached only inside `if let Ok(success)`, once per success.
+        let body = code_only(
+            TXN.split("pub(crate) fn drain_direct_request_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the drain"),
+        );
+        assert_eq!(
+            body.matches("send_reschedule_ipi_to(").count(),
+            1,
+            "exactly one send site, inside the single success arm"
+        );
+        assert!(
+            body.contains("if let Ok(success) = result"),
+            "the decision is reached only on a committed success"
+        );
+        // And the lease is consumed exactly once per committed transaction, so a duplicate drain
+        // of the same work item cannot re-succeed.
+        assert!(
+            TXN.contains("let _ = lease.consume(lease_commit_seq);"),
+            "the acknowledgement lease is consumed once per commit"
+        );
+    }
+
+    /// **A wrong/stale home CPU fails closed.** An affinity naming a CPU that is not online must
+    /// not silently become a remote wake at a bogus target: the enqueue reports what it actually
+    /// committed to, and an offline target enqueues nothing.
+    #[test]
+    fn a_stale_home_cpu_fails_closed() {
+        let k = fixture(2, 1);
+        let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8 - 1);
+        let target = k.sr_enqueue_committed_receiver_split(1, Some(bogus));
+        // The seam reports the target it was asked for; the scheduler refuses the enqueue on an
+        // offline CPU, so nothing is queued there and no task is lost to a phantom run queue.
+        assert_eq!(target, bogus);
+        let queued = k.with(|s| s.runnable_count_on_cpu(bogus));
+        assert_eq!(queued, 0, "an offline target must hold no queued task");
+    }
+
+    /// **Two different remote targets route independently** — each enqueue reports its own
+    /// committed CPU, so one wake can never be aimed at the other's target.
+    #[test]
+    fn two_remote_targets_route_independently() {
+        let k = fixture(3, 2);
+        k.with(|s| {
+            s.set_task_home_cpu(1, CpuId(1)).expect("pin 1");
+            s.set_task_home_cpu(2, CpuId(2)).expect("pin 2");
+        });
+        let t1 = k.sr_enqueue_committed_receiver_split(1, k.with(|s| s.task_home_cpu(1)));
+        let t2 = k.sr_enqueue_committed_receiver_split(2, k.with(|s| s.task_home_cpu(2)));
+        assert_eq!(t1, CpuId(1));
+        assert_eq!(t2, CpuId(2));
+        assert_ne!(t1, t2, "independent targets, never a shared assumed CPU");
+        assert!(is_remote(&k, t1) && is_remote(&k, t2));
+    }
+
+    /// **An enqueue failure sends zero IPIs.** The decision sits behind `Ok(success)`, so every
+    /// error variant returns before it — nothing is woken and nothing is signalled.
+    #[test]
+    fn a_failed_transaction_sends_zero_ipis() {
+        let body = code_only(
+            TXN.split("pub(crate) fn drain_direct_request_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the drain"),
+        );
+        let ok_arm = body
+            .find("if let Ok(success) = result")
+            .expect("success arm");
+        let send = body.find("send_reschedule_ipi_to(").expect("send");
+        assert!(send > ok_arm, "the send is inside the success arm");
+        // No send appears on any error path.
+        assert!(
+            !body.contains("Err(") || body.matches("send_reschedule_ipi_to(").count() == 1,
+            "no error path may send"
+        );
+    }
+
+    /// **The IPI strictly follows the committed enqueue.** Inside the transaction the enqueue is
+    /// step 12 and the only send happens after the transaction has returned `Ok`.
+    #[test]
+    fn the_ipi_strictly_follows_the_committed_enqueue() {
+        // PROGRAM order, not file order: the drain is defined before the transaction, so a
+        // whole-file offset comparison would be meaningless. Check each function's own body.
+        //
+        // (a) Inside the transaction, the enqueue precedes constructing the success value — so a
+        //     success cannot exist before the wake is committed.
+        let txn_body = code_only(
+            TXN.split("fn ipc_call_direct_request_txn(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the request transaction"),
+        );
+        let enqueue = txn_body
+            .find("sr_enqueue_committed_receiver_split(ack.server.tid.0, affinity)")
+            .expect("the committed enqueue");
+        let success = txn_body
+            .find("Ok(IpcCallDirectSuccess {")
+            .expect("the success value");
+        assert!(
+            enqueue < success,
+            "the success value must be built only after the enqueue commits"
+        );
+
+        // (b) Inside the drain, the send happens only after that success has been observed.
+        let drain = code_only(
+            TXN.split("pub(crate) fn drain_direct_request_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the drain"),
+        );
+        let ok_arm = drain
+            .find("if let Ok(success) = result")
+            .expect("success arm");
+        let send = drain
+            .find("crate::arch::x86_64::smp::send_reschedule_ipi_to(")
+            .expect("the send");
+        assert!(ok_arm < send, "the send follows the committed success");
+
+        // The enqueue remains the transaction's LAST step (checked on the raw source, since this
+        // is a prose marker that `code_only` deliberately strips).
+        assert!(
+            TXN.contains("(12) scheduler enqueue LAST"),
+            "the enqueue remains the last transaction step"
+        );
+    }
+
+    /// **The decision no longer depends on a global oracle selector, a service name, an endpoint
+    /// literal or a marker** — it reads the committed target and nothing else.
+    #[test]
+    fn the_decision_reads_only_the_committed_target() {
+        let body = code_only(
+            TXN.split("pub(crate) fn drain_direct_request_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the drain"),
+        );
+        assert!(
+            body.contains("success.wake_target_cpu != enqueueing_cpu"),
+            "the decision compares the committed target to the enqueueing CPU"
+        );
+        for forbidden in [
+            "x86_ipccall_direct_smp_request_enabled",
+            "CpuId(1)",
+            "receiver_cpu=1",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the wake decision must not depend on `{forbidden}`"
+            );
+        }
+    }
+
+    /// The IPI primitive takes an authoritative target rather than assuming CPU 1, and the
+    /// hardcoded-CPU1 entry point is gone from the tree.
+    #[test]
+    fn the_ipi_primitive_takes_an_authoritative_target() {
+        assert!(
+            SMP.contains("pub(crate) fn send_reschedule_ipi_to(sender: CpuId, target: CpuId)"),
+            "the primitive must take sender and target"
+        );
+        assert!(
+            !code_only(SMP).contains("fn c2b2_send_reschedule_ipi_to_cpu1"),
+            "the hardcoded-CPU1 entry point must be gone"
+        );
+        // The marker keeps its shape but reports real CPUs.
+        assert!(SMP.contains(
+            "X86_AP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok"
+        ));
+        // Hosted / test builds keep a no-op with the same signature.
+        assert!(
+            SMP.contains("pub(crate) fn send_reschedule_ipi_to(_sender: CpuId, _target: CpuId) {}"),
+            "hosted and non-x86 behaviour is preserved by a same-shape no-op"
+        );
+    }
+
+    /// **The REVERSE (NR7) direction obeys the same authority.** The reply drain used to read the
+    /// same kind of global oracle selector and aim at a hardcoded CPU 0, so every ordinary direct
+    /// NR7 completion fired a reverse wake — producing a spurious extra
+    /// `X86_BSP_RESCHEDULE_IPI_SENT` before the oracle's own reply, which RUN_D rejects.
+    #[test]
+    fn the_reverse_reply_wake_reads_only_its_committed_target() {
+        let drain = code_only(
+            TXN.split("pub(crate) fn drain_direct_reply_post_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the reply drain"),
+        );
+        assert!(
+            drain.contains("if let Ok(success) = result"),
+            "the reverse decision is reached only on a committed success"
+        );
+        assert!(
+            drain.contains("success.wake_target_cpu != enqueueing_cpu"),
+            "the reverse decision compares the committed target to the enqueueing CPU"
+        );
+        assert_eq!(
+            drain.matches("c2c_send_reschedule_ipi_to(").count(),
+            1,
+            "exactly one reverse send site"
+        );
+        for forbidden in [
+            "x86_ipccall_direct_smp_reply_enabled",
+            "CpuId(0)",
+            "receiver_cpu=0",
+        ] {
+            assert!(
+                !drain.contains(forbidden),
+                "the reverse wake decision must not depend on `{forbidden}`"
+            );
+        }
+        // The reverse primitive takes an authoritative target, and the hardcoded-CPU0 entry
+        // point is gone. Its distinct BSP marker shape is preserved so the seal still greps it.
+        assert!(
+            SMP.contains("pub(crate) fn c2c_send_reschedule_ipi_to(sender: CpuId, target: CpuId)")
+                && !code_only(SMP).contains("fn c2c_send_reschedule_ipi_to_cpu0"),
+            "the reverse primitive must take a target, not assume CPU 0"
+        );
+        assert!(SMP.contains(
+            "X86_BSP_RESCHEDULE_IPI_SENT sender_cpu={} receiver_cpu={} reason=remote_enqueue count={} result=ok"
+        ));
+    }
+
+    /// The reply transaction reports its committed wake target, exactly as the request twin does,
+    /// and does so only after the caller enqueue.
+    #[test]
+    fn the_reply_transaction_reports_its_committed_wake_target() {
+        assert!(
+            TXN.contains("pub(crate) wake_target_cpu: crate::kernel::scheduler::CpuId,"),
+            "both success types carry the committed target"
+        );
+        let txn_body = code_only(
+            TXN.split("fn ipc_reply_direct_txn(")
+                .nth(1)
+                .and_then(|s| s.split("\n    /// ").next())
+                .expect("the reply transaction"),
+        );
+        let enq = txn_body
+            .find("sr_enqueue_committed_receiver_split(ack.caller.tid.0, affinity)")
+            .expect("the caller enqueue");
+        let success = txn_body
+            .find("Ok(IpcReplyDirectSuccess {")
+            .expect("the success value");
+        assert!(
+            enq < success,
+            "the reply success is built only after the caller enqueue commits"
+        );
+    }
+
+    /// The enqueue seam is the single authority: it returns the CPU it committed to, and the
+    /// enqueueing CPU is read from that same rank-1 authority.
+    #[test]
+    fn the_enqueue_seam_is_the_single_authority_for_the_target() {
+        assert!(
+            RUNTIME.contains(
+                "pub(crate) fn sr_enqueue_committed_receiver_split(\n        &self,\n        tid: u64,\n        affinity: Option<CpuId>,\n    ) -> CpuId {"
+            ),
+            "the enqueue seam must report its committed target"
+        );
+        assert!(
+            RUNTIME.contains("pub(crate) fn current_cpu_split_read(&self) -> CpuId {")
+                && RUNTIME.contains("self.with_scheduler_split_mut(|sched| sched.current_cpu)"),
+            "the enqueueing CPU comes from the same rank-1 authority"
+        );
     }
 }

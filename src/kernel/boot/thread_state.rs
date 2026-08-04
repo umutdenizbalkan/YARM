@@ -707,7 +707,7 @@ impl KernelState {
         static ACTIVE_ROOT_REPAIR_FAILED: core::sync::atomic::AtomicBool =
             core::sync::atomic::AtomicBool::new(false);
 
-        let active_asid = self.hal.active_asid();
+        let active_asid = self.hal.active_asid_on(self.current_cpu());
         let cr3 = active_asid.and_then(page_table::cr3_for_asid).unwrap_or(0);
         crate::yarm_log!(
             "D6_KERNEL_SWITCH_STACK_ACTIVE_ROOT cpu={} active_asid={} cr3=0x{:x}",
@@ -1201,7 +1201,7 @@ impl KernelState {
             rsp_page
         );
 
-        let Some(target_asid) = self.hal.active_asid() else {
+        let Some(target_asid) = self.hal.active_asid_on(self.current_cpu()) else {
             crate::yarm_log!(
                 "D6_PROOF_LIVE_RSP_STACK_SKIP reason=no_active_asid rsp=0x{:x}",
                 sampled_rsp
@@ -1419,7 +1419,7 @@ impl KernelState {
             (entry.0 & PageTableEntry::WRITABLE) != 0 && (entry.0 & PageTableEntry::USER) == 0
         }
 
-        let Some(active_asid) = self.hal.active_asid() else {
+        let Some(active_asid) = self.hal.active_asid_on(self.current_cpu()) else {
             crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_BEGIN active_asid=none");
             crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_DONE tasks=0 failures=0");
             return Ok(());

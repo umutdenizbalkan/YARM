@@ -275,6 +275,8 @@ mod tests {
             record_index: 0,
             record_generation: 1,
             server_reply_cap: crate::kernel::capabilities::CapId(9),
+            // Local enqueue: the committed target is the enqueueing CPU, so no remote wake.
+            wake_target_cpu: crate::kernel::scheduler::CpuId(0),
         })
     }
 
@@ -282,6 +284,8 @@ mod tests {
         Ok(IpcReplyDirectSuccess {
             record_index: 0,
             record_generation: 1,
+            // Local enqueue: the committed target is the enqueueing CPU, so no remote wake.
+            wake_target_cpu: crate::kernel::scheduler::CpuId(0),
         })
     }
 

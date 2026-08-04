@@ -46,7 +46,13 @@ recheck_exact_commit() {
 
 # Fixed-substring counter over a normalized (CR->LF) log.
 count_in() { tr '\r' '\n' <"$1" | rg -a -c -F "$2" 2>/dev/null || echo 0; }
-have_in()  { tr '\r' '\n' <"$1" | rg -a -q -F "$2"; }
+# NOTE: deliberately NOT `rg -q`. Under `set -o pipefail` (line 18), `rg -q` exits on its first
+# match and closes the pipe, `tr` then dies of SIGPIPE, and the pipeline status becomes 141 — so
+# a marker that IS present but appears early in a large boot log reported as ABSENT. That made
+# this seal fail on `server_wakes=1` (present at line 1004 of a 607 KB log) while the very same
+# assertion passed by hand. Dropping `-q` makes rg consume the whole stream, so there is no
+# SIGPIPE. The assertion itself is unchanged: still an anchored fixed-substring presence test.
+have_in()  { tr '\r' '\n' <"$1" | rg -a -F "$2" >/dev/null 2>&1; }
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 # RUN_A — x86 feature-off core smoke, SMP=1. No direct-oracle retirement markers may appear.

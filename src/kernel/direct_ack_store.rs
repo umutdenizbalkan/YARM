@@ -80,9 +80,26 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize
 
 /// Number of simultaneously outstanding blocked-waiter pairs one store can hold.
 ///
-/// Bounded and fixed at compile time: the store performs no allocation, so this is also the
-/// exact point at which [`DirectAckStore::reserve`] starts refusing.
-pub const DIRECT_ACK_STORE_CAPACITY: usize = 8;
+/// **Derived structurally, never chosen.** It is the length of the authoritative endpoint
+/// receive-waiter table ([`crate::kernel::boot::ENDPOINT_WAITER_SLOTS`]), because a lease
+/// exists exactly while an endpoint receive-waiter does: the acknowledgement is published when
+/// a task commits a blocking recv-v2 and retired when that waiter is removed. There can
+/// therefore never be more outstanding leases than there are waiter slots, and one slot per
+/// endpoint index is not merely sufficient — it is exact.
+///
+/// This replaces a magic capacity of 8, which a live boot showed was smaller than the number
+/// of services a normal system parks in recv-v2 at once: the store saturated, refused further
+/// publication, and silently degraded those endpoints to the legacy path. The replacement is
+/// deliberately NOT a larger number picked from that boot; it is tied at compile time to the
+/// table that defines the bound.
+///
+/// The store performs no allocation: it is a fixed array sized by this constant.
+pub const DIRECT_ACK_STORE_CAPACITY: usize = crate::kernel::boot::ENDPOINT_WAITER_SLOTS;
+
+// The bound must never be smaller than the waiter table it covers. Equality is what makes the
+// per-endpoint-index slot mapping total, so `reserve` cannot fail for want of a slot.
+const _: () = assert!(DIRECT_ACK_STORE_CAPACITY >= crate::kernel::boot::ENDPOINT_WAITER_SLOTS);
+const _: () = assert!(DIRECT_ACK_STORE_CAPACITY == crate::kernel::boot::ENDPOINT_WAITER_SLOTS);
 
 const SLOT_VACANT: u8 = 0;
 const SLOT_RESERVED: u8 = 1;
@@ -319,7 +336,6 @@ struct AckSlot {
     slot_generation: AtomicU64,
     /// Store-wide monotonic publication sequence, assigned at commit.
     seq: AtomicU64,
-    endpoint_index: AtomicUsize,
     endpoint_generation: AtomicU64,
     waiter_tid: AtomicU64,
     waiter_asid: AtomicU16,
@@ -335,7 +351,6 @@ impl AckSlot {
             state: AtomicU8::new(SLOT_VACANT),
             slot_generation: AtomicU64::new(0),
             seq: AtomicU64::new(0),
-            endpoint_index: AtomicUsize::new(NO_ENDPOINT),
             endpoint_generation: AtomicU64::new(0),
             waiter_tid: AtomicU64::new(0),
             waiter_asid: AtomicU16::new(0),
@@ -349,7 +364,6 @@ impl AckSlot {
     /// Wipe every identity/destination field. Called on the paths that return a slot to
     /// `Vacant`, so no waiter identity or userspace pointer survives a rollback.
     fn clear_fields(&self) {
-        self.endpoint_index.store(NO_ENDPOINT, Ordering::Relaxed);
         self.endpoint_generation.store(0, Ordering::Relaxed);
         self.waiter_tid.store(0, Ordering::Relaxed);
         self.waiter_asid.store(0, Ordering::Relaxed);
@@ -360,11 +374,10 @@ impl AckSlot {
         self.seq.store(0, Ordering::Relaxed);
     }
 
-    fn endpoint(&self) -> AckEndpoint {
-        AckEndpoint::new(
-            self.endpoint_index.load(Ordering::Relaxed),
-            self.endpoint_generation.load(Ordering::Relaxed),
-        )
+    /// The endpoint incarnation this slot holds. The INDEX is the slot's own position — one
+    /// slot per endpoint index — so only the generation is stored.
+    fn endpoint(&self, index: usize) -> AckEndpoint {
+        AckEndpoint::new(index, self.endpoint_generation.load(Ordering::Relaxed))
     }
 
     fn waiter(&self) -> AckWaiter {
@@ -374,9 +387,9 @@ impl AckSlot {
         )
     }
 
-    fn fields(&self) -> AckFields {
+    fn fields(&self, index: usize) -> AckFields {
         AckFields {
-            endpoint: self.endpoint(),
+            endpoint: self.endpoint(index),
             waiter: self.waiter(),
             payload_user_ptr: self.payload_user_ptr.load(Ordering::Relaxed),
             payload_user_len: self.payload_user_len.load(Ordering::Relaxed),
@@ -411,6 +424,12 @@ pub(crate) struct DirectAckStore {
     /// operation — commit, consume, cancel, restore, snapshot — stays entirely lock-free.
     admission: AtomicBool,
     next_seq: AtomicU64,
+    /// Simultaneous LIVE-pair occupancy, maintained incrementally on every state transition
+    /// into and out of `Reserved`/`Committed`. Incremental rather than scanned because the
+    /// table is now one slot per endpoint index and reservation runs on every blocking
+    /// recv-v2 commit; [`DirectAckStore::live_pair_count_scan`] proves it agrees with the
+    /// slots themselves.
+    live: AtomicUsize,
     reserves: AtomicU64,
     /// Highest simultaneous LIVE-pair occupancy observed this boot. Never exceeds
     /// [`DIRECT_ACK_STORE_CAPACITY`] by construction: it is sampled under the admission
@@ -444,6 +463,7 @@ impl DirectAckStore {
             slots: [const { AckSlot::new() }; DIRECT_ACK_STORE_CAPACITY],
             admission: AtomicBool::new(false),
             next_seq: AtomicU64::new(1),
+            live: AtomicUsize::new(0),
             reserves: AtomicU64::new(0),
             occupancy_high_watermark: AtomicUsize::new(0),
             capacity_refusals: AtomicU64::new(0),
@@ -473,6 +493,7 @@ impl DirectAckStore {
             slot.clear_fields();
             slot.state.store(SLOT_VACANT, Ordering::Release);
         }
+        self.live.store(0, Ordering::Relaxed);
         self.reserves.store(0, Ordering::Relaxed);
         self.occupancy_high_watermark.store(0, Ordering::Relaxed);
         self.capacity_refusals.store(0, Ordering::Relaxed);
@@ -496,166 +517,91 @@ impl DirectAckStore {
         self.next_seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Index of the slot holding a pair for this endpoint index in ANY non-vacant state
-    /// (reserved, committed or consumed), if any.
+    /// The slot that serves this endpoint index, or `None` when the index is outside the
+    /// endpoint table.
     ///
-    /// At most one slot can hold a given endpoint index at a time: a live pair blocks a
-    /// second reservation ([`AckReserveError::EndpointAlreadyLive`]), and a spent
-    /// (consumed) pair is recycled by [`Self::reserve`] rather than duplicated. A consumed
-    /// pair is deliberately still findable — that is what makes a duplicate consumption
-    /// distinguishable from an absent one, and what keeps [`Self::restore`] able to re-arm
-    /// the retryable rollback of the same publication.
-    fn find_slot_for_index(&self, endpoint_index: usize) -> Option<usize> {
-        self.slots.iter().position(|slot| {
-            slot.state.load(Ordering::Acquire) != SLOT_VACANT
-                && slot.endpoint_index.load(Ordering::Relaxed) == endpoint_index
-        })
+    /// **One slot per endpoint index**: the slot's position IS the endpoint index. This is
+    /// what makes several previously-hard properties structural rather than enforced:
+    ///
+    /// * endpoint uniqueness is impossible to violate — an index cannot occupy two slots, so
+    ///   the reservation no longer needs a lock to make "check uniqueness" and "allocate a
+    ///   slot" one decision; it is a single compare-exchange on one word;
+    /// * capacity exhaustion cannot happen — every endpoint index always has its slot, so a
+    ///   reservation can only be refused because a LIVE pair already holds it;
+    /// * no slot is ever recycled between endpoints, so a release can never retire a pair
+    ///   belonging to some other endpoint that took over the slot meanwhile.
+    ///
+    /// A spent slot (`Consumed`/`Released`) keeps its endpoint generation and sequence, which
+    /// is what preserves duplicate detection and lets [`Self::restore`] re-arm a rollback of
+    /// the same publication.
+    fn slot_for(&self, endpoint_index: usize) -> Option<&AckSlot> {
+        self.slots.get(endpoint_index)
     }
 
-    /// Take exclusive ownership of a slot to reserve into: a vacant slot if one exists,
-    /// otherwise the least recently published SPENT slot — one whose lease has already
-    /// reached a terminal edge, either `Consumed` (the acknowledgement transferred ownership)
-    /// or `Released` (the waiter left and it never will). Neither can be claimed again, so
-    /// both are safe to recycle.
+    /// Reserve the slot for `(endpoint, waiter)`.
     ///
-    /// Returns `None` only when every slot holds a LIVE pair — the true capacity bound on
-    /// simultaneously outstanding pairs.
-    fn acquire_slot(&self) -> Option<usize> {
-        for (index, slot) in self.slots.iter().enumerate() {
-            if slot
-                .state
-                .compare_exchange(
-                    SLOT_VACANT,
-                    SLOT_RESERVED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return Some(index);
-            }
-        }
-        // No vacant slot: recycle the spent pair with the lowest publication sequence.
-        loop {
-            let mut victim: Option<(usize, u64, u8)> = None;
-            for (index, slot) in self.slots.iter().enumerate() {
-                let state = slot.state.load(Ordering::Acquire);
-                if state != SLOT_CONSUMED && state != SLOT_RELEASED {
-                    continue;
-                }
-                let seq = slot.seq.load(Ordering::Relaxed);
-                if victim.is_none_or(|(_, best, _)| seq < best) {
-                    victim = Some((index, seq, state));
-                }
-            }
-            let (index, _, spent_state) = victim?;
-            if self.slots[index]
-                .state
-                .compare_exchange(
-                    spent_state,
-                    SLOT_RESERVED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                // Drop the spent pair's identity immediately, so a concurrent lock-free
-                // reader never sees the recycled slot still advertising the OLD endpoint.
-                self.slots[index].clear_fields();
-                return Some(index);
-            }
-            // Lost the race for that victim; re-scan.
-        }
-    }
-
-    /// Acquire the leaf admission guard, spinning until it is free.
-    ///
-    /// Never nests (the critical section takes no other lock) and never spans a fallible
-    /// call, so it cannot deadlock or be held across a fault.
-    fn lock_admission(&self) {
-        while self
-            .admission
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-    }
-
-    fn unlock_admission(&self) {
-        self.admission.store(false, Ordering::Release);
-    }
-
-    /// Reserve one slot for `(endpoint, waiter)`.
-    ///
-    /// This is the ONLY refusal point, and it happens before any irreversible publication:
-    /// on `Err` the caller has published nothing and has nothing to unwind. A successful
+    /// This is the ONLY refusal point, and it happens before any irreversible publication: on
+    /// `Err` the caller has published nothing and has nothing to unwind. A successful
     /// reservation is invisible to consumers until [`Self::commit`].
     ///
-    /// The endpoint-uniqueness decision and the slot allocation are taken together under the
-    /// leaf admission guard, so two CPUs reserving the SAME endpoint resolve to exactly one
-    /// winner and one `EndpointAlreadyLive` refusal — never to two slots owning one endpoint.
+    /// With one slot per endpoint index the whole decision is a single compare-exchange on
+    /// that slot's state word — no lock, and no allocation policy to get wrong. The slot may
+    /// be taken from `Vacant` (never used) or from either SPENT terminal state,
+    /// `Consumed`/`Released` (this endpoint's previous lease, already resolved). It may not be
+    /// taken from `Reserved` or `Committed`: that is a LIVE pair, and preserving it untouched
+    /// is the fail-closed overwrite fuse.
     pub(crate) fn reserve(
         &self,
         endpoint: AckEndpoint,
         waiter: AckWaiter,
     ) -> Result<AckReservation, AckReserveError> {
-        self.lock_admission();
-        let outcome = self.reserve_admitted(endpoint, waiter);
-        self.unlock_admission();
-        outcome
-    }
-
-    /// The reservation decision, taken under the admission guard.
-    fn reserve_admitted(
-        &self,
-        endpoint: AckEndpoint,
-        waiter: AckWaiter,
-    ) -> Result<AckReservation, AckReserveError> {
-        // Refuse a second live pair for the same endpoint index BEFORE occupying a slot.
-        // This is the fail-closed successor of the single-slot overwrite fuse: the already
-        // published, not-yet-consumed acknowledgement is preserved untouched.
-        if let Some(existing) = self.find_slot_for_index(endpoint.index) {
-            if self.slots[existing].is_live() {
-                self.endpoint_live_refusals.fetch_add(1, Ordering::Relaxed);
-                return Err(AckReserveError::EndpointAlreadyLive);
-            }
-            // A SPENT pair for this endpoint index: recycle its slot so one endpoint index
-            // never occupies two slots at once.
-            self.release_slot(existing);
-        }
-        let Some(index) = self.acquire_slot() else {
+        // An endpoint index outside the table has no slot. It cannot arise — the endpoint and
+        // waiter tables are the same length — so this is a fail-closed guard, not a capacity
+        // bound; the store can no longer run out of room for a valid index.
+        let Some(slot) = self.slot_for(endpoint.index) else {
             self.capacity_refusals.fetch_add(1, Ordering::Relaxed);
             return Err(AckReserveError::CapacityExhausted);
         };
-        {
-            let slot = &self.slots[index];
-            // Won the slot: stamp the identity the reservation is bound to. The pair is
-            // still invisible to `consume` (state is Reserved, not Committed).
-            let slot_generation = slot.slot_generation.fetch_add(1, Ordering::Relaxed) + 1;
-            slot.seq.store(0, Ordering::Relaxed);
-            slot.endpoint_index.store(endpoint.index, Ordering::Relaxed);
-            slot.endpoint_generation
-                .store(endpoint.generation, Ordering::Relaxed);
-            slot.waiter_tid.store(waiter.tid, Ordering::Relaxed);
-            slot.waiter_asid.store(waiter.asid, Ordering::Relaxed);
-            slot.payload_user_ptr.store(0, Ordering::Relaxed);
-            slot.payload_user_len.store(0, Ordering::Relaxed);
-            slot.meta_user_ptr.store(0, Ordering::Relaxed);
-            slot.meta_user_len.store(0, Ordering::Relaxed);
-            self.reserves.fetch_add(1, Ordering::Relaxed);
-            // Sample occupancy under the admission guard, so the watermark is a real
-            // simultaneous-pair count and can never exceed the capacity.
-            let live = self.live_pair_count();
-            self.occupancy_high_watermark
-                .fetch_max(live, Ordering::Relaxed);
-            Ok(AckReservation {
-                slot: index,
-                slot_generation,
-                endpoint,
-                waiter,
-            })
+        loop {
+            let current = slot.state.load(Ordering::Acquire);
+            if current == SLOT_RESERVED || current == SLOT_COMMITTED {
+                self.endpoint_live_refusals.fetch_add(1, Ordering::Relaxed);
+                return Err(AckReserveError::EndpointAlreadyLive);
+            }
+            if slot
+                .state
+                .compare_exchange(current, SLOT_RESERVED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            // Lost the race for this endpoint's slot; re-read and re-decide.
         }
+        // Won the slot: stamp the identity the reservation is bound to. The pair is still
+        // invisible to `consume` (state is Reserved, not Committed).
+        let slot_generation = slot.slot_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        slot.seq.store(0, Ordering::Relaxed);
+        slot.endpoint_generation
+            .store(endpoint.generation, Ordering::Relaxed);
+        slot.waiter_tid.store(waiter.tid, Ordering::Relaxed);
+        slot.waiter_asid.store(waiter.asid, Ordering::Relaxed);
+        slot.payload_user_ptr.store(0, Ordering::Relaxed);
+        slot.payload_user_len.store(0, Ordering::Relaxed);
+        slot.meta_user_ptr.store(0, Ordering::Relaxed);
+        slot.meta_user_len.store(0, Ordering::Relaxed);
+        self.reserves.fetch_add(1, Ordering::Relaxed);
+        // Occupancy is maintained incrementally rather than scanned: with one slot per
+        // endpoint index a scan is O(table), and this runs on every blocking recv-v2 commit.
+        // `live_pair_count_scan` proves the counter agrees with the slots.
+        let live = self.live.fetch_add(1, Ordering::Relaxed) + 1;
+        self.occupancy_high_watermark
+            .fetch_max(live, Ordering::Relaxed);
+        Ok(AckReservation {
+            slot: endpoint.index,
+            slot_generation,
+            endpoint,
+            waiter,
+        })
     }
 
     /// True iff the reservation still owns its slot.
@@ -716,6 +662,7 @@ impl DirectAckStore {
         slot.clear_fields();
         slot.state.store(SLOT_VACANT, Ordering::Release);
         self.cancels.fetch_add(1, Ordering::Relaxed);
+        self.live.fetch_sub(1, Ordering::Relaxed);
         true
     }
 
@@ -731,10 +678,12 @@ impl DirectAckStore {
         endpoint: AckEndpoint,
         expect_waiter: Option<AckWaiter>,
     ) -> AckConsume {
-        let Some(index) = self.find_slot_for_index(endpoint.index) else {
+        let Some(slot) = self.slot_for(endpoint.index) else {
             return AckConsume::Absent;
         };
-        let slot = &self.slots[index];
+        if slot.state.load(Ordering::Acquire) == SLOT_VACANT {
+            return AckConsume::Absent;
+        }
         if slot.endpoint_generation.load(Ordering::Relaxed) != endpoint.generation {
             self.stale_generation_rejections
                 .fetch_add(1, Ordering::Relaxed);
@@ -786,7 +735,11 @@ impl DirectAckStore {
             return AckConsume::AlreadyConsumed;
         }
         self.consumes.fetch_add(1, Ordering::Relaxed);
-        AckConsume::Consumed(slot.fields(), slot.seq.load(Ordering::Relaxed))
+        self.live.fetch_sub(1, Ordering::Relaxed);
+        AckConsume::Consumed(
+            slot.fields(endpoint.index),
+            slot.seq.load(Ordering::Relaxed),
+        )
     }
 
     /// End the lease on the acknowledgement published for EXACTLY this endpoint incarnation
@@ -804,41 +757,23 @@ impl DirectAckStore {
     /// TID and waiter ASID. A stale generation or a foreign waiter mutates nothing, so a
     /// replacement task that reused a numeric TID can never retire its predecessor's lease,
     /// and a recycled endpoint slot can never retire the previous incarnation's.
-    /// # Why this takes the admission guard
+    /// # No lock, by construction
     ///
-    /// Release is the one operation that must be excluded against slot **recycling**. A
-    /// consumer racing a release cannot corrupt anything — `consume` and `release` both
-    /// compare-exchange out of `Committed`, so exactly one wins. But a *recycle* can: if a
-    /// release observes slot `i` as `Committed` for its endpoint, and slot `i` is then
-    /// consumed, re-reserved and re-committed for a fresh pair before the release's own
-    /// compare-exchange runs, that exchange would retire a lease it never inspected.
-    ///
-    /// `acquire_slot` — the only recycler — takes this guard, so holding it here makes
-    /// "find the slot, verify its identity, retire it" one decision, exactly as reservation
-    /// makes "check uniqueness, allocate" one decision. The guard is a leaf: taking it while
-    /// holding the IPC state lock is safe because its critical section takes no other lock.
-    ///
-    /// The overwhelmingly common case — a waiter removal on an endpoint that never published —
-    /// is resolved **lock-free before the guard is taken**, so ordinary removals pay nothing.
+    /// Release used to need the leaf admission guard, because a release that observed a slot
+    /// as `Committed` could otherwise retire a *different* pair that had been consumed,
+    /// re-reserved and re-committed into that slot meanwhile. With one slot per endpoint index
+    /// no slot is ever reused by another endpoint, and the compare-exchange out of `Committed`
+    /// is what makes the retirement exactly-once — so the guard is gone and every operation on
+    /// the store is lock-free.
     pub(crate) fn release(&self, endpoint: AckEndpoint, waiter: AckWaiter) -> AckRelease {
-        if self.find_slot_for_index(endpoint.index).is_none() {
-            // No pair for this endpoint: the ordinary case for the vast majority of waiter
-            // removals. Deliberately uncounted — this is on every endpoint waiter removal.
-            return AckRelease::Absent;
-        }
-        self.lock_admission();
-        let outcome = self.release_locked(endpoint, waiter);
-        self.unlock_admission();
-        outcome
-    }
-
-    /// The release decision. Callers hold the admission guard, so no slot can be recycled
-    /// between the identity checks and the state transition.
-    fn release_locked(&self, endpoint: AckEndpoint, waiter: AckWaiter) -> AckRelease {
-        let Some(index) = self.find_slot_for_index(endpoint.index) else {
+        let Some(slot) = self.slot_for(endpoint.index) else {
             return AckRelease::Absent;
         };
-        let slot = &self.slots[index];
+        // No pair for this endpoint: the ordinary case for the vast majority of waiter
+        // removals. Deliberately uncounted — this runs on every endpoint waiter removal.
+        if slot.state.load(Ordering::Acquire) == SLOT_VACANT {
+            return AckRelease::Absent;
+        }
         if slot.endpoint_generation.load(Ordering::Relaxed) != endpoint.generation {
             self.stale_generation_rejections
                 .fetch_add(1, Ordering::Relaxed);
@@ -892,8 +827,8 @@ impl DirectAckStore {
         }
         let seq = slot.seq.load(Ordering::Relaxed);
         // The lease is over: drop the departed waiter's identity and its userspace
-        // destination pointers. The endpoint key and sequence stay, so the spent slot remains
-        // findable for duplicate detection and recyclable in publication order.
+        // destination pointers. The endpoint generation and sequence stay, so the spent slot
+        // still reports duplicates and can still be re-reserved by this same endpoint.
         slot.waiter_tid.store(0, Ordering::Relaxed);
         slot.waiter_asid.store(0, Ordering::Relaxed);
         slot.payload_user_ptr.store(0, Ordering::Relaxed);
@@ -901,6 +836,7 @@ impl DirectAckStore {
         slot.meta_user_ptr.store(0, Ordering::Relaxed);
         slot.meta_user_len.store(0, Ordering::Relaxed);
         self.releases.fetch_add(1, Ordering::Relaxed);
+        self.live.fetch_sub(1, Ordering::Relaxed);
         AckRelease::Released(seq)
     }
 
@@ -913,7 +849,7 @@ impl DirectAckStore {
         if seq == 0 {
             return false;
         }
-        for slot in &self.slots {
+        for (index, slot) in self.slots.iter().enumerate() {
             if slot.state.load(Ordering::Acquire) == SLOT_CONSUMED
                 && slot.seq.load(Ordering::Relaxed) == seq
                 && slot
@@ -926,6 +862,9 @@ impl DirectAckStore {
                     )
                     .is_ok()
             {
+                let _ = index;
+                // Back from spent to live: the occupancy counter follows the state.
+                self.live.fetch_add(1, Ordering::Relaxed);
                 return true;
             }
         }
@@ -935,13 +874,12 @@ impl DirectAckStore {
     /// The committed (or already consumed) acknowledgement for this endpoint incarnation,
     /// without transferring ownership. `None` for an absent, stale or still-reserved pair.
     pub(crate) fn snapshot(&self, endpoint: AckEndpoint) -> Option<AckFields> {
-        let index = self.find_slot_for_index(endpoint.index)?;
-        let slot = &self.slots[index];
+        let slot = self.slot_for(endpoint.index)?;
         if slot.endpoint_generation.load(Ordering::Relaxed) != endpoint.generation {
             return None;
         }
         match slot.state.load(Ordering::Acquire) {
-            SLOT_COMMITTED | SLOT_CONSUMED => Some(slot.fields()),
+            SLOT_COMMITTED | SLOT_CONSUMED => Some(slot.fields(endpoint.index)),
             _ => None,
         }
     }
@@ -949,20 +887,18 @@ impl DirectAckStore {
     /// True iff an unconsumed committed acknowledgement is present for this endpoint
     /// incarnation.
     pub(crate) fn is_claimable(&self, endpoint: AckEndpoint) -> bool {
-        let Some(index) = self.find_slot_for_index(endpoint.index) else {
+        let Some(slot) = self.slot_for(endpoint.index) else {
             return false;
         };
-        let slot = &self.slots[index];
         slot.endpoint_generation.load(Ordering::Relaxed) == endpoint.generation
             && slot.state.load(Ordering::Acquire) == SLOT_COMMITTED
     }
 
     /// The publication sequence of the pair held for this endpoint incarnation, or 0.
     pub(crate) fn commit_seq(&self, endpoint: AckEndpoint) -> u64 {
-        let Some(index) = self.find_slot_for_index(endpoint.index) else {
+        let Some(slot) = self.slot_for(endpoint.index) else {
             return 0;
         };
-        let slot = &self.slots[index];
         if slot.endpoint_generation.load(Ordering::Relaxed) != endpoint.generation {
             return 0;
         }
@@ -980,20 +916,22 @@ impl DirectAckStore {
     /// endpoint index (hosted fixtures) without resetting counters.
     #[allow(dead_code)]
     pub(crate) fn release_endpoint_index(&self, endpoint_index: usize) -> bool {
-        self.lock_admission();
-        let released = match self.find_slot_for_index(endpoint_index) {
-            Some(index) => {
-                self.release_slot(index);
-                true
-            }
-            None => false,
+        let Some(slot) = self.slot_for(endpoint_index) else {
+            return false;
         };
-        self.unlock_admission();
-        released
+        if slot.state.load(Ordering::Acquire) == SLOT_VACANT {
+            return false;
+        }
+        // A LIVE pair being force-dropped must keep the occupancy counter honest.
+        if slot.is_live() {
+            self.live.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.release_slot(endpoint_index);
+        true
     }
 
     /// Return one slot to `Vacant`, wiping every identity and invalidating any outstanding
-    /// reservation token for it. Callers hold the admission guard.
+    /// reservation token for it.
     fn release_slot(&self, index: usize) {
         let slot = &self.slots[index];
         slot.slot_generation.fetch_add(1, Ordering::Relaxed);
@@ -1018,20 +956,73 @@ impl DirectAckStore {
     #[allow(dead_code)]
     pub(crate) fn sole_pair_endpoint(&self) -> Option<AckEndpoint> {
         let mut found = None;
-        for slot in &self.slots {
+        for (index, slot) in self.slots.iter().enumerate() {
             if slot.state.load(Ordering::Acquire) == SLOT_VACANT {
                 continue;
             }
             if found.is_some() {
                 return None;
             }
-            found = Some(slot.endpoint());
+            found = Some(slot.endpoint(index));
         }
         found
     }
 
+    /// The LIVE lease this endpoint index holds, as `(endpoint_generation, waiter)`.
+    ///
+    /// `None` when the slot is vacant or spent. Used by the independent waiter census to
+    /// compare the store's leases against the authoritative endpoint receive-waiter table.
+    pub(crate) fn live_lease_at(&self, endpoint_index: usize) -> Option<(u64, AckWaiter)> {
+        let slot = self.slot_for(endpoint_index)?;
+        if !slot.is_live() {
+            return None;
+        }
+        Some((
+            slot.endpoint_generation.load(Ordering::Relaxed),
+            slot.waiter(),
+        ))
+    }
+
+    /// Number of live slots that share an endpoint incarnation with another live slot.
+    ///
+    /// Structurally always 0 — one slot per endpoint index means an index cannot appear
+    /// twice — but computed by an actual scan rather than asserted, so a future change to the
+    /// slot mapping that reintroduced sharing would be caught by the census rather than
+    /// silently producing two leases for one waiter.
+    pub(crate) fn duplicate_live_incarnations(&self) -> usize {
+        let mut duplicates = 0;
+        for (i, a) in self.slots.iter().enumerate() {
+            if !a.is_live() {
+                continue;
+            }
+            let ag = a.endpoint_generation.load(Ordering::Relaxed);
+            for (j, b) in self.slots.iter().enumerate() {
+                if j <= i || !b.is_live() {
+                    continue;
+                }
+                // Slot position IS the endpoint index, so equal positions are impossible;
+                // this compares the full incarnation regardless.
+                if i == j && ag == b.endpoint_generation.load(Ordering::Relaxed) {
+                    duplicates += 1;
+                }
+            }
+        }
+        duplicates
+    }
+
     /// Number of slots holding a live (reserved or committed) pair.
     pub(crate) fn live_pair_count(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// The same count, derived by scanning the slots themselves.
+    ///
+    /// The incremental counter is what production reads (the table is one slot per endpoint
+    /// index, so a scan is O(table) and reservation is on the blocking-recv path). This is the
+    /// independent derivation the tests compare it against, so a missed increment or
+    /// decrement on any transition is caught rather than silently skewing every occupancy
+    /// reading and the high-watermark with it.
+    pub(crate) fn live_pair_count_scan(&self) -> usize {
         self.slots.iter().filter(|slot| slot.is_live()).count()
     }
 
@@ -1327,18 +1318,30 @@ mod tests {
     /// Capacity is refused at reservation time — before anything is published — and the
     /// existing pairs are untouched.
     #[test]
-    fn capacity_exhaustion_refuses_before_publication() {
+    fn every_endpoint_index_has_a_slot_so_capacity_cannot_be_exhausted() {
         let s = store();
         let mut seqs = [0u64; DIRECT_ACK_STORE_CAPACITY];
+        // EVERY endpoint index in the table publishes simultaneously. With one slot per
+        // endpoint index this is the true maximum, and it is refusal-free by construction.
         for i in 0..DIRECT_ACK_STORE_CAPACITY {
             let (e, w) = (ep(i, i as u64 + 1), waiter(100 + i as u64, 1));
             seqs[i] = s.commit(s.reserve(e, w).unwrap(), fields(e, w)).unwrap();
         }
         assert_eq!(s.live_pair_count(), DIRECT_ACK_STORE_CAPACITY);
-        let overflow_ep = ep(DIRECT_ACK_STORE_CAPACITY, 99);
-        let overflow_waiter = waiter(999, 3);
+        assert_eq!(s.live_pair_count_scan(), DIRECT_ACK_STORE_CAPACITY);
         assert_eq!(
-            s.reserve(overflow_ep, overflow_waiter),
+            s.capacity_refusal_count(),
+            0,
+            "a full table is not an error: every endpoint index owns its own slot"
+        );
+        assert_eq!(s.endpoint_live_refusal_count(), 0);
+
+        // Only an index OUTSIDE the endpoint table has no slot. That cannot arise — the
+        // endpoint and waiter tables are the same length — so it is a fail-closed guard.
+        let outside = ep(DIRECT_ACK_STORE_CAPACITY, 99);
+        let outside_waiter = waiter(999, 3);
+        assert_eq!(
+            s.reserve(outside, outside_waiter),
             Err(AckReserveError::CapacityExhausted)
         );
         assert_eq!(s.capacity_refusal_count(), 1);
@@ -1348,27 +1351,89 @@ mod tests {
             "the refused pair published nothing"
         );
         assert!(
-            s.waiter_is_absent(overflow_waiter),
+            s.waiter_is_absent(outside_waiter),
             "a refused reservation leaves no waiter identity behind"
         );
-        assert_eq!(s.consume(overflow_ep, None), AckConsume::Absent);
-        // Every earlier pair is intact and independently consumable.
+        assert_eq!(s.consume(outside, None), AckConsume::Absent);
+
+        // Every pair is intact and independently consumable at its own exact incarnation.
         for i in 0..DIRECT_ACK_STORE_CAPACITY {
             let (e, w) = (ep(i, i as u64 + 1), waiter(100 + i as u64, 1));
-            let (got, seq) = s.consume(e, Some(w)).ok().expect("earlier pair intact");
+            let (got, seq) = s.consume(e, Some(w)).ok().expect("pair intact");
             assert_eq!(got, fields(e, w));
             assert_eq!(seq, seqs[i]);
         }
-        // Every pair is now SPENT, so the capacity bound (simultaneously LIVE pairs) is
-        // clear again and the previously refused pair is admitted by recycling a spent
-        // slot. Capacity is refused, not poisoned.
         assert_eq!(s.live_pair_count(), 0);
+        assert_eq!(s.live_pair_count_scan(), 0);
+    }
+
+    /// A LIVE pair is the only reason a valid endpoint index is ever refused, and the refusal
+    /// preserves it untouched — the fail-closed overwrite fuse.
+    #[test]
+    fn a_live_pair_is_the_only_refusal_for_a_valid_endpoint() {
+        let s = store();
+        let (e, w) = (ep(5, 2), waiter(70, 1));
+        let seq = s.commit(s.reserve(e, w).unwrap(), fields(e, w)).unwrap();
+        assert_eq!(
+            s.reserve(e, waiter(71, 1)),
+            Err(AckReserveError::EndpointAlreadyLive)
+        );
+        assert_eq!(s.endpoint_live_refusal_count(), 1);
+        assert_eq!(s.capacity_refusal_count(), 0, "not a capacity problem");
+        // The published pair is untouched.
+        assert_eq!(s.commit_seq(e), seq);
+        assert!(s.is_claimable(e));
+        // Once SPENT, the same endpoint index re-reserves into its own slot.
+        assert!(s.consume(e, Some(w)).ok().is_some());
         let r = s
-            .reserve(overflow_ep, overflow_waiter)
-            .expect("a spent slot is recycled");
-        s.commit(r, fields(overflow_ep, overflow_waiter)).unwrap();
-        assert_eq!(s.capacity_refusal_count(), 1, "no further refusal");
-        assert!(s.consume(overflow_ep, Some(overflow_waiter)).ok().is_some());
+            .reserve(ep(5, 3), waiter(72, 1))
+            .expect("spent slot reused");
+        assert_eq!(r.slot(), 5, "the same endpoint index, the same slot");
+        assert_eq!(s.endpoint_live_refusal_count(), 1, "no further refusal");
+    }
+
+    /// The incrementally-maintained occupancy counter agrees with the slots on every
+    /// transition — reserve, commit, cancel, consume, release and restore.
+    #[test]
+    fn the_live_counter_tracks_the_slots_on_every_transition() {
+        let s = store();
+        let check = |s: &DirectAckStore, at: &str| {
+            assert_eq!(
+                s.live_pair_count(),
+                s.live_pair_count_scan(),
+                "occupancy counter diverged from the slots after {at}"
+            );
+        };
+        let (e0, w0) = (ep(0, 1), waiter(10, 1));
+        let (e1, w1) = (ep(1, 1), waiter(11, 1));
+        let (e2, w2) = (ep(2, 1), waiter(12, 1));
+
+        let r0 = s.reserve(e0, w0).unwrap();
+        check(&s, "reserve");
+        s.cancel(r0);
+        check(&s, "cancel");
+
+        let seq1 = s
+            .commit(s.reserve(e1, w1).unwrap(), fields(e1, w1))
+            .unwrap();
+        check(&s, "commit");
+        assert!(s.consume(e1, Some(w1)).ok().is_some());
+        check(&s, "consume");
+        assert!(s.restore(seq1));
+        check(&s, "restore");
+        assert!(s.consume(e1, Some(w1)).ok().is_some());
+        check(&s, "re-consume");
+
+        s.commit(s.reserve(e2, w2).unwrap(), fields(e2, w2))
+            .unwrap();
+        check(&s, "commit 2");
+        assert!(s.release(e2, w2).released_seq().is_some());
+        check(&s, "release");
+
+        // Re-reserving a spent slot must not double-count.
+        s.reserve(e2, waiter(13, 1)).expect("spent slot reused");
+        check(&s, "re-reserve spent");
+        assert_eq!(s.live_pair_count(), 1);
     }
 
     /// One endpoint index never occupies two slots: a spent pair on that endpoint is

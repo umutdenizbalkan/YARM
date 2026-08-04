@@ -310,11 +310,17 @@ pub(crate) struct LiveTlbShootdownState {
 pub(crate) struct IpcSubsystem {
     pub(crate) cross_cpu_work: SmpMailbox,
     pub(crate) live_tlb_shootdown: LiveTlbShootdownState,
-    pub(crate) endpoints: [Option<KernelStorage<Endpoint>>; MAX_ENDPOINTS],
-    pub(crate) endpoint_waiters: [Option<ReceiverWaiterIdentity>; MAX_ENDPOINTS],
+    pub(crate) endpoints: [Option<KernelStorage<Endpoint>>; ENDPOINT_WAITER_SLOTS],
+    /// The **authoritative endpoint receive-waiter table**. Its length is the structural
+    /// bound on how many endpoint incarnations can simultaneously hold a blocked receiver —
+    /// and therefore on how many direct-IPC acknowledgement leases can be outstanding at
+    /// once, since a lease exists exactly while one of these slots does.
+    /// [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`] is derived from the
+    /// same constant, so the two can never drift.
+    pub(crate) endpoint_waiters: [Option<ReceiverWaiterIdentity>; ENDPOINT_WAITER_SLOTS],
     pub(crate) endpoint_sender_waiters:
-        [[Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS]; MAX_ENDPOINTS],
-    pub(crate) endpoint_generations: [u64; MAX_ENDPOINTS],
+        [[Option<SenderWaiter>; MAX_ENDPOINT_SENDER_WAITERS]; ENDPOINT_WAITER_SLOTS],
+    pub(crate) endpoint_generations: [u64; ENDPOINT_WAITER_SLOTS],
     pub(crate) notifications: [Option<NotificationObject>; MAX_NOTIFICATIONS],
     pub(crate) notification_waiters: [Option<ThreadId>; MAX_NOTIFICATIONS],
     pub(crate) notification_generations: [u64; MAX_NOTIFICATIONS],

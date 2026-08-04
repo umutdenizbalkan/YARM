@@ -100,6 +100,20 @@ pub(crate) struct DirectReplyFacts {
     /// off-lock would deliver the payload and **silently drop the capability** — the receiver
     /// sees a successful reply with `transferred_cap=0` and no way to tell it was robbed.
     pub(crate) transfer_cap_present: bool,
+    /// Whether this reply-record incarnation participates in an **armed terminal-ownership /
+    /// reply-timeout race**, read from the authoritative `reply_terminal_ownership` cell and
+    /// exact in record index AND generation
+    /// (`SharedKernel::reply_record_terminal_arbitrated_split_read`).
+    ///
+    /// Such a reply is arbitrated: it must reserve the terminal before its caller copy and
+    /// commit it after, so that a concurrent timeout claimant provably loses. That lease —
+    /// `reserve_reply_win_before_copy` → delivery → `commit_reply_win_after_delivery`, with
+    /// `rollback_reply_win` on a retryable copy fault — lives only on the legacy reply path.
+    /// The direct transaction neither takes it nor leaves the record in the state the legacy
+    /// path expects, so servicing an arbitrated reply off-lock loses the race the caller was
+    /// promised: live, the reply reserved, rolled back, and the timeout's deferred path
+    /// completed instead.
+    pub(crate) terminal_arbitrated: bool,
 }
 
 /// The exhaustive NR6 eligibility verdict.
@@ -147,6 +161,10 @@ pub(crate) enum DirectReplyEligibility {
     /// deliver. The legacy path owns it; declining here is what stops the capability from
     /// being silently dropped.
     TransferCapUnsupported,
+    /// The reply participates in an armed terminal-ownership / reply-timeout race. The
+    /// terminal lease that makes the reply provably beat a concurrent timeout lives only on
+    /// the legacy path, so this reply is the legacy path's to service.
+    TerminalArbitrationUnsupported,
     /// The endpoint is not admitted to the off-lock path (non-x86 oracle confinement).
     EndpointNotAdmitted,
 }
@@ -188,6 +206,14 @@ impl DirectReplyEligibility {
     /// implementing direct capability transfer would unlock.
     pub(crate) fn is_transfer_cap_decline(self) -> bool {
         matches!(self, Self::TransferCapUnsupported)
+    }
+
+    /// True for the one decline that exists because a terminal-ownership / reply-timeout race
+    /// is arbitrating this reply. Reported separately so a live boot can show exactly how much
+    /// of the legacy reply population is arbitrated — which is the size of the work that
+    /// porting the terminal lease into the direct transaction would unlock.
+    pub(crate) fn is_terminal_arbitration_decline(self) -> bool {
+        matches!(self, Self::TerminalArbitrationUnsupported)
     }
 }
 
@@ -270,6 +296,14 @@ pub(crate) fn classify_direct_reply_eligibility(
     if let Err(err) = facts.reply_object {
         return DirectReplyEligibility::ReplyCapUnresolved(err);
     }
+    // The reply record's identity is now known, so the arbitration fact applies. It is checked
+    // BEFORE eligibility can be granted, and therefore before the acknowledgement claim, the
+    // record reservation or consumption, the payload/meta copy, any waiter mutation or wake,
+    // the reverse-link close, and any direct transaction call — every one of which happens
+    // only on the `Eligible` arm at the call site.
+    if facts.terminal_arbitrated {
+        return DirectReplyEligibility::TerminalArbitrationUnsupported;
+    }
     let (index, generation) = match facts.reply_endpoint {
         Some(pair) => pair,
         None => return DirectReplyEligibility::ReplyEndpointGone,
@@ -308,6 +342,7 @@ mod tests {
             reply_endpoint: Some((4, 9)),
             endpoint_admitted: true,
             transfer_cap_present: false,
+            terminal_arbitrated: false,
         }
     }
 
@@ -654,6 +689,132 @@ mod tests {
         let verdict = DirectReplyEligibility::TransferCapUnsupported;
         assert_eq!(verdict.endpoint(), None);
         // It is not an error-carrying variant — the legacy path returns the real result.
+        assert!(!matches!(
+            verdict,
+            DirectReplyEligibility::ReplyCapUnresolved(_)
+        ));
+    }
+
+    // ── NR7 terminal-arbitration safety ────────────────────────────────────────────────
+
+    /// **The headline rule.** A reply whose record is arbitrated by an armed
+    /// terminal-ownership / reply-timeout race is ineligible, and declines for that reason
+    /// specifically. The terminal lease that makes such a reply provably beat a concurrent
+    /// timeout lives only on the legacy path.
+    #[test]
+    fn a_terminal_arbitrated_reply_is_ineligible() {
+        let mut facts = reply_facts();
+        facts.terminal_arbitrated = true;
+        let verdict = classify_direct_reply_eligibility(&facts);
+        assert_eq!(
+            verdict,
+            DirectReplyEligibility::TerminalArbitrationUnsupported
+        );
+        assert!(verdict.is_terminal_arbitration_decline());
+        assert_eq!(
+            verdict.endpoint(),
+            None,
+            "a decline services nothing: no endpoint to claim an acknowledgement for"
+        );
+        // It is the ONLY terminal-arbitration decline.
+        for other in [
+            DirectReplyEligibility::PayloadTooLong,
+            DirectReplyEligibility::RequesterUnavailable,
+            DirectReplyEligibility::ReplyCapUnresolved(KernelError::WrongObject),
+            DirectReplyEligibility::ReplyEndpointGone,
+            DirectReplyEligibility::TransferCapUnsupported,
+            DirectReplyEligibility::EndpointNotAdmitted,
+            DirectReplyEligibility::Eligible {
+                endpoint_index: 1,
+                endpoint_generation: 1,
+            },
+        ] {
+            assert!(!other.is_terminal_arbitration_decline(), "{other:?}");
+        }
+    }
+
+    /// An ORDINARY unarmed reply stays direct-eligible — the check narrows the direct path to
+    /// exactly the arbitrated population, it does not close it.
+    #[test]
+    fn an_unarmed_reply_remains_eligible() {
+        let facts = reply_facts();
+        assert!(!facts.terminal_arbitrated);
+        assert_eq!(
+            classify_direct_reply_eligibility(&facts),
+            DirectReplyEligibility::Eligible {
+                endpoint_index: 4,
+                endpoint_generation: 9,
+            }
+        );
+    }
+
+    /// The arbitration decline wins over every *later* check, so an arbitrated reply can never
+    /// reach an endpoint incarnation, an acknowledgement claim or the transaction — the
+    /// property is one of ordering, not of the call site's care.
+    #[test]
+    fn an_arbitrated_reply_declines_before_the_endpoint_is_even_resolved() {
+        let mut facts = reply_facts();
+        facts.terminal_arbitrated = true;
+        assert_eq!(
+            classify_direct_reply_eligibility(&facts),
+            DirectReplyEligibility::TerminalArbitrationUnsupported
+        );
+        // Even with the endpoint gone and the endpoint unadmitted, arbitration is what is
+        // reported — so the classifier never inspects them for an arbitrated reply.
+        facts.reply_endpoint = None;
+        facts.endpoint_admitted = false;
+        assert_eq!(
+            classify_direct_reply_eligibility(&facts),
+            DirectReplyEligibility::TerminalArbitrationUnsupported
+        );
+        // Only the checks that need no record identity at all outrank it: an unresolvable
+        // reply object has no record for the arbitration fact to be about.
+        let mut unresolved = reply_facts();
+        unresolved.terminal_arbitrated = true;
+        unresolved.reply_object = Err(KernelError::InvalidCapability);
+        assert_eq!(
+            classify_direct_reply_eligibility(&unresolved),
+            DirectReplyEligibility::ReplyCapUnresolved(KernelError::InvalidCapability)
+        );
+        let mut too_long = reply_facts();
+        too_long.terminal_arbitrated = true;
+        too_long.payload_len = IPC_DIRECT_PAYLOAD_MAX + 1;
+        assert_eq!(
+            classify_direct_reply_eligibility(&too_long),
+            DirectReplyEligibility::PayloadTooLong
+        );
+    }
+
+    /// NR6 has no arbitration fact and must not grow one: a request does not resolve a reply
+    /// record, so there is no terminal cell for it to race against.
+    #[test]
+    fn request_eligibility_has_no_terminal_arbitration_concept() {
+        let src = include_str!("direct_eligibility.rs");
+        let facts = src
+            .split("pub(crate) struct DirectRequestFacts {")
+            .nth(1)
+            .expect("facts present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(!facts.contains("terminal_arbitrated"));
+        let body = src
+            .split("pub(crate) fn classify_direct_request_eligibility(")
+            .nth(1)
+            .expect("classifier present")
+            .split("\n}\n")
+            .next()
+            .expect("body bounded");
+        assert!(!body.contains("terminal_arbitrated"));
+    }
+
+    /// The arbitration check is a DECLINE, never a failure: it yields no endpoint, so the call
+    /// site's `verdict.endpoint()` guard is what makes it mutation-free, and the legacy path
+    /// returns the real result.
+    #[test]
+    fn the_arbitration_decline_carries_no_error_and_no_endpoint() {
+        let verdict = DirectReplyEligibility::TerminalArbitrationUnsupported;
+        assert_eq!(verdict.endpoint(), None);
         assert!(!matches!(
             verdict,
             DirectReplyEligibility::ReplyCapUnresolved(_)

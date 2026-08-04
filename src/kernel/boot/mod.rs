@@ -72,6 +72,17 @@ use tid_allocation_policy::{TidAllocationCursor, TidAllocationPolicy};
 
 const MAX_ENDPOINTS: usize = 256;
 
+/// The length of the authoritative endpoint receive-waiter table
+/// ([`IpcSubsystem::endpoint_waiters`]), and the single place that length is named.
+///
+/// This is the **structural bound** on simultaneously outstanding direct-IPC acknowledgement
+/// leases: a lease exists exactly while an endpoint receive-waiter does, so there can never be
+/// more of them than there are waiter slots.
+/// [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`] is defined as this constant,
+/// and a compile-time assertion in that module pins the relationship — so the acknowledgement
+/// store cannot be under-sized by editing one of them.
+pub(crate) const ENDPOINT_WAITER_SLOTS: usize = MAX_ENDPOINTS;
+
 #[cfg(feature = "hosted-dev")]
 const MAX_ENDPOINT_SENDER_WAITERS: usize = 8;
 #[cfg(not(feature = "hosted-dev"))]
@@ -765,6 +776,34 @@ pub(crate) fn d6_switch_a_enabled() -> bool {
 /// (Stage 183). There is NO production opt-out back to the old global-lock path.
 pub(crate) fn d6_genuine_enabled() -> bool {
     cfg!(target_arch = "x86_64") && !d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()
+}
+
+/// Stage 199D — the CANONICAL replacement for [`d6_genuine_enabled`] as the "may this
+/// architecture run the authoritative queue-advancing dispatch outside the broad lock?"
+/// question, now that AArch64 readiness blocker 3 is structurally closed.
+///
+/// `d6_genuine_enabled` deliberately stays byte-identical and x86_64-only: it gates the D6
+/// queue-NEUTRAL dispatch slice and three `exec_state` decisions whose x86_64 semantics must
+/// not change, and widening it would silently alter AArch64 FutexWait/Yield behaviour. This
+/// predicate is the wider question, answered per architecture:
+///
+/// * **x86_64** — unchanged: exactly `d6_genuine_enabled()`.
+/// * **AArch64** — admitted, but only through the same `ipccall_direct_admission_enabled()`
+///   the direct NR6/NR7 path already uses, and only when no D6-switch diagnostic owns the
+///   switch path. Because `ipccall_direct_production_enabled()` is x86_64-only, that resolves
+///   to the armed proof/oracle gate on AArch64: **the AArch64 production default is OFF** and
+///   an ordinary AArch64 boot publishes no work item and drains nothing.
+/// * **RISC-V** — not admitted (no RISC-V work in this increment).
+// The only production caller is the AArch64 publication site; a hosted (x86_64) `lib` build
+// compiles no route to it, exactly like the sibling arch-gated predicates.
+#[allow(dead_code)]
+pub(crate) fn offlock_authoritative_dispatch_enabled() -> bool {
+    if cfg!(target_arch = "aarch64") {
+        return ipccall_direct_admission_enabled()
+            && !d6_controlled_switch_proof_enabled()
+            && !d6_switch_a_enabled();
+    }
+    d6_genuine_enabled()
 }
 
 /// Stage 167: per-CPU count of genuine scheduler-seam dispatch observations.
@@ -3113,43 +3152,49 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// True iff the direct NR6/NR7 path is the production default on this architecture.
 /// A compile-time constant, not a runtime knob.
 ///
-/// # HELD OFF — one live blocker remains (Stage 199D)
+/// # ENABLED on x86_64 — Stage 199D production default
 ///
-/// Every dependency on the proof oracle has been removed from admission, eligibility and
-/// acknowledgement publication: flipping this to `cfg!(target_arch = "x86_64")` is the
-/// entire enablement. The first attempt hard-stopped on a service-chain regression with four
-/// defects the oracle's endpoint confinement had been hiding. **Three are now fixed and one
-/// remains.**
+/// The off-lock direct NR6/NR7 path is the **production default on x86_64**: ordinary
+/// `IpcCall`/`IpcReply` traffic is serviced before the broad kernel lock, with no oracle, no
+/// proof gate and no endpoint confinement involved. AArch64 and RISC-V still resolve to the
+/// proof gate and the oracle confinement, so their boots are byte-identical.
 ///
-/// 1. ~~Capability transfer is silently dropped.~~ **FIXED.** NR7 eligibility now carries
-///    `transfer_cap_present`, asked through the same canonical `transfer_cap_arg_present`
-///    predicate the legacy decode uses, and a cap-bearing reply declines before any mutation
-///    to the legacy path. Live on a feature-off boot with the flip on: `transfer_cap=10`
-///    declines, `PM_ELF_ZC_FAIL count=0`, and **all 6 service entries present exactly once**.
-///    Direct capability transfer is still unimplemented — declining is the whole fix.
-/// 2. ~~The acknowledgement store has no production release path.~~ **FIXED.** The lease is
-///    now owned by the endpoint waiter lifecycle: the three `IpcSubsystem` waiter-removal
-///    primitives every canonical closing edge funnels through retire the exact
-///    `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` lease. Live:
-///    `release=52` (NR6) and `release=64` (NR7) leases retired that previously orphaned.
-/// 3. ~~Orphans trip the overwrite fuse.~~ **FIXED.** 17 trips on the first attempt, **0**
-///    now — each cycle's lease ends with its own waiter, so a re-block is never refused.
-/// 4. **Capacity is structurally too small — the remaining blocker.**
-///    `DIRECT_ACK_STORE_CAPACITY` is 8, and a normal boot parks more than that: ten distinct
-///    servers blocked in recv-v2 over one boot, and at `INIT_IDLE_PARK_BEGIN` the store sits
-///    at `live=8 high_watermark=8 capacity=8` with one `CAPACITY_REFUSED` per store. Those 8
-///    are **not** orphans — the accounting is exact in both directions
-///    (`reserve == consume + release + cancel + live`, 113 == 53+52+0+8 and 113 == 41+64+0+8)
-///    — they are resident services legitimately parked. The store is simply saturated, so a
-///    ninth parked server gets no lease and its endpoint silently falls back to legacy.
-///    Resizing is deliberately out of scope here.
+/// Seven blockers stood between the mechanism and this default. Every one was found by a live
+/// boot rather than by inspection, and every one is closed:
 ///
-/// Note that `live == 0` is **not** a valid quiescence requirement for a running microkernel:
-/// a healthy system always has its resident services parked in recv-v2, each holding a
-/// legitimate lease. `QuiescentVerdict::no_orphaned_lease` is the leak invariant that holds at
-/// any instant, and it passes.
+/// 1. **Capability transfer was silently dropped.** NR7 eligibility carries
+///    `transfer_cap_present`, asked through the one canonical `transfer_cap_arg_present`
+///    predicate the legacy decode is itself built on; a cap-bearing reply declines before any
+///    mutation and the legacy path does the transfer.
+/// 2. **The acknowledgement store had no production release path.** The lease is owned by the
+///    endpoint waiter lifecycle: the three `IpcSubsystem` waiter-removal primitives every
+///    canonical closing edge funnels through retire the exact
+///    `{endpoint_index, endpoint_generation, waiter_tid, waiter_asid}` lease.
+/// 3. **Orphans tripped the overwrite fuse** — 17 trips on the first attempt, 0 now.
+/// 4. **Capacity was a magic 8.** [`crate::kernel::direct_ack_store::DIRECT_ACK_STORE_CAPACITY`]
+///    is now [`ENDPOINT_WAITER_SLOTS`] — one slot per endpoint index, derived at compile time
+///    from the authoritative endpoint receive-waiter table rather than chosen.
+/// 5. **The reverse-link CREATION edge was blind to the direct path.** Both installation seams
+///    delegate to [`install_server_reply_link`].
+/// 6. **The reverse-link CLOSE edge had the same divergence**, permissively. All four closing
+///    paths delegate to [`close_server_reply_link`], so `links_created == links_closed` is a
+///    meaningful leak invariant on the production path.
+/// 7. **Terminal-arbitrated replies lost their race.** A reply whose record is arbitrated by an
+///    armed terminal-ownership / reply-timeout cell must reserve the terminal before its caller
+///    copy and commit it after; that lease lives only on the legacy path, so servicing one
+///    off-lock made the reply reserve, roll back, and lose to the timeout's deferred path. NR7
+///    eligibility now carries `terminal_arbitrated`, read from the authoritative cell and exact
+///    in record index AND generation, and such a reply declines before any mutation.
+///
+/// Both reverse-link edges and both installation edges are single shared decisions, and the
+/// arbitrated reply population is explicitly ineligible — so the direct path services exactly
+/// the traffic whose semantics it reproduces.
+///
+/// **Future canonical 199E work:** porting the reply-win terminal lease into the direct NR7
+/// transaction, which would let the arbitrated population go off-lock too. Until then those
+/// replies take the legacy path by design, counted as `declined_terminal_arbitration`.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    false
+    cfg!(target_arch = "x86_64")
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.
@@ -4062,6 +4107,184 @@ pub(crate) fn server_dies_stale_token() -> Option<(usize, u64, u64, u16)> {
 //
 // Feature-gated in full. With `ipc-reply-timeout-oracle-core` off, every entry point below
 // is absent and the production sites call nothing.
+/// Stage 199D — **THE single reverse-link installation decision**, shared by the legacy
+/// (`KernelState::register_server_reply_link`) and split
+/// (`SharedKernel::register_server_reply_link_split`) paths.
+///
+/// The two paths used to carry independent copies of this decision, and they drifted: the
+/// split twin installed the link but never stamped the system-wide creation edge, while the
+/// legacy one did. With the direct NR6 path as the production default, every request then
+/// installed a link the ServerDies leak accounting never counted as created, while the close
+/// edge still counted — `IPC_SERVER_DEATH_LINK_LEAK created=0 closed=13`. The links were fine;
+/// the attestation that would have caught a *real* reverse-link leak was blind.
+///
+/// Sharing the decision — not merely the stamp — is what makes that unrepeatable: there is one
+/// status gate, one set of match arms and one `note_link_created` call, so an installation edge
+/// cannot exist without its accounting, and neither can drift from the other.
+///
+/// Returns whether the server's TCB now holds EXACTLY `link`. The creation edge is stamped
+/// **exactly once**, and only on a genuine new installation:
+///
+/// | case | installs | returns | stamps |
+/// | --- | --- | --- | --- |
+/// | no link present | yes | `true` | **yes** |
+/// | the identical link already present (duplicate retry) | no | `true` | no |
+/// | a DIFFERENT live link present | no | `false` | no |
+/// | the incarnation has committed to exit | no | `false` | no |
+///
+/// A missing or foreign TCB never reaches here — both callers resolve the exact
+/// `{tid, asid}` incarnation first and return `false` without calling in.
+pub(crate) fn install_server_reply_link(
+    tcb: &mut crate::kernel::task::ThreadControlBlock,
+    link: crate::kernel::task::ServerReplyLink,
+) -> bool {
+    // Stage 200D-1: an incarnation that has already committed to exit must never be published
+    // as an authorized replier. Teardown snapshots the link AFTER the status flips, so a link
+    // installed now would never be looked at and the caller would block forever with no death
+    // claim. Refusing forces the NR6 publication to roll back, which is the only other
+    // permitted outcome of that race.
+    if !matches!(
+        tcb.status,
+        crate::kernel::task::TaskStatus::Runnable
+            | crate::kernel::task::TaskStatus::Running
+            | crate::kernel::task::TaskStatus::Blocked(_)
+    ) {
+        return false;
+    }
+    match tcb.server_reply_link {
+        // Idempotent re-registration: the authority already exists, so nothing is installed
+        // and nothing is counted. Counting here would double-count a duplicate retry.
+        Some(existing) if existing == link => true,
+        // A DIFFERENT live link: refuse rather than replace. Replacing would silently retire
+        // an authority whose close edge has not run, which is a real leak.
+        Some(_) => false,
+        None => {
+            tcb.server_reply_link = Some(link);
+            // The SYSTEM-WIDE creation edge — it fires for every bound `IpcCall`, not just the
+            // armed ServerDies one, so it feeds the unscoped leak totals.
+            // `note_link_created` adds it to the armed transaction's vector only when the
+            // record identities match, which is what stops unrelated calls from being compared
+            // against one death's single detach.
+            #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+            server_dies_counters::note_link_created(
+                link.reply_record_index,
+                link.reply_record_generation,
+            );
+            true
+        }
+    }
+}
+
+/// The reply-timeout domain's reverse-link close, re-exported so the fourth closing path has a
+/// direct behavioural test rather than only a structural one. It stays a narrow-domain helper
+/// with no production callers outside `ipc_state`.
+pub(crate) use ipc_state::rt_detach_server_link;
+
+/// Which reverse link a close is entitled to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkCloseSelector {
+    /// Remove the link **only** if it names this exact reply-record incarnation. Every
+    /// ordinary terminal close uses this: reply, timeout, caller exit, endpoint destruction,
+    /// cancellation and rollback all know which record they are finalizing, and a close that
+    /// does not name it has no business removing an authority.
+    Exact {
+        record_index: usize,
+        record_generation: u64,
+    },
+    /// Remove whatever link is present, whichever record it names.
+    ///
+    /// Used **only** by the exiting-server take path, which is not finalizing one record —
+    /// the whole incarnation is going away, so any authority it still holds must go with it.
+    Any,
+}
+
+/// The outcome of a reverse-link close.
+///
+/// Only [`LinkCloseOutcome::Closed`] mutates. Every other variant leaves the slot exactly as
+/// it was, so an absent, stale, foreign, repeated or non-matching close is a pure no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkCloseOutcome {
+    /// A link was genuinely removed, and is returned. The only mutating result, and the only
+    /// one that stamps the close edge.
+    Closed(crate::kernel::task::ServerReplyLink),
+    /// No link was present — the idempotent repeat case.
+    AlreadyAbsent,
+    /// The same record slot at a DIFFERENT generation: the slot was reclaimed and reused, so
+    /// this close belongs to a previous occupant and must mutate nothing.
+    StaleRecordGeneration,
+    /// A different outstanding record is live on this server. Removing it would silently
+    /// strip a valid authority, so it is refused.
+    DifferentLiveLink,
+}
+
+impl LinkCloseOutcome {
+    /// The removed link, when this call is the one that closed it.
+    pub(crate) fn closed(self) -> Option<crate::kernel::task::ServerReplyLink> {
+        match self {
+            Self::Closed(link) => Some(link),
+            Self::AlreadyAbsent | Self::StaleRecordGeneration | Self::DifferentLiveLink => None,
+        }
+    }
+}
+
+/// Stage 199D — **THE single reverse-link CLOSE decision**, shared by all four closing paths:
+/// `KernelState::detach_server_reply_link_exact`, `KernelState::take_server_reply_link`,
+/// `SharedKernel::unregister_server_reply_link_split` and the reply-timeout domain's
+/// `rt_detach_server_link`.
+///
+/// The exact mirror of [`install_server_reply_link`], and it exists for the same reason. The
+/// four paths carried independent copies of this decision and two of them — the direct NR7
+/// close and the reply-timeout close — removed links without stamping the close edge, while
+/// the other two stamped. Unifying the *creation* edge made that visible: the system totals
+/// went to `created=54 closed=13`, the 41 missing closes being exactly the direct NR7
+/// completions on that boot, and the leak attestation was wrong on the production path in the
+/// permissive direction.
+///
+/// Sharing the decision — not merely the stamp — is what makes it unrepeatable: one set of
+/// match arms and one `note_link_closed` call, on the arm that genuinely removes a link.
+///
+/// | case | removes | outcome | stamps |
+/// | --- | --- | --- | --- |
+/// | `Exact`, link matches the record incarnation | yes | `Closed(link)` | **yes** |
+/// | `Any`, a link is present | yes | `Closed(link)` | **yes** |
+/// | no link present (absent, or a repeated close) | no | `AlreadyAbsent` | no |
+/// | `Exact`, same slot at a different generation | no | `StaleRecordGeneration` | no |
+/// | `Exact`, a different record is live | no | `DifferentLiveLink` | no |
+///
+/// A missing or foreign TCB never reaches here — every caller resolves the exact
+/// `{tid, asid}` incarnation first and reports its own contract's failure without calling in.
+pub(crate) fn close_server_reply_link(
+    tcb: &mut crate::kernel::task::ThreadControlBlock,
+    selector: LinkCloseSelector,
+) -> LinkCloseOutcome {
+    let Some(link) = tcb.server_reply_link else {
+        return LinkCloseOutcome::AlreadyAbsent;
+    };
+    if let LinkCloseSelector::Exact {
+        record_index,
+        record_generation,
+    } = selector
+        && !link.matches_record(record_index, record_generation)
+    {
+        // Same slot, later incarnation: the slot was reclaimed and this close belongs to a
+        // previous occupant. Distinguished from a wholly different record because the two are
+        // very different bugs, and both callers that care report them separately.
+        return if link.reply_record_index == record_index {
+            LinkCloseOutcome::StaleRecordGeneration
+        } else {
+            LinkCloseOutcome::DifferentLiveLink
+        };
+    }
+    tcb.server_reply_link = None;
+    // The SYSTEM-WIDE close edge, stamped exactly once and only after a genuine
+    // `Some(link) -> None` mutation. It is attributed by the REMOVED link's record identity,
+    // not by the selector, so the `Any` path reports the record it actually closed and the
+    // armed ServerDies vector is moved only when it is that transaction's own link.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    server_dies_counters::note_link_closed(link.reply_record_index, link.reply_record_generation);
+    LinkCloseOutcome::Closed(link)
+}
+
 #[cfg(feature = "ipc-reply-timeout-oracle-core")]
 pub mod server_dies_counters {
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};

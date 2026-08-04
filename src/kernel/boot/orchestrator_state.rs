@@ -20,6 +20,20 @@ pub(crate) fn set_with_tcbs_probe(active: bool) {
     WITH_TCBS_PROBE_ACTIVE.store(active, Ordering::Release);
 }
 
+/// Stage 199D — raw projection of the task (rank 2) domain needed by the SPLIT SYSCALL
+/// RETURN: `(task_state_lock, tcbs, tls_restore_pending)`.
+///
+/// Both storages live in the task domain and are serialized by the same `task_state_lock`,
+/// so the handled-split return takes ONE rank-2 acquisition rather than straddling two.
+// Names the return type of a projector whose callers are AArch64-gated; a hosted `lib` build
+// compiles no route to it, exactly like the sibling `*_from_raw` projectors.
+#[allow(dead_code)]
+pub(crate) type TaskReturnSplitPtrs = (
+    *const crate::kernel::lock::SpinLockIrq<()>,
+    *mut KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
+    *mut KernelStorage<[Option<ThreadId>; MAX_TASKS]>,
+);
+
 impl KernelState {
     fn lock_domain_rank(domain: &'static str) -> u8 {
         match domain {
@@ -1410,6 +1424,28 @@ impl KernelState {
             (
                 core::ptr::addr_of!((*state).task_state_lock),
                 core::ptr::addr_of_mut!((*state).tcbs),
+            )
+        }
+    }
+
+    /// Stage 199D — task (rank 2) seam projector for the SPLIT SYSCALL RETURN.
+    ///
+    /// Returns [`TaskReturnSplitPtrs`]: `(task_state_lock, tcbs, tls_restore_pending)`.
+    ///
+    /// Exposes the TCB array **and** the TLS-restore table under the SAME task lock, because
+    /// the AArch64 handled-split return needs both and must not straddle two acquisitions:
+    /// the exact-incarnation validation, the TLS-restore take and the user-context commit are
+    /// one decision about one task.
+    pub(crate) unsafe fn task_return_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> TaskReturnSplitPtrs {
+        // SAFETY: see module pattern note above. `tls_restore_pending` lives in the task
+        // domain alongside `tcbs` and is serialized by the same `task_state_lock`.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).task_state_lock),
+                core::ptr::addr_of_mut!((*state).tcbs),
+                core::ptr::addr_of_mut!((*state).tls_restore_pending),
             )
         }
     }

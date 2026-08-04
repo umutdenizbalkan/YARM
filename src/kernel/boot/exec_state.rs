@@ -1615,6 +1615,37 @@ impl KernelState {
         // its reply endpoint). After the reply succeeds it issues ONE deliberate DUPLICATE NR7 (proving
         // the one-shot barrier: the kernel refuses it with WrongObject, zero side effects) then parks.
         // recv_cap patch offset is 23 (identical to C2B2), so the existing patch logic applies.
+        // Stage 199D repair — the NR7 reply must declare "no transfer capability".
+        //
+        // `SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`) is the ONE encoding that means "no capability";
+        // every other value — **including a raw 0** — NAMES one. That is the canonical contract
+        // (`transfer_cap_arg_present`, pinned by `transfer_cap_arg_zero_is_not_treated_as_none`).
+        //
+        // This stub left arg5 (r9) at 0 for its NR7, which under that contract is a CAP-BEARING
+        // reply naming capability id 0. Before the Stage 199D transfer-cap safety increment the
+        // direct NR7 gate had no transfer-cap fact at all, so the malformed argument was simply
+        // ignored and the reply was delivered — which is why the bidirectional seal passed at
+        // 4605ebc7. Once the gate correctly began declining cap-bearing replies
+        // (`TransferCapUnsupported`, since the direct transaction cannot transfer a capability),
+        // this reply fell through to the legacy path, where resolving capability id 0 as a
+        // transfer cap fails — so the reply never landed and RUN_D timed out. The kernel was
+        // right; the oracle was issuing a malformed NR7.
+        //
+        // The fix loads `-1` into r9 so the reply declares no transfer capability. To keep every
+        // relative jump displacement and the array length valid, the four bytes are freed by
+        // loading the two immediates via `push imm8; pop reg` (3 bytes each instead of 5) rather
+        // than by inserting — so both NR7 sites stay exactly 20 bytes:
+        //
+        //     6A 07 58        push 7 ; pop rax     -> eax = 7 (NR7)
+        //     44 89 EF        mov edi, r13d        -> arg0 = the receiver-local Reply cap
+        //     BE .. .. .. ..  mov esi, 0x20050000  -> arg1 = reply source
+        //     6A 08 5A        push 8 ; pop rdx     -> arg2 = 8
+        //     49 83 C9 FF     or r9, -1            -> arg5 = SYSCALL_NO_TRANSFER_CAP
+        //     0F 05           syscall
+        //
+        // Applied to BOTH sites: the genuine reply and the deliberate duplicate NR7 that proves
+        // the one-shot barrier (the duplicate must still be refused for being a duplicate, not
+        // for being malformed).
         const RECV_V2_SERVER_STUB_C2C: [u8; 262] = [
             0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x2E, 0x00, 0x00,
             0x00, 0x0F, 0x05, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xBF, 0x44, 0x44, 0x44, 0x44, 0xBE,
@@ -1627,12 +1658,12 @@ impl KernelState {
             0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x03, 0x02, 0x20, 0xBE, 0x60, 0x00, 0x00,
             0x00, 0x0F, 0x05, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x05, 0x02, 0x20, 0xBE,
             0x75, 0x00, 0x00, 0x00, 0x0F, 0x05, 0x41, 0xBD, 0x10, 0x00, 0x04, 0x20, 0x45, 0x8B,
-            0x6D, 0x00, 0x31, 0xDB, 0xFF, 0xC3, 0xB8, 0x07, 0x00, 0x00, 0x00, 0x44, 0x89, 0xEF,
-            0xBE, 0x00, 0x00, 0x05, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x0F, 0x05, 0x85, 0xC9,
+            0x6D, 0x00, 0x31, 0xDB, 0xFF, 0xC3, 0x6A, 0x07, 0x58, 0x44, 0x89, 0xEF, 0xBE, 0x00,
+            0x00, 0x05, 0x20, 0x6A, 0x08, 0x5A, 0x49, 0x83, 0xC9, 0xFF, 0x0F, 0x05, 0x85, 0xC9,
             0x74, 0x17, 0x83, 0xF9, 0x07, 0x75, 0x2D, 0x83, 0xFB, 0x40, 0x73, 0x28, 0xB9, 0x00,
-            0x00, 0x04, 0x00, 0xF3, 0x90, 0xFF, 0xC9, 0x75, 0xFA, 0xEB, 0xCF, 0xB8, 0x07, 0x00,
-            0x00, 0x00, 0x44, 0x89, 0xEF, 0xBE, 0x00, 0x00, 0x05, 0x20, 0xBA, 0x08, 0x00, 0x00,
-            0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00,
+            0x00, 0x04, 0x00, 0xF3, 0x90, 0xFF, 0xC9, 0x75, 0xFA, 0xEB, 0xCF, 0x6A, 0x07, 0x58,
+            0x44, 0x89, 0xEF, 0xBE, 0x00, 0x00, 0x05, 0x20, 0x6A, 0x08, 0x5A, 0x49, 0x83, 0xC9,
+            0xFF, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xB8, 0xC6, 0xA9, 0x00,
             0x00, 0x0F, 0x05, 0xEB, 0xFE, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x04, 0x02,
             0x20, 0xBE, 0x2F, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xEB,
         ];
@@ -1646,7 +1677,44 @@ impl KernelState {
         const CLIENT_NR6_FAIL_MARKER: &[u8] = b"X86_BSP_NR6_REQUEST cpu=0 result=fail\n";
         const _: () = assert!(CLIENT_NR6_MARKER.len() == 55);
         const _: () = assert!(CLIENT_NR6_FAIL_MARKER.len() == 38);
-        const CLIENT_NR6_REQUEST: &[u8] = b"NR6-REQ!";
+        // Stage 199D repair — the request must be staged in PRODUCTION FRAMING.
+        //
+        // `ipc_call` (NR6) sends `opcode = OPCODE_INLINE` with `FLAG_REPLY_CAP`, which by the frozen
+        // recv-v2 contract means the raw payload is a FRAMED message: its first two bytes are the
+        // inline application opcode and the remainder is the application data. Every legacy delivery
+        // path stripped that prefix; commit 458bb3d4 made the direct NR6 path conform, via the one
+        // canonical `project_recv_delivery`.
+        //
+        // This oracle client had never framed its request — it staged eight bare bytes. Under the
+        // pre-458bb3d4 direct path, which delivered the raw wire frame unstripped, the CPU-1 server
+        // happened to observe `NR6-REQ!` with `payload_len = 8` and validated. Once the direct path
+        // started conforming, those same eight bytes were correctly reinterpreted as
+        // `opcode = 0x524E` ("NR") plus a SIX-byte application payload `6-REQ!`, the server's ring-3
+        // comparison failed, `X86_AP_RECV_V2_VALIDATE_FAIL` fired, and the terminal request-OK
+        // marker — gated on the server's continuation — was never emitted. The kernel was right and
+        // the oracle was asserting pre-conformance framing.
+        //
+        // Staging a genuine two-byte inline opcode ahead of the payload restores the invariant the
+        // proof is actually about — *the receiver observes exactly the application bytes the sender
+        // sent* — and makes the oracle exercise production framing rather than an artefact of it.
+        // The CPU-1 server stub is UNCHANGED: it still validates `NR6-REQ!` and `payload_len == 8`,
+        // which is precisely what the conforming projection now delivers.
+        const CLIENT_NR6_INLINE_OPCODE: u16 = 0x0199;
+        const CLIENT_NR6_APP_PAYLOAD: &[u8] = b"NR6-REQ!";
+        const CLIENT_NR6_REQUEST: &[u8] = &[
+            0x99, 0x01, // CLIENT_NR6_INLINE_OPCODE, little-endian
+            b'N', b'R', b'6', b'-', b'R', b'E', b'Q', b'!',
+        ];
+        /// The wire length the client passes to NR6: two-byte prefix + eight application bytes.
+        const CLIENT_NR6_WIRE_LEN: u8 = 10;
+        // The staged bytes really are the declared opcode followed by the declared payload, and the
+        // wire length really is their sum. Compile-time, so the three cannot drift apart.
+        const _: () = assert!(CLIENT_NR6_REQUEST.len() == CLIENT_NR6_WIRE_LEN as usize);
+        const _: () = assert!(CLIENT_NR6_APP_PAYLOAD.len() == 8);
+        const _: () = assert!(CLIENT_NR6_REQUEST[0] == CLIENT_NR6_INLINE_OPCODE.to_le_bytes()[0]);
+        const _: () = assert!(CLIENT_NR6_REQUEST[1] == CLIENT_NR6_INLINE_OPCODE.to_le_bytes()[1]);
+        const _: () = assert!(CLIENT_NR6_REQUEST[2] == CLIENT_NR6_APP_PAYLOAD[0]);
+        const _: () = assert!(CLIENT_NR6_REQUEST[9] == CLIENT_NR6_APP_PAYLOAD[7]);
         // Stage 199A2D2C2C: reverse-direction (NR7 reply) client markers. After the NR6 SEND, the C2C
         // client issues a genuine recv-v2 on its OWN reply endpoint (blocking on CPU 0). When the CPU-1
         // server's reply is delivered + the client's saved frame resumes, it validates the reply bytes
@@ -1670,7 +1738,9 @@ impl KernelState {
         const RECV_V2_SERVER_REPLY_SRC_VA: u64 = 0x0000_0000_2005_0000;
         const CLIENT_STUB: [u8; 97] = [
             0x31, 0xDB, 0xFF, 0xC3, 0xB8, 0x06, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x00, 0x00,
-            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x00, 0x00,
+            // `mov edx, 0x0A` @20 — the FRAMED wire length (2-byte inline opcode + 8 app bytes),
+            // pinned to CLIENT_NR6_WIRE_LEN by the const assert below.
+            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x0A, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x00, 0x00,
             0x00, 0x00, 0x0F, 0x05, 0x85, 0xC9, 0x74, 0x10, 0x83, 0xF9, 0x07, 0x75, 0x25, 0x83,
             0xFB, 0x40, 0x73, 0x20, 0x31, 0xC0, 0x0F, 0x05, 0xEB, 0xCE, 0xB8, 0x0F, 0x00, 0x00,
             0x00, 0xBF, 0x00, 0x00, 0x02, 0x20, 0xBE, 0x37, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xB8,
@@ -1678,6 +1748,12 @@ impl KernelState {
             0x00, 0x01, 0x02, 0x20, 0xBE, 0x26, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xE4,
         ];
         const CLIENT_STUB_SEND_CAP_PATCH_OFFSET: usize = 10;
+        /// Offset of the NR6 length immediate (`mov edx, imm32`) in both client stubs.
+        const CLIENT_STUB_NR6_LEN_OFFSET: usize = 20;
+        // The hex immediate baked into each stub IS the declared framed wire length. Compile-time,
+        // so the machine code and the staged request can never disagree about the length again —
+        // which is exactly how the un-framed request went unnoticed until a live QEMU run.
+        const _: () = assert!(CLIENT_STUB[CLIENT_STUB_NR6_LEN_OFFSET] == CLIENT_NR6_WIRE_LEN);
         const CLIENT_STUB_REPLY_CAP_PATCH_OFFSET: usize = 26;
         // Stage 199A2D2C2C: the REVERSE-direction client stub. Prefix identical to CLIENT_STUB (bounded
         // NR6 retry, SEND cap @10, reply RECEIVE cap in NR6 arg5/R9 @26), but after X86_BSP_NR6_REQUEST_
@@ -1690,7 +1766,9 @@ impl KernelState {
         // (@26, @83) are patched to the SAME client reply RECEIVE cap.
         const CLIENT_STUB_C2C: [u8; 248] = [
             0x31, 0xDB, 0xFF, 0xC3, 0xB8, 0x06, 0x00, 0x00, 0x00, 0xBF, 0x11, 0x11, 0x11, 0x11,
-            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x08, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x22, 0x22,
+            // `mov edx, 0x0A` @20 — the FRAMED NR6 wire length. The later `mov edx, 8` in this stub
+            // is the recv-v2 REPLY length and stays 8: NR7 replies carry no opcode prefix.
+            0xBE, 0x00, 0x00, 0x03, 0x20, 0xBA, 0x0A, 0x00, 0x00, 0x00, 0x41, 0xB9, 0x22, 0x22,
             0x22, 0x22, 0x0F, 0x05, 0x85, 0xC9, 0x74, 0x18, 0x83, 0xF9, 0x07, 0x0F, 0x85, 0xB1,
             0x00, 0x00, 0x00, 0x83, 0xFB, 0x40, 0x0F, 0x83, 0xA8, 0x00, 0x00, 0x00, 0x31, 0xC0,
             0x0F, 0x05, 0xEB, 0xC6, 0xB8, 0x0F, 0x00, 0x00, 0x00, 0xBF, 0x00, 0x00, 0x02, 0x20,
@@ -1709,6 +1787,8 @@ impl KernelState {
             0x05, 0xB8, 0xC6, 0xA9, 0x00, 0x00, 0x0F, 0x05, 0xEB, 0xFE,
         ];
         const CLIENT_C2C_SEND_CAP_PATCH_OFFSET: usize = 10;
+        // Same tie for the reverse-direction client: its NR6 send uses the framed wire length.
+        const _: () = assert!(CLIENT_STUB_C2C[CLIENT_STUB_NR6_LEN_OFFSET] == CLIENT_NR6_WIRE_LEN);
         const CLIENT_C2C_REPLY_R9_PATCH_OFFSET: usize = 26;
         const CLIENT_C2C_REPLY_RECV_PATCH_OFFSET: usize = 83;
         const CLIENT_CODE_VA: u64 = 0x0000_0000_2000_0000;
@@ -2730,7 +2810,7 @@ impl KernelState {
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     pub(crate) fn d2_recv_switch_incoming_asid(&mut self, incoming: u64) {
         if let Some(asid) = self.task_asid(incoming) {
-            self.hal.switch_address_space(asid);
+            self.hal.switch_address_space(self.current_cpu(), asid);
         }
     }
 
@@ -2846,7 +2926,7 @@ impl KernelState {
                 if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!("DISPATCH: before switch_address_space asid={}", asid.0);
                 }
-                self.hal.switch_address_space(asid);
+                self.hal.switch_address_space(self.current_cpu(), asid);
                 if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                     crate::yarm_log!("DISPATCH: after switch_address_space asid={}", asid.0);
                     if self.current_cpu().0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
@@ -3321,7 +3401,7 @@ impl KernelState {
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);
             if let Some(asid) = incoming_asid {
-                self.hal.switch_address_space(asid);
+                self.hal.switch_address_space(self.current_cpu(), asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
             if outgoing_tid != Some(tid) {
@@ -3403,7 +3483,7 @@ impl KernelState {
         if let Some(tid) = next_tid {
             let incoming_asid = self.task_asid(tid);
             if let Some(asid) = incoming_asid {
-                self.hal.switch_address_space(asid);
+                self.hal.switch_address_space(self.current_cpu(), asid);
             }
             self.maybe_switch_kernel_context(outgoing_tid, tid)?;
             if outgoing_tid != Some(tid) {
@@ -3440,7 +3520,10 @@ impl KernelState {
     pub(crate) fn d6_emit_proof_cleanup_arch_markers(&mut self) {
         let current_tid = self.current_tid().unwrap_or(u64::MAX);
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK tid={}", current_tid);
-        let active_asid = self.hal.active_asid().map_or(0, |asid| asid.0);
+        let active_asid = self
+            .hal
+            .active_asid_on(self.current_cpu())
+            .map_or(0, |asid| asid.0);
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CR3_OK asid={}", active_asid);
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_TSS_OK");
         // Stage 139: force-restore hardware CR3 to the current task's address
@@ -3456,7 +3539,7 @@ impl KernelState {
                 hw_cr3,
                 task_asid.0
             );
-            self.hal.switch_address_space(task_asid);
+            self.hal.switch_address_space(self.current_cpu(), task_asid);
             crate::yarm_log!("D6_PROOF_CR3_CLEANUP_OK");
         }
     }
@@ -3503,7 +3586,9 @@ impl KernelState {
     /// Stage 133: narrow diagnostic accessor — returns the numeric ASID currently
     /// active in the HAL without exposing the private `hal` field.
     pub(crate) fn d6_diag_active_asid_num(&self) -> usize {
-        self.hal.active_asid().map_or(0, |a| a.0 as usize)
+        self.hal
+            .active_asid_on(self.current_cpu())
+            .map_or(0, |a| a.0 as usize)
     }
 }
 

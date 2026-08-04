@@ -51,10 +51,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **41** |
+| `SharedKernel::with_cpu` | **40** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **10** |
 | Raw `self.state.lock()` | **3** (only the three definitions in `runtime.rs`) |
-| **Total broad-lock acquisition sites** | **51** |
+| **Total broad-lock acquisition sites** | **50** |
 
 Canonical Stage **204A** additionally requires each site classified. That classification is
 complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
@@ -64,7 +64,7 @@ complete (`doc/KERNEL_UNLOCK_AUDIT.md` §1.4a):
 | boot-only | **0** | — |
 | test-only | **3** | `runtime.rs:1244`, `1248` (`ipc_recv_with_deadline_split_bridge`), `runtime.rs:2654` |
 | obsolete | **2** | `runtime.rs:2644` (`handle_trap_with_cpu`, **no in-tree caller at all**); `runtime.rs:3725` (`run_reply_timeout_completion`, superseded by `OffLockReplyTimeout`) |
-| runtime-required | **46** | the real retirement surface |
+| runtime-required | **45** | the real retirement surface |
 | undocumented | **0** | every site enumerated with file, line and enclosing function |
 
 This table is machine-checked: `tests/broad_lock_census_guard.rs` recomputes the per-file
@@ -77,25 +77,35 @@ is added or removed without updating it here, in `doc/KERNEL_UNLOCK_AUDIT.md` §
 > (`self.with(|k| k.task_home_cpu(tid))`). It is the only such case in the tree. Do not
 > treat the `_split_*` naming convention as a guarantee.
 
-#### `with_cpu` — 41 sites
+#### `with_cpu` — 40 sites
 
 | File | Count | Lines |
 |------|-------|-------|
-| `src/runtime.rs` | 13 | 389, 670, 1350, 1450, 1484, 1533, 1701, 1714, 1846, 2190, 2368, 2402, 2644 |
-| `src/arch/trap_entry.rs` | 12 | 299, 423, 499, 558, 644, 674, 747, 805, 1055, 1202, 1295, 1432 |
+| `src/runtime.rs` | 13 | 402, 683, 1602, 1702, 1736, 1785, 1953, 1966, 2098, 2443, 2621, 2655, 2897 |
+| `src/arch/trap_entry.rs` | 11 | 305, 429, 505, 701, 787, 817, 890, 948, 1198, 1345, 1438 |
 | `src/arch/riscv64/trap.rs` | 8 | 563, 659, 727, 825, 870, 958, 1063, 1194 |
 | `src/arch/x86_64/smp.rs` | 4 | 2179, 2455, 2571, 2664 |
 | `src/arch/x86_64/descriptor_tables.rs` | 2 | 1249, 1305 |
 | `src/arch/riscv64/boot.rs` | 1 | 1048 |
 | `src/kernel/boot/thread_state.rs` | 1 | 232 |
 
-Of those 41: **1** is the authoritative trap dispatch (`trap_entry.rs:299`, with its
+Of those 40: **1** is the authoritative trap dispatch (`trap_entry.rs:305`, with its
 RISC-V twin at `riscv64/trap.rs:563`) inside which every non-split syscall, every timer
 and external IRQ and every page fault runs its complete handler; **~20** are short
 post-lock re-acquisitions performed by the D2 / D6 / FutexWait / Yield drains purely to
 restore arch thread state after the authoritative dispatch already ran off-lock; **2** are
-identity snapshots (`descriptor_tables.rs:1249/1305`); **1** is the AArch64 split return
-path (`trap_entry.rs:1432`); the rest are SMP bring-up, RISC-V resume and thread creation.
+identity snapshots (`descriptor_tables.rs:1249/1305`); the rest are SMP bring-up, RISC-V
+resume and thread creation.
+
+> Stage 199D removed the AArch64 split-return site (`trap_entry.rs`, 12 → 11 sites) when
+> readiness blocker 2 was closed. Blocker 3's post-lock direct dispatch drain deliberately
+> added **none**: unlike the FutexWait/Yield drains above, it obtains its ASID activation and
+> its EL0 frame/TLS restore from bounded rank-2 seams rather than a brief `with_cpu`
+> re-acquire, which is why this table is unchanged at 40 across that increment. To make the
+> activation step possible without a `KernelState` mutation, the HAL's active-ASID record moved
+> out of `SelectedIsaHal` (a broad-lock-only field) into a lock-free cell that
+> `SelectedIsaHal::active_asid()` now reads — **no lock was added**, and one authority is kept
+> rather than two.
 
 #### Broad `.with(|state| …)` — 10 sites
 

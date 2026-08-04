@@ -23,12 +23,12 @@ Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **41** |
+| Production `SharedKernel::with_cpu` callsites | **40** |
 | Production broad `SharedKernel::with` callsites | **10** |
-| **Total production broad-lock acquisition sites** | **51** |
+| **Total production broad-lock acquisition sites** | **50** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
-| Off-lock authoritative dispatch | **x86_64 only** (`d6_genuine_enabled()` is compile-time false elsewhere) |
+| Off-lock authoritative dispatch | **x86_64 (live) + AArch64 (structural, proof-gated)** via `offlock_authoritative_dispatch_enabled()`; `d6_genuine_enabled()` itself remains compile-time x86_64-only. RISC-V not admitted. |
 
 ### Hosted validation (re-executed, not inherited)
 
@@ -67,8 +67,8 @@ complete the canonical stage.**
 | **Total** | **1 of 35** | 12 | 22 |
 
 **No canonical stage in Phases 2–6 or 8 is complete.** The one complete stage, 204A
-(broad-lock callsite census), is documentation rather than lock retirement: 51 callsites
-classified as 0 boot-only, 3 test-only, 2 obsolete, 46 runtime-required, 0 undocumented.
+(broad-lock callsite census), is documentation rather than lock retirement: 50 callsites
+classified as 0 boot-only, 3 test-only, 2 obsolete, 45 runtime-required, 0 undocumented.
 
 > **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
 > was the only row written without an `N of M` denominator, and the totals silently counted it
@@ -95,7 +95,7 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 | `ExitCurrentTask` NR 16 | **2 of 3** | x86_64 `0b5e98f`, AArch64; 202D (one sub-path; RISC-V unearned) |
 | **Server death (`ServerDies`) — x86_64** | **1 of 3** | **`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`; canonical 199D server-crash-cleanup increment** |
 | **Accepted total (production-path)** | **39** | 30 + 6 + 2 + 1 |
-| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D mechanism, **not** the production path |
+| Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D mechanism, **not** the production path. Originally earned at `ccceb03d`; **re-earned at `7d5a22c9`** after three repairs — see §0.1. |
 
 > **On the total.** There is no aggregate live-cell counter anywhere in the tree; the only
 > in-tree aggregate is Stage 198F's `total_live_cells=30`. The figure above is computed from
@@ -123,6 +123,98 @@ Exact commit `f5669cb55325ac58aba6a15207a89c95ad8cad3d`, tree
 
 Full detail: `doc/IPC.md` §8.5.
 
+### 0.1 x86_64 SMP=2 direct-IPC seal — reproduction status
+
+The four-run `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` was earned at `ccceb03d`. It does **not**
+reproduce at HEAD. Three independent defects were found; **one is repaired**, two are open and
+deliberately not folded into that repair.
+
+| # | Symptom | First bad | Status |
+|---|---------|-----------|--------|
+| 1 | RUN_C: `X86_AP_RECV_V2_VALIDATE_FAIL`; request-OK / user-validated absent | `458bb3d4` | ✅ **repaired** (`db783142`) |
+| 2 | RUN_C: `X86_AP_RESCHEDULE_IPI_SENT sender_cpu=0 receiver_cpu=1` fires **54×**, seal requires 1 | `fcfc55e3` | ✅ **repaired** (`6784a3ae`) |
+| 3 | RUN_D: reverse NR7 never completes — `IPCREPLY_DIRECT_SMP_REPLY_OK=0`, `timeout_before_completion` | `458bb3d4`-era transfer-cap decline vs. a malformed oracle NR7 | ✅ **repaired** (`7d5a22c9`) |
+
+**Defect 1 (repaired).** `ipc_call` (NR6) sends `opcode = OPCODE_INLINE` with `FLAG_REPLY_CAP`,
+which by the frozen recv-v2 contract makes the raw payload a **framed** message: first two bytes
+are the inline application opcode, the rest is application data. Every legacy path stripped that
+prefix; `458bb3d4` correctly converged the direct NR6 path onto the one canonical
+`project_recv_delivery`. The x86 SMP oracle's CPU-0 client had **never framed its request** — it
+staged eight bare bytes `NR6-REQ!`. Pre-`458bb3d4` the unstripped delivery meant the CPU-1 server
+saw exactly those eight bytes and validated; afterwards they were correctly reinterpreted as
+`opcode = 0x524E` plus a six-byte payload `6-REQ!`, so the server's ring-3 comparison failed.
+**The kernel was right; the oracle was asserting pre-conformance framing.** The repair stages a
+genuine two-byte inline opcode ahead of the payload (wire length 8 → 10) in both client stubs; the
+CPU-1 server stub is unchanged. Boundaries 1–13 of the causal chain now all pass.
+
+**Defect 2 (repaired).** First bad commit **`fcfc55e3`**. The candidate range toggles
+`ipccall_direct_production_enabled()` on and off repeatedly, so the signal is non-monotonic and
+`git bisect` is the wrong tool; testing the toggle points directly gives an exact correlation:
+
+| commit | `ipccall_direct_production_enabled()` | IPI sent |
+|---|---|---|
+| `da9d26e2` | `false` | 1 |
+| **`fcfc55e3`** | `cfg!(target_arch = "x86_64")` | **54** |
+| `340f7822` | `false` | 1 |
+| `c94cd304` | `cfg!(target_arch = "x86_64")` | **54** |
+
+**54 = 53 ordinary local direct-NR6 completions + the 1 genuine CPU0→CPU1 oracle delivery.** The
+post-transaction wake decision read a global oracle selector — a question that selector cannot
+answer — and aimed at a hardcoded CPU 1. The real authority was absent:
+`sr_enqueue_committed_receiver_split` computed the target CPU and discarded it. While the
+production default was off, the oracle's own request was the only traffic reaching the drain, so it
+fired once and looked correct. The repair makes the enqueue **return** its committed target,
+carries it in `IpcCallDirectSuccess`, and decides the wake by comparing it to the enqueueing CPU —
+so a local enqueue sends nothing regardless of any selector, and a real remote enqueue is woken on
+its authoritative home CPU.
+
+**Defect 3 (repaired).** RUN_D's first missing boundary was **#4, the direct NR7 eligibility
+verdict**: the AP's `nr=7` never split-dispatched. Instrumentation named it —
+`verdict=TransferCapUnsupported transfer_cap=true arg5=0x0`.
+
+`SYSCALL_NO_TRANSFER_CAP` (`u64::MAX`) is the ONE encoding meaning "no capability"; every other
+value — **including a raw `0`** — NAMES one (pinned by
+`transfer_cap_arg_zero_is_not_treated_as_none`). The AP oracle server left arg5 at 0, so its
+reply was cap-bearing. At `4605ebc7` the NR7 gate had no transfer-cap fact at all, so the
+malformed argument was ignored and the reply was delivered — which is why the bidirectional seal
+passed there. Once the Stage 199D transfer-cap safety increment correctly declined cap-bearing
+replies, the reply fell to legacy, where capability id 0 fails to resolve, and RUN_D timed out.
+Both NR7 sites now declare `SYSCALL_NO_TRANSFER_CAP`; the four bytes were freed via
+`push imm8; pop reg` rather than inserted, so the stub length and every jump displacement are
+unchanged.
+
+Repairing that exposed **defect 2's mirror on the reverse path** — the reply drain also read a
+global oracle selector and aimed at a hardcoded CPU 0, so the process manager's ordinary NR7 fired
+a spurious reverse IPI. Fixed identically to the forward path: the reply transaction reports its
+committed wake target and the drain compares it to the enqueueing CPU.
+
+### 0.2 The seal reproduces
+
+`STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok` at exact clean commit `7d5a22c9`, all four
+fresh runs from one commit with a clean-tree re-check after each:
+
+* **RUN_A** feature-off core smoke, marker-clean;
+* **RUN_B** `request=1 reply=1 server_wakes=1 caller_wakes=1 duplicate_reply=rejected`;
+* **RUN_C** `AP saved-dispatch=1 request_user_consumed=1 no ring-3 fault`;
+* **RUN_D** `request/reply cross-CPU=1, user-consumed both dirs, IPIs 1/1, continuations 1/1,
+  dup refused, no fuse`.
+
+Seal counters: `cross_cpu_request_smp2=1 cross_cpu_reply_smp2=1 request_user_consumed=1
+reply_user_consumed=1 trap_depth_errors=0 wrong_current_task=0 duplicate_replies=0
+duplicate_wakes=0 overwrite_fuse_trips=0`.
+
+This **preserves historical Stage 199 evidence and adds no live cell** — the six cells remain
+knob-gated and prove the 199D mechanism, not the production path.
+
+All three defects are repaired and the four-run seal reproduces — see §0.2. Standalone RUN_C
+reports `sent=1 received=1 request_ok=1 continuation=1 user_validated=1`; standalone RUN_D
+reports `cross_cpu_request=1 cross_cpu_reply=1 duplicate_replies=0 result=ok`.
+
+Unaffected and re-verified live at `db783142`: x86 production core boot, ServerDies
+(`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL … result=ok`), and the x86 reply-timeout retirement smoke.
+The reply-timeout **matrix** fails only at its first AArch64 cell because `qemu-system-aarch64` is
+not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_off_clean=2`).
+
 ### Immediate blockers
 
 1. **AArch64 and RISC-V ServerDies live cells are unearned** — 1 of 3. The x86_64 cell is
@@ -130,7 +222,7 @@ Full detail: `doc/IPC.md` §8.5.
    two blockers that used to head this list**: the `IPC_SERVER_DEATH_LINK_LEAK` accounting
    failure is resolved, and `revalidate_idle_owner_after_drains` has now executed in QEMU
    (`EXIT_TASK_OWNER_REVALIDATED … committed=replacement`).
-2. **NR 6 / NR 7 off-lock direct IPC cannot be made production-default yet — two remaining
+2. **NR 6 / NR 7 off-lock direct IPC IS the x86_64 production default** (was: cannot be made production-default yet — two remaining
    correctness defects in the transaction body, not the gates.** The acknowledgement-store
    prerequisite *is* met (the bounded endpoint-indexed multi-pair store,
    `src/kernel/direct_ack_store.rs`, Stage 199D), **delivery conformance is now met**
@@ -188,8 +280,135 @@ Full detail: `doc/IPC.md` §8.5.
    Resizing was out of scope. Also corrected: the quiescent trigger moved to
    `INIT_IDLE_PARK_BEGIN` (the earlier one sampled `high_watermark=2` before saturation), and
    `live == 0` is not a valid quiescence requirement for a running microkernel — the verdict now
-   requires `no_orphaned_lease`. Full evidence is in `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.7;
-   see also `doc/IPC.md` §8.6.5–§8.6.6.
+   requires `no_orphaned_lease`. **Blocker 4 is now closed too and the flip is ON.**
+   `DIRECT_ACK_STORE_CAPACITY` is derived at compile time from `ENDPOINT_WAITER_SLOTS`, the
+   authoritative endpoint receive-waiter table, with one slot per endpoint index — which makes
+   endpoint uniqueness and the absence of capacity exhaustion structural, reduces reservation to
+   a single compare-exchange, and removes the store's last lock. An independent waiter census
+   (`src/kernel/direct_ack_census.rs`), unbounded by the store's capacity and running on split
+   seams only, proves an exact lease/waiter bijection. **First production-default live seal:**
+   normal feature-off x86_64 boot with `YARM_BOOT_OK`, all 6 service entries exactly once,
+   `PM_ELF_ZC_FAIL count=0`, **53 NR6 and 41 NR7 ordinary syscalls completed off-lock with zero
+   broad-lock entries**, zero capacity refusals, zero overwrite-fuse trips, zero stale/foreign/
+   duplicate/crossed terminals, exact bijection both directions
+   (`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`), plus the
+   oracle regression (`live_cells=2 result=ok`). **No seal is issued and the constant is restored
+   to `false`:** the ServerDies regression fails, because
+   `SharedKernel::register_server_reply_link_split` — the direct NR6 reverse-link installation —
+   does not stamp `note_link_created` while its legacy twin does, so with the direct path as the
+   default the system-wide leak accounting sees `created=0 closed=13`. The links are installed
+   and closed correctly (an instrumentation gap in the split twin, not a link leak), but while it
+   is open the attestation that would detect a *real* reverse-link leak is blind on the
+   production path. AArch64 and RISC-V are untouched and remain proof-gated. Full evidence is in
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.6–§6.1.10; see also `doc/IPC.md` §8.6.5–§8.6.8.
+   **Blockers 6 and 7 are now closed and the x86_64 production default is ON.**
+   All four reverse-link closing paths delegate to the one `close_server_reply_link` decision,
+   so `links_created == links_closed` is a meaningful invariant on the production path. And
+   terminal-arbitrated NR7 replies are explicitly ineligible: `DirectReplyFacts::terminal_arbitrated`
+   is read from the authoritative `reply_terminal_ownership` cell, exact in record index AND
+   generation under one rank-3 acquisition, and such a reply declines before any mutation so the
+   legacy terminal lease can make it provably beat a concurrent timeout. Porting that lease into
+   the direct transaction is future canonical **199E** work.
+   **FIRST x86_64 NR6/NR7 PRODUCTION-DEFAULT LIVE SEAL, exact commit `0b5ec254`:** core boot with
+   `YARM_BOOT_OK`, all 6 service entries exactly once, `PM_ELF_ZC_FAIL count=0`, **53 NR6 + 41 NR7
+   ordinary syscalls off-lock with zero broad-lock entries**,
+   `IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok` and waiter/lease
+   bijection `result=ok`; oracle regression `live_cells=2 result=ok`; ServerDies vector `[1;9]`,
+   `created=54 closed=54 live_links=0`, one PeerDeath winner and one caller wake; and both x86
+   reply-timeout matrix cells with zero `[fail]` lines — reply-wins `reserve=1 commit=1
+   rollback=0 deferred=0 arbitrated=1`, timeout-wins unchanged with `late_reply=rejected`. Zero
+   fail/leak/duplicate/stale/fatal markers. The AArch64 and RISC-V matrix cells could not run
+   (`qemu-system-aarch64`/`riscv64` absent here); neither architecture was changed and both
+   remain proof-gated. Canonical 199D remains open — this is an increment, not a stage seal.
+   **AArch64 NR6/NR7 is audited and NOT ready.** The canonical contract stack is already
+   architecture-neutral (zero `target_arch` references across eligibility, disposition, the ack
+   store, the census, the counters and the projection; the transaction body has two, both
+   selector-gated x86 SMP IPI sends) and takes no broad lock — so no AArch64 semantic copy is
+   needed. Three blockers remain, all in the AArch64 arch bracketing: (i) the syscall-ABI import
+   admits NR6/NR7 only under the proof gate, so flipping the production predicate alone would be
+   a silent no-op; (ii) **decisive** — `finalize_split_handled_syscall` calls `with_cpu`, so
+   every HANDLED AArch64 split syscall reacquires the broad lock to save the user context,
+   restore arch thread state and export x0..x5 (x86_64's finalize is an empty no-op); (iii)
+   `d6_genuine_enabled()` is x86_64-only, so an AArch64 wake's downstream dispatch runs under the
+   broad lock. Nothing was staged live; production default unchanged (x86_64 only).
+   `qemu-system-aarch64` is also absent here. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.11 and
+   `doc/IPC.md` §8.6.10.
+   **AArch64 blockers (i) and (ii) are now CLOSED; (iii) remains open.** (i) The syscall-ABI
+   import and its return-path twin now admit NR6/NR7 through the canonical
+   `ipccall_direct_admission_enabled()`; no `ipccall_direct_proof_enabled()` call survives in
+   `src/arch/trap_entry.rs`, so AArch64 carries no architecture-specific admission rule (the
+   predicate is still `production || proof` and production is x86_64-only, so AArch64 still
+   resolves to the proof gate — a normal boot is byte-identical). (ii) The `with_cpu` wrapper
+   around `split_finalize_handled_syscall` is gone: the finalize is driven by an exact entering
+   identity `{tid, asid}` captured *before* the split dispatch, and splits into frame-only work
+   outside every lock plus two bounded rank-2 task-domain transactions (exact-incarnation TLS
+   take, exact-incarnation context commit). The pre-export save → restore → read-back round trip
+   was **proved redundant and removed** — `apply_user_context(capture_user_context())` is an
+   exact nine-field identity and the post-export save overwrites it before anything observes it.
+   Byte-for-byte preserved: success and error lanes, ELR/SPSR/SP and all user GPRs, x18 TLS,
+   stale-identity behaviour and every existing AArch64 split class. Census: `trap_entry.rs`
+   12 → 11, tree total 51 → 50, `AUDITED_WITH_CPU_TOTAL` 41 → 40, `CLASS_RUNTIME_REQUIRED`
+   46 → 45; no new broad-lock site. (iii) `d6_genuine_enabled()` is unchanged and explicitly
+   open — the sole remaining gating item. **The AArch64 production default stays OFF**; this is
+   structural preparation only, with no AArch64 flip and no QEMU seal (`qemu-system-aarch64`
+   still absent). See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.12 and `doc/IPC.md` §8.6.11.
+   **AArch64 blocker (iii) is now CLOSED STRUCTURALLY; live acceptance is pending.** The
+   authoritative queue-advancing dispatch — the step that picks the next runnable task and
+   actually resumes it — is no longer reachable only through the x86_64-only
+   `d6_genuine_enabled()`. Classification: **NR6** publishes exactly one typed,
+   generation-bearing work item
+   (`DirectDispatchWork { outgoing_tid, outgoing_asid, blocked_generation, cpu, class }`) at the
+   reply-blocked commit, i.e. only after the caller genuinely left `current` and committed
+   `Blocked(EndpointReceive(reply_cap))`; **NR7** publishes nothing — the replier stays
+   `current`, the caller is woken once inside the transaction, and the replier returns through
+   the narrow handled-return finalizer (enforced twice: a reply never reaches the publishing
+   commit, and `try_publish` refuses the `IpcReply` class). Publication is single-shot per CPU
+   and the drain takes the item destructively, so one item drives at most one dispatch. The
+   drain runs with the broad guard dropped: revalidate the exact incarnation and committed
+   blocked state (rank 2) → one authoritative dequeue (rank 1) → mark Running (rank 2) +
+   current-set agreement → ASID/TTBR0 activation → complete EL0 frame, x18 TLS and any parked
+   blocked-syscall completion → existing eret model, or the existing `idle_no_eret_loop()`
+   primitive. It **reuses** the FutexWait/Yield rank-1 dequeue, rank-2 mark-Running seam and
+   idle loop — one scheduler policy, not two — and differs only in taking **no broad lock**:
+   what those drains get from a brief `with_cpu`, this gets from bounded rank-2 seams, each
+   released before the next. Existing AArch64 FutexWait/Yield behaviour is unchanged. To avoid a
+   `KernelState` mutation in the activation step, the HAL's active-ASID record moved out of
+   `SelectedIsaHal` into a lock-free cell that `active_asid()` now reads — one authority, not
+   two. Races are exhaustive and fail closed (`DrainOutcome`, no wildcard arm); no broad-lock
+   fallback exists after a direct transaction has committed. `d6_genuine_enabled()` itself is
+   byte-identical and still x86_64-only; AArch64 is admitted by the canonical replacement
+   `offlock_authoritative_dispatch_enabled()`, which resolves to the armed proof/oracle gate
+   there, so **the AArch64 production default stays OFF** and an ordinary AArch64 boot publishes
+   and drains nothing. Broad-lock census **unchanged at 50**, with a new guard pinning "50 or
+   fewer". No live seal — `qemu-system-aarch64` remains absent. See
+   `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.13 and `doc/IPC.md` §8.6.12.
+   **That landing had four defects, now repaired.** (a) The publication protocol was a single
+   `PENDING` boolean conflating *being written* / *readable* / *being read*, correct only under
+   an unstated non-reentrancy assumption — replaced by an explicit per-CPU state machine
+   `EMPTY → WRITING → READY → READING → EMPTY`, where a publisher claims only `EMPTY`, a taker
+   only `READY`, and the slot recycles only after the payload is copied out. (b) **The serious
+   one:** the drain treated its pre-mutation revalidation as a verdict, so a caller that a reply
+   or timeout had made `Runnable` caused it to return "declined" — `eret`-ing through a parked
+   task's frame with `current` still `None`. The `current`-clear is now modelled as a **debt**:
+   the revalidation is diagnostics only, and every taken debt settles as either `Dispatched` or
+   `Idle`. After the dequeue mutates scheduler state, a later failure rolls back exactly
+   (status, `current`, queue) and takes an explicit fatal path that never returns to userspace;
+   the only no-debt exit is a superseded lease. (c) `tcb.blocked_recv_generation` is never
+   incremented anywhere in the tree — always 0 — so the "generation-bearing stale-cycle
+   protection" claim was withdrawn and replaced by a real per-CPU **dispatch lease**, a
+   monotonic epoch opened at exactly one site (the `current`-clear commit). (d) `ACTIVE_ASID`
+   was one global cell although `TTBR0_EL1`/`CR3` are per-core registers; it is now a per-CPU
+   table keyed by `CpuId`, `Hal::switch_address_space` takes the `CpuId` explicitly, and
+   `active_asid_on(cpu)` replaces `active_asid()`. Census unchanged at 50 / 40 / 45. Because the
+   HAL authority changed globally, the x86_64 live core-boot and ServerDies regressions were
+   re-run. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.14 and `doc/IPC.md` §8.6.13.
+   **Blocker 5 (link CREATION accounting) is now closed** — both installation seams delegate to
+   the one `install_server_reply_link` decision, so the creation stamp cannot drift; live,
+   `created` went 0 → 54. That exposed its mirror on the CLOSE edge: of four close sites only two
+   stamp `note_link_closed`, and the direct NR7 close (`unregister_server_reply_link_split`) is
+   one of the silent ones, so with the flip on the totals read `created=54 closed=13` and
+   ServerDies fails. Everything else about the flip is proven healthy at commit `c94cd304`. The
+   constant is restored to `false`; the fix is the exact mirror of the creation one.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
@@ -426,7 +645,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **51** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **50** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there

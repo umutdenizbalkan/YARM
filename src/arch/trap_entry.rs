@@ -179,6 +179,12 @@ pub fn handle_trap_entry_shared(
             // x86_64/riscv64). Without this the AArch64 split dispatch sees nr=0
             // and always falls back (Stage 160B).
             pre_split_import_syscall_abi(frame);
+            // Stage 199D: capture the EXACT entering task identity {tid, asid} BEFORE the
+            // split dispatch runs. The AArch64 return path must commit this syscall's
+            // register state into THIS incarnation, never into whatever task an unqualified
+            // "current" lookup would find afterwards — a direct NR6/NR7 transaction wakes and
+            // enqueues another task, so that lookup is not a safe question to ask after it.
+            let entering = split_return_identity(shared, cpu);
             if let Some(result) =
                 crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
             {
@@ -186,10 +192,10 @@ pub fn handle_trap_entry_shared(
                     Ok(()) => {
                         // Stage 160C: a HANDLED split syscall must return to
                         // userspace via the arch syscall-return ABI (export results
-                        // + advance past the trap instruction). AArch64-only and
-                        // proof-knob-gated; no-op on x86_64/riscv64, whose trap
-                        // return already does this from the ret lanes.
-                        finalize_split_handled_syscall(shared, cpu, frame);
+                        // + advance past the trap instruction). AArch64-only;
+                        // no-op on x86_64/riscv64, whose trap return already does
+                        // this from the ret lanes.
+                        finalize_split_handled_syscall(shared, cpu, entering, frame);
                         crate::yarm_log!(
                             "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=ok",
                             SPLIT_DISPATCH_ARCH_TAG,
@@ -221,7 +227,7 @@ pub fn handle_trap_entry_shared(
                         // arm — the error code must reach userspace (AArch64 via the
                         // user GPR lanes) and the SVC must advance (this is a
                         // completed syscall, not a WouldBlock retry).
-                        finalize_split_handled_syscall(shared, cpu, frame);
+                        finalize_split_handled_syscall(shared, cpu, entering, frame);
                         crate::yarm_log!(
                             "YARM_LOCK_SPLIT_DISPATCH {}nr={} cpu={} result=handled_err code={}",
                             SPLIT_DISPATCH_ARCH_TAG,
@@ -523,6 +529,165 @@ pub fn handle_trap_entry_shared(
             );
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
         }
+    }
+
+    // ── Stage 199D (AARCH64 BLOCKER 3): the post-lock DIRECT dispatch drain ──────────────────
+    //
+    // Closes the last AArch64 NR6/NR7 readiness blocker: the authoritative queue-advancing
+    // dispatch used to be compile-time x86_64-only, so an AArch64 wake finished under the broad
+    // lock even when the direct transaction itself had not taken it.
+    //
+    // What makes this drain different from the FutexWait/Yield drains directly below is not the
+    // scheduler policy — it deliberately reuses the SAME rank-1 dequeue
+    // (`futex_wait_dispatch_step_mut`) and the SAME rank-2 mark-Running seam, so there is one
+    // scheduler policy in the tree, not two. What differs is that it takes NO broad lock at any
+    // point: the ASID activation and the EL0 frame/TLS restore, which those drains obtain from a
+    // brief `with_cpu` re-acquire, are obtained here from bounded rank-2 task seams.
+    //
+    // ## Settlement is a DEBT, not a choice
+    //
+    // The commit that published the work item removed the caller from `current`. From that
+    // instant this CPU is running NOTHING, and the trap frame we would `eret` through belongs to
+    // a task the scheduler has parked. So once a live item is taken, this drain MUST settle —
+    // resume exactly one task, or enter the idle primitive. There is no "declined" path back to
+    // userspace, because that path would resume a parked task through a stale frame.
+    //
+    // In particular, observing that a reply or timeout made the outgoing caller `Runnable` does
+    // NOT cancel the debt: that caller is simply back on the run queue, and the authoritative
+    // dequeue may select it like any other candidate. The observation is logged and nothing
+    // more.
+    //
+    // The one case that legitimately owes nothing is a SUPERSEDED lease: a later `current`-clear
+    // on this CPU opened a newer lease and took over settlement, so this item's cycle is already
+    // closed.
+    #[cfg(target_arch = "aarch64")]
+    if crate::kernel::direct_dispatch::is_pending(cpu_idx) {
+        use crate::kernel::direct_dispatch::{self as dd, DrainOutcome, Settlement};
+        // The slot state machine makes the take destructive and exclusive: exactly one drain can
+        // claim a READY item, so a published debt is settled once and only once.
+        let outcome = match dd::take(cpu_idx) {
+            None => DrainOutcome::NoDebtNothingPublished,
+            Some(work) => {
+                crate::yarm_log!(
+                    "AARCH64_DIRECT_DISPATCH_BEGIN cpu={} outgoing={} lease={} class={:?}",
+                    cpu.0,
+                    work.outgoing_tid,
+                    work.lease,
+                    work.class
+                );
+                if !dd::lease_is_current(cpu, work.lease) {
+                    // A later current-clear owns settlement; this item's cycle is closed. This is
+                    // the ONLY way out of the drain without settling, and it is sound precisely
+                    // because the newer cycle is the one now holding the debt.
+                    crate::yarm_log!(
+                        "AARCH64_DIRECT_DISPATCH_SUPERSEDED cpu={} outgoing={} item_lease={} current_lease={}",
+                        cpu.0,
+                        work.outgoing_tid,
+                        work.lease,
+                        dd::current_lease(cpu)
+                    );
+                    DrainOutcome::NoDebtSupersededLease
+                } else {
+                    // Pre-mutation observation — DIAGNOSTICS ONLY. Whatever the outgoing task
+                    // has become, this CPU still owes a dispatch.
+                    let observed = shared.direct_dispatch_observe_outgoing_split(work);
+                    crate::yarm_log!(
+                        "AARCH64_DIRECT_DISPATCH_OUTGOING tid={} asid={} observed={:?} debt=owed",
+                        work.outgoing_tid,
+                        work.outgoing_asid,
+                        observed
+                    );
+                    // (2) ONE authoritative dequeue under the rank-1 scheduler seam. This is the
+                    //     single queue-advancing step for the cycle. It may legitimately select
+                    //     the outgoing caller itself, if a reply re-queued it.
+                    match shared.futex_wait_dispatch_step_mut(cpu) {
+                        None => {
+                            // SETTLE (idle). The run queue is empty: the outgoing caller stays
+                            // parked, `current` stays clear, no frame is restored and no incoming
+                            // task is fabricated. A success, not a failure.
+                            crate::yarm_log!("AARCH64_DIRECT_DISPATCH_NO_INCOMING cpu={}", cpu.0);
+                            dd::note_outcome(DrainOutcome::Settled(Settlement::Idle));
+                            crate::yarm_log!(
+                                "AARCH64_DIRECT_DISPATCH_DONE result=idle settled=1 broad_lock=0"
+                            );
+                            // The established idle primitive, broad guard already dropped.
+                            // Never returns.
+                            super::aarch64::trap::enter_post_lock_idle_after_direct_dispatch(
+                                cpu,
+                                work.outgoing_tid,
+                            );
+                        }
+                        Some(inc) => {
+                            // From here the scheduler is MUTATED: `inc` was dequeued and made
+                            // current. Any later failure must roll that back exactly and take
+                            // the explicit fatal path — never return with it half-committed.
+                            shared.d6_genuine_mark_running_via_task_seam(Some(inc));
+                            let agrees = shared.direct_dispatch_current_agrees_split_read(cpu, inc);
+                            let resumed = agrees
+                                && match frame.as_deref_mut() {
+                                    Some(f) => {
+                                        super::aarch64::trap::direct_dispatch_resume_incoming(
+                                            shared, cpu, inc, f,
+                                        )
+                                    }
+                                    None => false,
+                                };
+                            if resumed {
+                                crate::yarm_log!(
+                                    "AARCH64_DIRECT_DISPATCH_CURRENT_SET_OK cpu={} tid={}",
+                                    cpu.0,
+                                    inc
+                                );
+                                crate::yarm_log!("AARCH64_DIRECT_DISPATCH_RUNNING_OK tid={}", inc);
+                                crate::yarm_log!("AARCH64_DIRECT_DISPATCH_FRAME_OK tid={}", inc);
+                                DrainOutcome::Settled(Settlement::Dispatched { incoming: inc })
+                            } else {
+                                // Either the dequeue and `current` disagree, or the selected task
+                                // has no saved context to resume. Both are kernel-invariant
+                                // violations, not races. Undo the scheduler mutation EXACTLY,
+                                // then halt: returning "declined" here would leave the scheduler
+                                // believing `inc` is running while we eret through another
+                                // task's frame.
+                                let rolled_back = shared.direct_dispatch_rollback_split(cpu, inc);
+                                crate::yarm_log!(
+                                    "AARCH64_DIRECT_DISPATCH_ROLLBACK cpu={} incoming={} reason={} rolled_back={}",
+                                    cpu.0,
+                                    inc,
+                                    if agrees {
+                                        "no_saved_frame"
+                                    } else {
+                                        "current_disagreement"
+                                    },
+                                    rolled_back as u32
+                                );
+                                dd::note_outcome(DrainOutcome::RolledBackFatal);
+                                super::aarch64::trap::enter_post_lock_dispatch_fatal(
+                                    cpu,
+                                    inc,
+                                    rolled_back,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        dd::note_outcome(outcome);
+        // Return through the EXISTING eret model: the frame this drain restored is the one the
+        // AArch64 vector epilogue erets from. No second return path is introduced.
+        //
+        // Reaching here means either the debt was settled by a dispatch, or there was no debt to
+        // settle. The idle and fatal settlements never return at all.
+        debug_assert!(outcome.debt_is_discharged());
+        crate::yarm_log!(
+            "AARCH64_DIRECT_DISPATCH_DONE result={} settled={} broad_lock=0",
+            match outcome {
+                DrainOutcome::Settled(Settlement::Dispatched { .. }) => "ok",
+                DrainOutcome::NoDebtSupersededLease => "superseded",
+                _ => "no_work",
+            },
+            outcome.owed_a_debt() as u32
+        );
     }
 
     // Stage 192A (FUTEXWAIT QUEUE-ADVANCING DISPATCH): drain the deferred FutexWait
@@ -1398,9 +1563,14 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
         // armed, so their six-argument ABI is imported into the frame for the off-lock request/reply
         // gates. With the gate off, `nr` stays 0 and the split dispatcher declines them (unchanged
         // global-lock fallback) — this keeps a normal boot byte-identical.
+        // Stage 199D: admit IpcCall (NR 6) + IpcReply (NR 7) through the CANONICAL
+        // `ipccall_direct_admission_enabled()` — the same predicate the split dispatcher
+        // itself uses — so AArch64 gains no architecture-specific admission rule. It is
+        // still `production || proof`, and the AArch64 production default is OFF, so a
+        // normal AArch64 boot keeps `nr = 0` here and falls back byte-identically.
         || ((raw_nr == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
             || raw_nr == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)
-            && crate::kernel::boot::ipccall_direct_proof_enabled())
+            && crate::kernel::boot::ipccall_direct_admission_enabled())
     {
         super::aarch64::trap::split_import_syscall_abi(frame);
     }
@@ -1409,35 +1579,60 @@ fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
 fn pre_split_import_syscall_abi(_frame: &mut TrapFrame) {}
 
 #[cfg(target_arch = "aarch64")]
+fn split_return_identity(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+) -> crate::runtime::SplitReturnIdentity {
+    // Scheduler (rank 1) + task (rank 2) reads only — the same authoritative current-task
+    // read the split helpers use, qualified with the incarnation's ASID.
+    let tid = shared.current_tid_authoritative(cpu).unwrap_or(0);
+    crate::runtime::SplitReturnIdentity {
+        tid,
+        asid: crate::kernel::vm::Asid(shared.task_asid_for_tid_split_read(tid) as u16),
+    }
+}
+#[cfg(not(target_arch = "aarch64"))]
+fn split_return_identity(
+    _shared: &crate::runtime::SharedKernel,
+    _cpu: CpuId,
+) -> crate::runtime::SplitReturnIdentity {
+    crate::runtime::SplitReturnIdentity {
+        tid: 0,
+        asid: crate::kernel::vm::Asid(0),
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
 fn finalize_split_handled_syscall(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
+    entering: crate::runtime::SplitReturnIdentity,
     frame: &mut TrapFrame,
 ) {
     // Stage 195A / 197A: finalize is reached ONLY when the split dispatcher HANDLED the
     // syscall. In production the newly-eligible AArch64 pre-lock classes are DebugLog
-    // (nr=15) and FutexWake (nr=10), so this runs for those — mirroring the selective ABI
-    // import — plus the oracle-validated classes. The brief `with_cpu` here is the ARCH
-    // RETURN-PATH restore (export result to x0..x5 + advance past the SVC), NOT the split
-    // seam.
+    // (nr=15) and FutexWake (nr=10), plus the oracle-validated classes.
+    //
+    // Stage 199D: this NO LONGER takes the broad `KernelState` lock. The return work is
+    // split into frame-only steps outside every lock and two bounded rank-2 task-domain
+    // transactions (exact-incarnation TLS take, exact-incarnation context commit) — see
+    // `split_finalize_handled_syscall`. NR6/NR7 are admitted through the canonical
+    // `ipccall_direct_admission_enabled()` predicate, matching the import above.
     if frame.syscall_num() == crate::kernel::syscall::SYSCALL_DEBUG_LOG_NR
         || frame.syscall_num() == crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR
         || crate::kernel::boot::ipc_recv_oracle_proof_enabled()
-        // Stage 199A2C1: a HANDLED off-lock IpcCall/IpcReply returns via the AArch64 syscall-return
-        // ABI (export x0..x5 + advance ELR past the SVC) — mirroring the selective import above.
         || ((frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_CALL_NR
             || frame.syscall_num() == crate::kernel::syscall::SYSCALL_IPC_REPLY_NR)
-            && crate::kernel::boot::ipccall_direct_proof_enabled())
+            && crate::kernel::boot::ipccall_direct_admission_enabled())
     {
-        let _ = shared.with_cpu(cpu, |kernel| {
-            super::aarch64::trap::split_finalize_handled_syscall(kernel, cpu, frame)
-        });
+        super::aarch64::trap::split_finalize_handled_syscall(shared, cpu, entering, frame);
     }
 }
 #[cfg(not(target_arch = "aarch64"))]
 fn finalize_split_handled_syscall(
     _shared: &crate::runtime::SharedKernel,
     _cpu: CpuId,
+    _entering: crate::runtime::SplitReturnIdentity,
     _frame: &mut TrapFrame,
 ) {
 }

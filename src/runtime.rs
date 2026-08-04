@@ -321,6 +321,19 @@ impl OwnerRevalidation {
     }
 }
 
+/// Stage 199D — the **exact entering task identity** a handled split syscall returns to.
+///
+/// Captured at trap entry, BEFORE the split dispatch runs, and carried through the return
+/// path. The return must never re-discover an unqualified "current task" after a direct
+/// transaction: the transaction can wake and enqueue another task, and on a stale or replaced
+/// incarnation an unqualified lookup would commit this syscall's register state into somebody
+/// else's TCB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SplitReturnIdentity {
+    pub(crate) tid: u64,
+    pub(crate) asid: crate::kernel::vm::Asid,
+}
+
 impl SharedKernel {
     /// Stage 114 fix: this used to also cache `scheduler_state` /
     /// `boot_config_state_lock` / `boot_config` raw pointers computed from
@@ -1041,6 +1054,278 @@ impl SharedKernel {
         let _guard = task_lock.lock();
         let tcbs = unsafe { &mut *tcbs };
         f(kernel_mut(tcbs).as_mut_slice())
+    }
+
+    /// Stage 199D: task (rank 2) split-mut seam exposing the TCB array and the TLS-restore
+    /// table together — see `KernelState::task_return_split_mut_ptrs_from_raw`.
+    fn with_task_return_split_mut<R>(
+        &self,
+        f: impl FnOnce(
+            &mut [Option<crate::kernel::task::ThreadControlBlock>],
+            &mut [Option<crate::kernel::ipc::ThreadId>],
+        ) -> R,
+    ) -> R {
+        // SAFETY: same pattern as `with_task_tcbs_split_mut` — the task lock serializes both
+        // storages, which live in the same domain.
+        let (task_lock, tcbs, tls) =
+            unsafe { KernelState::task_return_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let tcbs = unsafe { &mut *tcbs };
+        let tls = unsafe { &mut *tls };
+        f(
+            kernel_mut(tcbs).as_mut_slice(),
+            kernel_mut(tls).as_mut_slice(),
+        )
+    }
+
+    /// Stage 199D — bounded rank-2 transaction #1 of the handled split return: validate the
+    /// EXACT entering incarnation and take its pending TLS-restore request.
+    ///
+    /// `None` means the incarnation is stale — the task is gone, or its ASID no longer
+    /// matches, or it is the idle task. The caller then skips the restore entirely, which is
+    /// exactly what the legacy broad-lock path did when `current_tid()` was absent, `0`, or
+    /// had no ASID. `Some(tls)` carries the TLS base to place in the TLS lane, `None` inside
+    /// when no restore was pending.
+    pub(crate) fn split_return_take_tls_split(
+        &self,
+        id: SplitReturnIdentity,
+    ) -> Option<Option<usize>> {
+        if id.tid == 0 {
+            return None; // the idle task, exactly as the legacy path bailed
+        }
+        self.with_task_return_split_mut(|tcbs, tls_pending| {
+            let tcb = tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == id.tid && t.asid == Some(id.asid))?;
+            let tls_base = tcb.tls_ptr.map(|ptr| ptr.0 as usize);
+            // Take the pending request at most once, exactly as `take_tls_restore_request`.
+            let pending = tls_pending
+                .iter()
+                .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == id.tid));
+            match pending {
+                Some(idx) => {
+                    tls_pending[idx] = None;
+                    Some(tls_base)
+                }
+                None => Some(None),
+            }
+        })
+    }
+
+    /// Stage 199D — bounded rank-2 transaction #2 of the handled split return: commit the
+    /// final user context into the EXACT entering incarnation's TCB.
+    ///
+    /// `false` when the incarnation is stale, in which case nothing is written — the legacy
+    /// path's `set_thread_user_context` likewise did nothing for an absent task, and writing
+    /// into a replacement task's TCB would be strictly worse than not writing at all.
+    pub(crate) fn split_return_commit_context_split(
+        &self,
+        id: SplitReturnIdentity,
+        context: crate::kernel::task::UserRegisterContext,
+    ) -> bool {
+        if id.tid == 0 {
+            return false;
+        }
+        self.with_task_return_split_mut(|tcbs, _| {
+            match tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == id.tid && t.asid == Some(id.asid))
+            {
+                Some(tcb) => {
+                    tcb.user_context = context;
+                    true
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// Stage 199D — post-lock dispatch: observe the outgoing incarnation, for DIAGNOSTICS ONLY.
+    ///
+    /// The work item was published by the commit that removed the caller from `current`. From
+    /// that instant the CPU runs nothing and owes a dispatch, and **nothing observed here
+    /// cancels that debt**. In particular a caller that a reply or timeout has made `Runnable`
+    /// is simply back on the run queue, where the authoritative dequeue may select it like any
+    /// other candidate; refusing to dispatch on that basis would leave the CPU idle-but-not-idle
+    /// with a stale frame to `eret` through, which is the defect this observation used to cause.
+    ///
+    /// So this returns a typed observation, not a verdict. The drain logs it and settles
+    /// regardless. `{tid, asid}` is exact: a replacement incarnation reusing the TID reads as
+    /// `Gone` rather than being mistaken for the original.
+    pub(crate) fn direct_dispatch_observe_outgoing_split(
+        &self,
+        work: crate::kernel::direct_dispatch::DirectDispatchWork,
+    ) -> crate::kernel::direct_dispatch::OutgoingObservation {
+        use crate::kernel::direct_dispatch::OutgoingObservation;
+        if work.outgoing_tid == 0 {
+            return OutgoingObservation::Gone;
+        }
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs.iter().flatten().find(|t| {
+                t.tid.0 == work.outgoing_tid
+                    && t.asid == Some(crate::kernel::vm::Asid(work.outgoing_asid))
+            }) else {
+                return OutgoingObservation::Gone;
+            };
+            match tcb.status {
+                crate::kernel::task::TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(_),
+                ) => OutgoingObservation::StillBlocked,
+                crate::kernel::task::TaskStatus::Runnable
+                | crate::kernel::task::TaskStatus::Running => OutgoingObservation::MadeRunnable,
+                _ => OutgoingObservation::OtherState,
+            }
+        })
+    }
+
+    /// Stage 199D — post-lock dispatch: EXACT rollback of a partially committed dispatch.
+    ///
+    /// Called only when the dequeue already mutated scheduler state (it selected `incoming`,
+    /// set `current` and the task was marked `Running`) and a LATER step then failed. Returning
+    /// "declined" at that point would leave the scheduler believing `incoming` is running while
+    /// the CPU `eret`s through somebody else's frame, so the mutation is undone exactly:
+    ///
+    /// * status `Running` → `Runnable` (rank 2);
+    /// * `current` cleared and `incoming` re-enqueued at the head so it is not lost (rank 1).
+    ///
+    /// Returns `true` iff the rollback fully succeeded. The caller takes the explicit fatal path
+    /// either way — this restores the invariant before halting so the failure is diagnosable and
+    /// the scheduler is not left in a torn state.
+    pub(crate) fn direct_dispatch_rollback_split(&self, cpu: CpuId, incoming: u64) -> bool {
+        // Rank 2 first: undo the status mutation.
+        let status_ok = self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs.iter_mut().flatten().find(|t| t.tid.0 == incoming) {
+                Some(tcb) => {
+                    tcb.status = crate::kernel::task::TaskStatus::Runnable;
+                    true
+                }
+                None => false,
+            }
+        });
+        // Rank 1: undo the dequeue and the current-set with the EXISTING exact inverse —
+        // `preempt_reenqueue_only_on` re-enqueues the current task and clears `current` without
+        // dispatching, which is precisely what `dispatch_next_on` did in reverse. No new
+        // scheduler primitive, so no second scheduler policy.
+        let sched_ok = self.with_scheduler_split_mut(|sched| {
+            let restored = kernel_mut(&mut sched.scheduler).preempt_reenqueue_only_on(cpu);
+            restored == Some(crate::kernel::ipc::ThreadId(incoming))
+        });
+        status_ok && sched_ok
+    }
+
+    /// Stage 199D — post-lock dispatch step 3b: does the authoritative `current` slot agree
+    /// with what the rank-1 dequeue just selected?
+    ///
+    /// The dequeue in `futex_wait_dispatch_step_mut` both selects the incoming task and sets
+    /// `current`. Reading `current` back through the scheduler seam and comparing it to the
+    /// selection is what turns "the dispatcher said X" into "the machine will resume X". A
+    /// disagreement is fail-closed: the drain resumes nothing rather than resuming a task the
+    /// scheduler does not consider current.
+    pub(crate) fn direct_dispatch_current_agrees_split_read(
+        &self,
+        cpu: CpuId,
+        incoming: u64,
+    ) -> bool {
+        self.current_tid_authoritative(cpu) == Some(incoming)
+    }
+
+    /// Stage 199D — post-lock dispatch step 4: activate the incoming task's address space.
+    ///
+    /// Reads the incoming ASID through the rank-2 task seam, then performs the activation
+    /// through the SAME arch primitive the in-lock path uses
+    /// (`hal_adapters::switch_address_space`, which carries the established AArch64
+    /// DSB/ISB/TLBI ordering), and records it against **this CPU** in the authoritative
+    /// per-CPU activation table so every existing `active_asid_on` consumer observes it.
+    ///
+    /// No `KernelState` is touched: the HAL's activation record was moved out of `KernelState`
+    /// to a lock-free per-CPU table precisely so this step needs no broad lock. Returns the
+    /// activated ASID, or `None` when the incoming task has none (nothing is activated).
+    pub(crate) fn direct_dispatch_activate_asid_split(
+        &self,
+        cpu: CpuId,
+        incoming: u64,
+    ) -> Option<u16> {
+        let asid = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == incoming)
+                .and_then(|t| t.asid)
+        })?;
+        crate::arch::hal_adapters::switch_address_space(asid);
+        crate::arch::hal::note_address_space_activated(cpu, asid);
+        Some(asid.0)
+    }
+
+    /// Stage 199D — post-lock dispatch step 5: restore the incoming task's complete saved user
+    /// context and its TLS state into `frame`, through the rank-2 task seam only.
+    ///
+    /// This is the narrow-seam equivalent of the in-lock
+    /// `resume_current_thread_with_frame` + TLS lane write that
+    /// `restore_arch_thread_state` performs, with two differences that are both deliberate:
+    ///
+    /// * it resolves the task by EXACT tid rather than by re-reading `current`, so it cannot
+    ///   restore a different task than the one the dequeue selected;
+    /// * it takes the pending TLS-restore request in the SAME rank-2 acquisition as the
+    ///   context read, so the two cannot straddle a lock boundary.
+    ///
+    /// Returns the TLS base to place in the TLS lane (`Some(None)` = no restore pending), or
+    /// `None` when the task has no saved context to restore.
+    pub(crate) fn direct_dispatch_restore_context_split(
+        &self,
+        incoming: u64,
+    ) -> Option<(crate::kernel::task::UserRegisterContext, Option<usize>)> {
+        if incoming == 0 {
+            return None;
+        }
+        self.with_task_return_split_mut(|tcbs, tls_pending| {
+            let tcb = tcbs.iter().flatten().find(|t| t.tid.0 == incoming)?;
+            let context = tcb.user_context;
+            let tls_base = tcb.tls_ptr.map(|ptr| ptr.0 as usize);
+            let pending = tls_pending
+                .iter()
+                .position(|slot| slot.is_some_and(|pending_tid| pending_tid.0 == incoming));
+            let tls = match pending {
+                Some(idx) => {
+                    tls_pending[idx] = None;
+                    tls_base
+                }
+                None => None,
+            };
+            Some((context, tls))
+        })
+    }
+
+    /// Stage 199D — post-lock dispatch step 5b: consume the incoming task's parked
+    /// blocked-syscall completion, through the rank-2 task seam only.
+    ///
+    /// Byte-for-byte the same decision as `KernelState::take_blocked_syscall_completion`,
+    /// which the in-lock resume path calls: the entry is taken either way (a stale one must
+    /// not linger to be seen by a later receive), it is RETURNED only on an exact
+    /// `{tid, asid, blocked_generation}` match, and an exact take clears the residue that
+    /// belongs to that completion alone. Keeping the two identical is what makes the incoming
+    /// task's resume lanes the same whether the dispatch ran in-lock or off-lock.
+    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
+    pub(crate) fn direct_dispatch_take_completion_split(
+        &self,
+        incoming: u64,
+    ) -> Option<crate::kernel::task::BlockedSyscallCompletion> {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == incoming)?;
+            let pending = tcb.pending_syscall_completion?;
+            let exact = pending.tid == incoming
+                && tcb.asid == Some(pending.asid)
+                && tcb.blocked_recv_generation == pending.blocked_generation;
+            tcb.pending_syscall_completion = None;
+            if !exact {
+                return None;
+            }
+            tcb.ipc_timeout_fired = false;
+            tcb.blocked_recv_state = None;
+            Some(pending)
+        })
     }
 
     /// Stage 108: VM/user-spaces (rank 5) split-mut seam.
@@ -3151,28 +3436,12 @@ impl SharedKernel {
             else {
                 return false;
             };
-            // Stage 200D-1: an incarnation that has already committed to exit must never
-            // be published as an authorized replier. Teardown snapshots the link AFTER the
-            // status flips, so registering here would install an authority nobody will
-            // ever look at — the caller would block forever with no death claim. Refusing
-            // makes the NR6 publication roll back instead, which is the only other
-            // permitted outcome of this race.
-            if !matches!(
-                tcb.status,
-                crate::kernel::task::TaskStatus::Runnable
-                    | crate::kernel::task::TaskStatus::Running
-                    | crate::kernel::task::TaskStatus::Blocked(_)
-            ) {
-                return false;
-            }
-            match tcb.server_reply_link {
-                Some(existing) if existing == link => true,
-                Some(_) => false,
-                None => {
-                    tcb.server_reply_link = Some(link);
-                    true
-                }
-            }
+            // Stage 199D: the SAME shared decision the legacy path uses — status gate, match
+            // arms and creation stamp together. This edge previously installed the link
+            // without stamping `note_link_created`, so with the direct NR6 path as the
+            // production default the system-wide leak accounting saw `created=0 closed=13`
+            // and the attestation that would catch a real leak was blind.
+            crate::kernel::boot::install_server_reply_link(tcb, link)
         })
     }
 
@@ -3228,16 +3497,30 @@ impl SharedKernel {
             else {
                 return false;
             };
-            match tcb.server_reply_link {
-                Some(link)
-                    if link.matches_server(server_tid, server_asid)
-                        && link.matches_record(record_index, record_generation) =>
-                {
-                    tcb.server_reply_link = None;
-                    true
-                }
-                _ => false,
+            // Stage 199D: the direct NR7 close, on the SAME shared decision the legacy seams
+            // use. It used to remove the link without stamping the close edge, so with the
+            // direct path as the production default the system totals read
+            // `created=54 closed=13` and the leak attestation was wrong permissively.
+            //
+            // The defensive server re-verify stays HERE, ahead of the shared decision: the
+            // TCB lookup already pinned `{tid, asid}`, so this only rejects a link that names
+            // some other server, which would be an installation bug. Preserving it keeps this
+            // seam's `false` contract byte-identical.
+            if !tcb
+                .server_reply_link
+                .is_some_and(|l| l.matches_server(server_tid, server_asid))
+            {
+                return false;
             }
+            crate::kernel::boot::close_server_reply_link(
+                tcb,
+                crate::kernel::boot::LinkCloseSelector::Exact {
+                    record_index,
+                    record_generation,
+                },
+            )
+            .closed()
+            .is_some()
         })
     }
 
@@ -3701,7 +3984,32 @@ impl SharedKernel {
     /// Runnable (committed under the task lock); this only enqueues it exactly once on its captured
     /// affinity (else the current CPU). This is the final externally visible action and is NON-fallible
     /// — no fallible work runs after it. Priority is class-derived (SystemServer=High else Normal).
-    pub(crate) fn sr_enqueue_committed_receiver_split(&self, tid: u64, affinity: Option<CpuId>) {
+    /// Stage 199D: the CPU this drain is running on, read from the SAME rank-1 authority
+    /// (`sched.current_cpu`) that `sr_enqueue_committed_receiver_split` uses for its unpinned
+    /// fallback. Comparing the two is therefore an apples-to-apples "was that enqueue remote?"
+    /// test: an unpinned receiver enqueues onto this very CPU and compares equal, so it can never
+    /// be mistaken for a remote wake.
+    pub(crate) fn current_cpu_split_read(&self) -> CpuId {
+        self.with_scheduler_split_mut(|sched| sched.current_cpu)
+    }
+
+    /// Returns the CPU the receiver was **actually enqueued on** — the committed wake target.
+    ///
+    /// Stage 199D: this used to compute the target and throw it away, which left the caller with
+    /// no authority for the post-enqueue wake decision. The one consumer that needed it
+    /// (`drain_direct_request_post_work`) therefore guessed, hardcoding CPU 1 behind a global
+    /// oracle selector — so once the NR6 production default was enabled, EVERY ordinary direct
+    /// request fired a remote-wake IPI at CPU 1. Returning the real target makes "was this
+    /// enqueue remote?" a fact rather than an assumption.
+    ///
+    /// The target is the receiver's authoritative affinity (its `task_home_cpu`), falling back to
+    /// the enqueueing CPU when unpinned — exactly the value used for the enqueue itself, read out
+    /// of the same rank-1 acquisition, so the two cannot disagree.
+    pub(crate) fn sr_enqueue_committed_receiver_split(
+        &self,
+        tid: u64,
+        affinity: Option<CpuId>,
+    ) -> CpuId {
         use crate::kernel::ipc::ThreadId;
         use crate::kernel::scheduler::TaskPriority;
         use crate::kernel::task::TaskClass;
@@ -3713,7 +4021,8 @@ impl SharedKernel {
             let cpu = affinity.unwrap_or(sched.current_cpu);
             let sm = kernel_mut(&mut sched.scheduler);
             let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
-        });
+            cpu
+        })
     }
 
     /// Stage 199A2D2A: read the cross-CPU wake TARGET for the SMP request oracle — a blocked
@@ -4339,6 +4648,126 @@ impl SharedKernel {
     /// broad lock: the caller is the off-lock DebugLog split path, and adding a broad
     /// acquisition there would both re-enter the lock this programme is retiring and break
     /// the Stage 204A census (`tests/broad_lock_census_guard.rs` would fail).
+    /// Stage 199D — whether this reply-record incarnation participates in an armed
+    /// terminal-ownership / reply-timeout race.
+    ///
+    /// The canonical predicate, read from the authoritative state itself
+    /// (`reply_terminal_ownership`, co-located with and indexed identically to `reply_caps`) —
+    /// never inferred from oracle selectors, markers or counters.
+    ///
+    /// # Exactness
+    ///
+    /// A cell is arbitrating THIS reply only when its epoch is non-zero (a vacant cell is
+    /// epoch 0 with `TerminalIdentity::ZERO`) **and** its immutable identity names this exact
+    /// record index AND generation. A cell armed for a previous occupant of a recycled slot
+    /// names the old generation and is correctly reported as not arbitrating this one.
+    ///
+    /// # Why this is not a TOCTOU test
+    ///
+    /// Two properties make the read exact rather than a sample:
+    ///
+    /// 1. **Internal consistency.** The record generation and the terminal cell are read under
+    ///    ONE rank-3 acquisition, so the pair cannot be torn — the generation cannot advance
+    ///    between reading it and reading the cell armed for it.
+    /// 2. **Arming strictly precedes reply deliverability.** The cell is armed by
+    ///    `maybe_arm_reply_timeout_oracle` at the caller's blocking-recv publication
+    ///    (`IPC_RECV_BLOCK_REGISTER`), which happens *before* the blocked-caller
+    ///    acknowledgement is published at `IPC_RECV_BLOCKED_STATE_SAVE`. The direct NR7 path
+    ///    cannot reach eligibility for a record whose caller has not yet published that
+    ///    acknowledgement. So a cell cannot transition unarmed → armed for this incarnation
+    ///    between this read and the transaction: the arming already happened, or the reply is
+    ///    not deliverable yet at all.
+    pub(crate) fn reply_record_terminal_arbitrated_split_read(
+        &self,
+        index: usize,
+        generation: u64,
+    ) -> bool {
+        self.with_ipc_split_mut(|ipc| {
+            // One acquisition covers both reads, so the record incarnation and the cell armed
+            // for it are observed together.
+            if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
+                return false;
+            }
+            let Some(cell) = ipc.reply_terminal_ownership.get(index) else {
+                return false;
+            };
+            if cell.current_epoch() == 0 {
+                return false; // vacant: never armed
+            }
+            let identity = cell.identity();
+            identity.reply_record_index == index && identity.reply_record_generation == generation
+        })
+    }
+
+    /// Stage 199D — the **final lease/waiter bijection**, measured from the waiter table.
+    ///
+    /// Two passes over the endpoint table, keyed by endpoint index (the acknowledgement store
+    /// is one slot per endpoint index, so the lease lookup is O(1)):
+    ///
+    /// 1. every endpoint receive-waiter is classified — eligible waiters must have exactly one
+    ///    live lease at their exact incarnation;
+    /// 2. every live lease must have exactly one eligible waiter behind it.
+    ///
+    /// Neither pass consults the store's own counters, so the two accounts are independent: a
+    /// store that balanced its books while dropping or orphaning a lease is caught here. The
+    /// previous capacity-8 store did exactly that — its counters read clean while a ninth
+    /// parked server was refused a lease.
+    ///
+    /// **Split-seam only — no broad lock.** The IPC (rank 3) and task (rank 2) domains are
+    /// taken one index at a time and never simultaneously, so this adds no broad-lock
+    /// acquisition to the split dispatcher that hosts it. It allocates nothing: the comparison
+    /// is accumulated in place rather than materialising either set.
+    pub(crate) fn direct_ack_lease_bijection(
+        &self,
+        store: &crate::kernel::direct_ack_store::DirectAckStore,
+        endpoint_admitted: impl Fn(usize) -> bool,
+    ) -> crate::kernel::direct_ack_census::LeaseBijection {
+        use crate::kernel::direct_ack_census::{CensusWaiter, LeaseBijection, classify_slot};
+        let slots = self.with_ipc_split_mut(|ipc| ipc.endpoint_waiters.len());
+        let mut out = LeaseBijection::default();
+        for idx in 0..slots {
+            let entry = self.with_ipc_split_mut(|ipc| {
+                ipc.endpoint_waiters[idx]
+                    .map(|id| (id.tid.0, id.asid.0, ipc.endpoint_generations[idx]))
+            });
+            let waiter = entry.map(|(tid, asid, generation)| CensusWaiter {
+                endpoint_index: idx,
+                endpoint_generation: generation,
+                tid,
+                asid,
+                // Eligible exactly when the acknowledgement publication contract would publish
+                // for it: a fully committed recv-v2 on an admitted endpoint. Re-derived from
+                // committed state rather than remembered, so a lease issued against a waiter
+                // that never qualified is detectable.
+                eligible: endpoint_admitted(idx)
+                    && self.blocked_recv_v2_commit_is_complete_split_read(tid),
+            });
+            let lease = store
+                .live_lease_at(idx)
+                .map(|(generation, w)| (generation, w.tid, w.asid));
+            classify_slot(waiter, lease, &mut out);
+        }
+        out.duplicate_endpoint_incarnations = store.duplicate_live_incarnations();
+        out
+    }
+
+    /// Whether this task is blocked in a FULLY committed recv-v2 — the same contract the
+    /// acknowledgement publication site applies (recv-v2 ABI, a valid payload destination and
+    /// a non-null metadata destination). Task domain (rank 2) only.
+    pub(crate) fn blocked_recv_v2_commit_is_complete_split_read(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.blocked_recv_state.as_ref())
+                .is_some_and(|state| {
+                    state.recv_abi == crate::kernel::task::RecvAbiVariant::RecvV2
+                        && state.payload_user_ptr != 0
+                        && state.meta_user_ptr != 0
+                })
+        })
+    }
+
     pub(crate) fn live_server_reply_link_count_split_read(&self) -> usize {
         self.with_task_tcbs_split_mut(|tcbs| {
             tcbs.iter()

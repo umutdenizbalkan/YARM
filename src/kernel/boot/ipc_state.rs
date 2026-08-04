@@ -205,7 +205,13 @@ fn rt_claim_endpoint_waiter_exact<D: ReplyTimeoutDomains>(
 /// This is the narrow-transaction counterpart of
 /// `KernelState::finalize_server_reply_link_for_record`; both close the SAME single
 /// lifecycle edge, so no terminal path can complete a record and leave its link live.
-fn rt_detach_server_link<D: ReplyTimeoutDomains>(d: &mut D, index: usize, generation: u64) -> bool {
+// `pub(crate)` so the fourth closing path has a direct behavioural test rather than only a
+// structural one; it stays a narrow-domain helper with no callers outside this module.
+pub(crate) fn rt_detach_server_link<D: ReplyTimeoutDomains>(
+    d: &mut D,
+    index: usize,
+    generation: u64,
+) -> bool {
     let bound = d.rtd_ipc(|ipc| {
         if ipc.reply_cap_generations.get(index).copied() != Some(generation) {
             return None;
@@ -226,13 +232,17 @@ fn rt_detach_server_link<D: ReplyTimeoutDomains>(d: &mut D, index: usize, genera
         else {
             return false;
         };
-        match tcb.server_reply_link {
-            Some(link) if link.matches_record(index, generation) => {
-                tcb.server_reply_link = None;
-                true
-            }
-            _ => false,
-        }
+        // Stage 199D: the reply-timeout domain's close, on the SAME shared decision as the
+        // other three. It used to remove the link and count nothing.
+        crate::kernel::boot::close_server_reply_link(
+            tcb,
+            crate::kernel::boot::LinkCloseSelector::Exact {
+                record_index: index,
+                record_generation: generation,
+            },
+        )
+        .closed()
+        .is_some()
     })
 }
 
@@ -696,6 +706,12 @@ impl IpcSubsystem {
     ) -> Option<ReceiverWaiterIdentity> {
         let displaced = self.endpoint_waiters.get(idx).copied().flatten();
         self.endpoint_waiters[idx] = Some(identity);
+        // Stage 199D independent census: the waiter table's own publisher maintains the
+        // count, so it cannot drift by a path forgetting to report. A displacement is net
+        // zero — one waiter left as another arrived.
+        if displaced.is_none() {
+            crate::kernel::direct_ack_census::note_waiter_linked();
+        }
         displaced
     }
 
@@ -737,11 +753,23 @@ impl IpcSubsystem {
         let _ = crate::kernel::boot::ipcreply_direct_ack::release(idx, generation, waiter);
     }
 
+    /// Report one endpoint receive-waiter removal to the independent census.
+    ///
+    /// Separate from [`Self::release_direct_ack_lease`] on purpose: the census must stay a
+    /// measurement of the WAITER TABLE, independent of whether the acknowledgement store had
+    /// a lease for that waiter — otherwise it could not detect a store that failed to issue
+    /// one. It is called from the same three primitives for the same reason: coverage should
+    /// be structural, not remembered.
+    fn note_waiter_removed(&self) {
+        crate::kernel::direct_ack_census::note_waiter_unlinked();
+    }
+
     /// Unconditionally take (remove + return) the waiter at `idx`.
     pub(crate) fn take_endpoint_waiter(&mut self, idx: usize) -> Option<ReceiverWaiterIdentity> {
         let taken = self.endpoint_waiters.get_mut(idx).and_then(Option::take);
         if let Some(waiter) = taken {
             self.release_direct_ack_lease(idx, waiter);
+            self.note_waiter_removed();
         }
         taken
     }
@@ -756,6 +784,7 @@ impl IpcSubsystem {
         if self.endpoint_waiters.get(idx).copied().flatten() == Some(identity) {
             self.endpoint_waiters[idx] = None;
             self.release_direct_ack_lease(idx, identity);
+            self.note_waiter_removed();
             true
         } else {
             false
@@ -771,6 +800,7 @@ impl IpcSubsystem {
             if self.endpoint_waiters[idx] == Some(identity) {
                 self.endpoint_waiters[idx] = None;
                 self.release_direct_ack_lease(idx, identity);
+                self.note_waiter_removed();
             }
         }
     }
@@ -1272,40 +1302,10 @@ impl KernelState {
             else {
                 return false;
             };
-            // Stage 200D-1: an incarnation that has already committed to exit must never be
-            // published as an authorized replier. Teardown snapshots the link AFTER the
-            // status flips, so a link installed now would never be looked at and the caller
-            // would block forever with no death claim. Refusing forces the NR6 publication
-            // to roll back, which is the only other permitted outcome of that race.
-            if !matches!(
-                tcb.status,
-                TaskStatus::Runnable | TaskStatus::Running | TaskStatus::Blocked(_)
-            ) {
-                return false;
-            }
-            match tcb.server_reply_link {
-                Some(existing) if existing == link => true,
-                Some(_) => false,
-                None => {
-                    tcb.server_reply_link = Some(link);
-                    // Stage 199D: a NEW reverse link now exists in the server's TCB. The
-                    // idempotent re-registration arm above returns `true` without installing
-                    // anything and deliberately does not count.
-                    //
-                    // This is the SYSTEM-WIDE creation edge — it fires for every bound
-                    // `IpcCall`, not just the armed ServerDies one — so it feeds the
-                    // unscoped leak totals. `note_link_created` adds it to the armed
-                    // transaction's vector only when the record identities match, which is
-                    // what stopped the 54 unrelated calls from being compared against one
-                    // death's single detach.
-                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-                    crate::kernel::boot::server_dies_counters::note_link_created(
-                        record_index,
-                        record_generation,
-                    );
-                    true
-                }
-            }
+            // Stage 199D: the status gate, the match arms and the creation stamp all live in
+            // the ONE shared decision, so the legacy and split installation edges cannot drift
+            // apart again — they did, and the ServerDies leak accounting went blind.
+            crate::kernel::boot::install_server_reply_link(tcb, link)
         })
     }
 
@@ -1335,32 +1335,22 @@ impl KernelState {
             else {
                 return DetachOutcome::StaleServerIdentity;
             };
-            match tcb.server_reply_link {
-                None => DetachOutcome::AlreadyAbsent,
-                Some(link) if link.matches_record(record_index, record_generation) => {
-                    tcb.server_reply_link = None;
-                    // Stage 199D: the ORDINARY terminal close — reply, timeout, caller exit,
-                    // endpoint destruction, cancellation, rollback. It used to count nothing
-                    // at all, which is why the created/detached pair was not even a valid
-                    // leak invariant. It is a genuine removal, so it closes a link for the
-                    // system totals; it moves the armed vector only if it is the armed
-                    // record's link (the reply-wins case, which the audit then correctly
-                    // fails on `PeerDeathWinner == 0`).
-                    #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-                    crate::kernel::boot::server_dies_counters::note_link_closed(
-                        record_index,
-                        record_generation,
-                    );
-                    DetachOutcome::Detached
-                }
-                // Same slot, different generation: the slot was reclaimed and reused, so
-                // this unlink belongs to a previous occupant and must mutate nothing.
-                Some(link) if link.reply_record_index == record_index => {
-                    DetachOutcome::StaleRecordGeneration
-                }
-                // A different outstanding record is live on this server. Removing it
-                // would silently strip a valid authority, so it is refused.
-                Some(_) => DetachOutcome::DifferentLiveLink,
+            // Stage 199D: the ORDINARY terminal close — reply, timeout, caller exit, endpoint
+            // destruction, cancellation, rollback. The match arms and the close stamp live in
+            // the ONE shared decision, so this path and the three others cannot drift apart
+            // again; two of them used to remove links without counting them at all.
+            use crate::kernel::boot::{LinkCloseOutcome, LinkCloseSelector};
+            match crate::kernel::boot::close_server_reply_link(
+                tcb,
+                LinkCloseSelector::Exact {
+                    record_index,
+                    record_generation,
+                },
+            ) {
+                LinkCloseOutcome::Closed(_) => DetachOutcome::Detached,
+                LinkCloseOutcome::AlreadyAbsent => DetachOutcome::AlreadyAbsent,
+                LinkCloseOutcome::StaleRecordGeneration => DetachOutcome::StaleRecordGeneration,
+                LinkCloseOutcome::DifferentLiveLink => DetachOutcome::DifferentLiveLink,
             }
         })
     }
@@ -1434,25 +1424,22 @@ impl KernelState {
         server_tid: u64,
         server_asid: Asid,
     ) -> Option<crate::kernel::task::ServerReplyLink> {
-        let taken = self.with_tcbs_mut(|tcbs| {
-            tcbs.iter_mut()
-                .flatten()
-                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))
-                .and_then(|t| t.server_reply_link.take())
-        });
-        // Stage 199D: the EXIT-PATH close. Counted only when a link was ACTUALLY removed —
+        // Stage 199D: the EXIT-PATH close, and the ONLY user of the `Any` selector — this is
+        // not finalizing one record, the whole incarnation is going away, so any authority it
+        // still holds must go with it. The removal and its stamp are the shared decision's;
         // the lookup is exact on {tid, asid}, so a reused numeric TID with a different ASID
-        // matches nothing, detaches nothing and records nothing. The removed link carries
-        // the record identity, so the close is attributed to the transaction that owns it
-        // rather than to whichever transaction happens to be armed.
-        #[cfg(feature = "ipc-reply-timeout-oracle-core")]
-        if let Some(link) = taken {
-            crate::kernel::boot::server_dies_counters::note_link_closed(
-                link.reply_record_index,
-                link.reply_record_generation,
-            );
-        }
-        taken
+        // matches nothing, detaches nothing and records nothing.
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == server_tid && t.asid == Some(server_asid))?;
+            crate::kernel::boot::close_server_reply_link(
+                tcb,
+                crate::kernel::boot::LinkCloseSelector::Any,
+            )
+            .closed()
+        })
     }
 
     /// Total live reverse links (hosted leak accounting only).
@@ -2210,6 +2197,22 @@ impl KernelState {
 
     /// Stage 200D-1 — hosted-only: drive a task's status directly, so the
     /// registration-versus-exit race can be stepped deterministically instead of raced.
+    /// Stage 199D — read a task's `blocked_recv_generation`.
+    ///
+    /// Exists so a test can DEMONSTRATE that this coordinate never advances: nothing in the
+    /// tree increments it, so it is always 0 and could never have distinguished one dispatch
+    /// cycle from another. That is why the post-lock dispatch item carries a real per-CPU
+    /// dispatch lease instead.
+    #[cfg(any(test, feature = "hosted-dev"))]
+    pub(crate) fn blocked_recv_generation_for_test(&self, tid: u64) -> Option<u64> {
+        self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| t.blocked_recv_generation)
+        })
+    }
+
     #[cfg(any(test, feature = "hosted-dev"))]
     pub(crate) fn set_task_status_for_test(&mut self, tid: u64, status: TaskStatus) {
         self.with_tcbs_mut(|tcbs| {
@@ -3302,6 +3305,88 @@ impl KernelState {
                 reason,
                 plan.blocked_tid.0
             );
+        }
+        // Stage 199D (AARCH64 BLOCKER 3): publish the typed, generation-bearing post-lock
+        // dispatch work item for the NR6 direction.
+        //
+        // THIS is the exact point the classification names: Phase A removed the caller from
+        // `current`, Phase B committed it to `Blocked(EndpointReceive(reply_cap))`, and Phase C
+        // published its waiter. The caller has genuinely left `current` AND committed to its
+        // canonical reply-blocked state — the run queue now needs advancing, and until it is
+        // advanced no task is running on this CPU. Publishing anywhere earlier would name a
+        // block that had not happened yet.
+        //
+        // NR7 is the other direction and is absent here BY CONSTRUCTION: a reply never reaches
+        // this commit (the replying server stays `current`), and `direct_dispatch::try_publish`
+        // independently refuses `IpcReply` so the contract cannot be violated even by mistake.
+        //
+        // Confinement: `offlock_authoritative_dispatch_enabled()` resolves to the armed
+        // proof/oracle gate on AArch64 (production is x86_64-only), so an ordinary AArch64 boot
+        // publishes nothing and reaches the unchanged in-lock `dispatch_next_task()` below.
+        // Declining publication is always safe for exactly that reason.
+        #[cfg(target_arch = "aarch64")]
+        if crate::kernel::boot::offlock_authoritative_dispatch_enabled() {
+            let cpu = self.current_cpu();
+            let cpu_idx = cpu.0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            // Single-DISPATCHER, exactly as the x86_64 sibling above: the out-of-lock dequeue
+            // is the accepted slice only while one CPU dispatches user tasks.
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            if trap_path && single_cpu {
+                // Open the dispatch lease HERE — bound to this exact `current`-clear, and to no
+                // other. The lease is what makes the debt identifiable: a drain holding an item
+                // whose lease is no longer this CPU's current one knows a later cycle already
+                // owns settlement. It is opened only on the path that actually publishes, so
+                // the lease counter and the debt cannot drift apart.
+                //
+                // (This replaces `tcb.blocked_recv_generation`, which is declared and read but
+                // never incremented anywhere in the tree — always zero, and therefore incapable
+                // of distinguishing one cycle from another.)
+                let lease = crate::kernel::direct_dispatch::open_dispatch_lease(cpu);
+                let work = crate::kernel::direct_dispatch::DirectDispatchWork {
+                    outgoing_tid: plan.blocked_tid.0,
+                    outgoing_asid: plan.receiver_asid.0,
+                    lease,
+                    cpu: cpu.0,
+                    class: crate::kernel::direct_dispatch::DirectDispatchClass::IpcCall,
+                };
+                let published = crate::kernel::direct_dispatch::try_publish(work);
+                if published == crate::kernel::direct_dispatch::PublishOutcome::Published {
+                    crate::yarm_log!(
+                        "AARCH64_DIRECT_DISPATCH_PUBLISHED tid={} asid={} lease={} cpu={} class=IpcCall",
+                        work.outgoing_tid,
+                        work.outgoing_asid,
+                        work.lease,
+                        cpu.0
+                    );
+                    // The out-of-lock trap-entry drain performs the single authoritative
+                    // queue-advancing dispatch; do NOT dispatch in-lock here.
+                    return Ok(plan.blocked_tid);
+                }
+                // Publication was declined (the slot is busy). The in-lock dispatch below
+                // settles this cycle instead, and the lease we just opened supersedes any
+                // older outstanding item — which is exactly the signal its drain needs to
+                // know that its debt has been taken over.
+                crate::yarm_log!(
+                    "AARCH64_DIRECT_DISPATCH_FALLBACK reason=slot_busy tid={} lease={} observed={:?}",
+                    plan.blocked_tid.0,
+                    lease,
+                    published
+                );
+            }
+            if !trap_path || !single_cpu {
+                crate::yarm_log!(
+                    "AARCH64_DIRECT_DISPATCH_FALLBACK reason={} tid={}",
+                    if !trap_path {
+                        "no_trap_drainer"
+                    } else {
+                        "multi_cpu"
+                    },
+                    plan.blocked_tid.0
+                );
+            }
         }
         let _ = self.dispatch_next_task()?;
         Ok(plan.blocked_tid)

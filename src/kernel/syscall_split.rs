@@ -437,9 +437,28 @@ fn try_split_debug_log_into_frame(
             // watermark of 2 at that point and then went on to exhaust all 8 slots. The
             // bounded per-direction census (`maybe_emit_attestation`) still covers a boot that
             // never reaches the park, so moving this later loses no diagnostic on failure.
-            crate::kernel::direct_ipc_counters::maybe_emit_quiescent_attestation(
-                msg.starts_with("INIT_IDLE_PARK_BEGIN"),
-            );
+            //
+            // The INDEPENDENT waiter census is computed here, off-lock, only when the trigger
+            // matches — it is a two-pass scan of the endpoint table, so it must not run on
+            // every DebugLog. It is measured from the waiter table, not from the store's own
+            // counters, which is what lets it detect a store that balanced its books while
+            // dropping or orphaning a lease.
+            if msg.starts_with("INIT_IDLE_PARK_BEGIN") {
+                let census = (
+                    shared.direct_ack_lease_bijection(
+                        crate::kernel::boot::ipccall_direct_ack::store(),
+                        crate::kernel::boot::ipccall_direct_request_endpoint_admitted,
+                    ),
+                    shared.direct_ack_lease_bijection(
+                        crate::kernel::boot::ipcreply_direct_ack::store(),
+                        crate::kernel::boot::ipccall_direct_reply_endpoint_admitted,
+                    ),
+                );
+                crate::kernel::direct_ipc_counters::maybe_emit_quiescent_attestation(
+                    true,
+                    Some(census),
+                );
+            }
         }
         // Copy failed (no mapping / not user-readable) — same as the global handler's
         // `DEBUG_LOG_COPY_FAIL` path: OK, no log.
@@ -833,6 +852,16 @@ fn try_split_ipcreply_direct_into_frame(
         // transaction cannot transfer a capability, so a cap-bearing reply must decline
         // before any mutation rather than deliver the payload and drop the capability.
         transfer_cap_present: crate::kernel::syscall::ipc_abi::transfer_cap_arg_present(frame),
+        // Read from the authoritative terminal-ownership cell, exact in record index AND
+        // generation. An arbitrated reply must reserve its terminal before the caller copy
+        // and commit it after so a concurrent timeout provably loses; that lease lives only
+        // on the legacy path, so this reply declines before any mutation.
+        terminal_arbitrated: match reply_object {
+            Ok((rec_idx, rec_gen)) => {
+                shared.reply_record_terminal_arbitrated_split_read(rec_idx, rec_gen)
+            }
+            Err(_) => false,
+        },
     };
     let verdict = classify_direct_reply_eligibility(&facts);
     let Some((reply_eidx, reply_egen)) = verdict.endpoint() else {
@@ -841,6 +870,7 @@ fn try_split_ipcreply_direct_into_frame(
             verdict
                 == crate::kernel::direct_eligibility::DirectReplyEligibility::EndpointNotAdmitted,
             verdict.is_transfer_cap_decline(),
+            verdict.is_terminal_arbitration_decline(),
         );
         return None; // ineligible: no ack claim, no copy, no mutation — legacy path
     };
