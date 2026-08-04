@@ -105882,7 +105882,7 @@ mod stage199d_closure_matrix {
     /// strictly ordered; naming them together with AArch64 was the taxonomy error.
     const RISCV_SEQUENCE: &[&str] = &[
         "1. [CLOSED] kernel target-spec / toolchain repair — the LLVM triple named the Rust target name `riscv64gc`; it now names the LLVM architecture, ISA and ABI unchanged",
-        "2. [AUDITED case_c] RISC-V off-lock NR6/NR7 code — the contract stack is inherited clean, but the trap bridge re-enters the broad lock on the return path even at SMP=1; see §6.1.17",
+        "2. [AUDITED case_c; blocker 2 CLOSED] RISC-V off-lock NR6/NR7 code — the contract stack is inherited clean and the trap bridge no longer re-enters the broad lock (§6.1.18); admission is still proof-gated (blocker 1), so the link stays open",
         "3. RISC-V production enablement",
         "4. live RISC-V NR6/NR7 and ServerDies evidence",
     ];
@@ -106253,11 +106253,16 @@ mod stage199d_closure_matrix {
             AUDIT.contains("link 1 is **CLOSED**"),
             "the audit must record link 1 as closed"
         );
-        // Link 2 is AUDITED, not closed — case C. The distinction is the whole point: an audit
-        // that found a decisive blocker must not read as progress.
+        // Link 2 is AUDITED and its DECISIVE blocker is closed — but the link itself is not.
+        // The distinction is the whole point: closing the return-path blocker is not the same as
+        // closing the link, because admission is still proof-gated.
         assert!(
-            RISCV_SEQUENCE[1].contains("[AUDITED case_c]"),
-            "link 2 is audited"
+            RISCV_SEQUENCE[1].contains("[AUDITED case_c; blocker 2 CLOSED]"),
+            "link 2 is audited with its decisive blocker closed"
+        );
+        assert!(
+            !RISCV_SEQUENCE[1].starts_with("2. [CLOSED]"),
+            "link 2 itself is NOT closed"
         );
         assert!(
             AUDIT.contains("RISCV_199D_READINESS=case_c"),
@@ -106786,6 +106791,9 @@ mod stage199d_riscv_production_readiness_audit {
         what: &'static str,
         site: &'static str,
         severity: BlockerSeverity,
+        /// Closed by a later increment. The finding stays in the map — an audit that found a
+        /// blocker does not un-find it when the blocker is fixed.
+        closed: bool,
     }
 
     const BLOCKERS: &[Blocker] = &[
@@ -106795,6 +106803,7 @@ mod stage199d_riscv_production_readiness_audit {
                    admission predicate — flipping the production default alone is a silent no-op",
             site: "src/arch/riscv64/trap.rs",
             severity: BlockerSeverity::SilentNoOp,
+            closed: false,
         },
         Blocker {
             id: 2,
@@ -106803,6 +106812,7 @@ mod stage199d_riscv_production_readiness_audit {
                    a HANDLED direct transaction still enters the broad lock three times",
             site: "src/arch/riscv64/boot.rs",
             severity: BlockerSeverity::Decisive,
+            closed: true,
         },
         Blocker {
             id: 3,
@@ -106810,6 +106820,7 @@ mod stage199d_riscv_production_readiness_audit {
                    x86_64-cfg-gated and RISC-V exposes no SBI IPI / software-interrupt seam",
             site: "src/kernel/ipccall_direct_txn.rs + src/arch/riscv64/sbi.rs",
             severity: BlockerSeverity::LatentAtCurrentTopology,
+            closed: false,
         },
     ];
 
@@ -106928,42 +106939,41 @@ mod stage199d_riscv_production_readiness_audit {
         }
     }
 
-    /// **Blocker 2, pinned exactly — the decisive finding.** `current_tid_authoritative` is a
-    /// `with_cpu` acquisition, and the RISC-V trap BRIDGE calls it on entry and again on the
-    /// return path, then takes a third `with_cpu` for the SATP asid. All three are outside the
-    /// wrapper, so the Phase-1 early return does not avoid them.
+    /// **Blocker 2 — the decisive finding, now CLOSED.** The bridge used to call
+    /// `current_tid_authoritative` (which is `self.with_cpu(..)`) for the entering and resume
+    /// identities and take a third `with_cpu` for the SATP asid. All three are gone; the record
+    /// of the finding stays, and this guard now pins the closure rather than the defect.
     #[test]
-    fn the_riscv_bridge_brackets_every_trap_with_broad_lock_acquisitions() {
+    fn blocker_two_is_closed_the_bridge_takes_no_broad_lock() {
         assert!(
             function_body(RUNTIME, "pub fn current_tid_authoritative").contains("self.with_cpu("),
             "`current_tid_authoritative` IS a broad-lock acquisition — that is why the bridge's \
-             use of it matters"
+             former use of it was the blocker"
         );
         let bridge = function_body(RISCV_BRIDGE, "extern \"C\" fn yarm_riscv64_trap_bridge");
-        let acquisitions: alloc::vec::Vec<&str> = code_lines(&bridge)
-            .into_iter()
-            .filter(|l| l.contains("current_tid_authoritative") || l.contains("with_cpu("))
-            .collect();
+        for l in code_lines(&bridge) {
+            assert!(
+                !l.contains("current_tid_authoritative") && !l.contains("with_cpu("),
+                "the bridge must hold no broad-lock acquisition: `{l}`"
+            );
+        }
+        // The narrow replacements are in place, at the same boundaries.
         assert!(
-            acquisitions.len() >= 3,
-            "the bridge is expected to hold at least three broad-lock touches, found {}: {:?}",
-            acquisitions.len(),
-            acquisitions
-        );
-        // The two that a HANDLED direct transaction cannot avoid, by name.
-        assert!(
-            bridge
-                .contains("let entering_tid = shared.current_tid_authoritative(cpu).unwrap_or(0);"),
-            "the ENTERING identity is read through the broad lock, before the split dispatcher"
+            bridge.contains("let entering_tid = shared.current_tid_split_read(cpu).unwrap_or(0);")
         );
         assert!(
-            bridge.contains(".current_tid_authoritative(cpu)"),
-            "the RESUME identity is re-read through the broad lock, after the handler returns"
+            bridge.contains("shared.current_tid_split_read(cpu).unwrap_or(entering_tid);"),
+            "the resume snapshot uses the narrow seam with the unchanged fallback"
         );
-        assert!(
-            bridge.contains(".with_cpu(cpu, |k| k.task_asid(resume_tid))"),
-            "the SATP asid lookup is a third broad-lock acquisition on the return path"
-        );
+        assert!(bridge.contains("shared.task_asid_for_tid_split_read(resume_tid)"));
+        let b = MATRIX_BLOCKER(2);
+        assert!(b.closed, "blocker 2 is recorded closed");
+        assert_eq!(b.severity, BlockerSeverity::Decisive);
+    }
+
+    #[allow(non_snake_case)]
+    fn MATRIX_BLOCKER(id: u8) -> &'static Blocker {
+        BLOCKERS.iter().find(|b| b.id == id).expect("blocker")
     }
 
     /// The replacement seams ALREADY EXIST and are architecture-neutral — the smallest next
@@ -107235,6 +107245,12 @@ mod stage199d_riscv_production_readiness_audit {
         assert_ne!(VERDICT, Case::StructurallyReady);
         assert_ne!(VERDICT, Case::LocalCompleteRemoteMissing);
         assert_eq!(BLOCKERS.len(), 3, "three genuine blockers");
+        // Blocker 2 is closed; 1 and 3 remain, so the case-C verdict still stands — with
+        // admission still proof-gated, an SMP=1 production boot does not run NR6/NR7 off-lock
+        // at all, which is a code blocker reachable at SMP=1.
+        assert!(MATRIX_BLOCKER(2).closed, "the decisive blocker is closed");
+        assert!(!MATRIX_BLOCKER(1).closed, "admission is still proof-gated");
+        assert!(!MATRIX_BLOCKER(3).closed, "no cross-hart wake exists");
         for (i, b) in BLOCKERS.iter().enumerate() {
             assert_eq!(b.id as usize, i + 1);
             assert!(!b.what.is_empty() && !b.site.is_empty());
@@ -107245,7 +107261,7 @@ mod stage199d_riscv_production_readiness_audit {
                 .iter()
                 .any(|b| b.severity == BlockerSeverity::Decisive
                     && b.site == "src/arch/riscv64/boot.rs"),
-            "the decisive blocker is on the RISC-V return path"
+            "the decisive blocker was on the RISC-V return path"
         );
     }
 
@@ -107257,6 +107273,438 @@ mod stage199d_riscv_production_readiness_audit {
         assert!(
             AUDIT.contains("CONDITIONAL_PRODUCTION_ENABLEMENT_AND_LIVE_EVIDENCE"),
             "the reclassification that was NOT taken must still be named, so the decision is legible"
+        );
+    }
+}
+
+// ── RISC-V readiness blocker 2 CLOSED — narrow snapshots on the trap bridge ──────────────────
+//
+// `yarm_riscv64_trap_bridge` used to bracket EVERY trap — including a handled Phase-1 NR6/NR7
+// direct transaction — with broad-lock acquisitions: `current_tid_authoritative` for the entering
+// identity, again for the resume identity, and `with_cpu(|k| k.task_asid(..))` for the SATP
+// lookup. `current_tid_authoritative` is `self.with_cpu(cpu, |kernel| kernel.current_tid())`, so
+// a syscall whose transaction is entirely broad-lock-free still entered the broad lock three
+// times. That was case C's decisive blocker.
+//
+// The replacements are the existing narrow authoritative seams — a call-site swap, no new
+// mechanism and no RISC-V semantic copy:
+//
+//   entering / resume  `current_tid_authoritative(cpu)` -> `current_tid_split_read(cpu)`
+//   SATP asid          `with_cpu(|k| k.task_asid(tid))` -> `task_asid_for_tid_split_read(tid)`
+//
+// **Why the equivalence holds here, when `current_tid_split_read` is marked TRAP_FORBIDDEN for
+// the x86_64 trap seam.** `KernelState::current_tid()` is `current_tid_on(self.current_cpu())`,
+// and `with_cpu(cpu, ..)` calls `set_current_cpu(cpu)` FIRST — so the broad-lock read resolves to
+// `current_tid_on(cpu)`, which is exactly what the split seam reads. The two differ only in (a)
+// serialization against a concurrent broad-lock holder and (b) the `set_current_cpu` side effect.
+// On this bridge both are vacuous: RISC-V is BSP-only, the bridge always passes
+// `BOOTSTRAP_CPU_ID`, and `validate_online_cpu` admits no other CPU while `online_cpus == 1`, so
+// `current_cpu` is invariant and the rebind changes nothing. `riscv_current_cpu_binding_is_invariant`
+// pins that premise, so if RISC-V ever boots a second hart this module fails rather than the
+// bridge silently regressing.
+mod stage199d_riscv_narrow_trap_snapshots {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::runtime::SharedKernel;
+
+    const BRIDGE: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    fn bridge_body() -> &'static str {
+        let at = BRIDGE
+            .find("extern \"C\" fn yarm_riscv64_trap_bridge")
+            .expect("the trap bridge");
+        let closer = "\n}";
+        let end = BRIDGE[at..]
+            .find(closer)
+            .map(|i| at + i)
+            .unwrap_or(BRIDGE.len());
+        &BRIDGE[at..end]
+    }
+
+    fn code_lines(body: &str) -> alloc::vec::Vec<&str> {
+        body.lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("///"))
+            .collect()
+    }
+
+    // ── Differential: the narrow snapshot equals the old authoritative result ───────────────
+
+    /// **Same-current.** A single dispatched task: both reads name it.
+    #[test]
+    fn narrow_and_authoritative_agree_for_same_current() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        kernel.with(|state| {
+            state.register_task(77).expect("task77");
+            state.enqueue_current_cpu(77).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+        let narrow = kernel.current_tid_split_read(cpu);
+        let authoritative = kernel.current_tid_authoritative(cpu);
+        assert_eq!(narrow, authoritative, "same-current must agree");
+        assert_eq!(narrow, Some(77));
+        // And the bridge's `unwrap_or(0)` shaping agrees too.
+        assert_eq!(narrow.unwrap_or(0), authoritative.unwrap_or(0));
+    }
+
+    /// **Switched-current.** After a queue-advancing switch both reads name the NEW task, so the
+    /// bridge's `task_switched` decision is unchanged.
+    #[test]
+    fn narrow_and_authoritative_agree_for_switched_current() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        kernel.with(|state| {
+            state.register_task(81).expect("task81");
+            state.register_task(82).expect("task82");
+            state.enqueue_current_cpu(81).expect("enqueue 81");
+            state.enqueue_current_cpu(82).expect("enqueue 82");
+            state.dispatch_next_task().expect("dispatch");
+        });
+        let entering_narrow = kernel.current_tid_split_read(cpu);
+        let entering_auth = kernel.current_tid_authoritative(cpu);
+        assert_eq!(entering_narrow, entering_auth);
+
+        kernel.with(|state| state.yield_current().expect("yield"));
+
+        let resume_narrow = kernel.current_tid_split_read(cpu);
+        let resume_auth = kernel.current_tid_authoritative(cpu);
+        assert_eq!(resume_narrow, resume_auth, "switched-current must agree");
+        assert_ne!(resume_narrow, entering_narrow, "a switch really happened");
+        // The bridge's decision is computed identically from either read.
+        assert_eq!(
+            resume_narrow.unwrap_or(0) != entering_narrow.unwrap_or(0),
+            resume_auth.unwrap_or(0) != entering_auth.unwrap_or(0),
+            "task_switched must be identical under both reads"
+        );
+    }
+
+    /// **Replacement.** A task that exits and is replaced by another TID: both reads name the
+    /// replacement, so the SATP lookup is keyed on the same TID either way.
+    #[test]
+    fn narrow_and_authoritative_agree_for_replacement() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let cpu = CpuId(0);
+        kernel.with(|state| {
+            state.register_task(91).expect("task91");
+            state.register_task(92).expect("task92");
+            state.enqueue_current_cpu(91).expect("enqueue 91");
+            state.dispatch_next_task().expect("dispatch 91");
+        });
+        let before = kernel.current_tid_split_read(cpu);
+        assert_eq!(before, kernel.current_tid_authoritative(cpu));
+
+        // Replace the running task with a different TID.
+        kernel.with(|state| {
+            state.enqueue_current_cpu(92).expect("enqueue 92");
+            state.yield_current().expect("yield to 92");
+        });
+        let after_narrow = kernel.current_tid_split_read(cpu);
+        let after_auth = kernel.current_tid_authoritative(cpu);
+        assert_eq!(after_narrow, after_auth, "replacement must agree");
+        assert_eq!(
+            kernel.task_asid_for_tid_split_read(after_narrow.unwrap_or(0)),
+            kernel.task_asid_for_tid_split_read(after_auth.unwrap_or(0)),
+            "the SATP lookup is keyed on the same TID under either read"
+        );
+    }
+
+    /// **No-current.** An offline / unbound CPU yields `None` from both, so the bridge's
+    /// `unwrap_or(entering_tid)` fallback and the typed-idle invariant behave identically.
+    #[test]
+    fn narrow_and_authoritative_agree_for_no_current() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let offline = CpuId(7);
+        let narrow = kernel.current_tid_split_read(offline);
+        let authoritative = kernel.current_tid_authoritative(offline);
+        assert_eq!(narrow, None, "no current on an offline CPU");
+        assert_eq!(narrow, authoritative, "no-current must agree");
+        // The typed-idle invariant reads the same 0.
+        assert_eq!(narrow.unwrap_or(0), 0);
+        assert_eq!(authoritative.unwrap_or(0), 0);
+    }
+
+    // ── The fail-closed SATP translation ────────────────────────────────────────────────────
+
+    /// **Stale / missing resume identity must NOT install another task's address space.** The
+    /// narrow asid seam reports both "no such TID" and "no address space" as `0`, where the
+    /// broad-lock read returned `None`. `0` is unambiguous because the allocator never hands out
+    /// `Asid(0)` — so mapping `0` back to `None` reproduces "leave the installed SATP alone".
+    #[test]
+    fn a_missing_resume_tid_yields_no_asid_and_installs_nothing() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        // A TID that was never registered.
+        let raw = kernel.task_asid_for_tid_split_read(999_999);
+        assert_eq!(raw, 0, "an unknown TID reports absence as 0");
+        let translated = match raw {
+            0 => None,
+            v => Some(crate::kernel::vm::Asid(v as u16)),
+        };
+        assert!(
+            translated.is_none(),
+            "absence must translate to None so no SATP write happens"
+        );
+        // The broad-lock read it replaces agrees.
+        let authoritative = kernel
+            .with_cpu(CpuId(0), |k| k.task_asid(999_999))
+            .ok()
+            .flatten();
+        assert_eq!(translated, authoritative, "fail-closed translation matches");
+    }
+
+    /// The translation is exactly the one the bridge performs, and `Asid(0)` never names a real
+    /// address space — the premise the translation rests on.
+    #[test]
+    fn asid_zero_is_never_a_real_address_space() {
+        const VM: &str = include_str!("../vm.rs");
+        assert!(
+            VM.contains("ASID 0 must never be allocated"),
+            "the allocator must never hand out Asid(0), or 0 would be ambiguous"
+        );
+        let body = bridge_body();
+        assert!(
+            body.contains(
+                "let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {"
+            ) && body.contains("0 => None,"),
+            "the bridge must translate 0 to None explicitly"
+        );
+    }
+
+    /// A live TID's asid agrees between the narrow seam and the broad-lock read.
+    #[test]
+    fn a_live_tid_yields_the_same_asid_under_both_reads() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.register_task(55).expect("task55");
+            state.enqueue_current_cpu(55).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+        });
+        let narrow = match kernel.task_asid_for_tid_split_read(55) {
+            0 => None,
+            v => Some(crate::kernel::vm::Asid(v as u16)),
+        };
+        let authoritative = kernel
+            .with_cpu(CpuId(0), |k| k.task_asid(55))
+            .ok()
+            .flatten();
+        assert_eq!(narrow, authoritative, "live TID asid must agree");
+    }
+
+    // ── The premise that makes the dropped `set_current_cpu` vacuous ────────────────────────
+
+    /// `with_cpu` also REBINDS `current_cpu`; a pure read does not. On this bridge that side
+    /// effect is idempotent because RISC-V is BSP-only and the bridge always passes
+    /// `BOOTSTRAP_CPU_ID`. If that ever stops being true, this fails.
+    #[test]
+    fn riscv_current_cpu_binding_is_invariant() {
+        // Read structurally: a hosted x86 test build does not link the RISC-V arch module.
+        const RISCV_LAYOUT: &str = include_str!("../../arch/riscv64/platform_layout.rs");
+        assert!(
+            RISCV_LAYOUT.contains("pub const BOOTSTRAP_CPU_ID: u8 = 0;"),
+            "the bridge's CPU is the bootstrap hart"
+        );
+        assert!(
+            BRIDGE.contains("RISC-V is BSP-only (`online_cpus==1`)"),
+            "the BSP-only premise must stay recorded at the site that depends on it"
+        );
+        assert!(
+            bridge_body().contains(
+                "let cpu = crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);"
+            ),
+            "the bridge must not derive its CPU from anything but the bootstrap constant"
+        );
+        // A single-hart scheduler admits no other CPU, so a rebind could only ever be a no-op.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        assert!(
+            kernel
+                .with(|state| state.set_current_cpu(CpuId(1)))
+                .is_err(),
+            "while only one CPU is online, binding any other CPU must be refused"
+        );
+    }
+
+    // ── Structural guards ───────────────────────────────────────────────────────────────────
+
+    /// **No broad-lock lookup survives inside the bridge** — in code. Comments explaining the
+    /// history are fine; acquisitions are not.
+    #[test]
+    fn the_bridge_contains_no_broad_lock_acquisition() {
+        for l in code_lines(bridge_body()) {
+            assert!(
+                !l.contains("current_tid_authoritative"),
+                "the bridge must not take the authoritative (broad-lock) current read: `{l}`"
+            );
+            assert!(
+                !l.contains("with_cpu(") && !l.contains("state.lock()"),
+                "the bridge must not acquire the broad lock: `{l}`"
+            );
+        }
+    }
+
+    /// **Nothing broad happens before or after a handled Phase-1 direct transaction.** The
+    /// wrapper's handled path returns before the broad-lock phase, and the bridge that wraps it
+    /// is now clean on both sides — so the whole handled trap is broad-lock-free.
+    #[test]
+    fn a_handled_direct_transaction_never_touches_the_broad_lock() {
+        let wrapper_at = RISCV_TRAP
+            .find("pub fn handle_riscv_trap_entry_shared")
+            .expect("the wrapper");
+        let wrapper = &RISCV_TRAP[wrapper_at..];
+        let handled = wrapper
+            .find("return Ok(RiscvTrapEntryOutcome::ReturnToCurrent)")
+            .expect("the handled early return");
+        let phase2 = wrapper
+            .find("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE")
+            .expect("the broad-lock phase");
+        assert!(
+            handled < phase2,
+            "the handled split path must return before the broad-lock phase"
+        );
+        for l in code_lines(&wrapper[..handled]) {
+            assert!(
+                !l.contains("with_cpu("),
+                "nothing before the handled return may take the broad lock: `{l}`"
+            );
+        }
+        // …and the bridge on both sides of the wrapper call.
+        let body = bridge_body();
+        let call = body
+            .find("handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)")
+            .expect("the wrapper call");
+        for (half, region) in [("before", &body[..call]), ("after", &body[call..])] {
+            for l in code_lines(region) {
+                assert!(
+                    !l.contains("with_cpu(") && !l.contains("current_tid_authoritative"),
+                    "the bridge must be broad-lock-free {half} the wrapper call: `{l}`"
+                );
+            }
+        }
+    }
+
+    /// The snapshots are taken at the SAME program boundaries: entering before the wrapper call,
+    /// resume after it and before the register write-back.
+    #[test]
+    fn the_snapshots_are_taken_at_the_same_program_boundaries() {
+        let body = bridge_body();
+        let entering = body
+            .find("let entering_tid = shared.current_tid_split_read(cpu).unwrap_or(0);")
+            .expect("entering snapshot");
+        let call = body
+            .find("handle_riscv_trap_entry_shared(shared, cpu, ctx, &mut tframe)")
+            .expect("wrapper call");
+        let resume = body
+            .find("let resume_tid = shared")
+            .expect("resume snapshot");
+        let writeback = body
+            .find("if task_switched || scause == EXC_USER_ECALL {")
+            .expect("register write-back");
+        let satp = body
+            .find("let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {")
+            .expect("SATP lookup");
+        assert!(entering < call, "entering snapshot precedes the wrapper");
+        assert!(call < resume, "resume snapshot follows the wrapper");
+        assert!(
+            resume < writeback,
+            "resume snapshot precedes the write-back"
+        );
+        assert!(writeback < satp, "SATP selection follows the write-back");
+    }
+
+    /// SATP is selected from the EXACT resume TID, and the existing activation + `sfence.vma`
+    /// ordering is untouched.
+    #[test]
+    fn satp_is_selected_from_the_exact_resume_tid_with_unchanged_activation() {
+        let body = bridge_body();
+        assert!(
+            body.contains("shared.task_asid_for_tid_split_read(resume_tid)"),
+            "the asid must be keyed on the resume TID, not on `current`"
+        );
+        let satp = body.find("let resume_asid = match").expect("asid lookup");
+        let tail = &body[satp..];
+        let map = tail
+            .find("map_kernel_shared_into_asid(asid)")
+            .expect("shared map");
+        let write = tail.find("write_satp(satp)").expect("satp write");
+        assert!(
+            map < write,
+            "the kernel-shared mapping must still precede the SATP write"
+        );
+        assert!(
+            tail.contains("if let Some(asid) = resume_asid {"),
+            "absence must still skip activation entirely"
+        );
+    }
+
+    // ── Scope: what this increment did NOT change ───────────────────────────────────────────
+
+    /// Blocker 1 is untouched: NR6/NR7 admission stays proof-gated.
+    #[test]
+    fn blocker_one_remains_proof_gated() {
+        let at = RISCV_TRAP
+            .find("pub fn handle_riscv_trap_entry_shared")
+            .expect("the wrapper");
+        let wrapper = &RISCV_TRAP[at..];
+        assert!(
+            wrapper.contains("crate::kernel::boot::ipccall_direct_proof_enabled()"),
+            "RISC-V admission must still be the proof gate — blocker 1 is NOT closed here"
+        );
+        assert!(
+            !code_lines(wrapper)
+                .iter()
+                .any(|l| l.contains("ipccall_direct_admission_enabled()")),
+            "this increment must not switch RISC-V to the canonical admission predicate"
+        );
+    }
+
+    /// Blocker 3 is untouched: no cross-hart wake was added.
+    #[test]
+    fn blocker_three_remains_open() {
+        const SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+        assert!(
+            !SBI.contains("SBI_EXT_IPI") && !SBI.contains("0x735049"),
+            "no IPI extension may be introduced by this increment"
+        );
+        const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+        assert_eq!(
+            TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "the wake sends stay x86_64-only"
+        );
+    }
+
+    /// Production predicates are untouched.
+    #[test]
+    fn no_production_predicate_changed() {
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+
+    /// **Coordinate 23 stays OPEN, but case C's decisive blocker is closed.** Closing the
+    /// return-path blocker does not make RISC-V production-ready: admission is still proof-gated
+    /// and there is still no cross-hart wake.
+    #[test]
+    fn coordinate_23_stays_open_with_blocker_two_closed() {
+        assert!(
+            AUDIT.contains("blocker 2 is **CLOSED**"),
+            "the audit must record blocker 2 as closed"
+        );
+        assert!(
+            AUDIT.contains("RISCV_199D_READINESS=case_c"),
+            "the case-C verdict stands: blockers 1 and 3 remain"
+        );
+        // The matrix row is unchanged.
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,"),
+            "coordinate 23 must still be OPEN"
         );
     }
 }

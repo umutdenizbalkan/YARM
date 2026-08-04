@@ -704,9 +704,16 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         riscv_trap_halt("no_trap_shared_kernel");
     };
     // RISC-V is BSP-only (`online_cpus==1`); the trapping CPU is always the
-    // bootstrap hart. `with_cpu` rebinds `current_cpu` to this value anyway.
+    // bootstrap hart, so `current_cpu` is invariantly this value.
     let cpu = crate::kernel::scheduler::CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
-    let entering_tid = shared.current_tid_authoritative(cpu).unwrap_or(0);
+    // Stage 199D (RISC-V readiness blocker 2): the ENTERING identity comes from the rank-1
+    // scheduler seam, not the broad lock. `with_cpu(cpu, |k| k.current_tid())` resolves to
+    // `current_tid_on(current_cpu)` AFTER `set_current_cpu(cpu)` rebinds it, so on this bridge —
+    // which always passes `BOOTSTRAP_CPU_ID` on a BSP-only architecture — it is the same
+    // `current_tid_on(cpu)` this seam reads directly. The rebind it also performed is idempotent
+    // here for the same reason (see `riscv_current_cpu_binding_is_invariant`), so dropping the
+    // broad acquisition drops no state change. Taken at the SAME program boundary as before.
+    let entering_tid = shared.current_tid_split_read(cpu).unwrap_or(0);
 
     // ── Phase: SAVE_DONE ────────────────────────────────────────────────
     if first_trap {
@@ -816,7 +823,7 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // INVARIANT (not the control-flow discriminator): the typed idle outcome already
             // decided we idle; `current == None|Some(0)` must hold. A live current here is a bug —
             // treat it as a fatal invariant violation, NEVER as idle-into-a-live-task.
-            let cur = shared.current_tid_authoritative(cpu).unwrap_or(0);
+            let cur = shared.current_tid_split_read(cpu).unwrap_or(0);
             if cur != 0 {
                 early_marker!(
                     "RISCV_TYPED_IDLE_INVARIANT_VIOLATION reason={:?} current={}",
@@ -869,9 +876,13 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // return path (same task) or from the resumed task's saved
     // `UserRegisterContext.args` (different task; first-run on fresh spawn or
     // resume after IPC block).
-    let resume_tid = shared
-        .current_tid_authoritative(cpu)
-        .unwrap_or(entering_tid);
+    // Stage 199D (RISC-V readiness blocker 2): the RESUME identity comes from the same rank-1
+    // seam as the entering snapshot, at the SAME program boundary as before — immediately after
+    // the trap-entry wrapper returns and before any register write-back. A HANDLED Phase-1
+    // direct transaction therefore returns to userspace without re-entering the broad lock.
+    // `unwrap_or(entering_tid)` is unchanged: a missing current still resolves to the entering
+    // task, so a stale identity never names some OTHER task.
+    let resume_tid = shared.current_tid_split_read(cpu).unwrap_or(entering_tid);
     let task_switched = resume_tid != entering_tid;
     if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
         crate::yarm_log!(
@@ -1044,10 +1055,21 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // live. Activate the new task's satp here explicitly so the sret lands
     // in the right user page table. The asid lookup is a bounded read through
     // the shared kernel (Stage 196A: no persistent raw `&mut KernelState`).
-    let resume_asid = shared
-        .with_cpu(cpu, |k| k.task_asid(resume_tid))
-        .ok()
-        .flatten();
+    // Stage 199D (RISC-V readiness blocker 2): the asid comes from the rank-2 task seam, keyed
+    // on the EXACT resume TID, with the activation + `sfence.vma` ordering below unchanged.
+    //
+    // FAIL-CLOSED TRANSLATION. `task_asid_for_tid_split_read` returns a raw `u64` and reports
+    // "no such TID" and "TID has no address space" alike as `0`; the broad-lock read it replaces
+    // returned `None` for both, and `None` means *leave the installed SATP alone*. `0` is
+    // unambiguous as an absence because the ASID allocator never hands out `Asid(0)`
+    // (`kernel::vm`: "ASID 0 must never be allocated"). Mapping it back to `None` is what keeps a
+    // stale or missing resume identity from installing address space 0 — activating SOME task's
+    // page table instead of declining is precisely the failure this translation exists to
+    // prevent, and `cr3_for_asid` would otherwise materialise a root for it.
+    let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {
+        0 => None,
+        raw => Some(crate::kernel::vm::Asid(raw as u16)),
+    };
     if let Some(asid) = resume_asid {
         // Make sure the kernel-shared gigapage is present in the resumed
         // task's page table. Idempotent for asids that already have it.

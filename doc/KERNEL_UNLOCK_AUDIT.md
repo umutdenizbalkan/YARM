@@ -127,10 +127,10 @@ lines excluded.
 
 | Category | Production callsites |
 |----------|---------------------|
-| `SharedKernel::with_cpu` | **40** |
+| `SharedKernel::with_cpu` | **39** |
 | `SharedKernel::with` (broad `&mut KernelState`) | **10** |
 | Raw `self.state.lock()` | **3** (all inside the three definitions above) |
-| **Total broad-lock acquisition sites** | **50** |
+| **Total broad-lock acquisition sites** | **49** |
 
 ### 1.3 `with_cpu` — 40 production callsites
 
@@ -202,7 +202,7 @@ Enclosing functions were resolved mechanically from source.
 | boot-only | **0** |
 | test-only | **3** |
 | obsolete | **2** |
-| runtime-required | **45** |
+| runtime-required | **44** |
 | undocumented | **0** |
 
 #### test-only (3)
@@ -1656,6 +1656,111 @@ three bridge acquisitions, the ABI import and return-lane parity, `sepc` advanci
 `tp` preservation, local enqueue authority, the absent remote wake, the inherited transfer-cap and
 terminal-arbitration declines, that neither NR6 nor NR7 clears `current`, and the case-C verdict
 computed from the blocker map.
+
+---
+
+### 6.1.18 RISC-V readiness blocker 2 — CLOSED (narrow trap-bridge snapshots)
+
+§6.1.17 answered *"can an eligible RISC-V NR6/NR7 transaction complete end-to-end without
+entering or re-entering the broad `KernelState` lock?"* with **no**, and named the decisive
+reason: `yarm_riscv64_trap_bridge` bracketed **every** trap — including a handled Phase-1 direct
+transaction — with broad-lock acquisitions. **That blocker 2 is **CLOSED**.**
+
+Scope: a call-site swap to seams that already existed. No new mechanism, no RISC-V semantic copy,
+and no change to NR6/NR7 admission, production predicates, cross-hart wake, scheduler policy,
+AArch64, ServerDies or Stage 199E. No QEMU seal.
+
+| Site | Was | Now |
+|---|---|---|
+| entering identity | `current_tid_authoritative(cpu)` | `current_tid_split_read(cpu)` |
+| typed-idle invariant read | `current_tid_authoritative(cpu)` | `current_tid_split_read(cpu)` |
+| resume identity | `current_tid_authoritative(cpu)` | `current_tid_split_read(cpu)` |
+| SATP asid | `with_cpu(\|k\| k.task_asid(resume_tid))` | `task_asid_for_tid_split_read(resume_tid)` |
+
+§6.1.17 counted three sites; the bridge in fact held a **fourth** — the typed-idle invariant read
+in the `EnterKernelIdle` arm. It is converted too, because the structural guard is *no broad-lock
+acquisition anywhere in the bridge*, and leaving one behind would have left the guard unenforceable.
+
+#### Why the equivalence holds here, given `current_tid_split_read` is marked TRAP_FORBIDDEN
+
+`current_tid_split_read` carries an explicit warning — *"stale at the pre-global-lock x86_64 trap
+seam (Stage 29A proof: returned tid 0 instead of running requester)"* — and the Stage 4T+6R revert
+records an x86_64 service-chain stall when the entering/exiting snapshots were converted. That
+warning was taken seriously rather than waved past.
+
+`KernelState::current_tid()` is `current_tid_on(self.current_cpu())`, and `with_cpu(cpu, ..)`
+calls `set_current_cpu(cpu)` **first**. So the broad-lock read resolves to `current_tid_on(cpu)`
+— exactly what the narrow seam reads. The two can differ in only two ways:
+
+1. **Serialization** against a concurrent broad-lock holder. RISC-V is BSP-only
+   (`online_cpus == 1`), so there is no second hart to hold it.
+2. **The `set_current_cpu` side effect**, which a pure read does not perform. This is the more
+   important one, and is the likelier mechanism behind the x86_64 revert: converting the read
+   also removed a binding. On this bridge it is vacuous — the bridge always passes
+   `BOOTSTRAP_CPU_ID` (`= 0`), and `validate_online_cpu` refuses every other CPU while one hart
+   is online, so `current_cpu` is invariant and the rebind can only ever be a no-op.
+
+`riscv_current_cpu_binding_is_invariant` pins premise 2 — including that binding `CpuId(1)` is
+refused while one CPU is online — so if RISC-V ever boots a second hart, the test fails rather
+than the bridge silently regressing. The TRAP_FORBIDDEN annotation on the seam remains correct
+**for x86_64**, where neither premise holds.
+
+#### The fail-closed SATP translation
+
+This is the one place where a naive swap would have been a real defect.
+`with_cpu(|k| k.task_asid(tid))` returns `Option<Asid>`, and `None` means *leave the installed
+SATP alone*. `task_asid_for_tid_split_read` returns a raw `u64` and reports **both** "no such TID"
+and "TID has no address space" as `0`. Passing that through unchanged would have made a stale or
+missing resume identity install address space **0** — activating some other task's page table
+instead of declining, and `cr3_for_asid` would have materialised a root for it.
+
+The bridge therefore translates explicitly:
+
+```rust
+let resume_asid = match shared.task_asid_for_tid_split_read(resume_tid) {
+    0 => None,
+    raw => Some(crate::kernel::vm::Asid(raw as u16)),
+};
+```
+
+`0` is unambiguous as an absence because the ASID allocator never hands out `Asid(0)`
+(`kernel::vm`: *"ASID 0 must never be allocated"*). The activation and `sfence.vma` ordering below
+it is untouched, and absence still skips activation entirely — the existing fatal/idle contract.
+
+#### Preserved semantics
+
+Both snapshots are taken at the **same program boundaries** as before — entering before the
+wrapper call, resume after it and before the register write-back — and SATP is still selected from
+the **exact** resume TID. The `unwrap_or(entering_tid)` fallback is unchanged, so a missing current
+still resolves to the entering task and never names some other one. Every trap outcome is
+unaffected: same-task return, split NR6/NR7 success and handled error, ordinary broad-lock syscall
+fallback, queue-advancing switch to an incoming task, `ExitCurrentTask` with replacement,
+intentional no-current idle, and stale/missing resume identity.
+
+#### Effect on the audited question
+
+A handled Phase-1 direct transaction now returns to userspace **without any broad-lock
+acquisition at all**: the wrapper's handled path already returned before the broad-lock phase, and
+the bridge that wraps it is now clean on both sides.
+`a_handled_direct_transaction_never_touches_the_broad_lock` proves the whole handled trap is
+broad-lock-free, before and after the wrapper call.
+
+**Coordinate 23 remains OPEN, and `RISCV_199D_READINESS=case_c` still stands.** Closing the
+return-path blocker does not make RISC-V production-ready:
+
+* **Blocker 1 — still open.** NR6/NR7 admission still asks `ipccall_direct_proof_enabled()`
+  rather than the canonical `ipccall_direct_admission_enabled()`, so with the proof gate off an
+  SMP=1 production boot does not run NR6/NR7 off-lock **at all**. That is a code blocker
+  reachable at SMP=1, which is why the case-C verdict is unchanged.
+* **Blocker 3 — still open.** No cross-hart wake authority: both post-enqueue sends remain
+  x86_64-cfg-gated and the SBI surface still exposes no IPI extension.
+
+`stage199d_riscv_narrow_trap_snapshots` (16 tests) proves the narrow snapshots match the old
+authoritative results for the same-current, switched-current, replacement and no-current cases,
+proves the fail-closed asid translation against the broad-lock read it replaces, and pins the
+structural guards: no broad-lock acquisition inside the bridge, none before or after a handled
+direct transaction, blocker 1 still proof-gated, blocker 3 still open, production predicates
+unchanged, and coordinate 23 still OPEN.
 
 ---
 

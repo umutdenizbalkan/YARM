@@ -23,9 +23,9 @@ Full evidence: `doc/KERNEL_UNLOCK_AUDIT.md`. Canonical stage ladder and roadmap:
 
 | Metric | Value |
 |--------|-------|
-| Production `SharedKernel::with_cpu` callsites | **40** |
+| Production `SharedKernel::with_cpu` callsites | **39** |
 | Production broad `SharedKernel::with` callsites | **10** |
-| **Total production broad-lock acquisition sites** | **50** |
+| **Total production broad-lock acquisition sites** | **49** |
 | Ungated off-lock syscall classes | **5** on x86_64 (NR 15, 10, 8, 2-narrow, 14-narrow); **2** on AArch64 (NR 15, 10); **2** on RISC-V (NR 15, 10) |
 | Proof-gated off-lock classes (default **OFF**) | NR 6 `IpcCall`, NR 7 `IpcReply` — all three architectures |
 | Off-lock authoritative dispatch | **x86_64 (live) + AArch64 (structural, proof-gated)** via `offlock_authoritative_dispatch_enabled()`; `d6_genuine_enabled()` itself remains compile-time x86_64-only. RISC-V not admitted. |
@@ -67,8 +67,8 @@ complete the canonical stage.**
 | **Total** | **1 of 35** | 12 | 22 |
 
 **No canonical stage in Phases 2–6 or 8 is complete.** The one complete stage, 204A
-(broad-lock callsite census), is documentation rather than lock retirement: 50 callsites
-classified as 0 boot-only, 3 test-only, 2 obsolete, 45 runtime-required, 0 undocumented.
+(broad-lock callsite census), is documentation rather than lock retirement: 49 callsites
+classified as 0 boot-only, 3 test-only, 2 obsolete, 44 runtime-required, 0 undocumented.
 
 > **Arithmetic correction.** An earlier revision reported *1 of 34* with 11 partials. Phase 7
 > was the only row written without an `N of M` denominator, and the totals silently counted it
@@ -497,6 +497,27 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    **Coordinate 23 stays OPEN**; tally and the 40 / 6 / 46 ledger unchanged.
    `stage199d_riscv_production_readiness_audit` (18 tests) pins all of it. See
    `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.17.
+   **RISC-V readiness blocker 2 is now CLOSED — the decisive one.** The trap bridge's four
+   broad-lock lookups (entering identity, the typed-idle invariant read, resume identity, and the
+   SATP asid) are replaced by the existing narrow seams: `current_tid_split_read(cpu)` and
+   `task_asid_for_tid_split_read(resume_tid)`. A call-site swap — no new mechanism, no RISC-V
+   semantic copy. **A handled Phase-1 NR6/NR7 direct transaction now returns to userspace with no
+   broad-lock acquisition at all.** Two things made this non-trivial. First,
+   `current_tid_split_read` is annotated TRAP_FORBIDDEN for the x86_64 trap seam; the equivalence
+   holds here because `with_cpu(cpu, ..)` rebinds `current_cpu` *before* reading, so both resolve
+   to `current_tid_on(cpu)`, and on a BSP-only architecture whose bridge always passes
+   `BOOTSTRAP_CPU_ID` the rebind is idempotent — a guard pins that premise and fails if RISC-V
+   ever boots a second hart. Second, `task_asid_for_tid_split_read` reports both "no such TID" and
+   "no address space" as `0`, where the broad-lock read returned `None` meaning *leave SATP
+   alone*; the bridge translates `0 → None` explicitly, so a stale identity declines instead of
+   installing address space 0. Snapshots are taken at the same program boundaries, SATP is
+   selected from the exact resume TID, and the activation + `sfence.vma` ordering is untouched.
+   **Census: 50 / 40 / 45 → 49 / 39 / 44.** `stage199d_riscv_narrow_trap_snapshots` (16 tests)
+   proves the narrow snapshots match the old authoritative results for same-current,
+   switched-current, replacement and no-current, proves the fail-closed asid translation, and
+   pins that no broad-lock acquisition remains in the bridge. **Blockers 1 and 3 remain open**
+   (admission still proof-gated; no cross-hart wake), so `RISCV_199D_READINESS=case_c` stands and
+   **coordinate 23 stays OPEN**. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.18.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.
 4. **Every capability seam is `M2_SEAM_HELPER_ONLY`** — all of Phase 3 has zero production
@@ -733,7 +754,7 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel unlocking — canonical Stage 199D.**
-   The broad `SpinLock<KernelState>` still has **50** production acquisition sites (§0).
+   The broad `SpinLock<KernelState>` still has **49** production acquisition sites (§0).
    The ServerDies reverse-link accounting failure that used to head this list is
    **resolved** (`doc/IPC.md` §8.5): the transition counters now describe exactly one armed
    ServerDies transaction and the leak invariant moved to system-wide link totals, so there
