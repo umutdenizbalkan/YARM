@@ -537,13 +537,29 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    has HSM but no IPI extension) — which is case B by definition. **Coordinate 23 remains OPEN**:
    structural completeness is not production readiness, the remote-wake requirement is unresolved,
    the RISC-V production predicate is still false, and no live evidence is earned.
-   **The RISC-V SMP=1 proof-gated QEMU smoke could NOT be run — `qemu-system-riscv64` is not
-   installed here — so the requested revalidation of the historical proof-gated evidence after the
-   trap-bridge change is outstanding and none of its observations are claimed.** The feature-off
-   RISC-V core boot is unavailable for the same reason; its artifacts were built to the end anyway
-   (`ARTIFACT_BUILD_INTEGRITY arch=riscv64 … result=ok`, linked `yarm-riscv64.bin` + initramfs),
-   so the change links into a bootable image — only the boot could not be observed. Neither run
-   would have added a live cell. `stage199d_riscv_canonical_admission` (11 tests) pins the
+   **RISC-V QEMU revalidation — TAKEN.** `qemu-system-riscv64` was installed for the purpose
+   (Ubuntu 24.04 `qemu-system-misc`, QEMU 8.2.2; `qemu-system-aarch64` deliberately not installed)
+   and both runs were executed from a clean `c9840e0f` tree after a fresh artifact build.
+   **The proof-gated direct smoke PASSES:** `STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=riscv64
+   classes=2 live_cells=2 duplicate_replies=0 duplicate_wakes=0 result=ok`, with genuine NR6
+   request and NR7 reply delivery, request/reply userspace validation, the deliberate duplicate
+   NR7 refused (`dup_rejected=1 err=Err(WrongObject)`), `ret2` return-lane parity, both direct
+   classes retired off-lock (`GLOBAL_LOCK_RETIRE_CLASS_DONE … class=IpcCallDirectRequest` and
+   `class=IpcReplyDirect`) with **no** in-lock dispatch or fallback marker, all fuses zero, and
+   the lease balance holding at the structural `capacity=256`. Feature-off is marker-clean, so
+   selector-off NR6/NR7 stay on the legacy path; selector-on admits the same single oracle round
+   trip as before `c9840e0f`. *sepc-advanced-once, tp/TLS and SATP preservation are attested
+   indirectly* — no marker prints them — by both sides completing their round trip
+   (`client_continuations=1 server_continuations=1`) with zero fault markers.
+   **The feature-off core boot FAILS on a stale harness pattern, and is NOT repaired here.** The
+   boot is healthy (`YARM_BOOT_OK`, service chain up, ending in the script's own expected
+   `RISCV_KERNEL_IDLE_WAITING_FOR_IO … all_services_blocked`) and **no other rejected pattern
+   appears**; the single failure is `\bcapacity\b` in `REJECT_PATTERNS` colliding with the benign
+   `capacity=256` / `ack_capacity=256` quiescent reporters. Those reporters landed at `fcfc55e3`,
+   **20 commits before `c9840e0f`**, and the reject list has not been touched since — neither
+   blocker repair touches either side. It is a stale oracle pattern, the same class as the
+   `have_in` SIGPIPE defect in §0.1, not a RISC-V kernel defect. **Neither run adds a live cell**;
+   the ledger stays 40 / 6 / 46. `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.

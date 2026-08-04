@@ -1831,27 +1831,85 @@ found — with the recomputed verdict recorded beside it.
 readiness: the remote-wake requirement is unresolved, the RISC-V production predicate is still
 false, and no live evidence has been earned.
 
-#### QEMU evidence — NOT taken
+#### QEMU evidence — TAKEN (revalidation; adds no live cell)
 
-The RISC-V SMP=1 proof-gated direct request/reply smoke (`scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh`)
-**could not be run: `qemu-system-riscv64` is not installed in this environment.** The requested
-revalidation of the historical proof-gated evidence after the trap-bridge runtime change is
-therefore **outstanding**, and none of its required observations — genuine NR6 request and NR7
-reply delivery, request/reply userspace validation, duplicate reply rejected, `sepc` advanced
-once, `a0`/`a1`/`a2`/`a3` return parity, `tp`/TLS and SATP preserved, zero broad-lock NR6/NR7
-entries, no fault/stale-identity/duplicate-wake/fatal marker — is claimed here. It would have
-added no live cell in any case; it is a revalidation of existing proof-gated evidence.
+`qemu-system-riscv64` was **installed for this purpose** (Ubuntu 24.04, `apt-get install
+qemu-system-misc`, giving QEMU 8.2.2) and both runs were executed from a clean `c9840e0f` tree
+after a fresh `scripts/build-qemu-riscv64-artifacts.sh`. `qemu-system-aarch64` was deliberately
+**not** installed — no AArch64 run was in scope.
 
-The **feature-off RISC-V core boot** is unavailable for the same reason. Its artifacts were built
-to the end anyway — `scripts/build-qemu-riscv64-artifacts.sh` completed with
-`ARTIFACT_BUILD_INTEGRITY arch=riscv64 stale_artifact_acceptance=0 failed_build_rejected=1
-result=ok`, producing a linked `build-riscv64/yarm-riscv64.bin` and initramfs — so the change
-links into a bootable RISC-V image; only the boot itself could not be observed.
+**Run 2 — `scripts/qemu-ipccall-reply-direct-riscv64-smoke.sh`: PASS.**
 
-Everything provable without an emulator was run: the feature-off and oracle RISC-V kernel builds,
-the full RISC-V artifact build and link, all four hosted configurations serially with integration
-binaries, every architecture's kernel and user target, fmt, clippy, the crate graph and the shell
-gates.
+```
+STAGE_199_IPCCALL_REPLY_DIRECT_LIVE_SEAL arch=riscv64 classes=2 live_cells=2
+  duplicate_replies=0 duplicate_wakes=0 result=ok
+```
+
+| Required observation | Live evidence |
+|---|---|
+| proof-gated NR6 request delivery | `IPCCALL_DIRECT_REQUEST_OK arch=riscv64 source_copy_offlock=1 reply_cap=1 server_wakes=1` |
+| proof-gated NR7 reply delivery | `IPCREPLY_DIRECT_OK arch=riscv64 source_copy_offlock=1 caller_wakes=1 one_shot=1` |
+| request userspace validation | `IPCCALL_DIRECT_ORACLE_SERVER_RECV opcode=1543 opcode_ok=1 data_ok=1 plen=8 reply_cap_ok=1` |
+| reply userspace validation | `IPCCALL_DIRECT_ORACLE_CLIENT_REPLY_RECV plen=8 reply_ok=1` |
+| deliberate duplicate NR7 rejected | `IPCCALL_DIRECT_ORACLE_SERVER_DUP dup_rejected=1 err=Err(WrongObject)`, and `IPC_DIRECT_ACK_FUSES … dir=nr7 duplicate=1` — the one deliberate duplicate, refused |
+| return-lane parity | `IPCCALL_DIRECT_ORACLE_CLIENT_CALL_RET2 ret2=18446744073709551615 expected=18446744073709551615 ret2_ok=1 result=ok` — `ret2` is `SYSCALL_NO_TRANSFER_CAP`, the same success lane the shared encoder writes |
+| zero broad-lock NR6/NR7 entries | `GLOBAL_LOCK_RETIRE_CLASS_DONE arch=riscv64 class=IpcCallDirectRequest result=ok` and `class=IpcReplyDirect result=ok`; **no** `UNEXPECTED_INLOCK_DISPATCH`, `YARM_SPLIT_DISPATCH_FALLBACK` or `UNLOCK_GRADUATED_FALLBACK` anywhere in the log |
+| no fault / stale / duplicate wake / overwrite fuse / fatal | `RISCV_EARLY_TRAP`, `PAGE_FAULT_UNHANDLED`, `PANIC`, `FATAL`, `RISCV_TRAP_HANDLE_FAILED`, `USER_FAULT` all **0**; settled fuses `capacity_refused=0 overwrite_fuse=0 stale=0 foreign=0 dup_release=0 crossed=0 not_committed=0` both directions |
+| lease balance | nr6 and nr7 both `reserve=1 commit=1 consume=1 release=0 cancel=0 live=0`, i.e. `reserve == consume + release + cancel + live`, at `capacity=256` — the structural bound, not the retired magic 8 |
+| round-trip summary | `RISCV_IPCCALL_DIRECT_ROUNDTRIP_DONE request_ok=1 reply_ok=1 duplicate_reply=rejected server_wakes=1 caller_wakes=1 client_continuations=1 server_continuations=1 result=ok` |
+
+**Selector OFF / ON.** The script builds a **feature-off** kernel and fails if the binary contains
+any direct-class literal — it is marker-clean, so feature-off NR6/NR7 stay on the legacy path.
+With the selector on, the admitted population is the same single oracle round trip as before
+`c9840e0f`: exactly one NR6 and one NR7 reservation (`reserve=1` each), which is what the
+canonical-admission swap predicted, since on RISC-V admission reduces to the proof gate.
+
+**Two observations are attested indirectly, and are recorded as such.** No marker in this oracle
+prints `sepc` on the return path or the `tp` value, so *"sepc advanced exactly once"* and
+*"tp/TLS preserved"* are not directly asserted by a log line. What the run does show is
+`client_continuations=1 server_continuations=1` with both userspace sides completing their
+round trip and no fault: a missing advance would loop on the `ecall`, and a double advance would
+fault into the next instruction — neither happened. SATP/ASID preservation is likewise attested
+by both tasks continuing to execute in their own mappings (`USER_MAP_PA_CHECK asid=1 …`) with
+zero page-fault markers, rather than by a dedicated SATP marker.
+
+#### Run 1 — feature-off RISC-V core boot: FAILED on a stale harness pattern
+
+`scripts/qemu-riscv64-core-smoke.sh` reports **exactly one** failed check (it prints only
+failures):
+
+```
+[fail] rejected pattern present: \bcapacity\b
+[fail] qemu-riscv64-core-smoke: 1 check(s) failed (qemu_status=124)
+```
+
+**First missing causal boundary: none in the kernel.** The boot itself is healthy —
+`YARM_BOOT_OK present_cpus=1 online_cpus=1`, the service chain comes up, and it ends in the
+script's own expected terminal state, `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task
+all_services_blocked` → `RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io`. **No other rejected
+pattern appears at all.** The four `capacity` matches are benign quiescent diagnostics:
+
+```
+IPC_DIRECT_PRODUCTION_ACK_QUIESCENT dir=nr6 … live=0 spent=0 high_watermark=0 capacity=256
+IPC_DIRECT_WAITER_CENSUS dir=nr6 waiters_current=10 … ack_capacity=256 eligible=0 live_leases=0
+```
+
+`\bcapacity\b` sits in `REJECT_PATTERNS` beside `\boom\b` and `Vm\(Full\)` — it was written to
+catch a resource-exhaustion message, and now collides with the word `capacity=` in the structural
+ack-store and census reporters. Those two reporters were introduced at **`fcfc55e3`** (*"structural
+ack capacity, independent waiter census"*), **20 commits before `c9840e0f`**; the reject list has
+not been touched since. Neither `d82ef8de` (blocker 2) nor `c9840e0f` (blocker 1) touches the
+emitters or the script. The collision is therefore a **stale oracle pattern predating this work**,
+in the same class as the `have_in` SIGPIPE defect recorded in §0.1 — not a RISC-V kernel defect,
+and not a regression from the blocker repairs.
+
+**Hard-stop: the pattern is NOT repaired here**, per the evidence-only scope of this task. The
+smallest fix would narrow the pattern to the exhaustion message it was written for (e.g.
+`capacity_refused=[1-9]`), leaving the quiescent reporters alone.
+
+**No live cell is added.** This revalidates historical proof-gated evidence after the trap-bridge
+and admission changes; the ledger stays **40 production / 6 knob-gated / 46 total**, and
+coordinate 23 remains **OPEN** on blocker 3.
 
 `stage199d_riscv_canonical_admission` (11 tests) pins: NR6 and NR7 both use canonical admission;
 no `ipccall_direct_proof_enabled()` call remains in the RISC-V ingress; all three admission
