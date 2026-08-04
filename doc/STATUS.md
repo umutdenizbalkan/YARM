@@ -570,7 +570,31 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    (`live_cells=2`, request/reply userspace validation, duplicate reply refused, both direct
    classes retired off-lock with zero in-lock dispatch, fuses clean). **Neither run adds a live
    cell**; the ledger stays 40 / 6 / 46, `RISCV_199D_READINESS` remains `case_b`, and coordinate
-   23 remains OPEN solely on cross-hart wake, production enablement and production live evidence. `stage199d_riscv_canonical_admission` (11 tests) pins the
+   23 remains OPEN solely on cross-hart wake, production enablement and production live evidence.
+   **RISC-V blocker 3 audited — `RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY`.**
+   Audit only; nothing implemented, flipped or re-homed. The intended chain (committed
+   `wake_target_cpu` → local/remote comparison → arch wake seam → SBI IPI → supervisor software
+   interrupt → target trap entry → pending-bit ack → cross-CPU work consumption → dispatch → user
+   continuation) has **only two of ten links present**: the wake-target comparison and the
+   cross-CPU consumer. It does **not** fail at the transport — it fails at the first link. Live
+   `-smp 2` evidence: hart 1 *is* started through SBI HSM (`YARM_RISCV64_SMP_HART_START hart=1
+   ret=0 ack=1 state=parked_not_online`) and the DTB scan sees both harts
+   (`present_cpus=2 present_bitmap=0x3`), but `RISCV_SCHEDULER_BSP_ONLY online_cpus=1
+   reason=riscv_smp_scheduler_not_enabled` — hart 1 is **present and started but not
+   scheduler-online**, parked in a `wfi` loop with an `stvec` pointing at that park, `sstatus.SIE`
+   cleared, and no `sscratch`, `satp` or per-CPU binding. `sie.SSIE` is never set on either hart;
+   the only bit the tree enables is `STIE`. There is no SBI IPI transport, and cause 1 has no
+   decoder arm (only causes 5 and 9 are recognised), so a software interrupt would fall to
+   `TrapEvent::Unknown`. Independently, **no RISC-V task is ever pinned to CPU 1** — the sole
+   `set_task_home_cpu(.., CpuId(1))` caller is the x86 AP workload builder — so the committed wake
+   target is always the enqueueing CPU and the remote branch is dead code. Firmware is *not* the
+   constraint: OpenSBI v1.3 advertises `Platform IPI Device : aclint-mswi`. **Minimum needed: (d)
+   a larger RISC-V SMP foundation**, not transport alone. **Smallest next increment:** bring CPU 1
+   online in the RISC-V scheduler and give hart 1 a real trap vector — nothing else — with
+   hard-stops on `probe_extension(0x735049)`, `-smp 1` byte-identity, no user code on hart 1, and
+   a healthy service chain at `online_cpus=2`. `stage199d_riscv_remote_wake_readiness` (13 tests)
+   computes the classification from architecture-scoped seam probes. Ledger unchanged at
+   40 / 6 / 46; coordinate 23 stays OPEN. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.20. `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
    RISC-V cannot retire any queue-advancing class.

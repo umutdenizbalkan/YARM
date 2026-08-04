@@ -1959,6 +1959,160 @@ predicate changed.
 
 ---
 
+### 6.1.20 RISC-V readiness blocker 3 — remote-wake audit: `RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY`
+
+Audit only. No runtime code, production predicate or scheduler policy changed; nothing was
+implemented, no hart was given user work, no affinity was re-homed. Ledger stays **40 / 6 / 46**
+and coordinate 23 remains **OPEN**.
+
+```
+RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY
+```
+
+**The chain does not fail at the transport. It fails at its first link.** A remote enqueue cannot
+even be *requested* on RISC-V, so every downstream question is moot until the topology changes.
+
+#### The intended chain, traced
+
+| # | Link | Seam | Status |
+|---|---|---|---|
+| 1 | a RISC-V task can be pinned to a non-boot CPU | `set_task_home_cpu` (RISC-V scope) | **absent** |
+| 2 | the scheduler brings CPU 1 online | `RISCV_SCHEDULER_SMP_ONLINE` | **absent** |
+| 3 | committed wake target compared to the enqueueing CPU | `if success.wake_target_cpu != enqueueing_cpu` | present |
+| 4 | a RISC-V arch wake seam | `riscv64::smp::send_reschedule_ipi_to` | **absent** |
+| 5 | an SBI IPI transport | `SBI_EXT_IPI` | **absent** |
+| 6 | `sie.SSIE` enabled | `SSIE` | **absent** |
+| 7 | hart 1's `stvec` is the YARM trap vector | `RISCV_SECONDARY_TRAP_VECTOR_INSTALLED` | **absent** |
+| 8 | cause 1 has a decoder arm | `IRQ_SUPERVISOR_SOFT` | **absent** |
+| 9 | cross-CPU work consumer on a trap path | `kernel.process_cross_cpu_work_for_cpu(cpu)` | present |
+| 10 | hart 1 can perform saved user dispatch | `RISCV_SECONDARY_USER_DISPATCH` | **absent** |
+
+Only links 3 and 9 exist. `stage199d_riscv_remote_wake_readiness` (13 tests) computes the
+classification from the earliest missing link, and each `present` flag is checked against the
+tree under an **architecture-scoped** probe — scoping matters, because
+`set_task_home_cpu(.., CpuId(1))` does exist in the tree, for x86_64, and an unscoped search
+would have reported the RISC-V pin as present when no RISC-V path has one.
+
+#### Answers
+
+**1. Does YARM start hart 1 through SBI HSM under `-smp 2`? YES.** Live:
+
+```
+YARM_RISCV64_SMP_HART_START hart=1 ret=0 ack=1 state=parked_not_online entry=0x80200062 …
+RISCV_SECONDARY_HART_PARK hart=1
+YARM_RISCV64_SMP_SECONDARY_PARKED
+RISCV_SECONDARY_HARTS_PARKED count=1
+```
+
+**2. Online, or parked? Parked.** The marker says so itself, and the scheduler confirms it:
+
+```
+RISCV_DTB_CPU_SCAN_DONE bitmap=0x3 count=2
+RISCV_HART_TOPOLOGY present_cpus=2 present_bitmap=0x3 boot_hart=0
+RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled
+YARM_BOOT_OK present_cpus=2 present_bitmap=0x3 online_cpus=1
+```
+
+Hart 1 is **present** and **started**, but **not a scheduler-online CPU**. Differential against
+`-smp 1`, same tree: `present_cpus=1 present_bitmap=0x1 online_cpus=1`, `count=0` secondaries.
+
+**3. What hart 1 owns.** From `yarm_riscv64_secondary_entry`: a private stack (`ld sp, 8(a1)`
+from the handoff); an `stvec` pointing at a **local `wfi` park label**, *not*
+`yarm_riscv64_trap_entry`; `sstatus.SIE` explicitly **cleared** (`csrc sstatus, t1`, t1 = 2); and
+**no `sscratch`, no `satp`, no per-CPU binding**. `yarm_riscv64_secondary_boot` writes its ack,
+emits the park marker and spins in `wfi` forever, touching no scheduler or kernel state.
+
+**4. Supervisor software interrupts enabled? NO, on either hart.** The only `sie` bit the tree
+ever sets is `STIE` (bit 5, timer), in `timer.rs`. `SSIE` (bit 1) is not named anywhere.
+`sstatus.SIE` is set on the boot hart after the trap vector is installed, and explicitly cleared
+on hart 1.
+
+**5. Can an SBI IPI reach hart 1 and enter a real YARM handler? Firmware yes; YARM no.** The
+QEMU-virt firmware advertises the transport — `OpenSBI v1.3`, `Platform HART Count : 2`,
+`Platform IPI Device : aclint-mswi` — so `sbi_send_ipi` would raise a supervisor software
+interrupt on hart 1. YARM never calls it: the SBI surface carries HSM and TIME only. And even if
+one arrived, hart 1 has `sstatus.SIE` clear and an `stvec` that parks, so it could not be taken.
+
+**6. Could the handler acknowledge and consume cross-CPU work? The consumer exists; the handler
+does not.** `process_cross_cpu_work_for_cpu(cpu)` is wired into
+`handle_trap_entry_with_fault_bookkeeping_mode`, so the **boot hart** consumes cross-CPU work on
+every trap. `decode_trap_context` recognises only causes 5 (timer) and 9 (external); a supervisor
+software interrupt is cause **1**, which falls to `TrapEvent::Unknown`. There is no pending-bit
+acknowledgement path because there is no arm to acknowledge from.
+
+**7. Can hart 1 perform saved user dispatch? No — park-only.** Its terminal state is a `wfi` loop
+inside `yarm_riscv64_secondary_boot`; there is no AP dispatcher and no user-return path.
+
+**8. Can a real NR6/NR7 commit a waiter to CPU 1? No — every task is effectively `home_cpu=0`.**
+`sr_enqueue_committed_receiver_split` uses `affinity.unwrap_or(sched.current_cpu)`; the affinity
+is `ReceiverCommit::Committed(tcb.cpu_affinity)`; `cpu_affinity` is set only by
+`set_task_home_cpu`, whose sole `CpuId(1)` caller is `build_ap_workload`, reached only from
+`arch/x86_64/smp.rs`. No RISC-V path calls it. So the committed `wake_target_cpu` always equals
+the enqueueing CPU, and the remote branch is dead code — which is additionally
+`#[cfg(target_arch = "x86_64")]` on both directions.
+
+**9. Unreachable, or reachable-but-unwakeable? UNREACHABLE.** Two independent reasons, either
+sufficient: no RISC-V task is ever pinned to CPU 1, and CPU 1 is not scheduler-online
+(`riscv_smp_scheduler_not_enabled`), so an enqueue could not target it even if one were
+requested.
+
+**10. Minimum needed: (d) a larger RISC-V SMP foundation.** Computed, not asserted: links
+1, 2, 6, 7, 8 and 10 are missing *in addition to* the transport links 4 and 5, so (a)
+transport-only, (b) transport + trap consumer and (c) transport + AP dispatch are all
+insufficient.
+
+#### The SBI IPI calling convention, derived and pinned
+
+Not assumed — derived from the SBI specification's ASCII extension encoding and cross-checked
+against the firmware this environment actually runs.
+
+| Item | Value |
+|---|---|
+| Extension ID (EID) | `0x735049` — ASCII `'s'<<16 \| 'P'<<8 \| 'I'` = `"sPI"` |
+| Function ID (FID) | `0` — `sbi_send_ipi` |
+| `a0` | `hart_mask` — a bit vector of harts, **relative to `hart_mask_base`** |
+| `a1` | `hart_mask_base` — the hart id that bit 0 of `hart_mask` refers to |
+| all-harts form | `hart_mask_base == usize::MAX` (all ones) ⇒ ignore the mask, send to every hart |
+| success | `sbiret.error == SBI_SUCCESS (0)` |
+| invalid hart | `SBI_ERR_INVALID_PARAM (-3)` — a hart id in the mask is invalid or not startable |
+| target = current hart | permitted; the sender receives its own software interrupt |
+| target offline/absent | reported through `sbi_hart_get_status`/`SBI_ERR_INVALID_PARAM`, never silently dropped |
+| effect | raises the **supervisor software interrupt** (`sip.SSIP`) on each target; the handler must clear `sip.SSIP` to acknowledge |
+
+To wake hart 1 specifically from hart 0: `hart_mask = 1 << (1 - hart_mask_base)` with
+`hart_mask_base = 1`, i.e. `a0 = 0b1, a1 = 1`. The existing `sbi.rs` already has the ecall
+wrapper and `SbiError::from_error_code`, so the transport is a small addition — it is simply not
+the binding constraint.
+
+**This convention is recorded, not implemented.** An empirical `probe_extension(0x735049)` is
+deferred to the implementation increment, where it is a hard-stop precondition.
+
+#### Smallest next code increment
+
+**Bring CPU 1 online in the RISC-V scheduler and give hart 1 a real trap vector — nothing else.**
+That is link 2 plus link 7, the two that make every other link testable. Concretely: replace the
+secondary park with an entry that installs `yarm_riscv64_trap_entry` in `stvec`, establishes
+`sscratch` and the per-CPU binding, activates the kernel address space, and registers the hart as
+scheduler-online — then stops, still with `sstatus.SIE` clear and no user work.
+
+Hard-stop conditions for that increment:
+
+1. **`probe_extension(0x735049)` must return non-zero** on the target firmware before any IPI code
+   is written. If it does not, stop and report — the transport assumption is wrong.
+2. **`-smp 1` must remain byte-identical.** If the single-hart boot changes at all, stop.
+3. **Hart 1 must not run user code.** No dispatch, no user return, no affinity change — if the
+   increment needs any of those to show progress, it is too large.
+4. **`online_cpus` must go 1 → 2 with the service chain still healthy.** If bringing CPU 1 online
+   destabilises the boot hart's chain, revert and stop.
+5. **No production predicate flip, no ServerDies, no AArch64, no Stage 199E.**
+6. If enabling `sie.SSIE` on either hart produces an unhandled cause-1 trap before the decoder arm
+   exists, that ordering is wrong — install the decoder arm first.
+
+Only after CPU 1 is genuinely online does the question "was that enqueue remote?" become
+answerable on RISC-V, and only then is the IPI transport worth writing.
+
+---
+
 
 ## 7. Method and limits
 

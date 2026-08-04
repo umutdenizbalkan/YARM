@@ -108124,3 +108124,501 @@ mod stage199d_riscv_canonical_admission {
         );
     }
 }
+
+// ── RISC-V readiness blocker 3 — remote-wake readiness audit ─────────────────────────────────
+//
+// The question: after a remote NR6/NR7 enqueue, can RISC-V authoritatively wake the target hart?
+//
+// The intended chain is: committed `wake_target_cpu` → local/remote comparison → arch wake seam →
+// SBI IPI → supervisor software interrupt → target trap entry → pending-bit acknowledgement →
+// `process_cross_cpu_work_for_cpu` → runnable-task selection → user continuation.
+//
+// **Verdict: D — REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY.** The chain does not fail at
+// the transport; it fails at its FIRST link. A remote enqueue cannot even be *requested* on
+// RISC-V: the scheduler runs BSP-only (`online_cpus=1`), and no RISC-V task is ever pinned to
+// CPU 1, so the committed `wake_target_cpu` is always the enqueueing CPU and the remote branch is
+// dead code. Everything downstream is missing too, which is why the minimum is a larger SMP
+// foundation rather than "transport only".
+//
+// Each capability below is decided by a NAMED SOURCE SEAM, and the classification is computed
+// from which capabilities are present — not asserted textually.
+mod stage199d_riscv_remote_wake_readiness {
+    use super::*;
+
+    const RISCV_BOOT: &str = include_str!("../../arch/riscv64/boot.rs");
+    const RISCV_TRAP: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_SBI: &str = include_str!("../../arch/riscv64/sbi.rs");
+    const RISCV_TIMER: &str = include_str!("../../arch/riscv64/timer.rs");
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+    const EXEC_STATE: &str = include_str!("exec_state.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+
+    /// The blocker classification.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Classification {
+        /// A — only the SBI IPI transport is missing.
+        TransportOnlyMissing,
+        /// B — transport AND the software-interrupt trap consumer are missing.
+        TransportAndTrapConsumerMissing,
+        /// C — transport, trap consumer AND an AP dispatcher / user return are missing.
+        ApDispatchFoundationMissing,
+        /// D — a remote enqueue cannot be requested at all under the present topology.
+        RemoteEnqueueUnreachableUnderCurrentTopology,
+        /// E — none of the above; an exact reason is required.
+        Other(&'static str),
+    }
+    use Classification::*;
+
+    /// One link of the intended chain, decided by a named source seam.
+    struct Link {
+        /// Position in the chain, 1 = committed wake target.
+        step: u8,
+        what: &'static str,
+        seam: &'static str,
+        /// WHICH sources the seam must be searched in. Scoping matters: `set_task_home_cpu(..
+        /// CpuId(1))` exists in the tree — for x86_64 — so an unscoped probe would report the
+        /// RISC-V pin as present when no RISC-V path has one.
+        scope: Scope,
+        present: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Scope {
+        /// The RISC-V arch sources only.
+        Riscv,
+        /// The architecture-neutral direct-IPC transaction.
+        Txn,
+        /// The architecture-neutral runtime seams.
+        Runtime,
+    }
+
+    fn sources_for(scope: Scope) -> &'static [&'static str] {
+        match scope {
+            Scope::Riscv => &[RISCV_BOOT, RISCV_TRAP, RISCV_SBI, RISCV_TIMER],
+            Scope::Txn => &[TXN],
+            Scope::Runtime => &[RUNTIME],
+        }
+    }
+
+    /// Does the tree contain the seam that would make this link work?
+    fn probe(seam: &str, src: &str) -> bool {
+        src.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//") && !l.starts_with("///"))
+            .any(|l| l.contains(seam))
+    }
+
+    fn chain() -> alloc::vec::Vec<Link> {
+        alloc::vec![
+            Link {
+                step: 1,
+                what: "a RISC-V task can be pinned to a non-boot CPU, so a remote target exists",
+                // `set_task_home_cpu(.., CpuId(1))` has exactly one caller, and it is the x86 AP
+                // workload builder — reached only from `arch/x86_64/smp.rs`.
+                seam: "set_task_home_cpu",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 2,
+                what: "the scheduler brings CPU 1 online so an enqueue can target it",
+                seam: "RISCV_SCHEDULER_SMP_ONLINE",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 3,
+                what: "the committed wake target is reported and compared against the enqueueing CPU",
+                seam: "if success.wake_target_cpu != enqueueing_cpu {",
+                scope: Scope::Txn,
+                present: true,
+            },
+            Link {
+                step: 4,
+                what: "an architecture wake seam exists for RISC-V",
+                seam: "riscv64::smp::send_reschedule_ipi_to",
+                scope: Scope::Txn,
+                present: false,
+            },
+            Link {
+                step: 5,
+                what: "an SBI IPI transport exists",
+                seam: "SBI_EXT_IPI",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 6,
+                what: "supervisor software interrupts are enabled in sie (SSIE, bit 1)",
+                seam: "SSIE",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 7,
+                what: "hart 1's stvec points at the YARM trap vector rather than a wfi park",
+                seam: "RISCV_SECONDARY_TRAP_VECTOR_INSTALLED",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 8,
+                what: "the trap decoder recognises the supervisor software interrupt (cause 1)",
+                seam: "IRQ_SUPERVISOR_SOFT",
+                scope: Scope::Riscv,
+                present: false,
+            },
+            Link {
+                step: 9,
+                what: "the cross-CPU work consumer exists and runs on a trap path",
+                seam: "kernel.process_cross_cpu_work_for_cpu(cpu)",
+                scope: Scope::Riscv,
+                present: true,
+            },
+            Link {
+                step: 10,
+                what: "hart 1 can perform saved user dispatch / user return",
+                seam: "RISCV_SECONDARY_USER_DISPATCH",
+                scope: Scope::Riscv,
+                present: false,
+            },
+        ]
+    }
+
+    /// The classification, COMPUTED from which links are present.
+    fn classify() -> Classification {
+        let links = chain();
+        let missing: alloc::vec::Vec<u8> = links
+            .iter()
+            .filter(|l| !l.present)
+            .map(|l| l.step)
+            .collect();
+        if missing.is_empty() {
+            return Other("every link is present — the blocker would be closed");
+        }
+        // The chain is ordered: the EARLIEST missing link decides the classification, because
+        // nothing downstream can be exercised until it exists.
+        let first = missing[0];
+        match first {
+            1 | 2 => RemoteEnqueueUnreachableUnderCurrentTopology,
+            3 => Other("the committed wake target itself is missing"),
+            4 | 5 if missing.iter().all(|s| *s == 4 || *s == 5) => TransportOnlyMissing,
+            4 | 5 if missing.iter().all(|s| matches!(s, 4 | 5 | 6 | 7 | 8)) => {
+                TransportAndTrapConsumerMissing
+            }
+            4 | 5 => ApDispatchFoundationMissing,
+            _ => Other("an unexpected link ordering"),
+        }
+    }
+
+    // ── The verdict ─────────────────────────────────────────────────────────────────────────
+
+    /// **The classification, computed — not asserted.**
+    #[test]
+    fn the_blocker_classifies_as_remote_enqueue_unreachable() {
+        assert_eq!(
+            classify(),
+            RemoteEnqueueUnreachableUnderCurrentTopology,
+            "the earliest missing link is topology, not transport"
+        );
+        let links = chain();
+        let missing: alloc::vec::Vec<u8> = links
+            .iter()
+            .filter(|l| !l.present)
+            .map(|l| l.step)
+            .collect();
+        assert_eq!(
+            missing,
+            alloc::vec![1u8, 2, 4, 5, 6, 7, 8, 10],
+            "only the wake-target comparison (3) and the cross-CPU consumer (9) exist"
+        );
+        assert_ne!(classify(), TransportOnlyMissing);
+        assert_ne!(classify(), TransportAndTrapConsumerMissing);
+        assert_ne!(classify(), ApDispatchFoundationMissing);
+    }
+
+    /// Every link's `present` flag agrees with the tree — so the classification cannot drift away
+    /// from the source it claims to describe.
+    #[test]
+    fn every_link_presence_flag_matches_the_tree() {
+        for link in chain() {
+            let found = sources_for(link.scope).iter().any(|s| probe(link.seam, s));
+            assert_eq!(
+                found, link.present,
+                "link {} ({}) claims present={} but the tree says {found}: seam `{}`",
+                link.step, link.what, link.present, link.seam
+            );
+        }
+    }
+
+    // ── Q1/Q2: hart 1 is started, but parked, not online ────────────────────────────────────
+
+    /// HSM `hart_start` IS driven for the secondaries, and the marker itself records the outcome.
+    #[test]
+    fn hart_one_is_started_through_sbi_hsm_but_parked_not_online() {
+        assert!(
+            probe(
+                "crate::arch::riscv64::sbi::hsm_hart_start(hart_id, entry_addr, handoff_ptr)",
+                RISCV_BOOT
+            ),
+            "the secondaries are started through SBI HSM"
+        );
+        assert!(
+            RISCV_BOOT.contains("state=parked_not_online"),
+            "and the start marker records that the hart is parked, NOT online"
+        );
+        assert!(
+            probe(
+                "early_marker!(\"RISCV_SECONDARY_HART_PARK hart={}\", hart_id);",
+                RISCV_BOOT
+            ),
+            "the parked hart emits its park marker"
+        );
+        // The park is a terminal wfi loop inside the secondary's own boot function.
+        let at = RISCV_BOOT
+            .find("extern \"C\" fn yarm_riscv64_secondary_boot")
+            .expect("the secondary boot fn");
+        let body = &RISCV_BOOT[at..at + 1200];
+        assert!(
+            body.contains("asm!(\"wfi\""),
+            "the secondary's terminal state is a wfi loop"
+        );
+        assert!(
+            !body.contains("dispatch") && !body.contains("with_cpu"),
+            "the parked hart touches no scheduler or kernel state"
+        );
+    }
+
+    // ── Q3: what hart 1 owns ────────────────────────────────────────────────────────────────
+
+    /// The secondary entry gives hart 1 a private stack and a **wfi-park stvec**, clears
+    /// `sstatus.SIE`, and writes neither `sscratch` nor `satp`.
+    #[test]
+    fn hart_one_owns_a_park_vector_and_no_kernel_binding() {
+        let at = RISCV_BOOT
+            .find("yarm_riscv64_secondary_entry:")
+            .expect("the secondary entry stub");
+        let stub = &RISCV_BOOT[at..at + 700];
+        assert!(
+            stub.contains("ld sp, 8(a1)"),
+            "hart 1 gets its own stack from the handoff"
+        );
+        assert!(
+            stub.contains("csrw stvec, t0"),
+            "hart 1 installs a trap vector"
+        );
+        // …but the vector it installs is the local wfi label, not the YARM trap entry.
+        assert!(
+            !stub.contains("yarm_riscv64_trap_entry"),
+            "hart 1's stvec must NOT be the YARM trap vector — it is a wfi park"
+        );
+        assert!(
+            stub.contains("csrc sstatus, t1"),
+            "hart 1 CLEARS sstatus.SIE — interrupts are masked"
+        );
+        assert!(
+            !stub.contains("csrw sscratch") && !stub.contains("csrw satp"),
+            "hart 1 owns no sscratch and no address space"
+        );
+    }
+
+    // ── Q4: interrupt enablement ────────────────────────────────────────────────────────────
+
+    /// Only the timer bit is ever enabled in `sie`; the supervisor **software** interrupt enable
+    /// (SSIE, bit 1) is never set on any hart, so an IPI could not be taken even if one arrived.
+    #[test]
+    fn supervisor_software_interrupts_are_never_enabled() {
+        assert!(
+            probe("in(reg) 1usize << 5,", RISCV_TIMER),
+            "sie.STIE (bit 5, timer) is the one bit the tree enables"
+        );
+        for src in [RISCV_BOOT, RISCV_TRAP, RISCV_TIMER] {
+            assert!(
+                !src.contains("csrs sie, ") || !src.contains("1usize << 1,\n                in"),
+                "no sie.SSIE enablement may exist yet"
+            );
+        }
+        assert!(
+            !RISCV_BOOT.contains("SSIE") && !RISCV_TRAP.contains("SSIE"),
+            "SSIE is not named anywhere — the enable does not exist"
+        );
+    }
+
+    // ── Q5/Q6: transport and consumer ───────────────────────────────────────────────────────
+
+    /// No SBI IPI transport exists. The SBI surface carries HSM and TIME only.
+    #[test]
+    fn no_sbi_ipi_transport_exists() {
+        assert!(
+            RISCV_SBI.contains("SBI_EXT_HSM"),
+            "HSM is present — that is how the secondaries are started"
+        );
+        assert!(
+            !RISCV_SBI.contains("SBI_EXT_IPI") && !RISCV_SBI.contains("0x735049"),
+            "the IPI extension is absent"
+        );
+        // And no wake seam calls one.
+        assert!(
+            !probe("send_ipi", RISCV_BOOT) && !probe("send_ipi", RISCV_TRAP),
+            "no RISC-V arch wake seam exists"
+        );
+    }
+
+    /// The trap decoder recognises only the timer and external interrupts; a supervisor software
+    /// interrupt (cause 1) would fall through to `TrapEvent::Unknown`, so there is no consumer.
+    #[test]
+    fn the_supervisor_software_interrupt_has_no_decoder_arm() {
+        assert!(RISCV_TRAP.contains("const IRQ_SUPERVISOR_TIMER: usize = 5;"));
+        assert!(RISCV_TRAP.contains("const IRQ_SUPERVISOR_EXTERNAL: usize = 9;"));
+        assert!(
+            !RISCV_TRAP.contains("IRQ_SUPERVISOR_SOFT"),
+            "cause 1 has no named constant, so no decoder arm can reference it"
+        );
+        let at = RISCV_TRAP
+            .find("pub fn decode_trap_context")
+            .expect("the decoder");
+        let body = &RISCV_TRAP[at..at + 700];
+        assert!(
+            body.contains("IRQ_SUPERVISOR_TIMER => TrapEvent::TimerInterrupt")
+                && body.contains("IRQ_SUPERVISOR_EXTERNAL => TrapEvent::ExternalInterrupt")
+                && body.contains("_ => TrapEvent::Unknown"),
+            "an unrecognised interrupt cause falls to Unknown — there is no software-interrupt arm"
+        );
+    }
+
+    /// The cross-CPU work consumer DOES exist on the RISC-V trap path — but only on the boot
+    /// hart, because hart 1 never enters a YARM trap.
+    #[test]
+    fn the_cross_cpu_consumer_exists_but_only_the_boot_hart_reaches_it() {
+        assert!(
+            probe(
+                "let _ = kernel.process_cross_cpu_work_for_cpu(cpu);",
+                RISCV_TRAP
+            ),
+            "the consumer is wired into the RISC-V trap path"
+        );
+        // It is reached from the broad-lock phase of the boot hart's trap handling, and hart 1's
+        // stvec is a wfi park (proved above), so hart 1 can never reach it.
+        let at = RISCV_TRAP
+            .find("let _ = kernel.process_cross_cpu_work_for_cpu(cpu);")
+            .expect("the call");
+        assert!(
+            RISCV_TRAP[..at].contains("fn handle_trap_entry_with_fault_bookkeeping_mode"),
+            "the consumer sits inside the trap-entry handler"
+        );
+    }
+
+    // ── Q8/Q9: is a remote enqueue even requestable? ────────────────────────────────────────
+
+    /// **The decisive finding.** The wake target is the receiver's captured affinity, falling back
+    /// to the enqueueing CPU. Affinity comes from `tcb.cpu_affinity`, set only by
+    /// `set_task_home_cpu`, whose only `CpuId(1)` caller is the **x86_64** AP workload builder. On
+    /// RISC-V no task is ever pinned, so the committed target is always the enqueueing CPU and the
+    /// remote branch is unreachable.
+    #[test]
+    fn no_riscv_task_can_be_committed_to_cpu_one() {
+        assert!(
+            probe("let cpu = affinity.unwrap_or(sched.current_cpu);", RUNTIME),
+            "the enqueue target is the captured affinity, else the enqueueing CPU"
+        );
+        assert!(
+            probe("ReceiverCommit::Committed(tcb.cpu_affinity)", RUNTIME),
+            "the affinity is the receiver's own captured cpu_affinity"
+        );
+        // The only assignment of a non-zero home CPU is the x86 AP workload builder.
+        assert!(
+            EXEC_STATE.contains("set_task_home_cpu(base_tid, crate::kernel::scheduler::CpuId(1))"),
+            "the sole CpuId(1) pin lives in the AP workload builder"
+        );
+        const X86_SMP: &str = include_str!("../../arch/x86_64/smp.rs");
+        assert!(
+            X86_SMP.contains("build_ap_workload"),
+            "and that builder is reached only from the x86_64 SMP path"
+        );
+        for src in [RISCV_BOOT, RISCV_TRAP] {
+            assert!(
+                !src.contains("set_task_home_cpu"),
+                "no RISC-V path pins a task to a home CPU"
+            );
+        }
+    }
+
+    /// The remote wake send is x86_64-cfg-gated on both directions, so even a hypothetical remote
+    /// target would not be signalled from the RISC-V build.
+    #[test]
+    fn the_remote_wake_send_is_compiled_out_on_riscv() {
+        assert_eq!(
+            TXN.matches("#[cfg(all(not(feature = \"hosted-dev\"), target_arch = \"x86_64\"))]")
+                .count(),
+            2,
+            "both post-enqueue wake sends are x86_64-only"
+        );
+    }
+
+    // ── Q10: the minimum, and the scope guard ───────────────────────────────────────────────
+
+    /// The minimum is (d) a larger RISC-V SMP foundation — **not** transport alone. Computed:
+    /// more than the transport links are missing.
+    #[test]
+    fn the_minimum_is_a_larger_smp_foundation() {
+        let links = chain();
+        let missing_non_transport: alloc::vec::Vec<u8> = links
+            .iter()
+            .filter(|l| !l.present && !matches!(l.step, 4 | 5))
+            .map(|l| l.step)
+            .collect();
+        assert!(
+            !missing_non_transport.is_empty(),
+            "if only transport were missing the answer would be (a)"
+        );
+        assert_eq!(
+            missing_non_transport,
+            alloc::vec![1u8, 2, 6, 7, 8, 10],
+            "topology, interrupt enablement, trap vector, decoder arm and AP dispatch are all absent"
+        );
+    }
+
+    /// This increment is an audit: nothing was implemented, flipped or re-homed.
+    #[test]
+    fn the_audit_implemented_nothing() {
+        assert!(
+            !RISCV_SBI.contains("SBI_EXT_IPI"),
+            "no SBI IPI was implemented"
+        );
+        assert!(
+            !RISCV_BOOT.contains("RISCV_SECONDARY_USER_DISPATCH"),
+            "no user work was started on hart 1"
+        );
+        const MOD_SRC: &str = include_str!("mod.rs");
+        let production = MOD_SRC
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the production predicate");
+        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+
+    /// The audit document records the computed verdict and the live topology evidence.
+    #[test]
+    fn the_audit_document_records_the_verdict_and_live_evidence() {
+        assert!(
+            AUDIT.contains("RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY")
+        );
+        assert!(
+            AUDIT.contains(
+                "RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled"
+            ),
+            "the decisive live marker must be recorded verbatim"
+        );
+        assert!(
+            AUDIT.contains("state=parked_not_online"),
+            "the -smp 2 hart-start outcome must be recorded"
+        );
+        // Coordinate 23 stays OPEN and the ledger is untouched.
+        const TESTS: &str = include_str!("tests.rs");
+        assert!(
+            TESTS.contains("name: \"RISC-V off-lock NR6/NR7\",") && TESTS.contains("status: Open,")
+        );
+    }
+}
