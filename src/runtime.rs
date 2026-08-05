@@ -3993,23 +3993,28 @@ impl SharedKernel {
         self.with_scheduler_split_mut(|sched| sched.current_cpu)
     }
 
-    /// Returns the CPU the receiver was **actually enqueued on** — the committed wake target.
+    /// Reports what the rank-1 enqueue **actually did**.
     ///
     /// Stage 199D: this used to compute the target and throw it away, which left the caller with
     /// no authority for the post-enqueue wake decision. The one consumer that needed it
     /// (`drain_direct_request_post_work`) therefore guessed, hardcoding CPU 1 behind a global
     /// oracle selector — so once the NR6 production default was enabled, EVERY ordinary direct
-    /// request fired a remote-wake IPI at CPU 1. Returning the real target makes "was this
-    /// enqueue remote?" a fact rather than an assumption.
+    /// request fired a remote-wake IPI at CPU 1.
+    ///
+    /// Returning the *requested* CPU was the second half of that same mistake, and `ca55400b`
+    /// caught it live: aimed at an online **wake-only** CPU the enqueue was denied, the `Err` was
+    /// dropped, and the seam still answered `CpuId(1)` for a task that ended up in **no** run
+    /// queue. The doc comment claimed the returned CPU and the enqueued CPU "cannot disagree";
+    /// they did. Now the return value carries the enqueue's own verdict, so a wake target can
+    /// only ever name a placement that happened.
     ///
     /// The target is the receiver's authoritative affinity (its `task_home_cpu`), falling back to
-    /// the enqueueing CPU when unpinned — exactly the value used for the enqueue itself, read out
-    /// of the same rank-1 acquisition, so the two cannot disagree.
+    /// the enqueueing CPU when unpinned — read out of the same rank-1 acquisition as the enqueue.
     pub(crate) fn sr_enqueue_committed_receiver_split(
         &self,
         tid: u64,
         affinity: Option<CpuId>,
-    ) -> CpuId {
+    ) -> ReceiverEnqueue {
         use crate::kernel::ipc::ThreadId;
         use crate::kernel::scheduler::TaskPriority;
         use crate::kernel::task::TaskClass;
@@ -4020,8 +4025,71 @@ impl SharedKernel {
         self.with_scheduler_split_mut(|sched| {
             let cpu = affinity.unwrap_or(sched.current_cpu);
             let sm = kernel_mut(&mut sched.scheduler);
-            let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);
-            cpu
+            match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {
+                Ok(()) => ReceiverEnqueue::Enqueued { cpu },
+                Err(error) => ReceiverEnqueue::Rejected { cpu, error },
+            }
+        })
+    }
+
+    /// rank 2 (task lock) — Stage 199D: the exact INVERSE of
+    /// [`Self::sr_commit_blocked_receiver_split`], for the one case that has no other cure: the
+    /// commit succeeded but the rank-1 enqueue that follows it was refused. Without this the
+    /// receiver is left **Runnable but in no run queue** — unschedulable forever, and not even
+    /// reachable by the reply timeout, which only fires for a *blocked* task.
+    ///
+    /// Restores `Blocked(EndpointReceive(recv_cap))` for the EXACT `{tid, asid}` incarnation, and
+    /// only from `Runnable` — a receiver that has since exited, been replaced, or somehow started
+    /// running is left alone and reported `false`. `recv_cap` is the wait reason captured from the
+    /// TCB immediately before the commit.
+    ///
+    /// The blocked-return registers that the commit zeroed are deliberately NOT restored: they
+    /// are the recv syscall's return lanes, meaningless while the task is blocked, and rewritten
+    /// by whichever delivery or timeout eventually completes it. `blocked_recv_state` is likewise
+    /// untouched — it was consumed into the snapshot at ack production, *before* this transaction
+    /// began, so it is already `None` in the state this restores to.
+    pub(crate) fn sr_uncommit_blocked_receiver_split(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+        recv_cap: CapId,
+    ) -> bool {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == tid && t.asid == Some(asid))
+            else {
+                return false;
+            };
+            if !matches!(tcb.status, TaskStatus::Runnable) {
+                return false;
+            }
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            true
+        })
+    }
+
+    /// rank 2 (task lock) — Stage 199D: read the endpoint-receive capability an exactly-blocked
+    /// receiver is waiting on, so a post-commit rollback can restore the same wait reason it had.
+    /// `None` unless the `{tid, asid}` incarnation is present and `Blocked(EndpointReceive(_))`.
+    pub(crate) fn blocked_recv_cap_split_read(
+        &self,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+    ) -> Option<CapId> {
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        self.with_task_tcbs_split_mut(|tcbs| {
+            match tcbs
+                .iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid && t.asid == Some(asid))
+                .map(|t| t.status)
+            {
+                Some(TaskStatus::Blocked(WaitReason::EndpointReceive(cap))) => Some(cap),
+                _ => None,
+            }
         })
     }
 
@@ -4403,8 +4471,22 @@ impl SharedKernel {
         // Phase 3 (rank 2): commit — registers cleared ONLY here, strictly after the claim.
         match self.sr_commit_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
             ReceiverCommit::Committed(affinity) => {
-                // Phase 4 (rank 1): the single, non-fallible enqueue — the last externally visible act.
-                self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity);
+                // Phase 4 (rank 1): the single enqueue — the last externally visible act. Stage
+                // 199D: a refused placement is now reported rather than silently swallowed. This
+                // shared-region path has no wake target to publish and no post-commit rollback of
+                // its own, so it keeps its `Some(true)` "wake attempted" contract and only
+                // attests the refusal; the direct NR6/NR7 paths are the ones that must not
+                // fabricate a target, and they consume the outcome.
+                if let ReceiverEnqueue::Rejected { cpu, error } =
+                    self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity)
+                {
+                    crate::yarm_log!(
+                        "SR_RECEIVER_ENQUEUE_REJECTED tid={} cpu={} error={:?}",
+                        snap.receiver_tid,
+                        cpu.0,
+                        error
+                    );
+                }
                 Some(true)
             }
             // Receiver exited OR was replaced (ASID changed) after the identity claim: the claimed
@@ -5094,6 +5176,39 @@ pub(crate) struct WaiterClaim {
     /// Stage 198E3B2B2: the COMPLETE generation-bearing receiver identity (tid + ASID) that was
     /// removed — a restore can only ever re-install this exact identity, never a replacement task.
     pub(crate) receiver: crate::kernel::boot::ReceiverWaiterIdentity,
+}
+
+/// Stage 199D — what the single rank-1 receiver enqueue actually did.
+///
+/// The five distinctions the direct paths must tell apart are exactly `SchedulerError`'s, once
+/// wake-only stopped being folded into `CpuOffline`: `InvalidCpu`, `CpuOffline`, `WakeOnly`,
+/// `QueueFull`, `AlreadyQueued`. So the outcome adds no parallel taxonomy — it adds only the one
+/// thing `SchedulerError` cannot say, namely *which CPU* a success landed on.
+///
+/// **Load-bearing:** a `wake_target_cpu` may be read only out of `Enqueued`. `Rejected` carries
+/// the attempted CPU for diagnosis, and that CPU is deliberately not a wake target: nothing may
+/// IPI it, and no direct-IPC success object may name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReceiverEnqueue {
+    /// The enqueue SUCCEEDED. `cpu` is the run queue the receiver is now on.
+    Enqueued { cpu: CpuId },
+    /// The enqueue was REFUSED and the receiver is in **no** run queue. `cpu` is what was
+    /// attempted, never what was achieved.
+    Rejected {
+        cpu: CpuId,
+        error: crate::kernel::scheduler::SchedulerError,
+    },
+}
+
+impl ReceiverEnqueue {
+    /// The committed wake target, or `None` when nothing was placed. The ONLY way to obtain a
+    /// wake target — there is no accessor that yields a CPU for a rejected enqueue.
+    pub(crate) fn enqueued_cpu(self) -> Option<CpuId> {
+        match self {
+            ReceiverEnqueue::Enqueued { cpu } => Some(cpu),
+            ReceiverEnqueue::Rejected { .. } => None,
+        }
+    }
 }
 
 /// Outcome of the Phase-3 task commit, run only AFTER a successful waiter claim (Stage 198E3B2B1).

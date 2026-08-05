@@ -2582,6 +2582,11 @@ it is production behaviour on the one architecture where NR6 is the default, and
 (returning the achieved placement, or failing the transaction when the wake cannot be placed) is
 its own increment with its own live seal.
 
+> **Repaired in §6.1.26.** Both halves: the seam now reports what it actually did, and a refused
+> placement rolls the publication back instead of leaving a Runnable-but-unqueued receiver.
+
+
+
 #### The exact contract that must be split first
 
 Before link 1 can close, one of these must land — each is a production scheduler change, not a
@@ -2603,6 +2608,119 @@ target rather than an achieved one.
 The withdrawal foundation from §6.1.24 is **not** implicated: it worked exactly as specified —
 `outcome=NotQueued` on a TID that was genuinely not queued is its correct, fail-closed answer.
 It remains unwired (`the_withdrawal_foundation_remains_unwired`).
+
+
+### 6.1.26 The false-success enqueue contract — repaired
+
+§6.1.25's second finding, closed. This changes no production predicate, no wake-only semantics
+and no RISC-V status; it repairs the seam that reports a wake and the two transactions that
+consume it.
+
+**RISC-V status is untouched and recomputes unchanged:** link 1 **ABSENT**; links 2, 3, 7, 9
+present; 4, 5, 6, 8, 10 absent; `RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**;
+coordinate 23 **OPEN**; ledger **40 / 6 / 46**; **no new live cell**. The §6.1.24 withdrawal
+foundation remains unwired.
+
+#### The contract
+
+```rust
+let cpu = requested_target;
+let _ = enqueue_on_with_priority(cpu, tid, priority);   // Err discarded
+cpu                                                     // reported regardless
+```
+
+became
+
+```rust
+match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {
+    Ok(())     => ReceiverEnqueue::Enqueued { cpu },
+    Err(error) => ReceiverEnqueue::Rejected { cpu, error },
+}
+```
+
+`ReceiverEnqueue` adds no parallel taxonomy. The five distinctions the direct paths must tell
+apart are exactly `SchedulerError`'s — `InvalidCpu`, `CpuOffline`, `WakeOnly`, `QueueFull`,
+`AlreadyQueued` — so the outcome carries `SchedulerError` verbatim and adds only the one thing it
+cannot say: *which CPU* a success landed on. `WakeOnly` is new: it used to be folded into
+`CpuOffline`, and "the target is down" versus "the target is up but refuses work" are materially
+different answers for a wake.
+
+**The load-bearing rule is structural.** `enqueued_cpu()` is the only accessor, it returns `None`
+for every rejection, and both transactions bind through an `Enqueued` let-else — so a
+`wake_target_cpu` cannot be written down unless `enqueue_on_with_priority` returned `Ok` under the
+authoritative rank-1 acquisition. No success object exists on failure, and the drain's IPI and
+retirement marker both sit inside `if let Ok(success)`, so a refused enqueue signals nothing.
+
+#### Route B: complete rollback, not a bare `Err`
+
+At the enqueue, NR6 has already reserved and published a reply record, minted and bound a
+server-local reply cap, copied payload and metadata into the server's buffers, claimed the
+endpoint waiter, transitioned the server `Runnable` and registered the reverse link. Returning
+`Err` there would leave the server **Runnable but in no run queue** — unschedulable forever, and
+invisible to the reply timeout, which only fires for a *blocked* task. That is what
+`ca55400b`'s live `-smp 2` run actually produced.
+
+Preflight admission (route A) was rejected: `QueueFull` is genuinely racy against other CPUs'
+enqueues, so a preflight could not stay authoritative, and the real enqueue result must remain the
+authority. So the publication is undone, in exact reverse order:
+
+| # | published | undone by |
+|---|---|---|
+| 11b | reverse link registered | `unregister_server_reply_link_split` (idempotent) |
+| 11 | record `Reserved → Available` | `cancel_direct_reply_record_split` |
+| 6/7 | provisional server-local reply cap | `sr_revoke_split` |
+| 10 | server `Blocked → Runnable` | `sr_uncommit_blocked_receiver_split` *(new)* |
+| 9 | endpoint waiter claimed | `sr_restore_endpoint_waiter_split` |
+
+Order matters twice. Record and cap go first, so no reply authority is reachable at any instant.
+And the receiver must return to `Blocked` **before** its waiter is restored, because
+`sr_restore_endpoint_waiter_split` prevalidates exactly that. The wait reason is captured from the
+TCB immediately before the commit clears it. The blocked-return registers the commit zeroed are
+deliberately not restored — they are the recv syscall's return lanes, meaningless while blocked,
+and rewritten by whatever eventually completes the task. `blocked_recv_state` is untouched: it was
+consumed into the snapshot at ack production, *before* the transaction began, so it is already
+`None` in the state being restored to.
+
+The payload and metadata already copied into the receiver's buffers cannot be un-copied. They are
+never *observed*: the receiver returns to `Blocked` with no reply cap and no record, so it never
+returns from `recv` on the strength of them, and the next delivery overwrites the same buffers.
+
+**NR6 is retryable.** The ack lease is restored when the exact server is blocked again, so a later
+drain can deliver. The end-to-end test proves this the strongest available way: after the
+rollback it removes the refusal and re-runs the *same* transaction, which succeeds and yields a
+real `wake_target_cpu`. That can only happen if the record slot, reverse link, CNode slot and
+waiter were all genuinely returned.
+
+**NR7 is terminal.** Its enqueue sits after `consume_reply_record_split` — the one-shot barrier.
+Un-consuming would re-arm a second reply, so the record stays `Consumed`, which is the same
+terminal the `CallerGone` arm uses (`discard_reply_record_split` *is* the consume). What is undone
+is the caller's own state: back to `Blocked` with its waiter reinstalled, so the existing reply
+timeout can still complete it. The lease is discarded, never restored. Strictly better than
+before, where the caller was left unschedulable *and* invisible to that timeout.
+
+The NR6 reverse-link-registration failure arm left the identical state and had the identical gap;
+it now runs the same shared rollback rather than a second, weaker one.
+
+#### Disposition
+
+Both `EnqueueRejected` variants classify as `Failed(SyscallError::Internal)`, not
+fallback-eligible. This file's standing rule is that anything past the copy line never falls
+through, and both sit after step (8)/(4). The kernel could not *place* the wake — an internal
+condition, not a userspace error.
+
+#### Evidence
+
+Twelve focused tests drive the **real** seam for each distinction — successful local, successful
+remote to a dispatching CPU, online wake-only, offline, out-of-range, full queue, already queued —
+plus the two end-to-end transaction rollbacks through the existing NR6/NR7 blocked fixtures, and
+the structural proof that no rejection can yield a wake target by any route.
+
+The regression test reproduces `ca55400b` exactly: target online **and** wake-only, enqueue
+refused, task in no runqueue, and the seam must not answer `Enqueued { cpu: CpuId(1) }`.
+
+Three guards that pinned the old contract were **updated, not deleted** —
+`a_stale_home_cpu_fails_closed` had literally asserted `assert_eq!(target, bogus)` alongside "and
+nothing is queued there", which is the defect written down as if it were correct.
 
 ---
 

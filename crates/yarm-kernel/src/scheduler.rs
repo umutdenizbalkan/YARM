@@ -16,6 +16,11 @@ pub enum TaskPriority {
 pub enum SchedulerError {
     InvalidCpu,
     CpuOffline,
+    /// The CPU is PRESENT and ONLINE but wake-only: it runs no dispatcher, so explicit
+    /// placement is refused. Materially different from `CpuOffline` — the CPU is up, and a
+    /// caller that must distinguish "the target is down" from "the target is up but refuses
+    /// work" (a direct-IPC wake, for one) cannot do so if the two collapse.
+    WakeOnly,
     QueueFull,
     AlreadyQueued,
 }

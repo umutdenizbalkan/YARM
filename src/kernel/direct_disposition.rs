@@ -208,7 +208,16 @@ pub(crate) fn classify_direct_request_outcome(
         // ── Past the publication line: falling through would deliver twice ───────────
         IpcCallDirectError::WaiterLost => DirectDisposition::Failed(SyscallError::WrongObject),
         IpcCallDirectError::ServerGone => DirectDisposition::Failed(SyscallError::ServerDied),
-        IpcCallDirectError::RecordCommitFailed => DirectDisposition::Failed(SyscallError::Internal),
+        // Stage 199D: the publication is rolled back COMPLETELY (record cancelled, cap
+        // revoked, link unregistered, server returned to Blocked with its waiter reinstalled),
+        // so nothing was delivered and nothing leaked. It is still NOT fallback-eligible: it
+        // sits after step (8), so the server's payload/metadata destinations have already been
+        // written, and this file's standing rule is that anything past the copy line never
+        // falls through. The kernel could not PLACE the wake — that is an internal condition,
+        // not a userspace error.
+        IpcCallDirectError::RecordCommitFailed | IpcCallDirectError::EnqueueRejected => {
+            DirectDisposition::Failed(SyscallError::Internal)
+        }
     }
 }
 
@@ -256,7 +265,10 @@ pub(crate) fn classify_direct_reply_outcome(
         IpcReplyDirectError::WaiterLostAfterCopy | IpcReplyDirectError::CallerGone => {
             DirectDisposition::Failed(SyscallError::WrongObject)
         }
-        IpcReplyDirectError::RecordConsumeFailed => {
+        // Stage 199D: the record stays `Consumed` (one-shot spent, never re-armed) and the
+        // caller is returned to Blocked with its waiter reinstalled, so nothing leaks and no
+        // second reply is possible. Past the copy line, so never a fallback.
+        IpcReplyDirectError::RecordConsumeFailed | IpcReplyDirectError::EnqueueRejected => {
             DirectDisposition::Failed(SyscallError::Internal)
         }
     }

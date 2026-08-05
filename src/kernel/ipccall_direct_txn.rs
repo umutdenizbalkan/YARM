@@ -24,7 +24,7 @@
 use crate::kernel::boot::KernelError;
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipccall_direct::{AckLease, BlockedServerAck, IpcCallDirectSnapshot};
-use crate::runtime::{ReceiverCommit, SharedKernel};
+use crate::runtime::{ReceiverCommit, ReceiverEnqueue, SharedKernel};
 
 /// Success payload of a committed direct request transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +77,10 @@ pub(crate) enum IpcCallDirectError {
     RecordCommitFailed,
     /// The lease was not `ClaimedByWork` by this work item (duplicate/aliased drain).
     LeaseNotClaimed,
+    /// Stage 199D: the final rank-1 placement was REFUSED (target offline, wake-only,
+    /// out of range, queue full, or the receiver was somehow already queued). The whole
+    /// publication is rolled back and NO success — and therefore no wake target — exists.
+    EnqueueRejected,
 }
 
 /// Bounded, owned post-work item published by the x86 trap-entry gate and drained
@@ -163,6 +167,61 @@ impl SharedKernel {
                 ack.endpoint_generation,
                 ack.server,
             )
+    }
+
+    /// Stage 199D — the COMPLETE rollback of a direct-request publication that has already
+    /// passed the waiter claim and the receiver commit.
+    ///
+    /// Undoes every mutation in exact reverse order of publication:
+    ///
+    /// | # | published | undone by |
+    /// |---|---|---|
+    /// | 11b | reverse link registered | `unregister_server_reply_link_split` (idempotent; a no-op if it was never registered) |
+    /// | 11 | record `Reserved → Available` | `cancel_direct_reply_record_split` |
+    /// | 6/7 | provisional server-local reply cap | `sr_revoke_split` |
+    /// | 10 | server `Blocked → Runnable` | `sr_uncommit_blocked_receiver_split` |
+    /// | 9 | endpoint waiter claimed | `sr_restore_endpoint_waiter_split` |
+    ///
+    /// Order matters twice. The record and cap go first, so no reply authority is reachable at
+    /// any instant when the server could be scheduled — it cannot be, since it is never enqueued,
+    /// but the ordering makes that independent of the enqueue. And the receiver must be returned
+    /// to `Blocked` **before** the waiter is restored: `sr_restore_endpoint_waiter_split`
+    /// prevalidates that the task is exactly blocked, so restoring first would simply fail.
+    ///
+    /// The payload and metadata already copied into the server's buffers at (8) are not undone —
+    /// they cannot be. They are also never *observed*: the server returns to `Blocked` with no
+    /// reply cap and no record, so it never returns from `recv` on the strength of them, and
+    /// whichever delivery or timeout eventually completes it overwrites those same buffers.
+    ///
+    /// Returns `true` iff the server is exactly blocked again with its waiter reinstalled — the
+    /// condition under which the acknowledgement may be RESTORED for a later retry rather than
+    /// discarded. The caller settles the lease; this never touches it.
+    #[allow(clippy::too_many_arguments)]
+    fn rollback_direct_request_after_commit(
+        &self,
+        ack: &BlockedServerAck,
+        claim: &crate::runtime::WaiterClaim,
+        server_recv_cap: Option<CapId>,
+        server_cnode: crate::kernel::capabilities::CNodeId,
+        server_cap: CapId,
+        reply_object: CapObject,
+        idx: usize,
+        rgen: u64,
+    ) -> bool {
+        let _ =
+            self.unregister_server_reply_link_split(ack.server.tid.0, ack.server.asid, idx, rgen);
+        let _ = self.cancel_direct_reply_record_split(idx, rgen);
+        self.sr_revoke_split(server_cnode, server_cap, reply_object);
+        let Some(recv_cap) = server_recv_cap else {
+            // The wait reason was not captured, so the exact blocked state cannot be
+            // reconstructed. Everything externally visible is still reclaimed above; the
+            // acknowledgement will be discarded rather than restored.
+            return false;
+        };
+        if !self.sr_uncommit_blocked_receiver_split(ack.server.tid.0, ack.server.asid, recv_cap) {
+            return false;
+        }
+        self.sr_restore_endpoint_waiter_split(claim)
     }
 
     /// Settle the acknowledgement lease after a PRE-waiter-claim failure: restore it
@@ -369,6 +428,12 @@ impl SharedKernel {
             }
         };
 
+        // (9b) Stage 199D: capture the server's wait reason BEFORE the commit clears it, so a
+        // refused enqueue at (12) can restore the exact `Blocked(EndpointReceive(cap))` it had.
+        // Read-only (rank 2). Its absence would mean the server is no longer exactly blocked,
+        // which (10) is about to reject anyway.
+        let server_recv_cap = self.blocked_recv_cap_split_read(ack.server.tid.0, ack.server.asid);
+
         // (10) commit the blocked server (Runnable + wake plan). Registers are cleared
         // ONLY here, strictly after the claim.
         match self.sr_commit_blocked_receiver_split(ack.server.tid.0, ack.server.asid) {
@@ -403,20 +468,63 @@ impl SharedKernel {
                     idx,
                     rgen,
                 ) {
-                    self.sr_revoke_split(server_cnode, server_cap, reply_object);
-                    let _ = self.cancel_direct_reply_record_split(idx, rgen);
-                    lease.discard();
+                    // Stage 199D: this leaves the SAME state a refused enqueue does — server
+                    // Runnable, waiter claimed, record Available — so it runs the SAME complete
+                    // rollback rather than a second, weaker one. (It previously reclaimed the cap
+                    // and record but left the server Runnable-but-unqueued with its waiter
+                    // removed.) The link registration failed, and unregistering is idempotent by
+                    // construction, so the shared helper is safe here.
+                    let restored = self.rollback_direct_request_after_commit(
+                        ack,
+                        &claim,
+                        server_recv_cap,
+                        server_cnode,
+                        server_cap,
+                        reply_object,
+                        idx,
+                        rgen,
+                    );
+                    self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
                     crate::yarm_log!(
-                        "IPC_SERVER_REPLY_LINK_REGISTER_FAIL server_tid={} record_index={} reason=capacity result=rolled_back",
+                        "IPC_SERVER_REPLY_LINK_REGISTER_FAIL server_tid={} record_index={} reason=capacity restored={} result=rolled_back",
                         ack.server.tid.0,
-                        idx
+                        idx,
+                        u32::from(restored)
                     );
                     return Err(IpcCallDirectError::RecordCommitFailed);
                 }
-                // (12) scheduler enqueue LAST — the single, non-fallible wake. It reports the CPU
-                //      it actually enqueued on, which becomes this success's wake target.
-                let wake_target_cpu =
-                    self.sr_enqueue_committed_receiver_split(ack.server.tid.0, affinity);
+                // (12) scheduler enqueue LAST — the single wake. It reports what it ACTUALLY
+                //      did, and only `Enqueued` may become this success's wake target.
+                let ReceiverEnqueue::Enqueued {
+                    cpu: wake_target_cpu,
+                } = self.sr_enqueue_committed_receiver_split(ack.server.tid.0, affinity)
+                else {
+                    // Stage 199D — the placement was REFUSED after the publication committed.
+                    // Roll the whole publication back, in exact reverse order, so the server is
+                    // returned to the retryable state it held when this transaction began rather
+                    // than left Runnable-but-unqueued (unschedulable, and invisible to the reply
+                    // timeout, which only fires for a blocked task).
+                    let restored = self.rollback_direct_request_after_commit(
+                        ack,
+                        &claim,
+                        server_recv_cap,
+                        server_cnode,
+                        server_cap,
+                        reply_object,
+                        idx,
+                        rgen,
+                    );
+                    // Restoring the lease is admissible only when the exact server really is
+                    // blocked again — otherwise a later drain could act on a stale ack.
+                    self.settle_lease_pre_claim(ack, lease, lease_commit_seq);
+                    crate::yarm_log!(
+                        "IPC_DIRECT_REQUEST_ENQUEUE_REJECTED server_tid={} record_index={} restored={} result=rolled_back",
+                        ack.server.tid.0,
+                        idx,
+                        u32::from(restored)
+                    );
+                    return Err(IpcCallDirectError::EnqueueRejected);
+                };
                 // (13) consume the acknowledgement lease exactly once.
                 let _ = lease.consume(lease_commit_seq);
                 Ok(IpcCallDirectSuccess {
@@ -494,6 +602,11 @@ pub(crate) enum IpcReplyDirectError {
     RecordConsumeFailed,
     /// The lease was not `ClaimedByWork` by this work item (duplicate/aliased drain).
     LeaseNotClaimed,
+    /// Stage 199D: the final rank-1 placement was REFUSED. The record stays `Consumed`
+    /// (the one-shot barrier already fired and must not be re-armed), the caller is
+    /// returned to `Blocked` with its waiter reinstalled, and NO success — and therefore
+    /// no wake target — exists. Terminal: the acknowledgement is discarded, not restored.
+    EnqueueRejected,
 }
 
 /// Bounded, owned NR7 reply post-work item (Stage 199A2B3). Owned data only.
@@ -613,6 +726,10 @@ impl SharedKernel {
             }
         };
 
+        // (5b) Stage 199D: capture the caller's wait reason BEFORE the commit clears it, so a
+        // refused enqueue at (8) can restore the exact `Blocked(EndpointReceive(cap))` it had.
+        let caller_recv_cap = self.blocked_recv_cap_split_read(ack.caller.tid.0, ack.caller.asid);
+
         // (6) commit the blocked caller (Runnable + wake plan) strictly after the claim.
         match self.sr_commit_blocked_receiver_split(ack.caller.tid.0, ack.caller.asid) {
             ReceiverCommit::Committed(affinity) => {
@@ -625,10 +742,41 @@ impl SharedKernel {
                     lease.discard();
                     return Err(IpcReplyDirectError::RecordConsumeFailed);
                 }
-                // (8) enqueue the caller LAST — the single, non-fallible wake. It reports the
-                //     CPU it actually enqueued on, which becomes this success's wake target.
-                let wake_target_cpu =
-                    self.sr_enqueue_committed_receiver_split(ack.caller.tid.0, affinity);
+                // (8) enqueue the caller LAST — the single wake. It reports what it ACTUALLY
+                //     did, and only `Enqueued` may become this success's wake target.
+                let ReceiverEnqueue::Enqueued {
+                    cpu: wake_target_cpu,
+                } = self.sr_enqueue_committed_receiver_split(ack.caller.tid.0, affinity)
+                else {
+                    // Stage 199D — the placement was REFUSED after the record was consumed.
+                    //
+                    // Unlike NR6 this cannot be made retryable: (7) already fired the one-shot
+                    // barrier, so the reply authority is spent and MUST stay spent — un-consuming
+                    // it would re-arm a second reply. `Consumed` is the same terminal the
+                    // `CallerGone` arm below uses (`discard_reply_record_split` IS the consume),
+                    // so the record, its bound cap and its reverse link are balanced, not leaked.
+                    //
+                    // What must be undone is the caller's own state: returning it to `Blocked`
+                    // with its waiter reinstalled leaves its terminal to the existing reply
+                    // timeout, which is the only mechanism that can still complete it. Leaving it
+                    // Runnable-but-unqueued instead — what this path did before — is strictly
+                    // worse: unschedulable forever AND invisible to that timeout.
+                    let restored = caller_recv_cap.is_some_and(|cap| {
+                        self.sr_uncommit_blocked_receiver_split(
+                            ack.caller.tid.0,
+                            ack.caller.asid,
+                            cap,
+                        )
+                    }) && self.sr_restore_endpoint_waiter_split(&claim);
+                    lease.discard();
+                    crate::yarm_log!(
+                        "IPC_DIRECT_REPLY_ENQUEUE_REJECTED caller_tid={} record_index={} restored={} record=consumed result=rolled_back",
+                        ack.caller.tid.0,
+                        idx,
+                        u32::from(restored)
+                    );
+                    return Err(IpcReplyDirectError::EnqueueRejected);
+                };
                 let _ = lease.consume(lease_commit_seq);
                 Ok(IpcReplyDirectSuccess {
                     record_index: idx,

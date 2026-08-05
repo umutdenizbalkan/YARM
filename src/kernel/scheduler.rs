@@ -687,7 +687,10 @@ impl SmpScheduler {
                 tid.0,
                 cpu.0
             );
-            return Err(SchedulerError::CpuOffline);
+            // Stage 199D: `WakeOnly`, not `CpuOffline`. The CPU is up; it refuses work. A
+            // direct-IPC wake must be able to tell those apart — collapsing them is what let
+            // `sr_enqueue_committed_receiver_split` report a placement that never happened.
+            return Err(SchedulerError::WakeOnly);
         }
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(

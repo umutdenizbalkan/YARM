@@ -728,6 +728,36 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    `RISCV_199D_READINESS` stays `case_b`; coordinate 23 stays OPEN; **no new canonical live cell**;
    ledger stays 40 / 6 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.25.
 
+   **The false-success enqueue contract is REPAIRED.** §6.1.25's second finding, closed — no
+   production predicate, no wake-only change, no RISC-V status change.
+   `sr_enqueue_committed_receiver_split` now returns `ReceiverEnqueue::{Enqueued{cpu},
+   Rejected{cpu,error}}` instead of a bare `CpuId`, carrying `SchedulerError` verbatim so the five
+   distinctions stay distinct: `InvalidCpu`, `CpuOffline`, `WakeOnly`, `QueueFull`,
+   `AlreadyQueued`. `WakeOnly` is new — it used to fold into `CpuOffline`, and "the target is
+   down" versus "the target is up but refuses work" are materially different answers for a wake.
+   The load-bearing rule is **structural**: `enqueued_cpu()` is the only accessor and returns
+   `None` for every rejection, and both transactions bind through an `Enqueued` let-else, so a
+   `wake_target_cpu` cannot be written down unless the rank-1 enqueue returned `Ok`. No success
+   object exists on failure, and the drain's IPI and retirement marker both sit inside
+   `if let Ok(success)`. **Route B (complete rollback), not a bare `Err`:** preflight admission was
+   rejected because `QueueFull` is genuinely racy against other CPUs, so the real enqueue stays the
+   authority. On refusal NR6 undoes the whole publication in reverse order — reverse link, record,
+   reply cap, `Runnable → Blocked` (new `sr_uncommit_blocked_receiver_split`), waiter restore — and
+   the ack lease is restored, so it is genuinely retryable; the end-to-end test proves that by
+   removing the refusal and re-running the *same* transaction to success. NR7 is terminal instead:
+   its enqueue sits after the one-shot `consume_reply_record_split`, which must never be re-armed,
+   so the record stays `Consumed` (the same terminal `CallerGone` uses) while the caller returns to
+   `Blocked` with its waiter — leaving its completion to the existing reply timeout, which the old
+   Runnable-but-unqueued state made impossible. The NR6 reverse-link-failure arm had the identical
+   gap and now shares the same rollback. Twelve focused tests drive the real seam for every
+   distinction plus both end-to-end rollbacks; the regression test reproduces `ca55400b` exactly.
+   Three guards pinning the old contract were **updated, not deleted** —
+   `a_stale_home_cpu_fails_closed` had asserted `assert_eq!(target, bogus)` beside "and nothing is
+   queued there", the defect written down as if correct. RISC-V status recomputes unchanged: link 1
+   ABSENT, links 2/3/7/9 present, 4/5/6/8/10 absent, `RISCV_REMOTE_WAKE` **D**,
+   `RISCV_199D_READINESS` `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live cell, and
+   the withdrawal foundation still unwired. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.26.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and

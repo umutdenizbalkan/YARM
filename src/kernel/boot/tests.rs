@@ -77001,6 +77001,7 @@ mod stage199a2b2d_direct_request_txn {
         let sg = TXN_SRC
             .split("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
             .nth(1)
+            .and_then(|arm| arm.split("\n            }").next())
             .expect("ServerGone arm present");
         assert!(sg.contains("sr_revoke_split"));
         assert!(sg.contains("cancel_direct_reply_record_split"));
@@ -77010,6 +77011,97 @@ mod stage199a2b2d_direct_request_txn {
             "a vanished server's claimed waiter must not be restored"
         );
         assert!(TXN_SRC.contains("IpcCallDirectError::RecordCommitFailed"));
+        // Stage 199D: the LIVE (not defensive) post-commit rollback — a refused rank-1 placement
+        // — is the opposite case: the server is alive and exactly ours, so its waiter MUST be
+        // restored, and the shared helper is the only thing that does it.
+        let rb = TXN_SRC
+            .split("fn rollback_direct_request_after_commit(")
+            .nth(1)
+            .expect("the post-commit rollback helper");
+        for step in [
+            "unregister_server_reply_link_split",
+            "cancel_direct_reply_record_split",
+            "sr_revoke_split",
+            "sr_uncommit_blocked_receiver_split",
+            "sr_restore_endpoint_waiter_split",
+        ] {
+            assert!(rb.contains(step), "the rollback must undo `{step}`");
+        }
+        // The receiver must be returned to Blocked BEFORE its waiter is reinstalled — the
+        // restore prevalidates that the task is exactly blocked.
+        assert!(
+            rb.find("sr_uncommit_blocked_receiver_split").unwrap()
+                < rb.find("sr_restore_endpoint_waiter_split").unwrap(),
+            "uncommit must precede the waiter restore"
+        );
+    }
+
+    /// **NR6 failure accounting + rollback, driven end-to-end.** The server is pinned to an
+    /// ONLINE WAKE-ONLY CPU, so the final rank-1 placement is refused after the publication has
+    /// already committed (record Available, cap minted, link registered, waiter claimed, server
+    /// Runnable). Every one of those must be undone.
+    #[test]
+    fn a_refused_placement_rolls_the_whole_nr6_publication_back() {
+        let fx = blocked_server_fixture();
+        fx.k.with(|s| {
+            s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+            s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+            s.set_task_home_cpu(2, CpuId(1))
+                .expect("pin the server to cpu 1");
+        });
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(77);
+
+        let out =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 77);
+
+        // (10) no success object exists, so no wake target and no wake work can be derived.
+        assert_eq!(out, Err(IpcCallDirectError::EnqueueRejected));
+        assert!(out.is_err(), "no IpcCallDirectSuccess may be produced");
+        // The failure invariants.
+        fx.k.with(|s| {
+            assert!(
+                matches!(s.task_status(2), Some(TaskStatus::Blocked(_))),
+                "the server is Blocked again — never Runnable-but-unqueued"
+            );
+            assert!(
+                !s.task_present_in_any_runqueue(2),
+                "and it is in no run queue on any CPU"
+            );
+        });
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(
+                fx.endpoint_index,
+                fx.endpoint_generation,
+                fx.server
+            ),
+            "the claimed waiter was reinstalled, not silently removed"
+        );
+        assert!(
+            lease.is_available(),
+            "the exact server is retryable, so the ack lease is restored — not leaked, not consumed"
+        );
+
+        // Balance, proved end-to-end: with the refusal removed, the SAME transaction now
+        // succeeds. That can only happen if the record slot, the reverse link, the server's
+        // CNode slot and the waiter were all genuinely returned.
+        fx.k.with(|s| s.mark_cpu_wake_only(CpuId(1), false).expect("dispatching"));
+        let mut lease2 = claimed_lease(78);
+        let retry =
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease2, 78)
+                .expect("the rolled-back transaction is genuinely retryable");
+        assert_eq!(
+            retry.wake_target_cpu,
+            CpuId(1),
+            "and now a real placement yields a real wake target"
+        );
+        fx.k.with(|s| {
+            assert!(
+                s.task_present_in_any_runqueue(2),
+                "the retry actually queued the server"
+            );
+        });
     }
 }
 
@@ -78021,8 +78113,8 @@ mod stage199a2b3_direct_reply_txn {
     fn defensive_rollback_branches_present() {
         const TXN_SRC: &str = include_str!("../ipccall_direct_txn.rs");
         let cg = TXN_SRC
-            .split("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
-            .nth(1)
+            .rsplit("ReceiverCommit::GoneDead | ReceiverCommit::Replaced")
+            .next()
             .expect("CallerGone arm present");
         assert!(cg.contains("discard_reply_record_split"));
         assert!(cg.contains("lease.discard()"));
@@ -78031,6 +78123,81 @@ mod stage199a2b3_direct_reply_txn {
             "a vanished caller's claimed waiter must not be restored"
         );
         assert!(TXN_SRC.contains("IpcReplyDirectError::RecordConsumeFailed"));
+        // Stage 199D: a refused rank-1 placement is the LIVE counterpart — the caller is alive
+        // and exactly ours, so it is returned to Blocked with its waiter reinstalled, while the
+        // record stays Consumed (the one-shot barrier must never be re-armed).
+        let rej = TXN_SRC
+            .split("IPC_DIRECT_REPLY_ENQUEUE_REJECTED")
+            .next()
+            .and_then(|head| head.rsplit("ReceiverEnqueue::Enqueued {").next())
+            .expect("the reply enqueue-rejected arm");
+        assert!(rej.contains("sr_uncommit_blocked_receiver_split"));
+        assert!(rej.contains("sr_restore_endpoint_waiter_split"));
+        assert!(rej.contains("lease.discard()"), "terminal: never restored");
+        assert!(
+            !rej.contains("un_consume") && !rej.contains("reserve_existing_reply_record_split"),
+            "the consumed record must never be re-armed"
+        );
+    }
+
+    /// **NR7 failure accounting + rollback, driven end-to-end.** The caller is pinned to an
+    /// ONLINE WAKE-ONLY CPU, so the final placement is refused after the record was consumed.
+    /// The caller must be returned to `Blocked` with its waiter — and the record must stay
+    /// terminally spent, because the one-shot barrier already fired.
+    #[test]
+    fn a_refused_placement_rolls_the_nr7_caller_back_and_keeps_the_record_spent() {
+        let fx = blocked_caller_fixture();
+        fx.k.with(|s| {
+            s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+            s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
+            s.set_task_home_cpu(1, CpuId(1))
+                .expect("pin the caller to cpu 1");
+        });
+        let snap = snapshot_for(&fx, b"replyOK!");
+        let ack = fx.published_ack;
+        let mut lease = claimed_lease(91);
+
+        let out = fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 91);
+
+        assert_eq!(out, Err(IpcReplyDirectError::EnqueueRejected));
+        assert!(out.is_err(), "no IpcReplyDirectSuccess may be produced");
+        fx.k.with(|s| {
+            assert!(
+                matches!(s.task_status(1), Some(TaskStatus::Blocked(_))),
+                "the caller is Blocked again — never Runnable-but-unqueued"
+            );
+            assert!(
+                !s.task_present_in_any_runqueue(1),
+                "and it is in no run queue on any CPU"
+            );
+        });
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(
+                fx.published_ack.endpoint_index,
+                fx.published_ack.endpoint_generation,
+                fx.caller
+            ),
+            "the claimed caller waiter was reinstalled"
+        );
+        assert!(
+            !lease.is_available(),
+            "terminal, not retryable: the ack is discarded because the reply was spent"
+        );
+        assert!(
+            !fx.k
+                .with(|s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "the one-shot record stays spent — no second reply is possible"
+        );
+        // …and it really is terminal: even with the refusal removed, the same reply cannot
+        // re-run, because the record was consumed exactly once.
+        fx.k.with(|s| s.mark_cpu_wake_only(CpuId(1), false).expect("dispatching"));
+        let mut lease2 = claimed_lease(92);
+        assert!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease2, 92)
+                .is_err(),
+            "a spent record can never be replied through again"
+        );
+        teardown();
     }
 }
 
@@ -105118,6 +105285,14 @@ mod stage199d_remote_wake_authority {
         target != k.current_cpu_split_read()
     }
 
+    /// The committed wake target, or a panic naming the refusal. Stage 199D: a wake target
+    /// exists ONLY for an `Enqueued` outcome, so every test below has to go through this.
+    fn enqueued_cpu(outcome: crate::runtime::ReceiverEnqueue) -> CpuId {
+        outcome
+            .enqueued_cpu()
+            .unwrap_or_else(|| panic!("expected a committed enqueue, got {outcome:?}"))
+    }
+
     /// **53 local successes → zero remote IPIs.** The regression in one test: these are ordinary
     /// production NR6 completions, exactly the traffic the old selector-driven decision turned
     /// into 53 spurious remote wakes.
@@ -105128,7 +105303,7 @@ mod stage199d_remote_wake_authority {
         let mut remote = 0usize;
         for tid in 1..=53u64 {
             // Unpinned receiver: the enqueue falls back to the enqueueing CPU.
-            let target = k.sr_enqueue_committed_receiver_split(tid, None);
+            let target = enqueued_cpu(k.sr_enqueue_committed_receiver_split(tid, None));
             assert_eq!(target, here, "an unpinned enqueue commits to the local CPU");
             if is_remote(&k, target) {
                 remote += 1;
@@ -105145,7 +105320,7 @@ mod stage199d_remote_wake_authority {
         let affinity = k.with(|s| s.task_home_cpu(1));
         assert_eq!(affinity, Some(CpuId(1)), "the home CPU is authoritative");
 
-        let target = k.sr_enqueue_committed_receiver_split(1, affinity);
+        let target = enqueued_cpu(k.sr_enqueue_committed_receiver_split(1, affinity));
         assert_eq!(target, CpuId(1), "the enqueue commits to the home CPU");
         assert!(is_remote(&k, target), "CPU0 -> CPU1 is a remote wake");
         assert_ne!(target, k.current_cpu_split_read());
@@ -105183,16 +105358,31 @@ mod stage199d_remote_wake_authority {
     }
 
     /// **A wrong/stale home CPU fails closed.** An affinity naming a CPU that is not online must
-    /// not silently become a remote wake at a bogus target: the enqueue reports what it actually
-    /// committed to, and an offline target enqueues nothing.
+    /// not become a remote wake at a bogus target.
+    ///
+    /// Stage 199D UPDATED CONTRACT: this test used to assert the seam "reports the target it was
+    /// asked for" — `assert_eq!(target, bogus)` — while also asserting nothing was queued there.
+    /// That pair *is* the false-success defect, written down as if it were correct. The seam now
+    /// reports the refusal, and there is no accessor that yields a wake target for it.
     #[test]
     fn a_stale_home_cpu_fails_closed() {
+        use crate::runtime::ReceiverEnqueue;
         let k = fixture(2, 1);
         let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8 - 1);
-        let target = k.sr_enqueue_committed_receiver_split(1, Some(bogus));
-        // The seam reports the target it was asked for; the scheduler refuses the enqueue on an
-        // offline CPU, so nothing is queued there and no task is lost to a phantom run queue.
-        assert_eq!(target, bogus);
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(bogus));
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: bogus,
+                error: crate::kernel::scheduler::SchedulerError::CpuOffline,
+            },
+            "an offline target must be reported as refused, not as a committed wake target"
+        );
+        assert_eq!(
+            outcome.enqueued_cpu(),
+            None,
+            "and it must yield NO wake target at all"
+        );
         let queued = k.with(|s| s.runnable_count_on_cpu(bogus));
         assert_eq!(queued, 0, "an offline target must hold no queued task");
     }
@@ -105206,8 +105396,10 @@ mod stage199d_remote_wake_authority {
             s.set_task_home_cpu(1, CpuId(1)).expect("pin 1");
             s.set_task_home_cpu(2, CpuId(2)).expect("pin 2");
         });
-        let t1 = k.sr_enqueue_committed_receiver_split(1, k.with(|s| s.task_home_cpu(1)));
-        let t2 = k.sr_enqueue_committed_receiver_split(2, k.with(|s| s.task_home_cpu(2)));
+        let t1 =
+            enqueued_cpu(k.sr_enqueue_committed_receiver_split(1, k.with(|s| s.task_home_cpu(1))));
+        let t2 =
+            enqueued_cpu(k.sr_enqueue_committed_receiver_split(2, k.with(|s| s.task_home_cpu(2))));
         assert_eq!(t1, CpuId(1));
         assert_eq!(t2, CpuId(2));
         assert_ne!(t1, t2, "independent targets, never a shared assumed CPU");
@@ -105413,9 +105605,15 @@ mod stage199d_remote_wake_authority {
     fn the_enqueue_seam_is_the_single_authority_for_the_target() {
         assert!(
             RUNTIME.contains(
-                "pub(crate) fn sr_enqueue_committed_receiver_split(\n        &self,\n        tid: u64,\n        affinity: Option<CpuId>,\n    ) -> CpuId {"
+                "pub(crate) fn sr_enqueue_committed_receiver_split(\n        &self,\n        tid: u64,\n        affinity: Option<CpuId>,\n    ) -> ReceiverEnqueue {"
             ),
-            "the enqueue seam must report its committed target"
+            "the enqueue seam must report what it ACTUALLY did, not a bare CPU"
+        );
+        // Stage 199D: and the ONLY route from that report to a wake target is `Enqueued`.
+        assert!(
+            RUNTIME.contains("Ok(()) => ReceiverEnqueue::Enqueued { cpu },")
+                && RUNTIME.contains("Err(error) => ReceiverEnqueue::Rejected { cpu, error },"),
+            "success and refusal are distinguished by the enqueue's own result"
         );
         assert!(
             RUNTIME.contains("pub(crate) fn current_cpu_split_read(&self) -> CpuId {")
@@ -109804,15 +110002,18 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
         );
     }
 
-    /// **`sr_enqueue_committed_receiver_split` reports a target it did not achieve.** Its own
-    /// doc comment says the returned CPU is the one the receiver was *actually enqueued on* and
-    /// that the two "cannot disagree". Driven against an online wake-only CPU, they disagree: the
-    /// rank-1 enqueue's `Err` is discarded and the requested CPU is returned regardless.
+    /// **REGRESSION — `ca55400b`'s exact defect.** The seam used to report a target it did not
+    /// achieve: aimed at an online wake-only CPU, the rank-1 enqueue's `Err` was discarded and
+    /// `CpuId(1)` was returned for a task that landed in no run queue. Its own doc claimed the
+    /// returned CPU and the enqueued CPU "cannot disagree"; they did. That is what made §6.1.23
+    /// condition 4 score YES.
     ///
-    /// This is why §6.1.23 condition 4 was wrongly scored **YES**. It is latent, not live, on
-    /// x86_64 — the AP dispatcher clears `wake_only` there, so the denial never fires.
+    /// Reproduced exactly — target online AND wake-only, enqueue refused, task in no runqueue —
+    /// and now the seam must NOT answer `Enqueued { cpu: CpuId(1) }`, and must yield no wake
+    /// target at all.
     #[test]
     fn the_committed_wake_target_can_report_a_placement_that_never_happened() {
+        use crate::runtime::ReceiverEnqueue;
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let tid = 4242u64;
         kernel.with(|s| {
@@ -109822,20 +110023,33 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             s.bring_up_cpu(CpuId(1)).expect("cpu 1 online");
             s.set_task_home_cpu(tid, CpuId(1)).expect("home cpu");
         });
+        // The precondition the defect needed: online AND wake-only.
+        kernel.with(|s| {
+            assert!(s.online_cpu_bitmap() & 0b10 != 0, "CPU 1 is online");
+            assert!(s.wake_only_cpu_bitmap() & 0b10 != 0, "CPU 1 is wake-only");
+        });
 
-        // The REAL seam the NR6 transaction uses for its single, last, "non-fallible" wake.
-        let reported = kernel.sr_enqueue_committed_receiver_split(tid, Some(CpuId(1)));
+        // The REAL seam the NR6 transaction uses for its single, last wake.
+        let outcome = kernel.sr_enqueue_committed_receiver_split(tid, Some(CpuId(1)));
 
-        assert_eq!(
-            reported,
-            CpuId(1),
-            "the seam reports CPU 1 as the committed wake target"
+        assert_ne!(
+            outcome,
+            ReceiverEnqueue::Enqueued { cpu: CpuId(1) },
+            "the seam must NOT claim a placement on a wake-only CPU"
         );
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: CpuId(1),
+                error: crate::kernel::scheduler::SchedulerError::WakeOnly,
+            },
+            "…it must report the refusal, distinguishing wake-only from offline"
+        );
+        assert_eq!(outcome.enqueued_cpu(), None, "and yield NO wake target");
         kernel.with(|s| {
             assert!(
                 !s.task_present_in_any_runqueue(tid),
-                "…yet the task is in NO runqueue: the reported target is the REQUESTED cpu, not \
-                 an achieved placement"
+                "the task really is in no runqueue — the refusal is the truth"
             );
         });
     }
@@ -109889,8 +110103,8 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             "the denial is attested with its reason"
         );
         assert!(
-            body.contains("return Err(SchedulerError::CpuOffline);"),
-            "and it fails closed rather than placing the task"
+            body.contains("return Err(SchedulerError::WakeOnly);"),
+            "and it fails closed rather than placing the task, naming wake-only distinctly"
         );
         assert!(
             body.contains("183.6 lifts this per CPU when the AP dispatcher lands"),
@@ -109898,7 +110112,11 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
         );
     }
 
-    /// The `Err` really is discarded at the call site — the second half of the defect.
+    /// The second half of the defect — the discarded `Err` at the call site — is **REPAIRED**.
+    ///
+    /// This guard used to pin the defect (`let _ = sm.enqueue_on_with_priority(…)` followed by a
+    /// bare `cpu`). It now pins its absence and the replacement contract, so the discard cannot
+    /// come back.
     #[test]
     fn the_enqueue_seam_discards_the_placement_result() {
         let at = RUNTIME
@@ -109907,19 +110125,20 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
         // Bound the slice at the method's closing brace (column 4), not at a byte count.
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("the method end")];
         assert!(
-            body.contains("let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);"),
-            "the enqueue result is dropped"
+            !body.contains("let _ = sm.enqueue_on_with_priority"),
+            "the enqueue result must never be dropped again"
         );
-        let tail = body
-            .split("let _ = sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority);")
-            .nth(1)
-            .expect("the code after the enqueue");
-        assert_eq!(
-            tail.lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty() && !l.starts_with("//")),
-            Some("cpu"),
-            "…and the REQUESTED cpu is returned unconditionally, with no check in between"
+        assert!(
+            body.contains("match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {"),
+            "the result is matched"
+        );
+        assert!(
+            body.contains("Ok(()) => ReceiverEnqueue::Enqueued { cpu },"),
+            "success names the CPU it landed on"
+        );
+        assert!(
+            body.contains("Err(error) => ReceiverEnqueue::Rejected { cpu, error },"),
+            "refusal carries the scheduler's own distinction, not a collapsed bool"
         );
     }
 
@@ -110013,5 +110232,295 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
         assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+    }
+}
+
+/// Stage 199D — the enqueue seam's typed result, driven for every distinction it must make.
+///
+/// `sr_enqueue_committed_receiver_split` used to answer with a bare `CpuId`: the CPU it was
+/// *asked* for, whether or not the enqueue happened. `ca55400b` caught that live. The seam now
+/// reports what it actually did, and the five failure classes stay distinct — they are exactly
+/// `SchedulerError`'s, once wake-only stopped being folded into `CpuOffline`.
+mod stage199d_receiver_enqueue_outcome {
+    use super::*;
+    use crate::kernel::scheduler::{MAX_CPUS, MAX_RUN_QUEUE, SchedulerError};
+    use crate::runtime::{ReceiverEnqueue, SharedKernel};
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    /// A kernel with `cpus` CPUs online and tids `1..=n` registered.
+    fn fixture(cpus: u8, n: u64) -> SharedKernel {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        k.with(|s| {
+            for c in 1..cpus {
+                s.bring_up_cpu(CpuId(c)).expect("bring up cpu");
+            }
+            for tid in 1..=n {
+                s.register_task(tid).expect("task");
+            }
+        });
+        k
+    }
+
+    // ── (1) success, local ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_successful_local_enqueue_reports_the_cpu_it_landed_on() {
+        let k = fixture(1, 1);
+        let here = k.current_cpu_split_read();
+        let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+        assert_eq!(outcome, ReceiverEnqueue::Enqueued { cpu: here });
+        assert_eq!(outcome.enqueued_cpu(), Some(here));
+        k.with(|s| assert!(s.task_present_in_any_runqueue(1), "really queued"));
+    }
+
+    // ── (2) success, remote to a DISPATCHING cpu ────────────────────────────────────────────
+
+    #[test]
+    fn a_successful_remote_enqueue_to_a_dispatching_cpu_reports_that_cpu() {
+        let k = fixture(2, 1);
+        // Online and NOT wake-only — a genuine dispatching CPU.
+        k.with(|s| {
+            assert!(s.online_cpu_bitmap() & 0b10 != 0, "cpu 1 online");
+            assert_eq!(s.wake_only_cpu_bitmap() & 0b10, 0, "cpu 1 dispatching");
+        });
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(CpuId(1)));
+        assert_eq!(outcome, ReceiverEnqueue::Enqueued { cpu: CpuId(1) });
+        assert_ne!(
+            outcome.enqueued_cpu(),
+            Some(k.current_cpu_split_read()),
+            "this is a genuine remote placement"
+        );
+        assert_eq!(k.with(|s| s.runnable_count_on_cpu(CpuId(1))), 1);
+    }
+
+    // ── (3) online wake-only ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_online_wake_only_target_is_reported_as_wake_only_not_offline() {
+        let k = fixture(1, 1);
+        k.with(|s| {
+            s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+            s.bring_up_cpu(CpuId(1)).expect("online");
+        });
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(CpuId(1)));
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: CpuId(1),
+                error: SchedulerError::WakeOnly
+            },
+            "wake-only is materially different from offline and must not collapse into it"
+        );
+        assert_eq!(outcome.enqueued_cpu(), None);
+        k.with(|s| assert!(!s.task_present_in_any_runqueue(1)));
+    }
+
+    // ── (4) offline target ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_offline_target_is_reported_as_offline() {
+        let k = fixture(1, 1); // only CPU 0 is online
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(CpuId(1)));
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: CpuId(1),
+                error: SchedulerError::CpuOffline
+            }
+        );
+        assert_eq!(outcome.enqueued_cpu(), None);
+    }
+
+    // ── (5) invalid CPU ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_out_of_range_cpu_is_reported_as_invalid() {
+        let k = fixture(1, 1);
+        let bogus = CpuId(MAX_CPUS as u8);
+        let outcome = k.sr_enqueue_committed_receiver_split(1, Some(bogus));
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: bogus,
+                error: SchedulerError::InvalidCpu
+            },
+            "out of range is distinct from present-but-offline"
+        );
+        assert_eq!(outcome.enqueued_cpu(), None);
+    }
+
+    // ── (6) full target queue ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_full_target_queue_is_reported_as_queue_full() {
+        let n = MAX_RUN_QUEUE as u64;
+        let k = fixture(1, n + 1);
+        let here = k.current_cpu_split_read();
+        for tid in 1..=n {
+            assert_eq!(
+                k.sr_enqueue_committed_receiver_split(tid, None),
+                ReceiverEnqueue::Enqueued { cpu: here },
+                "tid {tid} fills the queue"
+            );
+        }
+        let outcome = k.sr_enqueue_committed_receiver_split(n + 1, None);
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: here,
+                error: SchedulerError::QueueFull
+            }
+        );
+        assert_eq!(outcome.enqueued_cpu(), None);
+        k.with(|s| {
+            assert!(
+                !s.task_present_in_any_runqueue(n + 1),
+                "the refused task is queued nowhere"
+            )
+        });
+    }
+
+    // ── (7) AlreadyQueued ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn an_already_queued_receiver_is_reported_as_already_queued() {
+        let k = fixture(1, 1);
+        let here = k.current_cpu_split_read();
+        assert_eq!(
+            k.sr_enqueue_committed_receiver_split(1, None),
+            ReceiverEnqueue::Enqueued { cpu: here }
+        );
+        let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+        assert_eq!(
+            outcome,
+            ReceiverEnqueue::Rejected {
+                cpu: here,
+                error: SchedulerError::AlreadyQueued
+            },
+            "a double wake must be reported, never counted as a second success"
+        );
+        assert_eq!(outcome.enqueued_cpu(), None);
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(here)),
+            1,
+            "and it must not appear twice"
+        );
+    }
+
+    // ── (10) no success object and no wake work on failure ──────────────────────────────────
+
+    /// Structurally: a wake target can be obtained ONLY from `Enqueued`. There is no accessor,
+    /// field or `From` impl that yields a CPU for a rejection.
+    #[test]
+    fn a_rejected_enqueue_yields_no_wake_target_by_any_route() {
+        for error in [
+            SchedulerError::InvalidCpu,
+            SchedulerError::CpuOffline,
+            SchedulerError::WakeOnly,
+            SchedulerError::QueueFull,
+            SchedulerError::AlreadyQueued,
+        ] {
+            let rejected = ReceiverEnqueue::Rejected {
+                cpu: CpuId(1),
+                error,
+            };
+            assert_eq!(rejected.enqueued_cpu(), None, "{error:?} yields no target");
+        }
+        let at = RUNTIME
+            .find("impl ReceiverEnqueue {")
+            .expect("the outcome impl");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n}\n").expect("impl end")];
+        assert_eq!(
+            body.matches("pub(crate) fn ").count(),
+            1,
+            "exactly one accessor — a second one is how a rejection would leak a CPU"
+        );
+        assert!(
+            body.contains("ReceiverEnqueue::Rejected { .. } => None,"),
+            "and it returns None for every rejection"
+        );
+    }
+
+    /// Both direct successes are constructed only inside an `Enqueued` binding, and the drain's
+    /// IPI + retirement marker sit behind `Ok(success)` — so a refused enqueue signals nothing.
+    #[test]
+    fn no_direct_success_or_wake_work_survives_a_refused_enqueue() {
+        for (direction, success) in [
+            ("ack.server.tid.0", "Ok(IpcCallDirectSuccess {"),
+            ("ack.caller.tid.0", "Ok(IpcReplyDirectSuccess {"),
+        ] {
+            // Whitespace-insensitive: rustfmt reflows the let-else across lines.
+            let squashed: alloc::string::String = TXN
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
+            let bind = alloc::format!(
+                "let ReceiverEnqueue::Enqueued {{ cpu: wake_target_cpu, }} =                  self.sr_enqueue_committed_receiver_split({direction}, affinity) else {{"
+            );
+            let bind = bind
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
+            assert!(
+                squashed.contains(&bind),
+                "the {direction} enqueue must bind through Enqueued only:\n{bind}"
+            );
+            let at = squashed.find(&bind).expect("the binding");
+            let success_squashed = success
+                .split_whitespace()
+                .collect::<alloc::vec::Vec<_>>()
+                .join(" ");
+            assert!(
+                squashed[at..].contains(&success_squashed),
+                "…and the success object is built after it"
+            );
+        }
+        // The refusal arms return before any success can exist.
+        assert!(TXN.contains("return Err(IpcCallDirectError::EnqueueRejected);"));
+        assert!(TXN.contains("return Err(IpcReplyDirectError::EnqueueRejected);"));
+        // The drain's IPI and retirement marker are both inside the single success arm.
+        let drain = TXN
+            .split("pub(crate) fn drain_direct_request_post_work(")
+            .nth(1)
+            .and_then(|s| s.split("\n    /// ").next())
+            .expect("the drain");
+        let ok_arm = drain
+            .find("if let Ok(success) = result")
+            .expect("success arm");
+        assert!(
+            drain.find("send_reschedule_ipi_to(").expect("ipi") > ok_arm,
+            "no IPI outside the success arm"
+        );
+        assert!(
+            drain
+                .find("emit_ipccall_direct_request_live_markers()")
+                .expect("marker")
+                > ok_arm,
+            "no remote-wake-success marker outside the success arm"
+        );
+    }
+
+    /// The five distinctions are carried by `SchedulerError` itself — no parallel taxonomy, and
+    /// nothing collapsed into `bool` or `Option`.
+    #[test]
+    fn the_outcome_reuses_scheduler_error_and_collapses_nothing() {
+        let distinct = [
+            SchedulerError::InvalidCpu,
+            SchedulerError::CpuOffline,
+            SchedulerError::WakeOnly,
+            SchedulerError::QueueFull,
+            SchedulerError::AlreadyQueued,
+        ];
+        for (i, a) in distinct.iter().enumerate() {
+            for (j, b) in distinct.iter().enumerate() {
+                assert_eq!(i == j, a == b, "{a:?} vs {b:?} must stay distinct");
+            }
+        }
+        assert!(
+            RUNTIME.contains("error: crate::kernel::scheduler::SchedulerError,"),
+            "the rejection carries SchedulerError, not a re-derived enum"
+        );
     }
 }
