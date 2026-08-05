@@ -3648,24 +3648,32 @@ impl SharedKernel {
         })
     }
 
-    /// rank 3 — Stage 199D: `Consumed → Available`, restoring the EXACT one-shot reply
-    /// authority after a reply whose caller-enqueue was refused and provably never observed.
+    /// Stage 199D — the COMPOSED, all-or-nothing restore of a consumed one-shot reply
+    /// authority, for a reply whose caller-enqueue was refused and provably never observed.
     ///
-    /// This is the only route that re-arms a consumed record, and it is deliberately narrow:
+    /// Externally observable outcomes are exactly two:
     ///
-    /// * the record slot must still be present at the **exact generation** the transaction
-    ///   owned, so a recycled slot can never be re-armed;
-    /// * it must still be bound to the **exact replier identity** (`{tid, asid}`) that consumed
-    ///   it, so no other replier can inherit the authority;
-    /// * it must be in `Consumed` — a `Cancelled` or already-`Available` record is refused,
-    ///   making the restore idempotent-safe and un-stackable.
+    /// * **A** — record `Available` **and** the exact reverse link installed; or
+    /// * **B** — record `Consumed` **and** no newly installed reverse link.
     ///
-    /// `consume_reply_record_split` closes the reverse link on the same edge, so the restore
-    /// re-registers it: the replier still owes that reply, exactly as before the transaction.
-    /// Returns `true` only when BOTH the record and the link are back.
+    /// "Available without a link" is not reachable. The previous version published the record
+    /// first and only then attempted registration, so a refused registration left precisely that
+    /// state: an invokable reply with no teardown-visible link.
     ///
-    /// The caller must independently prove the caller task neither executed nor was enqueued —
-    /// this seam checks record identity, not task state.
+    /// **Composition.** The task lock (rank 2) is taken FIRST and held across the whole
+    /// operation; the ipc lock (rank 3) is taken nested inside it. That is ascending rank order,
+    /// so the lock-order discipline is preserved. Under the single rank-2 hold:
+    ///
+    /// 1. the exact replier incarnation `{tid, asid}` is located and its link slot is validated
+    ///    free (or already exactly ours) and its status live — **nothing is written**;
+    /// 2. at rank 3 the record is validated (exact index, exact generation, `Consumed`, bound to
+    ///    this exact replier) and flipped to `Available`;
+    /// 3. the link is installed through the shared `install_server_reply_link` decision, which
+    ///    also stamps the leak accounting. It cannot fail here — the slot was validated under
+    ///    this same uninterrupted hold — but if it ever did, the record is flipped straight back
+    ///    to `Consumed` before releasing, so outcome B still holds.
+    ///
+    /// Any failure at step 1 returns before the record is touched at all.
     pub(crate) fn restore_consumed_reply_record_split(
         &self,
         index: usize,
@@ -3673,23 +3681,75 @@ impl SharedKernel {
         replier: crate::kernel::boot::ReceiverWaiterIdentity,
     ) -> bool {
         use crate::kernel::boot::ReplyRecordReservation;
-        let restored = self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
-            Some(Some(record))
-                if ipc.reply_cap_generations[index] == generation
-                    && record.reservation == ReplyRecordReservation::Consumed
-                    && record.responder_tid == Some(replier.tid)
-                    && record.replier_asid == Some(replier.asid) =>
+        use crate::kernel::task::{ServerReplyLink, TaskStatus};
+        let link = ServerReplyLink {
+            server_tid: replier.tid.0,
+            server_asid: replier.asid,
+            reply_record_index: index,
+            reply_record_generation: generation,
+        };
+        // rank 2 held across everything below; rank 3 nested inside (ascending order).
+        self.with_task_tcbs_split_mut(|tcbs| {
+            let Some(pos) = tcbs.iter().position(|slot| {
+                slot.as_ref()
+                    .is_some_and(|t| t.tid.0 == replier.tid.0 && t.asid == Some(replier.asid))
+            }) else {
+                return false;
+            };
+            // (1) validate the link slot WITHOUT writing it.
             {
-                record.reservation = ReplyRecordReservation::Available;
-                true
+                let tcb = tcbs[pos].as_ref().expect("position just found it");
+                match tcb.server_reply_link {
+                    None => {}
+                    Some(existing) if existing == link => {}
+                    // Occupied by a DIFFERENT live record: refuse before touching the record.
+                    Some(_) => return false,
+                }
+                if !matches!(
+                    tcb.status,
+                    TaskStatus::Runnable | TaskStatus::Running | TaskStatus::Blocked(_)
+                ) {
+                    return false;
+                }
             }
-            _ => false,
-        });
-        if !restored {
-            return false;
-        }
-        // The consume closed the reverse link; the replier owes the reply again.
-        self.register_server_reply_link_split(replier.tid.0, replier.asid, index, generation)
+            // (2) rank 3: validate + flip the record. Still nothing written at rank 2.
+            let flipped = self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+                Some(Some(record))
+                    if ipc.reply_cap_generations[index] == generation
+                        && record.reservation == ReplyRecordReservation::Consumed
+                        && record.responder_tid == Some(replier.tid)
+                        && record.replier_asid == Some(replier.asid) =>
+                {
+                    record.reservation = ReplyRecordReservation::Available;
+                    true
+                }
+                _ => false,
+            });
+            if !flipped {
+                return false; // outcome B
+            }
+            // (3) install the link. Validated free under this same hold, so this is infallible;
+            // the revert below keeps the two-outcome contract true even if it ever were not.
+            // Because step 1 makes step 3 unreachable, the revert is exercised by a test-only
+            // fault hook — the only way to prove the path rather than assert it.
+            let tcb = tcbs[pos].as_mut().expect("position just found it");
+            #[cfg(test)]
+            let forced_failure =
+                RESTORE_FORCE_LINK_INSTALL_FAILURE.load(core::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(test))]
+            let forced_failure = false;
+            if !forced_failure && crate::kernel::boot::install_server_reply_link(tcb, link) {
+                return true; // outcome A
+            }
+            self.with_ipc_split_mut(|ipc| {
+                if let Some(Some(record)) = ipc.reply_caps.get_mut(index) {
+                    if ipc.reply_cap_generations[index] == generation {
+                        record.reservation = ReplyRecordReservation::Consumed;
+                    }
+                }
+            });
+            false // outcome B
+        })
     }
 
     /// rank 3 — discard a `Reserved` record for STALE authority (caller exited/replaced,
@@ -4054,6 +4114,11 @@ impl SharedKernel {
     ///
     /// The target is the receiver's authoritative affinity (its `task_home_cpu`), falling back to
     /// the enqueueing CPU when unpinned — read out of the same rank-1 acquisition as the enqueue.
+    ///
+    /// **Generic: never reconciles.** An `AlreadyQueued` collision is reported with
+    /// `reconciled: None` and nothing is withdrawn. Silently removing a pre-existing entry on
+    /// behalf of a caller that cannot complete a rollback would be a hidden side effect; the
+    /// direct-IPC paths use [`Self::sr_enqueue_committed_receiver_reconciled_split`] instead.
     pub(crate) fn sr_enqueue_committed_receiver_split(
         &self,
         tid: u64,
@@ -4066,20 +4131,56 @@ impl SharedKernel {
             Some(TaskClass::SystemServer) => TaskPriority::High,
             _ => TaskPriority::Normal,
         };
+        self.enqueue_committed_receiver_inner(tid, priority, affinity, false)
+    }
+
+    /// rank 1 — Stage 199D: the **direct-IPC-only** enqueue seam. Identical to
+    /// [`Self::sr_enqueue_committed_receiver_split`] except that an `AlreadyQueued` collision is
+    /// RECONCILED inside the same acquisition that detected it.
+    ///
+    /// Withdrawing a pre-existing scheduler entry is a real side effect, and only NR6/NR7 own a
+    /// rollback that can complete it. It is therefore a separate seam rather than a flag: the
+    /// shared-region finalizer literally cannot select it, because it calls the other function.
+    pub(crate) fn sr_enqueue_committed_receiver_reconciled_split(
+        &self,
+        tid: u64,
+        affinity: Option<CpuId>,
+    ) -> ReceiverEnqueue {
+        use crate::kernel::scheduler::TaskPriority;
+        use crate::kernel::task::TaskClass;
+        let priority = match self.task_class_split_read(tid) {
+            Some(TaskClass::SystemServer) => TaskPriority::High,
+            _ => TaskPriority::Normal,
+        };
+        self.enqueue_committed_receiver_inner(tid, priority, affinity, true)
+    }
+
+    /// The shared body. `reconcile` is set ONLY by the direct-IPC seam above; the parameter is
+    /// private to this module and neither public seam exposes it.
+    fn enqueue_committed_receiver_inner(
+        &self,
+        tid: u64,
+        priority: crate::kernel::scheduler::TaskPriority,
+        affinity: Option<CpuId>,
+        reconcile: bool,
+    ) -> ReceiverEnqueue {
+        use crate::kernel::ipc::ThreadId;
         self.with_scheduler_split_mut(|sched| {
             let cpu = affinity.unwrap_or(sched.current_cpu);
             let sm = kernel_mut(&mut sched.scheduler);
             match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {
                 Ok(()) => ReceiverEnqueue::Enqueued { cpu },
-                // Pre-existing membership. Reconcile it HERE, still holding the rank-1 lock the
-                // collision was detected under — there is no unlock/relock window in which a
-                // dispatcher could take the entry between the two.
+                // Pre-existing membership. When the caller owns a rollback that can complete it,
+                // reconcile HERE, still holding the rank-1 lock the collision was detected under —
+                // there is no unlock/relock window in which a dispatcher could take the entry
+                // between the two. Otherwise report the collision and touch NOTHING.
                 Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued) => {
-                    let reconciled = sm.withdraw_queued_tid_on(cpu, ThreadId(tid));
+                    let reconciled =
+                        reconcile.then(|| sm.withdraw_queued_tid_on(cpu, ThreadId(tid)));
                     ReceiverEnqueue::Rejected {
                         cpu,
                         error: crate::kernel::scheduler::SchedulerError::AlreadyQueued,
-                        reconciled: Some(reconciled),
+                        reconciled,
                     }
                 }
                 Err(error) => ReceiverEnqueue::Rejected {
@@ -4541,27 +4642,51 @@ impl SharedKernel {
         // Phase 2 (rank 3): the exact, generation-bearing IDENTITY claim (remove once). Because the
         // claim requires the full {tid, ASID} identity, a replacement task (reused numeric TID, new
         // ASID) can never be claimed or cleared here.
-        let _claim = self.sr_claim_endpoint_waiter_split(eidx, egen, receiver)?;
+        let claim = self.sr_claim_endpoint_waiter_split(eidx, egen, receiver)?;
+        // Stage 199D: capture the wait reason before the commit clears it, so a refused
+        // placement can restore the exact blocked state.
+        let recv_cap = self.blocked_recv_cap_split_read(snap.receiver_tid, snap.receiver_asid);
         // Phase 3 (rank 2): commit — registers cleared ONLY here, strictly after the claim.
         match self.sr_commit_blocked_receiver_split(snap.receiver_tid, snap.receiver_asid) {
             ReceiverCommit::Committed(affinity) => {
-                // Phase 4 (rank 1): the single enqueue — the last externally visible act. Stage
-                // 199D: a refused placement is now reported rather than silently swallowed. This
-                // shared-region path has no wake target to publish and no post-commit rollback of
-                // its own, so it keeps its `Some(true)` "wake attempted" contract and only
-                // attests the refusal; the direct NR6/NR7 paths are the ones that must not
-                // fabricate a target, and they consume the outcome.
-                if let ReceiverEnqueue::Rejected { cpu, error, .. } =
-                    self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity)
-                {
-                    crate::yarm_log!(
-                        "SR_RECEIVER_ENQUEUE_REJECTED tid={} cpu={} error={:?}",
-                        snap.receiver_tid,
-                        cpu.0,
-                        error
-                    );
+                // Phase 4 (rank 1): the single enqueue — the last externally visible act.
+                //
+                // Stage 199D: a refused placement is no longer swallowed, and no longer reported
+                // as a wake either. This caller uses the GENERIC seam, which never withdraws a
+                // pre-existing entry: it owns no rollback that could complete such a withdrawal,
+                // so removing one would be a hidden side effect. On refusal it restores its own
+                // receiver — `Runnable → Blocked` on the exact recv cap, waiter reinstalled — and
+                // reports NO wake, rather than leaving a Runnable-but-unqueued task behind.
+                //
+                // An `AlreadyQueued` collision arrives unreconciled (`reconciled: None`), so the
+                // receiver's membership is unknown: fail closed with ZERO mutation — do not force
+                // it Blocked on top of live membership, and do not touch its queue entry.
+                match self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity) {
+                    ReceiverEnqueue::Enqueued { .. } => Some(true),
+                    ReceiverEnqueue::Rejected { cpu, error, .. } => {
+                        let unplaced = !matches!(
+                            error,
+                            crate::kernel::scheduler::SchedulerError::AlreadyQueued
+                        );
+                        let restored = unplaced
+                            && recv_cap.is_some_and(|cap| {
+                                self.sr_uncommit_blocked_receiver_split(
+                                    snap.receiver_tid,
+                                    snap.receiver_asid,
+                                    cap,
+                                )
+                            })
+                            && self.sr_restore_endpoint_waiter_split(&claim);
+                        crate::yarm_log!(
+                            "SR_RECEIVER_ENQUEUE_REJECTED tid={} cpu={} error={:?} restored={} result=no_wake",
+                            snap.receiver_tid,
+                            cpu.0,
+                            error,
+                            u32::from(restored)
+                        );
+                        None
+                    }
                 }
-                Some(true)
             }
             // Receiver exited OR was replaced (ASID changed) after the identity claim: the claimed
             // waiter belonged to our exact receiver incarnation, which no longer exists — it is
@@ -6557,3 +6682,10 @@ mod tests {
         assert!(runtime_src.contains("VALIDATION: M2_SEAM_LIVE_D6_GENUINE"));
     }
 }
+
+/// Test-only fault hook: force step (3) of `restore_consumed_reply_record_split` to fail after
+/// the record has already been flipped, so the revert that preserves the two-outcome contract is
+/// exercised rather than merely asserted. `#[cfg(test)]` — it exists in no shipped kernel.
+#[cfg(test)]
+pub(crate) static RESTORE_FORCE_LINK_INSTALL_FAILURE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);

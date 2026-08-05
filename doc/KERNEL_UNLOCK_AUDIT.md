@@ -2765,6 +2765,9 @@ Three changes:
    `EnqueueRejectedUnreconciled(WithdrawOutcome)`: the externally visible authority is reclaimed,
    and **no claim is made that the receiver was restored**.
 
+> **Placed too late — corrected in §6.1.28.** The preflight sat *after* the record reservation,
+> the reply-cap mint and the user copy, so it could not support retry or restoration.
+
 **On the hard-stop.** "Could an `AlreadyQueued` task already have executed or observed the
 publication?" Rather than argue the window, it is **closed**: both transactions now run a
 pre-commit membership preflight (NR6 step 9c, NR7 step 5c). A receiver that is still `Blocked`
@@ -2793,7 +2796,10 @@ The whole direct-eligible reply population is therefore **untimed**. The claim i
 
 `consume_reply_record_split` closes the reverse link on the same edge, so the restore
 re-registers it: the replier owes the reply again, exactly as before. The acknowledgement lease is
-restored, not discarded. Re-arming is admissible **only** when `receiver_is_unplaced()` holds —
+restored, not discarded.
+
+> **Not atomic — corrected in §6.1.28.** The record was published `Available` *before* the link
+> registration was attempted, so a refused registration left `Available`-without-link. Re-arming is admissible **only** when `receiver_is_unplaced()` holds —
 otherwise the caller may already have observed the delivery, and arming a second reply against it
 would be unsound.
 
@@ -2821,6 +2827,93 @@ Three mutations, each caught:
 | reconciliation replaced by a constant `Removed` (i.e. no atomic withdrawal) | `the_membership_reconciliation_shares_the_detecting_acquisition`, `already_queued_distinguishes_exactly_one_current_and_duplicate`, `no_blocked_task_ever_holds_queued_or_current_membership` |
 | replier identity guard dropped from the authority restore | `the_reply_authority_restore_is_identity_and_generation_exact` |
 | reverse-link re-registration dropped | initially **structural only** — a behavioural link-count assertion was added, and it now fails too |
+
+
+### 6.1.28 Three rejection-safety defects — repaired
+
+Review of §6.1.27 found three. All closed here. No production predicate, no `wake_only` policy,
+no affinity, no SBI/IPI, no AArch64, no ServerDies, no 199E, no RISC-V link-1 work.
+**RISC-V status recomputes unchanged**: link 1 **ABSENT**; links 2, 3, 7, 9 present; 4, 5, 6, 8,
+10 absent; `RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**; coordinate 23
+**OPEN**; ledger **40 / 6 / 46**; **no new live cell**.
+
+#### 1. Membership detection moved before user-visible mutation
+
+§6.1.27's preflight was placed too late. Traced exactly:
+
+| direction | first userspace-observable mutation | old preflight | new |
+|---|---|---|---|
+| NR6 | (5) record reserved → visible to another transaction; (6)/(7) provisional cap in the **server's own cnode**; (8) copy into the server's user memory | (9c), after all three | **(4a)**, before all three |
+| NR7 | (3) record `Available → Reserved`; (4) copy into the caller's user memory | (5c), after both | **(2b)**, before both |
+
+A receiver reported `RefusedCurrent` may already be executing and may already have read those
+bytes, so a check after them cannot support retry or authority restoration. The new check runs
+before any user copy, any provisional capability in the receiver's cnode, any record state
+exposed to another transaction, any waiter claim and any TCB mutation.
+
+A legitimate `Blocked` receiver holding a committed waiter cannot acquire scheduler membership —
+nothing can wake it while both are true — so an early positive result is an **invariant
+violation**, not a retryable `WouldBlock`. It performs no mutation, **discards** the claimed
+acknowledgement rather than re-arming it, returns the typed
+`ReceiverMembershipViolation`, and claims nothing about the receiver being restored or unplaced.
+
+The post-copy defence remains for genuine invariant violations, classified by the
+same-acquisition `WithdrawOutcome`: `Removed` → rollback may proceed; `RefusedCurrent` →
+publication may have been observed, never restore; `RefusedDuplicate` / `NotQueued` /
+`InvalidCpu` → fail closed. And **no post-copy membership detection returns retryable
+authority**: NR6 settles the lease only when `reconciled.is_none()`, NR7 restores the authority
+only when `reconciled.is_none()` — so even a cleanly-`Removed` collision found after the copy is
+terminal.
+
+`direct_server_exact_still_blocked` and `direct_caller_exact_still_blocked` now also require the
+absence of scheduler membership: `Blocked` plus an intact waiter is **not** sufficient when the
+task is queued or current.
+
+#### 2. The NR7 authority restore is all-or-nothing
+
+The old version published `Consumed → Available` and only afterwards attempted registration,
+which permits `Available`-without-link — an invokable reply with no teardown-visible link.
+
+Replaced by one composed transaction. The task lock (rank 2) is taken first and held across the
+whole operation; the ipc lock (rank 3) is nested inside it — ascending rank order, so the
+discipline is preserved. Under that single hold: **(1)** locate the exact replier incarnation and
+validate its link slot free (or already exactly ours) and its status live, **writing nothing**;
+**(2)** at rank 3 validate the record (exact index, exact generation, `Consumed`, bound to this
+exact replier) and flip it; **(3)** install the link through the shared
+`install_server_reply_link` decision, which also stamps the leak accounting.
+
+Step 1 makes step 3 unreachable, but the revert is implemented anyway and **exercised**: a
+`#[cfg(test)]`-only fault hook forces the install to fail after the flip, and
+`a_forced_link_install_failure_leaves_the_record_consumed` proves the record is reverted. Only
+two outcomes are observable: **A** record `Available` and the exact link installed, or **B**
+record `Consumed` and no newly installed link.
+
+Five failure cases each proved to leave outcome B, with the live link count unchanged and no
+second reply invokable: occupied link slot, changed replier incarnation, recycled generation,
+already-`Available` record, `Cancelled` record.
+
+#### 3. The hidden shared-region side effect is gone
+
+§6.1.27 put the `AlreadyQueued` reconciliation in the seam that the shared-region finalizer also
+calls, so that caller silently withdrew a pre-existing scheduler entry it had no rollback for.
+
+**Option A** was taken — a separate seam, not a flag:
+
+* `sr_enqueue_committed_receiver_split` — generic, **never** reconciles (`reconciled: None`);
+* `sr_enqueue_committed_receiver_reconciled_split` — direct-IPC only, used by exactly the two
+  transactions.
+
+The shared-region finalizer cannot select the reconciling one because it calls the other
+function; a guard pins that it names neither `reconciled_split` nor `withdraw_queued_tid`, and
+that the reconciling seam has exactly two call sites.
+
+Its rejection contract is repaired too: it no longer returns `Some(true)` after a refusal. On the
+four never-touched-a-queue reasons it restores its own receiver (`Runnable → Blocked` on the
+exact recv cap, waiter reinstalled) and reports `None`. On an unreconciled `AlreadyQueued` it
+fails closed with **zero mutation** — it does not force `Blocked` on top of live membership and
+does not touch the queue entry. Behavioural tests cover `WakeOnly`, `QueueFull`, and
+`AlreadyQueued` as exactly-once, current and duplicate, each proving the pre-existing membership
+is untouched.
 
 ---
 

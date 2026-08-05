@@ -77211,8 +77211,12 @@ mod stage199a2b2d_direct_request_txn {
         let mut lease = claimed_lease(201);
         assert_eq!(
             fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 201),
-            Err(IpcCallDirectError::WouldBlock),
-            "declined before mutation, not after publication"
+            Err(IpcCallDirectError::ReceiverMembershipViolation),
+            "a typed fail-closed violation, not a retryable WouldBlock"
+        );
+        assert!(
+            !lease.is_available(),
+            "the acknowledgement is DISCARDED, never re-armed"
         );
         fx.k.with(|s| {
             assert_eq!(
@@ -78445,6 +78449,202 @@ mod stage199a2b3_direct_reply_txn {
             assert!(lease.is_available(), "{reason:?} is retryable");
             teardown();
         }
+    }
+
+    // ── The composed restore: every failure leaves outcome B ────────────────────────────────
+
+    /// Drive the composed restore to a rejection and prove outcome **B** every time: record
+    /// still `Consumed`, no exact reverse link added, no second reply invokable, and the live
+    /// link accounting balanced.
+    fn assert_restore_outcome_b(fx: &Fixture, links_before: usize, why: &str) {
+        assert!(
+            !fx.k
+                .with(|s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "{why}: the record must remain Consumed"
+        );
+        assert_eq!(
+            fx.k.live_server_reply_link_count_split_read(),
+            links_before,
+            "{why}: no reverse link may be added"
+        );
+        // And no reply can be invoked through it. (This probe's OWN lease disposition is the
+        // pre-reserve policy of the probing transaction, not part of the restore's contract —
+        // the transaction-level tests assert the real discard.)
+        let snap = snapshot_for(fx, b"replyOK!");
+        let mut lease = claimed_lease(400);
+        assert!(
+            fx.k.ipc_reply_direct_txn(&snap, &fx.published_ack, &mut lease, 400)
+                .is_err(),
+            "{why}: a spent record must stay un-invokable"
+        );
+    }
+
+    /// Bring the fixture to the exact state the restore is called from: record `Consumed`,
+    /// reverse link closed.
+    fn consume_for_restore(fx: &Fixture) {
+        assert!(
+            fx.k.reserve_existing_reply_record_split(
+                fx.record_index,
+                fx.record_generation,
+                fx.replier
+            ),
+            "reserve"
+        );
+        assert!(
+            fx.k.consume_reply_record_split(fx.record_index, fx.record_generation),
+            "consume"
+        );
+    }
+
+    #[test]
+    fn the_composed_restore_refuses_an_occupied_reverse_link_slot() {
+        let fx = blocked_caller_fixture();
+        consume_for_restore(&fx);
+        // Install a DIFFERENT live link on the replier.
+        assert!(fx.k.register_server_reply_link_split(
+            2,
+            fx.replier_asid,
+            fx.record_index + 1,
+            fx.record_generation ^ 0xF,
+        ));
+        let before = fx.k.live_server_reply_link_count_split_read();
+        assert!(
+            !fx.k.restore_consumed_reply_record_split(
+                fx.record_index,
+                fx.record_generation,
+                fx.replier
+            ),
+            "an occupied slot must refuse BEFORE the record is touched"
+        );
+        assert_restore_outcome_b(&fx, before, "occupied link slot");
+        teardown();
+    }
+
+    #[test]
+    fn the_composed_restore_refuses_a_changed_replier_incarnation() {
+        let fx = blocked_caller_fixture();
+        consume_for_restore(&fx);
+        let before = fx.k.live_server_reply_link_count_split_read();
+        let replaced = crate::kernel::boot::ReceiverWaiterIdentity::new(
+            ThreadId(2),
+            Asid(fx.replier_asid.0 ^ 0x55),
+        );
+        assert!(
+            !fx.k.restore_consumed_reply_record_split(
+                fx.record_index,
+                fx.record_generation,
+                replaced
+            ),
+            "a replaced incarnation can never inherit the authority"
+        );
+        assert_restore_outcome_b(&fx, before, "changed replier incarnation");
+        teardown();
+    }
+
+    #[test]
+    fn the_composed_restore_refuses_a_recycled_record_generation() {
+        let fx = blocked_caller_fixture();
+        consume_for_restore(&fx);
+        let before = fx.k.live_server_reply_link_count_split_read();
+        assert!(
+            !fx.k.restore_consumed_reply_record_split(
+                fx.record_index,
+                fx.record_generation.wrapping_add(1),
+                fx.replier
+            ),
+            "a recycled slot must never be re-armed"
+        );
+        assert_restore_outcome_b(&fx, before, "recycled generation");
+        teardown();
+    }
+
+    #[test]
+    fn the_composed_restore_refuses_an_already_available_record() {
+        let fx = blocked_caller_fixture();
+        // Never consumed: the record is Available.
+        let before = fx.k.live_server_reply_link_count_split_read();
+        assert!(
+            fx.k.with(|s| s
+                .direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "precondition: Available"
+        );
+        assert!(
+            !fx.k.restore_consumed_reply_record_split(
+                fx.record_index,
+                fx.record_generation,
+                fx.replier
+            ),
+            "the restore must not stack on an Available record"
+        );
+        assert_eq!(
+            fx.k.live_server_reply_link_count_split_read(),
+            before,
+            "and it adds no link"
+        );
+        teardown();
+    }
+
+    #[test]
+    fn the_composed_restore_refuses_a_cancelled_or_terminal_record() {
+        let fx = blocked_caller_fixture();
+        // Reserve then CANCEL: a terminal state that is neither Consumed nor Available.
+        assert!(fx.k.reserve_existing_reply_record_split(
+            fx.record_index,
+            fx.record_generation,
+            fx.replier
+        ));
+        assert!(
+            fx.k.cancel_direct_reply_record_split(fx.record_index, fx.record_generation),
+            "cancel"
+        );
+        let before = fx.k.live_server_reply_link_count_split_read();
+        assert!(
+            !fx.k.restore_consumed_reply_record_split(
+                fx.record_index,
+                fx.record_generation,
+                fx.replier
+            ),
+            "a Cancelled record is terminal and must never be re-armed"
+        );
+        assert!(
+            !fx.k
+                .with(|s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "it stays terminal"
+        );
+        assert_eq!(
+            fx.k.live_server_reply_link_count_split_read(),
+            before,
+            "and no link is added"
+        );
+        teardown();
+    }
+
+    /// **The partial-restore bug, mutation-tested directly.** Step (3) is forced to fail AFTER
+    /// the record has been flipped to `Available`. The two-outcome contract requires the record
+    /// to be reverted to `Consumed` before the composition releases — the previous version had
+    /// no revert at all, and would have left `Available` with no reverse link.
+    #[test]
+    fn a_forced_link_install_failure_leaves_the_record_consumed() {
+        use core::sync::atomic::Ordering;
+        let fx = blocked_caller_fixture();
+        consume_for_restore(&fx);
+        let before = fx.k.live_server_reply_link_count_split_read();
+        crate::runtime::RESTORE_FORCE_LINK_INSTALL_FAILURE.store(true, Ordering::Relaxed);
+        let restored = fx.k.restore_consumed_reply_record_split(
+            fx.record_index,
+            fx.record_generation,
+            fx.replier,
+        );
+        crate::runtime::RESTORE_FORCE_LINK_INSTALL_FAILURE.store(false, Ordering::Relaxed);
+        assert!(!restored, "a failed install must report failure");
+        assert_restore_outcome_b(&fx, before, "forced link-install failure");
+        // Explicitly: the record was flipped and then reverted, so it is NOT Available.
+        assert!(
+            !fx.k
+                .with(|s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "Available-without-link must be unreachable"
+        );
+        teardown();
     }
 
     /// **A terminal-arbitrated reply still declines before EVERY mutation.** The direct path is
@@ -85751,7 +85951,7 @@ mod stage199a2d2c2b2_guards {
             .find("commit_direct_reply_record_split(idx, rgen)")
             .unwrap();
         let enq = TXN
-            .find("sr_enqueue_committed_receiver_split(ack.server.tid.0")
+            .find("sr_enqueue_committed_receiver_reconciled_split(ack.server.tid.0")
             .unwrap();
         assert!(avail < enq, "record Available before enqueue");
     }
@@ -85770,7 +85970,7 @@ mod stage199a2d2c2b2_guards {
             .nth(1)
             .expect("the request transaction");
         let enq = txn_body
-            .find("sr_enqueue_committed_receiver_split(ack.server.tid.0")
+            .find("sr_enqueue_committed_receiver_reconciled_split(ack.server.tid.0")
             .expect("the committed enqueue");
         let success = txn_body
             .find("Ok(IpcCallDirectSuccess {")
@@ -93887,7 +94087,7 @@ mod stage200d1_publication_and_guards {
             .expect("registration");
         // Anchor on the actual CALL: the module doc comment names the helper too.
         let enqueue = TXN_SRC
-            .find("self.sr_enqueue_committed_receiver_split(ack.server.tid.0")
+            .find("self.sr_enqueue_committed_receiver_reconciled_split(ack.server.tid.0")
             .expect("enqueue");
         assert!(
             probe < reserve,
@@ -105742,7 +105942,7 @@ mod stage199d_remote_wake_authority {
                 .expect("the request transaction"),
         );
         let enqueue = txn_body
-            .find("sr_enqueue_committed_receiver_split(ack.server.tid.0, affinity)")
+            .find("sr_enqueue_committed_receiver_reconciled_split(ack.server.tid.0, affinity)")
             .expect("the committed enqueue");
         let success = txn_body
             .find("Ok(IpcCallDirectSuccess {")
@@ -105886,7 +106086,7 @@ mod stage199d_remote_wake_authority {
                 .expect("the reply transaction"),
         );
         let enq = txn_body
-            .find("sr_enqueue_committed_receiver_split(ack.caller.tid.0, affinity)")
+            .find("sr_enqueue_committed_receiver_reconciled_split(ack.caller.tid.0, affinity)")
             .expect("the caller enqueue");
         let success = txn_body
             .find("Ok(IpcReplyDirectSuccess {")
@@ -105913,9 +106113,10 @@ mod stage199d_remote_wake_authority {
                 && RUNTIME.contains("reconciled: None,"),
             "success and refusal are distinguished by the enqueue's own result"
         );
-        // The AlreadyQueued reconciliation happens in the SAME rank-1 closure.
+        // The AlreadyQueued reconciliation happens in the SAME rank-1 closure, and ONLY for the
+        // direct-IPC seam.
         assert!(
-            RUNTIME.contains("let reconciled = sm.withdraw_queued_tid_on(cpu, ThreadId(tid));"),
+            RUNTIME.contains("reconcile.then(|| sm.withdraw_queued_tid_on(cpu, ThreadId(tid)))"),
             "membership is reconciled under the acquisition that detected it"
         );
         assert!(
@@ -110428,8 +110629,8 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
     #[test]
     fn the_enqueue_seam_discards_the_placement_result() {
         let at = RUNTIME
-            .find("pub(crate) fn sr_enqueue_committed_receiver_split")
-            .expect("the enqueue seam");
+            .find("\n    fn enqueue_committed_receiver_inner(\n")
+            .expect("the shared enqueue body");
         // Bound the slice at the method's closing brace (column 4), not at a byte count.
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("the method end")];
         assert!(
@@ -110523,12 +110724,12 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             "exactly one runtime caller: the same-acquisition reconciliation"
         );
         let at = RUNTIME
-            .find("pub(crate) fn sr_enqueue_committed_receiver_split")
-            .expect("the enqueue seam");
+            .find("\n    fn enqueue_committed_receiver_inner(\n")
+            .expect("the shared enqueue body");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
         assert!(
             body.contains("withdraw_queued_tid_on"),
-            "…and it is inside the enqueue seam, not anywhere else"
+            "…and it is inside the enqueue body, not anywhere else"
         );
     }
 
@@ -110574,6 +110775,12 @@ mod stage199d_receiver_enqueue_outcome {
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
     const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    /// The direct-IPC seam: the only one that reconciles. Every membership expectation below
+    /// goes through it, because the generic seam deliberately does not.
+    fn enqueue_reconciled(k: &SharedKernel, tid: u64, affinity: Option<CpuId>) -> ReceiverEnqueue {
+        k.sr_enqueue_committed_receiver_reconciled_split(tid, affinity)
+    }
 
     /// A rejection with no pre-existing membership — the shape the four non-membership
     /// reasons produce.
@@ -110710,7 +110917,23 @@ mod stage199d_receiver_enqueue_outcome {
             k.sr_enqueue_committed_receiver_split(1, None),
             ReceiverEnqueue::Enqueued { cpu: here }
         );
-        let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+        // The GENERIC seam reports the collision and reconciles NOTHING.
+        assert_eq!(
+            k.sr_enqueue_committed_receiver_split(1, None),
+            ReceiverEnqueue::Rejected {
+                cpu: here,
+                error: SchedulerError::AlreadyQueued,
+                reconciled: None,
+            },
+            "the generic seam must never withdraw a pre-existing entry"
+        );
+        assert_eq!(
+            k.with(|s| s.runnable_count_on_cpu(here)),
+            1,
+            "…and the entry is untouched by it"
+        );
+        // The direct-IPC seam reconciles under the acquisition that detected the collision.
+        let outcome = enqueue_reconciled(&k, 1, None);
         assert_eq!(
             outcome,
             ReceiverEnqueue::Rejected {
@@ -110793,7 +111016,7 @@ mod stage199d_receiver_enqueue_outcome {
                 .collect::<alloc::vec::Vec<_>>()
                 .join(" ");
             let bind = alloc::format!(
-                "let outcome = self.sr_enqueue_committed_receiver_split({direction}, affinity); let ReceiverEnqueue::Enqueued {{ cpu: wake_target_cpu, }} = outcome else {{"
+                "let outcome = self.sr_enqueue_committed_receiver_reconciled_split({direction}, affinity); let ReceiverEnqueue::Enqueued {{ cpu: wake_target_cpu, }} = outcome else {{"
             );
             let bind = bind
                 .split_whitespace()
@@ -110854,7 +111077,7 @@ mod stage199d_receiver_enqueue_outcome {
                 k.sr_enqueue_committed_receiver_split(1, None),
                 ReceiverEnqueue::Enqueued { .. }
             ));
-            let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+            let outcome = enqueue_reconciled(&k, 1, None);
             assert_eq!(
                 outcome,
                 ReceiverEnqueue::Rejected {
@@ -110878,7 +111101,7 @@ mod stage199d_receiver_enqueue_outcome {
                 s.dispatch_next_on_cpu(here)
                     .expect("dispatch it to current");
             });
-            let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+            let outcome = enqueue_reconciled(&k, 1, None);
             assert_eq!(
                 outcome,
                 ReceiverEnqueue::Rejected {
@@ -110914,7 +111137,7 @@ mod stage199d_receiver_enqueue_outcome {
                 ReceiverEnqueue::Enqueued { .. }
             ));
             // A third attempt on `here` collides with `here`'s own entry.
-            let outcome = k.sr_enqueue_committed_receiver_split(1, Some(here));
+            let outcome = enqueue_reconciled(&k, 1, Some(here));
             assert_eq!(
                 outcome,
                 ReceiverEnqueue::Rejected {
@@ -110974,8 +111197,7 @@ mod stage199d_receiver_enqueue_outcome {
             s.dispatch_next_on_cpu(here).expect("make it current");
         });
         assert!(
-            !k.sr_enqueue_committed_receiver_split(1, Some(here))
-                .receiver_is_unplaced(),
+            !enqueue_reconciled(&k, 1, Some(here)).receiver_is_unplaced(),
             "a current receiver is never unplaced"
         );
     }
@@ -110988,8 +111210,8 @@ mod stage199d_receiver_enqueue_outcome {
     #[test]
     fn the_membership_reconciliation_shares_the_detecting_acquisition() {
         let at = RUNTIME
-            .find("pub(crate) fn sr_enqueue_committed_receiver_split")
-            .expect("the enqueue seam");
+            .find("\n    fn enqueue_committed_receiver_inner(\n")
+            .expect("the shared enqueue body");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
         let open = body
             .find("self.with_scheduler_split_mut(|sched| {")
@@ -110998,7 +111220,7 @@ mod stage199d_receiver_enqueue_outcome {
             .find("Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued)")
             .expect("the collision arm");
         let reconcile = body
-            .find("let reconciled = sm.withdraw_queued_tid_on(cpu, ThreadId(tid));")
+            .find("reconcile.then(|| sm.withdraw_queued_tid_on(cpu, ThreadId(tid)))")
             .expect("the reconciliation");
         assert!(
             open < detect && detect < reconcile,
@@ -111038,8 +111260,33 @@ mod stage199d_receiver_enqueue_outcome {
             );
         }
         assert!(
-            body.contains("register_server_reply_link_split"),
-            "the consume closed the reverse link; the restore must re-register it"
+            body.contains("install_server_reply_link"),
+            "the consume closed the reverse link; the restore must re-install it"
+        );
+        // ALL-OR-NOTHING: the link slot is validated (no write) BEFORE the record is flipped,
+        // and a failed install flips the record straight back.
+        let validate = body
+            .find("Some(_) => return false,")
+            .expect("the occupied-slot refusal");
+        let flip = body
+            .find("record.reservation = ReplyRecordReservation::Available;")
+            .expect("the record flip");
+        let install = body
+            .find("install_server_reply_link(tcb, link)")
+            .expect("the install");
+        assert!(
+            validate < flip && flip < install,
+            "validate the slot, then flip the record, then install"
+        );
+        assert!(
+            body.contains("record.reservation = ReplyRecordReservation::Consumed;"),
+            "a failed install must revert the record, so Available-without-link is unreachable"
+        );
+        // One rank-2 hold spans everything; rank 3 is nested inside it (ascending order).
+        assert!(
+            body.find("with_task_tcbs_split_mut").expect("rank 2")
+                < body.find("with_ipc_split_mut").expect("rank 3"),
+            "task rank is acquired first and held across the composition"
         );
     }
 
@@ -111063,5 +111310,383 @@ mod stage199d_receiver_enqueue_outcome {
             RUNTIME.contains("error: crate::kernel::scheduler::SchedulerError,"),
             "the rejection carries SchedulerError, not a re-derived enum"
         );
+    }
+}
+
+/// Stage 199D — the shared-region finalizer's rejection contract, and the seam split that keeps
+/// the direct-IPC reconciliation out of it.
+///
+/// `sr_enqueue_committed_receiver_split` had grown a hidden side effect: an `AlreadyQueued`
+/// collision silently withdrew the pre-existing entry. That is correct only for a caller that
+/// owns a rollback able to complete the withdrawal — NR6/NR7 do; the shared-region finalizer does
+/// not. The reconciliation now lives in a separate direct-IPC-only seam, and this caller cannot
+/// select it because it calls the other function.
+mod stage199d_shared_region_enqueue_rejection {
+    use super::*;
+    use crate::kernel::boot::TransferSharedRegion;
+    use crate::kernel::boot::shared_region_txn::RecvBoundarySharedRegionSnapshot;
+    use crate::kernel::capabilities::CapRights;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::scheduler::SchedulerError;
+    use crate::runtime::{ReceiverEnqueue, SharedKernel};
+
+    const RUNTIME: &str = include_str!("../../runtime.rs");
+    const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    /// A kernel with task 2 blocked as an exact endpoint waiter, plus the snapshot the finalizer
+    /// consumes. Only `receiver_tid`, `receiver_asid`, `endpoint` and `blocked_endpoint_waiter`
+    /// are load-bearing for this path; the rest are inert placeholders.
+    struct Fx {
+        k: SharedKernel,
+        snap: RecvBoundarySharedRegionSnapshot,
+        receiver_asid: Asid,
+        endpoint: CapObject,
+        recv_cap: CapId,
+    }
+
+    fn fixture() -> Fx {
+        let k = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid2, recv_cap_t2) = k.with(|state| {
+            state.register_task(1).expect("t1");
+            state.register_task(2).expect("t2");
+            let (a1, _) = state.create_user_address_space().expect("asid1");
+            let (a2, aspace2) = state.create_user_address_space().expect("asid2");
+            state.bind_task_asid(1, a1).expect("bind1");
+            state.bind_task_asid(2, a2).expect("bind2");
+            state
+                .map_user_page(
+                    aspace2,
+                    VirtAddr(SR_PAYLOAD_VA as u64),
+                    Mapping {
+                        phys: PhysAddr(0xC000),
+                        flags: PageFlags::USER_RW,
+                    },
+                )
+                .expect("map receiver buffers");
+            let (_eid, _send, recv_global) = state.create_endpoint(4).expect("ep");
+            let recv_t2 = state
+                .grant_capability_task_to_task(0, recv_global, 2)
+                .expect("grant recv");
+            state.enqueue_current_cpu(2).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            while state.current_tid() != Some(2) {
+                state.yield_current().expect("switch");
+            }
+            let mut recv = TrapFrame::new(
+                crate::kernel::syscall::Syscall::IpcRecv as usize,
+                [recv_t2.0 as usize, SR_PAYLOAD_VA, 8, SR_META_VA, 40, 0],
+            );
+            let _ = state.handle_trap(Trap::Syscall, Some(&mut recv));
+            assert!(
+                matches!(state.task_status(2), Some(TaskStatus::Blocked(_))),
+                "receiver must be a blocked endpoint waiter"
+            );
+            (a2, recv_t2)
+        });
+        let endpoint = k
+            .resolve_endpoint_recv_cap_split_read(2, recv_cap_t2)
+            .expect("resolve recv endpoint")
+            .endpoint;
+        let snap = RecvBoundarySharedRegionSnapshot {
+            receiver_cnode: k.with(|s| s.task_cnode(2)).expect("cnode"),
+            object: endpoint,
+            object_generation: 0,
+            rights: CapRights::RECEIVE,
+            descriptor: TransferSharedRegion { offset: 0, len: 0 },
+            source_tid: 1,
+            source_cap: CapId(0),
+            receiver_tid: 2,
+            receiver_pid: 2,
+            receiver_asid: asid2,
+            endpoint,
+            map_va: SR_PAYLOAD_VA as u64,
+            meta_ptr: SR_META_VA as u64,
+            map_write: false,
+            pin_owned: false,
+            origin_direct: true,
+            blocked_endpoint_waiter: true,
+            msg: Message::with_header(1, 0, 0, None, b"sr").expect("msg"),
+        };
+        let recv_cap = k
+            .blocked_recv_cap_split_read(2, asid2)
+            .expect("the receiver's recv cap");
+        Fx {
+            k,
+            snap,
+            receiver_asid: asid2,
+            endpoint,
+            recv_cap,
+        }
+    }
+
+    const SR_PAYLOAD_VA: usize = 0x4000_0000;
+    const SR_META_VA: usize = 0x4000_0100;
+
+    fn waiter_intact(fx: &Fx) -> bool {
+        let CapObject::Endpoint { index, generation } = fx.endpoint else {
+            panic!("endpoint");
+        };
+        fx.k.endpoint_waiter_is_split_read(
+            index,
+            generation,
+            crate::kernel::boot::ReceiverWaiterIdentity::new(ThreadId(2), fx.receiver_asid),
+        )
+    }
+
+    /// The finalizer must report NO wake, restore the exact blocked state, and leave nothing
+    /// Runnable-but-unqueued.
+    fn assert_no_wake_and_restored(fx: &Fx, why: &str) {
+        fx.k.with(|s| {
+            assert_eq!(
+                s.task_status(2),
+                Some(TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(fx.recv_cap)
+                )),
+                "{why}: Blocked on the exact original recv cap"
+            );
+            assert!(
+                !s.task_present_in_any_runqueue(2),
+                "{why}: never Runnable-but-unqueued"
+            );
+        });
+        assert!(waiter_intact(fx), "{why}: the exact waiter is reinstalled");
+    }
+
+    // ── (1) WakeOnly ────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn shared_region_completion_under_a_wake_only_target_reports_no_wake() {
+        let fx = fixture();
+        fx.k.with(|s| {
+            s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+            s.bring_up_cpu(CpuId(1)).expect("online");
+            s.set_task_home_cpu(2, CpuId(1)).expect("pin");
+        });
+        assert_eq!(
+            fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+            None,
+            "a refused placement is NOT a wake — Some(true) would be a lie"
+        );
+        assert_no_wake_and_restored(&fx, "wake-only");
+    }
+
+    // ── (2) QueueFull ───────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn shared_region_completion_under_a_full_queue_reports_no_wake() {
+        let fx = fixture();
+        let here = fx.k.current_cpu_split_read();
+        fx.k.with(|s| {
+            for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+                s.register_task(tid).expect("filler");
+            }
+        });
+        for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+            let _ = fx.k.sr_enqueue_committed_receiver_split(tid, Some(here));
+        }
+        assert_eq!(
+            fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+            None
+        );
+        assert_no_wake_and_restored(&fx, "queue full");
+    }
+
+    // ── (3)(4)(5) AlreadyQueued in all three membership shapes ──────────────────────────────
+
+    /// **The finalizer must never remove a pre-existing entry.** It owns no rollback that could
+    /// complete such a withdrawal, so all three `AlreadyQueued` shapes fail closed with the
+    /// receiver's membership exactly as found.
+    #[test]
+    fn shared_region_completion_never_disturbs_pre_existing_membership() {
+        let here_of = |k: &SharedKernel| k.current_cpu_split_read();
+
+        // (3) exactly once.
+        {
+            let fx = fixture();
+            let here = here_of(&fx.k);
+            assert!(matches!(
+                fx.k.sr_enqueue_committed_receiver_split(2, Some(here)),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            assert_eq!(
+                fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+                None,
+                "an unreconciled collision is not a wake"
+            );
+            assert_eq!(
+                fx.k.with(|s| s.runnable_count_on_cpu(here)),
+                1,
+                "the pre-existing entry is UNTOUCHED"
+            );
+        }
+        // (4) current.
+        {
+            let fx = fixture();
+            let here = here_of(&fx.k);
+            assert!(matches!(
+                fx.k.sr_enqueue_committed_receiver_split(2, Some(here)),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            fx.k.with(|s| {
+                s.dispatch_next_on_cpu(here).expect("make current");
+            });
+            assert_eq!(
+                fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+                None
+            );
+            assert_eq!(
+                fx.k.with(|s| s.current_tid_on_cpu(here)),
+                Some(2),
+                "a current receiver is left exactly as found — zero mutation"
+            );
+        }
+        // (5) duplicate across CPUs.
+        {
+            let fx = fixture();
+            let here = here_of(&fx.k);
+            fx.k.with(|s| s.bring_up_cpu(CpuId(1)).expect("cpu1"));
+            assert!(matches!(
+                fx.k.sr_enqueue_committed_receiver_split(2, Some(here)),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            assert!(matches!(
+                fx.k.sr_enqueue_committed_receiver_split(2, Some(CpuId(1))),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            assert_eq!(
+                fx.k.sr_finalize_blocked_receiver_and_wake_split(&fx.snap),
+                None
+            );
+            assert_eq!(
+                fx.k.with(|s| s.runnable_count_on_cpu(here))
+                    + fx.k.with(|s| s.runnable_count_on_cpu(CpuId(1))),
+                2,
+                "both pre-existing entries are untouched"
+            );
+        }
+    }
+
+    // ── The seam split is structural ────────────────────────────────────────────────────────
+
+    /// The reconciling seam is used ONLY by the two direct-IPC transactions, and the
+    /// shared-region finalizer uses the generic one. Not a flag — a different function.
+    #[test]
+    fn only_the_direct_ipc_transactions_use_the_reconciling_seam() {
+        let code: alloc::vec::Vec<&str> = RUNTIME
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("///"))
+            .collect();
+        // In runtime.rs the reconciling seam is only DEFINED, never called.
+        assert_eq!(
+            code.iter()
+                .filter(|l| l.contains("sr_enqueue_committed_receiver_reconciled_split"))
+                .count(),
+            1,
+            "runtime.rs defines it and never calls it"
+        );
+        // The shared-region finalizer calls the GENERIC seam.
+        let at = RUNTIME
+            .find("pub(crate) fn sr_finalize_blocked_receiver_and_wake_split")
+            .expect("the finalizer");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("end")];
+        assert!(
+            body.contains("self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity)"),
+            "the finalizer uses the non-reconciling seam"
+        );
+        assert!(
+            !body.contains("reconciled_split"),
+            "and it cannot select the reconciling one"
+        );
+        assert!(
+            !body.contains("withdraw_queued_tid"),
+            "nor withdraw anything itself"
+        );
+        // Exactly two direct-IPC call sites.
+        assert_eq!(
+            TXN.matches("sr_enqueue_committed_receiver_reconciled_split")
+                .count(),
+            2,
+            "NR6 and NR7, and nothing else"
+        );
+        // No boolean flag is exposed on either public seam.
+        assert!(
+            !RUNTIME.contains("pub(crate) fn sr_enqueue_committed_receiver_split(\n        &self,\n        tid: u64,\n        affinity: Option<CpuId>,\n        reconcile: bool,"),
+            "no boolean flag on the generic seam"
+        );
+    }
+
+    /// The finalizer no longer returns `Some(true)` on a refusal.
+    #[test]
+    fn the_finalizer_never_reports_a_wake_it_did_not_perform() {
+        let at = RUNTIME
+            .find("pub(crate) fn sr_finalize_blocked_receiver_and_wake_split")
+            .expect("the finalizer");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("end")];
+        assert!(
+            body.contains("ReceiverEnqueue::Enqueued { .. } => Some(true),"),
+            "only a committed enqueue reports a wake"
+        );
+        assert!(
+            body.contains("ReceiverEnqueue::Rejected {"),
+            "and a rejection is handled explicitly"
+        );
+        let rejected = body
+            .split("ReceiverEnqueue::Rejected {")
+            .nth(1)
+            .expect("the rejection arm");
+        assert!(
+            !rejected.contains("Some(true)"),
+            "the rejection arm must not report a wake"
+        );
+        assert!(
+            rejected.contains("SchedulerError::AlreadyQueued"),
+            "…and it must treat an unreconciled collision separately"
+        );
+    }
+
+    /// No path that detects membership after a user copy returns retryable authority.
+    #[test]
+    fn a_post_copy_membership_detection_is_never_retryable() {
+        // NR6: the lease is only settled (restorable) when the rejection carried NO
+        // reconciliation — i.e. it was not a membership detection.
+        assert!(
+            TXN.contains("if reconciled.is_none() {")
+                && TXN.contains("self.settle_lease_pre_claim(ack, lease, lease_commit_seq);"),
+            "NR6 restores the ack only for non-membership rejections"
+        );
+        // NR7: the authority is only restored for non-membership rejections.
+        assert!(
+            TXN.contains("let authority_restored = reconciled.is_none()"),
+            "NR7 restores the authority only for non-membership rejections"
+        );
+        // And the early check runs before ANY user copy in both directions.
+        for (txn_fn, marker) in [
+            (
+                "fn ipc_call_direct_request_txn(",
+                "IPC_DIRECT_REQUEST_MEMBERSHIP_VIOLATION",
+            ),
+            (
+                "fn ipc_reply_direct_txn(",
+                "IPC_DIRECT_REPLY_MEMBERSHIP_VIOLATION",
+            ),
+        ] {
+            let body = TXN.split(txn_fn).nth(1).expect("the transaction");
+            let check = body.find(marker).expect("the early membership check");
+            let copy = body
+                .find("copy_slice_to_user_asid_split_write")
+                .expect("the user copy");
+            assert!(
+                check < copy,
+                "{txn_fn}: the membership check precedes the user copy"
+            );
+            let mint_or_reserve = body
+                .find("reserve_direct_reply_record_split")
+                .or_else(|| body.find("reserve_existing_reply_record_split"))
+                .expect("the first record mutation");
+            assert!(
+                check < mint_or_reserve,
+                "{txn_fn}: …and precedes the first record mutation"
+            );
+        }
     }
 }

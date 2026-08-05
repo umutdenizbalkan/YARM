@@ -797,6 +797,44 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    foundation is now consumed by exactly one caller — that reconciliation — and by no oracle,
    no RISC-V path and no link-1 work. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.27.
 
+   **Three rejection-safety defects found in review of §6.1.27 are REPAIRED.**
+   **(1) Membership detection moved before user-visible mutation.** The preflight had sat *after*
+   NR6's record reservation, provisional reply-cap mint into the **server's own cnode**, and user
+   copy — and after NR7's record reservation and caller copy. A receiver reported `RefusedCurrent`
+   may already be executing and may already have read those bytes, so a check there cannot support
+   retry or authority restoration. It now runs at NR6 (4a) and NR7 (2b), before any user copy, any
+   provisional capability in the receiver's cnode, any record state exposed to another
+   transaction, any waiter claim and any TCB mutation. A `Blocked` receiver with a committed waiter
+   cannot acquire membership, so an early positive is an **invariant violation**: no mutation, the
+   acknowledgement **discarded** (never re-armed), typed `ReceiverMembershipViolation`, and no
+   claim that the task was restored or unplaced. The post-copy defence stays for genuine
+   violations, classified by the same-acquisition `WithdrawOutcome`, and **no post-copy membership
+   detection returns retryable authority** — NR6 settles the lease and NR7 restores the authority
+   only when `reconciled.is_none()`. `direct_server_exact_still_blocked` /
+   `direct_caller_exact_still_blocked` now also require the absence of scheduler membership:
+   `Blocked` plus an intact waiter is not sufficient when the task is queued or current.
+   **(2) The NR7 authority restore is all-or-nothing.** It had published `Consumed → Available` and
+   only then attempted registration, permitting `Available`-without-link. It is now one composed
+   transaction: task rank 2 taken first and held throughout, ipc rank 3 nested inside (ascending
+   order); the link slot is validated **without writing**, then the record is validated and
+   flipped, then the link is installed. Only two outcomes are observable — record `Available` with
+   the exact link, or record `Consumed` with no new link. The revert is exercised by a
+   `#[cfg(test)]`-only fault hook that forces the install to fail after the flip. Five failure
+   cases each proved to leave outcome B: occupied slot, changed replier incarnation, recycled
+   generation, already-`Available`, `Cancelled`.
+   **(3) The hidden shared-region side effect is gone.** The reconciliation had lived in the seam
+   the shared-region finalizer also calls, so that caller silently withdrew a pre-existing entry it
+   had no rollback for. Option A: `sr_enqueue_committed_receiver_split` never reconciles;
+   `sr_enqueue_committed_receiver_reconciled_split` is direct-IPC-only with exactly two call sites.
+   Not a flag — the finalizer cannot select it because it calls the other function. Its rejection
+   contract is repaired: no more `Some(true)` after a refusal; it restores its own receiver on the
+   four never-touched-a-queue reasons and reports `None`; an unreconciled `AlreadyQueued` fails
+   closed with **zero mutation**. Behavioural tests cover `WakeOnly`, `QueueFull` and
+   `AlreadyQueued` as exactly-once/current/duplicate, each proving pre-existing membership is
+   untouched. RISC-V status recomputes unchanged: link 1 ABSENT, 2/3/7/9 present, 4/5/6/8/10
+   absent, `RISCV_REMOTE_WAKE` **D**, `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live
+   cell. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.28.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and
