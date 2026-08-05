@@ -96,23 +96,29 @@ essentially no production wiring — every capability seam is `M2_SEAM_HELPER_ON
 | **Server death (`ServerDies`) — x86_64** | **1 of 3** | **`STAGE_200D2B1C_X86_64_SERVER_DIES_SEAL`, commit `f5669cb5`; canonical 199D server-crash-cleanup increment** |
 | *Pre-production subtotal* | *39* | *30 + 6 + 2 + 1 — the figure accepted before the x86_64 production default was flipped* |
 | **Direct IPC NR 6 / NR 7 — x86_64 production default ON** | **1** | **`IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok=1 nr7_ok=1 census_ok=1 result=ok`, exact commit `0b5ec254`** — 53 NR6 + 41 NR7 ordinary syscalls off-lock with zero broad-lock entries on the **production** path; canonical 199D production-path increment |
-| **Accepted total (production-path)** | **40** | 30 + 6 + 2 + 1 + 1 |
+| **Current production-path total** | **39** | 30 + 6 + 2 + 1 — the direct-IPC production cell moved out at Stage 199D-WA1-GATE |
+| **Direct IPC NR 6 / NR 7 — moved to non-production at WA1-GATE** | **1** | **Originally earned UNDER the x86_64 production default** at `0b5ec254` (not under a proof knob). Retained as historical mechanism/production evidence. It is **no longer a claim about the current production predicate**, which `ipccall_direct_production_enabled()` now returns `false` for on every architecture while `WAITER_OWNERSHIP_EXCLUSIVE=no`. |
 | Direct IPC NR 6 / NR 7 (x86_64, SMP=2) | 6, **knob-gated** | `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL … result=ok`; proves the 199D **mechanism**, **not** the production path. Originally earned at `ccceb03d`; **re-earned at `7d5a22c9`** after three repairs — see §0.1. The re-earning restores historical evidence and **adds no new cell**. |
-| **Total including knob-gated mechanism evidence** | **46** | 40 + 6 |
+| **Non-production / mechanism evidence** | **7** | 6 knob-gated + the 1 moved at WA1-GATE |
+| **Historical total** | **46** | 39 + 7 — unchanged; nothing is retracted and no new live cell is earned |
 
 > **On the total.** There is no aggregate live-cell counter anywhere in the tree; the only
 > in-tree aggregate is Stage 198F's `total_live_cells=30`. The figures above are computed from
 > the seals listed, each of which is named with its exact commit.
 >
-> * **Production-path = 40.** The pre-production subtotal was **39** (30 + 6 + 2 + 1). The
->   x86_64 NR6/NR7 production-default seal at `0b5ec254` is **one** production-path increment —
->   the first live evidence that NR6/NR7 run off-lock with `ipccall_direct_production_enabled()`
->   true rather than under a proof knob — so the production-path total is **40**.
-> * **Proof-gated / knob-gated = 6.** The six x86 SMP direct-IPC cells frozen by
+> * **Current production-path = 39.** Stage 199D-WA1-GATE disabled the x86_64 direct production
+>   default, so the one `0b5ec254` cell moved out of the current-production bucket and the
+>   total returned to the pre-production subtotal (30 + 6 + 2 + 1). Exactly one cell moved: the
+>   ledger records the x86 NR6+NR7 production-default increment as **one combined cell**, not
+>   two.
+> * **Non-production / mechanism = 7.** The six knob-gated x86 SMP cells below, plus the one
+>   moved at WA1-GATE. The six x86 SMP direct-IPC cells frozen by
 >   `STAGE_199_X86_DIRECT_IPC_FINAL_SEAL` are historical **mechanism** evidence. They were
 >   re-earned at `7d5a22c9` after the three repairs in §0.1; re-earning preserves evidence and
 >   **adds no new cell**, so they are counted once and only here.
-> * **Total = 46.** 40 + 6, stated explicitly so the two policies cannot be conflated.
+> * **Historical total = 46.** 39 + 7, stated explicitly so the two policies cannot be
+>   conflated. The total is unchanged by the gate — WA1-GATE reclassifies evidence, it does not
+>   retract it, and it earns no new live cell.
 >
 > A previously-quoted figure of **43** matches neither policy: it requires counting the six
 > knob-gated Stage 199 cells *and* excluding the two `ExitCurrentTask` cells. The earlier
@@ -469,7 +475,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    `stage199d_riscv_target_spec_guards` (8 tests) pins the triple, the ISA feature set and the
    ABI as three independent propositions, each mutation-tested, so the triple can never be
    "fixed" by dropping `+c`/`+f`/`+d` or switching `lp64d`. **Links 2–4 are untouched and
-   coordinate 23 stays OPEN**; the tally and the 40 / 6 / 46 ledger are unchanged. No QEMU seal
+   coordinate 23 stays OPEN**; the tally and the 39 / 7 / 46 ledger are unchanged. No QEMU seal
    is required for a target-spec-only repair. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.16.
    **RISC-V chain link 2 is AUDITED, not closed — `RISCV_199D_READINESS=case_c`.** An audit only;
    no runtime code, production predicate or target spec changed. The question was whether an
@@ -494,7 +500,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    `task_asid_for_tid_split_read` seams — a call-site swap, no new mechanism, no RISC-V semantic
    copy. Blocker 1 must not land first: admitting NR6/NR7 while the bridge still brackets the trap
    would claim off-lock NR6/NR7 while taking the broad lock three times per syscall.
-   **Coordinate 23 stays OPEN**; tally and the 40 / 6 / 46 ledger unchanged.
+   **Coordinate 23 stays OPEN**; tally and the 39 / 7 / 46 ledger unchanged.
    `stage199d_riscv_production_readiness_audit` (18 tests) pins all of it. See
    `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.17.
    **RISC-V readiness blocker 2 is now CLOSED — the decisive one.** The trap bridge's four
@@ -569,7 +575,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    **absent** as feature-off requires). **Proof-gated direct smoke PASSES unchanged**
    (`live_cells=2`, request/reply userspace validation, duplicate reply refused, both direct
    classes retired off-lock with zero in-lock dispatch, fuses clean). **Neither run adds a live
-   cell**; the ledger stays 40 / 6 / 46, `RISCV_199D_READINESS` remains `case_b`, and coordinate
+   cell**; the ledger stays 39 / 7 / 46, `RISCV_199D_READINESS` remains `case_b`, and coordinate
    23 remains OPEN solely on cross-hart wake, production enablement and production live evidence.
    **RISC-V blocker 3 audited — `RISCV_REMOTE_WAKE=D_REMOTE_ENQUEUE_UNREACHABLE_UNDER_CURRENT_TOPOLOGY`.**
    Audit only; nothing implemented, flipped or re-homed. The intended chain (committed
@@ -594,7 +600,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    hard-stops on `probe_extension(0x735049)`, `-smp 1` byte-identity, no user code on hart 1, and
    a healthy service chain at `online_cpus=2`. `stage199d_riscv_remote_wake_readiness` (13 tests)
    computes the classification from architecture-scoped seam probes. Ledger unchanged at
-   40 / 6 / 46; coordinate 23 stays OPEN. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.20.
+   39 / 7 / 46; coordinate 23 stays OPEN. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.20.
    **Blocker-3 link 7 is now structurally CLOSED — the trap-ready parked secondary.** Hart 1 owns
    a valid kernel execution/trap context and parks with every interrupt admission disabled: a
    validated, atomically-claimed logical `CpuId(1)`; the boot hart's live `satp` captured from its
@@ -617,7 +623,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    trap-stack top, `sie=0x0 sstatus_sie=0 ssie=0 stie=0 seie=0`, **`online_cpus` still 1**, no
    user/scheduler/timer work on hart 1, a healthy boot-hart service chain and no unexpected trap.
    **Link 2 remains absent**, so `RISCV_REMOTE_WAKE` stays **D**, `RISCV_199D_READINESS` stays
-   `case_b`, coordinate 23 stays OPEN and the ledger stays 40 / 6 / 46. See §6.1.21.
+   `case_b`, coordinate 23 stays OPEN and the ledger stays 39 / 7 / 46. See §6.1.21.
    **Chain link 2 is now CLOSED — CPU 1 is scheduler-online, WAKE-ONLY.** The pre-audit found the
    tree already represents the required state through the **generic** mechanism x86_64 (183.5) and
    AArch64 (195D) use — no hard-stop, no RISC-V-private scheduler, no second bitmap. The decisive
@@ -645,7 +651,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    **Links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent.** The earliest missing link is now 1 — no
    RISC-V task is pinned to a non-boot CPU — so `RISCV_REMOTE_WAKE` stays **D**,
    `RISCV_199D_READINESS` stays `case_b`, coordinate 23 stays OPEN and the ledger stays
-   40 / 6 / 46. See §6.1.22.
+   39 / 7 / 46. See §6.1.22.
    **Chain link 1 HARD-STOPPED — no code written, link 1 remains ABSENT.** The pre-audit found
    conditions 1–4 satisfiable (the existing oracle already spawns a disposable child server that
    runs on CPU 0 and parks in the exact NR6 waiter state; `set_task_home_cpu` is arch-neutral; and
@@ -666,7 +672,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    to it is missing. Splitting into link 1A/1B does not help: retirement blocks NR6 and NR7
    identically. Chain unchanged — links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent;
    `RISCV_REMOTE_WAKE` recomputes to **D**; `RISCV_199D_READINESS` stays `case_b`; coordinate 23
-   stays OPEN; ledger stays 40 / 6 / 46; `probe_extension(0x735049)` still uncalled.
+   stays OPEN; ledger stays 39 / 7 / 46; `probe_extension(0x735049)` still uncalled.
    See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.23.
 
    **The generic non-dispatching runqueue-withdrawal foundation is CLOSED — link 1 is still
@@ -696,7 +702,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    caller outside the scheduler, its wrapper and tests. Chain unchanged — links 2, 3, 7, 9 present;
    1, 4, 5, 6, 8, 10 absent; `RISCV_REMOTE_WAKE` stays **D**; `RISCV_199D_READINESS` stays
    `case_b`; coordinate 23 stays OPEN; **no live cell and no QEMU seal**; ledger stays
-   40 / 6 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.24.
+   39 / 7 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.24.
 
    **RISC-V chain link 1 (NR6) HARD-STOPS on wake-only placement — link 1 remains ABSENT.** The
    requested proof needs CPU 1 to be **online**, **wake-only** and holding the server **queued
@@ -726,7 +732,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    reachability is NOT live-proved**; the NR6 blocker applies to it identically. Chain unchanged —
    links 2, 3, 7, 9 present; 1, 4, 5, 6, 8, 10 absent; `RISCV_REMOTE_WAKE` recomputes to **D**;
    `RISCV_199D_READINESS` stays `case_b`; coordinate 23 stays OPEN; **no new canonical live cell**;
-   ledger stays 40 / 6 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.25.
+   ledger stays 39 / 7 / 46. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.25.
 
    **The false-success enqueue contract is REPAIRED.** §6.1.25's second finding, closed — no
    production predicate, no wake-only change, no RISC-V status change.
@@ -755,7 +761,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    `a_stale_home_cpu_fails_closed` had asserted `assert_eq!(target, bogus)` beside "and nothing is
    queued there", the defect written down as if correct. RISC-V status recomputes unchanged: link 1
    ABSENT, links 2/3/7/9 present, 4/5/6/8/10 absent, `RISCV_REMOTE_WAKE` **D**,
-   `RISCV_199D_READINESS` `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live cell, and
+   `RISCV_199D_READINESS` `case_b`, coordinate 23 OPEN, ledger 39 / 7 / 46, no new live cell, and
    the withdrawal foundation still unwired. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.26.
 
    **The two unsound enqueue-REJECTION contracts §6.1.26 shipped are REPAIRED.**
@@ -793,7 +799,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    remaining rejected. Three mutations were run and all three now fail behaviourally (the
    reverse-link one was structural-only until a link-count assertion was added). RISC-V status
    recomputes unchanged: link 1 ABSENT, 2/3/7/9 present, 4/5/6/8/10 absent, `RISCV_REMOTE_WAKE`
-   **D**, `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live cell. The withdrawal
+   **D**, `case_b`, coordinate 23 OPEN, ledger 39 / 7 / 46, no new live cell. The withdrawal
    foundation is now consumed by exactly one caller — that reconciliation — and by no oracle,
    no RISC-V path and no link-1 work. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.27.
 
@@ -832,7 +838,7 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    closed with **zero mutation**. Behavioural tests cover `WakeOnly`, `QueueFull` and
    `AlreadyQueued` as exactly-once/current/duplicate, each proving pre-existing membership is
    untouched. RISC-V status recomputes unchanged: link 1 ABSENT, 2/3/7/9 present, 4/5/6/8/10
-   absent, `RISCV_REMOTE_WAKE` **D**, `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live
+   absent, `RISCV_REMOTE_WAKE` **D**, `case_b`, coordinate 23 OPEN, ledger 39 / 7 / 46, no new live
    cell. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.28.
 
    **`WAITER_OWNERSHIP_EXCLUSIVE=no` — the waiter-claim reorder is HARD-STOPPED; the
@@ -866,6 +872,33 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    caller, the exact waiter, the record `Available` at the same generation and the exact replier
    reverse link, retries once and still rejects a duplicate, with **no timeout dependency**. The
    accepted §6.1.28 composed restore is preserved. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.29.
+
+   **WA1-GATE: the x86 direct production default is OFF, and §6.1.29's reachability claim is
+   RETRACTED.** That claim ("today's direct-eligible population is narrower than the ordinary
+   timeout mechanism") rested on a grep for `ipc_timeout_deadline = Some(...)`, which found only
+   the reply-receive timeout. A complete audit of `ipc_timeout_deadline\s*=` finds **seven**
+   assignments, three of which arm an ordinary deadline by assigning a variable —
+   `recv_block_phase_b_task` (`Blocked(EndpointReceive)`), its send-block twin
+   (`Blocked(EndpointSend)`) and the queued-recv block path — **none** with a
+   `reply_timeout_token`. So ordinary recv/send deadlines are independent of the reply-terminal
+   arbitration that gates direct NR7 eligibility, `process_ipc_timeout_deadlines` can genuinely
+   race an endpoint-blocked receiver mid-publication, and this is a **reachable production safety
+   issue**, not a mechanism-level concern. `WAITER_OWNERSHIP_EXCLUSIVE` stays **no**.
+   `ipccall_direct_production_enabled()` therefore returns `false` on every architecture; its
+   body is exactly `false`, with no `target_arch`, `cfg!`, `||` or atomic load that could
+   silently restore it. Admission is unchanged in form and is now exactly the proof gate: with
+   the selector clear, ordinary NR6/NR7 reach neither the direct transaction nor the
+   blocked-waiter acknowledgement and fall back to the legacy path; with it set, both are
+   reachable. Every explicit proof/oracle selector survives verbatim.
+   `AlreadyQueued + Removed` now fails closed on every freestanding runtime build including the
+   proof kernels — `Removed` proves current queue state, not historical non-observation — while
+   hosted `cfg(test)` builds keep exercising the rollback algebra. The `0b5ec254` seal is **not**
+   re-emitted with changed semantics; a distinct `IPC_DIRECT_PRODUCTION_DISABLED_SEAL` is added,
+   computed from the authoritative `REQUEST.completed` / `REPLY.completed` counters rather than
+   inferred from absent user logs. Ledger reconciled to **39 / 7 / 46** (exactly one cell moved;
+   no new live cell). Canonical 199D **OPEN**; waiter-claim-aware timeout arbitration and
+   generation-bearing notification arbitration **not implemented**; RISC-V links/status
+   unchanged. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.30.
 
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.

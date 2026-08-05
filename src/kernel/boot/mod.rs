@@ -3193,8 +3193,26 @@ pub fn ipccall_direct_proof_enabled() -> bool {
 /// **Future canonical 199E work:** porting the reply-win terminal lease into the direct NR7
 /// transaction, which would let the arbitrated population go off-lock too. Until then those
 /// replies take the legacy path by design, counted as `declined_terminal_arbitration`.
+/// ─── Stage 199D-WA1-GATE: the x86_64 production DEFAULT is DISABLED ────────────────────────
+///
+/// `WAITER_OWNERSHIP_EXCLUSIVE=no`, and the reachability is REAL, not mechanism-level. The
+/// direct NR6/NR7 transactions publish the reply record, the provisional server-local reply cap
+/// and the receiver's user memory BEFORE claiming the endpoint waiter, and
+/// `process_ipc_timeout_deadlines` wakes a `Blocked(EndpointReceive)` task at task rank before
+/// invalidating its waiter at ipc rank — so it cannot lose to a claim it never consults.
+///
+/// Ordinary recv/send deadlines are armed by `recv_block_phase_b_task`, its send-block twin and
+/// the queued-recv block path, all of which set `ipc_timeout_deadline` **without** a
+/// `reply_timeout_token`. They are therefore fully independent of the reply-terminal
+/// arbitration that gates direct NR7 eligibility. The notification signal wake never consults
+/// the endpoint waiter at all. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.30.
+///
+/// This is a GATE, not a retraction. Every explicit proof/oracle selector is untouched:
+/// `ipccall_direct_admission_enabled()` still admits NR6/NR7 whenever
+/// `ipccall_direct_proof_enabled()` is armed, so every knob-gated mechanism seal stays
+/// reproducible. Ordinary traffic falls back to the accepted legacy path.
 pub const fn ipccall_direct_production_enabled() -> bool {
-    cfg!(target_arch = "x86_64")
+    false
 }
 
 /// True iff NR6/NR7 may be admitted to the split dispatcher at all.

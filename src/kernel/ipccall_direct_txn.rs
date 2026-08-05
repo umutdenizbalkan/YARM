@@ -558,7 +558,7 @@ impl SharedKernel {
                     else {
                         unreachable!("Enqueued was matched above")
                     };
-                    if !outcome.receiver_is_unplaced() {
+                    if !outcome.rejection_is_runtime_recoverable() {
                         let _ = self.unregister_server_reply_link_split(
                             ack.server.tid.0,
                             ack.server.asid,
@@ -889,7 +889,7 @@ impl SharedKernel {
                     else {
                         unreachable!("Enqueued was matched above")
                     };
-                    if !outcome.receiver_is_unplaced() {
+                    if !outcome.rejection_is_runtime_recoverable() {
                         lease.discard();
                         crate::yarm_log!(
                             "IPC_DIRECT_REPLY_ENQUEUE_UNRECONCILED caller_tid={} record_index={} error={:?} membership={:?} authority_restored=0 result=failed_closed",

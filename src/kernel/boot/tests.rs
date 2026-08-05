@@ -52823,8 +52823,7 @@ mod stage167_d6_genuine {
             "Stage 182: the D6_GENUINE AtomicBool + setter must be deleted"
         );
         assert!(
-            MOD_SRC.contains("fn d6_genuine_enabled() -> bool")
-                && MOD_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            MOD_SRC.contains("fn d6_genuine_enabled() -> bool") && MOD_SRC.contains("false"),
             "d6_genuine_enabled must be a compile-time cfg accessor"
         );
     }
@@ -57303,7 +57302,7 @@ mod stage181_graduate_knobs {
         }
         // The accessors are compile-time (cfg-based), not AtomicBool loads.
         assert!(
-            MOD_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            MOD_SRC.contains("false"),
             "seam gates must be compile-time cfg constants after Stage 182"
         );
     }
@@ -58011,8 +58010,7 @@ mod stage182_remove_fallbacks {
             assert!(!MOD_SRC.contains(gone), "Stage 182 must delete: {gone}");
         }
         assert!(
-            MOD_SRC.contains("fn d6_genuine_enabled() -> bool")
-                && MOD_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            MOD_SRC.contains("fn d6_genuine_enabled() -> bool") && MOD_SRC.contains("false"),
             "the seam gate must be a compile-time cfg accessor"
         );
     }
@@ -58182,7 +58180,7 @@ mod stage183_smp_live {
             .unwrap_or(rest.len());
         let body = &rest[..end.min(rest.len())];
         assert!(
-            body.contains("cfg!(target_arch = \"x86_64\")")
+            body.contains("false")
                 && body.contains("present_cpu_bitmap().count_ones()")
                 && body.contains("X86_SMP_UNLOCK_AUDIT_STARTED"),
             "audit must be x86_64 + present>1 gated + one-shot"
@@ -79408,7 +79406,7 @@ mod stage199a2b4_live_oracle_guards {
         // The arch split itself: x86_64 is unconditional, other arches keep the oracle test.
         assert!(
             MOD_SRC.contains("pub const fn ipccall_direct_production_enabled() -> bool {")
-                && MOD_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+                && MOD_SRC.contains("false"),
             "production admission is a compile-time x86_64 constant, not a runtime knob"
         );
         for predicate in [
@@ -79608,7 +79606,7 @@ mod stage199a2c1_aarch64_guards {
             "the canonical admission predicate remains production || proof"
         );
         assert!(
-            BOOT_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            BOOT_SRC.contains("false"),
             "production default remains x86_64-only, so AArch64 stays OFF"
         );
     }
@@ -83499,7 +83497,7 @@ mod stage199d_production_default_guards {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "false",
             "the whole condition is the target architecture: x86_64 is production-default, \
              every other architecture is not"
         );
@@ -83569,9 +83567,23 @@ mod stage199d_production_default_guards {
                 && doc.contains("boots are byte-identical"),
             "the record states that no other architecture was ported"
         );
-        assert!(crate::kernel::boot::ipccall_direct_production_enabled());
-        assert!(crate::kernel::boot::ipccall_direct_admission_enabled());
+        // Stage 199D-WA1-GATE: repointed — the default is OFF while
+        // WAITER_OWNERSHIP_EXCLUSIVE=no, and the explicit proof gate is what admits NR6/NR7.
+        assert!(!crate::kernel::boot::ipccall_direct_production_enabled());
+        // With production off, admission and publication are EXACTLY the proof gate — the
+        // ordinary configuration reaches neither, and the explicit selector reaches both.
+        crate::kernel::boot::set_ipccall_direct_proof_enabled(false);
+        assert!(
+            !crate::kernel::boot::ipccall_direct_admission_enabled(),
+            "ordinary production configuration must not reach direct NR6/NR7"
+        );
+        crate::kernel::boot::set_ipccall_direct_proof_enabled(true);
+        assert!(
+            crate::kernel::boot::ipccall_direct_admission_enabled(),
+            "the explicit proof selector still reaches both directions"
+        );
         assert!(crate::kernel::boot::ipccall_direct_publication_enabled());
+        crate::kernel::boot::set_ipccall_direct_proof_enabled(false);
     }
 
     /// Endpoint admission is the ARCH-SPLIT predicate, never an oracle endpoint list: it is
@@ -104448,7 +104460,7 @@ mod stage199d_aarch64_readiness_audit {
             .expect("body bounded");
         assert_eq!(
             body.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "false",
             "AArch64 stays off until its blockers are closed"
         );
         assert!(
@@ -104901,7 +104913,7 @@ mod stage199d_split_return_without_broad_lock {
             .split("\n}\n")
             .next()
             .expect("body bounded");
-        assert_eq!(body.trim(), "cfg!(target_arch = \"x86_64\")");
+        assert_eq!(body.trim(), "false");
     }
 }
 
@@ -105623,7 +105635,14 @@ mod stage199d_aarch64_offlock_dispatch {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
+        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
+        // the disabled predicate just as exactly as it pinned the enabled one.
+        assert_eq!(production.trim(), "false");
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "the predicate is false on every architecture"
+        );
         assert_eq!(
             crate::kernel::boot::offlock_authoritative_dispatch_enabled(),
             crate::kernel::boot::d6_genuine_enabled()
@@ -107196,7 +107215,7 @@ mod stage199d_closure_matrix {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "false",
             "x86_64 ON, every other architecture OFF"
         );
     }
@@ -107307,21 +107326,23 @@ mod stage199d_live_evidence_ledger {
     /// can be quoted as if it were the other.
     #[test]
     fn total_including_knob_gated_is_forty_six() {
-        assert_eq!(production_total() + knob_gated_total(), 46, "40 + 6");
+        assert_eq!(production_total() + knob_gated_total(), 46, "39 + 7");
     }
 
-    /// The document quotes exactly these figures — 40 production-path, 46 including knob-gated,
-    /// with 39 preserved only as the superseded pre-production subtotal.
+    /// The document quotes exactly these figures. Stage 199D-WA1-GATE moved the one direct-IPC
+    /// production cell out of the current-production bucket, so the CURRENT figures are
+    /// 39 / 7 / 46; the historical total is unchanged and no cell was retracted.
     #[test]
     fn the_status_ledger_quotes_the_computed_figures() {
         assert!(
-            STATUS
-                .contains("| **Accepted total (production-path)** | **40** | 30 + 6 + 2 + 1 + 1 |"),
-            "STATUS must record the production-path total as 40 with its arithmetic"
+            STATUS.contains(
+                "| **Current production-path total** | **39** | 30 + 6 + 2 + 1 — the direct-IPC production cell moved out at Stage 199D-WA1-GATE |"
+            ),
+            "STATUS must record the current production-path total as 39 with its arithmetic"
         );
         assert!(
             STATUS.contains(
-                "| **Total including knob-gated mechanism evidence** | **46** | 40 + 6 |"
+                "| **Historical total** | **46** | 39 + 7 — unchanged; nothing is retracted and no new live cell is earned |"
             ),
             "STATUS must record the combined total as 46 with its arithmetic"
         );
@@ -108591,7 +108612,14 @@ mod stage199d_riscv_narrow_trap_snapshots {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
+        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
+        // the disabled predicate just as exactly as it pinned the enabled one.
+        assert_eq!(production.trim(), "false");
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "the predicate is false on every architecture"
+        );
     }
 
     /// **Coordinate 23 stays OPEN, but case C's decisive blocker is closed.** Closing the
@@ -108779,7 +108807,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "false",
             "production is x86_64-only, so it is compile-time false on RISC-V"
         );
         assert!(
@@ -108823,7 +108851,7 @@ mod stage199d_riscv_canonical_admission {
             .expect("the production predicate");
         assert_eq!(
             production.trim(),
-            "cfg!(target_arch = \"x86_64\")",
+            "false",
             "production is x86_64-only, so on RISC-V admission adds no term beyond proof"
         );
     }
@@ -108943,7 +108971,14 @@ mod stage199d_riscv_canonical_admission {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
+        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
+        // the disabled predicate just as exactly as it pinned the enabled one.
+        assert_eq!(production.trim(), "false");
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "the predicate is false on every architecture"
+        );
         let admission = MOD_SRC
             .split("pub fn ipccall_direct_admission_enabled() -> bool {")
             .nth(1)
@@ -109483,7 +109518,14 @@ mod stage199d_riscv_remote_wake_readiness {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
+        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
+        // the disabled predicate just as exactly as it pinned the enabled one.
+        assert_eq!(production.trim(), "false");
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "the predicate is false on every architecture"
+        );
     }
 
     /// The audit document records the computed verdict and the live topology evidence.
@@ -110152,7 +110194,14 @@ mod stage199d_riscv_link2_wake_only_online {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
+        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
+        // the disabled predicate just as exactly as it pinned the enabled one.
+        assert_eq!(production.trim(), "false");
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "the predicate is false on every architecture"
+        );
     }
 }
 
@@ -110584,7 +110633,14 @@ mod stage199d_runqueue_withdrawal_foundation {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
+        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
+        // the disabled predicate just as exactly as it pinned the enabled one.
+        assert_eq!(production.trim(), "false");
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "the predicate is false on every architecture"
+        );
     }
 }
 
@@ -110897,7 +110953,14 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("the production predicate");
-        assert_eq!(production.trim(), "cfg!(target_arch = \"x86_64\")");
+        // Stage 199D-WA1-GATE: the x86_64 production DEFAULT is OFF while
+        // WAITER_OWNERSHIP_EXCLUSIVE=no. This guard is REPOINTED, not weakened — it now pins
+        // the disabled predicate just as exactly as it pinned the enabled one.
+        assert_eq!(production.trim(), "false");
+        assert!(
+            !crate::kernel::boot::ipccall_direct_production_enabled(),
+            "the predicate is false on every architecture"
+        );
     }
 }
 
@@ -111123,7 +111186,7 @@ mod stage199d_receiver_enqueue_outcome {
         // for a rejection, and only one returns a CPU at all.
         assert_eq!(
             body.matches("pub(crate) fn ").count(),
-            2,
+            3,
             "an unexpected accessor is how a rejection would leak a CPU: {body}"
         );
         assert_eq!(
@@ -111794,7 +111857,8 @@ mod stage199d_shared_region_enqueue_rejection {
     fn a_post_copy_membership_detection_is_never_retryable() {
         // Both directions gate the recovery on the one predicate…
         assert_eq!(
-            TXN.matches("if !outcome.receiver_is_unplaced() {").count(),
+            TXN.matches("if !outcome.rejection_is_runtime_recoverable() {")
+                .count(),
             2,
             "NR6 and NR7 both fail closed unless the receiver is provably unplaced"
         );
@@ -112011,6 +112075,235 @@ mod stage199d_waiter_ownership_exclusivity_audit {
             TXN.matches("sr_claim_endpoint_waiter_split(").count(),
             2,
             "one claim in NR6, one in NR7"
+        );
+    }
+}
+
+/// Stage 199D-WA1-GATE — the corrected ordinary-timeout reachability record, and the gate.
+mod stage199d_wa1_gate {
+    use super::*;
+
+    const IPC_STATE: &str = include_str!("ipc_state.rs");
+    const MODRS: &str = include_str!("mod.rs");
+    const AUDIT: &str = include_str!("../../../doc/KERNEL_UNLOCK_AUDIT.md");
+    const STATUS: &str = include_str!("../../../doc/STATUS.md");
+
+    /// **The `= Some` grep error, pinned so it cannot recur.** §6.1.29 claimed the ordinary
+    /// timeout mechanism was unreachable for the direct-eligible population because "the only
+    /// site that arms `ipc_timeout_deadline` also arms `reply_timeout_token`". That was found
+    /// by grepping `= Some(...)` and missed three sites that assign a variable.
+    ///
+    /// This enumerates EVERY assignment, so an audit cannot repeat the mistake.
+    #[test]
+    fn every_ipc_timeout_deadline_assignment_site_is_enumerated() {
+        let sites: alloc::vec::Vec<&str> = IPC_STATE
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| {
+                let Some(rest) = l.split("ipc_timeout_deadline").nth(1) else {
+                    return false;
+                };
+                let rest = rest.trim_start();
+                rest.starts_with('=') && !rest.starts_with("==")
+            })
+            .collect();
+        assert_eq!(
+            sites,
+            alloc::vec![
+                "tcb.ipc_timeout_deadline = None;",
+                "tcb.ipc_timeout_deadline = Some(deadline_tick);",
+                "tcb.ipc_timeout_deadline = None;",
+                "tcb.ipc_timeout_deadline = deadline;",
+                "tcb.ipc_timeout_deadline = deadline;",
+                "tcb.ipc_timeout_deadline = None;",
+                "tcb.ipc_timeout_deadline = deadline;",
+            ],
+            "an assignment site appeared or vanished — re-audit reachability before trusting \
+             any exclusivity claim"
+        );
+        // THREE ordinary arm sites assign a variable, not `Some(...)`. Each blocks the task on
+        // an ENDPOINT wait reason and none of them arms a reply-timeout token.
+        let variable_arms = sites
+            .iter()
+            .filter(|l| **l == "tcb.ipc_timeout_deadline = deadline;")
+            .count();
+        assert_eq!(
+            variable_arms, 3,
+            "the three ordinary recv/send/queued-recv arms"
+        );
+        for owner in [
+            "fn recv_block_phase_b_task(",
+            "TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));",
+            "TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));",
+        ] {
+            assert!(
+                IPC_STATE.contains(owner),
+                "ordinary arm owner `{owner}` is present"
+            );
+        }
+    }
+
+    /// The corrected conclusion is recorded, and the retracted one is gone.
+    #[test]
+    fn the_reachability_correction_is_recorded() {
+        assert!(
+            AUDIT.contains("WAITER_OWNERSHIP_EXCLUSIVE=no"),
+            "the verdict stands"
+        );
+        assert!(
+            AUDIT.contains("reachable production safety issue"),
+            "the corrected conclusion must be stated"
+        );
+        assert!(
+            !AUDIT.contains("Reachability for *today's* direct-eligible populations is narrower"),
+            "the retracted §6.1.29 hedge must be deleted, not merely annotated"
+        );
+    }
+
+    // ── The gate ────────────────────────────────────────────────────────────────────────────
+
+    /// Ordinary production configuration reaches NEITHER direction; the explicit selector
+    /// reaches BOTH. Behavioural, driven through the real predicates.
+    #[test]
+    fn ordinary_production_cannot_reach_direct_nr6_or_nr7() {
+        use crate::kernel::boot::*;
+        assert!(!ipccall_direct_production_enabled());
+        set_ipccall_direct_proof_enabled(false);
+        assert!(
+            !ipccall_direct_admission_enabled(),
+            "ordinary configuration must not reach direct NR6/NR7"
+        );
+        assert!(
+            !ipccall_direct_publication_enabled(),
+            "…and must publish no blocked-waiter acknowledgement"
+        );
+        set_ipccall_direct_proof_enabled(true);
+        assert!(
+            ipccall_direct_admission_enabled() && ipccall_direct_publication_enabled(),
+            "the explicit proof/oracle selector still reaches both directions"
+        );
+        set_ipccall_direct_proof_enabled(false);
+    }
+
+    /// No architecture-specific OR branch or selector silently restores the default.
+    #[test]
+    fn no_branch_silently_restores_the_production_default() {
+        let body = MODRS
+            .split("pub const fn ipccall_direct_production_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("the predicate");
+        assert_eq!(body.trim(), "false", "the whole body is `false`");
+        for forbidden in ["target_arch", "cfg!", "||", "&&", "load(", "enabled()"] {
+            assert!(
+                !body.contains(forbidden),
+                "the predicate must carry no `{forbidden}` term"
+            );
+        }
+        // Admission is exactly the proof gate now.
+        let adm = MODRS
+            .split("pub fn ipccall_direct_admission_enabled() -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("admission");
+        assert_eq!(
+            adm.trim(),
+            "ipccall_direct_production_enabled() || ipccall_direct_proof_enabled()",
+            "admission is unchanged in form; only its production term went false"
+        );
+    }
+
+    /// The proof/oracle selectors are preserved verbatim — not renamed, merged or broadened.
+    #[test]
+    fn every_explicit_proof_selector_is_preserved() {
+        for selector in [
+            "pub fn ipccall_direct_proof_enabled() -> bool {",
+            "pub fn x86_ipccall_direct_oracle_enabled() -> bool {",
+            "pub fn aarch64_ipccall_direct_oracle_enabled() -> bool {",
+            "pub fn riscv_ipccall_direct_oracle_enabled() -> bool {",
+            "pub fn ipccall_direct_oracle_enabled() -> bool {",
+        ] {
+            assert!(
+                MODRS.contains(selector),
+                "selector `{selector}` must survive"
+            );
+        }
+    }
+
+    /// `AlreadyQueued + Removed` fails closed on every non-test runtime build.
+    #[test]
+    fn already_queued_removed_fails_closed_outside_tests() {
+        const RUNTIME: &str = include_str!("../../runtime.rs");
+        let body = RUNTIME
+            .split("pub(crate) fn rejection_is_runtime_recoverable(self) -> bool {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("the runtime-recoverable predicate");
+        assert!(
+            body.contains("error: SchedulerError::AlreadyQueued,")
+                && body.contains("} => cfg!(test) && self.receiver_is_unplaced(),"),
+            "AlreadyQueued is recoverable only under cfg(test): {body}"
+        );
+        // The four never-touched-a-runqueue reasons keep their existing policy.
+        assert!(
+            body.contains("ReceiverEnqueue::Rejected { .. } => self.receiver_is_unplaced(),"),
+            "the four provably-unplaced reasons are unchanged"
+        );
+        // Both transactions gate on it.
+        const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+        assert_eq!(
+            TXN.matches("if !outcome.rejection_is_runtime_recoverable() {")
+                .count(),
+            2,
+            "NR6 and NR7"
+        );
+    }
+
+    // ── Evidence and ledger ─────────────────────────────────────────────────────────────────
+
+    /// The old production-ON seal is not re-emitted with changed semantics; a DISTINCT
+    /// current-state seal is, computed from the authoritative counters.
+    #[test]
+    fn the_current_state_seal_is_distinct_and_counter_derived() {
+        const COUNTERS: &str = include_str!("../direct_ipc_counters.rs");
+        assert!(
+            COUNTERS.contains("IPC_DIRECT_PRODUCTION_DISABLED_SEAL production_enabled={} ordinary_nr6_direct={} ordinary_nr7_direct={} proof_nr6_available={} proof_nr7_available={} result={}"),
+            "the distinct current-state seal must exist"
+        );
+        assert!(
+            COUNTERS.contains("let ordinary_nr6 = REQUEST.completed.load(Ordering::Relaxed);")
+                && COUNTERS.contains("let ordinary_nr7 = REPLY.completed.load(Ordering::Relaxed);"),
+            "…derived from the authoritative completed-transaction counters, not absent logs"
+        );
+        // The historical seal keeps its exact original text.
+        assert!(
+            COUNTERS.contains(
+                "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok={} nr7_ok={} census_ok={} result={}"
+            ),
+            "the pre-existing quiescent seal is untouched"
+        );
+    }
+
+    /// The ledger is 39 / 7 / 46, and the seventh non-production cell is described accurately.
+    #[test]
+    fn the_ledger_reconciles_to_thirty_nine_seven_forty_six() {
+        assert!(
+            STATUS.contains("39 production") || STATUS.contains("**39**"),
+            "current production is 39"
+        );
+        assert!(STATUS.contains("**7**"), "non-production evidence is 7");
+        assert!(
+            STATUS.contains("**46**"),
+            "the historical total is unchanged at 46"
+        );
+        assert!(
+            STATUS.contains("Originally earned UNDER the x86_64 production default"),
+            "the moved cell must not be described as earned under a proof knob"
+        );
+        assert!(
+            !STATUS.contains("40 / 6 / 46"),
+            "no stale 40/6/46 pin may survive"
         );
     }
 }

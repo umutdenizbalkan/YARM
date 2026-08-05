@@ -426,6 +426,34 @@ pub(crate) fn maybe_emit_quiescent_attestation(
         None => Default::default(),
     };
     let census_ok = emit_census("nr6", nr6_bij) & emit_census("nr7", nr7_bij);
+    // ─── Stage 199D-WA1-GATE: the CURRENT-STATE seal ────────────────────────────────────
+    //
+    // The `0b5ec254` production-ON seal remains valid HISTORICAL evidence that the x86
+    // production default once ran NR6 and NR7 off-lock; it is not evidence about the current
+    // configuration, and it is not re-emitted with changed semantics. This distinct seal
+    // attests what is true NOW, from the same authoritative per-direction counters — not from
+    // absent user logs. `ordinary_nr*_direct` is the completed-transaction count, which is
+    // zero on an ordinary boot precisely because the production predicate is false and every
+    // ordinary NR6/NR7 falls back to the legacy path.
+    {
+        let production_enabled = crate::kernel::boot::ipccall_direct_production_enabled();
+        let ordinary_nr6 = REQUEST.completed.load(Ordering::Relaxed);
+        let ordinary_nr7 = REPLY.completed.load(Ordering::Relaxed);
+        // The proof/oracle mechanism must remain REACHABLE: admission is exactly the proof
+        // gate once production is off, so this reports the seam's availability, not traffic.
+        let proof_available = crate::kernel::boot::ipccall_direct_admission_enabled()
+            || crate::kernel::boot::ipccall_direct_proof_enabled();
+        let ordinary_clean = !production_enabled && ordinary_nr6 == 0 && ordinary_nr7 == 0;
+        crate::yarm_log!(
+            "IPC_DIRECT_PRODUCTION_DISABLED_SEAL production_enabled={} ordinary_nr6_direct={} ordinary_nr7_direct={} proof_nr6_available={} proof_nr7_available={} result={}",
+            u8::from(production_enabled),
+            ordinary_nr6,
+            ordinary_nr7,
+            u8::from(proof_available),
+            u8::from(proof_available),
+            if ordinary_clean { "ok" } else { "fail" },
+        );
+    }
     crate::yarm_log!(
         "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok={} nr7_ok={} census_ok={} result={}",
         nr6.ok() as u8,

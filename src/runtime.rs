@@ -5445,6 +5445,31 @@ impl ReceiverEnqueue {
     /// same-acquisition reconciliation removed exactly one queued entry. `RefusedCurrent`
     /// (the receiver is dispatched — it may already have observed the publication),
     /// `RefusedDuplicate`, `NotQueued` and `InvalidCpu` are ambiguous and fail closed.
+    /// Stage 199D-WA1-GATE — may a rejection yield **retryable runtime authority**?
+    ///
+    /// Strictly narrower than [`Self::receiver_is_unplaced`]. The four reasons that provably
+    /// fail before touching a runqueue keep their existing policy. `AlreadyQueued` + `Removed`
+    /// does **not**: `Removed` proves only that one queued entry was removed under the
+    /// detecting scheduler acquisition — it does **not** prove the receiver never ran, nor that
+    /// it never observed an earlier publication, while waiter ownership is non-exclusive
+    /// (`WAITER_OWNERSHIP_EXCLUSIVE=no`). On every freestanding runtime build — including the
+    /// explicit proof/oracle kernels — it therefore takes the terminal, fail-closed path.
+    ///
+    /// Hosted `#[cfg(test)]` builds keep exercising the rollback algebra directly, so the
+    /// recovery path stays covered without any freestanding runtime decision depending on
+    /// `Removed` being historically unobserved.
+    pub(crate) fn rejection_is_runtime_recoverable(self) -> bool {
+        use crate::kernel::scheduler::SchedulerError;
+        match self {
+            ReceiverEnqueue::Enqueued { .. } => false,
+            ReceiverEnqueue::Rejected {
+                error: SchedulerError::AlreadyQueued,
+                ..
+            } => cfg!(test) && self.receiver_is_unplaced(),
+            ReceiverEnqueue::Rejected { .. } => self.receiver_is_unplaced(),
+        }
+    }
+
     pub(crate) fn receiver_is_unplaced(self) -> bool {
         use crate::kernel::scheduler::{SchedulerError, WithdrawOutcome};
         match self {
