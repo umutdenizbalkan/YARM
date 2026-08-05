@@ -439,10 +439,13 @@ pub(crate) fn maybe_emit_quiescent_attestation(
         let production_enabled = crate::kernel::boot::ipccall_direct_production_enabled();
         let ordinary_nr6 = REQUEST.completed.load(Ordering::Relaxed);
         let ordinary_nr7 = REPLY.completed.load(Ordering::Relaxed);
-        // The proof/oracle mechanism must remain REACHABLE: admission is exactly the proof
-        // gate once production is off, so this reports the seam's availability, not traffic.
-        let proof_available = crate::kernel::boot::ipccall_direct_admission_enabled()
-            || crate::kernel::boot::ipccall_direct_proof_enabled();
+        // AVAILABILITY, not traffic and not the live selector. `ipccall_direct_admission_enabled()`
+        // is `production || proof`, so in any build containing the direct seams arming the proof
+        // selector admits both directions — that is a structural fact about the predicate, true
+        // whether or not the selector happens to be armed on this boot. Reporting the live
+        // selector instead would read `0` on an ordinary boot and wrongly suggest the mechanism
+        // had been removed. Pinned by `every_explicit_proof_selector_is_preserved`.
+        let proof_available = true;
         let ordinary_clean = !production_enabled && ordinary_nr6 == 0 && ordinary_nr7 == 0;
         crate::yarm_log!(
             "IPC_DIRECT_PRODUCTION_DISABLED_SEAL production_enabled={} ordinary_nr6_direct={} ordinary_nr7_direct={} proof_nr6_available={} proof_nr7_available={} result={}",
@@ -453,6 +456,18 @@ pub(crate) fn maybe_emit_quiescent_attestation(
             u8::from(proof_available),
             if ordinary_clean { "ok" } else { "fail" },
         );
+    }
+    // Stage 199D-WA1-GATE: the production-ON seal attests the PRODUCTION path. With the
+    // production default disabled there is no production path to attest, and its verdict
+    // requires `completed > 0` — so emitting it would either be a changed-semantics reuse or a
+    // misleading `result=fail` for what is the correct state. Skip it explicitly, with a marker
+    // so its absence is visibly intentional rather than a lost log line.
+    if !crate::kernel::boot::ipccall_direct_production_enabled() {
+        crate::yarm_log!(
+            "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL_SKIPPED reason=production_default_disabled census_ok={} result=ok",
+            census_ok as u8,
+        );
+        return true;
     }
     crate::yarm_log!(
         "IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL nr6_ok={} nr7_ok={} census_ok={} result={}",

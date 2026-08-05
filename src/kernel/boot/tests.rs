@@ -112276,6 +112276,13 @@ mod stage199d_wa1_gate {
                 && COUNTERS.contains("let ordinary_nr7 = REPLY.completed.load(Ordering::Relaxed);"),
             "…derived from the authoritative completed-transaction counters, not absent logs"
         );
+        // The production-ON seal is SKIPPED, not re-emitted with changed semantics, whenever
+        // there is no production path to attest — and its absence is marked, not silent.
+        assert!(
+            COUNTERS.contains("if !crate::kernel::boot::ipccall_direct_production_enabled() {")
+                && COUNTERS.contains("IPC_DIRECT_PRODUCTION_QUIESCENT_SEAL_SKIPPED reason=production_default_disabled"),
+            "the production-ON seal must be skipped with an explicit marker"
+        );
         // The historical seal keeps its exact original text.
         assert!(
             COUNTERS.contains(
