@@ -3648,6 +3648,50 @@ impl SharedKernel {
         })
     }
 
+    /// rank 3 — Stage 199D: `Consumed → Available`, restoring the EXACT one-shot reply
+    /// authority after a reply whose caller-enqueue was refused and provably never observed.
+    ///
+    /// This is the only route that re-arms a consumed record, and it is deliberately narrow:
+    ///
+    /// * the record slot must still be present at the **exact generation** the transaction
+    ///   owned, so a recycled slot can never be re-armed;
+    /// * it must still be bound to the **exact replier identity** (`{tid, asid}`) that consumed
+    ///   it, so no other replier can inherit the authority;
+    /// * it must be in `Consumed` — a `Cancelled` or already-`Available` record is refused,
+    ///   making the restore idempotent-safe and un-stackable.
+    ///
+    /// `consume_reply_record_split` closes the reverse link on the same edge, so the restore
+    /// re-registers it: the replier still owes that reply, exactly as before the transaction.
+    /// Returns `true` only when BOTH the record and the link are back.
+    ///
+    /// The caller must independently prove the caller task neither executed nor was enqueued —
+    /// this seam checks record identity, not task state.
+    pub(crate) fn restore_consumed_reply_record_split(
+        &self,
+        index: usize,
+        generation: u64,
+        replier: crate::kernel::boot::ReceiverWaiterIdentity,
+    ) -> bool {
+        use crate::kernel::boot::ReplyRecordReservation;
+        let restored = self.with_ipc_split_mut(|ipc| match ipc.reply_caps.get_mut(index) {
+            Some(Some(record))
+                if ipc.reply_cap_generations[index] == generation
+                    && record.reservation == ReplyRecordReservation::Consumed
+                    && record.responder_tid == Some(replier.tid)
+                    && record.replier_asid == Some(replier.asid) =>
+            {
+                record.reservation = ReplyRecordReservation::Available;
+                true
+            }
+            _ => false,
+        });
+        if !restored {
+            return false;
+        }
+        // The consume closed the reverse link; the replier owes the reply again.
+        self.register_server_reply_link_split(replier.tid.0, replier.asid, index, generation)
+    }
+
     /// rank 3 — discard a `Reserved` record for STALE authority (caller exited/replaced,
     /// endpoint/waiter drifted): transition `Reserved → Consumed` so the reply cap is
     /// permanently non-invokable (the physical cnode slot is reclaimed idempotently at
@@ -4027,8 +4071,38 @@ impl SharedKernel {
             let sm = kernel_mut(&mut sched.scheduler);
             match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {
                 Ok(()) => ReceiverEnqueue::Enqueued { cpu },
-                Err(error) => ReceiverEnqueue::Rejected { cpu, error },
+                // Pre-existing membership. Reconcile it HERE, still holding the rank-1 lock the
+                // collision was detected under — there is no unlock/relock window in which a
+                // dispatcher could take the entry between the two.
+                Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued) => {
+                    let reconciled = sm.withdraw_queued_tid_on(cpu, ThreadId(tid));
+                    ReceiverEnqueue::Rejected {
+                        cpu,
+                        error: crate::kernel::scheduler::SchedulerError::AlreadyQueued,
+                        reconciled: Some(reconciled),
+                    }
+                }
+                Err(error) => ReceiverEnqueue::Rejected {
+                    cpu,
+                    error,
+                    reconciled: None,
+                },
             }
+        })
+    }
+
+    /// rank 1 — Stage 199D: does `tid` hold ANY scheduler membership (queued or dispatched) on
+    /// any online CPU? Read-only.
+    ///
+    /// Used as a pre-commit preflight by the direct transactions: a receiver that is `Blocked`
+    /// with its endpoint waiter exclusively claimed cannot legitimately be in a run queue, and
+    /// nothing can wake it while that is true, so this check does not race. Declining here keeps
+    /// the dangerous `AlreadyQueued`-after-publication branch off the ordinary path entirely —
+    /// the branch remains, and fails closed, for a genuine invariant violation.
+    pub(crate) fn receiver_has_scheduler_membership_split_read(&self, tid: u64) -> bool {
+        use crate::kernel::ipc::ThreadId;
+        self.with_scheduler_split_mut(|sched| {
+            kernel_ref(&sched.scheduler).task_present_anywhere(ThreadId(tid))
         })
     }
 
@@ -4477,7 +4551,7 @@ impl SharedKernel {
                 // its own, so it keeps its `Some(true)` "wake attempted" contract and only
                 // attests the refusal; the direct NR6/NR7 paths are the ones that must not
                 // fabricate a target, and they consume the outcome.
-                if let ReceiverEnqueue::Rejected { cpu, error } =
+                if let ReceiverEnqueue::Rejected { cpu, error, .. } =
                     self.sr_enqueue_committed_receiver_split(snap.receiver_tid, affinity)
                 {
                     crate::yarm_log!(
@@ -5188,15 +5262,36 @@ pub(crate) struct WaiterClaim {
 /// **Load-bearing:** a `wake_target_cpu` may be read only out of `Enqueued`. `Rejected` carries
 /// the attempted CPU for diagnosis, and that CPU is deliberately not a wake target: nothing may
 /// IPI it, and no direct-IPC success object may name it.
+///
+/// **`Rejected` states only that THIS enqueue did not commit.** It deliberately makes no claim
+/// about where the TID is. Four of the five reasons do imply "no new placement was performed":
+/// `InvalidCpu`, `CpuOffline`, `WakeOnly` and `QueueFull` all fail before touching a queue.
+/// `AlreadyQueued` is the opposite — it reports **pre-existing scheduler membership**, and
+/// because `PriorityScheduler::contains_tid` reads the membership mirror, which tracks the
+/// queues *plus* the dispatched `current` task, it can mean the receiver is **executing right
+/// now**. Treating it as "nothing is queued" and running the ordinary
+/// `Runnable → Blocked` + waiter-restore rollback would produce a `Blocked` task that is still
+/// queued or current: a corrupt state, and a lie about what was restored.
+///
+/// So `AlreadyQueued` carries `reconciled`: the outcome of a
+/// [`SmpScheduler::withdraw_queued_tid_on`](crate::kernel::scheduler::SmpScheduler) performed
+/// inside the **same rank-1 acquisition** that detected the collision. There is no
+/// unlock/relock window between detection and reconciliation, so no dispatcher can take the
+/// entry in between. Only `WithdrawOutcome::Removed` — an atomically removed, exactly-one
+/// queued entry, which by construction was *not* `current` — may proceed to a rollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReceiverEnqueue {
     /// The enqueue SUCCEEDED. `cpu` is the run queue the receiver is now on.
     Enqueued { cpu: CpuId },
-    /// The enqueue was REFUSED and the receiver is in **no** run queue. `cpu` is what was
-    /// attempted, never what was achieved.
+    /// THIS enqueue did not commit. `cpu` is what was attempted, never what was achieved, and
+    /// `error` is the scheduler's own reason, preserved rather than collapsed.
+    ///
+    /// `reconciled` is `Some(..)` for `AlreadyQueued` only — the same-acquisition membership
+    /// reconciliation — and `None` for the four reasons that never touched a queue.
     Rejected {
         cpu: CpuId,
         error: crate::kernel::scheduler::SchedulerError,
+        reconciled: Option<crate::kernel::scheduler::WithdrawOutcome>,
     },
 }
 
@@ -5207,6 +5302,29 @@ impl ReceiverEnqueue {
         match self {
             ReceiverEnqueue::Enqueued { cpu } => Some(cpu),
             ReceiverEnqueue::Rejected { .. } => None,
+        }
+    }
+
+    /// True iff the receiver provably holds **no scheduler membership** as a result of this
+    /// enqueue — the precondition for the ordinary `Runnable → Blocked` + waiter-restore
+    /// rollback.
+    ///
+    /// The four non-membership reasons qualify unconditionally: they fail before touching any
+    /// queue, and the receiver was `Blocked` with its waiter exclusively claimed on entry, so
+    /// nothing else could have placed it. `AlreadyQueued` qualifies **only** when the
+    /// same-acquisition reconciliation removed exactly one queued entry. `RefusedCurrent`
+    /// (the receiver is dispatched — it may already have observed the publication),
+    /// `RefusedDuplicate`, `NotQueued` and `InvalidCpu` are ambiguous and fail closed.
+    pub(crate) fn receiver_is_unplaced(self) -> bool {
+        use crate::kernel::scheduler::{SchedulerError, WithdrawOutcome};
+        match self {
+            ReceiverEnqueue::Enqueued { .. } => false,
+            ReceiverEnqueue::Rejected {
+                error: SchedulerError::AlreadyQueued,
+                reconciled,
+                ..
+            } => reconciled == Some(WithdrawOutcome::Removed),
+            ReceiverEnqueue::Rejected { .. } => true,
         }
     }
 }

@@ -758,6 +758,45 @@ not installed here; both x86 cells pass (`timeout_wins=1 reply_wins=1 feature_of
    `RISCV_199D_READINESS` `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live cell, and
    the withdrawal foundation still unwired. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.26.
 
+   **The two unsound enqueue-REJECTION contracts §6.1.26 shipped are REPAIRED.**
+   **(A) `AlreadyQueued` is not "nothing is queued".** `Rejected` had documented itself as "the
+   receiver is in no run queue" — true for `InvalidCpu`/`CpuOffline`/`WakeOnly`/`QueueFull`, which
+   all fail before touching a queue, but false for `AlreadyQueued`, which reports *pre-existing*
+   membership. And because `contains_tid` reads the membership mirror, which tracks the queues
+   **plus the dispatched `current` task**, `AlreadyQueued` can mean the receiver is **executing**.
+   The ordinary rollback would then have produced a `Blocked` task that is still queued or current.
+   Fixed three ways: the reason now survives into the transaction error
+   (`EnqueueRejected(SchedulerError)`, not one information-free variant); on `AlreadyQueued` the
+   seam reconciles membership via `withdraw_queued_tid_on` **inside the same
+   `with_scheduler_split_mut` closure** that detected it — one acquisition only, never through
+   `self` — and carries the `WithdrawOutcome`; and only `Removed` (an atomically removed
+   exactly-one queued entry, by construction not `current`) may enter the TCB rollback.
+   `RefusedCurrent`/`RefusedDuplicate`/`NotQueued`/`InvalidCpu` fail closed via
+   `EnqueueRejectedUnreconciled`, reclaiming the authority while making **no** restoration claim.
+   The hard-stop window is *closed*, not argued: both transactions now run a pre-commit membership
+   preflight (NR6 9c, NR7 5c) — a still-`Blocked` receiver with its waiter exclusively claimed
+   cannot legitimately hold membership and nothing can wake it, so the check does not race — and
+   decline before the first irreversible mutation.
+   **(B) A direct-eligible NR7 has no timeout owner.** §6.1.26 justified leaving the caller
+   `Blocked` with the record `Consumed` by appealing to "the existing reply timeout". That was
+   false for exactly this population: `classify_direct_reply_eligibility` declines
+   `terminal_arbitrated` replies **before any mutation**, and that flag *means* a reply timeout is
+   armed — so every direct-eligible reply is untimed and the caller was stranded with no terminal
+   owner. The claim is deleted and **route A** implemented:
+   `restore_consumed_reply_record_split` returns the record `Consumed → Available` only at the
+   exact generation, bound to the exact replier `{tid, asid}`, and only from `Consumed`; the
+   reverse link the consume closed is re-registered; the ack lease is restored. Re-arming happens
+   only when the receiver is provably unplaced. Proved end-to-end for each reachable reason:
+   `Blocked` on the **exact original recv cap**, waiter restored once, neither queued nor current,
+   no success/marker/IPI, no cap/record/link leak — NR6 by re-running the same transaction to
+   success, NR7 by the restored authority retrying, succeeding exactly once, and a duplicate
+   remaining rejected. Three mutations were run and all three now fail behaviourally (the
+   reverse-link one was structural-only until a link-count assertion was added). RISC-V status
+   recomputes unchanged: link 1 ABSENT, 2/3/7/9 present, 4/5/6/8/10 absent, `RISCV_REMOTE_WAKE`
+   **D**, `case_b`, coordinate 23 OPEN, ledger 40 / 6 / 46, no new live cell. The withdrawal
+   foundation is now consumed by exactly one caller — that reconciliation — and by no oracle,
+   no RISC-V path and no link-1 work. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.27.
+
    `stage199d_riscv_canonical_admission` (11 tests) pins the
    contract. See `doc/KERNEL_UNLOCK_AUDIT.md` §6.1.19.
 3. **`d6_genuine_enabled()` is compile-time x86_64-only** — 203C blocked; AArch64 and

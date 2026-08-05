@@ -215,7 +215,9 @@ pub(crate) fn classify_direct_request_outcome(
         // written, and this file's standing rule is that anything past the copy line never
         // falls through. The kernel could not PLACE the wake — that is an internal condition,
         // not a userspace error.
-        IpcCallDirectError::RecordCommitFailed | IpcCallDirectError::EnqueueRejected => {
+        IpcCallDirectError::RecordCommitFailed
+        | IpcCallDirectError::EnqueueRejected(_)
+        | IpcCallDirectError::EnqueueRejectedUnreconciled(_) => {
             DirectDisposition::Failed(SyscallError::Internal)
         }
     }
@@ -268,7 +270,9 @@ pub(crate) fn classify_direct_reply_outcome(
         // Stage 199D: the record stays `Consumed` (one-shot spent, never re-armed) and the
         // caller is returned to Blocked with its waiter reinstalled, so nothing leaks and no
         // second reply is possible. Past the copy line, so never a fallback.
-        IpcReplyDirectError::RecordConsumeFailed | IpcReplyDirectError::EnqueueRejected => {
+        IpcReplyDirectError::RecordConsumeFailed
+        | IpcReplyDirectError::EnqueueRejected(_)
+        | IpcReplyDirectError::EnqueueRejectedUnreconciled(_) => {
             DirectDisposition::Failed(SyscallError::Internal)
         }
     }

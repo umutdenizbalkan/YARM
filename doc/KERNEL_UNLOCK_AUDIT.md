@@ -2638,6 +2638,9 @@ match sm.enqueue_on_with_priority(cpu, ThreadId(tid), priority) {
 }
 ```
 
+> **Partly unsound — corrected in §6.1.27.** `Rejected`'s documented meaning ("the receiver is in
+> no run queue") is false for `AlreadyQueued`, which reports *pre-existing* membership.
+
 `ReceiverEnqueue` adds no parallel taxonomy. The five distinctions the direct paths must tell
 apart are exactly `SchedulerError`'s — `InvalidCpu`, `CpuOffline`, `WakeOnly`, `QueueFull`,
 `AlreadyQueued` — so the outcome carries `SchedulerError` verbatim and adds only the one thing it
@@ -2695,8 +2698,13 @@ waiter were all genuinely returned.
 Un-consuming would re-arm a second reply, so the record stays `Consumed`, which is the same
 terminal the `CallerGone` arm uses (`discard_reply_record_split` *is* the consume). What is undone
 is the caller's own state: back to `Blocked` with its waiter reinstalled, so the existing reply
-timeout can still complete it. The lease is discarded, never restored. Strictly better than
-before, where the caller was left unschedulable *and* invisible to that timeout.
+timeout can still complete it. The lease is discarded, never restored.
+
+> **WRONG — corrected in §6.1.27.** There is no "existing reply timeout" for this population.
+> `classify_direct_reply_eligibility` declines `terminal_arbitrated` replies *before any
+> mutation*, and `terminal_arbitrated` means exactly "a reply timeout is armed for this record
+> incarnation" — so every direct-eligible reply is **untimed**. Leaving the caller `Blocked` with
+> the record spent stranded it with **no terminal owner at all**.
 
 The NR6 reverse-link-registration failure arm left the identical state and had the identical gap;
 it now runs the same shared rollback rather than a second, weaker one.
@@ -2721,6 +2729,98 @@ refused, task in no runqueue, and the seam must not answer `Enqueued { cpu: CpuI
 Three guards that pinned the old contract were **updated, not deleted** —
 `a_stale_home_cpu_fails_closed` had literally asserted `assert_eq!(target, bogus)` alongside "and
 nothing is queued there", which is the defect written down as if it were correct.
+
+
+### 6.1.27 The two unsound enqueue-rejection contracts — repaired
+
+§6.1.26 fixed the false-success contract but shipped two unsound rejection contracts. Both are
+closed here. No production predicate, no `wake_only` policy, no affinity, no SBI/IPI, no AArch64,
+no 199E, and **no RISC-V status change**: link 1 **ABSENT**; links 2, 3, 7, 9 present; 4, 5, 6, 8,
+10 absent; `RISCV_REMOTE_WAKE` = **D**; `RISCV_199D_READINESS` = **`case_b`**; coordinate 23
+**OPEN**; ledger **40 / 6 / 46**; **no new live cell**.
+
+#### Finding A — `AlreadyQueued` is not "nothing is queued"
+
+`ReceiverEnqueue::Rejected` documented itself as "the receiver is in **no** run queue". That holds
+for `InvalidCpu`, `CpuOffline`, `WakeOnly` and `QueueFull` — all fail before touching a queue. It
+is **false** for `AlreadyQueued`, which reports *pre-existing membership*. Worse:
+`PriorityScheduler::contains_tid` reads the membership mirror, which tracks the queues **plus the
+dispatched `current` task** — so `AlreadyQueued` can mean *the receiver is executing right now*.
+Running the ordinary `Runnable → Blocked` + waiter-restore rollback on that produces a `Blocked`
+task that is still queued or current, and claims a restoration that did not happen.
+
+Three changes:
+
+1. **The reason survives.** `EnqueueRejected(SchedulerError)` on both directions, instead of one
+   information-free variant. `Rejected` now states only that *this* enqueue did not commit.
+2. **Reconciliation shares the detecting acquisition.** On `AlreadyQueued` the seam calls
+   `withdraw_queued_tid_on` **inside the same `with_scheduler_split_mut` closure**, on the same
+   `sm` binding. The seam contains exactly one acquisition — a second one *would be* the
+   unlock/relock window — and never reconciles through `self`, which would re-acquire.
+   `Rejected` carries the resulting `WithdrawOutcome`.
+3. **Only `Removed` may roll back.** `receiver_is_unplaced()` is true for the four
+   never-touched-a-queue reasons, and for `AlreadyQueued` only when the reconciliation removed
+   exactly one queued entry — which by construction was *not* `current`. `RefusedCurrent`,
+   `RefusedDuplicate`, `NotQueued` and `InvalidCpu` fail closed through
+   `EnqueueRejectedUnreconciled(WithdrawOutcome)`: the externally visible authority is reclaimed,
+   and **no claim is made that the receiver was restored**.
+
+**On the hard-stop.** "Could an `AlreadyQueued` task already have executed or observed the
+publication?" Rather than argue the window, it is **closed**: both transactions now run a
+pre-commit membership preflight (NR6 step 9c, NR7 step 5c). A receiver that is still `Blocked`
+with its endpoint waiter exclusively claimed cannot legitimately hold scheduler membership and
+nothing can wake it while both are true — so the preflight does not race — and it declines
+**before the first irreversible mutation**. After that, a post-publication `AlreadyQueued` can only
+come from an invariant violation, and it fails closed rather than pretending. The `RefusedCurrent`
+branch is precisely the "may already have observed the publication" case, and it never claims
+restoration.
+
+#### Finding B — a direct-eligible NR7 has no timeout owner
+
+§6.1.26 justified leaving the caller `Blocked` with the record `Consumed` by saying the "existing
+reply timeout" would complete it. That is false for exactly the population that reaches the direct
+path: `classify_direct_reply_eligibility` declines `terminal_arbitrated` replies **before any
+mutation**, and `terminal_arbitrated` *means* a reply timeout is armed for that record incarnation.
+The whole direct-eligible reply population is therefore **untimed**. The claim is deleted.
+
+**Route A** is implemented: the exact one-shot authority is restored so the same reply retries.
+`restore_consumed_reply_record_split` moves the record `Consumed → Available` only when
+
+* the slot is at the **exact generation** the transaction owned (a recycled slot can never be
+  re-armed), and
+* it is still bound to the **exact replier identity** `{tid, asid}` that consumed it, and
+* it is in `Consumed` — not `Cancelled`, not already `Available`, so the restore cannot stack.
+
+`consume_reply_record_split` closes the reverse link on the same edge, so the restore
+re-registers it: the replier owes the reply again, exactly as before. The acknowledgement lease is
+restored, not discarded. Re-arming is admissible **only** when `receiver_is_unplaced()` holds —
+otherwise the caller may already have observed the delivery, and arming a second reply against it
+would be unsound.
+
+#### What is proved after every recoverable rejection
+
+Driven end-to-end through the existing NR6/NR7 blocked fixtures, for **each** of the four
+reachable `SchedulerError` reasons:
+
+* the task is `Blocked` on the **exact original recv cap** (compared as
+  `WaitReason::EndpointReceive(cap)`, not merely "some Blocked");
+* its exact waiter is restored **once**;
+* it is neither queued nor current on any CPU;
+* no success object, retirement marker or IPI exists — structurally, since both bind through an
+  `Enqueued` let-else and the drain's IPI and marker sit inside `if let Ok(success)`;
+* no reply cap, record or reverse-link leak — for NR6 proved by re-running the *same* transaction
+  to success; for NR7 by the restored authority retrying, succeeding **exactly once**, and a
+  duplicate remaining rejected, with `live_server_reply_link_count_split_read() == 1`.
+
+#### Mutation results
+
+Three mutations, each caught:
+
+| Mutation | Caught by |
+|---|---|
+| reconciliation replaced by a constant `Removed` (i.e. no atomic withdrawal) | `the_membership_reconciliation_shares_the_detecting_acquisition`, `already_queued_distinguishes_exactly_one_current_and_duplicate`, `no_blocked_task_ever_holds_queued_or_current_membership` |
+| replier identity guard dropped from the authority restore | `the_reply_authority_restore_is_identity_and_generation_exact` |
+| reverse-link re-registration dropped | initially **structural only** — a behavioural link-count assertion was added, and it now fails too |
 
 ---
 

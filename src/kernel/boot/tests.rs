@@ -77057,7 +77057,12 @@ mod stage199a2b2d_direct_request_txn {
             fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 77);
 
         // (10) no success object exists, so no wake target and no wake work can be derived.
-        assert_eq!(out, Err(IpcCallDirectError::EnqueueRejected));
+        assert_eq!(
+            out,
+            Err(IpcCallDirectError::EnqueueRejected(
+                crate::kernel::scheduler::SchedulerError::WakeOnly
+            ))
+        );
         assert!(out.is_err(), "no IpcCallDirectSuccess may be produced");
         // The failure invariants.
         fx.k.with(|s| {
@@ -77102,6 +77107,130 @@ mod stage199a2b2d_direct_request_txn {
                 "the retry actually queued the server"
             );
         });
+    }
+
+    /// Assert the failure invariants the repair promises after a RECOVERABLE rejection.
+    fn assert_nr6_fully_restored(fx: &Fixture, expected_cap: CapId) {
+        fx.k.with(|s| {
+            assert_eq!(
+                s.task_status(2),
+                Some(TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(expected_cap)
+                )),
+                "Blocked on the EXACT original recv cap"
+            );
+            assert!(
+                !s.task_present_in_any_runqueue(2),
+                "neither queued nor current on any CPU"
+            );
+        });
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(
+                fx.endpoint_index,
+                fx.endpoint_generation,
+                fx.server
+            ),
+            "the exact waiter restored once"
+        );
+    }
+
+    /// **Every rejection reason reachable through the real NR6 transaction**, each carrying the
+    /// scheduler's own reason and each leaving the server fully restored.
+    #[test]
+    fn each_nr6_rejection_reason_preserves_its_scheduler_error_and_restores_the_server() {
+        use crate::kernel::scheduler::SchedulerError;
+        for (reason, prepare) in [
+            (
+                SchedulerError::WakeOnly,
+                (|k: &SharedKernel| {
+                    k.with(|s| {
+                        s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+                        s.bring_up_cpu(CpuId(1)).expect("online");
+                        s.set_task_home_cpu(2, CpuId(1)).expect("pin");
+                    })
+                }) as fn(&SharedKernel),
+            ),
+            (SchedulerError::CpuOffline, |k: &SharedKernel| {
+                // CPU 1 present but never brought online.
+                k.with(|s| s.set_task_home_cpu(2, CpuId(1)).expect("pin"));
+            }),
+            (SchedulerError::InvalidCpu, |k: &SharedKernel| {
+                let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8);
+                k.with(|s| s.set_task_home_cpu(2, bogus).expect("pin"));
+            }),
+            (SchedulerError::QueueFull, |k: &SharedKernel| {
+                // Fill the local queue the unpinned enqueue would use.
+                let here = k.current_cpu_split_read();
+                k.with(|s| {
+                    for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+                        s.register_task(tid).expect("filler");
+                    }
+                });
+                for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+                    let _ = k.sr_enqueue_committed_receiver_split(tid, Some(here));
+                }
+            }),
+        ] {
+            let fx = blocked_server_fixture();
+            let recv_cap =
+                fx.k.blocked_recv_cap_split_read(2, fx.server_aspace_asid)
+                    .expect("the server's original recv cap");
+            prepare(&fx.k);
+            let snap = snapshot_for(&fx, b"request!");
+            let ack = ack_for(&fx);
+            let mut lease = claimed_lease(200);
+            let out =
+                fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 200);
+            assert_eq!(
+                out,
+                Err(IpcCallDirectError::EnqueueRejected(reason)),
+                "{reason:?} must survive to the transaction error"
+            );
+            assert_nr6_fully_restored(&fx, recv_cap);
+            assert!(lease.is_available(), "{reason:?} is retryable");
+        }
+    }
+
+    /// **Pre-existing membership is declined BEFORE any mutation.** A `Blocked` server that
+    /// already holds scheduler membership is an invariant violation; the transaction refuses it
+    /// at the preflight rather than publishing and then discovering the collision.
+    #[test]
+    fn a_server_with_pre_existing_membership_is_declined_before_mutation() {
+        let fx = blocked_server_fixture();
+        let recv_cap =
+            fx.k.blocked_recv_cap_split_read(2, fx.server_aspace_asid)
+                .expect("recv cap");
+        // Force the pathological state: Blocked AND queued.
+        let here = fx.k.current_cpu_split_read();
+        assert!(matches!(
+            fx.k.sr_enqueue_committed_receiver_split(2, Some(here)),
+            crate::runtime::ReceiverEnqueue::Enqueued { .. }
+        ));
+        let snap = snapshot_for(&fx, b"request!");
+        let ack = ack_for(&fx);
+        let mut lease = claimed_lease(201);
+        assert_eq!(
+            fx.k.ipc_call_direct_request_txn(&snap, &ack, &mut lease, 201),
+            Err(IpcCallDirectError::WouldBlock),
+            "declined before mutation, not after publication"
+        );
+        fx.k.with(|s| {
+            assert_eq!(
+                s.task_status(2),
+                Some(TaskStatus::Blocked(
+                    crate::kernel::task::WaitReason::EndpointReceive(recv_cap)
+                )),
+                "no TCB mutation happened at all"
+            );
+        });
+        assert!(
+            fx.k.endpoint_waiter_is_split_read(
+                fx.endpoint_index,
+                fx.endpoint_generation,
+                fx.server
+            ),
+            "the waiter is intact"
+        );
     }
 }
 
@@ -78140,10 +78269,16 @@ mod stage199a2b3_direct_reply_txn {
         );
     }
 
-    /// **NR7 failure accounting + rollback, driven end-to-end.** The caller is pinned to an
-    /// ONLINE WAKE-ONLY CPU, so the final placement is refused after the record was consumed.
-    /// The caller must be returned to `Blocked` with its waiter — and the record must stay
-    /// terminally spent, because the one-shot barrier already fired.
+    /// **NR7 failure accounting + rollback, driven end-to-end (route A).** The caller is pinned
+    /// to an ONLINE WAKE-ONLY CPU, so the final placement is refused after the record was
+    /// consumed.
+    ///
+    /// **UPDATED CONTRACT.** This test previously asserted the record stayed spent and the
+    /// caller's completion was left to "the existing reply timeout". That claim was false for
+    /// exactly this population: `classify_direct_reply` declines `terminal_arbitrated` replies
+    /// before any mutation, and `terminal_arbitrated` *means* a reply timeout is armed for that
+    /// record incarnation — so every direct-eligible reply is untimed and has **no** terminal
+    /// owner. The exact one-shot authority is now restored instead, and the same reply retries.
     #[test]
     fn a_refused_placement_rolls_the_nr7_caller_back_and_keeps_the_record_spent() {
         let fx = blocked_caller_fixture();
@@ -78159,8 +78294,16 @@ mod stage199a2b3_direct_reply_txn {
 
         let out = fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 91);
 
-        assert_eq!(out, Err(IpcReplyDirectError::EnqueueRejected));
+        assert_eq!(
+            out,
+            Err(IpcReplyDirectError::EnqueueRejected(
+                crate::kernel::scheduler::SchedulerError::WakeOnly
+            )),
+            "the scheduler's own reason is preserved, not collapsed"
+        );
         assert!(out.is_err(), "no IpcReplyDirectSuccess may be produced");
+
+        // The caller is exactly as it was before the transaction.
         fx.k.with(|s| {
             assert!(
                 matches!(s.task_status(1), Some(TaskStatus::Blocked(_))),
@@ -78168,7 +78311,7 @@ mod stage199a2b3_direct_reply_txn {
             );
             assert!(
                 !s.task_present_in_any_runqueue(1),
-                "and it is in no run queue on any CPU"
+                "and it is neither queued nor current on any CPU"
             );
         });
         assert!(
@@ -78177,27 +78320,181 @@ mod stage199a2b3_direct_reply_txn {
                 fx.published_ack.endpoint_generation,
                 fx.caller
             ),
-            "the claimed caller waiter was reinstalled"
+            "the claimed caller waiter was reinstalled exactly once"
+        );
+        // Route A: the exact one-shot authority is back, so the ack is restored, not discarded.
+        assert!(
+            fx.k.with(|s| s
+                .direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
+            "the reply authority is restored to Available at the same generation"
+        );
+        // …including the reverse link the consume closed: the replier owes the reply again.
+        assert_eq!(
+            fx.k.live_server_reply_link_count_split_read(),
+            1,
+            "the reverse link is re-registered, not leaked closed"
         );
         assert!(
-            !lease.is_available(),
-            "terminal, not retryable: the ack is discarded because the reply was spent"
+            !fx.k.can_reserve_server_reply_link_split(2, fx.replier_asid),
+            "…and it is the exact replier's single outstanding link"
+        );
+        assert!(
+            lease.is_available(),
+            "and the acknowledgement is restored for the retry"
+        );
+
+        // The retry succeeds EXACTLY once…
+        fx.k.with(|s| s.mark_cpu_wake_only(CpuId(1), false).expect("dispatching"));
+        let mut lease2 = claimed_lease(92);
+        let retry =
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease2, 92)
+                .expect("the restored authority is genuinely usable");
+        assert_eq!(retry.wake_target_cpu, CpuId(1));
+        fx.k.with(|s| assert!(s.task_present_in_any_runqueue(1), "the caller is woken"));
+
+        // …and a duplicate reply remains rejected.
+        let mut lease3 = claimed_lease(93);
+        assert!(
+            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease3, 93)
+                .is_err(),
+            "the one-shot barrier still holds after the retry"
         );
         assert!(
             !fx.k
                 .with(|s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)),
-            "the one-shot record stays spent — no second reply is possible"
-        );
-        // …and it really is terminal: even with the refusal removed, the same reply cannot
-        // re-run, because the record was consumed exactly once.
-        fx.k.with(|s| s.mark_cpu_wake_only(CpuId(1), false).expect("dispatching"));
-        let mut lease2 = claimed_lease(92);
-        assert!(
-            fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease2, 92)
-                .is_err(),
-            "a spent record can never be replied through again"
+            "the record is spent exactly once"
         );
         teardown();
+    }
+
+    /// **Every rejection reason reachable through the real NR7 transaction**, each carrying the
+    /// scheduler's own reason and each restoring the exact reply authority.
+    #[test]
+    fn each_nr7_rejection_reason_preserves_its_scheduler_error_and_restores_the_authority() {
+        use crate::kernel::scheduler::SchedulerError;
+        for (reason, prepare) in [
+            (
+                SchedulerError::WakeOnly,
+                (|k: &SharedKernel| {
+                    k.with(|s| {
+                        s.mark_cpu_wake_only(CpuId(1), true).expect("wake-only");
+                        s.bring_up_cpu(CpuId(1)).expect("online");
+                        s.set_task_home_cpu(1, CpuId(1)).expect("pin");
+                    })
+                }) as fn(&SharedKernel),
+            ),
+            (SchedulerError::CpuOffline, |k: &SharedKernel| {
+                k.with(|s| s.set_task_home_cpu(1, CpuId(1)).expect("pin"));
+            }),
+            (SchedulerError::InvalidCpu, |k: &SharedKernel| {
+                let bogus = CpuId(crate::kernel::scheduler::MAX_CPUS as u8);
+                k.with(|s| s.set_task_home_cpu(1, bogus).expect("pin"));
+            }),
+            (SchedulerError::QueueFull, |k: &SharedKernel| {
+                let here = k.current_cpu_split_read();
+                k.with(|s| {
+                    for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+                        s.register_task(tid).expect("filler");
+                    }
+                });
+                for tid in 100..100 + crate::kernel::scheduler::MAX_RUN_QUEUE as u64 {
+                    let _ = k.sr_enqueue_committed_receiver_split(tid, Some(here));
+                }
+            }),
+        ] {
+            let fx = blocked_caller_fixture();
+            let recv_cap =
+                fx.k.blocked_recv_cap_split_read(1, fx.caller_asid)
+                    .expect("the caller's original recv cap");
+            prepare(&fx.k);
+            let snap = snapshot_for(&fx, b"replyOK!");
+            let ack = fx.published_ack;
+            let mut lease = claimed_lease(210);
+            assert_eq!(
+                fx.k.ipc_reply_direct_txn(&snap, &ack, &mut lease, 210),
+                Err(IpcReplyDirectError::EnqueueRejected(reason)),
+                "{reason:?} must survive to the transaction error"
+            );
+            fx.k.with(|s| {
+                assert_eq!(
+                    s.task_status(1),
+                    Some(TaskStatus::Blocked(
+                        crate::kernel::task::WaitReason::EndpointReceive(recv_cap)
+                    )),
+                    "{reason:?}: Blocked on the EXACT original recv cap"
+                );
+                assert!(
+                    !s.task_present_in_any_runqueue(1),
+                    "{reason:?}: neither queued nor current"
+                );
+            });
+            assert!(
+                fx.k.endpoint_waiter_is_split_read(
+                    fx.published_ack.endpoint_index,
+                    fx.published_ack.endpoint_generation,
+                    fx.caller
+                ),
+                "{reason:?}: the exact waiter restored once"
+            );
+            assert!(
+                fx.k.with(
+                    |s| s.direct_reply_record_is_invokable(fx.record_index, fx.record_generation)
+                ),
+                "{reason:?}: the one-shot authority is restored"
+            );
+            assert!(lease.is_available(), "{reason:?} is retryable");
+            teardown();
+        }
+    }
+
+    /// **A terminal-arbitrated reply still declines before EVERY mutation.** The direct path is
+    /// only reachable for untimed replies — which is exactly why route A (restore the authority)
+    /// is required rather than leaning on a timeout that is not armed.
+    #[test]
+    fn a_terminal_arbitrated_reply_declines_before_every_mutation() {
+        use crate::kernel::direct_eligibility::{
+            DirectReplyEligibility, DirectReplyFacts, classify_direct_reply_eligibility,
+        };
+        let facts = DirectReplyFacts {
+            payload_len: 8,
+            requester_available: true,
+            reply_object: Ok((5, 2)),
+            reply_endpoint: Some((4, 9)),
+            endpoint_admitted: true,
+            transfer_cap_present: false,
+            terminal_arbitrated: true,
+        };
+        assert_eq!(
+            classify_direct_reply_eligibility(&facts),
+            DirectReplyEligibility::TerminalArbitrationUnsupported,
+            "an armed reply timeout keeps the reply on the legacy path"
+        );
+        // Sanity: the SAME facts with the flag clear ARE eligible, so the decline is caused by
+        // arbitration alone and this test cannot pass vacuously.
+        let mut untimed = facts;
+        untimed.terminal_arbitrated = false;
+        assert!(matches!(
+            classify_direct_reply_eligibility(&untimed),
+            DirectReplyEligibility::Eligible { .. }
+        ));
+        // …and the decline is ahead of every mutating step in the classifier's source order.
+        const ELIG: &str = include_str!("../direct_eligibility.rs");
+        let at = ELIG
+            .find("if facts.terminal_arbitrated {")
+            .expect("the arbitration gate");
+        let tail = &ELIG[at..];
+        for mutating in [
+            "reserve",
+            "consume",
+            "copy_slice_to_user",
+            "claim",
+            "enqueue",
+        ] {
+            assert!(
+                !tail[..tail.find("\n}").unwrap_or(tail.len())].contains(mutating),
+                "no `{mutating}` may run after the arbitration gate inside the classifier"
+            );
+        }
     }
 }
 
@@ -105375,6 +105672,7 @@ mod stage199d_remote_wake_authority {
             ReceiverEnqueue::Rejected {
                 cpu: bogus,
                 error: crate::kernel::scheduler::SchedulerError::CpuOffline,
+                reconciled: None,
             },
             "an offline target must be reported as refused, not as a committed wake target"
         );
@@ -105612,8 +105910,13 @@ mod stage199d_remote_wake_authority {
         // Stage 199D: and the ONLY route from that report to a wake target is `Enqueued`.
         assert!(
             RUNTIME.contains("Ok(()) => ReceiverEnqueue::Enqueued { cpu },")
-                && RUNTIME.contains("Err(error) => ReceiverEnqueue::Rejected { cpu, error },"),
+                && RUNTIME.contains("reconciled: None,"),
             "success and refusal are distinguished by the enqueue's own result"
+        );
+        // The AlreadyQueued reconciliation happens in the SAME rank-1 closure.
+        assert!(
+            RUNTIME.contains("let reconciled = sm.withdraw_queued_tid_on(cpu, ThreadId(tid));"),
+            "membership is reconciled under the acquisition that detected it"
         );
         assert!(
             RUNTIME.contains("pub(crate) fn current_cpu_split_read(&self) -> CpuId {")
@@ -109889,10 +110192,14 @@ mod stage199d_runqueue_withdrawal_foundation {
         }
 
         let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Stage 199D: `runtime.rs` joined the owners when the enqueue seam gained its
+        // same-acquisition `AlreadyQueued` reconciliation — the seam's ONLY consumer. It is
+        // still wired into no oracle, no RISC-V path and no production wake decision.
         const OWNERS: &[&str] = &[
             "src/kernel/scheduler.rs",
             "src/kernel/boot/scheduler_state.rs",
             "src/kernel/boot/tests.rs",
+            "src/runtime.rs",
         ];
         let mut callers: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
         let mut owners_seen = 0usize;
@@ -110042,6 +110349,7 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             ReceiverEnqueue::Rejected {
                 cpu: CpuId(1),
                 error: crate::kernel::scheduler::SchedulerError::WakeOnly,
+                reconciled: None,
             },
             "…it must report the refusal, distinguishing wake-only from offline"
         );
@@ -110137,7 +110445,7 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
             "success names the CPU it landed on"
         );
         assert!(
-            body.contains("Err(error) => ReceiverEnqueue::Rejected { cpu, error },"),
+            body.contains("error,") && body.contains("reconciled: None,"),
             "refusal carries the scheduler's own distinction, not a collapsed bool"
         );
     }
@@ -110193,16 +110501,34 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
         );
     }
 
-    /// The withdrawal foundation is still unwired — this increment did not consume it.
+    /// The withdrawal foundation is now consumed by exactly ONE caller — the enqueue seam's
+    /// `AlreadyQueued` membership reconciliation — and by nothing else. It is still not wired
+    /// into any oracle, any RISC-V path, or link 1.
     #[test]
     fn the_withdrawal_foundation_remains_unwired() {
         assert!(
             SCHED.contains("pub(crate) fn withdraw_queued_tid_on"),
             "the foundation from §6.1.24 is still present"
         );
+        let runtime_code: alloc::vec::Vec<&str> = RUNTIME
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(
+            runtime_code
+                .iter()
+                .filter(|l| l.contains("withdraw_queued_tid_on"))
+                .count(),
+            1,
+            "exactly one runtime caller: the same-acquisition reconciliation"
+        );
+        let at = RUNTIME
+            .find("pub(crate) fn sr_enqueue_committed_receiver_split")
+            .expect("the enqueue seam");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
         assert!(
-            !RUNTIME.contains("withdraw_queued_tid"),
-            "…and still has no runtime caller"
+            body.contains("withdraw_queued_tid_on"),
+            "…and it is inside the enqueue seam, not anywhere else"
         );
     }
 
@@ -110243,11 +110569,21 @@ mod stage199d_riscv_remote_enqueue_nr6_hardstop {
 /// `SchedulerError`'s, once wake-only stopped being folded into `CpuOffline`.
 mod stage199d_receiver_enqueue_outcome {
     use super::*;
-    use crate::kernel::scheduler::{MAX_CPUS, MAX_RUN_QUEUE, SchedulerError};
+    use crate::kernel::scheduler::{MAX_CPUS, MAX_RUN_QUEUE, SchedulerError, WithdrawOutcome};
     use crate::runtime::{ReceiverEnqueue, SharedKernel};
 
     const RUNTIME: &str = include_str!("../../runtime.rs");
     const TXN: &str = include_str!("../ipccall_direct_txn.rs");
+
+    /// A rejection with no pre-existing membership — the shape the four non-membership
+    /// reasons produce.
+    fn rejected(cpu: CpuId, error: SchedulerError) -> ReceiverEnqueue {
+        ReceiverEnqueue::Rejected {
+            cpu,
+            error,
+            reconciled: None,
+        }
+    }
 
     /// A kernel with `cpus` CPUs online and tids `1..=n` registered.
     fn fixture(cpus: u8, n: u64) -> SharedKernel {
@@ -110307,10 +110643,7 @@ mod stage199d_receiver_enqueue_outcome {
         let outcome = k.sr_enqueue_committed_receiver_split(1, Some(CpuId(1)));
         assert_eq!(
             outcome,
-            ReceiverEnqueue::Rejected {
-                cpu: CpuId(1),
-                error: SchedulerError::WakeOnly
-            },
+            rejected(CpuId(1), SchedulerError::WakeOnly),
             "wake-only is materially different from offline and must not collapse into it"
         );
         assert_eq!(outcome.enqueued_cpu(), None);
@@ -110323,13 +110656,7 @@ mod stage199d_receiver_enqueue_outcome {
     fn an_offline_target_is_reported_as_offline() {
         let k = fixture(1, 1); // only CPU 0 is online
         let outcome = k.sr_enqueue_committed_receiver_split(1, Some(CpuId(1)));
-        assert_eq!(
-            outcome,
-            ReceiverEnqueue::Rejected {
-                cpu: CpuId(1),
-                error: SchedulerError::CpuOffline
-            }
-        );
+        assert_eq!(outcome, rejected(CpuId(1), SchedulerError::CpuOffline));
         assert_eq!(outcome.enqueued_cpu(), None);
     }
 
@@ -110342,10 +110669,7 @@ mod stage199d_receiver_enqueue_outcome {
         let outcome = k.sr_enqueue_committed_receiver_split(1, Some(bogus));
         assert_eq!(
             outcome,
-            ReceiverEnqueue::Rejected {
-                cpu: bogus,
-                error: SchedulerError::InvalidCpu
-            },
+            rejected(bogus, SchedulerError::InvalidCpu),
             "out of range is distinct from present-but-offline"
         );
         assert_eq!(outcome.enqueued_cpu(), None);
@@ -110366,13 +110690,7 @@ mod stage199d_receiver_enqueue_outcome {
             );
         }
         let outcome = k.sr_enqueue_committed_receiver_split(n + 1, None);
-        assert_eq!(
-            outcome,
-            ReceiverEnqueue::Rejected {
-                cpu: here,
-                error: SchedulerError::QueueFull
-            }
-        );
+        assert_eq!(outcome, rejected(here, SchedulerError::QueueFull));
         assert_eq!(outcome.enqueued_cpu(), None);
         k.with(|s| {
             assert!(
@@ -110397,15 +110715,21 @@ mod stage199d_receiver_enqueue_outcome {
             outcome,
             ReceiverEnqueue::Rejected {
                 cpu: here,
-                error: SchedulerError::AlreadyQueued
+                error: SchedulerError::AlreadyQueued,
+                reconciled: Some(WithdrawOutcome::Removed),
             },
-            "a double wake must be reported, never counted as a second success"
+            "a double wake must be reported with its membership reconciled, never counted as a \
+             second success"
         );
         assert_eq!(outcome.enqueued_cpu(), None);
+        assert!(
+            outcome.receiver_is_unplaced(),
+            "an atomically removed exactly-one entry leaves the receiver unplaced"
+        );
         assert_eq!(
             k.with(|s| s.runnable_count_on_cpu(here)),
-            1,
-            "and it must not appear twice"
+            0,
+            "the reconciliation removed the pre-existing entry under the same acquisition"
         );
     }
 
@@ -110425,6 +110749,7 @@ mod stage199d_receiver_enqueue_outcome {
             let rejected = ReceiverEnqueue::Rejected {
                 cpu: CpuId(1),
                 error,
+                reconciled: None,
             };
             assert_eq!(rejected.enqueued_cpu(), None, "{error:?} yields no target");
         }
@@ -110432,14 +110757,25 @@ mod stage199d_receiver_enqueue_outcome {
             .find("impl ReceiverEnqueue {")
             .expect("the outcome impl");
         let body = &RUNTIME[at..][..RUNTIME[at..].find("\n}\n").expect("impl end")];
+        // Two accessors: the wake target and the unplaced predicate. Neither may return a CPU
+        // for a rejection, and only one returns a CPU at all.
         assert_eq!(
             body.matches("pub(crate) fn ").count(),
+            2,
+            "an unexpected accessor is how a rejection would leak a CPU: {body}"
+        );
+        assert_eq!(
+            body.matches("-> Option<CpuId>").count(),
             1,
-            "exactly one accessor — a second one is how a rejection would leak a CPU"
+            "exactly one accessor yields a CPU at all"
         );
         assert!(
             body.contains("ReceiverEnqueue::Rejected { .. } => None,"),
             "and it returns None for every rejection"
+        );
+        assert!(
+            body.contains("pub(crate) fn receiver_is_unplaced(self) -> bool {"),
+            "the membership predicate returns bool — it can never leak a CPU"
         );
     }
 
@@ -110457,7 +110793,7 @@ mod stage199d_receiver_enqueue_outcome {
                 .collect::<alloc::vec::Vec<_>>()
                 .join(" ");
             let bind = alloc::format!(
-                "let ReceiverEnqueue::Enqueued {{ cpu: wake_target_cpu, }} =                  self.sr_enqueue_committed_receiver_split({direction}, affinity) else {{"
+                "let outcome = self.sr_enqueue_committed_receiver_split({direction}, affinity); let ReceiverEnqueue::Enqueued {{ cpu: wake_target_cpu, }} = outcome else {{"
             );
             let bind = bind
                 .split_whitespace()
@@ -110478,8 +110814,8 @@ mod stage199d_receiver_enqueue_outcome {
             );
         }
         // The refusal arms return before any success can exist.
-        assert!(TXN.contains("return Err(IpcCallDirectError::EnqueueRejected);"));
-        assert!(TXN.contains("return Err(IpcReplyDirectError::EnqueueRejected);"));
+        assert!(TXN.contains("return Err(IpcCallDirectError::EnqueueRejected(error));"));
+        assert!(TXN.contains("return Err(IpcReplyDirectError::EnqueueRejected(error));"));
         // The drain's IPI and retirement marker are both inside the single success arm.
         let drain = TXN
             .split("pub(crate) fn drain_direct_request_post_work(")
@@ -110499,6 +110835,211 @@ mod stage199d_receiver_enqueue_outcome {
                 .expect("marker")
                 > ok_arm,
             "no remote-wake-success marker outside the success arm"
+        );
+    }
+
+    // ── (3) AlreadyQueued in all three membership shapes ────────────────────────────────────
+
+    /// **`AlreadyQueued` never means "nothing is queued".** It reports pre-existing membership,
+    /// and because the membership mirror tracks the queues *plus* the dispatched `current` task,
+    /// it can mean the receiver is executing. Each shape gets its own reconciliation verdict, and
+    /// only an atomically removed exactly-one queued entry counts as unplaced.
+    #[test]
+    fn already_queued_distinguishes_exactly_one_current_and_duplicate() {
+        // (a) exactly one queued entry → Removed → unplaced.
+        {
+            let k = fixture(1, 1);
+            let here = k.current_cpu_split_read();
+            assert!(matches!(
+                k.sr_enqueue_committed_receiver_split(1, None),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+            assert_eq!(
+                outcome,
+                ReceiverEnqueue::Rejected {
+                    cpu: here,
+                    error: SchedulerError::AlreadyQueued,
+                    reconciled: Some(WithdrawOutcome::Removed),
+                }
+            );
+            assert!(outcome.receiver_is_unplaced());
+            k.with(|s| assert!(!s.task_present_in_any_runqueue(1), "atomically withdrawn"));
+        }
+        // (b) the receiver is CURRENT — it may already have executed. Fail closed.
+        {
+            let k = fixture(1, 1);
+            let here = k.current_cpu_split_read();
+            assert!(matches!(
+                k.sr_enqueue_committed_receiver_split(1, None),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            k.with(|s| {
+                s.dispatch_next_on_cpu(here)
+                    .expect("dispatch it to current");
+            });
+            let outcome = k.sr_enqueue_committed_receiver_split(1, None);
+            assert_eq!(
+                outcome,
+                ReceiverEnqueue::Rejected {
+                    cpu: here,
+                    error: SchedulerError::AlreadyQueued,
+                    reconciled: Some(WithdrawOutcome::RefusedCurrent),
+                },
+                "a dispatched receiver must be reported as current, never as unplaced"
+            );
+            assert!(
+                !outcome.receiver_is_unplaced(),
+                "it may already have observed the publication — fail closed"
+            );
+            assert_eq!(
+                k.with(|s| s.current_tid_on_cpu(here)),
+                Some(1),
+                "and it is left exactly as found"
+            );
+        }
+        // (c) duplicate membership → fail closed with zero mutation.
+        {
+            let k = fixture(2, 1);
+            let here = k.current_cpu_split_read();
+            // Force the pathological duplicate: queued on BOTH CPUs (per-CPU membership makes
+            // this reachable, which is precisely why the reconciliation must fail closed).
+            assert!(matches!(
+                k.sr_enqueue_committed_receiver_split(1, Some(here)),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            let other = CpuId(1);
+            assert!(matches!(
+                k.sr_enqueue_committed_receiver_split(1, Some(other)),
+                ReceiverEnqueue::Enqueued { .. }
+            ));
+            // A third attempt on `here` collides with `here`'s own entry.
+            let outcome = k.sr_enqueue_committed_receiver_split(1, Some(here));
+            assert_eq!(
+                outcome,
+                ReceiverEnqueue::Rejected {
+                    cpu: here,
+                    error: SchedulerError::AlreadyQueued,
+                    reconciled: Some(WithdrawOutcome::Removed),
+                }
+            );
+            // …and the OTHER CPU still holds it, so "unplaced" would be a lie about the system.
+            assert_eq!(
+                k.with(|s| s.runnable_count_on_cpu(other)),
+                1,
+                "membership elsewhere is untouched — `Rejected` speaks only for THIS enqueue"
+            );
+        }
+    }
+
+    // ── (4) Blocked never coexists with scheduler membership ────────────────────────────────
+
+    /// After every recoverable rejection the receiver is `Blocked`, and no `Blocked` task
+    /// anywhere holds queued or current membership. Swept over the whole task table.
+    #[test]
+    fn no_blocked_task_ever_holds_queued_or_current_membership() {
+        let k = fixture(2, 4);
+        // Block tid 1..=4 the way the direct paths leave them, then sweep.
+        k.with(|s| {
+            for tid in 1..=4u64 {
+                s.set_task_status_for_test(
+                    tid,
+                    crate::kernel::task::TaskStatus::Blocked(crate::kernel::task::WaitReason::Poll),
+                );
+            }
+        });
+        k.with(|s| {
+            for tid in 1..=4u64 {
+                assert!(
+                    matches!(
+                        s.task_status(tid),
+                        Some(crate::kernel::task::TaskStatus::Blocked(_))
+                    ),
+                    "tid {tid} is Blocked"
+                );
+                assert!(
+                    !s.task_present_in_any_runqueue(tid),
+                    "a Blocked task must hold NO queued or current membership (tid {tid})"
+                );
+            }
+        });
+        // And the predicate that guards the rollback agrees: a rejection whose receiver still
+        // holds membership is never reported unplaced.
+        let here = k.current_cpu_split_read();
+        assert!(matches!(
+            k.sr_enqueue_committed_receiver_split(1, Some(here)),
+            ReceiverEnqueue::Enqueued { .. }
+        ));
+        k.with(|s| {
+            s.dispatch_next_on_cpu(here).expect("make it current");
+        });
+        assert!(
+            !k.sr_enqueue_committed_receiver_split(1, Some(here))
+                .receiver_is_unplaced(),
+            "a current receiver is never unplaced"
+        );
+    }
+
+    // ── (9) the two properties mutation testing must be able to break ───────────────────────
+
+    /// **The reconciliation is inside the acquisition that detected the collision.** Not "shortly
+    /// after" — inside the same `with_scheduler_split_mut` closure, using the same `sm` binding,
+    /// so no unlock/relock window exists in which a dispatcher could take the entry.
+    #[test]
+    fn the_membership_reconciliation_shares_the_detecting_acquisition() {
+        let at = RUNTIME
+            .find("pub(crate) fn sr_enqueue_committed_receiver_split")
+            .expect("the enqueue seam");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
+        let open = body
+            .find("self.with_scheduler_split_mut(|sched| {")
+            .expect("acquisition");
+        let detect = body
+            .find("Err(crate::kernel::scheduler::SchedulerError::AlreadyQueued)")
+            .expect("the collision arm");
+        let reconcile = body
+            .find("let reconciled = sm.withdraw_queued_tid_on(cpu, ThreadId(tid));")
+            .expect("the reconciliation");
+        assert!(
+            open < detect && detect < reconcile,
+            "detection and reconciliation must both sit inside the one acquisition"
+        );
+        // Exactly one acquisition in the whole seam: a second one would BE the window.
+        assert_eq!(
+            body.matches("with_scheduler_split_mut").count(),
+            1,
+            "a second acquisition is exactly the unlock/relock window this forbids"
+        );
+        // The reconciliation uses the guard's own scheduler binding, not a fresh `self.` call.
+        assert!(
+            !body.contains("self.withdraw_queued_tid"),
+            "reconciling through `self` would re-acquire the lock"
+        );
+    }
+
+    /// **The NR7 authority restore is identity- and generation-exact.** A foreign replier, a
+    /// stale generation, or a record that is not `Consumed` must all be refused — otherwise the
+    /// restore would re-arm a one-shot reply for somebody who never owned it.
+    #[test]
+    fn the_reply_authority_restore_is_identity_and_generation_exact() {
+        let at = RUNTIME
+            .find("pub(crate) fn restore_consumed_reply_record_split")
+            .expect("the restore seam");
+        let body = &RUNTIME[at..][..RUNTIME[at..].find("\n    }\n").expect("method end")];
+        for guard in [
+            "ipc.reply_cap_generations[index] == generation",
+            "record.reservation == ReplyRecordReservation::Consumed",
+            "record.responder_tid == Some(replier.tid)",
+            "record.replier_asid == Some(replier.asid)",
+        ] {
+            assert!(
+                body.contains(guard),
+                "the restore must be guarded by `{guard}`"
+            );
+        }
+        assert!(
+            body.contains("register_server_reply_link_split"),
+            "the consume closed the reverse link; the restore must re-register it"
         );
     }
 
